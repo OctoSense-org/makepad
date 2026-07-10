@@ -113,6 +113,14 @@ pub trait Agent {
 
     /// Inject prior conversation history into a session (for stateless backends)
     fn inject_history(&mut self, _session_id: SessionId, _messages: Vec<Message>) {}
+
+    /// Re-attach to an existing server-side session identified by an opaque
+    /// backend key (e.g. an octos `SessionKey` string) and request its chat
+    /// history. Returns the local `SessionId` now mapped to that session, or
+    /// `None` for backends without server-side sessions (the default).
+    fn resume_session(&mut self, _cx: &mut Cx, _backend_key: &str) -> Option<SessionId> {
+        None
+    }
 }
 
 /// Simple wrapper to use an Agent with automatic session management
