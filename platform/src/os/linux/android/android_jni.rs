@@ -458,6 +458,18 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     {
         std::env::set_var("STUDIO_CRATE", &studio_crate);
     }
+
+    // Generic app-config passthrough: `--es makepad.APP_CONFIG <value>`
+    // surfaces to the app as the MAKEPAD_APP_CONFIG env var. Unlike the
+    // studio extras this is intentionally not persisted in prefs — it is a
+    // one-shot provisioning channel (e.g. octos-app's login-free server
+    // bootstrap); apps persist what they need themselves.
+    std::env::remove_var("MAKEPAD_APP_CONFIG");
+    if let Some(app_config) = get_intent_string_extra(env, activity, "makepad.APP_CONFIG")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_APP_CONFIG", &app_config);
+    }
 }
 
 pub unsafe fn attach_jni_env() -> *mut jni_sys::JNIEnv {
@@ -1416,6 +1428,19 @@ pub unsafe fn to_java_copy_to_clipboard(content: String) {
         env,
         get_activity(),
         "copyToClipboard",
+        "(Ljava/lang/String;)V",
+        content
+    );
+}
+
+pub unsafe fn to_java_share_text(content: String) {
+    let env = attach_jni_env();
+    let content = CString::new(content).unwrap();
+    let content = ((**env).NewStringUTF.unwrap())(env, content.as_ptr());
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "shareText",
         "(Ljava/lang/String;)V",
         content
     );

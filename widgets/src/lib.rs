@@ -643,6 +643,12 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
 pub fn script_mod(vm: &mut ScriptVm) {
     theme_mod(vm);
     widgets_mod(vm);
+    // Register the `agent` global (with `agent.notify(...)`) here so it is
+    // present in BOTH the main script VM and every isolated Splash VM (each
+    // isolate re-runs this `script_mod` at creation — see
+    // `widget_async.rs`). Splash button callbacks (`agent.notify("inc", {})`)
+    // fail with "method notify not found" without it.
+    crate::splash::register_agent_module(vm);
 }
 
 #[cfg(test)]

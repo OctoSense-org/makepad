@@ -2376,6 +2376,9 @@ impl Cx {
                         );
                     }
                 }
+                CxOsOp::ShareText(content) => unsafe {
+                    android_jni::to_java_share_text(content);
+                },
                 CxOsOp::CopyToClipboard(content) => unsafe {
                     android_jni::to_java_copy_to_clipboard(content);
                 },

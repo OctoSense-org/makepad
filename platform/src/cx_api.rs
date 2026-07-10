@@ -293,6 +293,7 @@ pub enum CxOsOp {
     },
     HideClipboardActions,
     CopyToClipboard(String),
+    ShareText(String),
     SetPrimarySelection(String),
     ShowSelectionHandles {
         start: Vec2d,
@@ -439,6 +440,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::ShowClipboardActions { .. } => write!(f, "ShowClipboardActions"),
             Self::HideClipboardActions => write!(f, "HideClipboardActions"),
             Self::CopyToClipboard(..) => write!(f, "CopyToClipboard"),
+            Self::ShareText(..) => write!(f, "ShareText"),
             Self::SetPrimarySelection(..) => write!(f, "SetPrimarySelection"),
             Self::ShowSelectionHandles { .. } => write!(f, "ShowSelectionHandles"),
             Self::UpdateSelectionHandles { .. } => write!(f, "UpdateSelectionHandles"),
@@ -946,6 +948,14 @@ impl Cx {
 
     pub fn text_ime_was_dismissed(&mut self) {
         self.keyboard.set_text_ime_dismissed();
+        // A focused TextInput re-pushes ShowTextIME on every draw, so a show
+        // op queued by a frame drawn just before this dismissal landed can
+        // still be in platform_ops. If it drains after the backend forgets
+        // its last-shown config (e.g. Android's ResizeTextIME-closed clearing
+        // last_ime_config), it re-opens the keyboard the user just closed
+        // (tug-of-war). Drop the stale shows.
+        self.platform_ops
+            .retain(|op| !matches!(op, CxOsOp::ShowTextIME(..)));
         self.platform_ops.push(CxOsOp::HideTextIME);
     }
 
@@ -1033,6 +1043,13 @@ impl Cx {
     pub fn copy_to_clipboard(&mut self, content: &str) {
         self.platform_ops
             .push(CxOsOp::CopyToClipboard(content.to_owned()));
+    }
+
+    /// Open the OS share sheet (Android ACTION_SEND) with `content`. No-op on
+    /// platforms whose backend doesn't handle `CxOsOp::ShareText`.
+    pub fn share_text(&mut self, content: &str) {
+        self.platform_ops
+            .push(CxOsOp::ShareText(content.to_owned()));
     }
 
     /// Sets the primary selection (Linux middle-click paste).
