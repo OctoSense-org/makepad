@@ -240,6 +240,12 @@ impl Image {
                 .map(|r| PathBuf::from(&r.abs_path))
                 .unwrap_or_else(|| PathBuf::from("http_resource"))
         };
+        log!(
+            "[IMGTRACE] widget {:p} consumed {} bytes, spawning decode path={}",
+            self as *const _,
+            data.len(),
+            path.display()
+        );
         let _ = self.load_image_from_data_async(cx, &path, Arc::new((*data).clone()));
     }
 }
@@ -440,6 +446,11 @@ impl Widget for Image {
                 if self.load_image_from_cache(cx, &path, 0) {
                     self.async_image_size = None;
                     self.animator_play(cx, ids!(async_load.off));
+                    log!(
+                        "[IMGTRACE] widget {:p} self-heal adopted {}",
+                        self as *const _,
+                        path.display()
+                    );
                 }
             }
         }
@@ -545,6 +556,18 @@ impl Image {
         // we change either nothing, or width or height
         let rect = cx.peek_walk_turtle(walk);
         let dpi = cx.current_dpi_factor();
+        if self.texture.is_some() {
+            log!(
+                "[IMGBOX] req_h={:?} box={:.0}x{:.0} pos=({:.0},{:.0}) margin_v={:.0} fit={:?}",
+                walk.height,
+                rect.size.x,
+                rect.size.y,
+                rect.pos.x,
+                rect.pos.y,
+                walk.margin.top + walk.margin.bottom,
+                self.fit
+            );
+        }
 
         let (width, height) = if let Some((w, h)) = &self.async_image_size {
             // still loading

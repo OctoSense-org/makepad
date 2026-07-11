@@ -170,6 +170,11 @@ impl Cx {
                     NetworkResponse::HttpResponse { response: res, .. } => {
                         if let Some(body) = res.get_body() {
                             if (200..300).contains(&res.status_code) {
+                                crate::log!(
+                                    "[IMGTRACE] resource loaded {} bytes {}",
+                                    body.len(),
+                                    resource_info
+                                );
                                 self.script_data
                                     .resources
                                     .handle_http_response(request_id, body.clone());

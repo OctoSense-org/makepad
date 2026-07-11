@@ -95,6 +95,40 @@ impl ScriptHeap {
         }
     }
 
+    /// Like `new_handle`, but guarantees the returned handle VALUE is not
+    /// claimed by `is_taken`. Handle values are per-heap indices, so two VMs
+    /// mint identical values — fatal for tables SHARED across VMs (e.g. the
+    /// global script resource table): a fresh VM's first handles collide with
+    /// another VM's registered handles, so lookups hit the wrong entry and a
+    /// dying VM's GC deletes the other VM's entry. Colliding slots are burned
+    /// with a no-op GC box so their eventual sweep cannot touch shared state.
+    pub fn new_handle_excluding(
+        &mut self,
+        ty: ScriptHandleType,
+        hgc: Box<dyn ScriptHandleGc>,
+        is_taken: &mut dyn FnMut(ScriptHandle) -> bool,
+    ) -> ScriptHandle {
+        struct NoopGc;
+        impl ScriptHandleGc for NoopGc {
+            fn gc(&mut self) {}
+        }
+        let mut hgc = Some(hgc);
+        loop {
+            let handle = self.new_handle(ty, Box::new(NoopGc));
+            if !is_taken(handle) {
+                // Claim this slot for the real GC box.
+                let mut real = hgc.take().unwrap();
+                real.set_handle(handle);
+                self.handles[handle] = Some(ScriptHandleData {
+                    tag: Default::default(),
+                    handle: real,
+                });
+                return handle;
+            }
+            // Colliding value: leave the burned no-op slot behind and retry.
+        }
+    }
+
     pub fn handle_ref<T: ScriptHandleGc + 'static>(&self, handle: ScriptHandle) -> Option<&T> {
         self.handles[handle]
             .as_ref()

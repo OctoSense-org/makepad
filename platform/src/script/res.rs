@@ -845,7 +845,14 @@ pub fn script_mod(vm: &mut ScriptVm) {
                     handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
                     handle: ScriptHandle::ZERO,
                 };
-                let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
+                // Collision-guarded: handle values are per-VM heap indices, and
+                // this table is shared across VMs (see new_handle_excluding).
+                let shared = handle_gc.resources.clone();
+                let handle = vm.bx.heap.new_handle_excluding(
+                    res_type,
+                    Box::new(handle_gc),
+                    &mut |h| shared.borrow().iter().any(|r| r.handle == h),
+                );
 
                 cx.script_data.resources.insert_resource(CxScriptResource {
                     abs_path,
@@ -898,7 +905,14 @@ pub fn script_mod(vm: &mut ScriptVm) {
                                 .clone(),
                             handle: ScriptHandle::ZERO,
                         };
-                        let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
+                        // Collision-guarded: handle values are per-VM heap indices, and
+                // this table is shared across VMs (see new_handle_excluding).
+                let shared = handle_gc.resources.clone();
+                let handle = vm.bx.heap.new_handle_excluding(
+                    res_type,
+                    Box::new(handle_gc),
+                    &mut |h| shared.borrow().iter().any(|r| r.handle == h),
+                );
 
                         cx.script_data.resources.insert_resource(CxScriptResource {
                             abs_path,
@@ -940,7 +954,14 @@ pub fn script_mod(vm: &mut ScriptVm) {
                     handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
                     handle: ScriptHandle::ZERO,
                 };
-                let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
+                // Collision-guarded: handle values are per-VM heap indices, and
+                // this table is shared across VMs (see new_handle_excluding).
+                let shared = handle_gc.resources.clone();
+                let handle = vm.bx.heap.new_handle_excluding(
+                    res_type,
+                    Box::new(handle_gc),
+                    &mut |h| shared.borrow().iter().any(|r| r.handle == h),
+                );
 
                 // Create the resource in Loading state
                 cx.script_data.resources.insert_resource(CxScriptResource {
@@ -987,7 +1008,13 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
                 handle: ScriptHandle::ZERO,
             };
-            let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
+            // Collision-guarded (see new_handle_excluding).
+            let shared = handle_gc.resources.clone();
+            let handle = vm.bx.heap.new_handle_excluding(
+                res_type,
+                Box::new(handle_gc),
+                &mut |h| shared.borrow().iter().any(|r| r.handle == h),
+            );
 
             cx.script_data.resources.insert_resource(CxScriptResource {
                 abs_path: format!("binary://{}", LiveId::unique().0),
