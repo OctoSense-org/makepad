@@ -38,6 +38,46 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
     vm.set_injected_global(id!(agent), agent.into());
+
+    // `sys` module — Rust helpers callable from generated splash code.
+    // Extend this with more methods (data fetchers, formatters, card builders)
+    // and teach the LLM to call them in the A2App prompt.
+    let sys = vm.new_module(id!(sys));
+
+    // sys.photo("tokyo skyline sunset") -> a full-screen 9:16 REAL photo URL for
+    // that subject (loremflickr serves a real Flickr photo by keyword). Centralises
+    // image sourcing in Rust so it can be improved (curation, quality, providers)
+    // without touching the prompt. Use as `Image{ src: http_resource(sys.photo("<q>")) }`.
+    vm.add_method(
+        sys,
+        id_lut!(photo),
+        script_args_def!(query = NIL),
+        |vm, args| {
+            let query_value = script_value!(vm, args.query);
+            let mut query = String::new();
+            vm.bx.heap.cast_to_string(query_value, &mut query);
+
+            // Normalise to comma-separated keyword tags loremflickr expects:
+            // lowercase, alphanumerics kept, everything else -> a single comma.
+            let mut slug = String::with_capacity(query.len());
+            let mut last_comma = true; // avoid a leading comma
+            for ch in query.trim().chars() {
+                if ch.is_ascii_alphanumeric() {
+                    slug.push(ch.to_ascii_lowercase());
+                    last_comma = false;
+                } else if !last_comma {
+                    slug.push(',');
+                    last_comma = true;
+                }
+            }
+            let slug = slug.trim_matches(',');
+            let slug = if slug.is_empty() { "landscape,nature" } else { slug };
+            let url = format!("https://loremflickr.com/1080/1920/{slug}");
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    vm.set_injected_global(id!(sys), sys.into());
 }
 
 script_mod! {
