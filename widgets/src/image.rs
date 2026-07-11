@@ -429,6 +429,20 @@ impl Widget for Image {
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         self.load_from_resource(cx);
+        // Self-heal: if an async decode is still pending here but its one-shot
+        // `AsyncImageLoad` action was serviced against a different instance
+        // (e.g. a Splash card eval'd twice → streaming vs pooled `Image`s share
+        // one deduped decode job), the decoded texture is already in the global
+        // ImageCache but was never adopted by THIS instance. Reconcile from the
+        // cache every draw so a missed action can't strand the image on black.
+        if self.texture.is_none() {
+            if let Some(path) = self.async_image_path.clone() {
+                if self.load_image_from_cache(cx, &path, 0) {
+                    self.async_image_size = None;
+                    self.animator_play(cx, ids!(async_load.off));
+                }
+            }
+        }
         self.draw_walk_image(cx, walk)
     }
 }
