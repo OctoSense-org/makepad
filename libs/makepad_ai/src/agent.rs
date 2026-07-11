@@ -121,6 +121,11 @@ pub trait Agent {
     fn resume_session(&mut self, _cx: &mut Cx, _backend_key: &str) -> Option<SessionId> {
         None
     }
+
+    /// Toggle extra reasoning/thinking effort for subsequent turns. Maps to the
+    /// backend's per-turn reasoning-effort override (thinking-capable models
+    /// only). Default no-op for backends without a thinking mode.
+    fn set_thinking(&mut self, _on: bool) {}
 }
 
 /// Simple wrapper to use an Agent with automatic session management
