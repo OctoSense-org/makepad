@@ -44,10 +44,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     // and teach the LLM to call them in the A2App prompt.
     let sys = vm.new_module(id!(sys));
 
-    // sys.photo("tokyo skyline sunset") -> a full-screen 9:16 REAL photo URL for
-    // that subject (loremflickr serves a real Flickr photo by keyword). Centralises
-    // image sourcing in Rust so it can be improved (curation, quality, providers)
-    // without touching the prompt. Use as `Image{ src: http_resource(sys.photo("<q>")) }`.
+    // sys.photo("tokyo skyline sunset") -> a full-screen 9:16 image URL for that
+    // subject (pollinations.ai renders the prompt with an AI model, so the photo
+    // always matches the subject). Centralises image sourcing in Rust so it can be
+    // improved (curation, quality, providers) without touching the prompt.
+    // Use as `Image{ src: http_resource(sys.photo("<q>")) }`.
     vm.add_method(
         sys,
         id_lut!(photo),
@@ -57,22 +58,39 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let mut query = String::new();
             vm.bx.heap.cast_to_string(query_value, &mut query);
 
-            // Normalise to comma-separated keyword tags loremflickr expects:
-            // lowercase, alphanumerics kept, everything else -> a single comma.
-            let mut slug = String::with_capacity(query.len());
-            let mut last_comma = true; // avoid a leading comma
-            for ch in query.trim().chars() {
-                if ch.is_ascii_alphanumeric() {
-                    slug.push(ch.to_ascii_lowercase());
-                    last_comma = false;
-                } else if !last_comma {
-                    slug.push(',');
-                    last_comma = true;
+            // AI-generated, always ON-TOPIC 9:16 portrait image. loremflickr
+            // OR-matches comma tags, so a multi-word subject ("paris eiffel
+            // tower sunny") returned unrelated photos (a cat statue). Pollinations
+            // renders the full natural-language prompt, so the photo always
+            // matches the subject and is high quality — the "nano banana"-style
+            // AI source the app wants for beautiful full-screen backgrounds.
+            let q = query.trim();
+            let q = if q.is_empty() {
+                "beautiful cinematic landscape scenery, golden hour"
+            } else {
+                q
+            };
+            // Percent-encode the prompt for a URL path segment (RFC 3986):
+            // keep unreserved chars, encode everything else (incl. spaces) by
+            // UTF-8 byte.
+            let mut enc = String::with_capacity(q.len() * 3);
+            let mut buf = [0u8; 4];
+            for ch in q.chars() {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+                    enc.push(ch);
+                } else {
+                    for b in ch.encode_utf8(&mut buf).as_bytes() {
+                        enc.push('%');
+                        enc.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                        enc.push(char::from_digit((b & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+                    }
                 }
             }
-            let slug = slug.trim_matches(',');
-            let slug = if slug.is_empty() { "landscape,nature" } else { slug };
-            let url = format!("https://loremflickr.com/1080/1920/{slug}");
+            // 1080x1920 = 9:16. nologo strips the watermark; model=flux is fast
+            // and photoreal.
+            let url = format!(
+                "https://image.pollinations.ai/prompt/{enc}?width=1080&height=1920&nologo=true&model=flux"
+            );
             vm.bx.heap.new_string_from_str(&url)
         },
     );
