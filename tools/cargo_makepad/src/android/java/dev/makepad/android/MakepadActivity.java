@@ -70,6 +70,10 @@ import android.text.SpannableStringBuilder;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.EditText;
+import android.widget.TextView;
+import android.view.Gravity;
+import android.util.TypedValue;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -227,6 +231,14 @@ class MakepadImeInsets {
         int bottomOverlap = bottomOverlapPx(view, insets);
         boolean visible = isVisible(view, bottomOverlap);
         MakepadNative.surfaceOnResizeTextIME(bottomOverlap, visible);
+
+        // Reuse the same computed IME overlap to lift the native floating
+        // composer pill above the soft keyboard, so it tracks the show/hide
+        // animation (the window is SOFT_INPUT_ADJUST_NOTHING — nothing else
+        // moves for the keyboard). The report View's context is the activity.
+        if (view != null && view.getContext() instanceof MakepadActivity) {
+            ((MakepadActivity) view.getContext()).positionComposerForKeyboard(bottomOverlap);
+        }
     }
 }
 
@@ -1054,6 +1066,18 @@ public class MakepadActivity
     private SelectionHandleView mSelectionHandleEnd;
     private int mSelectionHandleSizePx;
 
+    // Native floating chat composer overlay. `mComposerOverlay` is a
+    // MATCH_PARENT, non-clickable FrameLayout sibling stacked above the GL
+    // surface (same pattern as `mSelectionHandleOverlay`). `mComposerPill` is
+    // the rounded EditText+send pill anchored to the bottom that gets lifted
+    // above the soft keyboard; `mComposerInput` is its EditText. Because the
+    // Android view tree dispatches touches, taps on the pill are consumed by
+    // it *before* Makepad's routing runs, and taps elsewhere fall through the
+    // non-clickable overlay to the full-screen Splash card.
+    private FrameLayout mComposerOverlay;
+    private LinearLayout mComposerPill;
+    private EditText mComposerInput;
+
     static {
         System.loadLibrary("makepad");
     }
@@ -1307,6 +1331,8 @@ public class MakepadActivity
         mSelectionHandleEnd.setOnTouchListener(createSelectionHandleDragListener(SELECTION_HANDLE_END));
         mSelectionHandleOverlay.addView(mSelectionHandleStart);
         mSelectionHandleOverlay.addView(mSelectionHandleEnd);
+
+        setupComposerOverlay();
 
         setContentView(mRootLayout);
         restoreWarmResumeSurfaceSnapshotIfAvailable();
@@ -2383,6 +2409,212 @@ public class MakepadActivity
                 mSelectionHandleOverlay.setVisibility(View.GONE);
             }
         });
+    }
+
+    // ---- Native floating chat composer overlay ---------------------------
+    // Built once here from onCreate. A rounded translucent pill (EditText +
+    // send button) anchored to the bottom of a MATCH_PARENT, non-clickable
+    // overlay that floats over the full-screen GL surface. Its touches are
+    // dispatched by the Android view tree, so the pill consumes its own taps
+    // *before* Makepad's routing runs (the full-screen card's PortalList can't
+    // swallow them); taps outside the pill fall through to the card.
+    private void setupComposerOverlay() {
+        final float d = getResources().getDisplayMetrics().density;
+
+        mComposerOverlay = new FrameLayout(this);
+        mComposerOverlay.setLayoutParams(new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+        mComposerOverlay.setClickable(false);
+        mComposerOverlay.setFocusable(false);
+        mComposerOverlay.setVisibility(View.GONE);
+
+        // The pill: horizontal EditText + send button, translucent teal to
+        // match the app's liquid-glass composer so the card shows through.
+        mComposerPill = new LinearLayout(this);
+        mComposerPill.setOrientation(LinearLayout.HORIZONTAL);
+        mComposerPill.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setColor(0xE60B4035);                    // ~90% opaque #0B4035
+        pillBg.setCornerRadius(24.0f * d);
+        pillBg.setStroke(Math.max(1, (int) (1.5f * d)), 0x5572E4FF);
+        mComposerPill.setBackground(pillBg);
+        int padH = (int) (16.0f * d);
+        int padV = (int) (8.0f * d);
+        mComposerPill.setPadding(padH, padV, (int) (8.0f * d), padV);
+        // Tap anywhere on the pill focuses the input + raises the keyboard;
+        // being clickable also stops card taps leaking through the pill band.
+        mComposerPill.setClickable(true);
+        mComposerPill.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                focusComposerInput();
+            }
+        });
+
+        FrameLayout.LayoutParams pillLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        pillLp.gravity = Gravity.BOTTOM;
+        int side = (int) (12.0f * d);
+        pillLp.setMargins(side, 0, side, (int) (12.0f * d));
+        mComposerPill.setLayoutParams(pillLp);
+
+        // EditText: the SOLE IME client while the composer is up. Makepad keeps
+        // no TextInput focused, so Rust never issues a competing ShowTextIME
+        // and there is no two-controller keyboard race.
+        mComposerInput = new EditText(this);
+        mComposerInput.setBackground(null);
+        // Placeholder "问任何事…" (matches the app's Makepad composer). The
+        // cargo-makepad javac runs under file.encoding=UTF-8, so the literal
+        // UTF-8 source is decoded correctly.
+        mComposerInput.setHint("问任何事…");
+        mComposerInput.setHintTextColor(0x88F3E3C7);
+        mComposerInput.setTextColor(0xFFF3E3C7);
+        mComposerInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.0f);
+        // Single line so the IME shows a "Send" action key (a multiline flag
+        // turns it into a newline key). Prompts here are short.
+        mComposerInput.setSingleLine(true);
+        mComposerInput.setInputType(InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        mComposerInput.setImeOptions(EditorInfo.IME_ACTION_SEND);
+        LinearLayout.LayoutParams inputLp = new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
+        );
+        mComposerInput.setLayoutParams(inputLp);
+        mComposerInput.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override
+            public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                if (actionId == EditorInfo.IME_ACTION_SEND
+                    || (event != null
+                        && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                        && event.getAction() == KeyEvent.ACTION_DOWN)) {
+                    submitComposer();
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        // Send button — gold paper-plane glyph.
+        TextView send = new TextView(this);
+        send.setText("➤");                                    // ➤
+        send.setTextColor(0xFFF3E3C7);
+        send.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20.0f);
+        send.setGravity(Gravity.CENTER);
+        int sendSize = (int) (40.0f * d);
+        send.setLayoutParams(new LinearLayout.LayoutParams(sendSize, sendSize));
+        send.setClickable(true);
+        send.setFocusable(true);
+        send.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                submitComposer();
+            }
+        });
+
+        mComposerPill.addView(mComposerInput);
+        mComposerPill.addView(send);
+        mComposerOverlay.addView(mComposerPill);
+        mRootLayout.addView(mComposerOverlay);
+    }
+
+    private void focusComposerInput() {
+        if (mComposerInput == null) {
+            return;
+        }
+        mComposerInput.requestFocus();
+        InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.showSoftInput(mComposerInput, InputMethodManager.SHOW_IMPLICIT);
+        }
+    }
+
+    private void submitComposer() {
+        if (mComposerInput == null) {
+            return;
+        }
+        String text = mComposerInput.getText().toString();
+        if (text.trim().length() == 0) {
+            return;
+        }
+        mComposerInput.setText("");
+        // Hand the text to Rust → the app's send path.
+        MakepadNative.onComposerSubmit(text);
+        // A card will render behind — drop the keyboard so it's full-screen.
+        hideComposerKeyboard();
+    }
+
+    private void hideComposerKeyboard() {
+        if (mComposerInput != null) {
+            mComposerInput.clearFocus();
+        }
+        // Match showKeyboard()'s hide path: WindowInsetsController on API 30+,
+        // where the legacy hideSoftInputFromWindow is unreliable (OxygenOS /
+        // edge-to-edge).
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.ime());
+            }
+        } else {
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null && mComposerInput != null) {
+                imm.hideSoftInputFromWindow(mComposerInput.getWindowToken(), 0);
+            }
+        }
+    }
+
+    // Called from Rust via `android_jni::to_java_show_composer`.
+    public void showComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerOverlay == null) {
+                    return;
+                }
+                mComposerOverlay.setVisibility(View.VISIBLE);
+                mComposerOverlay.bringToFront();
+            }
+        });
+    }
+
+    // Called from Rust via `android_jni::to_java_hide_composer`.
+    public void hideComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerOverlay == null) {
+                    return;
+                }
+                hideComposerKeyboard();
+                mComposerOverlay.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    // Lift the composer pill above the soft keyboard. Driven by the IME inset
+    // the host already computes (`MakepadImeInsets.report`), so the pill tracks
+    // the keyboard's show/hide animation. `keyboardOverlapPx` is the keyboard's
+    // overlap with the surface bottom (0 when the keyboard is down). Already on
+    // the UI thread (report() runs from layout / inset callbacks).
+    //
+    // We lift via the overlay's *bottom padding* (a real layout change) rather
+    // than `setTranslationY` on the pill: a translated wide ViewGroup with a
+    // drawable background does not recomposite over the GL SurfaceView (it stays
+    // functionally present but invisible), whereas a genuine relayout redraws it
+    // at the new position. The pill is BOTTOM-gravity inside the overlay, so
+    // bottom padding pushes it up above the keyboard.
+    public void positionComposerForKeyboard(int keyboardOverlapPx) {
+        if (mComposerOverlay == null) {
+            return;
+        }
+        int pad = Math.max(0, keyboardOverlapPx);
+        if (mComposerOverlay.getPaddingBottom() != pad) {
+            mComposerOverlay.setPadding(0, 0, 0, pad);
+        }
     }
 
     public void requestHttp(long id, long metadataId, String url, String method, String headers, byte[] body) {

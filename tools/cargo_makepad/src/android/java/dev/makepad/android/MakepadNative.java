@@ -60,6 +60,10 @@ public class MakepadNative {
     // Called when user presses the action button on the soft keyboard
     public native static void onImeEditorAction(int actionCode);
 
+    // Native floating chat composer (an Android view floating over the GL
+    // surface) submitted its text — user tapped send or pressed IME "Send".
+    public native static void onComposerSubmit(String text);
+
     // midi
     public native static void onMidiDeviceOpened(String name, Object midi_device);
     
