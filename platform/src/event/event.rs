@@ -27,6 +27,20 @@ use {
     },
 };
 
+/// Text submitted by the native Android floating chat-composer overlay
+/// (`MakepadActivity`'s composer view that floats over the GL surface).
+///
+/// Posted as a bare action via `Cx::post_action` from the `onComposerSubmit`
+/// JNI callback and drained into `Event::Actions`, so the app routes it into
+/// its normal send path from `handle_actions` (`downcast_ref`). Defined
+/// cross-platform (not behind a `cfg`) so non-Android app builds can still
+/// name it in a `downcast_ref` without gating; it is only ever *posted* on
+/// Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidComposerSubmit {
+    pub text: String,
+}
+
 /// Events that can be sent between the Makepad framework and the application.
 #[derive(Debug)]
 pub enum Event {

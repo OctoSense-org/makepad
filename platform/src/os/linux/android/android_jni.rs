@@ -230,6 +230,9 @@ pub enum FromJavaMessage {
     ImeEditorAction {
         action_code: i32,
     },
+    ComposerSubmit {
+        text: String,
+    },
 }
 unsafe impl Send for FromJavaMessage {}
 
@@ -1304,6 +1307,20 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onImeEditorActio
     });
 }
 
+// The native floating chat composer (an Android view floating over the GL
+// surface, see `MakepadActivity`) submitted its text — the user tapped the
+// send button or pressed the IME "Send" action key. Routed to the app's send
+// path via a `ComposerSubmit` message (see `android.rs::handle_message`).
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSubmit(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    text: jni_sys::jstring,
+) {
+    let text = jstring_to_string(env, text);
+    send_from_java_message(FromJavaMessage::ComposerSubmit { text });
+}
+
 unsafe fn jstring_to_string(env: *mut jni_sys::JNIEnv, java_string: jni_sys::jstring) -> String {
     let chars = (**env).GetStringUTFChars.unwrap()(env, java_string, std::ptr::null_mut());
     let rust_string = std::ffi::CStr::from_ptr(chars)
@@ -1444,6 +1461,21 @@ pub unsafe fn to_java_share_text(content: String) {
         "(Ljava/lang/String;)V",
         content
     );
+}
+
+// Show the native floating chat composer overlay (see `MakepadActivity`). The
+// composer floats over the full-screen GL surface so the Splash card behind it
+// stays edge-to-edge; the Android view tree dispatches its touches directly so
+// Makepad's touch routing can't swallow taps meant for it.
+pub unsafe fn to_java_show_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "showComposer", "()V");
+}
+
+// Hide the native floating chat composer overlay and drop its keyboard.
+pub unsafe fn to_java_hide_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "hideComposer", "()V");
 }
 
 pub unsafe fn to_java_paste_from_clipboard() -> String {

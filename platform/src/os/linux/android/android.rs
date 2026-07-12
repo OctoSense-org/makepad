@@ -1317,6 +1317,16 @@ impl Cx {
                 let e = Event::ImeAction(ImeActionEvent { action });
                 self.call_event_handler(&e);
             }
+            FromJavaMessage::ComposerSubmit { text } => {
+                // The native floating composer submitted text. Deliver it as a
+                // bare action and drain it *this tick* (post_action alone would
+                // sit in the global channel until the next RenderLoop's
+                // `handle_other_events`, which — when the app is idle behind a
+                // rendered card — may not arrive until the next touch). The app
+                // routes it into its send path from `handle_actions`.
+                Cx::post_action(crate::event::AndroidComposerSubmit { text });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
@@ -2378,6 +2388,12 @@ impl Cx {
                 }
                 CxOsOp::ShareText(content) => unsafe {
                     android_jni::to_java_share_text(content);
+                },
+                CxOsOp::ShowAndroidComposer => unsafe {
+                    android_jni::to_java_show_composer();
+                },
+                CxOsOp::HideAndroidComposer => unsafe {
+                    android_jni::to_java_hide_composer();
                 },
                 CxOsOp::CopyToClipboard(content) => unsafe {
                     android_jni::to_java_copy_to_clipboard(content);

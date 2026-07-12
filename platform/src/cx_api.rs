@@ -294,6 +294,12 @@ pub enum CxOsOp {
     HideClipboardActions,
     CopyToClipboard(String),
     ShareText(String),
+    // Show/hide the native Android floating chat-composer overlay (a native
+    // view floating over the GL surface so the full-screen Splash card behind
+    // it is edge-to-edge). Handled only by the Android backend; ignored by
+    // every other backend's catch-all.
+    ShowAndroidComposer,
+    HideAndroidComposer,
     SetPrimarySelection(String),
     ShowSelectionHandles {
         start: Vec2d,
@@ -441,6 +447,8 @@ impl std::fmt::Debug for CxOsOp {
             Self::HideClipboardActions => write!(f, "HideClipboardActions"),
             Self::CopyToClipboard(..) => write!(f, "CopyToClipboard"),
             Self::ShareText(..) => write!(f, "ShareText"),
+            Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
+            Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
             Self::SetPrimarySelection(..) => write!(f, "SetPrimarySelection"),
             Self::ShowSelectionHandles { .. } => write!(f, "ShowSelectionHandles"),
             Self::UpdateSelectionHandles { .. } => write!(f, "UpdateSelectionHandles"),
@@ -1050,6 +1058,20 @@ impl Cx {
     pub fn share_text(&mut self, content: &str) {
         self.platform_ops
             .push(CxOsOp::ShareText(content.to_owned()));
+    }
+
+    /// Show the native Android floating chat-composer overlay so it floats
+    /// over the full-screen Splash card. No-op on platforms whose backend
+    /// doesn't handle `CxOsOp::ShowAndroidComposer` (i.e. everything but
+    /// Android).
+    pub fn show_android_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::ShowAndroidComposer);
+    }
+
+    /// Hide the native Android floating chat-composer overlay (and drop its
+    /// keyboard). No-op off Android.
+    pub fn hide_android_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::HideAndroidComposer);
     }
 
     /// Sets the primary selection (Linux middle-click paste).
