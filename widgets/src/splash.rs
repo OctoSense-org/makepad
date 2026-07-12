@@ -17,6 +17,16 @@ pub enum SplashAction {
     None,
 }
 
+/// Web-Mercator "slippy map" tile (x, y) covering `lat`/`lon` at zoom `z`
+/// (the standard OSM/XYZ scheme used by Carto and WAQI tile servers).
+fn slippy_tile(lat: f64, lon: f64, z: u32) -> (i64, i64) {
+    let n = (1u64 << z) as f64;
+    let x = ((lon + 180.0) / 360.0 * n).floor();
+    let y = ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor();
+    let max = (1i64 << z) - 1;
+    ((x as i64).clamp(0, max), (y as i64).clamp(0, max))
+}
+
 pub fn register_agent_module(vm: &mut ScriptVm) {
     let agent = vm.new_module(id!(agent));
     vm.add_method(
@@ -91,6 +101,81 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let url = format!(
                 "https://image.pollinations.ai/prompt/{enc}?width=1080&height=1920&nologo=true&model=flux"
             );
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    // sys.satellite() -> a LIVE full-disk satellite cloud map (卫星云图) image URL:
+    // Himawari-9 true-color over Asia-Pacific from NICT, refreshed every 10 min. The
+    // frame timestamp is computed at CALL time (i.e. on each render), so a saved card
+    // always shows recent clouds instead of a stale baked URL. The true-color full
+    // disk is daylight only (dark over Asia at local night). The disk is square with
+    // a black-space margin, so ImageFit.Smallest shows the whole Earth cleanly.
+    // Use as `Image{ src: http_resource(sys.satellite()) fit: ImageFit.Smallest }`.
+    vm.add_method(
+        sys,
+        id_lut!(satellite),
+        script_args_def!(region = NIL),
+        |vm, _args| {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            // The newest published full-disk frame lags real time; back off 40 min
+            // and floor to the 10-min cadence so the tile is reliably available.
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let t = now.saturating_sub(40 * 60);
+            let t = t - (t % 600);
+            let secs_of_day = t % 86_400;
+            let hh = secs_of_day / 3_600;
+            let mm = (secs_of_day % 3_600) / 60;
+            // Civil date from days-since-epoch (Howard Hinnant's algorithm).
+            let days = (t / 86_400) as i64;
+            let z = days + 719_468;
+            let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+            let doe = z - era * 146_097; // [0, 146096]
+            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+            let mp = (5 * doy + 2) / 153; // [0, 11]
+            let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+            let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+            let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+            let url = format!(
+                "https://himawari8.nict.go.jp/img/D531106/1d/550/{year:04}/{month:02}/{day:02}/{hh:02}{mm:02}00_0_0.png"
+            );
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    // sys.basemap(lat, lon) -> a dark base-map tile (Carto, no key) at the city, meant to
+    // sit UNDER sys.airmap in an Overlay so the AQI colours have geographic context.
+    // Zoom 7 frames the metro + surrounding region in one 256px tile.
+    vm.add_method(
+        sys,
+        id_lut!(basemap),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let (x, y) = slippy_tile(lat, lon, 7);
+            let url = format!("https://a.basemaps.cartocdn.com/dark_all/7/{x}/{y}.png");
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    // sys.airmap(lat, lon) -> a LIVE air-quality colour overlay tile (WAQI, US-EPA AQI
+    // scale). Mostly transparent except where AQI data exists, so stack it OVER
+    // sys.basemap(lat, lon) at the SAME lat/lon in an Overlay (both use zoom 7).
+    // Use as `View{ flow: Overlay Image{basemap} Image{airmap} }`.
+    vm.add_method(
+        sys,
+        id_lut!(airmap),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let (x, y) = slippy_tile(lat, lon, 7);
+            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/7/{x}/{y}.png?token=_");
             vm.bx.heap.new_string_from_str(&url)
         },
     );
