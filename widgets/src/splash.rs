@@ -435,6 +435,68 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.movers(index, "field") -> the LIVE "top gainers" list (Yahoo day_gainers
+    // screener, no auth). index 0 = the biggest % gainer today, up to 9. Fields
+    // (case-insensitive): symbol, name, price, change (signed), changepct (signed %),
+    // high, low, prev, open, 52wh, 52wl, vol, marketcap, currency, exchange.
+    // ONE fetch (deduped by URL) serves all 10 rows × all fields. Use for a top-10
+    // movers LIST card; tap a row to open the per-ticker detail (sys.stock/stockbar).
+    vm.add_method(
+        sys,
+        id_lut!(movers),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10".to_string();
+            let base = format!("finance.result.0.quotes.{index}");
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => "—".to_string(),
+                Some(bytes) => {
+                    let raw = |k: &str| json_pluck(&bytes, &format!("{base}.{k}"));
+                    let num = |k: &str| raw(k).and_then(|s| s.parse::<f64>().ok());
+                    let money = |k: &str| num(k).map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
+                    match field.trim().to_ascii_lowercase().as_str() {
+                        "symbol" => raw("symbol").unwrap_or_else(|| "—".into()),
+                        "name" => raw("displayName")
+                            .or_else(|| raw("shortName"))
+                            .or_else(|| raw("longName"))
+                            .unwrap_or_else(|| "—".into()),
+                        "price" => money("regularMarketPrice"),
+                        "change" => num("regularMarketChange").map(|v| format!("{v:+.2}")).unwrap_or_else(|| "—".into()),
+                        "changepct" | "changepercent" => num("regularMarketChangePercent").map(|v| format!("{v:+.2}%")).unwrap_or_else(|| "—".into()),
+                        "high" => money("regularMarketDayHigh"),
+                        "low" => money("regularMarketDayLow"),
+                        "prev" | "prevclose" => money("regularMarketPreviousClose"),
+                        "open" => money("regularMarketOpen"),
+                        "52wh" | "yearhigh" => money("fiftyTwoWeekHigh"),
+                        "52wl" | "yearlow" => money("fiftyTwoWeekLow"),
+                        "currency" => raw("currency").unwrap_or_else(|| "—".into()),
+                        "exchange" => raw("fullExchangeName").unwrap_or_else(|| "—".into()),
+                        "vol" | "volume" => match num("regularMarketVolume") {
+                            Some(v) if v >= 1e9 => format!("{:.2}B", v / 1e9),
+                            Some(v) if v >= 1e6 => format!("{:.1}M", v / 1e6),
+                            Some(v) if v >= 1e3 => format!("{:.1}K", v / 1e3),
+                            Some(v) => format!("{v:.0}"),
+                            None => "—".to_string(),
+                        },
+                        "marketcap" | "mktcap" | "cap" => match num("marketCap") {
+                            Some(v) if v >= 1e12 => format!("{:.2}T", v / 1e12),
+                            Some(v) if v >= 1e9 => format!("{:.1}B", v / 1e9),
+                            Some(v) if v >= 1e6 => format!("{:.0}M", v / 1e6),
+                            Some(v) => format!("{v:.0}"),
+                            None => "—".to_string(),
+                        },
+                        other => raw(other).unwrap_or_else(|| "—".into()),
+                    }
+                }
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     // sys.news(index, "key") -> a LIVE Hacker News front-page story (index 0..).
     // Same "—"/redraw semantics. `key` (case-insensitive):
     //   title | url | author | points | comments
@@ -479,6 +541,7 @@ fn body_binds_live_data(body: &str) -> bool {
         || body.contains("sys.airquality")
         || body.contains("sys.stock")
         || body.contains("sys.news")
+        || body.contains("sys.movers")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
