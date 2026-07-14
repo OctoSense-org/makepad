@@ -1077,6 +1077,10 @@ public class MakepadActivity
     private FrameLayout mComposerOverlay;
     private LinearLayout mComposerPill;
     private EditText mComposerInput;
+    // Collapsed state: a small round "+" button (bottom-right). Tapping it
+    // expands back to the full pill. Rust drives the collapse (while a card
+    // generates / after it renders) via expand/collapseComposer().
+    private TextView mComposerFab;
 
     static {
         System.loadLibrary("makepad");
@@ -1241,9 +1245,33 @@ public class MakepadActivity
         if (Build.VERSION.SDK_INT >= 30) {
             setTheme(R.style.MakepadAppTheme);
         }
-        
+
         super.onCreate(savedInstanceState);
-        
+
+        // Route the app's OWN http (card background images fetched via
+        // MakepadNetwork's HttpURLConnection) through the same proxy as the
+        // embedded octos server when `--es makepad.OCTOS_PROXY http://host:port`
+        // is set — needed when the device has no direct internet route (e.g. an
+        // adb-reverse tunnel to the dev host). HttpURLConnection honours these
+        // JVM proxy system properties, so no per-request change is needed.
+        try {
+            Intent launchIntent = getIntent();
+            String proxy = launchIntent != null
+                ? launchIntent.getStringExtra("makepad.OCTOS_PROXY") : null;
+            if (proxy != null && proxy.length() > 0) {
+                String hp = proxy.replaceFirst("^https?://", "").replaceAll("/.*$", "");
+                int colon = hp.lastIndexOf(':');
+                if (colon > 0) {
+                    String host = hp.substring(0, colon);
+                    String port = hp.substring(colon + 1);
+                    System.setProperty("http.proxyHost", host);
+                    System.setProperty("http.proxyPort", port);
+                    System.setProperty("https.proxyHost", host);
+                    System.setProperty("https.proxyPort", port);
+                }
+            }
+        } catch (Exception e) { /* proxy is best-effort */ }
+
         this.requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setSoftInputMode(
             LayoutParams.SOFT_INPUT_ADJUST_NOTHING
@@ -2515,9 +2543,81 @@ public class MakepadActivity
             }
         });
 
+        // Layer 3 — new-app (＋) and switch (⟳) controls sit LEFT of the input,
+        // so all app-management lives in the composer (the rest of the screen is
+        // just the a2app card). They fold away with the pill; collapsed shows
+        // only the "+" FAB. Order: [＋][⟳][input][➤].
+        int ctlSize = (int) (40.0f * d);
+        TextView newAppBtn = new TextView(this);
+        newAppBtn.setText("＋");
+        newAppBtn.setTextColor(0xFF72E4FF);
+        newAppBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.0f);
+        newAppBtn.setGravity(Gravity.CENTER);
+        newAppBtn.setLayoutParams(new LinearLayout.LayoutParams(ctlSize, ctlSize));
+        newAppBtn.setClickable(true);
+        newAppBtn.setFocusable(true);
+        newAppBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                MakepadNative.onComposerNewApp();
+            }
+        });
+        TextView switchBtn = new TextView(this);
+        switchBtn.setText("⟳");
+        switchBtn.setTextColor(0xFFF3E3C7);
+        switchBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.0f);
+        switchBtn.setGravity(Gravity.CENTER);
+        switchBtn.setLayoutParams(new LinearLayout.LayoutParams(ctlSize, ctlSize));
+        switchBtn.setClickable(true);
+        switchBtn.setFocusable(true);
+        switchBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                MakepadNative.onComposerSwitch();
+            }
+        });
+
+        mComposerPill.addView(newAppBtn);
+        mComposerPill.addView(switchBtn);
         mComposerPill.addView(mComposerInput);
         mComposerPill.addView(send);
         mComposerOverlay.addView(mComposerPill);
+
+        // Collapsed "+" button — a round FAB in the bottom-right that replaces
+        // the pill when the composer collapses. Hidden by default (starts
+        // expanded, matching the app's composer_shown=true); tapping it expands.
+        mComposerFab = new TextView(this);
+        mComposerFab.setText("+");
+        mComposerFab.setTextColor(0xFFF3E3C7);
+        mComposerFab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28.0f);
+        mComposerFab.setGravity(Gravity.CENTER);
+        mComposerFab.setIncludeFontPadding(false);
+        GradientDrawable fabBg = new GradientDrawable();
+        fabBg.setShape(GradientDrawable.OVAL);
+        fabBg.setColor(0xE60B4035);                    // matches the pill teal
+        fabBg.setStroke(Math.max(1, (int) (1.5f * d)), 0x5572E4FF);
+        mComposerFab.setBackground(fabBg);
+        int fabSize = (int) (52.0f * d);
+        FrameLayout.LayoutParams fabLp = new FrameLayout.LayoutParams(fabSize, fabSize);
+        fabLp.gravity = Gravity.BOTTOM | Gravity.END;
+        int fabMargin = (int) (16.0f * d);
+        fabLp.setMargins(0, 0, fabMargin, fabMargin);
+        mComposerFab.setLayoutParams(fabLp);
+        mComposerFab.setClickable(true);
+        mComposerFab.setFocusable(true);
+        mComposerFab.setVisibility(View.GONE);
+        mComposerFab.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                // Explicit intent to type: show the pill AND raise the keyboard.
+                // (onClick already runs on the UI thread.)
+                mComposerFab.setVisibility(View.GONE);
+                mComposerPill.setVisibility(View.VISIBLE);
+                focusComposerInput();
+            }
+        });
+        mComposerOverlay.addView(mComposerFab);
+
         mRootLayout.addView(mComposerOverlay);
     }
 
@@ -2543,8 +2643,10 @@ public class MakepadActivity
         mComposerInput.setText("");
         // Hand the text to Rust → the app's send path.
         MakepadNative.onComposerSubmit(text);
-        // A card will render behind — drop the keyboard so it's full-screen.
-        hideComposerKeyboard();
+        // A card will render behind — collapse to the "+" button (this also drops
+        // the keyboard) so it's full-screen. Rust re-asserts this via sync_composer
+        // when streaming starts; collapsing here gives instant feedback on send.
+        collapseComposer();
     }
 
     private void hideComposerKeyboard() {
@@ -2591,6 +2693,40 @@ public class MakepadActivity
                 }
                 hideComposerKeyboard();
                 mComposerOverlay.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    // Called from Rust via `android_jni::to_java_expand_composer`. Swap the "+"
+    // button for the full input pill. Does NOT raise the keyboard — this is used
+    // to reflect state (e.g. at boot), and popping the IME on launch is wrong.
+    // The FAB's own onClick raises the keyboard (explicit user intent to type).
+    public void expandComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerPill == null || mComposerFab == null) {
+                    return;
+                }
+                mComposerFab.setVisibility(View.GONE);
+                mComposerPill.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    // Called from Rust via `android_jni::to_java_collapse_composer`. Drop the
+    // keyboard, hide the pill, show the "+" button. The draft text is preserved
+    // (we never clear mComposerInput here) so expanding restores it.
+    public void collapseComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerPill == null || mComposerFab == null) {
+                    return;
+                }
+                hideComposerKeyboard();
+                mComposerPill.setVisibility(View.GONE);
+                mComposerFab.setVisibility(View.VISIBLE);
             }
         });
     }

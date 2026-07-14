@@ -64,6 +64,10 @@ public class MakepadNative {
     // surface) submitted its text — user tapped send or pressed IME "Send".
     public native static void onComposerSubmit(String text);
 
+    // Composer control buttons: open another app / switch to the next app.
+    public native static void onComposerNewApp();
+    public native static void onComposerSwitch();
+
     // midi
     public native static void onMidiDeviceOpened(String name, Object midi_device);
     
