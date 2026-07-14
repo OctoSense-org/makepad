@@ -48,6 +48,19 @@ import android.view.PixelCopy;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.ImageReader;
+import android.media.Image;
+import android.graphics.ImageFormat;
+import android.util.Size;
+import android.view.Surface;
+import java.util.Arrays;
+import java.nio.ByteBuffer;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -1081,6 +1094,17 @@ public class MakepadActivity
     // expands back to the full pill. Rust drives the collapse (while a card
     // generates / after it renders) via expand/collapseComposer().
     private TextView mComposerFab;
+    // QR scanner (LLM provisioning): a full-screen camera overlay that streams
+    // luma frames to Rust for a pure-Rust QR decode (see onQrCameraFrame).
+    private FrameLayout mQrScanOverlay;
+    private CameraDevice mQrCameraDevice;
+    private CameraCaptureSession mQrCaptureSession;
+    private ImageReader mQrImageReader;
+    private HandlerThread mQrBgThread;
+    private Handler mQrBgHandler;
+    private volatile boolean mQrScanning = false;
+    private long mQrLastFrameMs = 0;
+    private static final int QR_CAMERA_PERM_REQ = 0x51A2;
 
     static {
         System.loadLibrary("makepad");
@@ -1542,6 +1566,16 @@ public class MakepadActivity
             
             // Use the new unified callback
             MakepadNative.onPermissionResult(permissions[i], requestId, status);
+        }
+
+        // QR-scanner camera permission: open the scanner once granted.
+        if (requestId == QR_CAMERA_PERM_REQ) {
+            for (int i = 0; i < permissions.length; i++) {
+                if (Manifest.permission.CAMERA.equals(permissions[i])
+                    && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    showQrScanner();
+                }
+            }
         }
     }
 
@@ -2576,9 +2610,26 @@ public class MakepadActivity
                 MakepadNative.onComposerSwitch();
             }
         });
+        // QR scan (⛶) — opens the camera to scan an LLM-provisioning QR (see
+        // showQrScanner). Sits left of the input: [＋][⟳][⛶][input][➤].
+        TextView qrBtn = new TextView(this);
+        qrBtn.setText("⛶");
+        qrBtn.setTextColor(0xFFF3E3C7);
+        qrBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.0f);
+        qrBtn.setGravity(Gravity.CENTER);
+        qrBtn.setLayoutParams(new LinearLayout.LayoutParams(ctlSize, ctlSize));
+        qrBtn.setClickable(true);
+        qrBtn.setFocusable(true);
+        qrBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showQrScanner();
+            }
+        });
 
         mComposerPill.addView(newAppBtn);
         mComposerPill.addView(switchBtn);
+        mComposerPill.addView(qrBtn);
         mComposerPill.addView(mComposerInput);
         mComposerPill.addView(send);
         mComposerOverlay.addView(mComposerPill);
@@ -2619,6 +2670,187 @@ public class MakepadActivity
         mComposerOverlay.addView(mComposerFab);
 
         mRootLayout.addView(mComposerOverlay);
+    }
+
+    // Open the QR scanner overlay (requesting CAMERA first). Rust decodes the
+    // streamed frames; on a hit it applies the LLM config (see onQrCameraFrame).
+    private void showQrScanner() {
+        if (mQrScanning) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+            && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, QR_CAMERA_PERM_REQ);
+            return; // re-opened from onRequestPermissionsResult once granted
+        }
+        runOnUiThread(new Runnable() { public void run() { startQrScanner(); } });
+    }
+
+    private void startQrScanner() {
+        if (mQrScanning) return;
+        mQrScanning = true;
+        final float d = getResources().getDisplayMetrics().density;
+        final SurfaceView sv = new SurfaceView(this);
+        mQrScanOverlay = new FrameLayout(this);
+        mQrScanOverlay.setLayoutParams(new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        mQrScanOverlay.setBackgroundColor(0xFF000000);
+        mQrScanOverlay.addView(sv, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        TextView hint = new TextView(this);
+        hint.setText("Scan your LLM QR   ·   tap to cancel");
+        hint.setTextColor(0xFFFFFFFF);
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.0f);
+        hint.setGravity(Gravity.CENTER);
+        hint.setPadding(0, (int) (56 * d), 0, 0);
+        FrameLayout.LayoutParams hintLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hintLp.gravity = Gravity.TOP;
+        mQrScanOverlay.addView(hint, hintLp);
+        mQrScanOverlay.setClickable(true);
+        mQrScanOverlay.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { hideQrScanner(); }
+        });
+        mRootLayout.addView(mQrScanOverlay);
+
+        mQrBgThread = new HandlerThread("qr-camera");
+        mQrBgThread.start();
+        mQrBgHandler = new Handler(mQrBgThread.getLooper());
+
+        sv.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                openQrCamera2(holder.getSurface());
+            }
+            @Override public void surfaceChanged(SurfaceHolder holder, int fmt, int w, int h) {}
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {}
+        });
+    }
+
+    // Camera2 capture: a preview on `previewSurface` + an ImageReader (YUV_420_888)
+    // whose Y plane (luma) is streamed to Rust for a pure-Rust QR decode. Camera2
+    // attributes via the app Context, unlike the deprecated `Camera` API (which is
+    // frame-blocked on some OEMs).
+    private void openQrCamera2(final Surface previewSurface) {
+        try {
+            final CameraManager mgr = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            String backId = null;
+            for (String id : mgr.getCameraIdList()) {
+                Integer f = mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING);
+                if (f != null && f == CameraCharacteristics.LENS_FACING_BACK) { backId = id; break; }
+            }
+            if (backId == null) {
+                String[] ids = mgr.getCameraIdList();
+                if (ids.length == 0) { hideQrScanner(); return; }
+                backId = ids[0];
+            }
+            StreamConfigurationMap map = mgr.getCameraCharacteristics(backId)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            Size chosen = new Size(640, 480);
+            if (map != null) {
+                Size[] sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
+                if (sizes != null) {
+                    for (Size s : sizes) {
+                        if (s.getWidth() <= 1280 && s.getWidth() * s.getHeight()
+                                > chosen.getWidth() * chosen.getHeight()) {
+                            chosen = s;
+                        }
+                    }
+                }
+            }
+            mQrImageReader = ImageReader.newInstance(
+                chosen.getWidth(), chosen.getHeight(), ImageFormat.YUV_420_888, 2);
+            mQrImageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                @Override public void onImageAvailable(ImageReader reader) {
+                    Image img = null;
+                    try {
+                        img = reader.acquireLatestImage();
+                        if (img == null || !mQrScanning) return;
+                        long now = System.currentTimeMillis();
+                        if (now - mQrLastFrameMs < 200) return; // ~5 fps
+                        mQrLastFrameMs = now;
+                        int w = img.getWidth(), h = img.getHeight();
+                        Image.Plane yp = img.getPlanes()[0];
+                        ByteBuffer buf = yp.getBuffer();
+                        int rowStride = yp.getRowStride();
+                        int pixStride = yp.getPixelStride();
+                        byte[] luma = new byte[w * h];
+                        byte[] rowBuf = new byte[rowStride];
+                        int out = 0;
+                        for (int row = 0; row < h; row++) {
+                            int toRead = Math.min(rowStride, buf.remaining());
+                            buf.get(rowBuf, 0, toRead);
+                            for (int col = 0; col < w; col++) luma[out++] = rowBuf[col * pixStride];
+                        }
+                        if (MakepadNative.onQrCameraFrame(luma, w, h)) {
+                            hideQrScanner();
+                        }
+                    } catch (Exception e) {
+                        // transient frame errors are fine; keep scanning
+                    } finally {
+                        if (img != null) img.close();
+                    }
+                }
+            }, mQrBgHandler);
+
+            mgr.openCamera(backId, new CameraDevice.StateCallback() {
+                @Override public void onOpened(CameraDevice device) {
+                    mQrCameraDevice = device;
+                    try {
+                        final CaptureRequest.Builder rb =
+                            device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                        rb.addTarget(previewSurface);
+                        rb.addTarget(mQrImageReader.getSurface());
+                        rb.set(CaptureRequest.CONTROL_AF_MODE,
+                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                        device.createCaptureSession(
+                            Arrays.asList(previewSurface, mQrImageReader.getSurface()),
+                            new CameraCaptureSession.StateCallback() {
+                                @Override public void onConfigured(CameraCaptureSession session) {
+                                    if (mQrCameraDevice == null) return;
+                                    mQrCaptureSession = session;
+                                    try { session.setRepeatingRequest(rb.build(), null, mQrBgHandler); }
+                                    catch (Exception e) { hideQrScanner(); }
+                                }
+                                @Override public void onConfigureFailed(CameraCaptureSession s) {
+                                    hideQrScanner();
+                                }
+                            }, mQrBgHandler);
+                    } catch (Exception e) {
+                        android.util.Log.e("Makepad", "QR camera2 session failed: " + e);
+                        hideQrScanner();
+                    }
+                }
+                @Override public void onDisconnected(CameraDevice device) { device.close(); }
+                @Override public void onError(CameraDevice device, int error) {
+                    android.util.Log.e("Makepad", "QR camera2 error: " + error);
+                    device.close();
+                    hideQrScanner();
+                }
+            }, mQrBgHandler);
+        } catch (Exception e) {
+            android.util.Log.e("Makepad", "QR camera2 open failed: " + e);
+            hideQrScanner();
+        }
+    }
+
+    // Close the scanner + release the camera. Safe to call from any thread.
+    public void hideQrScanner() {
+        runOnUiThread(new Runnable() { public void run() {
+            mQrScanning = false;
+            try { if (mQrCaptureSession != null) mQrCaptureSession.close(); } catch (Exception ignore) {}
+            mQrCaptureSession = null;
+            try { if (mQrCameraDevice != null) mQrCameraDevice.close(); } catch (Exception ignore) {}
+            mQrCameraDevice = null;
+            try { if (mQrImageReader != null) mQrImageReader.close(); } catch (Exception ignore) {}
+            mQrImageReader = null;
+            if (mQrBgThread != null) {
+                try { mQrBgThread.quitSafely(); } catch (Exception ignore) {}
+                mQrBgThread = null;
+                mQrBgHandler = null;
+            }
+            if (mQrScanOverlay != null && mRootLayout != null) {
+                mRootLayout.removeView(mQrScanOverlay);
+                mQrScanOverlay = null;
+            }
+        }});
     }
 
     private void focusComposerInput() {
