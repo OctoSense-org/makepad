@@ -476,6 +476,17 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
         std::env::set_var("MAKEPAD_APP_CONFIG", &app_config);
     }
 
+    // LLM provisioning passthrough: `--es makepad.PROVISION_CONFIG '<json>'` → the
+    // MAKEPAD_PROVISION_CONFIG env var. The JSON is the same self-contained payload
+    // the composer's QR scan yields ({"llm_family":..,"llm_model":..,"llm_key":..});
+    // the app writes it into the octos profile config on boot (bring-your-own-key).
+    std::env::remove_var("MAKEPAD_PROVISION_CONFIG");
+    if let Some(prov) = get_intent_string_extra(env, activity, "makepad.PROVISION_CONFIG")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_PROVISION_CONFIG", &prov);
+    }
+
     // TEST-ONLY passthrough: `--es makepad.SEED_CARD_FILE <path>` → the
     // MAKEPAD_SEED_CARD_FILE env var, so the app can seed a canned card from a
     // file (bypassing the server/LLM) for on-device render/scroll/map tests.
