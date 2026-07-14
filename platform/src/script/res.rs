@@ -477,7 +477,6 @@ impl Cx {
             None => {}
         }
         let request_id = LiveId::unique();
-        crate::log!("[WXTRACE] data fetch FIRE {}", url);
         self.script_data.resources.begin_data_fetch(url, request_id);
         let mut req = HttpRequest::new(url.to_string(), Default::default());
         // Some data APIs (e.g. Yahoo Finance) 429 a request that has no browser

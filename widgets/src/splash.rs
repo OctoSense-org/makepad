@@ -282,15 +282,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
 &timezone=auto&forecast_days=7"
             );
             let value = match vm.host.cx_mut().script_data_fetch(&url) {
-                Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| {
-                    log!(
-                        "[WXTRACE] sys.weather pluck MISS path={:?} ({} bytes) head={:?}",
-                        path.trim(),
-                        bytes.len(),
-                        String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
-                    );
-                    "—".to_string()
-                }),
+                Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| "—".to_string()),
                 None => "—".to_string(),
             };
             vm.bx.heap.new_string_from_str(&value)
