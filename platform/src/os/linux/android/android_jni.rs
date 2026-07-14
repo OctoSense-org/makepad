@@ -235,6 +235,9 @@ pub enum FromJavaMessage {
     },
     ComposerNewApp,
     ComposerSwitch,
+    QrScanned {
+        json: String,
+    },
 }
 unsafe impl Send for FromJavaMessage {}
 
@@ -1390,6 +1393,47 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSwitch
     _: jni_sys::jclass,
 ) {
     send_from_java_message(FromJavaMessage::ComposerSwitch);
+}
+
+/// A camera frame (NV21 luma plane) from the QR scanner overlay. Decode it with
+/// the pure-Rust `rqrr`; on a hit, post the decoded string (the app applies it as
+/// an LLM-provisioning payload) and return JNI_TRUE so Java closes the scanner.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onQrCameraFrame(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    luma: jni_sys::jbyteArray,
+    width: jni_sys::jint,
+    height: jni_sys::jint,
+) -> jni_sys::jboolean {
+    let (w, h) = (width as usize, height as usize);
+    let len = (**env).GetArrayLength.unwrap()(env, luma) as usize;
+    if w == 0 || h == 0 || len < w * h {
+        return 0; // JNI_FALSE
+    }
+    let mut buf = vec![0i8; w * h];
+    (**env).GetByteArrayRegion.unwrap()(env, luma, 0, (w * h) as jni_sys::jsize, buf.as_mut_ptr());
+    let luma_u8 = std::slice::from_raw_parts(buf.as_ptr() as *const u8, w * h);
+    match decode_qr_luma(luma_u8, w, h) {
+        Some(json) => {
+            send_from_java_message(FromJavaMessage::QrScanned { json });
+            1 // JNI_TRUE
+        }
+        None => 0, // JNI_FALSE
+    }
+}
+
+/// Detect + decode a QR from an 8-bit greyscale (luma) buffer. Returns the text.
+fn decode_qr_luma(luma: &[u8], w: usize, h: usize) -> Option<String> {
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| luma[y * w + x]);
+    for grid in img.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            if !content.is_empty() {
+                return Some(content);
+            }
+        }
+    }
+    None
 }
 
 unsafe fn jstring_to_string(env: *mut jni_sys::JNIEnv, java_string: jni_sys::jstring) -> String {

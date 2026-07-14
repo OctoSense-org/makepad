@@ -52,6 +52,13 @@ pub struct AndroidComposerNewApp;
 #[derive(Clone, Debug, Default)]
 pub struct AndroidComposerSwitch;
 
+/// The composer's QR scanner decoded a payload (the JSON LLM-provisioning config).
+/// The app applies it via `login::apply_provision_config_json`.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidQrScanned {
+    pub json: String,
+}
+
 /// Events that can be sent between the Makepad framework and the application.
 #[derive(Debug)]
 pub enum Event {

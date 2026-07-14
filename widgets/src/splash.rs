@@ -351,6 +351,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 None => "—".to_string(),
                 Some(bytes) => {
                     let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
+                    // Monetary fields formatted to a consistent 2 decimals (Yahoo
+                    // returns e.g. 201.5, which otherwise breaks the visual rhythm).
+                    let money = |k: &str| num(k).map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
                     match field.trim().to_ascii_lowercase().as_str() {
                         "change" => match (num("regularMarketPrice"), num("chartPreviousClose")) {
                             (Some(p), Some(c)) => format!("{:+.2}", p - c),
@@ -362,19 +365,73 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                                 _ => "—".to_string(),
                             }
                         }
-                        "price" => json_pluck(&bytes, &m("regularMarketPrice")).unwrap_or_else(|| "—".into()),
-                        "prev" | "prevclose" => json_pluck(&bytes, &m("chartPreviousClose")).unwrap_or_else(|| "—".into()),
-                        "high" => json_pluck(&bytes, &m("regularMarketDayHigh")).unwrap_or_else(|| "—".into()),
-                        "low" => json_pluck(&bytes, &m("regularMarketDayLow")).unwrap_or_else(|| "—".into()),
-                        "open" => json_pluck(&bytes, &m("regularMarketOpen")).unwrap_or_else(|| "—".into()),
+                        "price" => money("regularMarketPrice"),
+                        "prev" | "prevclose" => money("chartPreviousClose"),
+                        "high" => money("regularMarketDayHigh"),
+                        "low" => money("regularMarketDayLow"),
+                        "open" => money("regularMarketOpen"),
                         "currency" => json_pluck(&bytes, &m("currency")).unwrap_or_else(|| "—".into()),
-                        "name" => json_pluck(&bytes, &m("shortName")).unwrap_or_else(|| "—".into()),
+                        "name" => json_pluck(&bytes, &m("longName"))
+                            .or_else(|| json_pluck(&bytes, &m("shortName")))
+                            .unwrap_or_else(|| "—".into()),
                         "symbol" => json_pluck(&bytes, &m("symbol")).unwrap_or_else(|| "—".into()),
+                        "exchange" => json_pluck(&bytes, &m("fullExchangeName")).unwrap_or_else(|| "—".into()),
+                        "52wh" | "yearhigh" => money("fiftyTwoWeekHigh"),
+                        "52wl" | "yearlow" => money("fiftyTwoWeekLow"),
+                        "vol" | "volume" => match num("regularMarketVolume") {
+                            Some(v) if v >= 1e9 => format!("{:.2}B", v / 1e9),
+                            Some(v) if v >= 1e6 => format!("{:.1}M", v / 1e6),
+                            Some(v) if v >= 1e3 => format!("{:.1}K", v / 1e3),
+                            Some(v) => format!("{v:.0}"),
+                            None => "—".to_string(),
+                        },
+                        // Day-range position 0..100 (where price sits low→high), for a range bar.
+                        "rangepct" => match (
+                            num("regularMarketPrice"),
+                            num("regularMarketDayLow"),
+                            num("regularMarketDayHigh"),
+                        ) {
+                            (Some(p), Some(lo), Some(hi)) if hi > lo => {
+                                format!("{:.0}", (((p - lo) / (hi - lo)) * 100.0).clamp(0.0, 100.0))
+                            }
+                            _ => "50".to_string(),
+                        },
                         other => json_pluck(&bytes, other).unwrap_or_else(|| "—".into()),
                     }
                 }
             };
             vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.stockbar("AAPL", index, count) -> the HEIGHT (dp, a NUMBER) of bar
+    // `index` of `count` in an intraday sparkline (Yahoo 5-minute closes for the
+    // day, normalized so the day's low→~8dp and high→~158dp). Draw the chart as a
+    // bottom-aligned `flow: Right` row of thin `SolidView{ height: sys.stockbar(
+    // "AAPL", N, COUNT) }` bars (an area/line of the price path). Returns a small
+    // height while the async fetch loads, then the card re-evaluates.
+    vm.add_method(
+        sys,
+        id_lut!(stockbar),
+        script_args_def!(symbol = NIL, index = NIL, count = NIL, maxh = NIL),
+        |vm, args| {
+            let sym_v = script_value!(vm, args.symbol);
+            let mut symbol = String::new();
+            vm.bx.heap.cast_to_string(sym_v, &mut symbol);
+            let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let count = (script_value!(vm, args.count).as_number().unwrap_or(40.0) as usize).max(2);
+            // Optional 4th arg: the chart's pixel height, so the area fills it
+            // exactly with no peak clipping. Defaults to 150 (legacy behavior).
+            let maxh = script_value!(vm, args.maxh).as_number().filter(|v| *v > 8.0).unwrap_or(150.0);
+            let sym = symbol.trim().to_ascii_uppercase();
+            let url = format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=5m&range=1d"
+            );
+            let h = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => stock_bar_height(&bytes, index, count, maxh),
+                None => 6.0,
+            };
+            ScriptValue::from_f64(h)
         },
     );
 
@@ -422,6 +479,37 @@ fn body_binds_live_data(body: &str) -> bool {
         || body.contains("sys.airquality")
         || body.contains("sys.stock")
         || body.contains("sys.news")
+}
+
+/// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
+/// 5-minute close series, normalized so the day's min→~8dp and max→`maxh`+8dp
+/// (so a chart of pixel height `maxh`+8 shows the full range without clipping).
+fn stock_bar_height(bytes: &[u8], index: usize, count: usize, maxh: f64) -> f64 {
+    let span = (maxh - 8.0).max(8.0);
+    let root: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return 6.0,
+    };
+    let arr = match root
+        .pointer("/chart/result/0/indicators/quote/0/close")
+        .and_then(|c| c.as_array())
+    {
+        Some(a) => a,
+        None => return 6.0,
+    };
+    let vals: Vec<f64> = arr.iter().filter_map(|x| x.as_f64()).collect();
+    if vals.len() < 2 {
+        return 6.0;
+    }
+    let mn = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mx = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if mx <= mn {
+        return 24.0;
+    }
+    let denom = (count.max(2) - 1) as f64;
+    let pos = ((index as f64 / denom) * (vals.len() - 1) as f64).round() as usize;
+    let val = vals[pos.min(vals.len() - 1)];
+    8.0 + (val - mn) / (mx - mn) * span
 }
 
 /// Extract a scalar from an open-meteo JSON body at a dot-path, formatted for

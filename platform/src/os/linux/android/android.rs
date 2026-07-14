@@ -1338,6 +1338,12 @@ impl Cx {
                 Cx::post_action(crate::event::AndroidComposerSwitch);
                 self.handle_action_receiver();
             }
+            FromJavaMessage::QrScanned { json } => {
+                // The composer QR scanner decoded a payload — hand it to the app
+                // (it applies it as an LLM-provisioning config). Drain this tick.
+                Cx::post_action(crate::event::AndroidQrScanned { json });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
