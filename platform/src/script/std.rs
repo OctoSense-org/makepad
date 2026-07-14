@@ -214,6 +214,42 @@ impl Cx {
                     }
                     _ => {}
                 }
+            } else if self.script_data.resources.is_data_fetch(request_id) {
+                // Script data-binding fetch (sys.weather etc): store the loaded
+                // JSON/text bytes (or mark errored) and redraw so the helper
+                // re-runs and returns the live value.
+                match response {
+                    NetworkResponse::HttpResponse { response: res, .. } => {
+                        if let Some(body) = res.get_body() {
+                            if (200..300).contains(&res.status_code) {
+                                self.script_data
+                                    .resources
+                                    .handle_data_fetch_response(request_id, body.clone());
+                            } else {
+                                crate::log!(
+                                    "Script data fetch failed: status={}",
+                                    res.status_code
+                                );
+                                self.script_data
+                                    .resources
+                                    .handle_data_fetch_error(request_id);
+                            }
+                        } else {
+                            self.script_data
+                                .resources
+                                .handle_data_fetch_error(request_id);
+                        }
+                        self.redraw_all();
+                    }
+                    NetworkResponse::HttpError { error: err, .. } => {
+                        crate::log!("Script data fetch request error: {}", err.message);
+                        self.script_data
+                            .resources
+                            .handle_data_fetch_error(request_id);
+                        self.redraw_all();
+                    }
+                    _ => {}
+                }
             }
         }
 

@@ -42,11 +42,31 @@ pub struct CxScriptHttpResource {
     pub handle: ScriptHandle,
 }
 
+/// State of a script *data* fetch (sys.weather etc): a live JSON/text pull
+/// keyed by URL. Unlike an image `http_resource`, no DSL value holds a handle
+/// to it, so it lives in a plain URL-keyed side-table (not the GC'd handle
+/// path) — the fetch persists for the card's lifetime without needing a root.
+#[derive(Clone)]
+pub enum DataFetch {
+    /// Request in flight; carries the request_id so the response can be routed.
+    Loading(LiveId),
+    Loaded(Rc<Vec<u8>>),
+    Error,
+}
+
+/// Bumped each time a script data fetch newly loads. A live-data-bound widget
+/// (Splash with sys.weather) bakes the "—" placeholder into a Label at eval
+/// time; a plain repaint won't re-run the script, so it watches this epoch and
+/// re-evaluates once when it changes, picking up the now-loaded value.
+static DATA_FETCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Default)]
 pub struct CxScriptResources {
     pub resources: Rc<RefCell<Vec<CxScriptResource>>>,
     pub handles_by_abs_path: Rc<RefCell<HashMap<String, ScriptHandle>>>,
     pub http_resources: Vec<CxScriptHttpResource>,
+    /// Live data fetches for script data-binding, keyed by URL (see DataFetch).
+    pub data_fetches: Rc<RefCell<HashMap<String, DataFetch>>>,
 }
 
 impl CxScriptResources {
@@ -115,6 +135,53 @@ impl CxScriptResources {
         self.http_resources
             .iter()
             .any(|r| r.request_id == request_id)
+    }
+
+    // --- Script data fetches (sys.weather etc), keyed by URL ---
+
+    /// Current state of the data fetch for `url`, if one exists.
+    pub fn get_data_fetch(&self, url: &str) -> Option<DataFetch> {
+        self.data_fetches.borrow().get(url).cloned()
+    }
+
+    /// Mark a URL as in flight under `request_id`.
+    pub fn begin_data_fetch(&self, url: &str, request_id: LiveId) {
+        self.data_fetches
+            .borrow_mut()
+            .insert(url.to_string(), DataFetch::Loading(request_id));
+    }
+
+    /// Does `request_id` belong to an in-flight data fetch?
+    pub fn is_data_fetch(&self, request_id: LiveId) -> bool {
+        self.data_fetches
+            .borrow()
+            .values()
+            .any(|f| matches!(f, DataFetch::Loading(id) if *id == request_id))
+    }
+
+    /// Store loaded bytes for the in-flight fetch matching `request_id`.
+    pub fn handle_data_fetch_response(&self, request_id: LiveId, data: Vec<u8>) -> bool {
+        let mut map = self.data_fetches.borrow_mut();
+        for fetch in map.values_mut() {
+            if matches!(fetch, DataFetch::Loading(id) if *id == request_id) {
+                *fetch = DataFetch::Loaded(Rc::new(data));
+                DATA_FETCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark the in-flight fetch matching `request_id` as errored.
+    pub fn handle_data_fetch_error(&self, request_id: LiveId) -> bool {
+        let mut map = self.data_fetches.borrow_mut();
+        for fetch in map.values_mut() {
+            if matches!(fetch, DataFetch::Loading(id) if *id == request_id) {
+                *fetch = DataFetch::Error;
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -394,6 +461,36 @@ impl Cx {
             #[cfg(target_arch = "wasm32")]
             &crate_manifests,
         );
+    }
+
+    /// Get-or-fetch a live data resource (JSON/text) by URL, for script
+    /// data-binding helpers like `sys.weather`. Returns the loaded bytes when
+    /// ready; otherwise fires the request once (deduped by URL) and returns
+    /// None while it loads. The response is stored in `data_fetches` and a
+    /// `redraw_all()` is issued (see the std.rs network-response handler), so a
+    /// subsequent draw re-runs the helper and reads the loaded value. This lets
+    /// generated DSL bind live data instead of the LLM hardcoding numbers.
+    pub fn script_data_fetch(&mut self, url: &str) -> Option<Rc<Vec<u8>>> {
+        match self.script_data.resources.get_data_fetch(url) {
+            Some(DataFetch::Loaded(bytes)) => return Some(bytes),
+            Some(DataFetch::Loading(_)) | Some(DataFetch::Error) => return None,
+            None => {}
+        }
+        let request_id = LiveId::unique();
+        crate::log!("[WXTRACE] data fetch FIRE {}", url);
+        self.script_data.resources.begin_data_fetch(url, request_id);
+        let mut req = HttpRequest::new(url.to_string(), Default::default());
+        // Some data APIs (e.g. Yahoo Finance) 429 a request that has no browser
+        // User-Agent; harmless for the others (open-meteo, HN).
+        req.set_header("User-Agent".to_string(), "Mozilla/5.0".to_string());
+        self.http_request(request_id, req);
+        None
+    }
+
+    /// Monotonic counter bumped whenever any script data fetch newly loads. A
+    /// live-data-bound widget re-evaluates when this changes (see DATA_FETCH_EPOCH).
+    pub fn script_data_fetch_epoch(&self) -> u64 {
+        DATA_FETCH_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Load all script resources that are still pending.

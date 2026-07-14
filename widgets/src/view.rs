@@ -859,9 +859,14 @@ impl Widget for View {
                     // A repopulate or optimize-mode flip forces one real re-render: the size-based
                     // cache check can't see content changes on a recycled/toggled view.
                     let force = std::mem::take(&mut self.force_texture_redraw);
-                    // Re-render whenever the on-screen rect changes (position or size) or a
-                    // repopulate/mode-flip forced it; only a truly unchanged view cache-hits.
-                    if !force && !cx.will_redraw(self.draw_list.as_mut().unwrap(), walk) {
+                    // Re-render on a SIZE change, a repopulate/mode-flip force, or an explicit
+                    // redraw (redraw_all / this draw list marked dirty). A position-only change
+                    // (scrolling) cache-hits and re-blits the cached texture at the new rect — so
+                    // a tall static card scrolls by compositing its bitmap, not re-rendering it.
+                    if !force
+                        && self.texture_cache.is_some()
+                        && !cx.will_redraw_ignore_pos(self.draw_list.as_mut().unwrap(), walk)
+                    {
                         if let Some(texture_cache) = &self.texture_cache {
                             self.draw_bg
                                 .draw_vars
@@ -1001,6 +1006,12 @@ impl Widget for View {
                     }
                     self.draw_bg.end(cx);
                     self.area = self.draw_bg.area();
+                } else if self.optimize.is_texture() {
+                    // Texture mode renders into a self-contained offscreen pass. Close the turtle
+                    // with the un-clipped variant so the FULL view (even one taller than its
+                    // on-screen viewport) lands in the texture, rather than inheriting an enclosing
+                    // PortalList viewport clip that would scissor the off-screen part to black.
+                    cx.end_texture_turtle_with_area(&mut self.area);
                 } else {
                     cx.end_turtle_with_area(&mut self.area);
                 };
@@ -1032,20 +1043,15 @@ impl Widget for View {
                             .set_texture(0, &texture_cache.color_texture);
                         self.draw_bg.draw_abs(cx, rect);
                         let area = self.draw_bg.area();
+                        // The card's offscreen content was drawn at this (provisional) origin and
+                        // is SkipTurtle-marked (see end_texture_turtle_with_area), so the enclosing
+                        // PortalList's post-draw shift_align_range moves the blit / self.area but NOT
+                        // the baked content. Pin the pass origin to the draw position so the offscreen
+                        // ortho stays matched to the content regardless of any later scroll-clamp shift
+                        // of `area` (plain set_pass_area would follow the shifted area and desync).
+                        let origin = area.rect(cx).pos;
                         let texture_cache = self.texture_cache.as_mut().unwrap();
-                        /* if false {
-                            // FIXME(eddyb) this was the previous logic,
-                            // but the only tested apps that use `CachedView`
-                            // are sized correctly (regardless of `dpi_factor`)
-                            // *without* extra scaling here.
-                            cx.set_pass_scaled_area(
-                                &texture_cache.pass,
-                                area,
-                                2.0 / self.dpi_factor.unwrap_or(1.0),
-                            );
-                        } else {*/
-                        cx.set_pass_area(&texture_cache.pass, area);
-                        //}
+                        cx.set_pass_area_with_origin(&texture_cache.pass, area, origin);
                     }
                 }
                 self.draw_state.end();

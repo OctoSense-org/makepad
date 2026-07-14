@@ -571,9 +571,47 @@ impl PortalList {
 
         if let Some(ListDrawState::End { viewport }) = self.draw_state.get() {
             let list = &mut self.draw_align_list;
+            // Drop any items drawn OUTSIDE the active range before positioning. An app
+            // may draw collapsed placeholder rows for out-of-range ids (e.g. during a
+            // top overscroll of a single over-tall item); if such an id — BELOW
+            // range_start — becomes first_id, the top-clamp below (which only fires when
+            // first_id == range_start) never engages and the item scrolls clean off the
+            // top of the viewport with no way back. Keeping the draw list within the
+            // range, and first_id clamped into it, guarantees the clamp always applies.
+            list.retain(|v| v.index >= self.range_start && v.index < self.range_end);
+            if self.first_id < self.range_start {
+                self.first_id = self.range_start;
+            } else if self.range_end > 0 && self.first_id >= self.range_end {
+                self.first_id = self.range_end - 1;
+            }
             if !list.is_empty() {
                 list.sort_by(|a, b| a.index.cmp(&b.index));
-                let first_index = list.iter().position(|v| v.index == self.first_id).unwrap();
+                let first_index = list
+                    .iter()
+                    .position(|v| v.index == self.first_id)
+                    .unwrap_or(0);
+
+                // Bottom clamp for a single over-tall item (the full-screen weather card) —
+                // the mirror of the top-clamp below. Without it a drag/flick sails the card
+                // UP past its own bottom, leaving blank space below with no way to settle
+                // (the top rubber-bands; the bottom otherwise doesn't). Gated to a single-item
+                // range so normal multi-item lists keep their existing end handling.
+                if self.range_end.saturating_sub(self.range_start) == 1 {
+                    let content: f64 = list
+                        .iter()
+                        .filter(|v| v.index >= self.range_start && v.index < self.range_end)
+                        .map(|v| v.size.index(vi))
+                        .sum();
+                    let vp = viewport.size.index(vi);
+                    if content > vp {
+                        // Most-negative first_scroll that still fills the viewport bottom;
+                        // don't allow scrolling past it into blank space.
+                        let min_scroll = vp - content;
+                        if self.first_scroll < min_scroll {
+                            self.first_scroll = min_scroll;
+                        }
+                    }
+                }
 
                 let mut first_pos = self.first_scroll;
                 for i in (0..first_index).rev() {

@@ -122,6 +122,15 @@ pub trait Agent {
         None
     }
 
+    /// The opaque backend key (e.g. an octos `SessionKey` string) currently
+    /// mapped to `session_id`, if this backend has server-side sessions. Lets a
+    /// multi-session client resume/hydrate a session it created earlier via
+    /// `create_session` (which returns only the local `SessionId`). Default
+    /// `None` for backends without server-side sessions.
+    fn backend_key(&self, _session_id: SessionId) -> Option<String> {
+        None
+    }
+
     /// Toggle extra reasoning/thinking effort for subsequent turns. Maps to the
     /// backend's per-turn reasoning-effort override (thinking-capable models
     /// only). Default no-op for backends without a thinking mode.

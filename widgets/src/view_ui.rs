@@ -684,7 +684,10 @@ script_mod! {
                 return self.clip_and_transform_vertex(self.rect_pos self.rect_size)
             }
             pixel: fn() {
-                return self.image.sample(self.pos * self.scale + self.shift)
+                // The offscreen FBO (GLES/host-GL) writes the cached texture Y-flipped
+                // relative to the sampler, so flip v back to render the card right-side-up.
+                let uv = self.pos * self.scale + self.shift
+                return self.image.sample(vec2(uv.x, 1.0 - uv.y))
             }
         }
     }

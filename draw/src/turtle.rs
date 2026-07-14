@@ -2053,6 +2053,37 @@ impl<'a, 'b> Cx2d<'a, 'b> {
         rect
     }
 
+    /// Like [`end_turtle_with_area`], but for a turtle whose draw calls are being routed into
+    /// a self-contained offscreen (texture-cache) pass.
+    ///
+    /// It finalizes the turtle exactly like `end_turtle_with_area` — computes any `Fit` size,
+    /// aligns children, and records `area` for the caller — but then re-clips JUST this turtle's
+    /// own align range with a FRESH clip stack (via `clip_and_shift_align_list`, which does
+    /// `turtle_clips.clear()` first). That makes the turtle's own `BeginClip` (its full content
+    /// bounds, expanded by `compute_final_size`) the root clip, so it is NOT intersected with any
+    /// enclosing viewport clip (e.g. the `BeginClip` a `PortalList` wraps its visible items in).
+    /// The range is then marked `SkipTurtle` so the outer window pass's `clip_and_shift_align_list`
+    /// jumps over it and does not re-apply that viewport clip.
+    ///
+    /// This is what lets a texture-cached view that is TALLER than its on-screen viewport render
+    /// its FULL content into the offscreen texture (no viewport-clipped black regions), while the
+    /// blitted quad in the outer pass still tracks the scrolled on-screen position.
+    pub fn end_texture_turtle_with_area(&mut self, area: &mut Area) -> Rect {
+        // Capture the turtle's own BeginClip index before it is popped.
+        let align_start = self.turtle().align_start;
+        // Finalize size/alignment; this pushes the matching EndClip and pops the turtle, so the
+        // range [align_start, align_list.len()) is now a balanced BeginClip..children..EndClip.
+        let rect = self.end_turtle_with_guard(Area::Empty);
+        let align_end = self.align_list.len();
+        // Clip this range against its own root clip only (fresh stack), independent of the parent.
+        self.clip_and_shift_align_list(align_start, align_end);
+        // Make the enclosing pass skip this already-clipped range (do not re-apply its clip).
+        self.align_list[align_start] = AlignEntry::SkipTurtle { skip: align_end };
+        // Record the on-screen area (blit rect / hit test) OUTSIDE the skipped range.
+        self.add_aligned_rect_area(area, rect);
+        rect
+    }
+
     pub fn set_turtle_wrap_spacing(&mut self, spacing: f64) {
         self.turtle_mut().wrap_spacing = spacing;
     }

@@ -300,6 +300,8 @@ pub enum CxOsOp {
     // every other backend's catch-all.
     ShowAndroidComposer,
     HideAndroidComposer,
+    ExpandAndroidComposer,
+    CollapseAndroidComposer,
     SetPrimarySelection(String),
     ShowSelectionHandles {
         start: Vec2d,
@@ -449,6 +451,8 @@ impl std::fmt::Debug for CxOsOp {
             Self::ShareText(..) => write!(f, "ShareText"),
             Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
             Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
+            Self::ExpandAndroidComposer => write!(f, "ExpandAndroidComposer"),
+            Self::CollapseAndroidComposer => write!(f, "CollapseAndroidComposer"),
             Self::SetPrimarySelection(..) => write!(f, "SetPrimarySelection"),
             Self::ShowSelectionHandles { .. } => write!(f, "ShowSelectionHandles"),
             Self::UpdateSelectionHandles { .. } => write!(f, "UpdateSelectionHandles"),
@@ -1072,6 +1076,18 @@ impl Cx {
     /// keyboard). No-op off Android.
     pub fn hide_android_composer(&mut self) {
         self.platform_ops.push(CxOsOp::HideAndroidComposer);
+    }
+
+    /// Expand the native Android composer from its collapsed "+" button back to
+    /// the full input pill (and focus it). No-op off Android.
+    pub fn expand_android_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::ExpandAndroidComposer);
+    }
+
+    /// Collapse the native Android composer to a small "+" button (and drop its
+    /// keyboard) so the full-screen card has more room. No-op off Android.
+    pub fn collapse_android_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::CollapseAndroidComposer);
     }
 
     /// Sets the primary selection (Linux middle-click paste).

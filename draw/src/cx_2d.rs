@@ -131,6 +131,26 @@ impl<'a, 'b> Cx2d<'a, 'b> {
             .draw_list_will_redraw(self, draw_list_2d.draw_list.id())
     }
 
+    /// Like [`will_redraw`], but a position-only change (same size) does NOT trigger a
+    /// re-render — it returns `false` so the caller can composite the cached texture at
+    /// the new position instead. Only a size change, `redraw_all`, or this draw list being
+    /// explicitly marked dirty forces a real re-render. Used by texture-cached views so
+    /// that scrolling a tall cached card blits its bitmap at the new offset (cheap) rather
+    /// than re-rendering its whole subtree every frame (the scroll offset is baked into the
+    /// item's absolute turtle position, and the cache-hit path re-blits at that new rect).
+    pub fn will_redraw_ignore_pos(&self, draw_list_2d: &mut DrawList2d, walk: Walk) -> bool {
+        let rect = self.peek_walk_turtle(walk);
+        if draw_list_2d.dirty_check_rect.size != rect.size {
+            draw_list_2d.dirty_check_rect = rect;
+            return true;
+        }
+        // Keep the remembered position current so a later real re-render measures from the
+        // right place, but don't treat the move itself as a redraw trigger.
+        draw_list_2d.dirty_check_rect.pos = rect.pos;
+        self.draw_event
+            .draw_list_will_redraw(self, draw_list_2d.draw_list.id())
+    }
+
     pub fn will_redraw_check_axis(
         &self,
         draw_list_2d: &mut DrawList2d,

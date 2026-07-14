@@ -26,6 +26,7 @@ makepad-pdf-parse = { path = "../libs/pdf_parse", version = "1.0.0", optional = 
 ttf-parser = { path = "../libs/ttf-parser" }
 
 serde = { version = "1.0", optional = true, features = ["derive"] }
+serde_json = "1.0"
 
 [features]
 default = []

@@ -1327,6 +1327,17 @@ impl Cx {
                 Cx::post_action(crate::event::AndroidComposerSubmit { text });
                 self.handle_action_receiver();
             }
+            FromJavaMessage::ComposerNewApp => {
+                // Native composer "＋" — open another app. Drain this tick (see
+                // ComposerSubmit above for why post_action alone can stall).
+                Cx::post_action(crate::event::AndroidComposerNewApp);
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::ComposerSwitch => {
+                // Native composer "⟳" — switch to the next app.
+                Cx::post_action(crate::event::AndroidComposerSwitch);
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
@@ -2394,6 +2405,12 @@ impl Cx {
                 },
                 CxOsOp::HideAndroidComposer => unsafe {
                     android_jni::to_java_hide_composer();
+                },
+                CxOsOp::ExpandAndroidComposer => unsafe {
+                    android_jni::to_java_expand_composer();
+                },
+                CxOsOp::CollapseAndroidComposer => unsafe {
+                    android_jni::to_java_collapse_composer();
                 },
                 CxOsOp::CopyToClipboard(content) => unsafe {
                     android_jni::to_java_copy_to_clipboard(content);

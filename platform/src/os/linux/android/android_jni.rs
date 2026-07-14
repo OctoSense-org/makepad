@@ -233,6 +233,8 @@ pub enum FromJavaMessage {
     ComposerSubmit {
         text: String,
     },
+    ComposerNewApp,
+    ComposerSwitch,
 }
 unsafe impl Send for FromJavaMessage {}
 
@@ -472,6 +474,46 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
         .filter(|v| !v.trim().is_empty())
     {
         std::env::set_var("MAKEPAD_APP_CONFIG", &app_config);
+    }
+
+    // TEST-ONLY passthrough: `--es makepad.SEED_CARD_FILE <path>` → the
+    // MAKEPAD_SEED_CARD_FILE env var, so the app can seed a canned card from a
+    // file (bypassing the server/LLM) for on-device render/scroll/map tests.
+    std::env::remove_var("MAKEPAD_SEED_CARD_FILE");
+    if let Some(seed) = get_intent_string_extra(env, activity, "makepad.SEED_CARD_FILE")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_SEED_CARD_FILE", &seed);
+    }
+
+    // TEST/automation passthrough: `--es makepad.AUTO_PROMPT "<text>"` → the
+    // MAKEPAD_AUTO_PROMPT env var, so the app can auto-submit one prompt on boot
+    // (a real LLM generation) without driving the native composer via adb input.
+    std::env::remove_var("MAKEPAD_AUTO_PROMPT");
+    if let Some(p) = get_intent_string_extra(env, activity, "makepad.AUTO_PROMPT")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_AUTO_PROMPT", &p);
+    }
+
+    // Passthrough: `--es makepad.OCTOS_PROXY <url>` → MAKEPAD_OCTOS_PROXY. Routes
+    // the embedded octos server's LLM HTTPS through a proxy (e.g. an adb-reverse
+    // tunnel to the dev host) when the device has no direct internet route.
+    std::env::remove_var("MAKEPAD_OCTOS_PROXY");
+    if let Some(proxy) = get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_OCTOS_PROXY", &proxy);
+    }
+
+    // Passthrough: `--es makepad.PROVISION_DIR <path>` → MAKEPAD_PROVISION_DIR.
+    // Names a world-readable staging dir whose tree is deployed into octos-home
+    // on boot — provisions a non-rooted device (GLM profile + a2app memory).
+    std::env::remove_var("MAKEPAD_PROVISION_DIR");
+    if let Some(dir) = get_intent_string_extra(env, activity, "makepad.PROVISION_DIR")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_PROVISION_DIR", &dir);
     }
 }
 
@@ -1321,6 +1363,24 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSubmit
     send_from_java_message(FromJavaMessage::ComposerSubmit { text });
 }
 
+/// The native composer's "＋" (open another app) button was tapped.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerNewApp(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+) {
+    send_from_java_message(FromJavaMessage::ComposerNewApp);
+}
+
+/// The native composer's "⟳" (switch to next app) button was tapped.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSwitch(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+) {
+    send_from_java_message(FromJavaMessage::ComposerSwitch);
+}
+
 unsafe fn jstring_to_string(env: *mut jni_sys::JNIEnv, java_string: jni_sys::jstring) -> String {
     let chars = (**env).GetStringUTFChars.unwrap()(env, java_string, std::ptr::null_mut());
     let rust_string = std::ffi::CStr::from_ptr(chars)
@@ -1476,6 +1536,18 @@ pub unsafe fn to_java_show_composer() {
 pub unsafe fn to_java_hide_composer() {
     let env = attach_jni_env();
     ndk_utils::call_void_method!(env, get_activity(), "hideComposer", "()V");
+}
+
+// Expand the native composer from its "+" button back to the full input pill.
+pub unsafe fn to_java_expand_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "expandComposer", "()V");
+}
+
+// Collapse the native composer to a small "+" button (and drop its keyboard).
+pub unsafe fn to_java_collapse_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "collapseComposer", "()V");
 }
 
 pub unsafe fn to_java_paste_from_clipboard() -> String {

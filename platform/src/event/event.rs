@@ -41,6 +41,17 @@ pub struct AndroidComposerSubmit {
     pub text: String,
 }
 
+/// The native Android floating composer's "＋" (open another app) button was
+/// tapped. Posted as a bare action like [`AndroidComposerSubmit`]; the app
+/// routes it into `open_new_app` from `handle_actions`.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidComposerNewApp;
+
+/// The native Android floating composer's "⟳" (switch to next app) button was
+/// tapped. Posted as a bare action; the app cycles the foreground app.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidComposerSwitch;
+
 /// Events that can be sent between the Makepad framework and the application.
 #[derive(Debug)]
 pub enum Event {

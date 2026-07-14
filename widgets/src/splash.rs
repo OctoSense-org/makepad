@@ -6,6 +6,8 @@ use crate::{
     widget_async::{CxSplashVmExt, SplashVmId, MAIN_SPLASH_VM_ID},
     widget_tree::CxWidgetExt,
 };
+// `vm.host.cx_mut()` — reach the host Cx from a script helper (sys.weather fetch).
+use crate::makepad_draw::makepad_platform::script::vm::ScriptVmCx;
 
 #[derive(Clone, Debug, Default)]
 pub enum SplashAction {
@@ -25,6 +27,48 @@ fn slippy_tile(lat: f64, lon: f64, z: u32) -> (i64, i64) {
     let y = ((1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n).floor();
     let max = (1i64 << z) - 1;
     ((x as i64).clamp(0, max), (y as i64).clamp(0, max))
+}
+
+/// Yesterday's civil date (UTC) as `YYYY-MM-DD` — the most recent day for
+/// which NASA GIBS daily global mosaics are guaranteed complete. Days-to-date
+/// via Howard Hinnant's `civil_from_days` (no chrono dep in this crate).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Howard Hinnant's `civil_from_days`: days-since-Unix-epoch → (year, month, day).
+fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn gibs_latest_date() -> String {
+    let (y, m, d) = civil_from_days((now_unix_secs() / 86_400) as i64 - 1); // yesterday
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A GIBS `TIME=` string for `minutes_ago` in the past, floored to a 10-minute
+/// boundary (the geostationary AHI/ABI granule cadence). Format
+/// `YYYY-MM-DDTHH:MM:00Z`.
+fn gibs_datetime(minutes_ago: i64) -> String {
+    let target = (now_unix_secs() as i64 - minutes_ago * 60).max(0);
+    let target = (target / 600) * 600; // floor to 10 min
+    let (y, m, d) = civil_from_days(target / 86_400);
+    let sod = target % 86_400;
+    let (hh, mm) = (sod / 3600, (sod % 3600) / 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:00Z")
 }
 
 pub fn register_agent_module(vm: &mut ScriptVm) {
@@ -105,51 +149,77 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
-    // sys.satellite() -> a LIVE full-disk satellite cloud map (卫星云图) image URL:
-    // Himawari-9 true-color over Asia-Pacific from NICT, refreshed every 10 min. The
-    // frame timestamp is computed at CALL time (i.e. on each render), so a saved card
-    // always shows recent clouds instead of a stale baked URL. The true-color full
-    // disk is daylight only (dark over Asia at local night). The disk is square with
-    // a black-space margin, so ImageFit.Smallest shows the whole Earth cleanly.
-    // Use as `Image{ src: http_resource(sys.satellite()) fit: ImageFit.Smallest }`.
+    // sys.satellite(lat, lon) -> REAL satellite cloud imagery (卫星云图) for the city's
+    // region: NASA GIBS WMS, MODIS Terra true-color corrected reflectance for yesterday
+    // (UTC) — the most recent complete daily global mosaic. Actual clouds over actual
+    // terrain, daylit everywhere, keyless, and a single GetMap call returns an
+    // arbitrary-size image so a full-width pane needs no tile stitching. 2:1 aspect
+    // (880x440 over a ~14°x7° box) — pair with `fit: ImageFit.CropToFill` in a wide pane.
+    // Use as `Image{ src: http_resource(sys.satellite(LAT, LON)) fit: ImageFit.CropToFill }`.
     vm.add_method(
         sys,
         id_lut!(satellite),
-        script_args_def!(region = NIL),
-        |vm, _args| {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            // The newest published full-disk frame lags real time; back off 40 min
-            // and floor to the 10-min cadence so the tile is reliably available.
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let t = now.saturating_sub(40 * 60);
-            let t = t - (t % 600);
-            let secs_of_day = t % 86_400;
-            let hh = secs_of_day / 3_600;
-            let mm = (secs_of_day % 3_600) / 60;
-            // Civil date from days-since-epoch (Howard Hinnant's algorithm).
-            let days = (t / 86_400) as i64;
-            let z = days + 719_468;
-            let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-            let doe = z - era * 146_097; // [0, 146096]
-            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-            let mp = (5 * doy + 2) / 153; // [0, 11]
-            let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
-            let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
-            let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(35.68);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(139.65);
+            // Keep the 7°-tall box inside the poles; wrap longitude edges.
+            let lat = lat.clamp(-78.0, 78.0);
+            let (min_lon, max_lon) = ((lon - 7.0).max(-180.0), (lon + 7.0).min(180.0));
+            let (min_lat, max_lat) = (lat - 3.5, lat + 3.5);
+            let date = gibs_latest_date();
             let url = format!(
-                "https://himawari8.nict.go.jp/img/D531106/1d/550/{year:04}/{month:02}/{day:02}/{hh:02}{mm:02}00_0_0.png"
+                "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=MODIS_Terra_CorrectedReflectance_TrueColor&SRS=EPSG:4326&BBOX={min_lon},{min_lat},{max_lon},{max_lat}&WIDTH=880&HEIGHT=440&FORMAT=image/jpeg&TIME={date}"
             );
             vm.bx.heap.new_string_from_str(&url)
         },
     );
 
-    // sys.basemap(lat, lon) -> a dark base-map tile (Carto, no key) at the city, meant to
-    // sit UNDER sys.airmap in an Overlay so the AQI colours have geographic context.
-    // Zoom 7 frames the metro + surrounding region in one 256px tile.
+    // sys.satellite_ir(lat, lon, frames_ago) -> ONE frame of a geostationary
+    // cloud-motion loop (卫星云图动画). Clean-IR brightness-temperature (clouds =
+    // white on dark), which — unlike the once-daily MODIS still in sys.satellite —
+    // updates every 10 min and is available day AND night, so cycling `frames_ago`
+    // 0..N via a Splash `fn tick()` + `ui.<img>.set_src(...)` animates real cloud
+    // movement. `frames_ago` 0 = newest (a fixed ~80 min latency floor so the
+    // granule is published), each +1 steps 10 min further back. Satellite picked by
+    // longitude: Himawari (Asia/Pacific) vs GOES-East (Americas/Atlantic); both are
+    // GIBS "best", keyless, snap TIME to the nearest granule. Use as
+    // `Image{ src: http_resource(sys.satellite_ir(LAT, LON, N)) fit: ImageFit.CropToFill }`.
+    vm.add_method(
+        sys,
+        id_lut!(satellite_ir),
+        script_args_def!(lat = NIL, lon = NIL, frames_ago = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(35.68);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(139.65);
+            let frames_ago = script_value!(vm, args.frames_ago)
+                .as_number()
+                .unwrap_or(0.0)
+                .clamp(0.0, 24.0) as i64;
+            let lat = lat.clamp(-78.0, 78.0);
+            let (min_lon, max_lon) = ((lon - 7.0).max(-180.0), (lon + 7.0).min(180.0));
+            let (min_lat, max_lat) = (lat - 3.5, lat + 3.5);
+            // ~80 min latency floor + 10 min per older frame.
+            let dt = gibs_datetime(80 + frames_ago * 10);
+            // Himawari sees Asia/Pacific; GOES-East the Americas/Atlantic.
+            let layer = if lon >= 60.0 || lon < -140.0 {
+                "Himawari_AHI_Band13_Clean_Infrared"
+            } else {
+                "GOES-East_ABI_Band13_Clean_Infrared"
+            };
+            let url = format!(
+                "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS={layer}&SRS=EPSG:4326&BBOX={min_lon},{min_lat},{max_lon},{max_lat}&WIDTH=880&HEIGHT=440&FORMAT=image/png&TIME={dt}"
+            );
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    // sys.basemap(lat, lon) -> a warm, LABELLED base-map tile (Carto "Voyager", no key) at
+    // the city, meant to sit UNDER sys.airmap in an Overlay so the AQI colours have legible
+    // geographic context. `voyager_labels_under` keeps place labels BENEATH the translucent
+    // AQI markers so both read clearly. Zoom 8 frames the metro itself (not the whole
+    // region — fewer, larger AQI badges on top), and the `@2x` retina tile (512px) stays
+    // sharp in a full-width pane.
     vm.add_method(
         sys,
         id_lut!(basemap),
@@ -157,15 +227,19 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
-            let (x, y) = slippy_tile(lat, lon, 7);
-            let url = format!("https://a.basemaps.cartocdn.com/dark_all/7/{x}/{y}.png");
+            let (x, y) = slippy_tile(lat, lon, 8);
+            let url = format!(
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager_labels_under/8/{x}/{y}@2x.png"
+            );
             vm.bx.heap.new_string_from_str(&url)
         },
     );
 
     // sys.airmap(lat, lon) -> a LIVE air-quality colour overlay tile (WAQI, US-EPA AQI
     // scale). Mostly transparent except where AQI data exists, so stack it OVER
-    // sys.basemap(lat, lon) at the SAME lat/lon in an Overlay (both use zoom 7).
+    // sys.basemap(lat, lon) at the SAME lat/lon in an Overlay (both use zoom 8 — one
+    // zoom step in from the old 7 quarters the station-marker density, so the badges
+    // read as a handful of legible chips instead of an overlapping pile).
     // Use as `View{ flow: Overlay Image{basemap} Image{airmap} }`.
     vm.add_method(
         sys,
@@ -174,13 +248,208 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
-            let (x, y) = slippy_tile(lat, lon, 7);
-            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/7/{x}/{y}.png?token=_");
+            let (x, y) = slippy_tile(lat, lon, 8);
+            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/8/{x}/{y}.png?token=_");
             vm.bx.heap.new_string_from_str(&url)
         },
     );
 
+    // sys.weather(lat, lon, "path") -> a LIVE value from the open-meteo forecast
+    // API (temperature, humidity, wind, pressure, UV, 7-day highs/lows, sunrise/
+    // sunset). `path` is dot-separated into the JSON; a numeric segment indexes an
+    // array, e.g.:
+    //   sys.weather(LAT, LON, "current.temperature_2m")     -> "27.3"
+    //   sys.weather(LAT, LON, "current.relative_humidity_2m")-> "54"
+    //   sys.weather(LAT, LON, "daily.temperature_2m_max.0")  -> "29.1"  (today)
+    //   sys.weather(LAT, LON, "daily.sunrise.0")             -> "05:52" (HH:MM)
+    // All fields for a given lat/lon share ONE cached fetch. Returns "—" while the
+    // (async) request loads; the card auto-redraws when data arrives, so the value
+    // fills in. THE LLM MUST CALL THIS FOR EVERY WEATHER NUMBER — never hardcode.
+    vm.add_method(
+        sys,
+        id_lut!(weather),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            let value = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| {
+                    log!(
+                        "[WXTRACE] sys.weather pluck MISS path={:?} ({} bytes) head={:?}",
+                        path.trim(),
+                        bytes.len(),
+                        String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
+                    );
+                    "—".to_string()
+                }),
+                None => "—".to_string(),
+            };
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+
+    // sys.airquality(lat, lon, "path") -> a LIVE value from the open-meteo air-
+    // quality API. e.g. sys.airquality(LAT, LON, "current.us_aqi") -> "42",
+    // "current.pm2_5", "current.pm10", "current.ozone". Same "—"/redraw semantics
+    // as sys.weather. (The AQI *map tile* is sys.airmap; this is the number.)
+    vm.add_method(
+        sys,
+        id_lut!(airquality),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat:.4}&longitude={lon:.4}\
+&current=us_aqi,pm2_5,pm10,ozone,nitrogen_dioxide&timezone=auto"
+            );
+            let value = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .unwrap_or_else(|| "—".to_string());
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+
+    // sys.stock("AAPL", "key") -> a LIVE value from Yahoo Finance for that ticker.
+    // Same "—"/redraw semantics as sys.weather. `key` (case-insensitive):
+    //   price | prev | high | low | open | currency | name | symbol
+    //   change    -> price − previous close, signed, e.g. "+1.99"
+    //   changepct -> percent change, signed, e.g. "+0.63%"
+    // e.g. sys.stock("AAPL", "price"), sys.stock("TSLA", "changepct").
+    vm.add_method(
+        sys,
+        id_lut!(stock),
+        script_args_def!(symbol = NIL, field = NIL),
+        |vm, args| {
+            let sym_v = script_value!(vm, args.symbol);
+            let mut symbol = String::new();
+            vm.bx.heap.cast_to_string(sym_v, &mut symbol);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let sym = symbol.trim().to_ascii_uppercase();
+            let url = format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
+            );
+            let m = |k: &str| format!("chart.result.0.meta.{k}");
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => "—".to_string(),
+                Some(bytes) => {
+                    let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
+                    match field.trim().to_ascii_lowercase().as_str() {
+                        "change" => match (num("regularMarketPrice"), num("chartPreviousClose")) {
+                            (Some(p), Some(c)) => format!("{:+.2}", p - c),
+                            _ => "—".to_string(),
+                        },
+                        "changepct" | "changepercent" => {
+                            match (num("regularMarketPrice"), num("chartPreviousClose")) {
+                                (Some(p), Some(c)) if c != 0.0 => format!("{:+.2}%", (p - c) / c * 100.0),
+                                _ => "—".to_string(),
+                            }
+                        }
+                        "price" => json_pluck(&bytes, &m("regularMarketPrice")).unwrap_or_else(|| "—".into()),
+                        "prev" | "prevclose" => json_pluck(&bytes, &m("chartPreviousClose")).unwrap_or_else(|| "—".into()),
+                        "high" => json_pluck(&bytes, &m("regularMarketDayHigh")).unwrap_or_else(|| "—".into()),
+                        "low" => json_pluck(&bytes, &m("regularMarketDayLow")).unwrap_or_else(|| "—".into()),
+                        "open" => json_pluck(&bytes, &m("regularMarketOpen")).unwrap_or_else(|| "—".into()),
+                        "currency" => json_pluck(&bytes, &m("currency")).unwrap_or_else(|| "—".into()),
+                        "name" => json_pluck(&bytes, &m("shortName")).unwrap_or_else(|| "—".into()),
+                        "symbol" => json_pluck(&bytes, &m("symbol")).unwrap_or_else(|| "—".into()),
+                        other => json_pluck(&bytes, other).unwrap_or_else(|| "—".into()),
+                    }
+                }
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.news(index, "key") -> a LIVE Hacker News front-page story (index 0..).
+    // Same "—"/redraw semantics. `key` (case-insensitive):
+    //   title | url | author | points | comments
+    // e.g. sys.news(0, "title"), sys.news(0, "points"), sys.news(1, "title").
+    vm.add_method(
+        sys,
+        id_lut!(news),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let idx = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let key = match field.trim().to_ascii_lowercase().as_str() {
+                "title" => "title",
+                "url" => "url",
+                "author" | "by" => "author",
+                "points" | "score" => "points",
+                "comments" | "num_comments" => "num_comments",
+                _ => "title",
+            };
+            let url =
+                "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=12".to_string();
+            let path = format!("hits.{idx}.{key}");
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => json_pluck(&bytes, &path).unwrap_or_else(|| "—".to_string()),
+                None => "—".to_string(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
+}
+
+/// True if a Splash body calls any live-data helper (sys.weather/airquality/
+/// stock/news). Such cards must re-evaluate when their async fetch lands (the
+/// value is baked into a Label at eval time), so we arm the frame pump + watch
+/// the data-fetch epoch for them. Keep in sync with the data `sys.*` helpers.
+fn body_binds_live_data(body: &str) -> bool {
+    body.contains("sys.weather")
+        || body.contains("sys.airquality")
+        || body.contains("sys.stock")
+        || body.contains("sys.news")
+}
+
+/// Extract a scalar from an open-meteo JSON body at a dot-path, formatted for
+/// display. A numeric path segment indexes into an array; other segments are
+/// object keys. Returns None if the path is absent or the leaf isn't a scalar.
+/// ISO datetimes ("2026-07-13T05:52", as open-meteo returns for sunrise/sunset)
+/// are shortened to "HH:MM".
+fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let mut cur = &root;
+    for seg in path.split('.') {
+        cur = if let Ok(idx) = seg.parse::<usize>() {
+            cur.get(idx)?
+        } else {
+            cur.get(seg)?
+        };
+    }
+    let s = match cur {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    // open-meteo ISO datetime -> HH:MM (sunrise/sunset).
+    if s.len() >= 16 && s.as_bytes().get(10) == Some(&b'T') {
+        return Some(s[11..16].to_string());
+    }
+    Some(s)
 }
 
 script_mod! {
@@ -219,6 +488,23 @@ pub struct Splash {
     /// text) reuses ONE vm body instead of a fresh generation per frame.
     #[rust]
     last_eval_body: String,
+    /// Per-frame redraw pump for time-based shaders. A card drawn once has a
+    /// frozen `self.draw_pass.time`, so any `pixel: fn(){… self.draw_pass.time …}`
+    /// animation (rain, drifting clouds, sun rays, wind) renders but never moves.
+    /// When the evaluated body uses `draw_pass.time` we keep requesting the next
+    /// frame and redrawing the view, giving continuous ~60fps animation without
+    /// any timer/state/asset. Off (NextFrame::default()) for static cards so
+    /// they cost nothing.
+    #[rust]
+    anim_next_frame: NextFrame,
+    #[rust]
+    animating: bool,
+    /// Value of the global script-data-fetch epoch at the last eval. When a live
+    /// `sys.weather`/`sys.airquality` fetch this card fired completes, the epoch
+    /// bumps; the per-frame pump notices the change and re-evaluates the body so
+    /// the "—" placeholders are replaced with the loaded values.
+    #[rust]
+    last_data_epoch: u64,
 }
 
 /// Prefix for View-children mode: wraps code inside a View
@@ -339,6 +625,36 @@ impl Splash {
         if body.contains("fn tick(") || body.contains("fn tick (") {
             self.tick_timer = cx.start_interval(1.0);
         }
+
+        // If the card animates via a time-based shader, start the per-frame
+        // redraw pump so `self.draw_pass.time` advances (see `anim_next_frame`).
+        // Trigger on inline `draw_pass.time` OR on `WeatherIcon` (whose animated
+        // shader lives in the widget def, so the body-scan wouldn't otherwise
+        // see it).
+        self.arm_animation_pump(cx, &body);
+
+        // Record the data-fetch epoch AT this eval, so the per-frame pump only
+        // re-evaluates when a LATER fetch completes (see handle_event).
+        self.last_data_epoch = cx.script_data_fetch_epoch();
+    }
+
+    /// Start (or stop) the per-frame redraw pump based on whether `body`
+    /// uses a time-based shader. Shared by `eval_body` and `stream_append`
+    /// so streamed cards animate too. Triggers on inline `draw_pass.time`
+    /// OR on `WeatherIcon` (whose animated shader lives in the widget def,
+    /// so a body-scan wouldn't otherwise see it). See `anim_next_frame`.
+    fn arm_animation_pump(&mut self, cx: &mut Cx, body: &str) {
+        // Also arm for live-data cards (sys.weather/sys.airquality) so the pump
+        // runs and can re-evaluate them when their async data arrives, even if
+        // the card has no time-based shader of its own.
+        self.animating = body.contains("draw_pass.time")
+            || body.contains("WeatherIcon")
+            || body_binds_live_data(body);
+        if self.animating {
+            self.anim_next_frame = cx.new_next_frame();
+        } else {
+            self.anim_next_frame = NextFrame::default();
+        }
     }
 
     /// Call a named function defined in the Splash code's scope.
@@ -441,6 +757,10 @@ impl Splash {
             crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
             cx.widget_tree_mark_dirty(self.uid);
         }
+        // Streamed cards must arm the animation pump too (eval_body isn't called
+        // on this path), or time-based shaders (WeatherIcon / draw_pass.time)
+        // render once and freeze.
+        self.arm_animation_pump(cx, &current);
     }
 }
 
@@ -481,6 +801,26 @@ impl Widget for Splash {
         // Handle tick timer — call tick() in the Splash code's scope
         if self.tick_timer.is_event(event).is_some() {
             self.call_fn(cx, id!(tick));
+        }
+
+        // Per-frame redraw pump for time-based shaders: redraw the view (so the
+        // pixel shaders re-run with an advanced `self.draw_pass.time`) and queue
+        // the next frame. Self-sustaining while `animating`.
+        if self.animating && self.anim_next_frame.is_event(event).is_some() {
+            // Live data (sys.weather/sys.airquality) loads asynchronously; when a
+            // fetch completes the global epoch bumps. Re-evaluate the body ONCE per
+            // change so the "—" placeholders baked in at eval time are replaced by
+            // the loaded values (a plain repaint never re-runs the script). eval_body
+            // only reads cached data / fires still-pending fetches — it never bumps
+            // the epoch — so this settles and cannot loop.
+            let epoch = cx.script_data_fetch_epoch();
+            if epoch != self.last_data_epoch && body_binds_live_data(self.body.as_ref()) {
+                self.eval_body(cx);
+                cx.redraw_all();
+            } else {
+                self.view.redraw(cx);
+            }
+            self.anim_next_frame = cx.new_next_frame();
         }
 
         self.view.handle_event(cx, event, scope);
