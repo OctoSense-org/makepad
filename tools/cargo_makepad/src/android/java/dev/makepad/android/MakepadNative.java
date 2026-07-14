@@ -68,6 +68,10 @@ public class MakepadNative {
     public native static void onComposerNewApp();
     public native static void onComposerSwitch();
 
+    // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
+    // it; returns true if a QR was found (the caller then closes the scanner).
+    public native static boolean onQrCameraFrame(byte[] luma, int width, int height);
+
     // midi
     public native static void onMidiDeviceOpened(String name, Object midi_device);
     
