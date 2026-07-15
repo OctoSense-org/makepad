@@ -762,12 +762,20 @@ impl Cx {
         let dpi_factor = self.passes[draw_pass_id].dpi_factor.unwrap();
         let pass_rect = self.get_pass_rect(draw_pass_id, dpi_factor).unwrap();
         let pass = &mut self.passes[draw_pass_id];
-        pass.paint_dirty = false;
         pass.os.shader_variant = SHADER_VARIANT_WINDOW;
 
+        // Size-check BEFORE clearing paint_dirty (parity with the Vulkan
+        // backend, vulkan.rs setup order). An Area-sized texture pass can
+        // transiently resolve to a zero rect on its first repaint (e.g. a
+        // CachedView inside a PortalList before layout settles); clearing the
+        // dirty flag first made that skip PERMANENT — dirty-propagation is
+        // child→parent only, so nothing ever re-marked the pass and its
+        // texture stayed empty (an invisible card). Keeping the flag set
+        // turns the zero-size skip into a retry on the next repaint.
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
             return None;
         }
+        pass.paint_dirty = false;
 
         if !pass.keep_camera_matrix {
             pass.set_ortho_matrix(pass_rect.pos, pass_rect.size);
