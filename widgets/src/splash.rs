@@ -397,15 +397,20 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     );
 
     // sys.stockbar("AAPL", index, count) -> the HEIGHT (dp, a NUMBER) of bar
-    // `index` of `count` in an intraday sparkline (Yahoo 5-minute closes for the
-    // day, normalized so the day's low→~8dp and high→~158dp). Draw the chart as a
-    // bottom-aligned `flow: Right` row of thin `SolidView{ height: sys.stockbar(
-    // "AAPL", N, COUNT) }` bars (an area/line of the price path). Returns a small
-    // height while the async fetch loads, then the card re-evaluates.
+    // `index` of `count` in a price sparkline (Yahoo closes, normalized so the
+    // range's low→~8dp and high→~158dp). Draw the chart as a bottom-aligned
+    // `flow: Right` row of thin `SolidView{ height: sys.stockbar("AAPL", N,
+    // COUNT) }` bars (an area/line of the price path). Returns a small height
+    // while the async fetch loads, then the card re-evaluates.
+    // Optional 5th arg selects the series range: "1d" (default, 5-minute
+    // intraday), "1w", "1m", "6m", "1y" — empty/unknown tokens fall back to
+    // "1d" so an unset `{{state.range}}` still draws the intraday chart. The
+    // close series is resampled to `count` bars, so the SAME bar row serves
+    // every range. One fetch per symbol×range (URL-deduped).
     vm.add_method(
         sys,
         id_lut!(stockbar),
-        script_args_def!(symbol = NIL, index = NIL, count = NIL, maxh = NIL),
+        script_args_def!(symbol = NIL, index = NIL, count = NIL, maxh = NIL, range = NIL),
         |vm, args| {
             let sym_v = script_value!(vm, args.symbol);
             let mut symbol = String::new();
@@ -415,15 +420,54 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             // Optional 4th arg: the chart's pixel height, so the area fills it
             // exactly with no peak clipping. Defaults to 150 (legacy behavior).
             let maxh = script_value!(vm, args.maxh).as_number().filter(|v| *v > 8.0).unwrap_or(150.0);
+            let range_v = script_value!(vm, args.range);
+            let mut range = String::new();
+            vm.bx.heap.cast_to_string(range_v, &mut range);
             let sym = symbol.trim().to_ascii_uppercase();
+            let (yr, yi) = yahoo_range_params(&range);
             let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=5m&range=1d"
+                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}"
             );
             let h = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => stock_bar_height(&bytes, index, count, maxh),
                 None => 6.0,
             };
             ScriptValue::from_f64(h)
+        },
+    );
+
+    // sys.stockrange("<TICKER>", "<RANGE>", "field") -> a range-aware scalar for
+    // the SAME close series the chart bars draw (same URL → the one fetch is
+    // shared). `sys.stock("high"/"low"/"change"/"changepct")` is DAY-only, so a
+    // card whose chart switches range uses THIS for the Y-axis labels and the
+    // change line. Range tokens as in sys.stockbar ("1d" default). Fields
+    // (case-insensitive): "high" | "low" (range extremes, 2dp), "change" |
+    // "changepct" (signed first→last close over the range), "up" ("1"/"0",
+    // last >= first — for green/red styling). "—" while loading / on error.
+    vm.add_method(
+        sys,
+        id_lut!(stockrange),
+        script_args_def!(symbol = NIL, range = NIL, field = NIL),
+        |vm, args| {
+            let sym_v = script_value!(vm, args.symbol);
+            let mut symbol = String::new();
+            vm.bx.heap.cast_to_string(sym_v, &mut symbol);
+            let range_v = script_value!(vm, args.range);
+            let mut range = String::new();
+            vm.bx.heap.cast_to_string(range_v, &mut range);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let sym = symbol.trim().to_ascii_uppercase();
+            let (yr, yi) = yahoo_range_params(&range);
+            let url = format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}"
+            );
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => "—".to_string(),
+                Some(bytes) => stock_range_field(&bytes, field.trim()),
+            };
+            vm.bx.heap.new_string_from_str(&out)
         },
     );
 
@@ -539,6 +583,59 @@ fn body_binds_live_data(body: &str) -> bool {
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
 /// 5-minute close series, normalized so the day's min→~8dp and max→`maxh`+8dp
 /// (so a chart of pixel height `maxh`+8 shows the full range without clipping).
+/// Map a card-facing range token to Yahoo chart-API `(range, interval)` params.
+/// Tokens (case-insensitive): "1d" (default), "1w", "1m", "6m", "1y" — the five
+/// chips an iOS-Stocks-style card shows. Empty/unknown tokens (e.g. an unset
+/// `{{state.range}}` rendering as "") fall back to the intraday default so a
+/// card is never blank because of a bad token.
+fn yahoo_range_params(token: &str) -> (&'static str, &'static str) {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "1w" | "5d" => ("5d", "30m"),
+        "1m" | "1mo" => ("1mo", "1d"),
+        "6m" | "6mo" => ("6mo", "1d"),
+        "1y" => ("1y", "1wk"),
+        _ => ("1d", "5m"),
+    }
+}
+
+/// Range-aware scalar for `sys.stockrange`, computed from the SAME Yahoo close
+/// series the chart bars draw: the range's high/low extremes and the range's
+/// own first→last change. Returns "—" when the series is absent/short so the
+/// card shows the standard loading placeholder.
+fn stock_range_field(bytes: &[u8], field: &str) -> String {
+    let root: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return "—".to_string(),
+    };
+    let vals: Vec<f64> = match root
+        .pointer("/chart/result/0/indicators/quote/0/close")
+        .and_then(|c| c.as_array())
+    {
+        Some(a) => a.iter().filter_map(|x| x.as_f64()).collect(),
+        None => return "—".to_string(),
+    };
+    if vals.is_empty() {
+        return "—".to_string();
+    }
+    let mn = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mx = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let (first, last) = (vals[0], vals[vals.len() - 1]);
+    match field.to_ascii_lowercase().as_str() {
+        "high" => format!("{mx:.2}"),
+        "low" => format!("{mn:.2}"),
+        "change" => format!("{:+.2}", last - first),
+        "changepct" | "changepercent" => {
+            if first != 0.0 {
+                format!("{:+.2}%", (last - first) / first * 100.0)
+            } else {
+                "—".to_string()
+            }
+        }
+        "up" => (if last >= first { "1" } else { "0" }).to_string(),
+        _ => "—".to_string(),
+    }
+}
+
 fn stock_bar_height(bytes: &[u8], index: usize, count: usize, maxh: f64) -> f64 {
     let span = (maxh - 8.0).max(8.0);
     let root: serde_json::Value = match serde_json::from_slice(bytes) {
