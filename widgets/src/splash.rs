@@ -40,7 +40,8 @@ fn now_unix_secs() -> u64 {
 }
 
 /// Howard Hinnant's `civil_from_days`: days-since-Unix-epoch → (year, month, day).
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
+/// `pub(crate)` so the StockPlot widget can reuse it for date tick labels.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -483,11 +484,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let range_v = script_value!(vm, args.range);
             let mut range = String::new();
             vm.bx.heap.cast_to_string(range_v, &mut range);
-            let sym = symbol.trim().to_ascii_uppercase();
-            let (yr, yi) = yahoo_range_params(&range);
-            let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}"
-            );
+            let url = yahoo_chart_url(&symbol, &range);
             let h = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => stock_bar_height(&bytes, index, count, maxh),
                 None => 6.0,
@@ -518,11 +515,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let sym = symbol.trim().to_ascii_uppercase();
-            let (yr, yi) = yahoo_range_params(&range);
-            let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}"
-            );
+            let url = yahoo_chart_url(&symbol, &range);
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => "—".to_string(),
                 Some(bytes) => stock_range_field(&bytes, field.trim()),
@@ -733,6 +726,16 @@ fn yahoo_range_params(token: &str) -> (&'static str, &'static str) {
         "1y" => ("1y", "1wk"),
         _ => ("1d", "5m"),
     }
+}
+
+/// The ONE Yahoo chart-API URL for a symbol×range. `sys.stockbar`,
+/// `sys.stockrange` and the `StockPlot` widget all build their URL here, so
+/// they share a single `script_data_fetch` cache entry — one request per
+/// symbol×range serves the plot, the bars and every scalar on the card.
+pub(crate) fn yahoo_chart_url(symbol: &str, range: &str) -> String {
+    let sym = symbol.trim().to_ascii_uppercase();
+    let (yr, yi) = yahoo_range_params(range);
+    format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}")
 }
 
 /// Range-aware scalar for `sys.stockrange`, computed from the SAME Yahoo close
