@@ -317,6 +317,66 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.weathernum(lat, lon, "path") / sys.aqinum(lat, lon, "path") -> the SAME
+    // live open-meteo values as sys.weather / sys.airquality, but as a NUMBER, so
+    // script conditions can branch on LIVE data — the enabling primitive for
+    // COMPOSED cards (pick activities by temperature/precipitation, gate
+    // "go outside" on AQI, switch content on is_day). Returns -9999 while the
+    // fetch loads or when the path is absent/non-numeric — guard with
+    // `>= -9998`; the card re-evaluates when the fetch lands (same redraw
+    // semantics as the string helpers). Shares the string helpers' fetch
+    // (identical URL -> one request serves both).
+    vm.add_method(
+        sys,
+        id_lut!(weathernum),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+    vm.add_method(
+        sys,
+        id_lut!(aqinum),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat:.4}&longitude={lon:.4}\
+&current=us_aqi,pm2_5,pm10,ozone,nitrogen_dioxide&timezone=auto"
+            );
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
     // sys.stock("AAPL", "key") -> a LIVE value from Yahoo Finance for that ticker.
     // Same "—"/redraw semantics as sys.weather. `key` (case-insensitive):
     //   price | prev | high | low | open | currency | name | symbol
