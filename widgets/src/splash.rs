@@ -625,19 +625,96 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.places(lat, lon, "category", index, "field") -> a REAL nearby venue
+    // from OpenStreetMap (Overpass API, keyless): row `index` (0 = nearest) of
+    // the named places within 4 km, sorted by distance. THE LLM MUST CALL THIS
+    // FOR EVERY VENUE NAME/DISTANCE — an invented "Riverside Park" that isn't
+    // actually there destroys trust in the whole card; these are real mapped
+    // venues. Category tokens (case-insensitive): park, garden, trail, museum,
+    // cafe, cinema, gym, library, pool, viewpoint, playground — unknown tokens
+    // fall back to park. Fields (case-insensitive):
+    //   name     -> "Ryland Park"
+    //   distance -> "0.7 km"   (from the request point, one decimal)
+    //   lat|lon  -> "37.3423"  (4 decimals — chain into sys.basemap/sys.photo)
+    //   count    -> total places found (ignores `index`)
+    // Returns "—" while the (async) fetch loads or when index/field is out of
+    // range; the card re-evaluates when data lands (same redraw semantics as
+    // sys.weather). Unnamed OSM elements are skipped and duplicate names
+    // deduped (one park is often mapped as several ways), so every index is a
+    // distinct, nameable venue. ONE fetch (URL-deduped) serves all rows ×
+    // fields of a list card.
+    vm.add_method(
+        sys,
+        id_lut!(places),
+        script_args_def!(lat = NIL, lon = NIL, category = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let cat_v = script_value!(vm, args.category);
+            let mut category = String::new();
+            vm.bx.heap.cast_to_string(cat_v, &mut category);
+            let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = overpass_places_url(lat, lon, &category);
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => "—".to_string(),
+                Some(bytes) => places_field(&bytes, lat, lon, index, field.trim()),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.placesnum(lat, lon, "category") -> how many places sys.places would
+    // list, as a NUMBER, so script conditions can branch on LIVE availability
+    // BEFORE laying out rows — skip the "parks" section when none are mapped,
+    // cap a list at the real row count, fall back to another category.
+    // Returns -9999 while the fetch loads / on a bad response — guard with
+    // `>= 0` (the same sentinel convention as sys.weathernum); a genuine
+    // "nothing nearby" is 0. Shares sys.places' fetch (identical URL -> ONE
+    // request serves both helpers).
+    vm.add_method(
+        sys,
+        id_lut!(placesnum),
+        script_args_def!(lat = NIL, lon = NIL, category = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let cat_v = script_value!(vm, args.category);
+            let mut category = String::new();
+            vm.bx.heap.cast_to_string(cat_v, &mut category);
+            let url = overpass_places_url(lat, lon, &category);
+            let n = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => -9999.0,
+                Some(bytes) => match places_parse(&bytes, lat, lon) {
+                    Some(places) => places.len() as f64,
+                    None => -9999.0,
+                },
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
 }
 
 /// True if a Splash body calls any live-data helper (sys.weather/airquality/
-/// stock/news). Such cards must re-evaluate when their async fetch lands (the
-/// value is baked into a Label at eval time), so we arm the frame pump + watch
-/// the data-fetch epoch for them. Keep in sync with the data `sys.*` helpers.
+/// stock/news/movers/places). Such cards must re-evaluate when their async
+/// fetch lands (the value is baked into a Label at eval time), so we arm the
+/// frame pump + watch the data-fetch epoch for them. Keep in sync with the
+/// data `sys.*` helpers. (Substring matches also cover the -num variants:
+/// "sys.weather" matches sys.weathernum, "sys.places" matches sys.placesnum.)
 fn body_binds_live_data(body: &str) -> bool {
     body.contains("sys.weather")
         || body.contains("sys.airquality")
+        // `sys.aqinum` shares no prefix with `sys.airquality` — without its own
+        // check an aqinum-only card would never re-evaluate when its fetch lands.
+        || body.contains("sys.aqinum")
         || body.contains("sys.stock")
         || body.contains("sys.news")
         || body.contains("sys.movers")
+        || body.contains("sys.places")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
@@ -750,6 +827,151 @@ fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
         return Some(s[11..16].to_string());
     }
     Some(s)
+}
+
+/// Overpass API endpoint (keyless, no auth). overpass-api.de is the primary
+/// public instance; https://overpass.kumi.systems/api/interpreter is a
+/// drop-in mirror should it ever rate-limit.
+const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
+
+/// Map a card-facing category token to the ONE OSM tag filter with the best
+/// worldwide coverage for that idea. "trail" uses nature_reserve because real
+/// trail routes are OSM *relations*, which need a far heavier query shape than
+/// the node/way `around` filter used here. Unknown tokens fall back to park —
+/// the most widely mapped leisure tag — so a novel word never yields an empty
+/// card.
+fn overpass_filter(category: &str) -> (&'static str, &'static str) {
+    match category.trim().to_ascii_lowercase().as_str() {
+        "garden" => ("leisure", "garden"),
+        "trail" => ("leisure", "nature_reserve"),
+        "museum" => ("tourism", "museum"),
+        "cafe" => ("amenity", "cafe"),
+        "cinema" => ("amenity", "cinema"),
+        "gym" => ("leisure", "fitness_centre"),
+        "library" => ("amenity", "library"),
+        "pool" => ("leisure", "swimming_pool"),
+        "viewpoint" => ("tourism", "viewpoint"),
+        "playground" => ("leisure", "playground"),
+        _ => ("leisure", "park"), // "park" and any unknown token
+    }
+}
+
+/// Percent-encode a string for a URL query VALUE (RFC 3986): unreserved chars
+/// pass through, everything else (space and Overpass QL's `[]();:,=`) becomes
+/// %XX per UTF-8 byte. Local so the crate needs no url-encoding dependency
+/// (same approach as the sys.photo prompt encoder).
+fn percent_encode_query(s: &str) -> String {
+    let mut enc = String::with_capacity(s.len() * 3);
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            enc.push(ch);
+        } else {
+            for b in ch.encode_utf8(&mut buf).as_bytes() {
+                enc.push('%');
+                enc.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                enc.push(char::from_digit((b & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    enc
+}
+
+/// The Overpass query URL for named `category` places within 4 km of lat/lon:
+/// nodes AND ways (most parks/pools are mapped as ways; `out center` gives
+/// each way a single representative point), capped at 30 elements to keep the
+/// response phone-sized. Lat/lon are fixed to 4 decimals (~11 m) so GPS jitter
+/// doesn't defeat the URL-level fetch dedup — sys.places and sys.placesnum
+/// build this SAME url, so one request serves both.
+fn overpass_places_url(lat: f64, lon: f64, category: &str) -> String {
+    let (key, value) = overpass_filter(category);
+    let around = format!("around:4000,{lat:.4},{lon:.4}");
+    let query = format!(
+        "[out:json][timeout:25];(node[{key}={value}]({around});way[{key}={value}]({around}););out center 30;"
+    );
+    format!("{OVERPASS_URL}?data={}", percent_encode_query(&query))
+}
+
+/// A named OSM place from an Overpass response, with its distance from the
+/// request point.
+struct NearbyPlace {
+    name: String,
+    dist_km: f64,
+    lat: f64,
+    lon: f64,
+}
+
+/// Great-circle distance in km (haversine, mean Earth radius). Sub-1% error
+/// is invisible at the one-decimal precision cards display.
+fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (dlat, dlon) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * 6371.0 * a.sqrt().min(1.0).asin()
+}
+
+/// Parse an Overpass `out center` body into named places sorted nearest-first.
+/// Position: `lat`/`lon` for nodes, `center.lat`/`center.lon` for ways (what
+/// `out center` emits for areas). Unnamed elements are skipped (a card can't
+/// show "way 24680") and duplicate names deduped keeping the nearest — one
+/// park is often mapped as several ways sharing a name. None when the body
+/// isn't an Overpass JSON response (vs Some(empty) for a valid "nothing
+/// nearby"), so callers can tell error from zero.
+fn places_parse(bytes: &[u8], lat: f64, lon: f64) -> Option<Vec<NearbyPlace>> {
+    let root: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let elements = root.get("elements")?.as_array()?;
+    let mut out = Vec::new();
+    for el in elements {
+        let name = match el.pointer("/tags/name").and_then(|n| n.as_str()) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => continue,
+        };
+        let coord = |key: &str, center_ptr: &str| {
+            el.get(key)
+                .and_then(|v| v.as_f64())
+                .or_else(|| el.pointer(center_ptr).and_then(|v| v.as_f64()))
+        };
+        let (plat, plon) = match (coord("lat", "/center/lat"), coord("lon", "/center/lon")) {
+            (Some(a), Some(o)) => (a, o),
+            _ => continue,
+        };
+        out.push(NearbyPlace {
+            name,
+            dist_km: haversine_km(lat, lon, plat, plon),
+            lat: plat,
+            lon: plon,
+        });
+    }
+    out.sort_by(|a, b| a.dist_km.total_cmp(&b.dist_km));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.name.clone()));
+    Some(out)
+}
+
+/// Field lookup for `sys.places`: row `index` of the parsed nearest-first
+/// list. "count" ignores `index` so a header can show it without a dummy row.
+/// "—" for unknown fields, out-of-range indices, or a malformed body — the
+/// same placeholder the other live helpers show while loading.
+fn places_field(bytes: &[u8], lat: f64, lon: f64, index: usize, field: &str) -> String {
+    let places = match places_parse(bytes, lat, lon) {
+        Some(p) => p,
+        None => return "—".to_string(),
+    };
+    let f = field.to_ascii_lowercase();
+    if f == "count" {
+        return places.len().to_string();
+    }
+    let p = match places.get(index) {
+        Some(p) => p,
+        None => return "—".to_string(),
+    };
+    match f.as_str() {
+        "name" => p.name.clone(),
+        "distance" | "dist" => format!("{:.1} km", p.dist_km),
+        "lat" => format!("{:.4}", p.lat),
+        "lon" => format!("{:.4}", p.lon),
+        _ => "—".to_string(),
+    }
 }
 
 script_mod! {

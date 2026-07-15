@@ -230,22 +230,16 @@ impl Cx {
                                     "Script data fetch failed: status={}",
                                     res.status_code
                                 );
-                                self.script_data
-                                    .resources
-                                    .handle_data_fetch_error(request_id);
+                                self.retry_data_fetch_or_fail(request_id);
                             }
                         } else {
-                            self.script_data
-                                .resources
-                                .handle_data_fetch_error(request_id);
+                            self.retry_data_fetch_or_fail(request_id);
                         }
                         self.redraw_all();
                     }
                     NetworkResponse::HttpError { error: err, .. } => {
                         crate::log!("Script data fetch request error: {}", err.message);
-                        self.script_data
-                            .resources
-                            .handle_data_fetch_error(request_id);
+                        self.retry_data_fetch_or_fail(request_id);
                         self.redraw_all();
                     }
                     _ => {}
@@ -256,5 +250,20 @@ impl Cx {
         self.with_script_std_vm(|host, std, script_vm| {
             makepad_script_std::handle_script_network_events(host, std, script_vm, responses)
         });
+    }
+
+    /// Data-fetch failure path: mark the URL errored and bump the fetch epoch.
+    /// The epoch bump makes live-data cards re-evaluate, and it is the NEXT
+    /// evaluation that re-issues the request while retry budget remains (lazy
+    /// retry — see script_data_fetch), so attempts are paced by the failing
+    /// round-trips instead of bursting into a rate-limited API.
+    fn retry_data_fetch_or_fail(&mut self, request_id: LiveId) {
+        if self
+            .script_data
+            .resources
+            .handle_data_fetch_error(request_id)
+        {
+            crate::script::res::bump_data_fetch_epoch();
+        }
     }
 }
