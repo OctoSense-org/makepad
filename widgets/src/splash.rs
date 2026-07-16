@@ -29,6 +29,25 @@ fn slippy_tile(lat: f64, lon: f64, z: u32) -> (i64, i64) {
     ((x as i64).clamp(0, max), (y as i64).clamp(0, max))
 }
 
+/// Fractional Web-Mercator tile coords plus the top-left tile of the 2x2
+/// block that best CENTERS (lat, lon): the point's own tile joined with its
+/// nearest neighbor in each axis, so the anchor always lands in the middle
+/// half of the mosaic (offset fraction in [0.25, 0.75) per axis). Returns
+/// (left_tile_x, top_tile_y, x_fraction_of_mosaic, y_fraction_of_mosaic).
+/// Backs `sys.maptile` (URLs) and `sys.mappin` (pin offset) — the two MUST
+/// agree, which is why the math lives in one place.
+fn slippy_mosaic(lat: f64, lon: f64, z: u32) -> (i64, i64, f64, f64) {
+    let n = (1u64 << z) as f64;
+    let xf = (lon + 180.0) / 360.0 * n;
+    let yf = (1.0 - lat.to_radians().tan().asinh() / std::f64::consts::PI) / 2.0 * n;
+    let left = if xf.fract() >= 0.5 { xf.floor() } else { xf.floor() - 1.0 };
+    let top = if yf.fract() >= 0.5 { yf.floor() } else { yf.floor() - 1.0 };
+    let max = (1i64 << z) - 1;
+    let left = (left as i64).clamp(0, (max - 1).max(0));
+    let top = (top as i64).clamp(0, (max - 1).max(0));
+    ((left), (top), (xf - left as f64) / 2.0, (yf - top as f64) / 2.0)
+}
+
 /// Yesterday's civil date (UTC) as `YYYY-MM-DD` — the most recent day for
 /// which NASA GIBS daily global mosaics are guaranteed complete. Days-to-date
 /// via Howard Hinnant's `civil_from_days` (no chrono dep in this crate).
@@ -252,6 +271,210 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let (x, y) = slippy_tile(lat, lon, 8);
             let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/8/{x}/{y}.png?token=_");
             vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    // sys.maptile(lat, lon, zoom, "tl"|"tr"|"bl"|"br") -> one quadrant URL of a
+    // CENTERED 2x2 Carto "Voyager" mosaic around (lat, lon). Unlike sys.basemap
+    // (single tile, the point lands wherever it falls), the four quadrants are
+    // chosen so the anchor sits in the middle half of the mosaic — pair with
+    // sys.mappin for the 📍. Layout: two `flow: Right` rows of two square
+    // Images inside a square pane; ALL FOUR calls must share the same lat/lon/
+    // zoom. Zoom by intent: country 5, city 12, district 14, landmark 16.
+    // Keyless Carto raster (fair use) — cards MUST caption the pane
+    // "© OpenStreetMap contributors © CARTO". Subdomain rotates per quadrant so
+    // the 4 GETs parallelize. Pure URL builder (feed to http_resource).
+    vm.add_method(
+        sys,
+        id_lut!(maptile),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL, quad = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat)
+                .as_number()
+                .unwrap_or(0.0)
+                .clamp(-85.0, 85.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(12.0)
+                .clamp(3.0, 17.0) as u32;
+            let quad_v = script_value!(vm, args.quad);
+            let mut quad = String::new();
+            vm.bx.heap.cast_to_string(quad_v, &mut quad);
+            let (left, top, _, _) = slippy_mosaic(lat, lon, z);
+            let (dx, dy, sub) = match quad.trim().to_ascii_lowercase().as_str() {
+                "tr" => (1, 0, "b"),
+                "bl" => (0, 1, "c"),
+                "br" => (1, 1, "d"),
+                _ => (0, 0, "a"), // "tl" and anything unrecognized
+            };
+            let url = format!(
+                "https://{sub}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{}/{}@2x.png",
+                left + dx,
+                top + dy
+            );
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
+    // sys.mappin(lat, lon, zoom, "x"|"y", size) -> the pin's offset IN DP from
+    // the mosaic pane's top-left, for a SQUARE sys.maptile 2x2 pane `size` dp
+    // wide. Same math as sys.maptile, so the pin lands exactly on the anchor.
+    // Bind into layout like sys.stockbar heights — e.g. an Overlay child:
+    //   View{ padding: Inset{ left: sys.mappin(LAT,LON,Z,"x",372) - 11
+    //                         top:  sys.mappin(LAT,LON,Z,"y",372) - 22 }
+    //         Label{ text: "📍" } }
+    // (subtract half the glyph width / full height so the pin TIP marks the spot).
+    // Pure math — no fetch, no sentinel.
+    vm.add_method(
+        sys,
+        id_lut!(mappin),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL, axis = NIL, size = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat)
+                .as_number()
+                .unwrap_or(0.0)
+                .clamp(-85.0, 85.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(12.0)
+                .clamp(3.0, 17.0) as u32;
+            let axis_v = script_value!(vm, args.axis);
+            let mut axis = String::new();
+            vm.bx.heap.cast_to_string(axis_v, &mut axis);
+            let size = script_value!(vm, args.size).as_number().unwrap_or(372.0);
+            let (_, _, fx, fy) = slippy_mosaic(lat, lon, z);
+            let f = if axis.trim().eq_ignore_ascii_case("y") { fy } else { fx };
+            ScriptValue::from_f64(f * size)
+        },
+    );
+
+    // sys.geocode(name, "field") -> a LIVE geocoding lookup (open-meteo geocoding
+    // API, keyless — same free tier as the forecast API). Resolves a city/town/
+    // landmark NAME to facts, so cards never rely on invented coordinates:
+    //   sys.geocode("kyoto", "name")    -> "Kyoto"
+    //   sys.geocode("kyoto", "country") -> "Japan"
+    //   sys.geocode("kyoto", "admin1")  -> "Kyoto"
+    //   sys.geocode("kyoto", "lat")     -> "35.0211"   (string, for captions)
+    //   sys.geocode("kyoto", "lon")     -> "135.7539"
+    //   also: "timezone", "population". Returns "—" while loading. For the
+    // NUMBERS that anchor sys.maptile/mappin/places, use sys.geocodenum.
+    vm.add_method(
+        sys,
+        id_lut!(geocode),
+        script_args_def!(name = NIL, field = NIL),
+        |vm, args| {
+            let name_v = script_value!(vm, args.name);
+            let mut name = String::new();
+            vm.bx.heap.cast_to_string(name_v, &mut name);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = geocode_url(&name);
+            let path = match field.trim() {
+                "lat" => "results.0.latitude",
+                "lon" => "results.0.longitude",
+                "name" => "results.0.name",
+                "country" => "results.0.country",
+                "admin1" => "results.0.admin1",
+                "timezone" => "results.0.timezone",
+                "population" => "results.0.population",
+                other => return {
+                    // Unknown field: pluck it verbatim under results.0 so new
+                    // API fields work without a rebuild.
+                    let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                        Some(bytes) => {
+                            json_pluck(&bytes, &format!("results.0.{other}"))
+                                .unwrap_or_else(|| "—".to_string())
+                        }
+                        None => "—".to_string(),
+                    };
+                    vm.bx.heap.new_string_from_str(&out)
+                },
+            };
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => json_pluck(&bytes, path).unwrap_or_else(|| "—".to_string()),
+                None => "—".to_string(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.geocodenum(name, "lat"|"lon") -> the coordinate as a NUMBER, -9999
+    // while the lookup loads / when the place is unknown — the anchor for a map
+    // card. Guard the whole card body on it:
+    //   let lat = sys.geocodenum("kyoto", "lat")
+    //   let lon = sys.geocodenum("kyoto", "lon")
+    //   if lat >= -9998 { <the card, using lat/lon everywhere> }
+    // Shares sys.geocode's fetch (identical URL -> one request serves both).
+    vm.add_method(
+        sys,
+        id_lut!(geocodenum),
+        script_args_def!(name = NIL, field = NIL),
+        |vm, args| {
+            let name_v = script_value!(vm, args.name);
+            let mut name = String::new();
+            vm.bx.heap.cast_to_string(name_v, &mut name);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = geocode_url(&name);
+            let path = if field.trim() == "lon" {
+                "results.0.longitude"
+            } else {
+                "results.0.latitude"
+            };
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.route(lat1, lon1, lat2, lon2, "field") -> LIVE driving route stats
+    // between two points (OSRM public demo server, keyless):
+    //   "km"  -> "5.5 km"     "min" -> "10 min"
+    //   "distance" -> meters raw    "duration" -> seconds raw
+    // Returns "—" while loading (the demo server has no SLA — cards must
+    // tolerate the dash). Chain from sys.geocodenum for both endpoints.
+    vm.add_method(
+        sys,
+        id_lut!(route),
+        script_args_def!(lat1 = NIL, lon1 = NIL, lat2 = NIL, lon2 = NIL, field = NIL),
+        |vm, args| {
+            let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
+            let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
+            let lat2 = script_value!(vm, args.lat2).as_number().unwrap_or(0.0);
+            let lon2 = script_value!(vm, args.lon2).as_number().unwrap_or(0.0);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = format!(
+                "https://router.project-osrm.org/route/v1/driving/{lon1:.4},{lat1:.4};{lon2:.4},{lat2:.4}?overview=false"
+            );
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => match field.trim() {
+                    "km" => json_pluck(&bytes, "routes.0.distance")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|m| format!("{:.1} km", m / 1000.0))
+                        .unwrap_or_else(|| "—".to_string()),
+                    "min" => json_pluck(&bytes, "routes.0.duration")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|s| format!("{:.0} min", s / 60.0))
+                        .unwrap_or_else(|| "—".to_string()),
+                    "duration" => json_pluck(&bytes, "routes.0.duration")
+                        .unwrap_or_else(|| "—".to_string()),
+                    _ => json_pluck(&bytes, "routes.0.distance")
+                        .unwrap_or_else(|| "—".to_string()),
+                },
+                None => "—".to_string(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
         },
     );
 
@@ -708,6 +931,9 @@ fn body_binds_live_data(body: &str) -> bool {
         || body.contains("sys.news")
         || body.contains("sys.movers")
         || body.contains("sys.places")
+        // substring covers sys.geocodenum too (same trick as weather/weathernum)
+        || body.contains("sys.geocode")
+        || body.contains("sys.route")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
@@ -881,8 +1107,20 @@ fn overpass_filter(category: &str) -> (&'static str, &'static str) {
         "pool" => ("leisure", "swimming_pool"),
         "viewpoint" => ("tourism", "viewpoint"),
         "playground" => ("leisure", "playground"),
+        "attraction" => ("tourism", "attraction"),
+        "restaurant" => ("amenity", "restaurant"),
+        "hotel" => ("tourism", "hotel"),
         _ => ("leisure", "park"), // "park" and any unknown token
     }
+}
+
+/// The open-meteo geocoding lookup URL for a place name — one URL per name so
+/// sys.geocode + sys.geocodenum share the same deduped fetch.
+fn geocode_url(name: &str) -> String {
+    format!(
+        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
+        percent_encode_query(name.trim())
+    )
 }
 
 /// Percent-encode a string for a URL query VALUE (RFC 3986): unreserved chars
