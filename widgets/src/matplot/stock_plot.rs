@@ -22,7 +22,7 @@
 
 use crate::matplot::plot_view::{nice_ticks, PlotView};
 use crate::matplot::types::LineStyle;
-use crate::splash::{civil_from_days, yahoo_chart_url};
+use crate::splash::{civil_from_days, yahoo_chart_url, sanitize_ticker};
 use crate::{makepad_derive_widget::*, makepad_draw::*, widget::*};
 
 script_mod! {
@@ -111,6 +111,11 @@ pub struct StockPlot {
     has_time: bool,
     #[rust]
     loaded: bool,
+    /// Fetch failed terminally, or a 2xx body had no usable series: stop
+    /// pumping and render the failure placeholder (a retry can only be
+    /// triggered by a symbol/range change, which resets this).
+    #[rust]
+    failed: bool,
 
     // ---- redraw pump while the async fetch is pending ----
     #[rust]
@@ -126,7 +131,7 @@ impl Widget for StockPlot {
         // re-arms the pump if it is still the one pending. Mirrors the Splash
         // live-data pump, but scoped to this widget (a plot-only card needs no
         // body re-evaluation to fill in).
-        if self.pump.is_event(event).is_some() && !self.loaded {
+        if self.pump.is_event(event).is_some() && !self.loaded && !self.failed {
             let epoch = cx.script_data_fetch_epoch();
             if epoch != self.last_epoch {
                 self.last_epoch = epoch;
@@ -166,15 +171,17 @@ impl Widget for StockPlot {
             self.draw_grid_and_ticks(cx);
             self.draw_series(cx);
         } else {
-            // Loading (or empty symbol): the standard dim placeholder; the
-            // pump redraws us into the real chart when the fetch lands.
+            // Loading: the standard dim placeholder (the pump redraws us into
+            // the real chart when the fetch lands). Terminal failure: say so —
+            // a silent dash that never resolves reads as a hang.
             let pr = self.plot_view.plot_rect().clone();
             let color = self.plot_view.text_color;
+            let label = if self.failed { "chart unavailable" } else { "—" };
             self.plot_view.draw_text_centered_px(
                 cx,
                 pr.pos.x + pr.size.x * 0.5,
                 pr.pos.y + pr.size.y * 0.5,
-                "—",
+                label,
                 color,
                 12.0,
             );
@@ -188,26 +195,48 @@ impl StockPlot {
     /// Resolve the Yahoo chart URL for the current symbol×range and (re)load
     /// the close series through the shared script-data-fetch cache.
     fn ensure_data(&mut self, cx: &mut Cx) {
-        if self.symbol.trim().is_empty() {
+        if sanitize_ticker(&self.symbol).is_empty() {
+            // Cleared/garbage symbol: drop any previous ticker's series so we
+            // don't keep drawing a stale chart, and let the pump lapse.
+            if !self.url.is_empty() {
+                self.url.clear();
+                self.loaded = false;
+                self.failed = false;
+                self.closes.clear();
+                self.stamps.clear();
+            }
             return;
         }
         let url = yahoo_chart_url(&self.symbol, &self.range);
         if url != self.url {
             self.url = url;
             self.loaded = false;
+            self.failed = false;
             self.closes.clear();
             self.stamps.clear();
         }
-        if self.loaded {
+        if self.loaded || self.failed {
             return;
         }
         match cx.script_data_fetch(&self.url) {
             Some(bytes) => {
-                self.parse(&bytes);
-                self.loaded = true;
+                // A 2xx body with no usable series (empty payload, HTML, a
+                // Yahoo error object) is terminal for this URL — the cache
+                // will serve the same bytes forever, so re-parsing each frame
+                // can never improve. Show the failure placeholder instead of
+                // pumping.
+                if self.parse(&bytes) {
+                    self.loaded = true;
+                } else {
+                    self.failed = true;
+                }
+            }
+            None if cx.script_data.resources.data_fetch_failed_terminally(&self.url) => {
+                // Out of retry budget: stop the pump for good.
+                self.failed = true;
             }
             None => {
-                // Pending (or retrying): arm the epoch watch.
+                // Pending (or awaiting a backoff retry): arm the epoch watch.
                 self.last_epoch = cx.script_data_fetch_epoch();
                 self.pump = cx.new_next_frame();
             }
@@ -216,18 +245,18 @@ impl StockPlot {
 
     /// Parse Yahoo chart JSON into aligned (timestamp, close) pairs, skipping
     /// null closes (Yahoo pads intraday series with nulls).
-    fn parse(&mut self, bytes: &[u8]) {
+    fn parse(&mut self, bytes: &[u8]) -> bool {
         self.closes.clear();
         self.stamps.clear();
         self.gmtoff = 0.0;
         self.has_time = false;
         let root: serde_json::Value = match serde_json::from_slice(bytes) {
             Ok(v) => v,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let result = match root.pointer("/chart/result/0") {
             Some(r) => r,
-            None => return,
+            None => return false,
         };
         self.gmtoff = result
             .pointer("/meta/gmtoffset")
@@ -242,21 +271,27 @@ impl StockPlot {
                 self.has_time = true;
                 for (c, t) in cl.iter().zip(ts.iter()) {
                     if let (Some(c), Some(t)) = (c.as_f64(), t.as_f64()) {
-                        self.closes.push(c);
-                        self.stamps.push(t);
+                        if c.is_finite() && t.is_finite() {
+                            self.closes.push(c);
+                            self.stamps.push(t);
+                        }
                     }
                 }
             }
             (Some(cl), None) => {
                 for (i, c) in cl.iter().enumerate() {
                     if let Some(c) = c.as_f64() {
-                        self.closes.push(c);
-                        self.stamps.push(i as f64);
+                        if c.is_finite() {
+                            self.closes.push(c);
+                            self.stamps.push(i as f64);
+                        }
                     }
                 }
             }
             _ => {}
         }
+        // A drawable series needs at least two finite points.
+        self.closes.len() >= 2
     }
 
     fn draw_grid_and_ticks(&mut self, cx: &mut Cx2d) {

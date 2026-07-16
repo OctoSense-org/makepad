@@ -230,7 +230,19 @@ impl Cx {
                                     "Script data fetch failed: status={}",
                                     res.status_code
                                 );
-                                self.retry_data_fetch_or_fail(request_id);
+                                // Only transient statuses are worth retrying;
+                                // a 4xx like 404/403 will fail identically
+                                // every time, so make it terminal at once.
+                                let transient = matches!(res.status_code, 408 | 429)
+                                    || res.status_code >= 500;
+                                if transient {
+                                    self.retry_data_fetch_or_fail(request_id);
+                                } else {
+                                    self.script_data
+                                        .resources
+                                        .fail_data_fetch_terminally(request_id);
+                                    crate::script::res::bump_data_fetch_epoch();
+                                }
                             }
                         } else {
                             self.retry_data_fetch_or_fail(request_id);

@@ -395,7 +395,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let sym = symbol.trim().to_ascii_uppercase();
+            let sym = sanitize_ticker(&symbol);
             let url = format!(
                 "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
             );
@@ -480,7 +480,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let count = (script_value!(vm, args.count).as_number().unwrap_or(40.0) as usize).max(2);
             // Optional 4th arg: the chart's pixel height, so the area fills it
             // exactly with no peak clipping. Defaults to 150 (legacy behavior).
-            let maxh = script_value!(vm, args.maxh).as_number().filter(|v| *v > 8.0).unwrap_or(150.0);
+            let maxh = script_value!(vm, args.maxh).as_number().filter(|v| v.is_finite() && *v > 8.0 && *v < 10_000.0).unwrap_or(150.0);
             let range_v = script_value!(vm, args.range);
             let mut range = String::new();
             vm.bx.heap.cast_to_string(range_v, &mut range);
@@ -728,12 +728,29 @@ fn yahoo_range_params(token: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// Sanitize a card-supplied ticker into a safe URL path segment. Card bodies
+/// are LLM-generated (semi-trusted): a symbol containing `?`/`#`/`/`/`%`
+/// would rewrite the request target (and split the fetch-dedup key), and a
+/// `\0` — which Splash string literals CAN carry — reaches the Android HTTP
+/// layer's `CString::new(url).unwrap()` and aborts the process. Keep only the
+/// characters real Yahoo tickers use (letters, digits, `.` `-` `^` `=`),
+/// uppercased, capped at 16.
+pub(crate) fn sanitize_ticker(symbol: &str) -> String {
+    symbol
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^' | '='))
+        .map(|c| c.to_ascii_uppercase())
+        .take(16)
+        .collect()
+}
+
 /// The ONE Yahoo chart-API URL for a symbol×range. `sys.stockbar`,
 /// `sys.stockrange` and the `StockPlot` widget all build their URL here, so
 /// they share a single `script_data_fetch` cache entry — one request per
 /// symbol×range serves the plot, the bars and every scalar on the card.
 pub(crate) fn yahoo_chart_url(symbol: &str, range: &str) -> String {
-    let sym = symbol.trim().to_ascii_uppercase();
+    let sym = sanitize_ticker(symbol);
     let (yr, yi) = yahoo_range_params(range);
     format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}")
 }
