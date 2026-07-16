@@ -40,7 +40,8 @@ fn now_unix_secs() -> u64 {
 }
 
 /// Howard Hinnant's `civil_from_days`: days-since-Unix-epoch → (year, month, day).
-fn civil_from_days(days: i64) -> (i64, u64, u64) {
+/// `pub(crate)` so the StockPlot widget can reuse it for date tick labels.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -317,6 +318,66 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.weathernum(lat, lon, "path") / sys.aqinum(lat, lon, "path") -> the SAME
+    // live open-meteo values as sys.weather / sys.airquality, but as a NUMBER, so
+    // script conditions can branch on LIVE data — the enabling primitive for
+    // COMPOSED cards (pick activities by temperature/precipitation, gate
+    // "go outside" on AQI, switch content on is_day). Returns -9999 while the
+    // fetch loads or when the path is absent/non-numeric — guard with
+    // `>= -9998`; the card re-evaluates when the fetch lands (same redraw
+    // semantics as the string helpers). Shares the string helpers' fetch
+    // (identical URL -> one request serves both).
+    vm.add_method(
+        sys,
+        id_lut!(weathernum),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+    vm.add_method(
+        sys,
+        id_lut!(aqinum),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat:.4}&longitude={lon:.4}\
+&current=us_aqi,pm2_5,pm10,ozone,nitrogen_dioxide&timezone=auto"
+            );
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
     // sys.stock("AAPL", "key") -> a LIVE value from Yahoo Finance for that ticker.
     // Same "—"/redraw semantics as sys.weather. `key` (case-insensitive):
     //   price | prev | high | low | open | currency | name | symbol
@@ -334,7 +395,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let sym = symbol.trim().to_ascii_uppercase();
+            let sym = sanitize_ticker(&symbol);
             let url = format!(
                 "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
             );
@@ -397,15 +458,20 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     );
 
     // sys.stockbar("AAPL", index, count) -> the HEIGHT (dp, a NUMBER) of bar
-    // `index` of `count` in an intraday sparkline (Yahoo 5-minute closes for the
-    // day, normalized so the day's low→~8dp and high→~158dp). Draw the chart as a
-    // bottom-aligned `flow: Right` row of thin `SolidView{ height: sys.stockbar(
-    // "AAPL", N, COUNT) }` bars (an area/line of the price path). Returns a small
-    // height while the async fetch loads, then the card re-evaluates.
+    // `index` of `count` in a price sparkline (Yahoo closes, normalized so the
+    // range's low→~8dp and high→~158dp). Draw the chart as a bottom-aligned
+    // `flow: Right` row of thin `SolidView{ height: sys.stockbar("AAPL", N,
+    // COUNT) }` bars (an area/line of the price path). Returns a small height
+    // while the async fetch loads, then the card re-evaluates.
+    // Optional 5th arg selects the series range: "1d" (default, 5-minute
+    // intraday), "1w", "1m", "6m", "1y" — empty/unknown tokens fall back to
+    // "1d" so an unset `{{state.range}}` still draws the intraday chart. The
+    // close series is resampled to `count` bars, so the SAME bar row serves
+    // every range. One fetch per symbol×range (URL-deduped).
     vm.add_method(
         sys,
         id_lut!(stockbar),
-        script_args_def!(symbol = NIL, index = NIL, count = NIL, maxh = NIL),
+        script_args_def!(symbol = NIL, index = NIL, count = NIL, maxh = NIL, range = NIL),
         |vm, args| {
             let sym_v = script_value!(vm, args.symbol);
             let mut symbol = String::new();
@@ -414,16 +480,47 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let count = (script_value!(vm, args.count).as_number().unwrap_or(40.0) as usize).max(2);
             // Optional 4th arg: the chart's pixel height, so the area fills it
             // exactly with no peak clipping. Defaults to 150 (legacy behavior).
-            let maxh = script_value!(vm, args.maxh).as_number().filter(|v| *v > 8.0).unwrap_or(150.0);
-            let sym = symbol.trim().to_ascii_uppercase();
-            let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=5m&range=1d"
-            );
+            let maxh = script_value!(vm, args.maxh).as_number().filter(|v| v.is_finite() && *v > 8.0 && *v < 10_000.0).unwrap_or(150.0);
+            let range_v = script_value!(vm, args.range);
+            let mut range = String::new();
+            vm.bx.heap.cast_to_string(range_v, &mut range);
+            let url = yahoo_chart_url(&symbol, &range);
             let h = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => stock_bar_height(&bytes, index, count, maxh),
                 None => 6.0,
             };
             ScriptValue::from_f64(h)
+        },
+    );
+
+    // sys.stockrange("<TICKER>", "<RANGE>", "field") -> a range-aware scalar for
+    // the SAME close series the chart bars draw (same URL → the one fetch is
+    // shared). `sys.stock("high"/"low"/"change"/"changepct")` is DAY-only, so a
+    // card whose chart switches range uses THIS for the Y-axis labels and the
+    // change line. Range tokens as in sys.stockbar ("1d" default). Fields
+    // (case-insensitive): "high" | "low" (range extremes, 2dp), "change" |
+    // "changepct" (signed first→last close over the range), "up" ("1"/"0",
+    // last >= first — for green/red styling). "—" while loading / on error.
+    vm.add_method(
+        sys,
+        id_lut!(stockrange),
+        script_args_def!(symbol = NIL, range = NIL, field = NIL),
+        |vm, args| {
+            let sym_v = script_value!(vm, args.symbol);
+            let mut symbol = String::new();
+            vm.bx.heap.cast_to_string(sym_v, &mut symbol);
+            let range_v = script_value!(vm, args.range);
+            let mut range = String::new();
+            vm.bx.heap.cast_to_string(range_v, &mut range);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = yahoo_chart_url(&symbol, &range);
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => "—".to_string(),
+                Some(bytes) => stock_range_field(&bytes, field.trim()),
+            };
+            vm.bx.heap.new_string_from_str(&out)
         },
     );
 
@@ -521,24 +618,190 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.places(lat, lon, "category", index, "field") -> a REAL nearby venue
+    // from OpenStreetMap (Overpass API, keyless): row `index` (0 = nearest) of
+    // the named places within 4 km, sorted by distance. THE LLM MUST CALL THIS
+    // FOR EVERY VENUE NAME/DISTANCE — an invented "Riverside Park" that isn't
+    // actually there destroys trust in the whole card; these are real mapped
+    // venues. Category tokens (case-insensitive): park, garden, trail, museum,
+    // cafe, cinema, gym, library, pool, viewpoint, playground — unknown tokens
+    // fall back to park. Fields (case-insensitive):
+    //   name     -> "Ryland Park"
+    //   distance -> "0.7 km"   (from the request point, one decimal)
+    //   lat|lon  -> "37.3423"  (4 decimals — chain into sys.basemap/sys.photo)
+    //   count    -> total places found (ignores `index`)
+    // Returns "—" while the (async) fetch loads or when index/field is out of
+    // range; the card re-evaluates when data lands (same redraw semantics as
+    // sys.weather). Unnamed OSM elements are skipped and duplicate names
+    // deduped (one park is often mapped as several ways), so every index is a
+    // distinct, nameable venue. ONE fetch (URL-deduped) serves all rows ×
+    // fields of a list card.
+    vm.add_method(
+        sys,
+        id_lut!(places),
+        script_args_def!(lat = NIL, lon = NIL, category = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let cat_v = script_value!(vm, args.category);
+            let mut category = String::new();
+            vm.bx.heap.cast_to_string(cat_v, &mut category);
+            let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = overpass_places_url(lat, lon, &category);
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => "—".to_string(),
+                Some(bytes) => places_field(&bytes, lat, lon, index, field.trim()),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.placesnum(lat, lon, "category") -> how many places sys.places would
+    // list, as a NUMBER, so script conditions can branch on LIVE availability
+    // BEFORE laying out rows — skip the "parks" section when none are mapped,
+    // cap a list at the real row count, fall back to another category.
+    // Returns -9999 while the fetch loads / on a bad response — guard with
+    // `>= 0` (the same sentinel convention as sys.weathernum); a genuine
+    // "nothing nearby" is 0. Shares sys.places' fetch (identical URL -> ONE
+    // request serves both helpers).
+    vm.add_method(
+        sys,
+        id_lut!(placesnum),
+        script_args_def!(lat = NIL, lon = NIL, category = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let cat_v = script_value!(vm, args.category);
+            let mut category = String::new();
+            vm.bx.heap.cast_to_string(cat_v, &mut category);
+            let url = overpass_places_url(lat, lon, &category);
+            let n = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => -9999.0,
+                Some(bytes) => match places_parse(&bytes, lat, lon) {
+                    Some(places) => places.len() as f64,
+                    None => -9999.0,
+                },
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
 }
 
 /// True if a Splash body calls any live-data helper (sys.weather/airquality/
-/// stock/news). Such cards must re-evaluate when their async fetch lands (the
-/// value is baked into a Label at eval time), so we arm the frame pump + watch
-/// the data-fetch epoch for them. Keep in sync with the data `sys.*` helpers.
+/// stock/news/movers/places). Such cards must re-evaluate when their async
+/// fetch lands (the value is baked into a Label at eval time), so we arm the
+/// frame pump + watch the data-fetch epoch for them. Keep in sync with the
+/// data `sys.*` helpers. (Substring matches also cover the -num variants:
+/// "sys.weather" matches sys.weathernum, "sys.places" matches sys.placesnum.)
 fn body_binds_live_data(body: &str) -> bool {
     body.contains("sys.weather")
         || body.contains("sys.airquality")
+        // `sys.aqinum` shares no prefix with `sys.airquality` — without its own
+        // check an aqinum-only card would never re-evaluate when its fetch lands.
+        || body.contains("sys.aqinum")
         || body.contains("sys.stock")
         || body.contains("sys.news")
         || body.contains("sys.movers")
+        || body.contains("sys.places")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
 /// 5-minute close series, normalized so the day's min→~8dp and max→`maxh`+8dp
 /// (so a chart of pixel height `maxh`+8 shows the full range without clipping).
+/// Map a card-facing range token to Yahoo chart-API `(range, interval)` params.
+/// Tokens (case-insensitive): "1d" (default), "1w", "1m", "6m", "1y" — the five
+/// chips an iOS-Stocks-style card shows. Empty/unknown tokens (e.g. an unset
+/// `{{state.range}}` rendering as "") fall back to the intraday default so a
+/// card is never blank because of a bad token.
+fn yahoo_range_params(token: &str) -> (&'static str, &'static str) {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "1w" | "5d" => ("5d", "30m"),
+        "1m" | "1mo" => ("1mo", "1d"),
+        "6m" | "6mo" => ("6mo", "1d"),
+        "1y" => ("1y", "1wk"),
+        _ => ("1d", "5m"),
+    }
+}
+
+/// Sanitize a card-supplied ticker into a safe URL path segment. Card bodies
+/// are LLM-generated (semi-trusted): a symbol containing `?`/`#`/`/`/`%`
+/// would rewrite the request target (and split the fetch-dedup key), and a
+/// `\0` — which Splash string literals CAN carry — reaches the Android HTTP
+/// layer's `CString::new(url).unwrap()` and aborts the process. Keep only the
+/// characters real Yahoo tickers use (letters, digits, `.` `-` `^` `=`),
+/// uppercased, capped at 16.
+pub(crate) fn sanitize_ticker(symbol: &str) -> String {
+    let out: String = symbol
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^' | '='))
+        .map(|c| c.to_ascii_uppercase())
+        .take(16)
+        .collect();
+    // A real ticker has at least one letter/digit. Reject a result that is
+    // empty or all-punctuation (e.g. ".." — which a URL canonicalizer would
+    // resolve as a path-traversal segment, rewriting the request target). The
+    // callers treat "" as "no symbol" and skip the fetch.
+    if out.chars().any(|c| c.is_ascii_alphanumeric()) {
+        out
+    } else {
+        String::new()
+    }
+}
+
+/// The ONE Yahoo chart-API URL for a symbol×range. `sys.stockbar`,
+/// `sys.stockrange` and the `StockPlot` widget all build their URL here, so
+/// they share a single `script_data_fetch` cache entry — one request per
+/// symbol×range serves the plot, the bars and every scalar on the card.
+pub(crate) fn yahoo_chart_url(symbol: &str, range: &str) -> String {
+    let sym = sanitize_ticker(symbol);
+    let (yr, yi) = yahoo_range_params(range);
+    format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}")
+}
+
+/// Range-aware scalar for `sys.stockrange`, computed from the SAME Yahoo close
+/// series the chart bars draw: the range's high/low extremes and the range's
+/// own first→last change. Returns "—" when the series is absent/short so the
+/// card shows the standard loading placeholder.
+fn stock_range_field(bytes: &[u8], field: &str) -> String {
+    let root: serde_json::Value = match serde_json::from_slice(bytes) {
+        Ok(v) => v,
+        Err(_) => return "—".to_string(),
+    };
+    let vals: Vec<f64> = match root
+        .pointer("/chart/result/0/indicators/quote/0/close")
+        .and_then(|c| c.as_array())
+    {
+        Some(a) => a.iter().filter_map(|x| x.as_f64()).collect(),
+        None => return "—".to_string(),
+    };
+    if vals.is_empty() {
+        return "—".to_string();
+    }
+    let mn = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mx = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let (first, last) = (vals[0], vals[vals.len() - 1]);
+    match field.to_ascii_lowercase().as_str() {
+        "high" => format!("{mx:.2}"),
+        "low" => format!("{mn:.2}"),
+        "change" => format!("{:+.2}", last - first),
+        "changepct" | "changepercent" => {
+            if first != 0.0 {
+                format!("{:+.2}%", (last - first) / first * 100.0)
+            } else {
+                "—".to_string()
+            }
+        }
+        "up" => (if last >= first { "1" } else { "0" }).to_string(),
+        _ => "—".to_string(),
+    }
+}
+
 fn stock_bar_height(bytes: &[u8], index: usize, count: usize, maxh: f64) -> f64 {
     let span = (maxh - 8.0).max(8.0);
     let root: serde_json::Value = match serde_json::from_slice(bytes) {
@@ -593,6 +856,151 @@ fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
         return Some(s[11..16].to_string());
     }
     Some(s)
+}
+
+/// Overpass API endpoint (keyless, no auth). overpass-api.de is the primary
+/// public instance; https://overpass.kumi.systems/api/interpreter is a
+/// drop-in mirror should it ever rate-limit.
+const OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
+
+/// Map a card-facing category token to the ONE OSM tag filter with the best
+/// worldwide coverage for that idea. "trail" uses nature_reserve because real
+/// trail routes are OSM *relations*, which need a far heavier query shape than
+/// the node/way `around` filter used here. Unknown tokens fall back to park —
+/// the most widely mapped leisure tag — so a novel word never yields an empty
+/// card.
+fn overpass_filter(category: &str) -> (&'static str, &'static str) {
+    match category.trim().to_ascii_lowercase().as_str() {
+        "garden" => ("leisure", "garden"),
+        "trail" => ("leisure", "nature_reserve"),
+        "museum" => ("tourism", "museum"),
+        "cafe" => ("amenity", "cafe"),
+        "cinema" => ("amenity", "cinema"),
+        "gym" => ("leisure", "fitness_centre"),
+        "library" => ("amenity", "library"),
+        "pool" => ("leisure", "swimming_pool"),
+        "viewpoint" => ("tourism", "viewpoint"),
+        "playground" => ("leisure", "playground"),
+        _ => ("leisure", "park"), // "park" and any unknown token
+    }
+}
+
+/// Percent-encode a string for a URL query VALUE (RFC 3986): unreserved chars
+/// pass through, everything else (space and Overpass QL's `[]();:,=`) becomes
+/// %XX per UTF-8 byte. Local so the crate needs no url-encoding dependency
+/// (same approach as the sys.photo prompt encoder).
+fn percent_encode_query(s: &str) -> String {
+    let mut enc = String::with_capacity(s.len() * 3);
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '~') {
+            enc.push(ch);
+        } else {
+            for b in ch.encode_utf8(&mut buf).as_bytes() {
+                enc.push('%');
+                enc.push(char::from_digit((b >> 4) as u32, 16).unwrap().to_ascii_uppercase());
+                enc.push(char::from_digit((b & 0xF) as u32, 16).unwrap().to_ascii_uppercase());
+            }
+        }
+    }
+    enc
+}
+
+/// The Overpass query URL for named `category` places within 4 km of lat/lon:
+/// nodes AND ways (most parks/pools are mapped as ways; `out center` gives
+/// each way a single representative point), capped at 30 elements to keep the
+/// response phone-sized. Lat/lon are fixed to 4 decimals (~11 m) so GPS jitter
+/// doesn't defeat the URL-level fetch dedup — sys.places and sys.placesnum
+/// build this SAME url, so one request serves both.
+fn overpass_places_url(lat: f64, lon: f64, category: &str) -> String {
+    let (key, value) = overpass_filter(category);
+    let around = format!("around:4000,{lat:.4},{lon:.4}");
+    let query = format!(
+        "[out:json][timeout:25];(node[{key}={value}]({around});way[{key}={value}]({around}););out center 30;"
+    );
+    format!("{OVERPASS_URL}?data={}", percent_encode_query(&query))
+}
+
+/// A named OSM place from an Overpass response, with its distance from the
+/// request point.
+struct NearbyPlace {
+    name: String,
+    dist_km: f64,
+    lat: f64,
+    lon: f64,
+}
+
+/// Great-circle distance in km (haversine, mean Earth radius). Sub-1% error
+/// is invisible at the one-decimal precision cards display.
+fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (dlat, dlon) = ((lat2 - lat1).to_radians(), (lon2 - lon1).to_radians());
+    let a = (dlat / 2.0).sin().powi(2)
+        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * 6371.0 * a.sqrt().min(1.0).asin()
+}
+
+/// Parse an Overpass `out center` body into named places sorted nearest-first.
+/// Position: `lat`/`lon` for nodes, `center.lat`/`center.lon` for ways (what
+/// `out center` emits for areas). Unnamed elements are skipped (a card can't
+/// show "way 24680") and duplicate names deduped keeping the nearest — one
+/// park is often mapped as several ways sharing a name. None when the body
+/// isn't an Overpass JSON response (vs Some(empty) for a valid "nothing
+/// nearby"), so callers can tell error from zero.
+fn places_parse(bytes: &[u8], lat: f64, lon: f64) -> Option<Vec<NearbyPlace>> {
+    let root: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let elements = root.get("elements")?.as_array()?;
+    let mut out = Vec::new();
+    for el in elements {
+        let name = match el.pointer("/tags/name").and_then(|n| n.as_str()) {
+            Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+            _ => continue,
+        };
+        let coord = |key: &str, center_ptr: &str| {
+            el.get(key)
+                .and_then(|v| v.as_f64())
+                .or_else(|| el.pointer(center_ptr).and_then(|v| v.as_f64()))
+        };
+        let (plat, plon) = match (coord("lat", "/center/lat"), coord("lon", "/center/lon")) {
+            (Some(a), Some(o)) => (a, o),
+            _ => continue,
+        };
+        out.push(NearbyPlace {
+            name,
+            dist_km: haversine_km(lat, lon, plat, plon),
+            lat: plat,
+            lon: plon,
+        });
+    }
+    out.sort_by(|a, b| a.dist_km.total_cmp(&b.dist_km));
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.name.clone()));
+    Some(out)
+}
+
+/// Field lookup for `sys.places`: row `index` of the parsed nearest-first
+/// list. "count" ignores `index` so a header can show it without a dummy row.
+/// "—" for unknown fields, out-of-range indices, or a malformed body — the
+/// same placeholder the other live helpers show while loading.
+fn places_field(bytes: &[u8], lat: f64, lon: f64, index: usize, field: &str) -> String {
+    let places = match places_parse(bytes, lat, lon) {
+        Some(p) => p,
+        None => return "—".to_string(),
+    };
+    let f = field.to_ascii_lowercase();
+    if f == "count" {
+        return places.len().to_string();
+    }
+    let p = match places.get(index) {
+        Some(p) => p,
+        None => return "—".to_string(),
+    };
+    match f.as_str() {
+        "name" => p.name.clone(),
+        "distance" | "dist" => format!("{:.1} km", p.dist_km),
+        "lat" => format!("{:.4}", p.lat),
+        "lon" => format!("{:.4}", p.lon),
+        _ => "—".to_string(),
+    }
 }
 
 script_mod! {

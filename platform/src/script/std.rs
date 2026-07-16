@@ -220,32 +220,43 @@ impl Cx {
                 // re-runs and returns the live value.
                 match response {
                     NetworkResponse::HttpResponse { response: res, .. } => {
-                        if let Some(body) = res.get_body() {
-                            if (200..300).contains(&res.status_code) {
+                        // Classify by STATUS first (independent of whether a body
+                        // is present — a bodyless 404 must not be retried as if
+                        // transient). A 2xx is only a real success if it carries
+                        // a NON-EMPTY body; an empty/absent 2xx body would
+                        // otherwise be cached as Loaded forever and poison the
+                        // binding (permanent "—", no retry).
+                        let status = res.status_code;
+                        let body = res.get_body().filter(|b| !b.is_empty());
+                        if (200..300).contains(&status) {
+                            if let Some(body) = body {
                                 self.script_data
                                     .resources
                                     .handle_data_fetch_response(request_id, body.clone());
                             } else {
-                                crate::log!(
-                                    "Script data fetch failed: status={}",
-                                    res.status_code
-                                );
-                                self.script_data
-                                    .resources
-                                    .handle_data_fetch_error(request_id);
+                                crate::log!("Script data fetch: {status} with empty body; retrying");
+                                self.retry_data_fetch_or_fail(request_id);
                             }
                         } else {
-                            self.script_data
-                                .resources
-                                .handle_data_fetch_error(request_id);
+                            crate::log!("Script data fetch failed: status={status}");
+                            // Transient statuses are worth retrying; a permanent
+                            // 4xx (404/403) fails identically every time -> make
+                            // it terminal at once.
+                            let transient = matches!(status, 408 | 429) || status >= 500;
+                            if transient {
+                                self.retry_data_fetch_or_fail(request_id);
+                            } else {
+                                self.script_data
+                                    .resources
+                                    .fail_data_fetch_terminally(request_id);
+                                crate::script::res::bump_data_fetch_epoch();
+                            }
                         }
                         self.redraw_all();
                     }
                     NetworkResponse::HttpError { error: err, .. } => {
                         crate::log!("Script data fetch request error: {}", err.message);
-                        self.script_data
-                            .resources
-                            .handle_data_fetch_error(request_id);
+                        self.retry_data_fetch_or_fail(request_id);
                         self.redraw_all();
                     }
                     _ => {}
@@ -256,5 +267,20 @@ impl Cx {
         self.with_script_std_vm(|host, std, script_vm| {
             makepad_script_std::handle_script_network_events(host, std, script_vm, responses)
         });
+    }
+
+    /// Data-fetch failure path: mark the URL errored and bump the fetch epoch.
+    /// The epoch bump makes live-data cards re-evaluate, and it is the NEXT
+    /// evaluation that re-issues the request while retry budget remains (lazy
+    /// retry — see script_data_fetch), so attempts are paced by the failing
+    /// round-trips instead of bursting into a rate-limited API.
+    fn retry_data_fetch_or_fail(&mut self, request_id: LiveId) {
+        if self
+            .script_data
+            .resources
+            .handle_data_fetch_error(request_id)
+        {
+            crate::script::res::bump_data_fetch_epoch();
+        }
     }
 }

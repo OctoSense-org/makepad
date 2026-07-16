@@ -67,6 +67,34 @@ pub struct CxScriptResources {
     pub http_resources: Vec<CxScriptHttpResource>,
     /// Live data fetches for script data-binding, keyed by URL (see DataFetch).
     pub data_fetches: Rc<RefCell<HashMap<String, DataFetch>>>,
+    /// Retry ledger for data fetches, keyed by URL: (attempts used, earliest
+    /// next-retry Instant). Public data APIs shed load with transient 5xx
+    /// (Overpass 504s routinely) and 429s can return in milliseconds — an
+    /// immediate re-issue would burn the whole budget inside one rate-limit
+    /// window, so retries back off exponentially (1s, 2s, 4s, …). Bounded by
+    /// [`DATA_FETCH_MAX_RETRIES`]; the entry is dropped when the URL finally
+    /// loads so the ledger doesn't grow for the process lifetime.
+    pub data_fetch_retries: Rc<RefCell<HashMap<String, (u8, std::time::Instant)>>>,
+}
+
+/// Retries per data-fetch URL before the Error state sticks (initial attempt
+/// not counted — 4 means up to 5 requests total). Retries are LAZY (issued on
+/// the card's next evaluation, paced by the failing round-trips), so a larger
+/// budget spreads over tens of seconds rather than hammering.
+pub const DATA_FETCH_MAX_RETRIES: u8 = 4;
+
+/// User-Agent for a script data fetch, chosen by target host. Yahoo endpoints
+/// 429 requests without a browser-ish UA, so that stays the default — but
+/// overpass-api.de's Apache rejects the bare "Mozilla/5.0" bot signature with
+/// 406 (and OSM etiquette wants an identifying UA anyway), so Overpass gets a
+/// descriptive one. Keep this beside the retry path so every (re)issue of a
+/// fetch picks the same UA.
+pub fn data_fetch_user_agent(url: &str) -> &'static str {
+    if url.contains("overpass") {
+        "octos-one-a2app/1.0 (+https://github.com/octos-org/octos-one; live card data binding)"
+    } else {
+        "Mozilla/5.0"
+    }
 }
 
 impl CxScriptResources {
@@ -162,9 +190,13 @@ impl CxScriptResources {
     /// Store loaded bytes for the in-flight fetch matching `request_id`.
     pub fn handle_data_fetch_response(&self, request_id: LiveId, data: Vec<u8>) -> bool {
         let mut map = self.data_fetches.borrow_mut();
-        for fetch in map.values_mut() {
+        for (url, fetch) in map.iter_mut() {
             if matches!(fetch, DataFetch::Loading(id) if *id == request_id) {
+                let url = url.clone();
                 *fetch = DataFetch::Loaded(Rc::new(data));
+                drop(map);
+                // Success closes the retry ledger entry (see data_fetch_retries).
+                self.data_fetch_retries.borrow_mut().remove(&url);
                 DATA_FETCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return true;
             }
@@ -183,6 +215,67 @@ impl CxScriptResources {
         }
         false
     }
+
+    /// Lazy-retry bookkeeping: does `url` still have retry budget AND has its
+    /// backoff window elapsed; if so, consume one unit. Called from
+    /// `script_data_fetch` when it encounters an Error entry — retries are
+    /// re-issued on a later evaluation, delayed exponentially (1s, 2s, 4s, …)
+    /// so a fast 429 can't burn the whole budget inside one rate-limit window.
+    pub fn take_data_fetch_retry(&self, url: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut retries = self.data_fetch_retries.borrow_mut();
+        let entry = retries.entry(url.to_string()).or_insert((0, now));
+        if entry.0 >= DATA_FETCH_MAX_RETRIES || now < entry.1 {
+            return false;
+        }
+        entry.0 += 1;
+        entry.1 = now + std::time::Duration::from_secs(1u64 << (entry.0.min(6) - 1));
+        true
+    }
+
+    /// Mark the fetch matching `request_id` as errored AND exhaust its retry
+    /// budget — for permanent failures (404/403…) where re-issuing the same
+    /// request can only fail identically. Makes
+    /// [`Self::data_fetch_failed_terminally`] true immediately.
+    pub fn fail_data_fetch_terminally(&self, request_id: LiveId) -> bool {
+        let url = {
+            let map = self.data_fetches.borrow();
+            map.iter().find_map(|(url, fetch)| {
+                matches!(fetch, DataFetch::Loading(id) if *id == request_id)
+                    .then(|| url.clone())
+            })
+        };
+        let Some(url) = url else { return false };
+        self.data_fetches
+            .borrow_mut()
+            .insert(url.clone(), DataFetch::Error);
+        self.data_fetch_retries
+            .borrow_mut()
+            .insert(url, (DATA_FETCH_MAX_RETRIES, std::time::Instant::now()));
+        true
+    }
+
+    /// Terminal-failure probe for widgets that render their own fetch (e.g.
+    /// StockPlot): true once `url` is in the Error state with NO retry budget
+    /// left — the signal to stop pumping frames and show a failure state.
+    pub fn data_fetch_failed_terminally(&self, url: &str) -> bool {
+        if !matches!(self.get_data_fetch(url), Some(DataFetch::Error)) {
+            return false;
+        }
+        self.data_fetch_retries
+            .borrow()
+            .get(url)
+            .is_some_and(|(used, _)| *used >= DATA_FETCH_MAX_RETRIES)
+    }
+}
+
+/// Bump the data-fetch epoch (see DATA_FETCH_EPOCH). Also fired on fetch
+/// FAILURE: live-data cards re-evaluate on epoch change, which is what gives
+/// an errored URL its lazy retry (script_data_fetch re-fires it, budget
+/// permitting). Terminates: an exhausted URL fires no new request, so no new
+/// failure bumps the epoch again.
+pub fn bump_data_fetch_epoch() {
+    DATA_FETCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -473,15 +566,24 @@ impl Cx {
     pub fn script_data_fetch(&mut self, url: &str) -> Option<Rc<Vec<u8>>> {
         match self.script_data.resources.get_data_fetch(url) {
             Some(DataFetch::Loaded(bytes)) => return Some(bytes),
-            Some(DataFetch::Loading(_)) | Some(DataFetch::Error) => return None,
+            Some(DataFetch::Loading(_)) => return None,
+            Some(DataFetch::Error) => {
+                // Lazy retry: re-fire on this evaluation if budget remains
+                // (see take_data_fetch_retry), else the Error is terminal.
+                if !self.script_data.resources.take_data_fetch_retry(url) {
+                    return None;
+                }
+                crate::log!("Script data fetch retrying: {}", url);
+                // fall through to re-issue below
+            }
             None => {}
         }
         let request_id = LiveId::unique();
         self.script_data.resources.begin_data_fetch(url, request_id);
         let mut req = HttpRequest::new(url.to_string(), Default::default());
-        // Some data APIs (e.g. Yahoo Finance) 429 a request that has no browser
-        // User-Agent; harmless for the others (open-meteo, HN).
-        req.set_header("User-Agent".to_string(), "Mozilla/5.0".to_string());
+        // Host-appropriate UA — Yahoo 429s without a browser-ish one, Overpass
+        // 406s ON the bare browser signature (see data_fetch_user_agent).
+        req.set_header("User-Agent".to_string(), data_fetch_user_agent(url).to_string());
         self.http_request(request_id, req);
         None
     }

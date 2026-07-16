@@ -121,6 +121,10 @@ pub mod flat_list;
 
 pub mod chart;
 
+// Vendored makepad-matplot plotting engine + the StockPlot card widget.
+// Deliberately NOT glob re-exported: use `crate::matplot::...` paths.
+pub mod matplot;
+
 // Commented out modules (not yet converted)
 // lets depricate these for now
 // pub mod toggle_panel;
@@ -594,6 +598,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::svg::script_mod(vm);
     crate::vector::script_mod(vm);
     crate::chart::script_mod(vm);
+    crate::matplot::script_mod(vm);
     #[cfg(feature = "maps")]
     crate::map::style::script_mod(vm);
     #[cfg(feature = "maps")]
