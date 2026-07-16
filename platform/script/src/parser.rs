@@ -714,6 +714,14 @@ pub struct ScriptParser {
     // Storage for nested patterns during parsing
     // Each entry is (pattern_info). The index into this vec is encoded in the ids list.
     nested_patterns: Vec<NestedPattern>,
+
+    /// Code index just past the most recently completed if/else or match
+    /// construct: the point where all branch paths converge (IF_TEST false-jumps
+    /// and IF_ELSE jumps land here). When a statement ENDS at this exact index,
+    /// EndStmt must emit a real POP_TO_ME opcode here instead of flagging the
+    /// last opcode (which is inside the final branch and gets skipped by the
+    /// other branches' jumps).
+    branch_merge_end: u32,
 }
 
 impl Default for ScriptParser {
@@ -728,6 +736,7 @@ impl Default for ScriptParser {
             }],
             file: String::new(),
             line_offset: 0,
+            branch_merge_end: u32::MAX,
             col_offset: 0,
             destruct_defaults: Default::default(),
             nested_patterns: Default::default(),
@@ -1147,6 +1156,7 @@ impl ScriptParser {
                         prev_else_start,
                         OpcodeArgs::from_u32(self.code_len() as u32 - prev_else_start),
                     );
+                    self.branch_merge_end = self.code_len();
                 }
                 // Expect }
                 if tok.is_close_curly() {
@@ -1181,6 +1191,7 @@ impl ScriptParser {
                         if_start,
                         OpcodeArgs::from_u32(self.code_len() as u32 - if_start).set_need_nil(),
                     );
+                    self.branch_merge_end = self.code_len();
                     self.state.push(State::EndExpr);
                     return 1;
                 }
@@ -3082,6 +3093,7 @@ impl ScriptParser {
                     if_start,
                     OpcodeArgs::from_u32(self.code_len() as u32 - if_start).set_need_nil(),
                 );
+                self.branch_merge_end = self.code_len();
                 // self.push_code_none(NIL);
                 if was_block {
                     // allow expression to chain
@@ -3108,6 +3120,7 @@ impl ScriptParser {
                     else_start,
                     OpcodeArgs::from_u32(self.code_len() as u32 - else_start),
                 );
+                self.branch_merge_end = self.code_len();
                 return 0;
             }
             State::IfElseBlock {
@@ -3128,6 +3141,7 @@ impl ScriptParser {
                         else_start,
                         OpcodeArgs::from_u32(self.code_len() as u32 - else_start),
                     );
+                    self.branch_merge_end = self.code_len();
                     self.state.push(State::EndExpr);
                     return 1;
                 } else {
@@ -3974,7 +3988,15 @@ impl ScriptParser {
                     }
                 }
                 // otherwise pop to me
-                self.set_pop_to_me();
+                if self.code_len() == self.branch_merge_end {
+                    // Statement ends exactly at an if/else (or match) merge point:
+                    // all branch jumps land HERE. A flag on the last opcode would
+                    // sit inside the final branch and be skipped by the other
+                    // branches' jumps; emit a real POP_TO_ME at the merge instead.
+                    self.push_code(Opcode::POP_TO_ME.into(), self.index);
+                } else {
+                    self.set_pop_to_me();
+                }
                 //self.push_code_none(Opcode::POP_TO_ME.into());
                 self.state.push(State::BeginStmt {
                     last_was_sep: false,
@@ -4054,7 +4076,12 @@ impl ScriptParser {
                     self.push_code(Opcode::INDEX_INHERIT_WRITE.into(), last_index);
                 }
                 State::EndStmt { .. } => {
-                    self.set_pop_to_me();
+                    if self.code_len() == self.branch_merge_end {
+                        // same merge-point rule as the main-loop EndStmt
+                        self.push_code(Opcode::POP_TO_ME.into(), self.index);
+                    } else {
+                        self.set_pop_to_me();
+                    }
                 }
                 State::EmitOp { what_op, index } => {
                     self.push_code(State::operator_to_opcode(what_op), index);
@@ -4245,7 +4272,12 @@ impl ScriptParser {
                     self.push_code(Opcode::INDEX_INHERIT_WRITE.into(), last_index);
                 }
                 State::EndStmt { .. } => {
-                    self.set_pop_to_me();
+                    if self.code_len() == self.branch_merge_end {
+                        // same merge-point rule as the main-loop EndStmt
+                        self.push_code(Opcode::POP_TO_ME.into(), self.index);
+                    } else {
+                        self.set_pop_to_me();
+                    }
                 }
                 State::EmitOp { what_op, index } => {
                     self.push_code(State::operator_to_opcode(what_op), index);
