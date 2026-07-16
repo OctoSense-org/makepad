@@ -338,6 +338,56 @@ unsafe fn new_jstring(env: *mut jni_sys::JNIEnv, value: &str) -> Option<jni_sys:
     }
 }
 
+/// Split a proxy spec like `http://127.0.0.1:8899` (or a bare `127.0.0.1:8899`)
+/// into `("127.0.0.1", "8899")`. Returns `None` if there is no numeric port —
+/// the JVM proxy properties are useless without one, so we'd rather leave them
+/// unset (direct connect) than set a half-configured proxy.
+fn parse_proxy_host_port(proxy: &str) -> Option<(String, String)> {
+    let s = proxy.trim();
+    let s = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let s = s.split('/').next().unwrap_or(s); // drop any trailing path
+    let (host, port) = s.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((host.to_string(), port.to_string()))
+}
+
+/// Call `System.setProperty(key, value)` via JNI. `System` is a class with only
+/// static methods, so this resolves the class + static method id directly rather
+/// than using the instance-method `call_method!` macros. Best-effort: any JNI
+/// failure just leaves the property unset.
+unsafe fn set_java_system_property(env: *mut jni_sys::JNIEnv, key: &str, value: &str) {
+    let (Some(k), Some(v)) = (new_jstring(env, key), new_jstring(env, value)) else {
+        return;
+    };
+    let cls_name = match CString::new("java/lang/System") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let cls = ((**env).FindClass.unwrap())(env, cls_name.as_ptr());
+    if cls.is_null() {
+        return;
+    }
+    let m_name = match CString::new("setProperty") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let m_sig = match CString::new("(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mid = ((**env).GetStaticMethodID.unwrap())(env, cls, m_name.as_ptr(), m_sig.as_ptr());
+    if mid.is_null() {
+        return;
+    }
+    // CallStaticObjectMethod is C-variadic in jni_sys; pass the two jstrings.
+    let _prev = ((**env).CallStaticObjectMethod.unwrap())(env, cls, mid, k, v);
+}
+
 unsafe fn get_prefs_object(
     env: *mut jni_sys::JNIEnv,
     activity: jni_sys::jobject,
@@ -511,13 +561,29 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     }
 
     // Passthrough: `--es makepad.OCTOS_PROXY <url>` → MAKEPAD_OCTOS_PROXY. Routes
-    // the embedded octos server's LLM HTTPS through a proxy (e.g. an adb-reverse
-    // tunnel to the dev host) when the device has no direct internet route.
+    // BOTH the embedded octos server's LLM HTTPS (via the env vars stdio_spawn
+    // sets on the kernel child) AND the app's OWN live-data fetches (sys.weather
+    // / sys.stock / sys.places — made by THIS process's HttpURLConnection, not
+    // the kernel) through a proxy — e.g. an `adb reverse` tunnel to the dev host
+    // — when the device has no direct internet route. Without the app-side leg,
+    // a Wi-Fi-less phone generates cards fine (LLM tunneled) but every `sys.*`
+    // fetch fails DNS, so cards render with "—"/empty rows.
     std::env::remove_var("MAKEPAD_OCTOS_PROXY");
     if let Some(proxy) = get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY")
         .filter(|v| !v.trim().is_empty())
     {
         std::env::set_var("MAKEPAD_OCTOS_PROXY", &proxy);
+        // App-side leg: MakepadNetwork opens connections with a bare
+        // `url.openConnection()`, which consults the JVM proxy system
+        // properties. Parse `http://host:port` and set them so every
+        // app-initiated HTTP(S) request CONNECT-tunnels through the proxy.
+        if let Some((host, port)) = parse_proxy_host_port(&proxy) {
+            for scheme in ["http", "https"] {
+                set_java_system_property(env, &format!("{scheme}.proxyHost"), &host);
+                set_java_system_property(env, &format!("{scheme}.proxyPort"), &port);
+            }
+            crate::log!("app HTTP proxy set: {}:{} (card data fetches tunneled)", host, port);
+        }
     }
 
     // Passthrough: `--es makepad.PROVISION_DIR <path>` → MAKEPAD_PROVISION_DIR.
