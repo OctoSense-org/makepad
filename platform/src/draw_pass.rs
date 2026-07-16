@@ -416,6 +416,14 @@ pub struct CxDrawPass {
     pub main_draw_list_id: Option<DrawListId>,
     pub parent: CxDrawPassParent,
     pub paint_dirty: bool,
+    /// Consecutive zero-size skips in the GL backend's setup_render_pass. The
+    /// retry-on-zero heal (keep paint_dirty set) fixes a pass whose Area sizes
+    /// a frame late, but a PERMANENTLY collapsed pass would spin the
+    /// choreographer every vsync — so it is bounded. Reset to 0 whenever the
+    /// pass area is (re)assigned (set_pass_area), giving a recovered pass its
+    /// retry budget back. Shared (not in the GL os struct) so the reset is
+    /// portable.
+    pub zero_size_skips: u8,
     pub pass_rect: Option<CxDrawPassRect>,
     pub view_shift: Vec2d,
     pub view_scale: Vec2d,
@@ -444,6 +452,7 @@ impl Default for CxDrawPass {
             view_scale: dvec2(1.0, 1.0),
             parent: CxDrawPassParent::None,
             paint_dirty: false,
+            zero_size_skips: 0,
             pass_rect: None,
             os: CxOsPass::default(),
         }

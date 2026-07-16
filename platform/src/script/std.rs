@@ -220,32 +220,37 @@ impl Cx {
                 // re-runs and returns the live value.
                 match response {
                     NetworkResponse::HttpResponse { response: res, .. } => {
-                        if let Some(body) = res.get_body() {
-                            if (200..300).contains(&res.status_code) {
+                        // Classify by STATUS first (independent of whether a body
+                        // is present — a bodyless 404 must not be retried as if
+                        // transient). A 2xx is only a real success if it carries
+                        // a NON-EMPTY body; an empty/absent 2xx body would
+                        // otherwise be cached as Loaded forever and poison the
+                        // binding (permanent "—", no retry).
+                        let status = res.status_code;
+                        let body = res.get_body().filter(|b| !b.is_empty());
+                        if (200..300).contains(&status) {
+                            if let Some(body) = body {
                                 self.script_data
                                     .resources
                                     .handle_data_fetch_response(request_id, body.clone());
                             } else {
-                                crate::log!(
-                                    "Script data fetch failed: status={}",
-                                    res.status_code
-                                );
-                                // Only transient statuses are worth retrying;
-                                // a 4xx like 404/403 will fail identically
-                                // every time, so make it terminal at once.
-                                let transient = matches!(res.status_code, 408 | 429)
-                                    || res.status_code >= 500;
-                                if transient {
-                                    self.retry_data_fetch_or_fail(request_id);
-                                } else {
-                                    self.script_data
-                                        .resources
-                                        .fail_data_fetch_terminally(request_id);
-                                    crate::script::res::bump_data_fetch_epoch();
-                                }
+                                crate::log!("Script data fetch: {status} with empty body; retrying");
+                                self.retry_data_fetch_or_fail(request_id);
                             }
                         } else {
-                            self.retry_data_fetch_or_fail(request_id);
+                            crate::log!("Script data fetch failed: status={status}");
+                            // Transient statuses are worth retrying; a permanent
+                            // 4xx (404/403) fails identically every time -> make
+                            // it terminal at once.
+                            let transient = matches!(status, 408 | 429) || status >= 500;
+                            if transient {
+                                self.retry_data_fetch_or_fail(request_id);
+                            } else {
+                                self.script_data
+                                    .resources
+                                    .fail_data_fetch_terminally(request_id);
+                                crate::script::res::bump_data_fetch_epoch();
+                            }
                         }
                         self.redraw_all();
                     }

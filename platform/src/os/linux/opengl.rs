@@ -776,13 +776,13 @@ impl Cx {
         // ticking every vsync forever, so after a few consecutive misses we
         // clear the flag and wait for a real re-dirty (layout change, redraw).
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
-            pass.os.zero_size_skips = pass.os.zero_size_skips.saturating_add(1);
-            if pass.os.zero_size_skips >= 8 {
+            pass.zero_size_skips = pass.zero_size_skips.saturating_add(1);
+            if pass.zero_size_skips >= 8 {
                 pass.paint_dirty = false;
             }
             return None;
         }
-        pass.os.zero_size_skips = 0;
+        pass.zero_size_skips = 0;
         pass.paint_dirty = false;
 
         if !pass.keep_camera_matrix {
@@ -2930,13 +2930,6 @@ pub struct CxOsPass {
     pub shader_variant: usize,
     pub pass_uniforms: OpenglBuffer,
     pub gl_framebuffer: Option<u32>,
-    /// Consecutive zero-size skips in setup_render_pass. The retry-on-zero
-    /// behavior (paint_dirty kept set) heals passes whose Area resolves a
-    /// frame late, but a PERMANENTLY collapsed pass would otherwise keep the
-    /// choreographer awake every vsync forever — after a few misses we give
-    /// up until something re-dirties the pass. Reset on every successful
-    /// setup and on set_pass_area (a new area = a new chance).
-    pub zero_size_skips: u8,
 }
 
 impl CxOsPass {

@@ -168,11 +168,19 @@ impl<'a> CxDraw<'a> {
     }
 
     pub fn set_pass_area(&mut self, pass: &DrawPass, area: Area) {
-        self.passes[pass.draw_pass_id()].pass_rect = Some(CxDrawPassRect::Area(area));
+        let p = &mut self.passes[pass.draw_pass_id()];
+        // A fresh area assignment gives a previously-collapsed (retry-capped)
+        // pass its zero-size retry budget back — otherwise a pass that sized 0
+        // for >=8 frames then recovers would stay blank (see opengl.rs
+        // setup_render_pass).
+        p.zero_size_skips = 0;
+        p.pass_rect = Some(CxDrawPassRect::Area(area));
     }
 
     pub fn set_pass_area_with_origin(&mut self, pass: &DrawPass, area: Area, origin: Vec2d) {
-        self.passes[pass.draw_pass_id()].pass_rect = Some(CxDrawPassRect::AreaOrigin(area, origin));
+        let p = &mut self.passes[pass.draw_pass_id()];
+        p.zero_size_skips = 0;
+        p.pass_rect = Some(CxDrawPassRect::AreaOrigin(area, origin));
     }
 
     pub fn set_pass_shift_scale(&mut self, pass: &DrawPass, shift: Vec2d, scale: Vec2d) {

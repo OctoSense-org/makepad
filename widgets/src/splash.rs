@@ -736,13 +736,22 @@ fn yahoo_range_params(token: &str) -> (&'static str, &'static str) {
 /// characters real Yahoo tickers use (letters, digits, `.` `-` `^` `=`),
 /// uppercased, capped at 16.
 pub(crate) fn sanitize_ticker(symbol: &str) -> String {
-    symbol
+    let out: String = symbol
         .trim()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^' | '='))
         .map(|c| c.to_ascii_uppercase())
         .take(16)
-        .collect()
+        .collect();
+    // A real ticker has at least one letter/digit. Reject a result that is
+    // empty or all-punctuation (e.g. ".." — which a URL canonicalizer would
+    // resolve as a path-traversal segment, rewriting the request target). The
+    // callers treat "" as "no symbol" and skip the fetch.
+    if out.chars().any(|c| c.is_ascii_alphanumeric()) {
+        out
+    } else {
+        String::new()
+    }
 }
 
 /// The ONE Yahoo chart-API URL for a symbol×range. `sys.stockbar`,

@@ -129,9 +129,14 @@ impl Widget for StockPlot {
         // While the fetch is pending, watch the global data-fetch epoch each
         // frame; when ANY fetch lands, redraw — draw_walk retries our URL and
         // re-arms the pump if it is still the one pending. Mirrors the Splash
-        // live-data pump, but scoped to this widget (a plot-only card needs no
-        // body re-evaluation to fill in).
-        if self.pump.is_event(event).is_some() && !self.loaded && !self.failed {
+        // live-data pump, but scoped to this widget. Gate on a non-empty url
+        // too: a card that clears its symbol mid-load (url reset to "") must
+        // let the pump LAPSE rather than spin forever on nothing.
+        if self.pump.is_event(event).is_some()
+            && !self.url.is_empty()
+            && !self.loaded
+            && !self.failed
+        {
             let epoch = cx.script_data_fetch_epoch();
             if epoch != self.last_epoch {
                 self.last_epoch = epoch;
