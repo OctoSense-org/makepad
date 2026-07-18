@@ -1303,6 +1303,16 @@ pub struct Splash {
     /// the "—" placeholders are replaced with the loaded values.
     #[rust]
     last_data_epoch: u64,
+    /// Whether the CURRENT body has ever evaluated to a view. Reset on a
+    /// genuine content replacement, kept across streaming extensions.
+    #[rust]
+    render_ok: bool,
+    /// Quiet-period timer. A streamed body is syntactically incomplete for most
+    /// of its life, so a failed eval mid-stream is normal and must not be
+    /// surfaced. This fires only once the body has stopped growing, at which
+    /// point a still-empty view means the card really did fail.
+    #[rust]
+    failure_timer: Timer,
 }
 
 /// Prefix for View-children mode: wraps code inside a View
@@ -1310,6 +1320,19 @@ const SPLASH_PREFIX_VIEW: &str = "use mod.prelude.widgets.*View{height:Fit, ";
 /// Prefix for full-script mode: just imports, code must evaluate to a widget
 const SPLASH_PREFIX_SCRIPT: &str = "use mod.prelude.widgets.*\n";
 const SPLASH_EVAL_INSTRUCTION_LIMIT: usize = 200_000;
+/// How long the body must stop growing before a still-unrendered card is
+/// declared failed. Long enough to outlast a stalled network chunk, short
+/// enough that a dead card doesn't look like a hung app.
+const SPLASH_FAILURE_DELAY: f64 = 3.0;
+/// Offset for the failure card's vm body id, so it never collides with a
+/// generation of the real body (whose parser state is what just failed).
+const SPLASH_FAILURE_ID_SALT: usize = 0x5f_a1_1e_d0;
+/// Shown in place of the blank view when a body cannot be parsed. Deliberately
+/// tiny and literal — it must not itself depend on anything that can fail.
+const SPLASH_FAILURE_CARD: &str = r#"SolidView{ width: Fill height: Fit flow: Down new_batch: true draw_bg.color: #ffffff padding: Inset{left: 16 top: 14 right: 16 bottom: 14}
+    Label{ text: "Card failed to render" draw_text.color: #000000 draw_text.text_style.font_size: 15 }
+    Label{ text: "The generated card DSL did not parse. See the Makepad log for the parse errors." draw_text.color: #6a6a6a draw_text.text_style.font_size: 11 margin: Inset{top: 6} }
+}"#;
 
 /// Detect whether Splash code is a full script (starts with `let`, `fn`,
 /// or a widget constructor like `View{`, `SolidView{`) vs View children
@@ -1357,6 +1380,8 @@ impl Splash {
             !self.last_eval_body.is_empty() && body.starts_with(self.last_eval_body.as_str());
         if !is_extension {
             self.eval_generation += 1;
+            // New content, not a continuation — nothing has rendered for it yet.
+            self.render_ok = false;
         }
         self.last_eval_body = body.clone();
         let unique_id = self.self_id().wrapping_add(self.eval_generation as usize);
@@ -1426,7 +1451,12 @@ impl Splash {
             self.view.set_visible(cx, true);
             crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
             cx.widget_tree_mark_dirty(self.uid);
+            self.render_ok = true;
         }
+        // NOTE: on failure `self.view` is deliberately left alone — mid-stream
+        // that keeps the last good frame on screen. `set_text` arms
+        // `failure_timer` so a body that never recovers still surfaces instead
+        // of sitting there as a blank, zero-height view.
 
         // If the Splash code defines fn tick(), auto-start a 1s interval
         if body.contains("fn tick(") || body.contains("fn tick (") {
@@ -1443,6 +1473,74 @@ impl Splash {
         // Record the data-fetch epoch AT this eval, so the per-frame pump only
         // re-evaluates when a LATER fetch completes (see handle_event).
         self.last_data_epoch = cx.script_data_fetch_epoch();
+    }
+
+    /// The body stopped growing and still hasn't produced a view. Try once more
+    /// from a clean parser, then fall back to a visible failure card.
+    ///
+    /// Before this existed a card that failed to parse left `self.view` as the
+    /// default empty View — `height: Fit` over no children draws zero pixels,
+    /// so the app showed a blank screen with no signal anywhere in the UI. The
+    /// parse errors went to the log and nothing else: `report_error` only sets
+    /// `ScriptParser::had_error`, which nothing reads.
+    fn show_eval_failure(&mut self, cx: &mut Cx) {
+        if self.render_ok || self.body.as_ref().is_empty() {
+            return;
+        }
+
+        // Retry from scratch first. A streamed body parses incrementally from a
+        // checkpoint, so one bad token early in the stream poisons every later
+        // continuation — even when the completed text is perfectly valid.
+        // Clearing `last_eval_body` makes the next eval a non-extension, which
+        // bumps the generation and therefore allocates a fresh vm body + parser.
+        self.last_eval_body.clear();
+        self.eval_body(cx);
+        if self.render_ok {
+            return;
+        }
+
+        // Genuinely broken. Evaluate the failure card under its own body id so
+        // it cannot inherit the parser state that just failed.
+        log!(
+            "[SPLASH] body of {} bytes never rendered (gen={}) — showing failure card",
+            self.body.as_ref().len(),
+            self.eval_generation
+        );
+        let code = format!("{}{}", SPLASH_PREFIX_SCRIPT, SPLASH_FAILURE_CARD);
+        let script_mod = ScriptMod {
+            cargo_manifest_path: String::new(),
+            module_path: String::new(),
+            file: String::new(),
+            line: self.self_id().wrapping_add(SPLASH_FAILURE_ID_SALT),
+            column: 0,
+            code: String::new(),
+            values: vec![],
+        };
+        let vm_id = self.vm_id;
+        let self_uid = self.uid;
+        let new_view = cx.with_script_vm_id(vm_id, |vm| {
+            crate::widget_async::inject_scoped_ui_global(vm, self_uid);
+            let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
+                vm.eval_with_append_source(script_mod, &code, NIL.into())
+            });
+            if !value.is_err() && !value.is_nil() {
+                Some(View::script_from_value(vm, value))
+            } else {
+                None
+            }
+        });
+
+        if let Some(view) = new_view {
+            self.view = view;
+            self.view.set_visible(cx, true);
+            crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
+            cx.widget_tree_mark_dirty(self.uid);
+            cx.redraw_all();
+        } else {
+            // The failure card itself failed — that is a bug in this file, not
+            // in the generated DSL. Say so rather than going quiet again.
+            log!("[SPLASH] failure card did not evaluate; view stays blank");
+        }
     }
 
     /// Start (or stop) the per-frame redraw pump based on whether `body`
@@ -1619,6 +1717,11 @@ impl Widget for Splash {
             self.call_fn(cx, id!(tick));
         }
 
+        // The body has stopped growing. If it never rendered, surface that.
+        if self.failure_timer.is_event(event).is_some() {
+            self.show_eval_failure(cx);
+        }
+
         // Per-frame redraw pump for time-based shaders: redraw the view (so the
         // pixel shaders re-run with an advanced `self.draw_pass.time`) and queue
         // the next frame. Self-sustaining while `animating`.
@@ -1658,6 +1761,17 @@ impl Widget for Splash {
             // yet registered in the draw system, so self.redraw(cx) would be
             // a no-op.  Force a full redraw so the parent re-layouts.
             cx.redraw_all();
+
+            // aichat streams a card by calling set_text() with the full growing
+            // block, so every chunk lands here. Re-arm the quiet-period check on
+            // each one: while text keeps arriving the timer keeps being pushed
+            // back, and it only fires once the body has gone still. That is the
+            // point at which "no view yet" means failure rather than "not
+            // finished streaming".
+            cx.stop_timer(self.failure_timer);
+            if !self.render_ok {
+                self.failure_timer = cx.start_timeout(SPLASH_FAILURE_DELAY);
+            }
         }
     }
 }
