@@ -34,6 +34,7 @@ pub mod view_ui;
 
 pub mod animated_image_gif;
 pub mod browser;
+pub mod web_card;
 pub mod button;
 pub mod check_box;
 pub mod icon;
@@ -221,6 +222,7 @@ pub use crate::{
 
 #[cfg(feature = "cef")]
 pub use crate::browser::*;
+pub use crate::web_card::*;
 
 #[cfg(feature = "voice")]
 pub use crate::voice_wave::*;
@@ -522,6 +524,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::button::script_mod(vm);
     #[cfg(feature = "cef")]
     crate::browser::script_mod(vm);
+    crate::web_card::script_mod(vm);
     crate::check_box::script_mod(vm);
     crate::radio_button::script_mod(vm);
     crate::image::script_mod(vm);

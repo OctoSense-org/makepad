@@ -841,6 +841,14 @@ pub struct Markdown {
     in_splash_block: bool,
     #[rust]
     splash_block_string: String,
+    /// Set while reading the body of a ```runhtml fenced block (a "web app
+    /// card"). Mirrors `in_splash_block`; the accumulated HTML document is
+    /// dispatched to the `web_block` template at CodeBlock end (whose
+    /// `web_view` widget — a `WebCard` — renders it in a native WebView).
+    #[rust]
+    in_web_block: bool,
+    #[rust]
+    web_block_string: String,
     /// Set while reading the body of a ```mermaid fenced block. Mirrors
     /// `in_splash_block` / `in_code_block`. The accumulated source is
     /// dispatched to the `mermaid_block` template at CodeBlock end — the
@@ -1273,9 +1281,13 @@ impl Markdown {
                     };
                     let has_mermaid_tpl = tf.has_template(live_id!(mermaid_block));
                     let has_diagram_tpl = tf.has_template(live_id!(diagram_block));
+                    let has_web_tpl = tf.has_template(live_id!(web_block));
                     if lang == Some("runsplash") {
                         self.in_splash_block = true;
                         self.splash_block_string.clear();
+                    } else if lang == Some("runhtml") && has_web_tpl {
+                        self.in_web_block = true;
+                        self.web_block_string.clear();
                     } else if lang == Some("mermaid") && has_mermaid_tpl {
                         self.in_mermaid_block = true;
                         self.mermaid_block_string.clear();
@@ -1302,6 +1314,17 @@ impl Markdown {
                         // Draw the splash block using the $splash_block template
                         tf.item_with(cx, entry_id, id!(splash_block), |cx, item, _tf| {
                             item.widget(cx, ids!(splash_view)).set_text(cx, sbs);
+                            item.draw_all_unscoped(cx);
+                        });
+                    } else if self.in_web_block {
+                        self.in_web_block = false;
+                        let entry_id = tf.new_counted_id();
+                        let wbs = &self.web_block_string;
+
+                        // Draw the web app card using the $web_block template;
+                        // its `web_view` (a WebCard) hosts the native WebView.
+                        tf.item_with(cx, entry_id, id!(web_block), |cx, item, _tf| {
+                            item.widget(cx, ids!(web_view)).set_text(cx, wbs);
                             item.draw_all_unscoped(cx);
                         });
                     } else if self.in_mermaid_block {
@@ -1460,6 +1483,8 @@ impl Markdown {
                         });
                     } else if self.in_splash_block {
                         self.splash_block_string.push_str(&text);
+                    } else if self.in_web_block {
+                        self.web_block_string.push_str(&text);
                     } else if self.in_mermaid_block {
                         self.mermaid_block_string.push_str(&text);
                     } else if self.in_diagram_block {
@@ -1485,6 +1510,8 @@ impl Markdown {
                         });
                     } else if self.in_splash_block {
                         self.splash_block_string.push('\n');
+                    } else if self.in_web_block {
+                        self.web_block_string.push('\n');
                     } else if self.in_mermaid_block {
                         self.mermaid_block_string.push('\n');
                     } else if self.in_diagram_block {
@@ -1507,6 +1534,8 @@ impl Markdown {
                         });
                     } else if self.in_splash_block {
                         self.splash_block_string.push('\n');
+                    } else if self.in_web_block {
+                        self.web_block_string.push('\n');
                     } else if self.in_mermaid_block {
                         self.mermaid_block_string.push('\n');
                     } else if self.in_diagram_block {

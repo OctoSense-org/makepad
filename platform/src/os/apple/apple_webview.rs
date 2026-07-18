@@ -55,6 +55,7 @@ pub(crate) struct MacosSystemBrowser {
     attached_window: Option<WindowId>,
     host_view: ObjcId,
     web_view: ObjcId,
+    html_generation: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -65,6 +66,7 @@ impl MacosSystemBrowser {
             attached_window: None,
             host_view: nil,
             web_view: nil,
+            html_generation: 0,
         };
         browser.ensure_web_view();
         browser.set_url(url, false);
@@ -206,6 +208,17 @@ impl MacosSystemBrowser {
         }
     }
 
+    pub(crate) fn set_html(&mut self, html: &str, base_url: &str) {
+        self.ensure_web_view();
+        if self.web_view != nil {
+            self.html_generation += 1;
+            load_html_document(self.web_view, html, base_url, self.html_generation);
+            // Inline documents have no meaningful URL; make sure a later
+            // set_url to the previous URL is not deduped away.
+            self.current_url.clear();
+        }
+    }
+
     pub(crate) fn history_go(&mut self, delta: i32) {
         history_go(self.web_view, delta);
     }
@@ -217,6 +230,50 @@ impl MacosSystemBrowser {
             }
         }
         self.detach();
+    }
+}
+
+/// Load an inline HTML document. WKWebView in a non-bundled (plain cargo)
+/// process renders network and file loads but silently never commits
+/// loadHTMLString/data: documents (and ATS blocks plaintext-http loopback), so
+/// the document is staged as a temp file and loaded via
+/// loadFileURL:allowingReadAccessToURL: (generation-stamped file name defeats
+/// the URL-keyed page cache on reload). Note: file:// documents send no
+/// Referer, so referer-gated embeds (e.g. YouTube) show their error card on
+/// macOS; on Android loadDataWithBaseURL supplies a real https origin.
+fn load_html_document(web_view: ObjcId, html: &str, _base_url: &str, generation: u64) {
+    if web_view == nil {
+        return;
+    }
+    let dir = std::env::temp_dir().join("makepad_web_cards");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let file = dir.join(format!("card_{:x}_{}.html", web_view as usize, generation));
+    if std::fs::write(&file, html).is_err() {
+        return;
+    }
+    let prev = dir.join(format!(
+        "card_{:x}_{}.html",
+        web_view as usize,
+        generation.wrapping_sub(1)
+    ));
+    let _ = std::fs::remove_file(prev);
+    let Some(path) = file.to_str() else {
+        return;
+    };
+    unsafe {
+        let file_string = str_to_nsstring(path);
+        let dir_string = str_to_nsstring(&dir.to_string_lossy());
+        if file_string == nil || dir_string == nil {
+            return;
+        }
+        let file_url: ObjcId = msg_send![class!(NSURL), fileURLWithPath: file_string];
+        let dir_url: ObjcId = msg_send![class!(NSURL), fileURLWithPath: dir_string];
+        if file_url == nil || dir_url == nil {
+            return;
+        }
+        let () = msg_send![web_view, loadFileURL: file_url allowingReadAccessToURL: dir_url];
     }
 }
 
@@ -296,6 +353,7 @@ mod macos_tests {
 pub(crate) struct IosSystemBrowser {
     current_url: String,
     web_view: ObjcId,
+    html_generation: u64,
 }
 
 #[cfg(target_os = "ios")]
@@ -304,6 +362,7 @@ impl IosSystemBrowser {
         let mut browser = Self {
             current_url: String::new(),
             web_view: nil,
+            html_generation: 0,
         };
         browser.ensure_web_view();
         browser.set_url(url, false);
@@ -378,6 +437,15 @@ impl IosSystemBrowser {
                 self.current_url.clear();
                 self.current_url.push_str(url);
             }
+        }
+    }
+
+    pub(crate) fn set_html(&mut self, html: &str, base_url: &str) {
+        self.ensure_web_view();
+        if self.web_view != nil {
+            self.html_generation += 1;
+            load_html_document(self.web_view, html, base_url, self.html_generation);
+            self.current_url.clear();
         }
     }
 

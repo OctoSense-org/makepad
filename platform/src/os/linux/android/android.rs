@@ -2502,6 +2502,47 @@ impl Cx {
                         }
                     }
                 }
+                CxOsOp::SpawnSystemBrowser { browser_id, url } => unsafe {
+                    android_jni::to_java_spawn_system_browser(browser_id, &url);
+                },
+                CxOsOp::UpdateSystemBrowser {
+                    browser_id,
+                    area,
+                    visible,
+                } => {
+                    let rect = area.clipped_rect(self);
+                    let rect =
+                        self.windows[CxWindowPool::id_zero()].layout_rect_to_physical_pixels(rect);
+                    let left = rect.pos.x as i32;
+                    let top = rect.pos.y as i32;
+                    let right = (rect.pos.x + rect.size.x) as i32;
+                    let bottom = (rect.pos.y + rect.size.y) as i32;
+                    unsafe {
+                        android_jni::to_java_update_system_browser(
+                            browser_id, left, top, right, bottom, visible,
+                        );
+                    }
+                }
+                CxOsOp::DetachSystemBrowser { browser_id } => unsafe {
+                    android_jni::to_java_detach_system_browser(browser_id);
+                },
+                CxOsOp::CloseSystemBrowser { browser_id } => unsafe {
+                    android_jni::to_java_close_system_browser(browser_id);
+                },
+                CxOsOp::SetSystemBrowserUrl {
+                    browser_id,
+                    url,
+                    replace: _,
+                } => unsafe {
+                    android_jni::to_java_set_system_browser_url(browser_id, &url);
+                },
+                CxOsOp::SetSystemBrowserHtml {
+                    browser_id,
+                    html,
+                    base_url,
+                } => unsafe {
+                    android_jni::to_java_set_system_browser_html(browser_id, &html, &base_url);
+                },
                 CxOsOp::CheckPermission {
                     permission,
                     request_id,

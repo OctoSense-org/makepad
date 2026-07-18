@@ -731,6 +731,20 @@ impl Cx {
                         ptr::null(),
                         instances as i32,
                     );
+                    // LOCAL DEBUG: surface the first GL error per draw when
+                    // tracing (emulator translators poison the frame on the
+                    // first bad call; this pins WHICH shader/draw it is).
+                    if trace_draw {
+                        let err = (gl.glGetError)();
+                        if err != 0 {
+                            crate::log!(
+                                "GL ERROR {:#x} after draw shader={} variant={}",
+                                err,
+                                draw_call.draw_shader_id.index,
+                                shader_variant
+                            );
+                        }
+                    }
 
                     (gl.glBindVertexArray)(0);
                     (gl.glUseProgram)(0);
@@ -807,8 +821,16 @@ impl Cx {
         let (pass_size, dpi_factor) = if let Some(pz) = self.setup_render_pass(draw_pass_id) {
             pz
         } else {
+            // LOCAL DEBUG
+            if std::env::var_os("MAKEPAD_GL_DRAW_TRACE").is_some() {
+                crate::log!("PASS to_texture id={:?} SKIPPED: setup_render_pass None", draw_pass_id);
+            }
             return;
         };
+        // LOCAL DEBUG
+        if std::env::var_os("MAKEPAD_GL_DRAW_TRACE").is_some() {
+            crate::log!("PASS to_texture id={:?} size={:?} dpi={}", draw_pass_id, pass_size, dpi_factor);
+        }
 
         let mut clear_color = Vec4f::default();
         let mut clear_depth = 1.0;

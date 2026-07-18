@@ -505,10 +505,19 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
 &daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
 &timezone=auto&forecast_days=7"
             );
-            let value = match vm.host.cx_mut().script_data_fetch(&url) {
+            let mut value = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| "—".to_string()),
                 None => "—".to_string(),
             };
+            // Temperatures render as whole degrees (no decimal) — a weather card
+            // shows "27°", not "27.3°". Only *temperature* paths round; wind / UV /
+            // pressure keep their natural precision, and non-numeric values
+            // (sunrise "05:52", the "—" placeholder) pass through untouched.
+            if path.contains("temperature") {
+                if let Ok(n) = value.parse::<f64>() {
+                    value = n.round().to_string();
+                }
+            }
             vm.bx.heap.new_string_from_str(&value)
         },
     );
@@ -1399,6 +1408,15 @@ impl Splash {
             if !value.is_err() && !value.is_nil() {
                 Some(View::script_from_value(vm, value))
             } else {
+                // LOCAL DEBUG: this failure was SILENT — a card whose eval
+                // errors (e.g. instruction-limit) left the old/empty view
+                // with no trace.
+                crate::log!(
+                    "[SPLASH] eval FAILED: err={} nil={} value={:?}",
+                    value.is_err(),
+                    value.is_nil(),
+                    value
+                );
                 None
             }
         });
@@ -1534,6 +1552,15 @@ impl Splash {
             if !value.is_err() && !value.is_nil() {
                 Some(View::script_from_value(vm, value))
             } else {
+                // LOCAL DEBUG: this failure was SILENT — a card whose eval
+                // errors (e.g. instruction-limit) left the old/empty view
+                // with no trace.
+                crate::log!(
+                    "[SPLASH] eval FAILED: err={} nil={} value={:?}",
+                    value.is_err(),
+                    value.is_nil(),
+                    value
+                );
                 None
             }
         });

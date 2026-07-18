@@ -24,6 +24,7 @@ workspace.members = [
     "examples/text_selection",
 #    "examples/markdown_codeview_verify",
     "examples/counter",
+    "examples/webcard",
     "examples/browser",
     "examples/camera",
     "examples/windows_blur",

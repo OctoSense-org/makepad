@@ -1172,6 +1172,17 @@ impl Cx {
                         browser.cleanup();
                     }
                 }
+                CxOsOp::SetSystemBrowserHtml {
+                    browser_id,
+                    html,
+                    base_url,
+                } => {
+                    self.os
+                        .system_browsers
+                        .entry(browser_id)
+                        .or_insert_with(|| IosSystemBrowser::new("about:blank"))
+                        .set_html(&html, &base_url);
+                }
                 CxOsOp::PrepareVideoPlayback(
                     video_id,
                     source,

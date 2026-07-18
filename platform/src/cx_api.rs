@@ -144,6 +144,17 @@ impl<'a> CxSystemBrowser<'a> {
             browser_id: self.id.0,
         });
     }
+
+    /// Load an inline HTML document into the browser (with `base_url` as the
+    /// document origin, so relative fetches and embeds resolve against a real
+    /// https origin instead of `about:blank`).
+    pub fn set_html(&mut self, html: &str, base_url: &str) {
+        self.cx.platform_ops.push(CxOsOp::SetSystemBrowserHtml {
+            browser_id: self.id.0,
+            html: html.to_string(),
+            base_url: base_url.to_string(),
+        });
+    }
 }
 
 pub trait CxOsApi {
@@ -376,6 +387,11 @@ pub enum CxOsOp {
     CloseSystemBrowser {
         browser_id: LiveId,
     },
+    SetSystemBrowserHtml {
+        browser_id: LiveId,
+        html: String,
+        base_url: String,
+    },
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
     PauseVideoPlayback(LiveId),
@@ -475,6 +491,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::SetSystemBrowserUrl { .. } => write!(f, "SetSystemBrowserUrl"),
             Self::SystemBrowserHistoryGo { .. } => write!(f, "SystemBrowserHistoryGo"),
             Self::CloseSystemBrowser { .. } => write!(f, "CloseSystemBrowser"),
+            Self::SetSystemBrowserHtml { .. } => write!(f, "SetSystemBrowserHtml"),
             Self::PrepareAudioPlayback(..) => write!(f, "PrepareAudioPlayback"),
             Self::BeginVideoPlayback(..) => write!(f, "BeginVideoPlayback"),
             Self::PauseVideoPlayback(..) => write!(f, "PauseVideoPlayback"),

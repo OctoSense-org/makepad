@@ -1247,6 +1247,23 @@ impl Cx {
                         browser.cleanup();
                     }
                 }
+                CxOsOp::SetSystemBrowserHtml {
+                    browser_id,
+                    html,
+                    base_url,
+                } => {
+                    crate::log!(
+                        "SetSystemBrowserHtml id={:?} html_len={} base={}",
+                        browser_id,
+                        html.len(),
+                        base_url
+                    );
+                    self.os
+                        .system_browsers
+                        .entry(browser_id)
+                        .or_insert_with(|| MacosSystemBrowser::new("about:blank"))
+                        .set_html(&html, &base_url);
+                }
                 CxOsOp::SaveFileDialog(settings) => {
                     with_macos_app(|app| app.open_save_file_dialog(settings));
                 }

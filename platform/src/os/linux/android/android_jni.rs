@@ -549,6 +549,11 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     {
         std::env::set_var("MAKEPAD_SEED_CARD_FILE", &seed);
     }
+    // LOCAL DEBUG: per-draw GL tracing on device (emulator paint diagnosis).
+    if let Some(v) = get_intent_string_extra(env, activity, "makepad.GL_DRAW_TRACE")
+    {
+        std::env::set_var("MAKEPAD_GL_DRAW_TRACE", &v);
+    }
 
     // TEST/automation passthrough: `--es makepad.AUTO_PROMPT "<text>"` → the
     // MAKEPAD_AUTO_PROMPT env var, so the app can auto-submit one prompt on boot
@@ -2324,4 +2329,107 @@ pub unsafe fn to_java_update_ime_text_state(
     );
 
     (**env).DeleteLocalRef.unwrap()(env, text_jstr);
+}
+
+// ---- System browser (native WebView overlay for web app cards) ----
+// Mirrors the camera-native-preview overlay pattern: views live in a dedicated
+// FrameLayout above the GL surface, keyed by the browser id (see
+// `MakepadActivity.spawnSystemBrowser` and friends in the buildtool Java).
+
+unsafe fn new_java_string(env: *mut jni_sys::JNIEnv, s: &str) -> jni_sys::jobject {
+    let cleaned;
+    let s = if s.contains('\0') {
+        cleaned = s.replace('\0', "");
+        cleaned.as_str()
+    } else {
+        s
+    };
+    let c = CString::new(s).unwrap();
+    ((**env).NewStringUTF.unwrap())(env, c.as_ptr())
+}
+
+pub unsafe fn to_java_spawn_system_browser(browser_id: LiveId, url: &str) {
+    let env = attach_jni_env();
+    let url = new_java_string(env, url);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "spawnSystemBrowser",
+        "(JLjava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        url
+    );
+}
+
+pub unsafe fn to_java_update_system_browser(
+    browser_id: LiveId,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    visible: bool,
+) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "updateSystemBrowser",
+        "(JIIIIZ)V",
+        browser_id.get_value() as jni_sys::jlong,
+        left,
+        top,
+        right,
+        bottom,
+        visible as jni_sys::jboolean as std::ffi::c_uint
+    );
+}
+
+pub unsafe fn to_java_detach_system_browser(browser_id: LiveId) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "detachSystemBrowser",
+        "(J)V",
+        browser_id.get_value() as jni_sys::jlong
+    );
+}
+
+pub unsafe fn to_java_close_system_browser(browser_id: LiveId) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "closeSystemBrowser",
+        "(J)V",
+        browser_id.get_value() as jni_sys::jlong
+    );
+}
+
+pub unsafe fn to_java_set_system_browser_url(browser_id: LiveId, url: &str) {
+    let env = attach_jni_env();
+    let url = new_java_string(env, url);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "setSystemBrowserUrl",
+        "(JLjava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        url
+    );
+}
+
+pub unsafe fn to_java_set_system_browser_html(browser_id: LiveId, html: &str, base_url: &str) {
+    let env = attach_jni_env();
+    let html = new_java_string(env, html);
+    let base_url = new_java_string(env, base_url);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "setSystemBrowserHtml",
+        "(JLjava/lang/String;Ljava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        html,
+        base_url
+    );
 }
