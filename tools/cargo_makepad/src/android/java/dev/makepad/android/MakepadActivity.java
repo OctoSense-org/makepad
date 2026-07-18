@@ -95,6 +95,10 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
 
 // note: //% is a special miniquad's pre-processor for plugins
 // when there are no plugins - //% whatever will be replaced to an empty string
@@ -1063,6 +1067,12 @@ public class MakepadActivity
     private ImageView mSurfaceSnapshotOverlay;
     private FrameLayout mCameraPreviewOverlay;
     private HashMap<Long, CameraPreviewSurface> mCameraPreviewViews = new HashMap<>();
+    // Native WebView overlays for web app cards (see spawnSystemBrowser).
+    private FrameLayout mSystemBrowserOverlay;
+    private HashMap<Long, WebView> mSystemBrowserViews = new HashMap<>();
+    // Fullscreen video state for web app cards (WebChromeClient custom view).
+    private View mSystemBrowserCustomView;
+    private WebChromeClient.CustomViewCallback mSystemBrowserCustomViewCallback;
     private Bitmap mLatestSurfaceSnapshot;
     private int mLatestSurfaceSnapshotOrientation = android.content.res.Configuration.ORIENTATION_UNDEFINED;
     private boolean mSurfaceSnapshotCopyInFlight = false;
@@ -1365,6 +1375,11 @@ public class MakepadActivity
 
         mCameraPreviewOverlay = new FrameLayout(this);
         mRootLayout.addView(mCameraPreviewOverlay);
+
+        // Web app card overlays sit above the GL surface and camera previews,
+        // but below the selection handles and the chat composer.
+        mSystemBrowserOverlay = new FrameLayout(this);
+        mRootLayout.addView(mSystemBrowserOverlay);
 
         mSelectionHandleOverlay = new FrameLayout(this);
         mSelectionHandleOverlay.setLayoutParams(new FrameLayout.LayoutParams(
@@ -3223,6 +3238,161 @@ public class MakepadActivity
                 lp.topMargin = top;
                 preview.setLayoutParams(lp);
                 preview.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+            }
+        });
+    }
+
+    // ---- System browser (web app card) overlays ----
+    //
+    // A web app card is an LLM-generated, self-contained HTML document rendered
+    // in a real android.webkit.WebView floated over the GL surface. Content is
+    // loaded with loadDataWithBaseURL against an https base so the document has
+    // a proper origin (YouTube and other referer-gated embeds refuse file:// /
+    // null-origin pages).
+
+    private WebView ensureSystemBrowser(long browserId) {
+        WebView view = mSystemBrowserViews.get(browserId);
+        if (view != null) {
+            return view;
+        }
+        // Remote debugging for web app cards (chrome://inspect via adb).
+        WebView.setWebContentsDebuggingEnabled(true);
+        WebView web = new WebView(this);
+        WebSettings settings = web.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        web.setBackgroundColor(0xFF101418);
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onShowCustomView(View view, WebChromeClient.CustomViewCallback callback) {
+                // Fullscreen <video>: float the player's custom view over
+                // EVERYTHING (it is added last, so it is topmost) and hide the
+                // system bars while it is up.
+                if (mSystemBrowserCustomView != null) {
+                    callback.onCustomViewHidden();
+                    return;
+                }
+                mSystemBrowserCustomView = view;
+                mSystemBrowserCustomViewCallback = callback;
+                view.setBackgroundColor(0xFF000000);
+                mRootLayout.addView(view, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                ));
+                applyFullScreen(true);
+            }
+
+            @Override
+            public void onHideCustomView() {
+                if (mSystemBrowserCustomView == null) {
+                    return;
+                }
+                mRootLayout.removeView(mSystemBrowserCustomView);
+                mSystemBrowserCustomView = null;
+                if (mSystemBrowserCustomViewCallback != null) {
+                    mSystemBrowserCustomViewCallback.onCustomViewHidden();
+                    mSystemBrowserCustomViewCallback = null;
+                }
+                applyFullScreen(false);
+            }
+        });
+        web.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                // Keep top-level navigation inside the card: embeds/iframes are
+                // not affected by this callback, but a stray link click should
+                // not hijack the card into a full browsing session.
+                return true;
+            }
+        });
+        mSystemBrowserViews.put(browserId, web);
+        if (mSystemBrowserOverlay != null) {
+            mSystemBrowserOverlay.addView(web);
+        }
+        return web;
+    }
+
+    public void spawnSystemBrowser(final long browserId, final String url) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = ensureSystemBrowser(browserId);
+                if (url != null && !url.isEmpty() && !url.equals("about:blank")) {
+                    web.loadUrl(url);
+                }
+            }
+        });
+    }
+
+    public void updateSystemBrowser(final long browserId, final int left, final int top, final int right, final int bottom, final boolean visible) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.get(browserId);
+                if (web == null) {
+                    return;
+                }
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    Math.max(1, right - left),
+                    Math.max(1, bottom - top)
+                );
+                lp.leftMargin = left;
+                lp.topMargin = top;
+                web.setLayoutParams(lp);
+                web.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+            }
+        });
+    }
+
+    public void detachSystemBrowser(final long browserId) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.get(browserId);
+                if (web != null) {
+                    web.setVisibility(View.GONE);
+                }
+            }
+        });
+    }
+
+    public void closeSystemBrowser(final long browserId) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.remove(browserId);
+                if (web != null) {
+                    if (mSystemBrowserOverlay != null) {
+                        mSystemBrowserOverlay.removeView(web);
+                    }
+                    web.destroy();
+                }
+            }
+        });
+    }
+
+    public void setSystemBrowserUrl(final long browserId, final String url) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = ensureSystemBrowser(browserId);
+                web.loadUrl(url);
+            }
+        });
+    }
+
+    public void setSystemBrowserHtml(final long browserId, final String html, final String baseUrl) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = ensureSystemBrowser(browserId);
+                String base = (baseUrl == null || baseUrl.isEmpty()) ? "https://octos-one.app/" : baseUrl;
+                web.loadDataWithBaseURL(base, html, "text/html", "utf-8", null);
             }
         });
     }
