@@ -217,6 +217,38 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
       + '<div class="o-crow'+(expanded?"":" o-hidden")+'"><div class="o-ava" style="background:linear-gradient(135deg,#3ea6ff,#265f94);width:24px;height:24px;font-size:10px">Y</div><input class="o-cin" id="o-cin" placeholder="Add a comment…"><button class="o-cpost" onclick="'+h.post+'(event)">Post</button></div></div>'; };
   O.sec = function (label, viewAll) { return '<div class="o-sec">'+O_esc(label)+(viewAll?'<span class="va" onclick="'+viewAll+'">View all</span>':"")+"</div>"; };
   O.ytId = function (q) { var m=String(q).match(/(?:v=|youtu\.be\/|embed\/|shorts\/)([A-Za-z0-9_-]{11})/); if(m)return m[1]; if(/^[A-Za-z0-9_-]{11}$/.test(String(q).trim()))return q.trim(); return null; };
+  /* live YouTube search — Piped API (keyless, CORS-open) with instance fallback + a
+     CORS-proxy backstop, resolving to normalized {id,t,ch,live} tiles. Public instances
+     rot; refresh O.ytSearchInstances if search starts coming back empty. Resolves [] on
+     total failure so callers can degrade to the local catalog. */
+  O.ytSearchInstances = ["https://api.piped.private.coffee","https://pipedapi.r4fo.com","https://pipedapi.orangenet.cc","https://api.piped.yt","https://pipedapi.adminforge.de"];
+  O.ytSearch = function (query) {
+    var q = String(query || "").trim();
+    if (!q) return Promise.resolve([]);
+    var path = "/search?q=" + encodeURIComponent(q) + "&filter=videos", insts = O.ytSearchInstances, H = O.http;
+    function norm(d) {
+      return ((d && d.items) || []).map(function (it) {
+        return { id: O.ytId(String(it.url || it.videoId || "")), t: O.strip(it.title || ""), ch: it.uploaderName || it.uploader || "", live: it.duration < 0 || it.isLive === true };
+      }).filter(function (v) { return v.id; }).slice(0, 24);
+    }
+    function one(url, proxy) {
+      var ac = window.AbortController ? new AbortController() : null, opt = ac ? { signal: ac.signal } : undefined;
+      var to = setTimeout(function () { if (ac) ac.abort(); }, 5000);
+      return (proxy ? H.getJSONx(url, opt) : H.getJSON(url, opt)).then(function (d) { clearTimeout(to); return d; }, function (e) { clearTimeout(to); throw e; });
+    }
+    function pass(proxy) {
+      var i = 0;
+      function next() {
+        if (i >= insts.length) return Promise.reject();
+        var u = insts[i++] + path;
+        // accept the first instance that returns a valid items array (empty = genuine
+        // "no results", NOT a failure) — only fall through on request failure / bad shape.
+        return one(u, proxy).then(function (d) { return (d && Array.isArray(d.items)) ? norm(d) : next(); }, next);
+      }
+      return next();
+    }
+    return pass(false).catch(function () { return pass(true); }).catch(function () { return []; });
+  };
   O.oembed = function (id, cb) { fetch("https://noembed.com/embed?url=https://www.youtube.com/watch?v="+id).then(function(r){return r.json();}).then(function(j){ if(j&&j.title)cb({title:O.strip(j.title),author:j.author_name}); }).catch(function(){}); };
   O.setKebab = function (fn) { O._kebab = fn; };
 })();
