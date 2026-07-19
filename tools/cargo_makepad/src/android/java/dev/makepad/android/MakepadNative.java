@@ -81,6 +81,10 @@ public class MakepadNative {
     // text contents, or a cancel/error. Resolves the card's octos.invoke("dialog.open").
     public native static void onDialogResult(long callId, String name, String content, boolean cancelled, String error);
 
+    // Native streaming download (downloadFile): periodic progress, then completion.
+    public native static void onDownloadProgress(long callId, long done, long total);
+    public native static void onDownloadComplete(long callId, String path, String error);
+
     // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
     // it; returns true if a QR was found (the caller then closes the scanner).
     public native static boolean onQrCameraFrame(byte[] luma, int width, int height);
