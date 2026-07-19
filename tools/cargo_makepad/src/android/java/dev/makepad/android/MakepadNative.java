@@ -77,6 +77,10 @@ public class MakepadNative {
     // (ACTION_SEND text) — e.g. a YouTube link shared from another app.
     public native static void onDeepLink(String url);
 
+    // Result of a native file picker (openFileDialog) — the picked file's name +
+    // text contents, or a cancel/error. Resolves the card's octos.invoke("dialog.open").
+    public native static void onDialogResult(long callId, String name, String content, boolean cancelled, String error);
+
     // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
     // it; returns true if a QR was found (the caller then closes the scanner).
     public native static boolean onQrCameraFrame(byte[] luma, int width, int height);

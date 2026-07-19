@@ -13,6 +13,9 @@ import android.app.NotificationManager;
 import android.app.NotificationChannel;
 import android.app.Notification;
 import android.app.PendingIntent;
+import android.net.Uri;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -1583,6 +1586,30 @@ public class MakepadActivity
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         //% MAIN_ACTIVITY_ON_ACTIVITY_RESULT
+        if (requestCode == OCTOS_DIALOG_REQ) {
+            long callId = mPendingDialogCallId;
+            mPendingDialogCallId = 0;
+            try {
+                if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                    Uri uri = data.getData();
+                    String name = "";
+                    try {
+                        android.database.Cursor c = getContentResolver().query(uri, null, null, null, null);
+                        if (c != null) {
+                            int idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                            if (c.moveToFirst() && idx >= 0) name = c.getString(idx);
+                            c.close();
+                        }
+                    } catch (Throwable ignore) {}
+                    String content = readUriText(uri);
+                    MakepadNative.onDialogResult(callId, name, content, false, null);
+                } else {
+                    MakepadNative.onDialogResult(callId, null, null, true, null);
+                }
+            } catch (Throwable t) {
+                MakepadNative.onDialogResult(callId, null, null, false, "read failed: " + t.toString());
+            }
+        }
     }
 
     @Override
@@ -2254,6 +2281,46 @@ public class MakepadActivity
                 }
             }
         });
+    }
+
+    // Native file picker (Storage Access Framework). One dialog at a time; the
+    // pending call id is stored and read back in onActivityResult. Called from Rust
+    // via to_java_open_file_dialog (the card's octos.invoke("dialog.open", {mime})).
+    private static final int OCTOS_DIALOG_REQ = 0x0CD0;
+    private long mPendingDialogCallId = 0;
+    public void openFileDialog(final long callId, final String mime) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    mPendingDialogCallId = callId;
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    i.addCategory(Intent.CATEGORY_OPENABLE);
+                    i.setType((mime == null || mime.length() == 0) ? "*/*" : mime);
+                    startActivityForResult(i, OCTOS_DIALOG_REQ);
+                } catch (Throwable t) {
+                    MakepadNative.onDialogResult(callId, null, null, false, "open failed: " + t.toString());
+                }
+            }
+        });
+    }
+
+    // Read a content:// URI as UTF-8 text (bounded to ~8 MB to protect the bridge).
+    private String readUriText(Uri uri) throws Exception {
+        InputStream in = getContentResolver().openInputStream(uri);
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n; int total = 0;
+            while ((n = in.read(buf)) != -1) {
+                total += n;
+                if (total > 8 * 1024 * 1024) throw new Exception("file too large (>8MB)");
+                out.write(buf, 0, n);
+            }
+            return new String(out.toByteArray(), "UTF-8");
+        } finally {
+            if (in != null) in.close();
+        }
     }
 
     // Fire the system share sheet (ACTION_SEND) for social sharing. Called
