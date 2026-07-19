@@ -74,10 +74,11 @@ const HTTP_FETCH_ALLOWED_HOSTS: &[&str] = &[
     "query2.finance.yahoo.com",
 ];
 
-/// Enforce the `http.fetch` capability gate: https-only, no private/internal
-/// hosts (SSRF guard), and the host must be on the allowlist (boundary-correct
-/// suffix match, so `evil-googleapis.com` does NOT match `googleapis.com`).
-fn fetch_host_allowed(url: &str) -> Result<(), String> {
+/// Shared SSRF guard: require https and reject loopback / private / link-local /
+/// internal hosts. Returns the lowercased host. Used by both `http.fetch` (which
+/// adds the allowlist) and `download` (which doesn't — its bytes land in the
+/// sandbox, so the SSRF block is the protection that matters).
+fn check_https_public(url: &str) -> Result<String, String> {
     let rest = url
         .strip_prefix("https://")
         .ok_or_else(|| "only https:// URLs are allowed".to_string())?;
@@ -95,7 +96,6 @@ fn fetch_host_allowed(url: &str) -> Result<(), String> {
     if host.is_empty() {
         return Err("missing host".into());
     }
-    // SSRF guard: reject loopback / private / link-local / internal hosts.
     let blocked_prefix = ["127.", "10.", "192.168.", "169.254.", "0."];
     let private_172 = host.starts_with("172.")
         && host
@@ -114,6 +114,14 @@ fn fetch_host_allowed(url: &str) -> Result<(), String> {
     {
         return Err(format!("host not permitted (private/internal): {}", host));
     }
+    Ok(host)
+}
+
+/// Enforce the `http.fetch` capability gate: SSRF guard + the host must be on the
+/// allowlist (boundary-correct suffix match, so `evil-googleapis.com` does NOT
+/// match `googleapis.com`).
+fn fetch_host_allowed(url: &str) -> Result<(), String> {
+    let host = check_https_public(url)?;
     let allowed = HTTP_FETCH_ALLOWED_HOSTS
         .iter()
         .any(|a| host == *a || host.ends_with(&format!(".{}", a)));
@@ -180,6 +188,9 @@ pub struct WebCard {
     pending: Vec<(LiveId, i64)>,
     #[rust]
     req_seq: u64,
+    /// In-flight downloads: call_id → (client download id, sandbox-relative dest).
+    #[rust]
+    downloads: Vec<(i64, String, String)>,
 }
 
 /// Args for the `http.fetch` bridge tool. The card sends headers as `[[k,v],…]`
@@ -222,6 +233,15 @@ struct PathDataArg {
 #[derive(DeJson)]
 struct DialogArgs {
     mime: Option<String>,
+}
+
+/// Args for `download` — fetch `url` to the sandbox path `dest`; `id` is a
+/// client-chosen download id echoed back in `download.progress` events.
+#[derive(DeJson)]
+struct DownloadArgs {
+    url: String,
+    dest: String,
+    id: Option<String>,
 }
 
 /// Sandbox root for card fs — a dedicated subdir of the app's private storage.
@@ -491,6 +511,21 @@ impl WebCard {
                     .unwrap_or_else(|| "*/*".to_string());
                 cx.open_file_dialog(call_id, &mime);
             }
+            // Stream a URL to a sandbox file natively (large binary never touches
+            // JS). Gated (https + SSRF, dest inside the sandbox); progress arrives as
+            // download.progress events; resolves with {path} on complete.
+            "download" => match DownloadArgs::deserialize_json(args) {
+                Ok(a) => match check_https_public(&a.url).and_then(|_| fs_resolve(&a.dest)) {
+                    Ok(abs) => {
+                        let dest_abs = abs.to_string_lossy().into_owned();
+                        self.downloads
+                            .push((call_id, a.id.unwrap_or_default(), a.dest.clone()));
+                        cx.download_file(call_id, &a.url, &dest_abs);
+                    }
+                    Err(e) => self.reject(cx, call_id, &format!("download denied: {}", e)),
+                },
+                Err(e) => self.reject(cx, call_id, &format!("bad download args: {:?}", e)),
+            },
             // Default-deny: only registered tools are callable.
             other => self.reject(cx, call_id, &format!("unknown tool: {}", other)),
         }
@@ -560,6 +595,40 @@ impl Widget for WebCard {
                         )
                     };
                     self.resolve_raw(cx, dr.call_id, &payload);
+                }
+                // Download progress → emit a download.progress event (keyed by the
+                // client download id) so the card can render a progress bar.
+                if let Some(p) = action
+                    .downcast_ref::<crate::makepad_platform::event::AndroidDownloadProgress>()
+                {
+                    let dlid = self
+                        .downloads
+                        .iter()
+                        .find(|(cid, _, _)| *cid == p.call_id)
+                        .map(|(_, dlid, _)| dlid.clone());
+                    if let Some(dlid) = dlid {
+                        let payload = format!(
+                            "{{\"id\":{},\"done\":{},\"total\":{}}}",
+                            dlid.serialize_json(),
+                            p.done,
+                            p.total
+                        );
+                        cx.system_browser(self.browser_id()).emit("download.progress", &payload);
+                    }
+                }
+                // Download complete → resolve the invoke with the saved sandbox path.
+                if let Some(c) = action
+                    .downcast_ref::<crate::makepad_platform::event::AndroidDownloadComplete>()
+                {
+                    if let Some(pos) = self.downloads.iter().position(|(cid, _, _)| *cid == c.call_id) {
+                        let (_, _dlid, dest) = self.downloads.remove(pos);
+                        let payload = if c.error.is_empty() {
+                            format!("{{\"ok\":true,\"path\":{}}}", dest.serialize_json())
+                        } else {
+                            format!("{{\"ok\":false,\"error\":{}}}", c.error.serialize_json())
+                        };
+                        self.resolve_raw(cx, c.call_id, &payload);
+                    }
                 }
             }
         }

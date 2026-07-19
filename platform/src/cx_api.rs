@@ -328,6 +328,7 @@ pub enum CxOsOp {
     ShareText(String),
     ShowNotification { title: String, body: String },
     OpenFileDialog { call_id: i64, mime: String },
+    DownloadFile { call_id: i64, url: String, dest: String },
     // Show/hide the native Android floating chat-composer overlay (a native
     // view floating over the GL surface so the full-screen Splash card behind
     // it is edge-to-edge). Handled only by the Android backend; ignored by
@@ -496,6 +497,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::ShareText(..) => write!(f, "ShareText"),
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),
             Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
+            Self::DownloadFile { .. } => write!(f, "DownloadFile"),
             Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
             Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
             Self::ExpandAndroidComposer => write!(f, "ExpandAndroidComposer"),
@@ -1130,6 +1132,19 @@ impl Cx {
         self.platform_ops.push(CxOsOp::OpenFileDialog {
             call_id,
             mime: mime.to_owned(),
+        });
+    }
+
+    /// Stream a URL to a file on a native background thread (constant memory —
+    /// for large binaries the bytes never pass through JS). Progress is delivered
+    /// as `AndroidDownloadProgress` actions and completion as
+    /// `AndroidDownloadComplete`, both carrying `call_id`. `dest` is an absolute
+    /// path (the caller resolves it inside the card-fs sandbox first).
+    pub fn download_file(&mut self, call_id: i64, url: &str, dest: &str) {
+        self.platform_ops.push(CxOsOp::DownloadFile {
+            call_id,
+            url: url.to_owned(),
+            dest: dest.to_owned(),
         });
     }
 

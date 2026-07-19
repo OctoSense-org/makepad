@@ -75,6 +75,24 @@ pub struct AndroidDialogResult {
     pub error: String,
 }
 
+/// Progress of a native streaming download (`cx.download_file`). Correlated to
+/// the card's `octos.invoke("download")` by `call_id`. Only posted on Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidDownloadProgress {
+    pub call_id: i64,
+    pub done: i64,
+    pub total: i64,
+}
+
+/// Completion of a native streaming download. On success `error` is empty and
+/// `path` is the saved absolute path. Only posted on Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidDownloadComplete {
+    pub call_id: i64,
+    pub path: String,
+    pub error: String,
+}
+
 /// The native Android floating composer's "＋" (open another app) button was
 /// tapped. Posted as a bare action like [`AndroidComposerSubmit`]; the app
 /// routes it into `open_new_app` from `handle_actions`.

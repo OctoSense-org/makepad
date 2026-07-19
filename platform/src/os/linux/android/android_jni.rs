@@ -251,6 +251,16 @@ pub enum FromJavaMessage {
         cancelled: bool,
         error: String,
     },
+    DownloadProgress {
+        call_id: i64,
+        done: i64,
+        total: i64,
+    },
+    DownloadComplete {
+        call_id: i64,
+        path: String,
+        error: String,
+    },
     QrScanned {
         json: String,
     },
@@ -1553,6 +1563,55 @@ pub unsafe fn to_java_open_file_dialog(call_id: i64, mime: &str) {
         call_id as jni_sys::jlong,
         mime
     );
+}
+
+pub unsafe fn to_java_download_file(call_id: i64, url: &str, dest: &str) {
+    let env = attach_jni_env();
+    let url = new_java_string(env, url);
+    let dest = new_java_string(env, dest);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "downloadFile",
+        "(JLjava/lang/String;Ljava/lang/String;)V",
+        call_id as jni_sys::jlong,
+        url,
+        dest
+    );
+}
+
+/// Progress of a native streaming download → `AndroidDownloadProgress` action.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadProgress(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    call_id: jni_sys::jlong,
+    done: jni_sys::jlong,
+    total: jni_sys::jlong,
+) {
+    send_from_java_message(FromJavaMessage::DownloadProgress {
+        call_id: call_id as i64,
+        done: done as i64,
+        total: total as i64,
+    });
+}
+
+/// Completion of a native streaming download → `AndroidDownloadComplete` action.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadComplete(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    call_id: jni_sys::jlong,
+    path: jni_sys::jstring,
+    error: jni_sys::jstring,
+) {
+    let path = if path.is_null() { String::new() } else { jstring_to_string(env, path) };
+    let error = if error.is_null() { String::new() } else { jstring_to_string(env, error) };
+    send_from_java_message(FromJavaMessage::DownloadComplete {
+        call_id: call_id as i64,
+        path,
+        error,
+    });
 }
 
 /// A camera frame (NV21 luma plane) from the QR scanner overlay. Decode it with

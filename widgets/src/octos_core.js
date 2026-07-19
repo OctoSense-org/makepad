@@ -154,6 +154,17 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
       return O.invoke("dialog.open", { mime: mime || "*/*" });
     }
   };
+  /* stream a URL to a sandbox file (large binary never touches JS). onProgress
+     (optional) receives {id, done, total} as it downloads; resolves {ok, path}
+     (a card-fs path you can read via octos.fs). Native only. */
+  O.download = function (url, dest, onProgress) {
+    if (!O.hasNative()) return Promise.reject("download needs the native bridge");
+    var id = "dl" + (++O._seq), h = null;
+    if (onProgress) h = O.on("download.progress", function (p) { if (p && p.id === id) onProgress(p); });
+    function cleanup() { if (h) O.off("download.progress", h); }
+    return O.invoke("download", { url: String(url), dest: String(dest), id: id })
+      .then(function (r) { cleanup(); return r; }, function (e) { cleanup(); throw e; });
+  };
   /* write to the OS clipboard (native when present, else the browser copy hack) */
   O.clipboard = function (text) {
     text = String(text);

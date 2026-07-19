@@ -1385,6 +1385,14 @@ impl Cx {
                 });
                 self.handle_action_receiver();
             }
+            FromJavaMessage::DownloadProgress { call_id, done, total } => {
+                Cx::post_action(crate::event::AndroidDownloadProgress { call_id, done, total });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::DownloadComplete { call_id, path, error } => {
+                Cx::post_action(crate::event::AndroidDownloadComplete { call_id, path, error });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
@@ -2452,6 +2460,9 @@ impl Cx {
                 },
                 CxOsOp::OpenFileDialog { call_id, mime } => unsafe {
                     android_jni::to_java_open_file_dialog(call_id, &mime);
+                },
+                CxOsOp::DownloadFile { call_id, url, dest } => unsafe {
+                    android_jni::to_java_download_file(call_id, &url, &dest);
                 },
                 CxOsOp::ShowAndroidComposer => unsafe {
                     android_jni::to_java_show_composer();
