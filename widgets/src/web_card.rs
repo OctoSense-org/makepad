@@ -205,6 +205,66 @@ struct NotifyArgs {
     body: Option<String>,
 }
 
+/// Args for the `fs.read`/`fs.list`/`fs.remove`/`fs.exists`/`fs.mkdir` tools.
+#[derive(DeJson)]
+struct PathArg {
+    path: String,
+}
+
+/// Args for `fs.write`.
+#[derive(DeJson)]
+struct PathDataArg {
+    path: String,
+    data: String,
+}
+
+/// Sandbox root for card fs — a dedicated subdir of the app's private storage.
+/// A card can NEVER reach outside it (absolute paths and `..` are rejected in
+/// `fs_resolve`), so it can't read the octos profile, other apps, or the system.
+fn fs_sandbox_root() -> Result<std::path::PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "no app storage available".to_string())?;
+    Ok(std::path::PathBuf::from(home).join("card-fs"))
+}
+
+/// Resolve a card-relative path under the sandbox, rejecting any escape. Only
+/// `Normal` components are allowed — absolute paths (`RootDir`/`Prefix`) and `..`
+/// (`ParentDir`) are refused, so the result is always inside the sandbox even
+/// before the file exists (no reliance on canonicalize).
+fn fs_resolve(rel: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    if rel.trim().is_empty() {
+        return Err("empty path".into());
+    }
+    let mut safe = fs_sandbox_root()?;
+    for comp in std::path::Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => safe.push(c),
+            Component::CurDir => {}
+            _ => return Err(format!("path not allowed (escapes sandbox): {}", rel)),
+        }
+    }
+    Ok(safe)
+}
+
+/// List a sandbox directory as a JSON array of `{name, dir, size}`.
+fn fs_list_json(dir: &std::path::Path) -> Result<String, String> {
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("list failed: {}", e))?;
+    let mut items: Vec<String> = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let md = entry.metadata().ok();
+        let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+        items.push(format!(
+            "{{\"name\":{},\"dir\":{},\"size\":{}}}",
+            name.serialize_json(),
+            is_dir,
+            size
+        ));
+    }
+    Ok(format!("[{}]", items.join(",")))
+}
+
 impl WebCard {
     fn browser_id(&self) -> SystemBrowserId {
         web_card_browser_id()
@@ -336,6 +396,85 @@ impl WebCard {
                     self.resolve_raw(cx, call_id, "{\"ok\":true}");
                 }
                 Err(e) => self.reject(cx, call_id, &format!("bad notify args: {:?}", e)),
+            },
+            // ---- fs: sandboxed file storage (pure Rust std::fs under card-fs/) ----
+            // Every path is confined to the sandbox by fs_resolve; a card can't
+            // reach outside it. Synchronous (fs is fast) → resolves immediately.
+            "fs.read" => match PathArg::deserialize_json(args) {
+                Ok(a) => match fs_resolve(&a.path)
+                    .and_then(|p| std::fs::read_to_string(&p).map_err(|e| format!("read failed: {}", e)))
+                {
+                    Ok(content) => self.resolve_raw(
+                        cx,
+                        call_id,
+                        &format!("{{\"ok\":true,\"data\":{}}}", content.serialize_json()),
+                    ),
+                    Err(e) => self.reject(cx, call_id, &e),
+                },
+                Err(e) => self.reject(cx, call_id, &format!("bad fs.read args: {:?}", e)),
+            },
+            "fs.write" => match PathDataArg::deserialize_json(args) {
+                Ok(a) => {
+                    let r = fs_resolve(&a.path).and_then(|p| {
+                        if let Some(parent) = p.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
+                        }
+                        std::fs::write(&p, a.data.as_bytes()).map_err(|e| format!("write failed: {}", e))
+                    });
+                    match r {
+                        Ok(_) => self.resolve_raw(cx, call_id, "{\"ok\":true}"),
+                        Err(e) => self.reject(cx, call_id, &e),
+                    }
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad fs.write args: {:?}", e)),
+            },
+            "fs.list" => match PathArg::deserialize_json(args) {
+                Ok(a) => match fs_resolve(&a.path).and_then(|p| fs_list_json(&p)) {
+                    Ok(entries) => {
+                        self.resolve_raw(cx, call_id, &format!("{{\"ok\":true,\"entries\":{}}}", entries))
+                    }
+                    Err(e) => self.reject(cx, call_id, &e),
+                },
+                Err(e) => self.reject(cx, call_id, &format!("bad fs.list args: {:?}", e)),
+            },
+            "fs.exists" => match PathArg::deserialize_json(args) {
+                Ok(a) => match fs_resolve(&a.path) {
+                    Ok(p) => self.resolve_raw(
+                        cx,
+                        call_id,
+                        &format!("{{\"ok\":true,\"exists\":{}}}", p.exists()),
+                    ),
+                    Err(e) => self.reject(cx, call_id, &e),
+                },
+                Err(e) => self.reject(cx, call_id, &format!("bad fs.exists args: {:?}", e)),
+            },
+            "fs.remove" => match PathArg::deserialize_json(args) {
+                Ok(a) => {
+                    let r = fs_resolve(&a.path).and_then(|p| {
+                        if p.is_dir() {
+                            std::fs::remove_dir_all(&p)
+                        } else {
+                            std::fs::remove_file(&p)
+                        }
+                        .map_err(|e| format!("remove failed: {}", e))
+                    });
+                    match r {
+                        Ok(_) => self.resolve_raw(cx, call_id, "{\"ok\":true}"),
+                        Err(e) => self.reject(cx, call_id, &e),
+                    }
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad fs.remove args: {:?}", e)),
+            },
+            "fs.mkdir" => match PathArg::deserialize_json(args) {
+                Ok(a) => {
+                    let r = fs_resolve(&a.path)
+                        .and_then(|p| std::fs::create_dir_all(&p).map_err(|e| format!("mkdir failed: {}", e)));
+                    match r {
+                        Ok(_) => self.resolve_raw(cx, call_id, "{\"ok\":true}"),
+                        Err(e) => self.reject(cx, call_id, &e),
+                    }
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad fs.mkdir args: {:?}", e)),
             },
             // Default-deny: only registered tools are callable.
             other => self.reject(cx, call_id, &format!("unknown tool: {}", other)),

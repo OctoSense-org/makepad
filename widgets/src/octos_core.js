@@ -133,6 +133,19 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
     if (!O.hasNative()) return Promise.reject("notifications need the native bridge");
     return O.invoke("notify", { title: String(title || ""), body: String(body || "") });
   };
+  /* sandboxed file storage — all paths are relative to the card-fs sandbox (the
+     native side rejects absolute paths and `..`). Persists across reloads, unlike
+     localStorage which the WebView can clear. Native only. */
+  O.fs = {
+    read: function (path) { return O.invoke("fs.read", { path: String(path) }).then(function (r) { return r.data; }); },
+    write: function (path, data) { return O.invoke("fs.write", { path: String(path), data: String(data) }); },
+    list: function (path) { return O.invoke("fs.list", { path: String(path || "") }).then(function (r) { return r.entries || []; }); },
+    remove: function (path) { return O.invoke("fs.remove", { path: String(path) }); },
+    exists: function (path) { return O.invoke("fs.exists", { path: String(path) }).then(function (r) { return !!r.exists; }); },
+    mkdir: function (path) { return O.invoke("fs.mkdir", { path: String(path) }); },
+    readJSON: function (path) { return O.fs.read(path).then(function (t) { return JSON.parse(t); }); },
+    writeJSON: function (path, obj) { return O.fs.write(path, JSON.stringify(obj)); }
+  };
   /* write to the OS clipboard (native when present, else the browser copy hack) */
   O.clipboard = function (text) {
     text = String(text);
