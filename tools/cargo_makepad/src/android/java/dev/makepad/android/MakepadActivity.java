@@ -99,6 +99,7 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
+import android.webkit.JavascriptInterface;
 
 // note: //% is a special miniquad's pre-processor for plugins
 // when there are no plugins - //% whatever will be replaced to an empty string
@@ -3310,11 +3311,36 @@ public class MakepadActivity
                 return true;
             }
         });
+        // JS→native bridge: the card calls window.octos_native.invoke(callId, tool, args);
+        // we forward it to Rust (WebCard widget dispatches the tool and resolves the
+        // card promise via evalSystemBrowserJs). @JavascriptInterface runs on a WebView
+        // worker thread, so this returns immediately — the result comes back async.
+        final long boundBrowserId = browserId;
+        web.addJavascriptInterface(new Object() {
+            @JavascriptInterface
+            public void invoke(long callId, String tool, String args) {
+                MakepadNative.onSystemBrowserInvoke(boundBrowserId, callId, tool, args);
+            }
+        }, "octos_native");
         mSystemBrowserViews.put(browserId, web);
         if (mSystemBrowserOverlay != null) {
             mSystemBrowserOverlay.addView(web);
         }
         return web;
+    }
+
+    // Run JS inside a card's WebView (native→card channel). Called from Rust via
+    // android_jni::to_java_eval_system_browser_js to resolve octos.invoke promises.
+    public void evalSystemBrowserJs(final long browserId, final String js) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.get(browserId);
+                if (web != null) {
+                    web.evaluateJavascript(js, null);
+                }
+            }
+        });
     }
 
     public void spawnSystemBrowser(final long browserId, final String url) {
