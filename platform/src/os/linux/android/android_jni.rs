@@ -235,6 +235,12 @@ pub enum FromJavaMessage {
     },
     ComposerNewApp,
     ComposerSwitch,
+    SystemBrowserInvoke {
+        browser_id: i64,
+        call_id: i64,
+        tool: String,
+        args: String,
+    },
     QrScanned {
         json: String,
     },
@@ -1466,6 +1472,29 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSwitch
     send_from_java_message(FromJavaMessage::ComposerSwitch);
 }
 
+/// A `runhtml` card's JS called `octos.invoke(tool, args)` — bridged here via the
+/// WebView's `octos_native` JavascriptInterface. Delivered to the WebCard widget
+/// as an `AndroidSystemBrowserInvoke` action; the widget dispatches `tool` and
+/// resolves the card-side promise (`call_id`) with `evalSystemBrowserJs`.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserInvoke(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    browser_id: jni_sys::jlong,
+    call_id: jni_sys::jlong,
+    tool: jni_sys::jstring,
+    args: jni_sys::jstring,
+) {
+    let tool = jstring_to_string(env, tool);
+    let args = jstring_to_string(env, args);
+    send_from_java_message(FromJavaMessage::SystemBrowserInvoke {
+        browser_id: browser_id as i64,
+        call_id: call_id as i64,
+        tool,
+        args,
+    });
+}
+
 /// A camera frame (NV21 luma plane) from the QR scanner overlay. Decode it with
 /// the pure-Rust `rqrr`; on a hit, post the decoded string (the app applies it as
 /// an LLM-provisioning payload) and return JNI_TRUE so Java closes the scanner.
@@ -2431,5 +2460,18 @@ pub unsafe fn to_java_set_system_browser_html(browser_id: LiveId, html: &str, ba
         browser_id.get_value() as jni_sys::jlong,
         html,
         base_url
+    );
+}
+
+pub unsafe fn to_java_eval_system_browser_js(browser_id: LiveId, js: &str) {
+    let env = attach_jni_env();
+    let js = new_java_string(env, js);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "evalSystemBrowserJs",
+        "(JLjava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        js
     );
 }

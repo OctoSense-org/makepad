@@ -96,6 +96,28 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
   };
   C.closeSheet = function () { if(dim){dim.classList.remove("on");} if(sheet){sheet.classList.remove("on");} };
 
+  /* ---------- native bridge: octos.invoke(tool, args) → Rust (Tauri-style) ----------
+     The request executes in native Rust (no browser CORS), the result comes back
+     async and resolves the promise. Requires the host WebView's octos_native
+     JavascriptInterface (Android); rejects gracefully where it's absent. */
+  O._pending = {}; O._seq = 0;
+  O.invoke = function (tool, args) {
+    return new Promise(function (resolve, reject) {
+      if (!(window.octos_native && octos_native.invoke)) { reject("native bridge unavailable"); return; }
+      var id = ++O._seq;
+      O._pending[id] = { resolve: resolve, reject: reject };
+      try { octos_native.invoke(id, tool, JSON.stringify(args || {})); }
+      catch (e) { delete O._pending[id]; reject(String(e)); }
+    });
+  };
+  O.hasNative = function () { return !!(window.octos_native && octos_native.invoke); };
+  /* called BY native (evalSystemBrowserJs) to settle a pending invoke */
+  O._resolve = function (id, payload) {
+    var p = O._pending[id]; if (!p) return; delete O._pending[id];
+    if (payload && payload.ok === false) p.reject(payload.error || "invoke failed");
+    else p.resolve(payload);
+  };
+
   /* ---------- http (+ CORS proxy for keyless third-party APIs) ---------- */
   C.http = {
     /* wrap a URL so a keyless, CORS-less API becomes fetchable from the card origin */
@@ -103,7 +125,21 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
     getJSON: function (url, o) { return fetch(url, o).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); }); },
     getText: function (url, o) { return fetch(url, o).then(function (r) { if (!r.ok) throw new Error(r.status); return r.text(); }); },
     /* JSON from a host without CORS — routed through the proxy */
-    getJSONx: function (url, o) { return C.http.getJSON(C.http.proxy(url), o); }
+    getJSONx: function (url, o) { return C.http.getJSON(C.http.proxy(url), o); },
+    /* JSON via NATIVE HTTP (no CORS, arbitrary headers) when the bridge is present;
+       falls back to the CORS proxy otherwise. o.headers may be an object. */
+    getJSONn: function (url, o) {
+      o = o || {};
+      if (!O.hasNative()) return C.http.getJSONx(url, o);
+      var pairs = []; var h = o.headers || {};
+      for (var k in h) if (h.hasOwnProperty(k)) pairs.push([k, String(h[k])]);
+      return O.invoke("http.fetch", { url: url, method: o.method || "GET", headers: pairs, body: o.body || "" })
+        .then(function (r) {
+          if (!r || r.ok === false) throw (r && r.error) || "fetch failed";
+          if (r.status < 200 || r.status >= 300) throw "HTTP " + r.status;
+          return JSON.parse(r.body || "null");
+        });
+    }
   };
 
   /* ---------- expose common primitives at root for composition + back-compat ---------- */

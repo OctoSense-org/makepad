@@ -41,6 +41,19 @@ pub struct AndroidComposerSubmit {
     pub text: String,
 }
 
+/// A `runhtml` card called `octos.invoke(tool, args)` in its JS. Delivered as a
+/// bare action (like [`AndroidComposerSubmit`]); the WebCard widget dispatches
+/// the tool and resolves the card-side promise via `system_browser(..).eval_js`.
+/// Defined cross-platform so non-Android builds can `downcast_ref` it without a
+/// `cfg`; only ever posted on Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidSystemBrowserInvoke {
+    pub browser_id: u64,
+    pub call_id: i64,
+    pub tool: String,
+    pub args: String,
+}
+
 /// The native Android floating composer's "＋" (open another app) button was
 /// tapped. Posted as a bare action like [`AndroidComposerSubmit`]; the app
 /// routes it into `open_new_app` from `handle_actions`.

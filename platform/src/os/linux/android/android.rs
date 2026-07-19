@@ -1344,6 +1344,23 @@ impl Cx {
                 Cx::post_action(crate::event::AndroidQrScanned { json });
                 self.handle_action_receiver();
             }
+            FromJavaMessage::SystemBrowserInvoke {
+                browser_id,
+                call_id,
+                tool,
+                args,
+            } => {
+                // A runhtml card called octos.invoke(tool, args). Deliver to the
+                // WebCard widget as a bare action (drain this tick — same reason as
+                // ComposerSubmit: the app may be idle behind a rendered card).
+                Cx::post_action(crate::event::AndroidSystemBrowserInvoke {
+                    browser_id: browser_id as u64,
+                    call_id,
+                    tool,
+                    args,
+                });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
@@ -2542,6 +2559,9 @@ impl Cx {
                     base_url,
                 } => unsafe {
                     android_jni::to_java_set_system_browser_html(browser_id, &html, &base_url);
+                },
+                CxOsOp::EvalSystemBrowserJs { browser_id, js } => unsafe {
+                    android_jni::to_java_eval_system_browser_js(browser_id, &js);
                 },
                 CxOsOp::CheckPermission {
                     permission,

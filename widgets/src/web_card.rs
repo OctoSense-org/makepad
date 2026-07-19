@@ -16,7 +16,7 @@
 // and cannot clean up themselves, and "not drawn lately" is NOT a liveness
 // signal in a retained-mode renderer.
 
-use crate::{makepad_derive_widget::*, makepad_draw::*, widget::*};
+use crate::{makepad_derive_widget::*, makepad_draw::*, makepad_micro_serde::*, widget::*};
 
 /// The octos web-widget kit (the web counterpart of Splash `glass.*`), injected
 /// into EVERY web card so cards compose from `octos.*` instead of hand-rolling.
@@ -105,6 +105,22 @@ pub struct WebCard {
     spawned: bool,
     #[rust]
     settle_timer: Timer,
+    /// In-flight `octos.invoke("http.fetch", ...)` calls: request_id → JS call_id,
+    /// so the NetworkResponse can resolve the right card-side promise.
+    #[rust]
+    pending: Vec<(LiveId, i64)>,
+    #[rust]
+    req_seq: u64,
+}
+
+/// Args for the `http.fetch` bridge tool. The card sends headers as `[[k,v],…]`
+/// (micro-serde-friendly) and a string body; method defaults to GET.
+#[derive(DeJson)]
+struct FetchArgs {
+    url: String,
+    method: Option<String>,
+    headers: Option<Vec<Vec<String>>>,
+    body: Option<String>,
 }
 
 impl WebCard {
@@ -149,12 +165,121 @@ impl WebCard {
         self.loaded_html = self.html.clone();
         self.redraw(cx);
     }
+
+    fn next_seq(&mut self) -> u64 {
+        self.req_seq = self.req_seq.wrapping_add(1);
+        self.req_seq
+    }
+
+    /// Resolve the card-side promise for `call_id` with a raw JSON payload.
+    fn resolve_raw(&mut self, cx: &mut Cx, call_id: i64, payload_json: &str) {
+        let js = format!(
+            "window.octos&&octos._resolve&&octos._resolve({},{})",
+            call_id, payload_json
+        );
+        cx.system_browser(self.browser_id()).eval_js(&js);
+    }
+
+    fn reject(&mut self, cx: &mut Cx, call_id: i64, msg: &str) {
+        let mj = msg.to_string().serialize_json();
+        self.resolve_raw(cx, call_id, &format!("{{\"ok\":false,\"error\":{}}}", mj));
+    }
+
+    /// Dispatch one `octos.invoke(tool, args)`. `args` is a JSON string from the card.
+    fn handle_invoke(&mut self, cx: &mut Cx, call_id: i64, tool: &str, args: &str) {
+        match tool {
+            // Round-trip probe: echo the args object back untouched.
+            "ping" => {
+                self.resolve_raw(cx, call_id, &format!("{{\"ok\":true,\"echo\":{}}}", args));
+            }
+            // Native HTTP (no browser CORS). Reuses the platform's http_request;
+            // the response returns via Event::NetworkResponses (handle below).
+            "http.fetch" => match FetchArgs::deserialize_json(args) {
+                Ok(a) => {
+                    let method = match a.method.as_deref().unwrap_or("GET").to_ascii_uppercase().as_str() {
+                        "POST" => HttpMethod::POST,
+                        "PUT" => HttpMethod::PUT,
+                        "DELETE" => HttpMethod::DELETE,
+                        "HEAD" => HttpMethod::HEAD,
+                        "PATCH" => HttpMethod::PATCH,
+                        _ => HttpMethod::GET,
+                    };
+                    let mut req = HttpRequest::new(a.url.clone(), method);
+                    if let Some(hs) = &a.headers {
+                        for h in hs {
+                            if h.len() == 2 {
+                                req.set_header(h[0].clone(), h[1].clone());
+                            }
+                        }
+                    }
+                    if let Some(b) = &a.body {
+                        if !b.is_empty() {
+                            req.set_string_body(b.clone());
+                        }
+                    }
+                    let request_id = LiveId(0xF0C5_0000_0000_0000 ^ self.next_seq());
+                    self.pending.push((request_id, call_id));
+                    cx.http_request(request_id, req);
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad http.fetch args: {:?}", e)),
+            },
+            other => self.reject(cx, call_id, &format!("unknown tool: {}", other)),
+        }
+    }
+
+    fn handle_http_responses(&mut self, cx: &mut Cx, responses: &[NetworkResponse]) {
+        if self.pending.is_empty() {
+            return;
+        }
+        for response in responses {
+            match response {
+                NetworkResponse::HttpResponse { request_id, response } => {
+                    if let Some(pos) = self.pending.iter().position(|(rid, _)| rid == request_id) {
+                        let (_, call_id) = self.pending.remove(pos);
+                        let status = response.status_code;
+                        let body = response.get_string_body().unwrap_or_default();
+                        let payload = format!(
+                            "{{\"ok\":true,\"status\":{},\"body\":{}}}",
+                            status,
+                            body.serialize_json()
+                        );
+                        self.resolve_raw(cx, call_id, &payload);
+                    }
+                }
+                NetworkResponse::HttpError { request_id, error } => {
+                    if let Some(pos) = self.pending.iter().position(|(rid, _)| rid == request_id) {
+                        let (_, call_id) = self.pending.remove(pos);
+                        self.reject(cx, call_id, &format!("http error: {}", error.message));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 impl Widget for WebCard {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
         if self.settle_timer.is_event(event).is_some() {
             self.load_settled(cx);
+        }
+        // JS→native bridge: a card called octos.invoke(tool, args) (posted from the
+        // WebView's octos_native JavascriptInterface as an AndroidSystemBrowserInvoke
+        // action). Dispatch only our own browser's calls.
+        if let Event::Actions(actions) = event {
+            for action in actions {
+                if let Some(inv) = action
+                    .downcast_ref::<crate::makepad_platform::event::AndroidSystemBrowserInvoke>()
+                {
+                    if inv.browser_id == self.browser_id().0.get_value() {
+                        self.handle_invoke(cx, inv.call_id, &inv.tool, &inv.args);
+                    }
+                }
+            }
+        }
+        // Native HTTP responses for our in-flight http.fetch calls.
+        if let Event::NetworkResponses(responses) = event {
+            self.handle_http_responses(cx, responses);
         }
         // NOTE: no draw-based liveness watchdog here — makepad draws on demand,
         // so "no draw since last frame" does NOT mean the widget left the

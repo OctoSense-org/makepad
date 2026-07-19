@@ -155,6 +155,15 @@ impl<'a> CxSystemBrowser<'a> {
             base_url: base_url.to_string(),
         });
     }
+
+    /// Evaluate JS inside the browser document (native→card). Used to resolve
+    /// `octos.invoke` promises: `eval_js("octos._resolve(7, {...})")`.
+    pub fn eval_js(&mut self, js: &str) {
+        self.cx.platform_ops.push(CxOsOp::EvalSystemBrowserJs {
+            browser_id: self.id.0,
+            js: js.to_string(),
+        });
+    }
 }
 
 pub trait CxOsApi {
@@ -392,6 +401,12 @@ pub enum CxOsOp {
         html: String,
         base_url: String,
     },
+    /// Run a snippet of JavaScript inside the browser's document (native→card
+    /// channel — used to resolve `octos.invoke(...)` promises back in the card).
+    EvalSystemBrowserJs {
+        browser_id: LiveId,
+        js: String,
+    },
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
     PauseVideoPlayback(LiveId),
@@ -492,6 +507,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::SystemBrowserHistoryGo { .. } => write!(f, "SystemBrowserHistoryGo"),
             Self::CloseSystemBrowser { .. } => write!(f, "CloseSystemBrowser"),
             Self::SetSystemBrowserHtml { .. } => write!(f, "SetSystemBrowserHtml"),
+            Self::EvalSystemBrowserJs { .. } => write!(f, "EvalSystemBrowserJs"),
             Self::PrepareAudioPlayback(..) => write!(f, "PrepareAudioPlayback"),
             Self::BeginVideoPlayback(..) => write!(f, "BeginVideoPlayback"),
             Self::PauseVideoPlayback(..) => write!(f, "PauseVideoPlayback"),
