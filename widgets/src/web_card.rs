@@ -218,6 +218,12 @@ struct PathDataArg {
     data: String,
 }
 
+/// Args for `dialog.open` (optional MIME filter).
+#[derive(DeJson)]
+struct DialogArgs {
+    mime: Option<String>,
+}
+
 /// Sandbox root for card fs — a dedicated subdir of the app's private storage.
 /// A card can NEVER reach outside it (absolute paths and `..` are rejected in
 /// `fs_resolve`), so it can't read the octos profile, other apps, or the system.
@@ -476,6 +482,15 @@ impl WebCard {
                 }
                 Err(e) => self.reject(cx, call_id, &format!("bad fs.mkdir args: {:?}", e)),
             },
+            // Native file picker (Storage Access Framework). Async: launch here,
+            // resolve later when the AndroidDialogResult action arrives (handle_event).
+            "dialog.open" => {
+                let mime = DialogArgs::deserialize_json(args)
+                    .ok()
+                    .and_then(|a| a.mime)
+                    .unwrap_or_else(|| "*/*".to_string());
+                cx.open_file_dialog(call_id, &mime);
+            }
             // Default-deny: only registered tools are callable.
             other => self.reject(cx, call_id, &format!("unknown tool: {}", other)),
         }
@@ -528,6 +543,23 @@ impl Widget for WebCard {
                     if inv.browser_id == self.browser_id().0.get_value() {
                         self.handle_invoke(cx, inv.call_id, &inv.tool, &inv.args);
                     }
+                }
+                // Native file-picker result → resolve the pending dialog.open promise.
+                if let Some(dr) = action
+                    .downcast_ref::<crate::makepad_platform::event::AndroidDialogResult>()
+                {
+                    let payload = if dr.cancelled {
+                        "{\"ok\":true,\"cancelled\":true}".to_string()
+                    } else if !dr.error.is_empty() {
+                        format!("{{\"ok\":false,\"error\":{}}}", dr.error.serialize_json())
+                    } else {
+                        format!(
+                            "{{\"ok\":true,\"name\":{},\"data\":{}}}",
+                            dr.name.serialize_json(),
+                            dr.content.serialize_json()
+                        )
+                    };
+                    self.resolve_raw(cx, dr.call_id, &payload);
                 }
             }
         }

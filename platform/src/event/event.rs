@@ -63,6 +63,18 @@ pub struct AndroidDeepLink {
     pub url: String,
 }
 
+/// Result of a native file picker (`cx.open_file_dialog`) — the picked file's
+/// name + text contents, or a cancel/error. Correlated to the card's
+/// `octos.invoke` by `call_id`. Defined cross-platform; only posted on Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidDialogResult {
+    pub call_id: i64,
+    pub name: String,
+    pub content: String,
+    pub cancelled: bool,
+    pub error: String,
+}
+
 /// The native Android floating composer's "＋" (open another app) button was
 /// tapped. Posted as a bare action like [`AndroidComposerSubmit`]; the app
 /// routes it into `open_new_app` from `handle_actions`.

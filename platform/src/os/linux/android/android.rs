@@ -1367,6 +1367,24 @@ impl Cx {
                 Cx::post_action(crate::event::AndroidDeepLink { url });
                 self.handle_action_receiver();
             }
+            FromJavaMessage::DialogResult {
+                call_id,
+                name,
+                content,
+                cancelled,
+                error,
+            } => {
+                // Native file-picker result → the WebCard widget resolves the
+                // matching octos.invoke("dialog.open") promise.
+                Cx::post_action(crate::event::AndroidDialogResult {
+                    call_id,
+                    name,
+                    content,
+                    cancelled,
+                    error,
+                });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
@@ -2431,6 +2449,9 @@ impl Cx {
                 },
                 CxOsOp::ShowNotification { title, body } => unsafe {
                     android_jni::to_java_show_notification(title, body);
+                },
+                CxOsOp::OpenFileDialog { call_id, mime } => unsafe {
+                    android_jni::to_java_open_file_dialog(call_id, &mime);
                 },
                 CxOsOp::ShowAndroidComposer => unsafe {
                     android_jni::to_java_show_composer();

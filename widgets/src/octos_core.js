@@ -146,6 +146,14 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
     readJSON: function (path) { return O.fs.read(path).then(function (t) { return JSON.parse(t); }); },
     writeJSON: function (path, obj) { return O.fs.write(path, JSON.stringify(obj)); }
   };
+  /* native file picker (Storage Access Framework). open() resolves
+     {ok, name, data} on pick, {ok, cancelled:true} on cancel. Native only. */
+  O.dialog = {
+    open: function (mime) {
+      if (!O.hasNative()) return Promise.reject("file picker needs the native bridge");
+      return O.invoke("dialog.open", { mime: mime || "*/*" });
+    }
+  };
   /* write to the OS clipboard (native when present, else the browser copy hack) */
   O.clipboard = function (text) {
     text = String(text);

@@ -244,6 +244,13 @@ pub enum FromJavaMessage {
     DeepLink {
         url: String,
     },
+    DialogResult {
+        call_id: i64,
+        name: String,
+        content: String,
+        cancelled: bool,
+        error: String,
+    },
     QrScanned {
         json: String,
     },
@@ -1508,6 +1515,44 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDeepLink(
 ) {
     let url = jstring_to_string(env, url);
     send_from_java_message(FromJavaMessage::DeepLink { url });
+}
+
+/// Result of a native file picker (see `to_java_open_file_dialog`). Delivered to
+/// the WebCard widget as an `AndroidDialogResult` action, which resolves the
+/// card's `octos.invoke("dialog.open", …)` promise (`call_id`).
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDialogResult(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    call_id: jni_sys::jlong,
+    name: jni_sys::jstring,
+    content: jni_sys::jstring,
+    cancelled: jni_sys::jboolean,
+    error: jni_sys::jstring,
+) {
+    let name = if name.is_null() { String::new() } else { jstring_to_string(env, name) };
+    let content = if content.is_null() { String::new() } else { jstring_to_string(env, content) };
+    let error = if error.is_null() { String::new() } else { jstring_to_string(env, error) };
+    send_from_java_message(FromJavaMessage::DialogResult {
+        call_id: call_id as i64,
+        name,
+        content,
+        cancelled: cancelled != 0,
+        error,
+    });
+}
+
+pub unsafe fn to_java_open_file_dialog(call_id: i64, mime: &str) {
+    let env = attach_jni_env();
+    let mime = new_java_string(env, mime);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "openFileDialog",
+        "(JLjava/lang/String;)V",
+        call_id as jni_sys::jlong,
+        mime
+    );
 }
 
 /// A camera frame (NV21 luma plane) from the QR scanner overlay. Decode it with

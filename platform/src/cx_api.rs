@@ -327,6 +327,7 @@ pub enum CxOsOp {
     CopyToClipboard(String),
     ShareText(String),
     ShowNotification { title: String, body: String },
+    OpenFileDialog { call_id: i64, mime: String },
     // Show/hide the native Android floating chat-composer overlay (a native
     // view floating over the GL surface so the full-screen Splash card behind
     // it is edge-to-edge). Handled only by the Android backend; ignored by
@@ -494,6 +495,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::CopyToClipboard(..) => write!(f, "CopyToClipboard"),
             Self::ShareText(..) => write!(f, "ShareText"),
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),
+            Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
             Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
             Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
             Self::ExpandAndroidComposer => write!(f, "ExpandAndroidComposer"),
@@ -1117,6 +1119,17 @@ impl Cx {
         self.platform_ops.push(CxOsOp::ShowNotification {
             title: title.to_owned(),
             body: body.to_owned(),
+        });
+    }
+
+    /// Open the native file picker (Android Storage Access Framework). The result
+    /// (picked file's name + contents, or cancellation) is delivered later as an
+    /// `AndroidDialogResult` action carrying `call_id`. No-op on platforms whose
+    /// backend doesn't handle `CxOsOp::OpenFileDialog`.
+    pub fn open_file_dialog(&mut self, call_id: i64, mime: &str) {
+        self.platform_ops.push(CxOsOp::OpenFileDialog {
+            call_id,
+            mime: mime.to_owned(),
         });
     }
 
