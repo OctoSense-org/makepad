@@ -1315,8 +1315,20 @@ pub struct Splash {
     failure_timer: Timer,
 }
 
-/// Prefix for View-children mode: wraps code inside a View
+/// Prefix for View-children mode: wraps code inside a View.
+///
+/// `height: Fit` is right for the short snippets this was written for — a chat
+/// reply's inline widget should take only the room it needs.
 const SPLASH_PREFIX_VIEW: &str = "use mod.prelude.widgets.*View{height:Fit, ";
+/// Same, for a body whose own root asks to fill its parent.
+///
+/// A `height: Fill` child inside a `height: Fit` parent is degenerate: the
+/// parent sizes to its children, the child sizes to its parent, and the tree
+/// resolves to zero height — the card evaluates cleanly and draws NOTHING.
+/// Full-bleed app cards (`SolidView{ width: Fill height: Fill … }` as the
+/// first widget) hit this every time, which is why they rendered as an empty
+/// pane of background colour with no error anywhere.
+const SPLASH_PREFIX_VIEW_FILL: &str = "use mod.prelude.widgets.*View{height:Fill, ";
 /// Prefix for full-script mode: just imports, code must evaluate to a widget
 const SPLASH_PREFIX_SCRIPT: &str = "use mod.prelude.widgets.*\n";
 const SPLASH_EVAL_INSTRUCTION_LIMIT: usize = 200_000;
@@ -1355,6 +1367,26 @@ fn is_full_script(body: &str) -> bool {
     // (let/fn/mod) — these can't appear inside a View{} property list.
     // Uppercase widget names (View{, SolidView{, Label{) stay in View-children mode.
     trimmed.starts_with("let ") || trimmed.starts_with("fn ") || trimmed.starts_with("mod.")
+}
+
+/// Does this View-children body's FIRST widget ask to fill its parent?
+///
+/// `SPLASH_PREFIX_VIEW` wraps the body in `View{height:Fit, …}`, which is
+/// correct for a short inline snippet but collapses a full-bleed card to zero
+/// height: `Fill` inside `Fit` resolves to nothing, so the card evaluates with
+/// no error and draws no pixels. Scan just the first widget's property list —
+/// a nested `height: Fill` deeper in the tree is fine, it is only the ROOT
+/// asking for its parent's height that the `Fit` wrapper cannot satisfy.
+fn root_wants_fill(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    // Property list of the first widget: up to its first nested `{`, or the
+    // whole first line, whichever ends sooner.
+    let head_end = trimmed
+        .find('\n')
+        .unwrap_or(trimmed.len())
+        .min(trimmed.len());
+    let head = &trimmed[..head_end];
+    head.replace(' ', "").contains("height:Fill")
 }
 
 impl Splash {
@@ -1402,6 +1434,8 @@ impl Splash {
         // Choose prefix based on code style
         let prefix = if is_full_script(&body) {
             SPLASH_PREFIX_SCRIPT
+        } else if root_wants_fill(&body) {
+            SPLASH_PREFIX_VIEW_FILL
         } else {
             SPLASH_PREFIX_VIEW
         };
@@ -1632,6 +1666,8 @@ impl Splash {
 
         let prefix = if is_full_script(&current) {
             SPLASH_PREFIX_SCRIPT
+        } else if root_wants_fill(&current) {
+            SPLASH_PREFIX_VIEW_FILL
         } else {
             SPLASH_PREFIX_VIEW
         };
