@@ -241,6 +241,9 @@ pub enum FromJavaMessage {
         tool: String,
         args: String,
     },
+    DeepLink {
+        url: String,
+    },
     QrScanned {
         json: String,
     },
@@ -1493,6 +1496,18 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserI
         tool,
         args,
     });
+}
+
+/// The app was launched/resumed via a deep link or share intent (ACTION_VIEW URL
+/// or ACTION_SEND text). Delivered to the app as an `AndroidDeepLink` action.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDeepLink(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    url: jni_sys::jstring,
+) {
+    let url = jstring_to_string(env, url);
+    send_from_java_message(FromJavaMessage::DeepLink { url });
 }
 
 /// A camera frame (NV21 luma plane) from the QR scanner overlay. Decode it with

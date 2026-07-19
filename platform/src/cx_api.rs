@@ -164,6 +164,18 @@ impl<'a> CxSystemBrowser<'a> {
             js: js.to_string(),
         });
     }
+
+    /// Emit an event to the card — dispatched to its `octos.on(event, …)`
+    /// handlers. `payload_json` must be a valid JSON value (e.g. `"\"...\""` for
+    /// a string, `"{...}"` for an object). The event name is an internal
+    /// identifier (quotes/backslashes stripped defensively).
+    pub fn emit(&mut self, event: &str, payload_json: &str) {
+        let ev = event.replace(['\\', '"'], "");
+        self.eval_js(&format!(
+            "window.octos&&octos._event&&octos._event(\"{}\",{})",
+            ev, payload_json
+        ));
+    }
 }
 
 pub trait CxOsApi {

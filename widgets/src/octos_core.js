@@ -117,6 +117,12 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
     if (payload && payload.ok === false) p.reject(payload.error || "invoke failed");
     else p.resolve(payload);
   };
+  /* native→card EVENTS (the emit/listen half of the bridge): the card registers
+     octos.on(name, fn); native pushes octos._event(name, payload) via eval_js. */
+  O._handlers = {};
+  O.on = function (name, fn) { (O._handlers[name] = O._handlers[name] || []).push(fn); return fn; };
+  O.off = function (name, fn) { var a = O._handlers[name]; if (a) O._handlers[name] = a.filter(function (h) { return h !== fn; }); };
+  O._event = function (name, payload) { (O._handlers[name] || []).forEach(function (fn) { try { fn(payload); } catch (e) {} }); };
   /* native OS share sheet (falls back to clipboard copy where the bridge is absent) */
   O.share = function (text) {
     if (O.hasNative()) return O.invoke("share", { text: String(text) });

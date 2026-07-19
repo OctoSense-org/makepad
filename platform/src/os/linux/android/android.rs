@@ -1361,6 +1361,12 @@ impl Cx {
                 });
                 self.handle_action_receiver();
             }
+            FromJavaMessage::DeepLink { url } => {
+                // App opened/resumed via a deep link or share — hand it to the app
+                // (it plays a shared YouTube URL in the card). Drain this tick.
+                Cx::post_action(crate::event::AndroidDeepLink { url });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,

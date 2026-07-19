@@ -54,6 +54,15 @@ pub struct AndroidSystemBrowserInvoke {
     pub args: String,
 }
 
+/// The app was opened/resumed via a deep link or share (an `ACTION_VIEW` URL or
+/// `ACTION_SEND` text — e.g. a YouTube link shared from another app). Posted as a
+/// bare action; the app routes it (e.g. plays it in the youtube card). Defined
+/// cross-platform; only ever posted on Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidDeepLink {
+    pub url: String,
+}
+
 /// The native Android floating composer's "＋" (open another app) button was
 /// tapped. Posted as a bare action like [`AndroidComposerSubmit`]; the app
 /// routes it into `open_new_app` from `handle_actions`.
