@@ -251,4 +251,75 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
   };
   O.oembed = function (id, cb) { fetch("https://noembed.com/embed?url=https://www.youtube.com/watch?v="+id).then(function(r){return r.json();}).then(function(j){ if(j&&j.title)cb({title:O.strip(j.title),author:j.author_name}); }).catch(function(){}); };
   O.setKebab = function (fn) { O._kebab = fn; };
+
+  /* ---------- octos.auth — real Google/YouTube sign-in (OAuth device-code flow) ----------
+     Pure client-side: the card's WebView reaches Google's device/token endpoints and the
+     YouTube Data API directly (all CORS-open from the card origin). No native code. The
+     card calls O.auth.configure({clientId,clientSecret}) once (device-flow client secret
+     is non-confidential per Google — it ships in the app by design). Multi-account: tokens
+     persist in namespaced localStorage; switch/sign-out just re-point the active account. */
+  O.auth = (function () {
+    var CFG = { clientId: "", clientSecret: "" }, A = {};
+    var DEVICE_URL = "https://oauth2.googleapis.com/device/code", TOKEN_URL = "https://oauth2.googleapis.com/token";
+    var SCOPE = "https://www.googleapis.com/auth/youtube.readonly";
+    function form(o) { return Object.keys(o).map(function (k) { return encodeURIComponent(k) + "=" + encodeURIComponent(o[k]); }).join("&"); }
+    function post(url, o) { return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form(o) }).then(function (r) { return r.json(); }); }
+    function store() { return O.get("accounts", {}); }
+    function save(s) { O.set("accounts", s); }
+
+    A.configure = function (c) { CFG.clientId = (c && c.clientId) || ""; CFG.clientSecret = (c && c.clientSecret) || ""; };
+    A.configured = function () { return !!CFG.clientId; };
+    A.accounts = function () { var s = store(); return Object.keys(s).map(function (k) { return s[k]; }); };
+    A.active = function () { var id = O.get("activeAcct", null), s = store(); return (id && s[id]) ? s[id] : null; };
+    A.setActive = function (id) { O.set("activeAcct", id); };
+    A.signOut = function (id) { var s = store(); delete s[id]; save(s); if (O.get("activeAcct", null) === id) { var k = Object.keys(s); O.set("activeAcct", k.length ? k[0] : null); } };
+
+    /* device-code sign-in. cb receives {phase:'code',user_code,verification_url} then
+       {phase:'done',account} or {phase:'error',error}. */
+    A.start = function (cb) {
+      if (!CFG.clientId) { cb({ phase: "error", error: "not configured" }); return; }
+      post(DEVICE_URL, { client_id: CFG.clientId, scope: SCOPE }).then(function (j) {
+        if (!j.device_code) { cb({ phase: "error", error: j.error_description || j.error || "no device code" }); return; }
+        cb({ phase: "code", user_code: j.user_code, verification_url: j.verification_url || "https://www.google.com/device", interval: j.interval || 5 });
+        var deadline = Date.now() + (j.expires_in || 1800) * 1000;
+        poll(j.device_code, (j.interval || 5), deadline, cb);
+      }).catch(function (e) { cb({ phase: "error", error: String(e) }); });
+    };
+    function poll(dc, interval, deadline, cb) {
+      if (Date.now() > deadline) { cb({ phase: "error", error: "code expired" }); return; }
+      post(TOKEN_URL, { client_id: CFG.clientId, client_secret: CFG.clientSecret, device_code: dc, grant_type: "urn:ietf:params:oauth:grant-type:device_code" })
+        .then(function (j) {
+          if (j.access_token) { onToken(j, cb); return; }
+          if (j.error === "authorization_pending" || j.error === "slow_down") { setTimeout(function () { poll(dc, interval + (j.error === "slow_down" ? 5 : 0), deadline, cb); }, interval * 1000); return; }
+          cb({ phase: "error", error: j.error === "access_denied" ? "you denied access" : (j.error_description || j.error || "sign-in failed") });
+        }).catch(function () { setTimeout(function () { poll(dc, interval, deadline, cb); }, interval * 1000); });
+    }
+    function onToken(tok, cb) {
+      apiGet("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true", tok.access_token).then(function (ch) {
+        var it = (ch.items || [])[0] || {}, sn = it.snippet || {}, id = it.id || ("acct_" + (sn.title || "you"));
+        var thumb = sn.thumbnails && (sn.thumbnails.default || sn.thumbnails.medium);
+        var acct = { id: id, name: sn.title || "YouTube user", avatar: (thumb && thumb.url) || "", refresh: tok.refresh_token || "", access: tok.access_token, exp: Date.now() + (tok.expires_in || 3600) * 1000 };
+        var s = store(); s[id] = acct; save(s); O.set("activeAcct", id);
+        cb({ phase: "done", account: acct });
+      }).catch(function (e) { cb({ phase: "error", error: "couldn't read channel: " + e }); });
+    }
+    /* access token for the active account, refreshing if expired */
+    A.token = function () {
+      var acct = A.active(); if (!acct) return Promise.reject("not signed in");
+      if (acct.access && Date.now() < acct.exp - 60000) return Promise.resolve(acct.access);
+      if (!acct.refresh) return Promise.reject("session expired — sign in again");
+      return post(TOKEN_URL, { client_id: CFG.clientId, client_secret: CFG.clientSecret, refresh_token: acct.refresh, grant_type: "refresh_token" }).then(function (j) {
+        if (!j.access_token) throw (j.error || "refresh failed");
+        acct.access = j.access_token; acct.exp = Date.now() + (j.expires_in || 3600) * 1000;
+        var s = store(); s[acct.id] = acct; save(s); return acct.access;
+      });
+    };
+    function apiGet(url, tok) { return fetch(url, { headers: { Authorization: "Bearer " + tok } }).then(function (r) { if (!r.ok) return r.json().then(function (e) { throw ((e.error && e.error.message) || r.status); }); return r.json(); }); }
+    A.api = function (path) { return A.token().then(function (t) { return apiGet("https://www.googleapis.com/youtube/v3/" + path, t); }); };
+    A.subscriptions = function (pageToken) { return A.api("subscriptions?part=snippet&mine=true&maxResults=50&order=alphabetical" + (pageToken ? "&pageToken=" + pageToken : "")); };
+    A.playlists = function () { return A.api("playlists?part=snippet,contentDetails&mine=true&maxResults=50"); };
+    A.playlistItems = function (id) { return A.api("playlistItems?part=snippet&maxResults=50&playlistId=" + encodeURIComponent(id)); };
+    A.liked = function () { return A.api("videos?part=snippet,contentDetails,statistics&myRating=like&maxResults=25"); };
+    return A;
+  })();
 })();
