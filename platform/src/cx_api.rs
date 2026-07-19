@@ -326,6 +326,7 @@ pub enum CxOsOp {
     HideClipboardActions,
     CopyToClipboard(String),
     ShareText(String),
+    ShowNotification { title: String, body: String },
     // Show/hide the native Android floating chat-composer overlay (a native
     // view floating over the GL surface so the full-screen Splash card behind
     // it is edge-to-edge). Handled only by the Android backend; ignored by
@@ -492,6 +493,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::HideClipboardActions => write!(f, "HideClipboardActions"),
             Self::CopyToClipboard(..) => write!(f, "CopyToClipboard"),
             Self::ShareText(..) => write!(f, "ShareText"),
+            Self::ShowNotification { .. } => write!(f, "ShowNotification"),
             Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
             Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
             Self::ExpandAndroidComposer => write!(f, "ExpandAndroidComposer"),
@@ -1107,6 +1109,15 @@ impl Cx {
     pub fn share_text(&mut self, content: &str) {
         self.platform_ops
             .push(CxOsOp::ShareText(content.to_owned()));
+    }
+
+    /// Post a system notification (Android NotificationManager). No-op on
+    /// platforms whose backend doesn't handle `CxOsOp::ShowNotification`.
+    pub fn show_notification(&mut self, title: &str, body: &str) {
+        self.platform_ops.push(CxOsOp::ShowNotification {
+            title: title.to_owned(),
+            body: body.to_owned(),
+        });
     }
 
     /// Show the native Android floating chat-composer overlay so it floats

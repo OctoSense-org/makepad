@@ -128,6 +128,11 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
     if (O.hasNative()) return O.invoke("share", { text: String(text) });
     return O.clipboard(text);
   };
+  /* post a system notification (native only; no-op reject without the bridge) */
+  O.notify = function (title, body) {
+    if (!O.hasNative()) return Promise.reject("notifications need the native bridge");
+    return O.invoke("notify", { title: String(title || ""), body: String(body || "") });
+  };
   /* write to the OS clipboard (native when present, else the browser copy hack) */
   O.clipboard = function (text) {
     text = String(text);

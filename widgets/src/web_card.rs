@@ -198,6 +198,13 @@ struct TextArg {
     text: String,
 }
 
+/// Args for the `notify` bridge tool.
+#[derive(DeJson)]
+struct NotifyArgs {
+    title: String,
+    body: Option<String>,
+}
+
 impl WebCard {
     fn browser_id(&self) -> SystemBrowserId {
         web_card_browser_id()
@@ -321,6 +328,14 @@ impl WebCard {
                     self.resolve_raw(cx, call_id, "{\"ok\":true}");
                 }
                 Err(e) => self.reject(cx, call_id, &format!("bad clipboard args: {:?}", e)),
+            },
+            // Post a system notification (Android NotificationManager).
+            "notify" => match NotifyArgs::deserialize_json(args) {
+                Ok(a) => {
+                    cx.show_notification(&a.title, a.body.as_deref().unwrap_or(""));
+                    self.resolve_raw(cx, call_id, "{\"ok\":true}");
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad notify args: {:?}", e)),
             },
             // Default-deny: only registered tools are callable.
             other => self.reject(cx, call_id, &format!("unknown tool: {}", other)),

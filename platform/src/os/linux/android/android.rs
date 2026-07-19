@@ -2429,6 +2429,9 @@ impl Cx {
                 CxOsOp::ShareText(content) => unsafe {
                     android_jni::to_java_share_text(content);
                 },
+                CxOsOp::ShowNotification { title, body } => unsafe {
+                    android_jni::to_java_show_notification(title, body);
+                },
                 CxOsOp::ShowAndroidComposer => unsafe {
                     android_jni::to_java_show_composer();
                 },

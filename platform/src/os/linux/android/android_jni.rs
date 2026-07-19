@@ -1693,6 +1693,20 @@ pub unsafe fn to_java_share_text(content: String) {
     );
 }
 
+pub unsafe fn to_java_show_notification(title: String, body: String) {
+    let env = attach_jni_env();
+    let title = new_java_string(env, &title);
+    let body = new_java_string(env, &body);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "showNotification",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        title,
+        body
+    );
+}
+
 // Show the native floating chat composer overlay (see `MakepadActivity`). The
 // composer floats over the full-screen GL surface so the Splash card behind it
 // stays edge-to-edge; the Android view tree dispatches its touches directly so
