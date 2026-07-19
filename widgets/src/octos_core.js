@@ -117,6 +117,21 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
     if (payload && payload.ok === false) p.reject(payload.error || "invoke failed");
     else p.resolve(payload);
   };
+  /* native OS share sheet (falls back to clipboard copy where the bridge is absent) */
+  O.share = function (text) {
+    if (O.hasNative()) return O.invoke("share", { text: String(text) });
+    return O.clipboard(text);
+  };
+  /* write to the OS clipboard (native when present, else the browser copy hack) */
+  O.clipboard = function (text) {
+    text = String(text);
+    if (O.hasNative()) return O.invoke("clipboard.write", { text: text });
+    try {
+      var t = document.createElement("textarea"); t.value = text; document.body.appendChild(t);
+      t.select(); document.execCommand("copy"); document.body.removeChild(t);
+      return Promise.resolve({ ok: true });
+    } catch (e) { return Promise.reject(String(e)); }
+  };
 
   /* ---------- http (+ CORS proxy for keyless third-party APIs) ---------- */
   C.http = {

@@ -55,6 +55,75 @@ fn inject_widget_kit(html: &str) -> String {
     }
 }
 
+/// Host allowlist for the `http.fetch` bridge tool — the ONLY hosts a card may
+/// reach natively. This is the capability gate: the card's JS is untrusted, so
+/// the trusted Rust side enforces it (a JS-side check is bypassable). ymote/Splash
+/// `mod.tool` would formalize this with per-card leases + audit; until then it's a
+/// curated static allowlist plus an SSRF guard (https-only, no private/loopback/
+/// link-local/internal hosts). Keep the Piped hosts in sync with
+/// `octos_media.js::O.ytSearchInstances`.
+const HTTP_FETCH_ALLOWED_HOSTS: &[&str] = &[
+    "googleapis.com",           // YouTube Data API
+    "noembed.com",              // oEmbed
+    "piped.private.coffee",     // Piped search instances ↓
+    "pipedapi.r4fo.com",
+    "pipedapi.orangenet.cc",
+    "api.piped.yt",
+    "pipedapi.adminforge.de",
+    "query1.finance.yahoo.com", // stock card
+    "query2.finance.yahoo.com",
+];
+
+/// Enforce the `http.fetch` capability gate: https-only, no private/internal
+/// hosts (SSRF guard), and the host must be on the allowlist (boundary-correct
+/// suffix match, so `evil-googleapis.com` does NOT match `googleapis.com`).
+fn fetch_host_allowed(url: &str) -> Result<(), String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "only https:// URLs are allowed".to_string())?;
+    let host = rest
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or("")
+        .split('@')
+        .next_back()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("missing host".into());
+    }
+    // SSRF guard: reject loopback / private / link-local / internal hosts.
+    let blocked_prefix = ["127.", "10.", "192.168.", "169.254.", "0."];
+    let private_172 = host.starts_with("172.")
+        && host
+            .split('.')
+            .nth(1)
+            .and_then(|o| o.parse::<u8>().ok())
+            .map(|o| (16..=31).contains(&o))
+            .unwrap_or(false);
+    if host == "localhost"
+        || host == "::1"
+        || host.ends_with(".localhost")
+        || host.ends_with(".internal")
+        || host.ends_with(".local")
+        || blocked_prefix.iter().any(|p| host.starts_with(p))
+        || private_172
+    {
+        return Err(format!("host not permitted (private/internal): {}", host));
+    }
+    let allowed = HTTP_FETCH_ALLOWED_HOSTS
+        .iter()
+        .any(|a| host == *a || host.ends_with(&format!(".{}", a)));
+    if allowed {
+        Ok(())
+    } else {
+        Err(format!("host not on allowlist: {}", host))
+    }
+}
+
 script_mod! {
     use mod.prelude.widgets_internal.*
 
@@ -121,6 +190,12 @@ struct FetchArgs {
     method: Option<String>,
     headers: Option<Vec<Vec<String>>>,
     body: Option<String>,
+}
+
+/// Args for the `share` / `clipboard.write` bridge tools.
+#[derive(DeJson)]
+struct TextArg {
+    text: String,
 }
 
 impl WebCard {
@@ -194,35 +269,60 @@ impl WebCard {
             }
             // Native HTTP (no browser CORS). Reuses the platform's http_request;
             // the response returns via Event::NetworkResponses (handle below).
+            // GATED: the card's JS is untrusted, so the trusted Rust side enforces
+            // a host allowlist + SSRF guard before any request leaves the device.
             "http.fetch" => match FetchArgs::deserialize_json(args) {
                 Ok(a) => {
-                    let method = match a.method.as_deref().unwrap_or("GET").to_ascii_uppercase().as_str() {
-                        "POST" => HttpMethod::POST,
-                        "PUT" => HttpMethod::PUT,
-                        "DELETE" => HttpMethod::DELETE,
-                        "HEAD" => HttpMethod::HEAD,
-                        "PATCH" => HttpMethod::PATCH,
-                        _ => HttpMethod::GET,
-                    };
-                    let mut req = HttpRequest::new(a.url.clone(), method);
-                    if let Some(hs) = &a.headers {
-                        for h in hs {
-                            if h.len() == 2 {
-                                req.set_header(h[0].clone(), h[1].clone());
+                    if let Err(why) = fetch_host_allowed(&a.url) {
+                        log!("web_card http.fetch DENIED: {} ({})", a.url, why);
+                        self.reject(cx, call_id, &format!("http.fetch denied: {}", why));
+                    } else {
+                        let method = match a.method.as_deref().unwrap_or("GET").to_ascii_uppercase().as_str() {
+                            "POST" => HttpMethod::POST,
+                            "PUT" => HttpMethod::PUT,
+                            "DELETE" => HttpMethod::DELETE,
+                            "HEAD" => HttpMethod::HEAD,
+                            "PATCH" => HttpMethod::PATCH,
+                            _ => HttpMethod::GET,
+                        };
+                        let mut req = HttpRequest::new(a.url.clone(), method);
+                        if let Some(hs) = &a.headers {
+                            for h in hs {
+                                if h.len() == 2 {
+                                    req.set_header(h[0].clone(), h[1].clone());
+                                }
                             }
                         }
-                    }
-                    if let Some(b) = &a.body {
-                        if !b.is_empty() {
-                            req.set_string_body(b.clone());
+                        if let Some(b) = &a.body {
+                            if !b.is_empty() {
+                                req.set_string_body(b.clone());
+                            }
                         }
+                        let request_id = LiveId(0xF0C5_0000_0000_0000 ^ self.next_seq());
+                        self.pending.push((request_id, call_id));
+                        cx.http_request(request_id, req);
                     }
-                    let request_id = LiveId(0xF0C5_0000_0000_0000 ^ self.next_seq());
-                    self.pending.push((request_id, call_id));
-                    cx.http_request(request_id, req);
                 }
                 Err(e) => self.reject(cx, call_id, &format!("bad http.fetch args: {:?}", e)),
             },
+            // Open the OS share sheet (Android ACTION_SEND). Fire-and-forget —
+            // resolves immediately (no native round-trip needed).
+            "share" => match TextArg::deserialize_json(args) {
+                Ok(a) => {
+                    cx.share_text(&a.text);
+                    self.resolve_raw(cx, call_id, "{\"ok\":true}");
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad share args: {:?}", e)),
+            },
+            // Write text to the OS clipboard.
+            "clipboard.write" => match TextArg::deserialize_json(args) {
+                Ok(a) => {
+                    cx.copy_to_clipboard(&a.text);
+                    self.resolve_raw(cx, call_id, "{\"ok\":true}");
+                }
+                Err(e) => self.reject(cx, call_id, &format!("bad clipboard args: {:?}", e)),
+            },
+            // Default-deny: only registered tools are callable.
             other => self.reject(cx, call_id, &format!("unknown tool: {}", other)),
         }
     }
