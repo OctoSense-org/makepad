@@ -1320,6 +1320,18 @@ const SPLASH_PREFIX_VIEW: &str = "use mod.prelude.widgets.*View{height:Fit, ";
 /// Prefix for full-script mode: just imports, code must evaluate to a widget
 const SPLASH_PREFIX_SCRIPT: &str = "use mod.prelude.widgets.*\n";
 const SPLASH_EVAL_INSTRUCTION_LIMIT: usize = 200_000;
+/// Wall-clock budget for BUILDING a card, as opposed to the per-frame script
+/// work (`fn tick()`, callbacks) that `with_script_vm_id` budgets at 64ms.
+///
+/// A card build is one-shot, not frame work. An app-agent card runs tens of KB
+/// of DSL and cannot finish in 64ms — and because that budget sets soft ==
+/// hard there is no yield, so the eval bailed with "script time budget
+/// exceeded" and the card never rendered at all.
+///
+/// This does mean a heavy card can stall the frame for up to this long, once,
+/// while it builds. That is the trade being made: a visible hitch when a card
+/// arrives, instead of a card that never arrives.
+const SPLASH_BUILD_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
 /// How long the body must stop growing before a still-unrendered card is
 /// declared failed. Long enough to outlast a stalled network chunk, short
 /// enough that a dead card doesn't look like a hung app.
@@ -1330,8 +1342,8 @@ const SPLASH_FAILURE_ID_SALT: usize = 0x5f_a1_1e_d0;
 /// Shown in place of the blank view when a body cannot be parsed. Deliberately
 /// tiny and literal — it must not itself depend on anything that can fail.
 const SPLASH_FAILURE_CARD: &str = r#"SolidView{ width: Fill height: Fit flow: Down new_batch: true draw_bg.color: #ffffff padding: Inset{left: 16 top: 14 right: 16 bottom: 14}
-    Label{ text: "Card failed to render" draw_text.color: #000000 draw_text.text_style.font_size: 15 }
-    Label{ text: "The generated card DSL did not parse. See the Makepad log for the parse errors." draw_text.color: #6a6a6a draw_text.text_style.font_size: 11 margin: Inset{top: 6} }
+    Label{ width: Fill text: "Card failed to render" draw_text.color: #000000 draw_text.text_style.font_size: 15 }
+    Label{ width: Fill text: "The generated card did not evaluate — a syntax error, or a script that ran out of budget. See the Makepad log." draw_text.color: #6a6a6a draw_text.text_style.font_size: 11 margin: Inset{top: 6} }
 }"#;
 
 /// Detect whether Splash code is a full script (starts with `let`, `fn`,
@@ -1425,7 +1437,7 @@ impl Splash {
         // under this vm and mark the tree dirty so lookups can resolve them.
         let vm_id = self.vm_id;
         let self_uid = self.uid;
-        let new_view = cx.with_script_vm_id(vm_id, |vm| {
+        let new_view = cx.with_script_vm_id_budget(vm_id, SPLASH_BUILD_BUDGET, |vm| {
             crate::widget_async::inject_scoped_ui_global(vm, self_uid);
             let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
                 vm.eval_with_append_source(script_mod, &code, NIL.into())
@@ -1642,7 +1654,7 @@ impl Splash {
 
         let vm_id = self.vm_id;
         let self_uid = self.uid;
-        let new_view = cx.with_script_vm_id(vm_id, |vm| {
+        let new_view = cx.with_script_vm_id_budget(vm_id, SPLASH_BUILD_BUDGET, |vm| {
             crate::widget_async::inject_scoped_ui_global(vm, self_uid);
             let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
                 vm.eval_with_append_source(script_mod, &code, NIL.into())

@@ -68,6 +68,17 @@ pub enum AgentEvent {
         tool_input: String,
     },
 
+    /// The backend's authoritative full text for this turn, if it has one.
+    ///
+    /// `TextDelta` is a stream: a delta dropped in transit silently yields a
+    /// text that is short by exactly that chunk, with the surrounding bytes
+    /// glued together mid-token. Nothing downstream can tell — an app-card DSL
+    /// re-assembled that way is syntactically broken for reasons the model
+    /// never wrote. A backend that also receives the durably-stored message
+    /// (octos: `message/persisted`) emits it here so the consumer can prefer it
+    /// over its own accumulation.
+    TextAuthoritative { prompt_id: PromptId, text: String },
+
     /// Agent turn complete
     TurnComplete {
         prompt_id: PromptId,

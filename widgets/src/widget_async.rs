@@ -206,9 +206,34 @@ impl ScriptHandleGc for CxWidgetHandleGc {
     }
 }
 
+/// Wall-clock budget for a script run inside an isolated vm.
+///
+/// 64ms suits the per-frame work this was written for (`fn tick()`, button
+/// callbacks): overrunning a frame is worse than dropping the rest of the
+/// script. It is the wrong budget for the one-shot build of a card, which is
+/// not frame work — an app-agent card is tens of KB and blows straight through
+/// 64ms, and because `from_durations` is given soft == hard there is no yield,
+/// so the eval bails with "script time budget exceeded" and the card never
+/// renders at all.
+///
+/// `with_script_vm_id_budget` lets that one-shot path buy more time. The real
+/// fix is to make the soft deadline yield and resume on the next frame, but
+/// nothing currently resumes a paused thread — `TimeBudgetYield` just returns
+/// NIL — so that belongs in the vm scheduler, not at this call site.
+const FRAME_SCRIPT_BUDGET: std::time::Duration = std::time::Duration::from_millis(64);
+
 pub trait CxSplashVmExt {
     fn alloc_splash_vm(&mut self) -> SplashVmId;
     fn with_script_vm_id<R>(&mut self, vm_id: SplashVmId, f: impl FnOnce(&mut ScriptVm) -> R) -> R;
+    /// `with_script_vm_id` with an explicit wall-clock budget, for callers whose
+    /// work is one-shot rather than per-frame (building a card). See
+    /// `FRAME_SCRIPT_BUDGET` on the impl for why the default does not fit them.
+    fn with_script_vm_id_budget<R>(
+        &mut self,
+        vm_id: SplashVmId,
+        budget: std::time::Duration,
+        f: impl FnOnce(&mut ScriptVm) -> R,
+    ) -> R;
     fn with_script_vm_id_thread<R>(
         &mut self,
         vm_id: SplashVmId,
@@ -268,6 +293,15 @@ impl CxSplashVmExt for Cx {
     }
 
     fn with_script_vm_id<R>(&mut self, vm_id: SplashVmId, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
+        self.with_script_vm_id_budget(vm_id, FRAME_SCRIPT_BUDGET, f)
+    }
+
+    fn with_script_vm_id_budget<R>(
+        &mut self,
+        vm_id: SplashVmId,
+        budget: std::time::Duration,
+        f: impl FnOnce(&mut ScriptVm) -> R,
+    ) -> R {
         // Run on the already-active vm for the main vm OR a re-entrant call into
         // the currently-active isolated vm (e.g. a Splash `fn tick()` / callback
         // running in this vm re-enters here via a `ui.<id>.*` call). Removing an
@@ -293,11 +327,10 @@ impl CxSplashVmExt for Cx {
         self.script_vm = isolated.vm.take();
 
         let out = self.with_vm(|vm| {
-            let old_budget = vm.bx.run_budget.replace(ScriptRunBudget::from_durations(
-                std::time::Duration::from_millis(64),
-                std::time::Duration::from_millis(64),
-                512,
-            ));
+            let old_budget = vm
+                .bx
+                .run_budget
+                .replace(ScriptRunBudget::from_durations(budget, budget, 512));
             let out = f(vm);
             vm.bx.run_budget = old_budget;
             out
