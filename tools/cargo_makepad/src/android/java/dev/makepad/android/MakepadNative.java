@@ -68,6 +68,11 @@ public class MakepadNative {
     public native static void onComposerNewApp();
     public native static void onComposerSwitch();
 
+    // A runhtml web-card's JS called octos.invoke(tool, args) — bridged in from the
+    // WebView's "octos_native" JavascriptInterface. Rust dispatches the tool and
+    // resolves the card-side promise (callId) via evalSystemBrowserJs.
+    public native static void onSystemBrowserInvoke(long browserId, long callId, String tool, String args);
+
     // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
     // it; returns true if a QR was found (the caller then closes the scanner).
     public native static boolean onQrCameraFrame(byte[] luma, int width, int height);
