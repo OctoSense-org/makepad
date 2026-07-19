@@ -231,23 +231,33 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
         return { id: O.ytId(String(it.url || it.videoId || "")), t: O.strip(it.title || ""), ch: it.uploaderName || it.uploader || "", live: it.duration < 0 || it.isLive === true };
       }).filter(function (v) { return v.id; }).slice(0, 24);
     }
-    function one(url, proxy) {
+    function withTimeout(p, ms) { return Promise.race([p, new Promise(function (_, rej) { setTimeout(function () { rej("timeout"); }, ms); })]); }
+    // one instance via a transport: "native" (Rust HTTP, no CORS — reaches ANY
+    // instance, no third-party proxy), else browser "direct"/"proxy".
+    function one(url, mode) {
+      if (mode === "native") return withTimeout(H.getJSONn(url), 6000);
       var ac = window.AbortController ? new AbortController() : null, opt = ac ? { signal: ac.signal } : undefined;
       var to = setTimeout(function () { if (ac) ac.abort(); }, 5000);
-      return (proxy ? H.getJSONx(url, opt) : H.getJSON(url, opt)).then(function (d) { clearTimeout(to); return d; }, function (e) { clearTimeout(to); throw e; });
+      return (mode === "proxy" ? H.getJSONx(url, opt) : H.getJSON(url, opt)).then(function (d) { clearTimeout(to); return d; }, function (e) { clearTimeout(to); throw e; });
     }
-    function pass(proxy) {
+    function pass(mode) {
       var i = 0;
       function next() {
         if (i >= insts.length) return Promise.reject();
         var u = insts[i++] + path;
         // accept the first instance that returns a valid items array (empty = genuine
         // "no results", NOT a failure) — only fall through on request failure / bad shape.
-        return one(u, proxy).then(function (d) { return (d && Array.isArray(d.items)) ? norm(d) : next(); }, next);
+        return one(u, mode).then(function (d) { return (d && Array.isArray(d.items)) ? norm(d) : next(); }, next);
       }
       return next();
     }
-    return pass(false).catch(function () { return pass(true); }).catch(function () { return []; });
+    // Prefer NATIVE HTTP when the bridge is present (no CORS wall → the whole
+    // instance pool is usable and the allorigins proxy is out of the path);
+    // fall back to browser direct→proxy on desktop / no host bridge.
+    if (O.hasNative && O.hasNative()) {
+      return pass("native").catch(function () { return []; });
+    }
+    return pass("direct").catch(function () { return pass("proxy"); }).catch(function () { return []; });
   };
   O.oembed = function (id, cb) { fetch("https://noembed.com/embed?url=https://www.youtube.com/watch?v="+id).then(function(r){return r.json();}).then(function(j){ if(j&&j.title)cb({title:O.strip(j.title),author:j.author_name}); }).catch(function(){}); };
   O.setKebab = function (fn) { O._kebab = fn; };
