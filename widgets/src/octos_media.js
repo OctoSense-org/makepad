@@ -259,6 +259,42 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
     }
     return pass("direct").catch(function () { return pass("proxy"); }).catch(function () { return []; });
   };
+  /* related videos for a video — the official Data API dropped relatedToVideoId,
+     so try Piped /streams/{id}.relatedStreams (true related), and fall back to a
+     SEARCH by the video's channel (same-creator = relevant) since Piped's stream
+     extraction is far flakier than its search. Pass the video object {id,t,ch}
+     (or a bare id). Same native-first transport + instance fallback; resolves []. */
+  O.ytRelated = function (video) {
+    video = (typeof video === "string") ? { id: video } : (video || {});
+    var id = O.ytId(video.id) || video.id;
+    if (!id) return Promise.resolve([]);
+    var path = "/streams/" + encodeURIComponent(id), insts = O.ytSearchInstances, H = O.http;
+    function withTimeout(p, ms) { return Promise.race([p, new Promise(function (_, rej) { setTimeout(function () { rej("timeout"); }, ms); })]); }
+    function norm(d) {
+      return ((d && d.relatedStreams) || []).map(function (s) {
+        return { id: O.ytId(String(s.url || "")), t: O.strip(s.title || ""), ch: s.uploaderName || s.uploader || "", live: s.duration < 0 };
+      }).filter(function (v) { return v.id; }).slice(0, 20);
+    }
+    function one(url) {
+      if (O.hasNative && O.hasNative()) return withTimeout(H.getJSONn(url), 6000);
+      return H.getJSON(url).catch(function () { return H.getJSONx(url); });
+    }
+    function pass() {
+      var i = 0;
+      function next() {
+        if (i >= insts.length) return Promise.reject();
+        var u = insts[i++] + path;
+        return one(u).then(function (d) { return (d && Array.isArray(d.relatedStreams) && d.relatedStreams.length) ? norm(d) : next(); }, next);
+      }
+      return next();
+    }
+    function bySearch() {
+      var q = video.ch || video.t || "";
+      if (!q) return Promise.resolve([]);
+      return O.ytSearch(q).then(function (r) { return (r || []).filter(function (v) { return v.id !== id; }).slice(0, 20); });
+    }
+    return pass().then(function (r) { return (r && r.length) ? r : bySearch(); }, bySearch).catch(function () { return []; });
+  };
   O.oembed = function (id, cb) { fetch("https://noembed.com/embed?url=https://www.youtube.com/watch?v="+id).then(function(r){return r.json();}).then(function(j){ if(j&&j.title)cb({title:O.strip(j.title),author:j.author_name}); }).catch(function(){}); };
   O.setKebab = function (fn) { O._kebab = fn; };
 
