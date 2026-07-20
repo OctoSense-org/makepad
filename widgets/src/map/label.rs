@@ -136,6 +136,62 @@ pub fn extract_point_label(tags: &HashMap<String, String>, point: (f32, f32)) ->
     })
 }
 
+/// Point-of-interest label from a named amenity/shop/tourism node. Prefixes a
+/// category emoji so POIs read distinctly from street names in the nav view.
+pub fn extract_poi_label(tags: &HashMap<String, String>, point: (f32, f32)) -> Option<TileLabel> {
+    let name = tags.get("name")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let (cat, glyph) = if let Some(a) = tags.get("amenity") {
+        let g = match a.as_str() {
+            "restaurant" | "fast_food" | "food_court" => "🍴",
+            "cafe" => "☕",
+            "bar" | "pub" | "biergarten" => "🍺",
+            "fuel" => "⛽",
+            "bank" | "atm" => "🏦",
+            "pharmacy" => "💊",
+            "hospital" | "clinic" | "doctors" => "🏥",
+            "school" | "university" | "college" => "🎓",
+            "parking" => "🅿️",
+            "cinema" | "theatre" => "🎬",
+            "place_of_worship" => "⛪",
+            "fire_station" => "🚒",
+            "police" => "🚓",
+            _ => "📍",
+        };
+        (a.as_str(), g)
+    } else if let Some(s) = tags.get("shop") {
+        let g = match s.as_str() {
+            "supermarket" | "convenience" | "grocery" => "🛒",
+            "bakery" => "🥐",
+            "clothes" | "shoes" | "fashion" => "👗",
+            "hairdresser" | "beauty" => "💇",
+            "car" | "car_repair" => "🚗",
+            _ => "🛍️",
+        };
+        (s.as_str(), g)
+    } else if let Some(t) = tags.get("tourism") {
+        let g = match t.as_str() {
+            "hotel" | "motel" | "hostel" | "guest_house" => "🏨",
+            "museum" | "gallery" => "🏛️",
+            "attraction" | "viewpoint" | "artwork" => "🎡",
+            _ => "📸",
+        };
+        (t.as_str(), g)
+    } else {
+        return None;
+    };
+    let _ = cat;
+    Some(TileLabel {
+        text: format!("{glyph} {name}"),
+        priority: 3, // below streets (1-2) so adjacent road names win the cap
+        source_layer: "poi".to_string(),
+        road_kind: String::new(),
+        path_points: point_label_path(point),
+    })
+}
+
 pub fn compact_tile_labels(labels: &mut Vec<TileLabel>) {
     let mut by_street = HashMap::<(String, String), (f32, TileLabel)>::new();
     for label in labels.drain(..) {

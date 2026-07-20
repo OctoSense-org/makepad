@@ -104,6 +104,14 @@ pub struct AndroidComposerNewApp;
 #[derive(Clone, Debug, Default)]
 pub struct AndroidComposerSwitch;
 
+/// The native Android floating composer's collapsed "+" FAB was tapped to
+/// UNFOLD it. The Java overlay already swaps the FAB for the input pill and
+/// raises the keyboard; this action lets the app mark `composer_shown = true`
+/// so its state matches (and a later `sync_composer` won't re-fold the pill the
+/// user just opened). Posted as a bare action; only ever posted on Android.
+#[derive(Clone, Debug, Default)]
+pub struct AndroidComposerExpand;
+
 /// The composer's QR scanner decoded a payload (the JSON LLM-provisioning config).
 /// The app applies it via `login::apply_provision_config_json`.
 #[derive(Clone, Debug, Default)]

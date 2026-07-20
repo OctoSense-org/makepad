@@ -2,11 +2,13 @@ use super::geometry::*;
 use super::label::*;
 use super::style::*;
 use super::tile::*;
+use crate::makepad_draw::vector::{Tessellator, VVertex, VectorPath};
 use crate::{
-    makepad_derive_widget::*, makepad_draw::*, widget::*, DrawRotatedText, DrawVector,
-    PathGlyphInstance, PathTextPlacement, WidgetMatchEvent,
+    makepad_derive_widget::*, makepad_draw::*, widget::*, widget_async::ScriptAsyncResult,
+    DrawRotatedText, DrawVector, PathGlyphInstance, PathTextPlacement, WidgetMatchEvent,
 };
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::fs;
 use std::path::Path;
 
@@ -22,13 +24,87 @@ script_mod! {
         ..mod.draw.DrawVector
         map_scale: uniform(vec2(1.0, 1.0))
         map_offset: uniform(vec2(0.0, 0.0))
+        // --- navigation (heading-up) projection ---
+        // nav_mode: 0 = off (flat map), 1 = 3D first-person chase view (pinhole
+        // ground-plane projection, straight horizon), 2 = 2D heading-up.
+        // nav_anchor: widget-px position of the vehicle on the FLAT map (the map
+        // is centered on it). nav_rot: (sin, cos) of the bearing. All the pinhole
+        // params are in the same px units as the flat map at the current zoom.
+        nav_mode: uniform(0.0)
+        nav_anchor: uniform(vec2(0.0, 0.0))
+        nav_rot: uniform(vec2(0.0, 1.0))
+        // nav_cam: (cam_height_px, sin(pitch), cos(pitch), tan(hfov/2)) — trig
+        // is precomputed on the CPU so the vertex shader needs no sin/cos/tan.
+        nav_cam: uniform(vec4(40.0, 0.310, 0.951, 0.76))
+        // nav_screen: widget rect (x, y, w, h)
+        nav_screen: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        // nav_misc: (chase_px: camera sits this far behind the car,
+        //            maxg_px: far haze clip, car2d_row_px: car row in 2D, tan(vfov/2))
+        nav_misc: uniform(vec4(90.0, 500.0, 600.0, 0.533))
+        // haze tint the far ground fades into (matches the sky/背景)
+        nav_haze: uniform(vec4(0.847, 0.890, 0.929, 0.0))
 
         vertex: fn() {
             let pos = vec2(self.geom.x, self.geom.y);
-            let transformed = pos * self.map_scale + self.map_offset;
+            let flat = pos * self.map_scale + self.map_offset;
+            // heading-up frame around the vehicle: ahead(+) along bearing, cross(+) right
+            let rel = flat - self.nav_anchor;
+            let ahead = rel.x * self.nav_rot.x - rel.y * self.nav_rot.y;
+            let cross = rel.x * self.nav_rot.y + rel.y * self.nav_rot.x;
+            let a = ahead + self.nav_misc.x;
+            // TRUE pinhole ground-plane camera (Codex 2c). Camera at height h,
+            // pitched down; a = forward ground distance from the camera. x/y are
+            // rational functions of the SHARED depth z_cam, so a ground-plane
+            // triangle maps EXACTLY to a screen triangle (straight edges) — no
+            // densification, no atan/lat_a warp that only approximated it. Trig
+            // is precomputed: nav_cam = (h, sinP, cosP, tan(hfov/2)),
+            // nav_misc.w = tan(vfov/2).
+            let z_cam = a * self.nav_cam.z + self.nav_cam.x * self.nav_cam.y;
+            let y_cam = a * self.nav_cam.y - self.nav_cam.x * self.nav_cam.z;
+            // Near plane = a z_cam floor set BELOW the nearest visible ground, so
+            // all on-screen geometry is exact and only genuinely behind-camera
+            // vertices clamp — those drop to a clean below-screen curtain
+            // (connected, never flipping). The GPU does perspective via w=z_cam.
+            let near3 = self.nav_cam.x * 0.6;
+            let behind = 1.0 - step(near3, z_cam);
+            let zc = max(z_cam, near3);
+            let ndc_x = cross / (zc * self.nav_cam.w);
+            let ndc_y = y_cam / (zc * self.nav_misc.w);
+            let p3d = vec2(
+                mix(
+                    self.nav_screen.x + self.nav_screen.z * 0.5 * (1.0 + ndc_x),
+                    self.nav_screen.x + self.nav_screen.z * 0.5 + cross * 0.30,
+                    behind
+                ),
+                mix(
+                    self.nav_screen.y + self.nav_screen.w * 0.5 * (1.0 - ndc_y),
+                    self.nav_screen.y + self.nav_screen.w * 1.6,
+                    behind
+                )
+            );
+            let p2d = vec2(
+                self.nav_screen.x + self.nav_screen.z * 0.5 + cross,
+                self.nav_screen.y + self.nav_misc.z - ahead
+            );
+            let in_nav = step(0.5, self.nav_mode);
+            let in_2d = step(1.5, self.nav_mode);
+            let transformed = mix(flat, mix(p3d, p2d, in_2d), in_nav);
+            let haze_t = in_nav * (1.0 - in_2d)
+                * pow(clamp(a / self.nav_misc.y, 0.0, 1.0), 2.6) * 0.9;
 
             self.v_tcoord = vec2(self.geom.u, self.geom.v);
             self.v_color = vec4(self.geom.color_r, self.geom.color_g, self.geom.color_b, self.geom.color_a);
+            // atmospheric haze: far ground dissolves into the horizon (premul colors)
+            self.v_color = mix(
+                self.v_color,
+                vec4(
+                    self.nav_haze.x * self.v_color.w,
+                    self.nav_haze.y * self.v_color.w,
+                    self.nav_haze.z * self.v_color.w,
+                    self.v_color.w
+                ),
+                haze_t
+            );
             self.v_stroke_mult = self.geom.stroke_mult;
             self.v_stroke_dist = self.geom.stroke_dist;
             self.v_shape_id = self.geom.shape_id;
@@ -66,6 +142,14 @@ script_mod! {
             let shifted = transformed + self.draw_list.view_shift;
             self.v_world = shifted;
 
+            // Flat-space clip reject: honor it for flat/2D only, and use the
+            // stock offscreen sentinel (2,2,2,1) — NOT (0,0,0,0), which is
+            // degenerate. In 3D SKIP it: the flat radius is non-conservative
+            // once the near field magnifies an edge, so zeroing one vertex of a
+            // triangle that still crosses the view deforms/vanishes it (Codex);
+            // the pinhole instead maps the frustum into the rect and the GPU
+            // clips behind-camera geometry via w.
+            let in3d = in_nav * (1.0 - in_2d);
             let cr = self.geom.clip_radius * max(self.map_scale.x, self.map_scale.y);
             let clip = vec4(
                 max(self.draw_clip.x, self.draw_list.view_clip.x - self.draw_list.view_shift.x),
@@ -74,16 +158,23 @@ script_mod! {
                 min(self.draw_clip.w, self.draw_list.view_clip.w - self.draw_list.view_shift.y)
             )
 
-            if transformed.x + cr < clip.x || transformed.y + cr < clip.y
-                || transformed.x - cr > clip.z || transformed.y - cr > clip.w {
-                self.vertex_pos = vec4(0.0, 0.0, 0.0, 0.0);
+            if in3d < 0.5 && (transformed.x + cr < clip.x || transformed.y + cr < clip.y
+                || transformed.x - cr > clip.z || transformed.y - cr > clip.w) {
+                self.vertex_pos = vec4(2.0, 2.0, 2.0, 1.0);
                 return
             }
 
+            // Keep w = 1 (LINEAR screen-space varying interpolation). The pinhole
+            // already gives each vertex its exact screen position, and a
+            // ground-plane triangle maps to a straight-edged screen triangle
+            // (perspective preserves lines) — so positions are exact WITHOUT a
+            // w-divide. A perspective w-divide would instead make v_stroke_dist /
+            // v_world interpolate perspective-correct, distorting the screen-space
+            // stroke AA and SERRATING the route ribbon at steep view angles.
             let world = self.draw_list.view_transform * vec4(
-                shifted.x
-                shifted.y
-                self.draw_depth + self.draw_call.zbias + self.geom.zbias
+                shifted.x,
+                shifted.y,
+                self.draw_depth + self.draw_call.zbias + self.geom.zbias,
                 1.
             );
             self.v_world_clip = world;
@@ -223,6 +314,435 @@ script_mod! {
 
 // --- Draw shaders ---
 
+/// Reference zoom the navigation route ribbon geometry is tessellated at.
+/// Drawn with scale 2^(view_zoom - NAV_REF_Z), exactly like tile geometry.
+const NAV_REF_Z: u32 = 16;
+
+/// Ready tile geometry shared across MapView instances on the UI thread.
+/// Splash cards that animate re-evaluate ~1 Hz and REBUILD their widget tree,
+/// so a per-instance tile cache would refetch + retessellate every second
+/// (visible flicker). The owning `Geometry` lives here; instances hold
+/// non-owning `Geometry::new_borrowed` handles.
+struct SharedReadyTile {
+    fill: Option<Geometry>,
+    stroke: Option<Geometry>,
+    feature_count: usize,
+    labels: Vec<TileLabel>,
+    last_used: u64,
+}
+
+thread_local! {
+    static NAV_TILE_STORE: std::cell::RefCell<HashMap<TileKey, SharedReadyTile>> =
+        std::cell::RefCell::new(HashMap::new());
+    static NAV_TILE_STORE_TICK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // In-flight network requests, GLOBAL: Splash cards rebuild their widget
+    // tree ~1 Hz, and Overpass takes seconds — a per-instance pending map
+    // would drop every response (the requester is gone by arrival) and then
+    // re-request each second: a self-inflicted request storm. Any live
+    // instance can claim a response via this map.
+    static NAV_PENDING: std::cell::RefCell<HashMap<LiveId, PendingTileRequest>> =
+        std::cell::RefCell::new(HashMap::new());
+    // Per-tile request throttle (sim-clock seconds of the last attempt).
+    static NAV_REQ_RECENT: std::cell::RefCell<HashMap<TileKey, f64>> =
+        std::cell::RefCell::new(HashMap::new());
+    // Global request-id counter so ids never collide across instances.
+    static NAV_REQ_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+thread_local! {
+    // Car position in world px at the request zoom — set every nav draw; used
+    // for distance-based store eviction (keep what's near the drive).
+    static NAV_DRAW_CENTER: std::cell::Cell<(u32, f64, f64)> =
+        const { std::cell::Cell::new((0, 0.0, 0.0)) };
+}
+
+/// Collect ALL loaded tiles at `zoom` within `radius` world px of the center,
+/// straight from the shared store. This is the nav draw list: once a tile is
+/// loaded it is DRAWN every frame it is anywhere near the viewport —
+/// fetch/instance bookkeeping can never hide loaded content.
+fn nav_store_draw_ids(
+    zoom: u32,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+) -> (
+    Vec<(TileKey, GeometryId)>,
+    Vec<(TileKey, GeometryId)>,
+) {
+    let mut keys: Vec<(TileKey, Option<GeometryId>, Option<GeometryId>)> = Vec::new();
+    NAV_TILE_STORE.with(|store| {
+        let store = store.borrow();
+        for (k, t) in store.iter() {
+            if k.z != zoom {
+                continue;
+            }
+            let cx_ = (k.x as f64 + 0.5) * TILE_SIZE;
+            let cy_ = (k.y as f64 + 0.5) * TILE_SIZE;
+            if (cx_ - center_x).abs() > radius || (cy_ - center_y).abs() > radius {
+                continue;
+            }
+            keys.push((
+                *k,
+                t.fill.as_ref().map(|g| g.geometry_id()),
+                t.stroke.as_ref().map(|g| g.geometry_id()),
+            ));
+        }
+    });
+    keys.sort_unstable_by_key(|(k, _, _)| (k.y, k.x));
+    let fills = keys
+        .iter()
+        .filter_map(|(k, f, _)| f.map(|g| (*k, g)))
+        .collect();
+    let strokes = keys
+        .iter()
+        .filter_map(|(k, _, s)| s.map(|g| (*k, g)))
+        .collect();
+    (fills, strokes)
+}
+
+/// Collect street/place labels from stored tiles near the car, as
+/// (world_px_x, world_px_y, text, priority) at `zoom`. One representative
+/// point per label (path midpoint), deduped by text (nearest wins). For the
+/// nav view's upright projected labels.
+fn nav_store_labels(
+    zoom: u32,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+) -> Vec<(f64, f64, String, u8)> {
+    let mut best: HashMap<String, (f64, f64, u8, f64)> = HashMap::new();
+    NAV_TILE_STORE.with(|store| {
+        let store = store.borrow();
+        for (k, t) in store.iter() {
+            if k.z != zoom || t.labels.is_empty() {
+                continue;
+            }
+            let ox = k.x as f64 * TILE_SIZE;
+            let oy = k.y as f64 * TILE_SIZE;
+            for lab in &t.labels {
+                if lab.path_points.is_empty() {
+                    continue;
+                }
+                let mid = &lab.path_points[lab.path_points.len() / 2];
+                let wx = ox + mid.0 as f64;
+                let wy = oy + mid.1 as f64;
+                let dx = wx - center_x;
+                let dy = wy - center_y;
+                if dx.abs() > radius || dy.abs() > radius {
+                    continue;
+                }
+                let d2 = dx * dx + dy * dy;
+                match best.get(&lab.text) {
+                    Some((_, _, _, pd)) if *pd <= d2 => {}
+                    _ => {
+                        best.insert(lab.text.clone(), (wx, wy, lab.priority, d2));
+                    }
+                }
+            }
+        }
+    });
+    let mut out: Vec<(f64, f64, String, u8)> = best
+        .into_iter()
+        .map(|(text, (x, y, pri, _))| (x, y, text, pri))
+        .collect();
+    // nearest-to-camera first isn't needed; sort by priority so majors win the
+    // per-frame cap
+    out.sort_by_key(|(_, _, _, pri)| *pri);
+    out
+}
+
+fn nav_pending_insert(id: LiveId, pending: PendingTileRequest) {
+    NAV_PENDING.with(|p| p.borrow_mut().insert(id, pending));
+}
+
+fn nav_pending_take(id: &LiveId) -> Option<PendingTileRequest> {
+    NAV_PENDING.with(|p| p.borrow_mut().remove(id))
+}
+
+fn nav_pending_len() -> usize {
+    NAV_PENDING.with(|p| p.borrow().len())
+}
+
+fn nav_next_request_id() -> LiveId {
+    NAV_REQ_ID.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1).max(1));
+        LiveId(v)
+    })
+}
+
+/// True if this tile was requested within the last `window` seconds
+/// (and records now as the latest attempt otherwise).
+fn nav_req_throttled(key: TileKey, window: f64) -> bool {
+    // a request for this tile is already in flight — never double-request
+    let in_flight = NAV_PENDING.with(|p| p.borrow().values().any(|q| q.tile_key == key));
+    if in_flight {
+        return true;
+    }
+    let now = crate::splash::sim_clock_secs();
+    NAV_REQ_RECENT.with(|r| {
+        let mut r = r.borrow_mut();
+        if let Some(last) = r.get(&key) {
+            if now - last < window {
+                return true;
+            }
+        }
+        r.insert(key, now);
+        if r.len() > 4096 {
+            r.retain(|_, t| now - *t < 300.0);
+        }
+        false
+    })
+}
+
+thread_local! {
+    // Tile parse workers, GLOBAL: a per-instance pool + channel meant every
+    // 1 Hz Splash card rebuild spawned (and dropped) a whole thread pool each
+    // second, and any parse finishing after its dispatching instance died was
+    // silently lost — tiles appeared, vanished on rebuild, refilled late.
+    static NAV_TILE_WORKERS: std::cell::RefCell<
+        Option<(TagThreadPool<TileKey>, ToUIReceiver<TileWorkerMessage>)>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn nav_workers_ensure(cx: &mut Cx) {
+    NAV_TILE_WORKERS.with(|w| {
+        let mut w = w.borrow_mut();
+        if w.is_none() {
+            let num_threads = cx.cpu_cores().max(3) - 2;
+            *w = Some((TagThreadPool::new(cx, num_threads), ToUIReceiver::default()));
+        }
+    });
+}
+
+fn nav_workers_sender() -> ToUISender<TileWorkerMessage> {
+    NAV_TILE_WORKERS.with(|w| w.borrow().as_ref().expect("nav workers").1.sender())
+}
+
+fn nav_workers_execute(tag: TileKey, job: impl FnOnce(TileKey) + Send + 'static) {
+    NAV_TILE_WORKERS.with(|w| {
+        w.borrow()
+            .as_ref()
+            .expect("nav workers")
+            .0
+            .execute_rev(tag, job)
+    });
+}
+
+fn nav_workers_try_recv() -> Option<TileWorkerMessage> {
+    NAV_TILE_WORKERS.with(|w| {
+        w.borrow()
+            .as_ref()
+            .and_then(|(_, rx)| rx.try_recv().ok())
+    })
+}
+
+/// Decoded + tessellated route shared across the 1 Hz card rebuilds — the
+/// owning ribbon Geometry lives here; instances borrow it. Keyed by the
+/// polyline content hash.
+struct SharedNavRoute {
+    geom: Option<Geometry>,
+    origin: (f64, f64), // world px at NAV_REF_Z the geometry is rebased to
+    pts: Rc<Vec<Vec2d>>,
+    cum: Rc<Vec<f64>>,
+}
+
+thread_local! {
+    static NAV_ROUTE_STORE: std::cell::RefCell<HashMap<u64, SharedNavRoute>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Adopt a shared ready tile as a per-instance TileEntry (borrowed handles).
+fn nav_store_adopt(key: &TileKey, frame_counter: u64) -> Option<TileEntry> {
+    NAV_TILE_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let shared = store.get_mut(key)?;
+        let tick = NAV_TILE_STORE_TICK.with(|t| {
+            let v = t.get() + 1;
+            t.set(v);
+            v
+        });
+        shared.last_used = tick;
+        Some(TileEntry {
+            state: TileLoadState::Ready {
+                fill_geometry: shared
+                    .fill
+                    .as_ref()
+                    .map(|g| Geometry::new_borrowed(g.geometry_id())),
+                stroke_geometry: shared
+                    .stroke
+                    .as_ref()
+                    .map(|g| Geometry::new_borrowed(g.geometry_id())),
+                feature_count: shared.feature_count,
+                labels: shared.labels.clone(),
+            },
+            last_used: frame_counter,
+            attempts: 0,
+        })
+    })
+}
+
+/// Store owning geometry in the shared store (evicting LRU beyond a cap) and
+/// return a borrowed-handle TileEntry for the calling instance.
+fn nav_store_insert(
+    key: TileKey,
+    fill: Option<Geometry>,
+    stroke: Option<Geometry>,
+    feature_count: usize,
+    labels: Vec<TileLabel>,
+    frame_counter: u64,
+) -> TileEntry {
+    let entry = TileEntry {
+        state: TileLoadState::Ready {
+            fill_geometry: fill
+                .as_ref()
+                .map(|g| Geometry::new_borrowed(g.geometry_id())),
+            stroke_geometry: stroke
+                .as_ref()
+                .map(|g| Geometry::new_borrowed(g.geometry_id())),
+            feature_count,
+            labels: labels.clone(),
+        },
+        last_used: frame_counter,
+        attempts: 0,
+    };
+    NAV_TILE_STORE.with(|store| {
+        let mut store = store.borrow_mut();
+        let tick = NAV_TILE_STORE_TICK.with(|t| {
+            let v = t.get() + 1;
+            t.set(v);
+            v
+        });
+        store.insert(
+            key,
+            SharedReadyTile {
+                fill,
+                stroke,
+                feature_count,
+                labels,
+                last_used: tick,
+            },
+        );
+        if store.len() > 1400 {
+            // Evict FARTHEST from the drive first (never what's near the car —
+            // loaded content close to the viewport must not vanish). Falls
+            // back to LRU when no nav draw has run yet.
+            let (cz, cx_, cy_) = NAV_DRAW_CENTER.with(|c| c.get());
+            let mut ranked: Vec<(u64, TileKey)> = store
+                .iter()
+                .map(|(k, v)| {
+                    let rank = if cz != 0 {
+                        if k.z == cz {
+                            let dx = (k.x as f64 + 0.5) * TILE_SIZE - cx_;
+                            let dy = (k.y as f64 + 0.5) * TILE_SIZE - cy_;
+                            (dx * dx + dy * dy) as u64
+                        } else {
+                            u64::MAX / 2
+                        }
+                    } else {
+                        u64::MAX - v.last_used
+                    };
+                    (rank, *k)
+                })
+                .collect();
+            ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            for (_, k) in ranked.into_iter().take(48) {
+                store.remove(&k);
+            }
+        }
+    });
+    entry
+}
+
+/// Decode a Google/OSRM polyline5 string into (lat, lon) pairs.
+fn decode_polyline5(encoded: &str) -> Vec<(f64, f64)> {
+    let bytes = encoded.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    let (mut lat, mut lon): (i64, i64) = (0, 0);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let decode_one = |i: &mut usize| -> Option<i64> {
+            let (mut shift, mut result): (u32, i64) = (0, 0);
+            loop {
+                if *i >= bytes.len() {
+                    return None;
+                }
+                let b = bytes[*i] as i64 - 63;
+                *i += 1;
+                if b < 0 {
+                    return None;
+                }
+                result |= (b & 0x1f) << shift;
+                shift += 5;
+                if b < 0x20 {
+                    break;
+                }
+            }
+            Some(if result & 1 != 0 {
+                !(result >> 1)
+            } else {
+                result >> 1
+            })
+        };
+        let Some(dlat) = decode_one(&mut i) else { break };
+        let Some(dlon) = decode_one(&mut i) else { break };
+        lat += dlat;
+        lon += dlon;
+        out.push((lat as f64 * 1e-5, lon as f64 * 1e-5));
+    }
+    out
+}
+
+fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let (la1, lo1, la2, lo2) = (
+        lat1.to_radians(),
+        lon1.to_radians(),
+        lat2.to_radians(),
+        lon2.to_radians(),
+    );
+    let a = ((la2 - la1) / 2.0).sin().powi(2)
+        + la1.cos() * la2.cos() * ((lo2 - lo1) / 2.0).sin().powi(2);
+    6371000.0 * 2.0 * a.sqrt().asin()
+}
+
+/// Meters per world pixel at `zoom` and latitude (256px web-mercator tiles).
+fn meters_per_world_px(lat_deg: f64, zoom: f64) -> f64 {
+    40075016.686 * lat_deg.to_radians().cos() / tile_world_size_zoom(zoom)
+}
+
+/// Latitude (degrees) of a normalized web-mercator y.
+fn normalized_y_to_lat(y: f64) -> f64 {
+    let n = std::f64::consts::PI * (1.0 - 2.0 * y);
+    n.sinh().atan().to_degrees()
+}
+
+/// Per-frame navigation-projection parameters pushed into the DrawMapVector
+/// shader. `mode` 0 = flat map, 1 = 3D chase FPV, 2 = 2D heading-up.
+#[derive(Clone, Copy, Debug)]
+pub struct NavShaderParams {
+    pub mode: f32,
+    pub anchor: Vec2f,
+    pub rot: Vec2f,   // (sin bearing, cos bearing)
+    pub cam: [f32; 4],  // cam_h_px, pitch, vfov/2, tan(hfov/2)
+    pub screen: [f32; 4], // widget rect x,y,w,h
+    pub misc: [f32; 4],  // chase_px, maxg_px, car2d_row_px, 0
+    pub haze: [f32; 4],  // rgb + pad
+}
+
+impl Default for NavShaderParams {
+    fn default() -> Self {
+        Self {
+            mode: 0.0,
+            anchor: vec2(0.0, 0.0),
+            rot: vec2(0.0, 1.0),
+            cam: [40.0, 0.315, 0.49, 0.76],
+            screen: [0.0; 4],
+            misc: [90.0, 500.0, 600.0, 0.0],
+            haze: [0.847, 0.890, 0.929, 0.0],
+        }
+    }
+}
+
 #[derive(Script, ScriptHook, Debug)]
 #[repr(C)]
 pub struct DrawMapVector {
@@ -232,6 +752,8 @@ pub struct DrawMapVector {
     pub map_scale: Vec2f,
     #[rust(vec2(0.0, 0.0))]
     pub map_offset: Vec2f,
+    #[rust(NavShaderParams::default())]
+    pub nav: NavShaderParams,
 }
 
 impl DrawMapVector {
@@ -254,6 +776,30 @@ impl DrawMapVector {
             live_id!(map_offset),
             &[map_offset.x, map_offset.y],
         );
+        let nav = self.nav;
+        self.draw_super
+            .draw_vars
+            .set_uniform(cx.cx, live_id!(nav_mode), &[nav.mode]);
+        self.draw_super.draw_vars.set_uniform(
+            cx.cx,
+            live_id!(nav_anchor),
+            &[nav.anchor.x, nav.anchor.y],
+        );
+        self.draw_super
+            .draw_vars
+            .set_uniform(cx.cx, live_id!(nav_rot), &[nav.rot.x, nav.rot.y]);
+        self.draw_super
+            .draw_vars
+            .set_uniform(cx.cx, live_id!(nav_cam), &nav.cam);
+        self.draw_super
+            .draw_vars
+            .set_uniform(cx.cx, live_id!(nav_screen), &nav.screen);
+        self.draw_super
+            .draw_vars
+            .set_uniform(cx.cx, live_id!(nav_misc), &nav.misc);
+        self.draw_super
+            .draw_vars
+            .set_uniform(cx.cx, live_id!(nav_haze), &nav.haze);
         self.draw_super.draw_vars.geometry_id = Some(geometry_id);
         cx.new_draw_call(&self.draw_super.draw_vars);
         if self.draw_super.draw_vars.can_instance() {
@@ -311,6 +857,68 @@ pub struct MapView {
     #[live(true)]
     use_local_mbtiles: bool,
 
+    // --- turn-by-turn navigation mode ---
+    // "" = normal map; "3d" = first-person chase view (heading-up, pinhole
+    // ground projection); "2d" = top-down heading-up. The vehicle follows
+    // `nav_polyline` (OSRM polyline5) at `nav_speed_mph`, looping every
+    // `nav_period` seconds on the same clock as `sys.simsecs` so DSL overlays
+    // (banner countdown etc.) stay in lockstep with the map.
+    #[live]
+    nav_mode: ArcStringMut,
+    #[live]
+    nav_polyline: ArcStringMut,
+    #[live(92.0)]
+    nav_period: f64,
+    #[live(34.0)]
+    nav_speed_mph: f64,
+    #[live(56.0)]
+    nav_cam_h: f64, // camera height above ground, meters — higher vantage so
+    // near-field features stream past more gently at speed (less "too rapid")
+    #[live(0.37)]
+    nav_pitch: f64, // camera pitch below horizon, radians (steeper to hold the
+    // horizon in place after raising the camera)
+    #[live(0.98)]
+    nav_vfov: f64, // vertical field of view, radians
+    #[live(1.30)]
+    nav_hfov: f64, // horizontal field of view, radians
+    #[live(800.0)]
+    nav_maxg: f64, // far haze clip, meters
+    #[live(0.62)]
+    nav_carv: f64, // vehicle screen row in 3D (fraction of height)
+    #[live(0.60)]
+    nav_carv2d: f64, // vehicle screen row in 2D heading-up
+    #[live(15.0)]
+    nav_route_width: f64, // route ribbon core width, ground meters
+
+    #[rust]
+    nav_pts: Rc<Vec<Vec2d>>, // decoded route, normalized world coords
+    #[rust]
+    nav_cum: Rc<Vec<f64>>, // cumulative route meters
+    #[rust]
+    nav_poly_hash: u64,
+    #[rust]
+    nav_route_geom: Option<Geometry>,
+    #[rust]
+    nav_route_origin: (f64, f64),
+    // labels drawn last frame — kept STICKY so the on-screen set doesn't
+    // flicker frame-to-frame (the recompute/dedup/overlap order was flipping
+    // which names showed each frame, which read as text "vanishing").
+    #[rust]
+    nav_labels_shown: HashSet<String>,
+    // candidate labels (world_x, world_y, text, priority), refreshed a few Hz
+    // (the store scan + string clones are too costly to redo every 60fps frame)
+    #[rust]
+    nav_labels_cache: Vec<(f64, f64, String, u8)>,
+    // low-pass smoothed camera heading (radians) so turns rotate the map/ribbon
+    // gently instead of whipping around (the abrupt swing read as the ribbon
+    // vanishing from the bottom mid-turn)
+    #[rust]
+    nav_bearing: f64,
+    #[rust]
+    nav_bearing_init: bool,
+    #[rust]
+    nav_next_frame: NextFrame,
+
     #[rust]
     center_norm: Vec2d,
     #[rust]
@@ -319,10 +927,24 @@ pub struct MapView {
     drag_start_abs: Option<Vec2d>,
     #[rust]
     drag_start_center_norm: Vec2d,
+    // --- nav-mode touch gestures (pinch-zoom / pan) + recenter ---
+    // The card's configured nav zoom, captured once, so the recenter button can
+    // restore it after the user pinches/pans.
+    #[rust]
+    nav_home_zoom: f64,
+    // Normalized center offset from the car (0,0 = follow the car). Single-finger
+    // drag accumulates it; recenter clears it.
+    #[rust]
+    nav_pan: Vec2d,
+    // Active touches (digit LiveId, abs-pos) for 1-finger pan vs 2-finger pinch.
+    #[rust]
+    nav_touches: Vec<(LiveId, Vec2d)>,
+    // (finger distance, zoom) captured when the 2nd finger lands — the pinch base.
+    #[rust]
+    nav_pinch_base: Option<(f64, f64)>,
     #[rust]
     tiles: HashMap<TileKey, TileEntry>,
     #[rust]
-    request_to_tile: HashMap<LiveId, PendingTileRequest>,
     #[rust]
     next_request_id: u64,
     #[rust]
@@ -336,9 +958,6 @@ pub struct MapView {
     #[rust]
     local_source_missing_logged: bool,
     #[rust]
-    tile_worker_rx: ToUIReceiver<TileWorkerMessage>,
-    #[rust]
-    tile_thread_pool: Option<TagThreadPool<TileKey>>,
     #[rust]
     local_requested_tiles: HashSet<TileKey>,
     #[rust]
@@ -429,6 +1048,48 @@ impl ScriptHook for MapView {
 }
 
 impl Widget for MapView {
+    // `ui.<id>.set_nav_polyline("<polyline5>")` — push the OSRM route into the
+    // MapView from a card's `fn tick()` without re-evaluating the card. Lets a
+    // zero-rebuild nav card feed the route once it loads (empty/unchanged is a
+    // no-op; ensure_nav_route's content-hash guard tessellates only on change).
+    fn script_call(
+        &mut self,
+        vm: &mut ScriptVm,
+        method: LiveId,
+        args: ScriptValue,
+    ) -> ScriptAsyncResult {
+        if method == live_id!(set_nav_polyline) {
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+                if !value.is_err() {
+                    let s = vm.bx.heap.temp_string_with(|heap, out| {
+                        heap.cast_to_string(value, out);
+                        out.to_string()
+                    });
+                    if !s.trim().is_empty() && s.as_str() != self.nav_polyline.as_ref() {
+                        self.nav_polyline.as_mut_empty().push_str(&s);
+                        vm.with_cx_mut(|cx| self.redraw(cx));
+                    }
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        // `ui.<id>.set_nav_recenter(...)` — the recenter button: drop the user's
+        // pan + pinch and snap back to following the car at the card's zoom.
+        if method == live_id!(set_nav_recenter) {
+            self.nav_pan = dvec2(0.0, 0.0);
+            if self.nav_home_zoom > 0.0 {
+                self.zoom = self.nav_home_zoom;
+            }
+            self.nav_pinch_base = None;
+            self.nav_touches.clear();
+            vm.with_cx_mut(|cx| self.redraw(cx));
+            return ScriptAsyncResult::Return(NIL);
+        }
+        ScriptAsyncResult::MethodNotFound
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.handle_tile_worker_messages(cx);
         self.widget_match_event(cx, event, scope);
@@ -437,6 +1098,63 @@ impl Widget for MapView {
             if ke.key_code == KeyCode::KeyT {
                 self.set_dark_theme(cx, !self.dark_theme);
             }
+        }
+
+        if self.nav_kind() > 0 {
+            // Navigation drives the camera, but allow a touch PINCH to zoom and a
+            // one-finger PAN to look around; the recenter button restores follow.
+            // capture_overload = false so single taps on the card's overlay
+            // buttons (2D/3D, recenter, Exit) still reach them.
+            if self.nav_next_frame.is_event(event).is_some() {
+                self.redraw(cx);
+            }
+            if self.nav_home_zoom <= 0.0 {
+                self.nav_home_zoom = self.zoom;
+            }
+            let zmin = self.min_zoom.max(0.0);
+            let zmax = self.max_zoom.max(zmin);
+            match event.hits_with_capture_overload(cx, self.draw_bg.area(), false) {
+                Hit::FingerDown(fe) => {
+                    self.nav_touches.push((fe.digit_id.0, fe.abs));
+                    if self.nav_touches.len() == 2 {
+                        let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
+                        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
+                        self.nav_pinch_base = Some((d.max(1.0), self.view_zoom()));
+                    }
+                }
+                Hit::FingerMove(fe) => {
+                    let mut prev = None;
+                    for t in self.nav_touches.iter_mut() {
+                        if t.0 == fe.digit_id.0 {
+                            prev = Some(t.1);
+                            t.1 = fe.abs;
+                            break;
+                        }
+                    }
+                    if self.nav_touches.len() >= 2 {
+                        if let Some((base_d, base_z)) = self.nav_pinch_base {
+                            let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
+                            let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
+                            self.zoom = (base_z + (d / base_d).log2()).clamp(zmin, zmax);
+                            self.redraw(cx);
+                        }
+                    } else if let Some(p) = prev {
+                        // one-finger pan: shift the map center opposite the drag
+                        let world = tile_world_size_zoom(self.view_zoom());
+                        self.nav_pan.x -= (fe.abs.x - p.x) / world;
+                        self.nav_pan.y -= (fe.abs.y - p.y) / world;
+                        self.redraw(cx);
+                    }
+                }
+                Hit::FingerUp(fe) => {
+                    self.nav_touches.retain(|t| t.0 != fe.digit_id.0);
+                    if self.nav_touches.len() < 2 {
+                        self.nav_pinch_base = None;
+                    }
+                }
+                _ => {}
+            }
+            return;
         }
 
         match event.hits_with_capture_overload(cx, self.draw_bg.area(), true) {
@@ -477,15 +1195,50 @@ impl Widget for MapView {
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         let rect = cx.walk_turtle(walk);
         self.view_rect = rect;
+
+        // Point the tile disk cache at the app's writable data dir (once).
+        // Without this the relative cache path lands under the read-only "/"
+        // cwd and nothing persists — every tile re-fetches from the network.
+        if let Some(dir) = cx.get_data_dir() {
+            set_tile_cache_base(&dir);
+        }
+
+        let nav_kind = self.nav_kind();
+        if nav_kind > 0 {
+            self.ensure_nav_route(cx);
+            self.update_nav_camera(rect, nav_kind);
+            // prefetch tiles along the route AHEAD of the car — THROTTLED to a
+            // few Hz. Walking the whole loop corridor every 60fps frame starved
+            // the frame budget (judder); the car moves ~0.5m per frame so a
+            // ~4Hz refresh is plenty of lead time.
+            if self.frame_counter % 15 == 0 {
+                self.prefetch_route_ahead(cx);
+            }
+            // ~60fps camera animation while navigating
+            self.nav_next_frame = cx.new_next_frame();
+        } else if self.draw_map.nav.mode != 0.0 {
+            self.draw_map.nav = NavShaderParams::default();
+            self.apply_theme_palette();
+        }
+
         self.draw_bg.draw_abs(cx, rect);
-        self.ensure_visible_tiles(cx, rect);
+        let tile_rect = self.nav_tile_rect(rect, nav_kind);
+        self.ensure_visible_tiles(cx, tile_rect);
 
         let view_zoom = self.view_zoom();
         let world_size = tile_world_size_zoom(view_zoom);
         let center_world = self.center_norm * world_size;
-        let map_offset = Vec2f {
-            x: (rect.pos.x + rect.size.x * 0.5 - center_world.x) as f32,
-            y: (rect.pos.y + rect.size.y * 0.5 - center_world.y) as f32,
+        // f64 base offset; geometry is TILE-LOCAL, so the per-tile offset
+        // (base + origin*scale) stays small — no f32 catastrophic cancellation
+        let off_x = rect.pos.x + rect.size.x * 0.5 - center_world.x;
+        let off_y = rect.pos.y + rect.size.y * 0.5 - center_world.y;
+        let tile_offset = |key: &TileKey| -> Vec2f {
+            let (ox, oy) = tile_world_origin(*key);
+            let scale = 2.0_f64.powf(view_zoom - key.z as f64);
+            Vec2f {
+                x: (off_x + ox * scale) as f32,
+                y: (off_y + oy * scale) as f32,
+            }
         };
 
         self.fill_draw_tile_keys();
@@ -494,50 +1247,202 @@ impl Widget for MapView {
         // Take draw_tiles out so we can pass &[TileKey] while mutating self for labels
         let draw_tiles = std::mem::take(&mut self.scratch_draw_tiles);
 
-        // Fill pass
-        for key in &draw_tiles {
-            let Some(entry) = self.tiles.get(key) else {
-                continue;
+        if nav_kind > 0 {
+            // Navigation: draw store tiles near the car, but CULL to those that
+            // actually project on-screen — drawing all ~120 tiles in the radius
+            // (240+ draw calls) overloaded the GPU and strobed. Loaded content
+            // still can't vanish (every visible tile is in the store; proven).
+            let zoom_u = self.request_zoom_level();
+            let world = tile_world_size(zoom_u);
+            let cw = self.center_norm * world;
+            let lat = normalized_y_to_lat(self.center_norm.y);
+            let mpp = meters_per_world_px(lat, zoom_u as f64);
+            let radius = (self.nav_maxg.max(100.0) / mpp) * 3.0
+                + rect.size.x.max(rect.size.y);
+            NAV_DRAW_CENTER.with(|c| c.set((zoom_u, cw.x, cw.y)));
+            let (fills, strokes) = nav_store_draw_ids(zoom_u, cw.x, cw.y, radius);
+            let scale = 2.0_f64.powf(view_zoom - zoom_u as f64) as f32;
+            let dscale = scale as f64;
+            // Cull to VISIBLE tiles (drawing the whole radius overloads this
+            // phone -> 20fps stutter, itself perceived as vanishing). Robust
+            // test so nothing on-screen is ever dropped: (a) always draw the
+            // ring of tiles immediately around the car; (b) otherwise draw if
+            // the tile's projected corner BOUNDING BOX intersects the view rect
+            // expanded by a 30% margin (bbox-intersect catches tiles straddling
+            // the screen during turns; the earlier per-corner test missed them).
+            // Budget PRIORITY per tile: Some(0) = strictly on-screen, Some(1) =
+            // over-render margin only, None = culled. Sorting the budget purely
+            // by distance-to-car let near-but-OFF-SCREEN tiles (below/behind the
+            // car, inside the bottom over-render margin) consume budget slots and
+            // STARVE on-screen SIDE tiles (which sit farther from the car, toward
+            // the horizon) — so side features vanished before leaving the screen.
+            // On-screen-first fixes it: only ~8-15 tiles are ever strictly on
+            // screen at z15, well under budget, so nothing visible is cut.
+            let priority = |key: &TileKey, me: &Self| -> Option<u8> {
+                let (ox, oy) = tile_world_origin(*key);
+                let tcx = ox + 0.5 * TILE_SIZE;
+                let tcy = oy + 0.5 * TILE_SIZE;
+                let near_ring = (tcx - cw.x).abs() < TILE_SIZE * 2.6
+                    && (tcy - cw.y).abs() < TILE_SIZE * 2.6;
+                let (mut minx, mut maxx, mut miny, mut maxy) = (1e18, -1e18, 1e18, -1e18);
+                let mut any = false;
+                for (cxo, cyo) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)] {
+                    let wx = (ox + cxo * TILE_SIZE) * dscale;
+                    let wy = (oy + cyo * TILE_SIZE) * dscale;
+                    if let Some((sx, sy, _)) = me.nav_project_flat(off_x + wx, off_y + wy) {
+                        minx = minx.min(sx);
+                        maxx = maxx.max(sx);
+                        miny = miny.min(sy);
+                        maxy = maxy.max(sy);
+                        any = true;
+                    }
+                }
+                if !any {
+                    // no corner projects (fully behind camera): only the near
+                    // ring survives (near/under the car), everything else culled.
+                    return if near_ring { Some(0) } else { None };
+                }
+                // strictly on-screen = projected bbox intersects the ACTUAL rect
+                // (no margin). These MUST always get a budget slot.
+                let on_screen = maxx >= rect.pos.x
+                    && minx <= rect.pos.x + rect.size.x
+                    && maxy >= rect.pos.y
+                    && miny <= rect.pos.y + rect.size.y;
+                if on_screen || near_ring {
+                    return Some(0);
+                }
+                // over-render margin, ASYMMETRIC by where content enters the view:
+                //  - SIDES (mx, 1.8 screens): turns rotate content in from L/R, so
+                //    pre-render wide so nothing pops at the edge mid-turn.
+                //  - TOP (mtop, 1.0 screen): the horizon reveals as you drive fwd.
+                //  - BOTTOM (mbot, 0.25 screen): behind the car — content only
+                //    LEAVES here, nothing enters, so a big bottom margin just
+                //    wasted budget on never-seen tiles. Reclaimed for the sides.
+                // (y grows DOWN: top edge = rect.pos.y, bottom = pos.y+size.y.)
+                let mx = rect.size.x * 1.8;
+                let mtop = rect.size.y * 1.0;
+                let mbot = rect.size.y * 0.25;
+                if maxx >= rect.pos.x - mx
+                    && minx <= rect.pos.x + rect.size.x + mx
+                    && maxy >= rect.pos.y - mtop
+                    && miny <= rect.pos.y + rect.size.y + mbot
+                {
+                    Some(1)
+                } else {
+                    None
+                }
             };
-            if let TileLoadState::Ready { fill_geometry, .. } = &entry.state {
-                let Some(fill_geometry) = fill_geometry else {
+            // distance of a tile centre to the car (world px), for the budget
+            let tdist = |k: &TileKey| -> u64 {
+                let (ox, oy) = tile_world_origin(*k);
+                let dx = ox + 0.5 * TILE_SIZE - cw.x;
+                let dy = oy + 0.5 * TILE_SIZE - cw.y;
+                (dx * dx + dy * dy) as u64
+            };
+            // Filter to visible-or-margin, sort ON-SCREEN-FIRST then nearest, then
+            // HARD-CAP to a frame budget (a dense downtown must never blow the
+            // budget — that stutter itself reads as vanishing). Buildings (FILL)
+            // are the heavy geometry, so cap them tighter; roads (STROKE) are
+            // light, so draw them far + wide (road network to the horizon).
+            const NAV_FILL_BUDGET: usize = 26; // buildings/landuse — near only
+            const NAV_STROKE_BUDGET: usize = 60; // roads — far + wide
+            let mut fills: Vec<_> = fills
+                .into_iter()
+                .filter_map(|(k, id)| priority(&k, self).map(|p| (p, k, id)))
+                .collect();
+            let mut strokes: Vec<_> = strokes
+                .into_iter()
+                .filter_map(|(k, id)| priority(&k, self).map(|p| (p, k, id)))
+                .collect();
+            fills.sort_by_key(|(p, k, _)| (*p, tdist(k)));
+            strokes.sort_by_key(|(p, k, _)| (*p, tdist(k)));
+            fills.truncate(NAV_FILL_BUDGET);
+            strokes.truncate(NAV_STROKE_BUDGET);
+            for (_, key, id) in fills {
+                let off = tile_offset(&key);
+                self.draw_map
+                    .draw_geometry(cx, id, Vec2f { x: scale, y: scale }, off);
+            }
+            for (_, key, id) in strokes {
+                let off = tile_offset(&key);
+                self.draw_map
+                    .draw_geometry(cx, id, Vec2f { x: scale, y: scale }, off);
+            }
+        } else {
+            // Fill pass
+            for key in &draw_tiles {
+                let Some(entry) = self.tiles.get(key) else {
                     continue;
                 };
-                let scale = 2.0_f64.powf(view_zoom - key.z as f64) as f32;
-                self.draw_map.draw_geometry(
-                    cx,
-                    fill_geometry.geometry_id(),
-                    Vec2f { x: scale, y: scale },
-                    map_offset,
-                );
+                if let TileLoadState::Ready { fill_geometry, .. } = &entry.state {
+                    let Some(fill_geometry) = fill_geometry else {
+                        continue;
+                    };
+                    let scale = 2.0_f64.powf(view_zoom - key.z as f64) as f32;
+                    let off = tile_offset(key);
+                    self.draw_map.draw_geometry(
+                        cx,
+                        fill_geometry.geometry_id(),
+                        Vec2f { x: scale, y: scale },
+                        off,
+                    );
+                }
+            }
+
+            // Stroke pass
+            for key in &draw_tiles {
+                let Some(entry) = self.tiles.get(key) else {
+                    continue;
+                };
+                if let TileLoadState::Ready {
+                    stroke_geometry, ..
+                } = &entry.state
+                {
+                    let Some(stroke_geometry) = stroke_geometry else {
+                        continue;
+                    };
+                    let scale = 2.0_f64.powf(view_zoom - key.z as f64) as f32;
+                    let off = tile_offset(key);
+                    self.draw_map.draw_geometry(
+                        cx,
+                        stroke_geometry.geometry_id(),
+                        Vec2f { x: scale, y: scale },
+                        off,
+                    );
+                }
             }
         }
 
-        // Stroke pass
-        for key in &draw_tiles {
-            let Some(entry) = self.tiles.get(key) else {
-                continue;
-            };
-            if let TileLoadState::Ready {
-                stroke_geometry, ..
-            } = &entry.state
-            {
-                let Some(stroke_geometry) = stroke_geometry else {
-                    continue;
+        // Navigation route ribbon (world-space: perspective-tapers automatically)
+        if nav_kind > 0 {
+            if let Some(geom) = &self.nav_route_geom {
+                let scale = 2.0_f64.powf(view_zoom - NAV_REF_Z as f64);
+                let (rox, roy) = self.nav_route_origin;
+                let off = Vec2f {
+                    x: (off_x + rox * scale) as f32,
+                    y: (off_y + roy * scale) as f32,
                 };
-                let scale = 2.0_f64.powf(view_zoom - key.z as f64) as f32;
                 self.draw_map.draw_geometry(
                     cx,
-                    stroke_geometry.geometry_id(),
-                    Vec2f { x: scale, y: scale },
-                    map_offset,
+                    geom.geometry_id(),
+                    Vec2f {
+                        x: scale as f32,
+                        y: scale as f32,
+                    },
+                    off,
                 );
             }
         }
 
         // Labels
-        if view_zoom >= 13.0 {
-            self.place_and_draw_labels(cx, &draw_tiles, view_zoom, map_offset, rect);
+        if view_zoom >= 13.0 && nav_kind == 0 {
+            self.place_and_draw_labels(cx, &draw_tiles, view_zoom, (off_x, off_y), rect);
+        } else if nav_kind > 0 {
+            // nav view: UPRIGHT street/place labels, positioned by projecting
+            // each label's anchor through the nav camera (the tilted 3D map has
+            // no baked labels, so adjacent street names render here instead).
+            self.draw_nav_labels(cx, rect, off_x, off_y);
+            self.label_perf = LabelPerfStats::default();
         } else {
             self.label_perf = LabelPerfStats::default();
         }
@@ -559,7 +1464,7 @@ impl WidgetMatchEvent for MapView {
         response: &HttpResponse,
         _scope: &mut Scope,
     ) {
-        let Some(pending) = self.request_to_tile.remove(&request_id) else {
+        let Some(pending) = nav_pending_take(&request_id) else {
             return;
         };
         let tile_key = pending.tile_key;
@@ -596,12 +1501,11 @@ impl WidgetMatchEvent for MapView {
 
         // Offload heavy JSON parsing + tessellation to the thread pool
         self.ensure_tile_thread_pool(cx);
-        let pool = self.tile_thread_pool.as_ref().unwrap();
-        let sender = self.tile_worker_rx.sender();
+        let sender = nav_workers_sender();
         let style_epoch = self.style_epoch;
         let theme_style = self.active_style().clone();
 
-        pool.execute_rev(tile_key, move |_tag| {
+        nav_workers_execute(tile_key, move |_tag| {
             match build_tile_buffers_from_body(tile_key, &body, &theme_style) {
                 Ok(buffers) => {
                     store_tile_data_cache_on_disk(tile_key, &body);
@@ -629,7 +1533,7 @@ impl WidgetMatchEvent for MapView {
         err: &HttpError,
         _scope: &mut Scope,
     ) {
-        let Some(pending) = self.request_to_tile.remove(&request_id) else {
+        let Some(pending) = nav_pending_take(&request_id) else {
             return;
         };
         self.mark_tile_failed(
@@ -688,7 +1592,7 @@ impl MapView {
         }
         self.apply_theme_palette();
         self.tiles.clear();
-        self.request_to_tile.clear();
+        // NAV_PENDING is global — responses can still be claimed by live instances
         self.local_requested_tiles.clear();
     }
 
@@ -725,24 +1629,22 @@ impl MapView {
                 None
             };
 
-        self.tiles.insert(
+        // Owning geometry goes to the UI-thread shared store (survives the
+        // 1 Hz Splash card rebuilds); this instance keeps borrowed handles.
+        let entry = nav_store_insert(
             tile_key,
-            TileEntry {
-                state: TileLoadState::Ready {
-                    fill_geometry,
-                    stroke_geometry,
-                    feature_count: buffers.feature_count,
-                    labels: buffers.labels,
-                },
-                last_used: self.frame_counter,
-                attempts: 0,
-            },
+            fill_geometry,
+            stroke_geometry,
+            buffers.feature_count,
+            buffers.labels,
+            self.frame_counter,
         );
+        self.tiles.insert(tile_key, entry);
     }
 
     fn handle_tile_worker_messages(&mut self, cx: &mut Cx) {
         let mut redraw = false;
-        while let Ok(msg) = self.tile_worker_rx.try_recv() {
+        while let Some(msg) = nav_workers_try_recv() {
             match msg {
                 TileWorkerMessage::LocalBatchLoaded {
                     style_epoch,
@@ -873,8 +1775,7 @@ impl MapView {
             );
         }
 
-        let pool = self.tile_thread_pool.as_ref().unwrap();
-        let sender = self.tile_worker_rx.sender();
+        let sender = nav_workers_sender();
         let requested = missing.clone();
         let mbtiles_path = LOCAL_MBTILES_PATH.to_string();
         let cache_dir = TILE_CACHE_DIR.to_string();
@@ -882,7 +1783,7 @@ impl MapView {
         let theme_style = self.active_style().clone();
         let batch_tag = missing[0];
 
-        pool.execute_rev(batch_tag, move |_tag| {
+        nav_workers_execute(batch_tag, move |_tag| {
             let result = load_local_tile_batch(
                 Path::new(&mbtiles_path),
                 Path::new(&cache_dir),
@@ -972,9 +1873,540 @@ impl MapView {
     }
 
     fn ensure_tile_thread_pool(&mut self, cx: &mut Cx) {
-        if self.tile_thread_pool.is_none() {
-            let num_threads = cx.cpu_cores().max(3) - 2;
-            self.tile_thread_pool = Some(TagThreadPool::new(cx, num_threads));
+        nav_workers_ensure(cx);
+    }
+
+    /// 0 = normal map, 1 = 3D chase FPV, 2 = 2D heading-up.
+    fn nav_kind(&self) -> u8 {
+        match self.nav_mode.as_ref().trim() {
+            "3d" | "3D" => 1,
+            // "plan" is a 2D variant: same projection (renders the ribbon), but
+            // a STATIC north-up camera fit to the whole route (route preview).
+            "2d" | "2D" | "plan" => 2,
+            _ => 0,
+        }
+    }
+
+    fn is_plan(&self) -> bool {
+        self.nav_mode.as_ref().trim() == "plan"
+    }
+
+    /// PLAN route-preview camera: STATIC, north-up, fit to the WHOLE route,
+    /// framed into the top band above the card's summary sheet. Renders through
+    /// the 2D nav projection (mode 2) so the route ribbon shows; unlike the live
+    /// 2D follow-cam it does not track the sim vehicle.
+    fn update_plan_preview_camera(&mut self, rect: Rect) {
+        let (mut minx, mut maxx, mut miny, mut maxy) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+        for p in self.nav_pts.iter() {
+            minx = minx.min(p.x);
+            maxx = maxx.max(p.x);
+            miny = miny.min(p.y);
+            maxy = maxy.max(p.y);
+        }
+        let cx = (minx + maxx) * 0.5;
+        let cy = (miny + maxy) * 0.5;
+        let dx = (maxx - minx).max(1e-9);
+        let dy = (maxy - miny).max(1e-9);
+        // fit the bbox into ~85% width and the ~34% tall visible band above the
+        // sheet (its centre sits at ~25% down). Floor at z14 so the Overpass
+        // vector tiles still load (they serve nothing below ~z14).
+        let fitw = rect.size.x * 0.85;
+        let fith = rect.size.y * 0.34;
+        let zx = (fitw / (dx * TILE_SIZE)).log2();
+        let zy = (fith / (dy * TILE_SIZE)).log2();
+        let zmin = self.min_zoom.max(3.0);
+        let zmax = self.max_zoom.max(zmin);
+        self.zoom = zx.min(zy).clamp(zmin, zmax).max(14.0);
+        self.center_norm = dvec2(cx, cy);
+        self.wrap_and_clamp_center();
+        self.draw_map.nav = NavShaderParams {
+            mode: 2.0,
+            anchor: vec2(
+                (rect.pos.x + rect.size.x * 0.5) as f32,
+                (rect.pos.y + rect.size.y * 0.5) as f32,
+            ),
+            rot: vec2(0.0, 1.0), // north-up (static)
+            cam: [40.0, 0.315, 0.49, 0.76],
+            screen: [
+                rect.pos.x as f32,
+                rect.pos.y as f32,
+                rect.size.x as f32,
+                rect.size.y as f32,
+            ],
+            // misc.z = the route-bbox centre's screen row (25% down, in the band)
+            misc: [90.0, 500.0, (rect.size.y * 0.25) as f32, 0.533],
+            haze: [0.847, 0.890, 0.929, 0.0],
+        };
+    }
+
+    /// Decode `nav_polyline` and tessellate the route ribbon geometry
+    /// (casing + semi-transparent core) at NAV_REF_Z. Cached by content hash —
+    /// cheap on the 1 Hz card rebuilds.
+    fn ensure_nav_route(&mut self, cx: &mut Cx) {
+        let poly = self.nav_polyline.as_ref().trim().to_string();
+        if poly.is_empty() {
+            return;
+        }
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            poly.hash(&mut h);
+            h.finish()
+        };
+        if hash == self.nav_poly_hash && self.nav_route_geom.is_some() {
+            return;
+        }
+        // Shared across the 1 Hz card rebuilds: decode + tessellate ONCE.
+        let adopted = NAV_ROUTE_STORE.with(|s| {
+            let s = s.borrow();
+            s.get(&hash).map(|r| {
+                (
+                    r.geom
+                        .as_ref()
+                        .map(|g| Geometry::new_borrowed(g.geometry_id())),
+                    r.origin,
+                    r.pts.clone(),
+                    r.cum.clone(),
+                )
+            })
+        });
+        if let Some((geom, origin, pts, cum)) = adopted {
+            self.nav_route_geom = geom;
+            self.nav_route_origin = origin;
+            self.nav_pts = pts;
+            self.nav_cum = cum;
+            self.nav_poly_hash = hash;
+            return;
+        }
+        let coords0 = decode_polyline5(&poly);
+        if coords0.len() < 2 {
+            return;
+        }
+        // DENSIFY: OSRM points are ~10-50 m apart. Near the camera a long
+        // ribbon quad projects badly — the GPU interpolates the NON-LINEAR
+        // pinhole across the quad linearly, so the near ribbon kinks and can
+        // degenerate/vanish. Subdivide every segment to <= ~6 m so each quad
+        // is short and the perspective error is negligible.
+        let mut coords: Vec<(f64, f64)> = Vec::with_capacity(coords0.len() * 4);
+        for i in 0..coords0.len() {
+            let (lat, lon) = coords0[i];
+            coords.push((lat, lon));
+            if i + 1 < coords0.len() {
+                let (lat2, lon2) = coords0[i + 1];
+                let seg = haversine_m(lat, lon, lat2, lon2);
+                let steps = (seg / 6.0).floor() as usize;
+                for s in 1..steps {
+                    let t = s as f64 / steps as f64;
+                    coords.push((lat + (lat2 - lat) * t, lon + (lon2 - lon) * t));
+                }
+            }
+        }
+        let mut pts = Vec::with_capacity(coords.len());
+        let mut cums = Vec::with_capacity(coords.len());
+        let mut cum = 0.0_f64;
+        let mut prev: Option<(f64, f64)> = None;
+        for &(lat, lon) in &coords {
+            if let Some((plat, plon)) = prev {
+                cum += haversine_m(plat, plon, lat, lon);
+            }
+            pts.push(lon_lat_to_normalized(lon, lat));
+            cums.push(cum);
+            prev = Some((lat, lon));
+        }
+        self.nav_pts = Rc::new(pts);
+        self.nav_cum = Rc::new(cums);
+        self.nav_poly_hash = hash;
+
+        let world = tile_world_size(NAV_REF_Z);
+        let mid_lat = coords[coords.len() / 2].0;
+        let mpp = meters_per_world_px(mid_lat, NAV_REF_Z as f64);
+        // rebase to the first point (f64) so ribbon vertices stay small-f32
+        let origin = (
+            self.nav_pts[0].x * world,
+            self.nav_pts[0].y * world,
+        );
+        self.nav_route_origin = origin;
+        let pts_px: Vec<(f32, f32)> = self
+            .nav_pts
+            .iter()
+            .map(|p| {
+                (
+                    (p.x * world - origin.0) as f32,
+                    (p.y * world - origin.1) as f32,
+                )
+            })
+            .collect();
+        let core_w = (self.nav_route_width.max(4.0) / mpp) as f32;
+        let casing_w = core_w * 1.55;
+
+        let mut path = VectorPath::new();
+        let mut tess = Tessellator::default();
+        let mut tess_verts = Vec::<VVertex>::new();
+        let mut tess_indices = Vec::<u32>::new();
+        let mut vertices = Vec::<f32>::new();
+        let mut indices = Vec::<u32>::new();
+        let mut zbias = 0.0_f32;
+        // dark casing then bright semi-transparent core (Google-style)
+        append_route_ribbon_pass(
+            &mut path,
+            &pts_px,
+            &mut tess,
+            &mut tess_verts,
+            &mut tess_indices,
+            &mut vertices,
+            &mut indices,
+            casing_w,
+            0x24528F,
+            1.0,
+            &mut zbias,
+        );
+        append_route_ribbon_pass(
+            &mut path,
+            &pts_px,
+            &mut tess,
+            &mut tess_verts,
+            &mut tess_indices,
+            &mut vertices,
+            &mut indices,
+            core_w,
+            0x5B9BF8,
+            1.0,
+            &mut zbias,
+        );
+        if !indices.is_empty() {
+            let geometry = Geometry::new(cx);
+            geometry.update(cx, indices, vertices);
+            self.nav_route_geom = Some(Geometry::new_borrowed(geometry.geometry_id()));
+            NAV_ROUTE_STORE.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.len() > 6 {
+                    s.clear(); // routes are big; keep the store tiny
+                }
+                s.insert(
+                    hash,
+                    SharedNavRoute {
+                        geom: Some(geometry),
+                        origin,
+                        pts: self.nav_pts.clone(),
+                        cum: self.nav_cum.clone(),
+                    },
+                );
+            });
+        }
+    }
+
+    /// Follow the route on the sim clock (same epoch as `sys.simsecs`, so DSL
+    /// banner windows stay in lockstep), center the map on the vehicle and
+    /// push the projection uniforms.
+    fn update_nav_camera(&mut self, rect: Rect, nav_kind: u8) {
+        if self.nav_pts.len() < 2 {
+            return;
+        }
+        // PLAN preview: static fit-to-route camera (framed above the sheet),
+        // not the sim follow-cam.
+        if self.is_plan() {
+            self.update_plan_preview_camera(rect);
+            return;
+        }
+        let total = self.nav_cum.last().copied().unwrap_or(0.0);
+        let period = self.nav_period.max(1.0);
+        let secs = crate::splash::sim_clock_secs() % period;
+        // Distance-NORMALIZED sim: sweep the WHOLE route over `nav_period`,
+        // regardless of its length. (A speed-based `secs*mps` traversed short
+        // urban routes in seconds and then parked at the destination for the
+        // rest of the period — the drive looked frozen / perpetually "arrived".)
+        // The card's banner clock uses the same `secs/period * total`.
+        let d = (secs / period) * total;
+
+        let Some(car) = sample_polyline_point_at_distance(&self.nav_pts, &self.nav_cum, d) else {
+            return;
+        };
+        // bearing from a short look-ahead (normalized coords; north = -y)
+        let look = sample_polyline_point_at_distance(
+            &self.nav_pts,
+            &self.nav_cum,
+            (d + 45.0).min(total),
+        )
+        .unwrap_or(car);
+        let fwd = dvec2(look.x - car.x, look.y - car.y);
+        let target_bearing = if fwd.x.abs() < 1e-12 && fwd.y.abs() < 1e-12 {
+            self.nav_bearing
+        } else {
+            fwd.x.atan2(-fwd.y)
+        };
+        // low-pass ease toward the target heading (shortest angular way) so a
+        // turn rotates the camera gently instead of snapping — the abrupt
+        // rotation whipped the ribbon/road around and read as vanishing.
+        if !self.nav_bearing_init {
+            self.nav_bearing = target_bearing;
+            self.nav_bearing_init = true;
+        } else {
+            let pi = std::f64::consts::PI;
+            let mut diff = target_bearing - self.nav_bearing;
+            while diff > pi {
+                diff -= 2.0 * pi;
+            }
+            while diff < -pi {
+                diff += 2.0 * pi;
+            }
+            self.nav_bearing += diff * 0.10;
+        }
+        let bearing = self.nav_bearing;
+
+        // follow the car, plus any user pan offset (cleared by recenter)
+        self.center_norm = dvec2(car.x + self.nav_pan.x, car.y + self.nav_pan.y);
+        self.wrap_and_clamp_center();
+
+        let view_zoom = self.view_zoom();
+        let lat = normalized_y_to_lat(car.y);
+        let mpp = meters_per_world_px(lat, view_zoom);
+        let cam_h_px = (self.nav_cam_h.max(2.0) / mpp) as f32;
+        let pitch = self.nav_pitch as f32;
+        let (sph, cph) = (pitch.sin(), pitch.cos());
+        let tan_v = ((self.nav_vfov * 0.5) as f32).tan();
+        let tanh2 = ((self.nav_hfov * 0.5).tan()) as f32;
+        // Place the car (ahead = 0, forward dist = chase) at screen row nav_carv
+        // under the SAME pinhole the shader uses:
+        //   ndc_y = (a·sinP - h·cosP) / ((a·cosP + h·sinP)·tan_v) = 1 - 2·carv
+        // solved for a = chase. (The old atan mapping used a different form.)
+        let ndc_car = 1.0 - 2.0 * self.nav_carv as f32;
+        let denom = sph - ndc_car * tan_v * cph;
+        let chase = if denom > 1e-3 {
+            (cam_h_px * (cph + ndc_car * tan_v * sph) / denom).max(cam_h_px * 0.5)
+        } else {
+            cam_h_px * 2.0
+        };
+        let maxg_px = (self.nav_maxg.max(100.0) / mpp) as f32;
+
+        self.draw_map.nav = NavShaderParams {
+            mode: nav_kind as f32,
+            anchor: vec2(
+                (rect.pos.x + rect.size.x * 0.5) as f32,
+                (rect.pos.y + rect.size.y * 0.5) as f32,
+            ),
+            rot: vec2(bearing.sin() as f32, bearing.cos() as f32),
+            cam: [cam_h_px, sph, cph, tanh2],
+            screen: [
+                rect.pos.x as f32,
+                rect.pos.y as f32,
+                rect.size.x as f32,
+                rect.size.y as f32,
+            ],
+            misc: [chase, maxg_px, (rect.size.y * self.nav_carv2d) as f32, tan_v],
+            haze: [0.847, 0.890, 0.929, 0.0],
+        };
+        if nav_kind == 1 {
+            // far clip + above-horizon show the background: make it the haze
+            self.draw_bg.color = vec4(0.847, 0.890, 0.929, 1.0);
+        }
+    }
+
+    /// Tile-coverage rect for the current mode: the 3D frustum sees far ahead
+    /// (and the map rotates), so request a square neighbourhood around the car.
+    fn nav_tile_rect(&self, rect: Rect, nav_kind: u8) -> Rect {
+        if nav_kind == 0 {
+            return rect;
+        }
+        let half = if nav_kind == 1 {
+            let lat = normalized_y_to_lat(self.center_norm.y);
+            let mpp = meters_per_world_px(lat, self.view_zoom());
+            // fetch out to ~2x maxg so distant tiles are loaded before the
+            // (now horizon-reaching) shader wants to draw them
+            (self.nav_maxg.max(100.0) / mpp) * 2.0 + rect.size.x.max(rect.size.y) * 0.3
+        } else {
+            rect.size.x.max(rect.size.y) * 0.75
+        };
+        Rect {
+            pos: dvec2(
+                rect.pos.x + rect.size.x * 0.5 - half,
+                rect.pos.y + rect.size.y * 0.5 - half,
+            ),
+            size: dvec2(half * 2.0, half * 2.0),
+        }
+    }
+
+    /// Project a flat-map screen point through the nav camera (CPU mirror of
+    /// the DrawMapVector 3D vertex path). Returns the on-screen position, or
+    /// None if the point is behind the camera or past the haze horizon.
+    fn nav_project_flat(&self, fx: f64, fy: f64) -> Option<(f64, f64, f64)> {
+        // Same pinhole math as the DrawMapVector 3D shader path so the tile
+        // cull matches exactly what is drawn. cam = (h, sinP, cosP, tan(hfov/2));
+        // misc[3] = tan(vfov/2).
+        let nav = &self.draw_map.nav;
+        let rel_x = fx - nav.anchor.x as f64;
+        let rel_y = fy - nav.anchor.y as f64;
+        let ahead = rel_x * nav.rot.x as f64 - rel_y * nav.rot.y as f64;
+        let cross = rel_x * nav.rot.y as f64 + rel_y * nav.rot.x as f64;
+        let cam_h = nav.cam[0] as f64;
+        let sph = nav.cam[1] as f64;
+        let cph = nav.cam[2] as f64;
+        let tan_h = nav.cam[3] as f64;
+        let tan_v = nav.misc[3] as f64;
+        let a = ahead + nav.misc[0] as f64; // + chase
+        let z_cam = a * cph + cam_h * sph;
+        if z_cam < cam_h * 0.6 {
+            return None; // behind / too close to the camera (near-plane floor)
+        }
+        let y_cam = a * sph - cam_h * cph;
+        let ndc_x = cross / (z_cam * tan_h);
+        let ndc_y = y_cam / (z_cam * tan_v);
+        let sx = nav.screen[0] as f64 + nav.screen[2] as f64 * 0.5 * (1.0 + ndc_x);
+        let sy = nav.screen[1] as f64 + nav.screen[3] as f64 * 0.5 * (1.0 - ndc_y);
+        Some((sx, sy, a))
+    }
+
+    /// Draw upright street/place labels in the nav view by projecting each
+    /// label's map anchor through the nav camera. Google-style: text stays
+    /// horizontal (never tilted), shrinks with distance, majors win the cap.
+    fn draw_nav_labels(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64) {
+        let zoom = self.request_zoom_level();
+        let world = tile_world_size(zoom);
+        let lat = normalized_y_to_lat(self.center_norm.y);
+        let mpp = meters_per_world_px(lat, zoom as f64);
+        // ADJACENT only: labels within ~260 m of the car (not the whole 800 m
+        // frustum — the far-horizon roads were a cramped, flat-looking cluster)
+        let near_m = 260.0;
+        let radius = near_m / mpp;
+        let cw = self.center_norm * world;
+        // Refresh the candidate set only a few Hz (store scan + clones are
+        // costly); project + draw the cached candidates every frame.
+        if self.frame_counter % 10 == 0 || self.nav_labels_cache.is_empty() {
+            self.nav_labels_cache = nav_store_labels(zoom, cw.x, cw.y, radius);
+        }
+        let mut labels = self.nav_labels_cache.clone();
+        if labels.is_empty() {
+            self.nav_labels_shown.clear();
+            return;
+        }
+        // STICKY ordering: labels shown last frame come first (rank 0), so the
+        // visible set stays stable as the car moves instead of flickering.
+        {
+            let shown = &self.nav_labels_shown;
+            labels.sort_by_key(|(_, _, text, pri)| (!shown.contains(text) as u8, *pri));
+        }
+        let scale = 2.0_f64.powf(self.view_zoom() - zoom as f64);
+        let cam_h = self.draw_map.nav.cam[0] as f64;
+        // only label the near half of the frustum (ground-distance cutoff)
+        let far_cut = (near_m / mpp) + cam_h;
+        self.draw_text.color = vec4(0.16, 0.22, 0.30, 1.0);
+        let mut drawn = 0;
+        let mut placed: Vec<Rect> = Vec::new();
+        let mut now_shown: HashSet<String> = HashSet::new();
+        for (wx, wy, text, _pri) in labels {
+            if drawn >= 12 {
+                break;
+            }
+            let fx = off_x + wx * scale;
+            let fy = off_y + wy * scale;
+            let Some((sx, sy, a)) = self.nav_project_flat(fx, fy) else {
+                continue;
+            };
+            if a > far_cut {
+                continue; // too far — keep it to adjacent roads
+            }
+            // OVER-RENDER labels a half-screen beyond every edge so a name
+            // glides off the side/bottom smoothly instead of popping out at
+            // the boundary (same principle as the tiles).
+            let mgx = rect.size.x * 0.5;
+            if sx < rect.pos.x - mgx
+                || sx > rect.pos.x + rect.size.x + mgx
+                || sy < rect.pos.y - rect.size.y * 0.05
+                || sy > rect.pos.y + rect.size.y * 1.05
+            {
+                continue;
+            }
+            // strong perspective depth cue: near ~19 px, far ~8 px
+            let fs = (19.0 * (cam_h * 1.6 / a)).clamp(8.0, 19.0) as f32;
+            self.draw_text.text_style.font_size = fs;
+            let w = text.chars().count() as f64 * fs as f64 * 0.5;
+            let lr = Rect {
+                pos: dvec2(sx - w * 0.5, sy - fs as f64 * 0.6),
+                size: dvec2(w, fs as f64 * 1.3),
+            };
+            if placed
+                .iter()
+                .any(|p| rects_overlap_with_padding(*p, lr, 4.0))
+            {
+                continue;
+            }
+            placed.push(lr);
+            self.draw_text
+                .draw_abs(cx, dvec2(lr.pos.x, lr.pos.y), &text);
+            now_shown.insert(text);
+            drawn += 1;
+        }
+        self.nav_labels_shown = now_shown;
+    }
+
+    /// Cache the ENTIRE driven-loop corridor so nothing is ever re-fetched or
+    /// re-parsed while looping. Walks the whole loop segment starting AT the
+    /// car (so about-to-be-visible tiles are requested first), covering each
+    /// route tile plus its 8 neighbours (the frustum sees to the sides too).
+    /// Disk-cache-first, throttled, budget-capped per frame — it progressively
+    /// warms over the first ~loop and then goes quiet (everything resident).
+    fn prefetch_route_ahead(&mut self, cx: &mut Cx) {
+        if self.nav_pts.len() < 2 {
+            return;
+        }
+        let total = self.nav_cum.last().copied().unwrap_or(0.0);
+        if total < 1.0 {
+            return;
+        }
+        let period = self.nav_period.max(1.0);
+        // distance-normalized (matches update_nav_camera): sweep the whole route
+        let d = ((crate::splash::sim_clock_secs() % period) / period) * total;
+        // the loop drives the whole route each period
+        let loop_len = total;
+        let zoom = self.request_zoom_level();
+        let tiles_n = 1i32 << zoom;
+
+        let mut seen: HashSet<TileKey> = HashSet::new();
+        let mut budget = 6; // per frame; fills the whole loop over ~1-2 loops
+        let mut ahead = 0.0_f64;
+        while ahead <= loop_len && budget > 0 {
+            let da = {
+                let s = d + ahead;
+                if s <= total {
+                    s
+                } else {
+                    s - total
+                }
+            };
+            ahead += 200.0;
+            let Some(p) = sample_polyline_point_at_distance(&self.nav_pts, &self.nav_cum, da)
+            else {
+                continue;
+            };
+            let tx = (p.x * tiles_n as f64).floor() as i32;
+            let ty = (p.y * tiles_n as f64).floor() as i32;
+            // the route tile + a 5x5 neighbourhood — a turn swings the heading,
+            // so the map to the SIDES of the route must be preloaded too (a
+            // narrow corridor left the turn-revealed sides blank).
+            'nb: for dy in -2..=2 {
+                for dx in -2..=2 {
+                    if budget == 0 {
+                        break 'nb;
+                    }
+                    let key = TileKey {
+                        z: zoom,
+                        x: tx + dx,
+                        y: ty + dy,
+                    };
+                    if !seen.insert(key) {
+                        continue;
+                    }
+                    if self.tiles.contains_key(&key) {
+                        continue;
+                    }
+                    if let Some(entry) = nav_store_adopt(&key, self.frame_counter) {
+                        self.tiles.insert(key, entry);
+                        continue;
+                    }
+                    if self.request_tile(cx, key, 0, true) {
+                        budget -= 1;
+                    }
+                }
+            }
         }
     }
 
@@ -994,17 +2426,21 @@ impl MapView {
             }
         }
 
-        let mut pending = self
-            .tiles
-            .values()
-            .filter(|e| matches!(e.state, TileLoadState::LoadingNetwork))
-            .count();
+        let mut pending = nav_pending_len();
 
         for key in self.visible_tiles.clone() {
             let retry_attempt = self.tiles.get(&key).and_then(|entry| {
                 if let TileLoadState::Failed { retry_after } = entry.state {
                     if entry.attempts < MAX_TILE_RETRIES && self.frame_counter >= retry_after {
                         return Some(entry.attempts);
+                    }
+                    // exhausted retries: cool down ~15s (900 frames), then
+                    // start a fresh retry cycle — permanent holes are worse
+                    // than an occasional extra request
+                    if entry.attempts >= MAX_TILE_RETRIES
+                        && self.frame_counter >= retry_after + 900
+                    {
+                        return Some(1);
                     }
                 }
                 None
@@ -1016,6 +2452,13 @@ impl MapView {
                 continue;
             }
             if self.tiles.contains_key(&key) {
+                continue;
+            }
+            // Ready geometry may already exist in the UI-thread shared store
+            // (another instance — or this card's previous 1 Hz rebuild — parsed
+            // it): adopt borrowed handles instead of refetching.
+            if let Some(entry) = nav_store_adopt(&key, self.frame_counter) {
+                self.tiles.insert(key, entry);
                 continue;
             }
             if self.local_missing_tiles.contains(&key) {
@@ -1179,8 +2622,7 @@ impl MapView {
             if let Ok(cached_body) = fs::read_to_string(&cache_path) {
                 // Offload heavy JSON parsing + tessellation to the thread pool
                 self.ensure_tile_thread_pool(cx);
-                let pool = self.tile_thread_pool.as_ref().unwrap();
-                let sender = self.tile_worker_rx.sender();
+                let sender = nav_workers_sender();
                 let style_epoch = self.style_epoch;
                 let theme_style = self.active_style().clone();
                 self.tiles.insert(
@@ -1191,7 +2633,7 @@ impl MapView {
                         attempts: 0,
                     },
                 );
-                pool.execute_rev(tile_key, move |_tag| {
+                nav_workers_execute(tile_key, move |_tag| {
                     match build_tile_buffers_from_body(tile_key, &cached_body, &theme_style) {
                         Ok(buffers) => {
                             let _ = sender.send(TileWorkerMessage::NetworkTileParsed {
@@ -1218,11 +2660,21 @@ impl MapView {
             return false;
         }
 
-        let request_id = LiveId(self.next_request_id);
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        if self.next_request_id == 0 {
-            self.next_request_id = 1;
+        // ~1 Hz card rebuilds re-run this for every missing tile: throttle so a
+        // slow Overpass response (seconds) isn't re-requested each second.
+        // Retries (attempts > 0) bypass it — endpoint failover must not wait.
+        if attempts == 0 && nav_req_throttled(tile_key, 8.0) {
+            self.tiles.insert(
+                tile_key,
+                TileEntry {
+                    state: TileLoadState::LoadingNetwork,
+                    last_used: self.frame_counter,
+                    attempts,
+                },
+            );
+            return false;
         }
+        let request_id = nav_next_request_id();
 
         let query = overpass_query(tile_key);
         let endpoint = overpass_endpoint(attempts);
@@ -1232,8 +2684,7 @@ impl MapView {
         request.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
         request.set_body_string(&query);
 
-        self.request_to_tile
-            .insert(request_id, PendingTileRequest { tile_key, endpoint });
+        nav_pending_insert(request_id, PendingTileRequest { tile_key, endpoint });
         self.tiles.insert(
             tile_key,
             TileEntry {
@@ -1251,11 +2702,11 @@ impl MapView {
         cx: &mut Cx2d,
         draw_tiles: &[TileKey],
         view_zoom: f64,
-        map_offset: Vec2f,
+        base_offset: (f64, f64),
         rect: Rect,
     ) {
         let mut label_perf = LabelPerfStats::default();
-        self.collect_label_candidates(draw_tiles, view_zoom, map_offset, rect, &mut label_perf);
+        self.collect_label_candidates(draw_tiles, view_zoom, base_offset, rect, &mut label_perf);
         if self.scratch_candidates.is_empty() {
             self.label_perf = label_perf;
             return;
@@ -1365,7 +2816,7 @@ impl MapView {
         &mut self,
         draw_tiles: &[TileKey],
         view_zoom: f64,
-        map_offset: Vec2f,
+        base_offset: (f64, f64),
         rect: Rect,
         label_perf: &mut LabelPerfStats,
     ) {
@@ -1394,6 +2845,11 @@ impl MapView {
             label_perf.labels_in_tiles += labels.len();
             let scale = 2.0_f64.powf(view_zoom - key.z as f64) as f32;
             let zoom_delta = (view_zoom - key.z as f64).abs();
+            let (kox, koy) = tile_world_origin(*key);
+            let key_offset = Vec2f {
+                x: (base_offset.0 + kox * scale as f64) as f32,
+                y: (base_offset.1 + koy * scale as f64) as f32,
+            };
 
             for label in labels {
                 label_perf.labels_scanned += 1;
@@ -1410,7 +2866,7 @@ impl MapView {
                 build_screen_polyline_into(
                     &label.path_points,
                     scale,
-                    map_offset,
+                    key_offset,
                     &mut self.scratch_screen_path,
                 );
                 if self.scratch_screen_path.len() < 2

@@ -1338,6 +1338,13 @@ impl Cx {
                 Cx::post_action(crate::event::AndroidComposerSwitch);
                 self.handle_action_receiver();
             }
+            FromJavaMessage::ComposerExpand => {
+                // Native composer collapsed "+" FAB tapped — the user unfolded
+                // it. Java already expanded the pill; tell the app so it marks
+                // composer_shown = true and stays in sync.
+                Cx::post_action(crate::event::AndroidComposerExpand);
+                self.handle_action_receiver();
+            }
             FromJavaMessage::QrScanned { json } => {
                 // The composer QR scanner decoded a payload — hand it to the app
                 // (it applies it as an LLM-provisioning config). Drain this tick.

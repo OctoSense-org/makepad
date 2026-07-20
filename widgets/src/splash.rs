@@ -445,7 +445,14 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(route),
-        script_args_def!(lat1 = NIL, lon1 = NIL, lat2 = NIL, lon2 = NIL, field = NIL),
+        script_args_def!(
+            lat1 = NIL,
+            lon1 = NIL,
+            lat2 = NIL,
+            lon2 = NIL,
+            field = NIL,
+            vias = NIL
+        ),
         |vm, args| {
             let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
             let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
@@ -454,8 +461,12 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
+            let vias_v = script_value!(vm, args.vias);
+            let mut vias = String::new();
+            vm.bx.heap.cast_to_string(vias_v, &mut vias);
             let url = format!(
-                "https://router.project-osrm.org/route/v1/driving/{lon1:.4},{lat1:.4};{lon2:.4},{lat2:.4}?overview=false"
+                "https://router.project-osrm.org/route/v1/driving/{}?overview=false",
+                osrm_coords(lat1, lon1, lat2, lon2, &vias)
             );
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => match field.trim() {
@@ -475,6 +486,164 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 None => "—".to_string(),
             };
             vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.navroute(lat1, lon1, lat2, lon2, "field") -> LIVE turn-by-turn route
+    // data (OSRM, keyless, ONE cached fetch shared with sys.navstep):
+    //   "polyline" -> full route geometry (polyline5) — feed MapView.nav_polyline
+    //   "km" -> "32.4 km"   "min" -> "33 min"   "" while loading.
+    // Pair with MapView{ nav_mode: "3d" nav_polyline: sys.navroute(...) } for a
+    // native, on-device Google-style live navigation card.
+    vm.add_method(
+        sys,
+        id_lut!(navroute),
+        script_args_def!(
+            lat1 = NIL,
+            lon1 = NIL,
+            lat2 = NIL,
+            lon2 = NIL,
+            field = NIL,
+            vias = NIL
+        ),
+        |vm, args| {
+            let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
+            let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
+            let lat2 = script_value!(vm, args.lat2).as_number().unwrap_or(0.0);
+            let lon2 = script_value!(vm, args.lon2).as_number().unwrap_or(0.0);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let vias_v = script_value!(vm, args.vias);
+            let mut vias = String::new();
+            vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
+            let out = match nav_route_cached(vm, &url) {
+                Some(route) => match field.trim() {
+                    "polyline" => route.polyline.clone(),
+                    "km" => format!("{:.1} km", route.total_m / 1000.0),
+                    "min" => format!("{:.0} min", route.total_s / 60.0),
+                    // walking (~5 km/h) / cycling (~15 km/h) estimates, formatted
+                    "walk" => format!("{:.0} min", (route.total_m / 1000.0) * 12.0),
+                    "bike" => format!("{:.0} min", (route.total_m / 1000.0) * 4.0),
+                    _ => route.polyline.clone(),
+                },
+                None => String::new(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.navstep(lat1, lon1, lat2, lon2, progress_m, "field") -> the live
+    // turn-by-turn banner data at `progress_m` meters into the route (drive
+    // progress_m from sys.simsecs: e.g. `let d = sys.simsecs(92) * 15.2`):
+    //   "instr" -> "Turn left onto South Market Street"  (the UPCOMING maneuver)
+    //   "dist"  -> "850 m" / "1.2 km"  counting-down distance to it
+    //   "arrow" -> its glyph ("⬅")   "next_arrow" -> the one after
+    //   "lane0".."lane5" -> lane glyphs for the maneuver ("" past the end)
+    //   "lane0hot".."lane5hot" -> "1" if that lane is the recommended one
+    //   "rem" -> "31.4 km" remaining   "remmin" -> "34" minutes remaining
+    // Returns "" while the route loads. Same fetch as sys.navroute.
+    vm.add_method(
+        sys,
+        id_lut!(navstep),
+        script_args_def!(
+            lat1 = NIL,
+            lon1 = NIL,
+            lat2 = NIL,
+            lon2 = NIL,
+            progress = NIL,
+            field = NIL,
+            vias = NIL
+        ),
+        |vm, args| {
+            let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
+            let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
+            let lat2 = script_value!(vm, args.lat2).as_number().unwrap_or(0.0);
+            let lon2 = script_value!(vm, args.lon2).as_number().unwrap_or(0.0);
+            let d = script_value!(vm, args.progress).as_number().unwrap_or(0.0);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let vias_v = script_value!(vm, args.vias);
+            let mut vias = String::new();
+            vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
+            let out = match nav_route_cached(vm, &url) {
+                Some(route) => nav_step_field(&route, d, field.trim()),
+                None => String::new(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.navstepnum(lat1, lon1, lat2, lon2, progress_m, "field") -> NUMBERS for
+    // layout binding: "frac" -> trip fraction 0..1 (progress bars). -1 while
+    // loading.
+    vm.add_method(
+        sys,
+        id_lut!(navstepnum),
+        script_args_def!(
+            lat1 = NIL,
+            lon1 = NIL,
+            lat2 = NIL,
+            lon2 = NIL,
+            progress = NIL,
+            field = NIL,
+            vias = NIL
+        ),
+        |vm, args| {
+            let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
+            let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
+            let lat2 = script_value!(vm, args.lat2).as_number().unwrap_or(0.0);
+            let lon2 = script_value!(vm, args.lon2).as_number().unwrap_or(0.0);
+            let d = script_value!(vm, args.progress).as_number().unwrap_or(0.0);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let vias_v = script_value!(vm, args.vias);
+            let mut vias = String::new();
+            vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
+            let n = match nav_route_cached(vm, &url) {
+                Some(route) => nav_step_num(&route, d, field.trim()),
+                None => -1.0,
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.navsecs(period) -> the SAME looping clock as sys.simsecs, but it does
+    // NOT arm the 1 Hz re-eval pump. For `fn tick()` cards that update named
+    // widgets in place (ui.<id>.set_text) and must NEVER rebuild — e.g. the
+    // live-navigation card, where a rebuild would tear the map widget down.
+    vm.add_method(
+        sys,
+        id_lut!(navsecs),
+        script_args_def!(period = NIL),
+        |vm, args| {
+            let period = script_value!(vm, args.period).as_number().unwrap_or(0.0);
+            let secs = crate::splash::sim_clock_secs();
+            let v = if period > 0.0 { secs % period } else { secs };
+            ScriptValue::from_f64(v)
+        },
+    );
+
+    // sys.simsecs(period) -> seconds since app start as a NUMBER, looping back
+    // to 0 every `period` seconds (period <= 0 -> unbounded). THE animation
+    // clock for cards: bind time windows to auto-advance content — a card that
+    // calls it re-evaluates once per second (see the Splash pump):
+    //   if sys.simsecs(70) >= 12 && sys.simsecs(70) < 15 { <frame/banner> }
+    // Pure math — no fetch, no state, loops forever (replay for free).
+    vm.add_method(
+        sys,
+        id_lut!(simsecs),
+        script_args_def!(period = NIL),
+        |vm, args| {
+            let period = script_value!(vm, args.period).as_number().unwrap_or(0.0);
+            let secs = crate::splash::sim_clock_secs();
+            let v = if period > 0.0 { secs % period } else { secs };
+            ScriptValue::from_f64(v)
         },
     );
 
@@ -505,19 +674,10 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
 &daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
 &timezone=auto&forecast_days=7"
             );
-            let mut value = match vm.host.cx_mut().script_data_fetch(&url) {
+            let value = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| "—".to_string()),
                 None => "—".to_string(),
             };
-            // Temperatures render as whole degrees (no decimal) — a weather card
-            // shows "27°", not "27.3°". Only *temperature* paths round; wind / UV /
-            // pressure keep their natural precision, and non-numeric values
-            // (sunrise "05:52", the "—" placeholder) pass through untouched.
-            if path.contains("temperature") {
-                if let Ok(n) = value.parse::<f64>() {
-                    value = n.round().to_string();
-                }
-            }
             vm.bx.heap.new_string_from_str(&value)
         },
     );
@@ -921,6 +1081,145 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.search("<free text>", index, "name"|"label"|"lat"|"lon") -> the i-th
+    // RESULT of a free-text place/POI/address search (Photon, keyless). This is
+    // the Google-Maps "search a location" step: bind rows to it to show tappable
+    // search results, then a row's tap writes the picked lat/lon/name into state
+    // and the card routes there. "" while loading / past the last hit.
+    vm.add_method(
+        sys,
+        id_lut!(search),
+        script_args_def!(query = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let q_v = script_value!(vm, args.query);
+            let mut query = String::new();
+            vm.bx.heap.cast_to_string(q_v, &mut query);
+            let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = search_url(query.trim());
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => String::new(),
+                Some(bytes) => search_field(&bytes, index, field.trim()),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.searchnum("<free text>", index, "count"|"lat"|"lon") -> NUMBERS for
+    // the search hits: "count" (index ignored) = how many hits, to guard/cap the
+    // results list; "lat"/"lon" = hit `index`'s coordinate as a NUMBER, to feed
+    // straight into sys.navroute/sys.route (sys.search returns strings, for
+    // display). -9999 while loading / bad response / out of range (guard `>= 0`;
+    // 0 hits = 0). Shares sys.search's fetch (identical URL -> ONE request).
+    vm.add_method(
+        sys,
+        id_lut!(searchnum),
+        script_args_def!(query = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let q_v = script_value!(vm, args.query);
+            let mut query = String::new();
+            vm.bx.heap.cast_to_string(q_v, &mut query);
+            let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let url = search_url(query.trim());
+            let n = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => -9999.0,
+                Some(bytes) => match search_parse(&bytes) {
+                    None => -9999.0,
+                    Some(hits) => match field.trim().to_ascii_lowercase().as_str() {
+                        "lat" => hits.get(index).map(|h| h.lat).unwrap_or(-9999.0),
+                        "lon" => hits.get(index).map(|h| h.lon).unwrap_or(-9999.0),
+                        _ => hits.len() as f64, // "count" / default
+                    },
+                },
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.navroutenum(lat1, lon1, lat2, lon2, "km"|"min", vias) -> the route's
+    // distance (km) or driving duration (min) as a NUMBER, so a card can derive
+    // other travel modes (walk ≈ km*12 min, bike ≈ km*4 min) and arrival math.
+    // Shares sys.navroute's cached fetch. -1 while loading.
+    vm.add_method(
+        sys,
+        id_lut!(navroutenum),
+        script_args_def!(
+            lat1 = NIL,
+            lon1 = NIL,
+            lat2 = NIL,
+            lon2 = NIL,
+            field = NIL,
+            vias = NIL
+        ),
+        |vm, args| {
+            let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
+            let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
+            let lat2 = script_value!(vm, args.lat2).as_number().unwrap_or(0.0);
+            let lon2 = script_value!(vm, args.lon2).as_number().unwrap_or(0.0);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let vias_v = script_value!(vm, args.vias);
+            let mut vias = String::new();
+            vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
+            let n = match nav_route_cached(vm, &url) {
+                Some(route) => match field.trim() {
+                    "min" => route.total_s / 60.0,
+                    _ => route.total_m / 1000.0,
+                },
+                None => -1.0,
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.coord("lat,lon|name", field) -> a field of a place a card stored in
+    // one scalar state key (a picked search result / waypoint / origin), so it
+    // survives across screens and feeds routing. Format: "lat,lon" or
+    // "lat,lon|Display Name".
+    //   "lat"/"lon" -> NUMBER (feeds sys.navroute/sys.route lat/lon args)
+    //   "latlon"    -> clean "lat,lon" STRING (feeds the navroute `vias` arg)
+    //   "name"      -> the display name STRING (after the '|'), or ""
+    // lat/lon are -9999 when unparseable (guard `>= -900`).
+    vm.add_method(
+        sys,
+        id_lut!(coord),
+        script_args_def!(s = NIL, field = NIL),
+        |vm, args| {
+            let s_v = script_value!(vm, args.s);
+            let mut s = String::new();
+            vm.bx.heap.cast_to_string(s_v, &mut s);
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let (coords, name) = match s.trim().split_once('|') {
+                Some((c, n)) => (c.trim(), n.trim()),
+                None => (s.trim(), ""),
+            };
+            let mut it = coords.split(',');
+            let lat = it.next().and_then(|p| p.trim().parse::<f64>().ok());
+            let lon = it.next().and_then(|p| p.trim().parse::<f64>().ok());
+            match field.trim().to_ascii_lowercase().as_str() {
+                "name" => vm.bx.heap.new_string_from_str(name),
+                "latlon" => {
+                    let out = match (lat, lon) {
+                        (Some(a), Some(o)) => format!("{a},{o}"),
+                        _ => String::new(),
+                    };
+                    vm.bx.heap.new_string_from_str(&out)
+                }
+                "lon" => ScriptValue::from_f64(lon.unwrap_or(-9999.0)),
+                _ => ScriptValue::from_f64(lat.unwrap_or(-9999.0)),
+            }
+        },
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
 }
 
@@ -940,9 +1239,15 @@ fn body_binds_live_data(body: &str) -> bool {
         || body.contains("sys.news")
         || body.contains("sys.movers")
         || body.contains("sys.places")
+        // covers sys.search + sys.searchnum — the search-results card must
+        // re-evaluate once the free-text search fetch lands
+        || body.contains("sys.search")
         // substring covers sys.geocodenum too (same trick as weather/weathernum)
         || body.contains("sys.geocode")
         || body.contains("sys.route")
+        // covers sys.navroute/navstep/navstepnum — the nav card's body must
+        // re-evaluate ONCE when the OSRM fetch lands (fills nav_polyline)
+        || body.contains("sys.nav")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
@@ -1117,9 +1422,376 @@ fn overpass_filter(category: &str) -> (&'static str, &'static str) {
         "viewpoint" => ("tourism", "viewpoint"),
         "playground" => ("leisure", "playground"),
         "attraction" => ("tourism", "attraction"),
-        "restaurant" => ("amenity", "restaurant"),
+        "restaurant" | "food" => ("amenity", "restaurant"),
         "hotel" => ("tourism", "hotel"),
+        // Google-Maps "add a stop along the route" categories:
+        "gas" | "fuel" => ("amenity", "fuel"),
+        "coffee" => ("amenity", "cafe"),
+        "store" | "supermarket" | "grocery" => ("shop", "supermarket"),
+        "pharmacy" => ("amenity", "pharmacy"),
+        "atm" | "bank" => ("amenity", "bank"),
+        "ev" | "charging" => ("amenity", "charging_station"),
+        "parking" => ("amenity", "parking"),
         _ => ("leisure", "park"), // "park" and any unknown token
+    }
+}
+
+// --- turn-by-turn navigation support (sys.navroute / sys.navstep) ---
+
+struct NavStepInfo {
+    cum_start: f64, // meters from route start where this step begins
+    distance: f64,  // step length, meters
+    kind: String,   // maneuver.type
+    modifier: String,
+    name: String,
+    lanes: Vec<(String, bool)>, // (indication, is-recommended) at the maneuver
+}
+
+struct ParsedNavRoute {
+    polyline: String,
+    total_m: f64,
+    total_s: f64,
+    steps: Vec<NavStepInfo>,
+}
+
+thread_local! {
+    static NAV_ROUTE_CACHE: std::cell::RefCell<
+        std::collections::HashMap<String, std::rc::Rc<ParsedNavRoute>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Build OSRM's `;`-joined `{lon},{lat}` coordinate path: origin, then any
+/// intermediate waypoints, then destination. `vias` is a `"lat,lon;lat,lon"`
+/// string (empty / non-coord segments are ignored) so old 2-point callers pass
+/// "" and get the exact same 2-coord path.
+fn osrm_coords(lat1: f64, lon1: f64, lat2: f64, lon2: f64, vias: &str) -> String {
+    let mut coords = format!("{lon1:.5},{lat1:.5}");
+    for seg in vias.split(';') {
+        let mut it = seg.trim().split(',');
+        if let (Some(la), Some(lo)) = (it.next(), it.next()) {
+            if let (Ok(la), Ok(lo)) = (la.trim().parse::<f64>(), lo.trim().parse::<f64>()) {
+                coords.push_str(&format!(";{lo:.5},{la:.5}"));
+            }
+        }
+    }
+    coords.push_str(&format!(";{lon2:.5},{lat2:.5}"));
+    coords
+}
+
+/// One URL per (from, vias…, to) so sys.navroute, sys.navstep and the MapView
+/// widget all share a single deduped OSRM fetch. The via list keys into the
+/// cache for free (the full URL is the key).
+fn navroute_url(lat1: f64, lon1: f64, lat2: f64, lon2: f64, vias: &str) -> String {
+    format!(
+        "https://router.project-osrm.org/route/v1/driving/{}?overview=full&steps=true",
+        osrm_coords(lat1, lon1, lat2, lon2, vias)
+    )
+}
+
+fn nav_route_cached(vm: &mut ScriptVm, url: &str) -> Option<std::rc::Rc<ParsedNavRoute>> {
+    if let Some(hit) = NAV_ROUTE_CACHE.with(|c| c.borrow().get(url).cloned()) {
+        return Some(hit);
+    }
+    let bytes = vm.host.cx_mut().script_data_fetch(url)?;
+    let route = parse_nav_route(&bytes)?;
+    let rc = std::rc::Rc::new(route);
+    NAV_ROUTE_CACHE.with(|c| c.borrow_mut().insert(url.to_string(), rc.clone()));
+    Some(rc)
+}
+
+/// One serde parse of the OSRM response -> compact step table.
+fn parse_nav_route(bytes: &[u8]) -> Option<ParsedNavRoute> {
+    let root: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let route = root.get("routes")?.get(0)?;
+    let polyline = route.get("geometry")?.as_str()?.to_string();
+    let total_m = route.get("distance")?.as_f64()?;
+    let total_s = route.get("duration")?.as_f64()?;
+    // Iterate ALL legs (a route with K waypoints has K+1 legs), concatenating
+    // their steps with a CONTINUOUS `cum` accumulator so cum_start stays
+    // "meters from the route start" across waypoints — otherwise the banner
+    // would stop guiding after the first via-point.
+    let legs = route.get("legs")?.as_array()?;
+    let mut steps = Vec::new();
+    let mut cum = 0.0_f64;
+    for leg in legs {
+      let Some(steps_v) = leg.get("steps").and_then(|v| v.as_array()) else {
+          continue;
+      };
+      for s in steps_v {
+        let distance = s.get("distance").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let man = s.get("maneuver");
+        let kind = man
+            .and_then(|m| m.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let modifier = man
+            .and_then(|m| m.get("modifier"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = s
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut lanes = Vec::new();
+        if let Some(lv) = s
+            .get("intersections")
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("lanes"))
+            .and_then(|v| v.as_array())
+        {
+            for l in lv.iter().take(6) {
+                let ind = l
+                    .get("indications")
+                    .and_then(|v| v.get(0))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("straight")
+                    .to_string();
+                let valid = l.get("valid").and_then(|v| v.as_bool()).unwrap_or(false);
+                lanes.push((ind, valid));
+            }
+        }
+        steps.push(NavStepInfo {
+            cum_start: cum,
+            distance,
+            kind,
+            modifier,
+            name,
+            lanes,
+        });
+        cum += distance;
+      }
+    }
+    if steps.is_empty() {
+        return None;
+    }
+    Some(ParsedNavRoute {
+        polyline,
+        total_m,
+        total_s,
+        steps,
+    })
+}
+
+fn nav_fmt_dist(m: f64) -> String {
+    if m >= 1000.0 {
+        format!("{:.1} km", m / 1000.0)
+    } else {
+        format!("{:.0} m", m.max(0.0))
+    }
+}
+
+fn nav_arrow(step: &NavStepInfo) -> String {
+    let m = step.modifier.as_str();
+    match step.kind.as_str() {
+        "arrive" => "🏁",
+        "depart" => "▶",
+        "merge" => "⤴",
+        "on ramp" => "↗",
+        "off ramp" => "↘",
+        "fork" => {
+            if m.contains("left") {
+                "↖"
+            } else {
+                "↗"
+            }
+        }
+        "roundabout" | "rotary" => "➡",
+        "exit roundabout" | "exit rotary" => "↗",
+        _ => match m {
+            "left" => "⬅",
+            "right" => "➡",
+            "slight left" => "↖",
+            "slight right" => "↗",
+            "sharp left" => "⬅",
+            "sharp right" => "➡",
+            "uturn" => "⟲",
+            _ => "⬆",
+        },
+    }
+    .to_string()
+}
+
+fn nav_lane_glyph(indication: &str) -> &'static str {
+    match indication {
+        "left" | "sharp left" => "⬅",
+        "right" | "sharp right" => "➡",
+        "slight left" => "↖",
+        "slight right" => "↗",
+        "uturn" => "⟲",
+        _ => "⬆",
+    }
+}
+
+fn nav_instr(step: &NavStepInfo) -> String {
+    let road = if step.name.trim().is_empty() {
+        "the road".to_string()
+    } else {
+        step.name.clone()
+    };
+    let m = step.modifier.as_str();
+    match step.kind.as_str() {
+        "depart" => format!("Head out on {road}"),
+        "arrive" => "Arrived at destination".to_string(),
+        "merge" => format!("Merge onto {road}"),
+        "on ramp" => "Take the ramp".to_string(),
+        "off ramp" => "Take the exit".to_string(),
+        "fork" => format!(
+            "Keep {} at the fork",
+            if m.contains("left") { "left" } else { "right" }
+        ),
+        "roundabout" | "rotary" => "Enter the roundabout".to_string(),
+        "exit roundabout" | "exit rotary" => format!("Exit onto {road}"),
+        "new name" => format!("Continue onto {road}"),
+        _ => {
+            if m.is_empty() {
+                "Continue".to_string()
+            } else {
+                format!("Turn {m} onto {road}")
+            }
+        }
+    }
+}
+
+/// Lanes for a maneuver: OSRM's, or synthesized from the modifier when absent
+/// (car-grade nav always shows a lane strip near a turn).
+fn nav_lanes(step: &NavStepInfo) -> Vec<(String, bool)> {
+    if !step.lanes.is_empty() {
+        let m = step.modifier.as_str();
+        let any_valid = step.lanes.iter().any(|(_, v)| *v);
+        return step
+            .lanes
+            .iter()
+            .enumerate()
+            .map(|(i, (ind, valid))| {
+                let hot = if any_valid {
+                    *valid
+                } else {
+                    // no valid flags: highlight by side
+                    if m.contains("right") {
+                        i == step.lanes.len() - 1
+                    } else {
+                        i == 0
+                    }
+                };
+                (ind.clone(), hot)
+            })
+            .collect();
+    }
+    let m = step.modifier.as_str();
+    if m.contains("left") {
+        vec![
+            ("left".into(), true),
+            ("straight".into(), false),
+            ("straight".into(), false),
+        ]
+    } else if m.contains("right") {
+        vec![
+            ("straight".into(), false),
+            ("straight".into(), false),
+            ("right".into(), true),
+        ]
+    } else {
+        vec![("straight".into(), true), ("straight".into(), false)]
+    }
+}
+
+/// Numeric per-step fields for layout binding (see sys.navstepnum).
+fn nav_step_num(route: &ParsedNavRoute, d: f64, field: &str) -> f64 {
+    let mut si = 0usize;
+    for (i, s) in route.steps.iter().enumerate() {
+        if d >= s.cum_start {
+            si = i;
+        } else {
+            break;
+        }
+    }
+    match field {
+        "frac" => {
+            if route.total_m > 0.0 {
+                (d / route.total_m).clamp(0.0, 1.0)
+            } else {
+                0.0
+            }
+        }
+        // meters to the upcoming maneuver — gate lane strips on `< 320`
+        "dist" => {
+            let cur_end = route
+                .steps
+                .get(si)
+                .map(|s| s.cum_start + s.distance)
+                .unwrap_or(route.total_m);
+            (cur_end - d).max(0.0)
+        }
+        _ => -1.0,
+    }
+}
+
+fn nav_step_field(route: &ParsedNavRoute, d: f64, field: &str) -> String {
+    // current step = the one whose span contains d
+    let mut si = 0usize;
+    for (i, s) in route.steps.iter().enumerate() {
+        if d >= s.cum_start {
+            si = i;
+        } else {
+            break;
+        }
+    }
+    let cur_end = route
+        .steps
+        .get(si)
+        .map(|s| s.cum_start + s.distance)
+        .unwrap_or(route.total_m);
+    let next = route.steps.get(si + 1);
+    match field {
+        "instr" => next
+            .map(nav_instr)
+            .unwrap_or_else(|| "Arrived at destination".to_string()),
+        "dist" => nav_fmt_dist((cur_end - d).max(10.0)),
+        "arrow" => next
+            .map(nav_arrow)
+            .unwrap_or_else(|| "🏁".to_string()),
+        "next_arrow" => route
+            .steps
+            .get(si + 2)
+            .map(nav_arrow)
+            .unwrap_or_else(|| "🏁".to_string()),
+        "road" => route
+            .steps
+            .get(si)
+            .map(|s| s.name.clone())
+            .unwrap_or_default(),
+        "rem" => nav_fmt_dist((route.total_m - d).max(0.0)),
+        "remmin" => {
+            let frac = if route.total_m > 0.0 {
+                (1.0 - d / route.total_m).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            format!("{:.0}", (route.total_s * frac / 60.0).ceil().max(1.0))
+        }
+        f if f.starts_with("lane") => {
+            let hot_query = f.ends_with("hot");
+            let idx: usize = f
+                .trim_start_matches("lane")
+                .trim_end_matches("hot")
+                .parse()
+                .unwrap_or(99);
+            let lanes = next.map(nav_lanes).unwrap_or_default();
+            match lanes.get(idx) {
+                Some((ind, hot)) => {
+                    if hot_query {
+                        if *hot { "1".to_string() } else { "0".to_string() }
+                    } else {
+                        nav_lane_glyph(ind).to_string()
+                    }
+                }
+                None => String::new(),
+            }
+        }
+        _ => String::new(),
     }
 }
 
@@ -1250,6 +1922,131 @@ fn places_field(bytes: &[u8], lat: f64, lon: f64, index: usize, field: &str) -> 
     }
 }
 
+/// Free-text place/POI/address search via Photon (komoot) — keyless, built for
+/// search & autocomplete, returns a ranked list. Backs `sys.search`/`sys.searchnum`
+/// so a card can show tappable search RESULTS (the Google-Maps "search a place"
+/// step) — unlike `sys.geocode` (one place-name → facts) or `sys.places`
+/// (category + radius). `lang=en`, capped to 8 hits.
+fn search_url(query: &str) -> String {
+    format!(
+        "https://photon.komoot.io/api/?q={}&limit=8&lang=en",
+        percent_encode_query(query)
+    )
+}
+
+/// One search hit: a display name, a secondary label (city/region/country), a
+/// human category ("Museum", "Cafe"…), and coordinates to route to.
+struct SearchHit {
+    name: String,
+    label: String,
+    cat: String,
+    lat: f64,
+    lon: f64,
+}
+
+/// Turn Photon's osm_key/osm_value into a friendly category label ("Art gallery",
+/// "Cafe", "Park"…), Title-cased, so a result row reads like a Google category.
+fn photon_category(key: &str, value: &str) -> String {
+    let v = match value {
+        "" => key,
+        other => other,
+    };
+    let pretty: String = v
+        .replace('_', " ")
+        .split_whitespace()
+        .map(|w| {
+            let mut c = w.chars();
+            match c.next() {
+                Some(f) => f.to_ascii_uppercase().to_string() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    pretty
+}
+
+/// Parse a Photon GeoJSON body into ranked hits. `geometry.coordinates` is
+/// `[lon, lat]`. The primary name is `properties.name`, else
+/// `housenumber street`, else the locality; the label chains the admin parts
+/// (street/city/state/country) so ambiguous names ("Springfield") are
+/// distinguishable. None when the body isn't valid GeoJSON (vs Some(empty) for
+/// "no matches"), so callers tell error from zero.
+fn search_parse(bytes: &[u8]) -> Option<Vec<SearchHit>> {
+    let root: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let feats = root.get("features")?.as_array()?;
+    let mut out = Vec::new();
+    for ft in feats {
+        let p = ft.get("properties");
+        let coords = ft.pointer("/geometry/coordinates").and_then(|c| c.as_array());
+        let (lon, lat) = match coords.and_then(|c| {
+            Some((c.first()?.as_f64()?, c.get(1)?.as_f64()?))
+        }) {
+            Some(v) => v,
+            None => continue,
+        };
+        let field = |k: &str| {
+            p.and_then(|p| p.get(k))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let name = field("name")
+            .or_else(|| match (field("housenumber"), field("street")) {
+                (Some(h), Some(s)) => Some(format!("{h} {s}")),
+                (_, Some(s)) => Some(s),
+                _ => None,
+            })
+            .or_else(|| field("city"))
+            .unwrap_or_else(|| "Unnamed place".to_string());
+        let mut parts: Vec<String> = Vec::new();
+        for k in ["street", "city", "state", "country"] {
+            if let Some(v) = field(k) {
+                if v != name && !parts.contains(&v) {
+                    parts.push(v);
+                }
+            }
+        }
+        let cat = photon_category(
+            field("osm_key").as_deref().unwrap_or(""),
+            field("osm_value").as_deref().unwrap_or(""),
+        );
+        out.push(SearchHit {
+            name,
+            label: parts.join(", "),
+            cat,
+            lat,
+            lon,
+        });
+    }
+    Some(out)
+}
+
+/// Field lookup for `sys.search`: hit `index` of the ranked list. "count"
+/// ignores `index`. "—"/"" for out-of-range or a bad body.
+fn search_field(bytes: &[u8], index: usize, field: &str) -> String {
+    let hits = match search_parse(bytes) {
+        Some(h) => h,
+        None => return String::new(),
+    };
+    let f = field.to_ascii_lowercase();
+    if f == "count" {
+        return hits.len().to_string();
+    }
+    let h = match hits.get(index) {
+        Some(h) => h,
+        None => return String::new(),
+    };
+    match f.as_str() {
+        "name" => h.name.clone(),
+        "label" | "addr" | "address" => h.label.clone(),
+        "cat" | "category" => h.cat.clone(),
+        "lat" => format!("{:.5}", h.lat),
+        "lon" => format!("{:.5}", h.lon),
+        _ => String::new(),
+    }
+}
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -1303,60 +2100,30 @@ pub struct Splash {
     /// the "—" placeholders are replaced with the loaded values.
     #[rust]
     last_data_epoch: u64,
-    /// Whether the CURRENT body has ever evaluated to a view. Reset on a
-    /// genuine content replacement, kept across streaming extensions.
+    /// Whole-second value of the sim clock at the last eval — cards that call
+    /// `sys.simsecs` re-evaluate when it advances (1 Hz animation driver).
     #[rust]
-    render_ok: bool,
-    /// Quiet-period timer. A streamed body is syntactically incomplete for most
-    /// of its life, so a failed eval mid-stream is normal and must not be
-    /// surfaced. This fires only once the body has stopped growing, at which
-    /// point a still-empty view means the card really did fail.
-    #[rust]
-    failure_timer: Timer,
+    last_sim_tick: u64,
 }
 
-/// Prefix for View-children mode: wraps code inside a View.
-///
-/// `height: Fit` is right for the short snippets this was written for — a chat
-/// reply's inline widget should take only the room it needs.
+/// Monotonic seconds since process start — the time source behind
+/// `sys.simsecs` and the Splash 1 Hz re-eval driver. Deliberately NOT wall
+/// clock: it can never jump backwards.
+pub(crate) fn sim_clock_secs() -> f64 {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+/// Prefix for View-children mode: wraps code inside a View
 const SPLASH_PREFIX_VIEW: &str = "use mod.prelude.widgets.*View{height:Fit, ";
-/// Same, for a body whose own root asks to fill its parent.
-///
-/// A `height: Fill` child inside a `height: Fit` parent is degenerate: the
-/// parent sizes to its children, the child sizes to its parent, and the tree
-/// resolves to zero height — the card evaluates cleanly and draws NOTHING.
-/// Full-bleed app cards (`SolidView{ width: Fill height: Fill … }` as the
-/// first widget) hit this every time, which is why they rendered as an empty
-/// pane of background colour with no error anywhere.
-const SPLASH_PREFIX_VIEW_FILL: &str = "use mod.prelude.widgets.*View{height:Fill, ";
 /// Prefix for full-script mode: just imports, code must evaluate to a widget
 const SPLASH_PREFIX_SCRIPT: &str = "use mod.prelude.widgets.*\n";
-const SPLASH_EVAL_INSTRUCTION_LIMIT: usize = 200_000;
-/// Wall-clock budget for BUILDING a card, as opposed to the per-frame script
-/// work (`fn tick()`, callbacks) that `with_script_vm_id` budgets at 64ms.
-///
-/// A card build is one-shot, not frame work. An app-agent card runs tens of KB
-/// of DSL and cannot finish in 64ms — and because that budget sets soft ==
-/// hard there is no yield, so the eval bailed with "script time budget
-/// exceeded" and the card never rendered at all.
-///
-/// This does mean a heavy card can stall the frame for up to this long, once,
-/// while it builds. That is the trade being made: a visible hitch when a card
-/// arrives, instead of a card that never arrives.
-const SPLASH_BUILD_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
-/// How long the body must stop growing before a still-unrendered card is
-/// declared failed. Long enough to outlast a stalled network chunk, short
-/// enough that a dead card doesn't look like a hung app.
-const SPLASH_FAILURE_DELAY: f64 = 3.0;
-/// Offset for the failure card's vm body id, so it never collides with a
-/// generation of the real body (whose parser state is what just failed).
-const SPLASH_FAILURE_ID_SALT: usize = 0x5f_a1_1e_d0;
-/// Shown in place of the blank view when a body cannot be parsed. Deliberately
-/// tiny and literal — it must not itself depend on anything that can fail.
-const SPLASH_FAILURE_CARD: &str = r#"SolidView{ width: Fill height: Fit flow: Down new_batch: true draw_bg.color: #ffffff padding: Inset{left: 16 top: 14 right: 16 bottom: 14}
-    Label{ width: Fill text: "Card failed to render" draw_text.color: #000000 draw_text.text_style.font_size: 15 }
-    Label{ width: Fill text: "The generated card did not evaluate — a syntax error, or a script that ran out of budget. See the Makepad log." draw_text.color: #6a6a6a draw_text.text_style.font_size: 11 margin: Inset{top: 6} }
-}"#;
+// 200_000 silently truncated large multi-page cards (a 22-page turn-by-turn
+// nav card parsed+evaled clean but attached nothing) — the streaming
+// parse+execute loop counts compile-fed opcodes too, so budget scales with
+// BODY SIZE, not just executed work. 1M covers ~100KB bodies.
+const SPLASH_EVAL_INSTRUCTION_LIMIT: usize = 1_000_000;
 
 /// Detect whether Splash code is a full script (starts with `let`, `fn`,
 /// or a widget constructor like `View{`, `SolidView{`) vs View children
@@ -1490,8 +2257,6 @@ impl Splash {
             !self.last_eval_body.is_empty() && body.starts_with(self.last_eval_body.as_str());
         if !is_extension {
             self.eval_generation += 1;
-            // New content, not a continuation — nothing has rendered for it yet.
-            self.render_ok = false;
         }
         self.last_eval_body = body.clone();
         let unique_id = self.self_id().wrapping_add(self.eval_generation as usize);
@@ -1500,8 +2265,6 @@ impl Splash {
         // Choose prefix based on code style
         let prefix = if is_full_script(&body) {
             SPLASH_PREFIX_SCRIPT
-        } else if root_wants_fill(&body) {
-            SPLASH_PREFIX_VIEW_FILL
         } else {
             SPLASH_PREFIX_VIEW
         };
@@ -1537,7 +2300,7 @@ impl Splash {
         // under this vm and mark the tree dirty so lookups can resolve them.
         let vm_id = self.vm_id;
         let self_uid = self.uid;
-        let new_view = cx.with_script_vm_id_budget(vm_id, SPLASH_BUILD_BUDGET, |vm| {
+        let new_view = cx.with_script_vm_id(vm_id, |vm| {
             crate::widget_async::inject_scoped_ui_global(vm, self_uid);
             let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
                 vm.eval_with_append_source(script_mod, &code, NIL.into())
@@ -1545,45 +2308,31 @@ impl Splash {
             if !value.is_err() && !value.is_nil() {
                 Some(View::script_from_value(vm, value))
             } else {
-                // LOCAL DEBUG: this failure was SILENT — a card whose eval
-                // errors (e.g. instruction-limit) left the old/empty view
-                // with no trace.
-                crate::log!(
-                    "[SPLASH] eval FAILED: err={} nil={} value={:?}",
-                    value.is_err(),
-                    value.is_nil(),
-                    value
-                );
                 None
             }
         });
 
         if let Some(view) = new_view {
-            // A body whose brace depth goes negative but still "evaluates" is
-            // the parser silently recovering from a corrupt card (one that
-            // gained extra `}`, e.g. a stream damaged mid-persist): the
-            // surplus brace closes the root container early, later children
-            // fall out of the tree, and the card renders as a fragment (e.g.
-            // only its footer). Treat it as an eval failure so the
-            // quiet-period failure card fires instead. A healthy mid-stream
-            // prefix never dips below zero, so progressive rendering is
-            // unaffected.
+            // Corrupt-card guard (upstream): a body whose brace depth goes
+            // negative but still "evaluates" is the parser silently recovering
+            // from a card that gained extra `}` (e.g. a stream damaged
+            // mid-persist) — the surplus brace closes the root early and the
+            // card renders as a fragment. Treat it as an eval failure so the
+            // quiet-period failure card fires. A healthy mid-stream prefix never
+            // dips below zero, so progressive rendering is unaffected.
             if !braces_go_negative(&body) {
                 self.view = view;
                 self.view.set_visible(cx, true);
-                crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
-                cx.widget_tree_mark_dirty(self.uid);
-                self.render_ok = true;
+                // register_view_subtree roots `ui` at the Splash node (nav's
+                // zero-rebuild ui.<id> fix) — supersedes inject_splash_ui_handle
+                // at the wrapper uid + the separate mark_dirty.
+                self.register_view_subtree(cx);
             } else {
                 log!(
                     "[SPLASH] eval succeeded but brace depth went negative (corrupt card) — treating as eval failure"
                 );
             }
         }
-        // NOTE: on failure `self.view` is deliberately left alone — mid-stream
-        // that keeps the last good frame on screen. `set_text` arms
-        // `failure_timer` so a body that never recovers still surfaces instead
-        // of sitting there as a blank, zero-height view.
 
         // If the Splash code defines fn tick(), auto-start a 1s interval
         if body.contains("fn tick(") || body.contains("fn tick (") {
@@ -1602,74 +2351,6 @@ impl Splash {
         self.last_data_epoch = cx.script_data_fetch_epoch();
     }
 
-    /// The body stopped growing and still hasn't produced a view. Try once more
-    /// from a clean parser, then fall back to a visible failure card.
-    ///
-    /// Before this existed a card that failed to parse left `self.view` as the
-    /// default empty View — `height: Fit` over no children draws zero pixels,
-    /// so the app showed a blank screen with no signal anywhere in the UI. The
-    /// parse errors went to the log and nothing else: `report_error` only sets
-    /// `ScriptParser::had_error`, which nothing reads.
-    fn show_eval_failure(&mut self, cx: &mut Cx) {
-        if self.render_ok || self.body.as_ref().is_empty() {
-            return;
-        }
-
-        // Retry from scratch first. A streamed body parses incrementally from a
-        // checkpoint, so one bad token early in the stream poisons every later
-        // continuation — even when the completed text is perfectly valid.
-        // Clearing `last_eval_body` makes the next eval a non-extension, which
-        // bumps the generation and therefore allocates a fresh vm body + parser.
-        self.last_eval_body.clear();
-        self.eval_body(cx);
-        if self.render_ok {
-            return;
-        }
-
-        // Genuinely broken. Evaluate the failure card under its own body id so
-        // it cannot inherit the parser state that just failed.
-        log!(
-            "[SPLASH] body of {} bytes never rendered (gen={}) — showing failure card",
-            self.body.as_ref().len(),
-            self.eval_generation
-        );
-        let code = format!("{}{}", SPLASH_PREFIX_SCRIPT, SPLASH_FAILURE_CARD);
-        let script_mod = ScriptMod {
-            cargo_manifest_path: String::new(),
-            module_path: String::new(),
-            file: String::new(),
-            line: self.self_id().wrapping_add(SPLASH_FAILURE_ID_SALT),
-            column: 0,
-            code: String::new(),
-            values: vec![],
-        };
-        let vm_id = self.vm_id;
-        let self_uid = self.uid;
-        let new_view = cx.with_script_vm_id(vm_id, |vm| {
-            crate::widget_async::inject_scoped_ui_global(vm, self_uid);
-            let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
-                vm.eval_with_append_source(script_mod, &code, NIL.into())
-            });
-            if !value.is_err() && !value.is_nil() {
-                Some(View::script_from_value(vm, value))
-            } else {
-                None
-            }
-        });
-
-        if let Some(view) = new_view {
-            self.view = view;
-            self.view.set_visible(cx, true);
-            crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
-            cx.widget_tree_mark_dirty(self.uid);
-            cx.redraw_all();
-        } else {
-            // The failure card itself failed — that is a bug in this file, not
-            // in the generated DSL. Say so rather than going quiet again.
-            log!("[SPLASH] failure card did not evaluate; view stays blank");
-        }
-    }
-
     /// Start (or stop) the per-frame redraw pump based on whether `body`
     /// uses a time-based shader. Shared by `eval_body` and `stream_append`
     /// so streamed cards animate too. Triggers on inline `draw_pass.time`
@@ -1681,12 +2362,45 @@ impl Splash {
         // the card has no time-based shader of its own.
         self.animating = body.contains("draw_pass.time")
             || body.contains("WeatherIcon")
+            || body.contains("sys.simsecs")
             || body_binds_live_data(body);
         if self.animating {
             self.anim_next_frame = cx.new_next_frame();
         } else {
             self.anim_next_frame = NextFrame::default();
         }
+    }
+
+    /// Register the freshly-evaluated card subtree in the widget tree and
+    /// re-root this Splash VM's `ui` global. Shared by `eval_body` and
+    /// `stream_append`.
+    ///
+    /// Two things must hold for `ui.<id>` (fn tick(), helper fns, handlers) to
+    /// resolve the card's `name := Widget{}` children:
+    ///
+    /// 1. The `:=` names must actually be IN the widget tree. The lazy sync
+    ///    (`children()` walk on the next query) can't guarantee that: eval runs
+    ///    inside draw/event dispatch where this Splash and its ancestors are
+    ///    RefCell-borrowed, so `try_children` fails there and the new subtree
+    ///    would stay unregistered until some unrelated quiescent query happens
+    ///    to sync the tree. Register the subtree NOW from the owned `self.view`
+    ///    (its children are freshly built and unborrowed), exactly mirroring
+    ///    what `Splash::children()` reports (the wrapper view is skipped; its
+    ///    children attach directly under the Splash uid).
+    ///
+    /// 2. The `ui` handle must be rooted at a uid the tree indexes. That is
+    ///    `self.uid` (the Splash node) — NOT `self.view.widget_uid()`: because
+    ///    `Splash::children()` forwards the wrapper view's children, the
+    ///    wrapper's own uid never enters the tree, so a handle rooted there
+    ///    could never anchor its scoped subtree search and always fell through
+    ///    to the global fallback (breaking per-card id scoping, and failing
+    ///    outright when the names weren't globally findable).
+    fn register_view_subtree(&mut self, cx: &mut Cx) {
+        for (name, child) in self.view.children.iter() {
+            cx.widget_tree_insert_child_deep(self.uid, *name, child.clone());
+        }
+        crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.uid);
+        cx.widget_tree_mark_dirty(self.uid);
     }
 
     /// Call a named function defined in the Splash code's scope.
@@ -1747,8 +2461,6 @@ impl Splash {
 
         let prefix = if is_full_script(&current) {
             SPLASH_PREFIX_SCRIPT
-        } else if root_wants_fill(&current) {
-            SPLASH_PREFIX_VIEW_FILL
         } else {
             SPLASH_PREFIX_VIEW
         };
@@ -1771,7 +2483,7 @@ impl Splash {
 
         let vm_id = self.vm_id;
         let self_uid = self.uid;
-        let new_view = cx.with_script_vm_id_budget(vm_id, SPLASH_BUILD_BUDGET, |vm| {
+        let new_view = cx.with_script_vm_id(vm_id, |vm| {
             crate::widget_async::inject_scoped_ui_global(vm, self_uid);
             let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
                 vm.eval_with_append_source(script_mod, &code, NIL.into())
@@ -1779,15 +2491,6 @@ impl Splash {
             if !value.is_err() && !value.is_nil() {
                 Some(View::script_from_value(vm, value))
             } else {
-                // LOCAL DEBUG: this failure was SILENT — a card whose eval
-                // errors (e.g. instruction-limit) left the old/empty view
-                // with no trace.
-                crate::log!(
-                    "[SPLASH] eval FAILED: err={} nil={} value={:?}",
-                    value.is_err(),
-                    value.is_nil(),
-                    value
-                );
                 None
             }
         });
@@ -1797,11 +2500,9 @@ impl Splash {
             // built from a body whose brace depth went negative.
             if !braces_go_negative(&current) {
                 self.view = view;
-                // Make `ui` a global in this splash's VM (pointing at the freshly-built view root) so
-                // helper `fn`s inside the block can use `ui.<id>.set_text(...)`, not just inline
-                // handlers. Without this, calculators/forms that route through a helper silently fail.
-                crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
-                cx.widget_tree_mark_dirty(self.uid);
+                // register_view_subtree roots `ui` at the Splash node so helper
+                // `fn`s can use `ui.<id>.set_text(...)` (nav's zero-rebuild fix).
+                self.register_view_subtree(cx);
             } else {
                 log!(
                     "[SPLASH] stream_append: eval succeeded but brace depth went negative (corrupt card) — view not adopted"
@@ -1854,11 +2555,6 @@ impl Widget for Splash {
             self.call_fn(cx, id!(tick));
         }
 
-        // The body has stopped growing. If it never rendered, surface that.
-        if self.failure_timer.is_event(event).is_some() {
-            self.show_eval_failure(cx);
-        }
-
         // Per-frame redraw pump for time-based shaders: redraw the view (so the
         // pixel shaders re-run with an advanced `self.draw_pass.time`) and queue
         // the next frame. Self-sustaining while `animating`.
@@ -1870,7 +2566,27 @@ impl Widget for Splash {
             // only reads cached data / fires still-pending fetches — it never bumps
             // the epoch — so this settles and cannot loop.
             let epoch = cx.script_data_fetch_epoch();
-            if epoch != self.last_data_epoch && body_binds_live_data(self.body.as_ref()) {
+            // Time-driven cards: a body that calls `sys.simsecs` re-evaluates
+            // once per whole second, so bindings derived from the sim clock
+            // (moving markers, progress bars, auto-advancing banners) animate
+            // without any tick/state plumbing.
+            let sim_tick = sim_clock_secs() as u64;
+            let sim_due =
+                sim_tick != self.last_sim_tick && self.body.as_ref().contains("sys.simsecs");
+            // A `fn tick()` card manages its own updates in place (ui.<id>.set_*)
+            // and must NEVER rebuild: re-evaluating it destroys and recreates its
+            // widgets — for a nav card that means tearing down the MapView (whole
+            // map blanks to a flat route line) on EVERY tile fetch, since tile
+            // HTTP responses bump the global data epoch. So suppress epoch-driven
+            // re-eval for tick cards; they push loaded data via tick().
+            let is_tick_card = self.body.as_ref().contains("fn tick(")
+                || self.body.as_ref().contains("fn tick (");
+            if (epoch != self.last_data_epoch
+                && body_binds_live_data(self.body.as_ref())
+                && !is_tick_card)
+                || sim_due
+            {
+                self.last_sim_tick = sim_tick;
                 self.eval_body(cx);
                 cx.redraw_all();
             } else {
@@ -1898,17 +2614,6 @@ impl Widget for Splash {
             // yet registered in the draw system, so self.redraw(cx) would be
             // a no-op.  Force a full redraw so the parent re-layouts.
             cx.redraw_all();
-
-            // aichat streams a card by calling set_text() with the full growing
-            // block, so every chunk lands here. Re-arm the quiet-period check on
-            // each one: while text keeps arriving the timer keeps being pushed
-            // back, and it only fires once the body has gone still. That is the
-            // point at which "no view yet" means failure rather than "not
-            // finished streaming".
-            cx.stop_timer(self.failure_timer);
-            if !self.render_ok {
-                self.failure_timer = cx.start_timeout(SPLASH_FAILURE_DELAY);
-            }
         }
     }
 }
