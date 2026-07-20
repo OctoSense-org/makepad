@@ -1389,20 +1389,42 @@ fn root_wants_fill(body: &str) -> bool {
     head.replace(' ', "").contains("height:Fill")
 }
 
-/// Are the body's `{`/`}` balanced? Braces inside string literals and line
-/// comments are ignored. A corrupt card (truncated stream, overwritten lines)
-/// can still *parse* — the parser recovers by closing scopes early — but then
-/// whole subtrees silently vanish from the evaluated view. Callers use this to
-/// route such bodies to the failure card instead of rendering a fragment.
-fn braces_balanced(body: &str) -> bool {
+/// Does the body's `{`/`}` depth ever dip below zero? Braces inside string
+/// literals and comments (line comments, and nested block comments — the DSL
+/// tokenizer supports both) are ignored.
+///
+/// Depth going negative is the precise signature of a corrupt card whose text
+/// gained extra `}` (e.g. a streamed card damaged mid-persist): the surplus
+/// brace closes the root container early, later children fall out of the
+/// evaluated tree, and the card renders as a fragment. A *healthy* body —
+/// including every mid-stream prefix of a well-formed card — never dips below
+/// zero, so this gate cannot misfire on progressive rendering. (A merely
+/// *truncated* body stays at depth ≥ 0; the parser auto-closes it and the
+/// partial card renders, which is the intended streaming behavior.)
+fn braces_go_negative(body: &str) -> bool {
     let mut depth: i64 = 0;
     let mut chars = body.chars().peekable();
     let mut quote: Option<char> = None;
     let mut line_comment = false;
+    let mut block_comment_depth: i64 = 0;
     while let Some(c) = chars.next() {
         if line_comment {
             if c == '\n' {
                 line_comment = false;
+            }
+            continue;
+        }
+        if block_comment_depth > 0 {
+            match c {
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    block_comment_depth += 1;
+                }
+                '*' if chars.peek() == Some(&'/') => {
+                    chars.next();
+                    block_comment_depth -= 1;
+                }
+                _ => {}
             }
             continue;
         }
@@ -1420,17 +1442,21 @@ fn braces_balanced(body: &str) -> bool {
                 chars.next();
                 line_comment = true;
             }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                block_comment_depth = 1;
+            }
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
                 if depth < 0 {
-                    return false;
+                    return true;
                 }
             }
             _ => {}
         }
     }
-    depth == 0
+    false
 }
 
 impl Splash {
@@ -1537,13 +1563,16 @@ impl Splash {
         });
 
         if let Some(view) = new_view {
-            // A body whose braces do not balance but still "evaluates" is the
-            // parser silently recovering from a truncated/corrupt card: an
-            // extra `}` closes the root container early, later children fall
-            // out of the tree, and the card renders as a fragment (e.g. only
-            // its footer). Treat it as an eval failure so the quiet-period
-            // failure card fires instead of showing a partial tree.
-            if braces_balanced(&body) {
+            // A body whose brace depth goes negative but still "evaluates" is
+            // the parser silently recovering from a corrupt card (one that
+            // gained extra `}`, e.g. a stream damaged mid-persist): the
+            // surplus brace closes the root container early, later children
+            // fall out of the tree, and the card renders as a fragment (e.g.
+            // only its footer). Treat it as an eval failure so the
+            // quiet-period failure card fires instead. A healthy mid-stream
+            // prefix never dips below zero, so progressive rendering is
+            // unaffected.
+            if !braces_go_negative(&body) {
                 self.view = view;
                 self.view.set_visible(cx, true);
                 crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
@@ -1551,7 +1580,7 @@ impl Splash {
                 self.render_ok = true;
             } else {
                 log!(
-                    "[SPLASH] eval succeeded but braces are unbalanced — treating as eval failure"
+                    "[SPLASH] eval succeeded but brace depth went negative (corrupt card) — treating as eval failure"
                 );
             }
         }
@@ -1768,12 +1797,20 @@ impl Splash {
         });
 
         if let Some(view) = new_view {
-            self.view = view;
-            // Make `ui` a global in this splash's VM (pointing at the freshly-built view root) so
-            // helper `fn`s inside the block can use `ui.<id>.set_text(...)`, not just inline
-            // handlers. Without this, calculators/forms that route through a helper silently fail.
-            crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
-            cx.widget_tree_mark_dirty(self.uid);
+            // Same corrupt-card guard as eval_body: never adopt a fragment
+            // built from a body whose brace depth went negative.
+            if !braces_go_negative(&current) {
+                self.view = view;
+                // Make `ui` a global in this splash's VM (pointing at the freshly-built view root) so
+                // helper `fn`s inside the block can use `ui.<id>.set_text(...)`, not just inline
+                // handlers. Without this, calculators/forms that route through a helper silently fail.
+                crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
+                cx.widget_tree_mark_dirty(self.uid);
+            } else {
+                log!(
+                    "[SPLASH] stream_append: eval succeeded but brace depth went negative (corrupt card) — view not adopted"
+                );
+            }
         }
         // Streamed cards must arm the animation pump too (eval_body isn't called
         // on this path), or time-based shaders (WeatherIcon / draw_pass.time)
