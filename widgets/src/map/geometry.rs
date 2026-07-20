@@ -792,6 +792,55 @@ pub fn append_stroke_fill_overlay_pass(
     *stroke_zbias += VECTOR_ZBIAS_STEP;
 }
 
+/// Tessellate one pass of a navigation route ribbon (casing or core) into
+/// vector-geometry buffers. Like `append_stroke_pass` but with an explicit
+/// alpha so the ribbon can stay semi-transparent over the road, and always
+/// Round cap/join (a route ribbon, not a styled road).
+#[allow(clippy::too_many_arguments)]
+pub fn append_route_ribbon_pass(
+    path: &mut VectorPath,
+    points: &[(f32, f32)],
+    tess: &mut Tessellator,
+    tess_verts: &mut Vec<VVertex>,
+    tess_indices: &mut Vec<u32>,
+    vertices: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    width: f32,
+    color: u32,
+    alpha: f32,
+    zbias: &mut f32,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    emit_path(path, points, false);
+    let stroke_mult = tessellate_path_stroke(
+        path,
+        tess,
+        tess_verts,
+        tess_indices,
+        width,
+        LineCap::Round,
+        LineJoin::Round,
+        4.0,
+        1.0,
+    );
+    append_tessellated_geometry(
+        tess_verts,
+        tess_indices,
+        vertices,
+        indices,
+        VectorRenderParams {
+            color: hex_to_premul_rgba(color, alpha),
+            stroke_mult,
+            shape_id: 0.0,
+            params: [0.0; 6],
+            zbias: *zbias,
+        },
+    );
+    *zbias += VECTOR_ZBIAS_STEP;
+}
+
 fn expand_polyline_endpoints(points: &[(f32, f32)], _stroke_width: f32) -> Vec<(f32, f32)> {
     points.to_vec()
 }
@@ -879,13 +928,15 @@ pub fn is_descendant_tile(child: TileKey, parent: TileKey) -> bool {
     cx >= min_x && cx <= max_x && cy >= min_y && cy <= max_y
 }
 
-pub fn tile_clip_rect(tile_key: TileKey, padding: f32) -> (f32, f32, f32, f32) {
+/// TILE-LOCAL clip rect: tile geometry is built with the tile origin
+/// subtracted (see `tile_world_origin`), so the road-clip window is local too.
+pub fn tile_clip_rect(_tile_key: TileKey, padding: f32) -> (f32, f32, f32, f32) {
     let tile_size = TILE_SIZE as f32;
     (
-        tile_key.x as f32 * tile_size - padding,
-        tile_key.y as f32 * tile_size - padding,
-        (tile_key.x as f32 + 1.0) * tile_size + padding,
-        (tile_key.y as f32 + 1.0) * tile_size + padding,
+        -padding,
+        -padding,
+        tile_size + padding,
+        tile_size + padding,
     )
 }
 

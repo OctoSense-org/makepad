@@ -13,8 +13,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const OVERPASS_ENDPOINTS: &[&str] = &["https://overpass.kumi.systems/api/interpreter"];
-pub const MAX_PENDING_REQUESTS: usize = 2;
+pub const OVERPASS_ENDPOINTS: &[&str] = &[
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+];
+pub const MAX_PENDING_REQUESTS: usize = 6;
 pub const MAX_TILE_RETRIES: u8 = 6;
 pub const RETRY_BASE_FRAMES: u64 = 30;
 pub const RETRY_MAX_FRAMES: u64 = 300;
@@ -220,6 +224,16 @@ pub fn overpass_query(tile: TileKey) -> String {
         ));
     }
 
+    // POI nodes (named points of interest) only at close zoom, where there's
+    // room to label them — restaurants, cafes, fuel, banks, shops, etc.
+    if tile.z >= 16 {
+        ways.push_str(&format!(
+            "node[\"amenity\"][\"name\"]({south:.6},{west:.6},{north:.6},{east:.6});\
+             node[\"shop\"][\"name\"]({south:.6},{west:.6},{north:.6},{east:.6});\
+             node[\"tourism\"][\"name\"]({south:.6},{west:.6},{north:.6},{east:.6});"
+        ));
+    }
+
     format!(
         "[out:json][timeout:20];\
          ({ways});\
@@ -228,12 +242,47 @@ pub fn overpass_query(tile: TileKey) -> String {
     )
 }
 
+/// World-px origin of a tile at its own zoom. Geometry is built TILE-LOCAL
+/// (subtracted in f64 BEFORE the f32 cast) so vertex coordinates stay small:
+/// absolute world px at z16 reach 2^24 where f32 granularity is ~2px, which
+/// made every vertex swim/jitter as the nav camera moved.
+pub fn tile_world_origin(tile_key: TileKey) -> (f64, f64) {
+    (
+        tile_key.x as f64 * TILE_SIZE,
+        tile_key.y as f64 * TILE_SIZE,
+    )
+}
+
+// Absolute tile-cache dir, set once from `cx.get_data_dir()` (Android
+// getFilesDir). PROCESS-GLOBAL (OnceLock) because the tile-parse WORKER
+// threads read it too — a thread_local wouldn't reach them. The default
+// `TILE_CACHE_DIR` is RELATIVE, and the app's cwd on Android is "/"
+// (read-only), so without this, cache writes silently fail and NO tile ever
+// persists: every tile (incl. every 240s loop restart) re-fetches from
+// Overpass over the network → a blank/partial map for ~12s each time.
+static TILE_CACHE_BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Point the tile disk cache at an absolute, writable directory. Idempotent
+/// (first non-empty caller wins).
+pub fn set_tile_cache_base(dir: &str) {
+    if !dir.is_empty() {
+        let _ = TILE_CACHE_BASE.set(Path::new(dir).join(TILE_CACHE_DIR));
+    }
+}
+
+fn tile_cache_base() -> PathBuf {
+    TILE_CACHE_BASE
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(TILE_CACHE_DIR))
+}
+
 pub fn ensure_cache_dir() {
-    let _ = fs::create_dir_all(TILE_CACHE_DIR);
+    let _ = fs::create_dir_all(tile_cache_base());
 }
 
 pub fn tile_data_cache_path_for(tile_key: TileKey) -> PathBuf {
-    Path::new(TILE_CACHE_DIR).join(format!(
+    tile_cache_base().join(format!(
         "z{}_x{}_y{}.json",
         tile_key.z, tile_key.x, tile_key.y
     ))
@@ -270,6 +319,35 @@ pub fn format_tile_key_sample(keys: &[TileKey], limit: usize) -> String {
 
 // --- Tile buffer building ---
 
+/// Subdivide a polyline so no segment exceeds `max_seg` (tile-local px).
+/// Kept for the per-distance-LOD fix (see codex-map-vanish-review.md); not
+/// called uniformly because it tanks downtown fps.
+#[allow(dead_code)]
+/// Near the nav camera a long stroke quad projects badly — the GPU
+/// interpolates the non-linear pinhole linearly across it, so long near-field
+/// road segments degenerate/shimmer (same mechanism that made the route ribbon
+/// vanish; densifying the ribbon fixed it). Kept moderate to bound vertex count
+/// (this runs for every road in every tile; the phone is GPU-limited).
+fn densify_polyline_px(points: &[(f32, f32)], max_seg: f32) -> Vec<(f32, f32)> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let mut out = Vec::<(f32, f32)>::with_capacity(points.len() * 2);
+    for i in 0..points.len() - 1 {
+        let (x0, y0) = points[i];
+        let (x1, y1) = points[i + 1];
+        out.push((x0, y0));
+        let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+        let steps = (len / max_seg).floor() as usize;
+        for s in 1..steps {
+            let t = s as f32 / steps as f32;
+            out.push((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t));
+        }
+    }
+    out.push(points[points.len() - 1]);
+    out
+}
+
 pub fn build_tile_buffers_from_body(
     tile_key: TileKey,
     body: &str,
@@ -289,9 +367,11 @@ pub fn build_tile_buffers_from_body(
                     nodes.insert(element.id, (lon, lat));
                     if let Some(tags) = element.tags {
                         let world = lon_lat_to_world(lon, lat, tile_key.z);
-                        if let Some(label) =
-                            extract_point_label(&tags, (world.x as f32, world.y as f32))
-                        {
+                        let (ox, oy) = tile_world_origin(tile_key);
+                        let pt = ((world.x - ox) as f32, (world.y - oy) as f32);
+                        if let Some(label) = extract_point_label(&tags, pt) {
+                            labels.push(label);
+                        } else if let Some(label) = extract_poi_label(&tags, pt) {
                             labels.push(label);
                         }
                     }
@@ -327,7 +407,8 @@ pub fn build_tile_buffers_from_body(
 
     let mut prepared = Vec::<PreparedWay>::with_capacity(ways.len());
     for (way_index, way) in ways.iter().enumerate() {
-        let projected = project_way_points_with_nodes(&way.nodes, &nodes, tile_key.z);
+        let projected =
+            project_way_points_with_nodes(&way.nodes, &nodes, tile_key.z, tile_world_origin(tile_key));
         if projected.len() < 2 {
             continue;
         }
@@ -467,6 +548,11 @@ pub fn build_tile_buffers_from_body(
     let mut merged_stroke_parts = Vec::<(StrokeStyle, bool, Vec<Vec<(f32, f32)>>)>::new();
     for job in merged_stroke_jobs {
         let parts = build_polyline_parts(&job.points, clip_bounds, false, ROAD_SMOOTH_FACTOR);
+        // NOTE: densifying these road parts (via densify_polyline_px) fixes the
+        // near-field perspective degeneration but multiplies downtown road
+        // geometry ~4x and drops this phone to ~22fps — NOT viable uniformly.
+        // The right fix is per-distance LOD (densify only the nearest tiles) or
+        // render-to-texture + homography warp. See codex-map-vanish-review.md.
         merged_stroke_parts.push((job.style, job.center_overlay, parts));
     }
 
@@ -562,6 +648,7 @@ fn project_way_points_with_nodes(
     node_ids: &[i64],
     nodes: &HashMap<i64, (f64, f64)>,
     zoom: u32,
+    origin: (f64, f64),
 ) -> Vec<(i64, (f32, f32))> {
     let mut out = Vec::with_capacity(node_ids.len());
     let mut last: Option<(f32, f32)> = None;
@@ -571,7 +658,7 @@ fn project_way_points_with_nodes(
             continue;
         };
         let world = lon_lat_to_world(lon, lat, zoom);
-        let point = (world.x as f32, world.y as f32);
+        let point = ((world.x - origin.0) as f32, (world.y - origin.1) as f32);
 
         if let Some(prev) = last {
             let dx = point.0 - prev.0;
