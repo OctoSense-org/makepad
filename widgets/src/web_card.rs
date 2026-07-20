@@ -198,6 +198,16 @@ pub struct WebCard {
     /// In-flight downloads: call_id → (client download id, sandbox-relative dest).
     #[rust]
     downloads: Vec<(i64, String, String)>,
+    /// Whether the JS→native bridge is armed. Armed ONLY for the card's own
+    /// inline HTML (loaded via set_html). A `url:`-navigated document (or the
+    /// URLTEST probe) is a remote page: the bridge is a WebView-wide
+    /// JavascriptInterface / shared message handler, so without this gate ANY
+    /// page the card navigates to — and any third-party iframe — would inherit
+    /// fs.*, dialog.open, download, notify, clipboard.write. (Limitation: an
+    /// inline card whose main frame later navigates away is not re-detected at
+    /// this layer; closing that needs native navigation callbacks.)
+    #[rust]
+    bridge_allowed: bool,
 }
 
 /// Args for the `http.fetch` bridge tool. The card sends headers as `[[k,v],…]`
@@ -327,6 +337,7 @@ impl WebCard {
                 cx.system_browser(id).set_url(&url, false);
             }
             self.loaded_html = self.html.clone();
+            self.bridge_allowed = false; // remote document — no bridge
             self.redraw(cx);
             return;
         }
@@ -338,6 +349,7 @@ impl WebCard {
         let base = self.base_url_or_default().to_string();
         cx.system_browser(id).set_html(&html, &base);
         self.loaded_html = self.html.clone();
+        self.bridge_allowed = true; // our own inline document — arm the bridge
         self.redraw(cx);
     }
 
@@ -587,13 +599,15 @@ impl Widget for WebCard {
         }
         // JS→native bridge: a card called octos.invoke(tool, args) (posted from the
         // WebView's octos_native JavascriptInterface as an AndroidSystemBrowserInvoke
-        // action). Dispatch only our own browser's calls.
+        // action). Dispatch only our own browser's calls — and only when the
+        // current document is the card's OWN inline HTML (bridge_allowed), so a
+        // `url:`-navigated remote page or iframe cannot reach fs/dialog/download.
         if let Event::Actions(actions) = event {
             for action in actions {
                 if let Some(inv) = action
                     .downcast_ref::<crate::makepad_platform::event::AndroidSystemBrowserInvoke>()
                 {
-                    if inv.browser_id == self.browser_id().0.get_value() {
+                    if inv.browser_id == self.browser_id().0.get_value() && self.bridge_allowed {
                         self.handle_invoke(cx, inv.call_id, &inv.tool, &inv.args);
                     }
                 }
@@ -678,6 +692,7 @@ impl Widget for WebCard {
                 cx.system_browser(id).set_url(&self.url, false);
             }
             self.loaded_html = self.url.clone();
+            self.bridge_allowed = false; // remote document — no bridge
         }
 
         // Keep the native overlay glued to this rect while we are drawn.

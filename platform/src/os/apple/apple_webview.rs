@@ -328,19 +328,27 @@ pub fn define_octos_web_message_handler() -> *const Class {
             }
             let browser_id: u64 = *this.get_ivar("octos_browser_id");
             let body: ObjcId = msg_send![message, body];
-            if body == nil {
+            // The card's JS is untrusted — it can postMessage ANY value
+            // (a string, a number, an array). Every msg_send below assumes
+            // specific classes, and an unrecognized selector raises an
+            // NSException that takes the whole app down. Validate first.
+            if body == nil || !msg_send![body, isKindOfClass: class!(NSDictionary)] {
                 return;
             }
             // body is the JS object {id:Number, tool:String, args:String(json)}.
             let id_obj: ObjcId = msg_send![body, objectForKey: str_to_nsstring("id")];
             let tool_obj: ObjcId = msg_send![body, objectForKey: str_to_nsstring("tool")];
             let args_obj: ObjcId = msg_send![body, objectForKey: str_to_nsstring("args")];
-            let call_id: i64 = if id_obj != nil {
+            let call_id: i64 = if id_obj != nil
+                && msg_send![id_obj, isKindOfClass: class!(NSNumber)]
+            {
                 msg_send![id_obj, longLongValue]
             } else {
                 0
             };
-            let tool = if tool_obj != nil {
+            let tool = if tool_obj != nil
+                && msg_send![tool_obj, isKindOfClass: class!(NSString)]
+            {
                 crate::os::apple::apple_util::nsstring_to_string(tool_obj)
             } else {
                 String::new()
@@ -348,7 +356,9 @@ pub fn define_octos_web_message_handler() -> *const Class {
             if tool.is_empty() {
                 return;
             }
-            let args = if args_obj != nil {
+            let args = if args_obj != nil
+                && msg_send![args_obj, isKindOfClass: class!(NSString)]
+            {
                 crate::os::apple::apple_util::nsstring_to_string(args_obj)
             } else {
                 String::new()
