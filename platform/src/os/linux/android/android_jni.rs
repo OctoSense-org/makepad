@@ -235,6 +235,7 @@ pub enum FromJavaMessage {
     },
     ComposerNewApp,
     ComposerSwitch,
+    ComposerExpand,
     SystemBrowserInvoke {
         browser_id: i64,
         call_id: i64,
@@ -1490,6 +1491,15 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSwitch
     _: jni_sys::jclass,
 ) {
     send_from_java_message(FromJavaMessage::ComposerSwitch);
+}
+
+/// The native composer's collapsed "+" FAB was tapped to UNFOLD the composer.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerExpand(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+) {
+    send_from_java_message(FromJavaMessage::ComposerExpand);
 }
 
 /// A `runhtml` card's JS called `octos.invoke(tool, args)` — bridged here via the
