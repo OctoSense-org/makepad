@@ -1178,7 +1178,16 @@ impl Turtle {
             let unresolved_length = self.unresolved_length_from(count);
             let deferred_fill = &self.deferred_fills[count];
             let total_deferred_weight = self.total_deferred_weight_from(count);
-            let mut length = unresolved_length * deferred_fill.weight / total_deferred_weight;
+            // A `Fill` child inside a `Fit`-sized container has no unused length
+            // to distribute (the container's size is unknown until its children
+            // are laid out), so `unresolved_length` is NaN. Collapse the fill to
+            // 0 — the container then fits its remaining children — instead of
+            // propagating a NaN that panics later in `move_align_list`.
+            let mut length = if unresolved_length.is_nan() {
+                0.0
+            } else {
+                unresolved_length * deferred_fill.weight / total_deferred_weight
+            };
             if let Some(min) = deferred_fill.min {
                 length = length.max(min);
             }
