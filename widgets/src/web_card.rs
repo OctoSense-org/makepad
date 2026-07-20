@@ -17,6 +17,16 @@
 // signal in a retained-mode renderer.
 
 use crate::{makepad_derive_widget::*, makepad_draw::*, makepad_micro_serde::*, widget::*};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Every WebCard shares ONE native overlay (web_card_browser_id), so "whose
+/// document is currently in the WebView" is global state, not per-widget
+/// state. Records the uid of the widget that most recently loaded content
+/// (inline HTML or a url: navigation). Bridge invokes are only dispatched by
+/// the owner — otherwise an armed inline card would happily execute fs.*/…
+/// calls posted by a remote page a LATER url: card navigated the shared
+/// WebView to (and two inline cards would double-dispatch the same call).
+static OVERLAY_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// The octos web-widget kit (the web counterpart of Splash `glass.*`), injected
 /// into EVERY web card so cards compose from `octos.*` instead of hand-rolling.
@@ -198,6 +208,17 @@ pub struct WebCard {
     /// In-flight downloads: call_id → (client download id, sandbox-relative dest).
     #[rust]
     downloads: Vec<(i64, String, String)>,
+    /// Whether the JS→native bridge is armed. Armed ONLY for the card's own
+    /// inline HTML (loaded via set_html). A `url:`-navigated document (or the
+    /// URLTEST probe) is a remote page: the bridge is a WebView-wide
+    /// JavascriptInterface / shared message handler, so without this gate a
+    /// page the card navigates to would inherit fs.*, dialog.open, download,
+    /// notify, clipboard.write. (Limitations: an inline card whose main frame
+    /// later navigates away is not re-detected at this layer, and iframes
+    /// inside an armed inline card can also reach the bridge — both need
+    /// native navigation/frame callbacks to close.)
+    #[rust]
+    bridge_allowed: bool,
 }
 
 /// Args for the `http.fetch` bridge tool. The card sends headers as `[[k,v],…]`
@@ -327,6 +348,8 @@ impl WebCard {
                 cx.system_browser(id).set_url(&url, false);
             }
             self.loaded_html = self.html.clone();
+            self.bridge_allowed = false; // remote document — no bridge
+            OVERLAY_OWNER.store(self.uid.0, Ordering::SeqCst);
             self.redraw(cx);
             return;
         }
@@ -338,6 +361,8 @@ impl WebCard {
         let base = self.base_url_or_default().to_string();
         cx.system_browser(id).set_html(&html, &base);
         self.loaded_html = self.html.clone();
+        self.bridge_allowed = true; // our own inline document — arm the bridge
+        OVERLAY_OWNER.store(self.uid.0, Ordering::SeqCst);
         self.redraw(cx);
     }
 
@@ -587,13 +612,21 @@ impl Widget for WebCard {
         }
         // JS→native bridge: a card called octos.invoke(tool, args) (posted from the
         // WebView's octos_native JavascriptInterface as an AndroidSystemBrowserInvoke
-        // action). Dispatch only our own browser's calls.
+        // action). Dispatch only our own browser's calls — and only when the
+        // current document is the card's OWN inline HTML (bridge_allowed), so a
+        // `url:`-navigated remote page or iframe cannot reach fs/dialog/download.
         if let Event::Actions(actions) = event {
             for action in actions {
                 if let Some(inv) = action
                     .downcast_ref::<crate::makepad_platform::event::AndroidSystemBrowserInvoke>()
                 {
-                    if inv.browser_id == self.browser_id().0.get_value() {
+                    // The overlay is shared: only the widget that loaded the
+                    // CURRENT document (OVERLAY_OWNER) may answer invokes, and
+                    // only if that document is its own inline HTML.
+                    if inv.browser_id == self.browser_id().0.get_value()
+                        && self.bridge_allowed
+                        && OVERLAY_OWNER.load(Ordering::SeqCst) == self.uid.0
+                    {
                         self.handle_invoke(cx, inv.call_id, &inv.tool, &inv.args);
                     }
                 }
@@ -678,6 +711,8 @@ impl Widget for WebCard {
                 cx.system_browser(id).set_url(&self.url, false);
             }
             self.loaded_html = self.url.clone();
+            self.bridge_allowed = false; // remote document — no bridge
+            OVERLAY_OWNER.store(self.uid.0, Ordering::SeqCst);
         }
 
         // Keep the native overlay glued to this rect while we are drawn.
