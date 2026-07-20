@@ -1389,6 +1389,50 @@ fn root_wants_fill(body: &str) -> bool {
     head.replace(' ', "").contains("height:Fill")
 }
 
+/// Are the body's `{`/`}` balanced? Braces inside string literals and line
+/// comments are ignored. A corrupt card (truncated stream, overwritten lines)
+/// can still *parse* — the parser recovers by closing scopes early — but then
+/// whole subtrees silently vanish from the evaluated view. Callers use this to
+/// route such bodies to the failure card instead of rendering a fragment.
+fn braces_balanced(body: &str) -> bool {
+    let mut depth: i64 = 0;
+    let mut chars = body.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut line_comment = false;
+    while let Some(c) = chars.next() {
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                line_comment = true;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
 impl Splash {
     /// Stable identity for the streaming script body, based on pointer address.
     fn self_id(&self) -> usize {
@@ -1493,11 +1537,23 @@ impl Splash {
         });
 
         if let Some(view) = new_view {
-            self.view = view;
-            self.view.set_visible(cx, true);
-            crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
-            cx.widget_tree_mark_dirty(self.uid);
-            self.render_ok = true;
+            // A body whose braces do not balance but still "evaluates" is the
+            // parser silently recovering from a truncated/corrupt card: an
+            // extra `}` closes the root container early, later children fall
+            // out of the tree, and the card renders as a fragment (e.g. only
+            // its footer). Treat it as an eval failure so the quiet-period
+            // failure card fires instead of showing a partial tree.
+            if braces_balanced(&body) {
+                self.view = view;
+                self.view.set_visible(cx, true);
+                crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.view.widget_uid());
+                cx.widget_tree_mark_dirty(self.uid);
+                self.render_ok = true;
+            } else {
+                log!(
+                    "[SPLASH] eval succeeded but braces are unbalanced — treating as eval failure"
+                );
+            }
         }
         // NOTE: on failure `self.view` is deliberately left alone — mid-stream
         // that keeps the last good frame on screen. `set_text` arms
