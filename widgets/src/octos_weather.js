@@ -63,9 +63,12 @@
   }
   W.wcode = wcode;
 
-  /* ---------- data: open-meteo (CORS-open, keyless — direct fetch) ---------- */
+  /* ---------- data: open-meteo (keyless). Routed through the NATIVE bridge
+     (getJSONn) so it works from any origin — the macOS WKWebView loads cards from
+     a file:// origin where a plain browser fetch is CORS/ATS-blocked; off-native
+     (web preview) getJSONn falls back to the CORS proxy. ---------- */
   W.geocode = function (place) {
-    return C.http.getJSON("https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&name=" + encodeURIComponent(place))
+    return C.http.getJSONn("https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&name=" + encodeURIComponent(place))
       .then(function (j) { if (!j.results || !j.results[0]) throw new Error("no place"); var r = j.results[0];
         return { lat: r.latitude, lon: r.longitude, name: r.name, country: r.country || r.admin1 || "" }; });
   };
@@ -75,7 +78,7 @@
       + "&current=temperature_2m,weather_code,relative_humidity_2m,wind_speed_10m,apparent_temperature"
       + "&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=7"
       + (f ? "&temperature_unit=fahrenheit&wind_speed_unit=mph" : "");
-    return C.http.getJSON(u).then(function (j) {
+    return C.http.getJSONn(u).then(function (j) {
       return { now: { temp: j.current.temperature_2m, code: j.current.weather_code, feels: j.current.apparent_temperature,
                       wind: j.current.wind_speed_10m, hum: j.current.relative_humidity_2m },
         time: j.daily.time, code: j.daily.weather_code, max: j.daily.temperature_2m_max, min: j.daily.temperature_2m_min };

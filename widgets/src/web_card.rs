@@ -72,6 +72,7 @@ const HTTP_FETCH_ALLOWED_HOSTS: &[&str] = &[
     "pipedapi.adminforge.de",
     "query1.finance.yahoo.com", // stock card
     "query2.finance.yahoo.com",
+    "open-meteo.com",           // weather card (api. + geocoding-api. subdomains)
 ];
 
 /// Shared SSRF guard: require https and reject loopback / private / link-local /
