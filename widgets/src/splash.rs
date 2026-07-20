@@ -2136,6 +2136,92 @@ fn is_full_script(body: &str) -> bool {
     trimmed.starts_with("let ") || trimmed.starts_with("fn ") || trimmed.starts_with("mod.")
 }
 
+/// Does this View-children body's FIRST widget ask to fill its parent?
+///
+/// `SPLASH_PREFIX_VIEW` wraps the body in `View{height:Fit, …}`, which is
+/// correct for a short inline snippet but collapses a full-bleed card to zero
+/// height: `Fill` inside `Fit` resolves to nothing, so the card evaluates with
+/// no error and draws no pixels. Scan just the first widget's property list —
+/// a nested `height: Fill` deeper in the tree is fine, it is only the ROOT
+/// asking for its parent's height that the `Fit` wrapper cannot satisfy.
+fn root_wants_fill(body: &str) -> bool {
+    let trimmed = body.trim_start();
+    // Property list of the first widget: up to its first nested `{`, or the
+    // whole first line, whichever ends sooner.
+    let head_end = trimmed
+        .find('\n')
+        .unwrap_or(trimmed.len())
+        .min(trimmed.len());
+    let head = &trimmed[..head_end];
+    head.replace(' ', "").contains("height:Fill")
+}
+
+/// Does the body's `{`/`}` depth ever dip below zero? Braces inside string
+/// literals and comments (line comments, and block comments — ended by the
+/// first `*/`, matching the DSL tokenizer) are ignored.
+///
+/// Depth going negative is the precise signature of a corrupt card whose text
+/// gained extra `}` (e.g. a streamed card damaged mid-persist): the surplus
+/// brace closes the root container early, later children fall out of the
+/// evaluated tree, and the card renders as a fragment. A *healthy* body —
+/// including every mid-stream prefix of a well-formed card — never dips below
+/// zero, so this gate cannot misfire on progressive rendering. (A merely
+/// *truncated* body stays at depth ≥ 0; the parser auto-closes it and the
+/// partial card renders, which is the intended streaming behavior.)
+fn braces_go_negative(body: &str) -> bool {
+    let mut depth: i64 = 0;
+    let mut chars = body.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while let Some(c) = chars.next() {
+        if line_comment {
+            if c == '\n' {
+                line_comment = false;
+            }
+            continue;
+        }
+        if block_comment {
+            // The DSL tokenizer ends a block comment at the FIRST `*/` (no
+            // nesting) — mirror that exactly so the scan never disagrees
+            // with the parser about what is code.
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment = false;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' {
+                chars.next();
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' => quote = Some(c),
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                line_comment = true;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                block_comment = true;
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 impl Splash {
     /// Stable identity for the streaming script body, based on pointer address.
     fn self_id(&self) -> usize {
@@ -2227,9 +2313,25 @@ impl Splash {
         });
 
         if let Some(view) = new_view {
-            self.view = view;
-            self.view.set_visible(cx, true);
-            self.register_view_subtree(cx);
+            // Corrupt-card guard (upstream): a body whose brace depth goes
+            // negative but still "evaluates" is the parser silently recovering
+            // from a card that gained extra `}` (e.g. a stream damaged
+            // mid-persist) — the surplus brace closes the root early and the
+            // card renders as a fragment. Treat it as an eval failure so the
+            // quiet-period failure card fires. A healthy mid-stream prefix never
+            // dips below zero, so progressive rendering is unaffected.
+            if !braces_go_negative(&body) {
+                self.view = view;
+                self.view.set_visible(cx, true);
+                // register_view_subtree roots `ui` at the Splash node (nav's
+                // zero-rebuild ui.<id> fix) — supersedes inject_splash_ui_handle
+                // at the wrapper uid + the separate mark_dirty.
+                self.register_view_subtree(cx);
+            } else {
+                log!(
+                    "[SPLASH] eval succeeded but brace depth went negative (corrupt card) — treating as eval failure"
+                );
+            }
         }
 
         // If the Splash code defines fn tick(), auto-start a 1s interval
@@ -2394,8 +2496,18 @@ impl Splash {
         });
 
         if let Some(view) = new_view {
-            self.view = view;
-            self.register_view_subtree(cx);
+            // Same corrupt-card guard as eval_body: never adopt a fragment
+            // built from a body whose brace depth went negative.
+            if !braces_go_negative(&current) {
+                self.view = view;
+                // register_view_subtree roots `ui` at the Splash node so helper
+                // `fn`s can use `ui.<id>.set_text(...)` (nav's zero-rebuild fix).
+                self.register_view_subtree(cx);
+            } else {
+                log!(
+                    "[SPLASH] stream_append: eval succeeded but brace depth went negative (corrupt card) — view not adopted"
+                );
+            }
         }
         // Streamed cards must arm the animation pump too (eval_body isn't called
         // on this path), or time-based shaders (WeatherIcon / draw_pass.time)
