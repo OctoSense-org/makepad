@@ -1390,8 +1390,8 @@ fn root_wants_fill(body: &str) -> bool {
 }
 
 /// Does the body's `{`/`}` depth ever dip below zero? Braces inside string
-/// literals and comments (line comments, and nested block comments — the DSL
-/// tokenizer supports both) are ignored.
+/// literals and comments (line comments, and block comments — ended by the
+/// first `*/`, matching the DSL tokenizer) are ignored.
 ///
 /// Depth going negative is the precise signature of a corrupt card whose text
 /// gained extra `}` (e.g. a streamed card damaged mid-persist): the surplus
@@ -1406,7 +1406,7 @@ fn braces_go_negative(body: &str) -> bool {
     let mut chars = body.chars().peekable();
     let mut quote: Option<char> = None;
     let mut line_comment = false;
-    let mut block_comment_depth: i64 = 0;
+    let mut block_comment = false;
     while let Some(c) = chars.next() {
         if line_comment {
             if c == '\n' {
@@ -1414,17 +1414,13 @@ fn braces_go_negative(body: &str) -> bool {
             }
             continue;
         }
-        if block_comment_depth > 0 {
-            match c {
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    block_comment_depth += 1;
-                }
-                '*' if chars.peek() == Some(&'/') => {
-                    chars.next();
-                    block_comment_depth -= 1;
-                }
-                _ => {}
+        if block_comment {
+            // The DSL tokenizer ends a block comment at the FIRST `*/` (no
+            // nesting) — mirror that exactly so the scan never disagrees
+            // with the parser about what is code.
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                block_comment = false;
             }
             continue;
         }
@@ -1444,7 +1440,7 @@ fn braces_go_negative(body: &str) -> bool {
             }
             '/' if chars.peek() == Some(&'*') => {
                 chars.next();
-                block_comment_depth = 1;
+                block_comment = true;
             }
             '{' => depth += 1,
             '}' => {
