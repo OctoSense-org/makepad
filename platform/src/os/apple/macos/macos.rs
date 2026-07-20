@@ -1183,7 +1183,7 @@ impl Cx {
                     self.os
                         .system_browsers
                         .entry(browser_id)
-                        .or_insert_with(|| MacosSystemBrowser::new(&url))
+                        .or_insert_with(|| MacosSystemBrowser::new(browser_id, &url))
                         .set_url(&url, false);
                 }
                 CxOsOp::UpdateSystemBrowser {
@@ -1261,8 +1261,13 @@ impl Cx {
                     self.os
                         .system_browsers
                         .entry(browser_id)
-                        .or_insert_with(|| MacosSystemBrowser::new("about:blank"))
+                        .or_insert_with(|| MacosSystemBrowser::new(browser_id, "about:blank"))
                         .set_html(&html, &base_url);
+                }
+                CxOsOp::EvalSystemBrowserJs { browser_id, js } => {
+                    if let Some(browser) = self.os.system_browsers.get(&browser_id) {
+                        browser.eval_js(&js);
+                    }
                 }
                 CxOsOp::SaveFileDialog(settings) => {
                     with_macos_app(|app| app.open_save_file_dialog(settings));

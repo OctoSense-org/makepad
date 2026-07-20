@@ -170,6 +170,12 @@ pub struct WebCard {
     /// resolve against this instead of about:blank).
     #[live]
     base_url: String,
+    /// Splash-drivable direct navigation: `WebCard{ url: "https://…" }`. Used
+    /// only when no inline `html` is set; navigated once on first draw. Lets a
+    /// runsplash card embed a live web pane in a sub-region (e.g. beside a
+    /// native MapView) without an app-side `set_text` call.
+    #[live]
+    url: String,
     #[visible]
     #[live(true)]
     visible: bool,
@@ -504,6 +510,17 @@ impl WebCard {
             },
             // Native file picker (Storage Access Framework). Async: launch here,
             // resolve later when the AndroidDialogResult action arrives (handle_event).
+            // dialog.open + download resolve asynchronously via native result
+            // actions (AndroidDialogResult / AndroidDownloadComplete) that only the
+            // Android backend emits. On other platforms the op would no-op and the
+            // promise would hang, so reject cleanly rather than leave it pending.
+            // (A macOS-native path — NSOpenPanel / URLSession — is future work.)
+            "dialog.open" if !cfg!(target_os = "android") => {
+                self.reject(cx, call_id, "dialog.open is not supported on this platform yet");
+            }
+            "download" if !cfg!(target_os = "android") => {
+                self.reject(cx, call_id, "download is not supported on this platform yet");
+            }
             "dialog.open" => {
                 let mime = DialogArgs::deserialize_json(args)
                     .ok()
@@ -648,6 +665,19 @@ impl Widget for WebCard {
         }
         let rect = cx.walk_turtle(walk);
         self.draw_bg.draw_abs(cx, rect);
+
+        // A DSL-set `url` (no inline html) navigates once on first draw, so a
+        // runsplash card can embed a live web pane via `WebCard{ url: "…" }`.
+        if self.html.is_empty() && !self.url.is_empty() && self.loaded_html != self.url {
+            let id = self.browser_id();
+            if !self.spawned {
+                cx.system_browser(id).spawn(&self.url);
+                self.spawned = true;
+            } else {
+                cx.system_browser(id).set_url(&self.url, false);
+            }
+            self.loaded_html = self.url.clone();
+        }
 
         // Keep the native overlay glued to this rect while we are drawn.
         let area = self.draw_bg.area();

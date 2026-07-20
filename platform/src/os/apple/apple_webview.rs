@@ -4,7 +4,7 @@ use crate::{
     makepad_math::Rect,
     os::apple::{apple_sys::*, apple_util::str_to_nsstring},
 };
-use makepad_objc_sys::{class, msg_send};
+use makepad_objc_sys::{class, msg_send, sel};
 
 #[link(name = "WebKit", kind = "framework")]
 unsafe extern "C" {}
@@ -51,6 +51,7 @@ fn history_go(web_view: ObjcId, delta: i32) {
 
 #[cfg(target_os = "macos")]
 pub(crate) struct MacosSystemBrowser {
+    browser_id: u64,
     current_url: String,
     attached_window: Option<WindowId>,
     host_view: ObjcId,
@@ -60,8 +61,9 @@ pub(crate) struct MacosSystemBrowser {
 
 #[cfg(target_os = "macos")]
 impl MacosSystemBrowser {
-    pub(crate) fn new(url: &str) -> Self {
+    pub(crate) fn new(browser_id: crate::makepad_live_id::LiveId, url: &str) -> Self {
         let mut browser = Self {
+            browser_id: browser_id.get_value(),
             current_url: String::new(),
             attached_window: None,
             host_view: nil,
@@ -79,6 +81,21 @@ impl MacosSystemBrowser {
         }
         unsafe {
             let config: ObjcId = msg_send![class!(WKWebViewConfiguration), new];
+            // Install the octos_native script-message handler: the JS→native half
+            // of the bridge. octos.invoke posts here via
+            // webkit.messageHandlers.octos_native.postMessage({id,tool,args}).
+            let ucc: ObjcId = msg_send![config, userContentController];
+            if ucc != nil {
+                let handler_class = crate::os::apple::apple_classes::get_apple_class_global()
+                    .octos_web_message_handler;
+                let handler: ObjcId = msg_send![handler_class, alloc];
+                let handler: ObjcId = msg_send![handler, init];
+                if handler != nil {
+                    (*handler).set_ivar::<u64>("octos_browser_id", self.browser_id);
+                    let name = str_to_nsstring("octos_native");
+                    let () = msg_send![ucc, addScriptMessageHandler: handler name: name];
+                }
+            }
             let web_view: ObjcId = msg_send![class!(WKWebView), alloc];
             let web_view: ObjcId = msg_send![web_view, initWithFrame: NSRect {
                 origin: NSPoint { x: 0.0, y: 0.0 },
@@ -219,6 +236,20 @@ impl MacosSystemBrowser {
         }
     }
 
+    /// Native→card channel: run a snippet inside the document. Settles
+    /// octos.invoke promises (octos._resolve) and pushes octos._event(...) for
+    /// the events half of the bridge — the WKWebView twin of Android's
+    /// evalSystemBrowserJs.
+    pub(crate) fn eval_js(&self, js: &str) {
+        if self.web_view == nil {
+            return;
+        }
+        unsafe {
+            let js_string = str_to_nsstring(js);
+            let () = msg_send![self.web_view, evaluateJavaScript: js_string completionHandler: nil];
+        }
+    }
+
     pub(crate) fn history_go(&mut self, delta: i32) {
         history_go(self.web_view, delta);
     }
@@ -275,6 +306,75 @@ fn load_html_document(web_view: ObjcId, html: &str, _base_url: &str, generation:
         }
         let () = msg_send![web_view, loadFileURL: file_url allowingReadAccessToURL: dir_url];
     }
+}
+
+/// The `octos_native` WKScriptMessageHandler class. octos.invoke in the card
+/// posts `{id, tool, args}` here; we read the per-instance browser id (ivar) and
+/// post an AndroidSystemBrowserInvoke action into the makepad loop — the exact
+/// action the Android JavascriptInterface bridge posts, so the widget's dispatch
+/// (web_card.rs handle_invoke) is identical on both platforms. Registered once in
+/// AppleClasses.
+#[cfg(target_os = "macos")]
+pub fn define_octos_web_message_handler() -> *const Class {
+    extern "C" fn did_receive_script_message(
+        this: &Object,
+        _: Sel,
+        _content_controller: ObjcId,
+        message: ObjcId,
+    ) {
+        unsafe {
+            if message == nil {
+                return;
+            }
+            let browser_id: u64 = *this.get_ivar("octos_browser_id");
+            let body: ObjcId = msg_send![message, body];
+            if body == nil {
+                return;
+            }
+            // body is the JS object {id:Number, tool:String, args:String(json)}.
+            let id_obj: ObjcId = msg_send![body, objectForKey: str_to_nsstring("id")];
+            let tool_obj: ObjcId = msg_send![body, objectForKey: str_to_nsstring("tool")];
+            let args_obj: ObjcId = msg_send![body, objectForKey: str_to_nsstring("args")];
+            let call_id: i64 = if id_obj != nil {
+                msg_send![id_obj, longLongValue]
+            } else {
+                0
+            };
+            let tool = if tool_obj != nil {
+                crate::os::apple::apple_util::nsstring_to_string(tool_obj)
+            } else {
+                String::new()
+            };
+            if tool.is_empty() {
+                return;
+            }
+            let args = if args_obj != nil {
+                crate::os::apple::apple_util::nsstring_to_string(args_obj)
+            } else {
+                String::new()
+            };
+            crate::Cx::post_action(crate::event::AndroidSystemBrowserInvoke {
+                browser_id,
+                call_id,
+                tool,
+                args,
+            });
+            crate::thread::SignalToUI::set_ui_signal();
+        }
+    }
+    let superclass = class!(NSObject);
+    let mut decl = ClassDecl::new("MakepadOctosWebMessageHandler", superclass).unwrap();
+    unsafe {
+        decl.add_method(
+            sel!(userContentController: didReceiveScriptMessage:),
+            did_receive_script_message as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
+        );
+        if let Some(protocol) = Protocol::get("WKScriptMessageHandler") {
+            decl.add_protocol(protocol);
+        }
+    }
+    decl.add_ivar::<u64>("octos_browser_id");
+    decl.register()
 }
 
 #[cfg(target_os = "macos")]

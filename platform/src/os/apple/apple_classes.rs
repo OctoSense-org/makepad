@@ -61,6 +61,8 @@ pub struct AppleClasses {
     pub url_session_data_delegate: *const Class,
     #[cfg(target_os = "macos")]
     pub sc_stream_output_delegate: *const Class,
+    #[cfg(target_os = "macos")]
+    pub octos_web_message_handler: *const Class,
     pub const_attributes_for_marked_text: ObjcId,
     pub const_empty_string: RcObjcId,
 }
@@ -80,6 +82,9 @@ impl AppleClasses {
             key_value_observing_delegate: define_key_value_observing_delegate(),
             #[cfg(target_os = "macos")]
             sc_stream_output_delegate: define_sc_stream_output_delegate(),
+            #[cfg(target_os = "macos")]
+            octos_web_message_handler:
+                crate::os::apple::apple_webview::define_octos_web_message_handler(),
             const_attributes_for_marked_text: unsafe {
                 msg_send![
                     class!(NSArray),

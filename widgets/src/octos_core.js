@@ -98,19 +98,31 @@ html,body{background:var(--o-bg);color:var(--o-fg);font-family:Roboto,Arial,sans
 
   /* ---------- native bridge: octos.invoke(tool, args) → Rust (Tauri-style) ----------
      The request executes in native Rust (no browser CORS), the result comes back
-     async and resolves the promise. Requires the host WebView's octos_native
-     JavascriptInterface (Android); rejects gracefully where it's absent. */
+     async and resolves the promise. Two host transports, same protocol: Android's
+     octos_native JavascriptInterface, and the macOS/iOS WKWebView octos_native
+     script-message handler. Rejects gracefully where neither is present. */
   O._pending = {}; O._seq = 0;
+  O._wk = function () {
+    return (window.webkit && webkit.messageHandlers && webkit.messageHandlers.octos_native) || null;
+  };
+  O.hasNative = function () {
+    return !!((window.octos_native && octos_native.invoke) || O._wk());
+  };
+  O._send = function (id, tool, argsJson) {
+    if (window.octos_native && octos_native.invoke) { octos_native.invoke(id, tool, argsJson); return; }
+    var wk = O._wk();
+    if (wk) { wk.postMessage({ id: id, tool: tool, args: argsJson }); return; }
+    throw "native bridge unavailable";
+  };
   O.invoke = function (tool, args) {
     return new Promise(function (resolve, reject) {
-      if (!(window.octos_native && octos_native.invoke)) { reject("native bridge unavailable"); return; }
+      if (!O.hasNative()) { reject("native bridge unavailable"); return; }
       var id = ++O._seq;
       O._pending[id] = { resolve: resolve, reject: reject };
-      try { octos_native.invoke(id, tool, JSON.stringify(args || {})); }
+      try { O._send(id, tool, JSON.stringify(args || {})); }
       catch (e) { delete O._pending[id]; reject(String(e)); }
     });
   };
-  O.hasNative = function () { return !!(window.octos_native && octos_native.invoke); };
   /* called BY native (evalSystemBrowserJs) to settle a pending invoke */
   O._resolve = function (id, payload) {
     var p = O._pending[id]; if (!p) return; delete O._pending[id];
