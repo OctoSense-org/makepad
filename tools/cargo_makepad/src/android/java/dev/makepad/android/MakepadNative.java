@@ -68,6 +68,10 @@ public class MakepadNative {
     public native static void onComposerNewApp();
     public native static void onComposerSwitch();
 
+    // The collapsed "+" FAB was tapped to unfold the composer (keeps the app's
+    // composer_shown state in sync with the native overlay).
+    public native static void onComposerExpand();
+
     // A runhtml web-card's JS called octos.invoke(tool, args) — bridged in from the
     // WebView's "octos_native" JavascriptInterface. Rust dispatches the tool and
     // resolves the card-side promise (callId) via evalSystemBrowserJs.

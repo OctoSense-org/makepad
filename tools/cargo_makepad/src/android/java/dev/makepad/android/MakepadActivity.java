@@ -2849,7 +2849,12 @@ public class MakepadActivity
         mComposerFab.setLayoutParams(fabLp);
         mComposerFab.setClickable(true);
         mComposerFab.setFocusable(true);
-        mComposerFab.setVisibility(View.GONE);
+        // Folded by default: only the round "+" FAB shows; the input pill stays
+        // hidden until the user taps "+" to unfold it. (Rust's boot
+        // composer_shown=false + sync_composer also drives this, but starting
+        // folded here avoids a launch flash of the expanded pill.)
+        mComposerFab.setVisibility(View.VISIBLE);
+        mComposerPill.setVisibility(View.GONE);
         mComposerFab.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
@@ -2858,6 +2863,10 @@ public class MakepadActivity
                 mComposerFab.setVisibility(View.GONE);
                 mComposerPill.setVisibility(View.VISIBLE);
                 focusComposerInput();
+                // Keep the app's composer_shown state in sync with this manual
+                // unfold, so a later sync_composer won't re-fold the pill the
+                // user just opened.
+                MakepadNative.onComposerExpand();
             }
         });
         mComposerOverlay.addView(mComposerFab);
