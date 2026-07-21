@@ -42,6 +42,20 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
 .o-pipov .cls{position:absolute;top:5px;right:5px;width:30px;height:30px;border:0;border-radius:50%;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
 .o-pipov .tog svg{width:24px;height:24px;fill:#fff}
 .o-pipov .cls svg{width:18px;height:18px;fill:#fff}
+/* player control bar — sits OUTSIDE the video rect, in normal flow below the
+   player (and as a fixed pill above the PiP square). On Android the YouTube
+   video is a punched-through hardware surface that composites ABOVE all HTML
+   regardless of z-index, so the overlaid controls (.o-min/.o-fs/.o-pipov) can
+   be invisible there — this bar is the always-visible exit (octos-one#19). */
+.o-bar{display:flex;align-items:center;gap:6px;padding:6px 10px;background:#0f0f0f}
+.o-bar button{height:34px;min-width:34px;border:0;border-radius:17px;background:#272727;color:#f1f1f1;font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:0 12px}
+.o-bar button svg{width:18px;height:18px;fill:#f1f1f1}
+.o-bar .o-brestore svg{transform:rotate(180deg)}
+body.o-pip .o-b-inline{display:none}
+body:not(.o-pip) .o-b-pip{display:none}
+body.o-pip .o-bar{display:flex!important;position:fixed;right:10px;bottom:222px;z-index:58;padding:5px;border-radius:20px;background:rgba(15,15,15,.92);box-shadow:0 6px 22px rgba(0,0,0,.75)}
+body.o-pip .o-bar button{min-width:34px;width:34px;padding:0;border-radius:50%}
+body.o-pip .o-bar .o-blabel{display:none}
 /* meta + actions */
 .o-title{font-size:16px;font-weight:600;line-height:1.35;margin:11px 12px 3px}
 .o-meta{font-size:12.5px;color:#aaa;margin:0 12px 9px}
@@ -157,7 +171,19 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
     } else { ["captions","cc"].forEach(function(m){ try{P.yt.setOption(m,"track",{});}catch(e){} try{P.yt.unloadModule(m);}catch(e){} }); } }catch(e){} };
   P.captions = function (o) { if(o.on!==undefined)P.cc=o.on; if(o.lang!==undefined){P.ccLang=o.lang; P.cc=!!o.lang;} if(o.size!==undefined)P.capFont=o.size; P._caps(); };
   P.LANGS = [["","Off (original)"],["en","English"],["es","Espanol / Spanish"],["zh-Hans","Chinese (Simplified)"],["zh-Hant","Chinese (Traditional)"],["hi","Hindi"],["ar","Arabic"],["fr","French"],["ja","Japanese"],["de","German"],["pt","Portuguese"],["ru","Russian"],["ko","Korean"],["it","Italian"],["tr","Turkish"],["vi","Vietnamese"],["th","Thai"],["id","Indonesian"],["nl","Dutch"],["pl","Polish"],["uk","Ukrainian"],["el","Greek"],["iw","Hebrew"],["sv","Swedish"],["fil","Filipino"],["ms","Malay"],["bn","Bengali"],["ta","Tamil"],["ur","Urdu"],["fa","Persian"],["ro","Romanian"],["cs","Czech"]];
-  P.mini = function (on) { P._mini = on; document.body.classList.toggle("o-pip", on); };
+  P.mini = function (on) {
+    P._mini = on; document.body.classList.toggle("o-pip", on);
+    // Keep the control bar OUTSIDE any card container while in PiP: cards
+    // hide their own chrome (`#watch > :not(.o-player){display:none}`), which
+    // must not swallow the always-visible exit (octos-one#19).
+    var bar = document.querySelector(".o-bar"), pl = document.querySelector(".o-player");
+    if (bar && pl) {
+      if (on) { if (bar.parentElement !== document.body) document.body.appendChild(bar); }
+      else if (bar.parentElement === document.body && pl.nextSibling !== bar) {
+        pl.parentNode.insertBefore(bar, pl.nextSibling);
+      }
+    }
+  };
   P.fs = function () { var f = document.querySelector(".o-player iframe"); if (f && f.requestFullscreen) f.requestFullscreen(); };
   P.gestures = function (onMin) { P._onMin = onMin; P._setupGest(); };
   P._setupGest = function () {
@@ -176,15 +202,27 @@ body.o-pip .o-pipov{display:block;position:absolute;inset:0;z-index:10;backgroun
       if (dy>90) { if(P._onMin)P._onMin(); } else if (moved<10 && Date.now()-stt<300) { P.toggle(); } });
   };
 
-  /* the player widget HTML (host div + minimize + pip overlay). onMin/onMax/onClose are global fn names. */
+  /* the player widget HTML (host div + minimize + pip overlay). onMin/onMax/onClose are global fn names.
+     The trailing .o-bar is the always-visible control bar: it lives OUTSIDE
+     the video rect, so it keeps working where the video is a punched-through
+     hardware surface that hides every overlaid (z-indexed) control. */
   O.playerHtml = function (opts) { opts=opts||{};
+    var tog = "(event.stopPropagation(),("+(opts.onToggle||"octos.player.toggle")+")())";
     return '<div class="o-player" id="'+(opts.id||"o-player")+'">'
       + '<button class="o-min" onclick="'+(opts.onMin||"")+'">'+O_ic("chev")+"</button>"
       + '<div id="'+(opts.host||"o-yt")+'"></div>'
       + '<div class="o-pipov" onclick="'+(opts.onMax||"")+'">'
       +   '<button class="tog" onclick="event.stopPropagation();('+(opts.onToggle||"function(){}")+')()">'+O_ic("pause")+"</button>"
       +   '<button class="cls" onclick="event.stopPropagation();('+(opts.onClose||"function(){}")+')()">'+O_ic("close")+"</button>"
-      + "</div></div>"; };
+      + "</div></div>"
+      + '<div class="o-bar">'
+      +   '<button class="o-b-inline" onclick="'+(opts.onMin||"")+'">'+O_ic("chev")+'<span class="o-blabel">Minimize</span></button>'
+      +   '<button class="o-b-inline" onclick="'+tog+'">'+O_ic("play")+'<span class="o-blabel">Play/Pause</span></button>'
+      +   '<button class="o-b-inline" onclick="octos.player.fs()">'+O_ic("fs")+'<span class="o-blabel">Fullscreen</span></button>'
+      +   '<button class="o-b-pip o-brestore" onclick="'+(opts.onMax||"")+'">'+O_ic("chev")+'</button>'
+      +   '<button class="o-b-pip" onclick="'+tog+'">'+O_ic("play")+'</button>'
+      +   '<button class="o-b-pip" onclick="event.stopPropagation();('+(opts.onClose||"function(){}")+')()">'+O_ic("close")+"</button>"
+      + "</div>"; };
 
   /* ---------- visual widgets (render HTML) ---------- */
   O.topbar = function (o) { o=o||{};
