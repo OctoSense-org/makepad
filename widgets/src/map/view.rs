@@ -318,6 +318,10 @@ script_mod! {
 /// Drawn with scale 2^(view_zoom - NAV_REF_Z), exactly like tile geometry.
 const NAV_REF_Z: u32 = 16;
 
+/// Seconds of no touch after a manual pan/zoom before the nav camera eases back
+/// to the follow-cam (matches typical map apps' auto-recenter behavior).
+const NAV_RECENTER_IDLE_SECS: f64 = 4.0;
+
 /// Ready tile geometry shared across MapView instances on the UI thread.
 /// Splash cards that animate re-evaluate ~1 Hz and REBUILD their widget tree,
 /// so a per-instance tile cache would refetch + retessellate every second
@@ -835,6 +839,18 @@ pub struct MapView {
     #[redraw]
     #[live]
     draw_text: DrawText,
+    // Small solid quads for nav label ground-markers (leader line) and the
+    // vehicle puck — a separate DrawColor so it never clobbers `draw_bg`'s area
+    // (which nav hit-testing reads).
+    #[redraw]
+    #[live]
+    draw_dot: DrawColor,
+    // Screen-space vector drawer for the vehicle puck + standing pins — precise
+    // circles/triangles (no glyph-metric guessing). Not fed the nav-projection
+    // uniforms, so it draws flat in pixel space.
+    #[redraw]
+    #[live]
+    draw_ui: DrawVector,
 
     #[live(4.9041)]
     center_lon: f64,
@@ -890,6 +906,14 @@ pub struct MapView {
     #[live(15.0)]
     nav_route_width: f64, // route ribbon core width, ground meters
 
+    // Route annotation pins: (lat, lon, kind) where kind 0 = origin (green),
+    // 1 = intermediate/途经点 (blue), 2 = destination (red). Set by the card
+    // via `ui.<id>.set_route_markers("lat,lon,kind;lat,lon,kind;…")`. Drawn as
+    // world-space dots appended to the ribbon geometry so they project through
+    // the same shader in both plan and 3D modes (no CPU projection needed).
+    #[rust]
+    nav_markers: Vec<(f64, f64, u8)>,
+
     #[rust]
     nav_pts: Rc<Vec<Vec2d>>, // decoded route, normalized world coords
     #[rust]
@@ -942,6 +966,19 @@ pub struct MapView {
     // (finger distance, zoom) captured when the 2nd finger lands — the pinch base.
     #[rust]
     nav_pinch_base: Option<(f64, f64)>,
+    // Auto-restore (like Google/Apple Maps): after the user pans/zooms, wait
+    // IDLE seconds of no touch, then ease the camera back to the follow-cam
+    // (nav_pan -> 0, zoom -> nav_home_zoom). `nav_last_touch` is the sim-clock
+    // stamp of the last gesture; `nav_user_adjusted` gates the restore so it
+    // only runs after an actual manual pan/zoom.
+    #[rust]
+    nav_last_touch: f64,
+    #[rust]
+    nav_user_adjusted: bool,
+    // The car's world position (normalized) this frame — projected in the draw
+    // path to place the moving vehicle puck.
+    #[rust]
+    nav_car_norm: Vec2d,
     #[rust]
     tiles: HashMap<TileKey, TileEntry>,
     #[rust]
@@ -1075,6 +1112,44 @@ impl Widget for MapView {
             }
             return ScriptAsyncResult::Return(NIL);
         }
+        // `ui.<id>.set_route_markers("lat,lon,kind;lat,lon,kind;…")` — the
+        // trip-planner pins: origin (kind 0), each 途经点/intermediate stop
+        // (kind 1), and destination (kind 2). Parsed into `nav_markers` and
+        // re-tessellated into the route geometry so the dots project through
+        // the same shader as the ribbon. Empty string clears the pins.
+        if method == live_id!(set_route_markers) {
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+                if !value.is_err() {
+                    let s = vm.bx.heap.temp_string_with(|heap, out| {
+                        heap.cast_to_string(value, out);
+                        out.to_string()
+                    });
+                    let mut next: Vec<(f64, f64, u8)> = Vec::new();
+                    for part in s.split(';') {
+                        let f: Vec<&str> = part.split(',').collect();
+                        if f.len() >= 3 {
+                            if let (Ok(lat), Ok(lon), Ok(kind)) = (
+                                f[0].trim().parse::<f64>(),
+                                f[1].trim().parse::<f64>(),
+                                f[2].trim().parse::<u8>(),
+                            ) {
+                                if lat != 0.0 || lon != 0.0 {
+                                    next.push((lat, lon, kind));
+                                }
+                            }
+                        }
+                    }
+                    if next != self.nav_markers {
+                        self.nav_markers = next;
+                        self.nav_poly_hash = 0; // force ensure_nav_route re-tessellate
+                        vm.with_cx_mut(|cx| self.redraw(cx));
+                    }
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
         // `ui.<id>.set_nav_recenter(...)` — the recenter button: drop the user's
         // pan + pinch and snap back to following the car at the card's zoom.
         if method == live_id!(set_nav_recenter) {
@@ -1084,6 +1159,7 @@ impl Widget for MapView {
             }
             self.nav_pinch_base = None;
             self.nav_touches.clear();
+            self.nav_user_adjusted = false;
             vm.with_cx_mut(|cx| self.redraw(cx));
             return ScriptAsyncResult::Return(NIL);
         }
@@ -1116,6 +1192,7 @@ impl Widget for MapView {
             match event.hits_with_capture_overload(cx, self.draw_bg.area(), false) {
                 Hit::FingerDown(fe) => {
                     self.nav_touches.push((fe.digit_id.0, fe.abs));
+                    self.nav_last_touch = crate::splash::sim_clock_secs();
                     if self.nav_touches.len() == 2 {
                         let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
                         let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
@@ -1136,6 +1213,8 @@ impl Widget for MapView {
                             let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
                             let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
                             self.zoom = (base_z + (d / base_d).log2()).clamp(zmin, zmax);
+                            self.nav_last_touch = crate::splash::sim_clock_secs();
+                            self.nav_user_adjusted = true;
                             self.redraw(cx);
                         }
                     } else if let Some(p) = prev {
@@ -1143,6 +1222,8 @@ impl Widget for MapView {
                         let world = tile_world_size_zoom(self.view_zoom());
                         self.nav_pan.x -= (fe.abs.x - p.x) / world;
                         self.nav_pan.y -= (fe.abs.y - p.y) / world;
+                        self.nav_last_touch = crate::splash::sim_clock_secs();
+                        self.nav_user_adjusted = true;
                         self.redraw(cx);
                     }
                 }
@@ -1441,7 +1522,15 @@ impl Widget for MapView {
             // nav view: UPRIGHT street/place labels, positioned by projecting
             // each label's anchor through the nav camera (the tilted 3D map has
             // no baked labels, so adjacent street names render here instead).
+            // ONE draw_ui vector session for ALL markers (labels' standing pins,
+            // route origin/via/dest pins, and the vehicle puck) — multiple
+            // begin/end sessions per frame only flush the last, which was
+            // dropping every pin except the puck.
+            self.draw_ui.begin();
             self.draw_nav_labels(cx, rect, off_x, off_y);
+            self.draw_nav_route_pins(cx, rect, off_x, off_y, view_zoom);
+            self.draw_nav_puck(cx, rect, off_x, off_y, view_zoom);
+            self.draw_ui.end(cx);
             self.label_perf = LabelPerfStats::default();
         } else {
             self.label_perf = LabelPerfStats::default();
@@ -1951,6 +2040,20 @@ impl MapView {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             poly.hash(&mut h);
+            // Plan mode bakes the flat teardrop pins into the geometry; nav mode
+            // must NOT (it draws upright billboard pins instead). Discriminate
+            // the two so they get SEPARATE cached geometries — otherwise nav
+            // adopts the plan geometry and the flat teardrops leak into the 3D
+            // view.
+            self.is_plan().hash(&mut h);
+            // Fold the annotation pins in so a marker change re-tessellates (and
+            // gets its own NAV_ROUTE_STORE entry) instead of adopting the old
+            // geometry. Bit-cast the f64s — lat/lon are exact enough as bits.
+            for (lat, lon, kind) in &self.nav_markers {
+                lat.to_bits().hash(&mut h);
+                lon.to_bits().hash(&mut h);
+                kind.hash(&mut h);
+            }
             h.finish()
         };
         if hash == self.nav_poly_hash && self.nav_route_geom.is_some() {
@@ -2073,6 +2176,28 @@ impl MapView {
             1.0,
             &mut zbias,
         );
+        // Annotation pins (origin / 途经点 / destination): flat world-space
+        // teardrops read correctly only from the top-down PLAN camera — in the
+        // tilted nav view they'd lie flat (wrong), so nav mode draws upright
+        // billboard pins in `draw_nav_route_pins` instead. Plan mode only here.
+        let pin_r = (core_w * 2.6).max(7.0);
+        for &(mlat, mlon, kind) in &self.nav_markers {
+            if !self.is_plan() {
+                break;
+            }
+            let wp = lon_lat_to_normalized(mlon, mlat) * world;
+            let mx = (wp.x - origin.0) as f32;
+            let my = (wp.y - origin.1) as f32;
+            let color = match kind {
+                0 => 0x1DB954, // origin — green
+                2 => 0xEA4335, // destination — red
+                _ => 0x1A73E8, // 途经点 / intermediate — blue
+            };
+            append_marker_pin(
+                &mut path, &mut tess, &mut tess_verts, &mut tess_indices,
+                &mut vertices, &mut indices, mx, my, pin_r, color, &mut zbias,
+            );
+        }
         if !indices.is_empty() {
             let geometry = Geometry::new(cx);
             geometry.update(cx, indices, vertices);
@@ -2109,14 +2234,12 @@ impl MapView {
             return;
         }
         let total = self.nav_cum.last().copied().unwrap_or(0.0);
-        let period = self.nav_period.max(1.0);
-        let secs = crate::splash::sim_clock_secs() % period;
-        // Distance-NORMALIZED sim: sweep the WHOLE route over `nav_period`,
-        // regardless of its length. (A speed-based `secs*mps` traversed short
-        // urban routes in seconds and then parked at the destination for the
-        // rest of the period — the drive looked frozen / perpetually "arrived".)
-        // The card's banner clock uses the same `secs/period * total`.
-        let d = (secs / period) * total;
+        // CONSTANT-SPEED sim: drive at `nav_speed_mph` and LOOP at the route end
+        // (period-normalized sweeping made long routes absurdly fast and short
+        // ones crawl). Looping avoids the old "parked at destination" problem.
+        // The card's banner clock uses the same `(clock*mps) % total`.
+        let mps = (self.nav_speed_mph.max(1.0)) * 0.44704;
+        let d = (crate::splash::sim_clock_secs() * mps) % total.max(1.0);
 
         let Some(car) = sample_polyline_point_at_distance(&self.nav_pts, &self.nav_cum, d) else {
             return;
@@ -2152,6 +2275,30 @@ impl MapView {
             self.nav_bearing += diff * 0.10;
         }
         let bearing = self.nav_bearing;
+        self.nav_car_norm = car;
+
+        // Auto-restore: after IDLE seconds without a touch, ease the manual
+        // pan/zoom back to the follow-cam (like typical map apps' recenter).
+        // Runs every frame while the follow loop redraws, so the ease animates.
+        if self.nav_user_adjusted {
+            let idle = crate::splash::sim_clock_secs() - self.nav_last_touch;
+            if idle > NAV_RECENTER_IDLE_SECS {
+                self.nav_pan.x *= 0.84;
+                self.nav_pan.y *= 0.84;
+                if self.nav_home_zoom > 0.0 {
+                    self.zoom += (self.nav_home_zoom - self.zoom) * 0.16;
+                }
+                let z_done = self.nav_home_zoom <= 0.0
+                    || (self.zoom - self.nav_home_zoom).abs() < 0.01;
+                if self.nav_pan.x.abs() < 1e-6 && self.nav_pan.y.abs() < 1e-6 && z_done {
+                    self.nav_pan = dvec2(0.0, 0.0);
+                    if self.nav_home_zoom > 0.0 {
+                        self.zoom = self.nav_home_zoom;
+                    }
+                    self.nav_user_adjusted = false;
+                }
+            }
+        }
 
         // follow the car, plus any user pan offset (cleared by recenter)
         self.center_norm = dvec2(car.x + self.nav_pan.x, car.y + self.nav_pan.y);
@@ -2317,10 +2464,16 @@ impl MapView {
             }
             // strong perspective depth cue: near ~19 px, far ~8 px
             let fs = (19.0 * (cam_h * 1.6 / a)).clamp(8.0, 19.0) as f32;
-            self.draw_text.text_style.font_size = fs;
             let w = text.chars().count() as f64 * fs as f64 * 0.5;
+            // 2.5D standing pin: an upright pin STANDS at the exact ground point
+            // (tip down, head up — consistent with the perspective) and the
+            // readable label rides above the head. Pin height + head scale with
+            // distance, so near sites stand tall and far ones shrink.
+            let stem_h = (fs as f64 * 2.0).max(14.0);
+            let head_r = (fs as f64 * 0.42).max(2.6);
+            let label_y = sy - stem_h - head_r - fs as f64 * 1.1;
             let lr = Rect {
-                pos: dvec2(sx - w * 0.5, sy - fs as f64 * 0.6),
+                pos: dvec2(sx - w * 0.5, label_y),
                 size: dvec2(w, fs as f64 * 1.3),
             };
             if placed
@@ -2330,12 +2483,128 @@ impl MapView {
                 continue;
             }
             placed.push(lr);
+            // pin color: POIs (priority 3) blue, streets a muted slate
+            let color = if _pri >= 3 {
+                vec4(0.10, 0.45, 0.92, 1.0)
+            } else {
+                vec4(0.36, 0.45, 0.58, 1.0)
+            };
+            self.draw_upright_pin(cx, sx, sy, stem_h, head_r, color);
+            // the readable label (upright), above the pin head
+            self.draw_text.color = vec4(0.16, 0.22, 0.30, 1.0);
+            self.draw_text.text_style.font_size = fs;
             self.draw_text
                 .draw_abs(cx, dvec2(lr.pos.x, lr.pos.y), &text);
             now_shown.insert(text);
             drawn += 1;
         }
         self.nav_labels_shown = now_shown;
+    }
+
+    /// Draw an upright standing pin (screen-space billboard) whose tip sits at
+    /// the projected ground point `(sx, sy)` and whose head stands `h` px above
+    /// it — so it stands UP in the 2.5D scene (consistent with the perspective)
+    /// instead of lying flat. `r` = head radius; both scale with distance.
+    fn draw_upright_pin(&mut self, cx: &mut Cx2d, sx: f64, sy: f64, h: f64, r: f64, color: Vec4) {
+        // Precise vector shapes (no glyph metrics): a shadow ellipse at the tip,
+        // a vertical stem centered on sx, then a white ring + colored head disc
+        // both centered EXACTLY on (sx, hy) — so the stem always meets the head
+        // dead center.
+        // NOTE: caller wraps all pins+puck in ONE draw_ui.begin()/end() session
+        // (multiple sessions per frame only flush the last), so this just adds
+        // shapes.
+        let _ = cx;
+        let (sxf, syf, rf) = (sx as f32, sy as f32, r as f32);
+        let hyf = (sy - h) as f32; // head center
+        self.draw_ui.set_color(0.05, 0.08, 0.12, 0.26);
+        self.draw_ui.ellipse(sxf, syf + 1.5, rf * 0.85, rf * 0.5);
+        self.draw_ui.fill();
+        self.draw_ui
+            .set_color(color.x, color.y, color.z, color.w);
+        self.draw_ui.rect(sxf - 1.3, hyf, 2.6, h as f32);
+        self.draw_ui.fill();
+        self.draw_ui.set_color(1.0, 1.0, 1.0, 1.0);
+        self.draw_ui.circle(sxf, hyf, rf * 1.32);
+        self.draw_ui.fill();
+        self.draw_ui
+            .set_color(color.x, color.y, color.z, color.w);
+        self.draw_ui.circle(sxf, hyf, rf);
+        self.draw_ui.fill();
+    }
+
+    /// Draw the route annotation pins (origin/via/destination) as upright
+    /// standing pins in nav mode (the world-space teardrops only look right
+    /// top-down, so plan mode keeps those; nav mode uses these billboards).
+    fn draw_nav_route_pins(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
+        if self.nav_markers.is_empty() {
+            return;
+        }
+        let world = tile_world_size_zoom(view_zoom);
+        let cam_h = self.draw_map.nav.cam[0] as f64;
+        let markers = self.nav_markers.clone();
+        for (mlat, mlon, kind) in markers {
+            let n = lon_lat_to_normalized(mlon, mlat);
+            let Some((sx, sy, a)) = self.nav_project_flat(off_x + n.x * world, off_y + n.y * world)
+            else {
+                continue;
+            };
+            if sx < rect.pos.x - 60.0
+                || sx > rect.pos.x + rect.size.x + 60.0
+                || sy < rect.pos.y - 60.0
+                || sy > rect.pos.y + rect.size.y + 80.0
+            {
+                continue;
+            }
+            let sc = (cam_h * 1.6 / a).clamp(0.35, 1.35);
+            let color = match kind {
+                0 => vec4(0.11, 0.72, 0.33, 1.0), // origin green
+                2 => vec4(0.92, 0.26, 0.21, 1.0), // dest red
+                _ => vec4(0.10, 0.45, 0.92, 1.0), // via blue
+            };
+            self.draw_upright_pin(cx, sx, sy, 30.0 * sc, 9.0 * sc, color);
+        }
+    }
+
+    /// Draw the moving vehicle puck at the car's projected screen position: a
+    /// white halo + blue disc + white up-chevron. The heading-up camera keeps
+    /// forward toward the top, so the chevron always points up. When the user
+    /// pans/zooms the car moves off the anchor (and glides back on auto-restore).
+    fn draw_nav_puck(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
+        if self.nav_pts.len() < 2 {
+            return;
+        }
+        let world = tile_world_size_zoom(view_zoom);
+        let fx = off_x + self.nav_car_norm.x * world;
+        let fy = off_y + self.nav_car_norm.y * world;
+        let Some((sx, sy, _)) = self.nav_project_flat(fx, fy) else {
+            return;
+        };
+        if sx < rect.pos.x - 40.0
+            || sx > rect.pos.x + rect.size.x + 40.0
+            || sy < rect.pos.y - 40.0
+            || sy > rect.pos.y + rect.size.y + 40.0
+        {
+            return;
+        }
+        // Precise vector puck: white halo + blue disc, then a white up-chevron
+        // (filled triangle) centered on (sx,sy). No glyph metrics. Added to the
+        // caller's single draw_ui session (see draw_upright_pin note).
+        let _ = cx;
+        let (sxf, syf) = (sx as f32, sy as f32);
+        self.draw_ui.set_color(1.0, 1.0, 1.0, 1.0);
+        self.draw_ui.circle(sxf, syf, 21.0);
+        self.draw_ui.fill();
+        self.draw_ui.set_color(0.10, 0.45, 0.92, 1.0);
+        self.draw_ui.circle(sxf, syf, 17.0);
+        self.draw_ui.fill();
+        // up chevron centered on (sx,sy): apex above, base below (tuned so the
+        // filled triangle's optical center lands on the disc center)
+        self.draw_ui.set_color(1.0, 1.0, 1.0, 1.0);
+        self.draw_ui.move_to(sxf, syf - 6.5);
+        self.draw_ui.line_to(sxf - 7.5, syf + 7.5);
+        self.draw_ui.line_to(sxf + 7.5, syf + 7.5);
+        self.draw_ui.close();
+        self.draw_ui.fill();
     }
 
     /// Cache the ENTIRE driven-loop corridor so nothing is ever re-fetched or
@@ -2352,10 +2621,10 @@ impl MapView {
         if total < 1.0 {
             return;
         }
-        let period = self.nav_period.max(1.0);
-        // distance-normalized (matches update_nav_camera): sweep the whole route
-        let d = ((crate::splash::sim_clock_secs() % period) / period) * total;
-        // the loop drives the whole route each period
+        // constant-speed (matches update_nav_camera): drive at nav_speed_mph
+        let mps = (self.nav_speed_mph.max(1.0)) * 0.44704;
+        let d = (crate::splash::sim_clock_secs() * mps) % total.max(1.0);
+        // the loop drives the whole route
         let loop_len = total;
         let zoom = self.request_zoom_level();
         let tiles_n = 1i32 << zoom;

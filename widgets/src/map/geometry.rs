@@ -1,7 +1,7 @@
 use super::style::StrokePassStyle;
 use crate::makepad_draw::vector::{
-    append_tessellated_geometry, tessellate_path_stroke, LineCap, LineJoin, Tessellator, VVertex,
-    VectorPath, VectorRenderParams, VECTOR_ZBIAS_STEP,
+    append_tessellated_geometry, tessellate_path_fill, tessellate_path_stroke, LineCap, LineJoin,
+    Tessellator, VVertex, VectorPath, VectorRenderParams, VECTOR_ZBIAS_STEP,
 };
 use crate::makepad_draw::*;
 
@@ -839,6 +839,70 @@ pub fn append_route_ribbon_pass(
         },
     );
     *zbias += VECTOR_ZBIAS_STEP;
+}
+
+/// A Google-style teardrop map pin at world-px `(mx, my)` (the tip = the exact
+/// location), head sitting toward -y (north / up on the north-up plan map).
+/// Rendered as a white casing teardrop, a colored teardrop body, and a white
+/// center dot — filled polygons appended to the ribbon geometry so they project
+/// through the same shader. `r` is the head radius in world px.
+#[allow(clippy::too_many_arguments)]
+pub fn append_marker_pin(
+    path: &mut VectorPath,
+    tess: &mut Tessellator,
+    tess_verts: &mut Vec<VVertex>,
+    tess_indices: &mut Vec<u32>,
+    vertices: &mut Vec<f32>,
+    indices: &mut Vec<u32>,
+    mx: f32,
+    my: f32,
+    r: f32,
+    color: u32,
+    zbias: &mut f32,
+) {
+    let h = r * 2.35; // tip-to-head-center distance
+    let cy = my - h; // head center (north / up on screen)
+    // Build a teardrop polygon at head-radius `rr`: tip, then arc the top ~277°
+    // of the head circle between the two tangent points (~48.7° off east).
+    let teardrop = |rr: f32| -> Vec<(f32, f32)> {
+        let mut pts = Vec::with_capacity(28);
+        pts.push((mx, my));
+        let start = 48.7_f32.to_radians();
+        let sweep = -277.4_f32.to_radians();
+        let n = 24;
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let th = start + sweep * t;
+            pts.push((mx + rr * th.cos(), cy + rr * th.sin()));
+        }
+        pts
+    };
+    let mut fill = |pts: &[(f32, f32)], col: u32, z: &mut f32| {
+        emit_path(path, pts, true);
+        tessellate_path_fill(path, tess, tess_verts, tess_indices, LineJoin::Round, 4.0, 1.0, false);
+        append_tessellated_geometry(
+            tess_verts,
+            tess_indices,
+            vertices,
+            indices,
+            VectorRenderParams {
+                color: hex_to_premul_rgba(col, 1.0),
+                stroke_mult: 1.0,
+                shape_id: 0.0,
+                params: [0.0; 6],
+                zbias: *z,
+            },
+        );
+        *z += VECTOR_ZBIAS_STEP;
+    };
+    fill(&teardrop(r * 1.26), 0xFFFFFF, zbias); // white casing
+    fill(&teardrop(r), color, zbias); // colored body
+    // white center dot in the head — a round-capped 2-pt stroke
+    let dot = [(mx, cy), (mx + 0.4, cy)];
+    append_route_ribbon_pass(
+        path, &dot, tess, tess_verts, tess_indices, vertices, indices,
+        r * 0.82, 0xFFFFFF, 1.0, zbias,
+    );
 }
 
 fn expand_polyline_endpoints(points: &[(f32, f32)], _stroke_width: f32) -> Vec<(f32, f32)> {
