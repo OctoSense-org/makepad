@@ -1328,7 +1328,14 @@ impl Widget for MapView {
         // Take draw_tiles out so we can pass &[TileKey] while mutating self for labels
         let draw_tiles = std::mem::take(&mut self.scratch_draw_tiles);
 
-        if nav_kind > 0 {
+        // Only the 3D chase view (nav_kind 1) uses the pinhole tile cull below —
+        // `nav_project_flat` is the 3D-pinhole projection, so it ONLY matches
+        // what the shader draws in 3D. Plan preview + 2D heading-up (nav_kind 2)
+        // draw with the shader's 2D projection, so culling them with 3D-pinhole
+        // math rejects on-screen tiles and the map renders blank. Route those
+        // through the normal (uncull) fill/stroke passes below — the shader still
+        // applies their nav projection via the `nav.mode` uniform.
+        if nav_kind == 1 {
             // Navigation: draw store tiles near the car, but CULL to those that
             // actually project on-screen — drawing all ~120 tiles in the radius
             // (240+ draw calls) overloaded the GPU and strobed. Loaded content
@@ -1991,6 +1998,21 @@ impl MapView {
             maxx = maxx.max(p.x);
             miny = miny.min(p.y);
             maxy = maxy.max(p.y);
+        }
+        // Route polyline not decoded yet (or absent) — frame the annotation
+        // markers (origin + destination) so the camera still centers on the trip
+        // and tiles load, instead of an f64::MAX bbox → NaN center → blank map.
+        if self.nav_pts.is_empty() {
+            for (lat, lon, _) in self.nav_markers.iter() {
+                let p = lon_lat_to_normalized(*lon, *lat);
+                minx = minx.min(p.x);
+                maxx = maxx.max(p.x);
+                miny = miny.min(p.y);
+                maxy = maxy.max(p.y);
+            }
+        }
+        if minx > maxx {
+            return; // nothing to frame — keep the current center (no NaN)
         }
         let cx = (minx + maxx) * 0.5;
         let cy = (miny + maxy) * 0.5;
