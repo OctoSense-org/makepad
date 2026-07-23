@@ -205,11 +205,24 @@ pub fn overpass_query(tile: TileKey) -> String {
     let (south, west, north, east) = tile_bounds_padded(tile, TILE_QUERY_PAD);
     let mut ways = String::new();
 
-    ways.push_str(&format!(
-        "way[\"highway\"]({south:.6},{west:.6},{north:.6},{east:.6});\
-         way[\"waterway\"]({south:.6},{west:.6},{north:.6},{east:.6});\
-         way[\"natural\"=\"water\"]({south:.6},{west:.6},{north:.6},{east:.6});"
-    ));
+    if tile.z >= 14 {
+        // Detailed: every road + waterway + water.
+        ways.push_str(&format!(
+            "way[\"highway\"]({south:.6},{west:.6},{north:.6},{east:.6});\
+             way[\"waterway\"]({south:.6},{west:.6},{north:.6},{east:.6});\
+             way[\"natural\"=\"water\"]({south:.6},{west:.6},{north:.6},{east:.6});"
+        ));
+    } else {
+        // OVERVIEW zoom (route planner fit-to-whole-route): a sub-z14 tile
+        // covers a huge area, so querying EVERY residential street times out
+        // (504). Fetch only MAJOR roads + water — plenty of context, and the
+        // exact path is drawn by the route ribbon on top. Keeps the zoomed-out
+        // planner map fast.
+        ways.push_str(&format!(
+            "way[\"highway\"~\"^(motorway|trunk|primary|secondary|motorway_link|trunk_link|primary_link)$\"]({south:.6},{west:.6},{north:.6},{east:.6});\
+             way[\"natural\"=\"water\"]({south:.6},{west:.6},{north:.6},{east:.6});"
+        ));
+    }
 
     if tile.z >= 15 {
         ways.push_str(&format!(

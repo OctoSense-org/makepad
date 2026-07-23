@@ -1501,8 +1501,11 @@ impl Widget for MapView {
             }
         }
 
-        // Navigation route ribbon (world-space: perspective-tapers automatically)
-        if nav_kind > 0 {
+        // Navigation route ribbon (world-space: perspective-tapers automatically).
+        // Plan overview draws a constant-width SCREEN-space line instead (below),
+        // since this ribbon shrinks to a hairline when zoomed out to fit the
+        // whole route.
+        if nav_kind > 0 && !self.is_plan() {
             if let Some(geom) = &self.nav_route_geom {
                 let scale = 2.0_f64.powf(view_zoom - NAV_REF_Z as f64);
                 let (rox, roy) = self.nav_route_origin;
@@ -1534,9 +1537,16 @@ impl Widget for MapView {
             // begin/end sessions per frame only flush the last, which was
             // dropping every pin except the puck.
             self.draw_ui.begin();
-            self.draw_nav_labels(cx, rect, off_x, off_y);
-            self.draw_nav_route_pins(cx, rect, off_x, off_y, view_zoom);
-            self.draw_nav_puck(cx, rect, off_x, off_y, view_zoom);
+            if self.is_plan() {
+                // Plan overview: a prominent constant-width route line + A/B pins
+                // (no moving puck, no POI label clutter).
+                self.draw_nav_route_line(rect, off_x, off_y, view_zoom);
+                self.draw_nav_route_pins(cx, rect, off_x, off_y, view_zoom);
+            } else {
+                self.draw_nav_labels(cx, rect, off_x, off_y);
+                self.draw_nav_route_pins(cx, rect, off_x, off_y, view_zoom);
+                self.draw_nav_puck(cx, rect, off_x, off_y, view_zoom);
+            }
             self.draw_ui.end(cx);
             self.label_perf = LabelPerfStats::default();
         } else {
@@ -2016,19 +2026,31 @@ impl MapView {
         }
         let cx = (minx + maxx) * 0.5;
         let cy = (miny + maxy) * 0.5;
-        let dx = (maxx - minx).max(1e-9);
-        let dy = (maxy - miny).max(1e-9);
-        // fit the bbox into ~85% width and the ~34% tall visible band above the
-        // sheet (its centre sits at ~25% down). Floor at z14 so the Overpass
-        // vector tiles still load (they serve nothing below ~z14).
-        let fitw = rect.size.x * 0.85;
-        let fith = rect.size.y * 0.34;
-        let zx = (fitw / (dx * TILE_SIZE)).log2();
-        let zy = (fith / (dy * TILE_SIZE)).log2();
-        let zmin = self.min_zoom.max(3.0);
-        let zmax = self.max_zoom.max(zmin);
-        self.zoom = zx.min(zy).clamp(zmin, zmax).max(14.0);
-        self.center_norm = dvec2(cx, cy);
+        // Fit the WHOLE route on first show; once the user pinches/pans
+        // (nav_user_adjusted) keep THEIR view and only re-anchor the pan to the
+        // route centre. A recenter (set_nav_recenter) clears the flag to re-fit.
+        if !self.nav_user_adjusted {
+            let dx = (maxx - minx).max(1e-9);
+            let dy = (maxy - miny).max(1e-9);
+            // fit the route bbox into ~85% width and the ~34% tall band above the
+            // summary sheet. NO z14 floor now — sub-z14 tiles load a coarse
+            // major-roads layer (see overpass_query), so the ENTIRE route shows.
+            // The summary sheet overlays the bottom ~40%, so fit the route into
+            // the top ~55% (with side/vertical margin) so BOTH endpoints show.
+            let fitw = rect.size.x * 0.80;
+            let fith = rect.size.y * 0.50;
+            let zx = (fitw / (dx * TILE_SIZE)).log2();
+            let zy = (fith / (dy * TILE_SIZE)).log2();
+            let zmin = self.min_zoom.max(3.0);
+            let zmax = self.max_zoom.max(zmin);
+            // Floor at z10 (a z10 tile ~40 km keeps a very long route's Overpass
+            // query bounded); cap so a tiny route doesn't over-zoom.
+            self.zoom = zx.min(zy).clamp(zmin, zmax).clamp(10.0, 15.5);
+            self.nav_home_zoom = self.zoom;
+        }
+        // Route centre is the pan anchor; the user's pan offsets from it.
+        self.nav_car_norm = dvec2(cx, cy);
+        self.center_norm = dvec2(cx + self.nav_pan.x, cy + self.nav_pan.y);
         self.wrap_and_clamp_center();
         self.draw_map.nav = NavShaderParams {
             mode: 2.0,
@@ -2044,8 +2066,9 @@ impl MapView {
                 rect.size.x as f32,
                 rect.size.y as f32,
             ],
-            // misc.z = the route-bbox centre's screen row (25% down, in the band)
-            misc: [90.0, 500.0, (rect.size.y * 0.25) as f32, 0.533],
+            // misc.z = the route-bbox centre's screen row (30% down — centres the
+            // route in the visible map area above the summary sheet)
+            misc: [90.0, 500.0, (rect.size.y * 0.30) as f32, 0.533],
             haze: [0.847, 0.890, 0.929, 0.0],
         };
     }
@@ -2424,6 +2447,21 @@ impl MapView {
         Some((sx, sy, a))
     }
 
+    /// Project a world point through the flat 2D nav camera (plan / 2D
+    /// heading-up) — the CPU mirror of the DrawMapVector shader's `p2d` path, so
+    /// route line + pins line up EXACTLY with the tiles in plan mode (unlike
+    /// nav_project_flat, which is the 3D pinhole and only matches the 3D view).
+    fn nav_project_plan(&self, fx: f64, fy: f64) -> (f64, f64) {
+        let nav = &self.draw_map.nav;
+        let rel_x = fx - nav.anchor.x as f64;
+        let rel_y = fy - nav.anchor.y as f64;
+        let ahead = rel_x * nav.rot.x as f64 - rel_y * nav.rot.y as f64;
+        let cross = rel_x * nav.rot.y as f64 + rel_y * nav.rot.x as f64;
+        let sx = nav.screen[0] as f64 + nav.screen[2] as f64 * 0.5 + cross;
+        let sy = nav.screen[1] as f64 + nav.misc[2] as f64 - ahead;
+        (sx, sy)
+    }
+
     /// Draw upright street/place labels in the nav view by projecting each
     /// label's map anchor through the nav camera. Google-style: text stays
     /// horizontal (never tilted), shrinks with distance, majors win the cap.
@@ -2557,18 +2595,99 @@ impl MapView {
     /// Draw the route annotation pins (origin/via/destination) as upright
     /// standing pins in nav mode (the world-space teardrops only look right
     /// top-down, so plan mode keeps those; nav mode uses these billboards).
+    /// Draw the route as a CONSTANT-SCREEN-WIDTH polyline for the plan overview.
+    /// The world-space ribbon shrinks to a hairline when the camera zooms out to
+    /// fit the whole A->B route, so plan mode draws the route in screen space
+    /// instead — Google-Maps style: a white casing under a bright-blue core, at
+    /// a fixed pixel width regardless of zoom. Added to the caller's draw_ui
+    /// session (single begin/end).
+    fn draw_nav_route_line(&mut self, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
+        if self.nav_pts.len() < 2 {
+            return;
+        }
+        let world = tile_world_size_zoom(view_zoom);
+        // Project + decimate to ~220 screen points (the overview doesn't need
+        // the full densified polyline; keeps the fill count bounded).
+        let n = self.nav_pts.len();
+        let step = (n / 220).max(1);
+        let mut scr: Vec<(f32, f32)> = Vec::with_capacity(n / step + 2);
+        let push = |me: &Self, p: Vec2d| {
+            let (sx, sy) = me.nav_project_plan(off_x + p.x * world, off_y + p.y * world);
+            // keep points within a margin of the map rect (the route line must
+            // not bleed into the summary sheet below)
+            if sx > rect.pos.x - 40.0
+                && sx < rect.pos.x + rect.size.x + 40.0
+                && sy > rect.pos.y - 40.0
+                && sy < rect.pos.y + rect.size.y + 40.0
+            {
+                Some((sx as f32, sy as f32))
+            } else {
+                None
+            }
+        };
+        let mut i = 0;
+        while i < n {
+            if let Some(s) = push(self, self.nav_pts[i]) {
+                scr.push(s);
+            }
+            i += step;
+        }
+        if let Some(s) = push(self, self.nav_pts[n - 1]) {
+            scr.push(s);
+        }
+        if scr.len() < 2 {
+            return;
+        }
+        // Two passes: white casing (wider) under a bright-blue core.
+        for (w, r, g, b) in [
+            (8.0f32, 1.0f32, 1.0f32, 1.0f32),
+            (5.0f32, 0.13f32, 0.45f32, 0.94f32),
+        ] {
+            self.draw_ui.set_color(r, g, b, 1.0);
+            let hw = w * 0.5;
+            for k in 0..scr.len() - 1 {
+                let (x0, y0) = scr[k];
+                let (x1, y1) = scr[k + 1];
+                let (dx, dy) = (x1 - x0, y1 - y0);
+                let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+                let (px, py) = (-dy / len * hw, dx / len * hw);
+                self.draw_ui.move_to(x0 + px, y0 + py);
+                self.draw_ui.line_to(x1 + px, y1 + py);
+                self.draw_ui.line_to(x1 - px, y1 - py);
+                self.draw_ui.line_to(x0 - px, y0 - py);
+                self.draw_ui.close();
+                self.draw_ui.fill();
+                // round join at each vertex
+                self.draw_ui.circle(x1, y1, hw);
+                self.draw_ui.fill();
+            }
+            self.draw_ui.circle(scr[0].0, scr[0].1, hw);
+            self.draw_ui.fill();
+        }
+    }
+
     fn draw_nav_route_pins(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
         if self.nav_markers.is_empty() {
             return;
         }
         let world = tile_world_size_zoom(view_zoom);
         let cam_h = self.draw_map.nav.cam[0] as f64;
+        let is_plan = self.is_plan();
         let markers = self.nav_markers.clone();
         for (mlat, mlon, kind) in markers {
             let n = lon_lat_to_normalized(mlon, mlat);
-            let Some((sx, sy, a)) = self.nav_project_flat(off_x + n.x * world, off_y + n.y * world)
-            else {
-                continue;
+            // Plan uses the flat p2d projection (matches the tiles) at a constant
+            // pin size; the 3D/2D chase view uses the pinhole + distance scale.
+            let (sx, sy, sc) = if is_plan {
+                let (sx, sy) = self.nav_project_plan(off_x + n.x * world, off_y + n.y * world);
+                (sx, sy, 1.0f64)
+            } else {
+                let Some((sx, sy, a)) =
+                    self.nav_project_flat(off_x + n.x * world, off_y + n.y * world)
+                else {
+                    continue;
+                };
+                (sx, sy, (cam_h * 1.6 / a).clamp(0.35, 1.35))
             };
             if sx < rect.pos.x - 60.0
                 || sx > rect.pos.x + rect.size.x + 60.0
@@ -2577,7 +2696,6 @@ impl MapView {
             {
                 continue;
             }
-            let sc = (cam_h * 1.6 / a).clamp(0.35, 1.35);
             let color = match kind {
                 0 => vec4(0.11, 0.72, 0.33, 1.0), // origin green
                 2 => vec4(0.92, 0.26, 0.21, 1.0), // dest red
