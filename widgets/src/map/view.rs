@@ -2,7 +2,7 @@ use super::geometry::*;
 use super::label::*;
 use super::style::*;
 use super::tile::*;
-use crate::makepad_draw::vector::{Tessellator, VVertex, VectorPath};
+use crate::makepad_draw::vector::{LineJoin, Tessellator, VVertex, VectorPath};
 use crate::{
     makepad_derive_widget::*, makepad_draw::*, widget::*, widget_async::ScriptAsyncResult,
     DrawRotatedText, DrawVector, PathGlyphInstance, PathTextPlacement, WidgetMatchEvent,
@@ -449,9 +449,10 @@ fn nav_store_labels(
         .into_iter()
         .map(|(text, (x, y, pri, _))| (x, y, text, pri))
         .collect();
-    // nearest-to-camera first isn't needed; sort by priority so majors win the
-    // per-frame cap
-    out.sort_by_key(|(_, _, _, pri)| *pri);
+    // Priority first so majors win the per-frame cap, then by NAME as a stable
+    // tie-break — the candidate set comes from a HashMap (non-deterministic
+    // order), so without this the picked subset flickered between frames.
+    out.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
     out
 }
 
@@ -933,6 +934,11 @@ pub struct MapView {
     // (the store scan + string clones are too costly to redo every 60fps frame)
     #[rust]
     nav_labels_cache: Vec<(f64, f64, String, u8)>,
+    // plan-overview label -> sim-clock time it FIRST appeared, so a newly-shown
+    // name FADES IN (alpha ramp) instead of popping. Pruned to the visible set
+    // each frame so a name that leaves and returns fades in again.
+    #[rust]
+    nav_label_seen: HashMap<String, f64>,
     // low-pass smoothed camera heading (radians) so turns rotate the map/ribbon
     // gently instead of whipping around (the abrupt swing read as the ribbon
     // vanishing from the bottom mid-turn)
@@ -966,6 +972,20 @@ pub struct MapView {
     // (finger distance, zoom) captured when the 2nd finger lands — the pinch base.
     #[rust]
     nav_pinch_base: Option<(f64, f64)>,
+    // (abs-pos, nav_pan) captured when a 1-finger drag begins — the pan anchor.
+    // Pan is computed ABSOLUTELY from this anchor (not incrementally per move) so
+    // a partial/coalesced FingerMove stream still yields a 1:1 drag; re-anchored
+    // when a pinch releases back to one finger to avoid a jump.
+    #[rust]
+    nav_pan_drag: Option<(Vec2d, Vec2d)>,
+    // Eased-animation TARGETS for the plan overview. The +/- buttons and the
+    // my-location button set a target and the camera GLIDES to it (Google-style)
+    // each frame; a direct-manipulation gesture (pinch/drag) clears the target and
+    // takes over instantly. `Some` == animating that axis.
+    #[rust]
+    nav_zoom_anim: Option<f64>,
+    #[rust]
+    nav_pan_anim: Option<Vec2d>,
     // Auto-restore (like Google/Apple Maps): after the user pans/zooms, wait
     // IDLE seconds of no touch, then ease the camera back to the follow-cam
     // (nav_pan -> 0, zoom -> nav_home_zoom). `nav_last_touch` is the sim-clock
@@ -1159,8 +1179,59 @@ impl Widget for MapView {
             }
             self.nav_pinch_base = None;
             self.nav_touches.clear();
+            self.nav_zoom_anim = None;
+            self.nav_pan_anim = None;
             self.nav_user_adjusted = false;
             vm.with_cx_mut(|cx| self.redraw(cx));
+            return ScriptAsyncResult::Return(NIL);
+        }
+        // `ui.<id>.nav_zoom_by(delta)` — the +/- zoom controls on the plan/nav
+        // map: step the zoom and mark the camera user-adjusted so the fit stops
+        // fighting it (a precise complement to pinch-zoom, e.g. one-handed use).
+        if method == live_id!(nav_zoom_by) {
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+                if !value.is_err() {
+                    let s = vm.bx.heap.temp_string_with(|heap, out| {
+                        heap.cast_to_string(value, out);
+                        out.to_string()
+                    });
+                    let delta: f64 = s.trim().parse().unwrap_or(0.0);
+                    let zmin = self.min_zoom.max(3.0);
+                    let zmax = self.max_zoom.max(zmin);
+                    // animate toward the new zoom (glide, not snap) — the plan
+                    // camera eases self.zoom -> nav_zoom_anim each frame.
+                    let base = self.nav_zoom_anim.unwrap_or(self.zoom);
+                    self.nav_zoom_anim = Some((base + delta).clamp(zmin, zmax));
+                    self.nav_user_adjusted = true;
+                    self.nav_last_touch = crate::splash::sim_clock_secs();
+                    vm.with_cx_mut(|cx| self.redraw(cx));
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        // `ui.<id>.nav_center_origin(...)` — the "my location" button on the plan
+        // overview. octos has no live GPS, so the trip ORIGIN is the current-
+        // location proxy: recenter on it at a street-level zoom, like a maps app's
+        // locate button. Marks the camera user-adjusted so the route-fit stops
+        // fighting it; the plan center is `nav_car_norm` (route centre) + `nav_pan`
+        // every frame, so we center on the origin by offsetting the pan from it.
+        if method == live_id!(nav_center_origin) {
+            if let Some(&(lat, lon, _)) = self.nav_markers.first() {
+                let o = lon_lat_to_normalized(lon, lat);
+                let zmin = self.min_zoom.max(3.0);
+                let zmax = self.max_zoom.max(zmin);
+                // GLIDE to the origin (animate zoom + pan targets) instead of
+                // jumping. plan center == nav_car_norm (route centre) + nav_pan
+                // each frame, so target the pan that lands center on the origin.
+                self.nav_zoom_anim = Some(16.0_f64.clamp(zmin, zmax));
+                self.nav_pan_anim =
+                    Some(dvec2(o.x - self.nav_car_norm.x, o.y - self.nav_car_norm.y));
+                self.nav_user_adjusted = true;
+                self.nav_last_touch = crate::splash::sim_clock_secs();
+                vm.with_cx_mut(|cx| self.redraw(cx));
+            }
             return ScriptAsyncResult::Return(NIL);
         }
         ScriptAsyncResult::MethodNotFound
@@ -1197,13 +1268,16 @@ impl Widget for MapView {
                         let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
                         let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
                         self.nav_pinch_base = Some((d.max(1.0), self.view_zoom()));
+                        // a pinch supersedes any single-finger pan in progress
+                        self.nav_pan_drag = None;
+                    } else if self.nav_touches.len() == 1 {
+                        // anchor the pan so drag is computed absolutely from here
+                        self.nav_pan_drag = Some((fe.abs, self.nav_pan));
                     }
                 }
                 Hit::FingerMove(fe) => {
-                    let mut prev = None;
                     for t in self.nav_touches.iter_mut() {
                         if t.0 == fe.digit_id.0 {
-                            prev = Some(t.1);
                             t.1 = fe.abs;
                             break;
                         }
@@ -1213,15 +1287,19 @@ impl Widget for MapView {
                             let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
                             let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
                             self.zoom = (base_z + (d / base_d).log2()).clamp(zmin, zmax);
+                            self.nav_zoom_anim = None; // direct pinch overrides any glide
                             self.nav_last_touch = crate::splash::sim_clock_secs();
                             self.nav_user_adjusted = true;
                             self.redraw(cx);
                         }
-                    } else if let Some(p) = prev {
-                        // one-finger pan: shift the map center opposite the drag
+                    } else if let Some((abs0, pan0)) = self.nav_pan_drag {
+                        // one-finger pan: shift the map center opposite the drag.
+                        // ABSOLUTE from the anchor (not per-move deltas) so a
+                        // coalesced/partial move stream still pans 1:1 with the finger.
                         let world = tile_world_size_zoom(self.view_zoom());
-                        self.nav_pan.x -= (fe.abs.x - p.x) / world;
-                        self.nav_pan.y -= (fe.abs.y - p.y) / world;
+                        self.nav_pan.x = pan0.x - (fe.abs.x - abs0.x) / world;
+                        self.nav_pan.y = pan0.y - (fe.abs.y - abs0.y) / world;
+                        self.nav_pan_anim = None; // direct drag overrides any glide
                         self.nav_last_touch = crate::splash::sim_clock_secs();
                         self.nav_user_adjusted = true;
                         self.redraw(cx);
@@ -1231,6 +1309,14 @@ impl Widget for MapView {
                     self.nav_touches.retain(|t| t.0 != fe.digit_id.0);
                     if self.nav_touches.len() < 2 {
                         self.nav_pinch_base = None;
+                    }
+                    // re-anchor a still-active single finger (e.g. one finger
+                    // lifted after a pinch) so the pan doesn't jump; clear when
+                    // the last finger leaves.
+                    if let Some(t) = self.nav_touches.first() {
+                        self.nav_pan_drag = Some((t.1, self.nav_pan));
+                    } else {
+                        self.nav_pan_drag = None;
                     }
                 }
                 _ => {}
@@ -1548,6 +1634,11 @@ impl Widget for MapView {
                 self.draw_nav_puck(cx, rect, off_x, off_y, view_zoom);
             }
             self.draw_ui.end(cx);
+            // Plan street/place labels are TEXT (draw_text), so they go after the
+            // draw_ui vector session — on top of the tiles + route line.
+            if self.is_plan() {
+                self.draw_nav_labels_plan(cx, rect, off_x, off_y, view_zoom);
+            }
             self.label_perf = LabelPerfStats::default();
         } else {
             self.label_perf = LabelPerfStats::default();
@@ -2023,6 +2114,30 @@ impl MapView {
         }
         if minx > maxx {
             return; // nothing to frame — keep the current center (no NaN)
+        }
+        // GLIDE toward any button-set target (+/- zoom, my-location). The plan map
+        // redraws every frame (nav_next_frame), so easing self.zoom / self.nav_pan
+        // toward the target here animates smoothly; a gesture cleared the target
+        // and set the value directly, so this is a no-op during direct manipulation.
+        if let Some(tz) = self.nav_zoom_anim {
+            let d = tz - self.zoom;
+            if d.abs() > 0.004 {
+                self.zoom += d * 0.22;
+            } else {
+                self.zoom = tz;
+                self.nav_zoom_anim = None;
+            }
+        }
+        if let Some(tp) = self.nav_pan_anim {
+            let dx = tp.x - self.nav_pan.x;
+            let dy = tp.y - self.nav_pan.y;
+            if dx.abs() > 1e-7 || dy.abs() > 1e-7 {
+                self.nav_pan.x += dx * 0.22;
+                self.nav_pan.y += dy * 0.22;
+            } else {
+                self.nav_pan = tp;
+                self.nav_pan_anim = None;
+            }
         }
         let cx = (minx + maxx) * 0.5;
         let cy = (miny + maxy) * 0.5;
@@ -2561,6 +2676,102 @@ impl MapView {
         self.nav_labels_shown = now_shown;
     }
 
+    /// Plan-overview labels: flat street/place names across the WHOLE visible
+    /// route (not the 260 m radius of the 3D chase labels), projected via
+    /// nav_project_plan (so they sit on the tiles), dark text with a white halo
+    /// so they read over roads/water. Called OUTSIDE the draw_ui session so the
+    /// text batches on top.
+    fn draw_nav_labels_plan(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
+        let zoom = self.request_zoom_level();
+        let world = tile_world_size(zoom);
+        let scale = 2.0_f64.powf(view_zoom - zoom as f64);
+        let cw = self.center_norm * world;
+        // radius (world-px) covering the visible map, so labels span the route
+        let radius = (rect.size.x.max(rect.size.y)) * 0.6 / scale.max(1e-6);
+        if self.frame_counter % 15 == 0 || self.nav_labels_cache.is_empty() {
+            self.nav_labels_cache = nav_store_labels(zoom, cw.x, cw.y, radius);
+        }
+        let mut labels = self.nav_labels_cache.clone();
+        if labels.is_empty() {
+            return;
+        }
+        // STICKY + DETERMINISTIC order so the picked set doesn't FLICKER: labels
+        // shown last frame win the collision test (rank 0), then higher priority,
+        // then by name — a STABLE tie-break. Without it, `nav_store_labels`
+        // returns candidates in non-deterministic (HashMap) order, so each cache
+        // refresh re-picked a different subset and a static overview flashed.
+        {
+            let shown = &self.nav_labels_shown;
+            labels.sort_by(|a, b| {
+                (!shown.contains(&a.2) as u8, a.3)
+                    .cmp(&(!shown.contains(&b.2) as u8, b.3))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+        }
+        let fs = 13.0f32;
+        let now = crate::splash::sim_clock_secs();
+        let mut drawn = 0;
+        let mut placed: Vec<Rect> = Vec::new();
+        let mut now_shown: HashSet<String> = HashSet::new();
+        for (wx, wy, text, _pri) in labels {
+            if drawn >= 14 {
+                break;
+            }
+            let (sx, sy) = self.nav_project_plan(off_x + wx * scale, off_y + wy * scale);
+            // on the map + above the summary sheet (~60% down)
+            if sx < rect.pos.x + 8.0
+                || sx > rect.pos.x + rect.size.x - 8.0
+                || sy < rect.pos.y + 12.0
+                || sy > rect.pos.y + rect.size.y * 0.60
+            {
+                continue;
+            }
+            let w = text.chars().count() as f64 * fs as f64 * 0.52;
+            let lr = Rect {
+                pos: dvec2(sx - w * 0.5, sy - fs as f64 * 0.6),
+                size: dvec2(w, fs as f64 * 1.2),
+            };
+            // keep names out from under the top-right controls (the +/- zoom pill
+            // and the my-location button) so they never render clipped behind UI.
+            let ctrl_left = rect.pos.x + rect.size.x - 74.0;
+            let ctrl_bottom = rect.pos.y + 250.0;
+            if lr.pos.x + lr.size.x > ctrl_left && lr.pos.y < ctrl_bottom {
+                continue;
+            }
+            if placed
+                .iter()
+                .any(|p| rects_overlap_with_padding(*p, lr, 6.0))
+            {
+                continue;
+            }
+            placed.push(lr);
+            drawn += 1;
+            // FADE-IN: ramp a newly-appeared name from 0 -> 1 over ~0.22s
+            // (smoothstep) so it doesn't pop when panning/zooming reveals it.
+            let seen = *self.nav_label_seen.entry(text.clone()).or_insert(now);
+            let f = (((now - seen) / 0.22).clamp(0.0, 1.0)) as f32;
+            let a = f * f * (3.0 - 2.0 * f);
+            self.draw_text.text_style.font_size = fs;
+            let (tx, ty) = (lr.pos.x, lr.pos.y);
+            // 8-way halo (N/S/E/W + diagonals) for a rounder, crisper outline that
+            // keeps names legible over roads/water.
+            self.draw_text.color = vec4(1.0, 1.0, 1.0, 0.92 * a);
+            for (dx, dy) in [
+                (-1.2, 0.0), (1.2, 0.0), (0.0, -1.2), (0.0, 1.2),
+                (-0.9, -0.9), (0.9, -0.9), (-0.9, 0.9), (0.9, 0.9),
+            ] {
+                self.draw_text.draw_abs(cx, dvec2(tx + dx, ty + dy), &text);
+            }
+            self.draw_text.color = vec4(0.17, 0.21, 0.27, a);
+            self.draw_text.draw_abs(cx, dvec2(tx, ty), &text);
+            now_shown.insert(text);
+        }
+        // prune first-seen times to the visible set so a name that leaves and
+        // later returns fades in fresh instead of snapping back.
+        self.nav_label_seen.retain(|k, _| now_shown.contains(k));
+        self.nav_labels_shown = now_shown;
+    }
+
     /// Draw an upright standing pin (screen-space billboard) whose tip sits at
     /// the projected ground point `(sx, sy)` and whose head stands `h` px above
     /// it — so it stands UP in the 2.5D scene (consistent with the perspective)
@@ -2578,18 +2789,18 @@ impl MapView {
         let hyf = (sy - h) as f32; // head center
         self.draw_ui.set_color(0.05, 0.08, 0.12, 0.26);
         self.draw_ui.ellipse(sxf, syf + 1.5, rf * 0.85, rf * 0.5);
-        self.draw_ui.fill();
+        self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.6); // softer shadow
         self.draw_ui
             .set_color(color.x, color.y, color.z, color.w);
         self.draw_ui.rect(sxf - 1.3, hyf, 2.6, h as f32);
         self.draw_ui.fill();
         self.draw_ui.set_color(1.0, 1.0, 1.0, 1.0);
         self.draw_ui.circle(sxf, hyf, rf * 1.32);
-        self.draw_ui.fill();
+        self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.5); // softer ring
         self.draw_ui
             .set_color(color.x, color.y, color.z, color.w);
         self.draw_ui.circle(sxf, hyf, rf);
-        self.draw_ui.fill();
+        self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.5); // softer head
     }
 
     /// Draw the route annotation pins (origin/via/destination) as upright
@@ -2656,13 +2867,13 @@ impl MapView {
                 self.draw_ui.line_to(x1 - px, y1 - py);
                 self.draw_ui.line_to(x0 - px, y0 - py);
                 self.draw_ui.close();
-                self.draw_ui.fill();
+                self.draw_ui.fill_opts(LineJoin::Miter, 4.0, 1.7); // softer edge
                 // round join at each vertex
                 self.draw_ui.circle(x1, y1, hw);
-                self.draw_ui.fill();
+                self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.7);
             }
             self.draw_ui.circle(scr[0].0, scr[0].1, hw);
-            self.draw_ui.fill();
+            self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.7);
         }
     }
 
