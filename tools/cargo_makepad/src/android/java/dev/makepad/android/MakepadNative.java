@@ -99,6 +99,10 @@ public class MakepadNative {
     // permissions
     public native static void onPermissionResult(String permission, int requestId, int status);
 
+    // location (GPS) — the Android LocationListener delivers each fix here; Rust
+    // stores it in makepad_platform::gps for the Splash sys.gps(...) helper.
+    public native static void onLocation(double lat, double lon, float acc);
+
     // video playback
     public static native void onVideoPlaybackPrepared(long videoId, int videoWidth, int videoHeight, long duration, VideoPlayer surfaceTexture);
     public static native void onVideoPlaybackCompleted(long videoId);

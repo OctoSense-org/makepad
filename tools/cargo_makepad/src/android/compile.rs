@@ -2739,7 +2739,12 @@ pub fn build(
     // For APK builds, debuggable matches the cargo profile: release -> false,
     // anything else -> true (matches the historical behavior of `cargo makepad
     // android run`).
-    let debuggable = get_profile_from_args(args) != "release";
+    // Release APKs are non-debuggable; `MAKEPAD_FORCE_DEBUGGABLE` forces the
+    // debuggable manifest flag on an optimized release build (so WebView reads
+    // `/data/local/tmp/webview-command-line` — e.g. to disable SurfaceControl
+    // video compositing over the GL surface).
+    let debuggable = get_profile_from_args(args) != "release"
+        || std::env::var("MAKEPAD_FORCE_DEBUGGABLE").is_ok();
     let prep_opts = PrepareBuildOpts {
         build_crate,
         java_url: &resolved.java_url,
