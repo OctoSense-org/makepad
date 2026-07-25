@@ -1134,6 +1134,12 @@ public class MakepadActivity
     private long mQrLastFrameMs = 0;
     private static final int QR_CAMERA_PERM_REQ = 0x51A2;
 
+    // GPS location (AppCard, automatic) — a LocationListener feeds each fix to Rust via
+    // MakepadNative.onLocation; the Splash sys.gps(...) helper reads it.
+    private LocationManager mGpsLocationManager;
+    private LocationListener mGpsLocationListener;
+    private static final int LOCATION_PERM_REQ = 0x10CA;
+
     static {
         System.loadLibrary("makepad");
     }
@@ -1467,6 +1473,7 @@ public class MakepadActivity
         updateTaskDescription();
         MakepadNative.activityOnResume();
         reportPhysicalKeyboardIfChanged();
+        startGpsLocationUpdates();
 
         //% MAIN_ACTIVITY_ON_RESUME
     }
@@ -1475,6 +1482,7 @@ public class MakepadActivity
         prepareSurfaceSnapshotOverlayForPause();
         super.onPause();
         MakepadNative.activityOnPause();
+        stopGpsLocationUpdates();
 
         //% MAIN_ACTIVITY_ON_PAUSE
     }
@@ -1659,6 +1667,16 @@ public class MakepadActivity
                 }
             }
         }
+
+        // Location permission granted → start GPS updates.
+        if (requestId == LOCATION_PERM_REQ) {
+            for (int i = 0; i < permissions.length; i++) {
+                if (grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    startGpsLocationUpdates();
+                    break;
+                }
+            }
+        }
     }
 
     public int checkPermission(String permission) {
@@ -1796,6 +1814,81 @@ public class MakepadActivity
             // Not every provider offers a persistable grant. The URI is still
             // usable for this run, which is all most callers need.
             Log.w(LOG_TAG, "takePersistableUriPermission failed: " + e);
+        }
+    }
+
+    // ---- GPS location updates ----
+    // octos has no simulated location, so this feeds the DEVICE's real fix to the
+    // nav card (via sys.gps). Started in onResume once the runtime permission is
+    // granted, stopped in onPause so GPS isn't polled while backgrounded.
+    private void startGpsLocationUpdates() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+            && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
+            && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            }, LOCATION_PERM_REQ);
+            return; // re-invoked from onRequestPermissionsResult once granted
+        }
+        if (mGpsLocationManager == null) {
+            mGpsLocationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        }
+        if (mGpsLocationManager == null) {
+            return;
+        }
+        if (mGpsLocationListener == null) {
+            mGpsLocationListener = new LocationListener() {
+                @Override public void onLocationChanged(Location loc) {
+                    if (loc == null) return;
+                    final double lat = loc.getLatitude();
+                    final double lon = loc.getLongitude();
+                    final float acc = loc.hasAccuracy() ? loc.getAccuracy() : 0.0f;
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() { MakepadNative.onLocation(lat, lon, acc); }
+                    });
+                }
+                // Required by the LocationListener interface on older API levels.
+                @Override public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
+                @Override public void onProviderEnabled(String provider) {}
+                @Override public void onProviderDisabled(String provider) {}
+            };
+        }
+        try {
+            // Seed immediately with the freshest last-known fix so the card has a
+            // location before the first live update lands.
+            Location last = null;
+            for (String p : new String[]{ LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER }) {
+                if (mGpsLocationManager.isProviderEnabled(p)) {
+                    Location l = mGpsLocationManager.getLastKnownLocation(p);
+                    if (l != null && (last == null || l.getTime() > last.getTime())) {
+                        last = l;
+                    }
+                }
+            }
+            if (last != null) {
+                mGpsLocationListener.onLocationChanged(last);
+            }
+            // Subscribe to both providers: NETWORK is fast + coarse, GPS is precise.
+            for (String p : new String[]{ LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER }) {
+                if (mGpsLocationManager.isProviderEnabled(p)) {
+                    mGpsLocationManager.requestLocationUpdates(p, 2000L, 5.0f, mGpsLocationListener);
+                }
+            }
+        } catch (SecurityException e) {
+            // permission revoked between the check and the call — ignore
+        } catch (IllegalArgumentException e) {
+            // a provider is missing on this device — ignore
+        }
+    }
+
+    private void stopGpsLocationUpdates() {
+        if (mGpsLocationManager != null && mGpsLocationListener != null) {
+            try {
+                mGpsLocationManager.removeUpdates(mGpsLocationListener);
+            } catch (Exception e) {
+                // ignore
+            }
         }
     }
 
