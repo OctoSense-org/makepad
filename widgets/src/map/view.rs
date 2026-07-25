@@ -1507,6 +1507,13 @@ impl Widget for MapView {
             self.apply_theme_palette();
         }
 
+        // For the flat plan/preview map (nav_kind 2), fill the whole map area with the
+        // land tone before tiles, so regions beyond the fetched route corridor read as
+        // empty map instead of the dark clear colour ("2nd half of the map is black").
+        if nav_kind == 2 {
+            let bg = self.active_style().background;
+            self.draw_bg.color = bg;
+        }
         self.draw_bg.draw_abs(cx, rect);
         let tile_rect = self.nav_tile_rect(rect, nav_kind);
         self.ensure_visible_tiles(cx, tile_rect);
