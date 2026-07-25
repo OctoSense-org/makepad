@@ -1084,6 +1084,21 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnSafeAreaInsets(
     });
 }
 
+// The Android LocationListener delivers each fix here (via runOnUiThread ->
+// MakepadNative.onLocation). We write it straight into the platform-global last
+// fix so the Splash `sys.gps(...)` helper can read it SYNCHRONOUSLY during card
+// evaluation — no need to route through the FromJavaMessage event queue.
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_onLocation(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+    lat: jni_sys::jdouble,
+    lon: jni_sys::jdouble,
+    acc: jni_sys::jfloat,
+) {
+    crate::gps::set_gps_fix(lat as f64, lon as f64, acc as f32);
+}
+
 #[no_mangle]
 extern "C" fn Java_dev_makepad_android_MakepadNative_onRenderLoop(
     _: *mut jni_sys::JNIEnv,

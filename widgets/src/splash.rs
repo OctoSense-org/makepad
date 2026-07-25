@@ -1220,6 +1220,31 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.gps("lat"|"lon"|"acc"|"ok") -> the device's last-known GPS fix, read
+    // SYNCHRONOUSLY from the platform global (NO network fetch — so, unlike
+    // sys.search/navroute, it must NOT gate the card via body_binds_live_data).
+    // lat/lon/acc are numbers, -9999 when there is no fix yet; "ok" is 1 when a
+    // fix exists else 0. Cards guard with `sys.gps("ok") >= 1` before trusting
+    // lat/lon (same sentinel idiom as sys.coord). Fed by the Android
+    // LocationListener through JNI onLocation -> makepad_platform::gps.
+    vm.add_method(
+        sys,
+        id_lut!(gps),
+        script_args_def!(field = NIL),
+        |vm, args| {
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let fix = crate::makepad_draw::makepad_platform::gps::last_gps_fix();
+            match field.trim().to_ascii_lowercase().as_str() {
+                "ok" => ScriptValue::from_f64(if fix.is_some() { 1.0 } else { 0.0 }),
+                "lon" => ScriptValue::from_f64(fix.map(|f| f.lon).unwrap_or(-9999.0)),
+                "acc" => ScriptValue::from_f64(fix.map(|f| f.acc as f64).unwrap_or(-9999.0)),
+                _ => ScriptValue::from_f64(fix.map(|f| f.lat).unwrap_or(-9999.0)),
+            }
+        },
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
 }
 
@@ -2360,10 +2385,16 @@ impl Splash {
         // Also arm for live-data cards (sys.weather/sys.airquality) so the pump
         // runs and can re-evaluate them when their async data arrives, even if
         // the card has no time-based shader of its own.
+        // EXCEPT `fn tick()` cards (e.g. nav): they manage their own updates in
+        // place via tick() (1 Hz) and their widgets drive their own frames (the
+        // MapView), and their epoch-driven re-eval is suppressed anyway (see the
+        // pump handler). Arming here just made the pump repaint the whole card —
+        // MapView + tiles — 60x/s forever, pinning the GPU. Let them idle.
+        let is_tick = body.contains("fn tick(") || body.contains("fn tick (");
         self.animating = body.contains("draw_pass.time")
             || body.contains("WeatherIcon")
             || body.contains("sys.simsecs")
-            || body_binds_live_data(body);
+            || (body_binds_live_data(body) && !is_tick);
         if self.animating {
             self.anim_next_frame = cx.new_next_frame();
         } else {
@@ -2553,6 +2584,13 @@ impl Widget for Splash {
         // Handle tick timer — call tick() in the Splash code's scope
         if self.tick_timer.is_event(event).is_some() {
             self.call_fn(cx, id!(tick));
+            // tick() updates widgets in place (ui.<id>.set_text/…) — e.g. the nav
+            // card's live search-result rows and per-mode ETA. Those set_* calls
+            // don't self-schedule a paint; previously the per-frame animation pump
+            // repainted the card every frame so they showed up. Now that tick cards
+            // no longer run that 60fps pump (perf fix), repaint here so tick's
+            // updates actually render — at the 1 Hz tick cadence they're computed.
+            self.view.redraw(cx);
         }
 
         // Per-frame redraw pump for time-based shaders: redraw the view (so the
@@ -2581,6 +2619,15 @@ impl Widget for Splash {
             // re-eval for tick cards; they push loaded data via tick().
             let is_tick_card = self.body.as_ref().contains("fn tick(")
                 || self.body.as_ref().contains("fn tick (");
+            // A genuine PER-FRAME animation is a time-driven shader (`draw_pass.time`
+            // or the WeatherIcon's animated shader). A card that merely binds async
+            // live data is STATIC once loaded — repainting it every frame (below)
+            // just pins the GPU. So only repaint per-frame for real animations;
+            // live-data cards still repaint on their epoch change (the `if` above).
+            let needs_frame_anim = {
+                let b = self.body.as_ref();
+                b.contains("draw_pass.time") || b.contains("WeatherIcon")
+            };
             if (epoch != self.last_data_epoch
                 && body_binds_live_data(self.body.as_ref())
                 && !is_tick_card)
@@ -2589,7 +2636,7 @@ impl Widget for Splash {
                 self.last_sim_tick = sim_tick;
                 self.eval_body(cx);
                 cx.redraw_all();
-            } else {
+            } else if needs_frame_anim {
                 self.view.redraw(cx);
             }
             self.anim_next_frame = cx.new_next_frame();
