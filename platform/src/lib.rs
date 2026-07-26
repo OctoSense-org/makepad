@@ -42,6 +42,7 @@ mod debug;
 pub mod event;
 mod geometry;
 mod gpu_info;
+pub mod gps;
 mod id_pool;
 pub mod ime;
 mod live_reload;

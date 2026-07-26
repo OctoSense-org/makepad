@@ -322,6 +322,11 @@ const NAV_REF_Z: u32 = 16;
 /// to the follow-cam (matches typical map apps' auto-recenter behavior).
 const NAV_RECENTER_IDLE_SECS: f64 = 4.0;
 
+/// Extra frames the map keeps rendering AFTER motion stops so a just-revealed
+/// label finishes its ~0.22s fade-in (and any last tile paints) before going
+/// idle. ~16 frames ≈ 0.27s at 60fps, covering the fade.
+const NAV_SETTLE_FRAMES: u32 = 16;
+
 /// Ready tile geometry shared across MapView instances on the UI thread.
 /// Splash cards that animate re-evaluate ~1 Hz and REBUILD their widget tree,
 /// so a per-instance tile cache would refetch + retessellate every second
@@ -554,11 +559,23 @@ struct SharedNavRoute {
     origin: (f64, f64), // world px at NAV_REF_Z the geometry is rebased to
     pts: Rc<Vec<Vec2d>>,
     cum: Rc<Vec<f64>>,
+    seq: u64, // last-used tick for LRU eviction (see ensure_nav_route: never bulk-clear)
 }
 
 thread_local! {
     static NAV_ROUTE_STORE: std::cell::RefCell<HashMap<u64, SharedNavRoute>> =
         std::cell::RefCell::new(HashMap::new());
+    // Monotonic "last used" clock for NAV_ROUTE_STORE LRU eviction.
+    static NAV_ROUTE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Next value of the NAV_ROUTE_STORE LRU clock (bumped on every adopt + insert).
+fn next_nav_route_seq() -> u64 {
+    NAV_ROUTE_SEQ.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    })
 }
 
 /// Adopt a shared ready tile as a per-instance TileEntry (borrowed handles).
@@ -632,10 +649,18 @@ fn nav_store_insert(
                 last_used: tick,
             },
         );
-        if store.len() > 1400 {
+        if store.len() > 900 {
+            // Cap the shared owner store to BOUND MEMORY. The 3D chase view pulls a
+            // wide tile radius (turn/horizon prefetch), so an unbounded store fills
+            // to ~2.5 GB on entering drive and parks the process at the Android OOM
+            // ceiling — then any later allocation (even a bottom-sheet redraw) aborts
+            // with SIGABRT ("allocation failed"). 900 sits comfortably above the
+            // active working set (per-instance cap 640), so only never-drawn FAR
+            // history is trimmed — nothing visible changes.
             // Evict FARTHEST from the drive first (never what's near the car —
-            // loaded content close to the viewport must not vanish). Falls
-            // back to LRU when no nav draw has run yet.
+            // loaded content close to the viewport must not vanish; drawing only
+            // ever touches the nearest ~86 tiles, so a drawn tile is never evicted).
+            // Falls back to LRU when no nav draw has run yet.
             let (cz, cx_, cy_) = NAV_DRAW_CENTER.with(|c| c.get());
             let mut ranked: Vec<(u64, TileKey)> = store
                 .iter()
@@ -655,7 +680,7 @@ fn nav_store_insert(
                 })
                 .collect();
             ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            for (_, k) in ranked.into_iter().take(48) {
+            for (_, k) in ranked.into_iter().take(96) {
                 store.remove(&k);
             }
         }
@@ -952,6 +977,26 @@ pub struct MapView {
     nav_bearing_init: bool,
     #[rust]
     nav_next_frame: NextFrame,
+    // Frames still owed AFTER motion stops, so a just-revealed label finishes its
+    // ~0.22s fade-in (and any in-flight tile paints) before the map goes fully
+    // idle. Re-armed to NAV_SETTLE_FRAMES on any motion / tile arrival, counted
+    // down each static frame. Gates the `nav_next_frame` re-arm so a STATIC
+    // plan/preview map stops requesting frames (was pinning the GPU at ~100%).
+    #[rust]
+    nav_settle_frames: u32,
+    // Gesture disambiguation state. `nav_gesture_on_map`: this gesture was claimed by
+    // the map (a finger landed on it) — once claimed, pan/pinch is decided from ALL
+    // active fingers, not just those still inside the (short) map rect, so a finger
+    // drifting off the map doesn't flip pinch<->pan. `nav_gest`: committed gesture
+    // (0 idle · 1 pan · 2 pinch). `nav_gest_hold`: frames a NEW finger-count has
+    // persisted — a switch commits only after a few frames, rejecting momentary
+    // flickers (a palm graze, or pinch jitter dropping a finger).
+    #[rust]
+    nav_gesture_on_map: bool,
+    #[rust]
+    nav_gest: u8,
+    #[rust]
+    nav_gest_hold: u8,
 
     #[rust]
     center_norm: Vec2d,
@@ -970,12 +1015,15 @@ pub struct MapView {
     // drag accumulates it; recenter clears it.
     #[rust]
     nav_pan: Vec2d,
-    // Active touches (digit LiveId, abs-pos) for 1-finger pan vs 2-finger pinch.
+    // Latest position of every ACTIVE touch (raw uid -> abs-pos), accumulated
+    // across TouchUpdate events. A real 2-finger pinch is delivered as separate
+    // per-finger events, so no single event carries both fingers — we must track
+    // them to tell a genuine pinch (2 tracked) from a one-finger pan (1 tracked).
     #[rust]
-    nav_touches: Vec<(LiveId, Vec2d)>,
+    nav_touches: Vec<(u64, Vec2d)>,
     // (finger distance, zoom) captured when the 2nd finger lands — the pinch base.
     #[rust]
-    nav_pinch_base: Option<(f64, f64)>,
+    nav_pinch_base: Option<(f64, f64, Vec2d)>,
     // (abs-pos, nav_pan) captured when a 1-finger drag begins — the pan anchor.
     // Pan is computed ABSOLUTELY from this anchor (not incrementally per move) so
     // a partial/coalesced FingerMove stream still yields a 1:1 drag; re-anchored
@@ -1264,66 +1312,150 @@ impl Widget for MapView {
             }
             let zmin = self.min_zoom.max(0.0);
             let zmax = self.max_zoom.max(zmin);
-            match event.hits_with_capture_overload(cx, self.draw_bg.area(), false) {
-                Hit::FingerDown(fe) => {
-                    self.nav_touches.push((fe.digit_id.0, fe.abs));
-                    self.nav_last_touch = crate::splash::sim_clock_secs();
-                    if self.nav_touches.len() == 2 {
-                        let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
-                        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
-                        self.nav_pinch_base = Some((d.max(1.0), self.view_zoom()));
-                        // a pinch supersedes any single-finger pan in progress
-                        self.nav_pan_drag = None;
-                    } else if self.nav_touches.len() == 1 {
-                        // anchor the pan so drag is computed absolutely from here
-                        self.nav_pan_drag = Some((fe.abs, self.nav_pan));
-                    }
-                }
-                Hit::FingerMove(fe) => {
-                    for t in self.nav_touches.iter_mut() {
-                        if t.0 == fe.digit_id.0 {
-                            t.1 = fe.abs;
-                            break;
+
+            // Safety: whenever no finger is on the map, make sure the scroll-block
+            // (set below during a pan/pinch) is cleared, so it can never persist past
+            // a gesture and wedge scrolling on other cards. The gesture re-blocks per
+            // TouchUpdate. (This block is a Cx global with no per-frame auto-reset.)
+            if self.nav_touches.is_empty() {
+                cx.unblock_scrolling();
+            }
+
+            // Claim the gesture for the map ONLY when a finger lands on the EXPOSED
+            // map surface. hits() honours z-order, so a finger on the overlaid bottom
+            // sheet / control pills / buttons returns Miss here and the map does NOT
+            // pan under them. (Before this, the full-card map rect swallowed every
+            // touch on the sheet — tapping the sheet just panned the map instead of
+            // reaching its buttons, which reads as "app not responding".)
+            // capture_overload=false leaves those overlay taps for the widgets on top.
+            if let Hit::FingerDown(_) =
+                event.hits_with_capture_overload(cx, self.draw_bg.area(), false)
+            {
+                self.nav_gesture_on_map = true;
+            }
+
+            // Touch gestures (one-finger PAN, two-finger PINCH-zoom). Android reports
+            // EVERY active pointer on each event (the JNI loops getPointerCount), so
+            // `te.touches` is the authoritative current set — REBUILD from it (a missed
+            // Stop otherwise leaves a phantom finger that turns a pan into a pinch).
+            // Once a finger has landed ON the map the gesture is "claimed" (above); from
+            // then on pan vs pinch is decided from ALL active fingers, not just those
+            // still inside the map rect, so a finger drifting off doesn't flip
+            // pinch<->pan. Switches between pan and pinch are debounced a few frames to
+            // reject momentary flickers (a palm graze, or pinch jitter).
+            if let Event::TouchUpdate(te) = event {
+                let active: Vec<_> = te
+                    .touches
+                    .iter()
+                    .filter(|t| {
+                        !matches!(t.state, crate::makepad_platform::event::TouchState::Stop)
+                    })
+                    .map(|t| t.abs)
+                    .collect();
+                self.nav_touches = te
+                    .touches
+                    .iter()
+                    .filter(|t| {
+                        !matches!(t.state, crate::makepad_platform::event::TouchState::Stop)
+                    })
+                    .map(|t| (t.uid, t.abs))
+                    .collect();
+                // map rect — used by the pinch focal-point math below
+                let rect = self.draw_bg.area().clipped_rect(cx);
+
+                if active.is_empty() {
+                    // all fingers up — end the gesture and release the scroll block
+                    self.nav_gesture_on_map = false;
+                    self.nav_gest = 0;
+                    self.nav_gest_hold = 0;
+                    self.nav_pinch_base = None;
+                    self.nav_pan_drag = None;
+                    cx.unblock_scrolling();
+                } else {
+                    // the gesture was already claimed above via hits() (a finger on the
+                    // EXPOSED map only). A finger that landed on the sheet/buttons leaves
+                    // nav_gesture_on_map false, so it falls through here without panning.
+                    if self.nav_gesture_on_map {
+                        // block the enclosing drag-scrolling PortalList so pan/pinch move
+                        // the MAP, not the card (it checks is_scrolling_allowed_within()
+                        // before entering its drag, during child event-forwarding).
+                        cx.block_scrolling_except_within(self.draw_bg.area());
+                        // debounce pan<->pinch switches; the FIRST gesture commits at once
+                        let n = active.len().min(2) as u8;
+                        if self.nav_gest == 0 {
+                            self.nav_gest = n;
+                        } else if n != self.nav_gest {
+                            self.nav_gest_hold += 1;
+                            if self.nav_gest_hold >= 3 {
+                                self.nav_gest = n;
+                                self.nav_gest_hold = 0;
+                            }
+                        } else {
+                            self.nav_gest_hold = 0;
                         }
-                    }
-                    if self.nav_touches.len() >= 2 {
-                        if let Some((base_d, base_z)) = self.nav_pinch_base {
-                            let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
-                            let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
-                            self.zoom = (base_z + (d / base_d).log2()).clamp(zmin, zmax);
-                            self.nav_zoom_anim = None; // direct pinch overrides any glide
-                            self.nav_last_touch = crate::splash::sim_clock_secs();
-                            self.nav_user_adjusted = true;
-                            self.redraw(cx);
+                        let pts = &active;
+                        if self.nav_gest >= 2 && pts.len() >= 2 {
+                            // ---- two-finger PINCH, anchored on the focal point ----
+                            let d = ((pts[0].x - pts[1].x).powi(2)
+                                + (pts[0].y - pts[1].y).powi(2))
+                            .sqrt()
+                            .max(1.0);
+                            match self.nav_pinch_base {
+                                Some((base_d, base_z, fp0)) => {
+                                    // Zoom around the FIXED focal point captured at pinch
+                                    // start (`fp0`), not the live midpoint — a fixed
+                                    // anchor keeps the spot you pinched put and only pans
+                                    // to compensate for the SCALE change. PINCH_SENS > 1
+                                    // makes a modest spread zoom snappily.
+                                    const PINCH_SENS: f64 = 1.8;
+                                    let prev_zoom = self.zoom;
+                                    self.zoom = (base_z + PINCH_SENS * (d / base_d).log2())
+                                        .clamp(zmin, zmax);
+                                    let sc = dvec2(
+                                        rect.pos.x + rect.size.x * 0.5,
+                                        rect.pos.y + rect.size.y * 0.5,
+                                    );
+                                    let wo = tile_world_size_zoom(prev_zoom).max(1e-6);
+                                    let wn = tile_world_size_zoom(self.zoom).max(1e-6);
+                                    self.nav_pan.x += (fp0.x - sc.x) * (1.0 / wo - 1.0 / wn);
+                                    self.nav_pan.y += (fp0.y - sc.y) * (1.0 / wo - 1.0 / wn);
+                                    self.nav_zoom_anim = None;
+                                    self.nav_pan_anim = None;
+                                    self.nav_user_adjusted = true;
+                                    self.nav_last_touch = crate::splash::sim_clock_secs();
+                                    self.redraw(cx);
+                                }
+                                None => {
+                                    // pinch just began — capture base distance, zoom, and
+                                    // the finger midpoint as the fixed focal anchor
+                                    let fp0 =
+                                        dvec2((pts[0].x + pts[1].x) * 0.5, (pts[0].y + pts[1].y) * 0.5);
+                                    self.nav_pinch_base = Some((d, self.view_zoom(), fp0));
+                                }
+                            }
+                            self.nav_pan_drag = None;
+                        } else if self.nav_gest == 1 && !pts.is_empty() {
+                            // ---- one-finger PAN (absolute from the drag anchor) ----
+                            self.nav_pinch_base = None;
+                            let p = pts[0];
+                            if let Some((abs0, pan0)) = self.nav_pan_drag {
+                                let world = tile_world_size_zoom(self.view_zoom());
+                                self.nav_pan.x = pan0.x - (p.x - abs0.x) / world;
+                                self.nav_pan.y = pan0.y - (p.y - abs0.y) / world;
+                                self.nav_pan_anim = None;
+                                self.nav_user_adjusted = true;
+                                self.nav_last_touch = crate::splash::sim_clock_secs();
+                                self.redraw(cx);
+                            } else {
+                                // anchor a new drag (re-anchors after a pinch releases to
+                                // one finger, so the pan doesn't jump)
+                                self.nav_pan_drag = Some((p, self.nav_pan));
+                            }
                         }
-                    } else if let Some((abs0, pan0)) = self.nav_pan_drag {
-                        // one-finger pan: shift the map center opposite the drag.
-                        // ABSOLUTE from the anchor (not per-move deltas) so a
-                        // coalesced/partial move stream still pans 1:1 with the finger.
-                        let world = tile_world_size_zoom(self.view_zoom());
-                        self.nav_pan.x = pan0.x - (fe.abs.x - abs0.x) / world;
-                        self.nav_pan.y = pan0.y - (fe.abs.y - abs0.y) / world;
-                        self.nav_pan_anim = None; // direct drag overrides any glide
-                        self.nav_last_touch = crate::splash::sim_clock_secs();
-                        self.nav_user_adjusted = true;
-                        self.redraw(cx);
+                        // else: committed gesture vs live-finger count mismatch mid-switch
+                        // — hold (no pan, no zoom) until the debounce settles
                     }
                 }
-                Hit::FingerUp(fe) => {
-                    self.nav_touches.retain(|t| t.0 != fe.digit_id.0);
-                    if self.nav_touches.len() < 2 {
-                        self.nav_pinch_base = None;
-                    }
-                    // re-anchor a still-active single finger (e.g. one finger
-                    // lifted after a pinch) so the pan doesn't jump; clear when
-                    // the last finger leaves.
-                    if let Some(t) = self.nav_touches.first() {
-                        self.nav_pan_drag = Some((t.1, self.nav_pan));
-                    } else {
-                        self.nav_pan_drag = None;
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -1385,13 +1517,39 @@ impl Widget for MapView {
             if self.frame_counter % 15 == 0 {
                 self.prefetch_route_ahead(cx);
             }
-            // ~60fps camera animation while navigating
-            self.nav_next_frame = cx.new_next_frame();
+            // Only keep pumping frames while something is actually MOVING. A drive
+            // follow-cam (2d/3d) tracks the sim vehicle every frame so it always
+            // animates; a plan/preview map is STATIC unless a zoom/pan glide, a
+            // live touch gesture, or a just-revealed label fade is in flight.
+            // Re-arming unconditionally here pinned the GPU at ~100% on a frozen
+            // map (the reported sluggishness). Async tile arrivals repaint via
+            // their own UI signal (ToUISender → handle_tile_worker_messages), so
+            // they don't depend on this loop.
+            let moving = !self.is_plan()
+                || self.nav_zoom_anim.is_some()
+                || self.nav_pan_anim.is_some()
+                || !self.nav_touches.is_empty();
+            if moving {
+                self.nav_settle_frames = NAV_SETTLE_FRAMES;
+            }
+            if moving || self.nav_settle_frames > 0 {
+                self.nav_next_frame = cx.new_next_frame();
+                if !moving {
+                    self.nav_settle_frames -= 1;
+                }
+            }
         } else if self.draw_map.nav.mode != 0.0 {
             self.draw_map.nav = NavShaderParams::default();
             self.apply_theme_palette();
         }
 
+        // For the flat plan/preview map (nav_kind 2), fill the whole map area with the
+        // land tone before tiles, so regions beyond the fetched route corridor read as
+        // empty map instead of the dark clear colour ("2nd half of the map is black").
+        if nav_kind == 2 {
+            let bg = self.active_style().background;
+            self.draw_bg.color = bg;
+        }
         self.draw_bg.draw_abs(cx, rect);
         let tile_rect = self.nav_tile_rect(rect, nav_kind);
         self.ensure_visible_tiles(cx, tile_rect);
@@ -1930,6 +2088,10 @@ impl MapView {
         }
         if redraw {
             self.update_status_text();
+            // A tile just landed on a possibly-static map: give the map a short
+            // render window so the newly-drawn tile's labels can fade in (the
+            // `moving` guard in draw_walk would otherwise idle after one frame).
+            self.nav_settle_frames = self.nav_settle_frames.max(NAV_SETTLE_FRAMES);
             self.redraw(cx);
         }
     }
@@ -2226,17 +2388,22 @@ impl MapView {
         }
         // Shared across the 1 Hz card rebuilds: decode + tessellate ONCE.
         let adopted = NAV_ROUTE_STORE.with(|s| {
-            let s = s.borrow();
-            s.get(&hash).map(|r| {
-                (
+            let mut s = s.borrow_mut();
+            // bump the LRU clock on adopt so an actively-reused route can never
+            // be the eviction victim while an instance still borrows its handle
+            if let Some(r) = s.get_mut(&hash) {
+                r.seq = next_nav_route_seq();
+                Some((
                     r.geom
                         .as_ref()
                         .map(|g| Geometry::new_borrowed(g.geometry_id())),
                     r.origin,
                     r.pts.clone(),
                     r.cum.clone(),
-                )
-            })
+                ))
+            } else {
+                None
+            }
         });
         if let Some((geom, origin, pts, cum)) = adopted {
             self.nav_route_geom = geom;
@@ -2262,7 +2429,10 @@ impl MapView {
             if i + 1 < coords0.len() {
                 let (lat2, lon2) = coords0[i + 1];
                 let seg = haversine_m(lat, lon, lat2, lon2);
-                let steps = (seg / 6.0).floor() as usize;
+                // cap per-segment subdivision: a pathological (gappy/malformed)
+                // polyline segment could otherwise explode into millions of
+                // points and OOM-abort the process (profile.small: panic='abort')
+                let steps = ((seg / 6.0).floor() as usize).min(2048);
                 for s in 1..steps {
                     let t = s as f64 / steps as f64;
                     coords.push((lat + (lat2 - lat) * t, lon + (lon2 - lon) * t));
@@ -2369,8 +2539,23 @@ impl MapView {
             self.nav_route_geom = Some(Geometry::new_borrowed(geometry.geometry_id()));
             NAV_ROUTE_STORE.with(|s| {
                 let mut s = s.borrow_mut();
-                if s.len() > 6 {
-                    s.clear(); // routes are big; keep the store tiny
+                // Evict the LEAST-recently-used entries down to a cap. NEVER
+                // bulk-clear(): instances hold BORROWED handles into this store,
+                // including a just-dropped plan MapView whose final draw is still
+                // queued during a plan->drive transition. Freeing a live entry
+                // frees its GPU geometry slot; the pool reuses that slot for the
+                // next route/tile and the queued draw then reads a wrong-sized
+                // buffer -> native SIGSEGV (the reported "3D nav crash"). LRU keeps
+                // the routes currently on screen (the one just drawn + the incoming
+                // drive route) alive; only long-stale entries are dropped.
+                const NAV_ROUTE_CAP: usize = 12;
+                while s.len() >= NAV_ROUTE_CAP {
+                    match s.iter().min_by_key(|(_, r)| r.seq).map(|(&k, _)| k) {
+                        Some(k) => {
+                            s.remove(&k);
+                        }
+                        None => break,
+                    }
                 }
                 s.insert(
                     hash,
@@ -2379,6 +2564,7 @@ impl MapView {
                         origin,
                         pts: self.nav_pts.clone(),
                         cum: self.nav_cum.clone(),
+                        seq: next_nav_route_seq(),
                     },
                 );
             });

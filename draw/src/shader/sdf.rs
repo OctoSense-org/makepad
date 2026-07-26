@@ -392,8 +392,14 @@ script_mod! {
             box: fn(x: float, y: float, w: float, h: float, r: float) {
                 let p = self.pos - vec2(x, y);
                 let size = vec2(0.5 * w, 0.5 * h);
-                let bp = max(abs(p - size.xy) - (size.xy - vec2(2. * r, 2. * r).xy), vec2(0., 0.));
-                self.dist = (length(bp) - 2. * r) / self.scale_factor;
+                // The effective corner radius here is 2*r. Clamp it so 2*r can never
+                // exceed the shortest half-side: past that the rounded-box SDF
+                // overshoots and collapses into a diamond (a 50x50 view with
+                // border_radius 25 rendered as a rotated square). Clamping lets an
+                // over-large radius saturate cleanly to a circle / pill instead.
+                let rr = min(r, min(size.x, size.y) * 0.5);
+                let bp = max(abs(p - size.xy) - (size.xy - vec2(2. * rr, 2. * rr).xy), vec2(0., 0.));
+                self.dist = (length(bp) - 2. * rr) / self.scale_factor;
                 self.old_shape = self.shape;
                 self.shape = min(self.shape, self.dist);
             }

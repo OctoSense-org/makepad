@@ -601,9 +601,14 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     // a Wi-Fi-less phone generates cards fine (LLM tunneled) but every `sys.*`
     // fetch fails DNS, so cards render with "—"/empty rows.
     std::env::remove_var("MAKEPAD_OCTOS_PROXY");
-    if let Some(proxy) = get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY")
-        .filter(|v| !v.trim().is_empty())
-    {
+    // `direct` / `none` / `off` / empty (or no extra at all) => NO proxy: both the
+    // octos LLM leg and the app-side sys.* fetches go straight out over the
+    // device's own network (Wi-Fi). Any other value is a proxy URL to tunnel.
+    let proxy = get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY").filter(|v| {
+        let t = v.trim().to_ascii_lowercase();
+        !t.is_empty() && t != "direct" && t != "none" && t != "off"
+    });
+    if let Some(proxy) = proxy {
         std::env::set_var("MAKEPAD_OCTOS_PROXY", &proxy);
         // App-side leg: MakepadNetwork opens connections with a bare
         // `url.openConnection()`, which consults the JVM proxy system
@@ -616,6 +621,16 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
             }
             crate::log!("app HTTP proxy set: {}:{} (card data fetches tunneled)", host, port);
         }
+    } else {
+        // No proxy requested. A warm-started process can carry stale JVM proxy
+        // props over from a previous (proxied) launch, so CLEAR them — otherwise
+        // app-side fetches keep tunneling to a now-dead proxy and every sys.*
+        // call fails. An empty host makes the HTTP stack connect directly.
+        for scheme in ["http", "https"] {
+            set_java_system_property(env, &format!("{scheme}.proxyHost"), "");
+            set_java_system_property(env, &format!("{scheme}.proxyPort"), "");
+        }
+        crate::log!("app HTTP proxy cleared: direct connections (device Wi-Fi)");
     }
 
     // Passthrough: `--es makepad.PROVISION_DIR <path>` → MAKEPAD_PROVISION_DIR.
@@ -1082,6 +1097,21 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnSafeAreaInsets(
         bottom: bottom as f64,
         left: left as f64,
     });
+}
+
+// The Android LocationListener delivers each fix here (via runOnUiThread ->
+// MakepadNative.onLocation). We write it straight into the platform-global last
+// fix so the Splash `sys.gps(...)` helper can read it SYNCHRONOUSLY during card
+// evaluation — no need to route through the FromJavaMessage event queue.
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_onLocation(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+    lat: jni_sys::jdouble,
+    lon: jni_sys::jdouble,
+    acc: jni_sys::jfloat,
+) {
+    crate::gps::set_gps_fix(lat as f64, lon as f64, acc as f32);
 }
 
 #[no_mangle]

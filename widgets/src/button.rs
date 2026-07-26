@@ -424,6 +424,21 @@ pub struct Button {
     #[live]
     on_press: ScriptFnRef,
 
+    // Swipe gesture (opt-in via `swipe: true`): a vertical drag fires on_swipe_up /
+    // on_swipe_down instead of a click — used for the drive sheet's grab handle.
+    #[live]
+    swipe: bool,
+
+    #[live]
+    on_swipe_up: ScriptFnRef,
+
+    #[live]
+    on_swipe_down: ScriptFnRef,
+
+    // FingerDown position, to measure the swipe delta at FingerUp.
+    #[rust]
+    swipe_down_abs: DVec2,
+
     /// Legacy compatibility flag that fires `on_click` on press instead of click.
     #[live]
     trigger_on_press: bool,
@@ -509,6 +524,7 @@ impl Widget for Button {
                 self.draw_bg.redraw(cx);
             }
             Hit::FingerDown(fe) if self.enabled && fe.is_primary_hit() => {
+                self.swipe_down_abs = fe.abs;
                 if self.grab_key_focus {
                     cx.set_key_focus(self.draw_bg.area());
                 }
@@ -545,6 +561,21 @@ impl Widget for Button {
                 cx.widget_action_with_data(&self.action_data, uid, ButtonAction::LongPressed);
             }
             Hit::FingerUp(fe) if self.enabled && fe.is_primary_hit() => {
+                // Vertical-swipe gesture (opt-in): if a swipe handler is bound and the
+                // finger travelled mostly up/down past a threshold, fire it instead of
+                // the click — lets the drive sheet's handle be dragged open/closed.
+                let d = fe.abs - self.swipe_down_abs;
+                let is_vswipe = self.swipe && d.y.abs() > 22.0 && d.y.abs() > d.x.abs();
+                if is_vswipe && d.y < 0.0 {
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_up.clone(), &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
+                if is_vswipe && d.y > 0.0 {
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_down.clone(), &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
                 let was_clicked = fe.is_over
                     && if self.enable_long_press {
                         fe.was_tap()
