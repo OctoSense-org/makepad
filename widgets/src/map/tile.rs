@@ -14,9 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const OVERPASS_ENDPOINTS: &[&str] = &[
-    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
     "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ];
 pub const MAX_PENDING_REQUESTS: usize = 6;
 pub const MAX_TILE_RETRIES: u8 = 6;
@@ -196,8 +196,14 @@ pub fn retry_delay_frames(attempts: u8) -> u64 {
     delay.min(RETRY_MAX_FRAMES)
 }
 
-pub fn overpass_endpoint(attempts: u8) -> &'static str {
-    let index = attempts as usize % OVERPASS_ENDPOINTS.len();
+pub fn overpass_endpoint(tile: TileKey, attempts: u8) -> &'static str {
+    // Spread the FIRST attempt across mirrors by tile, so the tile fan-out doesn't
+    // hammer ONE instance — which is itself what trips the public mirrors' rate
+    // limit into 504s (the "blank map" symptom). Retries advance to the next
+    // mirror, so a failing endpoint fails over on the following attempt.
+    let base =
+        (tile.x as usize) ^ (tile.y as usize).rotate_left(11) ^ (tile.z as usize).rotate_left(23);
+    let index = base.wrapping_add(attempts as usize) % OVERPASS_ENDPOINTS.len();
     OVERPASS_ENDPOINTS[index]
 }
 

@@ -3483,7 +3483,7 @@ impl MapView {
         let request_id = nav_next_request_id();
 
         let query = overpass_query(tile_key);
-        let endpoint = overpass_endpoint(attempts);
+        let endpoint = overpass_endpoint(tile_key, attempts);
         let mut request = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
         request.set_header("Content-Type".to_string(), "text/plain".to_string());
         request.set_header("Accept".to_string(), "application/json".to_string());
