@@ -2780,6 +2780,12 @@ public class MakepadActivity
         mComposerOverlay.setClickable(false);
         mComposerOverlay.setFocusable(false);
         mComposerOverlay.setVisibility(View.GONE);
+        // Render the composer overlay (pill + FAB) into its own hardware texture so
+        // it composites INDEPENDENTLY of the GL map surface's per-frame buffer
+        // swaps. Without this, every map repaint re-blends the native overlay
+        // against the changing surface underneath and the FAB flickers; the cached
+        // layer is only re-rasterised when the overlay itself actually changes.
+        mComposerOverlay.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 
         // The pill: horizontal EditText + send button, translucent teal to
         // match the app's liquid-glass composer so the card shows through.
