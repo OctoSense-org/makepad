@@ -83,6 +83,11 @@ const HTTP_FETCH_ALLOWED_HOSTS: &[&str] = &[
     "query1.finance.yahoo.com", // stock card
     "query2.finance.yahoo.com",
     "open-meteo.com",           // weather card (api. + geocoding-api. subdomains)
+    // news card — read-only public feeds. `zerohedge.com` also covers its
+    // `www.` and `assets.` subdomains via the boundary-correct suffix match.
+    "hacker-news.firebaseio.com",
+    "feeds.feedburner.com",
+    "zerohedge.com",
 ];
 
 /// Shared SSRF guard: require https and reject loopback / private / link-local /
