@@ -594,6 +594,22 @@ impl Cx {
         DATA_FETCH_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Placeholder text for a `sys.*` binding while `url`'s `script_data_fetch`
+    /// is unresolved: "—" (the existing loading glyph) while still
+    /// loading/retrying, or a visibly distinct "n/a" once the retry budget is
+    /// exhausted (see `data_fetch_failed_terminally`). Without this, a
+    /// permanently-unreachable source (blocked host, 404…) renders identically
+    /// to "still loading" forever — the card never tells the user the data
+    /// simply isn't coming. Call from a `script_data_fetch` `None` arm instead
+    /// of hardcoding "—".
+    pub fn script_data_placeholder(&self, url: &str) -> String {
+        if self.script_data.resources.data_fetch_failed_terminally(url) {
+            "n/a".to_string()
+        } else {
+            "—".to_string()
+        }
+    }
+
     /// Load all script resources that are still pending.
     ///
     /// Each platform uses a different loading strategy:
