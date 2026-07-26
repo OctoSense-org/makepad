@@ -777,6 +777,45 @@ impl Cx {
             }
         }
 
+        // OpenHarmony had no lazy fallback here at all. `self.dependencies` is
+        // never populated on this platform (measured on device: the eager
+        // `ohos_load_dependencies()` runs before anything registers, seeing an
+        // empty map), so EVERY lookup fell through to the Err below — silently.
+        // That means no font ever loads, text layout produces zero glyphs, no
+        // text draw call is emitted, and the app renders shapes but no text with
+        // no error anywhere. Android works purely via its lazy asset fallback
+        // above; this is the OHOS equivalent, reading from the HAP's rawfile.
+        #[cfg(target_env = "ohos")]
+        {
+            if let Some(raw_file) = self.os.raw_file.as_ref() {
+                // RawFileMgr is a thin wrapper around a raw
+                // *mut NativeResourceManager; `&mut` on read_to_end is
+                // incidental, so reading through a const-cast is sound here.
+                let mgr = raw_file as *const _
+                    as *mut crate::os::linux::open_harmony::raw_file::RawFileMgr;
+                // Dependency keys look like
+                // `makepad/makepad_widgets/resources/X.ttf`, but the HAP stores
+                // them under `resources/rawfile/makepad/...`. Which prefix the
+                // resource manager wants isn't documented, so try the plausible
+                // forms — Android does the same dance with `package_root`.
+                // cargo-makepad stages resources into
+                //   entry/src/main/resources/rawfile/makepad/<crate>/resources/…
+                // and the resource manager resolves paths relative to
+                // `resources/rawfile/`. Dependency keys are
+                // `<crate>/resources/<file>`, so the on-device key needs a
+                // `makepad/` prefix. Without it every font read fails silently.
+                let candidates = [format!("makepad/{}", path), path.to_string()];
+                for cand in candidates.iter() {
+                    let mut buffer = Vec::<u8>::new();
+                    let r = unsafe { (*mgr).read_to_end(cand.as_str(), &mut buffer) };
+                    if r.is_ok() && !buffer.is_empty() {
+                        return Ok(Rc::new(buffer));
+                    }
+                }
+                crate::log!("DEP MISS {}", path);
+            }
+        }
+
         Err(format!("Dependency not loaded {}", path))
     }
 
@@ -1856,9 +1895,20 @@ pub fn can_play_type(mime: &str) -> &'static str {
     can_play_type_impl(mime)
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::linux::linux_video_playback::can_play_type(mime)
+}
+
+// OpenHarmony builds compile out `linux_video_playback` (gstreamer) and have no
+// native playback backend wired up yet, so nothing is playable there.
+#[cfg(target_env = "ohos")]
+fn can_play_type_impl(_mime: &str) -> &'static str {
+    ""
 }
 
 #[cfg(target_os = "android")]

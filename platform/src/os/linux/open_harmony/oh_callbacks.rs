@@ -52,6 +52,37 @@ pub fn handle_delete_left_event(length: i32) -> napi_ohos::Result<()> {
     Ok(())
 }
 
+// ---- native composer overlay (ArkTS) ----
+//
+// The chat composer is a NATIVE overlay, not a makepad widget — the same design
+// Android uses (an EditText pill floating over the GL surface). A full-screen
+// card's PortalList would otherwise swallow the taps, and makepad has no text
+// input bridge on this platform at all.
+
+#[napi]
+pub fn handle_composer_submit(text: String) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerSubmit { text });
+    Ok(())
+}
+
+#[napi]
+pub fn handle_composer_new_app() -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerNewApp);
+    Ok(())
+}
+
+#[napi]
+pub fn handle_composer_switch() -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerSwitch);
+    Ok(())
+}
+
+#[napi]
+pub fn handle_composer_expand() -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerExpand);
+    Ok(())
+}
+
 #[napi]
 pub fn handle_keyboard_status(is_open: bool, keyboard_height: i32) -> napi_ohos::Result<()> {
     send_from_ohos_message(FromOhosMessage::ResizeTextIME(is_open, keyboard_height));
@@ -271,5 +302,15 @@ pub enum FromOhosMessage {
     TextInput(TextInputEvent),
     DeleteLeft(i32),
     ResizeTextIME(bool, i32),
+    /// The native ArkTS composer overlay submitted text.
+    ComposerSubmit {
+        text: String,
+    },
+    /// Its "＋" (open another app) button was tapped.
+    ComposerNewApp,
+    /// Its "⟳" (switch to next app) button was tapped.
+    ComposerSwitch,
+    /// Its collapsed FAB was tapped to unfold the composer.
+    ComposerExpand,
 }
 //TODO DIP

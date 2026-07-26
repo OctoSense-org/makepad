@@ -39,6 +39,7 @@ fn main() {
         .unwrap();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let target = env::var("TARGET").unwrap();
 
     if target_os == "macos" {
@@ -169,7 +170,11 @@ fn main() {
         }
         "linux" => {
             println!("cargo:rustc-cfg=use_gles_3");
-            println!("cargo:rustc-link-lib=xkbcommon");
+            // OpenHarmony also reports target_os=linux but has no xkbcommon in
+            // its sysroot (and compiles out the wayland/xkb backend anyway).
+            if target_env != "ohos" {
+                println!("cargo:rustc-link-lib=xkbcommon");
+            }
         }
         "android" => {
             println!("cargo:rustc-cfg=use_gles_3");

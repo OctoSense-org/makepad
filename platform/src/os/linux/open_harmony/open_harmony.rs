@@ -1,6 +1,7 @@
 use {
     self::super::{
-        super::gl_sys, super::gl_sys::LibGl, arkts_obj_ref::ArkTsObjRef, oh_callbacks::*,
+        super::gl_sys, super::gl_sys::LibGl, arkts_obj_ref::ArkArg, arkts_obj_ref::ArkTsObjRef,
+        oh_callbacks::*,
         oh_media::CxOpenHarmonyMedia, raw_file::RawFileMgr,
     },
     crate::{
@@ -75,6 +76,12 @@ impl Cx {
             match from_ohos_rx.recv() {
                 Ok(FromOhosMessage::VSync) => {
                     self.handle_all_pending_messages(&from_ohos_rx);
+                    // Drain HTTP/WebSocket results into the event loop. Every
+                    // other platform does this from its own loop; OHOS never
+                    // did, so responses sat in the channel forever — Splash
+                    // data bindings like sys.weather() stayed "—" permanently
+                    // even though the request had completed.
+                    self.dispatch_network_runtime_events();
                     self.handle_other_events();
                     self.handle_drawing();
                 }
@@ -235,6 +242,26 @@ impl Cx {
             }
             FromOhosMessage::TextInput(e) => {
                 self.call_event_handler(&Event::TextInput(e));
+            }
+            // Native composer overlay. Deliver as a bare action and drain it
+            // THIS tick: post_action alone would sit in the global channel
+            // until the next render loop, which — when the app is idle behind a
+            // rendered card — may not arrive until the next touch.
+            FromOhosMessage::ComposerSubmit { text } => {
+                Cx::post_action(crate::event::AndroidComposerSubmit { text });
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::ComposerNewApp => {
+                Cx::post_action(crate::event::AndroidComposerNewApp);
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::ComposerSwitch => {
+                Cx::post_action(crate::event::AndroidComposerSwitch);
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::ComposerExpand => {
+                Cx::post_action(crate::event::AndroidComposerExpand);
+                self.handle_action_receiver();
             }
             FromOhosMessage::DeleteLeft(length) => {
                 for _ in 0..length {
@@ -426,6 +453,10 @@ impl Cx {
     }
 
     pub fn ohos_load_dependencies(&mut self) {
+        // A failed read here is otherwise completely silent: the dependency is
+        // simply absent, fonts never load, text layout yields zero glyphs, and
+        // the app renders shapes but no text with no error anywhere.
+        let (mut ok, mut failed) = (0usize, 0usize);
         for (path, dep) in &mut self.dependencies {
             let mut buffer = Vec::<u8>::new();
             if let Ok(_) = self
@@ -435,11 +466,17 @@ impl Cx {
                 .unwrap()
                 .read_to_end(path, &mut buffer)
             {
+                ok += 1;
                 dep.data = Some(Ok(Rc::new(buffer)));
             } else {
+                failed += 1;
+                if failed <= 12 {
+                    crate::log!("DEP FAIL {}", path);
+                }
                 dep.data = Some(Err("read_to_end failed".to_string()));
             }
         }
+        crate::log!("DEPS loaded ok={ok} failed={failed}");
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
@@ -516,6 +553,21 @@ impl Cx {
         }
     }
 
+    /// Call a method on the ArkTS glue object (webview overlay, composer, …).
+    ///
+    /// Never panics if the ArkTS object is missing: ops can be queued before
+    /// `onCreate` has handed us the glue object, and a card or composer that
+    /// cannot be shown should not take the whole app down.
+    fn ohos_call_arkts(&mut self, method: &str, args: Vec<ArkArg>) {
+        let Some(obj) = self.os.arkts_obj.as_mut() else {
+            crate::error!("{}: ArkTS object not ready, dropping", method);
+            return;
+        };
+        if let Err(e) = obj.call_js_with_args(method, args) {
+            crate::error!("{} failed: {:?}", method, e);
+        }
+    }
+
     fn handle_platform_ops(&mut self) -> EventFlow {
         while let Some(op) = self.platform_ops.pop() {
             //crate::log!("============ handle_platform_ops");
@@ -580,6 +632,112 @@ impl Cx {
                         "showKeyBoard",
                         0,
                         std::ptr::null_mut(),
+                    );
+                }
+                // ---- native composer overlay ----
+                //
+                // The chat composer is native on OHOS for the same reason it is
+                // native on Android: a full-screen card's PortalList swallows
+                // taps aimed at a makepad-drawn composer, and makepad has no
+                // text-input bridge here, so a makepad TextInput could never
+                // receive characters anyway.
+                CxOsOp::ShowAndroidComposer => {
+                    self.ohos_call_arkts("composerShow", vec![]);
+                }
+                CxOsOp::HideAndroidComposer => {
+                    self.ohos_call_arkts("composerHide", vec![]);
+                }
+                CxOsOp::ExpandAndroidComposer => {
+                    self.ohos_call_arkts("composerExpand", vec![]);
+                }
+                CxOsOp::CollapseAndroidComposer => {
+                    self.ohos_call_arkts("composerCollapse", vec![]);
+                }
+                // ---- system browser (webview cards) ----
+                //
+                // Backed by an ArkTS `Web` component overlaid on the makepad
+                // XComponent, the same shape as the Android WebView-over-
+                // SurfaceView arrangement. Geometry is passed in vp (makepad's
+                // logical pixels), NOT physical pixels, because ArkTS lays the
+                // overlay out in vp — passing physical pixels would scale every
+                // card by the display density.
+                CxOsOp::SpawnSystemBrowser { browser_id, url } => {
+                    self.ohos_call_arkts(
+                        "webviewSpawn",
+                        vec![ArkArg::Str(browser_id.0.to_string()), ArkArg::Str(url)],
+                    );
+                }
+                CxOsOp::UpdateSystemBrowser {
+                    browser_id,
+                    area,
+                    visible,
+                } => {
+                    let rect = area.clipped_rect(self);
+                    self.ohos_call_arkts(
+                        "webviewUpdate",
+                        vec![
+                            ArkArg::Str(browser_id.0.to_string()),
+                            ArkArg::Num(rect.pos.x),
+                            ArkArg::Num(rect.pos.y),
+                            ArkArg::Num(rect.size.x),
+                            ArkArg::Num(rect.size.y),
+                            ArkArg::Bool(visible),
+                        ],
+                    );
+                }
+                CxOsOp::DetachSystemBrowser { browser_id } => {
+                    self.ohos_call_arkts(
+                        "webviewDetach",
+                        vec![ArkArg::Str(browser_id.0.to_string())],
+                    );
+                }
+                CxOsOp::CloseSystemBrowser { browser_id } => {
+                    self.ohos_call_arkts(
+                        "webviewClose",
+                        vec![ArkArg::Str(browser_id.0.to_string())],
+                    );
+                }
+                CxOsOp::SetSystemBrowserUrl {
+                    browser_id,
+                    url,
+                    replace,
+                } => {
+                    self.ohos_call_arkts(
+                        "webviewSetUrl",
+                        vec![
+                            ArkArg::Str(browser_id.0.to_string()),
+                            ArkArg::Str(url),
+                            ArkArg::Bool(replace),
+                        ],
+                    );
+                }
+                CxOsOp::SetSystemBrowserHtml {
+                    browser_id,
+                    html,
+                    base_url,
+                } => {
+                    self.ohos_call_arkts(
+                        "webviewSetHtml",
+                        vec![
+                            ArkArg::Str(browser_id.0.to_string()),
+                            ArkArg::Str(html),
+                            ArkArg::Str(base_url),
+                        ],
+                    );
+                }
+                CxOsOp::EvalSystemBrowserJs { browser_id, js } => {
+                    self.ohos_call_arkts(
+                        "webviewEvalJs",
+                        vec![ArkArg::Str(browser_id.0.to_string()), ArkArg::Str(js)],
+                    );
+                }
+                CxOsOp::SystemBrowserHistoryGo { browser_id, delta } => {
+                    self.ohos_call_arkts(
+                        "webviewHistoryGo",
+                        vec![
+                            ArkArg::Str(browser_id.0.to_string()),
+                            ArkArg::Num(delta as f64),
+                        ],
                     );
                 }
                 CxOsOp::HideTextIME => {

@@ -468,12 +468,16 @@ fn nav_pending_len() -> usize {
     NAV_PENDING.with(|p| p.borrow().len())
 }
 
+/// Request ids for tile fetches.
+///
+/// MUST come from the same global source as every other `cx.http_request` id.
+/// This used to be a private counter starting at 1, which collided head-on with
+/// `LiveId::unique()` (also a counter from 1) used by `script_data_fetch` — so
+/// the nav card, which fires geocoder searches and tile fetches concurrently,
+/// delivered Photon's GeoJSON to the Overpass tile parser and the map stayed
+/// blank ("Key not found elements").
 fn nav_next_request_id() -> LiveId {
-    NAV_REQ_ID.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1).max(1));
-        LiveId(v)
-    })
+    LiveId::unique()
 }
 
 /// True if this tile was requested within the last `window` seconds
@@ -1713,10 +1717,11 @@ impl WidgetMatchEvent for MapView {
                     });
                 }
                 Err(err) => {
+                    let head: String = body.chars().take(160).collect();
                     let _ = sender.send(TileWorkerMessage::NetworkTileParseFailed {
                         style_epoch,
                         tile_key,
-                        error: err,
+                        error: format!("{err} | body len={} head={head:?}", body.len()),
                     });
                 }
             }

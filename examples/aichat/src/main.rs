@@ -3386,6 +3386,33 @@ impl AppMain for App {
                         }
                         cx.redraw_all();
                     }
+                    AgentEvent::TextAuthoritative { text, .. } => {
+                        // The backend's durably-stored copy of the message.
+                        // Prefer it over our own delta accumulation: a dropped
+                        // SSE chunk leaves that silently short, glued together
+                        // mid-token, and nothing downstream can tell. So this
+                        // REPLACES streaming_text rather than appending to it.
+                        log!(
+                            "aichat UI text authoritative chars={}",
+                            text.chars().count()
+                        );
+                        let workspace = self
+                            .current_prompt_workspace
+                            .unwrap_or(self.active_workspace);
+                        let item_id = {
+                            let mut data = chat_data_for_workspace(workspace).write().unwrap();
+                            data.streaming_text = text;
+                            data.messages.len()
+                        };
+                        if self.active_workspace == workspace {
+                            let chat_list = self.ui.widget(cx, ids!(chat_list));
+                            let list = chat_list.portal_list(cx, ids!(list));
+                            if let Some((_, item)) = list.get_item(item_id) {
+                                item.widget(cx, ids!(splash_view)).redraw(cx);
+                            }
+                        }
+                        cx.redraw_all();
+                    }
                     AgentEvent::ThinkingDelta { text, .. } => {
                         log!("aichat UI thinking delta chars={}", text.chars().count());
                         let workspace = self

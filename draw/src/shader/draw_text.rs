@@ -2899,7 +2899,15 @@ impl DrawText {
                 SlugGlyphCacheResult::Ready(slug_glyph) => {
                     return Some(ResolvedGlyph::Slug(slug_glyph));
                 }
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                // OpenHarmony reports target_os = "linux", but the deferred
+                // upload path below relies on the desktop slug-flush/warmup
+                // machinery. On OHOS that flush never lands, so the glyph is
+                // never returned and NO TEXT EVER RENDERS — silently, with no
+                // error. Take the immediate-return path there instead.
+                #[cfg(all(
+                    any(target_os = "linux", target_os = "windows"),
+                    not(target_env = "ohos")
+                ))]
                 SlugGlyphCacheResult::NeedsUpload {
                     generation,
                     glyph: _,
@@ -2908,7 +2916,10 @@ impl DrawText {
                         self.pending_slug_flush_generation.max(generation);
                     cx.redraw_all();
                 }
-                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                #[cfg(any(
+                    not(any(target_os = "linux", target_os = "windows")),
+                    target_env = "ohos"
+                ))]
                 SlugGlyphCacheResult::NeedsUpload {
                     generation,
                     glyph: slug_glyph,
