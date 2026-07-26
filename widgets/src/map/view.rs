@@ -555,11 +555,23 @@ struct SharedNavRoute {
     origin: (f64, f64), // world px at NAV_REF_Z the geometry is rebased to
     pts: Rc<Vec<Vec2d>>,
     cum: Rc<Vec<f64>>,
+    seq: u64, // last-used tick for LRU eviction (see ensure_nav_route: never bulk-clear)
 }
 
 thread_local! {
     static NAV_ROUTE_STORE: std::cell::RefCell<HashMap<u64, SharedNavRoute>> =
         std::cell::RefCell::new(HashMap::new());
+    // Monotonic "last used" clock for NAV_ROUTE_STORE LRU eviction.
+    static NAV_ROUTE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Next value of the NAV_ROUTE_STORE LRU clock (bumped on every adopt + insert).
+fn next_nav_route_seq() -> u64 {
+    NAV_ROUTE_SEQ.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    })
 }
 
 /// Adopt a shared ready tile as a per-instance TileEntry (borrowed handles).
@@ -1297,15 +1309,28 @@ impl Widget for MapView {
                 cx.unblock_scrolling();
             }
 
+            // Claim the gesture for the map ONLY when a finger lands on the EXPOSED
+            // map surface. hits() honours z-order, so a finger on the overlaid bottom
+            // sheet / control pills / buttons returns Miss here and the map does NOT
+            // pan under them. (Before this, the full-card map rect swallowed every
+            // touch on the sheet — tapping the sheet just panned the map instead of
+            // reaching its buttons, which reads as "app not responding".)
+            // capture_overload=false leaves those overlay taps for the widgets on top.
+            if let Hit::FingerDown(_) =
+                event.hits_with_capture_overload(cx, self.draw_bg.area(), false)
+            {
+                self.nav_gesture_on_map = true;
+            }
+
             // Touch gestures (one-finger PAN, two-finger PINCH-zoom). Android reports
             // EVERY active pointer on each event (the JNI loops getPointerCount), so
             // `te.touches` is the authoritative current set — REBUILD from it (a missed
             // Stop otherwise leaves a phantom finger that turns a pan into a pinch).
-            // Once a finger has landed ON the map the gesture is "claimed"; from then on
-            // pan vs pinch is decided from ALL active fingers, not just those still
-            // inside the (short preview) map rect, so a finger drifting off the map
-            // doesn't flip pinch<->pan. Switches between pan and pinch are debounced a
-            // few frames to reject momentary flickers (a palm graze, or pinch jitter).
+            // Once a finger has landed ON the map the gesture is "claimed" (above); from
+            // then on pan vs pinch is decided from ALL active fingers, not just those
+            // still inside the map rect, so a finger drifting off doesn't flip
+            // pinch<->pan. Switches between pan and pinch are debounced a few frames to
+            // reject momentary flickers (a palm graze, or pinch jitter).
             if let Event::TouchUpdate(te) = event {
                 let active: Vec<_> = te
                     .touches
@@ -1323,6 +1348,7 @@ impl Widget for MapView {
                     })
                     .map(|t| (t.uid, t.abs))
                     .collect();
+                // map rect — used by the pinch focal-point math below
                 let rect = self.draw_bg.area().clipped_rect(cx);
 
                 if active.is_empty() {
@@ -1334,11 +1360,9 @@ impl Widget for MapView {
                     self.nav_pan_drag = None;
                     cx.unblock_scrolling();
                 } else {
-                    // claim the gesture for the map only if a finger is ON it (not the
-                    // sheet / overlay buttons)
-                    if !self.nav_gesture_on_map {
-                        self.nav_gesture_on_map = active.iter().any(|p| rect.contains(*p));
-                    }
+                    // the gesture was already claimed above via hits() (a finger on the
+                    // EXPOSED map only). A finger that landed on the sheet/buttons leaves
+                    // nav_gesture_on_map false, so it falls through here without panning.
                     if self.nav_gesture_on_map {
                         // block the enclosing drag-scrolling PortalList so pan/pinch move
                         // the MAP, not the card (it checks is_scrolling_allowed_within()
@@ -2351,17 +2375,22 @@ impl MapView {
         }
         // Shared across the 1 Hz card rebuilds: decode + tessellate ONCE.
         let adopted = NAV_ROUTE_STORE.with(|s| {
-            let s = s.borrow();
-            s.get(&hash).map(|r| {
-                (
+            let mut s = s.borrow_mut();
+            // bump the LRU clock on adopt so an actively-reused route can never
+            // be the eviction victim while an instance still borrows its handle
+            if let Some(r) = s.get_mut(&hash) {
+                r.seq = next_nav_route_seq();
+                Some((
                     r.geom
                         .as_ref()
                         .map(|g| Geometry::new_borrowed(g.geometry_id())),
                     r.origin,
                     r.pts.clone(),
                     r.cum.clone(),
-                )
-            })
+                ))
+            } else {
+                None
+            }
         });
         if let Some((geom, origin, pts, cum)) = adopted {
             self.nav_route_geom = geom;
@@ -2387,7 +2416,10 @@ impl MapView {
             if i + 1 < coords0.len() {
                 let (lat2, lon2) = coords0[i + 1];
                 let seg = haversine_m(lat, lon, lat2, lon2);
-                let steps = (seg / 6.0).floor() as usize;
+                // cap per-segment subdivision: a pathological (gappy/malformed)
+                // polyline segment could otherwise explode into millions of
+                // points and OOM-abort the process (profile.small: panic='abort')
+                let steps = ((seg / 6.0).floor() as usize).min(2048);
                 for s in 1..steps {
                     let t = s as f64 / steps as f64;
                     coords.push((lat + (lat2 - lat) * t, lon + (lon2 - lon) * t));
@@ -2494,8 +2526,23 @@ impl MapView {
             self.nav_route_geom = Some(Geometry::new_borrowed(geometry.geometry_id()));
             NAV_ROUTE_STORE.with(|s| {
                 let mut s = s.borrow_mut();
-                if s.len() > 6 {
-                    s.clear(); // routes are big; keep the store tiny
+                // Evict the LEAST-recently-used entries down to a cap. NEVER
+                // bulk-clear(): instances hold BORROWED handles into this store,
+                // including a just-dropped plan MapView whose final draw is still
+                // queued during a plan->drive transition. Freeing a live entry
+                // frees its GPU geometry slot; the pool reuses that slot for the
+                // next route/tile and the queued draw then reads a wrong-sized
+                // buffer -> native SIGSEGV (the reported "3D nav crash"). LRU keeps
+                // the routes currently on screen (the one just drawn + the incoming
+                // drive route) alive; only long-stale entries are dropped.
+                const NAV_ROUTE_CAP: usize = 12;
+                while s.len() >= NAV_ROUTE_CAP {
+                    match s.iter().min_by_key(|(_, r)| r.seq).map(|(&k, _)| k) {
+                        Some(k) => {
+                            s.remove(&k);
+                        }
+                        None => break,
+                    }
                 }
                 s.insert(
                     hash,
@@ -2504,6 +2551,7 @@ impl MapView {
                         origin,
                         pts: self.nav_pts.clone(),
                         cum: self.nav_cum.clone(),
+                        seq: next_nav_route_seq(),
                     },
                 );
             });
