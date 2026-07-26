@@ -645,10 +645,18 @@ fn nav_store_insert(
                 last_used: tick,
             },
         );
-        if store.len() > 1400 {
+        if store.len() > 900 {
+            // Cap the shared owner store to BOUND MEMORY. The 3D chase view pulls a
+            // wide tile radius (turn/horizon prefetch), so an unbounded store fills
+            // to ~2.5 GB on entering drive and parks the process at the Android OOM
+            // ceiling — then any later allocation (even a bottom-sheet redraw) aborts
+            // with SIGABRT ("allocation failed"). 900 sits comfortably above the
+            // active working set (per-instance cap 640), so only never-drawn FAR
+            // history is trimmed — nothing visible changes.
             // Evict FARTHEST from the drive first (never what's near the car —
-            // loaded content close to the viewport must not vanish). Falls
-            // back to LRU when no nav draw has run yet.
+            // loaded content close to the viewport must not vanish; drawing only
+            // ever touches the nearest ~86 tiles, so a drawn tile is never evicted).
+            // Falls back to LRU when no nav draw has run yet.
             let (cz, cx_, cy_) = NAV_DRAW_CENTER.with(|c| c.get());
             let mut ranked: Vec<(u64, TileKey)> = store
                 .iter()
@@ -668,7 +676,7 @@ fn nav_store_insert(
                 })
                 .collect();
             ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            for (_, k) in ranked.into_iter().take(48) {
+            for (_, k) in ranked.into_iter().take(96) {
                 store.remove(&k);
             }
         }
