@@ -18,6 +18,20 @@ pub const OVERPASS_ENDPOINTS: &[&str] = &[
     "https://overpass-api.de/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ];
+
+// OpenFreeMap vector tiles (OpenMapTiles schema, MVT/PBF) — a CDN-served, keyless
+// alternative to the rate-limited public Overpass mirrors (which 504 under the
+// nav map's tile fan-out). `parse_mvt_tile`/`normalize_mvt_tags` already handle
+// the OpenMapTiles layer schema. maxzoom 14; higher nav zooms overzoom the z14
+// tile (same as the local mbtiles path). The tile path carries a DATED version
+// segment that rotates when the planet is re-cut, so the live template is read
+// from the TileJSON at runtime — this hardcoded default lets tiles start
+// immediately and is refreshed once the TileJSON lands.
+pub const OPENFREEMAP_TILEJSON_URL: &str = "https://tiles.openfreemap.org/planet";
+pub const OPENFREEMAP_DEFAULT_TEMPLATE: &str =
+    "https://tiles.openfreemap.org/planet/20260621_080001_pt/{z}/{x}/{y}.pbf";
+pub const OPENFREEMAP_MAX_ZOOM: u32 = 14;
+pub const OPENFREEMAP_LABEL: &str = "openfreemap-mvt";
 pub const MAX_PENDING_REQUESTS: usize = 6;
 pub const MAX_TILE_RETRIES: u8 = 6;
 pub const RETRY_BASE_FRAMES: u64 = 30;
@@ -67,6 +81,9 @@ pub struct TileEntry {
 pub struct PendingTileRequest {
     pub tile_key: TileKey,
     pub endpoint: &'static str,
+    // true = an OpenFreeMap MVT/PBF fetch (decode via mbtiles_tile_to_overpass_json);
+    // false = an Overpass JSON fetch (parse the UTF-8 body directly).
+    pub is_mvt: bool,
 }
 
 #[derive(Debug)]
@@ -836,7 +853,7 @@ pub fn load_local_tile_batch(
 
 // --- MVT (Mapbox Vector Tile) parsing ---
 
-fn mbtiles_tile_to_overpass_json(
+pub fn mbtiles_tile_to_overpass_json(
     tile_key: TileKey,
     raw_tile_data: &[u8],
 ) -> Result<String, String> {

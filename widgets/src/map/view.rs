@@ -461,6 +461,57 @@ fn nav_store_labels(
     out
 }
 
+// --- OpenFreeMap MVT tile-URL template (resolved from the TileJSON) ---
+// The tile path carries a dated version segment that rotates when the planet is
+// re-cut, so the live template is read from the TileJSON once at runtime. Until
+// it lands, the hardcoded default keeps tiles flowing.
+thread_local! {
+    static NAV_MVT_TEMPLATE: std::cell::RefCell<String> =
+        std::cell::RefCell::new(OPENFREEMAP_DEFAULT_TEMPLATE.to_string());
+    // bootstrap state: 0 = not started, 1 = TileJSON fetch in flight, 2 = resolved.
+    static NAV_MVT_BOOTSTRAP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    // the request id of the in-flight TileJSON fetch (to route its response).
+    static NAV_MVT_TILEJSON_REQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn nav_mvt_template() -> String {
+    NAV_MVT_TEMPLATE.with(|t| t.borrow().clone())
+}
+
+/// Build a concrete OpenFreeMap tile URL from the resolved template + tile key.
+fn nav_mvt_tile_url(tile: TileKey) -> String {
+    nav_mvt_template()
+        .replace("{z}", &tile.z.to_string())
+        .replace("{x}", &tile.x.to_string())
+        .replace("{y}", &tile.y.to_string())
+}
+
+/// Parse the `tiles[0]` URL template out of the OpenFreeMap TileJSON and adopt
+/// it (keeps the dated version segment current as the planet is re-cut).
+fn nav_mvt_adopt_tilejson(body: &str) -> bool {
+    let Some(v) = serde_json::from_str::<serde_json::Value>(body).ok() else {
+        return false;
+    };
+    if let Some(tmpl) = v
+        .get("tiles")
+        .and_then(|t| t.get(0))
+        .and_then(|u| u.as_str())
+    {
+        if tmpl.contains("{z}") && tmpl.contains("{x}") && tmpl.contains("{y}") {
+            NAV_MVT_TEMPLATE.with(|t| *t.borrow_mut() = tmpl.to_string());
+            return true;
+        }
+    }
+    false
+}
+
+/// A fetched tile payload moved into the worker thread: raw MVT/PBF bytes (decoded
+/// to Overpass-JSON there) or an Overpass-JSON string already.
+enum TilePayload {
+    Json(String),
+    Mvt(Vec<u8>),
+}
+
 fn nav_pending_insert(id: LiveId, pending: PendingTileRequest) {
     NAV_PENDING.with(|p| p.borrow_mut().insert(id, pending));
 }
@@ -898,6 +949,11 @@ pub struct MapView {
     use_network: bool,
     #[live(true)]
     use_local_mbtiles: bool,
+    // Online tile source for the NAV map: true = OpenFreeMap MVT (CDN, reliable);
+    // false = Overpass raw-OSM (rate-limited public mirrors, the blank-map risk).
+    // Only consulted when use_network && !use_local_mbtiles.
+    #[live(true)]
+    use_mvt: bool,
 
     // --- turn-by-turn navigation mode ---
     // "" = normal map; "3d" = first-person chase view (heading-up, pinhole
@@ -1819,6 +1875,21 @@ impl WidgetMatchEvent for MapView {
         response: &HttpResponse,
         _scope: &mut Scope,
     ) {
+        // OpenFreeMap TileJSON bootstrap response? (tracked separately from the
+        // tile pending map) — adopt the current dated tile-URL template.
+        if request_id.0 != 0 && NAV_MVT_TILEJSON_REQ.with(|c| c.get()) == request_id.0 {
+            NAV_MVT_TILEJSON_REQ.with(|c| c.set(0));
+            NAV_MVT_BOOTSTRAP.with(|b| b.set(2));
+            if response.status_code == 200 {
+                if let Some(tj) = response.get_string_body() {
+                    if nav_mvt_adopt_tilejson(&tj) {
+                        log!("MapView: OpenFreeMap tile template refreshed from TileJSON");
+                    }
+                }
+            }
+            return;
+        }
+
         let Some(pending) = nav_pending_take(&request_id) else {
             return;
         };
@@ -1844,25 +1915,55 @@ impl WidgetMatchEvent for MapView {
             return;
         }
 
-        let Some(body) = response.get_string_body() else {
-            self.mark_tile_failed(
-                tile_key,
-                &format!("endpoint {} missing utf8 response body", endpoint),
-            );
-            self.update_status_text();
-            self.redraw(cx);
-            return;
+        // Resolve the payload to move into the worker: MVT/PBF bytes (decoded to
+        // Overpass-JSON there via the shared bridge) or an Overpass-JSON string
+        // already. All decode/parse/tessellate stays off the UI thread.
+        let payload = if pending.is_mvt {
+            match response.get_body() {
+                Some(bytes) => TilePayload::Mvt(bytes.clone()),
+                None => {
+                    self.mark_tile_failed(
+                        tile_key,
+                        &format!("endpoint {} missing tile body", endpoint),
+                    );
+                    self.update_status_text();
+                    self.redraw(cx);
+                    return;
+                }
+            }
+        } else {
+            match response.get_string_body() {
+                Some(b) => TilePayload::Json(b),
+                None => {
+                    self.mark_tile_failed(
+                        tile_key,
+                        &format!("endpoint {} missing utf8 response body", endpoint),
+                    );
+                    self.update_status_text();
+                    self.redraw(cx);
+                    return;
+                }
+            }
         };
 
-        // Offload heavy JSON parsing + tessellation to the thread pool
+        // Offload heavy decode + JSON parse + tessellation to the thread pool.
         self.ensure_tile_thread_pool(cx);
         let sender = nav_workers_sender();
         let style_epoch = self.style_epoch;
         let theme_style = self.active_style().clone();
 
         nav_workers_execute(tile_key, move |_tag| {
-            match build_tile_buffers_from_body(tile_key, &body, &theme_style) {
-                Ok(buffers) => {
+            // Reduce to an Overpass-JSON string (decode MVT if needed), then build.
+            let json = match payload {
+                TilePayload::Json(j) => Ok(j),
+                TilePayload::Mvt(bytes) => mbtiles_tile_to_overpass_json(tile_key, &bytes),
+            };
+            let result = json.and_then(|body| {
+                build_tile_buffers_from_body(tile_key, &body, &theme_style)
+                    .map(|buffers| (body, buffers))
+            });
+            match result {
+                Ok((body, buffers)) => {
                     store_tile_data_cache_on_disk(tile_key, &body);
                     let _ = sender.send(TileWorkerMessage::NetworkTileParsed {
                         style_epoch,
@@ -3480,17 +3581,39 @@ impl MapView {
             );
             return false;
         }
+        // One-time TileJSON bootstrap so the dated OpenFreeMap version stays
+        // current; tiles proceed on the hardcoded default until it lands.
+        if self.use_mvt {
+            self.maybe_bootstrap_openfreemap(cx);
+        }
+
         let request_id = nav_next_request_id();
 
-        let query = overpass_query(tile_key);
-        let endpoint = overpass_endpoint(tile_key, attempts);
-        let mut request = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
-        request.set_header("Content-Type".to_string(), "text/plain".to_string());
-        request.set_header("Accept".to_string(), "application/json".to_string());
-        request.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
-        request.set_body_string(&query);
+        let (request, endpoint, is_mvt) = if self.use_mvt {
+            // OpenFreeMap MVT: GET the versioned z/x/y.pbf (z already capped ≤14
+            // by request_zoom_level, so this is a real OpenFreeMap tile).
+            let mut req = HttpRequest::new(nav_mvt_tile_url(tile_key), HttpMethod::GET);
+            req.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
+            (req, OPENFREEMAP_LABEL, true)
+        } else {
+            let query = overpass_query(tile_key);
+            let endpoint = overpass_endpoint(tile_key, attempts);
+            let mut req = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
+            req.set_header("Content-Type".to_string(), "text/plain".to_string());
+            req.set_header("Accept".to_string(), "application/json".to_string());
+            req.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
+            req.set_body_string(&query);
+            (req, endpoint, false)
+        };
 
-        nav_pending_insert(request_id, PendingTileRequest { tile_key, endpoint });
+        nav_pending_insert(
+            request_id,
+            PendingTileRequest {
+                tile_key,
+                endpoint,
+                is_mvt,
+            },
+        );
         self.tiles.insert(
             tile_key,
             TileEntry {
@@ -3501,6 +3624,21 @@ impl MapView {
         );
         cx.http_request(request_id, request);
         true
+    }
+
+    /// Fire the one-time OpenFreeMap TileJSON fetch to refresh the dated tile-URL
+    /// version. Non-blocking — tiles keep flowing on the hardcoded default until
+    /// (and unless) this lands.
+    fn maybe_bootstrap_openfreemap(&mut self, cx: &mut Cx) {
+        if NAV_MVT_BOOTSTRAP.with(|b| b.get()) != 0 {
+            return; // already in flight or resolved this session
+        }
+        NAV_MVT_BOOTSTRAP.with(|b| b.set(1));
+        let request_id = nav_next_request_id();
+        NAV_MVT_TILEJSON_REQ.with(|c| c.set(request_id.0));
+        let mut req = HttpRequest::new(OPENFREEMAP_TILEJSON_URL.to_string(), HttpMethod::GET);
+        req.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
+        cx.http_request(request_id, req);
     }
 
     fn place_and_draw_labels(
@@ -3911,6 +4049,10 @@ impl MapView {
         let mut zoom = self.view_zoom().round() as u32;
         if self.use_local_mbtiles {
             zoom = zoom.clamp(LOCAL_MBTILES_MIN_ZOOM, LOCAL_MBTILES_MAX_ZOOM);
+        } else if self.use_mvt {
+            // OpenFreeMap maxzoom is 14; a closer view fetches the z14 tile and
+            // overzooms it (the draw path already scales by view_zoom − key.z).
+            zoom = zoom.min(OPENFREEMAP_MAX_ZOOM);
         }
         zoom
     }
