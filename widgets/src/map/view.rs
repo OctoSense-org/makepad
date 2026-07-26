@@ -1231,6 +1231,7 @@ impl Widget for MapView {
                     if !s.trim().is_empty() && s.as_str() != self.nav_polyline.as_ref() {
                         self.nav_polyline.as_mut_empty().push_str(&s);
                         vm.with_cx_mut(|cx| self.redraw(cx));
+                        crate::splash::splash_mark_tick_changed();
                     }
                 }
             }
@@ -1269,6 +1270,7 @@ impl Widget for MapView {
                         self.nav_markers = next;
                         self.nav_poly_hash = 0; // force ensure_nav_route re-tessellate
                         vm.with_cx_mut(|cx| self.redraw(cx));
+                        crate::splash::splash_mark_tick_changed();
                     }
                 }
             }

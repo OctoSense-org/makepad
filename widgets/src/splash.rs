@@ -2579,18 +2579,37 @@ impl Drop for Splash {
     }
 }
 
+thread_local! {
+    /// Set by in-place tick setters (Label::set_text, MapView route setters) when
+    /// they ACTUALLY change a value. A `fn tick()` card's 1 Hz forced repaint is
+    /// then skipped when a tick changed nothing (e.g. a static plan map whose
+    /// route/labels are unchanged) — so the GL surface stops swapping every
+    /// second, which was flickering the native overlays (composer/FAB) composited
+    /// over it. The drive view changes the car/ETA each tick, so it still repaints.
+    static SPLASH_TICK_CHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called by an in-place widget setter when it changes a value during `tick()`.
+pub fn splash_mark_tick_changed() {
+    SPLASH_TICK_CHANGED.with(|c| c.set(true));
+}
+
 impl Widget for Splash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         // Handle tick timer — call tick() in the Splash code's scope
         if self.tick_timer.is_event(event).is_some() {
+            SPLASH_TICK_CHANGED.with(|c| c.set(false));
             self.call_fn(cx, id!(tick));
             // tick() updates widgets in place (ui.<id>.set_text/…) — e.g. the nav
-            // card's live search-result rows and per-mode ETA. Those set_* calls
-            // don't self-schedule a paint; previously the per-frame animation pump
-            // repainted the card every frame so they showed up. Now that tick cards
-            // no longer run that 60fps pump (perf fix), repaint here so tick's
-            // updates actually render — at the 1 Hz tick cadence they're computed.
-            self.view.redraw(cx);
+            // card's live per-mode ETA and drive car position. Those set_* calls
+            // don't self-schedule a paint on their own, so repaint here — but ONLY
+            // when a setter actually changed a value this tick. A static card (a
+            // plan map with an unchanged route/labels) forced a surface swap every
+            // second otherwise, and that swap flickered the native composer/FAB
+            // overlays over the GL surface.
+            if SPLASH_TICK_CHANGED.with(|c| c.get()) {
+                self.view.redraw(cx);
+            }
         }
 
         // Per-frame redraw pump for time-based shaders: redraw the view (so the
