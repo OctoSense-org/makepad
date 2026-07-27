@@ -5,6 +5,9 @@ import { window } from '@kit.ArkUI';
 import common from '@ohos.app.ability.common';
 import resourceManager from '@ohos.resourceManager';
 import webview from '@ohos.web.webview';
+import picker from '@ohos.file.picker';
+import fileIo from '@ohos.file.fs';
+import util from '@ohos.util';
 
 declare type Any = ESObject;
 
@@ -34,6 +37,7 @@ export class WebViewSpec {
 /// the ArkUI Web component existed to receive it.
 export class WebViewCtl {
   controller: webview.WebviewController = new webview.WebviewController();
+  bridge: OctosNativeBridge | undefined = undefined;
   attached: boolean = false;
   pendingUrl: string = '';
   pendingHtml: string = '';
@@ -134,6 +138,30 @@ export interface MakepadXComponentInterface{
   handleComposerNewApp():void;
   handleComposerSwitch():void;
   handleComposerExpand():void;
+  handleSystemBrowserInvoke(browserId: string, callId: string, tool: string, args: string):void;
+  handleDialogResult(callId: string, name: string, content: string, cancelled: boolean, error: string):void;
+}
+
+/// The `octos_native` object injected into a webview card's JS context, the
+/// OHOS counterpart of Android's `addJavascriptInterface(..., "octos_native")`.
+///
+/// A card calls `octos_native.invoke(callId, tool, argsJson)`; the WebCard
+/// widget on the Rust side dispatches the tool (fs.*, dialog.open, share,
+/// clipboard.write, notify, http.fetch, download — i.e. real native components)
+/// and resolves the card's promise by evaluating JS back into the page.
+///
+/// ids are stringified on the way out: they are u64/i64 and JS numbers are f64,
+/// so passing them as numbers loses precision past 2^53.
+export class OctosNativeBridge {
+  private browserId: string = '';
+
+  constructor(browserId: string) {
+    this.browserId = browserId;
+  }
+
+  invoke(callId: string, tool: string, args: string): void {
+    ArkGlue.getInstance().webviewInvoke(this.browserId, String(callId), tool, args);
+  }
 }
 
 /// State of the native chat composer overlay.
@@ -229,6 +257,58 @@ export class ArkGlue{
   /// The raw controller for an id, never routed through observed state.
   controllerFor(id: string): webview.WebviewController {
     return this.ctlEnsure(id).controller;
+  }
+
+  /// The `octos_native` proxy object for a card's JS context.
+  bridgeFor(id: string): OctosNativeBridge {
+    const ctl = this.ctlEnsure(id);
+    if (ctl.bridge === undefined) {
+      ctl.bridge = new OctosNativeBridge(id);
+    }
+    return ctl.bridge;
+  }
+
+  /// A card called `octos_native.invoke(...)` — hand it to Rust.
+  webviewInvoke(id: string, callId: string, tool: string, args: string): void {
+    this.xComponentContext?.handleSystemBrowserInvoke(id, callId, tool, args);
+  }
+
+  /// Open the SYSTEM file picker for a card's `octos.invoke("dialog.open")`.
+  ///
+  /// This is the real OS component (DocumentViewPicker), the OHOS counterpart
+  /// of Android's ACTION_OPEN_DOCUMENT intent — not an in-page file input. The
+  /// picked file is read here and handed back as text, matching the Android
+  /// contract (name + content + cancelled + error).
+  openFileDialog(callId: string, mime: string): void {
+    this.runFilePicker(callId, mime);
+  }
+
+  private async runFilePicker(callId: string, mime: string): Promise<void> {
+    try {
+      const options = new picker.DocumentSelectOptions();
+      options.maxSelectNumber = 1;
+      const uris: string[] = await new picker.DocumentViewPicker(this.context).select(options);
+      if (!uris || uris.length === 0) {
+        this.xComponentContext?.handleDialogResult(callId, '', '', true, '');
+        return;
+      }
+      const uri = uris[0];
+      const file = fileIo.openSync(uri, fileIo.OpenMode.READ_ONLY);
+      try {
+        const stat = fileIo.statSync(file.fd);
+        const buf = new ArrayBuffer(stat.size);
+        fileIo.readSync(file.fd, buf);
+        const content = util.TextDecoder.create('utf-8').decodeToString(new Uint8Array(buf));
+        const name = uri.substring(uri.lastIndexOf('/') + 1);
+        this.xComponentContext?.handleDialogResult(callId, name, content, false, '');
+      } finally {
+        fileIo.closeSync(file);
+      }
+    } catch (e) {
+      // A user-cancelled picker also throws on some releases; report it as an
+      // error rather than a silent cancel so the card's promise always settles.
+      this.xComponentContext?.handleDialogResult(callId, '', '', false, `picker: ${JSON.stringify(e)}`);
+    }
   }
 
   webviewAttached(id: string): void {

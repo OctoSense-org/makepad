@@ -52,7 +52,10 @@ struct MakepadComposer {
             .borderRadius(0)
             .caretColor('#72E4FF')
             .enterKeyType(EnterKeyType.Send)
-            .defaultFocus(true)
+            // Deliberately NOT defaultFocus: auto-focusing raises the IME as
+            // soon as the composer appears, which covers the card (a nav map
+            // ends up hidden behind the keyboard on launch). The user taps to
+            // type.
             .onChange((v: string) => { this.text = v; })
             .onSubmit(() => { this.submit(); })
           Text('↑')
@@ -88,8 +91,14 @@ struct MakepadComposer {
     .width('100%')
     .height('100%')
     .justifyContent(FlexAlign.End)
-    .alignItems(this.state.expanded ? HorizontalAlign.Center : HorizontalAlign.Start)
-    .padding({ left: 16, bottom: 18 })
+    // Collapsed FAB sits bottom-RIGHT: cards dock their own chrome bottom-left
+    // (the nav drive sheet puts the ETA there, and its 2D/3D toggle just above),
+    // so a bottom-left FAB lands right on top of them.
+    .alignItems(this.state.expanded ? HorizontalAlign.Center : HorizontalAlign.End)
+    // Collapsed FAB sits clear of a card's own bottom chrome: full-screen cards
+    // dock tab bars / sheets at the bottom edge (the news app's Today-Tech-
+    // Markets bar, the nav drive sheet), and an 18vp inset lands right on them.
+    .padding({ left: 16, right: 16, bottom: this.state.expanded ? 18 : 78 })
     .visibility(this.state.visible ? Visibility.Visible : Visibility.Hidden)
     .hitTestBehavior(HitTestMode.None)
   }
@@ -119,6 +128,16 @@ struct MakepadWebCard {
       .visibility(this.spec.visible ? Visibility.Visible : Visibility.Hidden)
       .javaScriptAccess(true)
       .domStorageAccess(true)
+      // JS→native bridge, the counterpart of Android's addJavascriptInterface:
+      // the card calls octos_native.invoke(callId, tool, args) and Rust
+      // dispatches it to real native components (file dialog, fs, clipboard,
+      // share, notifications), resolving the card's promise via runJavaScript.
+      .javaScriptProxy({
+        object: ArkGlue.getInstance().bridgeFor(this.spec.id),
+        name: 'octos_native',
+        methodList: ['invoke'],
+        controller: ArkGlue.getInstance().controllerFor(this.spec.id),
+      })
       .horizontalScrollBarAccess(false)
       .verticalScrollBarAccess(false)
       // Flush on onPageEnd, NOT onControllerAttached. The controller binds
