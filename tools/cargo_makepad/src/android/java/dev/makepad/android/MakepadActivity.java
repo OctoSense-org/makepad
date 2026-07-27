@@ -1132,6 +1132,14 @@ public class MakepadActivity
     private LocationManager mLocationManager;
     private LocationListener mLocationListener;
     private static final int LOCATION_PERM_REQ = 0x10CA;
+    // Guard so the location runtime permission is requested AT MOST ONCE per
+    // process. startLocationUpdates() runs on every onResume(); without this,
+    // a user who has DENIED location makes every resume call requestPermissions()
+    // again, and each call bounces activity focus (pause→resume→focus-change).
+    // That storm pins the window's HWUI layer redrawing continuously (~30fps on
+    // a static screen) — the composer/whole-screen flicker. Requesting once, then
+    // leaving the user's decision alone, lets the window go idle.
+    private boolean mLocationPermissionRequested = false;
 
     static {
         System.loadLibrary("makepad");
@@ -1709,10 +1717,17 @@ public class MakepadActivity
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
             && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
             && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{
-                Manifest.permission.ACCESS_FINE_LOCATION,
-                Manifest.permission.ACCESS_COARSE_LOCATION
-            }, LOCATION_PERM_REQ);
+            // Request only once per process. Re-requesting on every onResume()
+            // when the user has declined creates a pause/resume/focus storm that
+            // pins the window redrawing (the flicker). If granted later,
+            // onRequestPermissionsResult re-invokes this and the checks above pass.
+            if (!mLocationPermissionRequested) {
+                mLocationPermissionRequested = true;
+                requestPermissions(new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                }, LOCATION_PERM_REQ);
+            }
             return; // re-invoked from onRequestPermissionsResult once granted
         }
         if (mLocationManager == null) {
@@ -2780,12 +2795,13 @@ public class MakepadActivity
         mComposerOverlay.setClickable(false);
         mComposerOverlay.setFocusable(false);
         mComposerOverlay.setVisibility(View.GONE);
-        // Render the composer overlay (pill + FAB) into its own hardware texture so
-        // it composites INDEPENDENTLY of the GL map surface's per-frame buffer
-        // swaps. Without this, every map repaint re-blends the native overlay
-        // against the changing surface underneath and the FAB flickers; the cached
-        // layer is only re-rasterised when the overlay itself actually changes.
-        mComposerOverlay.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        // NOTE: do NOT promote this MATCH_PARENT overlay to a hardware layer. A
+        // full-window hardware layer stacked over the punch-through GL SurfaceView
+        // defeats Android's static-window compositing optimisation — the window's
+        // RenderThread must re-sync the window-sized GPU layer with the surface
+        // every frame, so the native window redraws continuously (~22fps, janky)
+        // even on a static screen and the composer/FAB flicker. Independent
+        // SurfaceFlinger composition (no layer) stays idle when nothing changes.
 
         // The pill: horizontal EditText + send button, translucent teal to
         // match the app's liquid-glass composer so the card shows through.
