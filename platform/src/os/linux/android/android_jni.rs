@@ -1534,7 +1534,7 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerExpand
 
 /// A `runhtml` card's JS called `octos.invoke(tool, args)` — bridged here via the
 /// WebView's `octos_native` JavascriptInterface. Delivered to the WebCard widget
-/// as an `AndroidSystemBrowserInvoke` action; the widget dispatches `tool` and
+/// as an `NativeSystemBrowserInvoke` action; the widget dispatches `tool` and
 /// resolves the card-side promise (`call_id`) with `evalSystemBrowserJs`.
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserInvoke(
@@ -1556,7 +1556,7 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserI
 }
 
 /// The app was launched/resumed via a deep link or share intent (ACTION_VIEW URL
-/// or ACTION_SEND text). Delivered to the app as an `AndroidDeepLink` action.
+/// or ACTION_SEND text). Delivered to the app as an `NativeDeepLink` action.
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDeepLink(
     env: *mut jni_sys::JNIEnv,
@@ -1568,7 +1568,7 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDeepLink(
 }
 
 /// Result of a native file picker (see `to_java_open_file_dialog`). Delivered to
-/// the WebCard widget as an `AndroidDialogResult` action, which resolves the
+/// the WebCard widget as an `NativeDialogResult` action, which resolves the
 /// card's `octos.invoke("dialog.open", …)` promise (`call_id`).
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDialogResult(
@@ -1620,7 +1620,7 @@ pub unsafe fn to_java_download_file(call_id: i64, url: &str, dest: &str) {
     );
 }
 
-/// Progress of a native streaming download → `AndroidDownloadProgress` action.
+/// Progress of a native streaming download → `NativeDownloadProgress` action.
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadProgress(
     _env: *mut jni_sys::JNIEnv,
@@ -1636,7 +1636,7 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadProgre
     });
 }
 
-/// Completion of a native streaming download → `AndroidDownloadComplete` action.
+/// Completion of a native streaming download → `NativeDownloadComplete` action.
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadComplete(
     env: *mut jni_sys::JNIEnv,

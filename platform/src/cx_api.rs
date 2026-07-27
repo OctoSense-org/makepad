@@ -333,10 +333,10 @@ pub enum CxOsOp {
     // view floating over the GL surface so the full-screen Splash card behind
     // it is edge-to-edge). Handled only by the Android backend; ignored by
     // every other backend's catch-all.
-    ShowAndroidComposer,
-    HideAndroidComposer,
-    ExpandAndroidComposer,
-    CollapseAndroidComposer,
+    ShowNativeComposer,
+    HideNativeComposer,
+    ExpandNativeComposer,
+    CollapseNativeComposer,
     SetPrimarySelection(String),
     ShowSelectionHandles {
         start: Vec2d,
@@ -498,10 +498,10 @@ impl std::fmt::Debug for CxOsOp {
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),
             Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
             Self::DownloadFile { .. } => write!(f, "DownloadFile"),
-            Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
-            Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
-            Self::ExpandAndroidComposer => write!(f, "ExpandAndroidComposer"),
-            Self::CollapseAndroidComposer => write!(f, "CollapseAndroidComposer"),
+            Self::ShowNativeComposer => write!(f, "ShowNativeComposer"),
+            Self::HideNativeComposer => write!(f, "HideNativeComposer"),
+            Self::ExpandNativeComposer => write!(f, "ExpandNativeComposer"),
+            Self::CollapseNativeComposer => write!(f, "CollapseNativeComposer"),
             Self::SetPrimarySelection(..) => write!(f, "SetPrimarySelection"),
             Self::ShowSelectionHandles { .. } => write!(f, "ShowSelectionHandles"),
             Self::UpdateSelectionHandles { .. } => write!(f, "UpdateSelectionHandles"),
@@ -1165,7 +1165,7 @@ impl Cx {
 
     /// Open the native file picker (Android Storage Access Framework). The result
     /// (picked file's name + contents, or cancellation) is delivered later as an
-    /// `AndroidDialogResult` action carrying `call_id`. No-op on platforms whose
+    /// `NativeDialogResult` action carrying `call_id`. No-op on platforms whose
     /// backend doesn't handle `CxOsOp::OpenFileDialog`.
     pub fn open_file_dialog(&mut self, call_id: i64, mime: &str) {
         self.platform_ops.push(CxOsOp::OpenFileDialog {
@@ -1176,8 +1176,8 @@ impl Cx {
 
     /// Stream a URL to a file on a native background thread (constant memory —
     /// for large binaries the bytes never pass through JS). Progress is delivered
-    /// as `AndroidDownloadProgress` actions and completion as
-    /// `AndroidDownloadComplete`, both carrying `call_id`. `dest` is an absolute
+    /// as `NativeDownloadProgress` actions and completion as
+    /// `NativeDownloadComplete`, both carrying `call_id`. `dest` is an absolute
     /// path (the caller resolves it inside the card-fs sandbox first).
     pub fn download_file(&mut self, call_id: i64, url: &str, dest: &str) {
         self.platform_ops.push(CxOsOp::DownloadFile {
@@ -1187,30 +1187,31 @@ impl Cx {
         });
     }
 
-    /// Show the native Android floating chat-composer overlay so it floats
-    /// over the full-screen Splash card. No-op on platforms whose backend
-    /// doesn't handle `CxOsOp::ShowAndroidComposer` (i.e. everything but
-    /// Android).
-    pub fn show_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::ShowAndroidComposer);
+    /// Show the native floating chat-composer overlay so it floats over the
+    /// full-screen Splash card. Implemented by the Android and OpenHarmony
+    /// backends; a no-op on platforms that don't handle
+    /// `CxOsOp::ShowNativeComposer` (desktop uses the docked composer).
+    pub fn show_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::ShowNativeComposer);
     }
 
-    /// Hide the native Android floating chat-composer overlay (and drop its
-    /// keyboard). No-op off Android.
-    pub fn hide_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::HideAndroidComposer);
+    /// Hide the native floating chat-composer overlay (and drop its keyboard).
+    /// No-op on backends without a native composer.
+    pub fn hide_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::HideNativeComposer);
     }
 
-    /// Expand the native Android composer from its collapsed "+" button back to
-    /// the full input pill (and focus it). No-op off Android.
-    pub fn expand_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::ExpandAndroidComposer);
+    /// Expand the native composer from its collapsed "+" button back to the
+    /// full input pill (and focus it). No-op on backends without one.
+    pub fn expand_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::ExpandNativeComposer);
     }
 
-    /// Collapse the native Android composer to a small "+" button (and drop its
-    /// keyboard) so the full-screen card has more room. No-op off Android.
-    pub fn collapse_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::CollapseAndroidComposer);
+    /// Collapse the native composer to a small "+" button (and drop its
+    /// keyboard) so the full-screen card has more room. No-op on backends
+    /// without one.
+    pub fn collapse_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::CollapseNativeComposer);
     }
 
     /// Sets the primary selection (Linux middle-click paste).

@@ -310,7 +310,7 @@ fn load_html_document(web_view: ObjcId, html: &str, _base_url: &str, generation:
 
 /// The `octos_native` WKScriptMessageHandler class. octos.invoke in the card
 /// posts `{id, tool, args}` here; we read the per-instance browser id (ivar) and
-/// post an AndroidSystemBrowserInvoke action into the makepad loop — the exact
+/// post an NativeSystemBrowserInvoke action into the makepad loop — the exact
 /// action the Android JavascriptInterface bridge posts, so the widget's dispatch
 /// (web_card.rs handle_invoke) is identical on both platforms. Registered once in
 /// AppleClasses.
@@ -363,7 +363,7 @@ pub fn define_octos_web_message_handler() -> *const Class {
             } else {
                 String::new()
             };
-            crate::Cx::post_action(crate::event::AndroidSystemBrowserInvoke {
+            crate::Cx::post_action(crate::event::NativeSystemBrowserInvoke {
                 browser_id,
                 call_id,
                 tool,

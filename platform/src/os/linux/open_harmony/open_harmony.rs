@@ -248,19 +248,53 @@ impl Cx {
             // until the next render loop, which — when the app is idle behind a
             // rendered card — may not arrive until the next touch.
             FromOhosMessage::ComposerSubmit { text } => {
-                Cx::post_action(crate::event::AndroidComposerSubmit { text });
+                Cx::post_action(crate::event::NativeComposerSubmit { text });
                 self.handle_action_receiver();
             }
             FromOhosMessage::ComposerNewApp => {
-                Cx::post_action(crate::event::AndroidComposerNewApp);
+                Cx::post_action(crate::event::NativeComposerNewApp);
                 self.handle_action_receiver();
             }
             FromOhosMessage::ComposerSwitch => {
-                Cx::post_action(crate::event::AndroidComposerSwitch);
+                Cx::post_action(crate::event::NativeComposerSwitch);
                 self.handle_action_receiver();
             }
             FromOhosMessage::ComposerExpand => {
-                Cx::post_action(crate::event::AndroidComposerExpand);
+                Cx::post_action(crate::event::NativeComposerExpand);
+                self.handle_action_receiver();
+            }
+            // A webview card called octos.invoke(tool, args). The WebCard widget
+            // dispatches the tool (fs.*, dialog.open, share, clipboard, notify,
+            // http.fetch, download) and resolves the card-side promise via
+            // EvalSystemBrowserJs.
+            FromOhosMessage::SystemBrowserInvoke {
+                browser_id,
+                call_id,
+                tool,
+                args,
+            } => {
+                Cx::post_action(crate::event::NativeSystemBrowserInvoke {
+                    browser_id,
+                    call_id,
+                    tool,
+                    args,
+                });
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::DialogResult {
+                call_id,
+                name,
+                content,
+                cancelled,
+                error,
+            } => {
+                Cx::post_action(crate::event::NativeDialogResult {
+                    call_id,
+                    name,
+                    content,
+                    cancelled,
+                    error,
+                });
                 self.handle_action_receiver();
             }
             FromOhosMessage::DeleteLeft(length) => {
@@ -641,17 +675,26 @@ impl Cx {
                 // taps aimed at a makepad-drawn composer, and makepad has no
                 // text-input bridge here, so a makepad TextInput could never
                 // receive characters anyway.
-                CxOsOp::ShowAndroidComposer => {
+                CxOsOp::ShowNativeComposer => {
                     self.ohos_call_arkts("composerShow", vec![]);
                 }
-                CxOsOp::HideAndroidComposer => {
+                CxOsOp::HideNativeComposer => {
                     self.ohos_call_arkts("composerHide", vec![]);
                 }
-                CxOsOp::ExpandAndroidComposer => {
+                CxOsOp::ExpandNativeComposer => {
                     self.ohos_call_arkts("composerExpand", vec![]);
                 }
-                CxOsOp::CollapseAndroidComposer => {
+                CxOsOp::CollapseNativeComposer => {
                     self.ohos_call_arkts("composerCollapse", vec![]);
+                }
+                // The system file picker, for a card's
+                // `octos.invoke("dialog.open", …)`. Backed by ArkTS
+                // DocumentViewPicker — a real OS component, not an in-page UI.
+                CxOsOp::OpenFileDialog { call_id, mime } => {
+                    self.ohos_call_arkts(
+                        "openFileDialog",
+                        vec![ArkArg::Str(call_id.to_string()), ArkArg::Str(mime)],
+                    );
                 }
                 // ---- system browser (webview cards) ----
                 //

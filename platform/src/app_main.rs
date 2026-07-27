@@ -328,7 +328,7 @@ macro_rules! _app_main_event_closure {
 #[macro_export]
 macro_rules! app_main {
     ( $ app: ident) => {
-        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+        #[cfg(not(mobile))]
         fn main() {
             app_main();
         }
