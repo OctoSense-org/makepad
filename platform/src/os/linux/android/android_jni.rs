@@ -726,10 +726,77 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographe
             }
         }
         match CHOREOGRAPHER_POST_CALLBACK_FN {
-            Some(_) => post_vsync_callback(),
+            Some(_) => arm_vsync(),
             None => init_simple_render_loop(device_refresh_rate),
         }
     }
+}
+
+// On-demand vsync heartbeat. The Choreographer callback used to re-arm itself
+// EVERY frame unconditionally, so the app rendered at the display refresh rate
+// forever — even on a fully static screen. That permanent per-vsync activity is
+// what kept the app's HWUI WINDOW layer recompositing ~40-60 fps (a native
+// composer/overlay stacked over the punch-through GL SurfaceView then flickers,
+// plus a constant GPU/battery cost).
+//
+// Now the heartbeat is on-demand and driven ONE frame at a time BY THE MAKEPAD
+// THREAD: the vsync callback deliberately does NOT re-arm itself. After drawing
+// a frame the makepad thread calls request_render() only while draw/animation
+// work remains, scheduling exactly one more vsync. When the screen is static
+// nothing re-arms, so the vsync goes idle and the window stops recompositing.
+// Timers/signals keep being polled by the makepad thread's recv_timeout, which
+// never touches the window.
+//
+// RENDER_WANTED starts true so the app renders through boot; it also gates the
+// OHOS / API<29 simple render loop (which has no Choreographer to idle).
+// VSYNC_PENDING debounces the arming so at most one Choreographer callback is
+// ever scheduled — two would double the frame rate, four would quadruple it, etc.
+pub static RENDER_WANTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+#[cfg(not(no_android_choreographer))]
+static VSYNC_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set by the makepad thread after each frame: true while there is active
+/// draw/animation work (dirty passes, pending next-frames, time shaders), false
+/// when the screen is static. Consumed by the simple render loop (OHOS / API<29)
+/// to skip idle frames.
+pub fn set_render_wanted(wanted: bool) {
+    RENDER_WANTED.store(wanted, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Wake the render loop from the makepad thread: mark work wanted and schedule
+/// one vsync frame. Safe to call cross-thread — `AChoreographer_post*Callback`
+/// posts to the choreographer's looper, and `CHOREOGRAPHER`/the callback fn are
+/// set once at init and only read thereafter.
+#[cfg(not(no_android_choreographer))]
+pub unsafe fn request_render() {
+    RENDER_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    arm_vsync();
+}
+#[cfg(no_android_choreographer)]
+pub fn request_render() {
+    RENDER_WANTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Schedule exactly one Choreographer frame callback. Idempotent until the
+/// callback fires (the VSYNC_PENDING debounce), so repeated calls within one
+/// frame never stack callbacks and multiply the frame rate.
+#[cfg(not(no_android_choreographer))]
+pub unsafe fn arm_vsync() {
+    use std::sync::atomic::Ordering;
+    if VSYNC_PENDING.swap(true, Ordering::AcqRel) {
+        return; // a callback is already scheduled
+    }
+    if let Some(post_callback) = CHOREOGRAPHER_POST_CALLBACK_FN {
+        if !CHOREOGRAPHER.is_null() && from_java_messages_already_set() {
+            post_callback(CHOREOGRAPHER, Some(vsync_callback), std::ptr::null_mut());
+            return;
+        }
+    }
+    // Couldn't post (no callback fn, or shutting down) — clear the debounce so a
+    // later arm_vsync can retry.
+    VSYNC_PENDING.store(false, Ordering::Release);
 }
 
 #[cfg(not(no_android_choreographer))]
@@ -737,17 +804,12 @@ unsafe extern "C" fn vsync_callback(
     _data: *mut ndk_sys::AChoreographerFrameCallbackData,
     _user_data: *mut std::ffi::c_void,
 ) {
+    // The scheduled callback has fired — clear the debounce so the makepad thread
+    // can schedule the next frame. Deliberately does NOT re-arm here: the makepad
+    // thread re-arms via request_render() only while draw work remains, which is
+    // what lets the heartbeat idle on a static screen.
+    VSYNC_PENDING.store(false, std::sync::atomic::Ordering::Release);
     send_from_java_message(FromJavaMessage::RenderLoop);
-    post_vsync_callback();
-}
-
-#[cfg(not(no_android_choreographer))]
-pub unsafe fn post_vsync_callback() {
-    if let Some(post_callback) = CHOREOGRAPHER_POST_CALLBACK_FN {
-        if !CHOREOGRAPHER.is_null() && from_java_messages_already_set() {
-            post_callback(CHOREOGRAPHER, Some(vsync_callback), std::ptr::null_mut());
-        }
-    }
 }
 
 /// Fallback render loop used when the Android Choreographer isn't available
@@ -761,8 +823,8 @@ fn init_simple_render_loop(device_refresh_rate: f32) {
             // Exit the thread once the app has shut down and the Java->native
             // message channel has been torn down by `from_java_messages_clear()`
             // (called when the main event loop quits). This mirrors
-            // `post_vsync_callback`, which likewise stops re-arming the
-            // Choreographer once `from_java_messages_already_set()` is false.
+            // `arm_vsync`, which likewise stops scheduling the Choreographer
+            // once `from_java_messages_already_set()` is false.
             //
             // Without this, the thread spins forever after the activity is
             // destroyed, sending `RenderLoop` into a dead channel and spamming
@@ -785,7 +847,13 @@ fn init_simple_render_loop(device_refresh_rate: f32) {
 
             if elapsed >= target_frame_time {
                 let frame_start = std::time::Instant::now();
-                send_from_java_message(FromJavaMessage::RenderLoop);
+                // On-demand: only drive a frame while there's draw work. When
+                // idle the makepad thread still polls timers/signals via its
+                // recv_timeout, and re-sets RENDER_WANTED when work appears, so
+                // skipping the send here just avoids needless idle frames.
+                if RENDER_WANTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    send_from_java_message(FromJavaMessage::RenderLoop);
+                }
                 let frame_duration = frame_start.elapsed();
 
                 // Adaptive sleep: sleep less if the last frame took longer to process

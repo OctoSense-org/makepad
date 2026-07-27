@@ -743,6 +743,24 @@ impl PollTimers {
         (time_now.duration_since(self.time_start)).as_secs_f64()
     }
 
+    /// Duration from now until the earliest timer is due, or `None` when there
+    /// are no timers. The Android event loop uses this to size its
+    /// `recv_timeout` so timers keep firing on schedule even while the render
+    /// heartbeat is idled (returns `Duration::ZERO` for an already-overdue
+    /// timer so it dispatches immediately on the next poll).
+    pub fn next_wake(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.timers
+            .values()
+            .map(|timer| {
+                let elapsed = now.saturating_duration_since(timer.start_time);
+                let next_due =
+                    Duration::from_nanos(timer.interval.as_nanos() as u64 * (timer.step + 1));
+                next_due.saturating_sub(elapsed)
+            })
+            .min()
+    }
+
     pub fn get_dispatch(&mut self) -> Vec<TimerEvent> {
         let mut to_be_dispatched = Vec::with_capacity(self.timers.len());
         let mut to_be_removed = Vec::with_capacity(self.timers.len());

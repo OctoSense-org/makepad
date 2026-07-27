@@ -311,90 +311,54 @@ impl Cx {
                 };
             }
 
-            // Wait for the next message, blocking until one is received.
-            // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
-            match from_java_rx.recv() {
+            // Idle poll cadence for the on-demand render loop. `recv_timeout`
+            // returns instantly for a real message (input, java events, a vsync
+            // RenderLoop), so this timeout only bounds the IDLE wait: it lets the
+            // loop keep firing timers on schedule and keep polling the
+            // `SignalToUI` atomics — network responses, streamed tokens and
+            // posted actions have NO wakeup, they are delivered purely by
+            // polling. Sized to the nearest timer deadline, capped at 16ms so
+            // background signals stay responsive. This polling runs on the
+            // makepad thread and never touches the window, so unlike the old
+            // unconditional per-vsync heartbeat it costs no layer recomposite.
+            // Clamp to [4ms, 16ms]: the 16ms cap keeps background signals
+            // responsive (they have no wakeup) and the 4ms floor stops a
+            // short-interval or already-overdue timer from busy-spinning the
+            // loop. Any realistic timer here is >=100ms, so the cap dominates;
+            // the floor only guards the degenerate case.
+            let poll_interval = self
+                .os
+                .timers
+                .next_wake()
+                .unwrap_or(std::time::Duration::from_millis(16))
+                .clamp(
+                    std::time::Duration::from_millis(4),
+                    std::time::Duration::from_millis(16),
+                );
+            match from_java_rx.recv_timeout(poll_interval) {
+                // A Choreographer vsync heartbeat and an idle poll-timeout do the
+                // same work: drain pending java messages, run periodic events
+                // (timers/signals), draw if dirty, then re-arm or idle the
+                // heartbeat. Sharing one path keeps timers/signals flowing even
+                // while the vsync is idled.
                 Ok(FromJavaMessage::RenderLoop) => {
-                    // Drain all pending messages, coalescing consecutive touch-move
-                    // events to avoid redundant event dispatch before painting.
-                    // Start/Stop events are never dropped — only pure-Move events
-                    // are replaced by the next one.
-                    let mut pending_touch_move: Option<FromJavaMessage> = None;
-                    while let Ok(msg) = from_java_rx.try_recv() {
-                        if let FromJavaMessage::Touch(ref touches) = msg {
-                            if touches
-                                .iter()
-                                .all(|t| t.state == crate::event::finger::TouchState::Move)
-                            {
-                                // This is a pure move event — defer it; a newer one
-                                // may arrive and supersede it.
-                                pending_touch_move = Some(msg);
-                                continue;
-                            }
-                        }
-                        // A non-touch or non-pure-move message arrived.
-                        // Flush the deferred move first (if any) so ordering is preserved.
-                        if let Some(deferred) = pending_touch_move.take() {
-                            self.handle_message(deferred);
-                        }
-                        self.handle_message(msg);
-                    }
-                    // Flush the last deferred move (if any).
-                    if let Some(deferred) = pending_touch_move.take() {
-                        self.handle_message(deferred);
-                    }
-                    self.handle_other_events();
-                    if self.os.in_xr_mode && self.os.openxr.session.is_none() {
-                        if !self.os.openxr.logged_waiting_for_session {
-                            self.os.openxr.logged_waiting_for_session = true;
-                        }
-                        continue;
-                    }
-                    self.os.openxr.logged_waiting_for_session = false;
-                    // After every event, drain any pending re-apply. The
-                    // cheap gate (both flags false) keeps the hot path
-                    // zero-cost; everything else — picking the right
-                    // `Event` variant for each flag, skipping shader-cache
-                    // reset for manual triggers, deferring a same-tick
-                    // `ScriptReapply` follow-up to keep rotation light —
-                    // is documented in `run_live_edit_if_needed`.
-                    if self.pending_script_reapply || self.pending_live_edit_request {
-                        self.run_live_edit_if_needed("android");
-                    }
-                    // Drop the frame entirely if the window surface has been
-                    // torn down (typically during background/foreground or a
-                    // rotation). Issuing GL calls without a current EGL context
-                    // — which is what `destroy_surface` leaves us in — is
-                    // undefined behavior and crashes Mali/Adreno drivers with
-                    // a SIGSEGV inside `render_view`.
-                    if self.os.has_drawable_surface() {
-                        // If we previously skipped frames because the surface
-                        // wasn't ready, the redraw request may have been consumed
-                        // by an earlier draw cycle that couldn't actually paint.
-                        // Force a full redraw on the first frame after the surface
-                        // becomes (or becomes again) drawable.
-                        if self.os.needs_first_draw {
-                            self.os.needs_first_draw = false;
-                            self.redraw_all();
-                        }
-                        self.handle_drawing();
-                    } else {
-                        // Surface not ready — remember that we need a full
-                        // redraw once it becomes available, since any pending
-                        // draw event may be consumed by handle_drawing() on
-                        // a future iteration when the surface is briefly valid
-                        // but immediately torn down again (rotation race).
-                        self.os.needs_first_draw = true;
-                    }
+                    self.drain_and_draw(&from_java_rx);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.drain_and_draw(&from_java_rx);
                 }
                 Ok(message) => {
                     self.handle_message(message);
                     // Dispatch platform ops immediately after non-RenderLoop messages.
                     // This ensures SyncImeState reaches Java before the IME's next buffer query.
                     self.handle_platform_ops();
+                    // A message (input, resize, key) may have dirtied the UI —
+                    // re-arm the heartbeat so the change actually paints on the
+                    // next vsync instead of waiting for the idle poll.
+                    self.update_render_heartbeat();
                 }
-                Err(e) => {
-                    crate::error!("Error receiving message: {:?}", e);
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::error!("from_java channel disconnected");
                     break;
                 }
             }
@@ -417,6 +381,109 @@ impl Cx {
                 .ok();
         }
         from_java_messages_clear()
+    }
+
+    /// One frame of work for the on-demand render loop, shared by the vsync
+    /// `RenderLoop` path and the idle `recv_timeout` poll path: drain pending
+    /// java messages (coalescing touch-moves), run periodic events
+    /// (timers/signals/live-edit), draw if the surface is drawable and dirty,
+    /// then re-arm or idle the Choreographer heartbeat via
+    /// `update_render_heartbeat`.
+    fn drain_and_draw(&mut self, from_java_rx: &mpsc::Receiver<FromJavaMessage>) {
+        // Drain all pending messages, coalescing consecutive touch-move
+        // events to avoid redundant event dispatch before painting.
+        // Start/Stop events are never dropped — only pure-Move events
+        // are replaced by the next one.
+        let mut pending_touch_move: Option<FromJavaMessage> = None;
+        while let Ok(msg) = from_java_rx.try_recv() {
+            if let FromJavaMessage::Touch(ref touches) = msg {
+                if touches
+                    .iter()
+                    .all(|t| t.state == crate::event::finger::TouchState::Move)
+                {
+                    // This is a pure move event — defer it; a newer one
+                    // may arrive and supersede it.
+                    pending_touch_move = Some(msg);
+                    continue;
+                }
+            }
+            // A non-touch or non-pure-move message arrived.
+            // Flush the deferred move first (if any) so ordering is preserved.
+            if let Some(deferred) = pending_touch_move.take() {
+                self.handle_message(deferred);
+            }
+            self.handle_message(msg);
+        }
+        // Flush the last deferred move (if any).
+        if let Some(deferred) = pending_touch_move.take() {
+            self.handle_message(deferred);
+        }
+        self.handle_other_events();
+        if self.os.in_xr_mode && self.os.openxr.session.is_none() {
+            if !self.os.openxr.logged_waiting_for_session {
+                self.os.openxr.logged_waiting_for_session = true;
+            }
+            return;
+        }
+        self.os.openxr.logged_waiting_for_session = false;
+        // After every event, drain any pending re-apply. The
+        // cheap gate (both flags false) keeps the hot path
+        // zero-cost; everything else — picking the right
+        // `Event` variant for each flag, skipping shader-cache
+        // reset for manual triggers, deferring a same-tick
+        // `ScriptReapply` follow-up to keep rotation light —
+        // is documented in `run_live_edit_if_needed`.
+        if self.pending_script_reapply || self.pending_live_edit_request {
+            self.run_live_edit_if_needed("android");
+        }
+        // Drop the frame entirely if the window surface has been
+        // torn down (typically during background/foreground or a
+        // rotation). Issuing GL calls without a current EGL context
+        // — which is what `destroy_surface` leaves us in — is
+        // undefined behavior and crashes Mali/Adreno drivers with
+        // a SIGSEGV inside `render_view`.
+        if self.os.has_drawable_surface() {
+            // If we previously skipped frames because the surface
+            // wasn't ready, the redraw request may have been consumed
+            // by an earlier draw cycle that couldn't actually paint.
+            // Force a full redraw on the first frame after the surface
+            // becomes (or becomes again) drawable.
+            if self.os.needs_first_draw {
+                self.os.needs_first_draw = false;
+                self.redraw_all();
+            }
+            self.handle_drawing();
+        } else {
+            // Surface not ready — remember that we need a full
+            // redraw once it becomes available, since any pending
+            // draw event may be consumed by handle_drawing() on
+            // a future iteration when the surface is briefly valid
+            // but immediately torn down again (rotation race).
+            self.os.needs_first_draw = true;
+        }
+        self.update_render_heartbeat();
+    }
+
+    /// Arm or idle the Choreographer vsync heartbeat based on whether there is
+    /// active draw/animation work. When there is none, the heartbeat stops
+    /// firing so the app's window layer stops recompositing every vsync — this
+    /// is the fix for the constant-repaint flicker and idle GPU/battery drain.
+    /// The event loop keeps polling timers/signals via `recv_timeout` regardless
+    /// (that never touches the window), and any new draw work re-arms the
+    /// heartbeat here so animation and streaming render at the display rate.
+    /// The predicate mirrors the `handle_drawing` gate exactly.
+    fn update_render_heartbeat(&mut self) {
+        let wants = self.any_passes_dirty()
+            || self.need_redrawing()
+            || !self.new_next_frames.is_empty()
+            || self.demo_time_repaint;
+        android_jni::set_render_wanted(wants);
+        if wants {
+            #[cfg(not(no_android_choreographer))]
+            unsafe {
+                android_jni::request_render();
+            }
+        }
     }
 
     fn sync_android_surface_alive_from_backend(&mut self) {
