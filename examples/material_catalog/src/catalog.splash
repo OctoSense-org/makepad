@@ -247,9 +247,9 @@ fn tooltip() {
             c: [ {t: "text", text: "Tooltip label", size: 12, color: inverse_on} ]}
 }
 
-// A circular progress indicator (mock): a 40dp primary ring, 4dp track.
+// A real, continuously-animated Material circular progress indicator.
 fn ring() {
-    return {t: "column", bg: surface, border: 4, bordercolor: primary, radius: 20, w: 40, h: 40}
+    return {t: "loading", bg: primary, w: 44, h: 44}
 }
 
 // A snackbar — 4dp corner, inverse surface, Body Medium, inverse-primary action.
@@ -376,11 +376,9 @@ fn search_view() {
     ]}
 }
 
-// A contained loading indicator (mock of M3's animated shape).
+// A real animated loading indicator (the same spinner shader, larger).
 fn loading_indicator() {
-    return {t: "column", bg: pri_container, radius: 14, w: 48, h: 48, alignx: 0.5, aligny: 0.5, c: [
-        {t: "column", bg: primary, radius: 8, w: 22, h: 22},
-    ]}
+    return {t: "loading", bg: primary, w: 48, h: 48}
 }
 
 // A shape-scale swatch (M3 corner ladder).
