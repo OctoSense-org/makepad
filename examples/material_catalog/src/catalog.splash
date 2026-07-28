@@ -1,0 +1,483 @@
+// Material-Design-3 component catalog, authored in the Splash DSL and rendered
+// as makepad native widgets. Colours follow the M3 baseline light scheme.
+
+fn argb(a, r, g, b) { return ((a * 256 + r) * 256 + g) * 256 + b }
+
+let primary        = argb(255, 103,  80, 164)   // #6750A4
+let on_primary     = argb(255, 255, 255, 255)
+let pri_container  = argb(255, 234, 221, 255)   // #EADDFF
+let on_pri_cont    = argb(255,  33,   0,  93)   // #21005D
+let secondary      = argb(255,  98,  91, 113)   // #625B71
+let sec_container  = argb(255, 232, 222, 248)   // #E8DEF8
+let on_sec_cont    = argb(255,  29,  25,  43)   // #1D192B
+let tertiary       = argb(255, 125,  82,  96)   // #7D5260
+let ter_container  = argb(255, 255, 216, 228)   // #FFD8E4
+let surface        = argb(255, 254, 247, 255)   // #FEF7FF
+let surf_variant   = argb(255, 231, 224, 236)   // #E7E0EC
+let surf_cont      = argb(255, 243, 237, 247)   // container tone
+let on_surface     = argb(255,  29,  27,  32)   // #1D1B20
+let on_surf_var    = argb(255,  73,  69,  79)   // #49454F
+let outline        = argb(255, 121, 116, 126)   // #79747E
+let outline_var    = argb(255, 202, 196, 208)   // #CAC4D0
+let error          = argb(255, 179,  38,  30)   // #B3261E
+let white          = argb(255, 255, 255, 255)
+
+// ---- component helpers -----------------------------------------------------
+
+// A titled white card grouping one component family.
+fn section(title, kids) {
+    let c = [ {t: "text", text: title, size: 16, color: on_surface, h: 24} ]
+    for k in kids { c.push(k) }
+    return {t: "column", bg: white, radius: 16, pad: 16, spacing: 12, c: c}
+}
+
+// A pill button that hugs its label (fitw) with the label centred.
+fn btn(txt, fill, ink) {
+    return {t: "column", bg: fill, radius: 20, pad: 12, fitw: 1,
+            alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: txt, size: 14, color: ink} ]}
+}
+fn outlined_btn(txt) {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline_var,
+            radius: 20, pad: 12, fitw: 1, alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: txt, size: 14, color: primary} ]}
+}
+fn text_btn(txt) {
+    return {t: "column", radius: 20, pad: 12, fitw: 1, alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: txt, size: 14, color: primary} ]}
+}
+
+// A chip: filled (selected) or outlined (assist/suggestion).
+fn chip(txt) {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline_var,
+            radius: 8, pad: 8, fitw: 1, alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: txt, size: 13, color: on_surf_var} ]}
+}
+fn chip_sel(txt) {
+    return {t: "column", bg: sec_container, radius: 8, pad: 8, fitw: 1,
+            alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: txt, size: 13, color: on_sec_cont} ]}
+}
+
+// A card tile with a title + supporting text.
+fn tile(title, supporting, bg, bord) {
+    return {t: "column", bg: bg, border: bord, bordercolor: outline_var,
+            radius: 12, pad: 16, spacing: 6, fitw: 1, w: 150,
+            c: [
+                {t: "text", text: title, size: 15, color: on_surface, h: 22},
+                {t: "text", text: supporting, size: 13, color: on_surf_var, h: 36},
+            ]}
+}
+
+// A linear progress track with a proportional fill.
+fn progress(fill_w) {
+    return {t: "column", bg: surf_variant, radius: 2, h: 4,
+            c: [ {t: "column", bg: primary, radius: 2, h: 4, w: fill_w} ]}
+}
+
+// A list row: leading avatar + title/subtitle.
+fn list_item(letter, title, subtitle) {
+    return {t: "row", h: 60, spacing: 16, aligny: 0.5, c: [
+        {t: "column", bg: pri_container, radius: 20, w: 40, h: 40,
+         alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: letter, size: 16, color: on_pri_cont} ]},
+        {t: "column", spacing: 2, c: [
+            {t: "text", text: title, size: 16, color: on_surface, h: 22},
+            {t: "text", text: subtitle, size: 13, color: on_surf_var, h: 18},
+        ]},
+    ]}
+}
+
+fn divider() { return {t: "column", bg: outline_var, h: 1} }
+
+// A bottom-navigation destination.
+fn nav_item(icon, label, ink, pill) {
+    return {t: "column", fitw: 1, spacing: 4, alignx: 0.5, c: [
+        {t: "column", bg: pill, radius: 16, w: 56, h: 32, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: icon, size: 16, color: ink} ]},
+        {t: "text", text: label, size: 12, color: ink, h: 16},
+    ]}
+}
+
+// A colour-role swatch.
+fn swatch(c, name) {
+    return {t: "column", fitw: 1, spacing: 4, c: [
+        {t: "column", bg: c, radius: 8, w: 66, h: 48},
+        {t: "text", text: name, size: 11, color: on_surf_var, h: 14},
+    ]}
+}
+
+// A top app bar: leading icon, title, spacer, trailing action icons.
+fn appbar(title) {
+    return {t: "row", bg: surf_cont, h: 60, pad: 14, spacing: 16, aligny: 0.5, c: [
+        {t: "text", text: "\u{2261}", size: 22, color: on_surface, fitw: 1},
+        {t: "text", text: title, size: 20, color: on_surface, fitw: 1},
+        {t: "column", c: []},
+        {t: "text", text: "\u{1F50D}", size: 20, color: on_surface, fitw: 1},
+        {t: "text", text: "\u{22EE}", size: 20, color: on_surface, fitw: 1},
+    ]}
+}
+
+// A tab: active shows the primary underline indicator.
+fn tab_active(txt) {
+    return {t: "column", fitw: 1, spacing: 8, alignx: 0.5, c: [
+        {t: "text", text: txt, size: 14, color: primary, h: 20},
+        {t: "column", bg: primary, radius: 2, h: 3, w: 44},
+    ]}
+}
+fn tab_idle(txt) {
+    return {t: "column", fitw: 1, spacing: 8, alignx: 0.5, c: [
+        {t: "text", text: txt, size: 14, color: on_surf_var, h: 20},
+        {t: "column", bg: white, radius: 2, h: 3, w: 44},
+    ]}
+}
+
+// One segment of a segmented button.
+fn seg_on(txt) {
+    return {t: "column", bg: sec_container, border: 1, bordercolor: outline,
+            h: 40, pad: 14, fitw: 1, alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: "\u{2713} " + txt, size: 13, color: on_sec_cont} ]}
+}
+fn seg_off(txt) {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline,
+            h: 40, pad: 14, fitw: 1, alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: txt, size: 13, color: on_surf_var} ]}
+}
+
+// A search bar (pill).
+fn searchbar() {
+    return {t: "row", bg: surf_variant, radius: 28, h: 56, pad: 18, spacing: 14, aligny: 0.5, c: [
+        {t: "text", text: "\u{1F50D}", size: 20, color: on_surf_var, fitw: 1},
+        {t: "text", text: "Search the catalog", size: 16, color: on_surf_var, fitw: 1},
+    ]}
+}
+
+// An icon carrying a small count badge.
+fn badge(icon, count) {
+    return {t: "row", fitw: 1, spacing: 4, c: [
+        {t: "text", text: icon, size: 26, color: on_surface, fitw: 1},
+        {t: "column", bg: error, radius: 9, w: 18, h: 18, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: count, size: 10, color: white} ]},
+    ]}
+}
+
+// A modal dialog (mock). The body Label is given a width so makepad wraps it.
+fn dialog() {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline_var,
+            radius: 28, pad: 24, spacing: 16, c: [
+        {t: "text", text: "Reset settings?", size: 22, color: on_surface, h: 30},
+        {t: "text", text: "This will restore default values for every preference in this app.",
+         size: 14, color: on_surf_var, w: 280, h: 44},
+        {t: "row", spacing: 8, aligny: 0.5, c: [
+            {t: "column", c: []},
+            text_btn("Cancel"),
+            text_btn("Reset"),
+        ]},
+    ]}
+}
+
+// A bottom sheet: drag handle + a few actions.
+fn sheet_row(icon, txt) {
+    return {t: "row", h: 48, spacing: 16, aligny: 0.5, c: [
+        {t: "text", text: icon, size: 20, color: on_surf_var, fitw: 1},
+        {t: "text", text: txt, size: 16, color: on_surface, fitw: 1},
+    ]}
+}
+fn bottom_sheet() {
+    return {t: "column", bg: surf_cont, radius: 28, pad: 16, spacing: 4, alignx: 0.5, c: [
+        {t: "column", bg: outline_var, radius: 2, w: 32, h: 4},
+        sheet_row("\u{2606}", "Add to favourites"),
+        sheet_row("\u{2709}", "Share via email"),
+        sheet_row("\u{2699}", "Edit label"),
+    ]}
+}
+
+// A date picker (mini month grid). 7 equal columns per row.
+fn dhead(t) { return {t: "column", alignx: 0.5, c: [ {t: "text", text: t, size: 12, color: on_surf_var, h: 28} ]} }
+fn dday(t)  { return {t: "column", alignx: 0.5, aligny: 0.5, h: 38, c: [ {t: "text", text: t, size: 14, color: on_surface} ]} }
+fn dsel(t)  { return {t: "column", alignx: 0.5, aligny: 0.5, h: 38, c: [
+                  {t: "column", bg: primary, radius: 16, w: 32, h: 32, alignx: 0.5, aligny: 0.5,
+                   c: [ {t: "text", text: t, size: 14, color: on_primary} ]} ]} }
+fn date_picker() {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline_var, radius: 16, pad: 16, spacing: 8, c: [
+        {t: "row", aligny: 0.5, c: [
+            {t: "text", text: "March 2026", size: 16, color: on_surface, fitw: 1},
+            {t: "column", c: []},
+            {t: "text", text: "\u{2039}   \u{203A}", size: 18, color: on_surf_var, fitw: 1},
+        ]},
+        {t: "row", c: [ dhead("S"), dhead("M"), dhead("T"), dhead("W"), dhead("T"), dhead("F"), dhead("S") ]},
+        {t: "row", c: [ dday("2"), dday("3"), dday("4"), dday("5"), dday("6"), dday("7"), dday("8") ]},
+        {t: "row", c: [ dday("9"), dday("10"), dsel("11"), dday("12"), dday("13"), dday("14"), dday("15") ]},
+        {t: "row", c: [ dday("16"), dday("17"), dday("18"), dday("19"), dday("20"), dday("21"), dday("22") ]},
+    ]}
+}
+
+// A time picker (mock): large HH:MM with AM/PM.
+fn time_picker() {
+    return {t: "row", spacing: 12, aligny: 0.5, c: [
+        {t: "column", bg: pri_container, radius: 8, w: 84, h: 72, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: "10", size: 44, color: on_pri_cont} ]},
+        {t: "text", text: ":", size: 44, color: on_surface, fitw: 1},
+        {t: "column", bg: surf_variant, radius: 8, w: 84, h: 72, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: "30", size: 44, color: on_surface} ]},
+        {t: "column", spacing: 0, c: [
+            {t: "column", bg: sec_container, border: 1, bordercolor: outline, radius: 8, w: 48, h: 36, alignx: 0.5, aligny: 0.5,
+             c: [ {t: "text", text: "AM", size: 14, color: on_sec_cont} ]},
+            {t: "column", bg: surface, border: 1, bordercolor: outline, radius: 8, w: 48, h: 36, alignx: 0.5, aligny: 0.5,
+             c: [ {t: "text", text: "PM", size: 14, color: on_surf_var} ]},
+        ]},
+    ]}
+}
+
+// A tooltip bubble.
+fn tooltip() {
+    return {t: "column", bg: argb(255, 50, 47, 55), radius: 6, pad: 8, fitw: 1, alignx: 0.5, aligny: 0.5,
+            c: [ {t: "text", text: "Tooltip label", size: 12, color: argb(255, 244, 239, 244)} ]}
+}
+
+// A circular progress indicator (mock): a primary ring.
+fn ring() {
+    return {t: "column", bg: surface, border: 4, bordercolor: primary, radius: 22, w: 44, h: 44}
+}
+
+// A snackbar (inverse surface) with an action.
+fn snackbar() {
+    return {t: "row", bg: argb(255, 50, 47, 55), radius: 8, h: 50, pad: 16, spacing: 16, aligny: 0.5, c: [
+        {t: "text", text: "Photo added to album", size: 14, color: argb(255, 244, 239, 244), fitw: 1},
+        {t: "column", c: []},
+        {t: "text", text: "UNDO", size: 14, color: argb(255, 208, 188, 255), fitw: 1},
+    ]}
+}
+
+// A dropdown menu (mock).
+fn menu_item(txt) {
+    return {t: "row", h: 44, pad: 12, aligny: 0.5, c: [
+        {t: "text", text: txt, size: 15, color: on_surface} ]}
+}
+fn menu() {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline_var,
+            radius: 8, pad: 8, w: 220, fitw: 1, c: [
+        menu_item("Edit"), menu_item("Duplicate"), menu_item("Share"), menu_item("Delete"),
+    ]}
+}
+
+// A bottom app bar: action icons on the left, a FAB on the right.
+fn bottom_app_bar() {
+    return {t: "row", bg: surf_cont, h: 64, pad: 14, spacing: 22, aligny: 0.5, c: [
+        {t: "text", text: "\u{2261}", size: 22, color: on_surf_var, fitw: 1},
+        {t: "text", text: "\u{2605}", size: 20, color: on_surf_var, fitw: 1},
+        {t: "text", text: "\u{2709}", size: 20, color: on_surf_var, fitw: 1},
+        {t: "column", c: []},
+        {t: "column", bg: pri_container, radius: 16, w: 56, h: 56, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: "\u{FF0B}", size: 24, color: on_pri_cont} ]},
+    ]}
+}
+
+// A navigation rail destination + the rail itself.
+fn rail_item(icon, label, ink, pill) {
+    return {t: "column", spacing: 4, alignx: 0.5, c: [
+        {t: "column", bg: pill, radius: 16, w: 56, h: 32, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: icon, size: 16, color: ink} ]},
+        {t: "text", text: label, size: 12, color: ink, h: 16},
+    ]}
+}
+fn nav_rail() {
+    return {t: "column", bg: surf_cont, radius: 16, pad: 12, spacing: 16, w: 96, alignx: 0.5, c: [
+        {t: "column", bg: pri_container, radius: 16, w: 56, h: 56, alignx: 0.5, aligny: 0.5,
+         c: [ {t: "text", text: "\u{FF0B}", size: 24, color: on_pri_cont} ]},
+        rail_item("\u{2302}", "Home", on_sec_cont, sec_container),
+        rail_item("\u{2605}", "Saved", on_surf_var, surf_cont),
+        rail_item("\u{2709}", "Inbox", on_surf_var, surf_cont),
+    ]}
+}
+
+// A carousel of media items (fixed widths; the row edge clips like a scrollable
+// carousel).
+fn carousel() {
+    return {t: "row", spacing: 8, c: [
+        {t: "column", bg: pri_container, radius: 16, w: 110, h: 120},
+        {t: "column", bg: sec_container, radius: 16, w: 140, h: 120},
+        {t: "column", bg: ter_container, radius: 16, w: 80, h: 120},
+    ]}
+}
+
+// A banner: leading icon, message, trailing actions.
+fn banner() {
+    return {t: "column", bg: surf_cont, radius: 12, pad: 16, spacing: 12, c: [
+        {t: "row", spacing: 12, c: [
+            {t: "text", text: "\u{2757}", size: 20, color: primary, fitw: 1},
+            {t: "text", text: "Your storage is almost full \u{2014} upgrade to keep syncing.",
+             size: 14, color: on_surface, w: 250, h: 40},
+        ]},
+        {t: "row", spacing: 8, aligny: 0.5, c: [
+            {t: "column", c: []}, text_btn("Dismiss"), text_btn("Upgrade"),
+        ]},
+    ]}
+}
+
+// ---- catalog ---------------------------------------------------------------
+
+{t: "column", pad: 16, spacing: 16, c: [
+
+    // header
+    {t: "column", spacing: 2, c: [
+        {t: "text", text: "Material Catalog", size: 30, color: on_surface, h: 40},
+        {t: "text", text: "Material 3 \u{00b7} hot-reloaded on device", size: 14, color: on_surf_var, h: 20},
+    ]},
+
+    section("Common buttons", [
+        {t: "row", spacing: 8, c: [
+            btn("Filled", primary, on_primary),
+            btn("Tonal", sec_container, on_sec_cont),
+            btn("Elevated", surf_cont, primary),
+        ]},
+        {t: "row", spacing: 8, c: [
+            outlined_btn("Outlined"),
+            text_btn("Text"),
+        ]},
+    ]),
+
+    section("Floating action buttons", [
+        {t: "row", spacing: 16, aligny: 0.5, c: [
+            {t: "column", bg: pri_container, radius: 12, w: 40, h: 40, alignx: 0.5, aligny: 0.5,
+             c: [ {t: "text", text: "\u{FF0B}", size: 18, color: on_pri_cont} ]},
+            {t: "column", bg: pri_container, radius: 16, w: 56, h: 56, alignx: 0.5, aligny: 0.5,
+             c: [ {t: "text", text: "\u{FF0B}", size: 24, color: on_pri_cont} ]},
+            {t: "row", bg: pri_container, radius: 16, h: 56, pad: 18, fitw: 1, spacing: 10, aligny: 0.5,
+             c: [ {t: "text", text: "\u{FF0B}", size: 20, color: on_pri_cont},
+                  {t: "text", text: "Extended", size: 15, color: on_pri_cont} ]},
+        ]},
+    ]),
+
+    section("Chips", [
+        {t: "row", spacing: 8, c: [ chip("Assist"), chip("Filter"), chip_sel("Selected") ]},
+        {t: "row", spacing: 8, c: [ chip("Suggestion"), chip("Input \u{00d7}") ]},
+    ]),
+
+    section("Cards", [
+        {t: "row", spacing: 12, c: [
+            tile("Elevated", "Filled surface tone", surf_cont, 0),
+            tile("Outlined", "1dp outline variant", surface, 1),
+        ]},
+    ]),
+
+    section("Selection controls", [
+        {t: "checkbox", text: "Checkbox", h: 34},
+        {t: "toggle", text: "Switch", h: 34},
+        {t: "radio", text: "Radio option A", h: 34},
+        {t: "radio", text: "Radio option B", h: 34},
+    ]),
+
+    section("Text fields", [
+        {t: "input", placeholder: "Filled text field", h: 50},
+        {t: "input", placeholder: "Another field", h: 50},
+    ]),
+
+    section("Sliders", [
+        {t: "slider", text: "Continuous", h: 44},
+    ]),
+
+    section("Progress indicators", [
+        {t: "text", text: "Linear \u{00b7} 40%", size: 13, color: on_surf_var, h: 18},
+        progress(150),
+        {t: "text", text: "Linear \u{00b7} 75%", size: 13, color: on_surf_var, h: 18},
+        progress(280),
+    ]),
+
+    section("Lists", [
+        list_item("A", "Ada Lovelace", "Analytical engine"),
+        divider(),
+        list_item("G", "Grace Hopper", "Compiler pioneer"),
+    ]),
+
+    section("Navigation bar", [
+        {t: "row", bg: surf_cont, radius: 16, pad: 8, h: 72, c: [
+            nav_item("\u{2302}", "Home", on_sec_cont, sec_container),
+            nav_item("\u{2605}", "Saved", on_surf_var, surf_cont),
+            nav_item("\u{2709}", "Inbox", on_surf_var, surf_cont),
+            nav_item("\u{263A}", "Profile", on_surf_var, surf_cont),
+        ]},
+    ]),
+
+    section("Typography", [
+        {t: "text", text: "Display Small", size: 34, color: on_surface, h: 44},
+        {t: "text", text: "Headline Small", size: 24, color: on_surface, h: 32},
+        {t: "text", text: "Title Large", size: 21, color: on_surface, h: 28},
+        {t: "text", text: "Body Large \u{2014} the quick brown fox", size: 16, color: on_surf_var, h: 22},
+        {t: "text", text: "LABEL LARGE", size: 13, color: on_surf_var, h: 18},
+    ]),
+
+    section("Color roles", [
+        {t: "row", spacing: 10, c: [
+            swatch(primary, "Primary"),
+            swatch(secondary, "Secondary"),
+            swatch(tertiary, "Tertiary"),
+            swatch(error, "Error"),
+        ]},
+        {t: "row", spacing: 10, c: [
+            swatch(pri_container, "P. Cont"),
+            swatch(sec_container, "S. Cont"),
+            swatch(ter_container, "T. Cont"),
+            swatch(surf_variant, "Surf Var"),
+        ]},
+    ]),
+
+    section("Top app bar", [ appbar("Catalog") ]),
+
+    section("Search", [ searchbar() ]),
+
+    section("Tabs", [
+        {t: "column", c: [
+            {t: "row", c: [ tab_active("Overview"), tab_idle("Specs"), tab_idle("Related") ]},
+            {t: "column", bg: outline_var, h: 1},
+        ]},
+    ]),
+
+    section("Segmented buttons", [
+        {t: "row", c: [ seg_on("Day"), seg_off("Week"), seg_off("Month") ]},
+    ]),
+
+    section("Badges", [
+        {t: "row", spacing: 32, aligny: 0.5, c: [
+            badge("\u{2709}", "3"), badge("\u{2302}", "12"), badge("\u{2605}", "99+"),
+        ]},
+    ]),
+
+    section("Dialog", [ dialog() ]),
+
+    section("Snackbar", [ snackbar() ]),
+
+    section("Menu", [ menu() ]),
+
+    section("Bottom sheet", [ bottom_sheet() ]),
+
+    section("Date picker", [ date_picker() ]),
+
+    section("Time picker", [ time_picker() ]),
+
+    section("Circular progress", [
+        {t: "row", spacing: 20, aligny: 0.5, c: [ ring(), ring(), ring() ]},
+    ]),
+
+    section("Tooltip", [
+        {t: "row", c: [ tooltip() ]},
+    ]),
+
+    section("Divider", [
+        {t: "column", spacing: 12, c: [
+            {t: "text", text: "Content above", size: 14, color: on_surf_var, h: 20},
+            divider(),
+            {t: "text", text: "Content below", size: 14, color: on_surf_var, h: 20},
+        ]},
+    ]),
+
+    section("Bottom app bar", [ bottom_app_bar() ]),
+
+    section("Navigation rail", [ {t: "row", c: [ nav_rail() ]} ]),
+
+    section("Carousel", [ carousel() ]),
+
+    section("Banner", [ banner() ]),
+
+    {t: "text", text: "one VM \u{00b7} one UiNode \u{00b7} makepad native widgets", size: 12, color: primary, h: 30},
+]}

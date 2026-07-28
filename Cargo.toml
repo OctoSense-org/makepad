@@ -10,6 +10,7 @@ workspace.members = [
     "examples/splash_card",
     "examples/splash_catalog",
     "examples/splash_runtime",
+    "examples/material_catalog",
     "examples/slides",
     "examples/isolate",
     "examples/uizoo",
