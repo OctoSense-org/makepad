@@ -542,7 +542,7 @@ fn demo_selection() {
     return demo("Selection controls", [
         section("Checkbox, switch, radio", [
             {t: "checkbox", text: "Checkbox", color: on_surface, h: 34},
-            {t: "toggle", text: "Switch", color: on_surface, h: 34},
+            {t: "toggle", text: "Switch", color: on_surface, h: 40},
             {t: "radio", text: "Radio option A", color: on_surface, h: 34},
             {t: "radio", text: "Radio option B", color: on_surface, h: 34},
         ]),

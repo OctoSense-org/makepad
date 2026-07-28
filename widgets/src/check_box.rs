@@ -227,13 +227,28 @@ script_mod! {
     }
 
     mod.widgets.CheckBox = mod.widgets.CheckBoxFlat{
+        // Material 3 checkbox: 18dp box, 2dp stroke, ~2dp corner. Transparent with
+        // an on-surface-variant outline when unchecked; primary fill + white tick
+        // when checked.
+        label_walk +: { margin: theme.mspace_h_1{left: 28.} }
         draw_bg +: {
-            border_color: theme.color_bevel_inset_1
-            border_color_hover: theme.color_bevel_inset_1_hover
-            border_color_down: theme.color_bevel_inset_1_down
-            border_color_active: theme.color_bevel_inset_1_active
-            border_color_focus: theme.color_bevel_inset_1_focus
+            size: uniform(18.0)
+            border_size: uniform(2.0)
+            border_radius: uniform(4.0)
+            color: #00000000
+            color_hover: #00000000
+            color_down: #00000000
+            color_focus: #00000000
+            color_active: #6750A4
+            border_color: #49454F
+            border_color_hover: #49454F
+            border_color_down: #6750A4
+            border_color_active: #6750A4
+            border_color_focus: #49454F
             border_color_disabled: theme.color_bevel_inset_1_disabled
+            mark_color: #00000000
+            mark_color_active: #FFFFFF
+            mark_color_active_hover: #FFFFFF
         }
     }
 
@@ -330,13 +345,26 @@ script_mod! {
     }
 
     mod.widgets.Toggle = mod.widgets.ToggleFlat{
+        // Material 3 switch colours: surface-variant track + outline thumb when off,
+        // primary track + white thumb when on. Keeps makepad's default pill geometry
+        // — the shader's thumb-carve distorts the pill into a lens at larger sizes.
+        label_walk +: { margin: theme.mspace_h_1{left: 34.} }
         draw_bg +: {
-            border_color: theme.color_bevel_inset_1
-            border_color_hover: theme.color_bevel_inset_1_hover
-            border_color_down: theme.color_bevel_inset_1_down
-            border_color_active: theme.color_bevel_inset_1_active
-            border_color_focus: theme.color_bevel_inset_1_focus
+            color: #E7E0EC
+            color_hover: #E7E0EC
+            color_down: #E7E0EC
+            color_focus: #E7E0EC
+            color_active: #6750A4
+            border_color: #49454F
+            border_color_hover: #49454F
+            border_color_down: #49454F
+            border_color_active: #6750A4
+            border_color_focus: #49454F
             border_color_disabled: theme.color_bevel_inset_1_disabled
+            mark_color: #49454F
+            mark_color_hover: #49454F
+            mark_color_active: #FFFFFF
+            mark_color_active_hover: #FFFFFF
         }
     }
 
