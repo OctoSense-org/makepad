@@ -57,6 +57,9 @@ script_mod! {
             down: instance(0.0)
             disabled: instance(0.0)
 
+            ripple_t: instance(0.0)
+            ripple_color: uniform(theme.color_label_inner)
+
             border_size: uniform(theme.beveling)
             border_radius: uniform(theme.corner_radius)
 
@@ -154,7 +157,7 @@ script_mod! {
                     color_stroke_disabled = mix(self.border_color_disabled, self.border_color_2_disabled, dir)
                 }
 
-                let fill = color_fill
+                let mut fill = color_fill
                     .mix(color_fill_focus, self.focus)
                     .mix(color_fill_hover, self.hover)
                     .mix(color_fill_down, self.down)
@@ -165,6 +168,19 @@ script_mod! {
                     .mix(color_stroke_hover, self.hover)
                     .mix(color_stroke_down, self.down)
                     .mix(color_stroke_disabled, self.disabled)
+
+                // Material touch ripple: a disc expands from the button centre at
+                // steady opacity over the first half of ripple_t, then fades over
+                // the second half (the Material timing). Self-zeroes at t=0 (radius
+                // 0) and t=1 (fade 0), so idle buttons are untouched, no branch.
+                let rip_c = vec2(0.5, 0.5) * self.rect_size
+                let rip_d = length(self.pos * self.rect_size - rip_c)
+                let rip_grow = clamp(self.ripple_t * 2.0, 0.0, 1.0)
+                let rip_fade = 1.0 - clamp(self.ripple_t * 2.0 - 1.0, 0.0, 1.0)
+                let rip_r = rip_grow * length(self.rect_size)
+                let rip_disc = 1.0 - smoothstep(rip_r - 12.0, rip_r, rip_d)
+                let rip_a = rip_disc * rip_fade * 0.28
+                fill = vec4(mix(fill.xyz, self.ripple_color.xyz, rip_a), max(fill.w, rip_a))
 
                 sdf.fill_keep(fill)
                 sdf.stroke(stroke, self.border_size)
@@ -248,6 +264,21 @@ script_mod! {
                     apply: {
                         draw_bg: {focus: 1.0}
                         draw_text: {focus: 1.0}
+                    }
+                }
+            }
+            ripple: {
+                default: @off
+                off: AnimatorState{
+                    from: {all: Forward {duration: 0.0}}
+                    apply: {
+                        draw_bg: {ripple_t: 0.0}
+                    }
+                }
+                on: AnimatorState{
+                    from: {all: Forward {duration: 0.6}}
+                    apply: {
+                        draw_bg: {ripple_t: 1.0}
                     }
                 }
             }
@@ -528,6 +559,9 @@ impl Widget for Button {
                     );
                 }
                 self.animator_play(cx, ids!(hover.down));
+                // Re-trigger the Material ripple from 0 on each fresh press.
+                self.animator_cut(cx, ids!(ripple.off));
+                self.animator_play(cx, ids!(ripple.on));
                 self.set_key_focus(cx);
             }
             Hit::FingerHoverIn(_) => {
