@@ -341,6 +341,12 @@ fn home_screen() {
         {t: "text", text: "Material Catalog", size: 30, color: on_surface, h: 42},
         {t: "text", text: "Splash \u{2192} makepad native \u{00b7} tap a family", size: 14, color: on_surf_var, h: 22},
         {t: "column", h: 6},
+        // Live app state: the button drives a Rust-side counter, re-mounted.
+        {t: "column", bg: white, radius: 16, pad: 16, spacing: 10, c: [
+            {t: "text", text: "Live state \u{00b7} tapped " + tap_count + " times", size: 15, color: on_surface, h: 22},
+            {t: "button", label: "Tap me (+1)", tapto: "act:count", fillw: 1, h: 48},
+        ]},
+        {t: "column", h: 6},
         nav_btn("Buttons", "buttons"),
         nav_btn("Selection controls", "selection"),
         nav_btn("Text fields & sliders", "text"),

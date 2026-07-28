@@ -65,6 +65,8 @@ pub struct App {
     #[rust]
     screen: String,
     #[rust]
+    count: u32,
+    #[rust]
     tick: u32,
     #[rust]
     started: bool,
@@ -82,9 +84,13 @@ impl App {
         let src = Self::current_source();
         self.last_src = src.clone();
         let route = if self.screen.is_empty() { "home" } else { &self.screen };
-        // `nav_route` (not `screen` — that name is reserved/builtin in the VM and
-        // shadows the injected value) carries the active route into the DSL.
-        let full = format!("let nav_route = {route:?}\n{src}");
+        // Inject the active route and live state into the DSL. `nav_route` (not
+        // `screen` — that name is reserved/builtin in the VM and shadows the
+        // injected value) carries the route; `tap_count` is live app state.
+        let full = format!(
+            "let nav_route = {route:?}\nlet tap_count = {}\n{src}",
+            self.count
+        );
         if let Some(node) = splash_render::build(&full, |_vm| {}) {
             let ui = splash_makepad::to_makepad_ui(&node);
             self.ui.widget(cx, ids!(host)).set_text(cx, &ui);
@@ -116,8 +122,15 @@ impl AppMain for App {
             self.tick = self.tick.wrapping_add(1);
             // Navigation: a tapped nav Button wrote its route into `nav_signal`.
             let nav = self.ui.widget(cx, ids!(nav_signal)).text();
-            if !nav.is_empty() && nav != self.screen {
-                self.screen = nav;
+            if !nav.is_empty() {
+                // Consume the signal so each tap fires exactly once.
+                self.ui.widget(cx, ids!(nav_signal)).set_text(cx, "");
+                if nav == "act:count" {
+                    // A live-state action rather than a route change.
+                    self.count = self.count.wrapping_add(1);
+                } else {
+                    self.screen = nav;
+                }
                 self.mount(cx);
             } else if self.tick % 20 == 0 && Self::current_source() != self.last_src {
                 // Hot reload: the pushed catalog changed.
