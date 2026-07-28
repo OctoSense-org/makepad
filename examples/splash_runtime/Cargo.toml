@@ -1,0 +1,19 @@
+[package]
+name = "makepad-example-splash-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "Splash DSL evaluated + translated to makepad widgets at RUNTIME, on device"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", version = "2.0.0" }
+# The shared render backend, consumed on-device. splash-render evaluates the
+# Splash DSL (in makepad-script) into a backend-agnostic UiNode; splash-makepad
+# turns that UiNode into makepad's own UI dialect. A [patch] in the workspace
+# root points their makepad-script at this repo's local one, so the whole app
+# runs on a single VM.
+splash-render = { path = "~/home/Splash-OH-render/crates/splash-render" }
+splash-makepad = { path = "~/home/Splash-OH-render/crates/splash-makepad" }
+
+[[bin]]
+name = "makepad-example-splash-runtime"
+path = "src/main.rs"

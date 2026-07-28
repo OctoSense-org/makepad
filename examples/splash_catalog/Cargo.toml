@@ -1,0 +1,8 @@
+[package]
+name = "makepad-example-splash-catalog"
+version = "0.1.0"
+edition = "2021"
+description = "A widget catalog authored in the Splash DSL, rendered by the makepad backend"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", version = "2.0.0" }
