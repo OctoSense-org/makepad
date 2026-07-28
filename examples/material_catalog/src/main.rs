@@ -66,6 +66,15 @@ pub struct App {
     screen: String,
     #[rust]
     count: u32,
+    // Per-component selection state, injected into the DSL so demos are stateful.
+    #[rust]
+    sel_tab: String,
+    #[rust]
+    sel_seg: String,
+    #[rust]
+    sel_date: String,
+    #[rust]
+    snack: bool,
     #[rust]
     tick: u32,
     #[rust]
@@ -84,12 +93,21 @@ impl App {
         let src = Self::current_source();
         self.last_src = src.clone();
         let route = if self.screen.is_empty() { "home" } else { &self.screen };
-        // Inject the active route and live state into the DSL. `nav_route` (not
-        // `screen` — that name is reserved/builtin in the VM and shadows the
-        // injected value) carries the route; `tap_count` is live app state.
+        let tab = if self.sel_tab.is_empty() { "overview" } else { &self.sel_tab };
+        let seg = if self.sel_seg.is_empty() { "day" } else { &self.sel_seg };
+        let date = if self.sel_date.is_empty() { "11" } else { &self.sel_date };
+        let count = self.count;
+        let snack = if self.snack { 1 } else { 0 };
+        // Inject the active route + live state as a single `let st = {…}` object
+        // (one object binding is reliable where several top-level `let`s drop
+        // bindings in this VM). The DSL reads st.route/st.count/st.tab/… — `st`
+        // avoids the reserved `screen`. Single-line, all-positional to avoid any
+        // format-literal subtlety.
+        // Inject the active route + live state as one `let st = {…}` object; the
+        // DSL reads st.route/st.count/st.tab/… (`st` avoids the reserved `screen`).
         let full = format!(
-            "let nav_route = {route:?}\nlet tap_count = {}\n{src}",
-            self.count
+            "let st = {{ route: {:?}, count: {}, tab: {:?}, seg: {:?}, date: {:?}, snack: {} }}\n{}",
+            route, count, tab, seg, date, snack, src
         );
         if let Some(node) = splash_render::build(&full, |_vm| {}) {
             let ui = splash_makepad::to_makepad_ui(&node);
@@ -121,15 +139,29 @@ impl AppMain for App {
         if self.next_frame.is_event(event).is_some() {
             self.tick = self.tick.wrapping_add(1);
             // Navigation: a tapped nav Button wrote its route into `nav_signal`.
-            let nav = self.ui.widget(cx, ids!(nav_signal)).text();
+            // The signal Label reads back as whitespace (" ") when empty, so trim
+            // it — otherwise a blank signal is treated as a real event and the
+            // route is perpetually reset to " " (→ always home).
+            let nav_raw = self.ui.widget(cx, ids!(nav_signal)).text();
+            let nav = nav_raw.trim();
             if !nav.is_empty() {
                 // Consume the signal so each tap fires exactly once.
                 self.ui.widget(cx, ids!(nav_signal)).set_text(cx, "");
                 if nav == "act:count" {
-                    // A live-state action rather than a route change.
                     self.count = self.count.wrapping_add(1);
+                } else if let Some(v) = nav.strip_prefix("tab:") {
+                    self.sel_tab = v.to_string();
+                } else if let Some(v) = nav.strip_prefix("seg:") {
+                    self.sel_seg = v.to_string();
+                } else if let Some(v) = nav.strip_prefix("date:") {
+                    self.sel_date = v.to_string();
+                } else if nav == "snack:show" {
+                    self.snack = true;
+                } else if nav == "snack:hide" {
+                    self.snack = false;
                 } else {
-                    self.screen = nav;
+                    // Anything else is a route change.
+                    self.screen = nav.to_string();
                 }
                 self.mount(cx);
             } else if self.tick % 20 == 0 && Self::current_source() != self.last_src {

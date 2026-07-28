@@ -334,6 +334,46 @@ fn demo(title, kids) {
     return {t: "column", spacing: 16, c: c}
 }
 
+// ---- interactive (stateful) helpers ----------------------------------------
+// Read injected state (st.tab/st.seg/st.date/snack) and emit Button taps the
+// host turns into a state change + re-mount, so these demos actually respond.
+
+fn itab(label, val) {
+    if val == st.tab { return {t: "button", label: "\u{25CF} " + label, tapto: "tab:" + val, fillw: 1, h: 44} }
+    return {t: "button", label: label, tapto: "tab:" + val, fillw: 1, h: 44}
+}
+fn tab_body() {
+    if st.tab == "specs" { return {t: "text", text: "Specs \u{00b7} 6.5\" OLED \u{00b7} 128 GB \u{00b7} 5000 mAh", size: 15, color: on_surf_var, w: 330, h: 24} }
+    if st.tab == "related" { return {t: "text", text: "Related \u{00b7} cases \u{00b7} chargers \u{00b7} covers", size: 15, color: on_surf_var, w: 330, h: 24} }
+    return {t: "text", text: "Overview \u{00b7} the active tab's content shows here", size: 15, color: on_surf_var, w: 330, h: 24}
+}
+
+fn iseg(label, val) {
+    if val == st.seg { return {t: "button", label: "\u{2713} " + label, tapto: "seg:" + val, fillw: 1, h: 44} }
+    return {t: "button", label: label, tapto: "seg:" + val, fillw: 1, h: 44}
+}
+
+fn isnackbar() {
+    if st.snack == 1 { return {t: "row", bg: argb(255, 50, 47, 55), radius: 8, h: 50, pad: 16, aligny: 0.5, c: [
+        {t: "text", text: "\u{2713}  Photo added to album", size: 14, color: argb(255, 244, 239, 244), fitw: 1},
+    ]} }
+    return {t: "text", text: "(hidden \u{2014} tap Show)", size: 13, color: on_surf_var, h: 20}
+}
+
+fn iday(d) {
+    if d == st.date { return {t: "button", label: "\u{25CF}" + d, tapto: "date:" + d, fillw: 1, h: 40} }
+    return {t: "button", label: d, tapto: "date:" + d, fillw: 1, h: 40}
+}
+fn idate_picker() {
+    return {t: "column", bg: surface, border: 1, bordercolor: outline_var, radius: 16, pad: 16, spacing: 8, c: [
+        {t: "text", text: "March 2026 \u{00b7} tap a day", size: 16, color: on_surface, h: 24},
+        {t: "row", c: [ dhead("S"), dhead("M"), dhead("T"), dhead("W"), dhead("T"), dhead("F"), dhead("S") ]},
+        {t: "row", spacing: 2, c: [ iday("2"), iday("3"), iday("4"), iday("5"), iday("6"), iday("7"), iday("8") ]},
+        {t: "row", spacing: 2, c: [ iday("9"), iday("10"), iday("11"), iday("12"), iday("13"), iday("14"), iday("15") ]},
+        {t: "row", spacing: 2, c: [ iday("16"), iday("17"), iday("18"), iday("19"), iday("20"), iday("21"), iday("22") ]},
+    ]}
+}
+
 // ---- screens ---------------------------------------------------------------
 
 fn home_screen() {
@@ -343,7 +383,7 @@ fn home_screen() {
         {t: "column", h: 6},
         // Live app state: the button drives a Rust-side counter, re-mounted.
         {t: "column", bg: white, radius: 16, pad: 16, spacing: 10, c: [
-            {t: "text", text: "Live state \u{00b7} tapped " + tap_count + " times", size: 15, color: on_surface, h: 22},
+            {t: "text", text: "Live state \u{00b7} tapped " + st.count + " times", size: 15, color: on_surface, h: 22},
             {t: "button", label: "Tap me (+1)", tapto: "act:count", fillw: 1, h: 48},
         ]},
         {t: "column", h: 6},
@@ -370,8 +410,9 @@ fn demo_buttons() {
             ]},
             {t: "row", spacing: 8, c: [ outlined_btn("Outlined"), text_btn("Text") ]},
         ]),
-        section("Segmented buttons", [
-            {t: "row", c: [ seg_on("Day"), seg_off("Week"), seg_off("Month") ]},
+        section("Segmented buttons (tap to select)", [
+            {t: "row", spacing: 4, c: [ iseg("Day", "day"), iseg("Week", "week"), iseg("Month", "month") ]},
+            {t: "text", text: "Showing: " + st.seg, size: 13, color: on_surf_var, h: 18},
         ]),
         section("Floating action buttons", [
             {t: "row", spacing: 16, aligny: 0.5, c: [
@@ -448,11 +489,10 @@ fn demo_nav() {
             ]},
         ]),
         section("Navigation rail", [ {t: "row", c: [ nav_rail() ]} ]),
-        section("Tabs", [
-            {t: "column", c: [
-                {t: "row", c: [ tab_active("Overview"), tab_idle("Specs"), tab_idle("Related") ]},
-                {t: "column", bg: outline_var, h: 1},
-            ]},
+        section("Tabs (tap to switch)", [
+            {t: "row", spacing: 4, c: [ itab("Overview", "overview"), itab("Specs", "specs"), itab("Related", "related") ]},
+            {t: "column", bg: outline_var, h: 1},
+            tab_body(),
         ]),
     ])
 }
@@ -460,7 +500,13 @@ fn demo_nav() {
 fn demo_comms() {
     return demo("Dialogs & communication", [
         section("Dialog", [ dialog() ]),
-        section("Snackbar", [ snackbar() ]),
+        section("Snackbar (show / hide)", [
+            {t: "row", spacing: 8, c: [
+                {t: "button", label: "Show", tapto: "snack:show", fillw: 1, h: 48},
+                {t: "button", label: "Hide", tapto: "snack:hide", fillw: 1, h: 48},
+            ]},
+            isnackbar(),
+        ]),
         section("Menu", [ menu() ]),
         section("Bottom sheet", [ bottom_sheet() ]),
         section("Tooltip", [ {t: "row", c: [ tooltip() ]} ]),
@@ -475,7 +521,7 @@ fn demo_comms() {
 
 fn demo_pickers() {
     return demo("Date & time pickers", [
-        section("Date picker", [ date_picker() ]),
+        section("Date picker (tap a day)", [ idate_picker() ]),
         section("Time picker", [ time_picker() ]),
     ])
 }
@@ -535,4 +581,4 @@ fn body(s) {
 // A hidden `nav_signal` Label the host reads for routing, plus the active
 // screen (chosen by the injected `let screen = "..."`).
 
-{t: "column", pad: 16, c: [ body(nav_route) ]}
+{t: "column", pad: 16, c: [ body(st.route) ]}
