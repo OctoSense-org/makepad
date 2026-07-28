@@ -391,6 +391,32 @@ fn elev_sw(c, label) {
     ]}
 }
 
+// Material cards: elevated (real drop shadow), filled, outlined.
+fn card_elevated(title, body) {
+    // The shadow view doesn't render children, so layer it behind the content:
+    // a filling RoundedShadowView (bg + drop shadow) with the content on top.
+    return {t: "stack", c: [
+        {t: "column", bg: white, elevation: 3, radius: 12, fillh: 1},
+        {t: "column", pad: 16, spacing: 6, c: [
+            {t: "text", text: title, size: 16, color: on_surface, h: 24},
+            {t: "text", text: body, size: 14, color: on_surf_var, w: 300, h: 44},
+            {t: "row", spacing: 8, c: [ {t: "column", c: []}, text_btn("Open") ]},
+        ]},
+    ]}
+}
+fn card_filled(title, body) {
+    return {t: "column", bg: surf_variant, radius: 12, pad: 16, spacing: 6, c: [
+        {t: "text", text: title, size: 16, color: on_surface, h: 24},
+        {t: "text", text: body, size: 14, color: on_surf_var, w: 300, h: 44},
+    ]}
+}
+fn card_outlined(title, body) {
+    return {t: "column", bg: white, border: 1, bordercolor: outline_var, radius: 12, pad: 16, spacing: 6, c: [
+        {t: "text", text: title, size: 16, color: on_surface, h: 24},
+        {t: "text", text: body, size: 14, color: on_surf_var, w: 300, h: 44},
+    ]}
+}
+
 // ---- catalog ---------------------------------------------------------------
 
 // ---- navigation ------------------------------------------------------------
@@ -542,10 +568,9 @@ fn demo_chips() {
 fn demo_cards() {
     return demo("Cards & lists", [
         section("Cards", [
-            {t: "row", spacing: 12, c: [
-                tile("Elevated", "Filled surface tone", surf_cont, 0),
-                tile("Outlined", "1dp outline variant", surface, 1),
-            ]},
+            card_elevated("Elevated card", "Rests on the surface with a soft drop shadow \u{2014} tap Open."),
+            card_filled("Filled card", "A filled container with no elevation, on the highest surface tone."),
+            card_outlined("Outlined card", "A 1dp outline and no elevation \u{2014} the lowest-emphasis card."),
         ]),
         section("Lists", [
             list_item("A", "Ada Lovelace", "Analytical engine"),
