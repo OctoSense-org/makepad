@@ -76,6 +76,8 @@ pub struct App {
     #[rust]
     snack: bool,
     #[rust]
+    dark: bool,
+    #[rust]
     tick: u32,
     #[rust]
     started: bool,
@@ -98,16 +100,14 @@ impl App {
         let date = if self.sel_date.is_empty() { "11" } else { &self.sel_date };
         let count = self.count;
         let snack = if self.snack { 1 } else { 0 };
+        let dark = if self.dark { 1 } else { 0 };
         // Inject the active route + live state as a single `let st = {…}` object
         // (one object binding is reliable where several top-level `let`s drop
-        // bindings in this VM). The DSL reads st.route/st.count/st.tab/… — `st`
-        // avoids the reserved `screen`. Single-line, all-positional to avoid any
-        // format-literal subtlety.
-        // Inject the active route + live state as one `let st = {…}` object; the
-        // DSL reads st.route/st.count/st.tab/… (`st` avoids the reserved `screen`).
+        // bindings in this VM). The DSL reads st.route/st.count/st.tab/…/st.dark —
+        // `st` avoids the reserved `screen`. Single-line, all-positional.
         let full = format!(
-            "let st = {{ route: {:?}, count: {}, tab: {:?}, seg: {:?}, date: {:?}, snack: {} }}\n{}",
-            route, count, tab, seg, date, snack, src
+            "let st = {{ route: {:?}, count: {}, tab: {:?}, seg: {:?}, date: {:?}, snack: {}, dark: {} }}\n{}",
+            route, count, tab, seg, date, snack, dark, src
         );
         if let Some(node) = splash_render::build(&full, |_vm| {}) {
             let ui = splash_makepad::to_makepad_ui(&node);
@@ -159,6 +159,8 @@ impl AppMain for App {
                     self.snack = true;
                 } else if nav == "snack:hide" {
                     self.snack = false;
+                } else if nav == "theme:toggle" {
+                    self.dark = !self.dark;
                 } else {
                     // Anything else is a route change.
                     self.screen = nav.to_string();

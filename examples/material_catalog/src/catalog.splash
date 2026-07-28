@@ -2,25 +2,30 @@
 // as makepad native widgets. Colours follow the M3 baseline light scheme.
 
 fn argb(a, r, g, b) { return ((a * 256 + r) * 256 + g) * 256 + b }
+// Pick dark (a) or light (b) by the injected st.dark flag.
+fn pick(d, a, b) { if d == 1 { return a } return b }
+let dk = st.dark
 
-let primary        = argb(255, 103,  80, 164)   // #6750A4
-let on_primary     = argb(255, 255, 255, 255)
-let pri_container  = argb(255, 234, 221, 255)   // #EADDFF
-let on_pri_cont    = argb(255,  33,   0,  93)   // #21005D
-let secondary      = argb(255,  98,  91, 113)   // #625B71
-let sec_container  = argb(255, 232, 222, 248)   // #E8DEF8
-let on_sec_cont    = argb(255,  29,  25,  43)   // #1D192B
-let tertiary       = argb(255, 125,  82,  96)   // #7D5260
-let ter_container  = argb(255, 255, 216, 228)   // #FFD8E4
-let surface        = argb(255, 254, 247, 255)   // #FEF7FF
-let surf_variant   = argb(255, 231, 224, 236)   // #E7E0EC
-let surf_cont      = argb(255, 243, 237, 247)   // container tone
-let on_surface     = argb(255,  29,  27,  32)   // #1D1B20
-let on_surf_var    = argb(255,  73,  69,  79)   // #49454F
-let outline        = argb(255, 121, 116, 126)   // #79747E
-let outline_var    = argb(255, 202, 196, 208)   // #CAC4D0
-let error          = argb(255, 179,  38,  30)   // #B3261E
-let white          = argb(255, 255, 255, 255)
+// M3 baseline palette — dark / light selected by st.dark.
+let primary       = pick(dk, argb(255, 208, 188, 255), argb(255, 103,  80, 164))
+let on_primary    = pick(dk, argb(255,  56,  30, 114), argb(255, 255, 255, 255))
+let pri_container = pick(dk, argb(255,  79,  55, 139), argb(255, 234, 221, 255))
+let on_pri_cont   = pick(dk, argb(255, 234, 221, 255), argb(255,  33,   0,  93))
+let secondary     = pick(dk, argb(255, 204, 194, 220), argb(255,  98,  91, 113))
+let sec_container = pick(dk, argb(255,  74,  68,  88), argb(255, 232, 222, 248))
+let on_sec_cont   = pick(dk, argb(255, 232, 222, 248), argb(255,  29,  25,  43))
+let tertiary      = pick(dk, argb(255, 239, 184, 200), argb(255, 125,  82,  96))
+let ter_container = pick(dk, argb(255,  99,  59,  72), argb(255, 255, 216, 228))
+let surface       = pick(dk, argb(255,  20,  18,  24), argb(255, 254, 247, 255))
+let surf_variant  = pick(dk, argb(255,  73,  69,  79), argb(255, 231, 224, 236))
+let surf_cont     = pick(dk, argb(255,  33,  31,  38), argb(255, 243, 237, 247))
+let on_surface    = pick(dk, argb(255, 230, 224, 233), argb(255,  29,  27,  32))
+let on_surf_var   = pick(dk, argb(255, 202, 196, 208), argb(255,  73,  69,  79))
+let outline       = pick(dk, argb(255, 147, 143, 153), argb(255, 121, 116, 126))
+let outline_var   = pick(dk, argb(255,  73,  69,  79), argb(255, 202, 196, 208))
+let error         = pick(dk, argb(255, 242, 184, 181), argb(255, 179,  38,  30))
+let white         = pick(dk, argb(255,  33,  31,  38), argb(255, 255, 255, 255))   // card surface
+let page          = pick(dk, argb(255,  20,  18,  24), argb(255, 254, 247, 255))   // page background
 
 // ---- component helpers -----------------------------------------------------
 
@@ -381,10 +386,13 @@ fn home_screen() {
         {t: "text", text: "Material Catalog", size: 30, color: on_surface, h: 42},
         {t: "text", text: "Splash \u{2192} makepad native \u{00b7} tap a family", size: 14, color: on_surf_var, h: 22},
         {t: "column", h: 6},
-        // Live app state: the button drives a Rust-side counter, re-mounted.
+        // Live app state: the buttons drive Rust-side state, re-mounted.
         {t: "column", bg: white, radius: 16, pad: 16, spacing: 10, c: [
             {t: "text", text: "Live state \u{00b7} tapped " + st.count + " times", size: 15, color: on_surface, h: 22},
-            {t: "button", label: "Tap me (+1)", tapto: "act:count", fillw: 1, h: 48},
+            {t: "row", spacing: 8, c: [
+                {t: "button", label: "Tap me (+1)", tapto: "act:count", fillw: 1, h: 48},
+                {t: "button", label: "Toggle theme", tapto: "theme:toggle", fillw: 1, h: 48},
+            ]},
         ]},
         {t: "column", h: 6},
         nav_btn("Buttons", "buttons"),
@@ -431,10 +439,10 @@ fn demo_buttons() {
 fn demo_selection() {
     return demo("Selection controls", [
         section("Checkbox, switch, radio", [
-            {t: "checkbox", text: "Checkbox", h: 34},
-            {t: "toggle", text: "Switch", h: 34},
-            {t: "radio", text: "Radio option A", h: 34},
-            {t: "radio", text: "Radio option B", h: 34},
+            {t: "checkbox", text: "Checkbox", color: on_surface, h: 34},
+            {t: "toggle", text: "Switch", color: on_surface, h: 34},
+            {t: "radio", text: "Radio option A", color: on_surface, h: 34},
+            {t: "radio", text: "Radio option B", color: on_surface, h: 34},
         ]),
     ])
 }
@@ -446,7 +454,7 @@ fn demo_text() {
             {t: "input", placeholder: "Another field", h: 50},
         ]),
         section("Search", [ searchbar() ]),
-        section("Sliders", [ {t: "slider", text: "Continuous", h: 44} ]),
+        section("Sliders", [ {t: "slider", text: "Continuous", color: on_surface, h: 44} ]),
     ])
 }
 
@@ -581,4 +589,4 @@ fn body(s) {
 // A hidden `nav_signal` Label the host reads for routing, plus the active
 // screen (chosen by the injected `let screen = "..."`).
 
-{t: "column", pad: 16, c: [ body(st.route) ]}
+{t: "column", bg: page, pad: 16, c: [ body(st.route) ]}
