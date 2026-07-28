@@ -175,14 +175,14 @@ fn badge(icon, count) {
 
 // A basic dialog — 28dp corner, 24dp padding, Headline Small title, Body Medium.
 fn dialog() {
-    return {t: "column", bg: surf_high, radius: 28, pad: 24, spacing: 16, c: [
+    return {t: "column", bg: surf_high, radius: 28, pad: 24, spacing: 16, w: 320, c: [
         {t: "text", text: "Reset settings?", size: 24, color: on_surface, h: 32},
         {t: "text", text: "This will restore default values for every preference in this app.",
-         size: 14, color: on_surf_var, w: 280, h: 44},
+         size: 14, color: on_surf_var, w: 272, h: 44},
         {t: "row", spacing: 8, aligny: 0.5, c: [
             {t: "column", c: []},
-            text_btn("Cancel"),
-            text_btn("Reset"),
+            {t: "button", label: "Cancel", tapto: "open:", fitw: 1, h: 40},
+            {t: "button", label: "Reset", tapto: "open:", fitw: 1, h: 40},
         ]},
     ]}
 }
@@ -195,11 +195,12 @@ fn sheet_row(icon, txt) {
     ]}
 }
 fn bottom_sheet() {
-    return {t: "column", bg: surf_low, radius: 28, pad: 16, spacing: 4, alignx: 0.5, c: [
+    return {t: "column", bg: surf_low, radius: 28, pad: 16, spacing: 8, alignx: 0.5, fillw: 1, c: [
         {t: "column", bg: outline_var, radius: 2, w: 32, h: 4},
         sheet_row("\u{f005}", "Add to favourites"),
         sheet_row("\u{f0e0}", "Share via email"),
         sheet_row("\u{f044}", "Edit label"),
+        {t: "button", label: "Close", tapto: "open:", fillw: 1, h: 44},
     ]}
 }
 
@@ -333,24 +334,25 @@ fn drawer_item(icon, label, pill, ink) {
     ]}
 }
 fn nav_drawer() {
-    return {t: "column", bg: surf_low, radius: 16, pad: 12, spacing: 4, c: [
+    return {t: "column", bg: surf_low, radius: 16, pad: 12, spacing: 4, w: 300, c: [
         {t: "text", text: "Mail", size: 14, weight: 500, color: on_surf_var, h: 40, padx: 16},
         drawer_item("\u{f01c}", "Inbox", sec_container, on_sec_cont),
         drawer_item("\u{f005}", "Starred", surf_low, on_surf_var),
         drawer_item("\u{f1d8}", "Sent", surf_low, on_surf_var),
         drawer_item("\u{f15c}", "Drafts", surf_low, on_surf_var),
+        {t: "button", label: "Close", tapto: "open:", fillw: 1, h: 44},
     ]}
 }
 
 // A side sheet: title bar + supporting text + filter chips.
 fn side_sheet() {
-    return {t: "column", bg: surf_low, radius: 16, pad: 16, spacing: 12, c: [
+    return {t: "column", bg: surf_low, radius: 16, pad: 16, spacing: 12, w: 300, c: [
         {t: "row", aligny: 0.5, c: [
             {t: "text", text: "Filters", size: 16, weight: 500, color: on_surface, fitw: 1},
             {t: "column", c: []},
-            {t: "text", text: "\u{f00d}", icon: 1, size: 18, color: on_surf_var, fitw: 1},
+            {t: "button", label: "\u{f00d}", icon: 1, size: 18, tapto: "open:", fitw: 1, h: 40},
         ]},
-        {t: "text", text: "Refine results with the options below.", size: 14, color: on_surf_var, w: 300, h: 22},
+        {t: "text", text: "Refine results with the options below.", size: 14, color: on_surf_var, w: 260, h: 22},
         {t: "row", spacing: 8, c: [ chip("Unread"), chip("Starred"), chip_sel("Has files") ]},
     ]}
 }
@@ -507,6 +509,7 @@ fn home_screen() {
         nav_btn("Date & time pickers", "pickers"),
         nav_btn("Progress", "progress"),
         nav_btn("Typography & color", "type"),
+        nav_btn("Toolbars & motion", "more"),
     ]}
 }
 
@@ -599,8 +602,12 @@ fn demo_nav() {
             ]},
         ]),
         section("Navigation rail", [ {t: "row", c: [ nav_rail() ]} ]),
-        section("Navigation drawer", [ nav_drawer() ]),
-        section("Side sheet", [ side_sheet() ]),
+        section("Navigation drawer (tap)", [
+            {t: "button", label: "Open drawer", tapto: "open:drawer", fitw: 1, h: 40},
+        ]),
+        section("Side sheet (tap)", [
+            {t: "button", label: "Open side sheet", tapto: "open:side", fitw: 1, h: 40},
+        ]),
         section("Tabs (tap to switch)", [
             {t: "row", spacing: 4, c: [ itab("Overview", "overview"), itab("Specs", "specs"), itab("Related", "related") ]},
             {t: "column", bg: outline_var, h: 1},
@@ -611,7 +618,9 @@ fn demo_nav() {
 
 fn demo_comms() {
     return demo("Dialogs & communication", [
-        section("Dialog", [ dialog() ]),
+        section("Dialog (tap)", [
+            {t: "button", label: "Show dialog", tapto: "open:dialog", fitw: 1, h: 40},
+        ]),
         section("Snackbar (show / hide)", [
             {t: "row", spacing: 8, c: [
                 {t: "button", label: "Show", tapto: "snack:show", fillw: 1, h: 40},
@@ -619,9 +628,17 @@ fn demo_comms() {
             ]},
             isnackbar(),
         ]),
-        section("Menu", [ menu() ]),
-        section("Bottom sheet", [ bottom_sheet() ]),
-        section("Tooltip", [ {t: "row", c: [ tooltip() ]} ]),
+        section("Menu (tap)", [
+            {t: "button", label: "Open menu", tapto: "open:menu", fitw: 1, h: 40},
+            imenu(),
+        ]),
+        section("Bottom sheet (tap)", [
+            {t: "button", label: "Show bottom sheet", tapto: "open:sheet", fitw: 1, h: 40},
+        ]),
+        section("Tooltip (tap)", [
+            {t: "button", label: "Toggle tooltip", tapto: "open:tooltip", fitw: 1, h: 40},
+            itooltip(),
+        ]),
         section("Banner", [ banner() ]),
         section("Badges", [
             {t: "row", spacing: 32, aligny: 0.5, c: [
@@ -693,6 +710,98 @@ fn demo_type() {
     ])
 }
 
+// ---- interactive overlays + new components (st.open = the one open overlay) --
+// Real behaviour, not static mocks: a trigger Button sets st.open; the DSL renders
+// the overlay and a Button inside clears it. The host Splash is height:Fit, so a
+// Fill scrim would collapse — use a fixed tall scrim to cover the viewport.
+
+fn modal_over(content, ay) {
+    return {t: "stack", fillw: 1, c: [
+        {t: "column", bg: argb(150, 0, 0, 0), fillw: 1, h: 820},
+        {t: "column", fillw: 1, h: 820, alignx: 0.5, aligny: ay, pad: 16, c: [ content ]},
+    ]}
+}
+fn modal_edge(content, ax) {
+    return {t: "stack", fillw: 1, c: [
+        {t: "column", bg: argb(150, 0, 0, 0), fillw: 1, h: 820},
+        {t: "row", fillw: 1, h: 820, alignx: ax, aligny: 0.0, c: [ content ]},
+    ]}
+}
+// The root overlay layer — a real modal when st.open names one, else nothing.
+fn overlay() {
+    if st.open == "dialog" { return modal_over(dialog(), 0.5) }
+    if st.open == "sheet"  { return modal_over(bottom_sheet(), 1.0) }
+    if st.open == "drawer" { return modal_edge(nav_drawer(), 0.0) }
+    if st.open == "side"   { return modal_edge(side_sheet(), 1.0) }
+    return {t: "column", c: []}
+}
+
+// Dropdown menus that actually open/close; each item taps to dismiss.
+fn menu_btn(txt) { return {t: "button", label: txt, tapto: "open:", fillw: 1, h: 44} }
+fn imenu() {
+    if st.open != "menu" { return {t: "column", h: 0} }
+    return {t: "column", bg: surf_cont, border: 1, bordercolor: outline_var, radius: 4, pad: 8, w: 220, spacing: 2, c: [
+        menu_btn("Edit"), menu_btn("Duplicate"), menu_btn("Share"), menu_btn("Delete"),
+    ]}
+}
+fn ioverflow() {
+    if st.open != "overflow" { return {t: "column", h: 0} }
+    return {t: "column", alignx: 1.0, c: [
+        {t: "column", bg: surf_cont, border: 1, bordercolor: outline_var, radius: 4, pad: 8, w: 210, spacing: 2, c: [
+            menu_btn("Settings"), menu_btn("Help & feedback"), menu_btn("Sign out"),
+        ]},
+    ]}
+}
+fn itooltip() {
+    if st.open != "tooltip" { return {t: "column", h: 0} }
+    return {t: "row", c: [ tooltip() ]}
+}
+
+// A real (tappable, rippling) icon button — the Button label renders in the icon
+// font via icon:1, and each tap bumps the live counter so the ripple fires.
+fn tool_btn(icon) { return {t: "button", label: icon, icon: 1, size: 20, tapto: "act:count", fitw: 1, h: 48} }
+fn docked_toolbar() {
+    return {t: "row", bg: surf_cont, radius: 16, pad: 8, h: 64, spacing: 4, aligny: 0.5, c: [
+        tool_btn("\u{f0c9}"), tool_btn("\u{f005}"), tool_btn("\u{f0e0}"), tool_btn("\u{f044}"),
+        {t: "column", c: []},
+        tool_btn("\u{f067}"),
+    ]}
+}
+fn floating_toolbar() {
+    return {t: "row", bg: pri_container, radius: 28, pad: 8, fitw: 1, spacing: 4, aligny: 0.5, c: [
+        tool_btn("\u{f068}"), tool_btn("\u{f067}"), tool_btn("\u{f0c1}"),
+    ]}
+}
+
+// Motion — a real container-transform-style expand/collapse (state-driven, so the
+// swap is instant; the re-mount pipeline can't tween).
+fn imotion() {
+    if st.open == "motion" {
+        return {t: "column", bg: pri_container, radius: 16, pad: 16, spacing: 8, c: [
+            {t: "text", text: "Expanded surface", size: 16, weight: 500, color: on_pri_cont, h: 24},
+            {t: "text", text: "The tapped card transformed into this larger surface. Tap collapse to return.", size: 14, color: on_pri_cont, w: 300, h: 44},
+            {t: "button", label: "Collapse", tapto: "open:", fitw: 1, h: 40},
+        ]}
+    }
+    return {t: "row", c: [ {t: "button", label: "Expand card", tapto: "open:motion", fitw: 1, h: 40} ]}
+}
+
+fn demo_more() {
+    return demo("Toolbars & motion", [
+        section("Docked toolbar", [ docked_toolbar() ]),
+        section("Floating toolbar", [ {t: "row", c: [ floating_toolbar() ]} ]),
+        section("Overflow menu (tap)", [
+            {t: "row", spacing: 8, aligny: 0.5, c: [
+                {t: "text", text: "Actions", size: 14, color: on_surface, fitw: 1},
+                {t: "column", c: []},
+                {t: "button", label: "\u{f142}", icon: 1, size: 20, tapto: "open:overflow", fitw: 1, h: 44},
+            ]},
+            ioverflow(),
+        ]),
+        section("Motion \u{00b7} container transform (tap)", [ imotion() ]),
+    ])
+}
+
 // Route the injected `screen` to the matching demo, defaulting to home.
 fn body(s) {
     if s == "buttons" { return demo_buttons() }
@@ -705,8 +814,13 @@ fn body(s) {
     if s == "pickers" { return demo_pickers() }
     if s == "progress" { return demo_progress() }
     if s == "type" { return demo_type() }
+    if s == "more" { return demo_more() }
     return home_screen()
 }
 
 // ---- root ------------------------------------------------------------------
-{t: "column", bg: page, pad: 16, spacing: 16, c: [ body(st.route) ]}
+// The screen, with a real modal overlay stacked on top when st.open is set.
+{t: "stack", fillw: 1, c: [
+    {t: "column", bg: page, pad: 16, spacing: 16, c: [ body(st.route) ]},
+    overlay(),
+]}

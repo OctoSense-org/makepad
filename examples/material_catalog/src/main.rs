@@ -77,6 +77,11 @@ pub struct App {
     snack: bool,
     #[rust]
     dark: bool,
+    // Which overlay/expander is currently open (dialog, menu, sheet, drawer,
+    // sidesheet, overflow, tooltip, motion, "") — one at a time, so opening one
+    // closes the rest. Drives real show/hide/dismiss, not a static mock.
+    #[rust]
+    open: String,
     #[rust]
     tick: u32,
     #[rust]
@@ -101,13 +106,14 @@ impl App {
         let count = self.count;
         let snack = if self.snack { 1 } else { 0 };
         let dark = if self.dark { 1 } else { 0 };
+        let open = self.open.as_str();
         // Inject the active route + live state as a single `let st = {…}` object
         // (one object binding is reliable where several top-level `let`s drop
         // bindings in this VM). The DSL reads st.route/st.count/st.tab/…/st.dark —
         // `st` avoids the reserved `screen`. Single-line, all-positional.
         let full = format!(
-            "let st = {{ route: {:?}, count: {}, tab: {:?}, seg: {:?}, date: {:?}, snack: {}, dark: {} }}\n{}",
-            route, count, tab, seg, date, snack, dark, src
+            "let st = {{ route: {:?}, count: {}, tab: {:?}, seg: {:?}, date: {:?}, snack: {}, dark: {}, open: {:?} }}\n{}",
+            route, count, tab, seg, date, snack, dark, open, src
         );
         if let Some(node) = splash_render::build(&full, |_vm| {}) {
             let ui = splash_makepad::to_makepad_ui(&node);
@@ -161,9 +167,13 @@ impl AppMain for App {
                     self.snack = false;
                 } else if nav == "theme:toggle" {
                     self.dark = !self.dark;
+                } else if let Some(v) = nav.strip_prefix("open:") {
+                    // Open/close an overlay or expander (one at a time).
+                    self.open = v.to_string();
                 } else {
-                    // Anything else is a route change.
+                    // Anything else is a route change; close any open overlay.
                     self.screen = nav.to_string();
+                    self.open = String::new();
                 }
                 self.mount(cx);
             } else if self.tick % 20 == 0 && Self::current_source() != self.last_src {
