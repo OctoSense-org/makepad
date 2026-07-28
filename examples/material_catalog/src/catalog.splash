@@ -320,6 +320,77 @@ fn banner() {
     ]}
 }
 
+// A navigation-drawer destination + the modal drawer.
+fn drawer_item(icon, label, pill, ink) {
+    return {t: "row", bg: pill, radius: 28, h: 48, pad: 16, spacing: 16, aligny: 0.5, c: [
+        {t: "text", text: icon, size: 18, color: ink, fitw: 1},
+        {t: "text", text: label, size: 15, color: ink, fitw: 1},
+    ]}
+}
+fn nav_drawer() {
+    return {t: "column", bg: surf_cont, radius: 16, pad: 12, spacing: 4, c: [
+        {t: "text", text: "Mail", size: 20, color: on_surface, h: 40, pad: 8},
+        drawer_item("\u{2302}", "Inbox", sec_container, on_sec_cont),
+        drawer_item("\u{2606}", "Starred", surf_cont, on_surf_var),
+        drawer_item("\u{2709}", "Sent", surf_cont, on_surf_var),
+        drawer_item("\u{1F4DD}", "Drafts", surf_cont, on_surf_var),
+    ]}
+}
+
+// A side sheet: title bar + supporting text + filter chips.
+fn side_sheet() {
+    return {t: "column", bg: surf_cont, radius: 16, pad: 16, spacing: 12, c: [
+        {t: "row", aligny: 0.5, c: [
+            {t: "text", text: "Filters", size: 18, color: on_surface, fitw: 1},
+            {t: "column", c: []},
+            {t: "text", text: "\u{00d7}", size: 22, color: on_surf_var, fitw: 1},
+        ]},
+        {t: "text", text: "Refine results with the options below.", size: 14, color: on_surf_var, w: 300, h: 22},
+        {t: "row", spacing: 8, c: [ chip("Unread"), chip("Starred"), chip_sel("Has files") ]},
+    ]}
+}
+
+// An expanded search view: back + query, divider, result rows.
+fn search_row(txt) {
+    return {t: "row", h: 44, spacing: 14, aligny: 0.5, c: [
+        {t: "text", text: "\u{1F550}", size: 15, color: on_surf_var, fitw: 1},
+        {t: "text", text: txt, size: 15, color: on_surface, fitw: 1},
+    ]}
+}
+fn search_view() {
+    return {t: "column", bg: surf_cont, radius: 28, pad: 16, spacing: 8, c: [
+        {t: "row", spacing: 14, aligny: 0.5, c: [
+            {t: "text", text: "\u{2190}", size: 20, color: on_surf_var, fitw: 1},
+            {t: "text", text: "project", size: 16, color: on_surface, fitw: 1},
+        ]},
+        {t: "column", bg: outline_var, h: 1},
+        search_row("project plan.pdf"),
+        search_row("project timeline"),
+    ]}
+}
+
+// A contained loading indicator (mock of M3's animated shape).
+fn loading_indicator() {
+    return {t: "column", bg: pri_container, radius: 14, w: 48, h: 48, alignx: 0.5, aligny: 0.5, c: [
+        {t: "column", bg: primary, radius: 8, w: 22, h: 22},
+    ]}
+}
+
+// A shape-scale swatch (increasing corner radius).
+fn shape_sw(r, label) {
+    return {t: "column", fitw: 1, spacing: 4, c: [
+        {t: "column", bg: pri_container, radius: r, w: 60, h: 52},
+        {t: "text", text: label, size: 11, color: on_surf_var, h: 14},
+    ]}
+}
+// A tonal-elevation swatch.
+fn elev_sw(c, label) {
+    return {t: "column", fitw: 1, spacing: 4, c: [
+        {t: "column", bg: c, border: 1, bordercolor: outline_var, radius: 12, w: 60, h: 52},
+        {t: "text", text: label, size: 11, color: on_surf_var, h: 14},
+    ]}
+}
+
 // ---- catalog ---------------------------------------------------------------
 
 // ---- navigation ------------------------------------------------------------
@@ -453,7 +524,8 @@ fn demo_text() {
             {t: "input", placeholder: "Filled text field", h: 50},
             {t: "input", placeholder: "Another field", h: 50},
         ]),
-        section("Search", [ searchbar() ]),
+        section("Search bar", [ searchbar() ]),
+        section("Search view", [ search_view() ]),
         section("Sliders", [ {t: "slider", text: "Continuous", color: on_surface, h: 44} ]),
     ])
 }
@@ -497,6 +569,8 @@ fn demo_nav() {
             ]},
         ]),
         section("Navigation rail", [ {t: "row", c: [ nav_rail() ]} ]),
+        section("Navigation drawer", [ nav_drawer() ]),
+        section("Side sheet", [ side_sheet() ]),
         section("Tabs (tap to switch)", [
             {t: "row", spacing: 4, c: [ itab("Overview", "overview"), itab("Specs", "specs"), itab("Related", "related") ]},
             {t: "column", bg: outline_var, h: 1},
@@ -545,6 +619,11 @@ fn demo_progress() {
         section("Circular", [
             {t: "row", spacing: 20, aligny: 0.5, c: [ ring(), ring(), ring() ]},
         ]),
+        section("Loading indicator", [
+            {t: "row", spacing: 16, aligny: 0.5, c: [
+                loading_indicator(), loading_indicator(), loading_indicator(),
+            ]},
+        ]),
     ])
 }
 
@@ -565,6 +644,18 @@ fn demo_type() {
             {t: "row", spacing: 10, c: [
                 swatch(pri_container, "P. Cont"), swatch(sec_container, "S. Cont"),
                 swatch(ter_container, "T. Cont"), swatch(surf_variant, "Surf Var"),
+            ]},
+        ]),
+        section("Shape", [
+            {t: "row", spacing: 8, c: [
+                shape_sw(0, "None"), shape_sw(4, "XS"), shape_sw(8, "S"),
+                shape_sw(16, "M"), shape_sw(28, "L"),
+            ]},
+        ]),
+        section("Elevation", [
+            {t: "row", spacing: 10, c: [
+                elev_sw(surface, "0"), elev_sw(surf_cont, "1"),
+                elev_sw(surf_variant, "3"), elev_sw(sec_container, "5"),
             ]},
         ]),
     ])
