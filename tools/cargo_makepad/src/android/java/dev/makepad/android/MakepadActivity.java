@@ -1744,7 +1744,12 @@ public class MakepadActivity
                     final double lon = loc.getLongitude();
                     final float acc = loc.hasAccuracy() ? loc.getAccuracy() : 0.0f;
                     runOnUiThread(new Runnable() {
-                        @Override public void run() { MakepadNative.onLocation(lat, lon, acc); }
+                        @Override public void run() {
+                            // Apps that do not consume location don't implement the
+                            // native onLocation; a stray fix must not crash them.
+                            try { MakepadNative.onLocation(lat, lon, acc); }
+                            catch (Throwable t) { /* no location consumer */ }
+                        }
                     });
                 }
                 // Required by the LocationListener interface on older API levels.
