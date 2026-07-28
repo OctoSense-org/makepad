@@ -317,167 +317,216 @@ fn banner() {
 
 // ---- catalog ---------------------------------------------------------------
 
-{t: "column", pad: 16, spacing: 16, c: [
+// ---- navigation ------------------------------------------------------------
 
-    // header
-    {t: "column", spacing: 2, c: [
-        {t: "text", text: "Material Catalog", size: 30, color: on_surface, h: 40},
-        {t: "text", text: "Material 3 \u{00b7} hot-reloaded on device", size: 14, color: on_surf_var, h: 20},
-    ]},
+// A full-width nav row (Button) that routes to a demo screen on tap.
+fn nav_btn(label, route) {
+    return {t: "button", label: label, tapto: route, fillw: 1, h: 52}
+}
+// A back button that routes to the home screen.
+fn back_btn() {
+    return {t: "button", label: "\u{2039}  Back", tapto: "home", fitw: 1, h: 40}
+}
+// A demo screen shell: back button + big title + the family's sections.
+fn demo(title, kids) {
+    let c = [ back_btn(), {t: "text", text: title, size: 28, color: on_surface, h: 42} ]
+    for k in kids { c.push(k) }
+    return {t: "column", spacing: 16, c: c}
+}
 
-    section("Common buttons", [
-        {t: "row", spacing: 8, c: [
-            btn("Filled", primary, on_primary),
-            btn("Tonal", sec_container, on_sec_cont),
-            btn("Elevated", surf_cont, primary),
-        ]},
-        {t: "row", spacing: 8, c: [
-            outlined_btn("Outlined"),
-            text_btn("Text"),
-        ]},
-    ]),
+// ---- screens ---------------------------------------------------------------
 
-    section("Floating action buttons", [
-        {t: "row", spacing: 16, aligny: 0.5, c: [
-            {t: "column", bg: pri_container, radius: 12, w: 40, h: 40, alignx: 0.5, aligny: 0.5,
-             c: [ {t: "text", text: "\u{FF0B}", size: 18, color: on_pri_cont} ]},
-            {t: "column", bg: pri_container, radius: 16, w: 56, h: 56, alignx: 0.5, aligny: 0.5,
-             c: [ {t: "text", text: "\u{FF0B}", size: 24, color: on_pri_cont} ]},
-            {t: "row", bg: pri_container, radius: 16, h: 56, pad: 18, fitw: 1, spacing: 10, aligny: 0.5,
-             c: [ {t: "text", text: "\u{FF0B}", size: 20, color: on_pri_cont},
-                  {t: "text", text: "Extended", size: 15, color: on_pri_cont} ]},
-        ]},
-    ]),
+fn home_screen() {
+    return {t: "column", spacing: 8, c: [
+        {t: "text", text: "Material Catalog", size: 30, color: on_surface, h: 42},
+        {t: "text", text: "Splash \u{2192} makepad native \u{00b7} tap a family", size: 14, color: on_surf_var, h: 22},
+        {t: "column", h: 6},
+        nav_btn("Buttons", "buttons"),
+        nav_btn("Selection controls", "selection"),
+        nav_btn("Text fields & sliders", "text"),
+        nav_btn("Chips", "chips"),
+        nav_btn("Cards & lists", "cards"),
+        nav_btn("Navigation", "nav"),
+        nav_btn("Dialogs & communication", "comms"),
+        nav_btn("Date & time pickers", "pickers"),
+        nav_btn("Progress", "progress"),
+        nav_btn("Typography & color", "type"),
+    ]}
+}
 
-    section("Chips", [
-        {t: "row", spacing: 8, c: [ chip("Assist"), chip("Filter"), chip_sel("Selected") ]},
-        {t: "row", spacing: 8, c: [ chip("Suggestion"), chip("Input \u{00d7}") ]},
-    ]),
+fn demo_buttons() {
+    return demo("Buttons", [
+        section("Common buttons", [
+            {t: "row", spacing: 8, c: [
+                btn("Filled", primary, on_primary),
+                btn("Tonal", sec_container, on_sec_cont),
+                btn("Elevated", surf_cont, primary),
+            ]},
+            {t: "row", spacing: 8, c: [ outlined_btn("Outlined"), text_btn("Text") ]},
+        ]),
+        section("Segmented buttons", [
+            {t: "row", c: [ seg_on("Day"), seg_off("Week"), seg_off("Month") ]},
+        ]),
+        section("Floating action buttons", [
+            {t: "row", spacing: 16, aligny: 0.5, c: [
+                {t: "column", bg: pri_container, radius: 12, w: 40, h: 40, alignx: 0.5, aligny: 0.5,
+                 c: [ {t: "text", text: "\u{FF0B}", size: 18, color: on_pri_cont} ]},
+                {t: "column", bg: pri_container, radius: 16, w: 56, h: 56, alignx: 0.5, aligny: 0.5,
+                 c: [ {t: "text", text: "\u{FF0B}", size: 24, color: on_pri_cont} ]},
+                {t: "row", bg: pri_container, radius: 16, h: 56, pad: 18, fitw: 1, spacing: 10, aligny: 0.5,
+                 c: [ {t: "text", text: "\u{FF0B}", size: 20, color: on_pri_cont},
+                      {t: "text", text: "Extended", size: 15, color: on_pri_cont} ]},
+            ]},
+        ]),
+    ])
+}
 
-    section("Cards", [
-        {t: "row", spacing: 12, c: [
-            tile("Elevated", "Filled surface tone", surf_cont, 0),
-            tile("Outlined", "1dp outline variant", surface, 1),
-        ]},
-    ]),
+fn demo_selection() {
+    return demo("Selection controls", [
+        section("Checkbox, switch, radio", [
+            {t: "checkbox", text: "Checkbox", h: 34},
+            {t: "toggle", text: "Switch", h: 34},
+            {t: "radio", text: "Radio option A", h: 34},
+            {t: "radio", text: "Radio option B", h: 34},
+        ]),
+    ])
+}
 
-    section("Selection controls", [
-        {t: "checkbox", text: "Checkbox", h: 34},
-        {t: "toggle", text: "Switch", h: 34},
-        {t: "radio", text: "Radio option A", h: 34},
-        {t: "radio", text: "Radio option B", h: 34},
-    ]),
+fn demo_text() {
+    return demo("Text fields & sliders", [
+        section("Text fields", [
+            {t: "input", placeholder: "Filled text field", h: 50},
+            {t: "input", placeholder: "Another field", h: 50},
+        ]),
+        section("Search", [ searchbar() ]),
+        section("Sliders", [ {t: "slider", text: "Continuous", h: 44} ]),
+    ])
+}
 
-    section("Text fields", [
-        {t: "input", placeholder: "Filled text field", h: 50},
-        {t: "input", placeholder: "Another field", h: 50},
-    ]),
+fn demo_chips() {
+    return demo("Chips", [
+        section("Chips", [
+            {t: "row", spacing: 8, c: [ chip("Assist"), chip("Filter"), chip_sel("Selected") ]},
+            {t: "row", spacing: 8, c: [ chip("Suggestion"), chip("Input \u{00d7}") ]},
+        ]),
+    ])
+}
 
-    section("Sliders", [
-        {t: "slider", text: "Continuous", h: 44},
-    ]),
-
-    section("Progress indicators", [
-        {t: "text", text: "Linear \u{00b7} 40%", size: 13, color: on_surf_var, h: 18},
-        progress(150),
-        {t: "text", text: "Linear \u{00b7} 75%", size: 13, color: on_surf_var, h: 18},
-        progress(280),
-    ]),
-
-    section("Lists", [
-        list_item("A", "Ada Lovelace", "Analytical engine"),
-        divider(),
-        list_item("G", "Grace Hopper", "Compiler pioneer"),
-    ]),
-
-    section("Navigation bar", [
-        {t: "row", bg: surf_cont, radius: 16, pad: 8, h: 72, c: [
-            nav_item("\u{2302}", "Home", on_sec_cont, sec_container),
-            nav_item("\u{2605}", "Saved", on_surf_var, surf_cont),
-            nav_item("\u{2709}", "Inbox", on_surf_var, surf_cont),
-            nav_item("\u{263A}", "Profile", on_surf_var, surf_cont),
-        ]},
-    ]),
-
-    section("Typography", [
-        {t: "text", text: "Display Small", size: 34, color: on_surface, h: 44},
-        {t: "text", text: "Headline Small", size: 24, color: on_surface, h: 32},
-        {t: "text", text: "Title Large", size: 21, color: on_surface, h: 28},
-        {t: "text", text: "Body Large \u{2014} the quick brown fox", size: 16, color: on_surf_var, h: 22},
-        {t: "text", text: "LABEL LARGE", size: 13, color: on_surf_var, h: 18},
-    ]),
-
-    section("Color roles", [
-        {t: "row", spacing: 10, c: [
-            swatch(primary, "Primary"),
-            swatch(secondary, "Secondary"),
-            swatch(tertiary, "Tertiary"),
-            swatch(error, "Error"),
-        ]},
-        {t: "row", spacing: 10, c: [
-            swatch(pri_container, "P. Cont"),
-            swatch(sec_container, "S. Cont"),
-            swatch(ter_container, "T. Cont"),
-            swatch(surf_variant, "Surf Var"),
-        ]},
-    ]),
-
-    section("Top app bar", [ appbar("Catalog") ]),
-
-    section("Search", [ searchbar() ]),
-
-    section("Tabs", [
-        {t: "column", c: [
-            {t: "row", c: [ tab_active("Overview"), tab_idle("Specs"), tab_idle("Related") ]},
-            {t: "column", bg: outline_var, h: 1},
-        ]},
-    ]),
-
-    section("Segmented buttons", [
-        {t: "row", c: [ seg_on("Day"), seg_off("Week"), seg_off("Month") ]},
-    ]),
-
-    section("Badges", [
-        {t: "row", spacing: 32, aligny: 0.5, c: [
-            badge("\u{2709}", "3"), badge("\u{2302}", "12"), badge("\u{2605}", "99+"),
-        ]},
-    ]),
-
-    section("Dialog", [ dialog() ]),
-
-    section("Snackbar", [ snackbar() ]),
-
-    section("Menu", [ menu() ]),
-
-    section("Bottom sheet", [ bottom_sheet() ]),
-
-    section("Date picker", [ date_picker() ]),
-
-    section("Time picker", [ time_picker() ]),
-
-    section("Circular progress", [
-        {t: "row", spacing: 20, aligny: 0.5, c: [ ring(), ring(), ring() ]},
-    ]),
-
-    section("Tooltip", [
-        {t: "row", c: [ tooltip() ]},
-    ]),
-
-    section("Divider", [
-        {t: "column", spacing: 12, c: [
-            {t: "text", text: "Content above", size: 14, color: on_surf_var, h: 20},
+fn demo_cards() {
+    return demo("Cards & lists", [
+        section("Cards", [
+            {t: "row", spacing: 12, c: [
+                tile("Elevated", "Filled surface tone", surf_cont, 0),
+                tile("Outlined", "1dp outline variant", surface, 1),
+            ]},
+        ]),
+        section("Lists", [
+            list_item("A", "Ada Lovelace", "Analytical engine"),
             divider(),
-            {t: "text", text: "Content below", size: 14, color: on_surf_var, h: 20},
-        ]},
-    ]),
+            list_item("G", "Grace Hopper", "Compiler pioneer"),
+        ]),
+        section("Carousel", [ carousel() ]),
+    ])
+}
 
-    section("Bottom app bar", [ bottom_app_bar() ]),
+fn demo_nav() {
+    return demo("Navigation", [
+        section("Top app bar", [ appbar("Catalog") ]),
+        section("Bottom app bar", [ bottom_app_bar() ]),
+        section("Navigation bar", [
+            {t: "row", bg: surf_cont, radius: 16, pad: 8, h: 72, c: [
+                nav_item("\u{2302}", "Home", on_sec_cont, sec_container),
+                nav_item("\u{2605}", "Saved", on_surf_var, surf_cont),
+                nav_item("\u{2709}", "Inbox", on_surf_var, surf_cont),
+                nav_item("\u{263A}", "Profile", on_surf_var, surf_cont),
+            ]},
+        ]),
+        section("Navigation rail", [ {t: "row", c: [ nav_rail() ]} ]),
+        section("Tabs", [
+            {t: "column", c: [
+                {t: "row", c: [ tab_active("Overview"), tab_idle("Specs"), tab_idle("Related") ]},
+                {t: "column", bg: outline_var, h: 1},
+            ]},
+        ]),
+    ])
+}
 
-    section("Navigation rail", [ {t: "row", c: [ nav_rail() ]} ]),
+fn demo_comms() {
+    return demo("Dialogs & communication", [
+        section("Dialog", [ dialog() ]),
+        section("Snackbar", [ snackbar() ]),
+        section("Menu", [ menu() ]),
+        section("Bottom sheet", [ bottom_sheet() ]),
+        section("Tooltip", [ {t: "row", c: [ tooltip() ]} ]),
+        section("Banner", [ banner() ]),
+        section("Badges", [
+            {t: "row", spacing: 32, aligny: 0.5, c: [
+                badge("\u{2709}", "3"), badge("\u{2302}", "12"), badge("\u{2605}", "99+"),
+            ]},
+        ]),
+    ])
+}
 
-    section("Carousel", [ carousel() ]),
+fn demo_pickers() {
+    return demo("Date & time pickers", [
+        section("Date picker", [ date_picker() ]),
+        section("Time picker", [ time_picker() ]),
+    ])
+}
 
-    section("Banner", [ banner() ]),
+fn demo_progress() {
+    return demo("Progress", [
+        section("Linear", [
+            {t: "text", text: "40%", size: 13, color: on_surf_var, h: 18},
+            progress(150),
+            {t: "text", text: "75%", size: 13, color: on_surf_var, h: 18},
+            progress(280),
+        ]),
+        section("Circular", [
+            {t: "row", spacing: 20, aligny: 0.5, c: [ ring(), ring(), ring() ]},
+        ]),
+    ])
+}
 
-    {t: "text", text: "one VM \u{00b7} one UiNode \u{00b7} makepad native widgets", size: 12, color: primary, h: 30},
-]}
+fn demo_type() {
+    return demo("Typography & color", [
+        section("Typography", [
+            {t: "text", text: "Display Small", size: 34, color: on_surface, h: 44},
+            {t: "text", text: "Headline Small", size: 24, color: on_surface, h: 32},
+            {t: "text", text: "Title Large", size: 21, color: on_surface, h: 28},
+            {t: "text", text: "Body Large \u{2014} the quick brown fox", size: 16, color: on_surf_var, h: 22},
+            {t: "text", text: "LABEL LARGE", size: 13, color: on_surf_var, h: 18},
+        ]),
+        section("Color roles", [
+            {t: "row", spacing: 10, c: [
+                swatch(primary, "Primary"), swatch(secondary, "Secondary"),
+                swatch(tertiary, "Tertiary"), swatch(error, "Error"),
+            ]},
+            {t: "row", spacing: 10, c: [
+                swatch(pri_container, "P. Cont"), swatch(sec_container, "S. Cont"),
+                swatch(ter_container, "T. Cont"), swatch(surf_variant, "Surf Var"),
+            ]},
+        ]),
+    ])
+}
+
+// Route the injected `screen` to the matching demo, defaulting to home.
+fn body(s) {
+    if s == "buttons" { return demo_buttons() }
+    if s == "selection" { return demo_selection() }
+    if s == "text" { return demo_text() }
+    if s == "chips" { return demo_chips() }
+    if s == "cards" { return demo_cards() }
+    if s == "nav" { return demo_nav() }
+    if s == "comms" { return demo_comms() }
+    if s == "pickers" { return demo_pickers() }
+    if s == "progress" { return demo_progress() }
+    if s == "type" { return demo_type() }
+    return home_screen()
+}
+
+// ---- root ------------------------------------------------------------------
+// A hidden `nav_signal` Label the host reads for routing, plus the active
+// screen (chosen by the injected `let screen = "..."`).
+
+{t: "column", pad: 16, c: [ body(nav_route) ]}
