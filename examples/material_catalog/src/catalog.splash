@@ -376,9 +376,10 @@ fn search_view() {
     ]}
 }
 
-// A real animated loading indicator (the same spinner shader, larger).
+// The real M3 loading indicator: a solid shape that morphs (circle <-> clover)
+// while rotating — the shape-morph animation, distinct from the circular spinner.
 fn loading_indicator() {
-    return {t: "loading", bg: primary, w: 48, h: 48}
+    return {t: "progress", bg: primary, w: 56, h: 56}
 }
 
 // A shape-scale swatch (M3 corner ladder).

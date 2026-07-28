@@ -51,4 +51,39 @@ script_mod! {
             }
         }
     }
+
+    // The Material 3 "loading indicator": a solid shape that continuously morphs
+    // (circle <-> scalloped clover) while rotating, off draw_pass.time — the
+    // shape-morph animation, not a spinner arc.
+    mod.widgets.LoadingMorph = View{
+        width: Fill
+        height: Fill
+        show_bg: true
+        draw_bg +: {
+            color: uniform(theme.color_makepad)
+
+            pixel: fn() {
+                let center = self.rect_size * 0.5
+                let t = self.draw_pass.time
+
+                // Rotate the sample point so the shape spins.
+                let a = t * 1.7
+                let cs = cos(a)
+                let sn = sin(a)
+                let rel = self.pos * self.rect_size - center
+                let rot = vec2(rel.x * cs - rel.y * sn, rel.x * sn + rel.y * cs) + center
+
+                let sdf = Sdf2d.viewport(rot)
+
+                // Morph the corner radius: circle (corner = half) <-> rounded square,
+                // eased in and out — the M3 shape-morph feel, built from sdf.box.
+                let half = min(center.x, center.y) * 0.56
+                let morph = 0.5 - 0.5 * cos(t * 1.5)
+                let corner = mix(half, half * 0.30, morph)
+
+                sdf.box(center.x - half, center.y - half, half * 2.0, half * 2.0, corner)
+                return sdf.fill(self.color)
+            }
+        }
+    }
 }
