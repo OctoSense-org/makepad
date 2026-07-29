@@ -70,6 +70,7 @@ pub mod fold_header;
 pub mod glass_panel;
 pub mod loading_spinner;
 pub mod weather_icon;
+pub mod temp_bar;
 
 pub mod bare_step;
 pub mod turtle_step;
@@ -561,6 +562,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
 
     crate::loading_spinner::script_mod(vm);
     crate::weather_icon::script_mod(vm);
+    crate::temp_bar::script_mod(vm);
     crate::glass_panel::script_mod(vm);
 
     crate::bare_step::script_mod(vm);
