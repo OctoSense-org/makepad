@@ -71,6 +71,9 @@ pub mod glass_panel;
 pub mod loading_spinner;
 pub mod weather_icon;
 pub mod temp_bar;
+pub mod moon_phase;
+pub mod sun_arc;
+pub mod aqi_contour;
 
 pub mod bare_step;
 pub mod turtle_step;
@@ -563,6 +566,9 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::loading_spinner::script_mod(vm);
     crate::weather_icon::script_mod(vm);
     crate::temp_bar::script_mod(vm);
+    crate::moon_phase::script_mod(vm);
+    crate::sun_arc::script_mod(vm);
+    crate::aqi_contour::script_mod(vm);
     crate::glass_panel::script_mod(vm);
 
     crate::bare_step::script_mod(vm);
