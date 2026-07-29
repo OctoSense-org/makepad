@@ -41,9 +41,15 @@ script_mod! {
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
                 let h = self.rect_size.y
-                // A rounded capsule spanning the whole widget; the row supplies
-                // the width, so the bar always meets both labels.
-                sdf.box(0.0, 0.0, self.rect_size.x, h, h * 0.5)
+                // A HAIRLINE capsule, vertically centred in whatever box the row
+                // gives us. The thickness is capped HERE rather than left to the
+                // card's `height:` — at iOS weight this bar is a 4-5px rule, and
+                // filling an 8px box edge to edge reads as a chunky slab. The row
+                // still sets `height` to control the row's rhythm; only the drawn
+                // track is pinned.
+                let track = min(h, 5.0)
+                let top = (h - track) * 0.5
+                sdf.box(0.0, top, self.rect_size.x, track, track * 0.5)
 
                 // Normalise this day's low/high against the week, then pick the
                 // spectrum colour at this pixel's position between them.

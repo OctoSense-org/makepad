@@ -772,9 +772,45 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.weekmin(lat, lon) / sys.weekmax(lat, lon) -> the LOWEST low and HIGHEST
+    // high across the 7-day forecast, for a TempBar's draw_bg.wmin / draw_bg.wmax.
+    //
+    // These exist because the card CANNOT know them. Every temperature on the card
+    // is a live sys.weather call, so a generated card asking the model to name the
+    // week's range is asking it to guess at numbers it has never seen — and it
+    // guesses badly ("10 to 35" for a 27-39C week), which clamps every high to the
+    // red end and pushes the whole week into the top of the scale.
+    //
+    // Shares the cached forecast fetch, so neither costs an extra request.
+    // Falls back to a plausible temperate range if the fetch is still in flight,
+    // rather than to 0/0 — a zero span would collapse every bar to one colour.
+    vm.add_method(
+        sys,
+        id_lut!(weekmin),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n = week_extreme(vm, lat, lon, "daily.temperature_2m_min", false).unwrap_or(0.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+    vm.add_method(
+        sys,
+        id_lut!(weekmax),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n = week_extreme(vm, lat, lon, "daily.temperature_2m_max", true).unwrap_or(30.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
     // sys.moonphase("field") -> the CURRENT 月相 (moon phase), computed from the
     // device clock — no network, so it never shows a "—" placeholder.
     //   "name"         -> "Waxing Gibbous"  (one of the eight principal phases)
+    //   "name_zh"      -> "盈凸月"           (the same phase, 八相 names)
     //   "illumination" -> "87"   (percent of the disc lit, 0-100)
     //   "phase"        -> "0.62" (position in the cycle, 0 new .. 0.5 full .. 1)
     // For the MoonPhase WIDGET uniform use sys.moonnum("phase"), which returns a
@@ -790,6 +826,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let f = moon_phase_fraction();
             let value = match field.trim().to_ascii_lowercase().as_str() {
                 "name" => moon_phase_name(f).to_string(),
+                "name_zh" | "name_cn" => moon_phase_name_zh(f).to_string(),
                 // Illuminated fraction is (1 - cos(2*pi*phase)) / 2: 0 at new,
                 // 1 at full, and correctly non-linear in between.
                 "illumination" | "illum" => {
@@ -1572,6 +1609,40 @@ fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
     Some(s)
 }
 
+/// Reduce a 7-element `daily.*` temperature array to its min or max.
+///
+/// `round_display` is deliberately NOT applied: this feeds a shader uniform, where
+/// the extra precision is free and rounding the span would visibly quantise the
+/// bar colours.
+fn week_extreme(
+    vm: &mut ScriptVm,
+    lat: f64,
+    lon: f64,
+    path: &str,
+    want_max: bool,
+) -> Option<f64> {
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+    );
+    let bytes = vm.host.cx_mut().script_data_fetch(&url)?;
+    let mut acc: Option<f64> = None;
+    for i in 0..7 {
+        let Some(v) = json_pluck(&bytes, &format!("{path}.{i}")) else {
+            continue;
+        };
+        let Ok(n) = v.parse::<f64>() else { continue };
+        acc = Some(match acc {
+            None => n,
+            Some(a) if want_max => a.max(n),
+            Some(a) => a.min(n),
+        });
+    }
+    acc
+}
+
 /// Mean synodic month — new moon to new moon — in seconds.
 const SYNODIC_SECS: f64 = 29.530_588_853 * 86_400.0;
 
@@ -1616,6 +1687,29 @@ fn moon_phase_name(f: f64) -> &'static str {
         "Last Quarter"
     } else {
         "Waning Crescent"
+    }
+}
+
+/// The principal-phase name in Chinese — the traditional 八相 names, so a Chinese
+/// card is not forced to print "Full Moon" in the middle of otherwise Chinese
+/// text. Same boundaries as `moon_phase_name`.
+fn moon_phase_name_zh(f: f64) -> &'static str {
+    if f < 0.0335 || f >= 0.9665 {
+        "新月"
+    } else if f < 0.2165 {
+        "蛾眉月"
+    } else if f < 0.2835 {
+        "上弦月"
+    } else if f < 0.4665 {
+        "盈凸月"
+    } else if f < 0.5335 {
+        "满月"
+    } else if f < 0.7165 {
+        "亏凸月"
+    } else if f < 0.7835 {
+        "下弦月"
+    } else {
+        "残月"
     }
 }
 
