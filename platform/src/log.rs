@@ -41,6 +41,68 @@ fn android_logcat_write(
     unsafe { __android_log_write(prio, "Makepad\0".as_ptr(), msg.as_ptr()) };
 }
 
+/// OpenHarmony has no stdout for an app process, so the `println!` fallback
+/// below silently discards every log line — which makes a misbehaving app on
+/// device completely opaque. Route through hilog instead, so `log!` shows up in
+/// `hdc shell hilog` under the `Makepad` tag.
+///
+/// `libhilog_ndk.z.so` is already linked by the OpenHarmony platform backend
+/// (see os/linux/open_harmony/oh_sys.rs), so no extra link attribute is needed.
+#[cfg(target_env = "ohos")]
+fn ohos_hilog_write(
+    file_name: &str,
+    line_start: u32,
+    column_start: u32,
+    message: &str,
+    level: LogLevel,
+) {
+    use std::ffi::c_int;
+    extern "C" {
+        // int OH_LOG_Print(LogType, LogLevel, unsigned int domain, const char *tag,
+        //                  const char *fmt, ...)
+        fn OH_LOG_Print(
+            type_: c_int,
+            level: c_int,
+            domain: u32,
+            tag: *const u8,
+            fmt: *const u8,
+            ...
+        ) -> c_int;
+    }
+
+    const LOG_APP: c_int = 0;
+    let prio: c_int = match level {
+        LogLevel::Error | LogLevel::Panic => 6, // LOG_ERROR
+        LogLevel::Warning => 5,                 // LOG_WARN
+        _ => 4,                                 // LOG_INFO
+    };
+    let msg = format!(
+        "{}:{}:{} - {}\0",
+        file_name,
+        line_start + 1,
+        column_start + 1,
+        message
+    );
+    // %{public}s — hilog redacts plain %s payloads as <private> by default.
+    unsafe {
+        OH_LOG_Print(
+            LOG_APP,
+            prio,
+            0xAF00,
+            "Makepad\0".as_ptr(),
+            "%{public}s\0".as_ptr(),
+            msg.as_ptr(),
+        )
+    };
+}
+
+/// Direct hilog write, bypassing the pluggable logger. Used to trace startup
+/// before/while the logger itself is being installed.
+#[cfg(target_env = "ohos")]
+pub fn ohos_boot_log(message: &str) {
+    ohos_hilog_write("boot", 0, 0, message, LogLevel::Log);
+}
+
 impl Cx {
     pub fn init_log() {
         let mut logger = LOG_WITH_LEVEL.write().expect("Logger lock poisoned");
@@ -79,6 +141,9 @@ pub(crate) fn log_with_level_makepad_platform(
 
     #[cfg(target_os = "android")]
     android_logcat_write(file_name, line_start, column_start, &message, level);
+
+    #[cfg(target_env = "ohos")]
+    ohos_hilog_write(file_name, line_start, column_start, &message, level);
 
     let studio_enabled = Cx::has_studio_web_socket();
     let studio_connected = Cx::has_studio_web_socket_connected();

@@ -719,6 +719,29 @@ impl Widget for View {
         method: LiveId,
         args: ScriptValue,
     ) -> ScriptAsyncResult {
+        // `ui.<id>.set_visible(true/false)` — flip a View in/out of the layout
+        // WITHOUT a card rebuild: the internal set_visible just toggles the flag
+        // and redraws. Lets a `fn`/closure show or hide a subtree (e.g. the nav
+        // drive sheet's End row on swipe) while sibling widgets — the map — stay
+        // intact. Accepts a bool or "1"/"0"/"true"/"false".
+        if method == live_id!(set_visible) {
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+                if !value.is_err() {
+                    let s = vm.bx.heap.temp_string_with(|heap, out| {
+                        heap.cast_to_string(value, out);
+                        out.to_string()
+                    });
+                    let t = s.trim();
+                    let vis = !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false"));
+                    vm.with_cx_mut(|cx| {
+                        self.set_visible(cx, vis);
+                    });
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
         if method == live_id!(render) {
             let me = self.make_render_me(vm);
             return vm.with_cx_mut(|cx| {

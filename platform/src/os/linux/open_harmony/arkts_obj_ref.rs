@@ -25,6 +25,19 @@ impl From<NulError> for ArkTsObjErr {
     }
 }
 
+/// An argument to an ArkTS method, in a form that can be built on the makepad
+/// thread and marshalled into `napi_value`s later.
+///
+/// `napi_value`s may only be created on the JS thread, so callers cannot build
+/// them directly — they hand over plain Rust data and `js_after_work_cb`
+/// converts it once it is running in the JS environment.
+#[derive(Clone, Debug)]
+pub enum ArkArg {
+    Str(String),
+    Num(f64),
+    Bool(bool),
+}
+
 pub struct ArkTsObjRef {
     raw_env: napi_env,
     obj_ref: napi_ref,
@@ -35,6 +48,7 @@ pub struct ArkTsObjRef {
     fn_name: String,
     argc: usize,
     argv: *const napi_value,
+    args: Vec<ArkArg>,
     worker: *mut uv_work_t,
 }
 
@@ -63,6 +77,7 @@ impl ArkTsObjRef {
             fn_name: "undefined".to_string(),
             argc: 0,
             argv: null_mut(),
+            args: Vec::new(),
             worker: req,
         }
     }
@@ -116,6 +131,40 @@ impl ArkTsObjRef {
             return;
         }
 
+        // We are on the JS thread now, so this is the only place `napi_value`s
+        // for the arguments may legally be created.
+        let args = unsafe { (*ark_obj).args.clone() };
+        let built: Vec<napi_value> = args
+            .iter()
+            .map(|arg| {
+                let mut v = null_mut();
+                match arg {
+                    ArkArg::Str(s) => {
+                        let _ = unsafe {
+                            napi_create_string_utf8(
+                                raw_env,
+                                s.as_ptr() as *const c_char,
+                                s.len(),
+                                &mut v,
+                            )
+                        };
+                    }
+                    ArkArg::Num(n) => {
+                        let _ = unsafe { napi_create_double(raw_env, *n, &mut v) };
+                    }
+                    ArkArg::Bool(b) => {
+                        let _ = unsafe { napi_get_boolean(raw_env, *b, &mut v) };
+                    }
+                }
+                v
+            })
+            .collect();
+        let (argc, argv) = if built.is_empty() {
+            (argc, argv)
+        } else {
+            (built.len(), built.as_ptr())
+        };
+
         let mut call_result = null_mut();
         let napi_status =
             unsafe { napi_call_function(raw_env, arkts_obj, js_fn, argc, argv, &mut call_result) };
@@ -153,6 +202,21 @@ impl ArkTsObjRef {
 
     fn as_ptr(&self) -> *const ArkTsObjRef {
         self as *const ArkTsObjRef
+    }
+
+    /// Call an ArkTS method with plain Rust arguments.
+    ///
+    /// Prefer this over `call_js_function`: the values are converted to
+    /// `napi_value`s on the JS thread, where doing so is actually sound.
+    pub fn call_js_with_args(
+        &mut self,
+        name: &str,
+        args: Vec<ArkArg>,
+    ) -> Result<napi_value, ArkTsObjErr> {
+        self.args = args;
+        let r = self.call_js_function(name, 0, std::ptr::null_mut());
+        self.args = Vec::new();
+        r
     }
 
     pub fn call_js_function(

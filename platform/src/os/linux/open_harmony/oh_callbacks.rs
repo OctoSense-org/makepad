@@ -52,6 +52,87 @@ pub fn handle_delete_left_event(length: i32) -> napi_ohos::Result<()> {
     Ok(())
 }
 
+// ---- native composer overlay (ArkTS) ----
+//
+// The chat composer is a NATIVE overlay, not a makepad widget — the same design
+// Android uses (an EditText pill floating over the GL surface). A full-screen
+// card's PortalList would otherwise swallow the taps, and makepad has no text
+// input bridge on this platform at all.
+
+#[napi]
+pub fn handle_composer_submit(text: String) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerSubmit { text });
+    Ok(())
+}
+
+#[napi]
+pub fn handle_composer_new_app() -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerNewApp);
+    Ok(())
+}
+
+#[napi]
+pub fn handle_composer_switch() -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerSwitch);
+    Ok(())
+}
+
+#[napi]
+pub fn handle_composer_expand() -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::ComposerExpand);
+    Ok(())
+}
+
+/// JS→native bridge for webview cards: `octos_native.invoke(callId, tool, args)`.
+///
+/// ids arrive as STRINGS: `browser_id` is a `LiveId` (full u64) and `call_id` is
+/// an i64, and every JS number is an f64 — passing them numerically silently
+/// mangles anything past 2^53. Parsing failures drop the call rather than guess,
+/// which surfaces as an unresolved promise in the card instead of a dispatch
+/// against the wrong browser.
+#[napi]
+pub fn handle_system_browser_invoke(
+    browser_id: String,
+    call_id: String,
+    tool: String,
+    args: String,
+) -> napi_ohos::Result<()> {
+    let (Ok(browser_id), Ok(call_id)) = (browser_id.parse::<u64>(), call_id.parse::<i64>()) else {
+        crate::error!("system browser invoke: bad ids browser_id={browser_id} call_id={call_id}");
+        return Ok(());
+    };
+    send_from_ohos_message(FromOhosMessage::SystemBrowserInvoke {
+        browser_id,
+        call_id,
+        tool,
+        args,
+    });
+    Ok(())
+}
+
+/// Result of the ArkTS system file picker (`dialog.open`).
+#[napi]
+pub fn handle_dialog_result(
+    call_id: String,
+    name: String,
+    content: String,
+    cancelled: bool,
+    error: String,
+) -> napi_ohos::Result<()> {
+    let Ok(call_id) = call_id.parse::<i64>() else {
+        crate::error!("dialog result: bad call_id={call_id}");
+        return Ok(());
+    };
+    send_from_ohos_message(FromOhosMessage::DialogResult {
+        call_id,
+        name,
+        content,
+        cancelled,
+        error,
+    });
+    Ok(())
+}
+
 #[napi]
 pub fn handle_keyboard_status(is_open: bool, keyboard_height: i32) -> napi_ohos::Result<()> {
     send_from_ohos_message(FromOhosMessage::ResizeTextIME(is_open, keyboard_height));
@@ -271,5 +352,31 @@ pub enum FromOhosMessage {
     TextInput(TextInputEvent),
     DeleteLeft(i32),
     ResizeTextIME(bool, i32),
+    /// The native ArkTS composer overlay submitted text.
+    ComposerSubmit {
+        text: String,
+    },
+    /// Its "＋" (open another app) button was tapped.
+    ComposerNewApp,
+    /// Its "⟳" (switch to next app) button was tapped.
+    ComposerSwitch,
+    /// Its collapsed FAB was tapped to unfold the composer.
+    ComposerExpand,
+    /// A `runhtml` card called `octos.invoke(tool, args)` in its JS, arriving
+    /// through the ArkTS `Web` component's `octos_native` JavaScript proxy.
+    SystemBrowserInvoke {
+        browser_id: u64,
+        call_id: i64,
+        tool: String,
+        args: String,
+    },
+    /// Result of the system file picker opened for `dialog.open`.
+    DialogResult {
+        call_id: i64,
+        name: String,
+        content: String,
+        cancelled: bool,
+        error: String,
+    },
 }
 //TODO DIP

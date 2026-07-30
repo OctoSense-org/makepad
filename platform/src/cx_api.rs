@@ -333,10 +333,10 @@ pub enum CxOsOp {
     // view floating over the GL surface so the full-screen Splash card behind
     // it is edge-to-edge). Handled only by the Android backend; ignored by
     // every other backend's catch-all.
-    ShowAndroidComposer,
-    HideAndroidComposer,
-    ExpandAndroidComposer,
-    CollapseAndroidComposer,
+    ShowNativeComposer,
+    HideNativeComposer,
+    ExpandNativeComposer,
+    CollapseNativeComposer,
     SetPrimarySelection(String),
     ShowSelectionHandles {
         start: Vec2d,
@@ -498,10 +498,10 @@ impl std::fmt::Debug for CxOsOp {
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),
             Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
             Self::DownloadFile { .. } => write!(f, "DownloadFile"),
-            Self::ShowAndroidComposer => write!(f, "ShowAndroidComposer"),
-            Self::HideAndroidComposer => write!(f, "HideAndroidComposer"),
-            Self::ExpandAndroidComposer => write!(f, "ExpandAndroidComposer"),
-            Self::CollapseAndroidComposer => write!(f, "CollapseAndroidComposer"),
+            Self::ShowNativeComposer => write!(f, "ShowNativeComposer"),
+            Self::HideNativeComposer => write!(f, "HideNativeComposer"),
+            Self::ExpandNativeComposer => write!(f, "ExpandNativeComposer"),
+            Self::CollapseNativeComposer => write!(f, "CollapseNativeComposer"),
             Self::SetPrimarySelection(..) => write!(f, "SetPrimarySelection"),
             Self::ShowSelectionHandles { .. } => write!(f, "ShowSelectionHandles"),
             Self::UpdateSelectionHandles { .. } => write!(f, "UpdateSelectionHandles"),
@@ -774,6 +774,45 @@ impl Cx {
                         return Ok(Rc::new(data));
                     }
                 }
+            }
+        }
+
+        // OpenHarmony had no lazy fallback here at all. `self.dependencies` is
+        // never populated on this platform (measured on device: the eager
+        // `ohos_load_dependencies()` runs before anything registers, seeing an
+        // empty map), so EVERY lookup fell through to the Err below — silently.
+        // That means no font ever loads, text layout produces zero glyphs, no
+        // text draw call is emitted, and the app renders shapes but no text with
+        // no error anywhere. Android works purely via its lazy asset fallback
+        // above; this is the OHOS equivalent, reading from the HAP's rawfile.
+        #[cfg(target_env = "ohos")]
+        {
+            if let Some(raw_file) = self.os.raw_file.as_ref() {
+                // RawFileMgr is a thin wrapper around a raw
+                // *mut NativeResourceManager; `&mut` on read_to_end is
+                // incidental, so reading through a const-cast is sound here.
+                let mgr = raw_file as *const _
+                    as *mut crate::os::linux::open_harmony::raw_file::RawFileMgr;
+                // Dependency keys look like
+                // `makepad/makepad_widgets/resources/X.ttf`, but the HAP stores
+                // them under `resources/rawfile/makepad/...`. Which prefix the
+                // resource manager wants isn't documented, so try the plausible
+                // forms — Android does the same dance with `package_root`.
+                // cargo-makepad stages resources into
+                //   entry/src/main/resources/rawfile/makepad/<crate>/resources/…
+                // and the resource manager resolves paths relative to
+                // `resources/rawfile/`. Dependency keys are
+                // `<crate>/resources/<file>`, so the on-device key needs a
+                // `makepad/` prefix. Without it every font read fails silently.
+                let candidates = [format!("makepad/{}", path), path.to_string()];
+                for cand in candidates.iter() {
+                    let mut buffer = Vec::<u8>::new();
+                    let r = unsafe { (*mgr).read_to_end(cand.as_str(), &mut buffer) };
+                    if r.is_ok() && !buffer.is_empty() {
+                        return Ok(Rc::new(buffer));
+                    }
+                }
+                crate::log!("DEP MISS {}", path);
             }
         }
 
@@ -1126,7 +1165,7 @@ impl Cx {
 
     /// Open the native file picker (Android Storage Access Framework). The result
     /// (picked file's name + contents, or cancellation) is delivered later as an
-    /// `AndroidDialogResult` action carrying `call_id`. No-op on platforms whose
+    /// `NativeDialogResult` action carrying `call_id`. No-op on platforms whose
     /// backend doesn't handle `CxOsOp::OpenFileDialog`.
     pub fn open_file_dialog(&mut self, call_id: i64, mime: &str) {
         self.platform_ops.push(CxOsOp::OpenFileDialog {
@@ -1137,8 +1176,8 @@ impl Cx {
 
     /// Stream a URL to a file on a native background thread (constant memory —
     /// for large binaries the bytes never pass through JS). Progress is delivered
-    /// as `AndroidDownloadProgress` actions and completion as
-    /// `AndroidDownloadComplete`, both carrying `call_id`. `dest` is an absolute
+    /// as `NativeDownloadProgress` actions and completion as
+    /// `NativeDownloadComplete`, both carrying `call_id`. `dest` is an absolute
     /// path (the caller resolves it inside the card-fs sandbox first).
     pub fn download_file(&mut self, call_id: i64, url: &str, dest: &str) {
         self.platform_ops.push(CxOsOp::DownloadFile {
@@ -1148,30 +1187,31 @@ impl Cx {
         });
     }
 
-    /// Show the native Android floating chat-composer overlay so it floats
-    /// over the full-screen Splash card. No-op on platforms whose backend
-    /// doesn't handle `CxOsOp::ShowAndroidComposer` (i.e. everything but
-    /// Android).
-    pub fn show_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::ShowAndroidComposer);
+    /// Show the native floating chat-composer overlay so it floats over the
+    /// full-screen Splash card. Implemented by the Android and OpenHarmony
+    /// backends; a no-op on platforms that don't handle
+    /// `CxOsOp::ShowNativeComposer` (desktop uses the docked composer).
+    pub fn show_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::ShowNativeComposer);
     }
 
-    /// Hide the native Android floating chat-composer overlay (and drop its
-    /// keyboard). No-op off Android.
-    pub fn hide_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::HideAndroidComposer);
+    /// Hide the native floating chat-composer overlay (and drop its keyboard).
+    /// No-op on backends without a native composer.
+    pub fn hide_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::HideNativeComposer);
     }
 
-    /// Expand the native Android composer from its collapsed "+" button back to
-    /// the full input pill (and focus it). No-op off Android.
-    pub fn expand_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::ExpandAndroidComposer);
+    /// Expand the native composer from its collapsed "+" button back to the
+    /// full input pill (and focus it). No-op on backends without one.
+    pub fn expand_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::ExpandNativeComposer);
     }
 
-    /// Collapse the native Android composer to a small "+" button (and drop its
-    /// keyboard) so the full-screen card has more room. No-op off Android.
-    pub fn collapse_android_composer(&mut self) {
-        self.platform_ops.push(CxOsOp::CollapseAndroidComposer);
+    /// Collapse the native composer to a small "+" button (and drop its
+    /// keyboard) so the full-screen card has more room. No-op on backends
+    /// without one.
+    pub fn collapse_native_composer(&mut self) {
+        self.platform_ops.push(CxOsOp::CollapseNativeComposer);
     }
 
     /// Sets the primary selection (Linux middle-click paste).
@@ -1856,9 +1896,20 @@ pub fn can_play_type(mime: &str) -> &'static str {
     can_play_type_impl(mime)
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::linux::linux_video_playback::can_play_type(mime)
+}
+
+// OpenHarmony builds compile out `linux_video_playback` (gstreamer) and have no
+// native playback backend wired up yet, so nothing is playable there.
+#[cfg(target_env = "ohos")]
+fn can_play_type_impl(_mime: &str) -> &'static str {
+    ""
 }
 
 #[cfg(target_os = "android")]

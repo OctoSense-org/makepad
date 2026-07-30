@@ -2,7 +2,7 @@ use super::geometry::*;
 use super::label::*;
 use super::style::*;
 use super::tile::*;
-use crate::makepad_draw::vector::{Tessellator, VVertex, VectorPath};
+use crate::makepad_draw::vector::{LineJoin, Tessellator, VVertex, VectorPath};
 use crate::{
     makepad_derive_widget::*, makepad_draw::*, widget::*, widget_async::ScriptAsyncResult,
     DrawRotatedText, DrawVector, PathGlyphInstance, PathTextPlacement, WidgetMatchEvent,
@@ -322,6 +322,11 @@ const NAV_REF_Z: u32 = 16;
 /// to the follow-cam (matches typical map apps' auto-recenter behavior).
 const NAV_RECENTER_IDLE_SECS: f64 = 4.0;
 
+/// Extra frames the map keeps rendering AFTER motion stops so a just-revealed
+/// label finishes its ~0.22s fade-in (and any last tile paints) before going
+/// idle. ~16 frames ≈ 0.27s at 60fps, covering the fade.
+const NAV_SETTLE_FRAMES: u32 = 16;
+
 /// Ready tile geometry shared across MapView instances on the UI thread.
 /// Splash cards that animate re-evaluate ~1 Hz and REBUILD their widget tree,
 /// so a per-instance tile cache would refetch + retessellate every second
@@ -449,10 +454,62 @@ fn nav_store_labels(
         .into_iter()
         .map(|(text, (x, y, pri, _))| (x, y, text, pri))
         .collect();
-    // nearest-to-camera first isn't needed; sort by priority so majors win the
-    // per-frame cap
-    out.sort_by_key(|(_, _, _, pri)| *pri);
+    // Priority first so majors win the per-frame cap, then by NAME as a stable
+    // tie-break — the candidate set comes from a HashMap (non-deterministic
+    // order), so without this the picked subset flickered between frames.
+    out.sort_by(|a, b| a.3.cmp(&b.3).then_with(|| a.2.cmp(&b.2)));
     out
+}
+
+// --- OpenFreeMap MVT tile-URL template (resolved from the TileJSON) ---
+// The tile path carries a dated version segment that rotates when the planet is
+// re-cut, so the live template is read from the TileJSON once at runtime. Until
+// it lands, the hardcoded default keeps tiles flowing.
+thread_local! {
+    static NAV_MVT_TEMPLATE: std::cell::RefCell<String> =
+        std::cell::RefCell::new(OPENFREEMAP_DEFAULT_TEMPLATE.to_string());
+    // bootstrap state: 0 = not started, 1 = TileJSON fetch in flight, 2 = resolved.
+    static NAV_MVT_BOOTSTRAP: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    // the request id of the in-flight TileJSON fetch (to route its response).
+    static NAV_MVT_TILEJSON_REQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn nav_mvt_template() -> String {
+    NAV_MVT_TEMPLATE.with(|t| t.borrow().clone())
+}
+
+/// Build a concrete OpenFreeMap tile URL from the resolved template + tile key.
+fn nav_mvt_tile_url(tile: TileKey) -> String {
+    nav_mvt_template()
+        .replace("{z}", &tile.z.to_string())
+        .replace("{x}", &tile.x.to_string())
+        .replace("{y}", &tile.y.to_string())
+}
+
+/// Parse the `tiles[0]` URL template out of the OpenFreeMap TileJSON and adopt
+/// it (keeps the dated version segment current as the planet is re-cut).
+fn nav_mvt_adopt_tilejson(body: &str) -> bool {
+    let Some(v) = serde_json::from_str::<serde_json::Value>(body).ok() else {
+        return false;
+    };
+    if let Some(tmpl) = v
+        .get("tiles")
+        .and_then(|t| t.get(0))
+        .and_then(|u| u.as_str())
+    {
+        if tmpl.contains("{z}") && tmpl.contains("{x}") && tmpl.contains("{y}") {
+            NAV_MVT_TEMPLATE.with(|t| *t.borrow_mut() = tmpl.to_string());
+            return true;
+        }
+    }
+    false
+}
+
+/// A fetched tile payload moved into the worker thread: raw MVT/PBF bytes (decoded
+/// to Overpass-JSON there) or an Overpass-JSON string already.
+enum TilePayload {
+    Json(String),
+    Mvt(Vec<u8>),
 }
 
 fn nav_pending_insert(id: LiveId, pending: PendingTileRequest) {
@@ -467,12 +524,16 @@ fn nav_pending_len() -> usize {
     NAV_PENDING.with(|p| p.borrow().len())
 }
 
+/// Request ids for tile fetches.
+///
+/// MUST come from the same global source as every other `cx.http_request` id.
+/// This used to be a private counter starting at 1, which collided head-on with
+/// `LiveId::unique()` (also a counter from 1) used by `script_data_fetch` — so
+/// the nav card, which fires geocoder searches and tile fetches concurrently,
+/// delivered Photon's GeoJSON to the Overpass tile parser and the map stayed
+/// blank ("Key not found elements").
 fn nav_next_request_id() -> LiveId {
-    NAV_REQ_ID.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1).max(1));
-        LiveId(v)
-    })
+    LiveId::unique()
 }
 
 /// True if this tile was requested within the last `window` seconds
@@ -549,11 +610,23 @@ struct SharedNavRoute {
     origin: (f64, f64), // world px at NAV_REF_Z the geometry is rebased to
     pts: Rc<Vec<Vec2d>>,
     cum: Rc<Vec<f64>>,
+    seq: u64, // last-used tick for LRU eviction (see ensure_nav_route: never bulk-clear)
 }
 
 thread_local! {
     static NAV_ROUTE_STORE: std::cell::RefCell<HashMap<u64, SharedNavRoute>> =
         std::cell::RefCell::new(HashMap::new());
+    // Monotonic "last used" clock for NAV_ROUTE_STORE LRU eviction.
+    static NAV_ROUTE_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Next value of the NAV_ROUTE_STORE LRU clock (bumped on every adopt + insert).
+fn next_nav_route_seq() -> u64 {
+    NAV_ROUTE_SEQ.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    })
 }
 
 /// Adopt a shared ready tile as a per-instance TileEntry (borrowed handles).
@@ -627,10 +700,18 @@ fn nav_store_insert(
                 last_used: tick,
             },
         );
-        if store.len() > 1400 {
+        if store.len() > 900 {
+            // Cap the shared owner store to BOUND MEMORY. The 3D chase view pulls a
+            // wide tile radius (turn/horizon prefetch), so an unbounded store fills
+            // to ~2.5 GB on entering drive and parks the process at the Android OOM
+            // ceiling — then any later allocation (even a bottom-sheet redraw) aborts
+            // with SIGABRT ("allocation failed"). 900 sits comfortably above the
+            // active working set (per-instance cap 640), so only never-drawn FAR
+            // history is trimmed — nothing visible changes.
             // Evict FARTHEST from the drive first (never what's near the car —
-            // loaded content close to the viewport must not vanish). Falls
-            // back to LRU when no nav draw has run yet.
+            // loaded content close to the viewport must not vanish; drawing only
+            // ever touches the nearest ~86 tiles, so a drawn tile is never evicted).
+            // Falls back to LRU when no nav draw has run yet.
             let (cz, cx_, cy_) = NAV_DRAW_CENTER.with(|c| c.get());
             let mut ranked: Vec<(u64, TileKey)> = store
                 .iter()
@@ -650,7 +731,7 @@ fn nav_store_insert(
                 })
                 .collect();
             ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-            for (_, k) in ranked.into_iter().take(48) {
+            for (_, k) in ranked.into_iter().take(96) {
                 store.remove(&k);
             }
         }
@@ -872,6 +953,11 @@ pub struct MapView {
     use_network: bool,
     #[live(true)]
     use_local_mbtiles: bool,
+    // Online tile source for the NAV map: true = OpenFreeMap MVT (CDN, reliable);
+    // false = Overpass raw-OSM (rate-limited public mirrors, the blank-map risk).
+    // Only consulted when use_network && !use_local_mbtiles.
+    #[live(true)]
+    use_mvt: bool,
 
     // --- turn-by-turn navigation mode ---
     // "" = normal map; "3d" = first-person chase view (heading-up, pinhole
@@ -933,6 +1019,11 @@ pub struct MapView {
     // (the store scan + string clones are too costly to redo every 60fps frame)
     #[rust]
     nav_labels_cache: Vec<(f64, f64, String, u8)>,
+    // plan-overview label -> sim-clock time it FIRST appeared, so a newly-shown
+    // name FADES IN (alpha ramp) instead of popping. Pruned to the visible set
+    // each frame so a name that leaves and returns fades in again.
+    #[rust]
+    nav_label_seen: HashMap<String, f64>,
     // low-pass smoothed camera heading (radians) so turns rotate the map/ribbon
     // gently instead of whipping around (the abrupt swing read as the ribbon
     // vanishing from the bottom mid-turn)
@@ -942,6 +1033,26 @@ pub struct MapView {
     nav_bearing_init: bool,
     #[rust]
     nav_next_frame: NextFrame,
+    // Frames still owed AFTER motion stops, so a just-revealed label finishes its
+    // ~0.22s fade-in (and any in-flight tile paints) before the map goes fully
+    // idle. Re-armed to NAV_SETTLE_FRAMES on any motion / tile arrival, counted
+    // down each static frame. Gates the `nav_next_frame` re-arm so a STATIC
+    // plan/preview map stops requesting frames (was pinning the GPU at ~100%).
+    #[rust]
+    nav_settle_frames: u32,
+    // Gesture disambiguation state. `nav_gesture_on_map`: this gesture was claimed by
+    // the map (a finger landed on it) — once claimed, pan/pinch is decided from ALL
+    // active fingers, not just those still inside the (short) map rect, so a finger
+    // drifting off the map doesn't flip pinch<->pan. `nav_gest`: committed gesture
+    // (0 idle · 1 pan · 2 pinch). `nav_gest_hold`: frames a NEW finger-count has
+    // persisted — a switch commits only after a few frames, rejecting momentary
+    // flickers (a palm graze, or pinch jitter dropping a finger).
+    #[rust]
+    nav_gesture_on_map: bool,
+    #[rust]
+    nav_gest: u8,
+    #[rust]
+    nav_gest_hold: u8,
 
     #[rust]
     center_norm: Vec2d,
@@ -960,12 +1071,29 @@ pub struct MapView {
     // drag accumulates it; recenter clears it.
     #[rust]
     nav_pan: Vec2d,
-    // Active touches (digit LiveId, abs-pos) for 1-finger pan vs 2-finger pinch.
+    // Latest position of every ACTIVE touch (raw uid -> abs-pos), accumulated
+    // across TouchUpdate events. A real 2-finger pinch is delivered as separate
+    // per-finger events, so no single event carries both fingers — we must track
+    // them to tell a genuine pinch (2 tracked) from a one-finger pan (1 tracked).
     #[rust]
-    nav_touches: Vec<(LiveId, Vec2d)>,
+    nav_touches: Vec<(u64, Vec2d)>,
     // (finger distance, zoom) captured when the 2nd finger lands — the pinch base.
     #[rust]
-    nav_pinch_base: Option<(f64, f64)>,
+    nav_pinch_base: Option<(f64, f64, Vec2d)>,
+    // (abs-pos, nav_pan) captured when a 1-finger drag begins — the pan anchor.
+    // Pan is computed ABSOLUTELY from this anchor (not incrementally per move) so
+    // a partial/coalesced FingerMove stream still yields a 1:1 drag; re-anchored
+    // when a pinch releases back to one finger to avoid a jump.
+    #[rust]
+    nav_pan_drag: Option<(Vec2d, Vec2d)>,
+    // Eased-animation TARGETS for the plan overview. The +/- buttons and the
+    // my-location button set a target and the camera GLIDES to it (Google-style)
+    // each frame; a direct-manipulation gesture (pinch/drag) clears the target and
+    // takes over instantly. `Some` == animating that axis.
+    #[rust]
+    nav_zoom_anim: Option<f64>,
+    #[rust]
+    nav_pan_anim: Option<Vec2d>,
     // Auto-restore (like Google/Apple Maps): after the user pans/zooms, wait
     // IDLE seconds of no touch, then ease the camera back to the follow-cam
     // (nav_pan -> 0, zoom -> nav_home_zoom). `nav_last_touch` is the sim-clock
@@ -1107,6 +1235,7 @@ impl Widget for MapView {
                     if !s.trim().is_empty() && s.as_str() != self.nav_polyline.as_ref() {
                         self.nav_polyline.as_mut_empty().push_str(&s);
                         vm.with_cx_mut(|cx| self.redraw(cx));
+                        crate::splash::splash_mark_tick_changed();
                     }
                 }
             }
@@ -1145,6 +1274,7 @@ impl Widget for MapView {
                         self.nav_markers = next;
                         self.nav_poly_hash = 0; // force ensure_nav_route re-tessellate
                         vm.with_cx_mut(|cx| self.redraw(cx));
+                        crate::splash::splash_mark_tick_changed();
                     }
                 }
             }
@@ -1159,8 +1289,59 @@ impl Widget for MapView {
             }
             self.nav_pinch_base = None;
             self.nav_touches.clear();
+            self.nav_zoom_anim = None;
+            self.nav_pan_anim = None;
             self.nav_user_adjusted = false;
             vm.with_cx_mut(|cx| self.redraw(cx));
+            return ScriptAsyncResult::Return(NIL);
+        }
+        // `ui.<id>.nav_zoom_by(delta)` — the +/- zoom controls on the plan/nav
+        // map: step the zoom and mark the camera user-adjusted so the fit stops
+        // fighting it (a precise complement to pinch-zoom, e.g. one-handed use).
+        if method == live_id!(nav_zoom_by) {
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+                if !value.is_err() {
+                    let s = vm.bx.heap.temp_string_with(|heap, out| {
+                        heap.cast_to_string(value, out);
+                        out.to_string()
+                    });
+                    let delta: f64 = s.trim().parse().unwrap_or(0.0);
+                    let zmin = self.min_zoom.max(3.0);
+                    let zmax = self.max_zoom.max(zmin);
+                    // animate toward the new zoom (glide, not snap) — the plan
+                    // camera eases self.zoom -> nav_zoom_anim each frame.
+                    let base = self.nav_zoom_anim.unwrap_or(self.zoom);
+                    self.nav_zoom_anim = Some((base + delta).clamp(zmin, zmax));
+                    self.nav_user_adjusted = true;
+                    self.nav_last_touch = crate::splash::sim_clock_secs();
+                    vm.with_cx_mut(|cx| self.redraw(cx));
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        // `ui.<id>.nav_center_origin(...)` — the "my location" button on the plan
+        // overview. octos has no live GPS, so the trip ORIGIN is the current-
+        // location proxy: recenter on it at a street-level zoom, like a maps app's
+        // locate button. Marks the camera user-adjusted so the route-fit stops
+        // fighting it; the plan center is `nav_car_norm` (route centre) + `nav_pan`
+        // every frame, so we center on the origin by offsetting the pan from it.
+        if method == live_id!(nav_center_origin) {
+            if let Some(&(lat, lon, _)) = self.nav_markers.first() {
+                let o = lon_lat_to_normalized(lon, lat);
+                let zmin = self.min_zoom.max(3.0);
+                let zmax = self.max_zoom.max(zmin);
+                // GLIDE to the origin (animate zoom + pan targets) instead of
+                // jumping. plan center == nav_car_norm (route centre) + nav_pan
+                // each frame, so target the pan that lands center on the origin.
+                self.nav_zoom_anim = Some(16.0_f64.clamp(zmin, zmax));
+                self.nav_pan_anim =
+                    Some(dvec2(o.x - self.nav_car_norm.x, o.y - self.nav_car_norm.y));
+                self.nav_user_adjusted = true;
+                self.nav_last_touch = crate::splash::sim_clock_secs();
+                vm.with_cx_mut(|cx| self.redraw(cx));
+            }
             return ScriptAsyncResult::Return(NIL);
         }
         ScriptAsyncResult::MethodNotFound
@@ -1189,51 +1370,150 @@ impl Widget for MapView {
             }
             let zmin = self.min_zoom.max(0.0);
             let zmax = self.max_zoom.max(zmin);
-            match event.hits_with_capture_overload(cx, self.draw_bg.area(), false) {
-                Hit::FingerDown(fe) => {
-                    self.nav_touches.push((fe.digit_id.0, fe.abs));
-                    self.nav_last_touch = crate::splash::sim_clock_secs();
-                    if self.nav_touches.len() == 2 {
-                        let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
-                        let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt();
-                        self.nav_pinch_base = Some((d.max(1.0), self.view_zoom()));
-                    }
-                }
-                Hit::FingerMove(fe) => {
-                    let mut prev = None;
-                    for t in self.nav_touches.iter_mut() {
-                        if t.0 == fe.digit_id.0 {
-                            prev = Some(t.1);
-                            t.1 = fe.abs;
-                            break;
+
+            // Safety: whenever no finger is on the map, make sure the scroll-block
+            // (set below during a pan/pinch) is cleared, so it can never persist past
+            // a gesture and wedge scrolling on other cards. The gesture re-blocks per
+            // TouchUpdate. (This block is a Cx global with no per-frame auto-reset.)
+            if self.nav_touches.is_empty() {
+                cx.unblock_scrolling();
+            }
+
+            // Claim the gesture for the map ONLY when a finger lands on the EXPOSED
+            // map surface. hits() honours z-order, so a finger on the overlaid bottom
+            // sheet / control pills / buttons returns Miss here and the map does NOT
+            // pan under them. (Before this, the full-card map rect swallowed every
+            // touch on the sheet — tapping the sheet just panned the map instead of
+            // reaching its buttons, which reads as "app not responding".)
+            // capture_overload=false leaves those overlay taps for the widgets on top.
+            if let Hit::FingerDown(_) =
+                event.hits_with_capture_overload(cx, self.draw_bg.area(), false)
+            {
+                self.nav_gesture_on_map = true;
+            }
+
+            // Touch gestures (one-finger PAN, two-finger PINCH-zoom). Android reports
+            // EVERY active pointer on each event (the JNI loops getPointerCount), so
+            // `te.touches` is the authoritative current set — REBUILD from it (a missed
+            // Stop otherwise leaves a phantom finger that turns a pan into a pinch).
+            // Once a finger has landed ON the map the gesture is "claimed" (above); from
+            // then on pan vs pinch is decided from ALL active fingers, not just those
+            // still inside the map rect, so a finger drifting off doesn't flip
+            // pinch<->pan. Switches between pan and pinch are debounced a few frames to
+            // reject momentary flickers (a palm graze, or pinch jitter).
+            if let Event::TouchUpdate(te) = event {
+                let active: Vec<_> = te
+                    .touches
+                    .iter()
+                    .filter(|t| {
+                        !matches!(t.state, crate::makepad_platform::event::TouchState::Stop)
+                    })
+                    .map(|t| t.abs)
+                    .collect();
+                self.nav_touches = te
+                    .touches
+                    .iter()
+                    .filter(|t| {
+                        !matches!(t.state, crate::makepad_platform::event::TouchState::Stop)
+                    })
+                    .map(|t| (t.uid, t.abs))
+                    .collect();
+                // map rect — used by the pinch focal-point math below
+                let rect = self.draw_bg.area().clipped_rect(cx);
+
+                if active.is_empty() {
+                    // all fingers up — end the gesture and release the scroll block
+                    self.nav_gesture_on_map = false;
+                    self.nav_gest = 0;
+                    self.nav_gest_hold = 0;
+                    self.nav_pinch_base = None;
+                    self.nav_pan_drag = None;
+                    cx.unblock_scrolling();
+                } else {
+                    // the gesture was already claimed above via hits() (a finger on the
+                    // EXPOSED map only). A finger that landed on the sheet/buttons leaves
+                    // nav_gesture_on_map false, so it falls through here without panning.
+                    if self.nav_gesture_on_map {
+                        // block the enclosing drag-scrolling PortalList so pan/pinch move
+                        // the MAP, not the card (it checks is_scrolling_allowed_within()
+                        // before entering its drag, during child event-forwarding).
+                        cx.block_scrolling_except_within(self.draw_bg.area());
+                        // debounce pan<->pinch switches; the FIRST gesture commits at once
+                        let n = active.len().min(2) as u8;
+                        if self.nav_gest == 0 {
+                            self.nav_gest = n;
+                        } else if n != self.nav_gest {
+                            self.nav_gest_hold += 1;
+                            if self.nav_gest_hold >= 3 {
+                                self.nav_gest = n;
+                                self.nav_gest_hold = 0;
+                            }
+                        } else {
+                            self.nav_gest_hold = 0;
                         }
-                    }
-                    if self.nav_touches.len() >= 2 {
-                        if let Some((base_d, base_z)) = self.nav_pinch_base {
-                            let (a, b) = (self.nav_touches[0].1, self.nav_touches[1].1);
-                            let d = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
-                            self.zoom = (base_z + (d / base_d).log2()).clamp(zmin, zmax);
-                            self.nav_last_touch = crate::splash::sim_clock_secs();
-                            self.nav_user_adjusted = true;
-                            self.redraw(cx);
+                        let pts = &active;
+                        if self.nav_gest >= 2 && pts.len() >= 2 {
+                            // ---- two-finger PINCH, anchored on the focal point ----
+                            let d = ((pts[0].x - pts[1].x).powi(2)
+                                + (pts[0].y - pts[1].y).powi(2))
+                            .sqrt()
+                            .max(1.0);
+                            match self.nav_pinch_base {
+                                Some((base_d, base_z, fp0)) => {
+                                    // Zoom around the FIXED focal point captured at pinch
+                                    // start (`fp0`), not the live midpoint — a fixed
+                                    // anchor keeps the spot you pinched put and only pans
+                                    // to compensate for the SCALE change. PINCH_SENS > 1
+                                    // makes a modest spread zoom snappily.
+                                    const PINCH_SENS: f64 = 1.8;
+                                    let prev_zoom = self.zoom;
+                                    self.zoom = (base_z + PINCH_SENS * (d / base_d).log2())
+                                        .clamp(zmin, zmax);
+                                    let sc = dvec2(
+                                        rect.pos.x + rect.size.x * 0.5,
+                                        rect.pos.y + rect.size.y * 0.5,
+                                    );
+                                    let wo = tile_world_size_zoom(prev_zoom).max(1e-6);
+                                    let wn = tile_world_size_zoom(self.zoom).max(1e-6);
+                                    self.nav_pan.x += (fp0.x - sc.x) * (1.0 / wo - 1.0 / wn);
+                                    self.nav_pan.y += (fp0.y - sc.y) * (1.0 / wo - 1.0 / wn);
+                                    self.nav_zoom_anim = None;
+                                    self.nav_pan_anim = None;
+                                    self.nav_user_adjusted = true;
+                                    self.nav_last_touch = crate::splash::sim_clock_secs();
+                                    self.redraw(cx);
+                                }
+                                None => {
+                                    // pinch just began — capture base distance, zoom, and
+                                    // the finger midpoint as the fixed focal anchor
+                                    let fp0 =
+                                        dvec2((pts[0].x + pts[1].x) * 0.5, (pts[0].y + pts[1].y) * 0.5);
+                                    self.nav_pinch_base = Some((d, self.view_zoom(), fp0));
+                                }
+                            }
+                            self.nav_pan_drag = None;
+                        } else if self.nav_gest == 1 && !pts.is_empty() {
+                            // ---- one-finger PAN (absolute from the drag anchor) ----
+                            self.nav_pinch_base = None;
+                            let p = pts[0];
+                            if let Some((abs0, pan0)) = self.nav_pan_drag {
+                                let world = tile_world_size_zoom(self.view_zoom());
+                                self.nav_pan.x = pan0.x - (p.x - abs0.x) / world;
+                                self.nav_pan.y = pan0.y - (p.y - abs0.y) / world;
+                                self.nav_pan_anim = None;
+                                self.nav_user_adjusted = true;
+                                self.nav_last_touch = crate::splash::sim_clock_secs();
+                                self.redraw(cx);
+                            } else {
+                                // anchor a new drag (re-anchors after a pinch releases to
+                                // one finger, so the pan doesn't jump)
+                                self.nav_pan_drag = Some((p, self.nav_pan));
+                            }
                         }
-                    } else if let Some(p) = prev {
-                        // one-finger pan: shift the map center opposite the drag
-                        let world = tile_world_size_zoom(self.view_zoom());
-                        self.nav_pan.x -= (fe.abs.x - p.x) / world;
-                        self.nav_pan.y -= (fe.abs.y - p.y) / world;
-                        self.nav_last_touch = crate::splash::sim_clock_secs();
-                        self.nav_user_adjusted = true;
-                        self.redraw(cx);
+                        // else: committed gesture vs live-finger count mismatch mid-switch
+                        // — hold (no pan, no zoom) until the debounce settles
                     }
                 }
-                Hit::FingerUp(fe) => {
-                    self.nav_touches.retain(|t| t.0 != fe.digit_id.0);
-                    if self.nav_touches.len() < 2 {
-                        self.nav_pinch_base = None;
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -1295,13 +1575,39 @@ impl Widget for MapView {
             if self.frame_counter % 15 == 0 {
                 self.prefetch_route_ahead(cx);
             }
-            // ~60fps camera animation while navigating
-            self.nav_next_frame = cx.new_next_frame();
+            // Only keep pumping frames while something is actually MOVING. A drive
+            // follow-cam (2d/3d) tracks the sim vehicle every frame so it always
+            // animates; a plan/preview map is STATIC unless a zoom/pan glide, a
+            // live touch gesture, or a just-revealed label fade is in flight.
+            // Re-arming unconditionally here pinned the GPU at ~100% on a frozen
+            // map (the reported sluggishness). Async tile arrivals repaint via
+            // their own UI signal (ToUISender → handle_tile_worker_messages), so
+            // they don't depend on this loop.
+            let moving = !self.is_plan()
+                || self.nav_zoom_anim.is_some()
+                || self.nav_pan_anim.is_some()
+                || !self.nav_touches.is_empty();
+            if moving {
+                self.nav_settle_frames = NAV_SETTLE_FRAMES;
+            }
+            if moving || self.nav_settle_frames > 0 {
+                self.nav_next_frame = cx.new_next_frame();
+                if !moving {
+                    self.nav_settle_frames -= 1;
+                }
+            }
         } else if self.draw_map.nav.mode != 0.0 {
             self.draw_map.nav = NavShaderParams::default();
             self.apply_theme_palette();
         }
 
+        // For the flat plan/preview map (nav_kind 2), fill the whole map area with the
+        // land tone before tiles, so regions beyond the fetched route corridor read as
+        // empty map instead of the dark clear colour ("2nd half of the map is black").
+        if nav_kind == 2 {
+            let bg = self.active_style().background;
+            self.draw_bg.color = bg;
+        }
         self.draw_bg.draw_abs(cx, rect);
         let tile_rect = self.nav_tile_rect(rect, nav_kind);
         self.ensure_visible_tiles(cx, tile_rect);
@@ -1548,6 +1854,11 @@ impl Widget for MapView {
                 self.draw_nav_puck(cx, rect, off_x, off_y, view_zoom);
             }
             self.draw_ui.end(cx);
+            // Plan street/place labels are TEXT (draw_text), so they go after the
+            // draw_ui vector session — on top of the tiles + route line.
+            if self.is_plan() {
+                self.draw_nav_labels_plan(cx, rect, off_x, off_y, view_zoom);
+            }
             self.label_perf = LabelPerfStats::default();
         } else {
             self.label_perf = LabelPerfStats::default();
@@ -1570,6 +1881,21 @@ impl WidgetMatchEvent for MapView {
         response: &HttpResponse,
         _scope: &mut Scope,
     ) {
+        // OpenFreeMap TileJSON bootstrap response? (tracked separately from the
+        // tile pending map) — adopt the current dated tile-URL template.
+        if request_id.0 != 0 && NAV_MVT_TILEJSON_REQ.with(|c| c.get()) == request_id.0 {
+            NAV_MVT_TILEJSON_REQ.with(|c| c.set(0));
+            NAV_MVT_BOOTSTRAP.with(|b| b.set(2));
+            if response.status_code == 200 {
+                if let Some(tj) = response.get_string_body() {
+                    if nav_mvt_adopt_tilejson(&tj) {
+                        log!("MapView: OpenFreeMap tile template refreshed from TileJSON");
+                    }
+                }
+            }
+            return;
+        }
+
         let Some(pending) = nav_pending_take(&request_id) else {
             return;
         };
@@ -1595,25 +1921,55 @@ impl WidgetMatchEvent for MapView {
             return;
         }
 
-        let Some(body) = response.get_string_body() else {
-            self.mark_tile_failed(
-                tile_key,
-                &format!("endpoint {} missing utf8 response body", endpoint),
-            );
-            self.update_status_text();
-            self.redraw(cx);
-            return;
+        // Resolve the payload to move into the worker: MVT/PBF bytes (decoded to
+        // Overpass-JSON there via the shared bridge) or an Overpass-JSON string
+        // already. All decode/parse/tessellate stays off the UI thread.
+        let payload = if pending.is_mvt {
+            match response.get_body() {
+                Some(bytes) => TilePayload::Mvt(bytes.clone()),
+                None => {
+                    self.mark_tile_failed(
+                        tile_key,
+                        &format!("endpoint {} missing tile body", endpoint),
+                    );
+                    self.update_status_text();
+                    self.redraw(cx);
+                    return;
+                }
+            }
+        } else {
+            match response.get_string_body() {
+                Some(b) => TilePayload::Json(b),
+                None => {
+                    self.mark_tile_failed(
+                        tile_key,
+                        &format!("endpoint {} missing utf8 response body", endpoint),
+                    );
+                    self.update_status_text();
+                    self.redraw(cx);
+                    return;
+                }
+            }
         };
 
-        // Offload heavy JSON parsing + tessellation to the thread pool
+        // Offload heavy decode + JSON parse + tessellation to the thread pool.
         self.ensure_tile_thread_pool(cx);
         let sender = nav_workers_sender();
         let style_epoch = self.style_epoch;
         let theme_style = self.active_style().clone();
 
         nav_workers_execute(tile_key, move |_tag| {
-            match build_tile_buffers_from_body(tile_key, &body, &theme_style) {
-                Ok(buffers) => {
+            // Reduce to an Overpass-JSON string (decode MVT if needed), then build.
+            let json = match payload {
+                TilePayload::Json(j) => Ok(j),
+                TilePayload::Mvt(bytes) => mbtiles_tile_to_overpass_json(tile_key, &bytes),
+            };
+            let result = json.and_then(|body| {
+                build_tile_buffers_from_body(tile_key, &body, &theme_style)
+                    .map(|buffers| (body, buffers))
+            });
+            match result {
+                Ok((body, buffers)) => {
                     store_tile_data_cache_on_disk(tile_key, &body);
                     let _ = sender.send(TileWorkerMessage::NetworkTileParsed {
                         style_epoch,
@@ -1622,10 +1978,11 @@ impl WidgetMatchEvent for MapView {
                     });
                 }
                 Err(err) => {
+                    let head: String = body.chars().take(160).collect();
                     let _ = sender.send(TileWorkerMessage::NetworkTileParseFailed {
                         style_epoch,
                         tile_key,
-                        error: err,
+                        error: format!("{err} | body len={} head={head:?}", body.len()),
                     });
                 }
             }
@@ -1834,6 +2191,10 @@ impl MapView {
         }
         if redraw {
             self.update_status_text();
+            // A tile just landed on a possibly-static map: give the map a short
+            // render window so the newly-drawn tile's labels can fade in (the
+            // `moving` guard in draw_walk would otherwise idle after one frame).
+            self.nav_settle_frames = self.nav_settle_frames.max(NAV_SETTLE_FRAMES);
             self.redraw(cx);
         }
     }
@@ -2024,6 +2385,30 @@ impl MapView {
         if minx > maxx {
             return; // nothing to frame — keep the current center (no NaN)
         }
+        // GLIDE toward any button-set target (+/- zoom, my-location). The plan map
+        // redraws every frame (nav_next_frame), so easing self.zoom / self.nav_pan
+        // toward the target here animates smoothly; a gesture cleared the target
+        // and set the value directly, so this is a no-op during direct manipulation.
+        if let Some(tz) = self.nav_zoom_anim {
+            let d = tz - self.zoom;
+            if d.abs() > 0.004 {
+                self.zoom += d * 0.22;
+            } else {
+                self.zoom = tz;
+                self.nav_zoom_anim = None;
+            }
+        }
+        if let Some(tp) = self.nav_pan_anim {
+            let dx = tp.x - self.nav_pan.x;
+            let dy = tp.y - self.nav_pan.y;
+            if dx.abs() > 1e-7 || dy.abs() > 1e-7 {
+                self.nav_pan.x += dx * 0.22;
+                self.nav_pan.y += dy * 0.22;
+            } else {
+                self.nav_pan = tp;
+                self.nav_pan_anim = None;
+            }
+        }
         let cx = (minx + maxx) * 0.5;
         let cy = (miny + maxy) * 0.5;
         // Fit the WHOLE route on first show; once the user pinches/pans
@@ -2106,17 +2491,22 @@ impl MapView {
         }
         // Shared across the 1 Hz card rebuilds: decode + tessellate ONCE.
         let adopted = NAV_ROUTE_STORE.with(|s| {
-            let s = s.borrow();
-            s.get(&hash).map(|r| {
-                (
+            let mut s = s.borrow_mut();
+            // bump the LRU clock on adopt so an actively-reused route can never
+            // be the eviction victim while an instance still borrows its handle
+            if let Some(r) = s.get_mut(&hash) {
+                r.seq = next_nav_route_seq();
+                Some((
                     r.geom
                         .as_ref()
                         .map(|g| Geometry::new_borrowed(g.geometry_id())),
                     r.origin,
                     r.pts.clone(),
                     r.cum.clone(),
-                )
-            })
+                ))
+            } else {
+                None
+            }
         });
         if let Some((geom, origin, pts, cum)) = adopted {
             self.nav_route_geom = geom;
@@ -2142,7 +2532,10 @@ impl MapView {
             if i + 1 < coords0.len() {
                 let (lat2, lon2) = coords0[i + 1];
                 let seg = haversine_m(lat, lon, lat2, lon2);
-                let steps = (seg / 6.0).floor() as usize;
+                // cap per-segment subdivision: a pathological (gappy/malformed)
+                // polyline segment could otherwise explode into millions of
+                // points and OOM-abort the process (profile.small: panic='abort')
+                let steps = ((seg / 6.0).floor() as usize).min(2048);
                 for s in 1..steps {
                     let t = s as f64 / steps as f64;
                     coords.push((lat + (lat2 - lat) * t, lon + (lon2 - lon) * t));
@@ -2249,8 +2642,23 @@ impl MapView {
             self.nav_route_geom = Some(Geometry::new_borrowed(geometry.geometry_id()));
             NAV_ROUTE_STORE.with(|s| {
                 let mut s = s.borrow_mut();
-                if s.len() > 6 {
-                    s.clear(); // routes are big; keep the store tiny
+                // Evict the LEAST-recently-used entries down to a cap. NEVER
+                // bulk-clear(): instances hold BORROWED handles into this store,
+                // including a just-dropped plan MapView whose final draw is still
+                // queued during a plan->drive transition. Freeing a live entry
+                // frees its GPU geometry slot; the pool reuses that slot for the
+                // next route/tile and the queued draw then reads a wrong-sized
+                // buffer -> native SIGSEGV (the reported "3D nav crash"). LRU keeps
+                // the routes currently on screen (the one just drawn + the incoming
+                // drive route) alive; only long-stale entries are dropped.
+                const NAV_ROUTE_CAP: usize = 12;
+                while s.len() >= NAV_ROUTE_CAP {
+                    match s.iter().min_by_key(|(_, r)| r.seq).map(|(&k, _)| k) {
+                        Some(k) => {
+                            s.remove(&k);
+                        }
+                        None => break,
+                    }
                 }
                 s.insert(
                     hash,
@@ -2259,6 +2667,7 @@ impl MapView {
                         origin,
                         pts: self.nav_pts.clone(),
                         cum: self.nav_cum.clone(),
+                        seq: next_nav_route_seq(),
                     },
                 );
             });
@@ -2561,6 +2970,102 @@ impl MapView {
         self.nav_labels_shown = now_shown;
     }
 
+    /// Plan-overview labels: flat street/place names across the WHOLE visible
+    /// route (not the 260 m radius of the 3D chase labels), projected via
+    /// nav_project_plan (so they sit on the tiles), dark text with a white halo
+    /// so they read over roads/water. Called OUTSIDE the draw_ui session so the
+    /// text batches on top.
+    fn draw_nav_labels_plan(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
+        let zoom = self.request_zoom_level();
+        let world = tile_world_size(zoom);
+        let scale = 2.0_f64.powf(view_zoom - zoom as f64);
+        let cw = self.center_norm * world;
+        // radius (world-px) covering the visible map, so labels span the route
+        let radius = (rect.size.x.max(rect.size.y)) * 0.6 / scale.max(1e-6);
+        if self.frame_counter % 15 == 0 || self.nav_labels_cache.is_empty() {
+            self.nav_labels_cache = nav_store_labels(zoom, cw.x, cw.y, radius);
+        }
+        let mut labels = self.nav_labels_cache.clone();
+        if labels.is_empty() {
+            return;
+        }
+        // STICKY + DETERMINISTIC order so the picked set doesn't FLICKER: labels
+        // shown last frame win the collision test (rank 0), then higher priority,
+        // then by name — a STABLE tie-break. Without it, `nav_store_labels`
+        // returns candidates in non-deterministic (HashMap) order, so each cache
+        // refresh re-picked a different subset and a static overview flashed.
+        {
+            let shown = &self.nav_labels_shown;
+            labels.sort_by(|a, b| {
+                (!shown.contains(&a.2) as u8, a.3)
+                    .cmp(&(!shown.contains(&b.2) as u8, b.3))
+                    .then_with(|| a.2.cmp(&b.2))
+            });
+        }
+        let fs = 13.0f32;
+        let now = crate::splash::sim_clock_secs();
+        let mut drawn = 0;
+        let mut placed: Vec<Rect> = Vec::new();
+        let mut now_shown: HashSet<String> = HashSet::new();
+        for (wx, wy, text, _pri) in labels {
+            if drawn >= 14 {
+                break;
+            }
+            let (sx, sy) = self.nav_project_plan(off_x + wx * scale, off_y + wy * scale);
+            // on the map + above the summary sheet (~60% down)
+            if sx < rect.pos.x + 8.0
+                || sx > rect.pos.x + rect.size.x - 8.0
+                || sy < rect.pos.y + 12.0
+                || sy > rect.pos.y + rect.size.y * 0.60
+            {
+                continue;
+            }
+            let w = text.chars().count() as f64 * fs as f64 * 0.52;
+            let lr = Rect {
+                pos: dvec2(sx - w * 0.5, sy - fs as f64 * 0.6),
+                size: dvec2(w, fs as f64 * 1.2),
+            };
+            // keep names out from under the top-right controls (the +/- zoom pill
+            // and the my-location button) so they never render clipped behind UI.
+            let ctrl_left = rect.pos.x + rect.size.x - 74.0;
+            let ctrl_bottom = rect.pos.y + 250.0;
+            if lr.pos.x + lr.size.x > ctrl_left && lr.pos.y < ctrl_bottom {
+                continue;
+            }
+            if placed
+                .iter()
+                .any(|p| rects_overlap_with_padding(*p, lr, 6.0))
+            {
+                continue;
+            }
+            placed.push(lr);
+            drawn += 1;
+            // FADE-IN: ramp a newly-appeared name from 0 -> 1 over ~0.22s
+            // (smoothstep) so it doesn't pop when panning/zooming reveals it.
+            let seen = *self.nav_label_seen.entry(text.clone()).or_insert(now);
+            let f = (((now - seen) / 0.22).clamp(0.0, 1.0)) as f32;
+            let a = f * f * (3.0 - 2.0 * f);
+            self.draw_text.text_style.font_size = fs;
+            let (tx, ty) = (lr.pos.x, lr.pos.y);
+            // 8-way halo (N/S/E/W + diagonals) for a rounder, crisper outline that
+            // keeps names legible over roads/water.
+            self.draw_text.color = vec4(1.0, 1.0, 1.0, 0.92 * a);
+            for (dx, dy) in [
+                (-1.2, 0.0), (1.2, 0.0), (0.0, -1.2), (0.0, 1.2),
+                (-0.9, -0.9), (0.9, -0.9), (-0.9, 0.9), (0.9, 0.9),
+            ] {
+                self.draw_text.draw_abs(cx, dvec2(tx + dx, ty + dy), &text);
+            }
+            self.draw_text.color = vec4(0.17, 0.21, 0.27, a);
+            self.draw_text.draw_abs(cx, dvec2(tx, ty), &text);
+            now_shown.insert(text);
+        }
+        // prune first-seen times to the visible set so a name that leaves and
+        // later returns fades in fresh instead of snapping back.
+        self.nav_label_seen.retain(|k, _| now_shown.contains(k));
+        self.nav_labels_shown = now_shown;
+    }
+
     /// Draw an upright standing pin (screen-space billboard) whose tip sits at
     /// the projected ground point `(sx, sy)` and whose head stands `h` px above
     /// it — so it stands UP in the 2.5D scene (consistent with the perspective)
@@ -2578,18 +3083,18 @@ impl MapView {
         let hyf = (sy - h) as f32; // head center
         self.draw_ui.set_color(0.05, 0.08, 0.12, 0.26);
         self.draw_ui.ellipse(sxf, syf + 1.5, rf * 0.85, rf * 0.5);
-        self.draw_ui.fill();
+        self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.6); // softer shadow
         self.draw_ui
             .set_color(color.x, color.y, color.z, color.w);
         self.draw_ui.rect(sxf - 1.3, hyf, 2.6, h as f32);
         self.draw_ui.fill();
         self.draw_ui.set_color(1.0, 1.0, 1.0, 1.0);
         self.draw_ui.circle(sxf, hyf, rf * 1.32);
-        self.draw_ui.fill();
+        self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.5); // softer ring
         self.draw_ui
             .set_color(color.x, color.y, color.z, color.w);
         self.draw_ui.circle(sxf, hyf, rf);
-        self.draw_ui.fill();
+        self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.5); // softer head
     }
 
     /// Draw the route annotation pins (origin/via/destination) as upright
@@ -2656,13 +3161,13 @@ impl MapView {
                 self.draw_ui.line_to(x1 - px, y1 - py);
                 self.draw_ui.line_to(x0 - px, y0 - py);
                 self.draw_ui.close();
-                self.draw_ui.fill();
+                self.draw_ui.fill_opts(LineJoin::Miter, 4.0, 1.7); // softer edge
                 // round join at each vertex
                 self.draw_ui.circle(x1, y1, hw);
-                self.draw_ui.fill();
+                self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.7);
             }
             self.draw_ui.circle(scr[0].0, scr[0].1, hw);
-            self.draw_ui.fill();
+            self.draw_ui.fill_opts(LineJoin::Round, 4.0, 1.7);
         }
     }
 
@@ -3083,17 +3588,39 @@ impl MapView {
             );
             return false;
         }
+        // One-time TileJSON bootstrap so the dated OpenFreeMap version stays
+        // current; tiles proceed on the hardcoded default until it lands.
+        if self.use_mvt {
+            self.maybe_bootstrap_openfreemap(cx);
+        }
+
         let request_id = nav_next_request_id();
 
-        let query = overpass_query(tile_key);
-        let endpoint = overpass_endpoint(attempts);
-        let mut request = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
-        request.set_header("Content-Type".to_string(), "text/plain".to_string());
-        request.set_header("Accept".to_string(), "application/json".to_string());
-        request.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
-        request.set_body_string(&query);
+        let (request, endpoint, is_mvt) = if self.use_mvt {
+            // OpenFreeMap MVT: GET the versioned z/x/y.pbf (z already capped ≤14
+            // by request_zoom_level, so this is a real OpenFreeMap tile).
+            let mut req = HttpRequest::new(nav_mvt_tile_url(tile_key), HttpMethod::GET);
+            req.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
+            (req, OPENFREEMAP_LABEL, true)
+        } else {
+            let query = overpass_query(tile_key);
+            let endpoint = overpass_endpoint(tile_key, attempts);
+            let mut req = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
+            req.set_header("Content-Type".to_string(), "text/plain".to_string());
+            req.set_header("Accept".to_string(), "application/json".to_string());
+            req.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
+            req.set_body_string(&query);
+            (req, endpoint, false)
+        };
 
-        nav_pending_insert(request_id, PendingTileRequest { tile_key, endpoint });
+        nav_pending_insert(
+            request_id,
+            PendingTileRequest {
+                tile_key,
+                endpoint,
+                is_mvt,
+            },
+        );
         self.tiles.insert(
             tile_key,
             TileEntry {
@@ -3104,6 +3631,21 @@ impl MapView {
         );
         cx.http_request(request_id, request);
         true
+    }
+
+    /// Fire the one-time OpenFreeMap TileJSON fetch to refresh the dated tile-URL
+    /// version. Non-blocking — tiles keep flowing on the hardcoded default until
+    /// (and unless) this lands.
+    fn maybe_bootstrap_openfreemap(&mut self, cx: &mut Cx) {
+        if NAV_MVT_BOOTSTRAP.with(|b| b.get()) != 0 {
+            return; // already in flight or resolved this session
+        }
+        NAV_MVT_BOOTSTRAP.with(|b| b.set(1));
+        let request_id = nav_next_request_id();
+        NAV_MVT_TILEJSON_REQ.with(|c| c.set(request_id.0));
+        let mut req = HttpRequest::new(OPENFREEMAP_TILEJSON_URL.to_string(), HttpMethod::GET);
+        req.set_header("User-Agent".to_string(), "makepad-map-view".to_string());
+        cx.http_request(request_id, req);
     }
 
     fn place_and_draw_labels(
@@ -3514,6 +4056,10 @@ impl MapView {
         let mut zoom = self.view_zoom().round() as u32;
         if self.use_local_mbtiles {
             zoom = zoom.clamp(LOCAL_MBTILES_MIN_ZOOM, LOCAL_MBTILES_MAX_ZOOM);
+        } else if self.use_mvt {
+            // OpenFreeMap maxzoom is 14; a closer view fetches the z14 tile and
+            // overzooms it (the draw path already scales by view_zoom − key.z).
+            zoom = zoom.min(OPENFREEMAP_MAX_ZOOM);
         }
         zoom
     }

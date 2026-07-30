@@ -39,6 +39,7 @@ fn main() {
         .unwrap();
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let target = env::var("TARGET").unwrap();
 
     if target_os == "macos" {
@@ -121,6 +122,23 @@ fn main() {
     }
     std::fs::write(Path::new(&out_dir).join("app_icon_gen.rs"), icon_gen).unwrap();
 
+
+    // `mobile` — Android and OpenHarmony share a phone-shaped shell: a native
+    // composer overlay instead of a docked one, a soft keyboard, a sandboxed
+    // per-app HOME, and no desktop window chrome. Gate that shared behaviour on
+    // `mobile` rather than repeating
+    // `any(target_os = "android", target_env = "ohos")` at every site.
+    //
+    // NOTE iOS is deliberately NOT included: it has its own shell and its own
+    // backend, and folding it in here would silently change its behaviour at
+    // every one of these sites. Add it only with per-site review.
+    println!("cargo:rustc-check-cfg=cfg(mobile)");
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "android"
+        || env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "ohos"
+    {
+        println!("cargo:rustc-cfg=mobile");
+    }
+
     println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,linux_direct,quest,no_android_choreographer,ohos_sim,headless,use_unstable_unix_socket_ancillary_data_2021)");
     println!("cargo:rerun-if-env-changed=MAKEPAD");
     println!("cargo:rerun-if-env-changed=MAKEPAD_PACKAGE_DIR");
@@ -169,7 +187,11 @@ fn main() {
         }
         "linux" => {
             println!("cargo:rustc-cfg=use_gles_3");
-            println!("cargo:rustc-link-lib=xkbcommon");
+            // OpenHarmony also reports target_os=linux but has no xkbcommon in
+            // its sysroot (and compiles out the wayland/xkb backend anyway).
+            if target_env != "ohos" {
+                println!("cargo:rustc-link-lib=xkbcommon");
+            }
         }
         "android" => {
             println!("cargo:rustc-cfg=use_gles_3");

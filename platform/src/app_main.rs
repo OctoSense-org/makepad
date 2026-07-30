@@ -328,7 +328,7 @@ macro_rules! _app_main_event_closure {
 #[macro_export]
 macro_rules! app_main {
     ( $ app: ident) => {
-        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+        #[cfg(not(mobile))]
         fn main() {
             app_main();
         }
@@ -401,6 +401,13 @@ macro_rules! app_main {
             exports: $crate::napi_ohos::JsObject,
             env: $crate::napi_ohos::Env,
         ) -> $crate::napi_ohos::Result<()> {
+            // Without this the platform logger is never installed on OHOS, so
+            // every `log!` falls through to the default println! backend — and
+            // an OHOS app has no stdout, so all diagnostics vanish. The desktop,
+            // android and wasm arms all do this; ohos was simply missed.
+            $crate::log::ohos_boot_log("ohos_init_app_main entered");
+            Cx::init_log();
+            $crate::log::ohos_boot_log("init_log done");
             Cx::ohos_init(exports, env, || {
                 let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
                 let studio_http = $crate::resolve_studio_http();

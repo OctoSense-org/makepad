@@ -141,6 +141,11 @@ impl Fonts {
     }
 
     pub fn should_use_slug_glyph(&self, dpxs_per_em: f32) -> bool {
+        // NOTE (OpenHarmony): forcing this to `false` — i.e. routing every glyph
+        // down the raster-atlas path instead of slug — was tried and did NOT make
+        // text appear. Both text paths are equally blank on device, so the fault
+        // is below them (shared glyph-atlas upload or font rasterization), not in
+        // the slug renderer. Don't re-try this without new evidence.
         dpxs_per_em >= self.slug_min_dpxs_per_em
     }
 

@@ -27,7 +27,7 @@ use {
     },
 };
 
-/// Text submitted by the native Android floating chat-composer overlay
+/// Text submitted by the native floating chat-composer overlay
 /// (`MakepadActivity`'s composer view that floats over the GL surface).
 ///
 /// Posted as a bare action via `Cx::post_action` from the `onComposerSubmit`
@@ -37,17 +37,17 @@ use {
 /// name it in a `downcast_ref` without gating; it is only ever *posted* on
 /// Android.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidComposerSubmit {
+pub struct NativeComposerSubmit {
     pub text: String,
 }
 
 /// A `runhtml` card called `octos.invoke(tool, args)` in its JS. Delivered as a
-/// bare action (like [`AndroidComposerSubmit`]); the WebCard widget dispatches
+/// bare action (like [`NativeComposerSubmit`]); the WebCard widget dispatches
 /// the tool and resolves the card-side promise via `system_browser(..).eval_js`.
 /// Defined cross-platform so non-Android builds can `downcast_ref` it without a
-/// `cfg`; only ever posted on Android.
+/// `cfg`; posted by the Android and OpenHarmony backends.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidSystemBrowserInvoke {
+pub struct NativeSystemBrowserInvoke {
     pub browser_id: u64,
     pub call_id: i64,
     pub tool: String,
@@ -57,17 +57,18 @@ pub struct AndroidSystemBrowserInvoke {
 /// The app was opened/resumed via a deep link or share (an `ACTION_VIEW` URL or
 /// `ACTION_SEND` text — e.g. a YouTube link shared from another app). Posted as a
 /// bare action; the app routes it (e.g. plays it in the youtube card). Defined
-/// cross-platform; only ever posted on Android.
+/// cross-platform; posted by the Android and OpenHarmony backends.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidDeepLink {
+pub struct NativeDeepLink {
     pub url: String,
 }
 
 /// Result of a native file picker (`cx.open_file_dialog`) — the picked file's
 /// name + text contents, or a cancel/error. Correlated to the card's
-/// `octos.invoke` by `call_id`. Defined cross-platform; only posted on Android.
+/// `octos.invoke` by `call_id`. Defined cross-platform; posted by the Android
+/// and OpenHarmony backends.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidDialogResult {
+pub struct NativeDialogResult {
     pub call_id: i64,
     pub name: String,
     pub content: String,
@@ -76,46 +77,49 @@ pub struct AndroidDialogResult {
 }
 
 /// Progress of a native streaming download (`cx.download_file`). Correlated to
-/// the card's `octos.invoke("download")` by `call_id`. Only posted on Android.
+/// the card's `octos.invoke("download")` by `call_id`. Android only so far —
+/// OpenHarmony has no streaming-download result path yet.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidDownloadProgress {
+pub struct NativeDownloadProgress {
     pub call_id: i64,
     pub done: i64,
     pub total: i64,
 }
 
 /// Completion of a native streaming download. On success `error` is empty and
-/// `path` is the saved absolute path. Only posted on Android.
+/// `path` is the saved absolute path. Android only so far — OpenHarmony has no
+/// streaming-download result path yet.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidDownloadComplete {
+pub struct NativeDownloadComplete {
     pub call_id: i64,
     pub path: String,
     pub error: String,
 }
 
 /// The native Android floating composer's "＋" (open another app) button was
-/// tapped. Posted as a bare action like [`AndroidComposerSubmit`]; the app
+/// tapped. Posted as a bare action like [`NativeComposerSubmit`]; the app
 /// routes it into `open_new_app` from `handle_actions`.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidComposerNewApp;
+pub struct NativeComposerNewApp;
 
 /// The native Android floating composer's "⟳" (switch to next app) button was
 /// tapped. Posted as a bare action; the app cycles the foreground app.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidComposerSwitch;
+pub struct NativeComposerSwitch;
 
 /// The native Android floating composer's collapsed "+" FAB was tapped to
 /// UNFOLD it. The Java overlay already swaps the FAB for the input pill and
 /// raises the keyboard; this action lets the app mark `composer_shown = true`
 /// so its state matches (and a later `sync_composer` won't re-fold the pill the
-/// user just opened). Posted as a bare action; only ever posted on Android.
+/// user just opened). Posted as a bare action by the Android and OpenHarmony
+/// backends.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidComposerExpand;
+pub struct NativeComposerExpand;
 
 /// The composer's QR scanner decoded a payload (the JSON LLM-provisioning config).
 /// The app applies it via `login::apply_provision_config_json`.
 #[derive(Clone, Debug, Default)]
-pub struct AndroidQrScanned {
+pub struct NativeQrScanned {
     pub json: String,
 }
 

@@ -319,8 +319,16 @@ impl Widget for Label {
     }
 
     fn set_text(&mut self, cx: &mut Cx, v: &str) {
+        // Short-circuit an unchanged value: re-setting identical text should NOT
+        // schedule a repaint. A `fn tick()` card (nav) calls set_text on many
+        // labels every second with the SAME values; each needless redraw forced a
+        // GL surface swap that flickered the native overlays composited over it.
+        if self.text.as_ref() == v {
+            return;
+        }
         self.text.as_mut_empty().push_str(v);
         self.redraw(cx);
+        crate::splash::splash_mark_tick_changed();
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {

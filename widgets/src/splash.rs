@@ -675,7 +675,14 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
 &timezone=auto&forecast_days=7"
             );
             let value = match vm.host.cx_mut().script_data_fetch(&url) {
-                Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| "—".to_string()),
+                // Union of two changes: round the plucked value (whole-degree
+                // display), and show the terminal-failure placeholder rather than
+                // a bare "—" when the fetch itself gives up (#17). The em dash
+                // stays for the case where the fetch SUCCEEDED but the path is
+                // absent, which is a card bug, not a network one.
+                Some(bytes) => json_pluck(&bytes, path.trim())
+                    .map(|v| round_display(path.trim(), v))
+                    .unwrap_or_else(|| "—".to_string()),
                 None => vm.host.cx_mut().script_data_placeholder(&url),
             };
             vm.bx.heap.new_string_from_str(&value)
@@ -764,6 +771,190 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 .and_then(|bytes| json_pluck(&bytes, path.trim()))
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.weekmin(lat, lon) / sys.weekmax(lat, lon) -> the LOWEST low and HIGHEST
+    // high across the 7-day forecast, for a TempBar's draw_bg.wmin / draw_bg.wmax.
+    //
+    // These exist because the card CANNOT know them. Every temperature on the card
+    // is a live sys.weather call, so a generated card asking the model to name the
+    // week's range is asking it to guess at numbers it has never seen — and it
+    // guesses badly ("10 to 35" for a 27-39C week), which clamps every high to the
+    // red end and pushes the whole week into the top of the scale.
+    //
+    // Shares the cached forecast fetch, so neither costs an extra request.
+    // Falls back to a plausible temperate range if the fetch is still in flight,
+    // rather than to 0/0 — a zero span would collapse every bar to one colour.
+    vm.add_method(
+        sys,
+        id_lut!(weekmin),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n = week_extreme(vm, lat, lon, "daily.temperature_2m_min", false).unwrap_or(0.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+    vm.add_method(
+        sys,
+        id_lut!(weekmax),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n = week_extreme(vm, lat, lon, "daily.temperature_2m_max", true).unwrap_or(30.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.moonphase("field") -> the CURRENT 月相 (moon phase), computed from the
+    // device clock — no network, so it never shows a "—" placeholder.
+    //   "name"         -> "Waxing Gibbous"  (one of the eight principal phases)
+    //   "name_zh"      -> "盈凸月"           (the same phase, 八相 names)
+    //   "illumination" -> "87"   (percent of the disc lit, 0-100)
+    //   "phase"        -> "0.62" (position in the cycle, 0 new .. 0.5 full .. 1)
+    // For the MoonPhase WIDGET uniform use sys.moonnum("phase"), which returns a
+    // number: draw_bg.phase needs a float, and a string silently reads as 0.
+    vm.add_method(
+        sys,
+        id_lut!(moonphase),
+        script_args_def!(field = NIL),
+        |vm, args| {
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let f = moon_phase_fraction();
+            let value = match field.trim().to_ascii_lowercase().as_str() {
+                "name" => moon_phase_name(f).to_string(),
+                "name_zh" | "name_cn" => moon_phase_name_zh(f).to_string(),
+                // Illuminated fraction is (1 - cos(2*pi*phase)) / 2: 0 at new,
+                // 1 at full, and correctly non-linear in between.
+                "illumination" | "illum" => {
+                    let lit = (1.0 - (std::f64::consts::TAU * f).cos()) * 50.0;
+                    format!("{}", lit.round() as i64)
+                }
+                _ => format!("{f:.2}"),
+            };
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+    vm.add_method(
+        sys,
+        id_lut!(moonnum),
+        script_args_def!(field = NIL),
+        |vm, args| {
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let f = moon_phase_fraction();
+            let n = match field.trim().to_ascii_lowercase().as_str() {
+                "illumination" | "illum" => (1.0 - (std::f64::consts::TAU * f).cos()) * 50.0,
+                _ => f,
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.daylight(lat, lon) -> fraction of DAYLIGHT elapsed: 0 at sunrise, 1 at
+    // sunset, for the SunArc widget's draw_bg.progress. Before sunrise it is
+    // negative and after sunset greater than 1, which the widget reads as night
+    // and dims the sun rather than hiding it.
+    //
+    // Shares the cached sys.weather forecast fetch, so it costs no extra request.
+    // Returns 0.5 while that fetch is in flight — the arc then shows a midday sun
+    // for one redraw, which reads better than a sun jammed at the horizon.
+    vm.add_method(
+        sys,
+        id_lut!(daylight),
+        script_args_def!(lat = NIL, lon = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            let progress = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| {
+                    let rise = hhmm_to_minutes(&json_pluck(&bytes, "daily.sunrise.0")?)?;
+                    let set = hhmm_to_minutes(&json_pluck(&bytes, "daily.sunset.0")?)?;
+
+                    // "Now" comes from the DEVICE CLOCK shifted by the city's UTC
+                    // offset — NOT from `current.time` in the response. The
+                    // forecast fetch is cached, so its timestamp is frozen at
+                    // whenever the card last fetched; using it parks the sun
+                    // wherever it stood then and drifts further all day. Sunrise,
+                    // sunset and the offset are all stable for the day, so only
+                    // the current instant must come from a live source.
+                    let offset = json_pluck(&bytes, "utc_offset_seconds")?
+                        .parse::<f64>()
+                        .ok()?;
+                    let local = (now_unix_secs() as f64 + offset).rem_euclid(86_400.0);
+                    let now = local / 60.0;
+
+                    let span = set - rise;
+                    if span <= 0.0 {
+                        // Polar day or night — no meaningful fraction.
+                        return None;
+                    }
+                    Some((now - rise) / span)
+                })
+                .unwrap_or(0.5);
+            ScriptValue::from_f64(progress)
+        },
+    );
+
+    // sys.aqigrid(lat, lon, span, idx) -> the US-AQI at one cell of a 4x4 grid
+    // covering `span` degrees centred on (lat, lon), for the AqiContour widget's
+    // a0..a15 uniforms. `idx` is 0..15, row-major with the NORTH row first.
+    //
+    // All sixteen cells come from ONE multi-location open-meteo request, which
+    // that API serves by accepting comma-separated coordinates and returning an
+    // array of results. Because the URL is identical for every idx, the sixteen
+    // card-side calls collapse to a single cached fetch.
+    vm.add_method(
+        sys,
+        id_lut!(aqigrid),
+        script_args_def!(lat = NIL, lon = NIL, span = NIL, idx = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let span = script_value!(vm, args.span).as_number().unwrap_or(1.5);
+            let idx = script_value!(vm, args.idx).as_number().unwrap_or(0.0) as usize;
+            let idx = idx.min(15);
+
+            // Row 0 is the NORTH edge, so latitude DECREASES with the row index —
+            // matching how the shader walks self.pos.y downward.
+            let step = span / 3.0;
+            let mut lats = Vec::with_capacity(16);
+            let mut lons = Vec::with_capacity(16);
+            for r in 0..4 {
+                for c in 0..4 {
+                    lats.push(format!("{:.4}", lat + span / 2.0 - r as f64 * step));
+                    lons.push(format!("{:.4}", lon - span / 2.0 + c as f64 * step));
+                }
+            }
+            let url = format!(
+                "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={}&longitude={}\
+&current=us_aqi&timezone=auto",
+                lats.join(","),
+                lons.join(",")
+            );
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, &format!("{idx}.current.us_aqi")))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
             ScriptValue::from_f64(n)
         },
     );
@@ -1218,6 +1409,31 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.gps("lat"|"lon"|"acc"|"ok") -> the device's last-known GPS fix, read
+    // SYNCHRONOUSLY from the platform global (NO network fetch — so, unlike
+    // sys.search/navroute, it must NOT gate the card via body_binds_live_data).
+    // lat/lon/acc are numbers, -9999 when there is no fix yet; "ok" is 1 when a
+    // fix exists else 0. Cards guard with `sys.gps("ok") >= 1` before trusting
+    // lat/lon (same sentinel idiom as sys.coord). Fed by the Android
+    // LocationListener through JNI onLocation -> makepad_platform::gps.
+    vm.add_method(
+        sys,
+        id_lut!(gps),
+        script_args_def!(field = NIL),
+        |vm, args| {
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let fix = crate::makepad_draw::makepad_platform::gps::last_gps_fix();
+            match field.trim().to_ascii_lowercase().as_str() {
+                "ok" => ScriptValue::from_f64(if fix.is_some() { 1.0 } else { 0.0 }),
+                "lon" => ScriptValue::from_f64(fix.map(|f| f.lon).unwrap_or(-9999.0)),
+                "acc" => ScriptValue::from_f64(fix.map(|f| f.acc as f64).unwrap_or(-9999.0)),
+                _ => ScriptValue::from_f64(fix.map(|f| f.lat).unwrap_or(-9999.0)),
+            }
+        },
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
 }
 
@@ -1394,6 +1610,153 @@ fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
         return Some(s[11..16].to_string());
     }
     Some(s)
+}
+
+/// Reduce a 7-element `daily.*` temperature array to its min or max.
+///
+/// `round_display` is deliberately NOT applied: this feeds a shader uniform, where
+/// the extra precision is free and rounding the span would visibly quantise the
+/// bar colours.
+fn week_extreme(
+    vm: &mut ScriptVm,
+    lat: f64,
+    lon: f64,
+    path: &str,
+    want_max: bool,
+) -> Option<f64> {
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+    );
+    let bytes = vm.host.cx_mut().script_data_fetch(&url)?;
+    let mut acc: Option<f64> = None;
+    for i in 0..7 {
+        let Some(v) = json_pluck(&bytes, &format!("{path}.{i}")) else {
+            continue;
+        };
+        let Ok(n) = v.parse::<f64>() else { continue };
+        acc = Some(match acc {
+            None => n,
+            Some(a) if want_max => a.max(n),
+            Some(a) => a.min(n),
+        });
+    }
+    acc
+}
+
+/// Mean synodic month — new moon to new moon — in seconds.
+const SYNODIC_SECS: f64 = 29.530_588_853 * 86_400.0;
+
+/// A known new moon: 2000-01-06 18:14 UTC, the epoch conventionally used for
+/// simple phase arithmetic.
+const NEW_MOON_EPOCH: f64 = 947_182_440.0;
+
+/// Position in the synodic cycle, 0..1: 0 new, 0.25 first quarter, 0.5 full,
+/// 0.75 last quarter.
+///
+/// This is the MEAN cycle, not a full lunar theory: the true phase wanders by up
+/// to about half a day because the Moon's orbit is elliptical. That is invisible
+/// on a rendered disc and in an illumination percentage rounded to units, which
+/// is all this feeds, and it avoids pulling an ephemeris into the widget crate.
+fn moon_phase_fraction() -> f64 {
+    let elapsed = now_unix_secs() as f64 - NEW_MOON_EPOCH;
+    let f = (elapsed % SYNODIC_SECS) / SYNODIC_SECS;
+    if f < 0.0 {
+        f + 1.0
+    } else {
+        f
+    }
+}
+
+/// The principal-phase name for a point in the cycle. The four exact phases (new,
+/// quarters, full) name a narrow window around the instant; the rest of the cycle
+/// is crescent or gibbous, waxing before full and waning after.
+fn moon_phase_name(f: f64) -> &'static str {
+    if f < 0.0335 || f >= 0.9665 {
+        "New Moon"
+    } else if f < 0.2165 {
+        "Waxing Crescent"
+    } else if f < 0.2835 {
+        "First Quarter"
+    } else if f < 0.4665 {
+        "Waxing Gibbous"
+    } else if f < 0.5335 {
+        "Full Moon"
+    } else if f < 0.7165 {
+        "Waning Gibbous"
+    } else if f < 0.7835 {
+        "Last Quarter"
+    } else {
+        "Waning Crescent"
+    }
+}
+
+/// The principal-phase name in Chinese — the traditional 八相 names, so a Chinese
+/// card is not forced to print "Full Moon" in the middle of otherwise Chinese
+/// text. Same boundaries as `moon_phase_name`.
+fn moon_phase_name_zh(f: f64) -> &'static str {
+    if f < 0.0335 || f >= 0.9665 {
+        "新月"
+    } else if f < 0.2165 {
+        "蛾眉月"
+    } else if f < 0.2835 {
+        "上弦月"
+    } else if f < 0.4665 {
+        "盈凸月"
+    } else if f < 0.5335 {
+        "满月"
+    } else if f < 0.7165 {
+        "亏凸月"
+    } else if f < 0.7835 {
+        "下弦月"
+    } else {
+        "残月"
+    }
+}
+
+/// "HH:MM" → minutes since midnight. json_pluck has already reduced open-meteo's
+/// ISO local datetimes to this form.
+fn hhmm_to_minutes(s: &str) -> Option<f64> {
+    let (h, m) = s.trim().split_once(':')?;
+    Some(h.trim().parse::<f64>().ok()? * 60.0 + m.trim().parse::<f64>().ok()?)
+}
+
+/// Round a DISPLAY reading to a whole number.
+///
+/// open-meteo reports a decimal, so an untouched card reads "29.5°", "8.45" and
+/// "5.0 km/h" where every real weather app shows "29°", "8" and "5 km/h". The
+/// decimals are noise at this precision and they cost real layout: a hero
+/// temperature is set 60-76pt, so ".5" is a wide, attention-grabbing appendage on
+/// the largest element of the card; in a forecast row it pushes the lo/hi labels
+/// wide enough to squeeze the TempBar between them; and in a detail tile ".45"
+/// pads a value already close to overflowing its box.
+///
+/// a2app's weather spec has always PROMISED this for temperatures ("show
+/// whole-degree temps — the helper rounds temperature paths automatically"); it
+/// was documented but never implemented, so every generated card carried them.
+///
+/// Scoped BY PATH NAME to the three quantities a card renders as a headline
+/// number. Everything else is left alone, deliberately:
+///   - `sys.airquality` shares `json_pluck`, and an AQI or pm2_5 reading must not
+///     be touched here;
+///   - "daily.sunrise.0" has already become "05:52", which must not be parsed as
+///     a number;
+///   - humidity and precipitation probability are already integers.
+/// Values that do not parse as a number pass through untouched — including the
+/// "—" placeholder shown while the fetch is in flight.
+fn round_display(path: &str, value: String) -> String {
+    let rounds = path.contains("temperature")
+        || path.contains("uv_index")
+        || path.contains("wind_speed");
+    if !rounds {
+        return value;
+    }
+    match value.parse::<f64>() {
+        Ok(n) => format!("{}", n.round() as i64),
+        Err(_) => value,
+    }
 }
 
 /// Overpass API endpoint (keyless, no auth). overpass-api.de is the primary
@@ -2358,10 +2721,16 @@ impl Splash {
         // Also arm for live-data cards (sys.weather/sys.airquality) so the pump
         // runs and can re-evaluate them when their async data arrives, even if
         // the card has no time-based shader of its own.
+        // EXCEPT `fn tick()` cards (e.g. nav): they manage their own updates in
+        // place via tick() (1 Hz) and their widgets drive their own frames (the
+        // MapView), and their epoch-driven re-eval is suppressed anyway (see the
+        // pump handler). Arming here just made the pump repaint the whole card —
+        // MapView + tiles — 60x/s forever, pinning the GPU. Let them idle.
+        let is_tick = body.contains("fn tick(") || body.contains("fn tick (");
         self.animating = body.contains("draw_pass.time")
             || body.contains("WeatherIcon")
             || body.contains("sys.simsecs")
-            || body_binds_live_data(body);
+            || (body_binds_live_data(body) && !is_tick);
         if self.animating {
             self.anim_next_frame = cx.new_next_frame();
         } else {
@@ -2546,11 +2915,37 @@ impl Drop for Splash {
     }
 }
 
+thread_local! {
+    /// Set by in-place tick setters (Label::set_text, MapView route setters) when
+    /// they ACTUALLY change a value. A `fn tick()` card's 1 Hz forced repaint is
+    /// then skipped when a tick changed nothing (e.g. a static plan map whose
+    /// route/labels are unchanged) — so the GL surface stops swapping every
+    /// second, which was flickering the native overlays (composer/FAB) composited
+    /// over it. The drive view changes the car/ETA each tick, so it still repaints.
+    static SPLASH_TICK_CHANGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Called by an in-place widget setter when it changes a value during `tick()`.
+pub fn splash_mark_tick_changed() {
+    SPLASH_TICK_CHANGED.with(|c| c.set(true));
+}
+
 impl Widget for Splash {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         // Handle tick timer — call tick() in the Splash code's scope
         if self.tick_timer.is_event(event).is_some() {
+            SPLASH_TICK_CHANGED.with(|c| c.set(false));
             self.call_fn(cx, id!(tick));
+            // tick() updates widgets in place (ui.<id>.set_text/…) — e.g. the nav
+            // card's live per-mode ETA and drive car position. Those set_* calls
+            // don't self-schedule a paint on their own, so repaint here — but ONLY
+            // when a setter actually changed a value this tick. A static card (a
+            // plan map with an unchanged route/labels) forced a surface swap every
+            // second otherwise, and that swap flickered the native composer/FAB
+            // overlays over the GL surface.
+            if SPLASH_TICK_CHANGED.with(|c| c.get()) {
+                self.view.redraw(cx);
+            }
         }
 
         // Per-frame redraw pump for time-based shaders: redraw the view (so the
@@ -2579,6 +2974,15 @@ impl Widget for Splash {
             // re-eval for tick cards; they push loaded data via tick().
             let is_tick_card = self.body.as_ref().contains("fn tick(")
                 || self.body.as_ref().contains("fn tick (");
+            // A genuine PER-FRAME animation is a time-driven shader (`draw_pass.time`
+            // or the WeatherIcon's animated shader). A card that merely binds async
+            // live data is STATIC once loaded — repainting it every frame (below)
+            // just pins the GPU. So only repaint per-frame for real animations;
+            // live-data cards still repaint on their epoch change (the `if` above).
+            let needs_frame_anim = {
+                let b = self.body.as_ref();
+                b.contains("draw_pass.time") || b.contains("WeatherIcon")
+            };
             if (epoch != self.last_data_epoch
                 && body_binds_live_data(self.body.as_ref())
                 && !is_tick_card)
@@ -2587,7 +2991,7 @@ impl Widget for Splash {
                 self.last_sim_tick = sim_tick;
                 self.eval_body(cx);
                 cx.redraw_all();
-            } else {
+            } else if needs_frame_anim {
                 self.view.redraw(cx);
             }
             self.anim_next_frame = cx.new_next_frame();
