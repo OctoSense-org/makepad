@@ -335,6 +335,10 @@ impl Rasterizer {
         glyph_id: GlyphId,
         dpxs_per_em: f32,
     ) -> Option<RasterizedGlyph> {
+        // NOTE (OpenHarmony): forcing every glyph onto the synchronous SDF path
+        // here — bypassing async MSDF worker rasterization entirely — was tried
+        // against the garbled-glyph bug and produced a PIXEL-IDENTICAL result.
+        // So neither MSDF nor its async slot-seeding is the cause. Don't retry.
         // Always keep small text on SDF, even if an MSDF slot already exists.
         if dpxs_per_em <= self.msdf_resolution.min_request_dpxs_per_em {
             return self.rasterize_glyph_outline_sdf(font, glyph_id, dpxs_per_em);

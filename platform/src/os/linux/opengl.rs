@@ -2350,7 +2350,16 @@ impl CxTexture {
     ///
     /// Note: This method assumes that the texture format doesn't change between updates.
     /// This is safe because when allocating textures at the Cx level, there are compatibility checks.
-    pub fn update_vec_texture(&mut self, gl: &LibGl, _os_type: &OsType) {
+    pub fn update_vec_texture(&mut self, gl: &LibGl, os_type: &OsType) {
+        // NOTE: upstream 01b6371e swaps this to RGBA on OHOS ("emulators only
+        // support RGBA"). Do NOT do that here. The glyph atlas is packed by
+        // MultiPlaneAllocator, which stores FOUR different glyphs in one rect
+        // separated by colour plane (R/G/B/A). Uploading BGRA bytes as RGBA
+        // swaps the R and B planes, so plane-0 and plane-2 glyphs render in
+        // each other's slots — text comes out legible-but-scrambled, with
+        // glyphs from one run appearing inside another. Keep BGRA.
+        let _ = os_type;
+        let (bgra_internal, bgra_format) = (gl_sys::BGRA, gl_sys::BGRA);
         fn gl_unpack_alignment(bytes_per_pixel: usize) -> i32 {
             if bytes_per_pixel % 8 == 0 {
                 8
@@ -2374,6 +2383,24 @@ impl CxTexture {
         // black boxes because on Android-with-SLUG the color atlas's very first
         // dirty rect is zero-sized (text goes through SLUG, not the atlas).
         let updated = self.take_updated();
+        #[cfg(target_env = "ohos")]
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static CALLS: AtomicUsize = AtomicUsize::new(0);
+            static UPLOADS: AtomicUsize = AtomicUsize::new(0);
+            let c = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+            if !updated.is_empty() {
+                UPLOADS.fetch_add(1, Ordering::Relaxed);
+            }
+            if c <= 40 || c % 200 == 0 {
+                crate::log!(
+                    "TEXCALL #{c} empty={} uploads={} fmt_is_vec={}",
+                    updated.is_empty(),
+                    UPLOADS.load(Ordering::Relaxed),
+                    self.format.is_vec()
+                );
+            }
+        }
         if updated.is_empty() {
             return;
         }
@@ -2499,8 +2526,8 @@ impl CxTexture {
                 } => (
                     *width,
                     *height,
-                    gl_sys::BGRA,
-                    gl_sys::BGRA,
+                    bgra_internal,
+                    bgra_format,
                     gl_sys::UNSIGNED_BYTE,
                     data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void,
                     4,
@@ -2516,8 +2543,8 @@ impl CxTexture {
                 } => (
                     *width,
                     *height,
-                    gl_sys::BGRA,
-                    gl_sys::BGRA,
+                    bgra_internal,
+                    bgra_format,
                     gl_sys::UNSIGNED_BYTE,
                     data.as_ref().unwrap().as_ptr() as *const std::ffi::c_void,
                     4,
@@ -2608,6 +2635,9 @@ impl CxTexture {
             // Partial texture uploads are critical for append-only SLUG float atlases on
             // Linux desktop. OHOS simulators/emulators still need the conservative full
             // upload path.
+            // NOTE: forcing this off for real OHOS devices (not just ohos_sim)
+            // was tried against the garbled-glyph bug and changed nothing, so
+            // partial uploads are NOT the cause. Left as upstream.
             const DO_PARTIAL_TEXTURE_UPDATES: bool = cfg!(not(ohos_sim));
             let allow_partial_texture_updates = DO_PARTIAL_TEXTURE_UPDATES
                 && !matches!(self.format, TextureFormat::VecRGBAf32 { .. });
@@ -2665,6 +2695,24 @@ impl CxTexture {
                 }
                 TextureUpdated::Empty => panic!("already asserted that updated is not empty"),
             };
+
+            // OHOS diagnostic: the glyph atlases upload here, and a rejected
+            // upload is otherwise completely silent (text simply never appears).
+            #[cfg(target_env = "ohos")]
+            {
+                let err = (gl.glGetError)();
+                if err != 0 {
+                    crate::log!(
+                        "TEXUPLOAD GL ERROR 0x{:X} internal_format=0x{:X} format=0x{:X} type=0x{:X} {}x{} bpp={}",
+                        err, internal_format, format, data_type, width, height, bytes_per_pixel
+                    );
+                } else {
+                    crate::log!(
+                        "TEXUPLOAD ok internal_format=0x{:X} format=0x{:X} {}x{}",
+                        internal_format, format, width, height
+                    );
+                }
+            }
 
             (gl.glPixelStorei)(gl_sys::UNPACK_ALIGNMENT, 4);
             (gl.glPixelStorei)(gl_sys::UNPACK_ROW_LENGTH, 0);

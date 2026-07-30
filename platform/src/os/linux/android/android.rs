@@ -1391,31 +1391,31 @@ impl Cx {
                 // `handle_other_events`, which — when the app is idle behind a
                 // rendered card — may not arrive until the next touch). The app
                 // routes it into its send path from `handle_actions`.
-                Cx::post_action(crate::event::AndroidComposerSubmit { text });
+                Cx::post_action(crate::event::NativeComposerSubmit { text });
                 self.handle_action_receiver();
             }
             FromJavaMessage::ComposerNewApp => {
                 // Native composer "＋" — open another app. Drain this tick (see
                 // ComposerSubmit above for why post_action alone can stall).
-                Cx::post_action(crate::event::AndroidComposerNewApp);
+                Cx::post_action(crate::event::NativeComposerNewApp);
                 self.handle_action_receiver();
             }
             FromJavaMessage::ComposerSwitch => {
                 // Native composer "⟳" — switch to the next app.
-                Cx::post_action(crate::event::AndroidComposerSwitch);
+                Cx::post_action(crate::event::NativeComposerSwitch);
                 self.handle_action_receiver();
             }
             FromJavaMessage::ComposerExpand => {
                 // Native composer collapsed "+" FAB tapped — the user unfolded
                 // it. Java already expanded the pill; tell the app so it marks
                 // composer_shown = true and stays in sync.
-                Cx::post_action(crate::event::AndroidComposerExpand);
+                Cx::post_action(crate::event::NativeComposerExpand);
                 self.handle_action_receiver();
             }
             FromJavaMessage::QrScanned { json } => {
                 // The composer QR scanner decoded a payload — hand it to the app
                 // (it applies it as an LLM-provisioning config). Drain this tick.
-                Cx::post_action(crate::event::AndroidQrScanned { json });
+                Cx::post_action(crate::event::NativeQrScanned { json });
                 self.handle_action_receiver();
             }
             FromJavaMessage::SystemBrowserInvoke {
@@ -1427,7 +1427,7 @@ impl Cx {
                 // A runhtml card called octos.invoke(tool, args). Deliver to the
                 // WebCard widget as a bare action (drain this tick — same reason as
                 // ComposerSubmit: the app may be idle behind a rendered card).
-                Cx::post_action(crate::event::AndroidSystemBrowserInvoke {
+                Cx::post_action(crate::event::NativeSystemBrowserInvoke {
                     browser_id: browser_id as u64,
                     call_id,
                     tool,
@@ -1438,7 +1438,7 @@ impl Cx {
             FromJavaMessage::DeepLink { url } => {
                 // App opened/resumed via a deep link or share — hand it to the app
                 // (it plays a shared YouTube URL in the card). Drain this tick.
-                Cx::post_action(crate::event::AndroidDeepLink { url });
+                Cx::post_action(crate::event::NativeDeepLink { url });
                 self.handle_action_receiver();
             }
             FromJavaMessage::DialogResult {
@@ -1450,7 +1450,7 @@ impl Cx {
             } => {
                 // Native file-picker result → the WebCard widget resolves the
                 // matching octos.invoke("dialog.open") promise.
-                Cx::post_action(crate::event::AndroidDialogResult {
+                Cx::post_action(crate::event::NativeDialogResult {
                     call_id,
                     name,
                     content,
@@ -1460,11 +1460,11 @@ impl Cx {
                 self.handle_action_receiver();
             }
             FromJavaMessage::DownloadProgress { call_id, done, total } => {
-                Cx::post_action(crate::event::AndroidDownloadProgress { call_id, done, total });
+                Cx::post_action(crate::event::NativeDownloadProgress { call_id, done, total });
                 self.handle_action_receiver();
             }
             FromJavaMessage::DownloadComplete { call_id, path, error } => {
-                Cx::post_action(crate::event::AndroidDownloadComplete { call_id, path, error });
+                Cx::post_action(crate::event::NativeDownloadComplete { call_id, path, error });
                 self.handle_action_receiver();
             }
             FromJavaMessage::SafeAreaInsets {
@@ -2538,16 +2538,16 @@ impl Cx {
                 CxOsOp::DownloadFile { call_id, url, dest } => unsafe {
                     android_jni::to_java_download_file(call_id, &url, &dest);
                 },
-                CxOsOp::ShowAndroidComposer => unsafe {
+                CxOsOp::ShowNativeComposer => unsafe {
                     android_jni::to_java_show_composer();
                 },
-                CxOsOp::HideAndroidComposer => unsafe {
+                CxOsOp::HideNativeComposer => unsafe {
                     android_jni::to_java_hide_composer();
                 },
-                CxOsOp::ExpandAndroidComposer => unsafe {
+                CxOsOp::ExpandNativeComposer => unsafe {
                     android_jni::to_java_expand_composer();
                 },
-                CxOsOp::CollapseAndroidComposer => unsafe {
+                CxOsOp::CollapseNativeComposer => unsafe {
                     android_jni::to_java_collapse_composer();
                 },
                 CxOsOp::CopyToClipboard(content) => unsafe {

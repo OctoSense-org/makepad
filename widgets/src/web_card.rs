@@ -540,13 +540,17 @@ impl WebCard {
                 Err(e) => self.reject(cx, call_id, &format!("bad fs.mkdir args: {:?}", e)),
             },
             // Native file picker (Storage Access Framework). Async: launch here,
-            // resolve later when the AndroidDialogResult action arrives (handle_event).
+            // resolve later when the NativeDialogResult action arrives (handle_event).
             // dialog.open + download resolve asynchronously via native result
-            // actions (AndroidDialogResult / AndroidDownloadComplete) that only the
-            // Android backend emits. On other platforms the op would no-op and the
-            // promise would hang, so reject cleanly rather than leave it pending.
+            // actions (NativeDialogResult / NativeDownloadComplete) that only
+            // some backends emit. Where the op would no-op the promise would
+            // hang, so reject cleanly rather than leave it pending.
             // (A macOS-native path — NSOpenPanel / URLSession — is future work.)
-            "dialog.open" if !cfg!(target_os = "android") => {
+            //
+            // OpenHarmony emits NativeDialogResult from its ArkTS
+            // DocumentViewPicker, so dialog.open is live there too; `download`
+            // has no OHOS result path yet and stays rejected.
+            "dialog.open" if !cfg!(mobile) => {
                 self.reject(cx, call_id, "dialog.open is not supported on this platform yet");
             }
             "download" if !cfg!(target_os = "android") => {
@@ -616,14 +620,14 @@ impl Widget for WebCard {
             self.load_settled(cx);
         }
         // JS→native bridge: a card called octos.invoke(tool, args) (posted from the
-        // WebView's octos_native JavascriptInterface as an AndroidSystemBrowserInvoke
+        // WebView's octos_native JavascriptInterface as an NativeSystemBrowserInvoke
         // action). Dispatch only our own browser's calls — and only when the
         // current document is the card's OWN inline HTML (bridge_allowed), so a
         // `url:`-navigated remote page or iframe cannot reach fs/dialog/download.
         if let Event::Actions(actions) = event {
             for action in actions {
                 if let Some(inv) = action
-                    .downcast_ref::<crate::makepad_platform::event::AndroidSystemBrowserInvoke>()
+                    .downcast_ref::<crate::makepad_platform::event::NativeSystemBrowserInvoke>()
                 {
                     // The overlay is shared: only the widget that loaded the
                     // CURRENT document (OVERLAY_OWNER) may answer invokes, and
@@ -637,7 +641,7 @@ impl Widget for WebCard {
                 }
                 // Native file-picker result → resolve the pending dialog.open promise.
                 if let Some(dr) = action
-                    .downcast_ref::<crate::makepad_platform::event::AndroidDialogResult>()
+                    .downcast_ref::<crate::makepad_platform::event::NativeDialogResult>()
                 {
                     let payload = if dr.cancelled {
                         "{\"ok\":true,\"cancelled\":true}".to_string()
@@ -655,7 +659,7 @@ impl Widget for WebCard {
                 // Download progress → emit a download.progress event (keyed by the
                 // client download id) so the card can render a progress bar.
                 if let Some(p) = action
-                    .downcast_ref::<crate::makepad_platform::event::AndroidDownloadProgress>()
+                    .downcast_ref::<crate::makepad_platform::event::NativeDownloadProgress>()
                 {
                     let dlid = self
                         .downloads
@@ -674,7 +678,7 @@ impl Widget for WebCard {
                 }
                 // Download complete → resolve the invoke with the saved sandbox path.
                 if let Some(c) = action
-                    .downcast_ref::<crate::makepad_platform::event::AndroidDownloadComplete>()
+                    .downcast_ref::<crate::makepad_platform::event::NativeDownloadComplete>()
                 {
                     if let Some(pos) = self.downloads.iter().position(|(cid, _, _)| *cid == c.call_id) {
                         let (_, _dlid, dest) = self.downloads.remove(pos);
