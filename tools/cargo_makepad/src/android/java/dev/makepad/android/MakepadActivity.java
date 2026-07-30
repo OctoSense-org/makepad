@@ -1756,6 +1756,14 @@ public class MakepadActivity
                 @Override public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
                 @Override public void onProviderEnabled(String provider) {}
                 @Override public void onProviderDisabled(String provider) {}
+                // Newer Android (14+) dispatches these interface DEFAULT methods
+                // through the desugaring companion (LocationListener$-CC), which
+                // is not packaged — override them explicitly or the first GPS
+                // fix crashes with ClassNotFoundException on new devices.
+                @Override public void onLocationChanged(java.util.List<Location> locations) {
+                    for (Location l : locations) onLocationChanged(l);
+                }
+                @Override public void onFlushComplete(int requestCode) {}
             };
         }
         try {
