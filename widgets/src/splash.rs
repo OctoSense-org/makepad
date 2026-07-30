@@ -2242,10 +2242,41 @@ fn nav_step_field(route: &ParsedNavRoute, d: f64, field: &str) -> String {
 
 /// The open-meteo geocoding lookup URL for a place name — one URL per name so
 /// sys.geocode + sys.geocodenum share the same deduped fetch.
+/// Build the geocoding request for a place NAME.
+///
+/// `language` is not cosmetic here — it gates whether the query MATCHES AT ALL.
+/// open-meteo's index is searched per-language, so "上海" with `language=en`
+/// returns an empty result set while `language=zh` returns Shanghai. A Chinese
+/// card therefore geocoded nothing, every coordinate came back as the -9999
+/// sentinel, and the whole card rendered "n/a" — with the place name and the
+/// condition displaying perfectly, which made it look like a data outage rather
+/// than a lookup failure.
+///
+/// So the language follows the SCRIPT OF THE QUERY. A card names the place in
+/// whatever language it is written in — that is the whole point of the card
+/// choosing one language — and resolving it is the framework's job, not the
+/// card's. Detecting CJK by codepoint range is enough: the alternative is asking
+/// the generating model to romanise names, which is another thing for it to get
+/// silently wrong.
 fn geocode_url(name: &str) -> String {
+    let name = name.trim();
+    let lang = if name.chars().any(is_cjk) { "zh" } else { "en" };
     format!(
-        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=en&format=json",
-        percent_encode_query(name.trim())
+        "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language={lang}&format=json",
+        percent_encode_query(name)
+    )
+}
+
+/// Is this codepoint CJK? Covers the unified ideographs (incl. extension A) and
+/// the compatibility block — enough to tell a Chinese/Japanese place name from a
+/// Latin one. Kana are deliberately included via the Hiragana/Katakana range so
+/// "きょうと" also routes to a CJK-indexed lookup.
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3040}'..='\u{30FF}'   // Hiragana + Katakana
+        | '\u{3400}'..='\u{4DBF}' // CJK ext A
+        | '\u{4E00}'..='\u{9FFF}' // CJK unified
+        | '\u{F900}'..='\u{FAFF}' // CJK compatibility
     )
 }
 

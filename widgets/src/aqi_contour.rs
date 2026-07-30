@@ -1,29 +1,130 @@
-use crate::makepad_draw::*;
+use crate::{makepad_derive_widget::*, makepad_draw::*, view::View, widget::*};
 
-// 空气质量图 — a filled contour map of US-AQI over the area around a city.
+// 空气质量图 — a filled contour map of US-AQI over the area around a place.
 //
-// The WAQI/open-meteo tile overlay marks discrete monitoring STATIONS; air
-// quality is a field, and a contour reads as one. The card samples a 4x4 grid of
-// AQI readings (`sys.aqigrid`) and passes them as the 16 uniforms a0..a15,
-// row-major with the NORTH row first. The shader interpolates them and colours
-// the result by the EPA categories.
+// A tile overlay (what `sys.airmap` returns) only marks discrete monitoring
+// STATIONS and over most cities is very nearly empty; air quality is a field, and
+// a contour reads as one. The shader interpolates a 4x4 grid of readings and
+// colours the result by the EPA categories, with isolines at each band boundary.
 //
-// Sixteen scalar uniforms rather than a texture because a `script_mod!` widget
-// is shader-only — it has no Rust draw_walk in which to build and upload one —
-// and because a card can already set float uniforms (`draw_bg.a0: …`) with no
-// new DSL support. A 4x4 field is coarse, but AQI varies smoothly at city scale,
-// so the interpolated surface is faithful; the grid is the sampling limit, not
-// the render.
+// ## Why this is a Rust widget and not a `script_mod!` shader
 //
-// Bilinear interpolation is done with the triangular-basis trick used in
-// `temp_bar`: each grid line contributes max(0, 1-|x-k|), which sums to exactly
-// linear interpolation between neighbours with no branches and no arrays —
-// neither of which MPSL offers here.
+// It used to be shader-only, which meant the CARD had to supply the field — as
+// sixteen scalar uniforms:
+//
+//     AqiContour{ draw_bg.a0: sys.aqigrid(LAT, LON, 1.6, 0)
+//                 draw_bg.a1: sys.aqigrid(LAT, LON, 1.6, 1)   ... through a15 }
+//
+// That put a GPU uniform layout into the authoring language. It is not a widget
+// contract, it is an ABI, and it leaked for a mechanical reason: a `script_mod!`
+// widget is shader-only, so there was no Rust `draw_walk` in which to fetch
+// anything. A backend without shaders then had to pattern-match sixteen magic
+// attribute names back into an array.
+//
+// So the widget now takes the SEMANTIC arguments and does the fetch itself:
+//
+//     AqiContour{ width: Fill height: 190 lat: … lon: … span: 1.6 }
+//
+// `draw_walk` builds the same multi-location request, reads the sixteen values
+// out of one cached response, and writes the uniforms via `set_uniform`. The
+// shader below is unchanged — same pixels, same cost. What changed is that a card
+// can no longer express the field wrongly, and a non-shader backend gets one
+// array attribute to map instead of sixteen names to recognise.
+#[derive(Script, Widget)]
+pub struct AqiContour {
+    #[source]
+    source: ScriptObjectRef,
+
+    #[deref]
+    view: View,
+
+    /// Centre of the sampled area. Pass `sys.geocodenum(place, "lat"/"lon")` —
+    /// never typed digits. Both are -9999 while that lookup is in flight, which
+    /// this treats as "not ready" rather than sampling the Null Island ocean.
+    #[live]
+    lat: f64,
+    #[live]
+    lon: f64,
+
+    /// Width of the sampled square in degrees. 1.6 suits a city.
+    #[live(1.6)]
+    span: f64,
+}
+
+/// Grid edge: 4x4 = the sixteen `a0..a15` uniforms the shader interpolates.
+const N: usize = 4;
+
+impl ScriptHook for AqiContour {}
+
+impl Widget for AqiContour {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.resolve_field(cx);
+        self.view.draw_walk(cx, scope, walk)
+    }
+}
+
+impl AqiContour {
+    /// Fetch the AQI field and push it into the shader's uniforms.
+    ///
+    /// All sixteen cells come from ONE multi-location open-meteo request — that
+    /// API accepts comma-separated coordinates and answers with an array — so the
+    /// whole field costs a single cached fetch. Returns quietly while the fetch
+    /// (or the geocode feeding it) is still in flight; `script_data_fetch`
+    /// redraws when the response lands, so the next draw fills it in.
+    fn resolve_field(&mut self, cx: &mut Cx2d) {
+        // -9999 is sys.geocodenum's loading sentinel. Sampling it would fetch a
+        // point in the Atlantic and cache the answer under a bogus URL.
+        if self.lat <= -900.0 || self.lon <= -900.0 {
+            return;
+        }
+        let step = self.span / (N as f64 - 1.0);
+        let mut lats = Vec::with_capacity(N * N);
+        let mut lons = Vec::with_capacity(N * N);
+        for r in 0..N {
+            for c in 0..N {
+                // Row 0 is the NORTH edge, so latitude DECREASES with the row
+                // index — matching how the shader walks self.pos.y downward.
+                lats.push(format!("{:.4}", self.lat + self.span / 2.0 - r as f64 * step));
+                lons.push(format!("{:.4}", self.lon - self.span / 2.0 + c as f64 * step));
+            }
+        }
+        let url = format!(
+            "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={}&longitude={}\
+&current=us_aqi&timezone=auto",
+            lats.join(","),
+            lons.join(",")
+        );
+        let Some(bytes) = cx.script_data_fetch(&url) else {
+            return;
+        };
+        let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        for i in 0..(N * N) {
+            let v = root
+                .get(i)
+                .and_then(|o| o.get("current"))
+                .and_then(|c| c.get("us_aqi"))
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.0) as f32;
+            // Uniform ids are a0..a15, matching the shader below.
+            let id = LiveId::from_str(&format!("a{i}"));
+            self.view.draw_bg.draw_vars.set_uniform(cx, id, &[v]);
+        }
+    }
+}
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.View
 
-    mod.widgets.AqiContour = View{
+    mod.widgets.AqiContourBase = #(AqiContour::register_widget(vm))
+
+    mod.widgets.AqiContour = mod.widgets.AqiContourBase{
         width: Fill
         height: 210
         show_bg: true
@@ -42,6 +143,10 @@ script_mod! {
                 let u = clamp(self.pos.x, 0.0, 1.0) * 3.0
                 let v = clamp(self.pos.y, 0.0, 1.0) * 3.0
 
+                // Bilinear interpolation via the triangular-basis trick used in
+                // `temp_bar`: each grid line contributes max(0, 1-|x-k|), which
+                // sums to exactly linear interpolation between neighbours with no
+                // branches and no arrays — neither of which MPSL offers here.
                 let bu = vec4(
                     max(0.0, 1.0 - abs(u - 0.0)),
                     max(0.0, 1.0 - abs(u - 1.0)),
@@ -55,7 +160,6 @@ script_mod! {
                     max(0.0, 1.0 - abs(v - 3.0))
                 )
 
-                // Interpolate along each row, then between rows.
                 let r0 = dot(vec4(self.a0, self.a1, self.a2, self.a3), bu)
                 let r1 = dot(vec4(self.a4, self.a5, self.a6, self.a7), bu)
                 let r2 = dot(vec4(self.a8, self.a9, self.a10, self.a11), bu)
