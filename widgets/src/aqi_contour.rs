@@ -49,6 +49,17 @@ pub struct AqiContour {
     /// Width of the sampled square in degrees. 1.6 suits a city.
     #[live(1.6)]
     span: f64,
+
+    /// The (fetch epoch, lat, lon, span) the uniforms were last built from.
+    ///
+    /// `draw_walk` runs on a HOT PATH: any card containing a `WeatherIcon` sets
+    /// `animating` in the host `Splash` (its shader reads `draw_pass.time`), which
+    /// self-sustains a ~60fps redraw. Without this guard the AQI response was
+    /// re-parsed with serde on every one of those frames. The epoch bumps when any
+    /// script data fetch completes, so comparing it with the resolved arguments
+    /// detects both "the data arrived" and "the place changed".
+    #[rust]
+    resolved: Option<(u64, f64, f64, f64)>,
 }
 
 /// Grid edge: 4x4 = the sixteen `a0..a15` uniforms the shader interpolates.
@@ -81,6 +92,10 @@ impl AqiContour {
         if self.lat <= -900.0 || self.lon <= -900.0 {
             return;
         }
+        let key = (cx.script_data_fetch_epoch(), self.lat, self.lon, self.span);
+        if self.resolved == Some(key) {
+            return;
+        }
         let step = self.span / (N as f64 - 1.0);
         let mut lats = Vec::with_capacity(N * N);
         let mut lons = Vec::with_capacity(N * N);
@@ -104,6 +119,17 @@ impl AqiContour {
         let Ok(root) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return;
         };
+        // Only now is there a field to draw. Until this point `have` stays 0 and the
+        // shader draws a neutral placeholder — because an unset field reads as AQI 0,
+        // which the EPA ramp colours GREEN, i.e. the card would assert CLEAN AIR for
+        // air it has never measured. A confident false statement about the world is
+        // the exact bug class this whole design exists to remove, and drawing
+        // nothing is the honest answer while a fetch is in flight.
+        self.view
+            .draw_bg
+            .draw_vars
+            .set_uniform(cx, live_id!(have), &[1.0]);
+        self.resolved = Some(key);
         for i in 0..(N * N) {
             let v = root
                 .get(i)
@@ -133,6 +159,9 @@ script_mod! {
             a4: uniform(0.0)   a5: uniform(0.0)   a6: uniform(0.0)   a7: uniform(0.0)
             a8: uniform(0.0)   a9: uniform(0.0)   a10: uniform(0.0)  a11: uniform(0.0)
             a12: uniform(0.0)  a13: uniform(0.0)  a14: uniform(0.0)  a15: uniform(0.0)
+
+            // 0 until the field has actually been fetched. See resolve_field.
+            have: uniform(0.0)
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -195,7 +224,9 @@ script_mod! {
                 let body = mix(col * shade, vec3(1.0, 1.0, 1.0), iso * 0.55)
 
                 sdf.box(0.0, 0.0, w, h, 18.0)
-                sdf.fill(vec4(body, 0.82))
+                // No field yet: a faint neutral wash, NOT the band colour for zero.
+                let placeholder = vec3(0.42, 0.45, 0.50)
+                sdf.fill(vec4(mix(placeholder, body, self.have), mix(0.28, 0.82, self.have)))
                 return sdf.result
             }
         }

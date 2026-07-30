@@ -775,6 +775,109 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.weathercond(lat, lon, "path") -> the WeatherIcon index 0..7 for the WMO
+    // weather code at `path` ("current.weather_code" or "daily.weather_code.N").
+    //
+    // This exists because the CONDITION IS LIVE DATA. A generated card used to
+    // carry `draw_bg.cond: 2` — a number the model chose, for weather it had never
+    // seen. It is the same class of invented value as a coordinate or a
+    // temperature, and it fails the same way: a plausible icon that does not match
+    // what the sky is doing, with nothing to catch it. `weather_code` is already in
+    // the cached forecast, so the mapping belongs here.
+    //
+    // WMO 4677 code groups, per open-meteo's documentation.
+    vm.add_method(
+        sys,
+        id_lut!(weathercond),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            let code = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|n| n as i64);
+            // Partly cloudy while the fetch is in flight: the least wrong default,
+            // and it changes to the real icon on the redraw.
+            let idx = match code {
+                Some(0) => 0,                                  // clear
+                Some(1) | Some(2) => 1,                        // mainly clear / partly
+                Some(3) => 2,                                  // overcast
+                Some(45) | Some(48) => 7,                       // fog
+                Some(51..=57) | Some(61..=67) | Some(80..=82) => 3, // drizzle / rain
+                Some(71..=77) | Some(85) | Some(86) => 5,       // snow
+                Some(95..=99) => 4,                            // thunderstorm
+                _ => 1,
+            };
+            ScriptValue::from_f64(idx as f64)
+        },
+    );
+
+    // sys.weatherword(lat, lon, "path", locale) -> the condition as DISPLAY TEXT
+    // ("Partly Cloudy", "多云") for the live WMO code at `path`.
+    //
+    // The companion to sys.weathercond: the icon and the word must agree, and both
+    // must come from the same live code. A card that carried the word itself could
+    // say "Cloudy" over a rain icon, or over actual sunshine, and look fine.
+    vm.add_method(
+        sys,
+        id_lut!(weatherword),
+        script_args_def!(lat = NIL, lon = NIL, path = NIL, locale = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let path_value = script_value!(vm, args.path);
+            let mut path = String::new();
+            vm.bx.heap.cast_to_string(path_value, &mut path);
+            let loc_v = script_value!(vm, args.locale);
+            let mut loc = String::new();
+            vm.bx.heap.cast_to_string(loc_v, &mut loc);
+            let zh = loc.trim().to_ascii_lowercase().starts_with("zh");
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            let code = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, path.trim()))
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|n| n as i64);
+            let (en, cn) = match code {
+                Some(0) => ("Clear", "晴"),
+                Some(1) => ("Mainly Clear", "晴间多云"),
+                Some(2) => ("Partly Cloudy", "局部多云"),
+                Some(3) => ("Overcast", "阴"),
+                Some(45) | Some(48) => ("Fog", "雾"),
+                Some(51..=57) => ("Drizzle", "小雨"),
+                Some(61..=67) => ("Rain", "雨"),
+                Some(71..=77) => ("Snow", "雪"),
+                Some(80..=82) => ("Showers", "阵雨"),
+                Some(85) | Some(86) => ("Snow Showers", "阵雪"),
+                Some(95..=99) => ("Thunderstorm", "雷暴"),
+                // Nothing loaded yet — an em dash, consistent with sys.weather,
+                // rather than a guess that later changes.
+                _ => ("—", "—"),
+            };
+            vm.bx.heap.new_string_from_str(if zh { cn } else { en })
+        },
+    );
+
     // sys.dayname(lat, lon, n, locale) -> the weekday LABEL for forecast row n.
     //   sys.dayname(LAT, LON, 0, "en") -> "Today"
     //   sys.dayname(LAT, LON, 1, "en") -> "Thu"
