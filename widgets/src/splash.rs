@@ -388,14 +388,14 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                             json_pluck(&bytes, &format!("results.0.{other}"))
                                 .unwrap_or_else(|| "—".to_string())
                         }
-                        None => "—".to_string(),
+                        None => vm.host.cx_mut().script_data_placeholder(&url),
                     };
                     vm.bx.heap.new_string_from_str(&out)
                 },
             };
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => json_pluck(&bytes, path).unwrap_or_else(|| "—".to_string()),
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
             };
             vm.bx.heap.new_string_from_str(&out)
         },
@@ -483,7 +483,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                     _ => json_pluck(&bytes, "routes.0.distance")
                         .unwrap_or_else(|| "—".to_string()),
                 },
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
             };
             vm.bx.heap.new_string_from_str(&out)
         },
@@ -675,10 +675,15 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
 &timezone=auto&forecast_days=7"
             );
             let value = match vm.host.cx_mut().script_data_fetch(&url) {
+                // Union of two changes: round the plucked value (whole-degree
+                // display), and show the terminal-failure placeholder rather than
+                // a bare "—" when the fetch itself gives up (#17). The em dash
+                // stays for the case where the fetch SUCCEEDED but the path is
+                // absent, which is a card bug, not a network one.
                 Some(bytes) => json_pluck(&bytes, path.trim())
                     .map(|v| round_display(path.trim(), v))
                     .unwrap_or_else(|| "—".to_string()),
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
             };
             vm.bx.heap.new_string_from_str(&value)
         },
@@ -702,12 +707,10 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 "https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lat:.4}&longitude={lon:.4}\
 &current=us_aqi,pm2_5,pm10,ozone,nitrogen_dioxide&timezone=auto"
             );
-            let value = vm
-                .host
-                .cx_mut()
-                .script_data_fetch(&url)
-                .and_then(|bytes| json_pluck(&bytes, path.trim()))
-                .unwrap_or_else(|| "—".to_string());
+            let value = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => json_pluck(&bytes, path.trim()).unwrap_or_else(|| "—".to_string()),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+            };
             vm.bx.heap.new_string_from_str(&value)
         },
     );
@@ -979,7 +982,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             );
             let m = |k: &str| format!("chart.result.0.meta.{k}");
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
                 Some(bytes) => {
                     let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
                     // Monetary fields formatted to a consistent 2 decimals (Yahoo
@@ -1095,7 +1098,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             vm.bx.heap.cast_to_string(field_v, &mut field);
             let url = yahoo_chart_url(&symbol, &range);
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
                 Some(bytes) => stock_range_field(&bytes, field.trim()),
             };
             vm.bx.heap.new_string_from_str(&out)
@@ -1120,7 +1123,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10".to_string();
             let base = format!("finance.result.0.quotes.{index}");
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
                 Some(bytes) => {
                     let raw = |k: &str| json_pluck(&bytes, &format!("{base}.{k}"));
                     let num = |k: &str| raw(k).and_then(|s| s.parse::<f64>().ok());
@@ -1190,7 +1193,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let path = format!("hits.{idx}.{key}");
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => json_pluck(&bytes, &path).unwrap_or_else(|| "—".to_string()),
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
             };
             vm.bx.heap.new_string_from_str(&out)
         },
@@ -1230,7 +1233,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             vm.bx.heap.cast_to_string(field_v, &mut field);
             let url = overpass_places_url(lat, lon, &category);
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
-                None => "—".to_string(),
+                None => vm.host.cx_mut().script_data_placeholder(&url),
                 Some(bytes) => places_field(&bytes, lat, lon, index, field.trim()),
             };
             vm.bx.heap.new_string_from_str(&out)
