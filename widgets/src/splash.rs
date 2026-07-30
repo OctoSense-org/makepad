@@ -775,6 +775,68 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.dayname(lat, lon, n, locale) -> the weekday LABEL for forecast row n.
+    //   sys.dayname(LAT, LON, 0, "en") -> "Today"
+    //   sys.dayname(LAT, LON, 1, "en") -> "Thu"
+    //   sys.dayname(LAT, LON, 1, "zh") -> "周四"
+    //
+    // A card must NEVER write weekday names as literal strings, for two reasons
+    // that both bit us before this existed:
+    //
+    //   * The generating model does not reliably know the date. On Wed
+    //     2026-07-29 it emitted "Today, Wed, Thu, …" — repeating today as
+    //     tomorrow, so every row after the first was mislabelled. Nobody
+    //     notices, because a wrong weekday looks exactly like a right one.
+    //   * Cards are PERSISTED and re-served (a2app_cards/), so a literal is
+    //     stale the next morning even when it was correct when generated.
+    //
+    // The date comes from `daily.time.n` in the SAME cached forecast the
+    // temperatures come from, so the labels are local to the FORECAST'S place —
+    // not to wherever the phone happens to be. Until that fetch lands we fall
+    // back to the device clock, which is right unless the place is across a date
+    // boundary, and self-corrects on the redraw when the real date arrives.
+    vm.add_method(
+        sys,
+        id_lut!(dayname),
+        script_args_def!(lat = NIL, lon = NIL, n = NIL, locale = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n = script_value!(vm, args.n).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let loc_v = script_value!(vm, args.locale);
+            let mut loc = String::new();
+            vm.bx.heap.cast_to_string(loc_v, &mut loc);
+            let zh = loc.trim().to_ascii_lowercase().starts_with("zh");
+
+            if n == 0 {
+                let s = if zh { "今天" } else { "Today" };
+                return vm.bx.heap.new_string_from_str(s);
+            }
+
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            // Authoritative: the forecast's own local date for that row.
+            let from_api = vm.host.cx_mut().script_data_fetch(&url).and_then(|bytes| {
+                let date = json_pluck(&bytes, &format!("daily.time.{n}"))?;
+                let mut it = date.trim().split('-');
+                let y = it.next()?.parse::<i64>().ok()?;
+                let m = it.next()?.parse::<u64>().ok()?;
+                let d = it.next()?.parse::<u64>().ok()?;
+                Some(weekday_from_days(days_from_civil(y, m, d)))
+            });
+            // Graceful: the device's own day, offset by n.
+            let wd = from_api.unwrap_or_else(|| {
+                weekday_from_days((now_unix_secs() / 86_400) as i64 + n as i64)
+            });
+            let s = if zh { DAY_ZH[wd] } else { DAY_EN[wd] };
+            vm.bx.heap.new_string_from_str(s)
+        },
+    );
+
     // sys.weekmin(lat, lon) / sys.weekmax(lat, lon) -> the LOWEST low and HIGHEST
     // high across the 7-day forecast, for a TempBar's draw_bg.wmin / draw_bg.wmax.
     //
@@ -1611,6 +1673,28 @@ fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
     }
     Some(s)
 }
+
+/// Howard Hinnant's `days_from_civil` — the inverse of `civil_from_days`.
+/// (year, month, day) → days since the Unix epoch.
+fn days_from_civil(y: i64, m: u64, d: u64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// Weekday for a days-since-epoch count, 0 = Sunday. 1970-01-01 was a Thursday,
+/// hence the +4.
+fn weekday_from_days(z: i64) -> usize {
+    (((z + 4) % 7 + 7) % 7) as usize
+}
+
+/// Abbreviated weekday names, index 0 = Sunday.
+const DAY_EN: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DAY_ZH: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
 /// Reduce a 7-element `daily.*` temperature array to its min or max.
 ///
