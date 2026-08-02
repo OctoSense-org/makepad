@@ -576,6 +576,23 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     {
         std::env::set_var("MAKEPAD_SEED_CARD_FILE", &seed);
     }
+    // TEST-ONLY passthrough: `--es makepad.SEED_L0_FILE <card>` plus
+    // `--es makepad.SEED_L0_DATA <json>` → the matching env vars, so the app can
+    // seed an L0 LEDGER rather than an already-lowered card.
+    //
+    // The distinction matters: SEED_CARD_FILE above pushes lowered DSL, which is
+    // inert by construction — nothing on device knows which card produced it, so
+    // a tap has nowhere to land. Seeding the ledger lets the app hold the source
+    // and re-realize it, which is what makes an interaction local.
+    for name in ["SEED_L0_FILE", "SEED_L0_DATA"] {
+        let var = format!("MAKEPAD_{name}");
+        std::env::remove_var(&var);
+        if let Some(v) = get_intent_string_extra(env, activity, &format!("makepad.{name}"))
+            .filter(|v| !v.trim().is_empty())
+        {
+            std::env::set_var(&var, &v);
+        }
+    }
     // LOCAL DEBUG: per-draw GL tracing on device (emulator paint diagnosis).
     if let Some(v) = get_intent_string_extra(env, activity, "makepad.GL_DRAW_TRACE")
     {
