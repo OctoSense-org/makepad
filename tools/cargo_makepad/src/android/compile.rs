@@ -1165,6 +1165,15 @@ fn compile_java(
         "-classpath",
         android_jar.to_str().unwrap(),
         "-Xlint:deprecation",
+        // Without this, javac falls back to the host JVM's default charset
+        // (on Windows, the ANSI codepage — e.g. GBK/936 on a zh-CN system,
+        // never UTF-8). The Java sources embed literal non-ASCII UI strings
+        // (composer hint, send/QR/switch glyphs); a non-UTF-8 default
+        // decodes those source bytes wrong and bakes mojibake into the
+        // compiled .class constant pool — invisible on Linux/macOS (UTF-8
+        // default) but wrong on every Windows build.
+        "-encoding",
+        "UTF-8",
         "-d",
         build_paths.java_out_dir.to_str().unwrap(),
     ];
@@ -1358,11 +1367,24 @@ fn bundle_ndk_shared_deps(
     let (_ndk_version, ndk_prebuilt_root) =
         resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
 
-    // Path to llvm-readelf shipped with the NDK.
-    let readelf_path = ndk_prebuilt_root.join("bin/llvm-readelf");
+    // Path to llvm-readelf shipped with the NDK. On Windows the NDK ships it as
+    // `llvm-readelf.exe`; checking the extension-less name would silently skip
+    // dependency bundling (e.g. the dynamic `libstd-<hash>.so`).
+    let readelf_name = match host_os {
+        HostOs::WindowsX64 => "bin/llvm-readelf.exe",
+        _ => "bin/llvm-readelf",
+    };
+    let readelf_path = ndk_prebuilt_root.join(readelf_name);
     if !readelf_path.exists() {
-        // Gracefully skip when the NDK toolchain doesn't include llvm-readelf
-        // (e.g. a stripped SDK install).
+        // Skip when the NDK toolchain doesn't include llvm-readelf (e.g. a
+        // stripped SDK install) — but say so loudly: without it, dynamically
+        // linked shared deps (e.g. libstd-<hash>.so) are NOT bundled, and the
+        // app WILL crash at launch with UnsatisfiedLinkError unless every dep
+        // happens to be statically linked.
+        println!(
+            "WARNING - llvm-readelf not found at {} — shared NDK/local dependencies will NOT be bundled into the APK; the app may crash at launch with UnsatisfiedLinkError.",
+            readelf_path.display()
+        );
         return Ok(());
     }
 
@@ -1443,8 +1465,16 @@ fn read_needed_shared_libs(
     let (_ndk_version, ndk_prebuilt_root) =
         resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
 
-    let readelf_path = ndk_prebuilt_root.join("bin/llvm-readelf");
+    let readelf_name = match host_os {
+        HostOs::WindowsX64 => "bin/llvm-readelf.exe",
+        _ => "bin/llvm-readelf",
+    };
+    let readelf_path = ndk_prebuilt_root.join(readelf_name);
     if !readelf_path.exists() {
+        println!(
+            "WARNING - llvm-readelf not found at {} — cannot determine this .so's NDK-provided dependencies; none will be bundled.",
+            readelf_path.display()
+        );
         return Ok(Vec::new());
     }
 
@@ -2120,8 +2150,16 @@ fn stage_ndk_shared_deps_for_so(
 ) -> Result<(), String> {
     let (_ndk_version, ndk_prebuilt_root) =
         resolve_ndk_prebuilt_root(sdk_dir, host_os, urls.ndk_version_full)?;
-    let readelf_path = ndk_prebuilt_root.join("bin/llvm-readelf");
+    let readelf_name = match host_os {
+        HostOs::WindowsX64 => "bin/llvm-readelf.exe",
+        _ => "bin/llvm-readelf",
+    };
+    let readelf_path = ndk_prebuilt_root.join(readelf_name);
     if !readelf_path.exists() {
+        println!(
+            "WARNING - llvm-readelf not found at {} — shared NDK/local dependencies will NOT be staged for this .so; the app may crash at launch with UnsatisfiedLinkError.",
+            readelf_path.display()
+        );
         return Ok(());
     }
     let cwd = std::env::current_dir().unwrap();
@@ -2739,7 +2777,12 @@ pub fn build(
     // For APK builds, debuggable matches the cargo profile: release -> false,
     // anything else -> true (matches the historical behavior of `cargo makepad
     // android run`).
-    let debuggable = get_profile_from_args(args) != "release";
+    // Release APKs are non-debuggable; `MAKEPAD_FORCE_DEBUGGABLE` forces the
+    // debuggable manifest flag on an optimized release build (so WebView reads
+    // `/data/local/tmp/webview-command-line` — e.g. to disable SurfaceControl
+    // video compositing over the GL surface).
+    let debuggable = get_profile_from_args(args) != "release"
+        || std::env::var("MAKEPAD_FORCE_DEBUGGABLE").is_ok();
     let prep_opts = PrepareBuildOpts {
         build_crate,
         java_url: &resolved.java_url,

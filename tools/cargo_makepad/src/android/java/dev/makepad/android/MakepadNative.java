@@ -68,6 +68,10 @@ public class MakepadNative {
     public native static void onComposerNewApp();
     public native static void onComposerSwitch();
 
+    // The collapsed "+" FAB was tapped to unfold the composer (keeps the app's
+    // composer_shown state in sync with the native overlay).
+    public native static void onComposerExpand();
+
     // A runhtml web-card's JS called octos.invoke(tool, args) — bridged in from the
     // WebView's "octos_native" JavascriptInterface. Rust dispatches the tool and
     // resolves the card-side promise (callId) via evalSystemBrowserJs.
@@ -94,6 +98,10 @@ public class MakepadNative {
     
     // permissions
     public native static void onPermissionResult(String permission, int requestId, int status);
+
+    // location (GPS) — the Android LocationListener delivers each fix here; Rust
+    // stores it in makepad_platform::gps for the Splash sys.gps(...) helper.
+    public native static void onLocation(double lat, double lon, float acc);
 
     // video playback
     public static native void onVideoPlaybackPrepared(long videoId, int videoWidth, int videoHeight, long duration, VideoPlayer surfaceTexture);
