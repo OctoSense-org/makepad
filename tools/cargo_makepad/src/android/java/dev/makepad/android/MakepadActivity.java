@@ -3655,6 +3655,25 @@ public class MakepadActivity
                 // not hijack the card into a full browsing session.
                 return true;
             }
+
+            @Override
+            public void onPageFinished(WebView v, String url) {
+                // Second hop of the card-content swap (see setSystemBrowserHtml):
+                // the blank page committed, the old media session is gone, now
+                // load the real payload stashed in the view tag.
+                if ("about:blank".equals(url)) {
+                    Object tag = v.getTag();
+                    if (tag instanceof String[]) {
+                        v.setTag(null);
+                        String[] pending = (String[]) tag;
+                        if ("HTML".equals(pending[0])) {
+                            v.loadDataWithBaseURL(pending[1], pending[2], "text/html", "utf-8", null);
+                        } else {
+                            v.loadUrl(pending[1]);
+                        }
+                    }
+                }
+            }
         });
         // JS→native bridge: the card calls window.octos_native.invoke(callId, tool, args);
         // we forward it to Rust (WebCard widget dispatches the tool and resolves the
@@ -3752,7 +3771,11 @@ public class MakepadActivity
             @Override
             public void run() {
                 WebView web = ensureSystemBrowser(browserId);
-                web.loadUrl(url);
+                // Route through about:blank first (see setSystemBrowserHtml) so
+                // a previous document's media controls are torn down.
+                web.stopLoading();
+                web.setTag(new String[]{"URL", url});
+                web.loadUrl("about:blank");
             }
         });
     }
@@ -3763,7 +3786,14 @@ public class MakepadActivity
             public void run() {
                 WebView web = ensureSystemBrowser(browserId);
                 String base = (baseUrl == null || baseUrl.isEmpty()) ? "https://octos-one.app/" : baseUrl;
-                web.loadDataWithBaseURL(base, html, "text/html", "utf-8", null);
+                // Older WebViews (observed on Chrome 61 / Android 8.1 watch) leave
+                // a stale media-controls overlay floating when a document with a
+                // playing <video> is replaced by new content. Swap via about:blank
+                // — the blank commit tears the old media session down; the real
+                // payload loads in onPageFinished (see WebViewClient above).
+                web.stopLoading();
+                web.setTag(new String[]{"HTML", base, html});
+                web.loadUrl("about:blank");
             }
         });
     }
