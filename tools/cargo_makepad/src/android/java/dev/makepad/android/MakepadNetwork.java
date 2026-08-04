@@ -87,6 +87,16 @@ public class MakepadNetwork {
                         : urlObj.openConnection());
                 connection.setRequestMethod(method);
 
+                // LOCAL BUILD FIX (2026-08-03): HttpURLConnection defaults to
+                // INFINITE connect/read timeouts. On networks that silently drop
+                // packets to a host (carrier-level filtering), getResponseCode()
+                // blocked forever — the future never completed, no NetworkResponse
+                // ever fired, and webview cards hung on their loading state.
+                // 15s/30s matches the values MakepadActivity uses for its own
+                // HttpURLConnection (dialog/download path).
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(30000);
+
                 String[] headerPairs = headers.split("\r\n");
 
                 for (String headerPair : headerPairs) {
