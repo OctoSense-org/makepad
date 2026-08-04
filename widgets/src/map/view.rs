@@ -1964,11 +1964,19 @@ impl WidgetMatchEvent for MapView {
                 TilePayload::Json(j) => Ok(j),
                 TilePayload::Mvt(bytes) => mbtiles_tile_to_overpass_json(tile_key, &bytes),
             };
-            let result = json.and_then(|body| {
-                build_tile_buffers_from_body(tile_key, &body, &theme_style)
-                    .map(|buffers| (body, buffers))
-            });
-            match result {
+            // The failure path wants the body's head for diagnostics, so the body
+            // must outlive the build attempt. `and_then` cannot do that — it
+            // consumes the body on the way to `Err`, leaving nothing to report.
+            // Carry it in the error instead, as `None` when the DECODE itself
+            // failed and there is genuinely no body to show.
+            let outcome = match json {
+                Err(err) => Err((err, None)),
+                Ok(body) => match build_tile_buffers_from_body(tile_key, &body, &theme_style) {
+                    Ok(buffers) => Ok((body, buffers)),
+                    Err(err) => Err((err, Some(body))),
+                },
+            };
+            match outcome {
                 Ok((body, buffers)) => {
                     store_tile_data_cache_on_disk(tile_key, &body);
                     let _ = sender.send(TileWorkerMessage::NetworkTileParsed {
@@ -1977,12 +1985,17 @@ impl WidgetMatchEvent for MapView {
                         buffers,
                     });
                 }
-                Err(err) => {
-                    let head: String = body.chars().take(160).collect();
+                Err((err, body)) => {
+                    let detail = body
+                        .map(|b| {
+                            let head: String = b.chars().take(160).collect();
+                            format!(" | body len={} head={head:?}", b.len())
+                        })
+                        .unwrap_or_default();
                     let _ = sender.send(TileWorkerMessage::NetworkTileParseFailed {
                         style_epoch,
                         tile_key,
-                        error: format!("{err} | body len={} head={head:?}", body.len()),
+                        error: format!("{err}{detail}"),
                     });
                 }
             }

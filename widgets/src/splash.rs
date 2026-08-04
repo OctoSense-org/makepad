@@ -43,7 +43,12 @@ fn slippy_mosaic(lat: f64, lon: f64, z: u32) -> (i64, i64, f64, f64) {
     let left = if xf.fract() >= 0.5 { xf.floor() } else { xf.floor() - 1.0 };
     let top = if yf.fract() >= 0.5 { yf.floor() } else { yf.floor() - 1.0 };
     let max = (1i64 << z) - 1;
-    let left = (left as i64).clamp(0, (max - 1).max(0));
+    // Longitude WRAPS at the antimeridian: keep `left` raw (it may be -1 so
+    // the anchor stays in the mosaic's middle band — a Fiji-class epicenter
+    // used to get clamped and land at the pane's edge) and wrap the actual
+    // tile x with rem_euclid when forming URLs. Latitude cannot wrap, so `top`
+    // stays clamped.
+    let left = left as i64;
     let top = (top as i64).clamp(0, (max - 1).max(0));
     ((left), (top), (xf - left as f64) / 2.0, (yf - top as f64) / 2.0)
 }
@@ -179,14 +184,23 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(satellite),
-        script_args_def!(lat = NIL, lon = NIL),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL),
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(35.68);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(139.65);
-            // Keep the 7°-tall box inside the poles; wrap longitude edges.
+            // Optional slippy-style zoom (default 8 = the historical 14°-wide
+            // frame; each +1 halves the span): z10 ≈ a metro close-up, z6 ≈ a
+            // continental view. Omitting the arg keeps old cards identical.
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(8.0)
+                .clamp(3.0, 12.0);
+            let half_lon = 7.0 * f64::powi(2.0, 8 - z as i32);
+            let half_lat = half_lon / 2.0;
+            // Keep the box inside the poles; wrap longitude edges.
             let lat = lat.clamp(-78.0, 78.0);
-            let (min_lon, max_lon) = ((lon - 7.0).max(-180.0), (lon + 7.0).min(180.0));
-            let (min_lat, max_lat) = (lat - 3.5, lat + 3.5);
+            let (min_lon, max_lon) = ((lon - half_lon).max(-180.0), (lon + half_lon).min(180.0));
+            let (min_lat, max_lat) = (lat - half_lat, lat + half_lat);
             let date = gibs_latest_date();
             let url = format!(
                 "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=MODIS_Terra_CorrectedReflectance_TrueColor&SRS=EPSG:4326&BBOX={min_lon},{min_lat},{max_lon},{max_lat}&WIDTH=880&HEIGHT=440&FORMAT=image/jpeg&TIME={date}"
@@ -243,13 +257,20 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(basemap),
-        script_args_def!(lat = NIL, lon = NIL),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL),
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
-            let (x, y) = slippy_tile(lat, lon, 8);
+            // Optional zoom (default 8 = the historical metro framing; omitting
+            // the arg keeps old cards identical). Zoom by intent: region 6,
+            // metro 8, city 10, district 12.
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(8.0)
+                .clamp(3.0, 17.0) as u32;
+            let (x, y) = slippy_tile(lat, lon, z);
             let url = format!(
-                "https://a.basemaps.cartocdn.com/rastertiles/voyager_labels_under/8/{x}/{y}@2x.png"
+                "https://a.basemaps.cartocdn.com/rastertiles/voyager_labels_under/{z}/{x}/{y}@2x.png"
             );
             vm.bx.heap.new_string_from_str(&url)
         },
@@ -264,12 +285,18 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(airmap),
-        script_args_def!(lat = NIL, lon = NIL),
+        script_args_def!(lat = NIL, lon = NIL, zoom = NIL),
         |vm, args| {
             let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
             let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
-            let (x, y) = slippy_tile(lat, lon, 8);
-            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/8/{x}/{y}.png?token=_");
+            // Optional zoom (default 8 keeps old cards identical). MUST match
+            // the zoom of the sys.basemap it stacks over, tile for tile.
+            let z = script_value!(vm, args.zoom)
+                .as_number()
+                .unwrap_or(8.0)
+                .clamp(3.0, 17.0) as u32;
+            let (x, y) = slippy_tile(lat, lon, z);
+            let url = format!("https://tiles.waqi.info/tiles/usepa-aqi/{z}/{x}/{y}.png?token=_");
             vm.bx.heap.new_string_from_str(&url)
         },
     );
@@ -308,9 +335,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 "br" => (1, 1, "d"),
                 _ => (0, 0, "a"), // "tl" and anything unrecognized
             };
+            // Wrap tile x across the antimeridian (left may be -1 or n-1+1).
+            let n = 1i64 << z;
             let url = format!(
                 "https://{sub}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{}/{}@2x.png",
-                left + dx,
+                (left + dx).rem_euclid(n),
                 top + dy
             );
             vm.bx.heap.new_string_from_str(&url)
@@ -775,6 +804,68 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.dayname(lat, lon, n, locale) -> the weekday LABEL for forecast row n.
+    //   sys.dayname(LAT, LON, 0, "en") -> "Today"
+    //   sys.dayname(LAT, LON, 1, "en") -> "Thu"
+    //   sys.dayname(LAT, LON, 1, "zh") -> "周四"
+    //
+    // A card must NEVER write weekday names as literal strings, for two reasons
+    // that both bit us before this existed:
+    //
+    //   * The generating model does not reliably know the date. On Wed
+    //     2026-07-29 it emitted "Today, Wed, Thu, …" — repeating today as
+    //     tomorrow, so every row after the first was mislabelled. Nobody
+    //     notices, because a wrong weekday looks exactly like a right one.
+    //   * Cards are PERSISTED and re-served (a2app_cards/), so a literal is
+    //     stale the next morning even when it was correct when generated.
+    //
+    // The date comes from `daily.time.n` in the SAME cached forecast the
+    // temperatures come from, so the labels are local to the FORECAST'S place —
+    // not to wherever the phone happens to be. Until that fetch lands we fall
+    // back to the device clock, which is right unless the place is across a date
+    // boundary, and self-corrects on the redraw when the real date arrives.
+    vm.add_method(
+        sys,
+        id_lut!(dayname),
+        script_args_def!(lat = NIL, lon = NIL, n = NIL, locale = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n = script_value!(vm, args.n).as_number().unwrap_or(0.0).max(0.0) as usize;
+            let loc_v = script_value!(vm, args.locale);
+            let mut loc = String::new();
+            vm.bx.heap.cast_to_string(loc_v, &mut loc);
+            let zh = loc.trim().to_ascii_lowercase().starts_with("zh");
+
+            if n == 0 {
+                let s = if zh { "今天" } else { "Today" };
+                return vm.bx.heap.new_string_from_str(s);
+            }
+
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,surface_pressure,is_day\
+&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max\
+&timezone=auto&forecast_days=7"
+            );
+            // Authoritative: the forecast's own local date for that row.
+            let from_api = vm.host.cx_mut().script_data_fetch(&url).and_then(|bytes| {
+                let date = json_pluck(&bytes, &format!("daily.time.{n}"))?;
+                let mut it = date.trim().split('-');
+                let y = it.next()?.parse::<i64>().ok()?;
+                let m = it.next()?.parse::<u64>().ok()?;
+                let d = it.next()?.parse::<u64>().ok()?;
+                Some(weekday_from_days(days_from_civil(y, m, d)))
+            });
+            // Graceful: the device's own day, offset by n.
+            let wd = from_api.unwrap_or_else(|| {
+                weekday_from_days((now_unix_secs() / 86_400) as i64 + n as i64)
+            });
+            let s = if zh { DAY_ZH[wd] } else { DAY_EN[wd] };
+            vm.bx.heap.new_string_from_str(s)
+        },
+    );
+
     // sys.weekmin(lat, lon) / sys.weekmax(lat, lon) -> the LOWEST low and HIGHEST
     // high across the 7-day forecast, for a TempBar's draw_bg.wmin / draw_bg.wmax.
     //
@@ -1199,6 +1290,58 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.quakes(index, "field") -> a REAL recent earthquake from the USGS
+    // live feed (M2.5+, last 24 h, keyless), newest first: index 0 = the most
+    // recent event. THE LLM MUST CALL THIS FOR EVERY DISPLAYED VALUE — an
+    // invented magnitude/place destroys trust in the whole card. Fields
+    // (case-insensitive):
+    //   place -> "42 km SW of Ashkasham, Afghanistan"
+    //   mag   -> "4.6"        (one decimal)
+    //   depth -> "10 km"      (whole km)
+    //   time  -> "2h ago"     (humanized age; "now" under a minute)
+    //   lat|lon -> "36.5622"  (4 decimals — chain into sys.basemap)
+    //   count -> total events in the feed (ignores `index`)
+    // Returns "—" while the (async) fetch loads or the index is out of range;
+    // the card re-evaluates when data lands (same redraw semantics as
+    // sys.weather). ONE URL-deduped fetch serves all rows × fields of a card.
+    vm.add_method(
+        sys,
+        id_lut!(quakes),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let idx = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let out = match vm.host.cx_mut().script_data_fetch(QUAKES_FEED_URL) {
+                Some(bytes) => quake_field(&bytes, idx, field.trim()),
+                None => "—".to_string(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.quakesnum(index, "field") -> the same quake values as NUMBERS
+    // (mag, depth, lat, lon, count) so scripts can branch on magnitude or
+    // chain the epicenter into sys.basemap(lat, lon). Returns -9999 while the
+    // fetch loads; guard with >= -9998 (same convention as sys.weathernum).
+    vm.add_method(
+        sys,
+        id_lut!(quakesnum),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let idx = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let n = match vm.host.cx_mut().script_data_fetch(QUAKES_FEED_URL) {
+                Some(bytes) => quake_num(&bytes, idx, field.trim()),
+                None => -9999.0,
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
     // sys.places(lat, lon, "category", index, "field") -> a REAL nearby venue
     // from OpenStreetMap (Overpass API, keyless): row `index` (0 = nearest) of
     // the named places within 4 km, sorted by distance. THE LLM MUST CALL THIS
@@ -1452,6 +1595,8 @@ fn body_binds_live_data(body: &str) -> bool {
         || body.contains("sys.stock")
         || body.contains("sys.news")
         || body.contains("sys.movers")
+        // substring covers sys.quakesnum too (same trick as weather/weathernum)
+        || body.contains("sys.quakes")
         || body.contains("sys.places")
         // covers sys.search + sys.searchnum — the search-results card must
         // re-evaluate once the free-text search fetch lands
@@ -1585,6 +1730,73 @@ fn stock_bar_height(bytes: &[u8], index: usize, count: usize, maxh: f64) -> f64 
 }
 
 /// Extract a scalar from an open-meteo JSON body at a dot-path, formatted for
+/// USGS live feed backing sys.quakes/sys.quakesnum: all M2.5+ earthquakes in
+/// the last 24 h as GeoJSON, newest first (keyless, ~50-200 KB).
+const QUAKES_FEED_URL: &str =
+    "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.geojson";
+
+/// Pluck one DISPLAY field for quake `idx` out of the raw USGS GeoJSON bytes.
+/// GeoJSON layout: features[i].properties.{mag,place,time(ms)} and
+/// features[i].geometry.coordinates = [lon, lat, depth_km].
+fn quake_field(bytes: &[u8], idx: i64, field: &str) -> String {
+    let f = field.to_ascii_lowercase();
+    let out = match f.as_str() {
+        "mag" | "magnitude" => json_pluck(bytes, &format!("features.{idx}.properties.mag"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|m| format!("{m:.1}")),
+        "depth" => json_pluck(bytes, &format!("features.{idx}.geometry.coordinates.2"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|d| format!("{d:.0} km")),
+        "lat" => json_pluck(bytes, &format!("features.{idx}.geometry.coordinates.1"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| format!("{v:.4}")),
+        "lon" => json_pluck(bytes, &format!("features.{idx}.geometry.coordinates.0"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| format!("{v:.4}")),
+        // Humanized age from the epoch-ms event time ("now", "12m ago", "3h ago").
+        "time" | "ago" => json_pluck(bytes, &format!("features.{idx}.properties.time"))
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|ms| {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as f64)
+                    .unwrap_or(ms);
+                let mins = ((now_ms - ms) / 60000.0).max(0.0) as i64;
+                if mins < 1 {
+                    "now".to_string()
+                } else if mins < 60 {
+                    format!("{mins}m ago")
+                } else if mins < 48 * 60 {
+                    format!("{}h ago", mins / 60)
+                } else {
+                    format!("{}d ago", mins / (60 * 24))
+                }
+            }),
+        "count" => json_pluck(bytes, "metadata.count"),
+        // Default (incl. "place"): the human-readable location string.
+        _ => json_pluck(bytes, &format!("features.{idx}.properties.place")),
+    };
+    out.unwrap_or_else(|| "—".to_string())
+}
+
+/// The numeric twin behind sys.quakesnum. -9999 while absent (sentinel shared
+/// with sys.weathernum so cards can guard with `>= -9998`).
+fn quake_num(bytes: &[u8], idx: i64, field: &str) -> f64 {
+    let f = field.to_ascii_lowercase();
+    let path = match f.as_str() {
+        "depth" => format!("features.{idx}.geometry.coordinates.2"),
+        "lat" => format!("features.{idx}.geometry.coordinates.1"),
+        "lon" => format!("features.{idx}.geometry.coordinates.0"),
+        "time" => format!("features.{idx}.properties.time"),
+        "count" => "metadata.count".to_string(),
+        // Default (incl. "mag").
+        _ => format!("features.{idx}.properties.mag"),
+    };
+    json_pluck(bytes, &path)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(-9999.0)
+}
+
 /// display. A numeric path segment indexes into an array; other segments are
 /// object keys. Returns None if the path is absent or the leaf isn't a scalar.
 /// ISO datetimes ("2026-07-13T05:52", as open-meteo returns for sunrise/sunset)
@@ -1611,6 +1823,28 @@ fn json_pluck(bytes: &[u8], path: &str) -> Option<String> {
     }
     Some(s)
 }
+
+/// Howard Hinnant's `days_from_civil` — the inverse of `civil_from_days`.
+/// (year, month, day) → days since the Unix epoch.
+fn days_from_civil(y: i64, m: u64, d: u64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// Weekday for a days-since-epoch count, 0 = Sunday. 1970-01-01 was a Thursday,
+/// hence the +4.
+fn weekday_from_days(z: i64) -> usize {
+    (((z + 4) % 7 + 7) % 7) as usize
+}
+
+/// Abbreviated weekday names, index 0 = Sunday.
+const DAY_EN: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DAY_ZH: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
 /// Reduce a 7-element `daily.*` temperature array to its min or max.
 ///
