@@ -2441,7 +2441,19 @@ public class MakepadActivity
                 if (total > 8 * 1024 * 1024) throw new Exception("file too large (>8MB)");
                 out.write(buf, 0, n);
             }
-            return new String(out.toByteArray(), "UTF-8");
+            byte[] bytes = out.toByteArray();
+            // Strict UTF-8: a lossy decode turns binary files (images etc.) into
+            // strings containing U+0000/U+FFFD, which cross JNI as modified
+            // UTF-8 (C0 A8) and used to crash the Rust side outright. Reject
+            // binary with a clean error the card's promise can surface instead.
+            java.nio.charset.CharsetDecoder dec = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+            try {
+                return dec.decode(java.nio.ByteBuffer.wrap(bytes)).toString();
+            } catch (java.nio.charset.CharacterCodingException e) {
+                throw new Exception("binary file (not UTF-8 text); base64 transfer isn't supported yet");
+            }
         } finally {
             if (in != null) in.close();
         }
