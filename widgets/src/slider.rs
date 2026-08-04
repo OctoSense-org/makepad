@@ -624,22 +624,28 @@ script_mod! {
     }
 
     mod.widgets.Slider = mod.widgets.SliderFlat{
+        // Material 3 slider: primary active track + handle, neutral inactive track.
         draw_bg +: {
-            handle_color: theme.color_handle_1
-            handle_color_hover: theme.color_handle_1_hover
-            handle_color_focus: theme.color_handle_1_focus
+            val_color: #6750A4
+            val_color_hover: #6750A4
+            val_color_focus: #6750A4
+            val_color_drag: #6750A4
+
+            handle_color: #6750A4
+            handle_color_hover: #6750A4
+            handle_color_focus: #6750A4
             handle_color_disabled: theme.color_handle_1_disabled
-            handle_color_drag: theme.color_handle_1_drag
+            handle_color_drag: #6750A4
 
-            handle_color_2: theme.color_handle_2
+            handle_color_2: #6750A4
 
-            border_color: theme.color_bevel_inset_1
-            border_color_hover: theme.color_bevel_inset_1_hover
-            border_color_focus: theme.color_bevel_inset_1_focus
+            border_color: #CAC4D0
+            border_color_hover: #CAC4D0
+            border_color_focus: #CAC4D0
             border_color_disabled: theme.color_bevel_inset_1_disabled
-            border_color_drag: theme.color_bevel_inset_1_drag
+            border_color_drag: #CAC4D0
 
-            border_color_2: theme.color_bevel_inset_2
+            border_color_2: #CAC4D0
         }
     }
 

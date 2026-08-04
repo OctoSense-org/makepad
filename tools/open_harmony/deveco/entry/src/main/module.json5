@@ -9,6 +9,18 @@
     ],
     "deliveryWithInstall": true,
     "installationFree": false,
+    // The template declares NO permissions by default, so every network call
+    // fails with "error sending request" and the app looks hung. Note the
+    // system file picker (DocumentViewPicker) needs no permission of its own —
+    // it grants access to whatever the user picks.
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.INTERNET"
+      },
+      {
+        "name": "ohos.permission.GET_NETWORK_INFO"
+      }
+    ],
     "pages": "$profile:main_pages",
     "abilities": [
       {

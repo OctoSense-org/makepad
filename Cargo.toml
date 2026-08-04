@@ -7,6 +7,10 @@ workspace.members = [
     "examples/map",
     "examples/arracing",
     "examples/splash",
+    "examples/splash_card",
+    "examples/splash_catalog",
+    "examples/splash_runtime",
+    "examples/material_catalog",
     "examples/slides",
     "examples/isolate",
     "examples/uizoo",
@@ -168,6 +172,12 @@ workspace.exclude = [
 
 workspace.resolver = "2"
 #debug = true
+
+# The shared splash-render/splash-makepad crates (in the Splash-OH-render repo)
+# pin makepad-script to a git rev; redirect it to this repo's local copy so the
+# on-device app runs the Splash DSL on the same single VM the widgets use.
+[patch."https://github.com/octos-org/makepad.git"]
+makepad-script = { path = "platform/script" }
 
 [patch.crates-io]
 arrayvec = { path = "libs/vulkan/arrayvec" }

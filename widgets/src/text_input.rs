@@ -427,15 +427,24 @@ script_mod! {
     }
 
     mod.widgets.TextInput = mod.widgets.TextInputFlat{
+        // Material 3 text field (outlined): surface fill, 4dp corner, on-surface-
+        // variant outline that turns primary on focus.
         draw_bg +: {
-            border_color: theme.color_bevel_inset_1
-            border_color_hover: theme.color_bevel_inset_1_hover
-            border_color_focus: theme.color_bevel_inset_1_focus
-            border_color_down: theme.color_bevel_inset_1_down
-            border_color_empty: theme.color_bevel_inset_1_empty
+            border_radius: uniform(4.0)
+            border_size: uniform(1.0)
+            color: #FEF7FF
+            color_hover: #FEF7FF
+            color_focus: #FEF7FF
+            color_down: #FEF7FF
+            color_empty: #FEF7FF
+            border_color: #49454F
+            border_color_hover: #49454F
+            border_color_focus: #6750A4
+            border_color_down: #6750A4
+            border_color_empty: #49454F
             border_color_disabled: theme.color_bevel_inset_1_disabled
 
-            border_color_2: theme.color_bevel_inset_1
+            border_color_2: #49454F
         }
     }
 

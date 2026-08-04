@@ -204,13 +204,25 @@ script_mod! {
     }
 
     mod.widgets.RadioButton = mod.widgets.RadioButtonFlat{
+        // Material 3 radio: 20dp, 2dp ring (on-surface-variant unselected, primary
+        // selected) with a primary inner dot.
+        label_walk +: { margin: theme.mspace_h_1{left: 30.} }
         draw_bg +: {
-            border_color: theme.color_bevel_inset_1
-            border_color_hover: theme.color_bevel_inset_1_hover
-            border_color_down: theme.color_bevel_inset_1_down
-            border_color_active: theme.color_bevel_inset_1_active
-            border_color_focus: theme.color_bevel_inset_1_focus
+            size: uniform(20.0)
+            border_size: uniform(2.0)
+            color: #00000000
+            color_hover: #00000000
+            color_down: #00000000
+            color_active: #00000000
+            color_focus: #00000000
+            border_color: #49454F
+            border_color_hover: #49454F
+            border_color_down: #6750A4
+            border_color_active: #6750A4
+            border_color_focus: #49454F
             border_color_disabled: theme.color_bevel_inset_1_disabled
+            mark_color: #00000000
+            mark_color_active: #6750A4
         }
     }
 

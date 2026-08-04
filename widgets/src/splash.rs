@@ -28,6 +28,14 @@ pub struct Splash {
     pub view: View,
     #[live]
     body: ArcStringMut,
+    // When false, evaluate the body on the host's main VM instead of a private
+    // isolate. Main-VM mounting shares the app's widget templates, theme and
+    // heap — use it for trusted, app-generated bodies (e.g. a Splash-DSL card
+    // translated at runtime) that should match the host's theme, and where the
+    // isolate's separate, smaller heap otherwise breaks widget animators that
+    // reference main-VM heap slots (out-of-bounds in the isolate).
+    #[live(true)]
+    isolate: bool,
     #[rust]
     vm_id: SplashVmId,
 }
@@ -47,7 +55,9 @@ impl Splash {
             return;
         }
 
-        if self.vm_id == MAIN_SPLASH_VM_ID {
+        // isolate == false keeps vm_id at MAIN_SPLASH_VM_ID, so with_script_vm_id
+        // below routes to the host's main VM (with_vm) rather than a private one.
+        if self.isolate && self.vm_id == MAIN_SPLASH_VM_ID {
             self.vm_id = cx.alloc_splash_vm();
         }
 

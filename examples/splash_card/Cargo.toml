@@ -1,0 +1,8 @@
+[package]
+name = "makepad-example-splash-card"
+version = "0.1.0"
+edition = "2021"
+description = "Renders a Splash card via makepad — the makepad render backend, on device"
+
+[dependencies]
+makepad-widgets = { path = "../../widgets", version = "2.0.0" }
