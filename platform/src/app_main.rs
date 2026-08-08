@@ -401,6 +401,12 @@ macro_rules! app_main {
             exports: $crate::napi_ohos::JsObject,
             env: $crate::napi_ohos::Env,
         ) -> $crate::napi_ohos::Result<()> {
+            // Install the logger, as the desktop, Android and wasm entry points
+            // all do. Without it `log_with_level` keeps its default target and
+            // every `log!` on OpenHarmony is discarded — the platform runs
+            // completely silent, which makes an app that draws nothing
+            // undiagnosable.
+            Cx::init_log();
             Cx::ohos_init(exports, env, || {
                 let mut cx = Box::new(Cx::new($crate::_app_main_event_closure!($app)));
                 let studio_http = $crate::resolve_studio_http();

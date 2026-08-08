@@ -84,6 +84,15 @@ impl Splash {
             if !value.is_err() && !value.is_nil() {
                 Some(View::script_from_value(vm, value))
             } else {
+                // TEMP diagnostic: a mounted body that evaluates to an error or
+                // nil produces no view and no complaint, which is
+                // indistinguishable from a blank screen.
+                crate::makepad_draw::makepad_platform::log!(
+                    "SPLASH eval failed: err={} nil={} body_len={}",
+                    value.is_err(),
+                    value.is_nil(),
+                    body.len()
+                );
                 None
             }
         });

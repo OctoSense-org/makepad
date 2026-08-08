@@ -76,6 +76,8 @@ impl Cx {
                 Ok(FromOhosMessage::VSync) => {
                     self.handle_all_pending_messages(&from_ohos_rx);
                     self.handle_other_events();
+                    // Pick up dependencies registered by the previous pass.
+                    self.ohos_load_dependencies();
                     self.handle_drawing();
                 }
                 Ok(message) => self.handle_message(message),
@@ -287,7 +289,7 @@ impl Cx {
         }) = from_ohos_rx.recv()
         {
             self.os.dpi_factor = display_density;
-            self.os.raw_file = Some(raw_file);
+            self.os.raw_file = Some(std::cell::RefCell::new(raw_file));
             self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
                 files_dir,
                 cache_dir,
@@ -425,18 +427,35 @@ impl Cx {
         });
     }
 
+    /// Fetch any dependency that does not have its bytes yet.
+    ///
+    /// Called before every draw, not once at startup. Fonts and images are
+    /// registered when a widget first draws, and the startup call happens before
+    /// `Event::Startup` is even dispatched — so the map was always empty there
+    /// and nothing was ever loaded. With no font bytes every `Label` measures
+    /// zero, every `Fit` container collapses, and the window renders blank apart
+    /// from whatever `Fill` background sits behind it.
     pub fn ohos_load_dependencies(&mut self) {
         for (path, dep) in &mut self.dependencies {
+            if dep.data.is_some() {
+                continue;
+            }
             let mut buffer = Vec::<u8>::new();
             if let Ok(_) = self
                 .os
                 .raw_file
-                .as_mut()
+                .as_ref()
                 .unwrap()
+                .borrow_mut()
                 .read_to_end(path, &mut buffer)
             {
+                crate::log!("DEP ok {} bytes={}", path, buffer.len());
                 dep.data = Some(Ok(Rc::new(buffer)));
             } else {
+                // TEMP diagnostic. A failed dependency read is recorded on the
+                // dependency and never reported, so a missing font shows up only
+                // as text that measures zero and containers that collapse.
+                crate::log!("DEP FAIL {}", path);
                 dep.data = Some(Err("read_to_end failed".to_string()));
             }
         }
@@ -641,7 +660,10 @@ pub struct CxOs {
     pub media: CxOpenHarmonyMedia,
     pub quit: bool,
     pub timers: PollTimers,
-    pub raw_file: Option<RawFileMgr>,
+    /// `RefCell` because `Cx::get_dependency` takes `&self` and
+    /// `RawFileMgr::read_to_end` takes `&mut self`. Wrapping the field keeps the
+    /// fix out of the public API.
+    pub raw_file: Option<std::cell::RefCell<RawFileMgr>>,
     pub arkts_obj: Option<ArkTsObjRef>,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,

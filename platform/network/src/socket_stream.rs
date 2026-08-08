@@ -1,12 +1,12 @@
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub struct SocketStream {
     inner: crate::backend::linux::socket_stream::SocketStream,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl SocketStream {
     pub fn connect(
         host: &str,
@@ -43,14 +43,14 @@ impl SocketStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Read for SocketStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Write for SocketStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
@@ -296,5 +296,70 @@ impl Write for SocketStream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+// OpenHarmony. The type has to exist — `makepad-script-std` and the crate root
+// both name it — but there is nothing to implement it with: makepad's TLS
+// stream is OpenSSL, and the OHOS sysroot ships `libnet_ssl.so` /
+// `libohcrypto.so`, which export none of the OpenSSL symbols. So it exists and
+// refuses, rather than being cfg'd away and cascading through every caller.
+#[cfg(target_env = "ohos")]
+pub struct SocketStream {
+    _unconstructible: std::convert::Infallible,
+}
+
+#[cfg(target_env = "ohos")]
+fn ohos_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "sockets are not implemented on OpenHarmony: makepad's TLS stream needs \
+         OpenSSL, which the OHOS sysroot does not provide",
+    )
+}
+
+#[cfg(target_env = "ohos")]
+impl SocketStream {
+    pub fn connect(
+        _host: &str,
+        _port: &str,
+        _use_tls: bool,
+        _ignore_ssl_cert: bool,
+    ) -> io::Result<Self> {
+        Err(ohos_unsupported())
+    }
+
+    pub fn into_tls(self, _host: &str, _ignore_ssl_cert: bool) -> io::Result<Self> {
+        match self._unconstructible {}
+    }
+
+    pub fn set_read_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        match self._unconstructible {}
+    }
+
+    pub fn set_write_timeout(&self, _timeout: Option<Duration>) -> io::Result<()> {
+        match self._unconstructible {}
+    }
+
+    pub fn shutdown(&mut self) {
+        match self._unconstructible {}
+    }
+}
+
+#[cfg(target_env = "ohos")]
+impl Read for SocketStream {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        match self._unconstructible {}
+    }
+}
+
+#[cfg(target_env = "ohos")]
+impl Write for SocketStream {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        match self._unconstructible {}
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self._unconstructible {}
     }
 }

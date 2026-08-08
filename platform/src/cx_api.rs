@@ -659,6 +659,32 @@ impl Cx {
             }
         }
 
+        // OpenHarmony: read straight out of the HAP's rawfile tree.
+        //
+        // The dependency map above is never populated on any platform — Android
+        // satisfies every lookup through the asset fallback below, and OHOS had
+        // none, so every font request failed and nothing was reported. With no
+        // glyphs, text measures zero and every `Fit` container collapses, which
+        // renders the window blank apart from any `Fill` background behind it.
+        //
+        // Keys arrive crate-relative (`makepad_widgets/resources/…`); the bundle
+        // stores them one level down, under `makepad/`.
+        #[cfg(target_env = "ohos")]
+        {
+            if let Some(raw_file) = self.os.raw_file.as_ref() {
+                let mut buffer = Vec::<u8>::new();
+                let bundled = format!("makepad/{path}");
+                let ok = raw_file
+                    .borrow_mut()
+                    .read_to_end(&bundled, &mut buffer)
+                    .is_ok();
+                crate::log!("DEPREAD {} ok={} bytes={}", bundled, ok, buffer.len());
+                if ok {
+                    return Ok(Rc::new(buffer));
+                }
+            }
+        }
+
         #[cfg(target_os = "android")]
         {
             if let Some(data) =
@@ -683,6 +709,12 @@ impl Cx {
     }
 
     pub fn get_dependency(&self, path: &str) -> Result<Rc<Vec<u8>>, String> {
+        // TEMP diagnostic: which keys are actually asked for. The dependency map
+        // is never populated on any platform — Android satisfies every lookup
+        // through its asset fallback below — so on OpenHarmony, which has no
+        // fallback, every font read fails silently.
+        #[cfg(target_env = "ohos")]
+        crate::log!("DEPREQ {} raw_file={}", path, self.os.raw_file.is_some());
         if let Some(data) = self.dependencies.get(path) {
             if let Some(data) = &data.data {
                 return match data {
@@ -1724,9 +1756,23 @@ pub fn can_play_type(mime: &str) -> &'static str {
     can_play_type_impl(mime)
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+// OpenHarmony is `target_os = "linux"` with `target_env = "ohos"`, so this arm
+// was selected there — while `os::linux::linux_video_playback` is declared
+// `#[cfg(not(any(target_env = "ohos", target_os = "android")))]` and does not
+// exist. The two cfgs disagreed, and the OHOS build could not compile at all.
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::linux::linux_video_playback::can_play_type(mime)
+}
+
+/// OpenHarmony has no video-playback backend yet, so nothing is playable.
+#[cfg(target_env = "ohos")]
+fn can_play_type_impl(_mime: &str) -> &'static str {
+    ""
 }
 
 #[cfg(target_os = "android")]

@@ -16,7 +16,12 @@ pub use self::android::{
 };
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "tvos"))]
 pub mod apple;
-#[cfg(target_os = "linux")]
+// Desktop Linux only. OpenHarmony is also `target_os = "linux"`, but this
+// backend links OpenSSL by name (`#[link(name = "ssl")]` in its socket_stream),
+// and the OHOS sysroot ships `libnet_ssl.so` / `libohcrypto.so` instead —
+// neither of which exports the OpenSSL symbols, so it is not a rename. Until an
+// OHOS backend exists, OHOS gets `UnsupportedBackend`.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
 #[cfg(target_arch = "wasm32")]
 pub mod web;
@@ -168,10 +173,20 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
     not(target_os = "android"),
     not(target_os = "windows"),
     not(any(target_os = "ios", target_os = "macos", target_os = "tvos")),
-    target_os = "linux"
+    target_os = "linux",
+    not(target_env = "ohos")
 ))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
     linux::create_backend()
+}
+
+/// OpenHarmony: no network backend yet. See the `linux` module gate above.
+#[cfg(all(not(target_arch = "wasm32"), target_env = "ohos"))]
+pub fn default_backend() -> Arc<dyn NetworkBackend> {
+    Arc::new(UnsupportedBackend::new(
+        "no OpenHarmony network backend: makepad's Linux backend links OpenSSL, \
+         which the OHOS sysroot does not provide",
+    ))
 }
 
 #[cfg(not(any(

@@ -41,6 +41,54 @@ fn android_logcat_write(
     unsafe { __android_log_write(prio, "Makepad\0".as_ptr(), msg.as_ptr()) };
 }
 
+/// Send a log line to hilog on OpenHarmony.
+///
+/// Without this, `log!` on OHOS goes nowhere: `log_with_level` dispatches through
+/// a function pointer and no OHOS writer was ever installed, so the platform is
+/// silent. That made every failure on device undiagnosable — an app that draws
+/// nothing and says nothing.
+///
+/// `OH_LOG_Print` is variadic and treats its `fmt` argument as a printf format
+/// string, so the message goes through as a `%s` *argument* rather than as the
+/// format itself — otherwise a log line containing `%` would be read as a
+/// conversion and could walk off the stack. (`OH_LOG_PrintMsg` takes plain text
+/// and would be safer, but it is behind hilog-sys' `api-18` feature.)
+#[cfg(target_env = "ohos")]
+fn ohos_hilog_write(
+    file_name: &str,
+    line_start: u32,
+    column_start: u32,
+    message: &str,
+    level: LogLevel,
+) {
+    use std::ffi::CString;
+    let lvl = match level {
+        LogLevel::Error | LogLevel::Panic => hilog_sys::LogLevel::LOG_ERROR,
+        LogLevel::Warning => hilog_sys::LogLevel::LOG_WARN,
+        _ => hilog_sys::LogLevel::LOG_INFO,
+    };
+    let text = format!(
+        "{}{}:{}:{} - {}",
+        log_level_prefix(level),
+        file_name,
+        line_start + 1,
+        column_start + 1,
+        message
+    );
+    if let (Ok(tag), Ok(msg)) = (CString::new("Makepad"), CString::new(text)) {
+        unsafe {
+            hilog_sys::OH_LOG_Print(
+                hilog_sys::LogType::LOG_APP,
+                lvl,
+                0,
+                tag.as_ptr(),
+                c"%s".as_ptr(),
+                msg.as_ptr(),
+            );
+        }
+    }
+}
+
 impl Cx {
     pub fn init_log() {
         let mut logger = LOG_WITH_LEVEL.write().expect("Logger lock poisoned");
@@ -79,6 +127,8 @@ pub(crate) fn log_with_level_makepad_platform(
 
     #[cfg(target_os = "android")]
     android_logcat_write(file_name, line_start, column_start, &message, level);
+    #[cfg(target_env = "ohos")]
+    ohos_hilog_write(file_name, line_start, column_start, &message, level);
 
     let studio_enabled = Cx::has_studio_web_socket();
     let studio_connected = Cx::has_studio_web_socket_connected();

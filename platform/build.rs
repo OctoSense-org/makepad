@@ -169,7 +169,14 @@ fn main() {
         }
         "linux" => {
             println!("cargo:rustc-cfg=use_gles_3");
-            println!("cargo:rustc-link-lib=xkbcommon");
+            // xkbcommon is desktop-Linux keyboard handling. OpenHarmony reports
+            // CARGO_CFG_TARGET_OS=linux too, and its SDK sysroot has no
+            // xkbcommon, so linking it there fails with
+            // `ld.lld: unable to find library -lxkbcommon`. Input on OHOS comes
+            // from the ArkUI surface, not from xkb.
+            if !target.contains("ohos") {
+                println!("cargo:rustc-link-lib=xkbcommon");
+            }
         }
         "android" => {
             println!("cargo:rustc-cfg=use_gles_3");
