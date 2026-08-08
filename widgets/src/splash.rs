@@ -1558,6 +1558,57 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.reading(index, "key") -> row `index` of the user's SAVED reading list
+    // (§5.12). The store holds Algolia story IDS — identities the item endpoint
+    // serves forever — so a bookmark outlives the front page it was found on:
+    // this fetches https://hn.algolia.com/api/v1/items/{id} per saved id and
+    // answers today's title/points, never a stored copy. Keys as sys.news,
+    // plus "id". "—" while the fetch loads; one fetch per id, deduped. The item
+    // endpoint serves no comment COUNT, so `comments` counts comment nodes in
+    // the payload rather than pretending a field exists.
+    vm.add_method(
+        sys,
+        id_lut!(reading),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let Some(id) = collection_at("reading", index) else {
+                return vm.bx.heap.new_string_from_str("—");
+            };
+            let key = match field.trim().to_ascii_lowercase().as_str() {
+                "id" => {
+                    // The identity itself needs no fetch — it IS the store.
+                    return vm.bx.heap.new_string_from_str(&id);
+                }
+                "url" => "url",
+                "author" | "by" => "author",
+                "points" | "score" => "points",
+                "comments" | "num_comments" => "num_comments",
+                _ => "title",
+            };
+            let url = format!("https://hn.algolia.com/api/v1/items/{id}");
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => match key {
+                    "num_comments" => {
+                        let n = String::from_utf8_lossy(&bytes)
+                            .matches("\"type\":\"comment\"")
+                            .count();
+                        format!("{n}")
+                    }
+                    k => json_pluck(&bytes, k).unwrap_or_else(|| "—".to_string()),
+                },
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     // sys.places(lat, lon, "category", index, "field") -> a REAL nearby venue
     // from OpenStreetMap (Overpass API, keyless): row `index` (0 = nearest) of
     // the named places within 4 km, sorted by distance. THE LLM MUST CALL THIS
