@@ -18,6 +18,33 @@ pub struct GpsFix {
 
 static LAST_GPS_FIX: Mutex<Option<GpsFix>> = Mutex::new(None);
 
+/// Whether an injected track owns the position — see [`claim_fake_gps`].
+static FAKE_GPS_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// An injected track (the `FAKE_GPS_FILE` harness hook) claims the position:
+/// from now on the REAL `LocationListener` is ignored.
+///
+/// Both feeds funnel into the same fix, and for two days that was moot — this
+/// handset had no live fix at all. The moment its network location woke back
+/// up, live nav started receiving interleaved positions: the walked track
+/// point, then the device's actual (stationary, ~250 m accuracy) location,
+/// 700 ms apart — and the follow camera "jumped randomly" between a simulated
+/// drive and the user's sofa. A simulation that is running IS the position;
+/// mixing in the real one is not honesty, it is two truths fighting.
+pub fn claim_fake_gps() {
+    FAKE_GPS_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `LocationListener`'s entry: a real fix, honoured only while no injected
+/// track has claimed the position.
+pub fn set_gps_fix_from_listener(lat: f64, lon: f64, acc: f32) {
+    if FAKE_GPS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    set_gps_fix(lat, lon, acc);
+}
+
 /// How far the device must move before a fix counts as news, in metres.
 ///
 /// This is the ESCALATION RATE, and escalating is expensive. An epoch change

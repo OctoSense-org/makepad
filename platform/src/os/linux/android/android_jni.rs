@@ -1222,7 +1222,7 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_onLocation(
     lon: jni_sys::jdouble,
     acc: jni_sys::jfloat,
 ) {
-    crate::gps::set_gps_fix(lat as f64, lon as f64, acc as f32);
+    crate::gps::set_gps_fix_from_listener(lat as f64, lon as f64, acc as f32);
 }
 
 #[no_mangle]
