@@ -1872,14 +1872,22 @@ public class MakepadActivity
                 @Override public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
                 @Override public void onProviderEnabled(String provider) {}
                 @Override public void onProviderDisabled(String provider) {}
-                // Newer Android (14+) dispatches these interface DEFAULT methods
-                // through the desugaring companion (LocationListener$-CC), which
-                // is not packaged — override them explicitly or the first GPS
-                // fix crashes with ClassNotFoundException on new devices.
-                @Override public void onLocationChanged(java.util.List<Location> locations) {
-                    for (Location l : locations) onLocationChanged(l);
+                // API 31 added a BATCHED overload as an interface DEFAULT method.
+                // Leaving it to the default is what crashed the app: D8 rewrites a
+                // call to an interface default into its synthesised companion
+                // `LocationListener$-CC`, that class was not in the APK, and the
+                // first fix delivered after granting the location permission died
+                // with NoClassDefFoundError on the main looper — taking the whole
+                // process with it.
+                //
+                // Implementing it means D8 never needs the companion. No
+                // `@Override`: on an SDK where the interface does not declare this
+                // overload it is a harmless extra method, and annotating it would
+                // fail to compile there.
+                public void onLocationChanged(java.util.List<Location> locations) {
+                    if (locations == null || locations.isEmpty()) return;
+                    onLocationChanged(locations.get(locations.size() - 1));
                 }
-                @Override public void onFlushComplete(int requestCode) {}
             };
         }
         try {
