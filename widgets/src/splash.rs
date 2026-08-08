@@ -360,6 +360,10 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     //   sys.geocode("kyoto", "lon")     -> "135.7539"
     //   also: "timezone", "population". Returns "—" while loading. For the
     // NUMBERS that anchor sys.maptile/mappin/places, use sys.geocodenum.
+    //
+    // An EMPTY name resolves to WHERE THE DEVICE IS (reverse geocode of the
+    // last GPS fix — see geocode_url); with no fix it keeps the placeholder.
+    // Field translation for both response shapes lives in geocode_pluck.
     vm.add_method(
         sys,
         id_lut!(geocode),
@@ -372,29 +376,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
             let url = geocode_url(&name);
-            let path = match field.trim() {
-                "lat" => "results.0.latitude",
-                "lon" => "results.0.longitude",
-                "name" => "results.0.name",
-                "country" => "results.0.country",
-                "admin1" => "results.0.admin1",
-                "timezone" => "results.0.timezone",
-                "population" => "results.0.population",
-                other => return {
-                    // Unknown field: pluck it verbatim under results.0 so new
-                    // API fields work without a rebuild.
-                    let out = match vm.host.cx_mut().script_data_fetch(&url) {
-                        Some(bytes) => {
-                            json_pluck(&bytes, &format!("results.0.{other}"))
-                                .unwrap_or_else(|| "—".to_string())
-                        }
-                        None => vm.host.cx_mut().script_data_placeholder(&url),
-                    };
-                    vm.bx.heap.new_string_from_str(&out)
-                },
-            };
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
-                Some(bytes) => json_pluck(&bytes, path).unwrap_or_else(|| "—".to_string()),
+                Some(bytes) => geocode_pluck(&bytes, field.trim())
+                    .unwrap_or_else(|| "—".to_string()),
                 None => vm.host.cx_mut().script_data_placeholder(&url),
             };
             vm.bx.heap.new_string_from_str(&out)
@@ -420,16 +404,12 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
             let url = geocode_url(&name);
-            let path = if field.trim() == "lon" {
-                "results.0.longitude"
-            } else {
-                "results.0.latitude"
-            };
+            let key = if field.trim() == "lon" { "lon" } else { "lat" };
             let n = vm
                 .host
                 .cx_mut()
                 .script_data_fetch(&url)
-                .and_then(|bytes| json_pluck(&bytes, path))
+                .and_then(|bytes| geocode_pluck(&bytes, key))
                 .and_then(|s| s.parse::<f64>().ok())
                 .unwrap_or(-9999.0);
             ScriptValue::from_f64(n)
@@ -3144,11 +3124,62 @@ fn nav_step_field(route: &ParsedNavRoute, d: f64, field: &str) -> String {
 /// silently wrong.
 fn geocode_url(name: &str) -> String {
     let name = name.trim();
+    // An EMPTY name means "where the device is" — the weather exemplar's
+    // `state city { shape: text, initial: "" }` is documented as exactly
+    // that — and querying open-meteo's search for the empty string asks for
+    // nothing and answers it: a full page of "n/a°" with no failure message.
+    // Resolve the blank from the device's last GPS fix instead, by REVERSE
+    // geocoding (Photon; open-meteo's gazetteer has no reverse endpoint).
+    // City-scale rounding (~1 km) keeps the URL cache-stable under GPS
+    // jitter — the answer is a PLACE, and the place does not change every
+    // 40 m the fix drifts. No name AND no fix falls through to the empty
+    // search, which resolves to nothing and keeps the placeholder path:
+    // never invent a place.
+    if name.is_empty() {
+        if let Some(fix) = crate::makepad_draw::makepad_platform::gps::last_gps_fix() {
+            return format!(
+                "https://photon.komoot.io/reverse?lat={:.2}&lon={:.2}&lang=en",
+                fix.lat, fix.lon
+            );
+        }
+    }
     let lang = if name.chars().any(is_cjk) { "zh" } else { "en" };
     format!(
         "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language={lang}&format=json",
         percent_encode_query(name)
     )
+}
+
+/// Pluck a logical geocode field from whichever response shape the fetch
+/// answered with: open-meteo search (`results.0.*`) for a NAMED place, or
+/// Photon reverse GeoJSON (`features.0.*`) when an empty name resolved from
+/// the device's GPS fix — see `geocode_url`. One translation point, so
+/// `sys.geocode` and `sys.geocodenum` cannot disagree about what "lat" means.
+fn geocode_pluck(bytes: &[u8], field: &str) -> Option<String> {
+    let candidates: &[&str] = match field {
+        "lat" => &["results.0.latitude", "features.0.geometry.coordinates.1"],
+        "lon" => &["results.0.longitude", "features.0.geometry.coordinates.0"],
+        // Reverse at device scale names a house or a POI; the CITY is the
+        // honest display name for "where the device is". `state` fills in
+        // for the rural case where Photon answers no city at all.
+        "name" => &[
+            "results.0.name",
+            "features.0.properties.city",
+            "features.0.properties.name",
+            "features.0.properties.state",
+        ],
+        "country" => &["results.0.country", "features.0.properties.country"],
+        "admin1" => &["results.0.admin1", "features.0.properties.state"],
+        // Photon carries neither; the em dash is the honest answer for a
+        // blank name resolved by reverse.
+        "timezone" => &["results.0.timezone"],
+        "population" => &["results.0.population"],
+        other => {
+            return json_pluck(bytes, &format!("results.0.{other}"))
+                .or_else(|| json_pluck(bytes, &format!("features.0.properties.{other}")));
+        }
+    };
+    candidates.iter().find_map(|p| json_pluck(bytes, p))
 }
 
 /// Is this codepoint CJK? Covers the unified ideographs (incl. extension A) and
@@ -4149,5 +4180,98 @@ mod nav_progress_tests {
         assert_eq!(nav_progress_m(&r, 37.2135, -121.9887), 0.0);
         // Just beside it, within the gate, still measured.
         assert!(nav_progress_m(&r, 37.2135, -122.0015) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod geocode_tests {
+    use super::*;
+
+    /// An empty place name resolves from the device's last GPS fix by REVERSE
+    /// geocoding; a named place still goes to the forward gazetteer; no name
+    /// and no fix keeps the empty search whose non-answer is the placeholder.
+    ///
+    /// The blank weather card was this: `state city { initial: "" }` is
+    /// documented as "empty ⇒ device location", and the backend queried
+    /// open-meteo for the empty string instead — a full page of "n/a°" with
+    /// no failure message. Sequenced as ONE test because the fix is a
+    /// process-wide global and there is no un-set.
+    #[test]
+    fn an_empty_name_geocodes_where_the_device_is() {
+        // 1. No fix yet (nothing writes it host-side): the empty search, so
+        //    the card keeps the placeholder rather than inventing a place.
+        let url = geocode_url("");
+        assert!(
+            url.contains("geocoding-api.open-meteo.com"),
+            "no fix: keep the (non-)answering forward search: {url}"
+        );
+
+        // 2. With a fix: the Photon reverse endpoint, at city-scale rounding
+        //    so GPS jitter does not churn the URL cache.
+        crate::makepad_draw::makepad_platform::gps::set_gps_fix(35.6595, 139.7005, 10.0);
+        let url = geocode_url("");
+        assert_eq!(
+            url, "https://photon.komoot.io/reverse?lat=35.66&lon=139.70&lang=en",
+            "an empty name is the device's position"
+        );
+        assert_eq!(geocode_url("   "), url, "whitespace is an empty name");
+
+        // 3. A NAMED place is never reverse-resolved, fix or no fix.
+        let url = geocode_url("kyoto");
+        assert!(
+            url.contains("geocoding-api.open-meteo.com") && url.contains("name=kyoto"),
+            "a named place keeps the forward search: {url}"
+        );
+        assert!(
+            geocode_url("上海").contains("language=zh"),
+            "and a CJK name still searches the zh index"
+        );
+    }
+
+    /// One logical field, two response shapes: `geocode_pluck` answers "lat"
+    /// (and friends) from an open-meteo search result AND from a Photon
+    /// reverse result, so every caller of either URL reads the same facts.
+    /// Differential on purpose — each assertion pins the VALUE, not just
+    /// that something came back.
+    #[test]
+    fn geocode_fields_are_answered_from_both_response_shapes() {
+        let open_meteo = br#"{"results":[{"name":"Kyoto","latitude":35.0211,
+            "longitude":135.7539,"country":"Japan","admin1":"Kyoto",
+            "timezone":"Asia/Tokyo","population":1459640}]}"#;
+        let photon = br#"{"type":"FeatureCollection","features":[{"type":"Feature",
+            "geometry":{"type":"Point","coordinates":[139.7005,35.6595]},
+            "properties":{"name":"Shibuya Crossing","city":"Shibuya",
+            "state":"Tokyo","country":"Japan"}}]}"#;
+
+        for (field, om, ph) in [
+            ("lat", "35.0211", "35.6595"),
+            ("lon", "135.7539", "139.7005"),
+            // Reverse names a POI; the CITY is what a weather card captions.
+            ("name", "Kyoto", "Shibuya"),
+            ("country", "Japan", "Japan"),
+            ("admin1", "Kyoto", "Tokyo"),
+        ] {
+            assert_eq!(
+                geocode_pluck(open_meteo, field).as_deref(),
+                Some(om),
+                "open-meteo {field}"
+            );
+            assert_eq!(
+                geocode_pluck(photon, field).as_deref(),
+                Some(ph),
+                "photon {field}"
+            );
+        }
+        // Photon carries no timezone; None becomes the em dash upstream —
+        // honest, not invented.
+        assert_eq!(geocode_pluck(photon, "timezone"), None);
+        assert_eq!(
+            geocode_pluck(open_meteo, "timezone").as_deref(),
+            Some("Asia/Tokyo")
+        );
+        // A rural reverse answer with no city still names SOMEWHERE real.
+        let rural = br#"{"features":[{"geometry":{"coordinates":[-120.1,39.1]},
+            "properties":{"state":"California","country":"United States"}}]}"#;
+        assert_eq!(geocode_pluck(rural, "name").as_deref(), Some("California"));
     }
 }
