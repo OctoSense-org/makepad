@@ -486,6 +486,55 @@ script_mod! {
     }
 }
 
+thread_local! {
+    /// The area a FOCUSED TextInput died holding.
+    ///
+    /// A generated card rebuilds its whole tree on every `on_change` keystroke, so
+    /// the field the soft keyboard is talking to is destroyed mid-conversation and
+    /// key focus keeps pointing at the dead widget — every IME `full_state_sync`
+    /// after that hits nothing. Measured on a OnePlus 6 typing "cup" key by key on
+    /// Gboard: the keyboard's suggestion bar read "Cups | Coup | Cupola" while the
+    /// field on screen stayed empty; only the first character — typed while the
+    /// original widget was still alive — ever echoed.
+    ///
+    /// Validity checks on the focus area cannot detect this: the dead widget's
+    /// draw list is dropped rather than redrawn, so its `redraw_id` never moves
+    /// and the area still LOOKS valid. The destructor is the one place that knows
+    /// for certain, so it records the orphaned area here and the next editable
+    /// field to draw adopts the session — exactly one widget is ever the IME's
+    /// peer, so first-drawn-wins is the right tiebreak, and adoption requires the
+    /// app's key focus to still equal the recorded area, so a session something
+    /// else legitimately claimed is never stolen.
+    ///
+    /// THE SELECTION RIDES ALONG, and it is not an optimization. A rebuilt field
+    /// starts with its cursor at index 0; adopting focus alone made `KeyFocus`
+    /// sync that 0..0 selection to Java, which moved the soft keyboard's cursor
+    /// to the START of the text — so every subsequent character was PREPENDED.
+    /// Typing c-u-p-e-r rendered "REPUC", in caps, because a cursor at 0 also
+    /// makes the keyboard auto-capitalize every letter as a sentence start. The
+    /// dying widget held the true selection (it applied Java's own state on the
+    /// last keystroke); carrying it across is what keeps the cursor where the
+    /// user left it.
+    static ORPHANED_KEY_FOCUS: std::cell::Cell<(Area, Selection)> =
+        const {
+            std::cell::Cell::new((
+                Area::Empty,
+                Selection {
+                    cursor: Cursor { index: 0, prefer_next_row: false },
+                    anchor: Cursor { index: 0, prefer_next_row: false },
+                },
+            ))
+        };
+}
+
+impl Drop for TextInput {
+    fn drop(&mut self) {
+        if self.holds_key_focus {
+            ORPHANED_KEY_FOCUS.with(|c| c.set((self.draw_bg.area(), self.selection)));
+        }
+    }
+}
+
 #[derive(Script, Widget, Animator)]
 pub struct TextInput {
     #[uid]
@@ -601,6 +650,38 @@ pub struct TextInput {
     /// Touch that started outside this input while focused and may blur on release.
     #[rust]
     pending_outside_focus_loss_touch: Option<u64>,
+
+    /// The area this field occupied on its previous draw.
+    ///
+    /// Key focus is recorded against an `Area`, and an `Area` names a position
+    /// in a draw list — so a widget that is redrawn somewhere new leaves the
+    /// recorded focus pointing at where it used to be. `update_area_refs`
+    /// migrates it (along with finger capture, drag and IME), and `html.rs` and
+    /// `text_flow.rs` both do this; this widget did not.
+    ///
+    /// It went unnoticed because a field in a static view keeps the same area
+    /// across redraws. A field inside a GENERATED card does not: the card's tree
+    /// is rebuilt whenever its ledger re-resolves, so the field focused fine and
+    /// then failed `has_key_focus` on the very next draw — which is the gate on
+    /// showing the keyboard. Tapping it did nothing, with a finger or otherwise.
+    #[rust]
+    drawn_area: Area,
+
+    /// Whether this instance currently holds key focus, tracked so `Drop` can
+    /// tell — a destructor has no `Cx` to ask. See `ORPHANED_KEY_FOCUS`.
+    #[rust]
+    holds_key_focus: bool,
+
+    /// Focus arrived by ADOPTION, so the next `Hit::KeyFocus` must not push this
+    /// widget's state at the platform IME. During a live session Java's Editable
+    /// is the authority — mid-composition it is one keystroke AHEAD of the text a
+    /// rebuilt card was realized from, and pushing the stale text back made the
+    /// keyboard re-commit its composition on top of it: typing c-u-p-e-r rendered
+    /// "CCuCCupCCuCCuper", every prefix re-inserted. An adopted field only needs
+    /// to LISTEN; the sync exists for user-initiated focus, where the keyboard is
+    /// the one that has to learn the field's state.
+    #[rust]
+    adopted_focus_silently: bool,
     /// IME composition tracking - byte index where composition starts
     #[rust]
     composition_start: usize,
@@ -2104,6 +2185,62 @@ impl Widget for TextInput {
         cx.pop_clip_rect();
         self.draw_scroll_bar(cx);
         self.draw_bg.end(cx);
+        // Carry key focus (and finger capture, drag, IME) across to wherever this
+        // field just landed — see `drawn_area`. Must happen BEFORE the focus
+        // check below, which is the gate on raising the keyboard.
+        self.drawn_area = cx.update_area_refs(self.drawn_area, self.draw_bg.area());
+        // ADOPT AN ORPHANED IME SESSION.
+        //
+        // `update_area_refs` migrates focus when the SAME widget is redrawn
+        // somewhere new. A generated card is not the same widget: every keystroke's
+        // `on_change` re-resolves the card and rebuilds its tree, so the focused
+        // TextInput is destroyed and a fresh one is drawn in its place. Key focus —
+        // and with it the IME session — stays on the dead widget's area, and every
+        // `full_state_sync` the soft keyboard sends afterwards hits nothing.
+        //
+        // Measured on a OnePlus 6, typing "cup" on Gboard key by key: the
+        // keyboard's own suggestion bar read "Cups | Coup | Cupola" — the Java
+        // Editable had the text — while the field on screen stayed empty. An
+        // `adb input text` burst hid this for a whole session: all its characters
+        // land inside one frame, so the single rebuild happens after the last one.
+        //
+        // The adoption rule, from the DESTRUCTOR rather than a validity check —
+        // a dead widget's draw list is dropped, not redrawn, so its area still
+        // looks valid and `is_valid` cannot tell (an earlier attempt used it and
+        // only the first typed character ever landed). A focused TextInput records
+        // its area in `ORPHANED_KEY_FOCUS` when it drops; the next editable field
+        // drawn while the app's key focus STILL points at that dead area claims
+        // the session. `set_key_focus` makes `Hit::KeyFocus` re-sync the IME
+        // against this widget's text on the next dispatch; the focus check below
+        // raises nothing new — the keyboard is already up.
+        if !self.is_read_only && !cx.has_key_focus(self.draw_bg.area()) {
+            let (orphan, orphan_sel) = ORPHANED_KEY_FOCUS.with(|c| c.get());
+            if orphan != Area::Empty {
+                // Claimed or superseded either way: a stale record must not make
+                // some later, unrelated field grab focus out of nowhere.
+                ORPHANED_KEY_FOCUS.with(|c| {
+                    c.set((
+                        Area::Empty,
+                        Selection {
+                            cursor: Cursor { index: 0, prefer_next_row: false },
+                            anchor: Cursor { index: 0, prefer_next_row: false },
+                        },
+                    ))
+                });
+                if cx.key_focus() == orphan {
+                    cx.set_key_focus(self.draw_bg.area());
+                    self.holds_key_focus = true;
+                    self.adopted_focus_silently = true;
+                    // The predecessor's cursor, not this widget's default 0 —
+                    // `set_selection` floors both ends to grapheme boundaries of
+                    // THIS text, so a shorter rebuilt text clamps safely. The
+                    // `KeyFocus` sync then tells Java a selection that matches
+                    // what the keyboard already has, instead of yanking its
+                    // cursor to the front of the field.
+                    self.set_selection(cx, orphan_sel);
+                }
+            }
+        }
         // A read-only field does no IME work at all (no state push, no keyboard).
         if cx.has_key_focus(self.draw_bg.area()) && !self.is_read_only {
             // Cache the caret relative to the draw_bg box (same draw space) so
@@ -2278,22 +2415,34 @@ impl Widget for TextInput {
                 self.animator_play(cx, ids!(hover.off));
             }
             Hit::KeyFocus(_) => {
+                self.holds_key_focus = true;
                 self.animator_play(cx, ids!(focus.on));
                 self.reset_blink_timer(cx);
-                // Sync text state to platform IME before keyboard shows
-                let sel_start_chars = self.text[..self.selection.start().index].chars().count();
-                let sel_end_chars = self.text[..self.selection.end().index].chars().count();
-                cx.sync_ime_state(
-                    self.text.clone(),
-                    CharOffset(sel_start_chars)..CharOffset(sel_end_chars),
-                    None,
-                );
-                self.last_sent_ime_text = self.text.clone();
-                self.last_sent_ime_sel_start = self.selection.start().index;
-                self.last_sent_ime_sel_end = self.selection.end().index;
+                if std::mem::take(&mut self.adopted_focus_silently) {
+                    // Adopted mid-session: the keyboard already knows the text —
+                    // it typed it. Record the state as already-sent so the next
+                    // genuine divergence still syncs, and say nothing now.
+                    self.last_sent_ime_text = self.text.clone();
+                    self.last_sent_ime_sel_start = self.selection.start().index;
+                    self.last_sent_ime_sel_end = self.selection.end().index;
+                } else {
+                    // Sync text state to platform IME before keyboard shows
+                    let sel_start_chars =
+                        self.text[..self.selection.start().index].chars().count();
+                    let sel_end_chars = self.text[..self.selection.end().index].chars().count();
+                    cx.sync_ime_state(
+                        self.text.clone(),
+                        CharOffset(sel_start_chars)..CharOffset(sel_end_chars),
+                        None,
+                    );
+                    self.last_sent_ime_text = self.text.clone();
+                    self.last_sent_ime_sel_start = self.selection.start().index;
+                    self.last_sent_ime_sel_end = self.selection.end().index;
+                }
                 cx.widget_action(uid, TextInputAction::KeyFocus);
             }
             Hit::KeyFocusLost(_) => {
+                self.holds_key_focus = false;
                 self.handle_focus_lost(cx, uid);
             }
             Hit::KeyDown(event) if self.handle_navigation_key(cx, uid, event) => {}
@@ -2320,6 +2469,22 @@ impl Widget for TextInput {
             }) if device.is_primary_hit() && !scrollbar_captured => {
                 self.reset_blink_timer(cx);
                 self.set_key_focus(cx);
+                // ASK FOR THE DRAW that presents the keyboard.
+                //
+                // `show_text_ime_with_config` runs in `draw_walk`, gated on this
+                // widget holding key focus — so focus without a redraw shows no
+                // keyboard at all. On a surface that renders ON DEMAND, and this
+                // app has one, a dirty area stays dirty until a frame is asked
+                // for. Measured: after tapping a field inside a generated card,
+                // `FingerDown` fired and not one draw followed, so the IME call
+                // was never reached and there was nothing to type into.
+                //
+                // It belongs HERE and not under `Hit::KeyFocus` — that hit is
+                // delivered on a later dispatch, which is exactly the frame that
+                // was never happening. An earlier attempt put it there and did
+                // nothing for that reason.
+                self.redraw(cx);
+                cx.new_next_frame();
                 let rel = abs - self.text_area.rect(cx).pos;
                 let Ok(cursor) =
                     self.point_in_lpxs_to_cursor(Point::new(rel.x as f32, rel.y as f32))

@@ -577,6 +577,48 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    #[cfg(feature = "maps")]
+    // sys.navprog(lat1, lon1, lat2, lon2, at_lat, at_lon) -> how far along the
+    // route the device ACTUALLY is, in meters, by projecting its fix onto the
+    // route geometry. Feeds sys.navstep's `progress_m`. 0 while the route loads,
+    // and 0 for a fix more than 500 m off the route (a device on another road has
+    // not made progress along this one). Shares sys.navroute's cached fetch.
+    //
+    // This exists so a turn banner advances because the device moved. The nav app
+    // fed `progress_m` a clock — `sys.navsecs(period) * 15.2` — which announced
+    // turns for a vehicle travelling an assumed 34 mph whether or not anything
+    // was moving.
+    vm.add_method(
+        sys,
+        id_lut!(navprog),
+        script_args_def!(
+            lat1 = NIL,
+            lon1 = NIL,
+            lat2 = NIL,
+            lon2 = NIL,
+            at_lat = NIL,
+            at_lon = NIL,
+            vias = NIL
+        ),
+        |vm, args| {
+            let lat1 = script_value!(vm, args.lat1).as_number().unwrap_or(0.0);
+            let lon1 = script_value!(vm, args.lon1).as_number().unwrap_or(0.0);
+            let lat2 = script_value!(vm, args.lat2).as_number().unwrap_or(0.0);
+            let lon2 = script_value!(vm, args.lon2).as_number().unwrap_or(0.0);
+            let at_lat = script_value!(vm, args.at_lat).as_number().unwrap_or(0.0);
+            let at_lon = script_value!(vm, args.at_lon).as_number().unwrap_or(0.0);
+            let vias_v = script_value!(vm, args.vias);
+            let mut vias = String::new();
+            vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
+            let n = match nav_route_cached(vm, &url) {
+                Some(route) => nav_progress_m(&route, at_lat, at_lon),
+                None => 0.0,
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
     // sys.navstepnum(lat1, lon1, lat2, lon2, progress_m, "field") -> NUMBERS for
     // layout binding: "frac" -> trip fraction 0..1 (progress bars). -1 while
     // loading.
@@ -750,6 +792,35 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             ScriptValue::from_f64(n)
         },
     );
+    // sys.num(v) -> v as a NUMBER, for L1 arithmetic over live calls.
+    //
+    // Every other sys.* helper returns a STRING, because a string is what a card
+    // renders and what concatenation composes: `"$" + sys.stock(…)` is how every
+    // live value reaches the screen. L1's expression form needs the other thing.
+    // `sys.cities(0,"feels") - sys.cities(0,"temp")` is string subtraction
+    // without this, which the VM evaluates to NaN — measured on device, the card
+    // drew "≈NaN°" in every row while every other value on the same row was
+    // correct.
+    //
+    // ONE helper rather than a `*num` variant per capability. `geocodenum` and
+    // `aqinum` exist because two specific fields were needed as numbers by other
+    // calls; L1 can ask for arithmetic over ANY numeric field of ANY capability,
+    // so the coercion belongs at the value rather than at the source.
+    //
+    // A value that is not a number yields NaN deliberately — an em dash while a
+    // fetch is in flight, or a field the helper cannot answer. NOT zero: a zero
+    // is a fabricated number, and arithmetic that quietly treats missing data as
+    // nothing is the exact failure profile §4 exists to prevent.
+    vm.add_method(sys, id_lut!(num), script_args_def!(v = NIL), |vm, args| {
+        let v = script_value!(vm, args.v);
+        if let Some(n) = v.as_number() {
+            return ScriptValue::from_f64(n);
+        }
+        let mut s = String::new();
+        vm.bx.heap.cast_to_string(v, &mut s);
+        ScriptValue::from_f64(s.trim().parse::<f64>().unwrap_or(f64::NAN))
+    });
+
     vm.add_method(
         sys,
         id_lut!(aqinum),
@@ -879,7 +950,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     );
 
     // sys.dayname(lat, lon, n, locale) -> the weekday LABEL for forecast row n.
-    //   sys.dayname(LAT, LON, 0, "en") -> "Today"
+    //   sys.dayname(LAT, LON, 0, "en") -> "Now"
     //   sys.dayname(LAT, LON, 1, "en") -> "Thu"
     //   sys.dayname(LAT, LON, 1, "zh") -> "周四"
     //
@@ -912,7 +983,12 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let zh = loc.trim().to_ascii_lowercase().starts_with("zh");
 
             if n == 0 {
-                let s = if zh { "今天" } else { "Today" };
+                // "Now", not "Today". The forecast's day column is a FIXED width
+                // — the labels have to line up down the list — and "Today" does
+                // not fit it, so row one wrapped to "Toda / y" beside six
+                // three-letter weekdays. "Now" is also the more accurate word for
+                // a row whose reading is current rather than forecast.
+                let s = if zh { "现在" } else { "Now" };
                 return vm.bx.heap.new_string_from_str(s);
             }
 
@@ -1145,59 +1221,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let url = format!(
                 "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
             );
-            let m = |k: &str| format!("chart.result.0.meta.{k}");
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => vm.host.cx_mut().script_data_placeholder(&url),
-                Some(bytes) => {
-                    let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
-                    // Monetary fields formatted to a consistent 2 decimals (Yahoo
-                    // returns e.g. 201.5, which otherwise breaks the visual rhythm).
-                    let money = |k: &str| num(k).map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
-                    match field.trim().to_ascii_lowercase().as_str() {
-                        "change" => match (num("regularMarketPrice"), num("chartPreviousClose")) {
-                            (Some(p), Some(c)) => format!("{:+.2}", p - c),
-                            _ => "—".to_string(),
-                        },
-                        "changepct" | "changepercent" => {
-                            match (num("regularMarketPrice"), num("chartPreviousClose")) {
-                                (Some(p), Some(c)) if c != 0.0 => format!("{:+.2}%", (p - c) / c * 100.0),
-                                _ => "—".to_string(),
-                            }
-                        }
-                        "price" => money("regularMarketPrice"),
-                        "prev" | "prevclose" => money("chartPreviousClose"),
-                        "high" => money("regularMarketDayHigh"),
-                        "low" => money("regularMarketDayLow"),
-                        "open" => money("regularMarketOpen"),
-                        "currency" => json_pluck(&bytes, &m("currency")).unwrap_or_else(|| "—".into()),
-                        "name" => json_pluck(&bytes, &m("longName"))
-                            .or_else(|| json_pluck(&bytes, &m("shortName")))
-                            .unwrap_or_else(|| "—".into()),
-                        "symbol" => json_pluck(&bytes, &m("symbol")).unwrap_or_else(|| "—".into()),
-                        "exchange" => json_pluck(&bytes, &m("fullExchangeName")).unwrap_or_else(|| "—".into()),
-                        "52wh" | "yearhigh" => money("fiftyTwoWeekHigh"),
-                        "52wl" | "yearlow" => money("fiftyTwoWeekLow"),
-                        "vol" | "volume" => match num("regularMarketVolume") {
-                            Some(v) if v >= 1e9 => format!("{:.2}B", v / 1e9),
-                            Some(v) if v >= 1e6 => format!("{:.1}M", v / 1e6),
-                            Some(v) if v >= 1e3 => format!("{:.1}K", v / 1e3),
-                            Some(v) => format!("{v:.0}"),
-                            None => "—".to_string(),
-                        },
-                        // Day-range position 0..100 (where price sits low→high), for a range bar.
-                        "rangepct" => match (
-                            num("regularMarketPrice"),
-                            num("regularMarketDayLow"),
-                            num("regularMarketDayHigh"),
-                        ) {
-                            (Some(p), Some(lo), Some(hi)) if hi > lo => {
-                                format!("{:.0}", (((p - lo) / (hi - lo)) * 100.0).clamp(0.0, 100.0))
-                            }
-                            _ => "50".to_string(),
-                        },
-                        other => json_pluck(&bytes, other).unwrap_or_else(|| "—".into()),
-                    }
-                }
+                Some(bytes) => yahoo_chart_field(&bytes, &field),
             };
             vm.bx.heap.new_string_from_str(&out)
         },
@@ -1270,8 +1296,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
-    // sys.movers(index, "field") -> the LIVE "top gainers" list (Yahoo day_gainers
-    // screener, no auth). index 0 = the biggest % gainer today, up to 9. Fields
+    // sys.movers(index, "field", symbols?) -> the LIVE movers list. With no
+    // `symbols` this is Yahoo's day_gainers screener (no auth), index 0 = the
+    // biggest % gainer today, up to 9. With a comma-separated `symbols` list it
+    // ranks THAT universe instead -- the only way to answer "top AI movers",
+    // since the screener has no theme. Fields
     // (case-insensitive): symbol, name, price, change (signed), changepct (signed %),
     // high, low, prev, open, 52wh, 52wl, vol, marketcap, currency, exchange.
     // ONE fetch (deduped by URL) serves all 10 rows × all fields. Use for a top-10
@@ -1279,12 +1308,100 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(movers),
-        script_args_def!(index = NIL, field = NIL),
+        script_args_def!(index = NIL, field = NIL, symbols = NIL),
         |vm, args| {
             let index = script_value!(vm, args.index).as_number().unwrap_or(0.0).max(0.0) as i64;
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
+            let symbols_v = script_value!(vm, args.symbols);
+            let mut symbols = String::new();
+            vm.bx.heap.cast_to_string(symbols_v, &mut symbols);
+            let symbols = symbols.trim().to_string();
+
+            // A NAMED universe: rank only these symbols. Yahoo's screener has no
+            // `scrIds` for a theme, so "top 10 AI movers" could otherwise only be
+            // answered by putting an AI title over market-wide gainers.
+            //
+            // Which companies are AI is world knowledge and comes from the card;
+            // who among them moved is computed here. Every symbol is fetched (the
+            // fetch dedupes by URL) and the whole set must be present before any
+            // row resolves -- ranking half a universe would silently reorder the
+            // list as the rest arrived.
+            if !symbols.is_empty() {
+                let syms: Vec<&str> = symbols
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let url_of = |sym: &str| {
+                    format!(
+                        "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=1d&interval=1d"
+                    )
+                };
+                let mut rows: Vec<(f64, String, std::rc::Rc<Vec<u8>>)> = Vec::new();
+                for sym in &syms {
+                    let u = url_of(sym);
+                    match vm.host.cx_mut().script_data_fetch(&u) {
+                        None => {
+                            // A ticker that will never resolve is DROPPED from
+                            // the universe; only one still loading holds the
+                            // list back. All-or-nothing was wrong: one delisted
+                            // or mistyped symbol among eighteen left every row
+                            // an em dash permanently.
+                            let ph = vm.host.cx_mut().script_data_placeholder(&u);
+                            if ph == "n/a" {
+                                continue;
+                            }
+                            return vm.bx.heap.new_string_from_str(&ph);
+                        }
+                        Some(bytes) => {
+                            let pluck = |k: &str| {
+                                json_pluck(&bytes, &format!("chart.result.0.meta.{k}"))
+                            };
+                            let price = pluck("regularMarketPrice").and_then(|v| v.parse::<f64>().ok());
+                            let prev = pluck("chartPreviousClose")
+                                .or_else(|| pluck("previousClose"))
+                                .and_then(|v| v.parse::<f64>().ok());
+                            if let (Some(p), Some(pv)) = (price, prev) {
+                                if pv != 0.0 {
+                                    rows.push(((p - pv) / pv * 100.0, (*sym).to_string(), bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                let out = match rows.get(index.max(0) as usize) {
+                    None => "—".to_string(),
+                    Some((pct, sym, bytes)) => {
+                        let m = |k: &str| json_pluck(bytes, &format!("chart.result.0.meta.{k}"));
+                        let n = |k: &str| m(k).and_then(|v| v.parse::<f64>().ok());
+                        let prev = n("chartPreviousClose").or_else(|| n("previousClose"));
+                        match field.trim().to_ascii_lowercase().as_str() {
+                            "symbol" => m("symbol").unwrap_or_else(|| sym.clone()),
+                            "name" => m("shortName")
+                                .or_else(|| m("longName"))
+                                .unwrap_or_else(|| sym.clone()),
+                            "price" => n("regularMarketPrice")
+                                .map(|v| format!("{v:.2}"))
+                                .unwrap_or_else(|| "—".into()),
+                            "change" => match (n("regularMarketPrice"), prev) {
+                                (Some(p), Some(pv)) => format!("{:+.2}", p - pv),
+                                _ => "—".into(),
+                            },
+                            "changepct" | "changepercent" => format!("{pct:+.2}%"),
+                            "currency" => m("currency").unwrap_or_else(|| "—".into()),
+                            "exchange" => m("fullExchangeName")
+                                .or_else(|| m("exchangeName"))
+                                .unwrap_or_else(|| "—".into()),
+                            other => m(other).unwrap_or_else(|| "—".into()),
+                        }
+                    }
+                };
+                return vm.bx.heap.new_string_from_str(&out);
+            }
+
             let url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=10".to_string();
             let base = format!("finance.result.0.quotes.{index}");
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
@@ -1351,6 +1468,14 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 "author" | "by" => "author",
                 "points" | "score" => "points",
                 "comments" | "num_comments" => "num_comments",
+                // The story's IDENTITY, which the catalog has always offered and
+                // the lowering has always emitted. It fell into the `_` arm and
+                // was answered with the TITLE — so a card storing "which story did
+                // the user tap" stored its headline, and `sys.news_item` was then
+                // asked to look up a story by a string that is not an id. A silent
+                // substitution in an identity field is the worst kind: everything
+                // downstream works on a plausible value that means something else.
+                "id" | "objectid" => "objectID",
                 _ => "title",
             };
             let url =
@@ -1360,6 +1485,95 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 Some(bytes) => json_pluck(&bytes, &path).unwrap_or_else(|| "—".to_string()),
                 None => vm.host.cx_mut().script_data_placeholder(&url),
             };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.newsitem(id, "key") -> one story of the SAME front page `sys.news`
+    // reads, found by its `objectID` rather than by row. Keys as `sys.news`.
+    //
+    // The same fetch on purpose. A detail screen opened from a list must agree
+    // with the row that was tapped, and a second endpoint can rank, expire or
+    // paginate differently between the tap and the read — so the story under the
+    // headline would quietly be a different story. It also costs no extra request.
+    //
+    // A story that has left the front page answers "—", which is honest: the card
+    // is holding a reference to something this capability can no longer see.
+    vm.add_method(
+        sys,
+        id_lut!(newsitem),
+        script_args_def!(id = NIL, field = NIL),
+        |vm, args| {
+            let id_v = script_value!(vm, args.id);
+            let mut id = String::new();
+            vm.bx.heap.cast_to_string(id_v, &mut id);
+            let id = id.trim().to_string();
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let key = match field.trim().to_ascii_lowercase().as_str() {
+                "url" => "url",
+                "author" | "by" => "author",
+                "points" | "score" => "points",
+                "comments" | "num_comments" => "num_comments",
+                "id" | "objectid" => "objectID",
+                _ => "title",
+            };
+            let url =
+                "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=12".to_string();
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => {
+                    let mut found = "\u{2014}".to_string();
+                    if !id.is_empty() {
+                        for row in 0..12 {
+                            let at = json_pluck(&bytes, &format!("hits.{row}.objectID"));
+                            if at.as_deref() == Some(id.as_str()) {
+                                found = json_pluck(&bytes, &format!("hits.{row}.{key}"))
+                                    .unwrap_or_else(|| "\u{2014}".to_string());
+                                break;
+                            }
+                        }
+                    }
+                    found
+                }
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.locale("lang" | "temp_unit") -> what the DEVICE is set to.
+    //
+    // Six of the seven L0 exemplars reach for this — it is what seeds a units
+    // toggle and picks a language — and nothing answered it, so every one of them
+    // read an em dash and the toggle appeared to start blank. Published by the app
+    // through `set_locale`, the same way the durable collections and the position
+    // fix cross this boundary.
+    vm.add_method(
+        sys,
+        id_lut!(locale),
+        script_args_def!(field = NIL),
+        |vm, args| {
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let out = locale_field(field.trim());
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.prefs("units" | "range") -> the user's own stored choice (§5.12,
+    // read-only). A reference the user owns, held in the same `user.json` the
+    // durable collections live in — never a fetched fact.
+    vm.add_method(
+        sys,
+        id_lut!(prefs),
+        script_args_def!(field = NIL),
+        |vm, args| {
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let out = pref_at(field.trim()).unwrap_or_else(|| "\u{2014}".to_string());
             vm.bx.heap.new_string_from_str(&out)
         },
     );
@@ -1382,6 +1596,77 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     // deduped (one park is often mapped as several ways), so every index is a
     // distinct, nameable venue. ONE fetch (URL-deduped) serves all rows ×
     // fields of a list card.
+    // sys.poi(lat, lon, "The Bund", "name"|"kind") -> a NAMED landmark near a
+    // coordinate, resolved live.
+    //
+    // Distinct from both neighbours. `sys.geocode` is a gazetteer of POPULATED
+    // places and returns nothing for a landmark (four of five Shanghai
+    // attractions came back empty). `sys.places` answers "what is tagged
+    // tourism=attraction nearest here", which is a different question -- sorted
+    // by distance it offers a game centre and a tourist information office ahead
+    // of the Bund. This one takes the NAME the card recommends and proves it
+    // against live data: resolved, or "—".
+    //
+    // Overpass, not Nominatim. Nominatim answers the same question and works
+    // from a laptop, but returns 403 to this device for every request even with
+    // the identifying UA its policy demands -- measured, five of five. A 403 is
+    // permanent, so every row went terminal at once. Overpass is the host
+    // `sys.places` already proves reachable from here.
+    vm.add_method(
+        sys,
+        id_lut!(poi),
+        script_args_def!(lat = NIL, lon = NIL, name = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let n_v = script_value!(vm, args.name);
+            let mut name = String::new();
+            vm.bx.heap.cast_to_string(n_v, &mut name);
+            let f_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(f_v, &mut field);
+            // Escape the regex/quote metacharacters Overpass would choke on.
+            let safe: String = name
+                .trim()
+                .chars()
+                .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == '\'')
+                .collect();
+            let around = format!("around:12000,{lat:.4},{lon:.4}");
+            let q = format!(
+                "[out:json][timeout:25];nwr[\"name\"~\"{safe}\",i]({around});out center 5;"
+            );
+            let url = format!("{OVERPASS_URL}?data={}", percent_encode_query(&q));
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => {
+                    // The first NAMED element; Overpass returns ways and nodes
+                    // for one feature and only some carry the tags.
+                    let mut found = "—".to_string();
+                    for i in 0..5 {
+                        let tag = |k: &str| {
+                            json_pluck(&bytes, &format!("elements.{i}.tags.{k}"))
+                                .filter(|v| !v.is_empty())
+                        };
+                        let Some(nm) = tag("name") else { continue };
+                        found = match field.trim().to_ascii_lowercase().as_str() {
+                            "name" => nm,
+                            "kind" => tag("tourism")
+                                .or_else(|| tag("historic"))
+                                .or_else(|| tag("leisure"))
+                                .or_else(|| tag("amenity"))
+                                .unwrap_or_else(|| "—".into())
+                                .replace('_', " "),
+                            other => tag(other).unwrap_or_else(|| "—".into()),
+                        };
+                        break;
+                    }
+                    found
+                }
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     vm.add_method(
         sys,
         id_lut!(places),
@@ -1599,7 +1884,404 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.watchlist(index, "field") -> a row of the user's SAVED list (§5.12).
+    //
+    // The ticker comes from the durable store; every other field is fetched
+    // live, through the same resolver `sys.stock` uses. That split is the whole
+    // design: the store holds references and the screen shows current values, so
+    // a saved list can never render a stale price.
+    //
+    // `sys.watchlistnum()` is the row count, so a card can realize the right
+    // number of rows before any fetch lands.
+    vm.add_method(
+        sys,
+        id_lut!(watchlist),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let Some(ticker) = collection_at("watchlist", index) else {
+                // Past the end of the list. Empty rather than an em dash: a row
+                // that does not exist is not a row whose value failed to load.
+                return vm.bx.heap.new_string_from_str("");
+            };
+            // The one field that needs no network — it IS what was stored.
+            if matches!(field.trim(), "symbol" | "ticker") {
+                return vm.bx.heap.new_string_from_str(&ticker);
+            }
+            let sym = sanitize_ticker(&ticker);
+            let url = format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval=1d&range=1d"
+            );
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => yahoo_chart_field(&bytes, &field),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.symbol_search("nvid", index, "field") -> a TICKER matching free text.
+    //
+    // The other half of a saved list: without it a user can only keep what the
+    // movers list happens to show. Fields are `symbol`, `name`, `exchange`,
+    // `kind` — the last because this returns equities, ETFs and crypto for the
+    // same query, and a card that cannot say which is offering someone a coin
+    // when they asked for a company.
+    //
+    // `longname` is null for many listings, verified against the live response,
+    // so `name` falls back to the short one rather than rendering an em dash for
+    // a company that plainly has a name.
+    // sys.cities(index, "field") -> a row of the user's SAVED places (§5.12).
+    //
+    // The store holds a NAME and nothing else — the purest form of the rule that
+    // a durable collection keeps references, never facts. Coordinates and every
+    // reading are resolved here: geocode the name, then read the weather at what
+    // comes back. Two chained fetches, each URL-cached, so a saved city costs one
+    // geocode ever and one forecast per refresh.
+    //
+    // Storing `name|lat|lon` was the first design and is what the card cannot
+    // produce: L0 has no way to build a composite value, which is the point of
+    // it having no expression form. The language was right and the helper was
+    // wrong.
+    vm.add_method(
+        sys,
+        id_lut!(cities),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let Some(name) = collection_at("cities", index) else {
+                return vm.bx.heap.new_string_from_str("");
+            };
+            // The one field that needs no network: it IS what was stored.
+            if field.trim() == "name" {
+                return vm.bx.heap.new_string_from_str(&name);
+            }
+            let geo = geocode_url(&name);
+            let (lat, lon) = match vm.host.cx_mut().script_data_fetch(&geo) {
+                None => {
+                    let placeholder = vm.host.cx_mut().script_data_placeholder(&geo);
+                    return vm.bx.heap.new_string_from_str(&placeholder);
+                }
+                Some(bytes) => {
+                    let num = |k: &str| {
+                        json_pluck(&bytes, k).and_then(|v| v.parse::<f64>().ok())
+                    };
+                    match (num("results.0.latitude"), num("results.0.longitude")) {
+                        (Some(a), Some(o)) => (a, o),
+                        // The name resolved to nothing. An em dash says so; a
+                        // reading at 0,0 would be a plausible number for the
+                        // Gulf of Guinea.
+                        _ => return vm.bx.heap.new_string_from_str("\u{2014}"),
+                    }
+                }
+            };
+            if field.trim() == "lat" {
+                return vm.bx.heap.new_string_from_str(&format!("{lat:.4}"));
+            }
+            if field.trim() == "lon" {
+                return vm.bx.heap.new_string_from_str(&format!("{lon:.4}"));
+            }
+            // The card's field names, as open-meteo's own paths.
+            let path = match field.trim() {
+                "temp" => "current.temperature_2m",
+                "cond" => "current.weather_code",
+                "humidity" => "current.relative_humidity_2m",
+                "wind" => "current.wind_speed_10m",
+                "feels" => "current.apparent_temperature",
+                "hi" => "daily.temperature_2m_max.0",
+                "lo" => "daily.temperature_2m_min.0",
+                other => other,
+            };
+            let url = format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m\
+&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1"
+            );
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => json_pluck(&bytes, path)
+                    .map(|v| round_display(path, v))
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    vm.add_method(
+        sys,
+        id_lut!(citiesnum),
+        script_args_def!(),
+        |_vm, _args| ScriptValue::from_f64(collection_len("cities") as f64),
+    );
+
+    vm.add_method(
+        sys,
+        id_lut!(symbol_search),
+        script_args_def!(query = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let q_v = script_value!(vm, args.query);
+            let mut query = String::new();
+            vm.bx.heap.cast_to_string(q_v, &mut query);
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let q = query.trim();
+            if q.is_empty() {
+                // No query is not a failed search. Empty, so a card can branch
+                // on it without an em dash claiming something went wrong.
+                return vm.bx.heap.new_string_from_str("");
+            }
+            let url = format!(
+                "https://query1.finance.yahoo.com/v1/finance/search?q={}&quotesCount=10&newsCount=0",
+                percent_encode_query(q)
+            );
+            let base = format!("quotes.{index}");
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => {
+                    let raw = |k: &str| json_pluck(&bytes, &format!("{base}.{k}"));
+                    match field.trim().to_ascii_lowercase().as_str() {
+                        "symbol" | "ticker" => raw("symbol").unwrap_or_default(),
+                        "name" => raw("longname")
+                            .filter(|s| !s.is_empty() && s != "null")
+                            .or_else(|| raw("shortname"))
+                            .unwrap_or_default(),
+                        "exchange" => raw("exchDisp").unwrap_or_default(),
+                        "kind" => raw("typeDisp").unwrap_or_default(),
+                        other => raw(other).unwrap_or_default(),
+                    }
+                }
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    vm.add_method(
+        sys,
+        id_lut!(symbol_searchnum),
+        script_args_def!(query = NIL),
+        |vm, args| {
+            let q_v = script_value!(vm, args.query);
+            let mut query = String::new();
+            vm.bx.heap.cast_to_string(q_v, &mut query);
+            let q = query.trim();
+            if q.is_empty() {
+                return ScriptValue::from_f64(0.0);
+            }
+            let url = format!(
+                "https://query1.finance.yahoo.com/v1/finance/search?q={}&quotesCount=10&newsCount=0",
+                percent_encode_query(q)
+            );
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| json_pluck(&bytes, "count"))
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    vm.add_method(
+        sys,
+        id_lut!(watchlistnum),
+        script_args_def!(),
+        |_vm, _args| ScriptValue::from_f64(collection_len("watchlist") as f64),
+    );
+
     vm.set_injected_global(id!(sys), sys.into());
+}
+
+/// The user's durable collections, as the store last reported them (§5.12).
+///
+/// A map because there is more than one: a watchlist of tickers, a list of
+/// saved cities, whatever the next store-backed capability names. Keyed by the
+/// capability's own name, so two cards binding `sys.watchlist` under different
+/// local names reach the same list.
+///
+/// The APP writes this and this crate reads it — the same shape `sys.gps` uses
+/// for the platform's location fix. The app owns the file and the schema, this
+/// crate owns the fetching, and neither depends on the other. What crosses is a
+/// list of REFERENCES: never a price, never a temperature.
+static COLLECTIONS: std::sync::RwLock<Option<std::collections::BTreeMap<String, Vec<String>>>> =
+    std::sync::RwLock::new(None);
+
+/// The device's locale, and the user's stored single-value preferences.
+///
+/// Same contract as `COLLECTIONS`: the APP writes, this crate reads, and what
+/// crosses is never a fetched fact. A locale is what the device is set to and a
+/// preference is what the user chose — both are references, both are the user's.
+static LOCALE: std::sync::RwLock<Option<(String, String)>> = std::sync::RwLock::new(None);
+static PREFS: std::sync::RwLock<Option<std::collections::BTreeMap<String, String>>> =
+    std::sync::RwLock::new(None);
+
+/// Publish the device locale as `(lang, temp_unit)`.
+pub fn set_locale(lang: &str, temp_unit: &str) {
+    if let Ok(mut slot) = LOCALE.write() {
+        *slot = Some((lang.to_owned(), temp_unit.to_owned()));
+    }
+}
+
+/// Publish the user's single-value preferences.
+pub fn set_prefs(map: std::collections::BTreeMap<String, String>) {
+    if let Ok(mut slot) = PREFS.write() {
+        *slot = Some(map);
+    }
+}
+
+/// `en` and `c` until the app says otherwise.
+///
+/// A DEFAULT, not an em dash. The other capabilities answer "—" while a fetch is
+/// in flight because a temperature nobody has measured must not be guessed; a
+/// locale is not fetched and not a measurement, and a card that cannot read one
+/// has no language to render its own labels in.
+fn locale_field(field: &str) -> String {
+    let held = LOCALE.read().ok().and_then(|l| l.clone());
+    let (lang, unit) = held.unwrap_or_else(|| ("en".to_owned(), "c".to_owned()));
+    match field {
+        "temp_unit" => unit,
+        _ => lang,
+    }
+}
+
+fn pref_at(field: &str) -> Option<String> {
+    PREFS.read().ok()?.as_ref()?.get(field).cloned()
+}
+
+/// Publish the stored references. Called on load and after every write.
+pub fn set_collections(map: std::collections::BTreeMap<String, Vec<String>>) {
+    if let Ok(mut slot) = COLLECTIONS.write() {
+        *slot = Some(map);
+    }
+}
+
+/// How many entries a collection holds, for `sys.<name>num()` — so a card can
+/// realize the right number of rows before any fetch lands.
+pub fn collection_len(name: &str) -> usize {
+    COLLECTIONS
+        .read()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(name).map(|v| v.len())))
+        .unwrap_or(0)
+}
+
+fn collection_at(name: &str, index: usize) -> Option<String> {
+    COLLECTIONS
+        .read()
+        .ok()?
+        .as_ref()?
+        .get(name)?
+        .get(index)
+        .cloned()
+}
+
+
+/// One field of a Yahoo *chart* response, in this profile's own field names.
+///
+/// Lifted out of `sys.stock` so `sys.watchlist` answers identically. The two
+/// differ only in where the ticker comes from — an argument, or the user's
+/// stored list — and a second copy of this match is how they would drift into
+/// answering the same question two different ways.
+fn yahoo_chart_field(bytes: &[u8], field: &str) -> String {
+    let m = |k: &str| format!("chart.result.0.meta.{k}");
+                let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
+                // Monetary fields formatted to a consistent 2 decimals (Yahoo
+                // returns e.g. 201.5, which otherwise breaks the visual rhythm).
+                let money = |k: &str| num(k).map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into());
+                match field.trim().to_ascii_lowercase().as_str() {
+                    "change" => match (num("regularMarketPrice"), num("chartPreviousClose")) {
+                        (Some(p), Some(c)) => format!("{:+.2}", p - c),
+                        _ => "—".to_string(),
+                    },
+                    // The same number with the currency INSIDE the sign.
+                    //
+                    // `signed_money` renders `+$7.13`, and a lowering can only
+                    // prepend a prefix to what this returns — `"$" + "+7.13"` is
+                    // `$+7.13`, which is wrong, so the card fell back to its
+                    // seeded value instead. That put a fixture's `+$3.10` beside
+                    // a live `+3.55%` on the same line, two numbers describing
+                    // the same move and disagreeing. Composing it here is the
+                    // only place the sign and the symbol can be ordered.
+                    "changemoney" => match (num("regularMarketPrice"), num("chartPreviousClose")) {
+                        (Some(p), Some(c)) => {
+                            let d = p - c;
+                            format!("{}${:.2}", if d < 0.0 { "-" } else { "+" }, d.abs())
+                        }
+                        _ => "—".to_string(),
+                    },
+                    "changepct" | "changepercent" => {
+                        match (num("regularMarketPrice"), num("chartPreviousClose")) {
+                            (Some(p), Some(c)) if c != 0.0 => format!("{:+.2}%", (p - c) / c * 100.0),
+                            _ => "—".to_string(),
+                        }
+                    }
+                    "price" => money("regularMarketPrice"),
+                    "prev" | "prevclose" => money("chartPreviousClose"),
+                    "high" => money("regularMarketDayHigh"),
+                    "low" => money("regularMarketDayLow"),
+                    // The session open is NOT in `meta`. Verified against the
+                    // live response: `regularMarketOpen` and `previousClose`
+                    // are both absent, while `regularMarketPrice`,
+                    // `…DayHigh`, `…DayLow` and `chartPreviousClose` are
+                    // present. Reading it from `meta` returned an em dash, so
+                    // the card fell back to its seeded value and drew a
+                    // fixture price beside two live ones — a $181 open under
+                    // a $207 price on a +3% day, which does not add up and
+                    // was the only thing on screen that said so.
+                    //
+                    // It IS in the bar series. This URL is fixed at
+                    // `interval=1d&range=1d`, so there is exactly one bar and
+                    // its open is today's; widening the range here would make
+                    // `open.0` the first bar of the RANGE instead.
+                    "open" => json_pluck(&bytes, "chart.result.0.indicators.quote.0.open.0")
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "—".into()),
+                    "currency" => json_pluck(&bytes, &m("currency")).unwrap_or_else(|| "—".into()),
+                    "name" => json_pluck(&bytes, &m("longName"))
+                        .or_else(|| json_pluck(&bytes, &m("shortName")))
+                        .unwrap_or_else(|| "—".into()),
+                    "symbol" => json_pluck(&bytes, &m("symbol")).unwrap_or_else(|| "—".into()),
+                    "exchange" => json_pluck(&bytes, &m("fullExchangeName")).unwrap_or_else(|| "—".into()),
+                    "52wh" | "yearhigh" => money("fiftyTwoWeekHigh"),
+                    "52wl" | "yearlow" => money("fiftyTwoWeekLow"),
+                    "vol" | "volume" => match num("regularMarketVolume") {
+                        Some(v) if v >= 1e9 => format!("{:.2}B", v / 1e9),
+                        Some(v) if v >= 1e6 => format!("{:.1}M", v / 1e6),
+                        Some(v) if v >= 1e3 => format!("{:.1}K", v / 1e3),
+                        Some(v) => format!("{v:.0}"),
+                        None => "—".to_string(),
+                    },
+                    // Day-range position 0..100 (where price sits low→high), for a range bar.
+                    "rangepct" => match (
+                        num("regularMarketPrice"),
+                        num("regularMarketDayLow"),
+                        num("regularMarketDayHigh"),
+                    ) {
+                        (Some(p), Some(lo), Some(hi)) if hi > lo => {
+                            format!("{:.0}", (((p - lo) / (hi - lo)) * 100.0).clamp(0.0, 100.0))
+                        }
+                        _ => "50".to_string(),
+                    },
+                    other => json_pluck(&bytes, other).unwrap_or_else(|| "—".into()),
+                }
 }
 
 /// True if a Splash body calls any live-data helper (sys.weather/airquality/
@@ -1621,6 +2303,13 @@ fn body_binds_live_data(body: &str) -> bool {
         // covers sys.search + sys.searchnum — the search-results card must
         // re-evaluate once the free-text search fetch lands
         || body.contains("sys.search")
+        // `sys.symbol_search` does NOT contain `sys.search` — the prefix trick
+        // the rest of this list leans on does not reach it, and a search card
+        // that never re-evaluates shows an empty result list forever.
+        || body.contains("sys.symbol_search")
+        // A saved row's values are fetched per ticker, so the list must
+        // re-evaluate when those land (§5.12).
+        || body.contains("sys.watchlist")
         // substring covers sys.geocodenum too (same trick as weather/weathernum)
         || body.contains("sys.geocode")
         || body.contains("sys.route")
@@ -2246,6 +2935,98 @@ fn nav_lanes(step: &NavStepInfo) -> Vec<(String, bool)> {
     }
 }
 
+thread_local! {
+    /// One decoded polyline, kept for `nav_progress_m`'s per-frame projection.
+    static DECODED_ROUTE: std::cell::RefCell<(String, std::rc::Rc<Vec<(f64, f64)>>)> =
+        std::cell::RefCell::new((String::new(), std::rc::Rc::new(Vec::new())));
+}
+
+/// The decoded points of a polyline, decoding only when it changes.
+#[cfg(feature = "maps")]
+fn decoded_route(polyline: &str) -> std::rc::Rc<Vec<(f64, f64)>> {
+    DECODED_ROUTE.with(|c| {
+        let mut slot = c.borrow_mut();
+        if slot.0 != polyline {
+            *slot = (
+                polyline.to_owned(),
+                std::rc::Rc::new(crate::map::decode_polyline5(polyline)),
+            );
+        }
+        slot.1.clone()
+    })
+}
+
+/// How far along the route a position actually is, in metres.
+///
+/// Gated on `maps` because it needs that module's polyline decoder, and because a
+/// position along a route has nothing to report without a map to draw it on. This
+/// crate builds with `--no-default-features` and the first version of this was not
+/// gated, which broke that configuration.
+#[cfg(feature = "maps")]
+///
+/// This is the number `sys.navstep` needs and the one nothing could measure. The
+/// nav app drove it from a clock — `sys.navsecs(period) * 15.2`, a looping timer
+/// times an assumed 34 mph — so the turn banner advanced whether or not the
+/// device moved, and arrived at the destination on schedule from a parked car.
+///
+/// Here the fix is projected onto the route: every segment is tested, the closest
+/// one wins, and the answer is the distance accumulated up to that projection. So
+/// progress moves when the device does and not otherwise.
+///
+/// The CLOSEST segment rather than the first within a tolerance, because a route
+/// that doubles back — a U-turn, a cloverleaf, a street driven twice — has two
+/// segments near the same point, and picking the earlier one would rewind the
+/// banner to a turn already taken.
+fn nav_progress_m(route: &ParsedNavRoute, at_lat: f64, at_lon: f64) -> f64 {
+    // The decoded geometry is MEMOISED, and that is not a micro-optimisation.
+    //
+    // This decoded the polyline on every call. Once the turn banner moved into
+    // `fn tick()` — so it could update without rebuilding the card — that became a
+    // 685-point decode sixty times a second, and the frame hitches it caused were
+    // measured at 46-62 ms each: the big 327 ms stalls were gone and had been
+    // replaced by constant small ones. Same total jank, different cause.
+    //
+    // Keyed by the polyline itself, so a re-route replaces the entry and nothing
+    // has to invalidate it.
+    let pts = decoded_route(&route.polyline);
+    if pts.len() < 2 {
+        return 0.0;
+    }
+    let (mut best_d, mut best_at) = (f64::MAX, 0.0);
+    let mut cum = 0.0;
+    for w in pts.windows(2) {
+        let ((a_lat, a_lon), (b_lat, b_lon)) = (w[0], w[1]);
+        let seg = crate::map::haversine_m(a_lat, a_lon, b_lat, b_lon);
+        // Project onto the segment in a local planar frame. Over the tens of
+        // metres a route segment spans, the error of treating degrees as flat is
+        // far below a GPS fix's own accuracy.
+        let kx = 111_320.0 * a_lat.to_radians().cos();
+        let (vx, vy) = ((b_lon - a_lon) * kx, (b_lat - a_lat) * 110_540.0);
+        let (wx, wy) = ((at_lon - a_lon) * kx, (at_lat - a_lat) * 110_540.0);
+        let len2 = vx * vx + vy * vy;
+        let t = if len2 > 0.0 {
+            ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let (dx, dy) = (wx - vx * t, wy - vy * t);
+        let off = (dx * dx + dy * dy).sqrt();
+        if off < best_d {
+            best_d = off;
+            best_at = cum + seg * t;
+        }
+        cum += seg;
+    }
+    // A fix nowhere near the route is not progress along it. Half a kilometre is
+    // wide enough for a parallel service road and a poor urban fix, and narrow
+    // enough that a device on a different road entirely reports the start rather
+    // than a confidently wrong position mid-route.
+    if best_d > 500.0 {
+        return 0.0;
+    }
+    best_at.clamp(0.0, route.total_m)
+}
+
 /// Numeric per-step fields for layout binding (see sys.navstepnum).
 fn nav_step_num(route: &ParsedNavRoute, d: f64, field: &str) -> f64 {
     let mut si = 0usize;
@@ -2618,6 +3399,18 @@ fn search_field(bytes: &[u8], index: usize, field: &str) -> String {
     };
     match f.as_str() {
         "name" => h.name.clone(),
+        // The text that FINDS THIS HIT AGAIN. A results list sets card state from
+        // the row a user picked, and that state is searched again to route — so a
+        // row that carries only its name sends "Stanford" back and gets the TOP
+        // "Stanford", which is in California whichever one was tapped. Name plus
+        // label is what tells the five apart, so it is what has to travel.
+        "query" => {
+            if h.label.trim().is_empty() {
+                h.name.clone()
+            } else {
+                format!("{}, {}", h.name, h.label)
+            }
+        }
         "label" | "addr" | "address" => h.label.clone(),
         "cat" | "category" => h.cat.clone(),
         "lat" => format!("{:.5}", h.lat),
@@ -3216,6 +4009,7 @@ impl Widget for Splash {
         }
 
         self.view.handle_event(cx, event, scope);
+
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -3255,5 +4049,105 @@ impl SplashRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.stream_append(cx, chunk);
         }
+    }
+}
+
+#[cfg(all(test, feature = "maps"))]
+mod nav_progress_tests {
+    use super::*;
+
+    /// Encode (lat, lon) pairs as polyline5, so a test can build a route.
+    fn encode(pts: &[(f64, f64)]) -> String {
+        fn one(v: i64, out: &mut String) {
+            let mut v = if v < 0 { !(v << 1) } else { v << 1 };
+            while v >= 0x20 {
+                out.push((((0x20 | (v & 0x1f)) + 63) as u8) as char);
+                v >>= 5;
+            }
+            out.push(((v + 63) as u8) as char);
+        }
+        let (mut plat, mut plon) = (0i64, 0i64);
+        let mut out = String::new();
+        for (lat, lon) in pts {
+            let (la, lo) = ((lat * 1e5).round() as i64, (lon * 1e5).round() as i64);
+            one(la - plat, &mut out);
+            one(lo - plon, &mut out);
+            (plat, plon) = (la, lo);
+        }
+        out
+    }
+
+    /// A straight north-south leg, ~1 km per 0.009°.
+    fn route() -> ParsedNavRoute {
+        let pts = [
+            (37.200, -122.000),
+            (37.209, -122.000),
+            (37.218, -122.000),
+            (37.227, -122.000),
+        ];
+        let total: f64 = pts
+            .windows(2)
+            .map(|w| crate::map::haversine_m(w[0].0, w[0].1, w[1].0, w[1].1))
+            .sum();
+        ParsedNavRoute {
+            polyline: encode(&pts),
+            total_m: total,
+            total_s: 0.0,
+            steps: vec![],
+        }
+    }
+
+    /// Progress is the distance along the route to the point nearest the fix.
+    ///
+    /// This is the number a turn banner is computed from, and the one the nav app
+    /// it replaces took from a clock — `sys.navsecs(period) * 15.2`, so it
+    /// announced turns for a vehicle moving at an assumed 34 mph whether or not
+    /// anything was. Every assertion here is about the fix DRIVING the answer.
+    #[test]
+    fn progress_is_measured_from_the_fix() {
+        let r = route();
+        let total = r.total_m;
+
+        // At the origin: nothing travelled.
+        assert!(
+            nav_progress_m(&r, 37.200, -122.000) < 5.0,
+            "a fix at the start is no progress"
+        );
+        // Halfway along: half the route, within a metre or two of rounding.
+        let mid = nav_progress_m(&r, 37.2135, -122.000);
+        assert!(
+            (mid - total / 2.0).abs() < 20.0,
+            "a fix at the midpoint is half the route: got {mid:.0} of {total:.0}"
+        );
+        // At the destination: all of it.
+        let end = nav_progress_m(&r, 37.227, -122.000);
+        assert!(
+            (end - total).abs() < 20.0,
+            "a fix at the end is the whole route: got {end:.0} of {total:.0}"
+        );
+        // And it MOVES with the fix, monotonically. A constant would satisfy every
+        // bound above if they were loose enough; this is the property that matters.
+        let mut last = -1.0;
+        for i in 0..=9 {
+            let lat = 37.200 + 0.0027 * i as f64;
+            let p = nav_progress_m(&r, lat, -122.000);
+            assert!(p > last, "progress must rise with the fix: {p:.0} after {last:.0}");
+            last = p;
+        }
+    }
+
+    /// A fix nowhere near the route is not progress along it.
+    ///
+    /// Verified on a device by accident: a card routing Stanford to Saratoga
+    /// reported the full distance remaining and a camera at the route's start,
+    /// which looked exactly like a broken follow camera. The handset was 4.8 km
+    /// from that route — 0 was the right answer, and the test was the wrong test.
+    #[test]
+    fn a_fix_off_the_route_is_not_progress_along_it() {
+        let r = route();
+        // ~1 km east of a route that runs due north.
+        assert_eq!(nav_progress_m(&r, 37.2135, -121.9887), 0.0);
+        // Just beside it, within the gate, still measured.
+        assert!(nav_progress_m(&r, 37.2135, -122.0015) > 0.0);
     }
 }

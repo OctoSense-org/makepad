@@ -584,7 +584,33 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     // inert by construction — nothing on device knows which card produced it, so
     // a tap has nowhere to land. Seeding the ledger lets the app hold the source
     // and re-realize it, which is what makes an interaction local.
-    for name in ["SEED_L0_FILE", "SEED_L0_DATA"] {
+    //
+    // `SEED_L0_EVENT`/`SEED_L0_VALUE` open the card on a state a tap would have
+    // reached. They were passed by the harness and dropped HERE, which is why
+    // every "detail view" capture was silently a capture of the list — the
+    // screenshot looked like a card, so nothing said the event never arrived.
+    //
+    // `FAKE_GPS_FILE`/`FAKE_GPS_MS` walk a track of `lat,lon` lines as if the
+    // device were driving it. That is the only way to test that navigation MOVES:
+    // everything downstream of `sys.gps` can be verified correct and frozen, and a
+    // handset sitting 3.7 km from the nearest routable road reports zero progress —
+    // correctly — so a working follow camera and a broken one are the same
+    // screenshot. The fixes go through `set_gps_fix`, the same function the
+    // `LocationListener` calls, so nothing above the platform can tell them apart.
+    //
+    // They are dropped here rather than read directly for the reason the two above
+    // it were: `SEED_L0_EVENT`/`SEED_L0_VALUE` were passed by the harness and not
+    // listed, so every "detail view" capture was silently a capture of the list.
+    // The screenshot looked like a card, so nothing said the extra never arrived —
+    // which is exactly how the first FAKE_GPS run failed, with no log line at all.
+    for name in [
+        "SEED_L0_FILE",
+        "SEED_L0_DATA",
+        "SEED_L0_EVENT",
+        "SEED_L0_VALUE",
+        "FAKE_GPS_FILE",
+        "FAKE_GPS_MS",
+    ] {
         let var = format!("MAKEPAD_{name}");
         std::env::remove_var(&var);
         if let Some(v) = get_intent_string_extra(env, activity, &format!("makepad.{name}"))
