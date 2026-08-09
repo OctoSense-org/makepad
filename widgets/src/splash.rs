@@ -1700,6 +1700,18 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.link("url") -> the page open in the host's reader overlay, "" when
+    // closed. Not a fetch: the overlay is host state, published like locale.
+    vm.add_method(
+        sys,
+        id_lut!(link),
+        script_args_def!(field = NIL),
+        |vm, _args| {
+            let url = LINK.read().map(|s| s.clone()).unwrap_or_default();
+            vm.bx.heap.new_string_from_str(&url)
+        },
+    );
+
     // sys.places(lat, lon, "category", index, "field") -> a REAL nearby venue
     // from OpenStreetMap (Overpass API, keyless): row `index` (0 = nearest) of
     // the named places within 4 km, sorted by distance. THE LLM MUST CALL THIS
@@ -2285,6 +2297,16 @@ fn locale_field(field: &str) -> String {
 
 fn pref_at(field: &str) -> Option<String> {
     PREFS.read().ok()?.as_ref()?.get(field).cloned()
+}
+
+/// The page currently open in the host's reader overlay — "" when closed.
+/// Same contract as LOCALE/PREFS: the app writes, this crate reads.
+static LINK: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+pub fn set_link(url: &str) {
+    if let Ok(mut slot) = LINK.write() {
+        *slot = url.to_owned();
+    }
 }
 
 /// Publish the stored references. Called on load and after every write.
