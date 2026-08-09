@@ -1477,8 +1477,10 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     // paginate differently between the tap and the read — so the story under the
     // headline would quietly be a different story. It also costs no extra request.
     //
-    // A story that has left the front page answers "—", which is honest: the card
-    // is holding a reference to something this capability can no longer see.
+    // Resolved from the cached front page when the id is there (one shared
+    // fetch serves every field of every visible story), and from items/{id}
+    // when it is not — a topic's top story or an old bookmark is still a
+    // story this capability can plainly fetch.
     vm.add_method(
         sys,
         id_lut!(newsitem),
@@ -1501,6 +1503,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             };
             let url =
                 "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=12".to_string();
+            let mut located = false;
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => vm.host.cx_mut().script_data_placeholder(&url),
                 Some(bytes) => {
@@ -1511,12 +1514,38 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                             if at.as_deref() == Some(id.as_str()) {
                                 found = json_pluck(&bytes, &format!("hits.{row}.{key}"))
                                     .unwrap_or_else(|| "\u{2014}".to_string());
+                                located = true;
                                 break;
                             }
                         }
                     }
                     found
                 }
+            };
+            // Not on the front page — a topic's top story or an old bookmark.
+            // The items endpoint serves any id forever (the reading list is
+            // built on it), so fall through to it instead of shrugging "\u{2014}"
+            // at a story this capability can plainly still fetch.
+            let out = if !located && !id.is_empty() {
+                let item_url = format!("https://hn.algolia.com/api/v1/items/{id}");
+                match vm.host.cx_mut().script_data_fetch(&item_url) {
+                    None => vm.host.cx_mut().script_data_placeholder(&item_url),
+                    Some(bytes) => match key {
+                        // items/{id} has no flat comment count; count nodes.
+                        "num_comments" => {
+                            let n = String::from_utf8_lossy(&bytes)
+                                .matches("\"type\":\"comment\"")
+                                .count();
+                            format!("{n}")
+                        }
+                        // The items endpoint names the identity "id".
+                        "objectID" => json_pluck(&bytes, "id")
+                            .unwrap_or_else(|| "\u{2014}".to_string()),
+                        k => json_pluck(&bytes, k).unwrap_or_else(|| "\u{2014}".to_string()),
+                    },
+                }
+            } else {
+                out
             };
             vm.bx.heap.new_string_from_str(&out)
         },
@@ -1604,6 +1633,68 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                     }
                     k => json_pluck(&bytes, k).unwrap_or_else(|| "—".to_string()),
                 },
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.topics(index, "key") -> row `index` of the user's FOLLOWED topics
+    // (§5.12). The store holds only the topic word ("ai", "nba"); the `top_*`
+    // keys are the first hit of a fresh Algolia search for that word, run when
+    // the row is read — a followed topic surfaces whatever is hot NOW, never
+    // the story that was hot when it was followed. "—" while the (deduped)
+    // fetch loads, like every joined row in this file.
+    vm.add_method(
+        sys,
+        id_lut!(topics),
+        script_args_def!(index = NIL, field = NIL),
+        |vm, args| {
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let field_v = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_v, &mut field);
+            let Some(name) = collection_at("topics", index) else {
+                return vm.bx.heap.new_string_from_str("—");
+            };
+            // json_pluck walks a dot-path from the ROOT (it is not a text
+            // scan) — the search response nests the hit, so every key starts
+            // at hits.0. The flat items/{id} keys in sys.reading do not.
+            let key = match field.trim().to_ascii_lowercase().as_str() {
+                "name" => {
+                    // The identity itself needs no fetch — it IS the store.
+                    return vm.bx.heap.new_string_from_str(&name);
+                }
+                "top_id" => "hits.0.objectID",
+                "top_points" => "hits.0.points",
+                _ => "hits.0.title",
+            };
+            // Restricted attributes: the default response opens each hit
+            // with _highlightResult, whose nested "title" would be the first
+            // occurrence json_pluck finds. Scoped to the last 90 days so a
+            // followed topic shows what is hot now, not 2019's biggest match.
+            // Quantized to a day: the fetch layer dedupes by URL, and a
+            // cutoff that moved every second would defeat it on every redraw.
+            let cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+                .saturating_sub(90 * 24 * 3600)
+                / 86400
+                * 86400;
+            let url = format!(
+                "https://hn.algolia.com/api/v1/search?query={}&tags=story&hitsPerPage=1\
+                 &attributesToRetrieve=title,points&attributesToHighlight=none\
+                 &numericFilters=created_at_i%3E{cutoff}",
+                name.replace(' ', "%20")
+            );
+            let out = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+                Some(bytes) => {
+                    json_pluck(&bytes, key).unwrap_or_else(|| "—".to_string())
+                }
             };
             vm.bx.heap.new_string_from_str(&out)
         },
