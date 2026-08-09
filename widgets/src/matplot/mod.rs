@@ -7,8 +7,10 @@
 // port. `stock_plot.rs` is this fork's card-facing widget on top of it — a
 // live Yahoo price line/area chart driven purely by DSL properties
 // (`StockPlot{ symbol: "TSLA" range: "1d" }`), sharing the sys.stockbar /
-// sys.stockrange fetch cache.
+// sys.stockrange fetch cache. `indicator_plot.rs` is its sibling: several
+// countries' World Bank series on one axis, for a card that compares.
 
+pub mod indicator_plot;
 pub mod plot_view;
 pub mod stock_plot;
 pub mod types;
@@ -19,4 +21,5 @@ pub fn script_mod(vm: &mut ScriptVm) {
     crate::matplot::types::script_mod(vm);
     crate::matplot::plot_view::script_mod(vm);
     crate::matplot::stock_plot::script_mod(vm);
+    crate::matplot::indicator_plot::script_mod(vm);
 }

@@ -1638,6 +1638,123 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.indicator("CHN,IND", "NY.GDP.MKTP.KD.ZG", 30, index, "key") -> one
+    // country's reading of a World Bank indicator. Rows are indexed in the
+    // order the CARD listed its countries, so row 0 is the first one it named
+    // — the same order IndicatorPlot assigns its legend colours, or the
+    // number beside the chart would belong to the other line.
+    //
+    // Shares the chart's URL, so the whole card costs ONE request.
+    // Keys: name (as the API spells it), latest, first, change (latest minus
+    // first), min, max, year (of the latest reading), title (the indicator's
+    // own name), count (how many countries answered; ignores index).
+    vm.add_method(
+        sys,
+        id_lut!(indicator),
+        script_args_def!(countries = NIL, indicator = NIL, years = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let mut countries = String::new();
+            let v = script_value!(vm, args.countries);
+            vm.bx.heap.cast_to_string(v, &mut countries);
+            let mut indicator = String::new();
+            let v = script_value!(vm, args.indicator);
+            vm.bx.heap.cast_to_string(v, &mut indicator);
+            let years = script_value!(vm, args.years).as_number().unwrap_or(30.0);
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let mut field = String::new();
+            let v = script_value!(vm, args.field);
+            vm.bx.heap.cast_to_string(v, &mut field);
+
+            let codes = wb_codes(&countries);
+            let code = wb_indicator(&indicator);
+            if codes.is_empty() || code.is_empty() {
+                return vm.bx.heap.new_string_from_str("\u{2014}");
+            }
+            // The chart's own URL builder — one request serves both, and the
+            // span anchoring can only drift if they disagree.
+            let url = crate::matplot::indicator_plot::worldbank_url(&codes, &code, years);
+            let bytes = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => {
+                    let ph = vm.host.cx_mut().script_data_placeholder(&url);
+                    return vm.bx.heap.new_string_from_str(&ph);
+                }
+                Some(b) => b,
+            };
+            let root: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(_) => return vm.bx.heap.new_string_from_str("\u{2014}"),
+            };
+            let rows = match root.get(1).and_then(|r| r.as_array()) {
+                Some(r) => r,
+                None => return vm.bx.heap.new_string_from_str("\u{2014}"),
+            };
+            if field.trim() == "count" {
+                let n = codes
+                    .iter()
+                    .filter(|c| {
+                        rows.iter().any(|r| {
+                            r.get("countryiso3code").and_then(|v| v.as_str()) == Some(c.as_str())
+                        })
+                    })
+                    .count();
+                return vm.bx.heap.new_string_from_str(&format!("{n}"));
+            }
+            let Some(want) = codes.get(index) else {
+                return vm.bx.heap.new_string_from_str("");
+            };
+            // (year, value) for this country, ascending, nulls dropped.
+            let mut pairs: Vec<(f64, f64)> = rows
+                .iter()
+                .filter(|r| {
+                    r.get("countryiso3code").and_then(|v| v.as_str()) == Some(want.as_str())
+                })
+                .filter_map(|r| {
+                    let y = r.get("date")?.as_str()?.parse::<f64>().ok()?;
+                    let v = r.get("value")?.as_f64()?;
+                    (y.is_finite() && v.is_finite()).then_some((y, v))
+                })
+                .collect();
+            pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            if pairs.is_empty() {
+                return vm.bx.heap.new_string_from_str("\u{2014}");
+            }
+            let out = match field.trim().to_ascii_lowercase().as_str() {
+                "name" => rows
+                    .iter()
+                    .find(|r| {
+                        r.get("countryiso3code").and_then(|v| v.as_str()) == Some(want.as_str())
+                    })
+                    .and_then(|r| r.pointer("/country/value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(want)
+                    .to_string(),
+                "title" => rows
+                    .first()
+                    .and_then(|r| r.pointer("/indicator/value"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                "first" => fmt_reading(pairs[0].1),
+                "min" => fmt_reading(
+                    pairs.iter().map(|p| p.1).fold(f64::INFINITY, f64::min),
+                ),
+                "max" => fmt_reading(
+                    pairs.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max),
+                ),
+                "year" => format!("{}", pairs[pairs.len() - 1].0 as i64),
+                "change" => {
+                    let d = pairs[pairs.len() - 1].1 - pairs[0].1;
+                    format!("{}{}", if d >= 0.0 { "+" } else { "" }, fmt_reading(d))
+                }
+                _ => fmt_reading(pairs[pairs.len() - 1].1),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     // sys.watchlist_has("NVDA") -> "1" when that ticker is in the user's
     // saved list, else "0". Synchronous — the store is published, not
     // fetched — and it is what lets a quote page show Add or Remove for
@@ -2761,6 +2878,48 @@ fn moon_phase_name_zh(f: f64) -> &'static str {
 fn hhmm_to_minutes(s: &str) -> Option<f64> {
     let (h, m) = s.trim().split_once(':')?;
     Some(h.trim().parse::<f64>().ok()? * 60.0 + m.trim().parse::<f64>().ok()?)
+}
+
+/// ISO3 codes in the order the card listed them (mirrors IndicatorPlot's own
+/// sanitizer — the row index a card asks for must mean the same country the
+/// chart drew in that colour).
+fn wb_codes(raw: &str) -> Vec<String> {
+    raw.split(|c| c == ',' || c == ';' || c == ' ')
+        .map(|s| s.trim())
+        .filter(|s| s.len() == 3 && s.chars().all(|c| c.is_ascii_alphabetic()))
+        .map(|s| s.to_ascii_uppercase())
+        .take(5)
+        .collect()
+}
+
+fn wb_indicator(raw: &str) -> String {
+    let t = raw.trim();
+    if !t.is_empty()
+        && t.len() <= 32
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+    {
+        t.to_ascii_uppercase()
+    } else {
+        String::new()
+    }
+}
+
+/// A World Bank reading, at the precision it is worth reading: a growth rate
+/// to a decimal, a GDP total as a magnitude.
+fn fmt_reading(v: f64) -> String {
+    let a = v.abs();
+    if a >= 1e12 {
+        format!("{:.2}T", v / 1e12)
+    } else if a >= 1e9 {
+        format!("{:.1}B", v / 1e9)
+    } else if a >= 1e6 {
+        format!("{:.1}M", v / 1e6)
+    } else if a >= 1000.0 {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.1}", v)
+    }
 }
 
 /// Round a DISPLAY reading to a whole number.
