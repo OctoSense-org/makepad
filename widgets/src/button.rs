@@ -424,8 +424,9 @@ pub struct Button {
     #[live]
     on_press: ScriptFnRef,
 
-    // Swipe gesture (opt-in via `swipe: true`): a vertical drag fires on_swipe_up /
-    // on_swipe_down instead of a click — used for the drive sheet's grab handle.
+    // Swipe gesture (opt-in via `swipe: true`): a drag past the threshold fires
+    // the matching on_swipe_* instead of a click — vertical for the drive
+    // sheet's grab handle, horizontal for a row's reveal-to-remove.
     #[live]
     swipe: bool,
 
@@ -434,6 +435,12 @@ pub struct Button {
 
     #[live]
     on_swipe_down: ScriptFnRef,
+
+    #[live]
+    on_swipe_left: ScriptFnRef,
+
+    #[live]
+    on_swipe_right: ScriptFnRef,
 
     // FingerDown position, to measure the swipe delta at FingerUp.
     #[rust]
@@ -573,6 +580,20 @@ impl Widget for Button {
                 }
                 if is_vswipe && d.y > 0.0 {
                     cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_down.clone(), &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
+                // The horizontal twin, for a row that reveals its action on
+                // swipe. Same instead-of-click contract: returning here is
+                // what stops the drag from also firing the row's tap.
+                let is_hswipe = self.swipe && d.x.abs() > 22.0 && d.x.abs() > d.y.abs();
+                if is_hswipe && d.x < 0.0 {
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_left.clone(), &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
+                if is_hswipe && d.x > 0.0 {
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_right.clone(), &[]);
                     self.animator_play(cx, ids!(hover.off));
                     return;
                 }
