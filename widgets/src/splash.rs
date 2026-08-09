@@ -1638,6 +1638,26 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.watchlist_has("NVDA") -> "1" when that ticker is in the user's
+    // saved list, else "0". Synchronous — the store is published, not
+    // fetched — and it is what lets a quote page show Add or Remove for
+    // the stock it is looking at.
+    vm.add_method(
+        sys,
+        id_lut!(watchlist_has),
+        script_args_def!(ticker = NIL),
+        |vm, args| {
+            let ticker_v = script_value!(vm, args.ticker);
+            let mut ticker = String::new();
+            vm.bx.heap.cast_to_string(ticker_v, &mut ticker);
+            let ticker = ticker.trim();
+            let held = (0..collection_len("watchlist"))
+                .filter_map(|i| collection_at("watchlist", i))
+                .any(|t| t == ticker);
+            vm.bx.heap.new_string_from_str(if held { "1" } else { "0" })
+        },
+    );
+
     // sys.topics(index, "key") -> row `index` of the user's FOLLOWED topics
     // (§5.12). The store holds only the topic word ("ai", "nba"); the `top_*`
     // keys are the first hit of a fresh Algolia search for that word, run when
