@@ -98,8 +98,14 @@ pub fn format_value_brief(heap: &ScriptHeap, value: ScriptValue) -> String {
     if let Some(s) = value.as_string() {
         if let Some(str_data) = &heap.strings[s] {
             let s = &str_data.string.0;
-            let truncated = if s.len() > 12 {
-                format!("{}...", &s[..12])
+            // By CHARS, not bytes: `&s[..12]` panics when byte 12 lands inside
+            // a multi-byte character, and this runs on the error path — so a
+            // diagnostic about a string containing an emoji or CJK killed the
+            // thread instead of describing the problem (measured: a YouTube
+            // title did it).
+            let truncated = if s.chars().count() > 12 {
+                let head: String = s.chars().take(12).collect();
+                format!("{head}...")
             } else {
                 s.to_string()
             };

@@ -1679,7 +1679,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
                 }
                 Some(b) => b,
             };
-            let hits = yt_parse_results(&bytes);
+            let hits = yt_results_for(&url, &bytes);
             if key == "count" {
                 return vm.bx.heap.new_string_from_str(&format!("{}", hits.len()));
             }
@@ -1726,7 +1726,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             match vm.host.cx_mut().script_data_fetch(&url) {
                 None => vm.bx.heap.new_string_from_str("0"),
                 Some(b) => {
-                    let n = yt_parse_results(&b).len();
+                    let n = yt_results_for(&url, &b).len();
                     vm.bx.heap.new_string_from_str(&format!("{n}"))
                 }
             }
@@ -2975,6 +2975,33 @@ fn hhmm_to_minutes(s: &str) -> Option<f64> {
     Some(h.trim().parse::<f64>().ok()? * 60.0 + m.trim().parse::<f64>().ok()?)
 }
 
+/// The last page parsed, by url.
+///
+/// A card asks for 8 fields of 12 rows: without this the 1.3 MB results page
+/// is re-parsed 96 times per render, which on the OnePlus 6 blew the VM's
+/// script time budget outright (`script time budget exceeded`) and the card
+/// never rendered a row — it looked like a slow network and was not. The
+/// bytes are already deduped by the fetch cache; this dedupes the WORK of
+/// reading them.
+static YT_PARSED: std::sync::RwLock<Option<(String, std::sync::Arc<Vec<YtHit>>)>> =
+    std::sync::RwLock::new(None);
+
+/// Parse `bytes` for `url`, reusing the last parse when the url is unchanged.
+fn yt_results_for(url: &str, bytes: &[u8]) -> std::sync::Arc<Vec<YtHit>> {
+    if let Ok(slot) = YT_PARSED.read() {
+        if let Some((u, hits)) = slot.as_ref() {
+            if u == url {
+                return hits.clone();
+            }
+        }
+    }
+    let hits = std::sync::Arc::new(yt_parse_results(bytes));
+    if let Ok(mut slot) = YT_PARSED.write() {
+        *slot = Some((url.to_owned(), hits.clone()));
+    }
+    hits
+}
+
 /// One parsed YouTube search result.
 struct YtHit {
     id: String,
@@ -3042,7 +3069,16 @@ fn yt_parse_results(bytes: &[u8]) -> Vec<YtHit> {
             // `lengthText` nests an accessibility label BEFORE its simpleText,
             // so the duration is found inside that object rather than by a
             // key that happens to follow it.
-            length: yt_nested(win, "\"lengthText\":{", "\"simpleText\":\""),
+            //
+            // A LIVE stream has no lengthText at all — it has no duration yet.
+            // Answering "" for it read as a pending fetch to the host's
+            // lifecycle probe, so a card whose first result was a livestream
+            // said "Searching..." over a full list of results (measured: Lofi
+            // Girl). "LIVE" is both true and not empty.
+            length: {
+                let d = yt_nested(win, "\"lengthText\":{", "\"simpleText\":\"");
+                if d.is_empty() { "LIVE".to_string() } else { d }
+            },
             views: pick("\"viewCountText\":{\"simpleText\":\""),
             age: pick("\"publishedTimeText\":{\"simpleText\":\""),
         });
@@ -3126,6 +3162,17 @@ mod yt_tests {
         assert_eq!(hits[0].views, "8,900,000,000 views");
         assert_eq!(hits[0].age, "8 years ago");
         assert_eq!(hits[1].length, "6:10:58");
+    }
+
+    #[test]
+    fn a_live_stream_says_live_rather_than_nothing() {
+        // No lengthText: a live stream has no duration. Empty would read as
+        // "still fetching" to the lifecycle probe.
+        const LIVE: &str = r#"{"videoRenderer":{"videoId":"jfKfPfyJRdk","title":{"runs":[{"text":"lofi radio"}]},
+          "longBylineText":{"runs":[{"text":"Lofi Girl"}]}}}"#;
+        let hits = yt_parse_results(LIVE.as_bytes());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].length, "LIVE", "a live result must not answer empty");
     }
 
     #[test]
