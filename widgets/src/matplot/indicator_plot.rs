@@ -58,7 +58,6 @@ script_mod! {
             text_style: theme.font_regular{}
         }
     }
-    mod.prelude.widgets.IndicatorPlot = mod.widgets.IndicatorPlot
 }
 
 /// One country's answered series, newest-last.

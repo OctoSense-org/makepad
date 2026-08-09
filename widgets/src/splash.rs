@@ -1638,6 +1638,101 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.video("lofi hip hop", index, "key") -> one YouTube search result.
+    //
+    // Keyless, and it has to be: every public Piped/Invidious instance the old
+    // web card fell back to is dead or 401s (checked 2026-08-09), which is why
+    // that card ended up asking the MODEL to remember video ids — ids that go
+    // stale and cannot be checked. YouTube's own results page carries the same
+    // data the app needs, and this fork already scrapes it for live ids
+    // (refresh_youtube_live_ids), so this is the proven path rather than a new
+    // dependency.
+    //
+    // Keys: id, title, channel, length, views, age, thumb (an image url) and
+    // embed (a player url a card can hand to sys.link). "count" answers how
+    // many results parsed, ignoring index.
+    vm.add_method(
+        sys,
+        id_lut!(video),
+        script_args_def!(query = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let mut query = String::new();
+            let v = script_value!(vm, args.query);
+            vm.bx.heap.cast_to_string(v, &mut query);
+            let index = script_value!(vm, args.index)
+                .as_number()
+                .unwrap_or(0.0)
+                .max(0.0) as usize;
+            let mut field = String::new();
+            let v = script_value!(vm, args.field);
+            vm.bx.heap.cast_to_string(v, &mut field);
+            let key = field.trim().to_ascii_lowercase();
+
+            if query.trim().is_empty() {
+                return vm.bx.heap.new_string_from_str("");
+            }
+            let url = yt_search_url(&query);
+            let bytes = match vm.host.cx_mut().script_data_fetch(&url) {
+                None => {
+                    let ph = vm.host.cx_mut().script_data_placeholder(&url);
+                    return vm.bx.heap.new_string_from_str(&ph);
+                }
+                Some(b) => b,
+            };
+            let hits = yt_parse_results(&bytes);
+            if key == "count" {
+                return vm.bx.heap.new_string_from_str(&format!("{}", hits.len()));
+            }
+            let Some(hit) = hits.get(index) else {
+                // Past the last result: empty, so a row list stops here rather
+                // than padding itself with rows that draw as nothing.
+                return vm.bx.heap.new_string_from_str("");
+            };
+            let out = match key.as_str() {
+                "title" => hit.title.clone(),
+                "channel" => hit.channel.clone(),
+                "length" => hit.length.clone(),
+                "views" => hit.views.clone(),
+                "age" => hit.age.clone(),
+                "thumb" => format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", hit.id),
+                // The player url, ready to open. A card cannot build one: L0
+                // has no string concatenation, and that is deliberate.
+                //
+                // The WATCH page, not /embed/. An embed refuses with "Error
+                // 153: video player configuration error" when it is loaded as
+                // a top-level document — the iframe player wants a real page
+                // origin, and the overlay has none. Measured on device.
+                "embed" => format!("https://m.youtube.com/watch?v={}", hit.id),
+                _ => hit.id.clone(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.videonum(query, 0, "count") -> how many results parsed. The shape
+    // fetched_rows expects of a searchable list, beside sys.searchnum.
+    vm.add_method(
+        sys,
+        id_lut!(videonum),
+        script_args_def!(query = NIL, index = NIL, field = NIL),
+        |vm, args| {
+            let mut query = String::new();
+            let v = script_value!(vm, args.query);
+            vm.bx.heap.cast_to_string(v, &mut query);
+            if query.trim().is_empty() {
+                return vm.bx.heap.new_string_from_str("0");
+            }
+            let url = yt_search_url(&query);
+            match vm.host.cx_mut().script_data_fetch(&url) {
+                None => vm.bx.heap.new_string_from_str("0"),
+                Some(b) => {
+                    let n = yt_parse_results(&b).len();
+                    vm.bx.heap.new_string_from_str(&format!("{n}"))
+                }
+            }
+        },
+    );
+
     // sys.indicator("CHN,IND", "NY.GDP.MKTP.KD.ZG", 30, index, "key") -> one
     // country's reading of a World Bank indicator. Rows are indexed in the
     // order the CARD listed its countries, so row 0 is the first one it named
@@ -2878,6 +2973,177 @@ fn moon_phase_name_zh(f: f64) -> &'static str {
 fn hhmm_to_minutes(s: &str) -> Option<f64> {
     let (h, m) = s.trim().split_once(':')?;
     Some(h.trim().parse::<f64>().ok()? * 60.0 + m.trim().parse::<f64>().ok()?)
+}
+
+/// One parsed YouTube search result.
+struct YtHit {
+    id: String,
+    title: String,
+    channel: String,
+    length: String,
+    views: String,
+    age: String,
+}
+
+/// The results page for a query. One url per query, so the fetch cache serves
+/// every row and every field of a card from a single request — the page is
+/// ~1.7 MB, which is the price of the only keyless path that still works.
+fn yt_search_url(query: &str) -> String {
+    let mut q = String::new();
+    for b in query.trim().as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                q.push(*b as char)
+            }
+            b' ' => q.push('+'),
+            other => q.push_str(&format!("%{other:02X}")),
+        }
+    }
+    format!("https://www.youtube.com/results?search_query={q}")
+}
+
+/// Pull `videoRenderer` blocks out of the results page.
+///
+/// A WINDOW after each id rather than a JSON parse: the page embeds several
+/// megabytes of `ytInitialData` whose shape shifts between rollouts, and a
+/// strict parse of the whole thing fails entirely when one key moves. Reading
+/// a bounded window per hit degrades field by field instead — a missing
+/// channel costs the channel, not the list.
+fn yt_parse_results(bytes: &[u8]) -> Vec<YtHit> {
+    let body = String::from_utf8_lossy(bytes);
+    let mut out: Vec<YtHit> = Vec::new();
+    let mut at = 0usize;
+    const MARK: &str = "\"videoRenderer\":{\"videoId\":\"";
+    while let Some(found) = body[at..].find(MARK) {
+        let start = at + found + MARK.len();
+        at = start;
+        let Some(end) = body[start..].find('"') else { break };
+        let id = &body[start..start + end];
+        if id.len() != 11 || out.iter().any(|h| h.id == id) {
+            continue;
+        }
+        let win = &body[start..(start + 2600).min(body.len())];
+        let pick = |open: &str| -> String {
+            win.find(open)
+                .and_then(|i| {
+                    let rest = &win[i + open.len()..];
+                    rest.find('"').map(|j| yt_unescape(&rest[..j]))
+                })
+                .unwrap_or_default()
+        };
+        let title = pick("\"title\":{\"runs\":[{\"text\":\"");
+        if title.is_empty() {
+            continue;
+        }
+        out.push(YtHit {
+            id: id.to_string(),
+            title,
+            channel: pick("\"longBylineText\":{\"runs\":[{\"text\":\""),
+            // `lengthText` nests an accessibility label BEFORE its simpleText,
+            // so the duration is found inside that object rather than by a
+            // key that happens to follow it.
+            length: yt_nested(win, "\"lengthText\":{", "\"simpleText\":\""),
+            views: pick("\"viewCountText\":{\"simpleText\":\""),
+            age: pick("\"publishedTimeText\":{\"simpleText\":\""),
+        });
+        if out.len() >= 20 {
+            break;
+        }
+    }
+    out
+}
+
+/// A value inside a named object: find the object, then the key within the
+/// bounded slice that follows it. Two steps because the page nests
+/// accessibility text ahead of the human-readable value.
+fn yt_nested(win: &str, object: &str, key: &str) -> String {
+    let Some(i) = win.find(object) else {
+        return String::new();
+    };
+    let scope = &win[i..(i + 400).min(win.len())];
+    scope
+        .find(key)
+        .and_then(|j| {
+            let rest = &scope[j + key.len()..];
+            rest.find('"').map(|k| yt_unescape(&rest[..k]))
+        })
+        .unwrap_or_default()
+}
+
+/// The page's JSON escapes, as far as a title needs them.
+fn yt_unescape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(ch) => out.push(ch),
+                    None => out.push_str(&hex),
+                }
+            }
+            Some('n') => out.push(' '),
+            Some(other) => out.push(other),
+            None => break,
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod yt_tests {
+    use super::*;
+
+    /// A trimmed shape of the real results page, with the two nestings that
+    /// caught the first parser out: the duration behind an accessibility
+    /// label, and a unicode escape in the title.
+    const PAGE: &str = r#"{"contents":[
+      {"videoRenderer":{"videoId":"kJQP7kiw5Fk","title":{"runs":[{"text":"Luis Fonsi & Daddy Yankee"}]},
+       "longBylineText":{"runs":[{"text":"LuisFonsiVEVO"}]},
+       "publishedTimeText":{"simpleText":"8 years ago"},
+       "lengthText":{"accessibility":{"accessibilityData":{"label":"4 minutes, 41 seconds"}},"simpleText":"4:41"},
+       "viewCountText":{"simpleText":"8,900,000,000 views"}}},
+      {"videoRenderer":{"videoId":"n61ULEU7CO0","title":{"runs":[{"text":"Best of lofi"}]},
+       "longBylineText":{"runs":[{"text":"Lofi Girl"}]},
+       "lengthText":{"accessibility":{"accessibilityData":{"label":"6 hours"}},"simpleText":"6:10:58"}}}
+    ]}"#;
+
+    #[test]
+    fn a_result_carries_every_field_the_card_shows() {
+        let hits = yt_parse_results(PAGE.as_bytes());
+        assert_eq!(hits.len(), 2, "both renderers parse");
+        assert_eq!(hits[0].id, "kJQP7kiw5Fk");
+        // The escape is decoded, not shown raw.
+        assert_eq!(hits[0].title, "Luis Fonsi & Daddy Yankee");
+        assert_eq!(hits[0].channel, "LuisFonsiVEVO");
+        // The HUMAN duration, not the accessibility sentence that precedes it.
+        assert_eq!(hits[0].length, "4:41");
+        assert_eq!(hits[0].views, "8,900,000,000 views");
+        assert_eq!(hits[0].age, "8 years ago");
+        assert_eq!(hits[1].length, "6:10:58");
+    }
+
+    #[test]
+    fn a_missing_field_costs_only_that_field() {
+        // The second hit has no viewCount and no age; it is still a result.
+        let hits = yt_parse_results(PAGE.as_bytes());
+        assert_eq!(hits[1].id, "n61ULEU7CO0");
+        assert_eq!(hits[1].channel, "Lofi Girl");
+        assert!(hits[1].views.is_empty());
+    }
+
+    #[test]
+    fn a_query_cannot_write_a_url() {
+        let u = yt_search_url("lofi hip hop");
+        assert_eq!(u, "https://www.youtube.com/results?search_query=lofi+hip+hop");
+        let evil = yt_search_url("a&b=c#d");
+        assert!(!evil.contains('&') && !evil.contains('#'), "{evil}");
+    }
 }
 
 /// ISO3 codes in the order the card listed them (mirrors IndicatorPlot's own
