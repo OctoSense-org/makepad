@@ -1808,10 +1808,13 @@ fn decode_qr_luma(luma: &[u8], w: usize, h: usize) -> Option<String> {
 
 unsafe fn jstring_to_string(env: *mut jni_sys::JNIEnv, java_string: jni_sys::jstring) -> String {
     let chars = (**env).GetStringUTFChars.unwrap()(env, java_string, std::ptr::null_mut());
+    // Lossy, never panics: GetStringUTFChars returns MODIFIED UTF-8, which
+    // encodes U+0000 as the overlong pair C0 A8 and lone surrogates as CESU-8 —
+    // both invalid under strict UTF-8. A binary file read as text Java-side
+    // (e.g. the file picker) hits exactly this and used to panic the whole app.
     let rust_string = std::ffi::CStr::from_ptr(chars)
-        .to_str()
-        .unwrap()
-        .to_string();
+        .to_string_lossy()
+        .into_owned();
     (**env).ReleaseStringUTFChars.unwrap()(env, java_string, chars);
     rust_string
 }
@@ -1924,7 +1927,9 @@ pub unsafe fn to_java_show_keyboard(visible: bool) {
 
 pub unsafe fn to_java_copy_to_clipboard(content: String) {
     let env = attach_jni_env();
-    let content = CString::new(content.clone()).unwrap();
+    // LOCAL BUILD FIX (2026-08-03): strip interior NULs — card JS can send them
+    // via JSON   and CString::new would panic, crashing the app.
+    let content = CString::new(content.replace('\0', "")).unwrap();
     let content = ((**env).NewStringUTF.unwrap())(env, content.as_ptr());
     ndk_utils::call_void_method!(
         env,
@@ -1937,7 +1942,8 @@ pub unsafe fn to_java_copy_to_clipboard(content: String) {
 
 pub unsafe fn to_java_share_text(content: String) {
     let env = attach_jni_env();
-    let content = CString::new(content).unwrap();
+    // LOCAL BUILD FIX (2026-08-03): strip interior NULs (see clipboard above).
+    let content = CString::new(content.replace('\0', "")).unwrap();
     let content = ((**env).NewStringUTF.unwrap())(env, content.as_ptr());
     ndk_utils::call_void_method!(
         env,
@@ -2070,14 +2076,17 @@ pub unsafe fn to_java_hide_selection_handles() {
 
 pub unsafe fn to_java_http_request(request_id: LiveId, request: HttpRequest) {
     let env = attach_jni_env();
-    let url = CString::new(request.url.clone()).unwrap();
+    // LOCAL BUILD FIX (2026-08-03): strip interior NULs from card-supplied
+    // url/headers — a NUL in the path or a header value passes the allowlist
+    // but panics CString::new, crashing the app.
+    let url = CString::new(request.url.replace('\0', "")).unwrap();
     let url = ((**env).NewStringUTF.unwrap())(env, url.as_ptr());
 
     let method = CString::new(request.method.to_string()).unwrap();
     let method = ((**env).NewStringUTF.unwrap())(env, method.as_ptr());
 
     let headers_string = request.get_headers_string();
-    let headers = CString::new(headers_string.clone()).unwrap();
+    let headers = CString::new(headers_string.replace('\0', "")).unwrap();
     let headers = ((**env).NewStringUTF.unwrap())(env, headers.as_ptr());
 
     let java_body = match &request.body {
