@@ -87,10 +87,15 @@ pub const DATA_FETCH_MAX_RETRIES: u8 = 4;
 /// 429 requests without a browser-ish UA, so that stays the default — but
 /// overpass-api.de's Apache rejects the bare "Mozilla/5.0" bot signature with
 /// 406 (and OSM etiquette wants an identifying UA anyway), so Overpass gets a
-/// descriptive one. Keep this beside the retry path so every (re)issue of a
-/// fetch picks the same UA.
+/// descriptive one — as does Nominatim, which requires it. Keep this beside the
+/// retry path so every (re)issue of a fetch picks the same UA.
 pub fn data_fetch_user_agent(url: &str) -> &'static str {
-    if url.contains("overpass") {
+    // Nominatim is the same case as Overpass and then some: its usage policy
+    // requires an identifying UA and refuses a generic one outright, so with the
+    // browser default every `sys.poi` row exhausted its retries and rendered
+    // "n/a" — the failure looked like a missing place rather than a rejected
+    // client.
+    if url.contains("overpass") || url.contains("nominatim") {
         "octos-one-a2app/1.0 (+https://github.com/octos-org/octos-one; live card data binding)"
     } else {
         "Mozilla/5.0"
@@ -274,6 +279,12 @@ impl CxScriptResources {
 /// an errored URL its lazy retry (script_data_fetch re-fires it, budget
 /// permitting). Terminates: an exhausted URL fires no new request, so no new
 /// failure bumps the epoch again.
+/// The epoch's current value, for tests that assert something bumped it.
+#[cfg(test)]
+pub fn data_fetch_epoch_for_test() -> u64 {
+    DATA_FETCH_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn bump_data_fetch_epoch() {
     DATA_FETCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

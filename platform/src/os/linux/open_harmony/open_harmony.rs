@@ -687,6 +687,29 @@ impl Cx {
                 CxOsOp::CollapseNativeComposer => {
                     self.ohos_call_arkts("composerCollapse", vec![]);
                 }
+                // ---- HTTP ----
+                //
+                // Every other backend wires these two arms; OpenHarmony was the
+                // only one that did not, so `CxOsOp::HttpRequest` fell through
+                // unhandled and NO http request a widget made was ever issued.
+                // The visible symptom is a MapView that lays out and paints its
+                // background but never receives a tile — the request is not
+                // failing, it is never sent.
+                //
+                // `cx.net` is the pure-Rust `NetworkRuntime` on `Cx` itself (not
+                // cfg-gated per platform), and it posts `NetworkResponses` back
+                // into the event loop on its own, so OpenHarmony needs exactly
+                // what the x11/wayland/direct backends need — no ArkTS/NAPI
+                // bridge, unlike the Android path which must hop through JNI.
+                CxOsOp::HttpRequest {
+                    request_id,
+                    request,
+                } => {
+                    let _ = self.net.http_start(request_id, request);
+                }
+                CxOsOp::CancelHttpRequest { request_id } => {
+                    let _ = self.net.http_cancel(request_id);
+                }
                 // The system file picker, for a card's
                 // `octos.invoke("dialog.open", …)`. Backed by ArkTS
                 // DocumentViewPicker — a real OS component, not an in-page UI.

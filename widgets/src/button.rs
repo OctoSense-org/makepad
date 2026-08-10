@@ -424,8 +424,9 @@ pub struct Button {
     #[live]
     on_press: ScriptFnRef,
 
-    // Swipe gesture (opt-in via `swipe: true`): a vertical drag fires on_swipe_up /
-    // on_swipe_down instead of a click — used for the drive sheet's grab handle.
+    // Swipe gesture (opt-in via `swipe: true`): a drag past the threshold fires
+    // the matching on_swipe_* instead of a click — vertical for the drive
+    // sheet's grab handle, horizontal for a row's reveal-to-remove.
     #[live]
     swipe: bool,
 
@@ -435,9 +436,21 @@ pub struct Button {
     #[live]
     on_swipe_down: ScriptFnRef,
 
+    #[live]
+    on_swipe_left: ScriptFnRef,
+
+    #[live]
+    on_swipe_right: ScriptFnRef,
+
     // FingerDown position, to measure the swipe delta at FingerUp.
     #[rust]
     swipe_down_abs: DVec2,
+
+    // A horizontal swipe fires MID-DRAG, the moment the finger crosses the
+    // threshold — waiting for finger-up made the reveal feel a beat late next
+    // to a native list. Once fired, the release must not also click.
+    #[rust]
+    swipe_fired: bool,
 
     /// Legacy compatibility flag that fires `on_click` on press instead of click.
     #[live]
@@ -525,6 +538,7 @@ impl Widget for Button {
             }
             Hit::FingerDown(fe) if self.enabled && fe.is_primary_hit() => {
                 self.swipe_down_abs = fe.abs;
+                self.swipe_fired = false;
                 if self.grab_key_focus {
                     cx.set_key_focus(self.draw_bg.area());
                 }
@@ -546,6 +560,23 @@ impl Widget for Button {
                 self.animator_play(cx, ids!(hover.down));
                 self.set_key_focus(cx);
             }
+            Hit::FingerMove(fe) if self.swipe && !self.swipe_fired => {
+                // The horizontal reveal, live: fire as soon as the drag is
+                // unmistakably sideways instead of on release. Vertical keeps
+                // its on-release contract (the sheet's drag feels fine there,
+                // and mid-drag vertical fires would fight scrolling).
+                let d = fe.abs - self.swipe_down_abs;
+                if d.x.abs() > 22.0 && d.x.abs() > d.y.abs() {
+                    self.swipe_fired = true;
+                    let handler = if d.x < 0.0 {
+                        self.on_swipe_left.clone()
+                    } else {
+                        self.on_swipe_right.clone()
+                    };
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), handler, &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                }
+            }
             Hit::FingerHoverIn(_) => {
                 if self.enabled {
                     cx.set_cursor(MouseCursor::Hand);
@@ -561,6 +592,12 @@ impl Widget for Button {
                 cx.widget_action_with_data(&self.action_data, uid, ButtonAction::LongPressed);
             }
             Hit::FingerUp(fe) if self.enabled && fe.is_primary_hit() => {
+                // A swipe that already fired mid-drag consumed this touch.
+                if self.swipe_fired {
+                    self.swipe_fired = false;
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
                 // Vertical-swipe gesture (opt-in): if a swipe handler is bound and the
                 // finger travelled mostly up/down past a threshold, fire it instead of
                 // the click — lets the drive sheet's handle be dragged open/closed.
@@ -573,6 +610,20 @@ impl Widget for Button {
                 }
                 if is_vswipe && d.y > 0.0 {
                     cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_down.clone(), &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
+                // The horizontal twin, for a row that reveals its action on
+                // swipe. Same instead-of-click contract: returning here is
+                // what stops the drag from also firing the row's tap.
+                let is_hswipe = self.swipe && d.x.abs() > 22.0 && d.x.abs() > d.y.abs();
+                if is_hswipe && d.x < 0.0 {
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_left.clone(), &[]);
+                    self.animator_play(cx, ids!(hover.off));
+                    return;
+                }
+                if is_hswipe && d.x > 0.0 {
+                    cx.widget_to_script_call(uid, NIL, self.source.clone(), self.on_swipe_right.clone(), &[]);
                     self.animator_play(cx, ids!(hover.off));
                     return;
                 }

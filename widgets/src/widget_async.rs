@@ -271,7 +271,16 @@ impl CxSplashVmExt for Cx {
                 std: &mut std,
                 bx: Box::new(ScriptVmBase::new()),
             };
-            crate::makepad_draw::makepad_platform::script::script_mod(&mut vm);
+            // SANDBOXED, not the full platform surface: every Splash card
+            // allocates its own isolate on first eval (`splash.rs`), so this is
+            // the single place a generated card's capabilities are decided.
+            // The full `script_mod` would hand it `fs`, `run`, `net` and
+            // `cx.quit` — enough to read or overwrite files, spawn a process,
+            // or terminate the app.
+            //
+            // The main VM (`platform/src/cx.rs`) still gets the full surface;
+            // it runs the app's own trusted scripts.
+            crate::makepad_draw::makepad_platform::script::script_mod_sandboxed(&mut vm);
             crate::script_mod(&mut vm);
             vm.bx
         };

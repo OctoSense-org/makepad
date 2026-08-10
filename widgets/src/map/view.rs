@@ -68,8 +68,18 @@ script_mod! {
             let near3 = self.nav_cam.x * 0.6;
             let behind = 1.0 - step(near3, z_cam);
             let zc = max(z_cam, near3);
-            let ndc_x = cross / (zc * self.nav_cam.w);
-            let ndc_y = y_cam / (zc * self.nav_misc.w);
+            // When nav is OFF (flat plan map) nav_cam/nav_misc are all zero, so
+            // zc and both denominators are 0 and these divides are 0/0 = NaN.
+            // The `mix(flat, ..., in_nav)` below has in_nav = 0, so the 3D branch
+            // is mathematically discarded — but it is evaluated as
+            // `flat*1 + p3d*0`, and NaN * 0 is NaN. Every position becomes NaN
+            // and NOTHING rasterises. Adreno folds the mix / flushes the NaN;
+            // Mali/Maleoon propagates it, which is why the map is blank on
+            // HarmonyOS and fine on Android. Bias the denominators so the
+            // unused branch stays finite; when nav IS active these terms are
+            // orders of magnitude larger and the epsilon is irrelevant.
+            let ndc_x = cross / (zc * self.nav_cam.w + 1e-6);
+            let ndc_y = y_cam / (zc * self.nav_misc.w + 1e-6);
             let p3d = vec2(
                 mix(
                     self.nav_screen.x + self.nav_screen.z * 0.5 * (1.0 + ndc_x),
@@ -326,6 +336,12 @@ const NAV_RECENTER_IDLE_SECS: f64 = 4.0;
 /// label finishes its ~0.22s fade-in (and any last tile paints) before going
 /// idle. ~16 frames ≈ 0.27s at 60fps, covering the fade.
 const NAV_SETTLE_FRAMES: u32 = 16;
+
+/// Ceiling on the shared tile-geometry store, in tiles.
+///
+/// Equal to the per-instance cap, so the store never holds more than one `MapView`
+/// can reference. See the eviction site for what 900 cost on a OnePlus 6.
+const SHARED_TILE_CAP: usize = 640;
 
 /// Ready tile geometry shared across MapView instances on the UI thread.
 /// Splash cards that animate re-evaluate ~1 Hz and REBUILD their widget tree,
@@ -700,14 +716,26 @@ fn nav_store_insert(
                 last_used: tick,
             },
         );
-        if store.len() > 900 {
+        if store.len() > SHARED_TILE_CAP {
             // Cap the shared owner store to BOUND MEMORY. The 3D chase view pulls a
             // wide tile radius (turn/horizon prefetch), so an unbounded store fills
             // to ~2.5 GB on entering drive and parks the process at the Android OOM
             // ceiling — then any later allocation (even a bottom-sheet redraw) aborts
-            // with SIGABRT ("allocation failed"). 900 sits comfortably above the
-            // active working set (per-instance cap 640), so only never-drawn FAR
-            // history is trimmed — nothing visible changes.
+            // with SIGABRT ("allocation failed").
+            //
+            // The cap was 900, and that was still too close to the ceiling it exists
+            // to avoid. Measured on a OnePlus 6 with a nav card: 2.0 GB resident, of
+            // which 1.61 GB is this store — roughly 1.8 MB a tile at 900 of them. A
+            // 2 GB process on a 6 GB phone is the first thing Android trims, and a
+            // trimmed app that holds focus and draws nothing is indistinguishable
+            // from a hung one, which is exactly how it gets reported.
+            //
+            // 640 is the PER-INSTANCE cap, so at that size the store holds no more
+            // than one MapView can reference and the 260 tiles of never-drawn far
+            // history are gone. The safety argument is unchanged and strictly
+            // tighter: eviction takes the farthest from the drive, and drawing only
+            // ever touches the nearest ~86 tiles, so a drawn tile is still never
+            // evicted.
             // Evict FARTHEST from the drive first (never what's near the car —
             // loaded content close to the viewport must not vanish; drawing only
             // ever touches the nearest ~86 tiles, so a drawn tile is never evicted).
@@ -740,7 +768,7 @@ fn nav_store_insert(
 }
 
 /// Decode a Google/OSRM polyline5 string into (lat, lon) pairs.
-fn decode_polyline5(encoded: &str) -> Vec<(f64, f64)> {
+pub(crate) fn decode_polyline5(encoded: &str) -> Vec<(f64, f64)> {
     let bytes = encoded.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 4);
     let (mut lat, mut lon): (i64, i64) = (0, 0);
@@ -778,7 +806,7 @@ fn decode_polyline5(encoded: &str) -> Vec<(f64, f64)> {
     out
 }
 
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+pub(crate) fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let (la1, lo1, la2, lo2) = (
         lat1.to_radians(),
         lon1.to_radians(),
@@ -791,6 +819,44 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 }
 
 /// Meters per world pixel at `zoom` and latitude (256px web-mercator tiles).
+/// `"lat,lon,kind;…"` -> the pins. Kind 0 origin, 1 a stop, 2 the destination.
+///
+/// Shared by the `set_route_markers` method and the `route_markers` property, so the
+/// imperative and declarative paths cannot drift into parsing it differently.
+/// A 0,0 pin is dropped: that is an unresolved endpoint, not the Gulf of Guinea.
+fn parse_route_markers(s: &str) -> Vec<(f64, f64, u8)> {
+    let mut out: Vec<(f64, f64, u8)> = Vec::new();
+    for part in s.split(';') {
+        let f: Vec<&str> = part.split(',').collect();
+        if f.len() >= 3 {
+            if let (Ok(lat), Ok(lon), Ok(kind)) = (
+                f[0].trim().parse::<f64>(),
+                f[1].trim().parse::<f64>(),
+                f[2].trim().parse::<u8>(),
+            ) {
+                if lat != 0.0 || lon != 0.0 {
+                    out.push((lat, lon, kind));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Is this a place, or the "no fix" sentinel?
+///
+/// `sys.gps` answers **-9999** for a coordinate it does not have, and a card cannot
+/// guard on that: a guard is evaluated when the card is realized, before any live
+/// value exists, so a card that tried would remove its own map. The check belongs
+/// here, where both the fix and the route are known.
+///
+/// Without it a follow camera with no fix centres on -9999 — a blank map somewhere
+/// off the Gulf of Guinea, with the trip's route drawn nowhere near it and the turn
+/// banner above it still reading like guidance.
+fn is_a_place(lat: f64, lon: f64) -> bool {
+    lat.abs() <= 90.0 && lon.abs() <= 180.0 && (lat != 0.0 || lon != 0.0)
+}
+
 fn meters_per_world_px(lat_deg: f64, zoom: f64) -> f64 {
     40075016.686 * lat_deg.to_radians().cos() / tile_world_size_zoom(zoom)
 }
@@ -969,6 +1035,30 @@ pub struct MapView {
     nav_mode: ArcStringMut,
     #[live]
     nav_polyline: ArcStringMut,
+    // The trip's pins, as `"lat,lon,kind;…"`. A live PROPERTY as well as the
+    // `set_route_markers` method, because a declarative backend sets properties and
+    // cannot call methods: the L0 nav card drew its route with no pins at all, since
+    // `nav_markers` was reachable only through the method and `draw_nav_route_pins`
+    // returns on its first line when the list is empty.
+    #[live]
+    route_markers: ArcStringMut,
+    /// What the drawn route COSTS, as a bubble on the path itself: two lines
+    /// separated by `|`, in practice a duration over a distance.
+    ///
+    /// On the route rather than in the sheet, because that is where it answers the
+    /// question you are asking — "how long is THAT way" — and because a sheet has to
+    /// pick one number while a map can label each line it draws.
+    ///
+    /// A pipe, not the `\u{1}` this used to say: the separator travels through a DSL
+    /// string literal, and a control character was debug-escaped into six literal
+    /// characters on the way, so the bubble rendered its own escape sequence.
+    #[live]
+    route_badge: ArcStringMut,
+
+    // What `route_markers` last parsed to, so the string is re-parsed when it
+    // changes and not once per frame.
+    #[rust]
+    route_markers_seen: String,
     #[live(92.0)]
     nav_period: f64,
     #[live(34.0)]
@@ -1107,6 +1197,32 @@ pub struct MapView {
     // path to place the moving vehicle puck.
     #[rust]
     nav_car_norm: Vec2d,
+    // The declared position the FOLLOW camera last drew from, so the frame loop
+    // can tell "the device moved" from "the device is parked". Without it a
+    // follow map re-arms every frame like the simulated drive does, and a card
+    // sitting at a red light pins the GPU — the same defect the settle gate was
+    // added for, arriving through a new mode.
+    #[rust]
+    nav_follow_at: DVec2,
+    // The route length the FOLLOW camera last projected against. A route that
+    // arrives after the first frame changes where the fix projects to, and
+    // nothing else in the gate can tell that the answer moved.
+    #[rust]
+    nav_follow_total: f64,
+    // Where the FOLLOW camera currently is along the route, in metres, eased toward
+    // the latest measured fix. Without it the camera snapped once per fix.
+    #[rust]
+    nav_follow_d: f64,
+    // The segment between the two most recent fixes, and when each arrived. The
+    // follow camera sweeps this, one interval behind. See `update_nav_camera`.
+    #[rust]
+    nav_seg_from: f64,
+    #[rust]
+    nav_seg_to: f64,
+    #[rust]
+    nav_seg_t0: f64,
+    #[rust]
+    nav_seg_t1: f64,
     #[rust]
     tiles: HashMap<TileKey, TileEntry>,
     #[rust]
@@ -1181,6 +1297,27 @@ impl ScriptHook for MapView {
         let min_zoom = self.min_zoom.max(0.0);
         let max_zoom = self.max_zoom.max(min_zoom);
         self.zoom = self.zoom.clamp(min_zoom, max_zoom);
+        // A CENTRE THAT IS NOT A PLACE IS IGNORED.
+        //
+        // `sys.gps` answers -9999 with no fix, and a card handed that centres the
+        // camera on an impossible latitude. Fitting an extent to it and prefetching
+        // around it loaded tiles at world scale: measured on a OnePlus 6, 441% CPU
+        // and memory climbing past 3 GB, against 0% and 229 MB for the same app
+        // with no map. The tile store's own cap is the backstop and it is sized for
+        // a drive radius, not for a garbage extent.
+        //
+        // Guarding HERE rather than in the card is deliberate. A card cannot check
+        // this: `when here.ok == 1` is evaluated at REALIZE time, before any live
+        // value exists, so it is false for every freshly generated card and removes
+        // the map unconditionally. The widget is the only layer that sees the
+        // number it was actually given.
+        if !(-90.0..=90.0).contains(&self.center_lat)
+            || !(-180.0..=180.0).contains(&self.center_lon)
+        {
+            self.center_lat = 0.0;
+            self.center_lon = 0.0;
+            self.zoom = self.zoom.min(3.0);
+        }
         self.center_norm = lon_lat_to_normalized(self.center_lon, self.center_lat);
         self.wrap_and_clamp_center();
         self.normalize_source_mode();
@@ -1255,21 +1392,7 @@ impl Widget for MapView {
                         heap.cast_to_string(value, out);
                         out.to_string()
                     });
-                    let mut next: Vec<(f64, f64, u8)> = Vec::new();
-                    for part in s.split(';') {
-                        let f: Vec<&str> = part.split(',').collect();
-                        if f.len() >= 3 {
-                            if let (Ok(lat), Ok(lon), Ok(kind)) = (
-                                f[0].trim().parse::<f64>(),
-                                f[1].trim().parse::<f64>(),
-                                f[2].trim().parse::<u8>(),
-                            ) {
-                                if lat != 0.0 || lon != 0.0 {
-                                    next.push((lat, lon, kind));
-                                }
-                            }
-                        }
-                    }
+                    let next = parse_route_markers(&s);
                     if next != self.nav_markers {
                         self.nav_markers = next;
                         self.nav_poly_hash = 0; // force ensure_nav_route re-tessellate
@@ -1583,7 +1706,59 @@ impl Widget for MapView {
             // map (the reported sluggishness). Async tile arrivals repaint via
             // their own UI signal (ToUISender → handle_tile_worker_messages), so
             // they don't depend on this loop.
+            // A FOLLOW map is static exactly when the device is. Each new fix
+            // re-arms the tail, which also carries the bearing ease that turns
+            // the camera; a parked device draws nothing after it expires.
+            let follow_moved = self.is_follow() && {
+                // The same source the camera reads, or the gate would settle while
+                // the fix moved and the map would stop mid-journey.
+                let (flat, flon) =
+                    match crate::makepad_draw::makepad_platform::gps::last_gps_fix() {
+                        Some(f) => (f.lat, f.lon),
+                        None => (self.center_lat, self.center_lon),
+                    };
+                let now = lon_lat_to_normalized(flon, flat);
+                let moved = (now.x - self.nav_follow_at.x).abs() > 1e-9
+                    || (now.y - self.nav_follow_at.y).abs() > 1e-9;
+                self.nav_follow_at = now;
+                // The ROUTE ARRIVING counts as motion too, and forgetting that is
+                // what made a follow camera look broken.
+                //
+                // Follow mode positions itself by projecting the declared fix onto
+                // the route, so with no geometry the projection is 0 and the camera
+                // sits at the route's start. The polyline arrives over the network,
+                // several frames later — and by then the fix has not changed, so
+                // the gate below saw nothing moving and stopped asking for frames.
+                // The camera stayed parked at the origin of the trip for the rest
+                // of the card's life, with the correct fix in hand the whole time.
+                let total = self.nav_cum.last().copied().unwrap_or(0.0);
+                let arrived = (total - self.nav_follow_total).abs() > 0.5;
+                self.nav_follow_total = total;
+                moved || arrived
+            };
+            // A FOLLOW map is always moving, and that is not the same claim as the
+            // simulated drive's.
+            //
+            // `follow_moved` below can tell that the fix changed, but only while the
+            // widget is DRAWING — it is computed in the draw path and compares against
+            // state the draw path updates. Once the settle tail expires the widget
+            // stops drawing, and then nothing can notice the next fix: the camera
+            // parks until something else forces a frame, which is a card re-resolve
+            // every 40 m. Measured that way: bursts of 30% pixel change separated by
+            // intervals of exactly 0.0%, which is precisely what "it is static" looks
+            // like.
+            //
+            // So a live navigation view keeps its pump running, as the `2d`/`3d` sim
+            // modes always have. The difference from them is what the frames DRAW: a
+            // simulated vehicle advances whether or not anything moved, while this
+            // re-reads the device's fix and holds still when the device does. The
+            // GPU-pinning that the settle gate was added for was a STATIC map asking
+            // for frames it had no use for; this one has a use for every frame.
+            //
+            // `follow_moved` is still computed, and still re-arms the tail, because it
+            // is what carries the bearing ease and the route-arrival case.
             let moving = !self.is_plan()
+                || follow_moved
                 || self.nav_zoom_anim.is_some()
                 || self.nav_pan_anim.is_some()
                 || !self.nav_touches.is_empty();
@@ -1849,15 +2024,22 @@ impl Widget for MapView {
                 self.draw_nav_route_line(rect, off_x, off_y, view_zoom);
                 self.draw_nav_route_pins(cx, rect, off_x, off_y, view_zoom);
             } else {
-                self.draw_nav_labels(cx, rect, off_x, off_y);
                 self.draw_nav_route_pins(cx, rect, off_x, off_y, view_zoom);
                 self.draw_nav_puck(cx, rect, off_x, off_y, view_zoom);
             }
             self.draw_ui.end(cx);
-            // Plan street/place labels are TEXT (draw_text), so they go after the
-            // draw_ui vector session — on top of the tiles + route line.
+            // Street/place labels are TEXT (`draw_text`), so they go AFTER the
+            // draw_ui vector session — on top of the tiles and the route line.
+            //
+            // The nav ones were called INSIDE that session, which is why a driving
+            // map had no street names at all: the text was submitted to a vector
+            // pass that does not draw text. The plan pass sat two lines below with a
+            // comment explaining exactly this, and the nav call never moved with it.
             if self.is_plan() {
                 self.draw_nav_labels_plan(cx, rect, off_x, off_y, view_zoom);
+                self.draw_route_badge(cx, rect, off_x, off_y, view_zoom);
+            } else {
+                self.draw_nav_labels(cx, rect, off_x, off_y);
             }
             self.label_perf = LabelPerfStats::default();
         } else {
@@ -2025,6 +2207,31 @@ impl WidgetMatchEvent for MapView {
 }
 
 // --- MapView impl ---
+
+/// The corner a nav card's controls stand in, which a street label may not enter.
+///
+/// A card draws its own chrome over the map — the zoom pill, the recenter ring, and
+/// whatever it docked below them — and the widget cannot measure siblings it does not
+/// own. The corner is a constant of the L0 theme's control column instead: 74 wide,
+/// and deep enough for a pill over a ring over one docked chip.
+///
+/// SHARED, because it was written for the 2D pass alone and 3D never had it.
+///
+/// It was not what R3.5 recorded, though. That note said the keep-out "should fire by
+/// arithmetic and does not", and the arithmetic was right to within one unit: measured
+/// on device, "Bayshore Freeway" computed a right edge of 302.9 against a threshold of
+/// 304.0 and cleared it, while its ink ran to 331 and under the pill. The rect was a
+/// quarter too narrow because the pass sized labels as `chars * font_size * 0.52`. The
+/// fix is `label_width_at`; this function was only ever half of it.
+///
+/// 300 rather than the 250 it started at: the column used to be a fixed offset inside
+/// the map and now flows under the instruction banner, so it reaches further down —
+/// measured to about 285 with a 2D/3D chip below the ring. Over-reserving costs a
+/// label in a corner; under-reserving is the illegible overlap this exists to stop.
+fn nav_label_under_controls(rect: Rect, label: Rect) -> bool {
+    label.pos.x + label.size.x > rect.pos.x + rect.size.x - 74.0
+        && label.pos.y < rect.pos.y + 300.0
+}
 
 impl MapView {
     fn rebuild_compiled_styles(&mut self) {
@@ -2359,16 +2566,69 @@ impl MapView {
     /// 0 = normal map, 1 = 3D chase FPV, 2 = 2D heading-up.
     fn nav_kind(&self) -> u8 {
         match self.nav_mode.as_ref().trim() {
-            "3d" | "3D" => 1,
-            // "plan" is a 2D variant: same projection (renders the ribbon), but
-            // a STATIC north-up camera fit to the whole route (route preview).
-            "2d" | "2D" | "plan" => 2,
+            // `follow3d` is the 3D PROJECTION with the measured camera: the
+            // tilted chase view the app this replaces shows while driving (its
+            // R8.1), positioned from the device's own fix rather than from a
+            // simulated vehicle. `3d` keeps the simulated drive it always had.
+            "3d" | "3D" | "follow3d" => 1,
+            // "plan" and "follow" are 2D variants: the same projection, so the
+            // ribbon renders, with different cameras. See `is_plan`/`is_follow`.
+            "2d" | "2D" | "plan" | "follow" => 2,
             _ => 0,
         }
     }
 
     fn is_plan(&self) -> bool {
         self.nav_mode.as_ref().trim() == "plan"
+    }
+
+    /// FOLLOW: the camera goes where the DEVICE is, and nowhere on its own.
+    ///
+    /// The distinction from `"2d"` is the whole reason this mode exists. `"2d"`
+    /// drives a simulated vehicle along the route at `nav_speed_mph` off
+    /// `sim_clock_secs()` — a demo camera, and a convincing one: it looks exactly
+    /// like navigating, which is why it survived as long as it did. Anything bound
+    /// to it reports a trip that is not happening.
+    ///
+    /// `"follow"` takes its position from `center_lat`/`center_lon`, which a card
+    /// declares from the device's own fix. The camera then moves when, and only
+    /// when, the device does. It is also why this mode may render at all under
+    /// L0: a generated card cannot state a fact it did not observe, and a camera
+    /// pose is a fact about where the user is.
+    fn is_follow(&self) -> bool {
+        matches!(self.nav_mode.as_ref().trim(), "follow" | "follow3d")
+    }
+
+    /// Route metres at the point on the route closest to `p` (normalized coords).
+    ///
+    /// The CLOSEST segment, not the first one near enough: a route that doubles
+    /// back — a U-turn, a cloverleaf, a street driven twice — has two segments by
+    /// the same point, and taking the earlier would rewind the camera to a turn
+    /// already made.
+    fn nav_route_distance_at(&self, p: DVec2) -> f64 {
+        let (pts, cum) = (&self.nav_pts, &self.nav_cum);
+        if pts.len() < 2 || cum.len() < pts.len() {
+            return 0.0;
+        }
+        let (mut best_off2, mut best_at) = (f64::MAX, 0.0);
+        for i in 0..pts.len() - 1 {
+            let (a, b) = (pts[i], pts[i + 1]);
+            let v = dvec2(b.x - a.x, b.y - a.y);
+            let w = dvec2(p.x - a.x, p.y - a.y);
+            let len2 = v.x * v.x + v.y * v.y;
+            let t = if len2 > 0.0 {
+                ((w.x * v.x + w.y * v.y) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (dx, dy) = (w.x - v.x * t, w.y - v.y * t);
+            let off2 = dx * dx + dy * dy;
+            if off2 < best_off2 {
+                best_off2 = off2;
+                best_at = cum[i] + (cum[i + 1] - cum[i]) * t;
+            }
+        }
+        best_at
     }
 
     /// PLAN route-preview camera: STATIC, north-up, fit to the WHOLE route,
@@ -2475,6 +2735,18 @@ impl MapView {
     /// (casing + semi-transparent core) at NAV_REF_Z. Cached by content hash —
     /// cheap on the 1 Hz card rebuilds.
     fn ensure_nav_route(&mut self, cx: &mut Cx) {
+        // Adopt the declarative pins before hashing: a change to them has to force a
+        // re-tessellation the same way a new polyline does, since plan mode bakes the
+        // pin geometry into the route's.
+        let pins = self.route_markers.as_ref().to_string();
+        if pins != self.route_markers_seen {
+            self.route_markers_seen = pins.clone();
+            let next = parse_route_markers(&pins);
+            if next != self.nav_markers {
+                self.nav_markers = next;
+                self.nav_poly_hash = 0;
+            }
+        }
         let poly = self.nav_polyline.as_ref().trim().to_string();
         if poly.is_empty() {
             return;
@@ -2701,12 +2973,115 @@ impl MapView {
             return;
         }
         let total = self.nav_cum.last().copied().unwrap_or(0.0);
-        // CONSTANT-SPEED sim: drive at `nav_speed_mph` and LOOP at the route end
-        // (period-normalized sweeping made long routes absurdly fast and short
-        // ones crawl). Looping avoids the old "parked at destination" problem.
-        // The card's banner clock uses the same `(clock*mps) % total`.
-        let mps = (self.nav_speed_mph.max(1.0)) * 0.44704;
-        let d = (crate::splash::sim_clock_secs() * mps) % total.max(1.0);
+        // How far along the route we are — MEASURED when the card declared a
+        // position, simulated otherwise.
+        let d = if self.is_follow() {
+            // THE FIX IS READ HERE, every frame, from the platform.
+            //
+            // It used to come from `center_lat`/`center_lon`, and that is a property
+            // set once when the widget tree is built — so the camera only moved when
+            // the whole card re-resolved. Emitting `sys.gps("lat")` into the property
+            // instead was worse: nothing re-evaluates it, so the centre became a
+            // constant and the camera froze completely. Measured on a OnePlus 6: 21
+            // fixes, ~105 m of travel, 0.0% of pixels different.
+            //
+            // A position that changes every second is not a property. Reading the
+            // store the `LocationListener` writes costs a mutex and needs no rebuild,
+            // no epoch bump and no card involvement at all — which is what made it
+            // safe to raise the GPS epoch threshold for the TEXT.
+            //
+            // The declared centre remains the fallback for the frame before the
+            // first fix lands.
+            let fix = crate::makepad_draw::makepad_platform::gps::last_gps_fix()
+                .map(|f| (f.lat, f.lon))
+                .filter(|(lat, lon)| is_a_place(*lat, *lon))
+                .or(Some((self.center_lat, self.center_lon)))
+                .filter(|(lat, lon)| is_a_place(*lat, *lon));
+            // Project onto the route so the puck sits on the road — a raw fix
+            // wanders off it by a lane's width — while the position it reports stays
+            // the device's own.
+            //
+            // NO FIX AND NO CENTRE: the START of the route, which is 0 along it. Not
+            // an early return — the follow path still has to set this mode's shader
+            // parameters, and handing that job to the plan camera wrote plan-mode
+            // params into a 3D map and drew a screen with no tiles on it at all.
+            // Everything downstream wants a distance along the route, and "we do not
+            // know where the driver is" is honestly the beginning of the trip.
+            let target = match fix {
+                Some((flat, flon)) => self.nav_route_distance_at(lon_lat_to_normalized(flon, flat)),
+                None => 0.0,
+            };
+            // EASE toward the measurement instead of snapping to it.
+            //
+            // A fix arrives roughly once a second and the camera draws sixty times a
+            // second, so jumping straight to each one shows one discrete lurch per
+            // fix — reported as "一顿一顿的", and correctly: the map was moving in
+            // steps because the data does.
+            //
+            // This is smoothing between two MEASUREMENTS, not invention. The target
+            // is always a real projected fix and an ease never passes its target, so
+            // the camera is only ever somewhere between where the device was and
+            // where it is — never ahead of it. That is the distinction from the sim
+            // mode this replaces, which advanced a position on a clock whether or not
+            // anything moved.
+            //
+            // 0.12 converges in about 200 ms at 60 fps: fast enough that the puck sits
+            // on the road, slow enough that a fix's jitter does not twitch the camera.
+            // A large jump — the first fix, or a re-route — snaps rather than crawling
+            // across the map for seconds.
+            // INTERPOLATE between the last two fixes, one interval behind.
+            //
+            // Three attempts at this, each removing a different kind of jank:
+            //
+            //   snap to each fix      — a visible lurch per fix, ~1.4 Hz
+            //   ease toward the fix   — smooth in POSITION, lumpy in VELOCITY: the
+            //                           camera lunges at each new fix and decays, so
+            //                           it pulses at the fix rate
+            //   advance at the measured rate — uniform until the camera catches the
+            //                           latest measurement, then it stalls against the
+            //                           clamp until the next one arrives
+            //
+            // This one plays the segment between the two most recent fixes, delayed by
+            // one fix interval, so there is always a known segment underfoot and the
+            // sweep is exactly linear. No rate to estimate, nothing to catch up to, no
+            // clamp to hit.
+            //
+            // It never leaves the measured path: every rendered position lies between
+            // two real fixes. That is the line the simulated drive mode crosses, and
+            // the reason the delay is worth its cost — a camera one second behind the
+            // truth is honest, a camera ahead of it is invented.
+            let now = crate::splash::sim_clock_secs();
+            if (target - self.nav_seg_to).abs() > 0.01 {
+                // A new measurement closes the current segment and opens the next.
+                self.nav_seg_from = self.nav_seg_to;
+                self.nav_seg_to = target;
+                self.nav_seg_t0 = self.nav_seg_t1;
+                self.nav_seg_t1 = now;
+            }
+            if (target - self.nav_follow_d).abs() > 400.0 {
+                // First fix, or a re-route: snap rather than crawl across the map.
+                self.nav_follow_d = target;
+                self.nav_seg_from = target;
+                self.nav_seg_to = target;
+                self.nav_seg_t0 = now;
+                self.nav_seg_t1 = now;
+            } else {
+                let span = (self.nav_seg_t1 - self.nav_seg_t0).max(0.05);
+                // `now - span` is one interval behind, which places it inside the
+                // segment just closed for the whole of the next one.
+                let frac = ((now - span - self.nav_seg_t0) / span).clamp(0.0, 1.0);
+                self.nav_follow_d =
+                    self.nav_seg_from + (self.nav_seg_to - self.nav_seg_from) * frac;
+            }
+            self.nav_follow_d
+        } else {
+            // CONSTANT-SPEED sim: drive at `nav_speed_mph` and LOOP at the route
+            // end (period-normalized sweeping made long routes absurdly fast and
+            // short ones crawl). Looping avoids the old "parked at destination"
+            // problem. The card's banner clock uses the same `(clock*mps) % total`.
+            let mps = (self.nav_speed_mph.max(1.0)) * 0.44704;
+            (crate::splash::sim_clock_secs() * mps) % total.max(1.0)
+        };
 
         let Some(car) = sample_polyline_point_at_distance(&self.nav_pts, &self.nav_cum, d) else {
             return;
@@ -2927,7 +3302,25 @@ impl MapView {
             }
             let fx = off_x + wx * scale;
             let fy = off_y + wy * scale;
-            let Some((sx, sy, a)) = self.nav_project_flat(fx, fy) else {
+            // The projection has to MATCH THE CAMERA. `nav_project_flat` is the 3D
+            // pinhole; a 2D heading-up view is `nav_project_plan`, and its own doc
+            // says so. Using the pinhole for both put every 2D label somewhere the
+            // ground under it was not — a name that slid against the map instead of
+            // sticking to its own street.
+            let flat_2d = self.nav_kind() == 2;
+            let projected = if flat_2d {
+                let (sx, sy) = self.nav_project_plan(fx, fy);
+                // No depth in a top-down view, so "distance ahead" is the screen
+                // distance from the puck — which is what the size ramp wants anyway.
+                let d = ((sx - (rect.pos.x + rect.size.x * 0.5)).powi(2)
+                    + (sy - (rect.pos.y + rect.size.y * 0.6)).powi(2))
+                .sqrt()
+                .max(1.0);
+                Some((sx, sy, d))
+            } else {
+                self.nav_project_flat(fx, fy)
+            };
+            let Some((sx, sy, a)) = projected else {
                 continue;
             };
             if a > far_cut {
@@ -2946,7 +3339,7 @@ impl MapView {
             }
             // strong perspective depth cue: near ~19 px, far ~8 px
             let fs = (19.0 * (cam_h * 1.6 / a)).clamp(8.0, 19.0) as f32;
-            let w = text.chars().count() as f64 * fs as f64 * 0.5;
+            let w = label_width_at(&text, fs as f64);
             // 2.5D standing pin: an upright pin STANDS at the exact ground point
             // (tip down, head up — consistent with the perspective) and the
             // readable label rides above the head. Pin height + head scale with
@@ -2958,6 +3351,9 @@ impl MapView {
                 pos: dvec2(sx - w * 0.5, label_y),
                 size: dvec2(w, fs as f64 * 1.3),
             };
+            if nav_label_under_controls(rect, lr) {
+                continue;
+            }
             if placed
                 .iter()
                 .any(|p| rects_overlap_with_padding(*p, lr, 4.0))
@@ -2988,6 +3384,64 @@ impl MapView {
     /// nav_project_plan (so they sit on the tiles), dark text with a white halo
     /// so they read over roads/water. Called OUTSIDE the draw_ui session so the
     /// text batches on top.
+    /// The route's own summary, drawn ON the route at its half-way point.
+    ///
+    /// Half way ALONG the path, not half way between its ends: a route that loops
+    /// away and back would put its midpoint in open country nowhere near the line.
+    fn draw_route_badge(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
+        let raw = self.route_badge.as_ref().trim().to_string();
+        if raw.is_empty() || self.nav_pts.len() < 2 {
+            return;
+        }
+        let lines: Vec<&str> = raw.split('|').filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            return;
+        }
+        let total = self.nav_cum.last().copied().unwrap_or(0.0);
+        if total <= 0.0 {
+            return;
+        }
+        let half = total * 0.5;
+        let at = self
+            .nav_cum
+            .iter()
+            .position(|d| *d >= half)
+            .unwrap_or(self.nav_pts.len() - 1)
+            .min(self.nav_pts.len() - 1);
+        let zoom = self.request_zoom_level();
+        let world = tile_world_size(zoom);
+        let scale = 2.0_f64.powf(view_zoom - zoom as f64);
+        let pt = self.nav_pts[at];
+        let (sx, sy) = self.nav_project_plan(
+            off_x + pt.x * world * scale,
+            off_y + pt.y * world * scale,
+        );
+        if sx < rect.pos.x || sx > rect.pos.x + rect.size.x || sy < rect.pos.y {
+            return;
+        }
+        let fs = 15.0;
+        let widest = lines
+            .iter()
+            .map(|l| label_width_at(l, fs))
+            .fold(0.0_f64, f64::max);
+        let w = widest + 22.0;
+        let h = lines.len() as f64 * fs * 1.35 + 14.0;
+        let bx = (sx - w * 0.5).clamp(rect.pos.x + 4.0, rect.pos.x + rect.size.x - w - 4.0);
+        let by = sy - h - 10.0;
+        self.draw_dot.color = vec4(0.13, 0.47, 0.96, 1.0);
+        self.draw_dot.draw_abs(cx, Rect { pos: dvec2(bx, by), size: dvec2(w, h) });
+        self.draw_text.text_style.font_size = fs as f32;
+        self.draw_text.color = vec4(1.0, 1.0, 1.0, 1.0);
+        for (i, line) in lines.iter().enumerate() {
+            let lw = label_width_at(line, fs);
+            self.draw_text.draw_abs(
+                cx,
+                dvec2(bx + (w - lw) * 0.5, by + 7.0 + i as f64 * fs * 1.35),
+                line,
+            );
+        }
+    }
+
     fn draw_nav_labels_plan(&mut self, cx: &mut Cx2d, rect: Rect, off_x: f64, off_y: f64, view_zoom: f64) {
         let zoom = self.request_zoom_level();
         let world = tile_world_size(zoom);
@@ -3033,16 +3487,12 @@ impl MapView {
             {
                 continue;
             }
-            let w = text.chars().count() as f64 * fs as f64 * 0.52;
+            let w = label_width_at(&text, fs as f64);
             let lr = Rect {
                 pos: dvec2(sx - w * 0.5, sy - fs as f64 * 0.6),
                 size: dvec2(w, fs as f64 * 1.2),
             };
-            // keep names out from under the top-right controls (the +/- zoom pill
-            // and the my-location button) so they never render clipped behind UI.
-            let ctrl_left = rect.pos.x + rect.size.x - 74.0;
-            let ctrl_bottom = rect.pos.y + 250.0;
-            if lr.pos.x + lr.size.x > ctrl_left && lr.pos.y < ctrl_bottom {
+            if nav_label_under_controls(rect, lr) {
                 continue;
             }
             if placed

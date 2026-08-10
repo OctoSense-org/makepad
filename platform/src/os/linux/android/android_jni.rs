@@ -576,6 +576,49 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     {
         std::env::set_var("MAKEPAD_SEED_CARD_FILE", &seed);
     }
+    // TEST-ONLY passthrough: `--es makepad.SEED_L0_FILE <card>` plus
+    // `--es makepad.SEED_L0_DATA <json>` → the matching env vars, so the app can
+    // seed an L0 LEDGER rather than an already-lowered card.
+    //
+    // The distinction matters: SEED_CARD_FILE above pushes lowered DSL, which is
+    // inert by construction — nothing on device knows which card produced it, so
+    // a tap has nowhere to land. Seeding the ledger lets the app hold the source
+    // and re-realize it, which is what makes an interaction local.
+    //
+    // `SEED_L0_EVENT`/`SEED_L0_VALUE` open the card on a state a tap would have
+    // reached. They were passed by the harness and dropped HERE, which is why
+    // every "detail view" capture was silently a capture of the list — the
+    // screenshot looked like a card, so nothing said the event never arrived.
+    //
+    // `FAKE_GPS_FILE`/`FAKE_GPS_MS` walk a track of `lat,lon` lines as if the
+    // device were driving it. That is the only way to test that navigation MOVES:
+    // everything downstream of `sys.gps` can be verified correct and frozen, and a
+    // handset sitting 3.7 km from the nearest routable road reports zero progress —
+    // correctly — so a working follow camera and a broken one are the same
+    // screenshot. The fixes go through `set_gps_fix`, the same function the
+    // `LocationListener` calls, so nothing above the platform can tell them apart.
+    //
+    // They are dropped here rather than read directly for the reason the two above
+    // it were: `SEED_L0_EVENT`/`SEED_L0_VALUE` were passed by the harness and not
+    // listed, so every "detail view" capture was silently a capture of the list.
+    // The screenshot looked like a card, so nothing said the extra never arrived —
+    // which is exactly how the first FAKE_GPS run failed, with no log line at all.
+    for name in [
+        "SEED_L0_FILE",
+        "SEED_L0_DATA",
+        "SEED_L0_EVENT",
+        "SEED_L0_VALUE",
+        "FAKE_GPS_FILE",
+        "FAKE_GPS_MS",
+    ] {
+        let var = format!("MAKEPAD_{name}");
+        std::env::remove_var(&var);
+        if let Some(v) = get_intent_string_extra(env, activity, &format!("makepad.{name}"))
+            .filter(|v| !v.trim().is_empty())
+        {
+            std::env::set_var(&var, &v);
+        }
+    }
     // LOCAL DEBUG: per-draw GL tracing on device (emulator paint diagnosis).
     if let Some(v) = get_intent_string_extra(env, activity, "makepad.GL_DRAW_TRACE")
     {
@@ -1179,7 +1222,7 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_onLocation(
     lon: jni_sys::jdouble,
     acc: jni_sys::jfloat,
 ) {
-    crate::gps::set_gps_fix(lat as f64, lon as f64, acc as f32);
+    crate::gps::set_gps_fix_from_listener(lat as f64, lon as f64, acc as f32);
 }
 
 #[no_mangle]

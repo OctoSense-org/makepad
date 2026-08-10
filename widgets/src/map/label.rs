@@ -304,7 +304,17 @@ pub fn label_shape_attempt_budget(view_zoom: f64) -> usize {
     }
 }
 
-pub fn estimate_label_width_pixels(text: &str, font_scale: f32) -> f64 {
+/// A label's width in EM-ISH UNITS, before any font size is applied.
+///
+/// Split out of `estimate_label_width_pixels` so the nav label passes can share it.
+/// They had their own estimate — `chars * font_size * 0.52` — which treats "MM" and
+/// "il" as the same width and came out about a quarter narrow on ordinary mixed-case
+/// road names. That is not a rounding error in a collision test: "Bayshore Freeway"
+/// measured 108 units against a drawn 136, so its right edge computed to 302.9
+/// against a 304.0 keep-out threshold and cleared it by one unit, while the ink ran
+/// 27 units past the edge and straight under the zoom pill. Two labels could overlap
+/// each other by the same margin.
+pub fn label_width_units(text: &str) -> f64 {
     let mut units = 0.0_f64;
     for ch in text.chars() {
         units += if ch.is_whitespace() {
@@ -317,7 +327,20 @@ pub fn estimate_label_width_pixels(text: &str, font_scale: f32) -> f64 {
             0.92
         };
     }
-    (units * 8.0 * font_scale as f64 + 6.0).max(12.0)
+    units
+}
+
+pub fn estimate_label_width_pixels(text: &str, font_scale: f32) -> f64 {
+    (label_width_units(text) * 8.0 * font_scale as f64 + 6.0).max(12.0)
+}
+
+/// A label's width at a font size, for the nav passes' screen-space rects.
+///
+/// 0.75 rather than a fitted 0.72: over-estimating costs a label in a crowded corner,
+/// under-estimating draws two names through each other. Calibrated on device against
+/// drawn ink — "Bayshore Freeway" at 13 units measures 136, this returns 142.
+pub fn label_width_at(text: &str, font_size: f64) -> f64 {
+    label_width_units(text) * font_size * 0.75
 }
 
 pub fn road_label_priority(road_kind: &str) -> u8 {

@@ -484,6 +484,38 @@ impl Cx {
                         (gl.glBindVertexArray)(vao.vao.unwrap());
                         // bind the vertex and indexbuffers
                         (gl.glBindBuffer)(gl_sys::ARRAY_BUFFER, vao.geom_vb.unwrap());
+                        #[cfg(target_env = "ohos")]
+                        {
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static N: AtomicUsize = AtomicUsize::new(0);
+                            if N.fetch_add(1, Ordering::Relaxed) < 40 {
+                                let vstride_f = shgl.geometries.first().map(|a| a.stride / 4).unwrap_or(1) as usize;
+                                let nverts = if vstride_f > 0 { geometry.vertices.len() / vstride_f } else { 0 };
+                                let maxidx = geometry.indices.iter().copied().max().unwrap_or(0);
+                                crate::log!(
+                                    "IDXCHK shader={} nverts={} n_indices={} max_index={} in_range={}",
+                                    draw_call.draw_shader_id.index,
+                                    nverts,
+                                    geometry.indices.len(),
+                                    maxidx,
+                                    (maxidx as usize) < nverts,
+                                );
+                                for a in &shgl.geometries {
+                                    crate::log!(
+                                        "  GEOMATTR shader={} loc={:?} size={} stride={} offset={}",
+                                        draw_call.draw_shader_id.index,
+                                        a.loc, a.size, a.stride, a.offset
+                                    );
+                                }
+                                for a in &shgl.instances {
+                                    crate::log!(
+                                        "  INSTATTR shader={} loc={:?} size={} stride={} offset={}",
+                                        draw_call.draw_shader_id.index,
+                                        a.loc, a.size, a.stride, a.offset
+                                    );
+                                }
+                            }
+                        }
                         for attr in &shgl.geometries {
                             if let Some(loc) = attr.loc {
                                 match attr.attr_format {
