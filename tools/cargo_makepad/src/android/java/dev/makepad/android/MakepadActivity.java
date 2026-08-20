@@ -1772,6 +1772,9 @@ public class MakepadActivity
                     if (locations == null || locations.isEmpty()) return;
                     onLocationChanged(locations.get(locations.size() - 1));
                 }
+                // Same companion-class hazard as the batched overload above, so
+                // implement it too — and for the same reason, no `@Override`.
+                public void onFlushComplete(int requestCode) {}
             };
         }
         try {
