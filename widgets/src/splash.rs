@@ -131,11 +131,35 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     vm.add_method(
         sys,
         id_lut!(photo),
-        script_args_def!(query = NIL),
+        script_args_def!(query = NIL, cond = NIL),
         |vm, args| {
             let query_value = script_value!(vm, args.query);
             let mut query = String::new();
             vm.bx.heap.cast_to_string(query_value, &mut query);
+            // THE DAY, folded in. A card reading 92 % rain under a sunlit
+            // backdrop is the page disagreeing with its own tiles, and the card
+            // cannot fix that itself: the condition is a live fact, so it has to
+            // arrive here rather than be written into the prompt by the model.
+            //
+            // Appended, never substituted — the SCENE is the card's words and
+            // this only says what the sky is doing over them. A placeholder is
+            // dropped rather than described: "—" is not weather.
+            let cond_value = script_value!(vm, args.cond);
+            let mut cond = String::new();
+            vm.bx.heap.cast_to_string(cond_value, &mut cond);
+            let cond = cond.trim();
+            if !cond.is_empty()
+                && cond != "\u{2014}"
+                && cond != "n/a"
+                && !cond.starts_with("$[")
+                && !cond.eq_ignore_ascii_case("nil")
+            {
+                if !query.trim().is_empty() {
+                    query.push_str(", ");
+                }
+                query.push_str(&cond.to_lowercase());
+                query.push_str(" weather");
+            }
 
             // AI-generated, always ON-TOPIC 9:16 portrait image. loremflickr
             // OR-matches comma tags, so a multi-word subject ("paris eiffel
@@ -144,6 +168,20 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             // matches the subject and is high quality — the "nano banana"-style
             // AI source the app wants for beautiful full-screen backgrounds.
             let q = query.trim();
+            // A SUBJECT THAT HAS NOT ARRIVED IS NOT A SUBJECT. `sys.photo(query:
+            // place.name)` is resolved at draw time, and while the geocode is in
+            // flight the name is the placeholder — so the card asked flux to
+            // generate an image of "—", waited for it, and then asked again for
+            // the real place once the name landed. Two generations per card, and
+            // the first is a picture of nothing.
+            //
+            // No URL is the honest answer: the image is simply absent until the
+            // subject exists, and the next redraw asks once, for the place.
+            // Distinct from the EMPTY case below — an empty query is a card
+            // deliberately asking for any handsome backdrop, and it gets one.
+            if matches!(q, "—" | "n/a") || q.starts_with("$[") {
+                return vm.bx.heap.new_string_from_str("");
+            }
             let q = if q.is_empty() {
                 "beautiful cinematic landscape scenery, golden hour"
             } else {
@@ -414,6 +452,30 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         },
     );
 
+    // sys.fetch(url) -> the raw response body, or "" while it loads. This is the
+    // ONLY Rust in the movie-detail path: a brokered HTTP primitive, nothing
+    // movie- or Wikipedia-specific. The URL-building and JSON parsing are done by
+    // the Splash data-source script that sys.wiki evaluates below.
+    vm.add_method(
+        sys,
+        id_lut!(fetch),
+        script_args_def!(url = NIL),
+        |vm, args| {
+            let url_v = script_value!(vm, args.url);
+            let mut url = String::new();
+            vm.bx.heap.cast_to_string(url_v, &mut url);
+            let url = url.trim();
+            if url.is_empty() {
+                return vm.bx.heap.new_string_from_str("");
+            }
+            let out = match vm.host.cx_mut().script_data_fetch(url) {
+                Some(bytes) => String::from_utf8_lossy(&bytes[..]).into_owned(),
+                None => String::new(),
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
     // sys.geocodenum(name, "lat"|"lon") -> the coordinate as a NUMBER, -9999
     // while the lookup loads / when the place is unknown — the anchor for a map
     // card. Guard the whole card body on it:
@@ -473,6 +535,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = format!(
                 "https://router.project-osrm.org/route/v1/driving/{}?overview=false",
                 osrm_coords(lat1, lon1, lat2, lon2, &vias)
@@ -526,6 +591,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let out = match nav_route_cached(vm, &url) {
                 Some(route) => match field.trim() {
@@ -577,6 +645,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let out = match nav_route_cached(vm, &url) {
                 Some(route) => nav_step_field(&route, d, field.trim()),
@@ -619,6 +690,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let n = match nav_route_cached(vm, &url) {
                 Some(route) => nav_progress_m(&route, at_lat, at_lon),
@@ -655,6 +729,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let n = match nav_route_cached(vm, &url) {
                 Some(route) => nav_step_num(&route, d, field.trim()),
@@ -695,6 +772,201 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let secs = crate::splash::sim_clock_secs();
             let v = if period > 0.0 { secs % period } else { secs };
             ScriptValue::from_f64(v)
+        },
+    );
+
+    // sys.citytime(lat, lon, "field") -> the CURRENT wall-clock time AT A PLACE,
+    // as a string. The DST-correct UTC offset comes from ONE cached open-meteo
+    // fetch per lat/lon (`timezone=auto`); the time itself is the device clock
+    // plus that offset, so a `fn tick()` card re-reading it every second costs
+    // nothing after the first fetch.
+    //   "hm"   -> "14:05"      "hms"     -> "14:05:09"
+    //   "h12"  -> "2:05 PM"    "day"     -> "Mon"     "day_zh"  -> "周一"
+    //   "date" -> "Aug 4"      "date_zh" -> "8月4日"
+    //   "offset" -> "UTC+9" / "UTC+5:30" / "UTC-7"    "tz" -> "Asia/Tokyo"
+    // Returns "—" while the offset fetch loads; the next tick fills it in.
+    vm.add_method(
+        sys,
+        id_lut!(citytime),
+        script_args_def!(lat = NIL, lon = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let field_value = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_value, &mut field);
+            let url = tz_offset_url(lat, lon);
+            let value = match vm.host.cx_mut().script_data_fetch(&url) {
+                Some(bytes) => match field.trim() {
+                    "tz" => json_pluck(&bytes, "timezone").unwrap_or_else(|| "—".to_string()),
+                    "abbr" => json_pluck(&bytes, "timezone_abbreviation")
+                        .unwrap_or_else(|| "—".to_string()),
+                    f => match tz_offset_secs(&bytes) {
+                        Some(off) => format_city_time(now_unix_secs() as i64 + off, off, f),
+                        None => "—".to_string(),
+                    },
+                },
+                None => vm.host.cx_mut().script_data_placeholder(&url),
+            };
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+
+    // sys.citytimenum(lat, lon, "field") -> the same place-local clock as a
+    // NUMBER for script conditions (day/night row theming, analog hands):
+    //   "hour" 0-23   "hour12" 1-12   "minute"   "second"   "offsecs"
+    // -9999 while the offset fetch loads.
+    vm.add_method(
+        sys,
+        id_lut!(citytimenum),
+        script_args_def!(lat = NIL, lon = NIL, field = NIL),
+        |vm, args| {
+            let lat = script_value!(vm, args.lat).as_number().unwrap_or(0.0);
+            let lon = script_value!(vm, args.lon).as_number().unwrap_or(0.0);
+            let field_value = script_value!(vm, args.field);
+            let mut field = String::new();
+            vm.bx.heap.cast_to_string(field_value, &mut field);
+            let url = tz_offset_url(lat, lon);
+            let n = vm
+                .host
+                .cx_mut()
+                .script_data_fetch(&url)
+                .and_then(|bytes| tz_offset_secs(&bytes))
+                .map(|off| {
+                    let local = now_unix_secs() as i64 + off;
+                    let (h, m, s) = hms_from_secs(local);
+                    match field.trim() {
+                        "hour" => h as f64,
+                        "hour12" => {
+                            let x = h % 12;
+                            if x == 0 { 12.0 } else { x as f64 }
+                        }
+                        "minute" => m as f64,
+                        "second" => s as f64,
+                        "offsecs" => off as f64,
+                        _ => -9999.0,
+                    }
+                })
+                .unwrap_or(-9999.0);
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.fx("FROM", "TO") -> the LIVE exchange rate as a display string
+    // ("0.8669", "156.68") — ExchangeRate-API open endpoint, keyless.
+    // ONE cached fetch per FROM currency covers every TO. "—" while loading.
+    // For MATH use sys.fxnum; never write a literal rate into a card.
+    vm.add_method(
+        sys,
+        id_lut!(fx),
+        script_args_def!(from = NIL, to = NIL),
+        |vm, args| {
+            let from_value = script_value!(vm, args.from);
+            let mut from = String::new();
+            vm.bx.heap.cast_to_string(from_value, &mut from);
+            let from = from.trim().to_ascii_uppercase();
+            let to_value = script_value!(vm, args.to);
+            let mut to = String::new();
+            vm.bx.heap.cast_to_string(to_value, &mut to);
+            let to = to.trim().to_ascii_uppercase();
+            let value = if from == to {
+                "1".to_string()
+            } else {
+                let url = fx_url(&from, &to);
+                match vm.host.cx_mut().script_data_fetch(&url) {
+                    Some(bytes) => json_pluck(&bytes, FX_RATE_PATH)
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(format_fx_rate)
+                        .unwrap_or_else(|| "—".to_string()),
+                    None => vm.host.cx_mut().script_data_placeholder(&url),
+                }
+            };
+            vm.bx.heap.new_string_from_str(&value)
+        },
+    );
+
+    // sys.fxnum("FROM", "TO") -> the raw rate as a NUMBER for math:
+    //   app.amt * sys.fxnum("USD", "EUR")
+    // -9999 while loading — gate on `>= 0` before showing a converted amount.
+    vm.add_method(
+        sys,
+        id_lut!(fxnum),
+        script_args_def!(from = NIL, to = NIL),
+        |vm, args| {
+            let from_value = script_value!(vm, args.from);
+            let mut from = String::new();
+            vm.bx.heap.cast_to_string(from_value, &mut from);
+            let from = from.trim().to_ascii_uppercase();
+            let to_value = script_value!(vm, args.to);
+            let mut to = String::new();
+            vm.bx.heap.cast_to_string(to_value, &mut to);
+            let to = to.trim().to_ascii_uppercase();
+            let n = if from == to {
+                1.0
+            } else {
+                let url = fx_url(&from, &to);
+                vm.host
+                    .cx_mut()
+                    .script_data_fetch(&url)
+                    .and_then(|bytes| json_pluck(&bytes, FX_RATE_PATH))
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(-9999.0)
+            };
+            ScriptValue::from_f64(n)
+        },
+    );
+
+    // sys.fmtdur(secs) -> a duration/clock string: "04:35" under an hour,
+    // "1:04:35" from an hour up. Negative clamps to "00:00". Pure math — the
+    // timer/stopwatch formatter (the script engine has no floor or %).
+    vm.add_method(
+        sys,
+        id_lut!(fmtdur),
+        script_args_def!(secs = NIL),
+        |vm, args| {
+            let n = script_value!(vm, args.secs).as_number().unwrap_or(0.0);
+            let t = if n.is_finite() && n > 0.0 { n.round() as i64 } else { 0 };
+            let (h, m, s) = (t / 3600, (t / 60) % 60, t % 60);
+            let out = if h > 0 {
+                format!("{h}:{m:02}:{s:02}")
+            } else {
+                format!("{m:02}:{s:02}")
+            };
+            vm.bx.heap.new_string_from_str(&out)
+        },
+    );
+
+    // sys.fmtnum(x, maxdecimals) -> x as a display string with AT MOST that many
+    // decimals, trailing zeros trimmed: sys.fmtnum(42.0, 6) -> "42",
+    // sys.fmtnum(0.866934, 4) -> "0.8669". THE display formatter for calculator
+    // results and converted amounts — the script engine cannot round.
+    vm.add_method(
+        sys,
+        id_lut!(fmtnum),
+        script_args_def!(x = NIL, decimals = NIL),
+        |vm, args| {
+            let x = script_value!(vm, args.x).as_number().unwrap_or(0.0);
+            let d = script_value!(vm, args.decimals)
+                .as_number()
+                .unwrap_or(2.0)
+                .clamp(0.0, 9.0) as usize;
+            let mut out = if x.is_finite() {
+                format!("{x:.d$}")
+            } else {
+                "—".to_string()
+            };
+            if out.contains('.') {
+                while out.ends_with('0') {
+                    out.pop();
+                }
+                if out.ends_with('.') {
+                    out.pop();
+                }
+            }
+            if out == "-0" {
+                out = "0".to_string();
+            }
+            vm.bx.heap.new_string_from_str(&out)
         },
     );
 
@@ -2184,6 +2456,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
+            // An empty query is not a search — photon answers it 400, and the
+            // one thing that can come back is a terminal failure for nothing.
+            if query.trim().is_empty() {
+                return vm.bx.heap.new_string_from_str("");
+            }
             let url = search_url(query.trim());
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => String::new(),
@@ -2211,6 +2488,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
+            if query.trim().is_empty() {
+                return ScriptValue::from_f64(-9999.0);
+            }
             let url = search_url(query.trim());
             let n = match vm.host.cx_mut().script_data_fetch(&url) {
                 None => -9999.0,
@@ -2253,6 +2533,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let vias_v = script_value!(vm, args.vias);
             let mut vias = String::new();
             vm.bx.heap.cast_to_string(vias_v, &mut vias);
+            if !osrm_ready(lat1, lon1, lat2, lon2) {
+                return vm.bx.heap.new_string_from_str("—");
+            }
             let url = navroute_url(lat1, lon1, lat2, lon2, &vias);
             let n = match nav_route_cached(vm, &url) {
                 Some(route) => match field.trim() {
@@ -2657,6 +2940,17 @@ fn collection_at(name: &str, index: usize) -> Option<String> {
 /// stored list — and a second copy of this match is how they would drift into
 /// answering the same question two different ways.
 fn yahoo_chart_field(bytes: &[u8], field: &str) -> String {
+    // Did Yahoo actually answer with a chart? A refusal still arrives as a
+    // complete HTTP response with a JSON body, so the fetch layer hands it over
+    // as success and every field below falls back to an em dash — which the host
+    // reads as "still fetching" (`state_of_answer` in the app's l0_card.rs), not
+    // as a failure. Measured on the 6T: Yahoo answered `429 Too Many Requests`
+    // and the card sat on "Fetching the quote…" indefinitely, which is the one
+    // thing §5.9's two states exist to keep apart. `n/a` is the failed sentinel,
+    // so the card renders its own `.failed` copy instead.
+    if json_pluck(bytes, "chart.result.0.meta.symbol").is_none() {
+        return "n/a".into();
+    }
     let m = |k: &str| format!("chart.result.0.meta.{k}");
                 let num = |k: &str| json_pluck(&bytes, &m(k)).and_then(|s| s.parse::<f64>().ok());
                 // Monetary fields formatted to a consistent 2 decimals (Yahoo
@@ -2775,6 +3069,11 @@ fn body_binds_live_data(body: &str) -> bool {
         // covers sys.navroute/navstep/navstepnum — the nav card's body must
         // re-evaluate ONCE when the OSRM fetch lands (fills nav_polyline)
         || body.contains("sys.nav")
+        // covers sys.citytimenum too — the clock card's body must re-evaluate
+        // once the tz-offset fetch lands (fn tick() then keeps it current)
+        || body.contains("sys.citytime")
+        // covers sys.fxnum too (sys.fmtnum does NOT match this prefix)
+        || body.contains("sys.fx")
 }
 
 /// Height (dp) of bar `index` of `count` for an intraday sparkline, from Yahoo's
@@ -3013,6 +3312,96 @@ fn weekday_from_days(z: i64) -> usize {
 /// Abbreviated weekday names, index 0 = Sunday.
 const DAY_EN: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const DAY_ZH: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+/// Abbreviated month names, index 0 = January (for sys.citytime "date").
+const MONTH_EN: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The minimal open-meteo request that still carries `utc_offset_seconds` +
+/// `timezone` — sys.citytime's ONE cached fetch per place. Deliberately a
+/// DIFFERENT URL from sys.weather's so a pure clock card downloads ~300 bytes,
+/// not a 7-day forecast (they cache separately; a card using both fetches both).
+fn tz_offset_url(lat: f64, lon: f64) -> String {
+    format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.4}&longitude={lon:.4}\
+&timezone=auto&forecast_days=1"
+    )
+}
+
+/// The DST-correct UTC offset (seconds) out of an open-meteo response.
+fn tz_offset_secs(bytes: &[u8]) -> Option<i64> {
+    json_pluck(bytes, "utc_offset_seconds")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|v| v as i64)
+}
+
+/// Split place-local unix seconds into (hour 0-23, minute, second).
+fn hms_from_secs(local: i64) -> (i64, i64, i64) {
+    let sod = local.rem_euclid(86_400);
+    (sod / 3600, (sod / 60) % 60, sod % 60)
+}
+
+/// Render one sys.citytime field from place-local unix seconds + the offset.
+fn format_city_time(local: i64, off: i64, field: &str) -> String {
+    let (h, m, s) = hms_from_secs(local);
+    let days = local.div_euclid(86_400);
+    match field {
+        "hms" => format!("{h:02}:{m:02}:{s:02}"),
+        "h12" => {
+            let x = h % 12;
+            let h12 = if x == 0 { 12 } else { x };
+            let ap = if h < 12 { "AM" } else { "PM" };
+            format!("{h12}:{m:02} {ap}")
+        }
+        "day" => DAY_EN[weekday_from_days(days)].to_string(),
+        "day_zh" => DAY_ZH[weekday_from_days(days)].to_string(),
+        "date" => {
+            let (_y, mo, d) = civil_from_days(days);
+            format!("{} {}", MONTH_EN[(mo as usize).clamp(1, 12) - 1], d)
+        }
+        "date_zh" => {
+            let (_y, mo, d) = civil_from_days(days);
+            format!("{mo}月{d}日")
+        }
+        "offset" => {
+            let sign = if off < 0 { "-" } else { "+" };
+            let a = off.abs();
+            let (oh, om) = (a / 3600, (a / 60) % 60);
+            if om == 0 {
+                format!("UTC{sign}{oh}")
+            } else {
+                format!("UTC{sign}{oh}:{om:02}")
+            }
+        }
+        // "hm" and anything unrecognized: the clock's bread-and-butter form.
+        _ => format!("{h:02}:{m:02}"),
+    }
+}
+
+/// ONE cached FX fetch per currency PAIR — Yahoo's intraday FX chart, the
+/// same host + browser UA the stock helpers already use (proven on-device).
+/// NOTE: the Cloudflare-fronted keyless FX APIs (api.frankfurter.dev,
+/// open.er-api.com) both HANG from the Android TLS stack (no response, no
+/// error, no timeout) while working from desktop — do not switch back
+/// without on-device proof.
+fn fx_url(from: &str, to: &str) -> String {
+    format!("https://query1.finance.yahoo.com/v8/finance/chart/{from}{to}=X")
+}
+
+/// Where the live rate lives in Yahoo's chart response.
+const FX_RATE_PATH: &str = "chart.result.0.meta.regularMarketPrice";
+
+/// Display precision for an FX rate: 156.68, 7.253, 0.8669.
+fn format_fx_rate(r: f64) -> String {
+    if r >= 100.0 {
+        format!("{r:.2}")
+    } else if r >= 10.0 {
+        format!("{r:.3}")
+    } else {
+        format!("{r:.4}")
+    }
+}
 
 /// Reduce a 7-element `daily.*` temperature array to its min or max.
 ///
@@ -3504,6 +3893,17 @@ fn osrm_coords(lat1: f64, lon1: f64, lat2: f64, lon2: f64, vias: &str) -> String
 /// One URL per (from, vias…, to) so sys.navroute, sys.navstep and the MapView
 /// widget all share a single deduped OSRM fetch. The via list keys into the
 /// cache for free (the full URL is the key).
+/// Whether a trip's endpoints are REAL yet. `sys.searchnum` answers -9999
+/// while its geocode is in flight (and forever for an empty query), and that
+/// sentinel was going out on the wire as a coordinate: measured,
+/// `route/v1/driving/-9999.00000,-9999.00000;…` → 400 — which is TERMINAL, so
+/// every such call also burned a permanent failure for nothing. A route whose
+/// endpoint is not a place yet is not a route to fetch; it is a route to wait
+/// for, and "—" already means exactly that.
+fn osrm_ready(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> bool {
+    [lat1, lon1, lat2, lon2].iter().all(|v| *v > -9998.0)
+}
+
 fn navroute_url(lat1: f64, lon1: f64, lat2: f64, lon2: f64, vias: &str) -> String {
     format!(
         "https://router.project-osrm.org/route/v1/driving/{}?overview=full&steps=true",
@@ -4645,8 +5045,19 @@ impl Splash {
             if let Some(scope) = scope_obj {
                 let tick_fn = vm.bx.heap.scope_value(scope, name, vm.trap());
                 if !tick_fn.is_nil() && !tick_fn.is_err() {
-                    vm.call(tick_fn, &[]);
+                    let ret = vm.call(tick_fn, &[]);
+                    if ret.is_err() {
+                        crate::log!("[SPLASH] call_fn({name:?}): fn returned err {ret:?}");
+                    }
+                } else {
+                    crate::log!(
+                        "[SPLASH] call_fn({name:?}): not found in body scope (nil={} err={})",
+                        tick_fn.is_nil(),
+                        tick_fn.is_err()
+                    );
                 }
+            } else {
+                crate::log!("[SPLASH] call_fn({name:?}): no body matches unique_id");
             }
         });
 

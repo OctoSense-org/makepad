@@ -2307,6 +2307,41 @@ impl Cx {
 
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
 
+        // Self-capture: while MAKEPAD_WRITE_FRAMEBUFFER_PNG is set, dump this
+        // pass's framebuffer as a PNG to that path. Lets octos photograph its
+        // OWN rendered card so the dev-loop can vision-score what actually drew
+        // — the visual check headless validation can't do. Size from
+        // display_size (pass_rect() is None for the fullscreen pass).
+        if let Some(path) = std::env::var_os("MAKEPAD_WRITE_FRAMEBUFFER_PNG") {
+            let w = self.os.display_size.x as u32;
+            let h = self.os.display_size.y as u32;
+            if w > 0 && h > 0 {
+                let gl = self.os.gl();
+                let mut pixels = vec![0u8; (w * h * 4) as usize];
+                unsafe {
+                    (gl.glReadPixels)(
+                        0,
+                        0,
+                        w as i32,
+                        h as i32,
+                        gl_sys::RGBA,
+                        gl_sys::UNSIGNED_BYTE,
+                        pixels.as_mut_ptr() as *mut _,
+                    );
+                }
+                let stride = (w * 4) as usize;
+                for y in 0..(h as usize / 2) {
+                    let top = y * stride;
+                    let bot = ((h as usize) - 1 - y) * stride;
+                    for x in 0..stride {
+                        pixels.swap(top + x, bot + x);
+                    }
+                }
+                if let Ok(png) = Self::encode_rgba_as_png(w, h, &pixels) {
+                    let _ = std::fs::write(path, png);
+                }
+            }
+        }
         //to_java.swap_buffers();
         //unsafe {
         //direct_app.drm.swap_buffers_and_wait(&direct_app.egl);

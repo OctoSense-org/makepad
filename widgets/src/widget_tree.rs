@@ -2404,6 +2404,139 @@ impl WidgetTree {
         }
         out
     }
+
+    /// Every laid-out node as JSON, for deterministic layout checking.
+    ///
+    /// `compact_dump` and `snapshot` both stop at the box a widget asked for.
+    /// The defects worth gating on live in the gap between that box and what
+    /// survived — so this also carries the CLIPPED rect, and the ink and fill
+    /// colours, which are the only way to check contrast without guessing at
+    /// pixels. See `lab/gates/` for the checks that consume it.
+    pub fn geometry_json(&self, cx: &Cx) -> String {
+        self.sync_dirty();
+        let inner = self.inner.borrow();
+
+        let mut widget_type_names: HashMap<TypeId, LiveId> = HashMap::new();
+        {
+            let widget_registry = cx.components.get::<WidgetRegistry>();
+            for (type_id, (info, _)) in widget_registry.map.iter() {
+                widget_type_names.insert(*type_id, info.name);
+            }
+        }
+        fn token(id: LiveId) -> String {
+            if id == LiveId(0) {
+                return "-".to_string();
+            }
+            id.as_string(|n| n.map(str::to_string).unwrap_or_else(|| format!("{:x}", id.0)))
+        }
+        fn esc(s: &str) -> String {
+            let mut o = String::with_capacity(s.len() + 2);
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    '\r' => o.push_str("\\r"),
+                    '\t' => o.push_str("\\t"),
+                    c if (c as u32) < 0x20 => o.push(' '),
+                    c => o.push(c),
+                }
+            }
+            o
+        }
+        // argb hex, the same form the L0 palettes are written in
+        fn argb(v: &[f32; 4]) -> String {
+            let b = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u32;
+            format!("#{:02x}{:02x}{:02x}{:02x}", b(v[3]), b(v[0]), b(v[1]), b(v[2]))
+        }
+
+        let mut out = String::from("{\"widgets\":[");
+        let mut first = true;
+        for (index, node) in inner.nodes.iter().enumerate() {
+            let Some(widget) = node.widget.upgrade() else {
+                continue;
+            };
+            let area = widget.area();
+            if !area.is_valid(cx) {
+                continue;
+            }
+            // union, not `rect` — a Label is one instance per glyph
+            let r = area.rect_union(cx, false);
+            let c = area.rect_union(cx, true);
+            if r.size.x <= 0.0 || r.size.y <= 0.0 {
+                continue;
+            }
+            let kind = widget
+                .widget_type_id()
+                .and_then(|t| widget_type_names.get(&t).copied())
+                .map(token)
+                .unwrap_or_else(|| "-".to_string());
+
+            let mut buf = [0f32; 4];
+            let fg = widget
+                .borrow::<crate::label::Label>()
+                .and_then(|l| l.draw_text.get_instance_on_area(cx, live_id!(color), &mut buf).then(|| argb(&buf)));
+            let mut buf2 = [0f32; 4];
+            let bg = widget
+                .borrow::<crate::view::View>()
+                .and_then(|v| v.draw_bg.get_instance_on_area(cx, live_id!(color), &mut buf2).then(|| argb(&buf2)));
+
+            let text = widget.text();
+            let text = text.trim();
+            // How many quads the draw actually emitted. For a text run that is
+            // one per GLYPH, so a count short of the string's own length is the
+            // renderer saying, in the only way it can, that the text did not
+            // fit. Nothing else after layout carries that fact.
+            let glyphs = match area {
+                Area::Instance(inst) => Some(inst.instance_count),
+                _ => None,
+            };
+
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            let _ = write!(
+                out,
+                "{{\"i\":{},\"parent\":{},\"id\":\"{}\",\"kind\":\"{}\",\
+                 \"x\":{},\"y\":{},\"w\":{},\"h\":{},\
+                 \"cx\":{},\"cy\":{},\"cw\":{},\"ch\":{}",
+                index,
+                if node.parent == NONE { -1 } else { node.parent as i64 },
+                esc(&token(inner.names[index])),
+                esc(&kind),
+                r.pos.x.round() as i64,
+                r.pos.y.round() as i64,
+                r.size.x.round() as i64,
+                r.size.y.round() as i64,
+                c.pos.x.round() as i64,
+                c.pos.y.round() as i64,
+                c.size.x.round() as i64,
+                c.size.y.round() as i64,
+            );
+            if !text.is_empty() {
+                let _ = write!(out, ",\"text\":\"{}\"", esc(text));
+                if let Some(g) = glyphs {
+                    let _ = write!(out, ",\"glyphs\":{g}");
+                }
+            }
+            if let Some(fg) = fg {
+                let _ = write!(out, ",\"fg\":\"{fg}\"");
+            }
+            if let Some(bg) = bg {
+                let _ = write!(out, ",\"bg\":\"{bg}\"");
+            }
+            if kind == "Button" {
+                out.push_str(",\"tappable\":true");
+            }
+            if kind.contains("Scroll") || kind == "PortalList" {
+                out.push_str(",\"scroller\":true");
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
 }
 
 // ============================================================================

@@ -488,6 +488,28 @@ impl Widget for Button {
             }
             return ScriptAsyncResult::Return(NIL);
         }
+        if method == live_id!(set_visible) {
+            // Same truthiness contract as View's script set_visible — Buttons
+            // are show/hidden by cards too (e.g. a popup's dismiss scrim), and
+            // MethodNotFound here silently no-ops the card's toggle.
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+                if !value.is_err() {
+                    let s = vm.bx.heap.temp_string_with(|heap, out| {
+                        heap.cast_to_string(value, out);
+                        out.to_string()
+                    });
+                    let t = s.trim();
+                    let vis = !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false"));
+                    vm.with_cx_mut(|cx| {
+                        self.visible = vis;
+                        self.redraw(cx);
+                    });
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
         if method == live_id!(on_click) {
             let uid = self.widget_uid();
             vm.with_cx_mut(|cx| {

@@ -268,6 +268,93 @@ impl Area {
         };
     }
 
+    /// The union of EVERY instance in this area, not just the first.
+    ///
+    /// `rect` and `clipped_rect` both read `instance_offset` alone, which is
+    /// right for a quad and wrong for anything that draws a run: a `Label`
+    /// emits one instance per glyph, so `rect` returns the box of its first
+    /// character. Layout checking needs the whole run — a text box reported as
+    /// 10x13 when it is really 210x13 makes every geometric check nonsense.
+    ///
+    /// `clipped` selects between the raw box and the one the clip left behind.
+    pub fn rect_union(&self, cx: &Cx, clipped: bool) -> Rect {
+        let Area::Instance(inst) = self else {
+            return if clipped { self.clipped_rect(cx) } else { self.rect(cx) };
+        };
+        if inst.instance_count <= 1 {
+            return if clipped { self.clipped_rect(cx) } else { self.rect(cx) };
+        }
+        let draw_list = &cx.draw_lists[inst.draw_list_id];
+        if draw_list.redraw_id != inst.redraw_id {
+            return Rect::default();
+        }
+        let draw_item = &draw_list.draw_items[inst.draw_item_id];
+        let Some(draw_call) = draw_item.draw_call() else {
+            return Rect::default();
+        };
+        let sh = &cx.draw_shaders[draw_call.draw_shader_id.index];
+        let (Some(rect_pos), Some(rect_size)) = (sh.mapping.rect_pos, sh.mapping.rect_size) else {
+            return Rect::default();
+        };
+        let stride = sh.mapping.instances.total_slots;
+        if stride == 0 {
+            return Rect::default();
+        }
+        let Some(buf) = draw_item.instances.as_ref() else {
+            return Rect::default();
+        };
+
+        let mut acc: Option<Rect> = None;
+        for n in 0..inst.instance_count {
+            let base = inst.instance_offset + n * stride;
+            if base + rect_size + 1 >= buf.len() {
+                break;
+            }
+            let pos = dvec2(buf[base + rect_pos] as f64, buf[base + rect_pos + 1] as f64);
+            let size = dvec2(buf[base + rect_size] as f64, buf[base + rect_size + 1] as f64);
+            let mut r = Rect { pos, size };
+            if clipped {
+                if let Some(draw_clip) = sh.mapping.draw_clip {
+                    let p1 = dvec2(buf[base + draw_clip] as f64, buf[base + draw_clip + 1] as f64);
+                    let p2 = dvec2(
+                        buf[base + draw_clip + 2] as f64,
+                        buf[base + draw_clip + 3] as f64,
+                    );
+                    r = r.clip((p1, p2));
+                    if draw_list.draw_list_has_clip {
+                        let p3 = dvec2(
+                            draw_list.draw_list_uniforms.view_clip.x as f64,
+                            draw_list.draw_list_uniforms.view_clip.y as f64,
+                        );
+                        let p4 = dvec2(
+                            draw_list.draw_list_uniforms.view_clip.z as f64,
+                            draw_list.draw_list_uniforms.view_clip.w as f64,
+                        );
+                        let shift = dvec2(
+                            draw_list.draw_list_uniforms.view_shift.x as f64,
+                            draw_list.draw_list_uniforms.view_shift.y as f64,
+                        );
+                        r = r.translate(shift).clip((p3, p4));
+                    }
+                }
+            }
+            if r.size.x <= 0.0 || r.size.y <= 0.0 {
+                continue;
+            }
+            acc = Some(match acc {
+                None => r,
+                Some(a) => {
+                    let x0 = a.pos.x.min(r.pos.x);
+                    let y0 = a.pos.y.min(r.pos.y);
+                    let x1 = (a.pos.x + a.size.x).max(r.pos.x + r.size.x);
+                    let y1 = (a.pos.y + a.size.y).max(r.pos.y + r.size.y);
+                    Rect { pos: dvec2(x0, y0), size: dvec2(x1 - x0, y1 - y0) }
+                }
+            });
+        }
+        acc.unwrap_or_default()
+    }
+
     pub fn rect(&self, cx: &Cx) -> Rect {
         return match self {
             Area::Instance(inst) => {

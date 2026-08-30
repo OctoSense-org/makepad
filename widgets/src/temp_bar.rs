@@ -32,6 +32,14 @@ script_mod! {
             wmin: uniform(0.0)
             wmax: uniform(1.0)
 
+            // Mood-owned FLAT mode: when `flat_ink` carries alpha the bar is a
+            // faint full-width rail plus a single-hue lo..hi segment — the
+            // restrained treatment a photo-mood card asks for. Alpha 0 (the
+            // default) keeps the legacy nine-stop spectrum, so no existing
+            // card changes. Branch-free on purpose: MPSL lets are immutable.
+            flat_ink: uniform(vec4(0.0))
+            rail_ink: uniform(vec4(0.0))
+
             // Nine-stop cold→hot ramp, matching the Android view's palette.
             //
             // Inlined rather than a helper `fn`: `draw_bg +:` extends a FROZEN
@@ -72,7 +80,13 @@ script_mod! {
                         + vec3(1.000, 0.541, 0.000) * max(0.0, 1.0 - abs(x - 6.0))
                         + vec3(1.000, 0.294, 0.063) * max(0.0, 1.0 - abs(x - 7.0))
                         + vec3(0.878, 0.106, 0.106) * max(0.0, 1.0 - abs(x - 8.0))
-                sdf.fill(vec4(col, 1.0))
+                let flat = step(0.001, self.flat_ink.w)
+                sdf.fill(mix(vec4(col, 1.0), self.rail_ink, flat))
+                // The segment: only visible in flat mode (alpha rides `flat`).
+                let seg_a = a * self.rect_size.x
+                let seg_w = max((b - a) * self.rect_size.x, track)
+                sdf.box(seg_a, top, seg_w, track, track * 0.5)
+                sdf.fill(vec4(self.flat_ink.xyz, self.flat_ink.w * flat))
                 return sdf.result
             }
         }

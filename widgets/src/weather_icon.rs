@@ -18,6 +18,11 @@ script_mod! {
         show_bg: true
         draw_bg +: {
             cond: uniform(0.0)
+            // Mood-owned MONO ink: when it carries alpha, the finished glyph is
+            // recoloured to a single-ink silhouette — the line-art restraint a
+            // photo-mood card asks for instead of the filled multi-colour icon.
+            // Alpha 0 (default) keeps the legacy colours.
+            mono_ink: uniform(vec4(0.0))
 
             pixel: fn() {
                 let sdf = Sdf2d.viewport(self.pos * self.rect_size)
@@ -80,7 +85,12 @@ script_mod! {
                     sdf.circle(cx + r*0.2, cyy - r*0.5, r*1.15) sdf.fill(#xdbe6f5)
                     sdf.circle(cx + r*1.2, cyy + r*0.15, r*0.85) sdf.fill(#xc4cede)
                     sdf.box(cx - r*1.9, cyy + r*0.1, r*3.8, r*1.0, r*0.5) sdf.fill(#xd4e0f0)
-                    let base = cyy + r*1.2  let span = h - base + 24.0
+                    // The travel must END inside the box: a drop is 15 tall and is drawn
+                    // DOWNWARD from y0, so the last frame's bottom edge is
+                    // base + span + 15. This read `+ 24.0`, which put that edge 39px
+                    // BELOW the widget — the drops fell out of their own row and
+                    // landed above the next row's cloud, where they read as its rain.
+                    let base = cyy + r*1.2  let span = max(0.0, h - base - 15.0)
                     let y0 = base + fract(t*0.95)*span       sdf.box(cx - w*0.22, y0, 3.0, 15.0, 1.5) sdf.fill(#x6db6ff)
                     let y1 = base + fract(t*1.15+0.35)*span   sdf.box(cx - w*0.06, y1, 3.0, 15.0, 1.5) sdf.fill(#x6db6ff)
                     let y2 = base + fract(t*0.85+0.62)*span   sdf.box(cx + w*0.10, y2, 3.0, 15.0, 1.5) sdf.fill(#x6db6ff)
@@ -99,7 +109,7 @@ script_mod! {
                         sdf.line_to(cx-w*0.07, base+h*0.46) sdf.line_to(cx+w*0.08, base+h*0.16) sdf.line_to(cx+w*0.0, base+h*0.16)
                         sdf.line_to(cx+w*0.06, base) sdf.close_path() sdf.fill(#xffd23c)
                     }
-                    let span = h-base+20.0
+                    let span = max(0.0, h - base - 13.0)   // drop is 13 tall; keep its bottom inside h
                     let y0 = base + fract(t*1.1)*span       sdf.box(cx-w*0.20, y0, 3.0, 13.0, 1.5) sdf.fill(#x6db6ff)
                     let y1 = base + fract(t*1.3+0.5)*span   sdf.box(cx+w*0.16, y1, 3.0, 13.0, 1.5) sdf.fill(#x6db6ff)
                 } else if c < 5.5 {
@@ -109,7 +119,7 @@ script_mod! {
                     sdf.circle(cx + r*0.2, cyy - r*0.5, r*1.15) sdf.fill(#xdbe6f5)
                     sdf.circle(cx + r*1.2, cyy + r*0.15, r*0.85) sdf.fill(#xc4cede)
                     sdf.box(cx - r*1.9, cyy + r*0.1, r*3.8, r*1.0, r*0.5) sdf.fill(#xd4e0f0)
-                    let base = cyy + r*1.3  let span = h-base+18.0
+                    let base = cyy + r*1.3  let span = max(0.0, h - base - 4.5)   // flake radius 4.5
                     let f0 = fract(t*0.45)       sdf.circle(cx-w*0.18 + sin(f0*6.28)*w*0.03, base+f0*span, 4.5) sdf.fill(#xffffff)
                     let f1 = fract(t*0.38+0.4)   sdf.circle(cx+w*0.02 + sin(f1*6.28)*w*0.03, base+f1*span, 4.5) sdf.fill(#xffffff)
                     let f2 = fract(t*0.5+0.7)    sdf.circle(cx+w*0.17 + sin(f2*6.28)*w*0.03, base+f2*span, 4.5) sdf.fill(#xffffff)
@@ -135,7 +145,11 @@ script_mod! {
                     sdf.box(cx - w*0.22 + sin(t*0.9+1.2)*w*0.05, b+h*0.13, w*0.44, 6.0, 3.0) sdf.fill(#xc6d2e2)
                     sdf.box(cx - w*0.26 + sin(t*0.9+2.3)*w*0.05, b+h*0.26, w*0.48, 6.0, 3.0) sdf.fill(#xd0dcec)
                 }
-                return sdf.result
+                let mono = step(0.001, self.mono_ink.w)
+                // Premultiplied, like everything Sdf2d returns: an
+                // unpremultiplied ink here painted the whole quad solid.
+                let ma = sdf.result.w * self.mono_ink.w
+                return mix(sdf.result, vec4(self.mono_ink.xyz * ma, ma), mono)
             }
         }
     }

@@ -185,6 +185,16 @@ impl CxScriptResources {
     }
 
     /// Does `request_id` belong to an in-flight data fetch?
+    /// The URL a loading fetch was issued for — for failure logs, so a wire
+    /// problem names the wire. Six identical "status=400" lines with no URL is
+    /// how a Pennsylvania waypoint hid inside a Stanford trip.
+    pub fn data_fetch_url(&self, request_id: LiveId) -> Option<String> {
+        let map = self.data_fetches.borrow();
+        map.iter().find_map(|(url, fetch)| {
+            matches!(fetch, DataFetch::Loading(id) if *id == request_id).then(|| url.clone())
+        })
+    }
+
     pub fn is_data_fetch(&self, request_id: LiveId) -> bool {
         self.data_fetches
             .borrow()
@@ -591,6 +601,7 @@ impl Cx {
         }
         let request_id = LiveId::unique();
         self.script_data.resources.begin_data_fetch(url, request_id);
+        crate::log!("Script data fetch: issuing {url}");
         let mut req = HttpRequest::new(url.to_string(), Default::default());
         // Host-appropriate UA — Yahoo 429s without a browser-ish one, Overpass
         // 406s ON the bare browser signature (see data_fetch_user_agent).

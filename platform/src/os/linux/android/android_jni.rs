@@ -610,6 +610,11 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
         "SEED_L0_VALUE",
         "FAKE_GPS_FILE",
         "FAKE_GPS_MS",
+        // The self-evolving-app harness: names the on-device dev master's
+        // mission file. Added the day the comment above came true AGAIN — the
+        // extra was passed, not listed, and round 1 never started, with no log
+        // line saying why.
+        "DEV_GOAL_FILE",
     ] {
         let var = format!("MAKEPAD_{name}");
         std::env::remove_var(&var);
