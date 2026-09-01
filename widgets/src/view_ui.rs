@@ -153,7 +153,12 @@ script_mod! {
                 sdf.fill_keep(fill_color)
 
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
                 return sdf.result
             }
@@ -243,7 +248,12 @@ script_mod! {
 
                 sdf.fill_keep(fill_color)
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
                 return sdf.result
             }
@@ -337,7 +347,12 @@ script_mod! {
                 sdf.fill_keep(fill_color)
 
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
                 return sdf.result
             }
@@ -398,7 +413,12 @@ script_mod! {
                 )
                 sdf.fill_keep(fill_color)
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
                 return sdf.result
             }
@@ -461,7 +481,12 @@ script_mod! {
                 )
                 sdf.fill_keep(fill_color)
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
                 return sdf.result
             }
@@ -526,7 +551,12 @@ script_mod! {
                 sdf.fill_keep(fill_color)
 
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
 
                 return sdf.result
@@ -593,7 +623,12 @@ script_mod! {
                 sdf.fill_keep(fill_color)
 
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
 
                 return sdf.result
@@ -669,7 +704,12 @@ script_mod! {
                 sdf.fill_keep(fill_color)
 
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
 
                 return sdf.result
@@ -744,7 +784,12 @@ script_mod! {
                 sdf.fill_keep(fill_color)
 
                 if self.border_size > 0.0 {
-                    sdf.stroke(stroke_color self.border_size)
+                    // BOUND, not bare: the MPSL->Metal translator silently
+                    // drops a value-returning method call in statement
+                    // position — the generated if-body was literally empty,
+                    // which is the whole three-day stroke mystery. Binding
+                    // the result forces the call to survive translation.
+                    let _stroked = sdf.stroke(stroke_color self.border_size)
                 }
 
                 return sdf.result
