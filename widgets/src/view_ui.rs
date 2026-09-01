@@ -106,6 +106,7 @@ script_mod! {
             border_size: uniform(0.0)
             border_inset: uniform(vec4(0))
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
             gradient_border_horizontal: uniform(0.0)
 
             color_2: instance(vec4(-1))
@@ -119,7 +120,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -158,6 +171,7 @@ script_mod! {
             border_size: uniform(0.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
 
             color_2: instance(vec4(-1))
             border_color: instance(#f00)
@@ -191,7 +205,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -234,6 +260,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
             color_2: instance(vec4(-1))
 
             border_radius: uniform(2.5)
@@ -270,7 +297,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -312,6 +351,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
 
             border_size: uniform(0.0)
             border_radius: uniform(2.5)
@@ -326,7 +366,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -360,6 +412,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
 
             color_2: instance(vec4(-1))
 
@@ -375,7 +428,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -410,6 +475,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
 
             color_2: instance(vec4(-1))
 
@@ -425,7 +491,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -463,6 +541,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
 
             color_2: instance(vec4(-1))
             border_size: uniform(0.0)
@@ -477,7 +556,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -517,6 +608,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
             color_2: instance(vec4(-1))
             border_size: uniform(0.0)
             border_color: instance(#0000)
@@ -544,7 +636,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -580,6 +684,7 @@ script_mod! {
             color_dither: uniform(1.0)
             gradient_border_horizontal: uniform(0.0)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
 
             color_2: instance(vec4(-1))
             border_color_2: instance(vec4(-1))
@@ -595,7 +700,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
 
@@ -647,7 +764,19 @@ script_mod! {
                 let mut fill_color = self.color
                 if self.color_2.x > -0.5 {
                     let dither = Math.random_2d(self.pos.xy) * 0.04 * self.color_dither
-                    let dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    var dir = if self.gradient_fill_horizontal > 0.5 self.pos.x else self.pos.y
+                    if abs(self.gradient_angle) > 0.5 {
+                        // Arbitrary-angle two-stop: project the quad position
+                        // onto the angle's unit vector, normalized so the
+                        // gradient spans the quad corner-to-corner. The
+                        // vertical/horizontal branch above stays untouched —
+                        // every shipped gradient renders bit-identically.
+                        let rad = self.gradient_angle * 0.017453292
+                        let gx = sin(rad)
+                        let gy = cos(rad)
+                        let span = abs(gx) + abs(gy)
+                        dir = clamp(((self.pos.x - 0.5) * gx + (self.pos.y - 0.5) * gy) / span + 0.5, 0.0, 1.0)
+                    }
                     fill_color = mix(self.color self.color_2 dir + dither)
                 }
                 return fill_color
@@ -664,6 +793,7 @@ script_mod! {
         draw_bg +: {
             color: instance(#00f)
             gradient_fill_horizontal: uniform(0.0)
+            gradient_angle: uniform(0.0)
             color_2: instance(vec4(-1))
             color_dither: uniform(1.0)
         }
