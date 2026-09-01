@@ -23,6 +23,7 @@ script_mod! {
         opacity: 1.0
         image_scale: vec2(1.0, 1.0)
         image_pan: vec2(0.0, 0.0)
+        tile: 0.0
         fit_scale: vec2(1.0, 1.0)
         fit_pan: vec2(0.0, 0.0)
         async_load: 0.0
@@ -47,7 +48,19 @@ script_mod! {
                 }
                 return self.image_texture.sample_as_bgra(uv)
             }
+            // `tile` wraps the coordinate in the SHADER rather than in the
+            // sampler. The platform has `SamplerAddress::Repeat` and every
+            // backend can translate it, but nothing in the tree ever constructs
+            // one — `ClampToEdge` is the hardcoded default — so a scale above 1
+            // smears the edge pixel instead of repeating. `fract` costs one
+            // instruction and needs no sampler plumbing.
+            //
+            // Opt-in and defaulted to zero, so every existing image samples on
+            // exactly the path it did before.
             let uv = self.pos * scale + pan
+            if self.tile > 0.5 {
+                return self.image_texture.sample_as_bgra(fract(uv))
+            }
             return self.image_texture.sample_as_bgra(uv)
         }
 
@@ -83,6 +96,10 @@ pub struct DrawImage {
     pub image_scale: Vec2f,
     #[live]
     pub image_pan: Vec2f,
+    /// Repeat the texture instead of clamping. See the shader for why this is
+    /// `fract` and not a sampler address mode.
+    #[live]
+    pub tile: f32,
     #[live]
     fit_scale: Vec2f,
     #[live]
