@@ -1173,6 +1173,13 @@ impl Turtle {
     }
 
     fn resolve_fill(&mut self, index: usize) -> f64 {
+        if std::env::var("MAKEPAD_DEBUG_FILL").is_ok() {
+            eprintln!(
+                "FILL idx={index} h={:.1} used_h={:.1} pad={:?} unused_inner_h={:.1} pos_y={:.1} origin_y={:.1}",
+                self.height(), self.used_height(), self.padding(),
+                self.unused_inner_height(), self.pos().y, self.origin().y
+            );
+        }
         let mut count = self.resolved_fill_count();
         while count <= index {
             let unresolved_length = self.unresolved_length_from(count);
