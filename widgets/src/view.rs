@@ -100,6 +100,7 @@ pub struct View {
     #[live]
     event_order: EventOrder,
 
+    #[imperative]
     #[live(true)]
     #[apply_state]
     pub visible: bool,
