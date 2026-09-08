@@ -1026,11 +1026,13 @@ impl ShellMenu {
                 .max(screen.pos.y + gaps_out)
                 .floor(),
         };
+        let offset=crate::desktop::SPECS[self.desktop_style as usize].menu_bottom_offset;
         let (x,y)=match self.desktop_style {
-            crate::desktop::DesktopStyle::Windows2000=>(screen.pos.x+3.0,screen.pos.y+screen.size.y-height-34.0),
-            crate::desktop::DesktopStyle::Windows=>(x,screen.pos.y+screen.size.y-height-66.0),
-            crate::desktop::DesktopStyle::Macos=>(x,screen.pos.y+screen.size.y-height-98.0),
+            DesktopStyle::Windows2000=>(screen.pos.x+3.0,screen.pos.y+screen.size.y-height-offset),
             DesktopStyle::NextStep=>(screen.pos.x+10.0,screen.pos.y+42.0),
+            // A shelf-anchored menu rises above its shelf; the rest stay centred.
+            // Styles that also place x keep an explicit arm above this guard.
+            _ if offset>0.0=>(x,screen.pos.y+screen.size.y-height-offset),
             _=>(x,y),
         };
         (rect(x.max(screen.pos.x),y.max(screen.pos.y+4.0),(if classic || next {244.0}else{CARD_WIDTH}).min(screen.size.x),height),visible)

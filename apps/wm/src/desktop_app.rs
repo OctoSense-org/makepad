@@ -1,7 +1,7 @@
 //! Desktop style orchestration. Application state stays in the existing clients;
 //! shell presentation and the compositor's frozen framebuffer change together.
 use crate::desk::ChromeHit;
-use crate::desktop::{DesktopShelf, DesktopStyle, ShelfHit};
+use crate::desktop::{DesktopShelf, DesktopStyle, ShelfHit, SPECS};
 use crate::*;
 
 /// Match the browser's initial page palette, including light Omarchy themes
@@ -78,17 +78,10 @@ impl App {
             style == DesktopStyle::Omarchy
                 && !theme::theme_backgrounds(&self.state_mut().theme_name).is_empty(),
         );
-        let (top, bottom) = match style {
-            DesktopStyle::Omarchy => (shell::rgb(16, 19, 21), shell::rgb(24, 30, 34)),
-            DesktopStyle::Macos if dark => (shell::rgb(12, 15, 36), shell::rgb(65, 36, 69)),
-            DesktopStyle::Macos => (shell::rgb(39, 43, 87), shell::rgb(171, 109, 131)),
-            DesktopStyle::Windows if dark => (shell::rgb(10, 19, 34), shell::rgb(21, 49, 72)),
-            DesktopStyle::Windows => (shell::rgb(10, 45, 108), shell::rgb(24, 137, 210)),
-            DesktopStyle::Windows2000 => (shell::rgb(0, 128, 128), shell::rgb(0, 128, 128)),
-            DesktopStyle::NextStep => (shell::rgb(85, 85, 85), shell::rgb(85, 85, 85)),
-            DesktopStyle::Ios => (shell::rgb(38, 78, 137), shell::rgb(159, 207, 227)),
-            DesktopStyle::Android => (shell::rgb(50, 46, 73), shell::rgb(158, 156, 204)),
-        };
+        let spec = &SPECS[style as usize];
+        let pair = if dark && style.supports_dark() { spec.ground_dark } else { spec.ground };
+        let to = |(r, g, b)| shell::rgb(r, g, b);
+        let (top, bottom) = (to(pair.0), to(pair.1));
         let mut bg = self.ui.widget(cx, ids!(bg_fill));
         script_apply_eval!(cx,bg,{draw_bg +: {color_top: #(top) color_bottom: #(bottom)}});
         self.update_bar(cx);

@@ -1118,8 +1118,8 @@ impl WmDesk {
         let dpi = cx.current_dpi_factor().max(1.0);
         draw_rect = snap_to_device(draw_rect, dpi);
 
-        let inset = self.style.value([BORDER_SIZE, 0.0, 0.0, 3.0, 1.0]);
-        let resize_bar = self.style.weights[4] * 8.0;
+        let inset = self.style.mix(|s| s.frame_inset);
+        let resize_bar = self.style.mix(|s| s.resize_bar);
         let mut inner = snap_child_rect(
             Rect {
                 pos: draw_rect.pos + dvec2(inset, inset),
@@ -1136,11 +1136,11 @@ impl WmDesk {
             .get(&client)
             .and_then(|item| with_tile_host(item, |v| (v.has_frame(), v.arrival_fade())))
             .unwrap_or((false, 1.0));
-        let startup_glass = self.style.target == crate::desktop::DesktopStyle::Macos && (!has_frame || arrival < 1.0);
+        let startup_glass = self.style.spec().composes && (!has_frame || arrival < 1.0);
         let backdrop = if self.composing && (self.terminal_clients.contains(&client) || startup_glass) {
             Some(self.compositor.as_mut().unwrap().backdrop(cx, inner, 3.0))
         } else {None};
-        let rounding = self.style.value([0.0, 14.0, 8.0, 0.0, 0.0]);
+        let rounding = self.style.mix(|s| s.rounding);
         self.draw_window_shadow(cx, draw_rect, focus, fade);
         let mut capture = self.dock_warps.get_mut(&client)
             .filter(|w| w.frame.is_none() || w.refresh)
@@ -1193,9 +1193,10 @@ impl WmDesk {
         self.draw_border.color_end = fade_color(ring_end, fade);
         self.draw_border.angle = borders.angle;
         self.draw_border.border_size = BORDER_SIZE as f32;
-        if self.style.weights[0] > 0.001 {
-            self.draw_border.color.w *= self.style.weights[0] as f32;
-            self.draw_border.color_end.w *= self.style.weights[0] as f32;
+        let tiling = self.style.share(|s| s.tiling);
+        if tiling > 0.001 {
+            self.draw_border.color.w *= tiling as f32;
+            self.draw_border.color_end.w *= tiling as f32;
             self.draw_border.draw_abs(cx, draw_rect);
         }
 
@@ -1431,8 +1432,9 @@ impl WmDesk {
     fn draw_window_shadow(&mut self, cx: &mut Cx2d, r: Rect, focus: f64, fade: f64) {
         use crate::shell::ui::rect;
         let t=&self.style;
-        if t.weights[1] + t.weights[2] > 0.001 {
-            self.draw_shadow.draw_vars.set_uniform(cx, live_id!(opacity), &[((t.weights[1]+t.weights[2])*fade*if focus>0.5 {0.28}else{0.16}) as f32]);
+        let shadowed=t.share(|s| s.shadow > 0.0);
+        if shadowed > 0.001 {
+            self.draw_shadow.draw_vars.set_uniform(cx, live_id!(opacity), &[(shadowed*fade*if focus>0.5 {0.28}else{0.16}) as f32]);
             self.draw_shadow.draw_abs(cx,rect(r.pos.x-24.0,r.pos.y-24.0,r.size.x+48.0,r.size.y+48.0));
         }
     }
@@ -1440,20 +1442,22 @@ impl WmDesk {
         use crate::desktop::DesktopStyle;
         use crate::shell::{rgb, alpha, ui::{rect,Ico,HAlign}};
         let t=&self.style;
-        let opacity = ((1.0-t.weights[0])*fade) as f32;
-        let classic = t.weights[3] as f32;
-        let next = t.weights[4] as f32;
+        let opacity = ((1.0-t.share(|s| s.tiling))*fade) as f32;
+        let classic64 = t.share(|s| s.bevel_classic);
+        let next64 = t.share(|s| s.bevel_next);
+        let classic = classic64 as f32;
+        let next = next64 as f32;
         let retro = classic + next;
         self.chrome.pressed=0.0;
         self.chrome.top_only=0.0;self.chrome.title_gradient=0.0;
-        self.chrome.radius=t.value([0.0,10.0,8.0,0.0,0.0]) as f32;
+        self.chrome.radius=t.mix(|s| s.chrome_radius) as f32;
         self.chrome.bevel=retro;
         self.chrome.color=alpha(if t.dark && t.target.supports_dark() {rgb(40,40,42)}else{rgb(212,208,200)},opacity);
-        self.chrome.frame_width=t.value([2.0,2.0,2.0,3.0,1.0]) as f32;
+        self.chrome.frame_width=t.mix(|s| s.frame_width) as f32;
         self.chrome.color.w *= retro;
         self.chrome.draw_abs(cx,r);
         self.chrome.frame_width=0.0;
-        let edge=3.0*t.weights[3]+t.weights[4];
+        let edge=3.0*classic64+next64;
         let title=rect(r.pos.x+edge,r.pos.y+edge,r.size.x-edge*2.0,h);
         self.chrome.top_only=1.0;
         self.chrome.title_gradient=classic;
@@ -1499,11 +1503,11 @@ impl WmDesk {
         let text_rect=rect(title.pos.x+inset,title.pos.y,(title.size.x-inset-if matches!(t.target,DesktopStyle::Macos|DesktopStyle::NextStep) {inset}else{142.0}).max(1.0),h);
         self.shell_draw.label_elided(cx,text_rect,retro>0.5,12.0,ink,if matches!(t.target,DesktopStyle::Macos|DesktopStyle::NextStep) {HAlign::Center}else{HAlign::Left},&text);
         self.chrome.top_only=0.0;self.chrome.title_gradient=0.0;
-        let mac=t.weights[1];
+        let mac=t.share(|s| s.caption_mac);
+        let width=t.mix(|s| s.caption_width);
         for (i,hit,ico,color) in [(0,ChromeHit::Close,Ico::Close,rgb(255,95,86)),(1,ChromeHit::Minimize,Ico::WindowMin,rgb(255,189,46)),(2,ChromeHit::Maximize,Ico::WindowMax,rgb(39,201,63))] {
             if t.target == DesktopStyle::NextStep && hit == ChromeHit::Maximize { continue; }
             let slot=if i==0 {0}else if i==1 {2}else{1};
-            let width=t.value([30.0,30.0,46.0,16.0,14.0]);
             let right=title.pos.x+title.size.x-width-2.0-(slot as f64)*(width+2.0);
             let left=title.pos.x+10.0+(i as f64)*23.0;
             let bw=width+(18.0-width)*mac;
@@ -1771,7 +1775,7 @@ impl Widget for WmDesk {
             &targets.iter().map(|(c, _)| *c).collect::<Vec<_>>(),
             &previews,
         );
-        self.composing = self.style.weights[1] > 0.001 || self.zorder.iter().any(|c| self.terminal_clients.contains(c));
+        self.composing = self.style.share(|s| s.composes) > 0.001 || self.zorder.iter().any(|c| self.terminal_clients.contains(c));
         if self.composing {
             self.compositor.get_or_insert_with(|| backdrop::BackdropCompositor::new(cx)).begin(cx);
             let bounds = self.wallpaper.area().rect(cx);
@@ -1800,7 +1804,7 @@ impl Widget for WmDesk {
             // The dock samples the final window stack. When no window reaches
             // its blur footprint it can share an earlier terminal checkpoint.
             let size = cx.owning_window_or_root_pass_size();
-            let dock = if self.style.weights[1] > 0.001 {
+            let dock = if self.style.share(|s| s.glass_shelf) > 0.001 {
                 scope.data.get_mut::<WmState>().map(|state| (crate::desktop::dock_bounds(state, size), 4.5))
             } else { None };
             let (snapshot, stacks, passes) = self.compositor.as_mut().unwrap().finish(cx, self.desk_rect, dock);
