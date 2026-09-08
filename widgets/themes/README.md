@@ -2,12 +2,17 @@
 
 These Splash files define the shared widget styles used by the window manager:
 `omarchy`, `macos`, `macos-dark`, `windows`, `windows-dark`, `windows-2000`,
-`nextstep`, `ios`, `ios-dark`, `android`, and `android-dark`.
+`nextstep`, `ios`, `ios-dark`, `android`, `android-dark`, and `makeos`.
+`makeos` is dark only and draws macOS's icon artwork until it has its own set,
+so the Light/Dark button and the per-family `icons/` directory described below
+do not apply to it.
 
 Each style has two phases:
 
 - `theme.splash` installs semantic roles, typography, spacing, radii, and bevels
-  before stock widgets are registered.
+  before stock widgets are registered. It may end with a
+  `mod.theme.material = { ... }` object, which the window manager reads for its
+  own chrome.
 - `widgets.splash` applies component geometry and materials after registration.
   It can replace a widget's shader as well as its properties. Windows 2000's
   raised buttons and sunken edit fields are examples.

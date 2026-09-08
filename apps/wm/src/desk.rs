@@ -357,6 +357,9 @@ pub struct WmState {
     pub snap: crate::snap::SnapState,
     pub phone: crate::mobile::PhoneState,
     pub style: StyleTween,
+    /// The material the selected style's sheet declares; flat until a
+    /// sheet says otherwise.
+    pub material: crate::shell::MaterialTokens,
     pub dock_backdrop: Option<gauss_view::GaussBlurSnapshot>,
     pub layout: WmLayout,
     pub clients: HashMap<ClientId, ClientSlot>,

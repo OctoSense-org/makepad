@@ -14,10 +14,11 @@ pub enum DesktopStyle {
     NextStep,
     Ios,
     Android,
+    MakeOs,
 }
 
 impl DesktopStyle {
-    pub const ALL: [Self; 7] = [Self::Omarchy, Self::Macos, Self::Windows, Self::Windows2000, Self::NextStep, Self::Ios, Self::Android];
+    pub const ALL: [Self; 8] = [Self::Omarchy, Self::Macos, Self::Windows, Self::Windows2000, Self::NextStep, Self::Ios, Self::Android, Self::MakeOs];
     pub fn id(self) -> &'static str {
         match self {
             Self::Omarchy => "omarchy",
@@ -27,6 +28,7 @@ impl DesktopStyle {
             Self::NextStep => "nextstep",
             Self::Ios => "ios",
             Self::Android => "android",
+            Self::MakeOs => "makeos",
         }
     }
     pub fn label(self) -> &'static str {
@@ -38,6 +40,7 @@ impl DesktopStyle {
             Self::NextStep => "NeXTSTEP",
             Self::Ios => "iOS",
             Self::Android => "Android",
+            Self::MakeOs => "MakeOS",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -52,10 +55,19 @@ impl DesktopStyle {
     pub fn floating(self) -> bool {
         self != Self::Omarchy && !self.mobile()
     }
+    /// The family whose icon artwork this style draws. MakeOS borrows macOS's
+    /// set until it has its own, bundled and on-disk alike, so an edit under
+    /// themes/macos/icons hot-loads for both.
+    pub fn artwork_family(self) -> Self {
+        match self {
+            Self::MakeOs => Self::Macos,
+            s => s,
+        }
+    }
     pub fn shelf_height(self) -> f64 {
         match self {
             Self::Omarchy => 0.0,
-            Self::Macos => 86.0,
+            Self::Macos | Self::MakeOs => 86.0,
             Self::Windows => 54.0,
             Self::Windows2000 => 34.0,
             Self::NextStep | Self::Ios | Self::Android => 0.0,
@@ -64,7 +76,7 @@ impl DesktopStyle {
     pub fn title_height(self) -> f64 {
         match self {
             Self::Omarchy => 0.0,
-            Self::Macos => 32.0,
+            Self::Macos | Self::MakeOs => 32.0,
             Self::Windows => 34.0,
             Self::Windows2000 => 20.0,
             Self::NextStep => 22.0,
@@ -147,6 +159,10 @@ impl StyleSheet {
             DesktopStyle::Android => (
                 include_str!("../themes/android/theme.splash"),
                 include_str!("../themes/android/widgets.splash"),
+            ),
+            DesktopStyle::MakeOs => (
+                include_str!("../themes/makeos/theme.splash"),
+                include_str!("../themes/makeos/widgets.splash"),
             ),
         };
         let read = |file: &str, bundled: &str| {
@@ -323,6 +339,7 @@ mod tests {
                         DesktopStyle::Windows => 4.0,
                         DesktopStyle::Ios => 14.0,
                         DesktopStyle::Android => 20.0,
+                        DesktopStyle::MakeOs => 8.0,
                         _ => 0.0,
                     }
                 );
@@ -402,5 +419,39 @@ mod tests {
         let sheet = StyleSheet::load(DesktopStyle::Windows2000);
         assert_eq!(StyleSheet::parse(&sheet.to_json()), Some(sheet));
         assert!(StyleSheet::parse("{\"wm\":\"Adopted\"}").is_none());
+    }
+    #[test]
+    fn makeos_round_trips_and_is_a_floating_dark_desktop() {
+        assert_eq!(DesktopStyle::parse("makeos"), Some(DesktopStyle::MakeOs));
+        assert_eq!(DesktopStyle::MakeOs.id(), "makeos");
+        assert_eq!(DesktopStyle::MakeOs.label(), "MakeOS");
+        assert!(!DesktopStyle::MakeOs.supports_dark());
+        assert!(!DesktopStyle::MakeOs.mobile());
+        assert!(DesktopStyle::MakeOs.floating());
+        // Appended after the last variant so no existing index moves.
+        assert_eq!(DesktopStyle::Android.next(), DesktopStyle::MakeOs);
+        assert_eq!(DesktopStyle::MakeOs.next(), DesktopStyle::Omarchy);
+        assert_eq!(DesktopStyle::ALL.len(), 8);
+        // The dock and title share macOS's geometry.
+        assert_eq!(DesktopStyle::MakeOs.shelf_height(), 86.0);
+        assert_eq!(DesktopStyle::MakeOs.title_height(), 32.0);
+    }
+    #[test]
+    fn makeos_sheet_evaluates_and_carries_its_material() {
+        let sheet = StyleSheet::load(DesktopStyle::MakeOs);
+        assert_eq!(sheet.name, "makeos");
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            install(vm, sheet);
+            vm.bx.captured_errors = Some(Vec::new());
+            vm.with_reload(crate::script_mod);
+            let errors = vm.take_errors();
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(script_eval!(vm, {mod.theme.color_focus}).as_color(), Some(0x5b9dffff));
+            // The material rides in the theme phase so later glass work reads it from here.
+            assert_eq!(script_eval!(vm, {mod.theme.material.lensing_strength}).as_f64(), Some(28.0));
+            assert_eq!(script_eval!(vm, {mod.theme.material.tint_color}).as_color(), Some(0x0b1220ff));
+        });
     }
 }

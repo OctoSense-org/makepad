@@ -80,18 +80,19 @@ fn valid_name(name: &str) -> bool {
 
 /// Loads all artwork for the wire stylesheet, including locally added app IDs.
 pub fn load_assets(style: DesktopStyle) -> Vec<IconAsset> {
+    let family = style.artwork_family();
     let mut assets: Vec<_> = ICONS
         .iter()
         .map(|icon| IconAsset {
             name: icon.name.into(),
-            svg: icon.variants[style as usize].into(),
+            svg: icon.variants[family as usize].into(),
         })
         .collect();
     #[cfg(not(target_arch = "wasm32"))]
     if let Ok(entries) = std::fs::read_dir(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("themes")
-            .join(style.id())
+            .join(family.id())
             .join("icons"),
     ) {
         for entry in entries.flatten() {
@@ -163,7 +164,9 @@ pub fn source(cx: &mut Cx, style: DesktopStyle, name: &str) -> Arc<str> {
         .get(&key)
         .or_else(|| catalog.sources.get(&(style as usize, "app".into())))
         .cloned()
-        .unwrap_or_else(|| Arc::from(ICONS.last().unwrap().variants[style as usize]))
+        // The bundled columns are per artwork family; the catalog keys above stay
+        // per style so an aliasing style caches apart from the family it draws.
+        .unwrap_or_else(|| Arc::from(ICONS.last().unwrap().variants[style.artwork_family() as usize]))
 }
 
 struct CachedIcon {
@@ -349,5 +352,25 @@ mod tests {
         ));
         assert_eq!(canonical_name("makepad-app-score"), "score");
         assert!(!valid_name("../secret"));
+    }
+    #[test]
+    fn makeos_icons_alias_the_macos_artwork() {
+        let makeos = load_assets(DesktopStyle::MakeOs);
+        let macos = load_assets(DesktopStyle::Macos);
+        assert_eq!(makeos, macos);
+        for icon in ICONS {
+            assert!(makeos.iter().any(|a| a.name == icon.name), "{}", icon.name);
+        }
+    }
+    #[test]
+    fn a_partial_makeos_sheet_falls_back_to_the_macos_artwork_without_panicking() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        // A wire sheet whose icon list omits "app": the catalog already holds
+        // MakeOS entries, so no bundled set is installed and the last resort
+        // must index the artwork family, not the style's own discriminant.
+        install(&mut cx, DesktopStyle::MakeOs, &[IconAsset { name: "terminal".into(), svg: "<svg/>".into() }]);
+        let fallback = source(&mut cx, DesktopStyle::MakeOs, "unknown");
+        assert_eq!(fallback.as_ref(), ICONS.last().unwrap().variants[DesktopStyle::Macos as usize]);
+        assert_eq!(source(&mut cx, DesktopStyle::MakeOs, "terminal").as_ref(), "<svg/>");
     }
 }

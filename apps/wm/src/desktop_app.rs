@@ -16,6 +16,18 @@ pub(super) fn browser_appearance(style: DesktopStyle, dark: bool, omarchy_source
 }
 
 impl App {
+    /// The material a style's sheet declares, for `WmState` to carry and the
+    /// chrome to paint from. Startup and every switch come through here, so
+    /// a sheet that grows a material block is honoured wherever it loads; a
+    /// line that does not read is logged and the rest still applies.
+    pub(super) fn material_from_sheet(sheet: &desktop_style::StyleSheet) -> shell::MaterialTokens {
+        let (material, problems) = theme::scan_material(&sheet.theme);
+        for problem in &problems {
+            log!("wm: style {} material {}", sheet.name, problem);
+        }
+        material
+    }
+
     pub(super) fn set_desktop_style(&mut self, cx: &mut Cx, style: DesktopStyle) {
         let previous = self.state_mut().style.target;
         let changes_size = previous.mobile() != style.mobile() || (style.mobile() && previous != style);
@@ -37,7 +49,9 @@ impl App {
         if let Some(mut desk) = self.desk(cx).borrow_mut::<WmDesk>() {desk.set_startup_style(cx, &sheet);}
         let sheet_name = sheet.name.clone();
         app_icon::install(cx, style, &sheet.icons);
+        let material = Self::material_from_sheet(&sheet);
         let state = self.state_mut();
+        state.material = material;
         state.dragging.clear();
         state.style.select(style);
         if changes_size { state.style.step(1.0); }
@@ -72,12 +86,30 @@ impl App {
             menu.dark = dark;
         }
         // Wallpaper is part of the framebuffer crossfade. Omarchy retains the
-        // selected wallpaper; the other desktop identities have their own ground.
-        self.ui.widget(cx, ids!(bg_image)).set_visible(
-            cx,
-            style == DesktopStyle::Omarchy
-                && !theme::theme_backgrounds(&self.state_mut().theme_name).is_empty(),
-        );
+        // selected wallpaper and MakeOS shows its bundled scene through the
+        // same slot, the spec gradient beneath as the fallback; the other
+        // desktop identities have their own ground.
+        let has_wallpaper = match style {
+            DesktopStyle::Omarchy => {
+                // The slot may still hold MakeOS's scene from an earlier
+                // visit: put the theme's own picture back (a cache hit when
+                // it is already decoded) rather than leave the vector one.
+                self.apply_background(cx, self.background_index);
+                !theme::theme_backgrounds(&self.state_mut().theme_name).is_empty()
+            }
+            DesktopStyle::MakeOs => {
+                let scene = theme::BUNDLED_MAKEOS_WALLPAPER.as_bytes();
+                match self.ui.image(cx, ids!(bg_image)).load_svg_from_data(cx, scene) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        log!("wm: the bundled MakeOS wallpaper did not load: {}", error);
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        self.ui.widget(cx, ids!(bg_image)).set_visible(cx, has_wallpaper);
         let spec = &SPECS[style as usize];
         let pair = if dark && style.supports_dark() { spec.ground_dark } else { spec.ground };
         let to = |(r, g, b)| shell::rgb(r, g, b);

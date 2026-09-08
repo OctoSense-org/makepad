@@ -45,7 +45,7 @@ pub struct StyleSpec {
 
 /// One row per `DesktopStyle`, at the discriminant the tween weights index.
 /// A static rather than a const so `StyleTween::spec` can hand out a row.
-pub static SPECS: [StyleSpec; 7] = [
+pub static SPECS: [StyleSpec; 8] = [
     StyleSpec {
         style: DesktopStyle::Omarchy,
         tiling: true,
@@ -124,14 +124,31 @@ pub static SPECS: [StyleSpec; 7] = [
         ground_dark: ((50, 46, 73), (158, 156, 204)),
         menu_bottom_offset: 0.0,
     },
+    // MakeOS floats like macOS: its dock overlays the desk rather than
+    // reserving a strip, and the title bar and menu share macOS's placement.
+    // Dark only, so both grounds are the same night gradient.
+    // rounding/shadow/frame_width are the compiled-in window geometry the desk
+    // draws; the sheet's material.corner_radius/shadow_alpha/border_width are the
+    // shell kit's hot-reloadable material. They join when the frame draws from it.
+    StyleSpec {
+        style: DesktopStyle::MakeOs,
+        tiling: false,
+        reserved_height: 0.0, title_height: 32.0,
+        frame_inset: 0.0, rounding: 12.0, chrome_radius: 10.0,
+        frame_width: 1.0, caption_width: 30.0, shelf_radius: 18.0, resize_bar: 0.0, shadow: 0.44,
+        glass_shelf: true, composes: true, caption_mac: true, bevel_classic: false, bevel_next: false,
+        ground: ((11, 18, 32), (5, 7, 14)),
+        ground_dark: ((11, 18, 32), (5, 7, 14)),
+        menu_bottom_offset: 98.0,
+    },
 ];
 
 #[derive(Clone, Debug)]
 pub struct StyleTween {
     pub target: DesktopStyle,
     pub dark: bool,
-    pub weights: [f64; 7],
-    from: [f64; 7],
+    pub weights: [f64; 8],
+    from: [f64; 8],
     elapsed: f64,
 }
 impl Default for StyleTween {
@@ -139,8 +156,8 @@ impl Default for StyleTween {
         Self {
             target: DesktopStyle::Omarchy,
             dark: false,
-            weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            from: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            from: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             elapsed: 1.0,
         }
     }
@@ -196,20 +213,21 @@ mod tests {
         t.step(0.0);
         assert_eq!(t.weights, old);
         t.step(1.0);
-        assert_eq!(t.weights, [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(t.weights, [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
     }
     #[test]
     fn specs_reproduce_the_literal_arrays_for_every_style() {
         // The arrays these replace, verbatim from the pre-refactor code, padded
-        // with the zeros the phone rows must hold for a tween into them to land.
-        let reserved = [0.0, 0.0, 54.0, 34.0, 0.0, 0.0, 0.0];
-        let title = [0.0, 32.0, 34.0, 20.0, 22.0, 0.0, 0.0];
-        let inset = [2.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0]; // BORDER_SIZE = 2.0
-        let rounding = [0.0, 14.0, 8.0, 0.0, 0.0, 0.0, 0.0];
-        let chrome_radius = [0.0, 10.0, 8.0, 0.0, 0.0, 0.0, 0.0];
-        let frame_width = [2.0, 2.0, 2.0, 3.0, 1.0, 0.0, 0.0];
-        let caption_width = [30.0, 30.0, 46.0, 16.0, 14.0, 0.0, 0.0];
-        let shelf_radius = [0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        // with the zeros the phone rows must hold for a tween into them to land,
+        // then the MakeOS row appended after the table existed.
+        let reserved = [0.0, 0.0, 54.0, 34.0, 0.0, 0.0, 0.0, 0.0];
+        let title = [0.0, 32.0, 34.0, 20.0, 22.0, 0.0, 0.0, 32.0];
+        let inset = [2.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 0.0]; // BORDER_SIZE = 2.0
+        let rounding = [0.0, 14.0, 8.0, 0.0, 0.0, 0.0, 0.0, 12.0];
+        let chrome_radius = [0.0, 10.0, 8.0, 0.0, 0.0, 0.0, 0.0, 10.0];
+        let frame_width = [2.0, 2.0, 2.0, 3.0, 1.0, 0.0, 0.0, 1.0];
+        let caption_width = [30.0, 30.0, 46.0, 16.0, 14.0, 0.0, 0.0, 30.0];
+        let shelf_radius = [0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 0.0, 18.0];
         for (i, style) in DesktopStyle::ALL.iter().enumerate() {
             let s = &SPECS[i];
             assert_eq!(s.style, *style);
@@ -231,8 +249,9 @@ mod tests {
         assert!(SPECS[1].glass_shelf && SPECS[1].composes && SPECS[1].shadow > 0.0 && SPECS[1].caption_mac);
         assert!(SPECS[2].shadow > 0.0 && !SPECS[2].glass_shelf);
         assert!(SPECS[3].bevel_classic && SPECS[4].bevel_next && SPECS[4].resize_bar == 8.0);
+        assert!(SPECS[7].glass_shelf && SPECS[7].composes && SPECS[7].shadow > 0.0 && SPECS[7].caption_mac && !SPECS[7].tiling);
         // The rest of the row, from the match arms it centralises.
-        assert_eq!(SPECS.map(|s| s.menu_bottom_offset), [0.0, 98.0, 66.0, 34.0, 0.0, 0.0, 0.0]);
+        assert_eq!(SPECS.map(|s| s.menu_bottom_offset), [0.0, 98.0, 66.0, 34.0, 0.0, 0.0, 0.0, 98.0]);
         assert_eq!(SPECS.map(|s| s.ground), [
             ((16, 19, 21), (24, 30, 34)),
             ((39, 43, 87), (171, 109, 131)),
@@ -241,6 +260,7 @@ mod tests {
             ((85, 85, 85), (85, 85, 85)),
             ((38, 78, 137), (159, 207, 227)),
             ((50, 46, 73), (158, 156, 204)),
+            ((11, 18, 32), (5, 7, 14)),
         ]);
         assert_eq!(SPECS.map(|s| s.ground_dark), [
             ((16, 19, 21), (24, 30, 34)),
@@ -250,6 +270,7 @@ mod tests {
             ((85, 85, 85), (85, 85, 85)),
             ((38, 78, 137), (159, 207, 227)),
             ((50, 46, 73), (158, 156, 204)),
+            ((11, 18, 32), (5, 7, 14)),
         ]);
         // Blending is the same sum the arrays gave, mid-tween into a desktop
         // style and into a phone one; the two heights are bit-exact.
@@ -301,10 +322,17 @@ mod tests {
         t.step(0.3);
         assert_eq!(shelf_geometry(screen, &t, n), old(&t), "mid-tween");
         // Into a phone row the old five-wide zip stopped short of the weight
-        // that is growing; the seven-term mix multiplies it by the row's zeros.
+        // that is growing; the eight-term mix multiplies it by the row's zeros.
         t.select(DesktopStyle::Ios);
         t.step(0.3);
         assert_eq!(shelf_geometry(screen, &t, n), old(&t), "into a phone row");
+        // MakeOS's dock is macOS's dock, settled: same rect from the same arms.
+        t.select(DesktopStyle::Macos);
+        t.step(1.0);
+        let mac = shelf_geometry(screen, &t, n);
+        t.select(DesktopStyle::MakeOs);
+        t.step(1.0);
+        assert_eq!(shelf_geometry(screen, &t, n), mac, "settled MakeOS");
     }
 }
 
@@ -697,14 +725,14 @@ fn shelf_geometry(screen: Rect, style: &StyleTween, app_count: usize) -> Rect {
     rect(
         screen.pos.x + style.mix(|s| match s.style {
             DesktopStyle::Omarchy => 8.0,
-            DesktopStyle::Macos => (screen.size.x - dock_width) * 0.5,
+            DesktopStyle::Macos | DesktopStyle::MakeOs => (screen.size.x - dock_width) * 0.5,
             DesktopStyle::Windows | DesktopStyle::Windows2000 => 0.0,
             DesktopStyle::NextStep => screen.size.x - 64.0,
             DesktopStyle::Ios | DesktopStyle::Android => 0.0,
         }),
         screen.pos.y + style.mix(|s| match s.style {
             DesktopStyle::Omarchy => 0.0,
-            DesktopStyle::Macos => screen.size.y - 88.0,
+            DesktopStyle::Macos | DesktopStyle::MakeOs => screen.size.y - 88.0,
             DesktopStyle::Windows => screen.size.y - 54.0,
             DesktopStyle::Windows2000 => screen.size.y - 34.0,
             DesktopStyle::NextStep => 40.0,
@@ -712,14 +740,14 @@ fn shelf_geometry(screen: Rect, style: &StyleTween, app_count: usize) -> Rect {
         }),
         style.mix(|s| match s.style {
             DesktopStyle::Omarchy => 32.0,
-            DesktopStyle::Macos => dock_width,
+            DesktopStyle::Macos | DesktopStyle::MakeOs => dock_width,
             DesktopStyle::Windows | DesktopStyle::Windows2000 => screen.size.x,
             DesktopStyle::NextStep => 56.0,
             DesktopStyle::Ios | DesktopStyle::Android => 0.0,
         }),
         style.mix(|s| match s.style {
             DesktopStyle::Omarchy => 0.0,
-            DesktopStyle::Macos => 78.0,
+            DesktopStyle::Macos | DesktopStyle::MakeOs => 78.0,
             DesktopStyle::Windows => 54.0,
             DesktopStyle::Windows2000 => 34.0,
             DesktopStyle::NextStep => next_height,
