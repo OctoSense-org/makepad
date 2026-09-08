@@ -1108,7 +1108,6 @@ impl ShellDraw {
     /// order. A surface may be hoisted once per frame: a second hoist
     /// would clear the same list under entries the ancestor still aligns.
     pub fn begin_surface(&mut self, cx: &mut Cx2d) {
-        debug_assert!(!self.hoisted, "begin_surface without end_surface");
         // Both reset here, not only in `end_surface`, so a surface that
         // returned early last frame does not stay hoisted or flat for good.
         self.hoisted = false;

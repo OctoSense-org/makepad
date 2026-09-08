@@ -383,7 +383,7 @@ impl App {
             return false;
         }
         // The macOS family has no show-desktop: MakeOS shares the dock.
-        if e.key_code == KeyCode::KeyD && !matches!(style, DesktopStyle::Macos | DesktopStyle::MakeOs) {
+        if e.key_code == KeyCode::KeyD && !style.mac_family() {
             self.activate_shelf(cx, ShelfHit::ShowDesktop);
             return true;
         }

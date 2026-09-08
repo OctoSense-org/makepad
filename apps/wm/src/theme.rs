@@ -934,7 +934,6 @@ fn material_slot<'a>(m: &'a mut MaterialTokens, key: &str) -> Option<MaterialSlo
     Some(match key {
         "glass" => Number(&mut m.glass),
         "corner_radius" => Number(&mut m.corner_radius),
-        "control_radius" => Number(&mut m.control_radius),
         "blur_level" => Number(&mut m.blur_level),
         "lensing_effect" => Number(&mut m.lensing_effect),
         "lensing_strength" => Number(&mut m.lensing_strength),

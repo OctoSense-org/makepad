@@ -138,7 +138,6 @@ mod.theme.color_terminal_text = mod.theme.color_text
 mod.theme.material = {
     glass: 1.0
     corner_radius: 12.0
-    control_radius: 8.0
     blur_level: 5.2
     lensing_effect: 0.94
     lensing_strength: 28.0

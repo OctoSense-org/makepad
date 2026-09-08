@@ -1129,10 +1129,8 @@ impl WmDesk {
         let dpi = cx.current_dpi_factor().max(1.0);
         draw_rect = snap_to_device(draw_rect, dpi);
 
-        // MakeOS's inset is the room for its glass ring: without a glass
-        // material to fill it the body sits flush, as it does under macOS.
         let glass = self.shell_draw.material().is_glass();
-        let inset = self.style.mix(|s| if s.style == crate::desktop::DesktopStyle::MakeOs && !glass { 0.0 } else { s.frame_inset });
+        let inset = self.style.frame_inset(glass);
         let glass_share = self.style.glass_share(glass);
         let resize_bar = self.style.mix(|s| s.resize_bar);
         let mut inner = snap_child_rect(
@@ -1157,6 +1155,17 @@ impl WmDesk {
         } else {None};
         let rounding = self.style.mix(|s| s.rounding);
         self.draw_window_shadow(cx, draw_rect, focus, fade);
+        // The glass frame's backdrop is requested HERE, before the capture
+        // opens its own draw list: a compositor checkpoint ends the scene's
+        // list, so every `backdrop()` request has to come before any nested
+        // draw list is open, or the begin/end pairs mismatch. The region
+        // under the window is the same on either side of `frame.begin`. The
+        // pyramid is rendered only as deep as the level asked for, and the
+        // kit samples at the material's own blur level.
+        let glass_backdrop = if glass_share > 0.001 && self.composing {
+            let level = self.shell_draw.material().blur_level;
+            Some(self.compositor.as_mut().unwrap().backdrop(cx, draw_rect, level))
+        } else { None };
         let mut capture = self.dock_warps.get_mut(&client)
             .filter(|w| w.frame.is_none() || w.refresh)
             .map(|w| {
@@ -1168,17 +1177,12 @@ impl WmDesk {
         // MakeOS: the Liquid Glass frame, inside the captured surface so the
         // window mask rounds it with everything else. The opaque body covers
         // it below the title; what shows is the title strip and the ring.
-        if glass_share > 0.001 && self.composing {
-            if let Some(compositor) = self.compositor.as_mut() {
-                // The pyramid is rendered only as deep as the level asked
-                // for, and the kit samples at the material's own blur level.
-                let m = self.shell_draw.material();
-                let snapshot = compositor.backdrop(cx, draw_rect, m.blur_level);
-                self.shell_draw.bind_snapshot(cx, Some(snapshot));
-                let ring = m.border_alpha * if focus > 0.5 { 1.0 } else { 0.5 };
-                let opacity = ((1.0 - self.style.share(|s| s.tiling)) * fade) as f32;
-                self.shell_draw.glass_frame(cx, draw_rect, rounding, ring, opacity);
-            }
+        if let Some(snapshot) = glass_backdrop {
+            let m = self.shell_draw.material();
+            self.shell_draw.bind_snapshot(cx, Some(snapshot));
+            let ring = m.border_alpha * if focus > 0.5 { 1.0 } else { 0.5 };
+            let opacity = ((1.0 - self.style.share(|s| s.tiling)) * fade) as f32;
+            self.shell_draw.glass_frame(cx, draw_rect, rounding, ring, opacity);
         }
         if let Some(snapshot) = backdrop {
             self.terminal_glass.draw_surface_with_backdrop(cx, inner, Some(snapshot), fade as f32);

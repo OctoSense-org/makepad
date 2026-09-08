@@ -455,19 +455,17 @@ impl Default for ShellTokens {
 }
 
 /// `mod.theme.material` — the MATERIAL every shell surface and window frame
-/// paints with. `glass` 0 is the flat omarchy look (what every imported
-/// theme gets); 1 is Liquid Glass, refracting the window's blur pyramid
-/// (widgets/src/gauss_view.rs). Radii are visual pixels; shaders that go
-/// through `Sdf2d.box` are handed half of them. Scanned out of the style
-/// sheet by `theme::scan_material`, never read from the DSL, so it stays
-/// a plain struct.
+/// paints with. `glass` 0 is the flat look, the default every style sheet
+/// without a material block gets; 1 is Liquid Glass, refracting the
+/// window's blur pyramid (widgets/src/gauss_view.rs). Radii are visual
+/// pixels; shaders that go through `Sdf2d.box` are handed half of them.
+/// Scanned out of the style sheet by `theme::scan_material`, never read
+/// from the DSL, so it stays a plain struct.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterialTokens {
     pub glass: f64,
     /// Card and bar-popup corner radius.
     pub corner_radius: f64,
-    /// Buttons, toggles, row highlights.
-    pub control_radius: f64,
     pub blur_level: f64,
     pub lensing_effect: f64,
     pub lensing_strength: f64,
@@ -502,7 +500,6 @@ impl Default for MaterialTokens {
         Self {
             glass: 0.0,
             corner_radius: 0.0,
-            control_radius: 0.0,
             blur_level: 5.2,
             lensing_effect: 0.94,
             lensing_strength: 28.0,
