@@ -12,6 +12,7 @@ mod.theme.color_bg_app = #0b1220
 mod.theme.color_fg_app = #05070e
 mod.theme.color_bg_container = #080d18
 mod.theme.color_focus = #5b9dff
+mod.theme.color_error = #ff6b81
 mod.theme.color_bg_highlight = #1d2b4a
 mod.theme.color_bg_highlight_inline = #1d2b4a
 mod.theme.color_ctrl_selected = #5b9dff

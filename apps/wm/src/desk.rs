@@ -25,6 +25,7 @@ use crate::module_view::MpModuleView;
 use crate::run_view::{MpRunView, MpRunViewAction};
 use crate::tile::TileHost;
 use crate::theme;
+use crate::theme::StyleRoles;
 use crate::desktop::{DrawDesktopChrome, StyleTween};
 use crate::shell::ui::ShellDraw;
 
@@ -360,6 +361,9 @@ pub struct WmState {
     /// The material the selected style's sheet declares; flat until a
     /// sheet says otherwise.
     pub material: crate::shell::MaterialTokens,
+    /// The palette roles the same sheet declares: what a MakeOS frame
+    /// inks its title and captions with.
+    pub roles: StyleRoles,
     pub dock_backdrop: Option<gauss_view::GaussBlurSnapshot>,
     pub layout: WmLayout,
     pub clients: HashMap<ClientId, ClientSlot>,
@@ -368,6 +372,9 @@ pub struct WmState {
     pub term_env: String,
     /// The theme accent — menu highlights, not the window border.
     pub accent: Vec4f,
+    /// The bar's parent strip under a flat material: the theme background
+    /// as the DSL resolved it (`mod.wm_theme.background`).
+    pub bar_ground: Vec4f,
     pub borders: BorderTheme,
     /// The gap the layout splits with: tile to tile (2 * gaps_in).
     pub gap: f64,
@@ -810,6 +817,7 @@ pub struct WmDesk {
     #[live] chrome: DrawDesktopChrome,
     #[live] draw_shadow: DrawQuad,
     #[live] shell_draw: ShellDraw,
+    #[rust] roles: StyleRoles,
     #[rust] style: StyleTween,
     #[rust] titles: HashMap<ClientId, String>,
     #[rust] window_apps: HashMap<ClientId, String>,
@@ -1121,7 +1129,11 @@ impl WmDesk {
         let dpi = cx.current_dpi_factor().max(1.0);
         draw_rect = snap_to_device(draw_rect, dpi);
 
-        let inset = self.style.mix(|s| s.frame_inset);
+        // MakeOS's inset is the room for its glass ring: without a glass
+        // material to fill it the body sits flush, as it does under macOS.
+        let glass = self.shell_draw.material().is_glass();
+        let inset = self.style.mix(|s| if s.style == crate::desktop::DesktopStyle::MakeOs && !glass { 0.0 } else { s.frame_inset });
+        let glass_share = self.style.glass_share(glass);
         let resize_bar = self.style.mix(|s| s.resize_bar);
         let mut inner = snap_child_rect(
             Rect {
@@ -1153,6 +1165,21 @@ impl WmDesk {
             }).or_else(|| (rounding > 0.01).then(|| self.desktop_frames.remove(&client)
                 .unwrap_or_else(|| WindowFrame::new_with_name(cx, "wm_window_surface"))));
         if let Some(frame) = &mut capture { frame.begin(cx, draw_rect); }
+        // MakeOS: the Liquid Glass frame, inside the captured surface so the
+        // window mask rounds it with everything else. The opaque body covers
+        // it below the title; what shows is the title strip and the ring.
+        if glass_share > 0.001 && self.composing {
+            if let Some(compositor) = self.compositor.as_mut() {
+                // The pyramid is rendered only as deep as the level asked
+                // for, and the kit samples at the material's own blur level.
+                let m = self.shell_draw.material();
+                let snapshot = compositor.backdrop(cx, draw_rect, m.blur_level);
+                self.shell_draw.bind_snapshot(cx, Some(snapshot));
+                let ring = m.border_alpha * if focus > 0.5 { 1.0 } else { 0.5 };
+                let opacity = ((1.0 - self.style.share(|s| s.tiling)) * fade) as f32;
+                self.shell_draw.glass_frame(cx, draw_rect, rounding, ring, opacity);
+            }
+        }
         if let Some(snapshot) = backdrop {
             self.terminal_glass.draw_surface_with_backdrop(cx, inner, Some(snapshot), fade as f32);
         }
@@ -1252,6 +1279,9 @@ impl WmDesk {
                 }
                 view.set_close_crop(None);
                 view.set_fade(fade as f32);
+                // Inside a glass frame the body's corners follow the ring,
+                // concentric at the inset; square for every other style.
+                view.set_corner_radius(((rounding - inset).max(0.0) * 0.5 * glass_share) as f32);
             });
             item.draw_walk_all(cx, scope, Walk::abs_rect(child_rect));
         }
@@ -1435,9 +1465,8 @@ impl WmDesk {
     fn draw_window_shadow(&mut self, cx: &mut Cx2d, r: Rect, focus: f64, fade: f64) {
         use crate::shell::ui::rect;
         let t=&self.style;
-        let shadowed=t.share(|s| s.shadow > 0.0);
-        if shadowed > 0.001 {
-            self.draw_shadow.draw_vars.set_uniform(cx, live_id!(opacity), &[(shadowed*fade*if focus>0.5 {0.28}else{0.16}) as f32]);
+        if t.share(|s| s.shadow > 0.0) > 0.001 {
+            self.draw_shadow.draw_vars.set_uniform(cx, live_id!(opacity), &[t.window_shadow_opacity(focus, fade)]);
             self.draw_shadow.draw_abs(cx,rect(r.pos.x-24.0,r.pos.y-24.0,r.size.x+48.0,r.size.y+48.0));
         }
     }
@@ -1451,11 +1480,20 @@ impl WmDesk {
         let classic = classic64 as f32;
         let next = next64 as f32;
         let retro = classic + next;
+        // MakeOS's share of the floating chrome: the glass `draw_tile` laid
+        // down stands in for the title fill, and the sheet's roles for the
+        // ink and the captions, blended so a tween into it crossfades. A
+        // MakeOS sheet with a flat material keeps the macOS title instead.
+        let glass_share = t.glass_share(self.shell_draw.material().is_glass());
+        let roles = self.roles;
+        // The flag, or MakeOS regardless of it: the macOS title MakeOS keeps
+        // when its material is flat, and the ink a tween into it starts from.
+        let chrome_dark = crate::desktop::dark_chrome(t.target, t.dark);
         self.chrome.pressed=0.0;
         self.chrome.top_only=0.0;self.chrome.title_gradient=0.0;
         self.chrome.radius=t.mix(|s| s.chrome_radius) as f32;
         self.chrome.bevel=retro;
-        self.chrome.color=alpha(if t.dark && t.target.supports_dark() {rgb(40,40,42)}else{rgb(212,208,200)},opacity);
+        self.chrome.color=alpha(if chrome_dark {rgb(40,40,42)}else{rgb(212,208,200)},opacity);
         self.chrome.frame_width=t.mix(|s| s.frame_width) as f32;
         self.chrome.color.w *= retro;
         self.chrome.draw_abs(cx,r);
@@ -1469,9 +1507,10 @@ impl WmDesk {
         // The title fills that surface without an independently inset edge.
         self.chrome.radius=0.0;
         self.chrome.bevel=0.0;
-        self.chrome.color=lerp_color(alpha(if t.dark && t.target.supports_dark() {rgb(48,48,51)}else{rgb(237,237,240)},opacity),alpha(if focus>0.5 {rgb(10,36,106)}else{rgb(128,128,128)},opacity),classic as f64);
+        self.chrome.color=lerp_color(alpha(if chrome_dark {rgb(48,48,51)}else{rgb(237,237,240)},opacity),alpha(if focus>0.5 {rgb(10,36,106)}else{rgb(128,128,128)},opacity),classic as f64);
         self.chrome.color=lerp_color(self.chrome.color,alpha(if focus>0.5 {rgb(0,0,0)}else{rgb(85,85,85)},opacity),next as f64);
         let title_fill=rect(title.pos.x,title.pos.y,title.size.x,(h-2.0*classic as f64).max(1.0));
+        self.chrome.color.w *= (1.0-glass_share) as f32;
         self.chrome.draw_abs(cx,title_fill);
         if classic>0.01 {
             self.shell_draw.solid(cx,rect(title.pos.x,title.pos.y+h-2.0,title.size.x,2.0),alpha(rgb(212,208,200),opacity*classic));
@@ -1495,16 +1534,20 @@ impl WmDesk {
             }
         }
         self.title_hits.push((client,title,ChromeHit::Title));
-        let ink=alpha(if retro>0.5 || (t.dark && t.target.supports_dark()) {rgb(255,255,255)}else{rgb(30,30,34)},opacity);
+        let ink=lerp_color(alpha(if retro>0.5 || chrome_dark {rgb(255,255,255)}else{rgb(30,30,34)},opacity),alpha(roles.text,opacity),glass_share);
         let text=self.titles.get(&client).cloned().unwrap_or_default();
-        let inset=if t.target==DesktopStyle::Macos {86.0}else if t.target==DesktopStyle::Windows {38.0}else{28.0};
-        if t.target != DesktopStyle::Macos && t.target != DesktopStyle::NextStep {
+        // MakeOS keeps macOS's title layout: captions left, no app icon, the
+        // title centred.
+        let mac_family=t.target.mac_family();
+        let centred=mac_family || t.target==DesktopStyle::NextStep;
+        let inset=if mac_family {86.0}else if t.target==DesktopStyle::Windows {38.0}else{28.0};
+        if !centred {
             let app = self.window_apps.get(&client).map(String::as_str).unwrap_or("app");
             let size = if t.target == DesktopStyle::Windows { 24.0 } else { 16.0 };
             self.app_icons.draw(cx, app, t.target, rect(title.pos.x+7.0,title.pos.y+(h-size)*0.5,size,size),opacity,ink);
         }
-        let text_rect=rect(title.pos.x+inset,title.pos.y,(title.size.x-inset-if matches!(t.target,DesktopStyle::Macos|DesktopStyle::NextStep) {inset}else{142.0}).max(1.0),h);
-        self.shell_draw.label_elided(cx,text_rect,retro>0.5,12.0,ink,if matches!(t.target,DesktopStyle::Macos|DesktopStyle::NextStep) {HAlign::Center}else{HAlign::Left},&text);
+        let text_rect=rect(title.pos.x+inset,title.pos.y,(title.size.x-inset-if centred {inset}else{142.0}).max(1.0),h);
+        self.shell_draw.label_elided(cx,text_rect,retro>0.5,12.0,ink,if centred {HAlign::Center}else{HAlign::Left},&text);
         self.chrome.top_only=0.0;self.chrome.title_gradient=0.0;
         let mac=t.share(|s| s.caption_mac);
         let width=t.mix(|s| s.caption_width);
@@ -1535,6 +1578,13 @@ impl WmDesk {
                     if pressed {rgb(82,82,86)}else{rgb(64,64,68)}
                 } else if pressed {rgb(196,196,200)}else{rgb(218,218,222)},opacity);
             }
+            if glass_share > 0.001 {
+                // MakeOS: translucent discs in the palette's ink at the
+                // traffic lights' places; the one under the pointer
+                // brightens, and close turns the palette's red.
+                let disc=if hovered && hit==ChromeHit::Close {alpha(roles.error,opacity)}else{alpha(roles.text,opacity*if hovered {0.30}else{0.18})};
+                self.chrome.color=lerp_color(self.chrome.color,disc,glass_share);
+            }
             let face=if mac>0.99 {rect(button.pos.x+2.0,button.pos.y+(button.size.y-14.0)*0.5,14.0,14.0)}else{button};
             use crate::desktop::MacCaption;
             let group_hover = self.chrome_hover.is_some_and(|(c,h)| c==client && matches!(h,ChromeHit::Close|ChromeHit::Minimize|ChromeHit::Maximize));
@@ -1548,7 +1598,12 @@ impl WmDesk {
                 ChromeHit::Minimize => rgb(153,112,0),
                 _ => rgb(0,108,25),
             },opacity);
-            if mac>0.99 && pressed {self.chrome.color = lerp_color(self.chrome.color,alpha(rgb(0,0,0),opacity),0.12);}
+            if glass_share > 0.001 {
+                let glyph=if hovered && hit==ChromeHit::Close {rgb(255,255,255)}else{roles.text};
+                self.chrome.caption_ink=lerp_color(self.chrome.caption_ink,alpha(glyph,opacity),glass_share);
+            }
+            // A press darkens the disc: macOS's 12 %, MakeOS's 15 %.
+            if mac>0.99 && pressed {self.chrome.color = lerp_color(self.chrome.color,alpha(rgb(0,0,0),opacity),0.12+0.03*glass_share);}
             self.chrome.draw_abs(cx,face);
             self.chrome.caption = MacCaption::None;
             if t.target==DesktopStyle::NextStep {
@@ -1560,7 +1615,7 @@ impl WmDesk {
             }
             if matches!(t.target,DesktopStyle::Windows2000|DesktopStyle::NextStep) {
                 draw_retro_caption(&mut self.shell_draw,cx,button,hit,t.target==DesktopStyle::NextStep,pressed,opacity);
-            }else if mac<0.99 { self.shell_draw.icon_centered(cx,ico,button,11.0,alpha(if (modern && hovered && hit == ChromeHit::Close) || (t.dark && t.target.supports_dark()) {rgb(255,255,255)}else{rgb(20,20,20)},opacity*(1.0-mac) as f32)); }
+            }else if mac<0.99 { self.shell_draw.icon_centered(cx,ico,button,11.0,alpha(if (modern && hovered && hit == ChromeHit::Close) || chrome_dark {rgb(255,255,255)}else{rgb(20,20,20)},opacity*(1.0-mac) as f32)); }
             self.title_hits.push((client,button,hit));
         }
         self.chrome.pressed=0.0;
@@ -1616,6 +1671,9 @@ impl Widget for WmDesk {
             for warp in self.dock_warps.values_mut() { warp.refresh = true; }
         }
         self.style = state.style.clone();
+        // The frame paints from the sheet the state carries, like every kit.
+        self.shell_draw.set_material(state.material);
+        self.roles = state.roles;
         self.titles = state.clients.iter().map(|(c,s)| (*c,s.display_title().to_string())).collect();
         self.title_hits.clear();
         rect.size.y = (rect.size.y - self.style.reserved_height()).max(1.0);
@@ -1632,7 +1690,7 @@ impl Widget for WmDesk {
         let mut targets = state.layout.rects(area, gap);
         let was_minimized = self.minimized.clone();
         self.minimized = state.layout.clients_on(state.layout.active).into_iter().filter(|c| state.layout.desktop.minimized(*c)).collect();
-        if self.style.target == crate::desktop::DesktopStyle::Macos {
+        if self.style.spec().dock_warp {
             let size=cx.owning_window_or_root_pass_size();
             for client in state.layout.clients_on(state.layout.active) {
                 let hidden=self.minimized.contains(&client);
@@ -1808,7 +1866,9 @@ impl Widget for WmDesk {
             // its blur footprint it can share an earlier terminal checkpoint.
             let size = cx.owning_window_or_root_pass_size();
             let dock = if self.style.share(|s| s.glass_shelf) > 0.001 {
-                scope.data.get_mut::<WmState>().map(|state| (crate::desktop::dock_bounds(state, size), 4.5))
+                // As deep as whichever pill samples it.
+                let level = crate::desktop::dock_backdrop_level(&self.style, &self.shell_draw.material());
+                scope.data.get_mut::<WmState>().map(|state| (crate::desktop::dock_bounds(state, size), level))
             } else { None };
             let (snapshot, stacks, passes) = self.compositor.as_mut().unwrap().finish(cx, self.desk_rect, dock);
             if self.blur_counts != (stacks, passes) {

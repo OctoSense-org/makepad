@@ -13,7 +13,10 @@ pub struct StyleSpec {
     /// a floating shelf (the macOS dock) reserves nothing.
     pub reserved_height: f64,
     pub title_height: f64,
-    /// Child inset from the tile rect: Omarchy's ring, or the retro bevel frame.
+    /// Child inset from the tile rect: Omarchy's ring, the retro bevel frame,
+    /// or MakeOS's glass ring — 2 × the material's 1 px border, since the
+    /// stroke is centred one border-width in and a 1 px inset would show only
+    /// half of it. The desk applies MakeOS's only under a glass material.
     pub frame_inset: f64,
     /// Window corner rounding through the captured window surface.
     pub rounding: f64,
@@ -41,6 +44,12 @@ pub struct StyleSpec {
     /// Popup menu offset from the screen bottom (macOS 98, Windows 66, W2K 34);
     /// 0 = the style's own placement.
     pub menu_bottom_offset: f64,
+    /// Minimize warps the window into its shelf icon (the dock genie) instead
+    /// of fading it out; restore plays it back.
+    pub dock_warp: bool,
+    /// Chrome that is dark by identity, whatever the appearance flag says:
+    /// MakeOS's sheet has no light look. Read through `dark_chrome`.
+    pub dark_chrome: bool,
 }
 
 /// One row per `DesktopStyle`, at the discriminant the tween weights index.
@@ -56,6 +65,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((16, 19, 21), (24, 30, 34)),
         ground_dark: ((16, 19, 21), (24, 30, 34)),
         menu_bottom_offset: 0.0,
+        dock_warp: false,
+        dark_chrome: false,
     },
     StyleSpec {
         style: DesktopStyle::Macos,
@@ -67,6 +78,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((39, 43, 87), (171, 109, 131)),
         ground_dark: ((12, 15, 36), (65, 36, 69)),
         menu_bottom_offset: 98.0,
+        dock_warp: true,
+        dark_chrome: false,
     },
     StyleSpec {
         style: DesktopStyle::Windows,
@@ -78,6 +91,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((10, 45, 108), (24, 137, 210)),
         ground_dark: ((10, 19, 34), (21, 49, 72)),
         menu_bottom_offset: 66.0,
+        dock_warp: false,
+        dark_chrome: false,
     },
     StyleSpec {
         style: DesktopStyle::Windows2000,
@@ -89,6 +104,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((0, 128, 128), (0, 128, 128)),
         ground_dark: ((0, 128, 128), (0, 128, 128)),
         menu_bottom_offset: 34.0,
+        dock_warp: false,
+        dark_chrome: false,
     },
     StyleSpec {
         style: DesktopStyle::NextStep,
@@ -100,6 +117,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((85, 85, 85), (85, 85, 85)),
         ground_dark: ((85, 85, 85), (85, 85, 85)),
         menu_bottom_offset: 0.0,
+        dock_warp: false,
+        dark_chrome: false,
     },
     // Phone modes draw no desktop chrome; every geometry number is 0.
     StyleSpec {
@@ -112,6 +131,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((38, 78, 137), (159, 207, 227)),
         ground_dark: ((38, 78, 137), (159, 207, 227)),
         menu_bottom_offset: 0.0,
+        dock_warp: false,
+        dark_chrome: false,
     },
     StyleSpec {
         style: DesktopStyle::Android,
@@ -123,6 +144,8 @@ pub static SPECS: [StyleSpec; 8] = [
         ground: ((50, 46, 73), (158, 156, 204)),
         ground_dark: ((50, 46, 73), (158, 156, 204)),
         menu_bottom_offset: 0.0,
+        dock_warp: false,
+        dark_chrome: false,
     },
     // MakeOS floats like macOS: its dock overlays the desk rather than
     // reserving a strip, and the title bar and menu share macOS's placement.
@@ -134,14 +157,24 @@ pub static SPECS: [StyleSpec; 8] = [
         style: DesktopStyle::MakeOs,
         tiling: false,
         reserved_height: 0.0, title_height: 32.0,
-        frame_inset: 0.0, rounding: 12.0, chrome_radius: 10.0,
-        frame_width: 1.0, caption_width: 30.0, shelf_radius: 18.0, resize_bar: 0.0, shadow: 0.44,
+        frame_inset: 2.0, rounding: 12.0, chrome_radius: 10.0,
+        frame_width: 1.0, caption_width: 30.0, shelf_radius: 24.0, resize_bar: 0.0, shadow: 0.44,
         glass_shelf: true, composes: true, caption_mac: true, bevel_classic: false, bevel_next: false,
         ground: ((11, 18, 32), (5, 7, 14)),
         ground_dark: ((11, 18, 32), (5, 7, 14)),
         menu_bottom_offset: 98.0,
+        dock_warp: true,
+        dark_chrome: true,
     },
 ];
+
+/// The chrome appearance a style draws: dark by identity (its row's
+/// `dark_chrome`), else the appearance flag when the style has a dark look
+/// at all — `supports_dark()` is false for MakeOS, so the flag alone would
+/// read it as light.
+pub fn dark_chrome(style: DesktopStyle, dark: bool) -> bool {
+    SPECS[style as usize].dark_chrome || (style.supports_dark() && dark)
+}
 
 #[derive(Clone, Debug)]
 pub struct StyleTween {
@@ -199,6 +232,26 @@ impl StyleTween {
     pub fn title_height(&self) -> f64 {
         self.mix(|s| s.title_height)
     }
+    /// The window shadow's opacity: the table's focused value, scaled to the
+    /// 0.16 an unfocused window always had against the 0.28 of the styles that
+    /// cast one, so those styles read the same numbers as before and MakeOS
+    /// gets its own darker 0.44.
+    pub fn window_shadow_opacity(&self, focus: f64, fade: f64) -> f32 {
+        (self.mix(|s| s.shadow) * fade * if focus > 0.5 { 1.0 } else { 0.16 / 0.28 }) as f32
+    }
+    /// MakeOS's share of the floating chrome: how far the glass frame has
+    /// taken over from the title fill, the sheet's roles from the ink — 1
+    /// settled, `makeos / (1 - tiling)` on the way in from a tiled desk so
+    /// the crossfade follows the chrome's own opacity, and 0 when there is
+    /// no glass material to paint the frame with.
+    pub fn glass_share(&self, is_glass: bool) -> f64 {
+        let floating = 1.0 - self.share(|s| s.tiling);
+        if !is_glass || floating <= 0.001 {
+            0.0
+        } else {
+            self.share(|s| s.style == DesktopStyle::MakeOs) / floating
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -222,12 +275,15 @@ mod tests {
         // then the MakeOS row appended after the table existed.
         let reserved = [0.0, 0.0, 54.0, 34.0, 0.0, 0.0, 0.0, 0.0];
         let title = [0.0, 32.0, 34.0, 20.0, 22.0, 0.0, 0.0, 32.0];
-        let inset = [2.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 0.0]; // BORDER_SIZE = 2.0
+        let inset = [2.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0, 2.0]; // BORDER_SIZE = 2.0
         let rounding = [0.0, 14.0, 8.0, 0.0, 0.0, 0.0, 0.0, 12.0];
         let chrome_radius = [0.0, 10.0, 8.0, 0.0, 0.0, 0.0, 0.0, 10.0];
         let frame_width = [2.0, 2.0, 2.0, 3.0, 1.0, 0.0, 0.0, 1.0];
         let caption_width = [30.0, 30.0, 46.0, 16.0, 14.0, 0.0, 0.0, 30.0];
-        let shelf_radius = [0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 0.0, 18.0];
+        // MakeOS's 24 is macOS's frosted pill as seen: that shader takes its
+        // DSL corner_radius of 12 as the SDF radius raw, the kit and the
+        // chrome halve a visual one.
+        let shelf_radius = [0.0, 18.0, 0.0, 0.0, 0.0, 0.0, 0.0, 24.0];
         for (i, style) in DesktopStyle::ALL.iter().enumerate() {
             let s = &SPECS[i];
             assert_eq!(s.style, *style);
@@ -252,6 +308,23 @@ mod tests {
         assert!(SPECS[7].glass_shelf && SPECS[7].composes && SPECS[7].shadow > 0.0 && SPECS[7].caption_mac && !SPECS[7].tiling);
         // The rest of the row, from the match arms it centralises.
         assert_eq!(SPECS.map(|s| s.menu_bottom_offset), [0.0, 98.0, 66.0, 34.0, 0.0, 0.0, 0.0, 98.0]);
+        assert_eq!(SPECS.map(|s| s.dock_warp), [false, true, false, false, false, false, false, true]);
+        assert_eq!(SPECS.map(|s| s.dark_chrome), [false, false, false, false, false, false, false, true]);
+        // The shadow reads the table: bit-neutral at the f32 the uniform takes
+        // for the styles that had 0.28 / 0.16, MakeOS's own 0.44 above them.
+        for (style, focused, unfocused) in [
+            (DesktopStyle::Macos, 0.28f32, 0.16f32),
+            (DesktopStyle::Windows, 0.28, 0.16),
+            (DesktopStyle::MakeOs, 0.44, (0.44 * (0.16 / 0.28)) as f32),
+        ] {
+            let mut t = StyleTween::default();
+            t.select(style);
+            t.step(1.0);
+            assert_eq!(t.window_shadow_opacity(1.0, 1.0), focused, "{style:?}");
+            assert_eq!(t.window_shadow_opacity(0.0, 1.0), unfocused, "{style:?}");
+            assert_eq!(t.window_shadow_opacity(1.0, 0.5), focused * 0.5, "{style:?} fades");
+        }
+        assert!((SPECS[7].shadow * (0.16 / 0.28) - 0.2514).abs() < 1e-3);
         assert_eq!(SPECS.map(|s| s.ground), [
             ((16, 19, 21), (24, 30, 34)),
             ((39, 43, 87), (171, 109, 131)),
@@ -287,6 +360,34 @@ mod tests {
             assert!((t.mix(|s| s.rounding) - expect).abs() < 1e-12);
             assert_eq!(t.share(|s| s.tiling), w[0]);
         }
+    }
+    #[test]
+    fn the_glass_share_is_makeos_within_the_floating_chrome() {
+        let mut t = StyleTween::default();
+        t.select(DesktopStyle::MakeOs);
+        t.step(1.0);
+        assert_eq!(t.glass_share(true), 1.0, "settled MakeOS");
+        assert_eq!(t.glass_share(false), 0.0, "no glass material, no glass frame");
+        t.select(DesktopStyle::Macos);
+        t.step(1.0);
+        assert_eq!(t.glass_share(true), 0.0, "settled macOS");
+        // Into MakeOS from the tiled desk: the share follows the chrome's own
+        // opacity, which is what fades in — never more than 1.
+        let mut t = StyleTween::default();
+        t.select(DesktopStyle::MakeOs);
+        t.step(0.3);
+        let makeos = t.weights[DesktopStyle::MakeOs as usize];
+        let tiling = t.weights[DesktopStyle::Omarchy as usize];
+        assert!(makeos > 0.0 && makeos < 1.0);
+        assert!((t.glass_share(true) - makeos / (1.0 - tiling)).abs() < 1e-12);
+        // From macOS, the floating share is already 1: the glass share is the
+        // MakeOS weight itself.
+        let mut t = StyleTween::default();
+        t.select(DesktopStyle::Macos);
+        t.step(1.0);
+        t.select(DesktopStyle::MakeOs);
+        t.step(0.3);
+        assert!((t.glass_share(true) - t.weights[DesktopStyle::MakeOs as usize]).abs() < 1e-12);
     }
     #[test]
     fn shelf_geometry_reads_the_table() {
@@ -334,12 +435,58 @@ mod tests {
         t.step(1.0);
         assert_eq!(shelf_geometry(screen, &t, n), mac, "settled MakeOS");
     }
+    #[test]
+    fn makeos_chrome_is_dark_by_identity_and_the_others_follow_the_flag() {
+        assert!(dark_chrome(DesktopStyle::MakeOs, false));
+        assert!(dark_chrome(DesktopStyle::MakeOs, true));
+        for style in [DesktopStyle::Macos, DesktopStyle::Windows, DesktopStyle::Ios, DesktopStyle::Android] {
+            assert!(dark_chrome(style, true), "{style:?}");
+            assert!(!dark_chrome(style, false), "{style:?}");
+        }
+        // No dark look at all: the flag is ignored, as it always was.
+        for style in [DesktopStyle::Omarchy, DesktopStyle::Windows2000, DesktopStyle::NextStep] {
+            assert!(!dark_chrome(style, true), "{style:?}");
+        }
+    }
+    #[test]
+    fn the_shelf_glass_is_split_between_the_frosted_and_the_liquid_pill() {
+        let mut t = StyleTween::default();
+        assert_eq!(shelf_glass_split(&t, false), (0.0, 0.0), "Omarchy");
+        assert_eq!(shelf_glass_split(&t, true), (0.0, 0.0), "Omarchy, glass material");
+        t.select(DesktopStyle::Macos);
+        t.step(1.0);
+        assert_eq!(shelf_glass_split(&t, false), (1.0, 0.0), "settled macOS");
+        t.select(DesktopStyle::MakeOs);
+        t.step(0.3);
+        let (frosted, makeos) = shelf_glass_split(&t, true);
+        assert!(frosted > 0.0 && makeos > 0.0, "mid-tween both pills are up");
+        assert!((frosted + makeos - t.share(|s| s.glass_shelf)).abs() < 1e-12, "one pill's worth of glass");
+        t.step(1.0);
+        assert_eq!(shelf_glass_split(&t, true), (0.0, 1.0), "settled MakeOS, glass");
+        assert_eq!(shelf_glass_split(&t, false), (1.0, 0.0), "settled MakeOS, flat: the frosted pill stands in");
+    }
+    #[test]
+    fn the_dock_backdrop_is_as_deep_as_the_pill_that_samples_it() {
+        let flat = MaterialTokens::default();
+        let glass = MaterialTokens { glass: 1.0, blur_level: 5.2, ..flat };
+        let shallow = MaterialTokens { glass: 1.0, blur_level: 3.0, ..flat };
+        let mut t = StyleTween::default();
+        t.select(DesktopStyle::MakeOs);
+        t.step(1.0);
+        assert_eq!(dock_backdrop_level(&t, &glass), 5.2);
+        assert_eq!(dock_backdrop_level(&t, &shallow), FROSTED_SHELF_BLUR_LEVEL, "never shallower than the frosted pill");
+        assert_eq!(dock_backdrop_level(&t, &flat), FROSTED_SHELF_BLUR_LEVEL, "flat material: the frosted pill");
+        t.select(DesktopStyle::Macos);
+        t.step(1.0);
+        assert_eq!(dock_backdrop_level(&t, &glass), FROSTED_SHELF_BLUR_LEVEL);
+        assert_eq!(dock_backdrop_level(&t, &flat), FROSTED_SHELF_BLUR_LEVEL);
+    }
 }
 
 use crate::desk::WmState;
 use crate::hub::ClientId;
 use crate::shell::{
-    alpha, rgb,
+    alpha, rgb, MaterialTokens,
     ui::{rect, HAlign, Ico, ShellDraw},
 };
 use makepad_widgets::app_icon::AppIconDraw;
@@ -441,7 +588,7 @@ script_mod! {
         glass: GlassPanel {
             width: Fill height: Fill
             draw_bg +: {
-                blur_level: 4.5
+                blur_level: #(FROSTED_SHELF_BLUR_LEVEL)
                 corner_radius: 12.0
                 lensing_strength: 0.0
                 diffraction_strength: 0.0
@@ -526,8 +673,13 @@ pub struct DesktopShelf {
     overlay: Option<DrawList2d>,
     #[rust]
     hover: Option<ShelfHit>,
+    /// The appearance flag as the tween carries it; `button()` resolves it
+    /// per style through `dark_chrome`.
     #[rust]
     dark: bool,
+    /// The appearance the frosted pill was last tinted for.
+    #[rust]
+    tint_dark: bool,
     #[rust]
     hover_mix: Vec<(ShelfHit, f64)>,
     #[rust]
@@ -572,14 +724,14 @@ impl DesktopShelf {
             .find(|(h, _)| h == &hit)
             .map(|(_, v)| *v)
             .unwrap_or(0.0);
-        let mac = style == DesktopStyle::Macos;
+        let mac = style.mac_family();
         let classic = style == DesktopStyle::Windows2000;
         let selected = classic && matches!(&hit, ShelfHit::Window(c) if Some(*c) == self.active_window);
         let inset = if selected { 1.0 } else { 0.0 };
         self.chrome.pressed = if selected { 1.0 } else { 0.0 };
         self.chrome.selected = self.chrome.pressed;
         let ink = alpha(
-            if style.supports_dark() && self.dark {
+            if dark_chrome(style, self.dark) {
                 rgb(240, 240, 245)
             } else {
                 rgb(28, 30, 36)
@@ -681,7 +833,7 @@ impl DesktopShelf {
                 25.0,
             );
             self.chrome.color = alpha(
-                if style.supports_dark() && self.dark {
+                if dark_chrome(style, self.dark) {
                     rgb(48, 48, 52)
                 } else {
                     rgb(240, 240, 244)
@@ -787,6 +939,34 @@ pub fn dock_icon_bounds(state: &WmState, size: Vec2d, app: &str) -> Rect {
     mac_icon_box(rect(dock.pos.x+10.0+slot as f64*cell,dock.pos.y+6.0,cell,dock.size.y-12.0), 0.0)
 }
 
+/// How the shelf's glass is shared between its two pills, `(frosted,
+/// makeos)`: macOS's frosted `GaussRoundedView` and MakeOS's Liquid Glass
+/// from the kit, which paints only under a glass material — a MakeOS sheet
+/// without one keeps the frosted pill. `glass_shelf` is the weight of every
+/// glass-shelf style, macOS's plus MakeOS's, so `frosted = glass_shelf -
+/// makeos` is macOS's own weight — or the whole glass share when the
+/// material is flat and the frosted pill stands in for MakeOS too. Through
+/// a macOS<->MakeOS tween the two sum to one pill's worth of glass.
+pub fn shelf_glass_split(t: &StyleTween, glass_material: bool) -> (f64, f64) {
+    let glass_shelf = t.share(|s| s.glass_shelf);
+    let makeos = if glass_material { t.share(|s| s.style == DesktopStyle::MakeOs) } else { 0.0 };
+    (glass_shelf - makeos, makeos)
+}
+
+/// Where the frosted pill samples the pyramid; the shelf's GlassPanel
+/// `blur_level` in the DSL reads it too.
+pub const FROSTED_SHELF_BLUR_LEVEL: f64 = 4.5;
+
+/// The pyramid depth the desk renders for the dock. The compositor renders
+/// floor(level)+1 mips; the frosted pill samples at the constant and the
+/// Liquid Glass pill at the material's own level, so while that one is up
+/// the request is the deeper of the two, or the kit would read mips that
+/// were never rendered.
+pub fn dock_backdrop_level(t: &StyleTween, m: &MaterialTokens) -> f64 {
+    let (_, makeos) = shelf_glass_split(t, m.is_glass());
+    if makeos > 0.001 { m.blur_level.max(FROSTED_SHELF_BLUR_LEVEL) } else { FROSTED_SHELF_BLUR_LEVEL }
+}
+
 impl Widget for DesktopShelf {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, self.layout);
@@ -803,17 +983,23 @@ impl Widget for DesktopShelf {
                 .collect();
             let t = &state.style;
             let style = t.target;
-            let dark = style.supports_dark() && t.dark;
-            if self.dark != dark {
-                self.dark = dark;
-                let tint = if dark {
+            self.dark = t.dark;
+            // The target's chrome appearance: the flat pill's fill and the
+            // frosted pill's tint. Only macOS's GaussRoundedView takes the
+            // tint; MakeOS's Liquid Glass reads its own from the material.
+            let chrome_dark = dark_chrome(style, t.dark);
+            if self.tint_dark != chrome_dark {
+                self.tint_dark = chrome_dark;
+                let tint = if chrome_dark {
                     rgb(24, 24, 28)
                 } else {
                     rgb(221, 221, 237)
                 };
-                let tint_alpha = if dark { 0.32 } else { 0.20 };
+                let tint_alpha = if chrome_dark { 0.32 } else { 0.20 };
                 script_apply_eval!(cx,self.glass,{draw_bg +: {tint_color: #(tint) tint_alpha: #(tint_alpha)}});
             }
+            // The pill paints from the sheet the state carries, like every kit.
+            self.d.set_material(state.material);
             let opacity = (1.0 - t.share(|s| s.tiling)) as f32;
             if opacity > 0.001 && !style.mobile() {
                 let mut apps: Vec<_> = crate::shell::launcher::apps()
@@ -850,21 +1036,35 @@ impl Widget for DesktopShelf {
                 let (x, y, w, h) = (r.pos.x, r.pos.y, r.size.x, r.size.y);
                 self.bounds = r;
                 let glass_shelf = t.share(|s| s.glass_shelf);
+                // One pill's worth of glass between the two pills.
+                let (frosted, makeos) = shelf_glass_split(t, self.d.material().is_glass());
                 // Window-backed Gaussian blur, sampled from the live desktop.
-                if glass_shelf > 0.01 {
+                if frosted > 0.01 {
                     if let Some(mut glass) = self.glass.borrow_mut::<gauss_view::GaussRoundedView>()
                     {
                         glass.draw_surface_with_backdrop(
                             cx,
                             r,
                             state.dock_backdrop.clone(),
-                            glass_shelf as f32,
+                            frosted as f32,
                         );
                     }
                 }
-                // Glass redirects drawing through its backdrop pass; keep its
-                // foreground in a separate list. Opaque shelves stay in the
-                // scene's recording so closing a child cannot detach them.
+                // The same snapshot, rendered as deep as the material samples
+                // (`dock_backdrop_level`). The radius is the table's visual
+                // one: the kit and the chrome halve it for Sdf2d, while the
+                // frosted GaussRoundedView takes its DSL corner_radius as
+                // the SDF radius raw — MakeOS's row carries twice that, so
+                // the pills a tween overlays share their corners. The quad
+                // lands in this list, under the foreground overlay below.
+                if makeos > 0.001 {
+                    self.d.bind_snapshot(cx, state.dock_backdrop.clone());
+                    self.d.glass_pill(cx, r, t.mix(|s| s.shelf_radius), makeos as f32);
+                }
+                // The pills draw in the scene list; the icons go to a
+                // separate overlay list so they composite above the glass.
+                // Opaque shelves stay in the scene's recording so closing a
+                // child cannot detach them.
                 let glass_foreground = glass_shelf > 0.001;
                 if glass_foreground {
                     if self.overlay.is_none() {
@@ -878,7 +1078,7 @@ impl Widget for DesktopShelf {
                 self.chrome.color = alpha(
                     if style == DesktopStyle::Windows2000 {
                         rgb(212, 208, 200)
-                    } else if dark {
+                    } else if chrome_dark {
                         rgb(32, 32, 32)
                     } else {
                         rgb(234, 238, 245)
@@ -893,6 +1093,7 @@ impl Widget for DesktopShelf {
                     DesktopStyle::Windows,
                     DesktopStyle::Windows2000,
                     DesktopStyle::NextStep,
+                    DesktopStyle::MakeOs,
                 ] {
                     let opacity = t.weights[style as usize] as f32;
                     if opacity < 0.001 {
@@ -937,12 +1138,12 @@ impl Widget for DesktopShelf {
                             );
                         }
                     } else {
-                        let cell = if style == DesktopStyle::Macos {
+                        let cell = if style.mac_family() {
                             (w - 20.0) / n
                         } else {
                             48.0_f64.min((w - 36.0) / n)
                         };
-                        let start = if style == DesktopStyle::Macos {
+                        let start = if style.mac_family() {
                             x + 10.0
                         } else {
                             x + (w - cell * n) * 0.5
@@ -952,7 +1153,7 @@ impl Widget for DesktopShelf {
                             rect(start, y + 6.0, cell, (h - 12.0).max(1.0)),
                             ShelfHit::Launcher,
                             Ico::Menu,
-                            if style == DesktopStyle::Macos {
+                            if style.mac_family() {
                                 "Applications"
                             } else {
                                 "Start"
@@ -980,7 +1181,7 @@ impl Widget for DesktopShelf {
                             );
                         }
                     }
-                    if style != DesktopStyle::Macos && style != DesktopStyle::NextStep {
+                    if !style.mac_family() && style != DesktopStyle::NextStep {
                         let button = rect(x + w - 22.0, y + 3.0, 19.0, (h - 6.0).max(1.0));
                         self.hits.push((button, ShelfHit::ShowDesktop));
                         self.d.solid(

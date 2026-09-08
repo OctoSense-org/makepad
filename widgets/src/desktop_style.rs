@@ -64,6 +64,11 @@ impl DesktopStyle {
             s => s,
         }
     }
+    /// macOS and the style that reuses its shell whole: the dock, the
+    /// caption layout, the minimize warp into the dock.
+    pub fn mac_family(self) -> bool {
+        matches!(self, Self::Macos | Self::MakeOs)
+    }
     pub fn shelf_height(self) -> f64 {
         match self {
             Self::Omarchy => 0.0,
@@ -292,6 +297,10 @@ pub fn handle_event(cx: &mut Cx, event: &Event) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mac_family_is_macos_and_makeos() {
+        assert_eq!(DesktopStyle::ALL.iter().filter(|s| s.mac_family()).copied().collect::<Vec<_>>(), [DesktopStyle::Macos, DesktopStyle::MakeOs]);
+    }
     #[test]
     fn mobile_typefaces_keep_symbol_fallbacks_across_appearances() {
         let mut cx=Cx::new(Box::new(|_,_|{}));

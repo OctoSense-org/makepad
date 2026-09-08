@@ -956,6 +956,56 @@ fn material_slot<'a>(m: &'a mut MaterialTokens, key: &str) -> Option<MaterialSlo
     })
 }
 
+/// The palette roles the window frame paints from under a style whose
+/// sheet is the source: the title ink, the focus accent and the destructive
+/// red of the close caption. Scanned out of the sheet like the material,
+/// never read from the DSL.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StyleRoles {
+    pub text: Vec4f,
+    pub focus: Vec4f,
+    pub error: Vec4f,
+}
+
+/// MakeOS's own palette, so a sheet that names no role still frames its
+/// windows in the bundled colours.
+impl Default for StyleRoles {
+    fn default() -> Self {
+        Self {
+            text: crate::shell::rgb(0xd6, 0xe2, 0xff),
+            focus: crate::shell::rgb(0x5b, 0x9d, 0xff),
+            error: crate::shell::rgb(0xff, 0x6b, 0x81),
+        }
+    }
+}
+
+/// `mod.theme.color_text = #rrggbb`, `color_focus`, `color_error` out of a
+/// style sheet's theme text. A role the sheet leaves out, or writes as
+/// anything but a hex literal, keeps its default; the others still apply.
+pub fn scan_style_roles(sheet_theme: &str) -> StyleRoles {
+    let mut roles = StyleRoles::default();
+    for (key, slot) in [
+        ("mod.theme.color_text", &mut roles.text),
+        ("mod.theme.color_focus", &mut roles.focus),
+        ("mod.theme.color_error", &mut roles.error),
+    ] {
+        if let Some(color) = scan_assigned_color(sheet_theme, key) {
+            *slot = color;
+        }
+    }
+    roles
+}
+
+/// The value of the first `key = #hex` line in a sheet: the assignment form
+/// the style sheets write, against the `key: #hex` form of the wm theme
+/// files that `scan_theme_color` reads.
+fn scan_assigned_color(sheet_theme: &str, key: &str) -> Option<Vec4f> {
+    sheet_theme.lines().find_map(|line| {
+        let (k, v) = line.split_once('=')?;
+        (k.trim() == key).then(|| parse_material_color(v.trim())).flatten()
+    })
+}
+
 /// A material colour, `#rrggbb` or `#rrggbbaa`; the alpha is 1 when absent.
 fn parse_material_color(value: &str) -> Option<Vec4f> {
     let hex = value.strip_prefix('#')?;
@@ -1444,6 +1494,23 @@ bright_magenta = "#bb9af7"
         );
         let (flat, problems) = scan_material("mod.theme.color_text = #fff\ntrue\n");
         assert!(!flat.is_glass() && problems.is_empty());
+    }
+
+    #[test]
+    fn style_roles_scan_the_sheet_and_default_where_it_is_silent() {
+        let sheet = include_str!("../../../widgets/themes/makeos/theme.splash");
+        let roles = scan_style_roles(sheet);
+        assert_eq!(roles.text, crate::shell::rgb(0xd6, 0xe2, 0xff));
+        assert_eq!(roles.focus, crate::shell::rgb(0x5b, 0x9d, 0xff));
+        assert_eq!(roles.error, crate::shell::rgb(0xff, 0x6b, 0x81), "the sheet owns its red");
+        // No `color_error`, a `color_text` of its own, and the hover
+        // variant of the same role must not be mistaken for it.
+        let partial = "mod.theme = mod.themes.dark\nmod.theme.color_text_hover = #ffffff\nmod.theme.color_text = #102030\nmod.theme.color_focus = mod.theme.color_text\ntrue\n";
+        let roles = scan_style_roles(partial);
+        assert_eq!(roles.text, crate::shell::rgb(0x10, 0x20, 0x30));
+        assert_eq!(roles.focus, StyleRoles::default().focus, "a reference, not a literal, keeps the default");
+        assert_eq!(roles.error, StyleRoles::default().error);
+        assert_eq!(scan_style_roles(""), StyleRoles::default());
     }
 
     #[test]
