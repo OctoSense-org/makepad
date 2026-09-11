@@ -41,7 +41,7 @@ impl<'a> ScriptVm<'a> {
             if old_value.is_err() {
                 self.bx.threads.cur().push_stack_unchecked(old_value);
             } else if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
+                let str = self.bx.heap.new_bounded_string_with(|heap, out| {
                     heap.cast_to_string(old_value, out);
                     heap.cast_to_string(value, out);
                 });
@@ -139,7 +139,7 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .value(obj, field, self.bx.threads.cur().trap.pass());
             if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
+                let str = self.bx.heap.new_bounded_string_with(|heap, out| {
                     heap.cast_to_string(old_value, out);
                     heap.cast_to_string(value, out);
                 });
@@ -223,12 +223,12 @@ impl<'a> ScriptVm<'a> {
                     .set_value(obj, index, value, self.bx.threads.cur().trap.pass());
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(arr) = object.as_array() {
-            self.bx.heap.set_array_index(
-                arr,
-                index.as_index(),
-                value,
-                self.bx.threads.cur().trap.pass(),
-            );
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
+            self.bx
+                .heap
+                .set_array_index(arr, index, value, self.bx.threads.cur().trap.pass());
             self.bx.threads.cur().push_stack_unchecked(value);
         } else {
             let value = script_err_wrong_value!(
@@ -252,7 +252,7 @@ impl<'a> ScriptVm<'a> {
                 .heap
                 .value(obj, index, self.bx.threads.cur().trap.pass());
             if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
+                let str = self.bx.heap.new_bounded_string_with(|heap, out| {
                     heap.cast_to_string(old_value, out);
                     heap.cast_to_string(value, out);
                 });
@@ -276,13 +276,15 @@ impl<'a> ScriptVm<'a> {
                 self.bx.threads.cur().push_stack_unchecked(value);
             }
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap
                 .array_index(arr, index, self.bx.threads.cur().trap.pass());
             if old_value.is_string_like() || value.is_string_like() {
-                let str = self.bx.heap.new_string_with(|heap, out| {
+                let str = self.bx.heap.new_bounded_string_with(|heap, out| {
                     heap.cast_to_string(old_value, out);
                     heap.cast_to_string(value, out);
                 });
@@ -336,7 +338,9 @@ impl<'a> ScriptVm<'a> {
                 self.bx.threads.cur().push_stack_unchecked(NIL);
             }
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap
@@ -690,7 +694,9 @@ impl<'a> ScriptVm<'a> {
             );
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap
@@ -739,7 +745,9 @@ impl<'a> ScriptVm<'a> {
             );
             self.bx.threads.cur().push_stack_unchecked(value);
         } else if let Some(arr) = object.as_array() {
-            let index = index.as_index();
+            let Some(index) = self.checked_array_index(index) else {
+                return;
+            };
             let old_value = self
                 .bx
                 .heap

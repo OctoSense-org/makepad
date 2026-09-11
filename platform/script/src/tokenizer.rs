@@ -243,6 +243,7 @@ enum State {
 
 #[derive(Default)]
 pub struct ScriptTokenizer {
+    // This is a Unicode scalar offset because token_index_to_row_col iterates chars.
     pos: usize,
     pub tokens: Vec<ScriptTokenPos>,
     pub original: String,
@@ -349,13 +350,13 @@ impl ScriptTokenizer {
     }
 
     fn emit_rust_value(&mut self) {
+        let len = self.temp.chars().count();
         let number = if let Ok(v) = self.temp.parse::<u32>() {
             self.temp.clear();
             v
         } else {
             0
         };
-        let len = self.temp.len();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -364,12 +365,12 @@ impl ScriptTokenizer {
     }
 
     fn emit_f64(&mut self) {
+        let len = self.temp.chars().count();
         let number = if let Ok(v) = self.temp.parse::<f64>() {
             // allow the shader compiler to recognise the difference btween 1 and 1.
             if !(self.temp.contains('.') || self.temp.contains('e') || self.temp.contains('E'))
                 && v <= 0xFF_FFFF_FFFFu64 as f64
             {
-                let len = self.temp.len();
                 self.temp.clear();
                 self.tokens.push(ScriptTokenPos {
                     pos: self.pos - len,
@@ -382,7 +383,6 @@ impl ScriptTokenizer {
         } else {
             0.0
         };
-        let len = self.temp.len();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -391,13 +391,13 @@ impl ScriptTokenizer {
     }
 
     fn emit_f32(&mut self) {
+        let len = self.temp.chars().count();
         let number = if let Ok(v) = self.temp.parse::<f32>() {
             self.temp.clear();
             v
         } else {
             0.0
         };
-        let len = self.temp.len();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -406,13 +406,13 @@ impl ScriptTokenizer {
     }
 
     fn emit_u32(&mut self) {
+        let len = self.temp.chars().count();
         let number = if let Ok(v) = self.temp.parse::<u32>() {
             self.temp.clear();
             v
         } else {
             0
         };
-        let len = self.temp.len();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -421,13 +421,13 @@ impl ScriptTokenizer {
     }
 
     fn emit_i32(&mut self) {
+        let len = self.temp.chars().count();
         let number = if let Ok(v) = self.temp.parse::<i32>() {
             self.temp.clear();
             v
         } else {
             0
         };
-        let len = self.temp.len();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -436,13 +436,13 @@ impl ScriptTokenizer {
     }
 
     fn emit_f16(&mut self) {
+        let len = self.temp.chars().count();
         let number = if let Ok(v) = self.temp.parse::<f32>() {
             self.temp.clear();
             v
         } else {
             0.0
         };
-        let len = self.temp.len();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -461,7 +461,7 @@ impl ScriptTokenizer {
             }
             Ok(id) => id,
         };
-        let len = self.temp.len();
+        let len = self.temp.chars().count();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -483,7 +483,7 @@ impl ScriptTokenizer {
             }
             Ok(id) => id,
         };
-        let len = self.temp.len();
+        let len = self.temp.chars().count();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -506,7 +506,7 @@ impl ScriptTokenizer {
             }
             Ok(id) => id,
         };
-        let len = self.temp.len();
+        let len = self.temp.chars().count();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -519,7 +519,7 @@ impl ScriptTokenizer {
             Err(()) => 0xff00ffff,
             Ok(color) => color,
         };
-        let len = self.temp.len();
+        let len = self.temp.chars().count();
         self.temp.clear();
         self.tokens.push(ScriptTokenPos {
             pos: self.pos - len,
@@ -972,8 +972,9 @@ impl ScriptTokenizer {
                         self.emit_f16();
                         self.state = State::Whitespace
                     } else if c == '_' {
-                        // skip these
-                        self.state = State::Whitespace
+                        // Numeric separators stay in the literal. Moving to whitespace here
+                        // left `temp` stale and let a later separator panic.
+                        continue;
                     } else if c == '$' || c.is_alphabetic() {
                         self.emit_f64();
                         self.state = State::Identifier;
@@ -1057,5 +1058,40 @@ impl ScriptTokenizer {
             }
         }
         &self.tokens[start..self.tokens.len()]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unicode_identifier_does_not_underflow_its_token_position() {
+        let mut heap = ScriptHeap::default();
+        let mut tokenizer = ScriptTokenizer::default();
+
+        tokenizer.tokenize("\u{540d} ", &mut heap);
+
+        assert_eq!(tokenizer.tokens.len(), 1);
+    }
+
+    #[test]
+    fn numeric_underscores_stay_in_the_pending_number_until_a_separator() {
+        let mut heap = ScriptHeap::default();
+        let mut tokenizer = ScriptTokenizer::default();
+
+        tokenizer.tokenize("0_;1_000;1.5_;1e2_;", &mut heap);
+
+        assert_eq!(tokenizer.tokens.len(), 8);
+        assert_eq!(tokenizer.tokens[0].token.as_u40(), Some(0));
+        assert_eq!(tokenizer.tokens[2].token.as_u40(), Some(1_000));
+        assert_eq!(tokenizer.tokens[4].token.as_f64(), Some(1.5));
+        assert_eq!(tokenizer.tokens[6].token.as_f64(), Some(100.0));
+        for separator in [1, 3, 5, 7] {
+            assert!(matches!(
+                tokenizer.tokens[separator].token,
+                ScriptToken::Separator(_)
+            ));
+        }
     }
 }
