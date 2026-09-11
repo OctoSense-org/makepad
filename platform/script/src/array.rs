@@ -10,7 +10,41 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::rc::Rc;
+
+/// Appends `bytes` with the same replacement behavior as
+/// `String::from_utf8_lossy` without materializing an unbounded intermediate
+/// string before the destination sink can apply its limit.
+fn append_utf8_lossy<S: ScriptStringSink>(mut bytes: &[u8], out: &mut S) {
+    while !bytes.is_empty() && !out.is_full() {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                out.append_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to != 0 {
+                    let valid = std::str::from_utf8(&bytes[..valid_up_to])
+                        .expect("UTF-8 errors report valid prefixes");
+                    out.append_str(valid);
+                    if out.is_full() {
+                        break;
+                    }
+                }
+
+                out.append_char('\u{FFFD}');
+                if out.is_full() {
+                    break;
+                }
+
+                let invalid_len = error.error_len().unwrap_or(bytes.len() - valid_up_to);
+                bytes = &bytes[valid_up_to + invalid_len..];
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ScriptArrayRef {
@@ -175,6 +209,35 @@ pub enum ScriptArrayStorage {
 }
 
 impl ScriptArrayStorage {
+    /// Backing allocation retained by this storage, excluding the enum itself.
+    ///
+    /// The heap budget uses retained capacity instead of logical length so a
+    /// cleared or sparsely written collection cannot hide already-reserved
+    /// memory from the host's accounting boundary.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::ScriptValue(values) => values.capacity().saturating_mul(size_of::<ScriptValue>()),
+            Self::F32(values) => values.capacity().saturating_mul(size_of::<f32>()),
+            Self::U32(values) => values.capacity().saturating_mul(size_of::<u32>()),
+            Self::U16(values) => values.capacity().saturating_mul(size_of::<u16>()),
+            Self::U8(values) => values.capacity(),
+        }
+    }
+
+    /// Minimum backing bytes needed to represent `length` values before any
+    /// allocator growth policy is applied. Callers use this before sparse
+    /// indexed writes so a hostile index cannot request an unbounded resize.
+    pub(crate) fn minimum_bytes_for_len(&self, length: usize) -> Option<usize> {
+        let element_bytes = match self {
+            Self::ScriptValue(_) => size_of::<ScriptValue>(),
+            Self::F32(_) => size_of::<f32>(),
+            Self::U32(_) => size_of::<u32>(),
+            Self::U16(_) => size_of::<u16>(),
+            Self::U8(_) => size_of::<u8>(),
+        };
+        length.checked_mul(element_bytes)
+    }
+
     pub fn clear(&mut self) {
         match self {
             Self::ScriptValue(v) => v.clear(),
@@ -398,35 +461,44 @@ impl ScriptArrayStorage {
             Self::U8(v) => v.remove(index).into(),
         }
     }
-    pub fn to_string(&self, heap: &ScriptHeap, s: &mut String) {
+    pub fn to_string<S: ScriptStringSink>(&self, heap: &ScriptHeap, out: &mut S) {
         match self {
-            Self::U8(bytes) => {
-                let v = String::from_utf8_lossy(bytes);
-                s.push_str(v.as_ref());
-            }
+            Self::U8(bytes) => append_utf8_lossy(bytes, out),
             Self::ScriptValue(vec) => {
                 for v in vec {
-                    heap.cast_to_string(*v, s);
+                    heap.cast_to_string(*v, out);
+                    if out.is_full() {
+                        break;
+                    }
                 }
             }
             Self::F32(v) => {
                 for v in v {
                     if let Some(c) = std::char::from_u32(*v as _) {
-                        s.push(c)
+                        out.append_char(c)
+                    }
+                    if out.is_full() {
+                        break;
                     }
                 }
             }
             Self::U32(v) => {
                 for v in v {
                     if let Some(c) = std::char::from_u32(*v) {
-                        s.push(c)
+                        out.append_char(c)
+                    }
+                    if out.is_full() {
+                        break;
                     }
                 }
             }
             Self::U16(v) => {
                 for v in v {
                     if let Some(c) = std::char::from_u32(*v as _) {
-                        s.push(c)
+                        out.append_char(c)
+                    }
+                    if out.is_full() {
+                        break;
                     }
                 }
             }
@@ -460,7 +532,7 @@ impl ScriptArrayData {
                     return vm
                         .bx
                         .heap
-                        .new_string_with(|heap, s| {
+                        .new_bounded_string_with(|heap, s| {
                             heap.array_storage(arr).to_string(heap, s);
                         })
                         .into();
@@ -473,15 +545,18 @@ impl ScriptArrayData {
             if let Some(array) = script_value!(vm, args.self).as_array(){
                 // Take json_parser out to avoid borrow conflict
                 let mut json_parser = std::mem::take(&mut vm.bx.threads.cur().json_parser);
-                let result = vm.bx.heap.array_mut_self_with(array, |heap, storage|{
-                    match storage{
-                        ScriptArrayStorage::U8(bytes)=>{
-                             let v = String::from_utf8_lossy(bytes);
-                            json_parser.read_json(v.as_ref(), heap)
+                let result = vm.bx.heap.temp_bounded_string_with(|heap, temp| {
+                    let is_byte_array = match heap.array_storage(array) {
+                        ScriptArrayStorage::U8(bytes) => {
+                            append_utf8_lossy(bytes, temp);
+                            true
                         }
-                        _=>{
-                            NIL // Error handled below
-                        }
+                        _ => false,
+                    };
+                    if is_byte_array && !temp.is_full() {
+                        json_parser.read_json(temp.as_str(), heap)
+                    } else {
+                        NIL
                     }
                 });
                 vm.bx.threads.cur().json_parser = json_parser;
@@ -506,10 +581,14 @@ impl ScriptArrayData {
                 if let Some(arr) = script_value!(vm, args.self).as_array() {
                     // Take json_parser out to avoid borrow conflict
                     let mut json_parser = std::mem::take(&mut vm.bx.threads.cur().json_parser);
-                    let result = vm.bx.heap.temp_string_with(|heap, temp| {
+                    let result = vm.bx.heap.temp_bounded_string_with(|heap, temp| {
                         let storage = heap.array_storage(arr);
                         storage.to_string(heap, temp);
-                        json_parser.read_json(temp, heap)
+                        if temp.is_full() {
+                            NIL
+                        } else {
+                            json_parser.read_json(temp.as_str(), heap)
+                        }
                     });
                     vm.bx.threads.cur().json_parser = json_parser;
                     return result;
@@ -668,6 +747,25 @@ impl ScriptArrayData {
             true
         } else {
             false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_utf8_lossy_matches_std() {
+        for bytes in [
+            b"valid".as_slice(),
+            b"prefix\xFFsuffix".as_slice(),
+            b"\xF0\x9F\x92".as_slice(),
+            b"\xC3\xA9\xFF\x80".as_slice(),
+        ] {
+            let mut out = String::new();
+            append_utf8_lossy(bytes, &mut out);
+            assert_eq!(out, String::from_utf8_lossy(bytes).as_ref());
         }
     }
 }

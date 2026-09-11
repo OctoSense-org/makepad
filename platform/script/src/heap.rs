@@ -1,12 +1,13 @@
 use crate::array::*;
 use crate::gc::*;
-use crate::gen_index::GenVec;
+use crate::gen_index::{GenSlot, GenVec};
 use crate::handle::*;
 use crate::makepad_live_id::*;
 use crate::object::*;
 use crate::pod::*;
 use crate::regex::*;
 use crate::string::*;
+use crate::string_heap::ScriptStringSink;
 use crate::traits::*;
 use crate::trap::*;
 use crate::value::*;
@@ -14,6 +15,7 @@ use crate::value::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::mem::size_of;
 use std::rc::Rc;
 
 #[derive(Default)]
@@ -38,6 +40,14 @@ pub struct ScriptHeap {
     pub(crate) strings_reuse: Vec<String>,
     pub(crate) strings: GenVec<Option<ScriptStringData>>,
     pub(crate) strings_free: Vec<ScriptString>,
+    pub(crate) max_string_bytes: Option<usize>,
+    pub(crate) string_limit_exceeded: bool,
+    pub(crate) max_heap_bytes: Option<usize>,
+    pub(crate) heap_limit_exceeded: bool,
+    // Cached retained-capacity accounting while an aggregate heap limit is
+    // active. Allocation paths update it by observed backing-capacity growth;
+    // hosts can reconcile it after trusted raw-VM configuration or collection.
+    pub(crate) accounted_heap_bytes: usize,
 
     pub(crate) arrays: GenVec<ScriptArrayData>,
     pub(crate) arrays_free: Vec<ScriptArray>,
@@ -72,6 +82,200 @@ impl ScriptHeap {
     /// which would otherwise never be released.
     const MAX_STRINGS_REUSE: usize = 1024;
 
+    /// Applies an aggregate cap to the Octoscript-owned heap data structures.
+    ///
+    /// `None` preserves the inherited Makepad VM behavior. The accounting
+    /// tracks retained capacity of script strings, arrays, objects, slots, and
+    /// intern tables. It intentionally cannot account for opaque host handles,
+    /// adapter-owned Rust allocations, or the process allocator's metadata.
+    pub fn set_max_heap_bytes(&mut self, maximum_bytes: Option<usize>) {
+        self.max_heap_bytes = maximum_bytes;
+        self.heap_limit_exceeded = false;
+
+        // A pooled buffer is retained process memory but does not represent a
+        // live script value. Drop it when enabling the cap so later string
+        // accounting has one clear ownership path.
+        if maximum_bytes.is_some() {
+            self.strings_reuse = Vec::new();
+        }
+        self.reconcile_heap_bytes();
+    }
+
+    /// Returns the configured aggregate Octoscript heap cap, if any.
+    pub fn max_heap_bytes(&self) -> Option<usize> {
+        self.max_heap_bytes
+    }
+
+    /// Returns the current tracked retained-capacity amount used for the
+    /// aggregate heap limit.
+    pub fn accounted_heap_bytes(&self) -> usize {
+        self.accounted_heap_bytes
+    }
+
+    /// Recomputes retained-capacity accounting from the current heap state.
+    ///
+    /// This is appropriate after trusted raw VM configuration or garbage
+    /// collection. Normal script allocation paths update the cached value in
+    /// constant time instead of scanning the heap on every instruction.
+    pub fn reconcile_heap_bytes(&mut self) {
+        self.accounted_heap_bytes = self.estimated_heap_bytes();
+        if self
+            .max_heap_bytes
+            .is_some_and(|maximum| self.accounted_heap_bytes > maximum)
+        {
+            self.heap_limit_exceeded = true;
+        }
+    }
+
+    /// Recomputes accounting for uncommon allocation paths whose backing
+    /// storage is owned by a lower-level helper.
+    pub(crate) fn reconcile_heap_bytes_if_limited(&mut self) {
+        if self.max_heap_bytes.is_some() {
+            self.reconcile_heap_bytes();
+        }
+    }
+
+    /// Returns and clears an aggregate heap-cap failure raised by a script
+    /// allocation path.
+    pub fn take_heap_limit_exceeded(&mut self) -> bool {
+        std::mem::take(&mut self.heap_limit_exceeded)
+    }
+
+    /// Records observed retained-capacity growth from a normal script-owned
+    /// allocation path. This remains a no-op for an unbounded raw VM.
+    pub(crate) fn note_heap_growth(&mut self, growth_bytes: usize) {
+        if self.max_heap_bytes.is_none() || growth_bytes == 0 {
+            return;
+        }
+        self.accounted_heap_bytes = self.accounted_heap_bytes.saturating_add(growth_bytes);
+        if self
+            .max_heap_bytes
+            .is_some_and(|maximum| self.accounted_heap_bytes > maximum)
+        {
+            self.heap_limit_exceeded = true;
+        }
+    }
+
+    /// Applies an observed retained-capacity replacement. A shrink makes the
+    /// cached amount accurate for later sparse-growth preflights, but never
+    /// clears a failure already raised by this execution.
+    pub(crate) fn note_heap_capacity_change(&mut self, before: usize, after: usize) {
+        if self.max_heap_bytes.is_none() || before == after {
+            return;
+        }
+        if after > before {
+            self.note_heap_growth(after - before);
+        } else {
+            self.accounted_heap_bytes = self.accounted_heap_bytes.saturating_sub(before - after);
+        }
+    }
+
+    /// Rejects a sparse collection resize before it asks Rust to allocate the
+    /// requested backing storage. Ordinary capacity growth is observed after
+    /// the operation; this preflight closes the one-operation allocation gap
+    /// for attacker-controlled indexes.
+    pub(crate) fn can_grow_heap_by(&mut self, growth_bytes: Option<usize>) -> bool {
+        let Some(maximum) = self.max_heap_bytes else {
+            return true;
+        };
+        let Some(growth_bytes) = growth_bytes else {
+            self.heap_limit_exceeded = true;
+            return false;
+        };
+        if growth_bytes > maximum.saturating_sub(self.accounted_heap_bytes) {
+            self.heap_limit_exceeded = true;
+            return false;
+        }
+        true
+    }
+
+    fn estimated_heap_bytes(&self) -> usize {
+        fn bytes_for<T>(capacity: usize) -> usize {
+            capacity.saturating_mul(size_of::<T>())
+        }
+
+        fn map_bytes<K, V, S>(map: &HashMap<K, V, S>) -> usize {
+            // HashMap keeps bucket control data in addition to key/value
+            // payload. Charge two machine words plus one control byte per
+            // usable bucket to avoid treating map capacity as free.
+            let entry_bytes = size_of::<(K, V)>()
+                .saturating_add(size_of::<usize>().saturating_mul(2))
+                .saturating_add(1);
+            map.capacity().saturating_mul(entry_bytes)
+        }
+
+        let mut bytes = size_of::<Self>();
+
+        bytes = bytes.saturating_add(bytes_for::<ScriptGcMark>(self.mark_vec.capacity()));
+        bytes = bytes.saturating_add(map_bytes(&*self.root_objects.borrow()));
+        bytes = bytes.saturating_add(map_bytes(&*self.root_arrays.borrow()));
+        bytes = bytes.saturating_add(map_bytes(&*self.root_handles.borrow()));
+        bytes = bytes.saturating_add(map_bytes(&self.type_defaults));
+
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<ScriptObjectData>>(
+            self.objects.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptObject>(self.objects_free.capacity()));
+        for object in self.objects.iter() {
+            bytes = bytes.saturating_add(object.retained_bytes());
+        }
+
+        bytes = bytes.saturating_add(map_bytes(&self.string_intern));
+        bytes = bytes.saturating_add(bytes_for::<String>(self.strings_reuse.capacity()));
+        for string in &self.strings_reuse {
+            bytes = bytes.saturating_add(string.capacity());
+        }
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<Option<ScriptStringData>>>(
+            self.strings.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptString>(self.strings_free.capacity()));
+        for string in self.strings.iter().flatten() {
+            bytes = bytes.saturating_add(string.string.0.capacity());
+        }
+
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<ScriptArrayData>>(
+            self.arrays.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptArray>(self.arrays_free.capacity()));
+        for array in self.arrays.iter() {
+            bytes = bytes.saturating_add(array.storage.retained_bytes());
+        }
+
+        bytes = bytes.saturating_add(bytes_for::<ScriptPodTypeData>(self.pod_types.capacity()));
+        bytes = bytes.saturating_add(bytes_for::<ScriptPodType>(self.pod_types_free.capacity()));
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<ScriptPodData>>(self.pods.capacity()));
+        bytes = bytes.saturating_add(bytes_for::<ScriptPod>(self.pods_free.capacity()));
+        for pod in self.pods.iter() {
+            bytes = bytes.saturating_add(bytes_for::<u32>(pod.data.capacity()));
+        }
+
+        bytes = bytes.saturating_add(bytes_for::<ScriptTypeCheck>(self.type_check.capacity()));
+        bytes = bytes.saturating_add(map_bytes(&self.type_index));
+
+        // Handle payloads are intentionally opaque Rust-owned allocations;
+        // count their slot bookkeeping but not the adapter's object graph.
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<Option<ScriptHandleData>>>(
+            self.handles.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptHandle>(self.handles_free.capacity()));
+
+        bytes = bytes.saturating_add(map_bytes(&self.regex_intern));
+        bytes = bytes.saturating_add(bytes_for::<GenSlot<Option<ScriptRegexData>>>(
+            self.regexes.capacity(),
+        ));
+        bytes = bytes.saturating_add(bytes_for::<ScriptRegex>(self.regexes_free.capacity()));
+        for regex in self.regexes.iter().flatten() {
+            // The compiled regex engine is opaque, but the pattern's retained
+            // bytes and all VM-level indexes are charged here.
+            bytes = bytes.saturating_add(regex.pattern.capacity());
+        }
+        for key in self.regex_intern.keys() {
+            bytes = bytes.saturating_add(key.pattern.capacity());
+        }
+
+        bytes
+    }
+
     /// Release memory the heap is holding purely for reuse / over-allocation, called after a
     /// GC sweep. This is safe because it never removes or moves any live slot — it only:
     ///   - drops excess pooled-for-reuse `String` buffers beyond a cap (re-allocated lazily),
@@ -98,6 +302,7 @@ impl ScriptHeap {
         self.pod_types_free.shrink_to_fit();
         self.handles_free.shrink_to_fit();
         self.regexes_free.shrink_to_fit();
+        self.reconcile_heap_bytes_if_limited();
     }
 
     pub fn empty() -> Self {
@@ -305,13 +510,12 @@ impl ScriptHeap {
         if let Some(v) = v.as_u40() {
             return v as _;
         }
-        if let Some(v) = v.as_string() {
-            let str = self.string(v);
-            if let Ok(v) = str.parse::<f64>() {
-                return v;
-            } else {
-                return 0.0;
-            }
+        if let Some(number) = self.string_with(v, |_, text| text.parse::<f64>()) {
+            return number.unwrap_or_else(|_| {
+                ScriptValue::from_f64_traced_nan(f64::NAN, ip)
+                    .as_f64()
+                    .unwrap()
+            });
         }
         if let Some(v) = v.as_bool() {
             return if v { 1.0 } else { 0.0 };
@@ -386,134 +590,6 @@ impl ScriptHeap {
     }
 
     // Debug and utility
-
-    pub fn deep_eq(&self, a: ScriptValue, b: ScriptValue) -> bool {
-        if a == b {
-            return true;
-        }
-        if let Some(a) = a.as_number() {
-            if let Some(b) = b.as_number() {
-                return a == b;
-            }
-            return false;
-        }
-        if a.is_object() {
-            let mut aw = a;
-            let mut bw = b;
-            loop {
-                if let Some(pa) = aw.as_object() {
-                    if let Some(pb) = bw.as_object() {
-                        let oa = &self.objects[pa];
-                        let ob = &self.objects[pb];
-                        if oa.vec.len() != ob.vec.len() {
-                            return false;
-                        }
-                        for (a, b) in oa.vec.iter().zip(ob.vec.iter()) {
-                            if !self.deep_eq(a.key, b.key) || !self.deep_eq(a.value, b.value) {
-                                return false;
-                            }
-                        }
-                        if oa.map_len() != ob.map_len() {
-                            return false;
-                        }
-                        if let Some(ret) = oa.map_iter_ret(|k, v1| {
-                            if let Some(v2) = ob.map_get(&k) {
-                                if !self.deep_eq(v1, v2) {
-                                    return Some(false);
-                                }
-                                return None;
-                            }
-                            // lets do the string keys shenanigans to make json ok
-                            else if k.is_id() && ob.tag.is_string_keys() {
-                                let id = k.as_id().unwrap();
-                                if let Some(v2) = id.as_string(|s| {
-                                    if let Some(s) = s {
-                                        if let Some(idx) = self.check_intern_string(s) {
-                                            ob.map_get(&idx)
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                }) {
-                                    if !self.deep_eq(v1, v2) {
-                                        return Some(false);
-                                    }
-                                    return None;
-                                }
-                            } else if k.is_string_like() && !ob.tag.is_string_keys() {
-                                let id = if let Some(s) = k.as_string() {
-                                    if let Some(s) = &self.strings[s] {
-                                        LiveId::from_str(&s.string.0)
-                                    } else {
-                                        LiveId(0)
-                                    }
-                                } else {
-                                    k.as_inline_string(|s| LiveId::from_str(s)).unwrap()
-                                };
-                                if let Some(v2) = ob.map_get(&id.into()) {
-                                    if !self.deep_eq(v1, v2) {
-                                        return Some(false);
-                                    }
-                                    return None;
-                                }
-                            }
-                            Some(false)
-                        }) {
-                            return ret;
-                        }
-                        aw = oa.proto;
-                        bw = ob.proto;
-                        if aw == bw {
-                            return true;
-                        }
-                    } else {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
-        } else if let Some(arr1) = a.as_array() {
-            if let Some(arr2) = b.as_array() {
-                match &self.arrays[arr1].storage {
-                    ScriptArrayStorage::ScriptValue(arr1) => match &self.arrays[arr2].storage {
-                        ScriptArrayStorage::ScriptValue(arr2) => {
-                            if arr1.len() != arr2.len() {
-                                return false;
-                            }
-                            for (a, b) in arr1.iter().zip(arr2.iter()) {
-                                if !self.deep_eq(*a, *b) {
-                                    return false;
-                                }
-                            }
-                            return true;
-                        }
-                        _ => return false,
-                    },
-                    ScriptArrayStorage::F32(arr1) => match &self.arrays[arr2].storage {
-                        ScriptArrayStorage::F32(arr2) => return arr1 == arr2,
-                        _ => return false,
-                    },
-                    ScriptArrayStorage::U32(arr1) => match &self.arrays[arr2].storage {
-                        ScriptArrayStorage::U32(arr2) => return arr1 == arr2,
-                        _ => return false,
-                    },
-                    ScriptArrayStorage::U16(arr1) => match &self.arrays[arr2].storage {
-                        ScriptArrayStorage::U16(arr2) => return arr1 == arr2,
-                        _ => return false,
-                    },
-                    ScriptArrayStorage::U8(arr1) => match &self.arrays[arr2].storage {
-                        ScriptArrayStorage::U8(arr2) => return arr1 == arr2,
-                        _ => return false,
-                    },
-                }
-            }
-            return false;
-        }
-        false
-    }
 
     pub fn println(&self, value: ScriptValue) {
         let mut out = String::new();
@@ -714,51 +790,69 @@ impl ScriptHeap {
     }
 
     pub fn to_json(&mut self, value: ScriptValue) -> ScriptValue {
-        self.new_string_with(|heap, s| {
+        self.new_bounded_string_with(|heap, s| {
             heap.to_json_inner(value, s);
         })
     }
 
-    pub fn to_json_inner(&self, value: ScriptValue, out: &mut String) {
-        fn escape_str(inp: &str, out: &mut String) {
+    pub fn to_json_inner<S: ScriptStringSink>(&self, value: ScriptValue, out: &mut S) {
+        fn escape_str<S: ScriptStringSink>(inp: &str, out: &mut S) {
             for c in inp.chars() {
                 match c {
-                    '\x08' => out.push_str("\\b"),
-                    '\x0c' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\"),
+                    '\x08' => out.append_str("\\b"),
+                    '\x0c' => out.append_str("\\f"),
+                    '\n' => out.append_str("\\n"),
+                    '\r' => out.append_str("\\r"),
+                    '"' => out.append_str("\\\""),
+                    '\\' => out.append_str("\\"),
                     c => {
-                        out.push(c);
+                        out.append_char(c);
                     }
                 }
+                if out.is_full() {
+                    break;
+                }
             }
+        }
+        if out.is_full() {
+            return;
         }
         if let Some(obj) = value.as_object() {
             let mut ptr = obj;
             // scan up the chain to set the proto value
-            out.push('{');
+            out.append_char('{');
             let mut first = true;
             loop {
                 let object = &self.objects[ptr];
                 object.map_iter(|key, value| {
+                    if out.is_full() {
+                        return;
+                    }
                     if !first {
-                        out.push(',')
+                        out.append_char(',')
                     }
                     self.to_json_inner(key, out);
-                    out.push(':');
+                    out.append_char(':');
                     self.to_json_inner(value, out);
                     first = false;
                 });
+                if out.is_full() {
+                    break;
+                }
                 for kv in object.vec.iter() {
+                    if out.is_full() {
+                        break;
+                    }
                     if !first {
-                        out.push(',')
+                        out.append_char(',')
                     }
                     first = false;
                     self.to_json_inner(kv.key, out);
-                    out.push(':');
+                    out.append_char(':');
                     self.to_json_inner(kv.value, out);
+                }
+                if out.is_full() {
+                    break;
                 }
                 if let Some(next_ptr) = object.proto.as_object() {
                     ptr = next_ptr
@@ -766,30 +860,39 @@ impl ScriptHeap {
                     break;
                 }
             }
-            out.push('}');
+            if !out.is_full() {
+                out.append_char('}');
+            }
         } else if let Some(arr) = value.as_array() {
             let array = &self.arrays[arr];
             let len = array.storage.len();
             let mut first = true;
-            out.push('[');
+            out.append_char('[');
             for i in 0..len {
                 if let Some(value) = array.storage.index(i) {
                     if !first {
-                        out.push(',')
+                        out.append_char(',')
                     }
                     first = false;
                     self.to_json_inner(value, out);
+                    if out.is_full() {
+                        break;
+                    }
                 }
             }
-            out.push(']');
+            if !out.is_full() {
+                out.append_char(']');
+            }
         } else if let Some(id) = value.as_id() {
-            out.push('"');
+            out.append_char('"');
             id.as_string(|s| {
                 if let Some(s) = s {
                     escape_str(s, out);
                 }
             });
-            out.push('"');
+            if !out.is_full() {
+                out.append_char('"');
+            }
             // alright. sself is json eh. so.
         } else if let Some(s) = value.as_string() {
             let s = if let Some(s) = &self.strings[s] {
@@ -797,29 +900,33 @@ impl ScriptHeap {
             } else {
                 ""
             };
-            out.push('"');
+            out.append_char('"');
             escape_str(s, out);
-            out.push('"');
+            if !out.is_full() {
+                out.append_char('"');
+            }
         } else if value
             .as_inline_string(|s| {
-                out.push('"');
+                out.append_char('"');
                 escape_str(s, out);
-                out.push('"');
+                if !out.is_full() {
+                    out.append_char('"');
+                }
             })
             .is_some()
         {
         } else if let Some(v) = value.as_bool() {
             if v {
-                out.push_str("true")
+                out.append_str("true")
             } else {
-                out.push_str("false")
+                out.append_str("false")
             }
         } else if let Some(v) = value.as_number() {
             write!(out, "{}", v).ok();
         } else if let Some(v) = value.as_handle() {
             write!(out, "Handle{:?}", v).ok();
         } else {
-            out.push_str("null");
+            out.append_str("null");
         }
     }
 
