@@ -8,7 +8,7 @@ use crate::{
     cx::Cx,
     draw_list::DrawListId,
     draw_pass::{DrawPassClearColor, DrawPassClearDepth, DrawPassId},
-    draw_shader::DrawShaderAttrFormat,
+    draw_shader::{DrawShaderAttrFormat, DrawShaderInputs},
     geometry::GeometryId,
     makepad_live_id::*,
     makepad_script::shader::TextureType,
@@ -92,10 +92,77 @@ struct VulkanBuffer {
     size: vk::DeviceSize,
 }
 
+/// Typed vertex fetch (one Vulkan attribute per compact leaf, typed WGSL
+/// inputs) versus decoding compact lanes to f32 on upload and using the
+/// packed vec4 path. Must agree with `WGSL_TYPED_GEOMETRY` in the generator.
+const VULKAN_TYPED_VERTEX_FETCH: bool = true;
+
+/// Decode a compact byte vertex layout into the f32 lanes of the shader's
+/// logical layout (`total_slots` per vertex), the way Metal's
+/// `_mp_decode_geometry` reads its raw struct.
+fn decode_compact_vertices(bytes: &[u8], layout: &DrawShaderInputs) -> Vec<f32> {
+    let stride = layout.stride_bytes.max(1);
+    let count = bytes.len() / stride;
+    let slots = layout.total_slots;
+    let mut out = vec![0.0f32; count * slots];
+    for v in 0..count {
+        let rec = &bytes[v * stride..v * stride + stride];
+        let dst = &mut out[v * slots..(v + 1) * slots];
+        for input in &layout.inputs {
+            let o = input.byte_offset;
+            let d = &mut dst[input.offset..input.offset + input.slots];
+            let u16_at = |k: usize| u16::from_le_bytes([rec[o + 2 * k], rec[o + 2 * k + 1]]);
+            let i16_at = |k: usize| i16::from_le_bytes([rec[o + 2 * k], rec[o + 2 * k + 1]]);
+            match input.attr_format {
+                DrawShaderAttrFormat::F16x2 | DrawShaderAttrFormat::F16x4 => {
+                    for k in 0..d.len() { d[k] = half_bits(u16_at(k)); }
+                }
+                DrawShaderAttrFormat::U16x2 => { for k in 0..2 { d[k] = u16_at(k) as f32; } }
+                DrawShaderAttrFormat::I16x2 => { for k in 0..2 { d[k] = i16_at(k) as f32; } }
+                DrawShaderAttrFormat::U16x2Norm => { for k in 0..2 { d[k] = u16_at(k) as f32 / 65535.0; } }
+                DrawShaderAttrFormat::I16x2Norm => { for k in 0..2 { d[k] = (i16_at(k) as f32 / 32767.0).max(-1.0); } }
+                DrawShaderAttrFormat::U8x4Norm => { for k in 0..4 { d[k] = rec[o + k] as f32 / 255.0; } }
+                DrawShaderAttrFormat::I8x4Norm => { for k in 0..4 { d[k] = (rec[o + k] as i8 as f32 / 127.0).max(-1.0); } }
+                // f32 lanes and 32-bit integer lanes: copy the bits (the
+                // shader bitcasts integer lanes, as the packed path does).
+                _ => {
+                    for k in 0..d.len() {
+                        let b = &rec[o + 4 * k..o + 4 * k + 4];
+                        d[k] = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn bytemuck_f32(v: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+/// IEEE half bits -> f32, for the one-shot typed-geometry diagnostics.
+fn half_bits(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let frac = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if frac == 0 { sign << 31 } else {
+            let mut e = 127 - 15 + 1; let mut f = frac;
+            while f & 0x400 == 0 { f <<= 1; e -= 1; }
+            (sign << 31) | ((e as u32) << 23) | ((f & 0x3ff) << 13)
+        }
+    } else if exp == 0x1f { (sign << 31) | 0x7f80_0000 | (frac << 13) }
+    else { (sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13) };
+    f32::from_bits(bits)
+}
+
 #[derive(Clone, Copy)]
 struct VulkanGeometryResource {
     vertex_buffer: VulkanBuffer,
     index_buffer: VulkanBuffer,
+    /// `UINT16` for compact (typed) geometry, `UINT32` otherwise.
+    index_type: vk::IndexType,
 }
 
 #[derive(Default)]
@@ -169,6 +236,9 @@ struct VulkanDrawPacket {
     alpha_blend: bool,
     backface_culling: bool,
     instances: Vec<f32>,
+    /// The item's instance ranges (one draw per range), empty = every instance;
+    /// the map's retained tile lists select their per-frame subset this way.
+    instance_ranges: Vec<std::ops::Range<u32>>,
     draw_call_uniforms: Vec<f32>,
     dyn_uniforms: Vec<f32>,
     scope_uniforms: Vec<f32>,
@@ -346,6 +416,7 @@ pub struct CxVulkan {
     pipelines: HashMap<VulkanPipelineKey, VulkanPipeline>,
     offscreen_render_passes: HashMap<VulkanRenderPassKey, vk::RenderPass>,
     geometries: HashMap<GeometryId, VulkanGeometryResource>,
+    /// Diagnostic: tile-space bbox of decoded compact geometry, per id.
     textures: HashMap<VulkanTextureKey, VulkanTextureResource>,
     frame_resources: FrameResources,
     command_pool: vk::CommandPool,
@@ -5853,7 +5924,13 @@ impl CxVulkan {
                     draw_stats.skipped_no_instance_slots += 1;
                     continue;
                 }
-                let instances = if let Some(instances) = draw_item.instances.as_ref() {
+                // A retained item (the map's tile lists) publishes its instances
+                // through `retained_instances`; its `instances` recording buffer
+                // is then gone. Take the publication like Metal/OpenGL do — as a
+                // per-frame upload for now, no resident copy.
+                let instances = if let Some(publication) = draw_item.retained_instances.as_ref() {
+                    publication.data().to_vec()
+                } else if let Some(instances) = draw_item.instances.as_ref() {
                     instances.to_vec()
                 } else {
                     draw_stats.skipped_no_instances_buffer += 1;
@@ -5911,6 +5988,7 @@ impl CxVulkan {
                     alpha_blend: draw_call.options.alpha_blend,
                     backface_culling: draw_call.options.backface_culling,
                     instances,
+                    instance_ranges: draw_item.instance_ranges.clone(),
                     draw_call_uniforms: draw_call.draw_call_uniforms.as_slice().to_vec(),
                     dyn_uniforms: draw_call.dyn_uniforms[..sh
                         .mapping
@@ -5949,7 +6027,7 @@ impl CxVulkan {
                 draw_stats.skipped_empty_geometry += 1;
                 continue;
             }
-            self.ensure_geometry_resource(packet.geometry_id, geometry)?;
+            self.ensure_geometry_resource(packet.geometry_id, geometry, Some(&shader_layout))?;
             let geometry_resource = self
                 .geometries
                 .get(&packet.geometry_id)
@@ -6053,7 +6131,6 @@ impl CxVulkan {
         if instance_count == 0 || index_count == 0 {
             return Ok(());
         }
-
         struct UniformUpload<'a> {
             binding: u32,
             src: &'a [f32],
@@ -6318,10 +6395,30 @@ impl CxVulkan {
                 self.command_buffer,
                 geometry_resource.index_buffer.buffer,
                 0,
-                vk::IndexType::UINT32,
+                geometry_resource.index_type,
             );
-            self.device
-                .cmd_draw_indexed(self.command_buffer, index_count, instance_count, 0, 0, 0);
+            if packet.instance_ranges.is_empty() {
+                self.device
+                    .cmd_draw_indexed(self.command_buffer, index_count, instance_count, 0, 0, 0);
+            } else {
+                // One draw per range, clamped to the instances actually staged;
+                // `instance_index` stays absolute (Vulkan adds first_instance).
+                for range in &packet.instance_ranges {
+                    let start = range.start.min(instance_count);
+                    let end = range.end.min(instance_count);
+                    if end <= start {
+                        continue;
+                    }
+                    self.device.cmd_draw_indexed(
+                        self.command_buffer,
+                        index_count,
+                        end - start,
+                        0,
+                        0,
+                        start,
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -6499,11 +6596,21 @@ impl CxVulkan {
         let instance_formats =
             Self::collect_attribute_chunk_formats(sh.mapping.instances.total_slots);
 
+        // A typed (compact) geometry layout is bound as its byte layout: one
+        // attribute per leaf input in the format the layout records (the
+        // WGSL side declares the matching `vb_typed_N` inputs); an f32-lane
+        // leaf inside it is fetched as vec4f chunks like the packed path.
+        let typed_geometry = VULKAN_TYPED_VERTEX_FETCH && sh.mapping.geometries.has_compact();
+        let geometry_stride = if typed_geometry {
+            sh.mapping.geometries.stride_bytes
+        } else {
+            sh.mapping.geometries.total_slots * std::mem::size_of::<f32>()
+        };
         let mut vertex_bindings = Vec::new();
         vertex_bindings.push(
             vk::VertexInputBindingDescription::default()
                 .binding(0)
-                .stride((sh.mapping.geometries.total_slots * std::mem::size_of::<f32>()) as u32)
+                .stride(geometry_stride as u32)
                 .input_rate(vk::VertexInputRate::VERTEX),
         );
         vertex_bindings.push(
@@ -6515,21 +6622,57 @@ impl CxVulkan {
 
         let mut vertex_attributes = Vec::new();
         let mut location = 0u32;
-        for (chunk_index, format) in geometry_formats.iter().enumerate() {
-            let remaining = sh
-                .mapping
-                .geometries
-                .total_slots
-                .saturating_sub(chunk_index * 4);
-            let components = remaining.min(4);
-            vertex_attributes.push(
-                vk::VertexInputAttributeDescription::default()
-                    .location(location)
-                    .binding(0)
-                    .format(Self::vk_vertex_format(*format, components))
-                    .offset((chunk_index * 4 * std::mem::size_of::<f32>()) as u32),
-            );
-            location += 1;
+        if typed_geometry {
+            for input in &sh.mapping.geometries.inputs {
+                if input.attr_format.is_compact() {
+                    vertex_attributes.push(
+                        vk::VertexInputAttributeDescription::default()
+                            .location(location)
+                            .binding(0)
+                            .format(Self::vk_vertex_format(input.attr_format, input.slots))
+                            .offset(input.byte_offset as u32),
+                    );
+                    location += 1;
+                } else {
+                    // f32 lanes (ints included: the shader bitcasts them, as
+                    // the packed path does), one vec4f chunk per attribute.
+                    let chunks = (input.slots + 3) / 4;
+                    for chunk in 0..chunks {
+                        let components = (input.slots - chunk * 4).min(4);
+                        vertex_attributes.push(
+                            vk::VertexInputAttributeDescription::default()
+                                .location(location)
+                                .binding(0)
+                                .format(Self::vk_vertex_format(
+                                    DrawShaderAttrFormat::F32x4,
+                                    components,
+                                ))
+                                .offset(
+                                    (input.byte_offset + chunk * 4 * std::mem::size_of::<f32>())
+                                        as u32,
+                                ),
+                        );
+                        location += 1;
+                    }
+                }
+            }
+        } else {
+            for (chunk_index, format) in geometry_formats.iter().enumerate() {
+                let remaining = sh
+                    .mapping
+                    .geometries
+                    .total_slots
+                    .saturating_sub(chunk_index * 4);
+                let components = remaining.min(4);
+                vertex_attributes.push(
+                    vk::VertexInputAttributeDescription::default()
+                        .location(location)
+                        .binding(0)
+                        .format(Self::vk_vertex_format(*format, components))
+                        .offset((chunk_index * 4 * std::mem::size_of::<f32>()) as u32),
+                );
+                location += 1;
+            }
         }
         for (chunk_index, format) in instance_formats.iter().enumerate() {
             let remaining = sh
@@ -6857,6 +7000,7 @@ impl CxVulkan {
         &mut self,
         geometry_id: GeometryId,
         geometry: &mut crate::geometry::CxGeometry,
+        shader_layout: Option<&DrawShaderInputs>,
     ) -> Result<(), String> {
         if geometry.vertex_count == 0 || geometry.index_count == 0 {
             if let Some(old) = self.geometries.remove(&geometry_id) {
@@ -6873,29 +7017,40 @@ impl CxVulkan {
         let index_needs_upload = existing.is_none() || geometry.dirty_indices;
 
         let new_vertex_buffer = if vertex_needs_upload {
-            let vertices = geometry.vertices.as_f32().ok_or_else(|| {
-                "vulkan: compact vertex formats are not implemented".to_string()
-            })?;
+            // A compact byte layout is decoded to f32 lanes here (the packed
+            // vec4 fetch path the WGSL uses) unless typed vertex fetch is on;
+            // f32 slots upload verbatim either way.
+            let decoded;
+            let vertices: &[u8] = match (VULKAN_TYPED_VERTEX_FETCH, geometry.vertices.as_f32(), shader_layout) {
+                (false, None, Some(layout)) => {
+                    decoded = decode_compact_vertices(geometry.vertices.as_bytes(), layout);
+                    bytemuck_f32(&decoded)
+                }
+                _ => geometry.vertices.as_bytes(),
+            };
             let buffer = self.create_host_buffer_with_data(
                 vk::BufferUsageFlags::VERTEX_BUFFER,
                 vertices,
             )?;
-            self.xr_geometry_upload_bytes_this_frame +=
-                std::mem::size_of_val(vertices) as u64;
+            self.xr_geometry_upload_bytes_this_frame += vertices.len() as u64;
             Some(buffer)
         } else {
             None
         };
-
+        // From the geometry's recorded width, not its CPU vector: the map
+        // releases the CPU copy once uploaded, and an emptied `IndexData`
+        // reads as the u32 default — binding the resident u16 buffer as
+        // UINT32 turned every tile into a few giant random triangles.
+        let index_type = if geometry.index_width == 2 {
+            vk::IndexType::UINT16
+        } else {
+            vk::IndexType::UINT32
+        };
         let new_index_buffer = if index_needs_upload {
-            let indices = match geometry.indices.as_u32() {
-                Some(i) => i,
-                None => return Err("vulkan: u16 index buffers are not implemented".to_string()),
-            };
+            let indices = geometry.indices.as_bytes();
             match self.create_host_buffer_with_data(vk::BufferUsageFlags::INDEX_BUFFER, indices) {
                 Ok(buffer) => {
-                    self.xr_geometry_upload_bytes_this_frame +=
-                        std::mem::size_of_val(indices) as u64;
+                    self.xr_geometry_upload_bytes_this_frame += indices.len() as u64;
                     Some(buffer)
                 }
                 Err(err) => {
@@ -6923,6 +7078,7 @@ impl CxVulkan {
                 VulkanGeometryResource {
                     vertex_buffer: new_vertex_buffer.unwrap_or(existing.vertex_buffer),
                     index_buffer: new_index_buffer.unwrap_or(existing.index_buffer),
+                    index_type: if index_needs_upload { index_type } else { existing.index_type },
                 }
             }
             None => VulkanGeometryResource {
@@ -6930,6 +7086,7 @@ impl CxVulkan {
                     .ok_or_else(|| "missing Vulkan vertex buffer upload".to_string())?,
                 index_buffer: new_index_buffer
                     .ok_or_else(|| "missing Vulkan index buffer upload".to_string())?,
+                index_type,
             },
         };
 

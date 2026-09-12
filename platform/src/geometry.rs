@@ -609,6 +609,11 @@ pub fn geometry_backend_supports_typed(
     if !typed {
         return true;
     }
+    // Vulkan describes each compact leaf as its own vertex attribute (the
+    // WGSL side declares matching typed inputs) and binds u16 index buffers.
+    if backend == "vulkan" {
+        return true;
+    }
     if !geom.logged_unsupported_typed {
         geom.logged_unsupported_typed = true;
         error!(

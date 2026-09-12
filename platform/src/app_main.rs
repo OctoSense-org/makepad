@@ -466,8 +466,10 @@ macro_rules! app_main {
             _: *const std::ffi::c_void,
             activity: *const std::ffi::c_void,
         ) {
-            Cx::init_log();
+            // The intent extras become env vars (MAKEPAD_TRACE among them), so
+            // they must land before the log's trace topics are read.
             $crate::os::linux::android::android_jni::apply_studio_env_from_activity(activity);
+            Cx::init_log();
             Cx::android_entry(activity, || {
                 let studio_http = $crate::resolve_studio_http();
                 let mut cx = Box::new($crate::new_cx_with_font_set(

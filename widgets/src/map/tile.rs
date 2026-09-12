@@ -67,7 +67,15 @@ unsafe impl GlobalAlloc for MapCountingAllocator {
 #[global_allocator]
 static MAP_TEST_ALLOCATOR: MapCountingAllocator = MapCountingAllocator;
 
-pub const OVERPASS_ENDPOINTS: &[&str] = &["https://overpass.kumi.systems/api/interpreter"];
+/// Rotated per attempt (`overpass_endpoint`): a single public Overpass
+/// instance answers 504 under load for minutes at a time, and a tile then
+/// burns all its retries on the same dead mirror.
+pub const OVERPASS_ENDPOINTS: &[&str] = &[
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+    "https://overpass.openstreetmap.fr/api/interpreter",
+];
 pub const MAX_PENDING_REQUESTS: usize = 2;
 pub const MAX_TILE_RETRIES: u8 = 6;
 pub const RETRY_BASE_FRAMES: u64 = 30;
@@ -2982,9 +2990,95 @@ pub fn retry_delay_frames(attempts: u8) -> u64 {
     delay.min(RETRY_MAX_FRAMES)
 }
 
-pub fn overpass_endpoint(attempts: u8) -> &'static str {
-    let index = attempts as usize % OVERPASS_ENDPOINTS.len();
-    OVERPASS_ENDPOINTS[index]
+/// How long a mirror is skipped after a transport error, a 5xx or a 429.
+pub const OVERPASS_MIRROR_DOWN_SECS: u64 = 60;
+
+thread_local! {
+    /// Per mirror, the app-time (seconds) until which it is skipped. Thread
+    /// local rather than per view: a card re-eval rebuilds the MapView, and
+    /// a fresh view would otherwise start every tile over on the mirror that
+    /// just refused the connection.
+    static OVERPASS_MIRROR_DOWN_UNTIL: std::cell::Cell<[u64; OVERPASS_ENDPOINTS.len()]> =
+        const { std::cell::Cell::new([0; OVERPASS_ENDPOINTS.len()]) };
+}
+
+/// Spread first attempts across the mirrors by tile, rotate per retry, and
+/// skip a mirror inside its down window: with every tile's first try on the
+/// same instance, one overloaded mirror (a 504 for minutes at a time)
+/// stalled the whole first paint, and with two of three public instances
+/// dead at once two thirds of the tiles waited on a mirror that had already
+/// failed. When every mirror is down, the rotation's pick is used anyway.
+pub fn overpass_endpoint(tile: TileKey, attempts: u8, now_secs: u64) -> &'static str {
+    let n = OVERPASS_ENDPOINTS.len();
+    let spread = (tile.x as usize).wrapping_add(tile.y as usize).wrapping_add(tile.z as usize);
+    let start = (spread + attempts as usize) % n;
+    let down_until = OVERPASS_MIRROR_DOWN_UNTIL.with(|c| c.get());
+    (0..n)
+        .map(|k| (start + k) % n)
+        .find(|&i| down_until[i] <= now_secs)
+        .map_or(OVERPASS_ENDPOINTS[start], |i| OVERPASS_ENDPOINTS[i])
+}
+
+/// Record that `endpoint` failed at the transport level or answered 5xx/429;
+/// `overpass_endpoint` avoids it for [`OVERPASS_MIRROR_DOWN_SECS`].
+pub fn mark_overpass_endpoint_down(endpoint: &str, now_secs: u64) {
+    let Some(i) = OVERPASS_ENDPOINTS.iter().position(|e| *e == endpoint) else {
+        return;
+    };
+    OVERPASS_MIRROR_DOWN_UNTIL.with(|c| {
+        let mut down_until = c.get();
+        down_until[i] = now_secs.saturating_add(OVERPASS_MIRROR_DOWN_SECS);
+        c.set(down_until);
+    });
+}
+
+/// Whether a tile fetch outcome says the mirror itself is unwell (skip it),
+/// as opposed to a problem with the query or the body.
+pub fn overpass_status_marks_mirror_down(status_code: u16) -> bool {
+    status_code >= 500 || status_code == 429
+}
+
+#[cfg(test)]
+mod overpass_mirror_tests {
+    use super::*;
+
+    fn tile(x: i32, y: i32) -> TileKey {
+        TileKey { z: 12, x, y }
+    }
+
+    #[test]
+    fn retries_rotate_through_every_mirror() {
+        let seen: std::collections::HashSet<&str> = (0..OVERPASS_ENDPOINTS.len() as u8)
+            .map(|a| overpass_endpoint(tile(660, 1588), a, 0))
+            .collect();
+        assert_eq!(seen.len(), OVERPASS_ENDPOINTS.len());
+    }
+
+    #[test]
+    fn a_down_mirror_is_skipped_until_its_window_passes() {
+        let first = overpass_endpoint(tile(1, 1), 0, 100);
+        mark_overpass_endpoint_down(first, 100);
+        let next = overpass_endpoint(tile(1, 1), 0, 100);
+        assert_ne!(next, first);
+        assert_eq!(overpass_endpoint(tile(1, 1), 0, 100 + OVERPASS_MIRROR_DOWN_SECS), first);
+    }
+
+    #[test]
+    fn all_mirrors_down_still_picks_one() {
+        for e in OVERPASS_ENDPOINTS {
+            mark_overpass_endpoint_down(e, 500);
+        }
+        let pick = overpass_endpoint(tile(3, 4), 1, 500);
+        assert!(OVERPASS_ENDPOINTS.contains(&pick));
+    }
+
+    #[test]
+    fn only_server_side_statuses_mark_a_mirror_down() {
+        assert!(overpass_status_marks_mirror_down(504));
+        assert!(overpass_status_marks_mirror_down(429));
+        assert!(!overpass_status_marks_mirror_down(400));
+        assert!(!overpass_status_marks_mirror_down(200));
+    }
 }
 
 pub fn overpass_query(tile: TileKey) -> String {
