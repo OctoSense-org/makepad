@@ -264,6 +264,7 @@ pub use crate::voice_wave::*;
 pub use crate::html::*;
 
 pub use crate::markdown::*;
+pub use crate::web_card::*;
 
 #[cfg(feature = "maps")]
 pub use crate::map::overlay::{MapMarker, MapPuck, MapRouteOverlay};
@@ -461,6 +462,15 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     #[cfg(feature = "maps")]
     crate::map::view::script_mod(vm);
     crate::math_view::script_mod(vm);
+    crate::text_roles::script_mod(vm);
+    crate::web_card::script_mod(vm);
+    crate::weather_icon::script_mod(vm);
+    crate::temp_bar::script_mod(vm);
+    crate::sun_arc::script_mod(vm);
+    crate::moon_phase::script_mod(vm);
+    crate::aqi_contour::script_mod(vm);
+    crate::matplot::script_mod(vm);
+    crate::kit::script_mod(vm);
 
     // Safe area inset values (in Makepad layout points). Populated from the platform's
     // display_context which is set before Startup on iOS/Android. On desktop

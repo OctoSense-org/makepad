@@ -62,6 +62,7 @@ mod component_map;
 mod cursor;
 mod debug;
 pub mod event;
+pub mod gps;
 mod geometry;
 mod gpu_info;
 mod id_pool;
