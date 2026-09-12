@@ -919,3 +919,68 @@ mod style_tests {
         splash.stop(&mut cx);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers the live-data widgets share with the sys.* bindings. Kept here so
+// StockPlot, IndicatorPlot and the scalar bindings build one identical URL and
+// therefore share a single script_data_fetch cache entry.
+// ---------------------------------------------------------------------------
+
+/// Howard Hinnant's `civil_from_days`: days-since-Unix-epoch to (year, month,
+/// day). Shared with the StockPlot widget for date tick labels.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u64, u64) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+fn yahoo_range_params(token: &str) -> (&'static str, &'static str) {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "1w" | "5d" => ("5d", "30m"),
+        "1m" | "1mo" => ("1mo", "1d"),
+        "6m" | "6mo" => ("6mo", "1d"),
+        "1y" => ("1y", "1wk"),
+        _ => ("1d", "5m"),
+    }
+}
+
+/// Sanitize a card-supplied ticker into a safe URL path segment. Card bodies
+/// are model-generated (semi-trusted): a symbol containing `?`/`#`/`/`/`%`
+/// would rewrite the request target (and split the fetch-dedup key), and a
+/// NUL — which Splash string literals CAN carry — reaches the Android HTTP
+/// layer's `CString::new(url).unwrap()` and aborts the process. Keep only the
+/// characters real tickers use, uppercased, capped at 16.
+pub(crate) fn sanitize_ticker(symbol: &str) -> String {
+    let out: String = symbol
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '^' | '='))
+        .map(|c| c.to_ascii_uppercase())
+        .take(16)
+        .collect();
+    // A real ticker has at least one letter/digit. Reject an empty or
+    // all-punctuation result (".." would resolve as a path-traversal segment).
+    // Callers treat "" as "no symbol" and skip the fetch.
+    if out.chars().any(|c| c.is_ascii_alphanumeric()) {
+        out
+    } else {
+        String::new()
+    }
+}
+
+/// The ONE chart-API URL for a symbol x range, so every consumer shares a
+/// single `script_data_fetch` cache entry — one request per symbol x range
+/// serves the plot, the bars and every scalar on the card.
+pub(crate) fn yahoo_chart_url(symbol: &str, range: &str) -> String {
+    let sym = sanitize_ticker(symbol);
+    let (yr, yi) = yahoo_range_params(range);
+    format!("https://query1.finance.yahoo.com/v8/finance/chart/{sym}?interval={yi}&range={yr}")
+}
