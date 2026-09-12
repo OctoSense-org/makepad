@@ -1264,11 +1264,11 @@ impl MacosApp {
                 self.pin_restore = None;
                 return;
             }
-            crate::log!(
-                "PIN stats: ns_moves={} sum_dx={:.1}",
-                self.pin_ns_moves,
-                self.pin_sum_dx
-            );
+            // crate::log!(
+            //     "PIN stats: ns_moves={} sum_dx={:.1}",
+            //     self.pin_ns_moves,
+            //     self.pin_sum_dx
+            // );
             self.mouse_pointer_lock = false;
             self.pointer_lock_applied = false;
             self.pointer_pin_mode = false;
@@ -1392,10 +1392,10 @@ impl MacosApp {
                             preferred: fps,
                         };
                         let () = msg_send![link, setPreferredFrameRateRange: range];
-                        crate::log!(
-                            "macos: display link pinned to {}fps (panel maximum)",
-                            maximum_fps
-                        );
+                        // crate::log!(
+                        //     "macos: display link pinned to {}fps (panel maximum)",
+                        //     maximum_fps
+                        // );
                     } else {
                         crate::log!("macos: display link has no rate-range API");
                     }
@@ -1409,10 +1409,10 @@ impl MacosApp {
                     let () = msg_send![link, setPaused: YES];
                 }
                 self.display_links.push((window, link));
-                crate::log!(
-                    "macos: paint pacing on CADisplayLink (frame-flip clock), window {}",
-                    self.display_links.len()
-                );
+                // crate::log!(
+                //     "macos: paint pacing on CADisplayLink (frame-flip clock), window {}",
+                //     self.display_links.len()
+                // );
             }
             if self.display_links_paused {
                 for (_w, link) in &self.display_links {
