@@ -1,0 +1,5 @@
+KaTeX fonts (Serif-*.ttf here) are MIT, (c) 2013-2020 Khan Academy and
+contributors. Vendored from katex/dist/fonts/KaTeX_Main-*.ttf and renamed by
+ROLE rather than by origin, so the face can be swapped without touching the
+emitter. 283 codepoints, covering Latin-1 and the degree sign the weather
+cards need.
