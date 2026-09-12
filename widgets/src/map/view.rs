@@ -1,4 +1,6 @@
 use super::archive::*;
+use crate::widget_async::ScriptAsyncResult;
+use super::nav::*;
 use super::geometry::*;
 use super::icons::icon_mesh_by_slot;
 use super::label::*;
@@ -4410,6 +4412,51 @@ pub struct MapView {
     show_labels: bool,
     #[live(false)]
     dark_theme: bool,
+    // ---- navigation layer (map/nav.rs): the AppCard nav-card surface ----
+    /// `""` normal map | `"2d"` top-down heading-up | `"3d"` tilted chase |
+    /// `"plan"` static route fit | `"follow"`/`"follow3d"` device-driven.
+    #[live]
+    nav_mode: ArcStringMut,
+    /// The route as a Google/OSRM polyline5 string.
+    #[live]
+    nav_polyline: ArcStringMut,
+    /// Pins: `"lat,lon,kind;…"` (kind 0 origin, 1 stop, 2 destination).
+    #[live]
+    route_markers: ArcStringMut,
+    /// Accepted for card compatibility; not drawn by this layer yet.
+    #[live]
+    route_badge: ArcStringMut,
+    /// Sim-clock period (s) a card's DSL overlays cycle on; kept in the DSL
+    /// surface so nav cards apply unchanged.
+    #[live(92.0)]
+    nav_period: f64,
+    /// Simulated vehicle speed for `2d`/`3d`.
+    #[live(34.0)]
+    nav_speed_mph: f64,
+    // The fork's pinhole camera tuning — accepted so existing cards apply;
+    // only the vehicle-row fractions are read by this layer.
+    #[live(56.0)]
+    nav_cam_h: f64,
+    #[live(0.37)]
+    nav_pitch: f64,
+    #[live(0.98)]
+    nav_vfov: f64,
+    #[live(1.30)]
+    nav_hfov: f64,
+    #[live(800.0)]
+    nav_maxg: f64,
+    /// Vehicle screen row in 3D (fraction of height from the top).
+    #[live(0.62)]
+    nav_carv: f64,
+    /// Vehicle screen row in 2D heading-up.
+    #[live(0.60)]
+    nav_carv2d: f64,
+    /// Route ribbon core width, ground metres (the overlay draws its own
+    /// width; kept for the DSL surface).
+    #[live(15.0)]
+    nav_route_width: f64,
+    #[rust]
+    nav: NavState,
     /// Active theme: 0 = light, 1 = dark, 2 = circuit city. `dark_theme`
     /// stays as the boolean shorthand for 0/1.
     #[live(0)]
@@ -5037,6 +5084,10 @@ slack={:.1} tiles={}/{} baked={:.1} lists={} geoms={} budget={:.0} big=[{big}]",
 
 impl Widget for MapView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Nav layer per-frame pump (a live follow camera, or a glide).
+        if self.nav.next_frame.is_event(event).is_some() {
+            self.redraw(cx);
+        }
         if self.use_local_mbtiles {
             self.ensure_archive_source(cx);
             self.handle_archive_events(cx, event);
@@ -5268,6 +5319,85 @@ impl Widget for MapView {
         }
     }
 
+    /// The nav-card methods: `ui.<map>.set_nav_polyline(s)`,
+    /// `set_route_markers(s)`, `set_nav_recenter(_)`, `nav_zoom_by(delta)`,
+    /// `nav_center_origin()` — see map/nav.rs.
+    fn script_call(
+        &mut self,
+        vm: &mut ScriptVm,
+        method: LiveId,
+        args: ScriptValue,
+    ) -> ScriptAsyncResult {
+        fn first_string_arg(vm: &mut ScriptVm, args: ScriptValue) -> Option<String> {
+            let args_obj = args.as_object()?;
+            let trap = vm.bx.threads.cur().trap.pass();
+            let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+            if value.is_err() {
+                return None;
+            }
+            vm.bx.heap.cast_to_owned_string(value, "nav method argument")
+        }
+        if method == live_id!(set_nav_polyline) {
+            if let Some(s) = first_string_arg(vm, args) {
+                if !s.trim().is_empty() && s.as_str() != self.nav_polyline.as_ref() {
+                    self.nav_polyline.as_mut_empty().push_str(&s);
+                    vm.with_cx_mut(|cx| self.redraw(cx));
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(set_route_markers) {
+            if let Some(s) = first_string_arg(vm, args) {
+                if s.as_str() != self.route_markers.as_ref() {
+                    self.route_markers.as_mut_empty().push_str(&s);
+                    vm.with_cx_mut(|cx| self.redraw(cx));
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(set_nav_recenter) {
+            self.nav.pan = dvec2(0.0, 0.0);
+            if self.nav.home_zoom > 0.0 {
+                self.zoom = self.nav.home_zoom;
+            }
+            self.nav.zoom_anim = None;
+            self.nav.pan_anim = None;
+            self.nav.user_adjusted = false;
+            vm.with_cx_mut(|cx| self.redraw(cx));
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(nav_zoom_by) {
+            // Step the zoom (glide, not snap) and mark the camera
+            // user-adjusted so the follow/fit stops fighting it.
+            if let Some(s) = first_string_arg(vm, args) {
+                let delta: f64 = s.trim().parse().unwrap_or(0.0);
+                let zmin = self.min_zoom.max(3.0);
+                let zmax = self.max_zoom.max(zmin);
+                let base = self.nav.zoom_anim.unwrap_or(self.zoom);
+                self.nav.zoom_anim = Some((base + delta).clamp(zmin, zmax));
+                self.nav.user_adjusted = true;
+                self.nav.last_touch = crate::splash::sim_clock_secs();
+                vm.with_cx_mut(|cx| self.redraw(cx));
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(nav_center_origin) {
+            // Glide to the origin pin at street zoom.
+            if let Some(&(lat, lon, _)) = self.nav.markers.first() {
+                let o = lon_lat_to_normalized(lon, lat);
+                let zmin = self.min_zoom.max(3.0);
+                let zmax = self.max_zoom.max(zmin);
+                self.nav.zoom_anim = Some(16.0_f64.clamp(zmin, zmax));
+                self.nav.pan_anim = Some(dvec2(o.x - self.nav.car.x, o.y - self.nav.car.y));
+                self.nav.user_adjusted = true;
+                self.nav.last_touch = crate::splash::sim_clock_secs();
+                vm.with_cx_mut(|cx| self.redraw(cx));
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        ScriptAsyncResult::MethodNotFound
+    }
+
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         let perf_start = cx.seconds_since_app_start();
         if !self.memory_report_armed {
@@ -5303,6 +5433,8 @@ impl Widget for MapView {
         );
         let rect = cx.turtle().rect();
         self.view_rect = rect;
+        // Nav layer first: it owns center/rotation/tilt/zoom in a nav mode.
+        self.nav_update(cx.cx, rect);
         self.draw_bg.draw_abs(cx, rect);
         self.write_shimmer_pass_uniform(cx.cx, false);
         self.ensure_visible_tiles(cx, rect);
@@ -13362,5 +13494,146 @@ mod tests {
         assert!(map.archive_request_watchdog_handle.is_none());
         assert!(map.local_requested_tiles.contains_key(&key));
         assert!(map.archive_pending_tiles.contains_key(&key));
+    }
+}
+
+
+// ---- navigation layer (map/nav.rs) ----
+impl MapView {
+    /// Runs at the top of every draw, before the camera is read: adopts the
+    /// declarative route/pins into the overlay and, in a nav mode, places the
+    /// vehicle and drives the camera for this frame.
+    fn nav_update(&mut self, cx: &mut Cx, rect: Rect) {
+        let mode = self.nav_mode.as_ref().trim().to_string();
+        let kind = nav_kind(&mode);
+        let polyline = self.nav_polyline.as_ref().to_string();
+        let pins = self.route_markers.as_ref().to_string();
+        if self.nav.adopt(&polyline, &pins) {
+            self.overlay.route = self.nav.has_route().then(|| MapRouteOverlay {
+                points_norm: self.nav.pts.clone(),
+                traveled_index: 0,
+            });
+            self.overlay.markers = self
+                .nav
+                .markers
+                .iter()
+                .enumerate()
+                .map(|(i, &(lat, lon, k))| MapMarker::new(i as u64 + 1, lon, lat, marker_color(k)))
+                .collect();
+        }
+        if kind == NavKind::Off {
+            if self.overlay.puck.is_some() {
+                self.overlay.puck = None;
+            }
+            self.nav.next_frame = NextFrame::default();
+            return;
+        }
+        // The nav camera owns center/rotation/tilt: no flight may fight it.
+        self.fly = None;
+        if self.nav.home_zoom <= 0.0 {
+            self.nav.home_zoom = self.zoom;
+        }
+        let now = crate::splash::sim_clock_secs();
+        let gliding = self.nav.tick_glide(&mut self.zoom);
+        if is_plan(&mode) {
+            self.nav_plan_camera(rect);
+            self.nav.next_frame = if gliding { cx.new_next_frame() } else { NextFrame::default() };
+            return;
+        }
+        if !self.nav.has_route() {
+            self.nav.next_frame = NextFrame::default();
+            return;
+        }
+        let total = self.nav.total_m();
+        let d = if is_follow(&mode) {
+            // Where the DEVICE is: the last fix, else the card's declared
+            // centre (a fact it observed), else nothing — the camera does not
+            // move on its own.
+            let fix = crate::makepad_draw::makepad_platform::gps::last_gps_fix()
+                .map(|f| (f.lat, f.lon))
+                .filter(|(lat, lon)| is_a_place(*lat, *lon))
+                .or(Some((self.center_lat, self.center_lon)))
+                .filter(|(lat, lon)| is_a_place(*lat, *lon));
+            let target = match fix {
+                Some((flat, flon)) => self.nav.distance_at(lon_lat_to_normalized(flon, flat)),
+                None => 0.0,
+            };
+            self.nav.follow_distance(target, now)
+        } else {
+            // The demo vehicle: `nav_speed_mph` along the route on the sim
+            // clock, looping.
+            let mps = self.nav_speed_mph.max(1.0) * 0.44704;
+            (now * mps) % total.max(1.0)
+        };
+        let Some(car) = self.nav.point_at(d) else {
+            self.nav.next_frame = NextFrame::default();
+            return;
+        };
+        let bearing = self.nav.heading_at(car, d);
+        self.nav.car = car;
+        // The vehicle sits below the screen centre (its `nav_carv*` row), so
+        // the camera centre is that much further along the heading.
+        let carv = if kind == NavKind::Chase3d { self.nav_carv } else { self.nav_carv2d };
+        let world = tile_world_size_zoom(self.view_zoom());
+        let ahead = (carv - 0.5) * rect.size.y / world;
+        let anchor = car + dvec2(bearing.sin(), -bearing.cos()) * ahead;
+        if self.gesture_panned {
+            // A drag in progress: adopt wherever the map's own gesture put the
+            // camera as the pan offset, so the follow-cam does not fight it.
+            self.nav.pan = self.center_norm - anchor;
+            self.nav.user_adjusted = true;
+            self.nav.last_touch = now;
+        } else {
+            self.nav.tick_recenter(now, &mut self.zoom);
+        }
+        self.center_norm = anchor + self.nav.pan;
+        self.wrap_and_clamp_center();
+        self.rotation = bearing.to_degrees();
+        self.tilt = if kind == NavKind::Chase3d {
+            NAV_CHASE_TILT_DEG.min(self.tilt_max_deg_now())
+        } else {
+            0.0
+        };
+        let (lon, lat) = normalized_to_lon_lat(car);
+        self.overlay.puck = Some(MapPuck::new(lon, lat, Some(bearing.to_degrees()), 0.0));
+        let idx = self.nav.traveled_index(d);
+        if let Some(route) = &mut self.overlay.route {
+            route.traveled_index = idx;
+        }
+        self.nav.next_frame = cx.new_next_frame();
+    }
+
+    /// PLAN route-preview camera: static, north-up, fit to the WHOLE route,
+    /// framed into the top band above the card's summary sheet.
+    fn nav_plan_camera(&mut self, rect: Rect) {
+        let Some((min, max)) = self.nav.bounds() else {
+            return; // nothing to frame — keep the current centre (no NaN)
+        };
+        let c = (min + max) * 0.5;
+        if !self.nav.user_adjusted {
+            let dx = (max.x - min.x).max(1e-9);
+            let dy = (max.y - min.y).max(1e-9);
+            let fitw = rect.size.x * 0.80;
+            let fith = (rect.size.y * 0.50)
+                .min(2.0 * (rect.size.y * 0.30 - 52.0))
+                .max(1.0);
+            let zx = (fitw / (dx * TILE_SIZE)).log2();
+            let zy = (fith / (dy * TILE_SIZE)).log2();
+            let zmin = self.min_zoom.max(3.0);
+            let zmax = self.max_zoom.max(zmin);
+            self.zoom = zx.min(zy).clamp(zmin, zmax).clamp(10.0, 15.5);
+            self.nav.home_zoom = self.zoom;
+        }
+        self.nav.car = c;
+        // Route centre at 30% of the height: the camera centre sits below it.
+        let world = tile_world_size_zoom(self.view_zoom());
+        let down = dvec2(0.0, (0.5 - 0.30) * rect.size.y / world);
+        self.center_norm = c + down + self.nav.pan;
+        self.wrap_and_clamp_center();
+        self.rotation = 0.0;
+        self.tilt = 0.0;
+        if self.overlay.puck.is_some() {
+            self.overlay.puck = None;
+        }
     }
 }
