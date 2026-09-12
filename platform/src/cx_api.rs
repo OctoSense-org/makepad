@@ -135,6 +135,34 @@ impl<'a> CxSystemBrowser<'a> {
         });
     }
 
+    /// Load an inline HTML document into the browser.
+    pub fn set_html(&mut self, html: &str, base_url: &str) {
+        self.cx.platform_ops.push_back(CxOsOp::SetSystemBrowserHtml {
+            browser_id: self.id.0,
+            html: html.to_string(),
+            base_url: base_url.to_string(),
+        });
+    }
+
+    /// Evaluate JS inside the browser document.
+    pub fn eval_js(&mut self, js: &str) {
+        self.cx.platform_ops.push_back(CxOsOp::EvalSystemBrowserJs {
+            browser_id: self.id.0,
+            js: js.to_string(),
+        });
+    }
+
+    /// Emit an event to the card, dispatched to its `octos.on(event, ...)`
+    /// handlers. `payload_json` must be a valid JSON value. The event name is an
+    /// internal identifier; quotes and backslashes are stripped defensively.
+    pub fn emit(&mut self, event: &str, payload_json: &str) {
+        let ev = event.replace(['\\', '"'], "");
+        self.eval_js(&format!(
+            "window.octos&&octos._event&&octos._event(\"{}\",{})",
+            ev, payload_json
+        ));
+    }
+
     pub fn history_go(&mut self, delta: i32) {
         self.cx
             .platform_ops
@@ -446,6 +474,31 @@ pub enum CxOsOp {
     CloseSystemBrowser {
         browser_id: LiveId,
     },
+    /// Load an inline HTML document, with `base_url` as the document origin so
+    /// relative fetches and embeds resolve against a real https origin rather
+    /// than about:blank.
+    SetSystemBrowserHtml {
+        browser_id: LiveId,
+        html: String,
+        base_url: String,
+    },
+    /// Evaluate JS inside the browser document (native to card).
+    EvalSystemBrowserJs {
+        browser_id: LiveId,
+        js: String,
+    },
+    /// Open the OS share sheet. Ignored by backends that do not handle it.
+    ShareText(String),
+    /// Post a system notification. Ignored by backends that do not handle it.
+    ShowNotification { title: String, body: String },
+    /// Open the native file picker. The result arrives later as a
+    /// NativeDialogResult action carrying `call_id`.
+    OpenFileDialog { call_id: i64, mime: String },
+    /// Stream a URL to a file on a native background thread, so large binaries
+    /// never pass through JS. Progress and completion arrive as
+    /// NativeDownloadProgress / NativeDownloadComplete actions carrying `call_id`.
+    /// `dest` is absolute; the caller resolves it inside the card-fs sandbox.
+    DownloadFile { call_id: i64, url: String, dest: String },
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
     PauseVideoPlayback(LiveId),
@@ -555,6 +608,12 @@ impl std::fmt::Debug for CxOsOp {
             Self::SetSystemBrowserUrl { .. } => write!(f, "SetSystemBrowserUrl"),
             Self::SystemBrowserHistoryGo { .. } => write!(f, "SystemBrowserHistoryGo"),
             Self::CloseSystemBrowser { .. } => write!(f, "CloseSystemBrowser"),
+            Self::SetSystemBrowserHtml { .. } => write!(f, "SetSystemBrowserHtml"),
+            Self::EvalSystemBrowserJs { .. } => write!(f, "EvalSystemBrowserJs"),
+            Self::ShareText(..) => write!(f, "ShareText"),
+            Self::ShowNotification { .. } => write!(f, "ShowNotification"),
+            Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
+            Self::DownloadFile { .. } => write!(f, "DownloadFile"),
             Self::PrepareAudioPlayback(..) => write!(f, "PrepareAudioPlayback"),
             Self::BeginVideoPlayback(..) => write!(f, "BeginVideoPlayback"),
             Self::PauseVideoPlayback(..) => write!(f, "PauseVideoPlayback"),
@@ -599,6 +658,44 @@ pub(crate) fn defer_platform_op(platform_ops: &mut VecDeque<CxOsOp>, op: CxOsOp)
 }
 
 impl Cx {
+    /// Open the OS share sheet with `content`. No-op on platforms whose backend
+    /// does not handle `CxOsOp::ShareText`.
+    pub fn share_text(&mut self, content: &str) {
+        self.platform_ops
+            .push_back(CxOsOp::ShareText(content.to_owned()));
+    }
+
+    /// Post a system notification. No-op on platforms whose backend does not
+    /// handle `CxOsOp::ShowNotification`.
+    pub fn show_notification(&mut self, title: &str, body: &str) {
+        self.platform_ops.push_back(CxOsOp::ShowNotification {
+            title: title.to_owned(),
+            body: body.to_owned(),
+        });
+    }
+
+    /// Open the native file picker. The result (name + contents, or
+    /// cancellation) arrives later as a `NativeDialogResult` action carrying
+    /// `call_id`. No-op where the backend does not handle it.
+    pub fn open_file_dialog(&mut self, call_id: i64, mime: &str) {
+        self.platform_ops.push_back(CxOsOp::OpenFileDialog {
+            call_id,
+            mime: mime.to_owned(),
+        });
+    }
+
+    /// Stream a URL to a file on a native background thread, in constant memory.
+    /// Progress arrives as `NativeDownloadProgress` and completion as
+    /// `NativeDownloadComplete`, both carrying `call_id`. `dest` is absolute —
+    /// the caller resolves it inside the card-fs sandbox first.
+    pub fn download_file(&mut self, call_id: i64, url: &str, dest: &str) {
+        self.platform_ops.push_back(CxOsOp::DownloadFile {
+            call_id,
+            url: url.to_owned(),
+            dest: dest.to_owned(),
+        });
+    }
+
     pub fn in_draw_event(&self) -> bool {
         self.in_draw_event
     }
