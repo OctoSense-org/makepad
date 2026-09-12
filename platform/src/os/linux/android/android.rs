@@ -1400,6 +1400,89 @@ impl Cx {
                 let e = Event::ImeAction(ImeActionEvent { action });
                 self.call_event_handler(&e);
             }
+            FromJavaMessage::ComposerSubmit { text } => {
+                // The native floating composer submitted text. Deliver it as a
+                // bare action and drain it *this tick* (post_action alone would
+                // sit in the global channel until the next RenderLoop's
+                // `handle_other_events`, which — when the app is idle behind a
+                // rendered card — may not arrive until the next touch). The app
+                // routes it into its send path from `handle_actions`.
+                Cx::post_action(crate::event::NativeComposerSubmit { text });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::ComposerNewApp => {
+                // Native composer "＋" — open another app. Drain this tick (see
+                // ComposerSubmit above for why post_action alone can stall).
+                Cx::post_action(crate::event::NativeComposerNewApp);
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::ComposerSwitch => {
+                // Native composer "⟳" — switch to the next app.
+                Cx::post_action(crate::event::NativeComposerSwitch);
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::ComposerExpand => {
+                // Native composer collapsed "+" FAB tapped — the user unfolded
+                // it. Java already expanded the pill; tell the app so it marks
+                // composer_shown = true and stays in sync.
+                Cx::post_action(crate::event::NativeComposerExpand);
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::QrScanned { json } => {
+                // The composer QR scanner decoded a payload — hand it to the app
+                // (it applies it as an LLM-provisioning config). Drain this tick.
+                Cx::post_action(crate::event::NativeQrScanned { json });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::SystemBrowserInvoke {
+                browser_id,
+                call_id,
+                tool,
+                args,
+            } => {
+                // A runhtml card called octos.invoke(tool, args). Deliver to the
+                // WebCard widget as a bare action (drain this tick — same reason as
+                // ComposerSubmit: the app may be idle behind a rendered card).
+                Cx::post_action(crate::event::NativeSystemBrowserInvoke {
+                    browser_id: browser_id as u64,
+                    call_id,
+                    tool,
+                    args,
+                });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::DeepLink { url } => {
+                // App opened/resumed via a deep link or share — hand it to the app
+                // (it plays a shared YouTube URL in the card). Drain this tick.
+                Cx::post_action(crate::event::NativeDeepLink { url });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::DialogResult {
+                call_id,
+                name,
+                content,
+                cancelled,
+                error,
+            } => {
+                // Native file-picker result → the WebCard widget resolves the
+                // matching octos.invoke("dialog.open") promise.
+                Cx::post_action(crate::event::NativeDialogResult {
+                    call_id,
+                    name,
+                    content,
+                    cancelled,
+                    error,
+                });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::DownloadProgress { call_id, done, total } => {
+                Cx::post_action(crate::event::NativeDownloadProgress { call_id, done, total });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::DownloadComplete { call_id, path, error } => {
+                Cx::post_action(crate::event::NativeDownloadComplete { call_id, path, error });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::SafeAreaInsets {
                 top,
                 right,
@@ -2541,6 +2624,76 @@ impl Cx {
                         );
                     }
                 }
+                CxOsOp::ShareText(content) => unsafe {
+                    android_jni::to_java_share_text(content);
+                },
+                CxOsOp::ShowNotification { title, body } => unsafe {
+                    android_jni::to_java_show_notification(title, body);
+                },
+                CxOsOp::OpenFileDialog { call_id, mime } => unsafe {
+                    android_jni::to_java_open_file_dialog_mime(call_id, &mime);
+                },
+                CxOsOp::DownloadFile { call_id, url, dest } => unsafe {
+                    android_jni::to_java_download_file(call_id, &url, &dest);
+                },
+                CxOsOp::ShowNativeComposer => unsafe {
+                    android_jni::to_java_show_composer();
+                },
+                CxOsOp::HideNativeComposer => unsafe {
+                    android_jni::to_java_hide_composer();
+                },
+                CxOsOp::ExpandNativeComposer => unsafe {
+                    android_jni::to_java_expand_composer();
+                },
+                CxOsOp::CollapseNativeComposer => unsafe {
+                    android_jni::to_java_collapse_composer();
+                },
+                CxOsOp::SpawnSystemBrowser { browser_id, url } => unsafe {
+                    android_jni::to_java_spawn_system_browser(browser_id, &url);
+                },
+                CxOsOp::UpdateSystemBrowser {
+                    browser_id,
+                    area,
+                    visible,
+                } => {
+                    // Rust positions are layout points; the Java WebView wants
+                    // physical pixels.
+                    let rect = area.clipped_rect(self);
+                    let rect =
+                        self.windows[CxWindowPool::id_zero()].layout_rect_to_physical_pixels(rect);
+                    let left = rect.pos.x as i32;
+                    let top = rect.pos.y as i32;
+                    let right = (rect.pos.x + rect.size.x) as i32;
+                    let bottom = (rect.pos.y + rect.size.y) as i32;
+                    unsafe {
+                        android_jni::to_java_update_system_browser(
+                            browser_id, left, top, right, bottom, visible,
+                        );
+                    }
+                }
+                CxOsOp::DetachSystemBrowser { browser_id } => unsafe {
+                    android_jni::to_java_detach_system_browser(browser_id);
+                },
+                CxOsOp::CloseSystemBrowser { browser_id } => unsafe {
+                    android_jni::to_java_close_system_browser(browser_id);
+                },
+                CxOsOp::SetSystemBrowserUrl {
+                    browser_id,
+                    url,
+                    replace: _,
+                } => unsafe {
+                    android_jni::to_java_set_system_browser_url(browser_id, &url);
+                },
+                CxOsOp::SetSystemBrowserHtml {
+                    browser_id,
+                    html,
+                    base_url,
+                } => unsafe {
+                    android_jni::to_java_set_system_browser_html(browser_id, &html, &base_url);
+                },
+                CxOsOp::EvalSystemBrowserJs { browser_id, js } => unsafe {
+                    android_jni::to_java_eval_system_browser_js(browser_id, &js);
+                },
                 CxOsOp::CopyToClipboard(content) => unsafe {
                     android_jni::to_java_copy_to_clipboard(content);
                 },

@@ -54,7 +54,18 @@ macro_rules! call_method {
                     method_cstr.as_ptr() as _,
                     sig_cstr.as_ptr() as _,
                 );
-                assert!(!resolved.is_null());
+                // A null method id means the packaged Java has no such method —
+                // almost always buildtool/framework version skew (the JNI side
+                // calls a Java method a stale buildtool doesn't define). Name the
+                // method and signature so the failure is actionable instead of an
+                // opaque null assert.
+                assert!(
+                    !resolved.is_null(),
+                    "JNI method not found: {}{} — the makepad buildtool is out of sync \
+                     with the framework. Update the buildtool to the matching commit and \
+                     reinstall cargo-makepad (see docs/BUILDING-ANDROID.md).",
+                    $method, $sig
+                );
                 CACHED_MID.store(resolved as *mut std::ffi::c_void, Ordering::Relaxed);
                 (**$env).DeleteLocalRef.unwrap()($env, class);
                 resolved as *mut std::ffi::c_void
