@@ -499,6 +499,15 @@ pub enum CxOsOp {
     /// NativeDownloadProgress / NativeDownloadComplete actions carrying `call_id`.
     /// `dest` is absolute; the caller resolves it inside the card-fs sandbox.
     DownloadFile { call_id: i64, url: String, dest: String },
+    /// Show / hide the native floating chat-composer overlay (a native view
+    /// floating over the GL surface so the full-screen Splash card behind it
+    /// is edge-to-edge), or expand it from its collapsed "+" button / collapse
+    /// it back. Handled by the Android and OpenHarmony backends; every other
+    /// backend's catch-all ignores them (desktop uses the docked composer).
+    ShowNativeComposer,
+    HideNativeComposer,
+    ExpandNativeComposer,
+    CollapseNativeComposer,
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
     PauseVideoPlayback(LiveId),
@@ -614,6 +623,10 @@ impl std::fmt::Debug for CxOsOp {
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),
             Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
             Self::DownloadFile { .. } => write!(f, "DownloadFile"),
+            Self::ShowNativeComposer => write!(f, "ShowNativeComposer"),
+            Self::HideNativeComposer => write!(f, "HideNativeComposer"),
+            Self::ExpandNativeComposer => write!(f, "ExpandNativeComposer"),
+            Self::CollapseNativeComposer => write!(f, "CollapseNativeComposer"),
             Self::PrepareAudioPlayback(..) => write!(f, "PrepareAudioPlayback"),
             Self::BeginVideoPlayback(..) => write!(f, "BeginVideoPlayback"),
             Self::PauseVideoPlayback(..) => write!(f, "PauseVideoPlayback"),
@@ -694,6 +707,29 @@ impl Cx {
             url: url.to_owned(),
             dest: dest.to_owned(),
         });
+    }
+
+    /// Show the native floating chat-composer overlay so it floats over the
+    /// full-screen Splash card. No-op on backends without one.
+    pub fn show_native_composer(&mut self) {
+        self.platform_ops.push_back(CxOsOp::ShowNativeComposer);
+    }
+
+    /// Hide the native floating chat-composer overlay (and drop its keyboard).
+    pub fn hide_native_composer(&mut self) {
+        self.platform_ops.push_back(CxOsOp::HideNativeComposer);
+    }
+
+    /// Expand the native composer from its collapsed "+" button back to the
+    /// full input pill, and focus it.
+    pub fn expand_native_composer(&mut self) {
+        self.platform_ops.push_back(CxOsOp::ExpandNativeComposer);
+    }
+
+    /// Collapse the native composer to a small "+" button (and drop its
+    /// keyboard) so the full-screen card has more room.
+    pub fn collapse_native_composer(&mut self) {
+        self.platform_ops.push_back(CxOsOp::CollapseNativeComposer);
     }
 
     pub fn in_draw_event(&self) -> bool {

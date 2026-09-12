@@ -243,6 +243,18 @@ pub enum FromJavaMessage {
     ImeEditorAction {
         action_code: i32,
     },
+    // ---- posted by the buildtool's octos Java (composer overlay, deep links,
+    // QR scanner, file picker, streaming download, runhtml card bridge) ----
+    ComposerSubmit { text: String },
+    ComposerNewApp,
+    ComposerSwitch,
+    ComposerExpand,
+    QrScanned { json: String },
+    SystemBrowserInvoke { browser_id: i64, call_id: i64, tool: String, args: String },
+    DeepLink { url: String },
+    DialogResult { call_id: i64, name: String, content: String, cancelled: bool, error: String },
+    DownloadProgress { call_id: i64, done: i64, total: i64 },
+    DownloadComplete { call_id: i64, path: String, error: String },
 }
 unsafe impl Send for FromJavaMessage {}
 
@@ -2425,4 +2437,385 @@ pub unsafe fn to_java_update_ime_text_state(
     );
 
     (**env).DeleteLocalRef.unwrap()(env, text_jstr);
+}
+
+// ===========================================================================
+// Inbound: natives the buildtool's octos Java calls. Each converts its
+// arguments and posts a FromJavaMessage; android.rs turns that into the
+// matching Native* action and drains it the same tick.
+// ===========================================================================
+
+// A GPS fix from the Java LocationListener. Written straight into the
+// platform-global last fix so the Splash `sys.gps(...)` helper can read it
+// synchronously during card evaluation, without a trip through the queue.
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_onLocation(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+    lat: jni_sys::jdouble,
+    lon: jni_sys::jdouble,
+    acc: jni_sys::jfloat,
+) {
+    crate::gps::set_gps_fix_from_listener(lat as f64, lon as f64, acc as f32);
+}
+
+// The native floating chat composer (an Android view floating over the GL
+// surface, see `MakepadActivity`) submitted its text — the user tapped the
+// send button or pressed the IME "Send" action key.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSubmit(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    text: jni_sys::jstring,
+) {
+    let text = jstring_to_string(env, text);
+    send_from_java_message(FromJavaMessage::ComposerSubmit { text });
+}
+
+/// The native composer's "＋" (open another app) button was tapped.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerNewApp(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+) {
+    send_from_java_message(FromJavaMessage::ComposerNewApp);
+}
+
+/// The native composer's "⟳" (switch to next app) button was tapped.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerSwitch(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+) {
+    send_from_java_message(FromJavaMessage::ComposerSwitch);
+}
+
+/// The native composer's collapsed "+" FAB was tapped to UNFOLD the composer.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onComposerExpand(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+) {
+    send_from_java_message(FromJavaMessage::ComposerExpand);
+}
+
+/// A `runhtml` card's JS called `octos.invoke(tool, args)` — bridged here via the
+/// WebView's `octos_native` JavascriptInterface. Delivered to the WebCard widget
+/// as a `NativeSystemBrowserInvoke` action; the widget dispatches `tool` and
+/// resolves the card-side promise (`call_id`) with `evalSystemBrowserJs`.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserInvoke(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    browser_id: jni_sys::jlong,
+    call_id: jni_sys::jlong,
+    tool: jni_sys::jstring,
+    args: jni_sys::jstring,
+) {
+    let tool = jstring_to_string(env, tool);
+    let args = jstring_to_string(env, args);
+    send_from_java_message(FromJavaMessage::SystemBrowserInvoke {
+        browser_id: browser_id as i64,
+        call_id: call_id as i64,
+        tool,
+        args,
+    });
+}
+
+/// The app was launched/resumed via a deep link or share intent (ACTION_VIEW URL
+/// or ACTION_SEND text). Delivered to the app as a `NativeDeepLink` action.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDeepLink(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    url: jni_sys::jstring,
+) {
+    let url = jstring_to_string(env, url);
+    send_from_java_message(FromJavaMessage::DeepLink { url });
+}
+
+/// Result of a native file picker (see `to_java_open_file_dialog`). Delivered to
+/// the WebCard widget as a `NativeDialogResult` action, which resolves the
+/// card's `octos.invoke("dialog.open", …)` promise (`call_id`).
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDialogResult(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    call_id: jni_sys::jlong,
+    name: jni_sys::jstring,
+    content: jni_sys::jstring,
+    cancelled: jni_sys::jboolean,
+    error: jni_sys::jstring,
+) {
+    let name = if name.is_null() { String::new() } else { jstring_to_string(env, name) };
+    let content = if content.is_null() { String::new() } else { jstring_to_string(env, content) };
+    let error = if error.is_null() { String::new() } else { jstring_to_string(env, error) };
+    send_from_java_message(FromJavaMessage::DialogResult {
+        call_id: call_id as i64,
+        name,
+        content,
+        cancelled: cancelled != 0,
+        error,
+    });
+}
+
+/// Progress of a native streaming download → `NativeDownloadProgress` action.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadProgress(
+    _env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    call_id: jni_sys::jlong,
+    done: jni_sys::jlong,
+    total: jni_sys::jlong,
+) {
+    send_from_java_message(FromJavaMessage::DownloadProgress {
+        call_id: call_id as i64,
+        done: done as i64,
+        total: total as i64,
+    });
+}
+
+/// Completion of a native streaming download → `NativeDownloadComplete` action.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onDownloadComplete(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    call_id: jni_sys::jlong,
+    path: jni_sys::jstring,
+    error: jni_sys::jstring,
+) {
+    let path = if path.is_null() { String::new() } else { jstring_to_string(env, path) };
+    let error = if error.is_null() { String::new() } else { jstring_to_string(env, error) };
+    send_from_java_message(FromJavaMessage::DownloadComplete {
+        call_id: call_id as i64,
+        path,
+        error,
+    });
+}
+
+/// A camera frame (NV21 luma plane) from the QR scanner overlay. Decoded with
+/// the pure-Rust `rqrr`; on a hit, post the decoded string (the app applies it
+/// as an LLM-provisioning payload) and return JNI_TRUE so Java closes the scanner.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onQrCameraFrame(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    luma: jni_sys::jbyteArray,
+    width: jni_sys::jint,
+    height: jni_sys::jint,
+) -> jni_sys::jboolean {
+    let (w, h) = (width as usize, height as usize);
+    let len = (**env).GetArrayLength.unwrap()(env, luma) as usize;
+    if w == 0 || h == 0 || len < w * h {
+        return 0; // JNI_FALSE
+    }
+    let mut buf = vec![0i8; w * h];
+    (**env).GetByteArrayRegion.unwrap()(env, luma, 0, (w * h) as jni_sys::jsize, buf.as_mut_ptr());
+    let luma_u8 = std::slice::from_raw_parts(buf.as_ptr() as *const u8, w * h);
+    match decode_qr_luma(luma_u8, w, h) {
+        Some(json) => {
+            send_from_java_message(FromJavaMessage::QrScanned { json });
+            1 // JNI_TRUE
+        }
+        None => 0, // JNI_FALSE
+    }
+}
+
+/// Detect + decode a QR from an 8-bit greyscale (luma) buffer. Returns the text.
+fn decode_qr_luma(luma: &[u8], w: usize, h: usize) -> Option<String> {
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| luma[y * w + x]);
+    for grid in img.detect_grids() {
+        if let Ok((_meta, content)) = grid.decode() {
+            if !content.is_empty() {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
+// ===========================================================================
+// Outbound: calls into the buildtool's octos Java (MakepadActivity).
+// ===========================================================================
+
+pub unsafe fn to_java_share_text(content: String) {
+    let env = attach_jni_env();
+    // Strip interior NULs: a NUL in a Java string aborts in NewStringUTF.
+    let content = CString::new(content.replace('\0', "")).unwrap();
+    let content = ((**env).NewStringUTF.unwrap())(env, content.as_ptr());
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "shareText",
+        "(Ljava/lang/String;)V",
+        content
+    );
+}
+
+pub unsafe fn to_java_show_notification(title: String, body: String) {
+    let env = attach_jni_env();
+    let title = new_java_string(env, &title);
+    let body = new_java_string(env, &body);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "showNotification",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        title,
+        body
+    );
+}
+
+// The octos buildtool's picker: `openFileDialog(long callId, String mime)`,
+// answered through `onDialogResult`. Distinct from upstream's own
+// `to_java_open_file_dialog`, which drives a different Java entry point.
+pub unsafe fn to_java_open_file_dialog_mime(call_id: i64, mime: &str) {
+    let env = attach_jni_env();
+    let mime = new_java_string(env, mime);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "openFileDialog",
+        "(JLjava/lang/String;)V",
+        call_id as jni_sys::jlong,
+        mime
+    );
+}
+
+pub unsafe fn to_java_download_file(call_id: i64, url: &str, dest: &str) {
+    let env = attach_jni_env();
+    let url = new_java_string(env, url);
+    let dest = new_java_string(env, dest);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "downloadFile",
+        "(JLjava/lang/String;Ljava/lang/String;)V",
+        call_id as jni_sys::jlong,
+        url,
+        dest
+    );
+}
+
+// The native floating chat composer: a Java view over the GL surface, so
+// Makepad's touch routing can't swallow taps meant for it.
+pub unsafe fn to_java_show_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "showComposer", "()V");
+}
+
+pub unsafe fn to_java_hide_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "hideComposer", "()V");
+}
+
+pub unsafe fn to_java_expand_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "expandComposer", "()V");
+}
+
+pub unsafe fn to_java_collapse_composer() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "collapseComposer", "()V");
+}
+
+// The system browser is a Java WebView the activity hosts over the GL surface
+// (`MakepadActivity.spawnSystemBrowser` and friends).
+pub unsafe fn to_java_spawn_system_browser(browser_id: LiveId, url: &str) {
+    let env = attach_jni_env();
+    let url = new_java_string(env, url);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "spawnSystemBrowser",
+        "(JLjava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        url
+    );
+}
+
+pub unsafe fn to_java_update_system_browser(
+    browser_id: LiveId,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    visible: bool,
+) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "updateSystemBrowser",
+        "(JIIIIZ)V",
+        browser_id.get_value() as jni_sys::jlong,
+        left,
+        top,
+        right,
+        bottom,
+        visible as jni_sys::jboolean as std::ffi::c_uint
+    );
+}
+
+pub unsafe fn to_java_detach_system_browser(browser_id: LiveId) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "detachSystemBrowser",
+        "(J)V",
+        browser_id.get_value() as jni_sys::jlong
+    );
+}
+
+pub unsafe fn to_java_close_system_browser(browser_id: LiveId) {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "closeSystemBrowser",
+        "(J)V",
+        browser_id.get_value() as jni_sys::jlong
+    );
+}
+
+pub unsafe fn to_java_set_system_browser_url(browser_id: LiveId, url: &str) {
+    let env = attach_jni_env();
+    let url = new_java_string(env, url);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "setSystemBrowserUrl",
+        "(JLjava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        url
+    );
+}
+
+pub unsafe fn to_java_set_system_browser_html(browser_id: LiveId, html: &str, base_url: &str) {
+    let env = attach_jni_env();
+    let html = new_java_string(env, html);
+    let base_url = new_java_string(env, base_url);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "setSystemBrowserHtml",
+        "(JLjava/lang/String;Ljava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        html,
+        base_url
+    );
+}
+
+pub unsafe fn to_java_eval_system_browser_js(browser_id: LiveId, js: &str) {
+    let env = attach_jni_env();
+    let js = new_java_string(env, js);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "evalSystemBrowserJs",
+        "(JLjava/lang/String;)V",
+        browser_id.get_value() as jni_sys::jlong,
+        js
+    );
 }

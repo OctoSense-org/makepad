@@ -29,6 +29,8 @@ name = "metal_alloc_probe"
 harness = false
 
 [dependencies]
+# Pure-Rust QR decode for the composer's LLM-provisioning scanner (android JNI).
+rqrr = "0.10"
 makepad-studio-protocol = { path = "./studio", version = "0.1.0" }
 makepad-futures = { path = "../libs/futures", version = "1.0.0" }
 makepad-shared-bytes = { path = "../libs/shared_bytes", version = "1.0.0" }
