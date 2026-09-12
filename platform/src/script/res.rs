@@ -559,6 +559,18 @@ impl Cx {
         None
     }
 
+    /// Placeholder for a `sys.*` binding whose fetch is unresolved: the loading
+    /// glyph while it may still arrive, a visibly distinct "n/a" once the retry
+    /// budget is spent. Without the distinction a permanently unreachable source
+    /// renders identically to "still loading", forever.
+    pub fn script_data_placeholder(&self, url: &str) -> String {
+        if self.script_data.resources.data_fetch_failed_terminally(url) {
+            "n/a".to_string()
+        } else {
+            "—".to_string()
+        }
+    }
+
     /// Monotonic counter bumped whenever any script data fetch newly loads. A
     /// live-data-bound widget re-evaluates when this changes.
     pub fn script_data_fetch_epoch(&self) -> u64 {
