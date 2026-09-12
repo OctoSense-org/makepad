@@ -341,6 +341,12 @@ pub trait Widget: WidgetNode {
         false
     }
 
+    /// Optional selection state of a composed native control. Defaulted, so
+    /// only widgets that model a selection need to answer.
+    fn selected_value(&self, _cx: &Cx) -> Option<String> {
+        None
+    }
+
     fn ref_cast_type_id(&self) -> TypeId
     where
         Self: 'static,
@@ -924,6 +930,10 @@ impl WidgetRef {
         } else {
             false
         }
+    }
+
+    pub fn selected_value(&self, cx: &Cx) -> Option<String> {
+        self.0.borrow().as_ref().and_then(|inner| inner.widget.selected_value(cx))
     }
 
     pub fn selection_text_len(&self) -> usize {

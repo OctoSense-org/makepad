@@ -103,6 +103,9 @@ pub struct View {
     #[live(true)]
     #[apply_state]
     pub visible: bool,
+    /// Selection exposed by the owning semantic kit component.
+    #[live]
+    pub selected: Option<bool>,
     #[live(false)]
     skip_widget_tree_search: bool,
 
@@ -915,6 +918,10 @@ impl Widget for View {
                 self.redraw(vm.cx_mut());
             }
         }
+    }
+
+    fn selected_value(&self, _cx: &Cx) -> Option<String> {
+        self.selected.map(|v| v.to_string())
     }
 
     fn is_interactive(&self) -> bool {
