@@ -355,6 +355,56 @@ unsafe fn new_jstring(env: *mut jni_sys::JNIEnv, value: &str) -> Option<jni_sys:
     }
 }
 
+/// Split a proxy spec like `http://127.0.0.1:8899` (or a bare `127.0.0.1:8899`)
+/// into `("127.0.0.1", "8899")`. Returns `None` if there is no numeric port —
+/// the JVM proxy properties are useless without one, so we'd rather leave them
+/// unset (direct connect) than set a half-configured proxy.
+fn parse_proxy_host_port(proxy: &str) -> Option<(String, String)> {
+    let s = proxy.trim();
+    let s = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s);
+    let s = s.split('/').next().unwrap_or(s); // drop any trailing path
+    let (host, port) = s.rsplit_once(':')?;
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((host.to_string(), port.to_string()))
+}
+
+/// Call `System.setProperty(key, value)` via JNI. `System` is a class with only
+/// static methods, so this resolves the class + static method id directly rather
+/// than using the instance-method `call_method!` macros. Best-effort: any JNI
+/// failure just leaves the property unset.
+unsafe fn set_java_system_property(env: *mut jni_sys::JNIEnv, key: &str, value: &str) {
+    let (Some(k), Some(v)) = (new_jstring(env, key), new_jstring(env, value)) else {
+        return;
+    };
+    let cls_name = match CString::new("java/lang/System") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let cls = ((**env).FindClass.unwrap())(env, cls_name.as_ptr());
+    if cls.is_null() {
+        return;
+    }
+    let m_name = match CString::new("setProperty") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let m_sig = match CString::new("(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mid = ((**env).GetStaticMethodID.unwrap())(env, cls, m_name.as_ptr(), m_sig.as_ptr());
+    if mid.is_null() {
+        return;
+    }
+    // CallStaticObjectMethod is C-variadic in jni_sys; pass the two jstrings.
+    let _prev = ((**env).CallStaticObjectMethod.unwrap())(env, cls, mid, k, v);
+}
+
 unsafe fn get_prefs_object(
     env: *mut jni_sys::JNIEnv,
     activity: jni_sys::jobject,
@@ -482,6 +532,153 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
         get_persisted_string_pref(env, activity, MAKEPAD_STUDIO_CRATE_PREF_KEY)
     {
         std::env::set_var("STUDIO_CRATE", &studio_crate);
+    }
+
+    // Generic app-config passthrough: `--es makepad.APP_CONFIG <value>`
+    // surfaces to the app as the MAKEPAD_APP_CONFIG env var. Unlike the
+    // studio extras this is intentionally not persisted in prefs — it is a
+    // one-shot provisioning channel (e.g. octos-app's login-free server
+    // bootstrap); apps persist what they need themselves.
+    std::env::remove_var("MAKEPAD_APP_CONFIG");
+    if let Some(app_config) = get_intent_string_extra(env, activity, "makepad.APP_CONFIG")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_APP_CONFIG", &app_config);
+    }
+
+    // LLM provisioning passthrough: `--es makepad.PROVISION_CONFIG '<json>'` → the
+    // MAKEPAD_PROVISION_CONFIG env var. The JSON is the same self-contained payload
+    // the composer's QR scan yields ({"llm_family":..,"llm_model":..,"llm_key":..});
+    // the app writes it into the octos profile config on boot (bring-your-own-key).
+    std::env::remove_var("MAKEPAD_PROVISION_CONFIG");
+    if let Some(prov) = get_intent_string_extra(env, activity, "makepad.PROVISION_CONFIG")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_PROVISION_CONFIG", &prov);
+    }
+
+    // TEST-ONLY passthrough: `--es makepad.SEED_CARD_FILE <path>` → the
+    // MAKEPAD_SEED_CARD_FILE env var, so the app can seed a canned card from a
+    // file (bypassing the server/LLM) for on-device render/scroll/map tests.
+    std::env::remove_var("MAKEPAD_SEED_CARD_FILE");
+    if let Some(seed) = get_intent_string_extra(env, activity, "makepad.SEED_CARD_FILE")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_SEED_CARD_FILE", &seed);
+    }
+    // TEST-ONLY passthrough: `--es makepad.SEED_L0_FILE <card>` plus
+    // `--es makepad.SEED_L0_DATA <json>` → the matching env vars, so the app can
+    // seed an L0 LEDGER rather than an already-lowered card.
+    //
+    // The distinction matters: SEED_CARD_FILE above pushes lowered DSL, which is
+    // inert by construction — nothing on device knows which card produced it, so
+    // a tap has nowhere to land. Seeding the ledger lets the app hold the source
+    // and re-realize it, which is what makes an interaction local.
+    //
+    // `SEED_L0_EVENT`/`SEED_L0_VALUE` open the card on a state a tap would have
+    // reached. They were passed by the harness and dropped HERE, which is why
+    // every "detail view" capture was silently a capture of the list — the
+    // screenshot looked like a card, so nothing said the event never arrived.
+    //
+    // `FAKE_GPS_FILE`/`FAKE_GPS_MS` walk a track of `lat,lon` lines as if the
+    // device were driving it. That is the only way to test that navigation MOVES:
+    // everything downstream of `sys.gps` can be verified correct and frozen, and a
+    // handset sitting 3.7 km from the nearest routable road reports zero progress —
+    // correctly — so a working follow camera and a broken one are the same
+    // screenshot. The fixes go through `set_gps_fix`, the same function the
+    // `LocationListener` calls, so nothing above the platform can tell them apart.
+    //
+    // They are dropped here rather than read directly for the reason the two above
+    // it were: `SEED_L0_EVENT`/`SEED_L0_VALUE` were passed by the harness and not
+    // listed, so every "detail view" capture was silently a capture of the list.
+    // The screenshot looked like a card, so nothing said the extra never arrived —
+    // which is exactly how the first FAKE_GPS run failed, with no log line at all.
+    for name in [
+        "SEED_L0_FILE",
+        "SEED_L0_DATA",
+        "SEED_L0_EVENT",
+        "SEED_L0_VALUE",
+        "FAKE_GPS_FILE",
+        "FAKE_GPS_MS",
+        // The self-evolving-app harness: names the on-device dev master's
+        // mission file. Added the day the comment above came true AGAIN — the
+        // extra was passed, not listed, and round 1 never started, with no log
+        // line saying why.
+        "DEV_GOAL_FILE",
+    ] {
+        let var = format!("MAKEPAD_{name}");
+        std::env::remove_var(&var);
+        if let Some(v) = get_intent_string_extra(env, activity, &format!("makepad.{name}"))
+            .filter(|v| !v.trim().is_empty())
+        {
+            std::env::set_var(&var, &v);
+        }
+    }
+    // LOCAL DEBUG: per-draw GL tracing on device (emulator paint diagnosis).
+    if let Some(v) = get_intent_string_extra(env, activity, "makepad.GL_DRAW_TRACE")
+    {
+        std::env::set_var("MAKEPAD_GL_DRAW_TRACE", &v);
+    }
+
+    // TEST/automation passthrough: `--es makepad.AUTO_PROMPT "<text>"` → the
+    // MAKEPAD_AUTO_PROMPT env var, so the app can auto-submit one prompt on boot
+    // (a real LLM generation) without driving the native composer via adb input.
+    std::env::remove_var("MAKEPAD_AUTO_PROMPT");
+    if let Some(p) = get_intent_string_extra(env, activity, "makepad.AUTO_PROMPT")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_AUTO_PROMPT", &p);
+    }
+
+    // Passthrough: `--es makepad.OCTOS_PROXY <url>` → MAKEPAD_OCTOS_PROXY. Routes
+    // BOTH the embedded octos server's LLM HTTPS (via the env vars stdio_spawn
+    // sets on the kernel child) AND the app's OWN live-data fetches (sys.weather
+    // / sys.stock / sys.places — made by THIS process's HttpURLConnection, not
+    // the kernel) through a proxy — e.g. an `adb reverse` tunnel to the dev host
+    // — when the device has no direct internet route. Without the app-side leg,
+    // a Wi-Fi-less phone generates cards fine (LLM tunneled) but every `sys.*`
+    // fetch fails DNS, so cards render with "—"/empty rows.
+    std::env::remove_var("MAKEPAD_OCTOS_PROXY");
+    // `direct` / `none` / `off` / empty (or no extra at all) => NO proxy: both the
+    // octos LLM leg and the app-side sys.* fetches go straight out over the
+    // device's own network (Wi-Fi). Any other value is a proxy URL to tunnel.
+    let proxy = get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY").filter(|v| {
+        let t = v.trim().to_ascii_lowercase();
+        !t.is_empty() && t != "direct" && t != "none" && t != "off"
+    });
+    if let Some(proxy) = proxy {
+        std::env::set_var("MAKEPAD_OCTOS_PROXY", &proxy);
+        // App-side leg: MakepadNetwork opens connections with a bare
+        // `url.openConnection()`, which consults the JVM proxy system
+        // properties. Parse `http://host:port` and set them so every
+        // app-initiated HTTP(S) request CONNECT-tunnels through the proxy.
+        if let Some((host, port)) = parse_proxy_host_port(&proxy) {
+            for scheme in ["http", "https"] {
+                set_java_system_property(env, &format!("{scheme}.proxyHost"), &host);
+                set_java_system_property(env, &format!("{scheme}.proxyPort"), &port);
+            }
+            crate::log!("app HTTP proxy set: {}:{} (card data fetches tunneled)", host, port);
+        }
+    } else {
+        // No proxy requested. A warm-started process can carry stale JVM proxy
+        // props over from a previous (proxied) launch, so CLEAR them — otherwise
+        // app-side fetches keep tunneling to a now-dead proxy and every sys.*
+        // call fails. An empty host makes the HTTP stack connect directly.
+        for scheme in ["http", "https"] {
+            set_java_system_property(env, &format!("{scheme}.proxyHost"), "");
+            set_java_system_property(env, &format!("{scheme}.proxyPort"), "");
+        }
+        crate::log!("app HTTP proxy cleared: direct connections (device Wi-Fi)");
+    }
+
+    // Passthrough: `--es makepad.PROVISION_DIR <path>` → MAKEPAD_PROVISION_DIR.
+    // Names a world-readable staging dir whose tree is deployed into octos-home
+    // on boot — provisions a non-rooted device (GLM profile + a2app memory).
+    std::env::remove_var("MAKEPAD_PROVISION_DIR");
+    if let Some(dir) = get_intent_string_extra(env, activity, "makepad.PROVISION_DIR")
+        .filter(|v| !v.trim().is_empty())
+    {
+        std::env::set_var("MAKEPAD_PROVISION_DIR", &dir);
     }
 }
 

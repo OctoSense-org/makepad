@@ -90,6 +90,24 @@ pub struct Splash {
     /// `!vm.is_reload()`-guarded application state survives a style reload.
     #[rust]
     body_modules: Vec<LiveId>,
+    /// Per-frame pump for live-data / time-driven bodies — see `handle_event`.
+    /// Armed by `eval_styled_body` when the body binds `sys.*` live data, uses a
+    /// time-based shader, or reads `sys.simsecs`; `NextFrame::default()` (off)
+    /// for static cards so they never repaint per frame.
+    #[rust]
+    anim_next_frame: NextFrame,
+    #[rust]
+    animating: bool,
+    /// Data-fetch epoch recorded at the last eval. A LATER fetch completing
+    /// bumps the global epoch (`script::res`), and the pump re-evaluates the
+    /// body once so the "—" placeholders baked in at eval time become values.
+    #[rust]
+    last_data_epoch: u64,
+    #[rust]
+    last_sim_tick: u64,
+    /// 1 Hz interval auto-started for bodies that define `fn tick()`.
+    #[rust]
+    tick_timer: Timer,
 }
 
 impl ScriptHook for Splash {
@@ -283,6 +301,7 @@ impl Splash {
             .filter(|id| !timers_before.contains(id))
             .collect();
 
+        let installed = new_view.is_some();
         if let Some(mut view) = new_view {
             // The HOST owns this widget's slot in its tree: `Splash{width: Fill
             // height: Fill}` is a promise about the space the Splash occupies,
@@ -308,6 +327,40 @@ impl Splash {
             crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.uid);
             cx.widget_tree_mark_dirty(self.uid);
         }
+        // ---- live-data / animation bookkeeping ----
+        // A body that binds async live data (sys.weather/…) evaluates against
+        // "—" placeholders while its fetches are in flight; arm the per-frame
+        // pump so `handle_event` can re-evaluate it once those land. `fn tick()`
+        // bodies manage their own updates in place at 1 Hz and must never be
+        // rebuilt underneath (a nav card would tear down its MapView on every
+        // tile fetch), so they get the timer instead of the pump.
+        let (has_tick, animating) = {
+            let b = self.body.as_ref();
+            let is_tick = b.contains("fn tick(") || b.contains("fn tick (");
+            (
+                is_tick,
+                b.contains("draw_pass.time")
+                    || b.contains("WeatherIcon")
+                    || b.contains("sys.simsecs")
+                    || (body_binds_live_data(b) && !is_tick),
+            )
+        };
+        if !preserve {
+            cx.stop_timer(self.tick_timer);
+            if has_tick {
+                self.tick_timer = cx.start_interval(1.0);
+            }
+        }
+        self.animating = animating;
+        self.anim_next_frame = if animating { cx.new_next_frame() } else { NextFrame::default() };
+        // Record the epoch AT this eval so the pump only re-evaluates when a
+        // LATER fetch completes. eval only reads cached data / fires pending
+        // fetches — it never bumps the epoch — so this settles and cannot loop.
+        self.last_data_epoch = cx.script_data_fetch_epoch();
+        log!(
+            "[SPLASH] eval: {} bytes preserve={} view={} animating={} tick={} epoch={}",
+            self.body.as_ref().len(), preserve, installed, animating, has_tick, self.last_data_epoch
+        );
     }
 
     /// Tears down this Splash's isolate (if any), returning it to the empty
@@ -516,6 +569,44 @@ impl Widget for Splash {
             if let Event::NetworkResponses(responses) = event {
                 crate::widget_async::handle_splash_network_responses(cx, self.vm_id, responses);
             }
+        }
+        // 1 Hz tick for `fn tick()` bodies: the script updates its widgets in
+        // place (ui.<id>.set_*), which schedules no paint of its own.
+        if self.tick_timer.is_event(event).is_some() {
+            self.call_script_fn(cx, id!(tick), &[]);
+            self.view.redraw(cx);
+        }
+        // Per-frame pump (see `anim_next_frame`): re-evaluate the body once per
+        // data-fetch epoch change (live values replace the "—" placeholders),
+        // once per whole sim-clock second for `sys.simsecs` bodies, and repaint
+        // per frame only for genuinely time-based shaders.
+        if self.animating && self.anim_next_frame.is_event(event).is_some() {
+            let epoch = cx.script_data_fetch_epoch();
+            let sim_tick = sim_clock_secs() as u64;
+            let (sim_due, is_tick_card, needs_frame_anim, binds_live) = {
+                let b = self.body.as_ref();
+                (
+                    sim_tick != self.last_sim_tick && b.contains("sys.simsecs"),
+                    b.contains("fn tick(") || b.contains("fn tick ("),
+                    b.contains("draw_pass.time") || b.contains("WeatherIcon"),
+                    body_binds_live_data(b),
+                )
+            };
+            if (epoch != self.last_data_epoch && binds_live && !is_tick_card) || sim_due {
+                self.last_sim_tick = sim_tick;
+                log!(
+                    "[SPLASH] live re-eval: epoch {} -> {} sim_due={} ({} bytes)",
+                    self.last_data_epoch, epoch, sim_due, self.body.as_ref().len()
+                );
+                // Full re-evaluation into a fresh view (what the fork did): the
+                // body's `sys.*` calls now read the fetch cache instead of
+                // returning placeholders.
+                self.eval_styled_body(cx, false);
+                cx.redraw_all();
+            } else if needs_frame_anim {
+                self.view.redraw(cx);
+            }
+            self.anim_next_frame = cx.new_next_frame();
         }
         self.view.handle_event(cx, event, scope);
     }
