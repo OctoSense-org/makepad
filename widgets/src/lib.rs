@@ -524,6 +524,13 @@ pub fn script_mod(vm: &mut ScriptVm) {
     widgets_mod(vm);
     crate::desktop_style::apply_widgets(vm);
     makepad_platform::startup_trace("widgets: widgets_mod done");
+    // Register the `sys` / `agent` globals here so they are present in BOTH the
+    // main script VM and every isolated Splash VM (each isolate re-runs this
+    // `script_mod` at creation — see `alloc_splash_vm_with_network` in
+    // `widget_async.rs`). Card bodies call `sys.weather(...)` and button
+    // callbacks `agent.notify(...)` fail without it. Last, so `sys` sees the
+    // final `mod.prelude.widgets` alias like `kit` does.
+    crate::splash::register_agent_module(vm);
 }
 
 #[cfg(test)]
