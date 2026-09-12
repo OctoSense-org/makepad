@@ -680,10 +680,13 @@ struct MarkdownLink {
 
 impl WidgetMatchEvent for MarkdownLink {
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions, _scope: &mut Scope) {
-        if self.link.clicked(actions) {
+        if let Some(modifiers) = self.link.clicked_modifiers(actions) {
             cx.widget_action(
                 self.widget_uid(),
-                MarkdownAction::LinkNavigated(self.href.clone()),
+                MarkdownAction::LinkNavigated {
+                    url: self.href.clone(),
+                    modifiers,
+                },
             );
         }
     }
@@ -721,5 +724,11 @@ impl MarkdownLinkRef {
 pub enum MarkdownAction {
     #[default]
     None,
-    LinkNavigated(String),
+    /// A link was activated. `modifiers` is the click's keyboard state, so a host
+    /// can open the URL only on a modified click and leave a plain one to
+    /// drag-selection on the Markdown widget.
+    LinkNavigated {
+        url: String,
+        modifiers: makepad_platform::KeyModifiers,
+    },
 }
