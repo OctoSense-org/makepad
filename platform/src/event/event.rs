@@ -486,6 +486,45 @@ pub enum QuitReason {
     Signal,
 }
 
+/// The native floating composer submitted text.
+#[derive(Clone, Debug, Default)]
+pub struct NativeComposerSubmit {
+    pub text: String,
+}
+
+/// A system-browser document navigated. Carries the browser it came from.
+#[derive(Clone, Debug, Default)]
+pub struct NativeSystemBrowserNavigation {
+    pub browser_id: u64,
+    pub url: String,
+    pub title: String,
+}
+
+/// The app was opened through a deep link.
+#[derive(Clone, Debug, Default)]
+pub struct NativeDeepLink {
+    pub url: String,
+}
+
+/// The composer's "＋" (open another app) button was tapped. A bare action.
+#[derive(Clone, Debug, Default)]
+pub struct NativeComposerNewApp;
+
+/// The composer's "⟳" (switch to next app) button was tapped. A bare action.
+#[derive(Clone, Debug, Default)]
+pub struct NativeComposerSwitch;
+
+/// The composer's collapsed "+" FAB was tapped to UNFOLD it, so the app can
+/// mark its own composer state as shown and not re-fold what the user opened.
+#[derive(Clone, Debug, Default)]
+pub struct NativeComposerExpand;
+
+/// The composer's QR scanner decoded a payload (the provisioning config JSON).
+#[derive(Clone, Debug, Default)]
+pub struct NativeQrScanned {
+    pub json: String,
+}
+
 /// A card's `octos.invoke` call arriving from the system browser document.
 #[derive(Clone, Debug, Default)]
 pub struct NativeSystemBrowserInvoke {
