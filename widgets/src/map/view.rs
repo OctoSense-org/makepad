@@ -5982,6 +5982,9 @@ impl WidgetMatchEvent for MapView {
         let endpoint = pending.endpoint;
 
         if response.status_code != 200 {
+            if overpass_status_marks_mirror_down(response.status_code) {
+                mark_overpass_endpoint_down(&endpoint, cx.seconds_since_app_start() as u64);
+            }
             let preview = response
                 .get_string_body()
                 .unwrap_or_default()
@@ -6055,6 +6058,7 @@ impl WidgetMatchEvent for MapView {
         let Some(pending) = self.request_to_tile.remove(&request_id) else {
             return;
         };
+        mark_overpass_endpoint_down(&pending.endpoint, cx.seconds_since_app_start() as u64);
         self.mark_tile_failed(
             pending.tile_key,
             &format!(
@@ -9382,7 +9386,7 @@ impl MapView {
         }
 
         let query = overpass_query(tile_key);
-        let endpoint = overpass_endpoint(attempts);
+        let endpoint = overpass_endpoint(tile_key, attempts, cx.seconds_since_app_start() as u64);
         let mut request = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
         request.set_header("Content-Type".to_string(), "text/plain".to_string());
         request.set_header("Accept".to_string(), "application/json".to_string());

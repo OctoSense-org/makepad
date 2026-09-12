@@ -125,6 +125,19 @@ fn wgsl_packed_component(prefix: &str, slot: usize) -> String {
     format!("{prefix}{vec_idx}.{comp}")
 }
 
+/// f32-lane count of a pod type as the packed vertex path sees it: compact
+/// leaves count their logical components, everything else its byte size / 4
+/// (`ScriptPodTy::slots`), mirroring `DrawShaderInputs::push_pod_fields`.
+fn wgsl_logical_slots(ty: &ScriptPodTy) -> usize {
+    match ty {
+        ScriptPodTy::Packed(p) => p.logical_slots(),
+        ScriptPodTy::Struct { fields, .. } if ty.has_compact_format() => {
+            fields.iter().map(|f| wgsl_logical_slots(&f.ty.data.ty)).sum()
+        }
+        _ => ty.slots(),
+    }
+}
+
 fn wgsl_push_field(
     output: &ShaderOutput,
     vm: &ScriptVm,
@@ -136,7 +149,9 @@ fn wgsl_push_field(
 ) {
     let io_name = output.backend.map_io_name(io.name);
     let pod_ty = vm.bx.heap.pod_type_ref(io.ty);
-    let slots = pod_ty.ty.slots();
+    // A compact (typed) struct's lanes are its leaves' LOGICAL slots (a
+    // packed vec2 is two f32 lanes once decoded), not its byte size / 4.
+    let slots = wgsl_logical_slots(&pod_ty.ty);
     let attr_format = if attribute_packing {
         wgsl_attr_format_from_pod_ty(&pod_ty.ty)
     } else {
@@ -287,6 +302,12 @@ fn wgsl_flatten_inline(
                 }
             }
         }
+        ScriptPodTy::Packed(p) => {
+            for comp in 0..p.logical_slots() {
+                let swizzle = wgsl_swizzle_component(comp);
+                out.push(format!("({expr}).{swizzle}"));
+            }
+        }
         scalar_ty => {
             out.push(wgsl_to_float_scalar_expr(scalar_ty, expr));
         }
@@ -361,11 +382,157 @@ fn wgsl_reconstruct_inline(
                 comps.join(", ")
             )
         }
+        // A compact vec arrives as its decoded f32 lanes (the packed path
+        // decodes on upload): rebuild the logical vec2f / vec4f.
+        ScriptPodTy::Packed(p) => {
+            let n = p.logical_slots();
+            let mut comps = Vec::with_capacity(n);
+            for _ in 0..n {
+                let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index);
+                comps.push(wgsl_convert_scalar_expr(source, &ScriptPodTy::F32, &scalar));
+            }
+            format!("vec{}<f32>({})", n, comps.join(", "))
+        }
         scalar_ty => {
             let scalar = wgsl_take_scalar_or_zero(scalars, scalar_index);
             wgsl_convert_scalar_expr(source, scalar_ty, &scalar)
         }
     }
+}
+
+/// One vertex-fetch leaf of a typed (compact) geometry layout. Leaves are
+/// listed in the order `DrawShaderInputs::push_pod_fields` walks the struct
+/// (a compact struct recurses into its fields; anything else is one leaf), so
+/// leaf `i` here is input `i` of the shader's geometry layout and its
+/// locations are the attributes the Vulkan pipeline describes for it.
+struct WgslTypedLeaf {
+    ty: ScriptPodTypeInline,
+    packed: Option<crate::pod::ScriptPodPacked>,
+    slots: usize,
+    first_location: u32,
+}
+
+impl WgslTypedLeaf {
+    /// Compact formats are one attribute; f32-lane leaves are fetched as
+    /// `vec4f` chunks like the packed path, one attribute per chunk.
+    fn location_count(&self) -> u32 {
+        if self.packed.is_some() {
+            1
+        } else {
+            wgsl_num_packed_vec4s(self.slots) as u32
+        }
+    }
+    /// The vertex-input type for each of this leaf's attributes: what the
+    /// backend's vertex format delivers. Float / normalized formats arrive as
+    /// floats; the plain 16-bit integer formats arrive as integers.
+    fn input_type(&self) -> &'static str {
+        use crate::pod::ScriptPodPacked as P;
+        match self.packed {
+            Some(P::F16x2) | Some(P::U16x2Norm) | Some(P::I16x2Norm) => "vec2<f32>",
+            Some(P::F16x4) | Some(P::U8x4Norm) | Some(P::I8x4Norm) => "vec4<f32>",
+            Some(P::U16x2) => "vec2<u32>",
+            Some(P::I16x2) => "vec2<i32>",
+            None => "vec4f",
+        }
+    }
+}
+
+/// Typed vertex inputs (one attribute per compact leaf) versus the packed
+/// path with the compact lanes decoded to f32 on upload. Must agree with
+/// `VULKAN_TYPED_VERTEX_FETCH` in the Vulkan backend.
+pub const WGSL_TYPED_GEOMETRY: bool = true;
+
+fn wgsl_geometry_is_typed(output: &ShaderOutput, vm: &ScriptVm) -> bool {
+    WGSL_TYPED_GEOMETRY && output.io.iter().any(|io| {
+        matches!(io.kind, ShaderIoKind::VertexBuffer)
+            && vm.bx.heap.pod_type_ref(io.ty).ty.has_compact_format()
+    })
+}
+
+fn wgsl_push_typed_leaves(ty: &ScriptPodTypeInline, location: &mut u32, out: &mut Vec<WgslTypedLeaf>) {
+    if let ScriptPodTy::Struct { fields, .. } = &ty.data.ty {
+        if ty.data.ty.has_compact_format() {
+            for field in fields {
+                wgsl_push_typed_leaves(&field.ty, location, out);
+            }
+            return;
+        }
+    }
+    let leaf = WgslTypedLeaf {
+        ty: ty.clone(),
+        packed: ty.data.ty.packed(),
+        slots: ty.data.ty.slots(),
+        first_location: *location,
+    };
+    *location += leaf.location_count();
+    out.push(leaf);
+}
+
+/// Every geometry leaf of a typed layout, with its attribute locations.
+fn wgsl_collect_typed_leaves(output: &ShaderOutput, vm: &ScriptVm) -> Vec<WgslTypedLeaf> {
+    let mut out = Vec::new();
+    let mut location = 0u32;
+    for io in &output.io {
+        if let ShaderIoKind::VertexBuffer = io.kind {
+            let pod_ty = vm.bx.heap.pod_type_ref(io.ty);
+            let inline = ScriptPodTypeInline { self_ref: io.ty, data: pod_ty.clone() };
+            wgsl_push_typed_leaves(&inline, &mut location, &mut out);
+        }
+    }
+    out
+}
+
+/// The leaf's value in its logical shader type (a compact vec is `vec2f` /
+/// `vec4f` in shader code; integer 16-bit formats convert like Metal's
+/// `float2(raw)`, normalized ones already arrive normalized).
+fn wgsl_typed_leaf_expr(output: &ShaderOutput, vm: &ScriptVm, leaf: &WgslTypedLeaf) -> String {
+    use crate::pod::ScriptPodPacked as P;
+    let var = |offset: u32| format!("in.vb_typed_{}", leaf.first_location + offset);
+    match leaf.packed {
+        Some(P::U16x2) | Some(P::I16x2) => format!("vec2<f32>({})", var(0)),
+        Some(_) => var(0),
+        None => {
+            let scalars = (0..leaf.slots)
+                .map(|slot| format!("{}.{}", var((slot / 4) as u32), wgsl_swizzle_component(slot & 3)))
+                .collect::<Vec<_>>();
+            let mut scalar_index = 0usize;
+            wgsl_reconstruct_inline(
+                output,
+                vm,
+                &leaf.ty,
+                WgslPackedSource::BitPackedFloat,
+                &scalars,
+                &mut scalar_index,
+            )
+        }
+    }
+}
+
+/// Rebuild a geometry input from its typed leaves — the inverse of
+/// `wgsl_push_typed_leaves`, consuming leaves in the same order.
+fn wgsl_typed_reconstruct(
+    output: &ShaderOutput,
+    vm: &ScriptVm,
+    ty: &ScriptPodTypeInline,
+    leaves: &[WgslTypedLeaf],
+    next: &mut usize,
+) -> String {
+    if let ScriptPodTy::Struct { fields, .. } = &ty.data.ty {
+        if ty.data.ty.has_compact_format() {
+            let field_exprs = fields
+                .iter()
+                .map(|field| wgsl_typed_reconstruct(output, vm, &field.ty, leaves, next))
+                .collect::<Vec<_>>();
+            return format!(
+                "{}({})",
+                wgsl_type_name_inline(output, vm, ty),
+                field_exprs.join(", ")
+            );
+        }
+    }
+    let leaf = &leaves[*next];
+    *next += 1;
+    wgsl_typed_leaf_expr(output, vm, leaf)
 }
 
 fn wgsl_unpack_expr_for_field(
@@ -393,6 +560,20 @@ fn build_draw_shader_wgsl(
     xr_multiview: bool,
 ) -> (String, u32, u32, u32, u32) {
     let mut out = String::new();
+    // Packed vertex attribute unpackers: two f16s / four unorm8s bitcast into
+    // one f32 geometry slot (the packed map vertex format). The GLSL and Metal
+    // generators emit the same pair in their preambles; the builtin table maps
+    // `unpack2f16`/`unpack4u8` onto these names for every backend, so without
+    // the definitions naga fails the module with "no definition in scope".
+    out.push_str(
+        "fn _mp_unpack2f16(x: f32) -> vec2<f32> {\n\
+    return unpack2x16float(bitcast<u32>(x));\n\
+}\n\
+fn _mp_unpack4u8(x: f32) -> vec4<f32> {\n\
+    let u = bitcast<u32>(x);\n\
+    return vec4<f32>(f32(u & 0xffu), f32((u >> 8u) & 0xffu), f32((u >> 16u) & 0xffu), f32((u >> 24u) & 0xffu)) * (1.0 / 255.0);\n\
+}\n",
+    );
 
     let geometry_fields = wgsl_collect_geometry_fields(output, vm);
     let instance_fields = wgsl_collect_instance_fields(output, vm);
@@ -652,14 +833,40 @@ fn build_draw_shader_wgsl(
         .last()
         .map(|field| field.offset + field.slots)
         .unwrap_or(0);
-    for idx in 0..wgsl_num_packed_vec4s(geometry_slots) {
-        writeln!(
-            out,
-            "    @location({}) packed_geometry_{}: vec4f,",
-            location, idx
-        )
-        .ok();
-        location += 1;
+    // A typed (compact) geometry layout is fetched per leaf field in the
+    // backend's vertex format — one attribute per leaf (or per vec4f chunk
+    // of an f32-lane leaf) — instead of the f32 vec4 slots of the packed
+    // path; see `WgslTypedLeaf`.
+    let typed_geometry = wgsl_geometry_is_typed(output, vm);
+    let typed_leaves = if typed_geometry {
+        wgsl_collect_typed_leaves(output, vm)
+    } else {
+        Vec::new()
+    };
+    if typed_geometry {
+        for leaf in &typed_leaves {
+            for _ in 0..leaf.location_count() {
+                writeln!(
+                    out,
+                    "    @location({}) vb_typed_{}: {},",
+                    location,
+                    location,
+                    leaf.input_type()
+                )
+                .ok();
+                location += 1;
+            }
+        }
+    } else {
+        for idx in 0..wgsl_num_packed_vec4s(geometry_slots) {
+            writeln!(
+                out,
+                "    @location({}) packed_geometry_{}: vec4f,",
+                location, idx
+            )
+            .ok();
+            location += 1;
+        }
     }
     for idx in 0..wgsl_num_packed_vec4s(instance_slots) {
         writeln!(
@@ -833,15 +1040,28 @@ fn build_draw_shader_wgsl(
     } else {
         writeln!(out, "    VIEW_ID = 0;").ok();
     }
-    for field in &geometry_fields {
-        let value_expr = wgsl_unpack_expr_for_field(
-            output,
-            vm,
-            field,
-            "in.packed_geometry_",
-            WgslPackedSource::BitPackedFloat,
-        );
-        writeln!(out, "    {} = {};", field.name, value_expr).ok();
+    if typed_geometry {
+        let mut next = 0usize;
+        for io in &output.io {
+            if let ShaderIoKind::VertexBuffer = io.kind {
+                let io_name = output.backend.map_io_name(io.name);
+                let pod_ty = vm.bx.heap.pod_type_ref(io.ty);
+                let inline = ScriptPodTypeInline { self_ref: io.ty, data: pod_ty.clone() };
+                let value_expr = wgsl_typed_reconstruct(output, vm, &inline, &typed_leaves, &mut next);
+                writeln!(out, "    vb_{} = {};", io_name, value_expr).ok();
+            }
+        }
+    } else {
+        for field in &geometry_fields {
+            let value_expr = wgsl_unpack_expr_for_field(
+                output,
+                vm,
+                field,
+                "in.packed_geometry_",
+                WgslPackedSource::BitPackedFloat,
+            );
+            writeln!(out, "    {} = {};", field.name, value_expr).ok();
+        }
     }
     for field in &instance_fields {
         let value_expr = wgsl_unpack_expr_for_field(
@@ -1109,10 +1329,19 @@ pub fn compile_draw_shader_wgsl_source(
 
     output.assign_uniform_buffer_indices(&vm.bx.heap, 3);
 
-    let geometry_slots = wgsl_collect_geometry_fields(&output, vm)
-        .last()
-        .map(|field| field.offset + field.slots)
-        .unwrap_or(0);
+    // A typed layout counts logical slots per leaf (a compact vec2 is 2), the
+    // way the shader's geometry layout does; the packed path counts f32 slots.
+    let geometry_slots = if wgsl_geometry_is_typed(&output, vm) {
+        wgsl_collect_typed_leaves(&output, vm)
+            .iter()
+            .map(|leaf| leaf.slots)
+            .sum()
+    } else {
+        wgsl_collect_geometry_fields(&output, vm)
+            .last()
+            .map(|field| field.offset + field.slots)
+            .unwrap_or(0)
+    };
     let instance_slots = wgsl_collect_instance_fields(&output, vm)
         .last()
         .map(|field| field.offset + field.slots)

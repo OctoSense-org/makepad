@@ -605,6 +605,10 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
         // extra was passed, not listed, and round 1 never started, with no log
         // line saying why.
         "DEV_GOAL_FILE",
+        // `--es makepad.TRACE shader.wgsl` → MAKEPAD_TRACE: the platform's
+        // trace topics (frames / startup / shader.wgsl …), which otherwise
+        // cannot be set on a device — there is no shell env for an app.
+        "TRACE",
     ] {
         let var = format!("MAKEPAD_{name}");
         std::env::remove_var(&var);
