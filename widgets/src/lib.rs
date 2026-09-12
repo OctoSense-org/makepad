@@ -143,6 +143,16 @@ pub mod flat_list;
 pub mod chart;
 pub mod perf_graph;
 pub mod screen_cap;
+pub mod aqi_contour;
+pub mod kit;
+pub mod matplot;
+pub mod moon_phase;
+pub mod splash_l0;
+pub mod sun_arc;
+pub mod temp_bar;
+pub mod text_roles;
+pub mod weather_icon;
+pub mod web_card;
 
 // Commented out modules (not yet converted)
 // lets depricate these for now
