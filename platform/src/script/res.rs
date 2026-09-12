@@ -60,6 +60,57 @@ pub struct CxScriptHttpResource {
     pub abs_path: String,
 }
 
+/// State of a script *data* fetch (sys.weather etc): a live JSON/text pull
+/// keyed by URL. Unlike an image `http_resource`, no DSL value holds a handle
+/// to it, so it lives in a plain URL-keyed side-table (not the GC'd handle
+/// path) — the fetch persists for the card's lifetime without needing a root.
+#[derive(Clone)]
+pub enum DataFetch {
+    /// Request in flight; carries the request_id so the response can be routed.
+    Loading(LiveId),
+    Loaded(Rc<Vec<u8>>),
+    Error,
+}
+
+/// Bumped each time a script data fetch newly loads. A live-data-bound widget
+/// bakes the "—" placeholder into a Label at eval time; a plain repaint won't
+/// re-run the script, so it watches this epoch and re-evaluates once when it
+/// changes, picking up the now-loaded value.
+static DATA_FETCH_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Retries per data-fetch URL before the Error state sticks (initial attempt
+/// not counted — 4 means up to 5 requests total). Retries are LAZY (issued on
+/// the card's next evaluation, paced by the failing round-trips), so a larger
+/// budget spreads over tens of seconds rather than hammering.
+pub const DATA_FETCH_MAX_RETRIES: u8 = 4;
+
+/// User-Agent for a script data fetch, chosen by target host. Yahoo endpoints
+/// 429 requests without a browser-ish UA, so that stays the default — but
+/// overpass-api.de's Apache rejects the bare "Mozilla/5.0" bot signature with
+/// 406 (and OSM etiquette wants an identifying UA anyway), so Overpass gets a
+/// descriptive one — as does Nominatim, which requires it outright.
+pub fn data_fetch_user_agent(url: &str) -> &'static str {
+    if url.contains("overpass") || url.contains("nominatim") {
+        "octoscript-appcard/1.0 (+https://github.com/OctoSense-org/Octoscript-AppCard; live card data binding)"
+    } else {
+        "Mozilla/5.0"
+    }
+}
+
+/// Bump the data-fetch epoch. Also fired on fetch FAILURE: live-data cards
+/// re-evaluate on epoch change, which is what gives an errored URL its lazy
+/// retry. Terminates: an exhausted URL fires no new request, so no new failure
+/// bumps the epoch again.
+pub fn bump_data_fetch_epoch() {
+    DATA_FETCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The epoch's current value, for tests that assert something bumped it.
+#[cfg(test)]
+pub fn data_fetch_epoch_for_test() -> u64 {
+    DATA_FETCH_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Default)]
 pub struct CxScriptResources {
     pub resources: Rc<RefCell<Vec<CxScriptResource>>>,
@@ -68,9 +119,122 @@ pub struct CxScriptResources {
     /// [`CxScriptResource::handles`]).
     pub handles_by_abs_path: Rc<RefCell<HashMap<(usize, String), ScriptHandle>>>,
     pub http_resources: Vec<CxScriptHttpResource>,
+    /// Live data fetches for script data-binding, keyed by URL (see DataFetch).
+    pub data_fetches: Rc<RefCell<HashMap<String, DataFetch>>>,
+    /// Retry ledger for data fetches, keyed by URL: (attempts used, earliest
+    /// next-retry Instant). Public data APIs shed load with transient 5xx and
+    /// 429s can return in milliseconds — an immediate re-issue would burn the
+    /// whole budget inside one rate-limit window, so retries back off
+    /// exponentially (1s, 2s, 4s, …). Bounded by [`DATA_FETCH_MAX_RETRIES`];
+    /// the entry is dropped when the URL finally loads.
+    pub data_fetch_retries: Rc<RefCell<HashMap<String, (u8, std::time::Instant)>>>,
 }
 
 impl CxScriptResources {
+
+    pub fn get_data_fetch(&self, url: &str) -> Option<DataFetch> {
+        self.data_fetches.borrow().get(url).cloned()
+    }
+
+    /// Mark a URL as in flight under `request_id`.
+    pub fn begin_data_fetch(&self, url: &str, request_id: LiveId) {
+        self.data_fetches
+            .borrow_mut()
+            .insert(url.to_string(), DataFetch::Loading(request_id));
+    }
+
+    /// The URL a loading fetch was issued for — for failure logs, so a wire
+    /// problem names the wire.
+    pub fn data_fetch_url(&self, request_id: LiveId) -> Option<String> {
+        let map = self.data_fetches.borrow();
+        map.iter().find_map(|(url, fetch)| {
+            matches!(fetch, DataFetch::Loading(id) if *id == request_id).then(|| url.clone())
+        })
+    }
+
+    /// Does `request_id` belong to an in-flight data fetch?
+    pub fn is_data_fetch(&self, request_id: LiveId) -> bool {
+        self.data_fetches
+            .borrow()
+            .values()
+            .any(|f| matches!(f, DataFetch::Loading(id) if *id == request_id))
+    }
+
+    /// Store loaded bytes for the in-flight fetch matching `request_id`.
+    pub fn handle_data_fetch_response(&self, request_id: LiveId, data: Vec<u8>) -> bool {
+        let mut map = self.data_fetches.borrow_mut();
+        for (url, fetch) in map.iter_mut() {
+            if matches!(fetch, DataFetch::Loading(id) if *id == request_id) {
+                let url = url.clone();
+                *fetch = DataFetch::Loaded(Rc::new(data));
+                drop(map);
+                // Success closes the retry ledger entry.
+                self.data_fetch_retries.borrow_mut().remove(&url);
+                DATA_FETCH_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mark the in-flight fetch matching `request_id` as errored.
+    pub fn handle_data_fetch_error(&self, request_id: LiveId) -> bool {
+        let mut map = self.data_fetches.borrow_mut();
+        for fetch in map.values_mut() {
+            if matches!(fetch, DataFetch::Loading(id) if *id == request_id) {
+                *fetch = DataFetch::Error;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Lazy-retry bookkeeping: does `url` still have retry budget AND has its
+    /// backoff window elapsed; if so, consume one unit.
+    pub fn take_data_fetch_retry(&self, url: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut retries = self.data_fetch_retries.borrow_mut();
+        let entry = retries.entry(url.to_string()).or_insert((0, now));
+        if entry.0 >= DATA_FETCH_MAX_RETRIES || now < entry.1 {
+            return false;
+        }
+        entry.0 += 1;
+        entry.1 = now + std::time::Duration::from_secs(1u64 << (entry.0.min(6) - 1));
+        true
+    }
+
+    /// Mark the fetch matching `request_id` as errored AND exhaust its retry
+    /// budget — for permanent failures (404/403…) where re-issuing the same
+    /// request can only fail identically.
+    pub fn fail_data_fetch_terminally(&self, request_id: LiveId) -> bool {
+        let url = {
+            let map = self.data_fetches.borrow();
+            map.iter().find_map(|(url, fetch)| {
+                matches!(fetch, DataFetch::Loading(id) if *id == request_id).then(|| url.clone())
+            })
+        };
+        let Some(url) = url else { return false };
+        self.data_fetches
+            .borrow_mut()
+            .insert(url.clone(), DataFetch::Error);
+        self.data_fetch_retries
+            .borrow_mut()
+            .insert(url, (DATA_FETCH_MAX_RETRIES, std::time::Instant::now()));
+        true
+    }
+
+    /// Terminal-failure probe for widgets that render their own fetch: true
+    /// once `url` is in the Error state with NO retry budget left — the signal
+    /// to stop pumping frames and show a failure state.
+    pub fn data_fetch_failed_terminally(&self, url: &str) -> bool {
+        if !matches!(self.get_data_fetch(url), Some(DataFetch::Error)) {
+            return false;
+        }
+        self.data_fetch_retries
+            .borrow()
+            .get(url)
+            .is_some_and(|(used, _)| *used >= DATA_FETCH_MAX_RETRIES)
+    }
     /// Resolve a heap-local resource handle before storing it in Cx-owned
     /// renderer state. Different script heaps can use the same handle value.
     pub fn path_for_handle(&self, heap_key: usize, handle: ScriptHandle) -> Option<String> {
@@ -361,6 +525,45 @@ fn font_policy_declares_path(font_set: crate::FontSet, dependency_path: Option<&
 }
 
 impl Cx {
+
+    /// Get-or-fetch a live data resource (JSON/text) by URL, for script
+    /// data-binding helpers like `sys.weather`. Returns the loaded bytes when
+    /// ready; otherwise fires the request once (deduped by URL) and returns
+    /// None while it loads. This lets generated DSL bind live data instead of
+    /// the model hardcoding numbers.
+    pub fn script_data_fetch(&mut self, url: &str) -> Option<Rc<Vec<u8>>> {
+        match self.script_data.resources.get_data_fetch(url) {
+            Some(DataFetch::Loaded(bytes)) => return Some(bytes),
+            Some(DataFetch::Loading(_)) => return None,
+            Some(DataFetch::Error) => {
+                // Lazy retry: re-fire on this evaluation if budget remains,
+                // else the Error is terminal.
+                if !self.script_data.resources.take_data_fetch_retry(url) {
+                    return None;
+                }
+                crate::log!("Script data fetch retrying: {}", url);
+            }
+            None => {}
+        }
+        let request_id = LiveId::unique();
+        self.script_data.resources.begin_data_fetch(url, request_id);
+        crate::log!("Script data fetch: issuing {url}");
+        let mut req = HttpRequest::new(url.to_string(), Default::default());
+        // Host-appropriate UA — Yahoo 429s without a browser-ish one, Overpass
+        // 406s ON the bare browser signature.
+        req.set_header(
+            "User-Agent".to_string(),
+            data_fetch_user_agent(url).to_string(),
+        );
+        self.http_request(request_id, req);
+        None
+    }
+
+    /// Monotonic counter bumped whenever any script data fetch newly loads. A
+    /// live-data-bound widget re-evaluates when this changes.
+    pub fn script_data_fetch_epoch(&self) -> u64 {
+        DATA_FETCH_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+    }
     fn load_script_resource_impl(
         &mut self,
         path: &str,
