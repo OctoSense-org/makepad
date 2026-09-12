@@ -285,6 +285,7 @@ fn parse_node(walker: &mut HtmlWalker, parent_style: &SvgStyle) -> Option<SvgNod
         t if t == live_id!(polyline) => Some(parse_polyline(walker, parent_style)),
         t if t == live_id!(polygon) => Some(parse_polygon(walker, parent_style)),
         t if t == live_id!(use) => Some(parse_use(walker, parent_style)),
+        t if t == live_id!(text) => Some(parse_text(walker, parent_style)),
         _ => {
             walker.jump_to_close();
             walker.walk();
@@ -398,6 +399,92 @@ fn parse_path(walker: &mut HtmlWalker, parent_style: &SvgStyle) -> SvgNode {
     );
     walker.walk();
     SvgNode::Path(svg_path)
+}
+
+fn parse_text(walker: &mut HtmlWalker, parent_style: &SvgStyle) -> SvgNode {
+    let style = parse_style_from_element(walker, parent_style);
+    let (id, transform) = parse_common_attrs(walker);
+    let x = walker
+        .find_attr_lc(live_id!(x))
+        .and_then(parse_length)
+        .unwrap_or(0.0);
+    let y = walker
+        .find_attr_lc(live_id!(y))
+        .and_then(parse_length)
+        .unwrap_or(0.0);
+    let font_size = walker
+        .find_attr_lc(live_id!(font - size))
+        .and_then(parse_length)
+        .unwrap_or(16.0);
+    let font_family = walker
+        .find_attr_lc(live_id!(font - family))
+        .map(|s| s.to_string());
+    let text_anchor = walker
+        .find_attr_lc(live_id!(text - anchor))
+        .map(|s| match s.trim() {
+            "middle" => SvgTextAnchor::Middle,
+            "end" => SvgTextAnchor::End,
+            _ => SvgTextAnchor::Start,
+        })
+        .unwrap_or_default();
+
+    let mut content = String::new();
+    let mut animations = Vec::new();
+    let mut animate_transforms = Vec::new();
+
+    walker.walk();
+    while !walker.done() {
+        // Top-level </text> closes us.
+        if walker.close_tag_lc() == Some(live_id!(text)) {
+            walker.walk();
+            break;
+        }
+        // Collect raw text runs, both direct children and tspan descendants.
+        if let Some(s) = walker.text() {
+            content.push_str(s);
+        }
+        if let Some(tag) = walker.open_tag_lc() {
+            if tag == live_id!(animate) {
+                animations.push(parse_animate_element(walker));
+                walker.walk();
+                continue;
+            }
+            if tag == live_id!(animatetransform) {
+                animate_transforms.push(parse_animate_transform_element(walker));
+                walker.walk();
+                continue;
+            }
+            // A `<tspan>` per visual line is how multi-line labels arrive. Its
+            // own x/dy are not parsed, but a newline is inserted between
+            // consecutive tspans so the text collector can split lines and
+            // offset them at the rendered font height. Without it two lines
+            // collapse into one run that overflows the node box.
+            if tag == live_id!(tspan) {
+                if !content.is_empty() && !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                walker.walk();
+                continue;
+            }
+            // Unknown child element: skip its subtree.
+            walker.jump_to_close();
+        }
+        walker.walk();
+    }
+
+    SvgNode::Text(SvgText {
+        id,
+        style,
+        transform,
+        x,
+        y,
+        font_size,
+        font_family,
+        text_anchor,
+        content,
+        animations,
+        animate_transforms,
+    })
 }
 
 fn parse_rect(walker: &mut HtmlWalker, parent_style: &SvgStyle) -> SvgNode {

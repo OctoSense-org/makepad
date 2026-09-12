@@ -708,6 +708,7 @@ impl<'a> ScriptVm<'a> {
         loop {
             let err = self.bx.threads.cur().trap.err_pop_front();
             if let Some(err) = err {
+                self.bx.uncaught_error_count = self.bx.uncaught_error_count.saturating_add(1);
                 if self.bx.captured_errors.is_some() {
                     let formatted = self.format_error(&err);
                     if let Some(sink) = self.bx.captured_errors.as_mut() {
@@ -1380,6 +1381,17 @@ impl<'a> ScriptVm<'a> {
         i as u16
     }
 
+    /// Evaluate a complete document with bounded bytecode execution. Reject a
+    /// recovered runtime failure even if a later expression produces a value.
+    /// Native calls and parsing are outside the instruction budget.
+    pub fn eval_checked(&mut self, script_mod: ScriptMod, limit: usize) -> Option<ScriptValue> {
+        let errors = self.bx.uncaught_error_count;
+        let value = self.with_instruction_limit(limit, |vm| vm.eval(script_mod));
+        self.drain_errors();
+        (!value.is_nil() && !value.is_err() && self.bx.uncaught_error_count == errors)
+            .then_some(value)
+    }
+
     pub fn eval(&mut self, script_mod: ScriptMod) -> ScriptValue {
         self.eval_with_source(script_mod, ScriptObject::ZERO)
     }
@@ -1583,6 +1595,9 @@ pub struct ScriptVmBase {
     pub is_reload: bool,
     pub debug_trace: bool,
     pub silence_errors: bool,
+    /// Errors drained without a handler, ever. `eval_checked` compares it across
+    /// one evaluation to reject a document that recovered from a runtime failure.
+    pub uncaught_error_count: usize,
     /// When Some, drained errors are pushed here (formatted) instead of being
     /// logged or dropped — even under `silence_errors`. Install before an
     /// eval/call, take after, to feed diagnostics back to a host (e.g. an AI
@@ -1608,6 +1623,7 @@ impl ScriptVmBase {
             is_reload: false,
             debug_trace: false,
             silence_errors: false,
+            uncaught_error_count: 0,
             captured_errors: None,
             run_budget: None,
             last_limit_consumed: 0,
@@ -1643,6 +1659,7 @@ impl ScriptVmBase {
             is_reload: false,
             debug_trace: false,
             silence_errors: false,
+            uncaught_error_count: 0,
             captured_errors: None,
             run_budget: None,
             last_limit_consumed: 0,

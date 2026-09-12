@@ -152,6 +152,9 @@ pub struct SvgStyle {
     pub shader_id: f32,
     /// Reference to a `<filter>` definition (e.g. `url(#shadow)`).
     pub filter: Option<String>,
+    /// Reference to a `<marker>` definition on the end of a path (e.g.
+    /// `marker-end="url(#arrow)"`) — how an edge declares its arrowhead.
+    pub marker_end: Option<String>,
 }
 
 impl Default for SvgStyle {
@@ -172,6 +175,7 @@ impl Default for SvgStyle {
             color: (0.0, 0.0, 0.0, 1.0), // CSS default: black
             shader_id: 0.0,
             filter: None,
+            marker_end: None,
         }
     }
 }
@@ -527,6 +531,29 @@ pub struct SvgUse {
     pub animate_transforms: Vec<SvgAnimateTransform>,
 }
 
+/// A `<text>` element. Only the element's own attributes and its concatenated
+/// text content are modelled; `<tspan>` positioning and wrapping are not, so
+/// text with children collapses to the joined run, with `\n` between tspans.
+#[derive(Clone, Debug)]
+pub struct SvgText {
+    pub id: Option<String>,
+    pub style: SvgStyle,
+    pub transform: Transform2d,
+    pub x: f32,
+    pub y: f32,
+    /// Font size in user units. `16.0` when the source SVG omits it.
+    pub font_size: f32,
+    /// Raw `font-family` string from the SVG. Resolution to an actual font is
+    /// deferred to the render stage.
+    pub font_family: Option<String>,
+    /// `start` | `middle` | `end`. `start` is the default.
+    pub text_anchor: SvgTextAnchor,
+    /// The text run: any child text nodes and `<tspan>` content, joined.
+    pub content: String,
+    pub animations: Vec<SvgAnimate>,
+    pub animate_transforms: Vec<SvgAnimateTransform>,
+}
+
 #[derive(Clone, Debug)]
 pub enum SvgNode {
     Group(SvgGroup),
@@ -538,6 +565,7 @@ pub enum SvgNode {
     Polyline(SvgPolyline),
     Polygon(SvgPolygon),
     Use(SvgUse),
+    Text(SvgText),
 }
 
 // ---- Filter ----
@@ -681,6 +709,11 @@ impl SvgDocument {
                         return true;
                     }
                 }
+                SvgNode::Text(t) => {
+                    if !t.animations.is_empty() || !t.animate_transforms.is_empty() {
+                        return true;
+                    }
+                }
                 SvgNode::Use(u) => {
                     if !u.animations.is_empty() || !u.animate_transforms.is_empty() {
                         return true;
@@ -744,6 +777,14 @@ impl SvgDocument {
                     for &(px, py) in &p.points {
                         bounds.add_point_xf(px, py, &xf);
                     }
+                }
+                SvgNode::Text(t) => {
+                    // Rough bounds: anchor point plus a font-size-tall box.
+                    // Width is unknown until shaping; include just the anchor so
+                    // we don't over-inflate the diagram bbox.
+                    let xf = t.transform.then(parent_xf);
+                    bounds.add_point_xf(t.x, t.y - t.font_size, &xf);
+                    bounds.add_point_xf(t.x, t.y, &xf);
                 }
                 SvgNode::Use(_) => {
                     // Use nodes resolved at render time; skip for bounds
@@ -812,4 +853,13 @@ impl BoundsAccum {
             None
         }
     }
+}
+
+/// Horizontal anchoring of an SVG text run, per the `text-anchor` attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SvgTextAnchor {
+    #[default]
+    Start,
+    Middle,
+    End,
 }
