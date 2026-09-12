@@ -78,6 +78,8 @@ fn render_nodes(
             SvgNode::Polyline(poly) => render_polyline(dv, poly, defs, parent_xf, time, grad_map),
             SvgNode::Polygon(poly) => render_polygon(dv, poly, defs, parent_xf, time, grad_map),
             SvgNode::Use(use_node) => render_use(dv, use_node, defs, parent_xf, time, grad_map),
+            // Text is laid out by the host from collect_text_cmds, not rasterised here.
+            SvgNode::Text(_) => {}
         }
     }
 }

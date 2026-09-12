@@ -364,6 +364,8 @@ fn emit_nodes_fill_only(
             }
             SvgNode::Line(_) => {}
             SvgNode::Use(use_node) => emit_use_fill_only(dg, use_node, defs, parent_xf),
+            // Text is laid out by the host from collect_text_cmds, not rasterised here.
+            SvgNode::Text(_) => {}
         }
     }
 }
