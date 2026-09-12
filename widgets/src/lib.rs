@@ -470,7 +470,6 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::moon_phase::script_mod(vm);
     crate::aqi_contour::script_mod(vm);
     crate::matplot::script_mod(vm);
-    crate::kit::script_mod(vm);
 
     // Safe area inset values (in Makepad layout points). Populated from the platform's
     // display_context which is set before Startup on iOS/Android. On desktop
@@ -512,6 +511,10 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
             ..mod.widgets,
         }
     });
+
+    // The kit components read `mod.prelude.widgets` at registration, so they
+    // go after the alias is assembled above — the same order the fork used.
+    crate::kit::script_mod(vm);
 }
 
 pub fn script_mod(vm: &mut ScriptVm) {

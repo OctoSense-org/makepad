@@ -498,6 +498,8 @@ pub struct NativeSystemBrowserNavigation {
     pub browser_id: u64,
     pub url: String,
     pub title: String,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 /// The app was opened through a deep link.
