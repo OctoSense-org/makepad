@@ -486,6 +486,43 @@ pub enum QuitReason {
     Signal,
 }
 
+/// A card's `octos.invoke` call arriving from the system browser document.
+#[derive(Clone, Debug, Default)]
+pub struct NativeSystemBrowserInvoke {
+    pub browser_id: u64,
+    pub call_id: i64,
+    pub tool: String,
+    pub args: String,
+}
+
+/// Result of a native file-picker dialog, carrying the `call_id` its
+/// `CxOsOp::OpenFileDialog` was issued with.
+#[derive(Clone, Debug, Default)]
+pub struct NativeDialogResult {
+    pub call_id: i64,
+    pub name: String,
+    pub content: String,
+    pub cancelled: bool,
+    pub error: String,
+}
+
+/// Progress of a native streaming download, carrying its `call_id`.
+#[derive(Clone, Debug, Default)]
+pub struct NativeDownloadProgress {
+    pub call_id: i64,
+    pub done: i64,
+    pub total: i64,
+}
+
+/// Completion of a native streaming download. On success `error` is empty and
+/// `path` names the written file.
+#[derive(Clone, Debug, Default)]
+pub struct NativeDownloadComplete {
+    pub call_id: i64,
+    pub path: String,
+    pub error: String,
+}
+
 #[derive(Debug)]
 pub struct QuitRequestedEvent {
     pub reason: QuitReason,
