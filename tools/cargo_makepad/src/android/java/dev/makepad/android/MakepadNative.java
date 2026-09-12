@@ -73,6 +73,10 @@ public class MakepadNative {
     // resolves the card-side promise (callId) via evalSystemBrowserJs.
     public native static void onSystemBrowserInvoke(long browserId, long callId, String tool, String args);
 
+    // The app was opened/resumed via a deep link (ACTION_VIEW URL) or a share
+    // (ACTION_SEND text) — e.g. a YouTube link shared from another app.
+    public native static void onDeepLink(String url);
+
     // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
     // it; returns true if a QR was found (the caller then closes the scanner).
     public native static boolean onQrCameraFrame(byte[] luma, int width, int height);
