@@ -42,7 +42,7 @@ pub fn install(vm: &mut ScriptVm, sys: ScriptObject) {
                 _ => None,
             };
             let result = amount.zip(pair)
-                .and_then(|(amount, (from, to))| splash_node::units::convert(amount, from, to));
+                .and_then(|(amount, (from, to))| octoscript_node::units::convert(amount, from, to));
             match result.zip(amount) {
                 Some((value, _)) if field == "value" => ScriptValue::from_f64(value),
                 Some((_, amount)) if field == "amount" => ScriptValue::from_f64(amount),

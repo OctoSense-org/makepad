@@ -7,6 +7,6 @@ use crate::{Cx, WidgetRef};
 // source-artboard DesignButton wrapper in this backend.
 fn set_design_selection(_root: &WidgetRef, _cx: &mut Cx, _selected: bool) {}
 
-#[path = "../../../splash-makepad/crates/splash-widgets/src/kit_shared.rs"]
-mod shared;
-pub use shared::*;
+#[path = "kit_shared.rs"]
+mod kit_shared;
+pub use kit_shared::*;
