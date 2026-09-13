@@ -66,73 +66,6 @@ unsafe impl Encode for CAFrameRateRange {
     }
 }
 
-static METAL_LINK_TRACE_UPDATES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static METAL_LINK_TRACE_DRAWABLES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static METAL_LINK_TRACE_PRESENTED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static METAL_LINK_TRACE_LAST_US: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn metal_link_frame_trace_enabled() -> bool {
-    crate::makepad_error_log::trace_enabled("frame")
-}
-
-pub(super) fn metal_link_trace_drawable_consumed() {
-    if metal_link_frame_trace_enabled() {
-        METAL_LINK_TRACE_DRAWABLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-pub(super) fn metal_link_trace_presented() {
-    if metal_link_frame_trace_enabled() {
-        METAL_LINK_TRACE_PRESENTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-fn metal_link_trace_update_fired() {
-    if metal_link_frame_trace_enabled() {
-        METAL_LINK_TRACE_UPDATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-fn metal_link_trace_report() {
-    if !metal_link_frame_trace_enabled() {
-        return;
-    }
-    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-    let now_us = START
-        .get_or_init(Instant::now)
-        .elapsed()
-        .as_micros()
-        .min(u64::MAX as u128) as u64;
-    let last_us = METAL_LINK_TRACE_LAST_US.load(std::sync::atomic::Ordering::Relaxed);
-    if now_us.saturating_sub(last_us) < 1_000_000
-        || METAL_LINK_TRACE_LAST_US
-            .compare_exchange(
-                last_us,
-                now_us,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-    {
-        return;
-    }
-    let updates = METAL_LINK_TRACE_UPDATES.swap(0, std::sync::atomic::Ordering::AcqRel);
-    let drawables = METAL_LINK_TRACE_DRAWABLES.swap(0, std::sync::atomic::Ordering::AcqRel);
-    let presented = METAL_LINK_TRACE_PRESENTED.swap(0, std::sync::atomic::Ordering::AcqRel);
-    crate::trace!(
-        "frame",
-        "metal-link interval_ms={:.1} updates_fired={} drawables_consumed={} presented={}",
-        now_us.saturating_sub(last_us) as f64 / 1000.0,
-        updates,
-        drawables,
-        presented,
-    );
-}
-
 pub fn with_macos_app<R>(f: impl FnOnce(&mut MacosApp) -> R) -> R {
     MACOS_APP.with_borrow_mut(|app| f(app.as_mut().unwrap()))
 }
@@ -350,15 +283,17 @@ pub struct MacosApp {
     pub time_start: Instant,
     pub timer_delegate_instance: ObjcId,
     timers: Vec<CocoaTimer>,
-    /// Per-layer CAMetalDisplayLink paint pacing on macOS 14+, with the
-    /// existing per-view CADisplayLink path as its runtime fallback: each
-    /// window's paint beat fires FROM its own panel's refresh callback
-    /// instead of an NSTimer racing it — the real frame-flip clock, per
-    /// window, per display. Empty until a window exists (or unsupported:
-    /// NSTimer pacing stays). Entries are (cocoa window, link).
+    /// Per-window CADisplayLink paint pacing: each window's paint beat fires
+    /// FROM its own panel's refresh callback instead of an NSTimer racing it
+    /// — the real frame-flip clock, per window, per display. Empty until a
+    /// window exists (or unsupported: NSTimer pacing stays). Entries are
+    /// (cocoa window, link).
     display_links: Vec<(ObjcId, ObjcId)>,
     display_links_paused: bool,
     remote_capture_deadline: Option<Instant>,
+    /// `NSProcessInfo` activity token that keeps a `--remote` or
+    /// `MAKEPAD_HIDE_WINDOWS` instance out of App Nap for the process life.
+    nap_activity: Option<RcObjcId>,
     /// The frame clock, measured (`MAKEPAD_TRACE=frames`).
     pub frame_trace: crate::frame_trace::FrameTrace,
     //pub signals: Mutex<RefCell<HashSet<Signal>>>,
@@ -432,6 +367,7 @@ impl MacosApp {
                 display_links: Vec::new(),
                 display_links_paused: false,
                 remote_capture_deadline: None,
+                nap_activity: None,
                 frame_trace: crate::frame_trace::FrameTrace::new(),
                 menu_delegate_instance: msg_send![get_macos_class_global().menu_delegate, new],
                 //app_delegate_instance,
@@ -461,6 +397,25 @@ impl MacosApp {
             }
         }
     }
+    /// Hold an `NSActivityUserInitiated` token so a hidden or `--remote`
+    /// test instance is not App-Napped during a long rest. No-op for a
+    /// normal interactive launch.
+    fn begin_test_instance_activity(&mut self) {
+        if self.nap_activity.is_some() {
+            return;
+        }
+        if !crate::remote::requested() && std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none() {
+            return;
+        }
+        unsafe {
+            let info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
+            let reason = str_to_nsstring("makepad remote/hidden test instance");
+            let options = NSActivityUserInitiated | NSActivityIdleSystemSleepDisabled;
+            let token: ObjcId = msg_send![info, beginActivityWithOptions: options reason: reason];
+            self.nap_activity = NonNull::new(token).map(RcObjcId::from_unowned);
+        }
+    }
+
     pub fn init_quit_menu(&mut self) {
         // Use the running app's CFBundleName (which is what macOS already
         // shows as the application menu title in the menu bar) so the
@@ -975,7 +930,10 @@ impl MacosApp {
             // Quit affordance out of the box. Apps that build their own menu
             // (via `cx.update_macos_menu` or the `WindowMenu` widget) will
             // overwrite this; the call is harmless either way.
-            with_macos_app(|app| app.init_quit_menu());
+            with_macos_app(|app| {
+                app.init_quit_menu();
+                app.begin_test_instance_activity();
+            });
             // get_macos_app_global().startup_focus_hack();
 
             loop {
@@ -1375,11 +1333,9 @@ impl MacosApp {
         }
     }
 
-    /// Arm (or resume) display-link pacing: one link per window. On macOS 14+
-    /// CAMetalDisplayLink is built from that view's CAMetalLayer so its update
-    /// owns both the beat and drawable. Older systems take the existing
-    /// NSView.displayLink path unchanged. Returns false when neither can run,
-    /// so the caller falls back to NSTimer pacing.
+    /// Arm (or resume) display-link pacing: one CADisplayLink per window via
+    /// NSView.displayLink. Returns false when that cannot run, so the caller
+    /// falls back to NSTimer pacing.
     pub fn ensure_display_link(&mut self) -> bool {
         unsafe {
             // Prune links whose window is gone.
@@ -1397,100 +1353,45 @@ impl MacosApp {
                 if self.display_links.iter().any(|(w, _)| *w == window) {
                     continue;
                 }
-                // Runtime availability is the contract here: referring to the
-                // class by name keeps the binary loadable before macOS 14.
-                let mut is_metal_link = false;
-                let mut link = nil;
-                // Opt-in until it paces at the display's rate: measured 11 fps
-                // visible on 2026-08-25 against 62 fps on the CVDisplayLink path.
-                let metal_link_wanted = std::env::var("MAKEPAD_METAL_DISPLAY_LINK")
-                    .map(|v| v != "0")
-                    .unwrap_or(false);
-                if let Some(link_class) =
-                    Class::get("CAMetalDisplayLink").filter(|_| metal_link_wanted)
-                {
-                    let layer: ObjcId = msg_send![view, layer];
-                    if layer != nil {
-                        let allocated: ObjcId = msg_send![link_class, alloc];
-                        link = msg_send![allocated, initWithMetalLayer: layer];
-                        if link != nil {
-                            let () = msg_send![link, setDelegate: self.timer_delegate_instance];
-                            let default_range: CAFrameRateRange =
-                                msg_send![link, preferredFrameRateRange];
-                            let default_latency: isize = msg_send![link, preferredFrameLatency];
-                            let screen: ObjcId = msg_send![window, screen];
-                            let maximum_fps: isize = if screen != nil {
-                                msg_send![screen, maximumFramesPerSecond]
-                            } else {
-                                60
-                            };
-                            let requested_fps = maximum_fps.max(1) as f32;
-                            let requested_range = CAFrameRateRange {
-                                minimum: requested_fps,
-                                maximum: requested_fps,
-                                preferred: requested_fps,
-                            };
-                            // The defaults do not promise the panel maximum. Request it
-                            // explicitly, and keep two frames of render latency against
-                            // the CAMetalLayer's three-drawable pool.
-                            let () = msg_send![link, setPreferredFrameRateRange: requested_range];
-                            let () = msg_send![link, setPreferredFrameLatency: 2isize];
-                            if metal_link_frame_trace_enabled() {
-                                crate::trace!(
-                                    "frame",
-                                    "metal-link defaults rate={:.1}..{:.1}@{:.1} latency={} requested={:.1} latency=2",
-                                    default_range.minimum,
-                                    default_range.maximum,
-                                    default_range.preferred,
-                                    default_latency,
-                                    requested_fps,
-                                );
-                            }
-                            is_metal_link = true;
-                        }
-                    }
+                let responds: bool = msg_send![
+                    view,
+                    respondsToSelector: sel!(displayLinkWithTarget: selector:)
+                ];
+                if !responds {
+                    return false;
                 }
-                if link == nil {
-                    let responds: bool = msg_send![
-                        view,
-                        respondsToSelector: sel!(displayLinkWithTarget: selector:)
-                    ];
-                    if !responds {
-                        return false;
-                    }
-                    link = msg_send![
-                        view,
-                        displayLinkWithTarget: self.timer_delegate_instance
-                        selector: sel!(receivedDisplayLink:)
-                    ];
-                    // An unconstrained CADisplayLink lets the SYSTEM pick the
-                    // rate, and it adaptively throttles a "static" window to
-                    // 30Hz — measured as a hard 33.9ms lock on frames that
-                    // cost 3ms. Pin the range to the panel's maximum.
-                    if link != nil {
-                        let responds: bool =
-                            msg_send![link, respondsToSelector: sel!(setPreferredFrameRateRange:)];
-                        if responds {
-                            let screen: ObjcId = msg_send![window, screen];
-                            let maximum_fps: isize = if screen != nil {
-                                msg_send![screen, maximumFramesPerSecond]
-                            } else {
-                                60
-                            };
-                            let fps = maximum_fps.max(1) as f32;
-                            let range = CAFrameRateRange {
-                                minimum: fps,
-                                maximum: fps,
-                                preferred: fps,
-                            };
-                            let () = msg_send![link, setPreferredFrameRateRange: range];
-                            crate::log!(
-                                "macos: display link pinned to {}fps (panel maximum)",
-                                maximum_fps
-                            );
+                let link: ObjcId = msg_send![
+                    view,
+                    displayLinkWithTarget: self.timer_delegate_instance
+                    selector: sel!(receivedDisplayLink:)
+                ];
+                // An unconstrained CADisplayLink lets the SYSTEM pick the
+                // rate, and it adaptively throttles a "static" window to
+                // 30Hz — measured as a hard 33.9ms lock on frames that
+                // cost 3ms. Pin the range to the panel's maximum.
+                if link != nil {
+                    let responds: bool =
+                        msg_send![link, respondsToSelector: sel!(setPreferredFrameRateRange:)];
+                    if responds {
+                        let screen: ObjcId = msg_send![window, screen];
+                        let maximum_fps: isize = if screen != nil {
+                            msg_send![screen, maximumFramesPerSecond]
                         } else {
-                            crate::log!("macos: display link has no rate-range API");
-                        }
+                            60
+                        };
+                        let fps = maximum_fps.max(1) as f32;
+                        let range = CAFrameRateRange {
+                            minimum: fps,
+                            maximum: fps,
+                            preferred: fps,
+                        };
+                        let () = msg_send![link, setPreferredFrameRateRange: range];
+                        crate::log!(
+                            "macos: display link pinned to {}fps (panel maximum)",
+                            maximum_fps
+                        );
+                    } else {
+                        crate::log!("macos: display link has no rate-range API");
                     }
                 }
                 if link == nil {
@@ -1503,12 +1404,7 @@ impl MacosApp {
                 }
                 self.display_links.push((window, link));
                 crate::log!(
-                    "macos: paint pacing on {} (frame-flip clock), window {}",
-                    if is_metal_link {
-                        "CAMetalDisplayLink"
-                    } else {
-                        "CADisplayLink"
-                    },
+                    "macos: paint pacing on CADisplayLink (frame-flip clock), window {}",
                     self.display_links.len()
                 );
             }
@@ -1531,33 +1427,6 @@ impl MacosApp {
                 self.display_links_paused = true;
             }
         }
-    }
-
-    /// Retire a CAMetalDisplayLink before a manual capture takes ownership of
-    /// its layer's drawables. The ordinary paint path re-arms the missing link.
-    pub(super) fn remove_window_metal_display_link(&mut self, window: ObjcId) -> bool {
-        let Some(class) = Class::get("CAMetalDisplayLink") else {
-            return false;
-        };
-        let mut removed = false;
-        self.display_links.retain(|(owner, link)| {
-            if *owner != window {
-                return true;
-            }
-            let is_metal: BOOL = unsafe { msg_send![*link, isKindOfClass: class] };
-            if is_metal != YES {
-                return true;
-            }
-            unsafe {
-                let () = msg_send![*link, invalidate];
-                // This branch only accepts CAMetalDisplayLink, which we
-                // created with alloc/initWithMetalLayer in ensure_display_link.
-                let () = msg_send![*link, release];
-            }
-            removed = true;
-            false
-        });
-        removed
     }
 
     pub(super) fn schedule_remote_capture(&mut self, deadline: Option<Instant>) {
@@ -1601,51 +1470,6 @@ impl MacosApp {
             drawable: None,
             target_presentation_time: target,
         });
-    }
-
-    /// CAMetalDisplayLink's delegate update is the authoritative frame:
-    /// transport time comes from its presentation target, and rendering uses
-    /// the drawable delivered for that same target instead of polling the
-    /// layer. A re-entrant callback simply skips this update rather than
-    /// panicking through the Objective-C delegate frame.
-    pub fn send_metal_display_link_update(link: ObjcId, update: ObjcId) {
-        metal_link_trace_update_fired();
-        if update == nil {
-            metal_link_trace_report();
-            return;
-        }
-        let (target, target_presentation, drawable, media_now): (f64, f64, ObjcId, f64) = unsafe {
-            (
-                msg_send![update, targetTimestamp],
-                msg_send![update, targetPresentationTimestamp],
-                msg_send![update, drawable],
-                CACurrentMediaTime(),
-            )
-        };
-        let Some((window, primary, app_now)) = try_with_macos_app(|app| {
-            app.display_links
-                .iter()
-                .position(|(_w, l)| *l == link)
-                .map(|i| (app.display_links[i].0, i == 0, app.time_now()))
-        })
-        .flatten() else {
-            metal_link_trace_report();
-            return;
-        };
-        let flip_target = if target_presentation > 0.0 {
-            target_presentation
-        } else {
-            target
-        };
-        let time = app_now + (flip_target - media_now).clamp(-0.1, 0.1);
-        MacosApp::do_callback(MacosEvent::LinkFire {
-            window,
-            time,
-            primary,
-            drawable: Some(drawable),
-            target_presentation_time: flip_target,
-        });
-        metal_link_trace_report();
     }
 
     pub fn start_timer(&mut self, timer_id: u64, interval: f64, repeats: bool) {
