@@ -1,7 +1,10 @@
 //! The TWEAKER — the design-feedback overlay every `--remote` app grows.
 //!
 //! Hardcoded into `Window` (like the caption bar: zero app wiring), inert
-//! unless the remote bridge is live, zero cost while off. Turned on (Shift+F10 or
+//! unless the remote bridge is live, zero cost while off. The toggle key needs
+//! the dev overlays switched on (`makepad_platform::devtools`: `--devtools`,
+//! `MAKEPAD_DEVTOOLS=1`, or `--remote`); [`set_tweak_on`] is always there for
+//! an app that wants to open the panel itself. Turned on (Shift+F10 or
 //! `GET /tweak?on=1`), a person points at the UI and live-edits it while the
 //! AI watches the same session through the bridge:
 //!
@@ -29,6 +32,7 @@
 use crate::{
     check_box::{CheckBox, CheckBoxAction},
     fab_controls::{format_hex, parse_hex, rgb_to_hsv, FabColorPick, FabColorPickAction, FabValueInput, FabValueInputAction},
+    makepad_draw::makepad_platform::devtools,
     makepad_draw::makepad_platform::sploded::{SPLODED_SPREAD_DEFAULT, SPLODED_SPREAD_MAX, SPLODED_SPREAD_MIN},
     file_tree::{FileTree, FileTreeAction},
     label::Label,
@@ -826,7 +830,10 @@ pub fn window_intercept(
     // Shift+F10 toggles the mode, bridge or no bridge: the design surface is
     // in-process and owes the remote nothing. Only the HTTP endpoints and
     // the AI vibecode loop need --remote; without it they simply are not
-    // there, and the panel still is.
+    // there, and the panel still is. It does need the dev overlays to be
+    // switched on though (`--devtools` / `MAKEPAD_DEVTOOLS=1` / `--remote`) —
+    // in a shipped app F12 belongs to the app, and `set_tweak_on` is still
+    // there for one that wants to open the panel itself.
     //
     // Ctrl+F10 is not ours: that is the screen recorder
     // (widgets/src/screen_cap.rs), and it must not drag the design surface
@@ -837,7 +844,7 @@ pub fn window_intercept(
             && !key_event.modifiers.control
             && !key_event.modifiers.alt
             && !key_event.modifiers.logo;
-        if key_event.is_tweaker_toggle() || f12 {
+        if (key_event.is_tweaker_toggle() || f12) && devtools::enabled() {
             let flip = {
                 let mut s = session().lock().unwrap();
                 if s.toggle_event_id != cx.event_id() {
@@ -5059,6 +5066,9 @@ pub struct Tweaker {
     saved_body_right: Option<f64>,
     #[rust]
     splitter_drag: bool,
+    /// Held for as long as `splitter_drag` is. Reconciled below `tweak_is_on`'s
+    /// early return, so closing the panel with F12 mid-drag cannot strand it.
+    cancel_scope: Option<CancelScope>,
 }
 
 impl ScriptHook for Tweaker {
@@ -8973,6 +8983,13 @@ impl Tweaker {
 
 impl Widget for Tweaker {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Above the early return on purpose: F12 turns the panel off without
+        // clearing splitter_drag, and a stranded scope would wedge Escape app-wide.
+        if self.cancel_scope.is_some() && (!self.splitter_drag || !tweak_is_on()) {
+            if let Some(scope) = self.cancel_scope.take() {
+                cx.end_cancel_scope(scope);
+            }
+        }
         if !tweak_is_on() {
             return;
         }

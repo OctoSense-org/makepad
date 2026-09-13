@@ -925,6 +925,11 @@ pub struct FabValueInput {
     #[visible]
     visible: bool,
 
+    /// Acquired when the drag starts and released when it ends, before the
+    /// next event's cancel owner is selected.
+    #[rust]
+    cancel_scope: Option<CancelScope>,
+
     #[live]
     label: String,
     #[live]
@@ -1109,6 +1114,7 @@ impl FabValueInput {
 
     pub fn begin_edit(&mut self, cx: &mut Cx) {
         self.drag = None;
+        self.cancel_scope = None;
         self.editing = true;
         let full = self.format_full();
         self.text_input.set_is_numeric_only(cx, true);
@@ -1162,6 +1168,7 @@ impl FabValueInput {
     }
 
     fn cancel_drag(&mut self, cx: &mut Cx, uid: WidgetUid) {
+        self.cancel_scope = None;
         if let Some(drag) = self.drag.take() {
             if drag.engaged {
                 // Early cancel (Escape / right-click): the button is still
@@ -1251,6 +1258,7 @@ impl Widget for FabValueInput {
                         cx.revert_key_focus();
                     }
                     self.drag = None;
+                    self.cancel_scope = None;
                     cx.widget_action(uid, FabValueInputAction::Reset);
                     return;
                 }
@@ -1273,11 +1281,21 @@ impl Widget for FabValueInput {
             }
         }
 
-        // Escape or a right-button press cancels an in-flight drag and
+        // Escape, Back or a right-button press cancels an in-flight drag and
         // restores the pressed value.
         if self.drag.is_some() {
             match event {
-                Event::KeyDown(ke) if ke.key_code == KeyCode::Escape => {
+                Event::KeyDown(ke)
+                    if ke.key_code == KeyCode::Escape
+                        && self.cancel_scope.as_ref().is_some_and(|s| cx.owns_cancel(s)) =>
+                {
+                    self.cancel_drag(cx, uid);
+                    return;
+                }
+                Event::BackPressed { .. }
+                    if self.cancel_scope.as_ref().is_some_and(|s| cx.owns_cancel(s))
+                        && event.back_pressed() =>
+                {
                     self.cancel_drag(cx, uid);
                     return;
                 }
@@ -1372,6 +1390,9 @@ impl Widget for FabValueInput {
                     shift: fe.modifiers.shift,
                     raw_value: self.value,
                 });
+                // The next event may already be Escape; ownership is captured
+                // before dispatch, so the scope must exist before this returns.
+                self.cancel_scope = Some(cx.begin_cancel_scope());
                 self.animator_play(cx, ids!(hover.down));
             }
             Hit::FingerMove(fe) => {
@@ -1428,6 +1449,7 @@ impl Widget for FabValueInput {
                 cx.repin_mouse_pointer();
             }
             Hit::FingerUp(fe) => {
+                self.cancel_scope = None;
                 let Some(drag) = self.drag.take() else {
                     return;
                 };
@@ -1884,6 +1906,10 @@ pub struct FabColorPick {
     overlay_list: Option<DrawList2d>,
     #[rust]
     open: bool,
+    /// Held while the popover is open, so `Escape` reverts this picker rather
+    /// than dismissing whatever it was opened in front of.
+    #[rust]
+    cancel_scope: Option<CancelScope>,
     #[rust]
     hsv: [f32; 3],
     #[rust(1.0)]
@@ -1955,6 +1981,7 @@ impl FabColorPick {
         }
         let uid = self.widget_uid();
         self.open = false;
+        self.cancel_scope = None;
         self.draw_swatch.open = 0.0;
         cx.widget_action(uid, FabColorPickAction::Closed);
         if let Some(list) = &self.overlay_list {
@@ -2019,6 +2046,7 @@ impl FabColorPick {
             return;
         }
         self.open = true;
+        self.cancel_scope = Some(cx.begin_cancel_scope());
         self.opened_value = self.rgba();
         self.draw_swatch.open = 1.0;
         self.sync_pending = true;
@@ -2053,6 +2081,7 @@ impl FabColorPick {
             self.publish(cx, uid, true);
         }
         self.open = false;
+        self.cancel_scope = None;
         self.draw_swatch.open = 0.0;
         cx.widget_action(uid, FabColorPickAction::Closed);
         if let Some(list) = &self.overlay_list {
@@ -2155,12 +2184,13 @@ impl Widget for FabColorPick {
         let uid = self.widget_uid();
 
         if self.open {
-            // Escape reverts and closes, from anywhere.
-            if let Event::KeyDown(ke) = event {
-                if ke.key_code == KeyCode::Escape {
-                    self.close_popover(cx, true);
-                    return;
-                }
+            // Only the owner can consume Back or act on Escape.
+            if self.cancel_scope.as_ref().is_some_and(|s| cx.owns_cancel(s))
+                && (matches!(event, Event::KeyDown(ke) if ke.key_code == KeyCode::Escape)
+                    || event.back_pressed())
+            {
+                self.close_popover(cx, true);
+                return;
             }
             // A press outside the panel and the swatch commits and closes.
             if let Event::MouseDown(me) = event {

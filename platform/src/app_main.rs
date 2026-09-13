@@ -299,7 +299,11 @@ macro_rules! _app_main_event_closure {
                 cx.start_hot_reload_file_observer_if_requested();
             }
             if let Event::LiveEdit = event {
+                // `ScriptReapply` for a stylesheet reapply, otherwise `Reload`
+                // when the DSL changed on disk or `Rebake` when `script_mod`
+                // only re-ran to pick up new heap primitives.
                 let style_reload = std::mem::take(&mut cx.pending_style_reload);
+                let live_edit_apply = if style_reload { $crate::Apply::ScriptReapply } else { cx.live_edit_apply() };
                 if let Some(app) = app.as_mut() {
                     cx.with_vm(|vm| {
                         let value = vm.with_reload(|vm| <$app as AppMain>::script_mod(vm));
@@ -309,7 +313,7 @@ macro_rules! _app_main_event_closure {
                         <$app as $crate::ScriptApply>::script_apply(
                             app,
                             vm,
-                            &if style_reload { $crate::Apply::ScriptReapply } else { $crate::Apply::Reload },
+                            &live_edit_apply,
                             &mut $crate::Scope::empty(),
                             value,
                         );

@@ -185,6 +185,12 @@ struct GraphNode {
     /// `Cx::nesting_depth` at this widget's last draw while the exploded view
     /// was up — the plane it renders on. 0 = never stamped.
     nesting_depth: u32,
+    /// Inserted via `insert_child`/`insert_child_deep` but not (yet) reported
+    /// by the parent's `children()`. A refresh keeps such a child linked
+    /// instead of unlinking and eventually removing its whole subtree, since
+    /// hosts like Dock-style containers own these children outside the
+    /// widget's child vec. Cleared the moment the parent reports it.
+    manual: bool,
 }
 
 #[derive(Clone)]
@@ -422,6 +428,7 @@ impl WidgetTree {
                         parent,
                         children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                     },
                 );
                 node_is_new = true;
@@ -544,6 +551,7 @@ impl WidgetTree {
                     parent: None,
                     children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                 },
             );
             if inner.root_uid == WidgetUid(0) {
@@ -562,6 +570,7 @@ impl WidgetTree {
         match inner.graph.get_mut(&child_uid) {
             Some(node) => {
                 old_parent = node.parent;
+                node.manual = true;
                 if node.name != name {
                     node.name = name;
                     name_changed = true;
@@ -591,6 +600,7 @@ impl WidgetTree {
                         parent: Some(parent_uid),
                         children: Vec::new(),
                         nesting_depth: 0,
+                        manual: true,
                     },
                 );
                 child_is_new = true;
@@ -789,6 +799,7 @@ impl WidgetTree {
                 parent: None,
                 children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
             },
         );
         if inner.root_uid == WidgetUid(0) {
@@ -852,6 +863,7 @@ impl WidgetTree {
                         parent: None,
                         children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                     },
                 );
                 node_is_new = true;
@@ -936,6 +948,7 @@ impl WidgetTree {
                     parent: None,
                     children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                 },
             );
             if inner.root_uid == WidgetUid(0) {
@@ -1518,6 +1531,9 @@ impl WidgetTree {
             match inner.graph.get_mut(&child_uid) {
                 Some(child_node) => {
                     old_parent = child_node.parent;
+                    // The parent reports this child now, so it no longer needs
+                    // manual-insert protection.
+                    child_node.manual = false;
                     if child_node.name != child_name {
                         child_node.name = child_name;
                         child_name_changed = true;
@@ -1556,6 +1572,7 @@ impl WidgetTree {
                             parent: Some(uid),
                             children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                         },
                     );
                     child_is_new = true;
@@ -1613,6 +1630,23 @@ impl WidgetTree {
             if child_is_new || child_widget_changed {
                 inner.dirty.insert(child_uid);
                 pending.push(child_uid);
+            }
+        }
+
+        // A child inserted via insert_child_deep is owned outside the parent's
+        // child vec, so children() never reports it. Losing it here unlinked
+        // its whole subtree from every downward search (and the removal pass
+        // below then deleted it), which silently killed name lookups inside
+        // dynamically hosted subtrees. Keep the live ones linked.
+        for old_uid in old_children.iter().copied() {
+            if new_children.iter().any(|entry| *entry == old_uid) {
+                continue;
+            }
+            let keep = inner.graph.get(&old_uid).map_or(false, |node| {
+                node.manual && node.parent == Some(uid) && node.widget.upgrade().is_some()
+            });
+            if keep {
+                new_children.push(old_uid);
             }
         }
 

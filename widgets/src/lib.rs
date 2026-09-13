@@ -235,8 +235,9 @@ pub use crate::{
         WidgetSet, WidgetSetIterator, WidgetUid,
     },
     widget_async::{
-        enter_isolate, leave_isolate, set_widget_async_trace, CxSplashVmExt, CxWidgetToScriptCallExt,
-        IsolateEntry, ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult, SplashVmId, MAIN_SPLASH_VM_ID,
+        enter_isolate, leave_isolate, set_splash_theme, set_widget_async_trace, CxSplashVmExt,
+        CxWidgetToScriptCallExt, IsolateEntry, ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult,
+        SplashTheme, SplashVmId, MAIN_SPLASH_VM_ID,
     },
     widget_match_event::WidgetMatchEvent,
     widget_tree::{set_ui_root, CxWidgetExt},

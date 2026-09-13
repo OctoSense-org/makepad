@@ -365,8 +365,11 @@ struct AnimatorTrack {
     play: Play,
     /// The ease function
     ease: Ease,
-    /// Keep the target alive if a stylesheet reapply replaces its template
-    /// while this animation is still running.
+    /// The target apply object (what we're animating to).
+    /// Held as a `ScriptObjectRef` for the same reason as `from_snapshot`: a
+    /// bare `ScriptObject` into the template dangles as soon as `script_mod`
+    /// re-runs (stylesheet reapply, safe-area inset change, hot reload), and
+    /// `interpolate_object` walks it every frame.
     target_apply: ScriptObjectRef,
     /// The starting values SNAPSHOT (captured/copied when animation begins)
     /// This is a SEPARATE object from state_object - it must not be mutated during animation
@@ -430,6 +433,16 @@ impl ScriptHook for Animator {
         let Some(obj) = value.as_object() else {
             return false;
         };
+        // A `script_mod` re-run replaces every template object an in-flight
+        // track is animating against. The track's refs keep those objects
+        // alive, so walking them is safe, but they now describe the previous
+        // template — and a `Play::Loop` track would pin them for good. Drop
+        // the tracks instead. `current_states` is kept: the logical state is
+        // still meaningful, and the next `cut`/`play` re-resolves its objects
+        // from the new heap.
+        if apply.follows_script_rerun() {
+            self.tracks.clear();
+        }
         let obj_ref = vm.bx.heap.new_object_ref(obj);
         // Minted from the VM we are running in, so this always resolves; the
         // fallback only exists because the lookup is fallible in general.
@@ -474,7 +487,11 @@ impl ScriptApplyDefault for Animator {
         _scope: &mut Scope,
         _value: ScriptValue,
     ) -> Option<ScriptValue> {
-        if apply.is_live_edit_reload() || apply.is_animate() || apply.is_eval() {
+        // `follows_script_rerun` rather than `is_live_edit_reload`: what makes
+        // injecting the current state unsafe is not that the DSL changed, it
+        // is that `script_mod` re-ran and freed the objects `state_object` and
+        // `groups` point at. Both `Reload` and `Rebake` re-run it.
+        if apply.follows_script_rerun() || apply.is_animate() || apply.is_eval() {
             return None;
         }
 
@@ -701,7 +718,9 @@ impl Animator {
                 },
             );
 
-            // Both inputs must outlive the stylesheet that started the track.
+            // Create ScriptObjectRefs to prevent GC from freeing either object
+            // out from under the running animation: both inputs must outlive
+            // the stylesheet or template that started the track.
             (
                 vm.bx.heap.new_object_ref(snapshot),
                 vm.bx.heap.new_object_ref(target_apply),
