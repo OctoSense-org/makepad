@@ -9,6 +9,7 @@ use {
         makepad_math::{dvec2, Rect, Vec2d},
         os::{
             apple::apple_sys::*,
+            apple_classes::get_apple_class_global,
             apple::apple_util::str_to_nsstring,
             macos::{
                 macos_app::{
@@ -207,7 +208,7 @@ impl MacosWindow {
             return;
         }
         object_setClass(container, subclass as ObjcId);
-        crate::log!("defang: titlebar container swapped — WindowDragQuery decides drags");
+        // crate::log!("defang: titlebar container swapped — WindowDragQuery decides drags");
     }
 
     pub fn set_window_level(&mut self, level: MacosWindowLevel) {
@@ -1129,6 +1130,16 @@ impl MacosWindow {
 
     pub fn set_ime_active(&mut self, active: bool) {
         self.ime_active = active;
+        if !active {
+            unsafe {
+                let has_marked_text: BOOL = msg_send![self.view, hasMarkedText];
+                if has_marked_text != NO {
+                    // The widget keeps its preview as text on blur. Clear only
+                    // AppKit's state so the next focused widget is not edited.
+                    clear_marked_text_ivar(&*self.view);
+                }
+            }
+        }
     }
 
     /// Starts a Finder-compatible file drag from this exact native window.
@@ -1252,6 +1263,16 @@ impl MacosWindow {
             session != nil
         }
     }
+}
+
+// Do not send TextInput here: callers have already committed the composition or
+// moved focus. Clear our state first so a reentrant unmarkText is a no-op.
+pub(crate) unsafe fn clear_marked_text_ivar(this: &Object) {
+    let marked_text: ObjcId = *this.get_ivar("markedText");
+    let mutable_string = marked_text.mutable_string();
+    let _: () = msg_send![mutable_string, setString: get_apple_class_global().const_empty_string.as_id()];
+    let input_context: ObjcId = msg_send![this, inputContext];
+    let _: () = msg_send![input_context, discardMarkedText];
 }
 
 pub fn get_cocoa_window(this: &Object) -> &mut MacosWindow {

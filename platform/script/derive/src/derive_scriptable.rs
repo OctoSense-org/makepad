@@ -140,10 +140,21 @@ fn derive_script_impl_inner(
                 .iter()
                 .any(|a| a.name == "live" || a.name == "apply_default")
             {
-                // Runtime widget state survives a stylesheet reapply. Explicit
-                // edits and ordinary source reloads still update the property.
-                let preserve_state = field.attrs.iter().any(|a| a.name == "apply_state");
-                if preserve_state { tb.add("if !matches!(apply, Apply::ScriptReapply) {"); }
+                // Runtime widget state survives the re-apply walks where nothing
+                // the developer wrote changed (`Apply::ScriptReapply` for a
+                // stylesheet reapply, `Apply::Rebake` for a `script_mod` re-run
+                // that only re-bakes heap primitives). Explicit edits and
+                // ordinary source reloads still update the property.
+                // `#[apply_state]` opts a field in; so does `#[imperative]`
+                // (and `#[visible]`), whose canonical mutation path is an
+                // imperative setter (`set_visible`) sharing storage with the
+                // DSL value. Otherwise every safe-area inset change — every
+                // Android system-bar hide and every rotation — silently put
+                // the DSL default back over the runtime state.
+                let preserve_state = field.attrs.iter().any(|a| {
+                    a.name == "apply_state" || a.name == "imperative" || a.name == "visible"
+                });
+                if preserve_state { tb.add("if !apply.preserves_runtime_state() {"); }
                 tb.add("{ let mut __field_value = vm.bx.heap.value_for_apply(value, id!(")
                     .ident(&field.name)
                     .add(").into(), apply);");

@@ -24,7 +24,7 @@ use {
                 str_to_nsstring,
             },
             cx_native::EventFlow,
-            macos::{macos_delegates::*, macos_event::*, macos_window::MacosWindow},
+            macos::{macos_delegates::*, macos_event::*, macos_ime::MacosImeKeyboard, macos_window::MacosWindow},
         },
         window::WindowId,
     },
@@ -346,6 +346,7 @@ pub struct MacosApp {
     /// Set by `send_command_event()` to avoid sending keyboard events
     /// for keyboard shortcuts that trigger a macOS menu command.
     pub(crate) menu_command_fired: bool,
+    pub(crate) ime_keyboard: MacosImeKeyboard,
 }
 
 impl MacosApp {
@@ -376,6 +377,7 @@ impl MacosApp {
                 cocoa_windows: Vec::new(),
                 cocoa_window_ids: Vec::new(),
                 retired_cocoa_windows: Vec::new(),
+                ime_keyboard: MacosImeKeyboard::default(),
                 event_flow: EventFlow::Poll,
                 last_key_mod: KeyModifiers {
                     ..Default::default()
@@ -643,6 +645,12 @@ impl MacosApp {
     unsafe fn process_ns_event(ns_event: ObjcId) {
         let ev_type: NSEventType = msg_send![ns_event, type];
 
+        // The receiving view records how its input context handled this event.
+        // Marked text in another view (or an inactive IME) must not consume it.
+        if matches!(ev_type, NSEventType::NSKeyDown) {
+            with_macos_app(|app| app.ime_keyboard.begin_key_down());
+        }
+
         let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
         // Clear the menu-consumed marker so we can tell after `sendEvent:`
         // whether the main menu took this NSEvent as a key equivalent.
@@ -666,6 +674,10 @@ impl MacosApp {
                 }
             }
             NSEventType::NSKeyUp => {
+                let native_key: u16 = msg_send![ns_event, keyCode];
+                if !with_macos_app(|app| app.ime_keyboard.key_up(native_key)) {
+                    return;
+                }
                 if let Some(key_code) = get_event_keycode(ns_event) {
                     let modifiers = get_event_key_modifier(ns_event);
                     //let key_char = get_event_char(ns_event);
@@ -681,13 +693,22 @@ impl MacosApp {
                 }
             }
             NSEventType::NSKeyDown => {
+                let native_key: u16 = msg_send![ns_event, keyCode];
+                let is_repeat: bool = msg_send![ns_event, isARepeat];
+                let forward_key = with_macos_app(|app| {
+                    app.ime_keyboard.end_key_down(native_key, is_repeat)
+                });
                 if with_macos_app(|app| app.menu_command_fired) {
+                    return;
+                }
+                if !forward_key {
+                    // Suppress both halves of an IME-owned press, including Escape
+                    // release, which would otherwise dismiss a containing modal.
                     return;
                 }
                 if let Some(key_code) = get_event_keycode(ns_event) {
                     let modifiers = get_event_key_modifier(ns_event);
                     //let key_char = get_event_char(ns_event);
-                    let is_repeat: bool = msg_send![ns_event, isARepeat];
                     //let is_return = if let KeyCode::Return = key_code{true} else{false};
 
                     #[cfg(target_os = "macos")]
@@ -744,21 +765,6 @@ impl MacosApp {
                         _ => {}
                     }
                     let time = with_macos_app(|app: &mut MacosApp| app.time_now());
-                    // lets check if we have marked text
-                    if KeyCode::Backspace == key_code {
-                        // we have to check if we dont have any marked text in our windows
-                        if with_macos_app(|app| {
-                            for (_, view) in &app.cocoa_windows {
-                                let marked = unsafe { msg_send![*view, hasMarkedText] };
-                                if marked {
-                                    return true;
-                                }
-                            }
-                            false
-                        }) {
-                            return;
-                        }
-                    }
                     MacosApp::do_callback(MacosEvent::KeyDown(KeyEvent {
                         key_code: key_code,
                         is_repeat: is_repeat,
@@ -1258,11 +1264,11 @@ impl MacosApp {
                 self.pin_restore = None;
                 return;
             }
-            crate::log!(
-                "PIN stats: ns_moves={} sum_dx={:.1}",
-                self.pin_ns_moves,
-                self.pin_sum_dx
-            );
+            // crate::log!(
+            //     "PIN stats: ns_moves={} sum_dx={:.1}",
+            //     self.pin_ns_moves,
+            //     self.pin_sum_dx
+            // );
             self.mouse_pointer_lock = false;
             self.pointer_lock_applied = false;
             self.pointer_pin_mode = false;
@@ -1386,10 +1392,10 @@ impl MacosApp {
                             preferred: fps,
                         };
                         let () = msg_send![link, setPreferredFrameRateRange: range];
-                        crate::log!(
-                            "macos: display link pinned to {}fps (panel maximum)",
-                            maximum_fps
-                        );
+                        // crate::log!(
+                        //     "macos: display link pinned to {}fps (panel maximum)",
+                        //     maximum_fps
+                        // );
                     } else {
                         crate::log!("macos: display link has no rate-range API");
                     }
@@ -1403,10 +1409,10 @@ impl MacosApp {
                     let () = msg_send![link, setPaused: YES];
                 }
                 self.display_links.push((window, link));
-                crate::log!(
-                    "macos: paint pacing on CADisplayLink (frame-flip clock), window {}",
-                    self.display_links.len()
-                );
+                // crate::log!(
+                //     "macos: paint pacing on CADisplayLink (frame-flip clock), window {}",
+                //     self.display_links.len()
+                // );
             }
             if self.display_links_paused {
                 for (_w, link) in &self.display_links {

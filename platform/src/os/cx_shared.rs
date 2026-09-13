@@ -5,8 +5,8 @@ use {
         cx_api::CxOsApi,
         draw_pass::{CxDrawPassParent, DrawPassId},
         event::{
-            DrawEvent, Event, KeyFocusEvent, NextFrameEvent, TextClipboardEvent, TimerEvent,
-            TriggerEvent,
+            DrawEvent, Event, KeyCode, KeyFocusEvent, NextFrameEvent, TextClipboardEvent,
+            TimerEvent, TriggerEvent,
         },
         makepad_live_id::{live_id, LiveId},
         makepad_network::NetworkResponse,
@@ -994,6 +994,7 @@ impl Cx {
             LiveEditTrigger::FileChange => {
                 self.draw_shaders.reset_for_live_reload();
                 self.pending_script_reapply = false;
+                self.live_edit_apply = crate::makepad_script::Apply::Reload;
                 self.call_event_handler(&Event::LiveEdit);
                 self.redraw_all();
                 if self.pending_script_reapply {
@@ -1008,6 +1009,10 @@ impl Cx {
                 // app-level handler that re-broadcasts sets a fresh flag
                 // that lands on the next tick.
                 self.pending_script_reapply = false;
+                // The DSL did not change, so re-apply with `Rebake`: the
+                // re-run only exists to pick up new `SAFE_INSET_PAD_*`
+                // values, and imperative runtime state must survive it.
+                self.live_edit_apply = crate::makepad_script::Apply::Rebake;
                 self.call_event_handler(&Event::LiveEdit);
                 self.redraw_all();
             }
@@ -1246,6 +1251,16 @@ impl Cx {
         if !matches!(event, Event::Shutdown) {
             crate::thread::service_scheduler(self, event);
         }
+        // Settle who owns this cancel gesture before anyone sees it: the frontmost scope
+        // takes the whole press, so one that ends part-way can't hand the rest to the next.
+        match event {
+            Event::KeyDown(key) if key.key_code == KeyCode::Escape && !key.is_repeat => {
+                self.cancel_scopes.begin_press();
+            }
+            Event::BackPressed { .. } => self.cancel_scopes.begin_press(),
+            _ => {}
+        }
+
         // A scrub pin listens for the button-up ITSELF: release must never
         // depend on a widget hit path. Schedule the cursor release here,
         // but do NOT clear the capture's pin flag yet — the flag must
