@@ -141,6 +141,8 @@ impl Cx {
                 .1
                 .allocations
                 .set_device_limit(allowance / 4);
+            // The one derived limit of the publication registry (contract §7).
+            self.publications.set_envelope(allowance / 4);
             crate::log!("retained-upload budgets: process_allowance={} allocation_limit={} source=web_process_allowance_fallback", allowance, allowance / 4);
         }
         let shaders_pending = self.os.webgl_shaders_pending != 0;
@@ -652,6 +654,16 @@ impl Cx {
                 if let Some(charge) = &draw_item.os.inst_charge {
                     charge.submitted(draw_item.consumed_serial);
                 }
+                if let Some((block, _)) = draw_item.shared.as_ref() {
+                    // The lease's receipt under the pass's serial; the frame
+                    // frontier (`poll_texture_lifetimes`) completes it.
+                    let receipt = block.receipt();
+                    receipt.mark_encoded(draw_item.consumed_serial);
+                    receipt.mark_submitted(
+                        draw_item.consumed_serial,
+                        draw_item.kind.draw_call().map_or(0, |call| call.uniforms_gen),
+                    );
+                }
                 draw_item.consumed_uniforms_gen = draw_item
                     .kind
                     .draw_call()
@@ -1128,6 +1140,14 @@ pub struct CxOsDrawCall {
     pub user_uniforms_gen: Option<u64>,
 }
 
+impl CxOsDrawCall {
+    /// This backend keeps no per-publication backing lease on a draw item
+    /// (contract §10): nothing to release when the item's lease clears.
+    pub(crate) fn take_backing(&mut self) -> Option<u64> {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct CxOsDrawShader {
     pub in_vertex: String,
@@ -1216,6 +1236,9 @@ impl Cx {
     }
 
     pub(crate) fn poll_texture_lifetimes(&mut self) {
+        // The adapter draws attached blocks here (no per-publication
+        // backing): dropped blocks release from this poll, contract §3.3.
+        self.publications.retire_without_backing();
         let completed = self
             .textures
             .1
