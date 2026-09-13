@@ -270,33 +270,8 @@ script_mod! {
         tweaker := Tweaker {}
 
         cursor: MouseCursor.Default
-        mouse_cursor_size: vec2(20 20)
-        draw_cursor +: {
-            border_size: uniform(1.5)
-            color: uniform(theme.color_cursor)
-            border_color: uniform(theme.color_cursor_border)
-
-            get_color: fn() {
-                return self.color
-            }
-
-            get_border_color: fn() {
-                return self.border_color
-            }
-
-            pixel: fn() {
-                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                sdf.move_to(1.0, 1.0)
-                sdf.line_to(self.rect_size.x - 1.0, self.rect_size.y * 0.5)
-                sdf.line_to(self.rect_size.x * 0.5, self.rect_size.y - 1.0)
-                sdf.close_path()
-                sdf.fill_keep(self.get_color())
-                if self.border_size > 0.0 {
-                    sdf.stroke(self.get_border_color(), self.border_size)
-                }
-                return sdf.result
-            }
-        }
+        mouse_cursor_size: vec2(24 24)
+        draw_cursor: mod.widgets.DrawMouseCursor {}
         window +: {
             inner_size: vec2(1024 768)
         }
@@ -317,6 +292,10 @@ pub struct Window {
     demo: bool,
     #[live]
     show_caption_bar: bool,
+    #[rust]
+    caption_has_content: Option<bool>,
+    #[rust]
+    hosted_caption_content: Option<bool>,
     /// Whether this widget should create its native surface during initial
     /// construction. The stable window id and widget tree still exist when
     /// false, so the owner can explicitly create the surface later.
@@ -439,6 +418,7 @@ impl ScriptHook for Window {
         _scope: &mut Scope,
         _value: ScriptValue,
     ) {
+        self.caption_has_content = None;
         if !self.create_on_start && !self.initial_create_policy_applied {
             apply_initial_create_policy(vm.cx_mut(), &self.window.handle, false);
             self.initial_create_policy_applied = true;
@@ -741,6 +721,24 @@ impl SsaaStack {
 }
 
 impl Window {
+    fn caption_contains_app_content(&mut self, cx: &mut Cx) -> bool {
+        if let Some(content) = self.caption_has_content {
+            return content;
+        }
+        // Preserve the actual app widgets and their identities/handlers. A
+        // stock title-only caption does not need a second row inside a WM tile.
+        let label_content = self.view(cx, ids!(caption_label)).borrow().is_some_and(|view| {
+            view.children.iter().any(|(id, _)| !matches!(*id, id!(caption_icon) | id!(label)))
+        });
+        let bar_content = self.view(cx, ids!(caption_bar)).borrow().is_some_and(|view| {
+            view.children.iter().any(|(id, _)| !matches!(*id,
+                id!(caption_label) | id!(voice_wave) | id!(windows_buttons) | id!(web_fullscreen)))
+        });
+        let content = label_content || bar_content;
+        self.caption_has_content = Some(content);
+        content
+    }
+
     fn close_after_recording(&mut self, cx: &mut Cx) {
         if self.screen_cap.is_managed() && self.screen_cap.is_busy() {
             self.managed_close_pending = true;
@@ -760,10 +758,15 @@ impl Window {
     }
 
     fn sync_caption_bar_state(&mut self, cx: &mut Cx) {
-        // Hosted inside studio: the studio chrome owns the window, never
-        // show our own caption bar (a DSL hot-reload re-runs this sync).
+        let has_content = self.caption_contains_app_content(cx);
         if cx.in_makepad_studio() {
-            self.view(cx, ids!(caption_bar)).set_visible(cx, false);
+            // The WM allows app-owned caption controls as a toolbar inside
+            // its tile. Other hosts retain their existing caption policy.
+            let enabled = *self.hosted_caption_content.get_or_insert_with(|| {
+                std::env::var("MAKEPAD_WM_CAPTION_CONTENT").is_ok_and(|value| value == "1")
+            });
+            self.view(cx, ids!(caption_bar)).set_visible(cx, self.show_caption_bar && enabled && has_content);
+            self.view(cx, ids!(windows_buttons)).set_visible(cx, false);
             return;
         }
         match cx.os_type() {
@@ -773,22 +776,19 @@ impl Window {
                 self.view(cx, ids!(windows_buttons)).set_visible(cx, true);
             }
             OsType::Macos => {
-                // In macOS fullscreen, the OS provides its own auto-hiding
-                // toolbar with traffic-light buttons, so hide our caption bar.
+                // Fullscreen supplies native traffic lights. Keep app controls
+                // as content, but omit a redundant title-only caption.
                 let is_fullscreen = self.window.handle.is_fullscreen(cx);
                 self.view(cx, ids!(caption_bar))
-                    .set_visible(cx, self.show_caption_bar && !is_fullscreen);
+                    .set_visible(cx, self.show_caption_bar && (!is_fullscreen || has_content));
             }
             OsType::LinuxWindow(params) => {
-                // Only show the caption bar if we're drawing our own window chrome
-                // (e.g. Wayland without server-side decorations). On X11 the WM
-                // provides native decorations, so we hide the in-app caption bar.
+                // With server-side decorations, app caption controls become
+                // a content toolbar; only the native window buttons disappear.
                 let custom_chrome = params.custom_window_chrome;
                 self.view(cx, ids!(caption_bar))
-                    .set_visible(cx, self.show_caption_bar && custom_chrome);
-                if custom_chrome {
-                    self.view(cx, ids!(windows_buttons)).set_visible(cx, true);
-                }
+                    .set_visible(cx, self.show_caption_bar && (custom_chrome || has_content));
+                self.view(cx, ids!(windows_buttons)).set_visible(cx, custom_chrome);
             }
             OsType::LinuxDirect | OsType::Android(_) => {
                 //self.frame.get_view(ids!(caption_bar)).set_visible(false);
@@ -820,8 +820,13 @@ impl Window {
     /// When the window is too narrow, the padding gracefully reduces to 0,
     /// transitioning to a left-aligned title.
     fn sync_caption_centering(&mut self, cx: &mut Cx) {
+        // App toolbars own their layout, including padding supplied by a theme.
+        if self.caption_contains_app_content(cx) {
+            return;
+        }
         let bar_width = self.view(cx, ids!(caption_bar)).area().rect(cx).size.x;
-        let buttons_width = self.view(cx, ids!(windows_buttons)).area().rect(cx).size.x;
+        let buttons = self.view(cx, ids!(windows_buttons));
+        let buttons_width = if buttons.visible() { buttons.area().rect(cx).size.x } else { 0.0 };
 
         if bar_width <= 0.0 {
             return; // No area info yet (first frame)
@@ -1009,20 +1014,39 @@ impl Window {
         Redrawing::yes()
     }
 
+    /// Route the display cursor before a WM's menus or drag handlers consume
+    /// pointer events. Updating this overlay does not relayout the desktop.
+    pub fn handle_direct_mouse_cursor(&mut self, cx: &mut Cx, event: &Event) {
+        if !matches!(cx.os_type(), OsType::LinuxDirect) { return; }
+        if let Event::MouseMove(ev) = event {
+            if ev.window_id != self.window.window_id() || ev.abs == self.last_mouse_pos { return; }
+            self.last_mouse_pos = ev.abs;
+            let rect = Rect {
+                pos: ev.abs - crate::cursor::hotspot(cx.mouse_cursor(), self.mouse_cursor_size),
+                size: self.mouse_cursor_size,
+            };
+            if self.draw_cursor.draw_vars.area.is_valid(cx) {
+                self.draw_cursor.update_abs(cx, rect);
+            } else {
+                self.main_draw_list.redraw(cx);
+            }
+            trace!("input.cursor", "direct cursor position=({}, {}) shape={:?}", ev.abs.x, ev.abs.y, cx.mouse_cursor());
+        }
+    }
+
     pub fn end(&mut self, cx: &mut Cx2d) {
         //while self.frame.draw_widget_continue(cx).is_not_done() {}
         //self.debug_view.draw(cx);
 
-        // lets draw our cursor
+        // Only the direct display owner draws a cursor, above every child.
         if let OsType::LinuxDirect = cx.os_type() {
+            let shape = cx.mouse_cursor();
+            self.draw_cursor.draw_vars.set_dyn_instance(cx, id!(shape), &[crate::cursor::shape_value(shape)]);
             self.cursor_draw_list.begin_overlay_last(cx);
-            self.draw_cursor.draw_abs(
-                cx,
-                Rect {
-                    pos: self.last_mouse_pos,
-                    size: self.mouse_cursor_size,
-                },
-            );
+            self.draw_cursor.draw_abs(cx, Rect {
+                pos: self.last_mouse_pos - crate::cursor::hotspot(shape, self.mouse_cursor_size),
+                size: self.mouse_cursor_size,
+            });
             self.cursor_draw_list.end(cx);
         }
 
@@ -1309,6 +1333,7 @@ impl WindowRef {
 
 impl Widget for Window {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.handle_direct_mouse_cursor(cx, event);
         crate::desktop_style::handle_event(cx, event);
         if let Event::Custom(json) = event {
             if let Some(keyboard) = makepad_platform::ime::HostedKeyboard::parse(json) {
@@ -1407,6 +1432,27 @@ impl Widget for Window {
             }
             Event::WindowGeomChange(ev) => {
                 if ev.window_id == self.window.window_id() {
+                    // Preserve physical cursor position when effective DPI changes before the next mouse event.
+                    if matches!(cx.os_type(), OsType::LinuxDirect) {
+                        let old_dpi = ev.old_geom.dpi_factor;
+                        let new_dpi = ev.new_geom.dpi_factor;
+                        if old_dpi.is_finite()
+                            && new_dpi.is_finite()
+                            && old_dpi > 0.0
+                            && new_dpi > 0.0
+                            && old_dpi != new_dpi
+                        {
+                            self.last_mouse_pos *= old_dpi / new_dpi;
+                        }
+                        // Native pointer bounds follow the chosen mirror-source; the cached
+                        // cursor position must stay visible when the new source is smaller.
+                        let size = ev.new_geom.inner_size;
+                        if size.x.is_finite() && size.y.is_finite() && size.x > 0.0 && size.y > 0.0 {
+                            self.last_mouse_pos.x = self.last_mouse_pos.x.clamp(0.0, size.x);
+                            self.last_mouse_pos.y = self.last_mouse_pos.y.clamp(0.0, size.y);
+                        }
+                        self.main_draw_list.redraw(cx);
+                    }
                     // The caption / buttons may have been re-laid-out; drop the WindowDragQuery
                     // geometry cache so it is recomputed on the next hit-test.
                     self.drag_query_cache = None;
@@ -1414,7 +1460,8 @@ impl Widget for Window {
                         OsType::Windows | OsType::Macos => {
                             if self.hide_caption_on_fullscreen && !cx.in_makepad_studio() {
                                 if ev.new_geom.is_fullscreen && !ev.old_geom.is_fullscreen {
-                                    self.view(cx, ids!(caption_bar)).set_visible(cx, false);
+                                    let content = self.caption_contains_app_content(cx);
+                                    self.view(cx, ids!(caption_bar)).set_visible(cx, self.show_caption_bar && content);
                                 } else if !ev.new_geom.is_fullscreen && ev.old_geom.is_fullscreen {
                                     self.view(cx, ids!(caption_bar))
                                         .set_visible(cx, self.show_caption_bar);
@@ -1497,9 +1544,12 @@ impl Widget for Window {
                     };
                     if visible {
                         if caption_rect.contains(dq.abs) {
-                            if buttons_rect.size != Vec2d::default()
+                            let content_toolbar = cx.in_makepad_studio()
+                                || matches!(cx.os_type(), OsType::LinuxWindow(params) if !params.custom_window_chrome)
+                                || (matches!(cx.os_type(), OsType::Macos) && self.window.handle.is_fullscreen(cx));
+                            if content_toolbar || (buttons_rect.size != Vec2d::default()
                                 && buttons_rect.contains(dq.abs)
-                            {
+                            ) {
                                 dq.response.set(WindowDragQueryResponse::Client);
                             } else {
                                 dq.response.set(WindowDragQueryResponse::Caption);
@@ -1589,19 +1639,7 @@ impl Widget for Window {
         //    CxDraw::reset_icon_atlas(cx);
         //}
 
-        if let Event::MouseMove(ev) = event {
-            if let OsType::LinuxDirect = cx.os_type() {
-                // ok move our mouse cursor
-                self.last_mouse_pos = ev.abs;
-                self.draw_cursor.update_abs(
-                    cx,
-                    Rect {
-                        pos: ev.abs,
-                        size: self.mouse_cursor_size,
-                    },
-                )
-            }
-        }
+
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
