@@ -735,7 +735,7 @@ mod imp {
     /// Metal calls this as soon as the presenting buffer's pixels are ready,
     /// before any PNG work. Return non-remote ids for probes/Studio/recording.
     #[cfg(all(
-        not(headless),
+        not(gpusim),
         any(target_os = "macos", target_os = "ios", target_os = "tvos")
     ))]
     pub(crate) fn deliver_grab_pixels(
@@ -884,7 +884,7 @@ mod imp {
                     .and_then(|pass| cx.passes[pass].color_textures.first())
                     .map(|color| color.texture.clone());
                 #[cfg(all(
-                    not(headless),
+                    not(gpusim),
                     any(target_os = "macos", target_os = "ios", target_os = "tvos")
                 ))]
                 let texture = if cx.in_makepad_studio { texture } else { None };
@@ -941,9 +941,9 @@ mod imp {
     /// `Cx::poll_control_channel`, i.e. from the event loop of every backend.
     pub(crate) fn poll(cx: &mut Cx) {
         // The native Mac event callback supplies its renderer so it can seal
-        // a grab BEFORE the next command. Hosted/headless backends retain
+        // a grab BEFORE the next command. Hosted/gpusim backends retain
         // their ordinary next-render readback path.
-        #[cfg(all(target_os = "macos", not(headless)))]
+        #[cfg(all(target_os = "macos", not(gpusim)))]
         if !cx.in_makepad_studio {
             return;
         }
@@ -952,12 +952,12 @@ mod imp {
 
     /// Returns whether a present is still waiting on its window's drawable
     /// (the caller schedules the next beat to poll it again).
-    #[cfg(all(target_os = "macos", not(headless)))]
+    #[cfg(all(target_os = "macos", not(gpusim)))]
     pub(crate) fn poll_macos(cx: &mut Cx, present: impl FnMut(&mut Cx, WindowId) -> Option<bool>) -> bool {
         poll_with_present(cx, present)
     }
 
-    #[cfg(all(target_os = "macos", not(headless)))]
+    #[cfg(all(target_os = "macos", not(gpusim)))]
     pub(crate) fn next_grab_deadline() -> Option<Instant> {
         CAPTURES.with_borrow(|captures| {
             captures
@@ -1243,37 +1243,47 @@ mod imp {
                             dy,
                             mods,
                             hw: _,
-                        } => match kind {
-                            MouseKind::Move => StudioToApp::MouseMove(RemoteMouseMove {
-                                time,
-                                x,
-                                y,
-                                modifiers: mods,
-                            }),
-                            MouseKind::Down => StudioToApp::MouseDown(RemoteMouseDown {
-                                time,
-                                x,
-                                y,
-                                button_raw_bits: 1 << button,
-                                modifiers: mods,
-                            }),
-                            MouseKind::Up => StudioToApp::MouseUp(RemoteMouseUp {
-                                time,
-                                x,
-                                y,
-                                button_raw_bits: 1 << button,
-                                modifiers: mods,
-                            }),
-                            MouseKind::Scroll => StudioToApp::Scroll(RemoteScroll {
-                                time,
-                                x,
-                                y,
-                                sx: dx,
-                                sy: dy,
-                                is_mouse: true,
-                                modifiers: mods,
-                            }),
-                        },
+                        } => {
+                            // Remote /click and /m are window-local layout points.
+                            // dispatch_studio_msg calls stdin_pointer_abs ->
+                            // dpi_override_scale and remaps native OS points into
+                            // layout. Convert first so that remap restores the
+                            // requested layout coordinate (saved scale 2.0 over
+                            // native 1.3 would otherwise send x1193 to x775.45).
+                            let native = cx.windows[window_id]
+                                .layout_vec2d_to_native_points(dvec2(x, y));
+                            match kind {
+                                MouseKind::Move => StudioToApp::MouseMove(RemoteMouseMove {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    modifiers: mods,
+                                }),
+                                MouseKind::Down => StudioToApp::MouseDown(RemoteMouseDown {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    button_raw_bits: 1 << button,
+                                    modifiers: mods,
+                                }),
+                                MouseKind::Up => StudioToApp::MouseUp(RemoteMouseUp {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    button_raw_bits: 1 << button,
+                                    modifiers: mods,
+                                }),
+                                MouseKind::Scroll => StudioToApp::Scroll(RemoteScroll {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    sx: dx,
+                                    sy: dy,
+                                    is_mouse: true,
+                                    modifiers: mods,
+                                }),
+                            }
+                        }
                         Input::Key { down, code, mods } => {
                             let event = KeyEvent {
                                 key_code: code,
@@ -2270,14 +2280,14 @@ mod imp {
     }
 
     // The recorder exercises the same /log serialization without binding a
-    // socket or starting an app. Only this headless process's ring is enabled.
-    #[cfg(headless)]
-    pub fn headless_start_log_capture() {
+    // socket or starting an app. Only this gpusim process's ring is enabled.
+    #[cfg(gpusim)]
+    pub fn gpusim_start_log_capture() {
         ACTIVE.store(true, Ordering::Relaxed);
     }
 
-    #[cfg(headless)]
-    pub fn headless_log_snapshot() -> String {
+    #[cfg(gpusim)]
+    pub fn gpusim_log_snapshot() -> String {
         log_json(&Params(vec![("since".into(), "0".into())]), "")
     }
 
@@ -2677,9 +2687,9 @@ mod imp {
     fn wake_commands() {
         // SignalToUI coalesces wakes until timer 0 clears its flag. A remote
         // capture must also wake between those ticks (including 200 ms idle).
-        #[cfg(all(target_os = "macos", not(headless)))]
+        #[cfg(all(target_os = "macos", not(gpusim)))]
         crate::os::apple::macos::macos_app::wake_event_loop();
-        #[cfg(not(all(target_os = "macos", not(headless))))]
+        #[cfg(not(all(target_os = "macos", not(gpusim))))]
         crate::thread::SignalToUI::set_ui_signal();
     }
 
