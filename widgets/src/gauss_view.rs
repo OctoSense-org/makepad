@@ -540,10 +540,13 @@ pub struct GaussRoundedView {
     // view is placed in the normal (background) flow rather than inside a `glass.Layer`.
     #[rust]
     draw_list: Option<DrawList2d>,
+    #[rust]
+    pub snapshot_ready: bool,
 }
 
 impl GaussRoundedView {
     fn bind_snapshot(&mut self, cx: &mut Cx2d, snapshot: Option<GaussBlurSnapshot>) {
+        self.snapshot_ready = snapshot.is_some();
         let draw_bg = &mut self.view.draw_bg.draw_vars;
         if let Some(snapshot) = snapshot {
             draw_bg.set_texture(0, &snapshot.scene_texture);

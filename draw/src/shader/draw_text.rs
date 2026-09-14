@@ -1268,6 +1268,10 @@ pub struct DrawText {
     pending_slug_flush_generation: u64,
     #[rust]
     slug_flush_defer_depth: u64,
+    // TextStyle's letter spacing adds eight bytes after native alignment.
+    // Keep the trailing shader-instance region aligned for derived text draws.
+    #[rust]
+    text_style_layout_pad: u64,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[rust]
     slug_draw: Option<DrawTextSlug>,
@@ -2520,6 +2524,7 @@ impl DrawText {
                 color: None,
             },
             options: LayoutOptions {
+                letter_spacing: self.text_style.letter_spacing,
                 first_row_indent_in_lpxs,
                 first_row_min_line_spacing_below_in_lpxs,
                 max_width_in_lpxs,
@@ -3185,6 +3190,8 @@ fn mat4_row(mat: &Mat4f, row: usize) -> [f32; 4] {
 
 #[derive(Debug, Clone, Script, ScriptHook)]
 pub struct TextStyle {
+    #[live(0.0)]
+    pub letter_spacing: f32,
     #[live]
     pub font_family: FontFamily,
     #[live(10.0)]
@@ -3211,17 +3218,26 @@ pub struct FontMember {
     pub weight: f32,
 }
 
-#[derive(Debug, Clone, Script, PartialEq)]
+#[derive(Debug, Clone, Script)]
 pub struct FontFamily {
     #[rust]
     id: LiveId,
     #[rust]
     members: Vec<FontMemberDef>,
+    #[rust]
+    resource_roots: Vec<ScriptHandleRef>,
+}
+
+impl PartialEq for FontFamily {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.members == other.members
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FontMemberDef {
     handle: ScriptHandle,
+    resource_path: Option<String>,
     asc: f32,
     desc: f32,
     weight: f32,
@@ -3308,11 +3324,26 @@ fn font_member_weight(member: &FontMemberDef) -> Option<f32> {
 
 fn font_member_font_id(member: &FontMemberDef) -> FontId {
     let mut hasher = DefaultHasher::new();
-    member.handle.index().hash(&mut hasher);
+    // Script handle slots can be recycled after a dynamic subtree is dropped.
+    // Loaded font caches outlive those slots, so identify the actual resource.
+    if let Some(path) = &member.resource_path {
+        path.hash(&mut hasher);
+    } else {
+        member.handle.index().hash(&mut hasher);
+    }
     member.asc.to_bits().hash(&mut hasher);
     member.desc.to_bits().hash(&mut hasher);
     member.weight.to_bits().hash(&mut hasher);
     FontId::from(hasher.finish())
+}
+
+fn font_family_definition_id(members: &[FontMemberDef]) -> LiveId {
+    let mut hasher = DefaultHasher::new();
+    members.len().hash(&mut hasher);
+    for member in members {
+        font_member_font_id(member).hash(&mut hasher);
+    }
+    LiveId(hasher.finish())
 }
 
 fn row_span_x_bounds_in_lpxs(
@@ -3354,9 +3385,8 @@ impl ScriptHook for FontFamily {
             return false;
         };
 
-        // Use the object index as the unique id
-        self.id = LiveId(obj.index() as u64);
         self.members.clear();
+        self.resource_roots.clear();
 
         let len = vm.bx.heap.vec_len(obj);
         for i in 0..len {
@@ -3365,12 +3395,19 @@ impl ScriptHook for FontFamily {
             if let Some(ref handle_ref) = member.res {
                 self.members.push(FontMemberDef {
                     handle: handle_ref.as_handle(),
+                    resource_path: vm.with_cx(|cx| cx.get_resource_abs_path(handle_ref.as_handle())),
                     asc: member.asc,
                     desc: member.desc,
                     weight: member.weight,
                 });
+                // Drawing is deferred until after the temporary FontMember
+                // value is gone. Keep its resource alive for this family.
+                self.resource_roots.push(handle_ref.clone());
             }
         }
+        // Object indices are reused by the VM's GC. Content identity prevents
+        // a later screen from inheriting another family's completed font cache.
+        self.id = font_family_definition_id(&self.members);
 
         // Don't eagerly register fonts here. Font registration is deferred
         // to ensure_fonts_loaded() which is called at draw time.
@@ -3394,6 +3431,22 @@ mod tests {
     #[test]
     fn draw_text_size_stays_16_byte_aligned() {
         assert_eq!(std::mem::size_of::<DrawText>() % 16, 0);
+    }
+
+    #[test]
+    fn font_family_identity_tracks_resources_metrics_weights_and_order() {
+        use super::{font_family_definition_id, FontMemberDef};
+        let regular = FontMemberDef { resource_path: Some("font.ttf".into()), weight: 400.0, ..Default::default() };
+        let bold = FontMemberDef { weight: 700.0, ..regular.clone() };
+        let other = FontMemberDef { resource_path: Some("other.ttf".into()), ..regular.clone() };
+        let shifted = FontMemberDef { asc: 0.18, ..regular.clone() };
+        let original = font_family_definition_id(&[regular.clone()]);
+        assert_eq!(original, font_family_definition_id(&[regular.clone()]));
+        for changed in [bold.clone(), other.clone(), shifted] {
+            assert_ne!(original, font_family_definition_id(&[changed]));
+        }
+        assert_ne!(font_family_definition_id(&[regular.clone(), other.clone()]),
+                   font_family_definition_id(&[other, regular]));
     }
 
     #[cfg(any(target_os = "linux", target_os = "windows"))]

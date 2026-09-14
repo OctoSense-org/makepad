@@ -3330,18 +3330,37 @@ public class MakepadActivity
     }
 
     public void requestHttp(long id, long metadataId, String url, String method, String headers, byte[] body) {
+        // Per-request tracing, off unless the device asks for it:
+        //   adb shell setprop log.tag.MakepadHttp DEBUG
+        final boolean trace = android.util.Log.isLoggable("MakepadHttp", android.util.Log.DEBUG);
+        final long started = System.currentTimeMillis();
+        if (trace) {
+            android.util.Log.i("MakepadHttp", "start #" + id + " " + method + " " + url
+                    + " headers=[" + headers.replace("\r\n", " | ") + "]");
+        }
         try {
             MakepadNetwork network = new MakepadNetwork();
 
             CompletableFuture<HttpResponse> future = network.performHttpRequest(url, method, headers, body);
 
             future.thenAccept(response -> {
+                if (trace) {
+                    android.util.Log.i("MakepadHttp", "done #" + id + " status=" + response.getStatusCode()
+                            + " bytes=" + (response.getBody() == null ? -1 : response.getBody().length)
+                            + " ms=" + (System.currentTimeMillis() - started));
+                }
                 runOnUiThread(() -> MakepadNative.onHttpResponse(id, metadataId, response.getStatusCode(), response.getHeaders(), response.getBody()));
             }).exceptionally(ex -> {
+                if (trace) {
+                    android.util.Log.w("MakepadHttp", "fail #" + id + " ms=" + (System.currentTimeMillis() - started) + " " + ex);
+                }
                 runOnUiThread(() -> MakepadNative.onHttpRequestError(id, metadataId, ex.toString()));
                 return null;
             });
         } catch (Exception e) {
+            if (trace) {
+                android.util.Log.w("MakepadHttp", "throw #" + id + " " + e);
+            }
             MakepadNative.onHttpRequestError(id, metadataId, e.toString());
         }
     }

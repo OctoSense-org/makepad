@@ -233,6 +233,13 @@ pub struct Label {
     #[live]
     padding: Inset,
 
+    /// Clip overflowing glyphs to the label frame. Disable for source layouts
+    /// whose ink intentionally extends beyond their typographic line box.
+    #[live(true)]
+    pub clip_x: bool,
+    #[live(true)]
+    pub clip_y: bool,
+
     /// Maximum number of lines to display. 0 means unlimited (default).
     /// Combined with `text_overflow: Ellipsis`, truncated text shows "…".
     #[live(0usize)]
@@ -241,8 +248,12 @@ pub struct Label {
     #[live]
     pub text_overflow: TextOverflow,
 
+    #[area]
     #[rust]
     area: Area,
+    /// Unclipped layout extent of the text drawn in the most recent frame.
+    #[rust]
+    pub text_layout_rect: Rect,
     #[live]
     text: ArcStringMut,
 
@@ -298,6 +309,8 @@ impl Widget for Label {
             walk,
             Layout {
                 flow: self.flow,
+                clip_x: self.clip_x,
+                clip_y: self.clip_y,
                 ..Default::default()
             },
         );
@@ -308,7 +321,7 @@ impl Widget for Label {
         });
         self.draw_text.max_lines = self.max_lines;
         self.draw_text.text_overflow = self.text_overflow;
-        self.draw_text
+        self.text_layout_rect = self.draw_text
             .draw_walk(cx, walk, self.align, self.text.as_ref());
         cx.end_turtle_with_area(&mut self.area);
         DrawStep::done()

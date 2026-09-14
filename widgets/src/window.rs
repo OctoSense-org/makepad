@@ -489,6 +489,14 @@ impl GaussStack {
         cx.end_pass(&self.scene_pass);
     }
 
+    fn clear_inactive_scene(&mut self, cx: &mut Cx2d) {
+        // A later blur request can repaint all child passes before its next
+        // capture. The previous scene's widgets may have been dropped by then;
+        // retaining their draw calls would replay freed SVG geometry.
+        let redraw_id = cx.redraw_id;
+        cx.draw_lists[self.scene_draw_list.id()].clear_draw_items(redraw_id);
+    }
+
     fn snapshot(&self, root_size: Vec2d, source_y_flip: f32, dpi_factor: f64) -> GaussBlurSnapshot {
         GaussBlurSnapshot {
             scene_texture: self.scene_texture.clone(),
@@ -800,6 +808,7 @@ impl Window {
             self.overlay
                 .begin_for_pass(cx, self.pass.handle.draw_pass_id());
         } else {
+            self.gauss_stack.clear_inactive_scene(cx);
             self.overlay.begin(cx);
         }
 
@@ -838,7 +847,9 @@ impl Window {
         self.overlay.end(cx);
         let window_id = self.window.handle.window_id();
         if finish_window_gauss_frame(cx, window_id) {
-            cx.repaint_pass_and_child_passes(self.pass.handle.draw_pass_id());
+            // Switching capture mode needs new scene commands, not a repaint
+            // of the last frame's commands.
+            self.main_draw_list.redraw(cx);
         }
 
         // lets get te pass size

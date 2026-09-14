@@ -1887,7 +1887,7 @@ impl WidgetTree {
                 let y = rect.pos.y.round() as i64;
                 let w = rect.size.x.round() as i64;
                 let h = rect.size.y.round() as i64;
-                if w > 0 && h > 0 && matches_query(mode, needle, &id_token, &ty_token) {
+                if rect.size.x > 0.0 && rect.size.y > 0.0 && matches_query(mode, needle, &id_token, &ty_token) {
                     rects.push(format!(
                         "{} {} {} {} {} {} {}",
                         dump_index, id_token, ty_token, x, y, w, h
@@ -2029,16 +2029,28 @@ impl WidgetTree {
                 .map(|check_box| check_box.active(cx));
             let radio_active = widget
                 .borrow::<RadioButton>()
-                .map(|radio_button| radio_button.active(cx));
+                .map(|radio_button| radio_button.active(cx))
+                .or_else(|| widget.checked(cx));
             let dropdown_selected = widget
                 .borrow::<DropDown>()
                 .map(|drop_down| drop_down.selected_item_label());
+            let view_selected = widget
+                .borrow::<crate::view::View>()
+                .and_then(|view| view.selected)
+                .map(|selected| selected.to_string())
+                .or_else(|| widget.selected_value(cx));
             let is_text_input = widget.borrow::<TextInput>().is_some();
 
             let mut text = None;
             let mut value = None;
+            if widget.borrow::<crate::slider::Slider>().is_some() {
+                value=Some(widget.text());
+            }
             if is_text_input {
                 value = Some(widget.text());
+                if let Some(input) = widget.borrow::<TextInput>() {
+                    text = Some(input.display_text());
+                }
             } else {
                 let widget_text = widget.text();
                 if is_button
@@ -2094,7 +2106,7 @@ impl WidgetTree {
                     text,
                     value,
                     checked: check_box_active.or(radio_active),
-                    selected: None,
+                    selected: view_selected,
                 });
             }
 
@@ -2278,7 +2290,9 @@ impl WidgetTree {
                 let y = rect.pos.y.round() as i64;
                 let w = rect.size.x.round() as i64;
                 let h = rect.size.y.round() as i64;
-                if w > 0 && h > 0 {
+                // Preserve thin, positive-sized widgets in the hierarchy even
+                // when the compact integer coordinate format rounds to zero.
+                if rect.size.x > 0.0 && rect.size.y > 0.0 {
                     let id_token = live_id_token(id);
                     let ty_token = live_id_token(ty);
                     dump_nodes.push(DumpNode {

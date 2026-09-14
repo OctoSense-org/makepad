@@ -652,8 +652,17 @@ impl DesktopRunView {
             return;
         }
 
-        let min_width = ((rect.size.x * dpi_factor).ceil() as u32).max(1);
-        let min_height = ((rect.size.y * dpi_factor).ceil() as u32).max(1);
+        // Remote RunViewResize may request a viewport larger than Studio's
+        // visible panel. Reserve an explicit backing size for such captures;
+        // resizing only the app geometry otherwise yields empty readbacks.
+        let minimum_allocation = |key: &str| {
+            std::env::var(key).ok().and_then(|v| v.parse::<u32>().ok())
+                .filter(|v| (1..=16384).contains(v)).unwrap_or(1)
+        };
+        let min_width = ((rect.size.x * dpi_factor).ceil() as u32)
+            .max(minimum_allocation("MAKEPAD_RUNVIEW_MIN_ALLOC_WIDTH"));
+        let min_height = ((rect.size.y * dpi_factor).ceil() as u32)
+            .max(minimum_allocation("MAKEPAD_RUNVIEW_MIN_ALLOC_HEIGHT"));
         let needs_new_swapchain = self
             .swapchain
             .as_ref()

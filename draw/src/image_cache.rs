@@ -589,8 +589,8 @@ impl ImageCache {
 
     /// Insert a freshly-loaded texture, then bound the cache size if it has grown too large.
     pub fn insert_loaded(&mut self, image_path: PathBuf, texture: Texture) {
-        self.map.insert(image_path, ImageCacheEntry::Loaded(texture));
-        self.evict_loaded_if_oversized();
+        self.map.insert(image_path.clone(), ImageCacheEntry::Loaded(texture));
+        self.evict_loaded_if_oversized(&image_path);
     }
 
     /// Drop `Loaded` entries once the cache exceeds its cap. This is safe because widgets keep
@@ -599,7 +599,7 @@ impl ImageCache {
     /// simply re-loads it. In-flight `Loading` entries are preserved so decode work isn't
     /// orphaned. There is no per-entry access timestamp, so eviction order is unspecified; the
     /// cap is generous enough that this rarely triggers in practice.
-    fn evict_loaded_if_oversized(&mut self) {
+    fn evict_loaded_if_oversized(&mut self, just_loaded: &Path) {
         if self.map.len() <= Self::MAX_ENTRIES {
             return;
         }
@@ -607,7 +607,8 @@ impl ImageCache {
         let to_remove: Vec<PathBuf> = self
             .map
             .iter()
-            .filter(|(_, e)| matches!(e, ImageCacheEntry::Loaded(_)))
+            // The requesting widget has not cloned this texture yet.
+            .filter(|(path, e)| path.as_path() != just_loaded && matches!(e, ImageCacheEntry::Loaded(_)))
             .map(|(k, _)| k.clone())
             .take(excess)
             .collect();
@@ -1073,6 +1074,22 @@ fn ensure_image_cache_inner(cx: &mut Cx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_eviction_preserves_texture_awaiting_its_first_consumer() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let mut cache = ImageCache::new();
+        // Only the just-completed image is evictable by the old policy. Its
+        // consumer must still receive it when many other decodes are in flight.
+        for index in 0..ImageCache::MAX_ENTRIES {
+            cache.map.insert(PathBuf::from(format!("pending-{index}")), ImageCacheEntry::Loading(1, 1));
+        }
+        let path = PathBuf::from("completed.png");
+        let texture = Texture::new(&mut cx);
+        cache.insert_loaded(path.clone(), texture.clone());
+        assert!(matches!(cache.map.get(&path), Some(ImageCacheEntry::Loaded(found)) if found == &texture));
+        assert_eq!(cache.map.len(), ImageCache::MAX_ENTRIES + 1);
+    }
     use makepad_gif::{Encoder, Frame};
     use std::borrow::Cow;
 
@@ -1567,13 +1584,8 @@ pub fn process_async_image_load(
         }
         cx.get_global::<ImageCache>()
             .insert_loaded(image_path.into(), texture);
-    } else {
-        if image_decode_debug_enabled() {
-            log!(
-                "ImageCache: gpu_commit key={} skipped (decode error)",
-                image_path.display()
-            );
-        }
+    } else if let Err(error) = result {
+        error!("ImageCache: decode failed for {}: {}", image_path.display(), error);
         cx.get_global::<ImageCache>().map.remove(image_path);
     }
 }

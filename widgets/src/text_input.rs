@@ -759,6 +759,17 @@ impl TextInput {
         &self.empty_text
     }
 
+    /// Text presented by the input, including its placeholder and masking.
+    pub fn display_text(&self) -> String {
+        if self.text.is_empty() {
+            self.empty_text.clone()
+        } else if self.is_password {
+            self.text.graphemes(true).map(|g| if g == "\n" { '\n' } else { '•' }).collect()
+        } else {
+            self.text.clone()
+        }
+    }
+
     pub fn set_empty_text(&mut self, cx: &mut Cx, empty_text: String) {
         self.empty_text = empty_text;
         if self.text.is_empty() {
@@ -1234,7 +1245,14 @@ impl TextInput {
         // also moves BeginClip entries. By setting the clip to inner_rect here,
         // we override whatever shift was applied, keeping the clip at the correct
         // absolute position (the inner area excluding padding).
-        cx.update_clip_rect_at(content_clip_index, inner_rect);
+        let mut content_clip = inner_rect;
+        if !self.layout.clip_y && !self.is_multiline {
+            // Source text may have a line box smaller than its glyph ink.
+            // Preserve horizontal editing/scroll clipping in this opt-in mode.
+            content_clip.pos.y -= 1000000.0;
+            content_clip.size.y += 2000000.0;
+        }
+        cx.update_clip_rect_at(content_clip_index, content_clip);
     }
 
     /// Draws the vertical scrollbar when the text content overflows the visible area.

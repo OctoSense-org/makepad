@@ -728,7 +728,9 @@ impl ScriptHeap {
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
                     '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\"),
+                    '\\' => out.push_str("\\\\"),
+                    '\t' => out.push_str("\\t"),
+                    c if c <= '\u{1f}' => { let _ = write!(out, "\\u{:04x}", c as u32); }
                     c => {
                         out.push(c);
                     }

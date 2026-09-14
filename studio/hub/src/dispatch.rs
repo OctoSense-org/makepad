@@ -483,6 +483,7 @@ pub struct HubCore {
     mount_suppress_fs_until: HashMap<String, Instant>,
     self_save_suppress_until_by_path: HashMap<String, Instant>,
     pending_forward_to_app_by_build: HashMap<QueryId, Vec<Vec<u8>>>,
+    remote_viewports: HashMap<(QueryId, usize), (f64, f64, f64)>,
     stdio_ready_builds: HashSet<QueryId>,
 }
 
@@ -544,6 +545,7 @@ impl HubCore {
             mount_suppress_fs_until: HashMap::new(),
             self_save_suppress_until_by_path: HashMap::new(),
             pending_forward_to_app_by_build: HashMap::new(),
+            remote_viewports: HashMap::new(),
             stdio_ready_builds: HashSet::new(),
         };
         for mount in this.vfs.mounts() {
@@ -1499,6 +1501,7 @@ impl HubCore {
                 }
             }
             ClientToHub::StopBuild { build_id } => {
+                self.remote_viewports.retain(|(build, _), _| *build != build_id);
                 if self.build_manager.stop_build(build_id).is_ok() {
                     return;
                 }
@@ -1513,6 +1516,7 @@ impl HubCore {
                 }
             }
             ClientToHub::ClearBuild { build_id } => {
+                self.remote_viewports.retain(|(build, _), _| *build != build_id);
                 if self.build_manager.stop_build(build_id).is_ok() {
                     self.send_build_cleanup_message(build_id);
                     return;
@@ -1704,6 +1708,12 @@ impl HubCore {
                 height,
                 dpi,
             } => {
+                if !width.is_finite() || !height.is_finite() || !dpi.is_finite()
+                    || width <= 0.0 || height <= 0.0 || dpi <= 0.0 {
+                    self.send_ui_error(client_id, "invalid remote viewport dimensions".to_owned());
+                    return;
+                }
+                self.remote_viewports.insert((build_id, window_id), (width, height, dpi));
                 if let Err(err) = self.send_app_msg(
                     build_id,
                     StudioToApp::WindowGeomChange {
@@ -2647,6 +2657,9 @@ impl HubCore {
     }
 
     fn send_to_app(&self, build_id: QueryId, msg_bin: Vec<u8>) -> Result<(), String> {
+        // A remote artboard size persists until changed or the build is
+        // stopped. Studio's later panel/bootstrap geometry must not replace it.
+        let msg_bin = self.apply_remote_viewport(build_id, msg_bin);
         if self.stdio_ready_builds.contains(&build_id) {
             if studio_hub_debug_enabled() {
                 eprintln!(
@@ -2657,6 +2670,25 @@ impl HubCore {
             return self.send_to_process_stdin(build_id, msg_bin);
         }
         self.send_to_app_with_socket(build_id, msg_bin).map(|_| ())
+    }
+
+    fn apply_remote_viewport(&self, build_id: QueryId, msg_bin: Vec<u8>) -> Vec<u8> {
+        if !self.remote_viewports.keys().any(|(build, _)| *build == build_id) {
+            return msg_bin;
+        }
+        let Ok(mut messages) = StudioToAppVec::deserialize_bin(&msg_bin) else {
+            return msg_bin;
+        };
+        let mut changed = false;
+        for message in &mut messages.0 {
+            if let StudioToApp::WindowGeomChange {window_id, width, height, dpi_factor, left, top} = message {
+                if let Some(&(w, h, dpi)) = self.remote_viewports.get(&(build_id, *window_id)) {
+                    *width = w; *height = h; *dpi_factor = dpi; *left = 0.0; *top = 0.0;
+                    changed = true;
+                }
+            }
+        }
+        if changed { messages.serialize_bin() } else { msg_bin }
     }
 
     fn build_ids_for_virtual_path(&self, virtual_path: &str) -> Vec<QueryId> {
@@ -5399,6 +5431,30 @@ mod tests {
         let args = vec!["--version".to_string()];
         let normalized = with_default_cargo_message_format(args.clone());
         assert_eq!(normalized, args);
+    }
+
+    #[test]
+    fn remote_viewport_survives_panel_bootstrap_without_changing_other_windows() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let (mut core, _) = test_core_with_ui(dir.path());
+        let build = QueryId(42);
+        core.remote_viewports.insert((build, 0), (393.0, 1477.0, 2.0));
+        let packet = StudioToAppVec(vec![StudioToApp::WindowGeomChange {
+            window_id: 0, width: 398.0, height: 600.0, dpi_factor: 1.0,
+            left: 20.0, top: 30.0,
+        }, StudioToApp::WindowGeomChange {
+            window_id: 1, width: 300.0, height: 200.0, dpi_factor: 1.0,
+            left: 0.0, top: 0.0,
+        }]).serialize_bin();
+        let fixed = core.apply_remote_viewport(build, packet.clone());
+        let messages = StudioToAppVec::deserialize_bin(&fixed).unwrap().0;
+        assert!(matches!(messages[0], StudioToApp::WindowGeomChange {
+            width: 393.0, height: 1477.0, dpi_factor: 2.0, left: 0.0, top: 0.0, ..
+        }));
+        assert!(matches!(messages[1], StudioToApp::WindowGeomChange {
+            width: 300.0, height: 200.0, ..
+        }));
+        assert_eq!(core.apply_remote_viewport(QueryId(43), packet.clone()), packet);
     }
 
     fn test_core_with_ui(root: &Path) -> (HubCore, ToUIReceiver<Vec<u8>>) {
