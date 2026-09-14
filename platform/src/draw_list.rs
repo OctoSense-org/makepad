@@ -866,7 +866,13 @@ impl CxDrawList {
         (draw_item_id < self.draw_items.len()).then_some(draw_item_id)
     }
 
-    pub fn clear_draw_items(&mut self, redraw_id: u64) {
+    /// `recording_gen` / `uniforms_gen` are the generations the port branch's
+    /// uniform-block caches key on; this lane keeps no such caches and only
+    /// requires them to be the nonzero values `Cx::next_uniform_gen` issues.
+    pub fn clear_draw_items(&mut self, redraw_id: u64, recording_gen: u64, uniforms_gen: u64) {
+        debug_assert_ne!(recording_gen, 0);
+        debug_assert_ne!(uniforms_gen, 0);
+        let _ = (recording_gen, uniforms_gen);
         self.redraw_id = redraw_id;
         self.draw_items.clear();
         self.draw_item_reorder = None;

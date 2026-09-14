@@ -514,3 +514,19 @@ impl Cx {
         }
     }
 }
+
+impl Cx {
+    /// Issue the next nonzero, process-wide uniform generation.
+    ///
+    /// This lane's draw lists do not cache uniform blocks by generation (see
+    /// port/appcard-on-octoscript for the version that does); the counter exists
+    /// so sources shared with that lane — Octoscript-Makepad's kit_shared.rs is
+    /// compiled by both — call one API. `DrawList::clear_draw_items` takes the
+    /// same two generations there and here.
+    #[inline]
+    pub fn next_uniform_gen(&mut self) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static UNIFORM_GEN: AtomicU64 = AtomicU64::new(1);
+        UNIFORM_GEN.fetch_add(1, Ordering::Relaxed)
+    }
+}
