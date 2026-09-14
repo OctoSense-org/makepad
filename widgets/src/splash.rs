@@ -246,7 +246,11 @@ impl Splash {
         }
         let timers_before = isolate_timer_ids(cx, heap_key);
         let body_modules = std::mem::take(&mut self.body_modules);
-        let (new_view, body_modules) = cx.with_script_vm_id(vm_id, |vm| {
+        // A panicking body must not take the host down: contain it here (an
+        // unwinding `with_script_vm_id` already restores the outer VM).
+        let mut eval_out = None;
+        crate::widget_async::contain_isolate_panic("app source eval", || {
+        eval_out = Some(cx.with_script_vm_id(vm_id, |vm| {
             if let Some(sheet)=sheet {
                 if crate::desktop_style::current(vm).as_ref()!=Some(&sheet) {
                     crate::desktop_style::install(vm,sheet);
@@ -294,7 +298,9 @@ impl Splash {
                 None
             };
             (view, body_modules)
+        }));
         });
+        let (new_view, body_modules) = eval_out.unwrap_or((None, Vec::new()));
         self.body_modules = body_modules;
         self.startup_timers = isolate_timer_ids(cx, heap_key)
             .into_iter()
@@ -502,7 +508,9 @@ pub fn validate_splash_body(cx: &mut Cx, body: &str, allow_net: bool) -> Vec<Str
         code: String::new(),
         values: vec![],
     };
-    let errors = cx.with_script_vm_id(vm_id, |vm| {
+    let mut errors_out = vec!["the script crashed its isolate during validation".to_string()];
+    crate::widget_async::contain_isolate_panic("validation eval", || {
+    errors_out = cx.with_script_vm_id(vm_id, |vm| {
         // Capture instead of logging: mid-eval errors otherwise go straight to
         // the error log (see `ScriptVm::take_errors`) and can't be returned.
         vm.bx.captured_errors = Some(Vec::new());
@@ -522,13 +530,14 @@ pub fn validate_splash_body(cx: &mut Cx, body: &str, allow_net: bool) -> Vec<Str
         }
         errors
     });
+    });
     crate::widget_async::mark_splash_isolate_dead(vm_id);
     // Reclaim NOW (stops the isolate's top-level timers and drops its sandbox
     // root binding) so nothing can re-create the scratch dir after we remove
     // it; then delete last, and it stays deleted.
     crate::widget_async::gc_dead_splash_isolates(cx);
     let _ = std::fs::remove_dir_all(&scratch);
-    errors
+    errors_out
 }
 
 impl WidgetNode for Splash {
@@ -652,7 +661,9 @@ impl Splash {
         let Some(scope) = self.body_scope(cx) else {
             return false;
         };
-        cx.with_script_vm_id(self.vm_id, |vm| {
+        let mut called = false;
+        crate::widget_async::contain_isolate_panic("script hook call", || {
+        called = cx.with_script_vm_id(self.vm_id, |vm| {
             // NoTrap: this is an existence probe for an OPTIONAL hook. A
             // trapping lookup queues a NotFound into the error log even though
             // the miss is handled right here — every host broadcast (e.g.
@@ -666,7 +677,9 @@ impl Splash {
                 vm.call(fnval, args);
             });
             true
-        })
+        });
+        });
+        called
     }
 
     /// Like [`Self::call_script_fn`], but with string arguments — those are
@@ -677,7 +690,9 @@ impl Splash {
         let Some(scope) = self.body_scope(cx) else {
             return false;
         };
-        cx.with_script_vm_id(self.vm_id, |vm| {
+        let mut called = false;
+        crate::widget_async::contain_isolate_panic("script hook call", || {
+        called = cx.with_script_vm_id(self.vm_id, |vm| {
             let fnval = vm.bx.heap.scope_value(scope, name, NoTrap);
             if fnval.is_nil() || fnval.is_err() {
                 return false;
@@ -690,7 +705,9 @@ impl Splash {
                 vm.call(fnval, &vals);
             });
             true
-        })
+        });
+        });
+        called
     }
 
     /// Sets whether this Splash's isolate gets the networking runtime. Must be
@@ -782,6 +799,9 @@ impl Splash {
     /// The scope object holding this Splash body's top-level definitions, via
     /// the body id cached at eval time (with a pointer-identity fallback for
     /// robustness).
+    /// The scope the script's top-level names live in: the one its body
+    /// ended in, since a `let`/`fn` that shadows a prelude name opens a
+    /// child scope the module scope cannot see into.
     fn body_scope(&mut self, cx: &mut Cx) -> Option<ScriptObject> {
         if self.vm_id == MAIN_SPLASH_VM_ID {
             return None;
@@ -790,13 +810,14 @@ impl Splash {
         let body_id = self.body_id;
         cx.with_script_vm_id(self.vm_id, |vm| {
             let bodies = vm.bx.code.bodies.borrow();
+            let ended_in = |body: &ScriptBody| {
+                body.end_scope.as_ref().unwrap_or(&body.scope).as_object()
+            };
             if let Some(body) = body_id.and_then(|i| bodies.get(i as usize)) {
-                return Some(body.scope.as_object());
+                return Some(ended_in(body));
             }
             bodies.iter().find_map(|body| match &body.source {
-                ScriptSource::Mod(m) if m.module_path == body_key => {
-                    Some(body.scope.as_object())
-                }
+                ScriptSource::Mod(m) if m.module_path == body_key => Some(ended_in(body)),
                 _ => None,
             })
         })

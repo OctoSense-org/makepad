@@ -72,11 +72,15 @@ impl FontFamily {
     }
 
     pub fn get_or_shape(&self, text: Substr) -> Rc<ShapedText> {
+        self.get_or_shape_with_spacing(text, Ems(0.0))
+    }
+
+    pub fn get_or_shape_with_spacing(&self, text: Substr, letter_spacing: Ems) -> Rc<ShapedText> {
         self.shaper.borrow_mut().get_or_shape(ShapeParams {
             text,
             fonts: self.fonts.clone(),
             direction: Direction::default(),
-            letter_spacing: Ems(0.0),
+            letter_spacing,
             word_spacing: Ems(0.0),
             features: Rc::new(Vec::new()),
             diagnostics: self.diagnostics.clone(),

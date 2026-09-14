@@ -372,6 +372,7 @@ impl VectorStop {
             .unwrap_or((0.0, 0.0, 0.0, 1.0));
         let fa = a * self.opacity;
         GradientStop {
+            straight_rgb: None,
             offset: self.offset,
             color: [r * fa, g * fa, b * fa, fa],
         }

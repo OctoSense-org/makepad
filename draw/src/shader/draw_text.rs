@@ -1300,6 +1300,10 @@ pub struct DrawText {
     pending_slug_flush_generation: u64,
     #[rust]
     slug_flush_defer_depth: u64,
+    // TextStyle's letter spacing adds eight bytes after native alignment.
+    // Keep the trailing shader-instance region aligned for derived text draws.
+    #[rust]
+    text_style_layout_pad: u64,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[rust]
     slug_draw: Option<DrawTextSlug>,
@@ -2793,6 +2797,7 @@ impl DrawText {
                 color: None,
             },
             options: LayoutOptions {
+                letter_spacing: self.text_style.letter_spacing,
                 first_row_indent_in_lpxs,
                 first_row_min_line_spacing_below_in_lpxs,
                 max_width_in_lpxs,
@@ -3470,6 +3475,8 @@ fn mat4_row(mat: &Mat4f, row: usize) -> [f32; 4] {
 
 #[derive(Debug, Clone, Script, ScriptHook)]
 pub struct TextStyle {
+    #[live(0.0)]
+    pub letter_spacing: f32,
     #[live]
     pub font_family: FontFamily,
     #[live(10.0)]
@@ -3705,6 +3712,15 @@ fn font_member_font_id(member: &FontMemberDef) -> FontId {
     FontId::from(hasher.finish())
 }
 
+fn font_family_definition_id(members: &[FontMemberDef]) -> LiveId {
+    let mut hasher = DefaultHasher::new();
+    members.len().hash(&mut hasher);
+    for member in members {
+        font_member_font_id(member).hash(&mut hasher);
+    }
+    LiveId(hasher.finish())
+}
+
 fn row_span_x_bounds_in_lpxs(
     row: &LaidoutRow,
     is_first_row: bool,
@@ -3788,6 +3804,9 @@ impl ScriptHook for FontFamily {
                 });
             }
         }
+        // Object indices are reused by the VM's GC. Content identity prevents
+        // a later screen from inheriting another family's completed font cache.
+        self.id = font_family_definition_id(&self.members);
 
         // Object and handle indices are local to a script heap. Font caches
         // belong to Cx, so identify the complete ordered family by its actual

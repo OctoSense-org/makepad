@@ -1414,6 +1414,10 @@ pub struct DrawSlider {
     label_size: f32,
     #[live]
     slide_pos: f32,
+    #[live]
+    slide_pos2: f32,
+    #[live]
+    range_mode: f32,
 }
 
 #[derive(Script, Widget, Animator)]
@@ -1462,6 +1466,9 @@ pub struct Slider {
     step: f64,
     #[live]
     default: f64,
+    /// Optional second handle, in the same units as min/max/value.
+    #[live]
+    pub range_end: Option<f64>,
 
     /// Fraction of the value range one scroll-wheel notch moves while the
     /// pointer hovers this slider. 0.0 (the default) disables wheel input.
@@ -1481,6 +1488,8 @@ pub struct Slider {
     pub relative_value: f64,
     #[rust]
     pub dragging: Option<f64>,
+    #[rust]
+    dragging_range_end: bool,
 }
 
 impl ScriptHook for Slider {
@@ -1541,6 +1550,8 @@ impl Slider {
 
     pub fn draw_walk_slider(&mut self, cx: &mut Cx2d, walk: Walk) {
         self.draw_bg.slide_pos = self.relative_value as f32;
+        self.draw_bg.range_mode = if self.range_end.is_some() {1.0} else {0.0};
+        self.draw_bg.slide_pos2 = self.range_end.map(|end|((end-self.min)/(self.max-self.min)) as f32).unwrap_or(0.0);
         self.draw_bg.begin(cx, walk, self.layout);
 
         if let Flow::Right { wrap: false, .. } = self.layout.flow {
@@ -1689,8 +1700,8 @@ impl Widget for Slider {
                 }
             }
             Hit::FingerDown(FingerDownEvent {
-                // abs,
-                // rect,
+                abs,
+                rect,
                 device,
                 tap_count,
                 ..
@@ -1713,7 +1724,14 @@ impl Widget for Slider {
                 self.text_input.redraw(cx);
 
                 self.animator_play(cx, ids!(drag.on));
-                self.dragging = Some(self.relative_value);
+                self.dragging_range_end = self.range_end.is_some_and(|end| {
+                    let pointer=if matches!(self.axis,DragAxis::Horizontal) {(abs.x-rect.pos.x)/rect.size.x} else {1.0-(abs.y-rect.pos.y)/rect.size.y};
+                    let high=(end-self.min)/(self.max-self.min);
+                    (pointer-high).abs() < (pointer-self.relative_value).abs()
+                });
+                self.dragging = Some(if self.dragging_range_end {
+                    (self.range_end.unwrap()-self.min)/(self.max-self.min)
+                } else {self.relative_value});
                 cx.widget_action(uid, SliderAction::StartSlide);
                 cx.set_cursor(MouseCursor::Grabbing);
             }
@@ -1742,6 +1760,7 @@ impl Widget for Slider {
 
                 let rel = fe.abs - fe.abs_start;
                 if let Some(start_pos) = self.dragging {
+                    let previous=self.relative_value;
                     if let DragAxis::Horizontal = self.axis {
                         self.relative_value = (start_pos
                             + rel.x / (fe.rect.size.x - self.draw_bg.label_size as f64))
@@ -1752,7 +1771,13 @@ impl Widget for Slider {
                             .max(0.0)
                             .min(1.0);
                     }
-                    self.set_internal(self.to_external());
+                    let external=self.to_external();
+                    if self.dragging_range_end {
+                        self.relative_value=previous;
+                        self.range_end=Some(external.max(self.value()));
+                    } else {
+                        self.set_internal(self.range_end.map_or(external,|end|external.min(end)));
+                    }
                     self.draw_bg.redraw(cx);
                     self.update_text_input(cx);
                     cx.widget_action(uid, SliderAction::Slide(self.to_external()));
@@ -1768,7 +1793,7 @@ impl Widget for Slider {
     }
 
     fn text(&self) -> String {
-        format!("{}", self.to_external())
+        self.range_end.map_or_else(||format!("{}",self.to_external()),|end|format!("[{},{}]",self.to_external(),end))
     }
 
     fn set_text(&mut self, cx: &mut Cx, v: &str) {

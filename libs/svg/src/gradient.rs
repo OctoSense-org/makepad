@@ -6,29 +6,60 @@ use crate::color::parse_color;
 use crate::document::{GradientUnits, SpreadMethod, SvgGradient};
 use crate::paint::GradientStop;
 use crate::transform::parse_transform;
-use crate::units::parse_number;
+use crate::units::parse_length_or_percent;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn svg_interpolates_straight_rgb_before_premultiplication() {
+        let doc=crate::parse_svg(r##"<svg><defs><linearGradient id="fade">
+            <stop offset="0" stop-color="#ff0000" stop-opacity="0"/>
+            <stop offset="1" stop-color="#0000ff"/>
+            </linearGradient></defs></svg>"##);
+        let stops=&doc.defs.gradients["fade"].stops;
+        assert_eq!(crate::paint::sample_stops(stops,0.5),[0.25,0.0,0.25,0.5]);
+        let mut translucent=stops.clone();
+        for stop in &mut translucent {for channel in &mut stop.color {*channel*=0.2;}}
+        let sample=crate::paint::sample_stops(&translucent,0.5);
+        assert!((sample[0]-0.05).abs()<0.00001);
+        assert!((sample[3]-0.1).abs()<0.00001);
+    }
+    #[test]
+    fn percentage_gradient_coordinates_do_not_fall_back_to_horizontal_defaults() {
+        let doc=crate::parse_svg(r##"<svg width="100" height="200"><defs>
+            <linearGradient id="linear" x1="9.2%" y1="17.6%" x2="91.8%" y2="79.4%"/>
+            <radialGradient id="radial" cx="25%" cy="75%" r="60%" fx="20%" fy="80%"/>
+            </defs></svg>"##);
+        let g=&doc.defs.gradients["linear"];
+        for (a,b) in [(g.x1,0.092),(g.y1,0.176),(g.x2,0.918),(g.y2,0.794)] {
+            assert!((a-b).abs()<0.00001);
+        }
+        let g=&doc.defs.gradients["radial"];
+        assert_eq!((g.cx,g.cy,g.r,g.fx,g.fy),(0.25,0.75,0.6,0.2,0.8));
+    }
+}
 
 pub fn parse_linear_gradient(walker: &HtmlWalker) -> (Option<String>, SvgGradient) {
     let mut grad = SvgGradient::new_linear();
     let id = walker.find_attr_lc(live_id!(id)).map(|s| s.to_string());
 
     if let Some(v) = walker.find_attr_lc(live_id!(x1)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.x1 = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(y1)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.y1 = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(x2)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.x2 = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(y2)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.y2 = n;
         }
     }
@@ -58,27 +89,27 @@ pub fn parse_radial_gradient(walker: &HtmlWalker) -> (Option<String>, SvgGradien
     let id = walker.find_attr_lc(live_id!(id)).map(|s| s.to_string());
 
     if let Some(v) = walker.find_attr_lc(live_id!(cx)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.cx = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(cy)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.cy = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(r)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.r = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(fx)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.fx = n;
         }
     }
     if let Some(v) = walker.find_attr_lc(live_id!(fy)) {
-        if let Some(n) = parse_number(v) {
+        if let Some(n) = parse_length_or_percent(v, 1.0) {
             grad.fy = n;
         }
     }
@@ -164,6 +195,7 @@ pub fn parse_stop(walker: &HtmlWalker) -> GradientStop {
     GradientStop {
         offset,
         color: [r * a, g * a, b * a, a],
+        straight_rgb: Some([r,g,b]),
     }
 }
 

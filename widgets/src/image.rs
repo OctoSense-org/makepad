@@ -279,7 +279,9 @@ impl Image {
                 .map(|r| PathBuf::from(&r.abs_path))
                 .unwrap_or_else(|| PathBuf::from("http_resource"))
         };
-        let _ = self.load_image_from_data_async(cx, &path, Arc::new((*data).clone()));
+        if let Err(error) = self.load_image_from_data_async(cx, &path, Arc::new((*data).clone())) {
+            error!("Image: resource decode failed for {}: {}", path.display(), error);
+        }
     }
 }
 
@@ -365,7 +367,12 @@ impl Widget for Image {
                         && self.async_image_path.as_deref() == Some(image_path.as_path())
                     {
                         // see if we can load from cache
-                        self.load_image_from_cache(cx, image_path, 0);
+                        if !self.load_image_from_cache(cx, image_path, 0) && self.src.is_some() {
+                            // Another completion in this Actions batch may
+                            // have evicted the texture before this widget got
+                            // its turn. Retry from the retained resource bytes.
+                            self.src_loaded = false;
+                        }
                         self.async_image_size = None;
                         self.async_image_path = None;
                         // Record which async load produced the texture, so a later

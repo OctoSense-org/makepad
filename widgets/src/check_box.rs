@@ -537,14 +537,14 @@ impl Widget for CheckBox {
                 self.animator_play(cx, ids!(focus.off));
                 self.draw_bg.redraw(cx);
             }
-            Hit::FingerHoverIn(_) => {
+            Hit::FingerHoverIn(_) if !self.disabled(cx) => {
                 cx.set_cursor(MouseCursor::Hand);
                 self.animator_play(cx, ids!(hover.on));
             }
             Hit::FingerHoverOut(_) => {
                 self.animator_play(cx, ids!(hover.off));
             }
-            Hit::FingerDown(fe) if fe.is_primary_hit() => {
+            Hit::FingerDown(fe) if fe.is_primary_hit() && !self.disabled(cx) => {
                 self.set_key_focus(cx);
                 let new_active = if self.animator_in_state(cx, ids!(active.on)) {
                     self.animator_play(cx, ids!(active.off));

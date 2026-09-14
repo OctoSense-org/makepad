@@ -10,7 +10,7 @@ use {
         rasterizer::{self, RasterizedGlyph, Rasterizer},
         sdfer,
         selection::{Cursor, CursorPosition, Selection},
-        shaper::{self, ShapedText},
+        shaper::{self, Ems, ShapedText},
         substr::Substr,
     },
     fxhash::FxHashMap,
@@ -426,6 +426,7 @@ impl LayoutContext {
             self.span_text(len),
             self.font_family.clone(),
             self.style.font_size_in_lpxs(),
+            self.options.letter_spacing,
             SegmentKind::Word,
         );
         while !fitter.is_empty() {
@@ -468,6 +469,7 @@ impl LayoutContext {
             self.span_text(len),
             self.font_family.clone(),
             self.style.font_size_in_lpxs(),
+            self.options.letter_spacing,
             SegmentKind::Grapheme,
         );
         while !fitter.is_empty() {
@@ -489,9 +491,10 @@ impl LayoutContext {
 
     fn layout_directly(&mut self, len: usize) {
         self.append_text(
-            &self.font_family.get_or_shape(
+            &self.font_family.get_or_shape_with_spacing(
                 self.text
                     .substr(self.current_row_end..self.current_row_end + len),
+                Ems(self.options.letter_spacing / self.style.font_size_in_lpxs()),
             ),
         );
     }
@@ -527,7 +530,20 @@ impl LayoutContext {
         let text = self
             .text
             .substr(self.current_row_start..self.current_row_end);
-        let width_in_lpxs = self.current_point_in_lpxs.x;
+        let mut width_in_lpxs = self.current_point_in_lpxs.x;
+        if self.options.wrap {
+            // A space consumed at a soft line break still belongs to the text
+            // (and caret positions), but must not widen or offset the visible
+            // line. Keep the glyphs and source text intact for hit testing.
+            let visible_end = text.trim_end().len();
+            for glyph in self.glyphs.iter().rev() {
+                if glyph.cluster < visible_end {
+                    break;
+                }
+                width_in_lpxs -= glyph.advance_in_lpxs();
+            }
+            width_in_lpxs = width_in_lpxs.max(0.0);
+        }
 
         let glyphs = mem::take(&mut self.glyphs);
         let mut row = LaidoutRow {
@@ -652,7 +668,8 @@ impl LayoutContext {
 
     /// Truncates the last row to fit within `max_width` and appends an ellipsis glyph.
     fn truncate_last_row_with_ellipsis(&mut self, max_width: f32) {
-        let ellipsis_shaped = self.font_family.get_or_shape("…".into());
+        let ellipsis_shaped = self.font_family.get_or_shape_with_spacing(
+            "…".into(), Ems(self.options.letter_spacing / self.style.font_size_in_lpxs()));
         let font_size_in_lpxs = self.style.font_size_in_lpxs();
         let ellipsis_width: f32 = ellipsis_shaped
             .glyphs
@@ -715,6 +732,7 @@ struct Fitter {
     text: Substr,
     font_family: Rc<FontFamily>,
     font_size_in_lpxs: f32,
+    letter_spacing: f32,
     lens: Vec<usize>,
     widths_in_lpxs: Vec<f32>,
 }
@@ -724,6 +742,7 @@ impl Fitter {
         text: Substr,
         font_family: Rc<FontFamily>,
         font_size_in_lpxs: f32,
+        letter_spacing: f32,
         segment_kind: SegmentKind,
     ) -> Self {
         let mut lens: Vec<_> = match segment_kind {
@@ -742,7 +761,8 @@ impl Fitter {
             .scan(0, |state, len| {
                 let start = *state;
                 let end = start + len;
-                let segment = font_family.get_or_shape(text.substr(start..end));
+                let segment = font_family.get_or_shape_with_spacing(
+                    text.substr(start..end), Ems(letter_spacing / font_size_in_lpxs));
                 let width_in_lpxs = segment.width_in_ems * font_size_in_lpxs;
                 *state = end;
                 Some(width_in_lpxs)
@@ -752,6 +772,7 @@ impl Fitter {
             text,
             font_family,
             font_size_in_lpxs,
+            letter_spacing,
             lens,
             widths_in_lpxs,
         }
@@ -781,7 +802,8 @@ impl Fitter {
         if let Some(mut best_count) = best_count {
             while best_count > 0 {
                 let best_len = self.lens[..best_count].iter().sum();
-                let best_text = self.font_family.get_or_shape(self.text.substr(0..best_len));
+                let best_text = self.font_family.get_or_shape_with_spacing(
+                    self.text.substr(0..best_len), Ems(self.letter_spacing / self.font_size_in_lpxs));
                 if best_text.width_in_ems * self.font_size_in_lpxs <= wrap_width_in_lpxs {
                     self.lens.drain(..best_count);
                     self.widths_in_lpxs.drain(..best_count);
@@ -1047,6 +1069,8 @@ impl PartialEq for Style {
 
 #[derive(Clone, Copy, Debug)]
 pub struct LayoutOptions {
+    /// Additional advance per shaped glyph, in logical pixels.
+    pub letter_spacing: f32,
     pub first_row_indent_in_lpxs: f32,
     /// Minimum distance in logical pixels from the first row's top edge to the
     /// second row's top edge. A continuation run's first row can share its
@@ -1071,6 +1095,7 @@ pub struct LayoutOptions {
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
+            letter_spacing: 0.0,
             first_row_indent_in_lpxs: 0.0,
             first_row_min_line_spacing_below_in_lpxs: 0.0,
             max_width_in_lpxs: None,
@@ -1091,6 +1116,7 @@ impl Hash for LayoutOptions {
         H: Hasher,
     {
         self.first_row_indent_in_lpxs.to_bits().hash(hasher);
+        self.letter_spacing.to_bits().hash(hasher);
         self.first_row_min_line_spacing_below_in_lpxs
             .to_bits()
             .hash(hasher);
@@ -1106,6 +1132,7 @@ impl Hash for LayoutOptions {
 impl PartialEq for LayoutOptions {
     fn eq(&self, other: &Self) -> bool {
         self.first_row_indent_in_lpxs.to_bits() == other.first_row_indent_in_lpxs.to_bits()
+            && self.letter_spacing.to_bits() == other.letter_spacing.to_bits()
             && self.first_row_min_line_spacing_below_in_lpxs.to_bits()
                 == other.first_row_min_line_spacing_below_in_lpxs.to_bits()
             && self.max_width_in_lpxs.map(f32::to_bits) == other.max_width_in_lpxs.map(f32::to_bits)
@@ -1420,6 +1447,56 @@ mod tests {
     };
     use std::rc::Rc;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn letter_spacing_changes_layout_cache_and_wrapping() {
+        use super::*;
+        use crate::makepad_platform::SharedBytes;
+        let mut layouter = Layouter::new(Settings::default());
+        let font_id = FontId::from(0x7A11_u64);
+        let family_id = FontFamilyId::from(0x7A11_u64);
+        layouter.define_font(font_id, FontDefinition {
+            data: SharedBytes::from_file_mmap_or_read(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../widgets/resources/IBMPlexSans-Text.ttf")).unwrap(),
+            index: 0, ascender_fudge_in_ems: 0.0, descender_fudge_in_ems: 0.0,
+            weight: None, variations: Vec::new(),
+        });
+        layouter.define_font_family(family_id, FontFamilyDefinition {
+            font_ids: vec![font_id], expected_member_count: 1,
+            diagnostics: FontDiagnostics::default(),
+        });
+        let params = BorrowedLayoutParams {
+            text: "CARD BALANCE",
+            style: Style {font_family_id: family_id, font_size_in_pts: 12.0, color: None},
+            options: LayoutOptions::default(),
+        };
+        let plain = layouter.get_or_layout(params);
+        let tracked_params = BorrowedLayoutParams {options: LayoutOptions {
+            letter_spacing: 2.0, ..params.options
+        }, ..params};
+        let tracked = layouter.get_or_layout(tracked_params);
+        assert!(!Rc::ptr_eq(&plain, &tracked));
+        assert!(Rc::ptr_eq(&tracked, &layouter.get_or_layout(tracked_params)));
+        assert!((tracked.size_in_lpxs.width - plain.size_in_lpxs.width - 24.0).abs() < 0.01);
+        let width = plain.size_in_lpxs.width + 1.0;
+        let wrapped = layouter.get_or_layout(BorrowedLayoutParams {
+            options: LayoutOptions {max_width_in_lpxs: Some(width), wrap: true, ..tracked_params.options},
+            ..params
+        });
+        assert_eq!(wrapped.rows.len(), 2);
+        assert!(wrapped.rows.iter().all(|r| r.width_in_lpxs <= width));
+
+        let word = layouter.get_or_layout(BorrowedLayoutParams {text: "CARD", ..params});
+        let width = word.size_in_lpxs.width + 0.1;
+        let centered = layouter.get_or_layout(BorrowedLayoutParams {
+            options: LayoutOptions {max_width_in_lpxs: Some(width), wrap: true,
+                align: 0.5, ..params.options}, ..params
+        });
+        assert_eq!(centered.rows[0].text.as_str(), "CARD ");
+        assert!((centered.rows[0].width_in_lpxs - word.size_in_lpxs.width).abs() < 0.01);
+        assert!((centered.rows[0].origin_in_lpxs.x - 0.05).abs() < 0.01);
+    }
 
     #[test]
     fn parses_text_atlas_size_from_env_value() {

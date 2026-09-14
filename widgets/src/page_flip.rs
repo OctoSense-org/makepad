@@ -22,6 +22,7 @@ pub struct PageFlip {
     layout: Layout,
     #[live(false)]
     lazy_init: bool,
+    #[imperative]
     #[live]
     #[apply_state]
     active_page: LiveId,

@@ -752,14 +752,13 @@ impl Cx {
     /// Requests a deferred `Event::LiveEdit` on the next event-loop iteration.
     /// The handler re-runs `script_mod` (re-evaluating any expressions that
     /// reference primitive heap values like `mod.widgets.SAFE_INSET_PAD_TOP`)
-    /// and then re-applies the widget tree with `Apply::Reload`.
+    /// and then re-applies the widget tree with `Apply::Rebake`, which
+    /// preserves imperative runtime state since the DSL itself is unchanged.
     ///
     /// Use this only when a primitive heap value has changed and that value
     /// is consumed by `script_mod!` block expressions — those expressions are
-    /// not re-evaluated by `Apply::ScriptReapply`. `Apply::Reload` walks
-    /// clobber runtime widget state (animator values, dynamic instance
-    /// buffers, user-typed text in widgets that don't early-return on
-    /// LiveEdit), so prefer `request_script_reapply` when the change can be
+    /// not re-evaluated by `Apply::ScriptReapply`. The re-run is still a full
+    /// tree walk, so prefer `request_script_reapply` when the change can be
     /// modeled as a shared-heap-object mutation instead.
     /// Re-evaluate application Splash with a new stylesheet, preserving text and
     /// other imperative state through `Apply::ScriptReapply`.
@@ -770,6 +769,14 @@ impl Cx {
 
     pub fn request_live_edit(&mut self) {
         self.pending_live_edit_request = true;
+    }
+
+    /// The `Apply` variant the currently dispatching `Event::LiveEdit` should
+    /// be re-applied with — `Reload` for a file-change hot reload, `Rebake`
+    /// for a `request_live_edit()` re-bake. `app_main!` reads this; app code
+    /// has no reason to.
+    pub fn live_edit_apply(&self) -> crate::makepad_script::Apply {
+        self.live_edit_apply.clone()
     }
 
     /// Remap an absolute coordinate from the OS-reported logical-point space
@@ -1163,7 +1170,7 @@ impl Cx {
     /// Metal, Vulkan and D3D use [0, 1] clip depth directly.
     pub fn clip_depth_scale_bias(&self) -> (f32, f32) {
         if cfg!(all(
-            not(headless),
+            not(gpusim),
             not(use_vulkan),
             any(
                 target_arch = "wasm32",
@@ -1804,10 +1811,10 @@ impl Cx {
     }
 
     /// What one texel of a BGRA8 render target costs on this backend: the
-    /// GPU backends allocate 4 bytes, the headless raster keeps float colour
+    /// GPU backends allocate 4 bytes, the gpusim raster keeps float colour
     /// (16 bytes). Caches that budget render targets charge this.
     pub fn render_target_bytes_per_texel(&self) -> usize {
-        if cfg!(headless) { 16 } else { 4 }
+        if cfg!(gpusim) { 16 } else { 4 }
     }
 
     /// What one texel of a `DepthD32` attachment costs (4 bytes everywhere).
@@ -1816,12 +1823,12 @@ impl Cx {
     }
 
     /// Whether a pass's depth attachment lives in its colour target's
-    /// storage: the headless raster keeps a depth plane per framebuffer, so
+    /// storage: the gpusim raster keeps a depth plane per framebuffer, so
     /// a retained render target painted with depth holds it for good; the
     /// GPU backends keep one `TextureSize::Auto` depth texture per handle,
     /// sized to the largest pass it served.
     pub fn depth_target_rides_with_render_target(&self) -> bool {
-        cfg!(headless)
+        cfg!(gpusim)
     }
 
     pub fn get_pass_name(&self, draw_pass_id: DrawPassId) -> &str {
@@ -2506,7 +2513,7 @@ fn can_play_type_impl(mime: &str) -> &'static str {
 
 #[cfg(all(
     any(target_os = "macos", target_os = "ios", target_os = "tvos"),
-    not(headless)
+    not(gpusim)
 ))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::apple::apple_video_playback::can_play_type(mime)
@@ -2514,7 +2521,7 @@ fn can_play_type_impl(mime: &str) -> &'static str {
 
 #[cfg(all(
     any(target_os = "macos", target_os = "ios", target_os = "tvos"),
-    headless
+    gpusim
 ))]
 fn can_play_type_impl(_mime: &str) -> &'static str {
     ""

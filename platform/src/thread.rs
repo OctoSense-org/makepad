@@ -75,16 +75,16 @@ pub fn lock_from_audio<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub(crate) fn wake_ui_event_loop() {
-    #[cfg(all(not(headless), target_os = "macos"))]
+    #[cfg(all(not(gpusim), target_os = "macos"))]
     crate::os::apple::macos::macos_app::wake_event_loop();
 
-    #[cfg(all(not(headless), target_arch = "wasm32"))]
+    #[cfg(all(not(gpusim), target_arch = "wasm32"))]
     unsafe {
         js_wake_ui();
     }
 
     #[cfg(any(
-        headless,
+        gpusim,
         target_os = "ios",
         target_os = "tvos",
         target_os = "windows",
@@ -94,7 +94,7 @@ pub(crate) fn wake_ui_event_loop() {
     crate::os::wake_ui_event_loop();
 }
 
-#[cfg(all(not(headless), target_arch = "wasm32"))]
+#[cfg(all(not(gpusim), target_arch = "wasm32"))]
 #[link(wasm_import_module = "env")]
 extern "C" {
     fn js_wake_ui();
@@ -717,7 +717,36 @@ fn detect_machine_topology(logical: usize) -> MachineTopology {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn detect_machine_topology(logical: usize) -> MachineTopology {
-    use std::{collections::BTreeMap, fs};
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        fs,
+    };
+    let cpu_list = |list: &str| -> BTreeSet<usize> {
+        list.trim()
+            .split(',')
+            .flat_map(|range| {
+                let mut bounds = range.split('-');
+                let first = bounds.next().and_then(|n| n.parse::<usize>().ok());
+                let last = bounds
+                    .next()
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .or(first);
+                first
+                    .zip(last)
+                    .into_iter()
+                    .flat_map(|(first, last)| first..=last)
+            })
+            .collect()
+    };
+    // Intel hybrid PMUs identify core classes directly. cpu_capacity can
+    // differ even within one class (e.g. a preferred boost core), so equality
+    // with the highest capacity must not reduce four P cores to one worker.
+    let performance_cpus = cpu_list(
+        &fs::read_to_string("/sys/bus/event_source/devices/cpu_core/cpus").unwrap_or_default(),
+    );
+    let efficiency_cpus = cpu_list(
+        &fs::read_to_string("/sys/bus/event_source/devices/cpu_atom/cpus").unwrap_or_default(),
+    );
     // Respect affinity/cpuset restrictions, and deduplicate SMT siblings.
     let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
     let allowed = status
@@ -725,24 +754,23 @@ fn detect_machine_topology(logical: usize) -> MachineTopology {
         .find_map(|line| line.strip_prefix("Cpus_allowed_list:"));
     let mut cores = BTreeMap::new();
     if let Some(allowed) = allowed {
-        for range in allowed.trim().split(',') {
-            let mut bounds = range.split('-');
-            let Some(first) = bounds.next().and_then(|n| n.parse::<usize>().ok()) else {
-                continue;
+        for cpu in cpu_list(allowed) {
+            let base = format!("/sys/devices/system/cpu/cpu{cpu}");
+            let siblings = fs::read_to_string(format!("{base}/topology/thread_siblings_list"));
+            let Ok(siblings) = siblings else { continue };
+            let capacity = fs::read_to_string(format!("{base}/cpu_capacity"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok());
+            let performance = if performance_cpus.contains(&cpu) {
+                Some(true)
+            } else if efficiency_cpus.contains(&cpu) {
+                Some(false)
+            } else {
+                None
             };
-            let last = bounds
-                .next()
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(first);
-            for cpu in first..=last {
-                let base = format!("/sys/devices/system/cpu/cpu{cpu}");
-                let siblings = fs::read_to_string(format!("{base}/topology/thread_siblings_list"));
-                let Ok(siblings) = siblings else { continue };
-                let capacity = fs::read_to_string(format!("{base}/cpu_capacity"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok());
-                cores.entry(siblings.trim().to_string()).or_insert(capacity);
-            }
+            cores
+                .entry(siblings.trim().to_string())
+                .or_insert((capacity, performance));
         }
     }
     if cores.is_empty() {
@@ -753,9 +781,25 @@ fn detect_machine_topology(logical: usize) -> MachineTopology {
         };
     }
     let physical = cores.len();
-    let performance = if cores.values().all(Option::is_some) {
-        let max = cores.values().filter_map(|c| *c).max();
-        cores.values().filter(|c| **c == max).count()
+    let pmu_classes = cores.values().all(|(_, class)| class.is_some());
+    let performance = if pmu_classes {
+        let count = cores
+            .values()
+            .filter(|(_, class)| *class == Some(true))
+            .count();
+        // An affinity mask containing only efficiency cores is homogeneous
+        // for this process; these are its fastest available cores.
+        if count == 0 {
+            physical
+        } else {
+            count
+        }
+    } else if cores.values().all(|(capacity, _)| capacity.is_some()) {
+        let max = cores.values().filter_map(|(capacity, _)| *capacity).max();
+        cores
+            .values()
+            .filter(|(capacity, _)| *capacity == max)
+            .count()
     } else {
         physical
     };
@@ -764,7 +808,11 @@ fn detect_machine_topology(logical: usize) -> MachineTopology {
         physical,
         performance,
         efficiency: physical - performance,
-        source: "sysfs-affinity-physical",
+        source: if pmu_classes {
+            "sysfs-pmu-affinity-physical"
+        } else {
+            "sysfs-affinity-physical"
+        },
     }
     .limited_to(logical)
 }
