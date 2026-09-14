@@ -32,6 +32,11 @@ ttf-parser = { path = "../libs/ttf-parser" }
 
 serde = { version = "1.0", optional = true, features = ["derive"] }
 
+# AppCard widget additions (feature `appcard`): the L0 unit tables come from
+# Octoscript-Makepad's node crate; serde_json is only read by those widgets.
+serde_json = { version = "1.0", optional = true }
+octoscript-node = { git = "https://github.com/OctoSense-org/Octoscript-Makepad.git", rev = "78f90f6e9e5e3b9fe4b5f5b0618fa4e93db30860", optional = true }
+
 [features]
 default = []
 
@@ -39,6 +44,9 @@ voice = ["dep:makepad-ai-speech", "dep:makepad-ai-hub"]
 maps = ["dep:makepad-mbtile-reader", "dep:makepad-fast-inflate", "dep:i_overlay"]
 pdf = ["dep:makepad-pdf-parse"]
 cef = ["dep:makepad-cef"]
+## The Octoscript-AppCard widget set (kit components, weather/finance
+## widgets, matplot, L0 helpers). Off by default so other apps are unaffected.
+appcard = ["dep:octoscript-node", "dep:serde_json"]
 
 ## Enables certain public-facing types to derive serde serialization traits.
 serde = ["dep:serde", "makepad-draw/serde", "makepad-derive-widget/serde"]
