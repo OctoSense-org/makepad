@@ -67,7 +67,19 @@ script_mod! {
             self.v_param5 = self.geom.param5;
             // Transform gradient geometry params by svg_scale/svg_offset and custom hook
             let grad_type = g_p0s.x;
-            if grad_type > 0.5 && grad_type < 1.5 {
+            if self.geom.stroke_mult < -0.5 && self.geom.stroke_mult > -1.5 {
+                // Analytic rectangle shadows store center/half-size/radius/
+                // sigma in these slots (cx, cy, hx, hy, corner, blur), rather
+                // than gradient parameters; scale them like the geometry.
+                let center = self.transform_svg_point(vec2(g_p0s.x, g_p12.x) * self.svg_scale + self.svg_offset) + self.rect_pos;
+                let scale = abs(self.svg_scale);
+                self.v_param0 = center.x;
+                self.v_param1 = center.y;
+                self.v_param2 = g_p12.y * scale.x;
+                self.v_param3 = g_p3c.x * scale.y;
+                self.v_param4 = self.geom.param4 * max(scale.x, scale.y);
+                self.v_param5 = self.geom.param5 * max(scale.x, scale.y);
+            } else if grad_type > 0.5 && grad_type < 1.5 {
                 // Linear gradient: p1,p2 = start point, p3,p4 = end point
                 let p0 = self.transform_svg_point(g_p12 * self.svg_scale + self.svg_offset) + self.rect_pos;
                 let p1 = self.transform_svg_point(vec2(g_p3c.x, self.geom.param4) * self.svg_scale + self.svg_offset) + self.rect_pos;
@@ -173,6 +185,9 @@ pub struct DrawSvg {
     pub has_animations: bool,
     #[live(true)]
     pub preserve_aspect: bool,
+    /// Keep source canvas padding instead of fitting to visible geometry.
+    #[live(false)]
+    pub preserve_viewbox: bool,
     #[live(1.0)]
     pub scale: f64,
     #[deref]
@@ -453,6 +468,11 @@ impl DrawSvg {
     pub fn set_doc_bounds(&mut self, doc: &SvgDocument) {
         // Compute the viewbox transform at 1:1 logical size
         let (lw, lh) = doc.logical_size();
+        if self.preserve_viewbox {
+            self.content_bounds = (0.0, 0.0, lw, lh);
+            self.content_size = dvec2(lw as f64, lh as f64);
+            return;
+        }
         let base_xf = if let Some(ref vb) = doc.viewbox {
             let (sx, sy, tx, ty) = viewbox_transform(vb, lw, lh);
             Transform2d {

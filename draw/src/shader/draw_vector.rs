@@ -831,37 +831,7 @@ impl DrawVector {
 /// Sample multi-stop gradient at parameter t (0..1). Returns (r, g, b, a).
 /// Stops must be sorted by offset. Colors in stops are premultiplied RGBA.
 fn sample_gradient_stops(stops: &[GradientStop], t: f32) -> (f32, f32, f32, f32) {
-    if stops.is_empty() {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-    if stops.len() == 1 || t <= stops[0].offset {
-        let c = &stops[0].color;
-        return (c[0], c[1], c[2], c[3]);
-    }
-    let last = stops.len() - 1;
-    if t >= stops[last].offset {
-        let c = &stops[last].color;
-        return (c[0], c[1], c[2], c[3]);
-    }
-    // Find the segment
-    for i in 1..stops.len() {
-        if t <= stops[i].offset {
-            let range = stops[i].offset - stops[i - 1].offset;
-            let seg_t = if range > 1e-6 {
-                (t - stops[i - 1].offset) / range
-            } else {
-                0.0
-            };
-            let a = &stops[i - 1].color;
-            let b = &stops[i].color;
-            return (
-                a[0] + (b[0] - a[0]) * seg_t,
-                a[1] + (b[1] - a[1]) * seg_t,
-                a[2] + (b[2] - a[2]) * seg_t,
-                a[3] + (b[3] - a[3]) * seg_t,
-            );
-        }
-    }
-    let c = &stops[last].color;
-    (c[0], c[1], c[2], c[3])
+    if stops.is_empty() { return (0.0,0.0,0.0,0.0); }
+    let c=makepad_svg::paint::sample_stops(stops,t);
+    (c[0],c[1],c[2],c[3])
 }

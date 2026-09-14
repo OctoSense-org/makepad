@@ -564,9 +564,12 @@ fn build_hap(
         &[
             hvigorw_path.to_str().unwrap(),
             "assembleHap",
-            "--mode module",
-            "-p product=default",
-            "-p buildMode=release",
+            "--mode",
+            "module",
+            "-p",
+            "product=default",
+            "-p",
+            "buildMode=release",
             "--no-daemon",
         ],
     )?;
