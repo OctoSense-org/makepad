@@ -22,6 +22,12 @@ use crate::makepad_draw::*;
 use super::geometry::{lon_lat_to_normalized, sample_polyline_point_at_distance};
 use super::{decode_polyline5, haversine_m};
 
+/// Seconds since this process started: the sim clock the demo vehicle and the
+/// follow-camera glide run on. The AppCard module's `sys.simsecs` reads the
+/// same clock so DSL banners stay in lockstep. One definition: it lives in
+/// `splash.rs` (compiled with or without `maps`) and is re-exported here.
+pub(crate) use crate::splash::sim_clock_secs;
+
 /// Seconds without a touch after which a user-adjusted follow camera glides
 /// back onto the vehicle.
 pub(super) const NAV_RECENTER_IDLE_SECS: f64 = 4.0;

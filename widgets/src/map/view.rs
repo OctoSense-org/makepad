@@ -5376,7 +5376,7 @@ impl Widget for MapView {
                 let base = self.nav.zoom_anim.unwrap_or(self.zoom);
                 self.nav.zoom_anim = Some((base + delta).clamp(zmin, zmax));
                 self.nav.user_adjusted = true;
-                self.nav.last_touch = crate::splash::sim_clock_secs();
+                self.nav.last_touch = sim_clock_secs();
                 vm.with_cx_mut(|cx| self.redraw(cx));
             }
             return ScriptAsyncResult::Return(NIL);
@@ -5390,7 +5390,7 @@ impl Widget for MapView {
                 self.nav.zoom_anim = Some(16.0_f64.clamp(zmin, zmax));
                 self.nav.pan_anim = Some(dvec2(o.x - self.nav.car.x, o.y - self.nav.car.y));
                 self.nav.user_adjusted = true;
-                self.nav.last_touch = crate::splash::sim_clock_secs();
+                self.nav.last_touch = sim_clock_secs();
                 vm.with_cx_mut(|cx| self.redraw(cx));
             }
             return ScriptAsyncResult::Return(NIL);
@@ -13537,7 +13537,7 @@ impl MapView {
         if self.nav.home_zoom <= 0.0 {
             self.nav.home_zoom = self.zoom;
         }
-        let now = crate::splash::sim_clock_secs();
+        let now = sim_clock_secs();
         let gliding = self.nav.tick_glide(&mut self.zoom);
         if is_plan(&mode) {
             self.nav_plan_camera(rect);
