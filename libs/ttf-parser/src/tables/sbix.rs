@@ -236,6 +236,57 @@ impl<'a> Table<'a> {
 
         self.strikes.get(idx)
     }
+
+    /// Selects a matching bitmap that actually contains the requested glyph.
+    /// Sparse strikes are valid: a glyph absent at one size can exist at others.
+    pub fn best_glyph_image(&self, glyph_id: GlyphId, pixels_per_em: u16) -> Option<RasterGlyphImage<'a>> {
+        if let Some(image) = self.best_strike(pixels_per_em).and_then(|strike| strike.get(glyph_id)) {
+            return Some(image);
+        }
+        let mut best: Option<RasterGlyphImage<'a>> = None;
+        for strike in self.strikes {
+            if let Some(image) = strike.get(glyph_id) {
+                let size = image.pixels_per_em;
+                let replace = best.as_ref().map_or(true, |old| {
+                    (pixels_per_em <= size && (old.pixels_per_em < pixels_per_em || size < old.pixels_per_em))
+                        || (size < pixels_per_em && old.pixels_per_em < size)
+                });
+                if replace {best = Some(image);}
+            }
+        }
+        best
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_bitmap_uses_an_available_strike() {
+        // Three bitmap sizes; the middle strike deliberately omits glyph 0.
+        let mut data = std::vec::Vec::from([0,1,0,0,0,0,0,3]);
+        data.resize(20,0);
+        for (index,(ppem,present)) in [(20u16,true),(40,false),(80,true)].iter().enumerate() {
+            let offset=data.len() as u32;
+            data[8+index*4..12+index*4].copy_from_slice(&offset.to_be_bytes());
+            data.extend_from_slice(&ppem.to_be_bytes());data.extend_from_slice(&72u16.to_be_bytes());
+            data.extend_from_slice(&12u32.to_be_bytes());
+            data.extend_from_slice(&(if *present {44u32} else {12u32}).to_be_bytes());
+            if *present {
+                data.extend_from_slice(&[0,0,0,0,b'p',b'n',b'g',b' ']);
+                data.extend_from_slice(&[0;16]);
+                data.extend_from_slice(&u32::from(*ppem).to_be_bytes());
+                data.extend_from_slice(&u32::from(*ppem).to_be_bytes());
+            }
+        }
+        let table=Table::parse(NonZeroU16::new(1).unwrap(),&data).unwrap();
+        assert!(table.best_strike(35).unwrap().get(GlyphId(0)).is_none());
+        for (requested,expected) in [(10,20),(20,20),(35,80),(40,80),(90,80)] {
+            assert_eq!(table.best_glyph_image(GlyphId(0),requested).unwrap().pixels_per_em,expected);
+        }
+        assert!(table.best_glyph_image(GlyphId(1),35).is_none());
+    }
 }
 
 // The `sbix` table doesn't store the image size, so we have to parse it manually.

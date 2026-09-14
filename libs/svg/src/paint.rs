@@ -6,6 +6,9 @@
 pub struct GradientStop {
     pub offset: f32,     // 0.0 .. 1.0
     pub color: [f32; 4], // RGBA premultiplied
+    /// SVG interpolates straight RGB separately from opacity. Keep RGB even
+    /// for fully transparent stops; other vector callers retain premultiplied interpolation.
+    pub straight_rgb: Option<[f32; 3]>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +114,7 @@ impl GradientStop {
         Self {
             offset,
             color: [r * a, g * a, b * a, a],
+            straight_rgb: None,
         }
     }
 
@@ -122,7 +126,7 @@ impl GradientStop {
     }
 }
 
-fn sample_stops(stops: &[GradientStop], t: f32) -> [f32; 4] {
+pub fn sample_stops(stops: &[GradientStop], t: f32) -> [f32; 4] {
     if stops.is_empty() {
         return [1.0, 1.0, 1.0, 1.0];
     }
@@ -142,6 +146,12 @@ fn sample_stops(stops: &[GradientStop], t: f32) -> [f32; 4] {
             } else {
                 0.0
             };
+            if let (Some(c0),Some(c1))=(s0.straight_rgb,s1.straight_rgb) {
+                let alpha=s0.color[3]+(s1.color[3]-s0.color[3])*f;
+                return [(c0[0]+(c1[0]-c0[0])*f)*alpha,
+                        (c0[1]+(c1[1]-c0[1])*f)*alpha,
+                        (c0[2]+(c1[2]-c0[2])*f)*alpha,alpha];
+            }
             return [
                 s0.color[0] + (s1.color[0] - s0.color[0]) * f,
                 s0.color[1] + (s1.color[1] - s0.color[1]) * f,

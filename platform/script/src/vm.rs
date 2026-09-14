@@ -765,6 +765,7 @@ impl<'a> ScriptVm<'a> {
         loop {
             let err = self.bx.threads.cur().trap.err_pop_front();
             if let Some(err) = err {
+                self.bx.uncaught_error_count = self.bx.uncaught_error_count.saturating_add(1);
                 if self.bx.captured_errors.is_some() {
                     let formatted = self.format_error(&err);
                     if let Some(sink) = self.bx.captured_errors.as_mut() {
@@ -1524,6 +1525,17 @@ impl<'a> ScriptVm<'a> {
         i as u16
     }
 
+    /// Evaluate a complete document with bounded bytecode execution. Reject a
+    /// recovered runtime failure even if a later expression produces a value.
+    /// Native calls and parsing are outside the instruction budget.
+    pub fn eval_checked(&mut self, script_mod: ScriptMod, limit: usize) -> Option<ScriptValue> {
+        let errors = self.bx.uncaught_error_count;
+        let value = self.with_instruction_limit(limit, |vm| vm.eval(script_mod));
+        self.drain_errors();
+        (!value.is_nil() && !value.is_err() && self.bx.uncaught_error_count == errors)
+            .then_some(value)
+    }
+
     pub fn eval(&mut self, script_mod: ScriptMod) -> ScriptValue {
         self.eval_with_source(script_mod, ScriptObject::ZERO)
     }
@@ -1737,6 +1749,8 @@ pub struct ScriptVmBase {
     /// eval/call, take after, to feed diagnostics back to a host (e.g. an AI
     /// agent editing the script live).
     pub captured_errors: Option<Vec<String>>,
+    /// Uncaught errors, including those suppressed from logs.
+    pub uncaught_error_count: usize,
     pub run_budget: Option<ScriptRunBudget>,
     /// Instructions charged by the most recent with_instruction_limit call
     /// (see ScriptVm::last_limit_consumed).
@@ -1759,6 +1773,7 @@ impl ScriptVmBase {
             silence_errors: false,
             allow_debug_output: true,
             captured_errors: None,
+            uncaught_error_count: 0,
             run_budget: None,
             last_limit_consumed: 0,
             last_limit_exit_remaining: 0,
@@ -1795,6 +1810,7 @@ impl ScriptVmBase {
             silence_errors: false,
             allow_debug_output: true,
             captured_errors: None,
+            uncaught_error_count: 0,
             run_budget: None,
             last_limit_consumed: 0,
             last_limit_exit_remaining: 0,

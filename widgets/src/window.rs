@@ -1008,6 +1008,7 @@ impl Window {
             self.overlay
                 .begin_for_pass(cx, self.ssaa_stack.scene_pass.draw_pass_id());
         } else {
+            self.gauss_stack.clear_inactive_scene(cx);
             self.overlay.begin(cx);
         }
 
@@ -1088,7 +1089,9 @@ impl Window {
         }
         let window_id = self.window.handle.window_id();
         if finish_window_gauss_frame(cx, window_id) {
-            cx.repaint_pass_and_child_passes(self.pass.handle.draw_pass_id());
+            // Switching capture mode needs new scene commands, not a repaint
+            // of the last frame's commands.
+            self.main_draw_list.redraw(cx);
         }
 
         // lets get te pass size

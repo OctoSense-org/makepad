@@ -125,7 +125,7 @@ impl std::ops::Index<GeometryId> for CxGeometryPool {
         let d = &self.0.pool[index.0];
         if d.generation != index.1 {
             error!(
-                "Drawlist id generation wrong {} {} {}",
+                "Geometry id generation wrong {} {} {}",
                 index.0, d.generation, index.1
             )
         }
@@ -138,7 +138,7 @@ impl std::ops::IndexMut<GeometryId> for CxGeometryPool {
         let d = &mut self.0.pool[index.0];
         if d.generation != index.1 {
             error!(
-                "Drawlist id generation wrong {} {} {}",
+                "Geometry id generation wrong {} {} {}",
                 index.0, d.generation, index.1
             )
         }

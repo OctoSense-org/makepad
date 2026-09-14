@@ -6,9 +6,10 @@ pub enum Winding {
     CW,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FillRule {
     NonZero,
+    #[default]
     EvenOdd,
 }
 
@@ -38,6 +39,8 @@ pub enum PathCmd {
 #[derive(Default, Clone, Debug)]
 pub struct VectorPath {
     pub cmds: Vec<PathCmd>,
+    /// Explicit SVG fill rule; None preserves the vector API's winding policy.
+    pub fill_rule: Option<FillRule>,
 }
 
 impl VectorPath {
@@ -46,6 +49,7 @@ impl VectorPath {
     }
     pub fn clear(&mut self) {
         self.cmds.clear();
+        self.fill_rule = None;
     }
 
     pub fn move_to(&mut self, x: f32, y: f32) {
