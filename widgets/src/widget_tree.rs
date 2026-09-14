@@ -185,6 +185,12 @@ struct GraphNode {
     /// `Cx::nesting_depth` at this widget's last draw while the exploded view
     /// was up — the plane it renders on. 0 = never stamped.
     nesting_depth: u32,
+    /// Inserted via `insert_child`/`insert_child_deep` but not (yet) reported
+    /// by the parent's `children()`. A refresh keeps such a child linked
+    /// instead of unlinking and eventually removing its whole subtree, since
+    /// hosts like Dock-style containers own these children outside the
+    /// widget's child vec. Cleared the moment the parent reports it.
+    manual: bool,
 }
 
 #[derive(Clone)]
@@ -555,6 +561,7 @@ impl WidgetTree {
                         parent,
                         children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                     },
                 );
                 node_is_new = true;
@@ -677,6 +684,7 @@ impl WidgetTree {
                     parent: None,
                     children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                 },
             );
             if inner.root_uid == WidgetUid(0) {
@@ -695,6 +703,7 @@ impl WidgetTree {
         match inner.graph.get_mut(&child_uid) {
             Some(node) => {
                 old_parent = node.parent;
+                node.manual = true;
                 if node.name != name {
                     node.name = name;
                     name_changed = true;
@@ -724,6 +733,7 @@ impl WidgetTree {
                         parent: Some(parent_uid),
                         children: Vec::new(),
                         nesting_depth: 0,
+                        manual: true,
                     },
                 );
                 child_is_new = true;
@@ -922,6 +932,7 @@ impl WidgetTree {
                 parent: None,
                 children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
             },
         );
         if inner.root_uid == WidgetUid(0) {
@@ -985,6 +996,7 @@ impl WidgetTree {
                         parent: None,
                         children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                     },
                 );
                 node_is_new = true;
@@ -1069,6 +1081,7 @@ impl WidgetTree {
                     parent: None,
                     children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                 },
             );
             if inner.root_uid == WidgetUid(0) {
@@ -1651,6 +1664,9 @@ impl WidgetTree {
             match inner.graph.get_mut(&child_uid) {
                 Some(child_node) => {
                     old_parent = child_node.parent;
+                    // The parent reports this child now, so it no longer needs
+                    // manual-insert protection.
+                    child_node.manual = false;
                     if child_node.name != child_name {
                         child_node.name = child_name;
                         child_name_changed = true;
@@ -1689,6 +1705,7 @@ impl WidgetTree {
                             parent: Some(uid),
                             children: Vec::new(),
                     nesting_depth: 0,
+                    manual: false,
                         },
                     );
                     child_is_new = true;
@@ -1746,6 +1763,23 @@ impl WidgetTree {
             if child_is_new || child_widget_changed {
                 inner.dirty.insert(child_uid);
                 pending.push(child_uid);
+            }
+        }
+
+        // A child inserted via insert_child_deep is owned outside the parent's
+        // child vec, so children() never reports it. Losing it here unlinked
+        // its whole subtree from every downward search (and the removal pass
+        // below then deleted it), which silently killed name lookups inside
+        // dynamically hosted subtrees. Keep the live ones linked.
+        for old_uid in old_children.iter().copied() {
+            if new_children.iter().any(|entry| *entry == old_uid) {
+                continue;
+            }
+            let keep = inner.graph.get(&old_uid).map_or(false, |node| {
+                node.manual && node.parent == Some(uid) && node.widget.upgrade().is_some()
+            });
+            if keep {
+                new_children.push(old_uid);
             }
         }
 
@@ -2329,7 +2363,9 @@ impl WidgetTree {
                     let y = rect.pos.y.round() as i64;
                     let w = rect.size.x.round() as i64;
                     let h = rect.size.y.round() as i64;
-                    if w > 0 && h > 0 && matches_query(mode, needle, &id_token, &ty_token) {
+                    // Preserve thin, positive-sized widgets even when the integer
+                    // coordinate format rounds them to zero.
+                    if rect.size.x > 0.0 && rect.size.y > 0.0 && matches_query(mode, needle, &id_token, &ty_token) {
                         rects.push(format!(
                             "{} {} {} {} {} {} {}",
                             dump_index, id_token, ty_token, x, y, w, h
@@ -2499,16 +2535,28 @@ impl WidgetTree {
                 .map(|check_box| check_box.active(cx));
             let radio_active = widget
                 .borrow::<RadioButton>()
-                .map(|radio_button| radio_button.active(cx));
+                .map(|radio_button| radio_button.active(cx))
+                .or_else(|| widget.checked(cx));
             let dropdown_selected = widget
                 .borrow::<DropDown>()
                 .map(|drop_down| drop_down.selected_item_label());
+            let view_selected = widget
+                .borrow::<crate::view::View>()
+                .and_then(|view| view.selected)
+                .map(|selected| selected.to_string())
+                .or_else(|| widget.selected_value(cx));
             let is_text_input = widget.borrow::<TextInput>().is_some();
 
             let mut text = None;
             let mut value = None;
+            if widget.borrow::<crate::slider::Slider>().is_some() {
+                value=Some(widget.text());
+            }
             if is_text_input {
                 value = Some(widget.text());
+                if let Some(input) = widget.borrow::<TextInput>() {
+                    text = Some(input.display_text());
+                }
             } else {
                 let widget_text = widget.text();
                 if is_button
@@ -2564,7 +2612,7 @@ impl WidgetTree {
                     text,
                     value,
                     checked: check_box_active.or(radio_active),
-                    selected: None,
+                    selected: view_selected,
                 });
             }
 
@@ -2790,7 +2838,9 @@ impl WidgetTree {
                 let y = rect.pos.y.round() as i64;
                 let w = rect.size.x.round() as i64;
                 let h = rect.size.y.round() as i64;
-                if w > 0 && h > 0 {
+                // Preserve thin, positive-sized widgets in the hierarchy even
+                // when the compact integer coordinate format rounds to zero.
+                if rect.size.x > 0.0 && rect.size.y > 0.0 {
                     let id_token = live_id_token(id);
                     let ty_token = live_id_token(ty);
                     dump_nodes.push(DumpNode {

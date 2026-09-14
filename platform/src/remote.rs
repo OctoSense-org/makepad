@@ -55,11 +55,14 @@ mod imp {
 
     static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-    /// True when this process was started with `--remote` (any form). Pure
-    /// argv scan, usable before the bridge itself is up — the platform's
-    /// focus policy reads it while the first window is being created.
+    /// True when this process asked for the remote bridge, in any of the forms
+    /// [`requested_bind`] accepts — including `MAKEPAD_REMOTE`, which a plain
+    /// argv scan used to miss, so `MAKEPAD_REMOTE=1` started the bridge while
+    /// everything keyed off this said no. Pure argv + env, usable before the
+    /// bridge itself is up: the platform's focus policy reads it while the
+    /// first window is being created.
     pub fn requested() -> bool {
-        std::env::args().any(|a| a == "--remote" || a.starts_with("--remote="))
+        requested_bind().is_some()
     }
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     static LIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
@@ -610,9 +613,14 @@ mod imp {
     /// "the user dismissed this" apart from "the app crashed", and remember it
     /// so requests aimed at that window get the real reason.
     pub fn note_user_closed_window(window_id: usize, title: &str) {
+        // Only chatter when the bridge is actually up: this line is for the
+        // agent driving the app, and a shipped app should not print
+        // `[makepad-remote] ...` to stdout every time a window closes.
         let line = format!("[makepad-remote] user closed window {window_id} ({title:?})");
-        println!("{line}");
-        let _ = std::io::stdout().flush();
+        if is_active() {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
         push_log_line(line);
         if let Ok(mut closed) = closed_windows().lock() {
             if !closed.iter().any(|(id, _)| *id == window_id) {
@@ -625,8 +633,10 @@ mod imp {
     /// away. Not a crash.
     pub fn note_user_closed_last_window() {
         let line = "[makepad-remote] app exit: user closed the last window".to_string();
-        println!("{line}");
-        let _ = std::io::stdout().flush();
+        if is_active() {
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
         push_log_line(line);
     }
 
@@ -735,7 +745,7 @@ mod imp {
     /// Metal calls this as soon as the presenting buffer's pixels are ready,
     /// before any PNG work. Return non-remote ids for probes/Studio/recording.
     #[cfg(all(
-        not(headless),
+        not(gpusim),
         any(target_os = "macos", target_os = "ios", target_os = "tvos")
     ))]
     pub(crate) fn deliver_grab_pixels(
@@ -884,7 +894,7 @@ mod imp {
                     .and_then(|pass| cx.passes[pass].color_textures.first())
                     .map(|color| color.texture.clone());
                 #[cfg(all(
-                    not(headless),
+                    not(gpusim),
                     any(target_os = "macos", target_os = "ios", target_os = "tvos")
                 ))]
                 let texture = if cx.in_makepad_studio { texture } else { None };
@@ -941,9 +951,9 @@ mod imp {
     /// `Cx::poll_control_channel`, i.e. from the event loop of every backend.
     pub(crate) fn poll(cx: &mut Cx) {
         // The native Mac event callback supplies its renderer so it can seal
-        // a grab BEFORE the next command. Hosted/headless backends retain
+        // a grab BEFORE the next command. Hosted/gpusim backends retain
         // their ordinary next-render readback path.
-        #[cfg(all(target_os = "macos", not(headless)))]
+        #[cfg(all(target_os = "macos", not(gpusim)))]
         if !cx.in_makepad_studio {
             return;
         }
@@ -952,12 +962,12 @@ mod imp {
 
     /// Returns whether a present is still waiting on its window's drawable
     /// (the caller schedules the next beat to poll it again).
-    #[cfg(all(target_os = "macos", not(headless)))]
+    #[cfg(all(target_os = "macos", not(gpusim)))]
     pub(crate) fn poll_macos(cx: &mut Cx, present: impl FnMut(&mut Cx, WindowId) -> Option<bool>) -> bool {
         poll_with_present(cx, present)
     }
 
-    #[cfg(all(target_os = "macos", not(headless)))]
+    #[cfg(all(target_os = "macos", not(gpusim)))]
     pub(crate) fn next_grab_deadline() -> Option<Instant> {
         CAPTURES.with_borrow(|captures| {
             captures
@@ -1243,37 +1253,47 @@ mod imp {
                             dy,
                             mods,
                             hw: _,
-                        } => match kind {
-                            MouseKind::Move => StudioToApp::MouseMove(RemoteMouseMove {
-                                time,
-                                x,
-                                y,
-                                modifiers: mods,
-                            }),
-                            MouseKind::Down => StudioToApp::MouseDown(RemoteMouseDown {
-                                time,
-                                x,
-                                y,
-                                button_raw_bits: 1 << button,
-                                modifiers: mods,
-                            }),
-                            MouseKind::Up => StudioToApp::MouseUp(RemoteMouseUp {
-                                time,
-                                x,
-                                y,
-                                button_raw_bits: 1 << button,
-                                modifiers: mods,
-                            }),
-                            MouseKind::Scroll => StudioToApp::Scroll(RemoteScroll {
-                                time,
-                                x,
-                                y,
-                                sx: dx,
-                                sy: dy,
-                                is_mouse: true,
-                                modifiers: mods,
-                            }),
-                        },
+                        } => {
+                            // Remote /click and /m are window-local layout points.
+                            // dispatch_studio_msg calls stdin_pointer_abs ->
+                            // dpi_override_scale and remaps native OS points into
+                            // layout. Convert first so that remap restores the
+                            // requested layout coordinate (saved scale 2.0 over
+                            // native 1.3 would otherwise send x1193 to x775.45).
+                            let native = cx.windows[window_id]
+                                .layout_vec2d_to_native_points(dvec2(x, y));
+                            match kind {
+                                MouseKind::Move => StudioToApp::MouseMove(RemoteMouseMove {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    modifiers: mods,
+                                }),
+                                MouseKind::Down => StudioToApp::MouseDown(RemoteMouseDown {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    button_raw_bits: 1 << button,
+                                    modifiers: mods,
+                                }),
+                                MouseKind::Up => StudioToApp::MouseUp(RemoteMouseUp {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    button_raw_bits: 1 << button,
+                                    modifiers: mods,
+                                }),
+                                MouseKind::Scroll => StudioToApp::Scroll(RemoteScroll {
+                                    time,
+                                    x: native.x,
+                                    y: native.y,
+                                    sx: dx,
+                                    sy: dy,
+                                    is_mouse: true,
+                                    modifiers: mods,
+                                }),
+                            }
+                        }
                         Input::Key { down, code, mods } => {
                             let event = KeyEvent {
                                 key_code: code,
@@ -2270,14 +2290,14 @@ mod imp {
     }
 
     // The recorder exercises the same /log serialization without binding a
-    // socket or starting an app. Only this headless process's ring is enabled.
-    #[cfg(headless)]
-    pub fn headless_start_log_capture() {
+    // socket or starting an app. Only this gpusim process's ring is enabled.
+    #[cfg(gpusim)]
+    pub fn gpusim_start_log_capture() {
         ACTIVE.store(true, Ordering::Relaxed);
     }
 
-    #[cfg(headless)]
-    pub fn headless_log_snapshot() -> String {
+    #[cfg(gpusim)]
+    pub fn gpusim_log_snapshot() -> String {
         log_json(&Params(vec![("since".into(), "0".into())]), "")
     }
 
@@ -2677,9 +2697,9 @@ mod imp {
     fn wake_commands() {
         // SignalToUI coalesces wakes until timer 0 clears its flag. A remote
         // capture must also wake between those ticks (including 200 ms idle).
-        #[cfg(all(target_os = "macos", not(headless)))]
+        #[cfg(all(target_os = "macos", not(gpusim)))]
         crate::os::apple::macos::macos_app::wake_event_loop();
-        #[cfg(not(all(target_os = "macos", not(headless))))]
+        #[cfg(not(all(target_os = "macos", not(gpusim))))]
         crate::thread::SignalToUI::set_ui_signal();
     }
 
@@ -3183,6 +3203,10 @@ mod imp {
     use crate::cx::Cx;
 
     pub fn start_if_requested() {}
+    /// There is no remote bridge on these targets, so nothing ever asked for one.
+    pub fn requested() -> bool {
+        false
+    }
     pub fn is_active() -> bool {
         false
     }

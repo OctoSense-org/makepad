@@ -64,6 +64,7 @@ pub mod ai_slot;
 #[cfg(feature = "voice")]
 pub mod voice_wave;
 pub mod window;
+pub mod cursor;
 pub mod window_menu;
 #[cfg(feature = "voice")]
 mod window_voice_input;
@@ -244,8 +245,9 @@ pub use crate::{
         WidgetSet, WidgetSetIterator, WidgetUid,
     },
     widget_async::{
-        enter_isolate, leave_isolate, set_widget_async_trace, CxSplashVmExt, CxWidgetToScriptCallExt,
-        IsolateEntry, ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult, SplashVmId, MAIN_SPLASH_VM_ID,
+        enter_isolate, leave_isolate, set_splash_theme, set_widget_async_trace, CxSplashVmExt,
+        CxWidgetToScriptCallExt, IsolateEntry, ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult,
+        SplashTheme, SplashVmId, MAIN_SPLASH_VM_ID,
     },
     widget_match_event::WidgetMatchEvent,
     widget_tree::{set_ui_root, CxWidgetExt},
@@ -393,6 +395,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     // The AI slot before the window: its DSL names `AiChatSlot`.
     crate::ai_slot::script_mod(vm);
     crate::app_icon::script_mod(vm);
+    crate::cursor::script_mod(vm);
     crate::window::script_mod(vm);
 
     crate::popup_menu::script_mod(vm);

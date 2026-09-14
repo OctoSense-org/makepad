@@ -1,4 +1,5 @@
 use crate::cursor::MouseCursor;
+use crate::gpu::{AppToHostGpu, HostToAppGpu};
 use crate::hub_protocol::FrameCodec;
 use crate::keyboard::{KeyEvent, TextInputEvent};
 use crate::mouse::KeyModifiers;
@@ -284,6 +285,11 @@ pub enum AppToStudio {
     DrawCompleteAndFlip(PresentableDraw),
     /// Application-defined response to a `StudioToApp::Custom` event.
     Custom(String),
+    Gpu(AppToHostGpu),
+    /// The child consumed one `StudioToApp::Tick` (timers, draw, repaint).
+    /// The host paces its next Tick on this, so a slow child never has
+    /// more than one frame's worth of ticks and pointer moves queued.
+    TickDone,
 }
 
 #[derive(SerBin, DeBin, SerJson, DeJson, Debug, Clone)]
@@ -437,10 +443,38 @@ pub enum StudioToApp {
     #[default]
     None,
     Kill,
+    Gpu(HostToAppGpu),
 }
 
 #[derive(SerBin, DeBin, SerJson, DeJson)]
 pub struct StudioToAppVec(pub Vec<StudioToApp>);
+
+#[cfg(test)]
+mod pointer_wire_tests {
+    use super::*;
+
+    #[test]
+    fn lab_pointer_packets_decode_as_native_studio_events() {
+        let down = [10,0,1,0,0,0,0,0,0,0,0,0,244,63,0,0,0,0,0,0,4,64,0,0,0,0,0,0,8,64,0,0,0,0];
+        let movement = [12,0,0,0,0,0,0,0,8,64,0,0,0,0,0,0,244,63,0,0,0,0,0,0,4,64,0,0,0,0];
+        let up = [11,0,0,0,0,0,0,0,8,64,1,0,0,0,0,0,0,0,0,0,244,63,0,0,0,0,0,0,4,64,0,0,0,0];
+        let StudioToApp::MouseDown(d)=StudioToApp::deserialize_bin(&down).unwrap() else {panic!("wrong mouse-down variant")};
+        let StudioToApp::MouseMove(m)=StudioToApp::deserialize_bin(&movement).unwrap() else {panic!("wrong mouse-move variant")};
+        let StudioToApp::MouseUp(u)=StudioToApp::deserialize_bin(&up).unwrap() else {panic!("wrong mouse-up variant")};
+        assert_eq!((d.x,d.y,d.time,d.button_raw_bits),(1.25,2.5,3.0,1));
+        assert_eq!((m.x,m.y,m.time),(1.25,2.5,3.0));
+        assert_eq!((u.x,u.y,u.time,u.button_raw_bits),(1.25,2.5,3.0,1));
+        assert_eq!(d.modifiers,RemoteKeyModifiers::default());
+        assert_eq!(m.modifiers,RemoteKeyModifiers::default());
+        assert_eq!(u.modifiers,RemoteKeyModifiers::default());
+        for packet in [down.as_slice(),movement.as_slice(),up.as_slice()] {
+            let mut wire=1u64.to_le_bytes().to_vec();wire.extend_from_slice(packet);
+            let messages=StudioToAppVec::deserialize_bin(&wire).unwrap();
+            assert_eq!(messages.0.len(),1);
+            assert_eq!(messages.serialize_bin(),wire);
+        }
+    }
+}
 
 impl AppToStudio {
     pub fn to_json(&self) -> String {

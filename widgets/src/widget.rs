@@ -341,6 +341,11 @@ pub trait Widget: WidgetNode {
         false
     }
 
+    /// Optional control state for composed widgets inspected by Studio.
+    fn checked(&self, _cx: &Cx) -> Option<bool> {
+        None
+    }
+
     /// Optional selection state of a composed native control. Defaulted, so
     /// only widgets that model a selection need to answer.
     fn selected_value(&self, _cx: &Cx) -> Option<String> {
@@ -1251,6 +1256,10 @@ impl WidgetRef {
             return inner.widget.disabled(cx);
         }
         true
+    }
+
+    pub fn checked(&self, cx: &Cx) -> Option<bool> {
+        self.0.borrow().as_ref().and_then(|inner| inner.widget.checked(cx))
     }
 
     pub fn draw_all(&self, cx: &mut Cx2d, scope: &mut Scope) {

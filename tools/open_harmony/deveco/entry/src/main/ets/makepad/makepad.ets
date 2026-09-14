@@ -58,6 +58,7 @@ export class ArkGlue{
   filesDir : string;
   cacheDir : string;
   tempDir : string;
+  launchParameters: string = '{}';
 
   keyboardHeight : number = 1020;
   xComponentContext : MakepadXComponentInterface | undefined = undefined;

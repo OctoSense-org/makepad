@@ -267,7 +267,26 @@ fn render_rect(
         }
     }
     let xf = local_xf.then(parent_xf);
-    let style = apply_animated_style(&rect.style, &rect.animations, time);
+    let mut style = apply_animated_style(&rect.style, &rect.animations, time);
+
+    // Wide tessellated fringes overlap at rectangle corners and can fold into
+    // hard diagonal seams. Use DrawVector's Gaussian rounded-rect integral for
+    // axis-aligned rectangles with a uniform transform.
+    if let Some((x,y,w,h,radius,scale)) = rect_shadow_geometry(rect,&xf) {
+        if let Some(filter)=style.filter.as_ref().and_then(|id|defs.filters.get(id)) {
+            let saved_paint=dv.cur_paint.clone();
+            for effect in &filter.effects {
+                match effect {
+                    SvgFilterEffect::DropShadow {dx,dy,std_dev,color} => {
+                        dv.set_color(color.0,color.1,color.2,color.3*style.opacity);
+                        dv.shadow(x,y,w,h,radius,(std_dev*scale).max(0.001),dx*xf.a,dy*xf.d);
+                    }
+                }
+            }
+            dv.cur_paint=saved_paint;
+            style.filter=None;
+        }
+    }
 
     let r = rect.rx.max(rect.ry);
     let bbox = LocalBbox::new(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height);
@@ -286,6 +305,16 @@ fn render_rect(
         &bbox,
         grad_map,
     );
+}
+
+fn rect_shadow_geometry(rect:&SvgRect,xf:&Transform2d)->Option<(f32,f32,f32,f32,f32,f32)> {
+    let scale=xf.a.abs();
+    if xf.b.abs()>1e-6 || xf.c.abs()>1e-6 || (scale-xf.d.abs()).abs()>1e-6 || scale<1e-6 {
+        return None;
+    }
+    let (x0,y0)=xf.apply(rect.x,rect.y);
+    let (x1,y1)=xf.apply(rect.x+rect.width,rect.y+rect.height);
+    Some((x0.min(x1),y0.min(y1),(x1-x0).abs(),(y1-y0).abs(),rect.rx.max(rect.ry)*scale,scale))
 }
 
 fn render_circle(
@@ -607,6 +636,7 @@ fn emit_shape(
         };
         if !matches!(paint, SvgPaint::None) {
             build_path(dv);
+            dv.path.fill_rule = Some(style.fill_rule);
             let fill_alpha = style.fill_opacity * opacity;
             set_paint(dv, paint, defs, fill_alpha, xf, bbox, grad_map);
             // Use pre-computed fringe (not GPU-expand) to avoid coincident-vertex
@@ -635,6 +665,14 @@ fn emit_shape(
             } else {
                 w.min(1.0)
             };
+            if let Some(pattern)=&style.stroke_dasharray {
+                let scale=xf.scale_factor();
+                let pattern:Vec<f32>=pattern.iter().map(|v|v*scale).collect();
+                dv.tess.flatten(&dv.path,0.25);
+                if let Some(path)=dv.tess.dashed_path(&pattern,style.stroke_dashoffset*scale) {
+                    dv.path=path;
+                }
+            }
             dv.stroke_opts(
                 w,
                 style.stroke_linecap,
@@ -668,9 +706,21 @@ fn set_paint(
         }
         SvgPaint::GradientRef(id) => {
             if let Some(grad) = defs.gradients.get(id) {
+                let mut adjusted;
+                let grad = if alpha != 1.0 {
+                    adjusted = grad.clone();
+                    for stop in &mut adjusted.stops {
+                        for channel in &mut stop.color { *channel *= alpha; }
+                    }
+                    &adjusted
+                } else { grad };
                 let vp = gradient_to_vector_paint(grad, xf, bbox);
                 // Set gradient texture row if we have a pre-built row for this gradient
-                if let Some(&row_idx) = grad_map.rows.get(id) {
+                if alpha != 1.0 && !grad.stops.is_empty() {
+                    // Gradient textures are shared by ID. A translucent use
+                    // needs its own premultiplied row, without changing peers.
+                    dv.cur_gradient_row_v = dv.add_gradient_row(&grad.stops);
+                } else if let Some(&row_idx) = grad_map.rows.get(id) {
                     dv.cur_gradient_row_v = row_idx;
                 } else {
                     dv.cur_gradient_row_v = -1.0;
@@ -696,17 +746,26 @@ fn gradient_to_vector_paint(grad: &SvgGradient, xf: &Transform2d, bbox: &LocalBb
 
     match grad.kind {
         GradientKind::Linear => {
-            let (x1, y1, x2, y2) = match grad.units {
-                GradientUnits::ObjectBoundingBox => {
-                    let (lx1, ly1) = bbox.map(grad.x1, grad.y1);
-                    let (lx2, ly2) = bbox.map(grad.x2, grad.y2);
-                    (lx1, ly1, lx2, ly2)
-                }
-                GradientUnits::UserSpaceOnUse => (grad.x1, grad.y1, grad.x2, grad.y2),
+            let units = match grad.units {
+                GradientUnits::ObjectBoundingBox => Transform2d::scale(bbox.width(), bbox.height())
+                    .then(&Transform2d::translate(bbox.min_x, bbox.min_y)),
+                GradientUnits::UserSpaceOnUse => Transform2d::identity(),
             };
-            let gxf = grad.transform.then(xf);
-            let (x0w, y0w) = gxf.apply(x1, y1);
-            let (x1w, y1w) = gxf.apply(x2, y2);
+            let gxf = grad.transform.then(&units).then(xf);
+            let (x0w, y0w) = gxf.apply(grad.x1, grad.y1);
+            // Gradient normals transform by the inverse transpose. Transforming
+            // endpoints directly distorts color progression on non-square bounds.
+            let dx = grad.x2 - grad.x1;
+            let dy = grad.y2 - grad.y1;
+            let det = gxf.a * gxf.d - gxf.b * gxf.c;
+            let len2 = dx * dx + dy * dy;
+            let (ex, ey) = if det.abs() > 1e-12 && len2 > 1e-12 {
+                let nx = (gxf.d * dx - gxf.b * dy) / (det * len2);
+                let ny = (-gxf.c * dx + gxf.a * dy) / (det * len2);
+                let norm2 = nx * nx + ny * ny;
+                if norm2 > 1e-20 {(nx / norm2, ny / norm2)} else {(0.0, 0.0)}
+            } else {(0.0, 0.0)};
+            let (x1w, y1w) = (x0w + ex, y0w + ey);
             VectorPaint::LinearGradient {
                 x0: x0w,
                 y0: y0w,
@@ -716,28 +775,57 @@ fn gradient_to_vector_paint(grad: &SvgGradient, xf: &Transform2d, bbox: &LocalBb
             }
         }
         GradientKind::Radial => {
-            let (cx, cy, r) = match grad.units {
-                GradientUnits::ObjectBoundingBox => {
-                    let (lcx, lcy) = bbox.map(grad.cx, grad.cy);
-                    // r is relative to the bbox diagonal; approximate with average of width/height
-                    let lr = grad.r * (bbox.width() + bbox.height()) * 0.5;
-                    (lcx, lcy, lr)
-                }
-                GradientUnits::UserSpaceOnUse => (grad.cx, grad.cy, grad.r),
+            let units = match grad.units {
+                GradientUnits::ObjectBoundingBox => Transform2d::scale(bbox.width(), bbox.height())
+                    .then(&Transform2d::translate(bbox.min_x, bbox.min_y)),
+                GradientUnits::UserSpaceOnUse => Transform2d::identity(),
             };
-            let gxf = grad.transform.then(xf);
-            let (cxw, cyw) = gxf.apply(cx, cy);
-            // Compute separate rx/ry to handle non-uniform scaling (e.g. viewbox)
-            let sx = (gxf.a * gxf.a + gxf.b * gxf.b).sqrt();
-            let sy = (gxf.c * gxf.c + gxf.d * gxf.d).sqrt();
+            let gxf = grad.transform.then(&units).then(xf);
+            let (cxw, cyw) = gxf.apply(grad.cx, grad.cy);
+            // A unit circle is transformed in gradient space before the object
+            // bounds. Row norms retain its x/y extents under an inner rotation.
+            let sx = (gxf.a * gxf.a + gxf.c * gxf.c).sqrt();
+            let sy = (gxf.b * gxf.b + gxf.d * gxf.d).sqrt();
             VectorPaint::RadialGradient {
                 cx: cxw,
                 cy: cyw,
-                rx: r * sx,
-                ry: r * sy,
+                rx: grad.r * sx,
+                ry: grad.r * sy,
                 stops: grad.stops.clone(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn rectangle_shadow_bounds_follow_reflected_source_geometry() {
+        let doc=makepad_svg::parse::parse_svg(r#"<svg><rect x="10" y="20" width="100" height="40" rx="8"/></svg>"#);
+        let SvgNode::Rect(rect)=&doc.root[0] else {panic!("expected rectangle")};
+        let xf=Transform2d {a:-2.0,b:0.0,c:0.0,d:2.0,e:300.0,f:10.0};
+        assert_eq!(rect_shadow_geometry(rect,&xf),Some((80.0,50.0,200.0,80.0,16.0,2.0)));
+        assert!(rect_shadow_geometry(rect,&Transform2d {b:0.5,..xf}).is_none());
+    }
+    #[test]
+    fn radial_gradient_uses_normalized_object_bounds() {
+        let mut gradient=SvgGradient::new_radial();
+        gradient.stops=vec![makepad_svg::GradientStop::new(0.0,0.0,0.0,0.0,1.0),
+                            makepad_svg::GradientStop::new(1.0,1.0,1.0,1.0,1.0)];
+        let paint=gradient_to_vector_paint(&gradient,&Transform2d::identity(),&LocalBbox::new(20.0,40.0,520.0,140.0));
+        assert!((paint.color_at(395.0,90.0)[0]-0.5).abs()<0.0001);
+        assert!((paint.color_at(270.0,115.0)[0]-0.5).abs()<0.0001);
+    }
+    #[test]
+    fn bounding_box_gradient_preserves_normal_under_nonuniform_scaling() {
+        let mut gradient=SvgGradient::new_linear();
+        gradient.x2=1.0;gradient.y2=1.0;
+        gradient.stops=vec![makepad_svg::GradientStop::new(0.0,0.0,0.0,0.0,1.0),
+                            makepad_svg::GradientStop::new(1.0,1.0,1.0,1.0,1.0)];
+        let paint=gradient_to_vector_paint(&gradient,&Transform2d::identity(),&LocalBbox::new(0.0,0.0,500.0,100.0));
+        assert!((paint.color_at(500.0,0.0)[0]-0.5).abs()<0.0001);
+        assert!((paint.color_at(0.0,100.0)[0]-0.5).abs()<0.0001);
     }
 }
 

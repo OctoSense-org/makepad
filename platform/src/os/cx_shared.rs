@@ -5,8 +5,8 @@ use {
         cx_api::CxOsApi,
         draw_pass::{CxDrawPassParent, DrawPassId},
         event::{
-            DrawEvent, Event, KeyFocusEvent, NextFrameEvent, TextClipboardEvent, TimerEvent,
-            TriggerEvent,
+            DrawEvent, Event, KeyCode, KeyFocusEvent, NextFrameEvent, TextClipboardEvent,
+            TimerEvent, TriggerEvent,
         },
         makepad_live_id::{live_id, LiveId},
         makepad_network::NetworkResponse,
@@ -135,6 +135,35 @@ impl Cx {
     pub(crate) fn compute_pass_repaint_order(&mut self, passes_todo: &mut Vec<DrawPassId>) {
         passes_todo.clear();
 
+        // Resolve attachment liveness through the whole consumer chain before
+        // propagating dirtiness. A descendant's own attachment can still be
+        // current inside an orphaned capture; it must not revive that capture.
+        // Mark a walk inactive while visiting it so recycled parent cycles
+        // cannot keep obsolete passes alive. Each slot is visited once.
+        let slot_cap = self.passes.id_iter().count();
+        let mut live = vec![None; slot_cap];
+        let mut path = Vec::new();
+        for draw_pass_id in self.passes.id_iter() {
+            let mut walk = draw_pass_id;
+            let active = loop {
+                if let Some(active) = live[walk.0] {
+                    break active;
+                }
+                live[walk.0] = Some(false);
+                path.push(walk);
+                if self.pass_attachment_is_stale(walk) {
+                    break false;
+                }
+                match self.passes[walk].parent {
+                    CxDrawPassParent::DrawPass(parent) => walk = parent,
+                    _ => break true,
+                }
+            };
+            for id in path.drain(..) {
+                live[id.0] = Some(active);
+            }
+        }
+
         // An orphaned child pass — attached by a draw list that has since
         // been recorded without it (`Cx::pass_attachment_is_stale`) — is not
         // painted, is neither a source nor a sink of dirtiness below, and has
@@ -142,8 +171,8 @@ impl Cx {
         // its behalf. The one exception is an explicit `repaint_pass`, which
         // paints it this once.
         for draw_pass_id in self.passes.id_iter() {
-            let requested = std::mem::take(&mut self.passes[draw_pass_id].repaint_requested);
-            if !requested && self.pass_attachment_is_stale(draw_pass_id) {
+            let requested = self.passes[draw_pass_id].repaint_requested;
+            if !requested && live[draw_pass_id.0] != Some(true) {
                 self.passes[draw_pass_id].paint_dirty = false;
             }
         }
@@ -153,9 +182,11 @@ impl Cx {
             // loop untill we don't propagate anymore
             let mut altered = false;
             for draw_pass_id in self.passes.id_iter() {
+                if live[draw_pass_id.0] != Some(true) {
+                    continue;
+                }
                 if self.demo_time_repaint
                     && self.pass_live_for_time_repaint(draw_pass_id)
-                    && !self.pass_attachment_is_stale(draw_pass_id)
                 {
                     self.passes[draw_pass_id].paint_dirty = true;
                 }
@@ -179,7 +210,7 @@ impl Cx {
             for draw_pass_id in self.passes.id_iter() {
                 if self.passes[draw_pass_id].live_with_parent
                     && !self.passes[draw_pass_id].paint_dirty
-                    && !self.pass_attachment_is_stale(draw_pass_id)
+                    && live[draw_pass_id.0] == Some(true)
                 {
                     if let CxDrawPassParent::DrawPass(parent_pass_id) = self.passes[draw_pass_id].parent {
                         if self.passes[parent_pass_id].paint_dirty {
@@ -209,11 +240,13 @@ impl Cx {
         // contract via the depth bias.
         const ROOT_NONE_BIAS: u64 = 1 << 32;
         for draw_pass_id in self.passes.id_iter() {
-            if self.passes[draw_pass_id].paint_dirty {
+            let requested = std::mem::take(&mut self.passes[draw_pass_id].repaint_requested);
+            if self.passes[draw_pass_id].paint_dirty
+                && (live[draw_pass_id.0] == Some(true) || requested)
+            {
                 passes_todo.push(draw_pass_id);
             }
         }
-        let slot_cap = self.passes.id_iter().count();
         let depth_of = |start: DrawPassId| -> u64 {
             let mut depth = 0u64;
             let mut walk = start;
@@ -282,7 +315,7 @@ impl Cx {
     /// repaint, so the caller should poll for the file to appear. Piggybacks on
     /// the studio screenshot pipeline: ids above `SCREENSHOT_FILE_ID_BASE` are
     /// routed to `SCREENSHOT_FILE_SINKS` instead of the studio connection.
-    /// (Headless builds write frames to files on their own; this is for the
+    /// (Gpusim builds write frames to files on their own; this is for the
     /// live GPU-rendered app.)
     /// Returns the capture's request id, so the caller can later
     /// [`cancel_frame_capture`](Self::cancel_frame_capture) it.
@@ -675,14 +708,14 @@ impl Cx {
         modifiers: crate::event::KeyModifiers,
         time: f64,
     ) {
-        // `os::apple` does not exist in a headless build (see os/mod.rs), so
+        // `os::apple` does not exist in a gpusim build (see os/mod.rs), so
         // the pointer-lock transform has to be gated on the module's own cfg,
         // not on the target alone.
-        #[cfg(all(target_os = "macos", not(headless)))]
+        #[cfg(all(target_os = "macos", not(gpusim)))]
         let (abs, lock_delta) = crate::os::apple::macos::macos_app::with_macos_app(|app| {
             app.locked_mouse_transform(raw, delta, seed)
         });
-        #[cfg(not(all(target_os = "macos", not(headless))))]
+        #[cfg(not(all(target_os = "macos", not(gpusim))))]
         let (abs, lock_delta) = {
             let _ = (delta, seed);
             (raw, crate::makepad_math::DVec2::default())
@@ -703,7 +736,7 @@ impl Cx {
     /// scrub pin at the platform layer first — exactly what
     /// macos_window::send_mouse_up does for a physical up.
     pub fn dispatch_hw_pin_release(&mut self) {
-        #[cfg(all(target_os = "macos", not(headless)))]
+        #[cfg(all(target_os = "macos", not(gpusim)))]
         crate::os::apple::macos::macos_app::with_macos_app(|app| {
             if app.pointer_pin_mode {
                 app.set_pointer_pin(false);
@@ -809,7 +842,7 @@ impl Cx {
                 self.call_event_handler(&Event::KeyUp(e));
             }
             StudioToApp::TextInput(e) => {
-                #[cfg(all(target_vendor = "apple", not(headless)))]
+                #[cfg(all(target_vendor = "apple", not(gpusim)))]
                 crate::os::apple::metal::note_input_event();
                 self.call_event_handler(&Event::TextInput(e));
             }
@@ -852,6 +885,17 @@ impl Cx {
             StudioToApp::Kill => {
                 self.call_event_handler(&Event::Shutdown);
                 return true;
+            }
+            StudioToApp::Gpu(command) => {
+                // Supporting hosted backends intercept this before generic
+                // input dispatch. Other backends must reject the transition
+                // explicitly so a host never waits for a silent no-op.
+                Self::send_studio_message(AppToStudio::Gpu(
+                    makepad_studio_protocol::AppToHostGpu::Failed {
+                        transition: command.transition(),
+                        message: "this backend does not support hosted GPU migration".into(),
+                    },
+                ));
             }
             StudioToApp::Custom(data) => {
                 if crate::ime::HostedBack::parse(&data).is_some_and(|back| back.handled.is_none()) {
@@ -950,6 +994,7 @@ impl Cx {
             LiveEditTrigger::FileChange => {
                 self.draw_shaders.reset_for_live_reload();
                 self.pending_script_reapply = false;
+                self.live_edit_apply = crate::makepad_script::Apply::Reload;
                 self.call_event_handler(&Event::LiveEdit);
                 self.redraw_all();
                 if self.pending_script_reapply {
@@ -964,6 +1009,10 @@ impl Cx {
                 // app-level handler that re-broadcasts sets a fresh flag
                 // that lands on the next tick.
                 self.pending_script_reapply = false;
+                // The DSL did not change, so re-apply with `Rebake`: the
+                // re-run only exists to pick up new `SAFE_INSET_PAD_*`
+                // values, and imperative runtime state must survive it.
+                self.live_edit_apply = crate::makepad_script::Apply::Rebake;
                 self.call_event_handler(&Event::LiveEdit);
                 self.redraw_all();
             }
@@ -977,8 +1026,8 @@ impl Cx {
         }
     }
 
-    // Same logic as headless::raster::encode_png_rgba which is behind
-    // cfg(headless) and unavailable to the windowed backend.
+    // Same logic as gpusim::raster::encode_png_rgba which is behind
+    // cfg(gpusim) and unavailable to the windowed backend.
     #[allow(dead_code)]
     pub fn encode_rgba_as_png(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
         use makepad_zune_png::{
@@ -1202,6 +1251,16 @@ impl Cx {
         if !matches!(event, Event::Shutdown) {
             crate::thread::service_scheduler(self, event);
         }
+        // Settle who owns this cancel gesture before anyone sees it: the frontmost scope
+        // takes the whole press, so one that ends part-way can't hand the rest to the next.
+        match event {
+            Event::KeyDown(key) if key.key_code == KeyCode::Escape && !key.is_repeat => {
+                self.cancel_scopes.begin_press();
+            }
+            Event::BackPressed { .. } => self.cancel_scopes.begin_press(),
+            _ => {}
+        }
+
         // A scrub pin listens for the button-up ITSELF: release must never
         // depend on a widget hit path. Schedule the cursor release here,
         // but do NOT clear the capture's pin flag yet — the flag must
@@ -1254,6 +1313,24 @@ impl Cx {
         }
     }
 
+    /// A platform caught a panic that unwound out of an event or draw
+    /// dispatch and goes on. What an unwound frame cannot put back itself
+    /// is put back here: the script VM has parked itself (the `with_vm`
+    /// family catches, parks and resumes) and the draw contexts returned
+    /// their stacks on drop, so what remains is a draw whose redraw list
+    /// went down with the frame — everything is asked to draw again — and
+    /// a check that the VM really did come back.
+    #[allow(dead_code)]
+    pub(crate) fn recover_after_caught_panic(&mut self) {
+        self.in_draw_event = false;
+        if self.script_vm.is_none() {
+            crate::error!(
+                "the script VM did not survive an unwound event handler: every later script entry will be refused as re-entrant"
+            );
+        }
+        self.redraw_all();
+    }
+
     #[allow(dead_code)]
     pub(crate) fn set_physical_keyboard_state(&mut self, connected: bool) {
         self.keyboard.set_physical_keyboard_state(connected);
@@ -1281,9 +1358,16 @@ impl Cx {
         std::mem::swap(&mut draw_event, &mut self.new_draw_event);
         draw_event.time = time;
         self.in_draw_event = true;
-
-        self.call_event_handler(&Event::Draw(draw_event));
+        // The flag comes down whether the draw returned or unwound: a
+        // platform that catches the panic and goes on must not have every
+        // later `redraw` refused as "already drawing".
+        let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.call_event_handler(&Event::Draw(draw_event))
+        }));
         self.in_draw_event = false;
+        if let Err(payload) = drawn {
+            std::panic::resume_unwind(payload);
+        }
         if let Some(mut hook) = self.post_draw_hook.take() {
             hook(self);
             if self.post_draw_hook.is_none() {
@@ -1433,5 +1517,100 @@ mod tests {
 
         cx.call_event_handler(&Event::Signal);
         assert_eq!(calls.get(), 2);
+    }
+}
+
+/// Hosted-child input pacing, shared by every `--stdin-loop` backend.
+impl Cx {
+    /// Collapse one drained host batch before dispatch: every `Tick` but
+    /// the last goes (one draw per drain, however far behind the child
+    /// fell), and a `MouseMove` that another `MouseMove` follows directly
+    /// is replaced by it (a frame can only show the pointer's latest
+    /// position). Everything else keeps its order, so a Down/Up/Scroll
+    /// still sees the move that preceded it.
+    #[cfg(not(target_os = "android"))]
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "ios"), allow(dead_code))]
+    #[cfg(any(not(linux_direct), use_vulkan))]
+    pub(crate) fn stdin_coalesce_host_batch(msgs: &mut Vec<StudioToApp>) {
+        let ticks = msgs
+            .iter()
+            .filter(|msg| matches!(msg, StudioToApp::Tick))
+            .count();
+        let move_runs = msgs.windows(2).any(|pair| {
+            matches!(
+                (&pair[0], &pair[1]),
+                (StudioToApp::MouseMove(_), StudioToApp::MouseMove(_))
+            )
+        });
+        if ticks < 2 && !move_runs {
+            return;
+        }
+        let mut seen_ticks = 0;
+        let mut out: Vec<StudioToApp> = Vec::with_capacity(msgs.len());
+        for msg in msgs.drain(..) {
+            match msg {
+                StudioToApp::Tick => {
+                    seen_ticks += 1;
+                    if seen_ticks == ticks {
+                        out.push(StudioToApp::Tick);
+                    }
+                }
+                StudioToApp::MouseMove(e) => {
+                    if matches!(out.last(), Some(StudioToApp::MouseMove(_))) {
+                        out.pop();
+                    }
+                    out.push(StudioToApp::MouseMove(e));
+                }
+                other => out.push(other),
+            }
+        }
+        *msgs = out;
+    }
+
+    /// Pull every host batch that is already queued into `into`, so a
+    /// child that fell behind sees its whole backlog at once and can
+    /// coalesce it. Returns true when the socket closed or failed; the
+    /// caller dispatches what it has and then leaves its loop.
+    #[cfg(not(target_os = "android"))]
+    #[cfg_attr(any(target_arch = "wasm32", target_os = "ios"), allow(dead_code))]
+    #[cfg(all(not(gpusim), any(not(linux_direct), use_vulkan)))]
+    // The direct Vulkan loop drains inline (it also polls its GPU inbox
+    // between batches); every blocking hosted loop uses this.
+    #[cfg(not(all(target_os = "linux", linux_direct, use_vulkan)))]
+    pub(crate) fn stdin_drain_host_batches(&mut self, into: &mut Vec<StudioToApp>) -> bool {
+        use crate::makepad_micro_serde::*;
+        use crate::web_socket::WebSocketMessage;
+        use makepad_studio_protocol::StudioToAppVec;
+        loop {
+            match self.try_recv_studio_websocket_message() {
+                Some(WebSocketMessage::Binary(data)) => {
+                    match StudioToAppVec::deserialize_bin(&data) {
+                        Ok(msgs) => into.extend(msgs.0),
+                        Err(err) => crate::error!(
+                            "Cant parse studio websocket binary payload in --stdin-loop: {:?}",
+                            err
+                        ),
+                    }
+                }
+                Some(WebSocketMessage::String(text)) => match StudioToApp::deserialize_json(&text) {
+                    Ok(msg) => into.push(msg),
+                    Err(_) => {
+                        if !text.trim().is_empty() {
+                            crate::warning!(
+                                "Ignoring unexpected studio websocket text: {}",
+                                text.trim()
+                            );
+                        }
+                    }
+                },
+                Some(WebSocketMessage::Error(err)) => {
+                    crate::error!("Studio websocket error in --stdin-loop: {}", err);
+                    return true;
+                }
+                Some(WebSocketMessage::Closed) => return true,
+                Some(WebSocketMessage::Opened) => {}
+                None => return false,
+            }
+        }
     }
 }

@@ -382,6 +382,8 @@ impl Cx {
                 .1
                 .allocations
                 .set_device_limit(allowance / 4);
+            // The one derived limit of the publication registry (contract §7).
+            self.publications.set_envelope(allowance / 4);
             crate::log!("retained-upload budgets: adapter_bytes={} process_allowance={} allocation_limit={} source={}", reported, self.memory_budget(), allowance / 4, if reported != 0 { "GL_NVX_gpu_memory_info" } else { "process_allowance_fallback" });
         }
         self.draw_lists.1.allocations.collect_for_frame(
@@ -604,6 +606,10 @@ impl Cx {
                         draw_item.os.inst_vb.charge = Some(charge);
                     }
                     draw_item.instance_upload_pending = false;
+                    // What this copy costs feeds the producers' pacing
+                    // (contract §8): summed per frame, recorded at the
+                    // pass's end.
+                    let copy_started = std::time::Instant::now();
                     if let Some(retained) = &draw_item.retained_instances {
                         draw_item.os.inst_vb.update_retained_array(
                             gl,
@@ -616,6 +622,11 @@ impl Cx {
                             .inst_vb
                             .update_array_buffer(gl, draw_item.instances.as_deref().unwrap());
                     }
+                    upload_budget.stats.bytes = upload_budget.stats.bytes.saturating_add(bytes);
+                    upload_budget.stats.install_us = upload_budget
+                        .stats
+                        .install_us
+                        .saturating_add(copy_started.elapsed().as_micros().min(u64::MAX as u128) as u64);
                 }
 
                 // update the zbias uniform if we have it.
@@ -663,7 +674,10 @@ impl Cx {
                     continue;
                 }
                 let geometry = &mut self.geometries[geometry_id];
-                if !crate::geometry::geometry_backend_supports_typed(
+                // Typed geometry (a byte layout, u16 indices) uploads as-is;
+                // the GL attribute pointers still assume f32-lane records,
+                // so a compact shader layout stays gated.
+                if !crate::geometry::geometry_backend_supports_compact(
                     geometry,
                     "opengl",
                     sh.mapping.geometry_is_compact(),
@@ -676,18 +690,30 @@ impl Cx {
                 ) {
                     continue;
                 }
-                if geometry.dirty_vertices || geometry.os.vb.gl_buffer.is_none() {
-                    let Some(vertices) = geometry.vertices.as_f32() else {
+                let index_gl_type = match geometry.index_width {
+                    2 => gl_sys::UNSIGNED_SHORT,
+                    4 => gl_sys::UNSIGNED_INT,
+                    width => {
+                        crate::error!("invalid resident index width {width}; skipping draw");
                         continue;
-                    };
-                    geometry.os.vb.update_array_buffer(gl, vertices);
+                    }
+                };
+                if geometry.dirty_vertices || geometry.os.vb.gl_buffer.is_none() {
+                    geometry
+                        .os
+                        .vb
+                        .update_array_buffer_bytes(gl, geometry.vertices.as_bytes());
                     geometry.dirty_vertices = false;
                 }
                 if geometry.dirty_indices || geometry.os.ib.gl_buffer.is_none() {
-                    let Some(indices) = geometry.indices.as_u32() else {
-                        continue;
-                    };
-                    geometry.os.ib.update_index_buffer(gl, indices);
+                    match &geometry.indices {
+                        crate::geometry::IndexData::U32(indices) => {
+                            geometry.os.ib.update_index_buffer(gl, indices);
+                        }
+                        crate::geometry::IndexData::U16(indices) => {
+                            geometry.os.ib.update_index_buffer_u16(gl, indices);
+                        }
+                    }
                     geometry.dirty_indices = false;
                 }
                 geometry.dirty = geometry.dirty_vertices || geometry.dirty_indices;
@@ -1012,7 +1038,7 @@ impl Cx {
                     (gl.glDrawElementsInstanced)(
                         gl_sys::TRIANGLES,
                         indices as i32,
-                        gl_sys::UNSIGNED_INT,
+                        index_gl_type,
                         ptr::null(),
                         instances as i32,
                     );
@@ -1029,6 +1055,13 @@ impl Cx {
                         charge.submitted(draw_item.consumed_serial);
                     }
                     draw_item.consumed_uniforms_gen = draw_call.uniforms_gen;
+                    if let Some((block, _)) = draw_item.shared.as_ref() {
+                        // The lease's receipt: this backend encodes and
+                        // submits in the same call, under the pass's serial.
+                        let receipt = block.receipt();
+                        receipt.mark_encoded(draw_item.consumed_serial);
+                        receipt.mark_submitted(draw_item.consumed_serial, draw_call.uniforms_gen);
+                    }
 
                     (gl.glBindVertexArray)(0);
                     (gl.glUseProgram)(0);
@@ -1071,6 +1104,7 @@ impl Cx {
         let dpi_factor = self.passes[draw_pass_id].dpi_factor.unwrap();
         let pass_rect = self.get_pass_rect(draw_pass_id, dpi_factor).unwrap();
         let repaint_id = self.repaint_id;
+        self.record_publication_copies();
         let pass = &mut self.passes[draw_pass_id];
         pass.paint_dirty = false;
         // the bake transaction's paint receipt (whole draws: ranges ignored)
@@ -2667,6 +2701,14 @@ pub struct CxOsDrawCall {
 }
 
 impl CxOsDrawCall {
+    /// This backend keeps no per-publication backing lease on a draw item
+    /// (contract §10): nothing to release when the item's lease clears.
+    pub(crate) fn take_backing(&mut self) -> Option<u64> {
+        None
+    }
+}
+
+impl CxOsDrawCall {
     pub fn free_resources(&mut self, gl: &LibGl) {
         self.inst_vb.free_resources(gl);
         if let Some(vao) = self.vao.take() {
@@ -3657,6 +3699,14 @@ impl OpenglBuffer {
     }
 
     pub fn update_array_buffer(&mut self, gl: &LibGl, data: &[f32]) {
+        self.update_array_buffer_bytes(gl, unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        });
+    }
+
+    /// A vertex record stream in its physical layout (typed geometry, or
+    /// the f32-lane path's bytes).
+    pub fn update_array_buffer_bytes(&mut self, gl: &LibGl, data: &[u8]) {
         self.retained_capacity = 0;
         if self.gl_buffer.is_none() {
             self.alloc_gl_buffer(gl);
@@ -3665,7 +3715,7 @@ impl OpenglBuffer {
             (gl.glBindBuffer)(gl_sys::ARRAY_BUFFER, self.gl_buffer.unwrap());
             (gl.glBufferData)(
                 gl_sys::ARRAY_BUFFER,
-                (data.len() * mem::size_of::<f32>()) as gl_sys::GLsizeiptr,
+                data.len() as gl_sys::GLsizeiptr,
                 data.as_ptr() as *const _,
                 gl_sys::STATIC_DRAW,
             );
@@ -3701,6 +3751,20 @@ impl OpenglBuffer {
     }
 
     pub fn update_index_buffer(&mut self, gl: &LibGl, data: &[u32]) {
+        self.update_index_buffer_bytes(gl, unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        });
+    }
+
+    /// Compact (u16) indices; the draw selects `GL_UNSIGNED_SHORT` from the
+    /// geometry's resident index width.
+    pub fn update_index_buffer_u16(&mut self, gl: &LibGl, data: &[u16]) {
+        self.update_index_buffer_bytes(gl, unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data))
+        });
+    }
+
+    fn update_index_buffer_bytes(&mut self, gl: &LibGl, data: &[u8]) {
         if self.gl_buffer.is_none() {
             self.alloc_gl_buffer(gl);
         }
@@ -3708,7 +3772,7 @@ impl OpenglBuffer {
             (gl.glBindBuffer)(gl_sys::ELEMENT_ARRAY_BUFFER, self.gl_buffer.unwrap());
             (gl.glBufferData)(
                 gl_sys::ELEMENT_ARRAY_BUFFER,
-                (data.len() * mem::size_of::<u32>()) as gl_sys::GLsizeiptr,
+                data.len() as gl_sys::GLsizeiptr,
                 data.as_ptr() as *const _,
                 gl_sys::STATIC_DRAW,
             );
@@ -4339,6 +4403,9 @@ impl Cx {
     }
 
     pub(crate) fn poll_texture_lifetimes(&mut self) {
+        // The adapter draws attached blocks here (no per-publication
+        // backing): dropped blocks release from this poll, contract §3.3.
+        self.publications.retire_without_backing();
         #[cfg(target_os = "linux")]
         let Some(display) = self.os.opengl_cx.as_ref() else {
             return;

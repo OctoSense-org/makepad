@@ -12,8 +12,8 @@ use {
         draw_pass::CxDrawPassPool,
         draw_shader::CxDrawShaders,
         event::{
-            CxDragDrop, CxFingers, CxKeyboard, DrawEvent, Event, NextFrame, Trigger,
-            WindowGeomChangeEvent,
+            CancelScope, CxCancelScopes, CxDragDrop, CxFingers, CxKeyboard, DrawEvent, Event,
+            NextFrame, Trigger, WindowGeomChangeEvent,
         },
         file_dialogs::FileDialogState,
         geometry::CxGeometryPool,
@@ -122,6 +122,7 @@ pub struct Cx {
     pub(crate) storage_state: StorageState,
 
     pub keyboard: CxKeyboard,
+    pub(crate) cancel_scopes: CxCancelScopes,
     pub fingers: CxFingers,
     pub(crate) ime_area: Area,
     pub keyboard_shift: f64,
@@ -169,17 +170,26 @@ pub struct Cx {
     pub pending_script_reapply: bool,
 
     /// When true, the next event-loop iteration will fire `Event::LiveEdit`,
-    /// which re-runs `script_mod` and re-applies with `Apply::Reload`. Use
+    /// which re-runs `script_mod` and re-applies with `Apply::Rebake`. Use
     /// this when a primitive heap value (e.g. `mod.widgets.SAFE_INSET_PAD_TOP`)
     /// has changed and needs to be re-baked into widget definitions that
     /// reference it via expressions like `top: (mod.widgets.SAFE_INSET_PAD_TOP)`
     /// — those expressions are only re-evaluated when `script_mod` re-runs.
-    /// `Apply::Reload` clobbers runtime widget state (animator values, etc.),
-    /// so prefer `pending_script_reapply` whenever the change can be modeled
-    /// as a shared-heap-object mutation instead.
+    /// The re-run is still a full-tree walk, so prefer
+    /// `pending_script_reapply` whenever the change can be modeled as a
+    /// shared-heap-object mutation instead.
     pub pending_live_edit_request: bool,
     /// Re-evaluate Splash definitions while preserving imperative widget state.
     pub pending_style_reload: bool,
+
+    /// Which `Apply` variant the pending `Event::LiveEdit` should re-apply
+    /// the freshly re-run `script_mod` value with. A file-change hot reload
+    /// means the DSL actually changed, so the new template wins
+    /// (`Apply::Reload`). A `request_live_edit()` re-bake did not change the
+    /// DSL, so imperative runtime state must survive (`Apply::Rebake`) —
+    /// otherwise every safe-area inset change wipes each `set_text`,
+    /// `set_visible` and animator state in the tree.
+    pub(crate) live_edit_apply: Apply,
 
     /// `WindowGeomChange` events queued up during an event dispatch.
     pub(crate) pending_window_geom_changes: Vec<WindowGeomChangeEvent>,
@@ -766,6 +776,27 @@ impl Cx {
         self.font_set_frozen
     }
 
+    /// The caller becomes the foreground owner of cancel gestures — the `Escape` key and
+    /// the back gesture — until it ends the returned scope, drops it, or something begins
+    /// a scope in front of it.
+    ///
+    /// Begin one when the widget becomes the active thing (a modal opens, a drag starts,
+    /// a dictation session begins) and end it when it stops being.
+    pub fn begin_cancel_scope(&mut self) -> CancelScope {
+        self.cancel_scopes.begin()
+    }
+
+    /// Gives up a scope from [`Self::begin_cancel_scope()`]. Dropping it does the same.
+    pub fn end_cancel_scope(&mut self, scope: CancelScope) {
+        self.cancel_scopes.end(scope)
+    }
+
+    /// Whether the cancel gesture being delivered belongs to `scope`, which is the only
+    /// case in which that scope's owner should act on it.
+    pub fn owns_cancel(&self, scope: &CancelScope) -> bool {
+        self.cancel_scopes.owns_press(scope)
+    }
+
     pub fn new(event_handler: Box<dyn FnMut(&mut Cx, &Event)>) -> Self {
         crate::thread::ui_hang::initialize();
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -862,6 +893,7 @@ impl Cx {
             storage_state: StorageState::default(),
 
             keyboard: Default::default(),
+            cancel_scopes: Default::default(),
             fingers: Default::default(),
             drag_drop: Default::default(),
             file_dialogs: Default::default(),
@@ -911,6 +943,7 @@ impl Cx {
             pending_script_reapply: false,
             pending_style_reload: false,
             pending_live_edit_request: false,
+            live_edit_apply: Apply::Reload,
             pending_window_geom_changes: Default::default(),
             clear_hover_queued: false,
 
