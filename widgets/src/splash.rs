@@ -5781,6 +5781,7 @@ mod nav_search_tests {
 }
 
 /// Monotonic seconds since first use — the clock `sys.simsecs` animates from.
+/// Also the map nav sim clock (`crate::map::nav::sim_clock_secs` re-exports it).
 pub(crate) fn sim_clock_secs() -> f64 {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();

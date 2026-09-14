@@ -32,8 +32,11 @@ ttf-parser = { path = "../libs/ttf-parser" }
 
 serde = { version = "1.0", optional = true, features = ["derive"] }
 
+# AppCard framework deps: the L0 unit tables come from Octoscript-Makepad's
+# node crate. On this port branch the AppCard framework is always on, so both
+# are unconditional (the `appcard` feature below stays valid but adds nothing).
 serde_json = "1.0"
-octoscript-node = { path = "../../Octoscript-Makepad/crates/octoscript-node" }
+octoscript-node = { git = "https://github.com/OctoSense-org/Octoscript-Makepad.git", rev = "78f90f6e9e5e3b9fe4b5f5b0618fa4e93db30860" }
 
 [features]
 default = []
@@ -42,6 +45,11 @@ voice = ["dep:makepad-ai-speech", "dep:makepad-ai-hub"]
 maps = ["dep:makepad-mbtile-reader", "dep:makepad-fast-inflate", "dep:i_overlay"]
 pdf = ["dep:makepad-pdf-parse"]
 cef = ["dep:makepad-cef"]
+## The Octoscript-AppCard widget set (kit components, weather/finance
+## widgets, matplot, L0 helpers). Off by default so other apps are unaffected.
+# The AppCard framework is unconditional on this branch; the feature is kept
+# so `--features appcard` remains a valid invocation.
+appcard = []
 
 ## Enables certain public-facing types to derive serde serialization traits.
 serde = ["dep:serde", "makepad-draw/serde", "makepad-derive-widget/serde"]
