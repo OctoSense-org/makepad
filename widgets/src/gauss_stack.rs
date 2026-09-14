@@ -106,6 +106,16 @@ impl GaussStack {
         cx.end_pass(&self.scene_pass);
     }
 
+    /// A later blur request can repaint all child passes before its next
+    /// capture. The previous scene's widgets may have been dropped by then;
+    /// retaining their draw calls would replay freed SVG geometry.
+    pub(crate) fn clear_inactive_scene(&mut self, cx: &mut Cx2d) {
+        let redraw_id = cx.redraw_id;
+        let recording_gen = cx.next_uniform_gen();
+        let uniforms_gen = cx.next_uniform_gen();
+        cx.draw_lists[self.scene_draw_list.id()].clear_draw_items(redraw_id, recording_gen, uniforms_gen);
+    }
+
     pub(crate) fn snapshot(
         &self,
         root_size: Vec2d,

@@ -1,5 +1,92 @@
 use crate::path::*;
 
+#[cfg(test)]
+mod subpath_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_svg_fill_rule_preserves_nonzero_overlapping_contours() {
+        fn area(rule:FillRule, reverse:bool)->f32 {
+            let mut path=VectorPath::new();
+            path.rect(0.0,0.0,10.0,10.0);
+            if reverse {
+                path.move_to(2.0,2.0);path.line_to(2.0,8.0);
+                path.line_to(8.0,8.0);path.line_to(8.0,2.0);path.close();
+            } else {path.rect(2.0,2.0,6.0,6.0);}
+            path.fill_rule=Some(rule);
+            let mut tess=Tessellator::default();tess.flatten(&path,0.25);
+            let mut v=Vec::new();let mut i=Vec::new();
+            tess.fill(0.0,LineJoin::Miter,4.0,false,&mut v,&mut i);
+            i.chunks_exact(3).map(|t| {
+                let (a,b,c)=(v[t[0] as usize],v[t[1] as usize],v[t[2] as usize]);
+                ((b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x)).abs()*0.5
+            }).sum()
+        }
+        assert!((area(FillRule::NonZero,false)-100.0).abs()<0.01);
+        assert!((area(FillRule::EvenOdd,false)-64.0).abs()<0.01);
+        assert!((area(FillRule::NonZero,true)-64.0).abs()<0.01);
+        let mut path=VectorPath::new();path.fill_rule=Some(FillRule::NonZero);
+        path.clear();assert!(path.fill_rule.is_none());
+    }
+
+    fn dash_runs(path:&VectorPath,array:&[f32],offset:f32)->Vec<Vec<(f32,f32)>> {
+        let mut tess=Tessellator::default();tess.flatten(path,0.25);
+        let result=tess.dashed_path(array,offset).unwrap();
+        let mut runs:Vec<Vec<(f32,f32)>>=Vec::new();
+        for cmd in result.cmds {
+            match cmd {
+                PathCmd::MoveTo(x,y)=>runs.push(vec![(x,y)]),
+                PathCmd::LineTo(x,y)=>runs.last_mut().unwrap().push((x,y)),
+                _=>{}
+            }
+        }
+        runs
+    }
+
+    #[test]
+    fn dashes_preserve_offset_odd_patterns_and_subpath_restarts() {
+        let mut path=VectorPath::new();path.move_to(0.0,0.0);path.line_to(120.0,0.0);
+        let runs=dash_runs(&path,&[10.0,20.0,30.0],0.0);
+        assert_eq!(runs,vec![vec![(0.0,0.0),(10.0,0.0)],vec![(30.0,0.0),(60.0,0.0)],vec![(70.0,0.0),(90.0,0.0)]]);
+        path.clear();
+        for y in [0.0,10.0] {path.move_to(0.0,y);path.line_to(20.0,y);}
+        let runs=dash_runs(&path,&[10.0,5.0],5.0);
+        assert_eq!(runs,vec![vec![(0.0,0.0),(5.0,0.0)],vec![(10.0,0.0),(20.0,0.0)],vec![(0.0,10.0),(5.0,10.0)],vec![(10.0,10.0),(20.0,10.0)]]);
+    }
+
+    #[test]
+    fn closed_dash_seam_is_joined_and_long_progress_gap_stays_empty() {
+        let mut path=VectorPath::new();path.rect(0.0,0.0,10.0,10.0);
+        let runs=dash_runs(&path,&[15.0,10.0],0.0);
+        assert_eq!(runs.len(),1);
+        assert!(runs[0].contains(&(0.0,0.0)));
+        path.clear();path.circle(0.0,0.0,75.5);
+        let runs=dash_runs(&path,&[135.0,9999.0,80.0],0.0);
+        assert_eq!(runs.len(),1);
+        let length:f32=runs[0].windows(2).map(|p|(p[1].0-p[0].0).hypot(p[1].1-p[0].1)).sum();
+        assert!((length-135.0).abs()<0.01);
+    }
+
+    #[test]
+    fn stroked_circles_never_connect_separate_subpaths() {
+        let mut path=VectorPath::default();
+        for x in [0.0,20.0,40.0] {path.circle(x,0.0,3.5);}
+        for join in [LineJoin::Miter,LineJoin::Bevel] {
+            let mut tess=Tessellator::default();
+            tess.flatten(&path,0.25);
+            let mut verts=Vec::new();
+            let mut indices=Vec::new();
+            tess.stroke(3.0,LineCap::Round,join,4.0,1.0,&mut verts,&mut indices);
+            assert!(!indices.is_empty());
+            for triangle in indices.chunks_exact(3) {
+                let group=(verts[triangle[0] as usize].x/20.0).round();
+                assert!(triangle.iter().all(|i|(verts[*i as usize].x/20.0).round()==group),
+                    "stroke triangle crosses independent circles: {triangle:?}");
+            }
+        }
+    }
+}
+
 // Output vertex: position + texcoord for AA + distance along stroke
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VVertex {
@@ -90,6 +177,9 @@ pub struct Tessellator {
     points: Vec<VPoint>,
     paths: Vec<SubPath>,
     cum_dists: Vec<f32>,
+    /// Explicit SVG fill rule from the flattened path; None keeps the
+    /// winding heuristic below.
+    fill_rule: Option<FillRule>,
     /// Reusable sweep-line tessellator: keeps its event/edge/monotone
     /// buffers alive across fill() calls to avoid per-fill allocation churn.
     sweep: SweepTessellator,
@@ -128,14 +218,67 @@ struct SubPath {
     nbevel: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-enum FillRule {
-    #[default]
-    EvenOdd,
-    NonZero,
-}
-
 impl Tessellator {
+    /// Split flattened contours into on-runs before stroke tessellation, so
+    /// every dash receives the requested native line caps and joins.
+    pub fn dashed_path(&self, array:&[f32], offset:f32)->Option<VectorPath> {
+        if array.is_empty() || array.iter().any(|v|!v.is_finite() || *v<0.0) || !offset.is_finite() {
+            return None;
+        }
+        let mut pattern=array.to_vec();
+        if pattern.len()%2==1 {pattern.extend_from_slice(array);}
+        let total: f32=pattern.iter().sum();
+        if !total.is_finite() || total<=1e-6 || !pattern.iter().any(|v|*v>1e-6) {return None;}
+        let mut out=VectorPath::new();
+        for path in &self.paths {
+            if path.count<2 {continue;}
+            let mut index=0;
+            let mut phase=offset.rem_euclid(total);
+            while phase>=pattern[index] {
+                phase-=pattern[index];index=(index+1)%pattern.len();
+            }
+            let mut remaining=pattern[index]-phase;
+            let mut runs:Vec<Vec<(f32,f32)>>=Vec::new();
+            let mut current:Option<Vec<(f32,f32)>>=None;
+            let segments=path.count-1+usize::from(path.closed);
+            for j in 0..segments {
+                let p=self.points[path.first+j%path.count];
+                let q=self.points[path.first+(j+1)%path.count];
+                let dx=q.x-p.x;let dy=q.y-p.y;
+                let length=dx.hypot(dy);
+                let mut used=0.0;
+                while used+1e-6<length {
+                    if remaining<=1e-6 {
+                        if let Some(run)=current.take() {runs.push(run);}
+                        index=(index+1)%pattern.len();remaining=pattern[index];
+                        continue;
+                    }
+                    let step=remaining.min(length-used);
+                    if used+step==used {break;}
+                    if index%2==0 {
+                        let begin=(p.x+dx*used/length,p.y+dy*used/length);
+                        let end=(p.x+dx*(used+step)/length,p.y+dy*(used+step)/length);
+                        current.get_or_insert_with(||vec![begin]).push(end);
+                    }
+                    used+=step;remaining-=step;
+                }
+            }
+            if let Some(run)=current {runs.push(run);}
+            // Merge on-runs across a closed contour's start; a path seam is
+            // a join, not a pair of round caps.
+            let same=|a:(f32,f32),b:(f32,f32)|(a.0-b.0).hypot(a.1-b.1)<1e-4;
+            if path.closed && runs.len()>1 && same(runs[0][0],*runs.last().unwrap().last().unwrap()) {
+                let mut last=runs.pop().unwrap();last.extend_from_slice(&runs[0][1..]);runs[0]=last;
+            }
+            for run in runs {
+                out.move_to(run[0].0,run[0].1);
+                for &(x,y) in &run[1..] {out.line_to(x,y);}
+                if path.closed && same(run[0],*run.last().unwrap()) {out.close();}
+            }
+        }
+        Some(out)
+    }
+
     /// Bounding box of flattened points: (min_x, min_y, max_x, max_y).
     /// Call after `flatten()`.
     pub fn bounds(&self) -> (f32, f32, f32, f32) {
@@ -151,6 +294,7 @@ impl Tessellator {
     }
 
     pub fn flatten(&mut self, path: &VectorPath, tess_tol: f32) {
+        self.fill_rule = path.fill_rule;
         self.points.clear();
         self.paths.clear();
         let dist_tol = 0.01;
@@ -558,7 +702,7 @@ impl Tessellator {
                 let flags = p1.flags;
                 if (flags & (PT_BEVEL | PT_INNERBEVEL)) != 0 {
                     let vi_before = verts.len();
-                    self.emit_bevel_join(verts, indices, p0, p1, hw, hw, u0, u1);
+                    self.emit_bevel_join(verts, indices, p0, p1, hw, hw, u0, u1, base);
                     for v in &mut verts[vi_before..] {
                         v.stroke_dist = dist;
                     }
@@ -805,6 +949,7 @@ impl Tessellator {
         rw: f32,
         u0: f32,
         u1: f32,
+        subpath_base: u32,
     ) {
         let vi = verts.len() as u32;
         let dlx0 = p0.dy;
@@ -831,7 +976,7 @@ impl Tessellator {
             verts.push(VVertex::new(rx1, ry1, u1, 1.0));
         }
         // connect to previous pair and within bevel
-        if vi >= 2 {
+        if vi >= subpath_base + 2 {
             indices.push(vi - 2);
             indices.push(vi - 1);
             indices.push(vi);
@@ -911,7 +1056,7 @@ impl Tessellator {
             return;
         }
 
-        let fill_rule = if self
+        let fill_rule = self.fill_rule.unwrap_or_else(|| if self
             .paths
             .iter()
             .any(|sp| sp.count >= 3 && sp.has_explicit_winding)
@@ -919,8 +1064,8 @@ impl Tessellator {
             FillRule::NonZero
         } else {
             FillRule::EvenOdd
-        };
-        let body_inset_woff = if matches!(fill_rule, FillRule::EvenOdd) {
+        });
+        let body_inset_woff = if self.fill_rule.is_some() || matches!(fill_rule, FillRule::EvenOdd) {
             // Implicit font-like outlines are fragile under inward body shrink.
             // Keep body on-edge and let the fringe provide AA falloff.
             0.0
@@ -1018,6 +1163,10 @@ impl Tessellator {
         indices: &mut Vec<u32>,
     ) {
         for &(first, count, sign) in valid_paths {
+            if sign == 0.0 {
+                // A redundant nonzero contour has fill on both sides: no AA edge.
+                continue;
+            }
             let fringe_base = verts.len() as u32;
             for j in 0..count {
                 let p1 = self.points[first + j];
@@ -1103,7 +1252,7 @@ impl Tessellator {
         if valid_paths.is_empty() {
             return;
         }
-        let fill_rule = if self
+        let fill_rule = self.fill_rule.unwrap_or_else(|| if self
             .paths
             .iter()
             .any(|sp| sp.count >= 3 && sp.has_explicit_winding)
@@ -1111,8 +1260,8 @@ impl Tessellator {
             FillRule::NonZero
         } else {
             FillRule::EvenOdd
-        };
-        let body_inset_woff = if matches!(fill_rule, FillRule::EvenOdd) {
+        });
+        let body_inset_woff = if self.fill_rule.is_some() || matches!(fill_rule, FillRule::EvenOdd) {
             0.0
         } else {
             woff
@@ -1273,6 +1422,12 @@ impl Tessellator {
             }
 
             if !found {
+                if self.fill_rule.is_some() {
+                    // A redundant nonzero contour has fill on both sides.
+                    // It participates in winding, but has no visible AA edge.
+                    valid_paths[i].2 = 0.0;
+                    continue;
+                }
                 // Fallback to contour orientation if local fill-side probe was inconclusive.
                 let area = poly_area(&self.points[first..first + count]);
                 sign = if area >= 0.0 { 1.0 } else { -1.0 };
