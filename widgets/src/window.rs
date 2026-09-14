@@ -494,7 +494,9 @@ impl GaussStack {
         // capture. The previous scene's widgets may have been dropped by then;
         // retaining their draw calls would replay freed SVG geometry.
         let redraw_id = cx.redraw_id;
-        cx.draw_lists[self.scene_draw_list.id()].clear_draw_items(redraw_id);
+        let recording_gen = cx.next_uniform_gen();
+        let uniforms_gen = cx.next_uniform_gen();
+        cx.draw_lists[self.scene_draw_list.id()].clear_draw_items(redraw_id, recording_gen, uniforms_gen);
     }
 
     fn snapshot(&self, root_size: Vec2d, source_y_flip: f32, dpi_factor: f64) -> GaussBlurSnapshot {

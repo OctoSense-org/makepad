@@ -102,7 +102,9 @@ impl DrawListExt for DrawList {
             cx.passes[pass_id].paint_dirty = true;
         }
 
-        cx.cx.draw_lists[self.id()].clear_draw_items(redraw_id);
+        let recording_gen = cx.cx.next_uniform_gen();
+        let uniforms_gen = cx.cx.next_uniform_gen();
+        cx.cx.draw_lists[self.id()].clear_draw_items(redraw_id, recording_gen, uniforms_gen);
 
         cx.nav_list_clear(self.id());
 
@@ -260,7 +262,9 @@ impl DrawList2d {
             cx.passes[pass_id].paint_dirty = true;
         }
 
-        cx.cx.draw_lists[self.draw_list.id()].clear_draw_items(redraw_id);
+        let recording_gen = cx.cx.next_uniform_gen();
+        let uniforms_gen = cx.cx.next_uniform_gen();
+        cx.cx.draw_lists[self.draw_list.id()].clear_draw_items(redraw_id, recording_gen, uniforms_gen);
 
         cx.nav_list_clear(self.draw_list.id());
 
