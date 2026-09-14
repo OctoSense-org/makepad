@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "label"
+    },
+    {
+      "name": "location_reason",
+      "value": "Use your location to show your position and update navigation directions."
     }
   ]
 }

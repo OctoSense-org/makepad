@@ -8,6 +8,9 @@ import webview from '@ohos.web.webview';
 import picker from '@ohos.file.picker';
 import fileIo from '@ohos.file.fs';
 import util from '@ohos.util';
+import geoLocationManager from '@ohos.geoLocationManager';
+import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
+import makepad from 'libmakepad.so';
 
 declare type Any = ESObject;
 
@@ -220,6 +223,7 @@ export class ArkGlue{
   filesDir : string;
   cacheDir : string;
   tempDir : string;
+  launchParameters: string = '{}';
 
   keyboardHeight : number = 1020;
   xComponentContext : MakepadXComponentInterface | undefined = undefined;
@@ -241,6 +245,56 @@ export class ArkGlue{
         enterKeyType: 1
       }
     };
+  }
+
+  private locationWanted: boolean = false;
+  private locationGranted: boolean = false;
+  private locationForeground: boolean = false;
+  private locationListening: boolean = false;
+  private locationCallback = (location: geoLocationManager.Location): void => {
+    makepad.handleLocation(location.latitude, location.longitude, location.accuracy);
+  };
+
+  // Lazy: only a card reading sys.gps asks for foreground location access.
+  async requestLocation(): Promise<void> {
+    if (this.locationWanted) { return; }
+    this.locationWanted = true;
+    try {
+      const result = await abilityAccessCtrl.createAtManager().requestPermissionsFromUser(
+        this.context as common.UIAbilityContext,
+        ['ohos.permission.APPROXIMATELY_LOCATION', 'ohos.permission.LOCATION']);
+      this.locationGranted = result.authResults.length === 2 && result.authResults.every((r: number) => r === 0);
+      this.resumeLocation();
+    } catch (e) {
+      console.error(`makepad location permission failed: ${JSON.stringify(e)}`);
+    }
+  }
+
+  setLocationForeground(foreground: boolean): void {
+    this.locationForeground = foreground;
+    if (foreground) {
+      this.resumeLocation();
+    } else if (this.locationListening) {
+      try { geoLocationManager.off('locationChange', this.locationCallback); }
+      catch (e) { console.error(`makepad location stop failed: ${JSON.stringify(e)}`); }
+      this.locationListening = false;
+    }
+  }
+
+  private resumeLocation(): void {
+    if (!this.locationGranted || !this.locationForeground || this.locationListening) { return; }
+    try {
+      const request: geoLocationManager.LocationRequest = {
+        scenario: geoLocationManager.LocationRequestScenario.NAVIGATION,
+        timeInterval: 1,
+        distanceInterval: 0,
+        maxAccuracy: 0
+      };
+      geoLocationManager.on('locationChange', request, this.locationCallback);
+      this.locationListening = true;
+    } catch (e) {
+      console.error(`makepad location start failed: ${JSON.stringify(e)}`);
+    }
   }
 
   // ---- system browser (webview cards), called from Rust ----

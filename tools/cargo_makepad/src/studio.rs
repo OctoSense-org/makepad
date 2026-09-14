@@ -19,6 +19,29 @@ use std::time::{Duration, Instant};
 const DEFAULT_STUDIO_HOST_PORT: &str = "127.0.0.1:8001";
 const STUDIO_UI_PATH: &str = "/ui";
 
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_is_forwarded_only_to_requesting_client() {
+        let query_id = QueryId::new(ClientId(3), 10);
+        let message = HubToClient::WidgetSnapshot {
+            query_id, build_id: QueryId(17), widgets: Vec::new(),
+        };
+        assert!(should_emit_protocol_response(&message));
+        assert_eq!(message_query_id(&message), Some(query_id));
+        let mut state = BridgeState {
+            client_id: Some(ClientId(3)), next_counter: 0,
+            auto_log_subscriptions: HashSet::new(),
+        };
+        assert!(should_emit_for_client(&state, &message));
+        state.client_id = Some(ClientId(4));
+        assert!(!should_emit_for_client(&state, &message));
+    }
+}
+
+
 fn bridge_debug_enabled() -> bool {
     env::var_os("MAKEPAD_STUDIO_BRIDGE_DEBUG").is_some()
 }
@@ -514,6 +537,7 @@ fn should_emit_protocol_response(msg: &HubToClient) -> bool {
             | HubToClient::Screenshot { .. }
             | HubToClient::WidgetTreeDump { .. }
             | HubToClient::WidgetQuery { .. }
+            | HubToClient::WidgetSnapshot { .. }
             | HubToClient::QueryCancelled { .. }
     )
 }
@@ -533,6 +557,7 @@ fn message_query_id(msg: &HubToClient) -> Option<QueryId> {
         HubToClient::Screenshot { query_id, .. }
         | HubToClient::WidgetTreeDump { query_id, .. }
         | HubToClient::WidgetQuery { query_id, .. }
+        | HubToClient::WidgetSnapshot { query_id, .. }
         | HubToClient::FindFileResults { query_id, .. }
         | HubToClient::SearchFileResults { query_id, .. }
         | HubToClient::QueryLogResults { query_id, .. }

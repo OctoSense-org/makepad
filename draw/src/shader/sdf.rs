@@ -392,8 +392,8 @@ script_mod! {
             box: fn(x: float, y: float, w: float, h: float, r: float) {
                 let p = self.pos - vec2(x, y);
                 let size = vec2(0.5 * w, 0.5 * h);
-                let bp = max(abs(p - size.xy) - (size.xy - vec2(2. * r, 2. * r).xy), vec2(0., 0.));
-                self.dist = (length(bp) - 2. * r) / self.scale_factor;
+                let q = abs(p - size.xy) - size.xy + vec2(2. * r, 2. * r);
+                self.dist = (length(max(q, vec2(0., 0.))) + min(max(q.x, q.y), 0.) - 2. * r) / self.scale_factor;
                 self.old_shape = self.shape;
                 self.shape = min(self.shape, self.dist);
             }

@@ -391,6 +391,14 @@ impl RadioButton {
 }
 
 impl Widget for RadioButton {
+    fn checked(&self, cx: &Cx) -> Option<bool> {
+        Some(self.active(cx))
+    }
+
+    fn is_interactive(&self) -> bool {
+        true
+    }
+
     fn set_disabled(&mut self, cx: &mut Cx, disabled: bool) {
         self.animator_toggle(
             cx,

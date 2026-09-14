@@ -240,7 +240,9 @@ impl Image {
                 .map(|r| PathBuf::from(&r.abs_path))
                 .unwrap_or_else(|| PathBuf::from("http_resource"))
         };
-        let _ = self.load_image_from_data_async(cx, &path, Arc::new((*data).clone()));
+        if let Err(error) = self.load_image_from_data_async(cx, &path, Arc::new((*data).clone())) {
+            error!("Image: resource decode failed for {}: {}", path.display(), error);
+        }
     }
 }
 
@@ -323,7 +325,12 @@ impl Widget for Image {
                         && self.async_image_path.clone() == Some(image_path.to_path_buf())
                     {
                         // see if we can load from cache
-                        self.load_image_from_cache(cx, image_path, 0);
+                        if !self.load_image_from_cache(cx, image_path, 0) && self.src.is_some() {
+                            // Another completion in this Actions batch may
+                            // have evicted the texture before this widget got
+                            // its turn. Retry from the retained resource bytes.
+                            self.src_loaded = false;
+                        }
                         self.async_image_size = None;
                         self.animator_play(cx, ids!(async_load.off));
                         self.redraw(cx);
@@ -658,8 +665,8 @@ impl Image {
         data: Arc<Vec<u8>>,
     ) -> Result<(), ImageError> {
         self.lazy_create_image_cache(cx);
-        if let Ok(result) = self.load_image_from_data_async_impl(cx, image_path, data, 0) {
-            match result {
+        let result = self.load_image_from_data_async_impl(cx, image_path, data, 0)?;
+        match result {
                 AsyncLoadResult::Loading(w, h) => {
                     self.async_image_size = Some((w, h));
                     self.async_image_path = Some(image_path.into());
@@ -669,7 +676,6 @@ impl Image {
                 AsyncLoadResult::Loaded => {
                     self.redraw(cx);
                 }
-            }
         }
         Ok(())
     }
