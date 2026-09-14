@@ -4804,7 +4804,7 @@ fn city_weather_value(bytes: &[u8], field: &str, path: &str, unit: &str) -> Stri
         _ => return json_pluck(bytes, path)
             .map(|v| round_display(path, v)).unwrap_or_else(|| "—".into()),
     };
-    celsius.and_then(|value| splash_node::units::temperature(value, unit, field == "feels_delta"))
+    celsius.and_then(|value| octoscript_node::units::temperature(value, unit, field == "feels_delta"))
         .map(|value| {
             if field == "feels_delta" { format!("{value:.1}") }
             else { format!("{value:.0}") }
