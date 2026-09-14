@@ -928,6 +928,10 @@ impl Widget for View {
         }
     }
 
+    fn selected_value(&self, _cx: &Cx) -> Option<String> {
+        self.selected.map(|v| v.to_string())
+    }
+
     fn is_interactive(&self) -> bool {
         self.cursor.is_some() || self.animator.is_defined
     }
