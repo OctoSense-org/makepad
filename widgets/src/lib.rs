@@ -145,6 +145,26 @@ pub mod chart;
 pub mod perf_graph;
 pub mod screen_cap;
 
+// Octoscript-AppCard's widget additions, behind the `appcard` feature.
+#[cfg(feature = "appcard")]
+pub mod aqi_contour;
+#[cfg(feature = "appcard")]
+pub mod kit;
+#[cfg(feature = "appcard")]
+pub mod matplot;
+#[cfg(feature = "appcard")]
+pub mod moon_phase;
+#[cfg(feature = "appcard")]
+pub mod splash_l0;
+#[cfg(feature = "appcard")]
+pub mod sun_arc;
+#[cfg(feature = "appcard")]
+pub mod temp_bar;
+#[cfg(feature = "appcard")]
+pub mod text_roles;
+#[cfg(feature = "appcard")]
+pub mod weather_icon;
+
 // Commented out modules (not yet converted)
 // lets depricate these for now
 // pub mod toggle_panel;
@@ -454,6 +474,16 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     #[cfg(feature = "maps")]
     crate::map::view::script_mod(vm);
     crate::math_view::script_mod(vm);
+    #[cfg(feature = "appcard")]
+    {
+        crate::text_roles::script_mod(vm);
+        crate::weather_icon::script_mod(vm);
+        crate::temp_bar::script_mod(vm);
+        crate::sun_arc::script_mod(vm);
+        crate::moon_phase::script_mod(vm);
+        crate::aqi_contour::script_mod(vm);
+        crate::matplot::script_mod(vm);
+    }
 
     // Safe area inset values (in Makepad layout points). Populated from the platform's
     // display_context which is set before Startup on iOS/Android. On desktop
@@ -495,6 +525,11 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
             ..mod.widgets,
         }
     });
+
+    // The kit components read `mod.prelude.widgets` at registration, so they
+    // go after the alias is assembled above — the same order the fork used.
+    #[cfg(feature = "appcard")]
+    crate::kit::script_mod(vm);
 }
 
 pub fn script_mod(vm: &mut ScriptVm) {
