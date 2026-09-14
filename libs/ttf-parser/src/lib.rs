@@ -2205,8 +2205,8 @@ impl<'a> Face<'a> {
         pixels_per_em: u16,
     ) -> Option<RasterGlyphImage<'_>> {
         if let Some(table) = self.tables.sbix {
-            if let Some(strike) = table.best_strike(pixels_per_em) {
-                return strike.get(glyph_id);
+            if let Some(image) = table.best_glyph_image(glyph_id, pixels_per_em) {
+                return Some(image);
             }
         }
         if let Some(bdat) = self.tables.bdat {

@@ -5,19 +5,43 @@ import makepad from 'libmakepad.so'
 import {ArkGlue} from '../makepad/makepad'
 
 export default class EntryAbility extends UIAbility {
+  private studioReview: boolean = false;
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     let x = ArkGlue.initInstance(this.context);
+    const parameters: Record<string, string> = {};
+    for (const key of Object.keys(want.parameters ?? {})) {
+      const value = want.parameters?.[key];
+      if (key.startsWith('makepad.') && typeof value === 'string') {
+        parameters[key] = value;
+      }
+    }
+    x.launchParameters = JSON.stringify(parameters);
+    this.studioReview = (parameters['makepad.STUDIO_BUILD'] ?? '').length > 0;
     makepad.onCreate(x);
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onCreate');
   }
 
   onDestroy(): void {
+    ArkGlue.getInstance().setLocationForeground(false);
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onDestroy');
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
     // Main window is created, set main page for this ability
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onWindowStageCreate');
+
+    // Studio input reaches the native app rather than the OS input dispatcher,
+    // so it does not reset the device's screen timeout during a review session.
+    if (this.studioReview) {
+      windowStage.getMainWindow().then((mainWindow) => {
+        mainWindow.setWindowKeepScreenOn(true, (err) => {
+          if (err.code) {
+            hilog.warn(0x0000, 'testTag', 'Studio keep-screen-on failed: %{public}d', err.code);
+          }
+        });
+      });
+    }
 
     windowStage.loadContent('pages/Index', (err) => {
       if (err.code) {
@@ -34,11 +58,13 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    ArkGlue.getInstance().setLocationForeground(true);
     // Ability has brought to foreground
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onForeground');
   }
 
   onBackground(): void {
+    ArkGlue.getInstance().setLocationForeground(false);
     // Ability has back to background
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onBackground');
   }

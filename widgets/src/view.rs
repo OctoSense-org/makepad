@@ -104,6 +104,10 @@ pub struct View {
     #[live(true)]
     #[apply_state]
     pub visible: bool,
+    /// Optional semantic selection for controls composed from a View. The
+    /// owning component renders this state; Studio exposes the mounted value.
+    #[live]
+    pub selected: Option<bool>,
     #[live(false)]
     skip_widget_tree_search: bool,
 
