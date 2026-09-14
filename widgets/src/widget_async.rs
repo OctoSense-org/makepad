@@ -41,6 +41,27 @@ thread_local! {
     static DEAD_SPLASH_ISOLATES: RefCell<Vec<SplashVmId>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Script mods the embedding host installs into every Splash isolate, in
+    /// registration order. Registered from host code that has no `Cx` in hand,
+    /// hence a thread-local rather than `CxWidgetAsync` state.
+    static HOST_ISOLATE_MODS: RefCell<Vec<fn(&mut ScriptVm)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Install a script mod into every Splash isolate allocated from here on.
+///
+/// An isolate receives makepad's own mods and nothing else, so a widget type
+/// defined out in host code is otherwise unnameable from a mounted body. Pass
+/// the `script_mod` fn of the crate whose widgets those bodies should reach.
+///
+/// An isolate takes its mods at allocation, so a registration only reaches
+/// isolates allocated after it: register before the first mount. Registering
+/// the same mod twice installs it twice, which is wasteful but harmless.
+/// (Same contract as port/appcard-on-octoscript.)
+pub fn register_splash_isolate_mod(f: fn(&mut ScriptVm)) {
+    HOST_ISOLATE_MODS.with(|g| g.borrow_mut().push(f));
+}
+
 /// Queue a Splash isolate for reclamation on the next isolate alloc. Called from
 /// `Splash::drop`, which has no `Cx`. Ignores the main VM (id 0), never an isolate.
 pub(crate) fn mark_splash_isolate_dead(vm_id: SplashVmId) {
@@ -208,6 +229,9 @@ impl ScriptHandleGc for CxWidgetHandleGc {
 
 pub trait CxSplashVmExt {
     fn alloc_splash_vm(&mut self) -> SplashVmId;
+    /// Allocate an isolate; `network_enabled` decides whether its `ScriptStd`
+    /// carries the host's network runtime.
+    fn alloc_splash_vm_with_network(&mut self, network_enabled: bool) -> SplashVmId;
     fn with_script_vm_id<R>(&mut self, vm_id: SplashVmId, f: impl FnOnce(&mut ScriptVm) -> R) -> R;
     fn with_script_vm_id_thread<R>(
         &mut self,
@@ -224,6 +248,10 @@ pub trait CxSplashVmExt {
 
 impl CxSplashVmExt for Cx {
     fn alloc_splash_vm(&mut self) -> SplashVmId {
+        self.alloc_splash_vm_with_network(false)
+    }
+
+    fn alloc_splash_vm_with_network(&mut self, network_enabled: bool) -> SplashVmId {
         ensure_widget_async_hooks_registered(self);
         // Reclaim isolates from dropped Splashes before growing, so the live count
         // tracks the number of live Splash widgets rather than accumulating.
@@ -239,6 +267,10 @@ impl CxSplashVmExt for Cx {
             id
         };
 
+        // This lane's `ScriptStd` has no network runtime to hand an isolate;
+        // `network_enabled` is accepted for source compatibility with
+        // port/appcard-on-octoscript and an isolate here never gets one.
+        let _ = network_enabled;
         let mut std = ScriptStd::new();
         let bx = {
             let mut vm = ScriptVm {
@@ -248,6 +280,15 @@ impl CxSplashVmExt for Cx {
             };
             crate::makepad_draw::makepad_platform::script::script_mod(&mut vm);
             crate::script_mod(&mut vm);
+            // Mods the embedding host registered through
+            // `register_splash_isolate_mod`, last so they see the final
+            // namespace. Collected first so the thread-local is not borrowed
+            // while a mod runs — a mod is free to register another.
+            let host_mods: Vec<fn(&mut ScriptVm)> =
+                HOST_ISOLATE_MODS.with(|g| g.borrow().clone());
+            for install in host_mods {
+                install(&mut vm);
+            }
             vm.bx
         };
 
