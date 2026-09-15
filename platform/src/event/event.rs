@@ -262,6 +262,11 @@ pub enum Event {
         handled: Cell<bool>,
     },
 
+    /// Android: the running activity received a HOME intent (the Home button
+    /// or gesture while this app is the device's Home app). A shell shows
+    /// its home screen; other apps can ignore it.
+    HomeIntent,
+
     /// Permission check or request result
     PermissionResult(PermissionResult),
 
@@ -354,6 +359,7 @@ impl Event {
             51 => "MouseLeave",
             52 => "Actions",
             53 => "BackPressed",
+            74 => "HomeIntent",
             54 => "PermissionResult",
 
             #[cfg(target_arch = "wasm32")]
@@ -448,6 +454,7 @@ impl Event {
             Self::MouseLeave(_) => 51,
             Self::Actions(_) => 52,
             Self::BackPressed { .. } => 53,
+            Self::HomeIntent => 74,
             Self::PermissionResult(_) => 54,
             Self::LocationUpdate(_) => 69,
             Self::LocationError(_) => 70,
