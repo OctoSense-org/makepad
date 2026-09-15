@@ -1049,7 +1049,7 @@ impl CxDrawListPool {
             let returned = batches.returned_tx.clone();
             let counter = self.1.retirements.clone();
             counter.fetch_add(1, Ordering::AcqRel);
-            slot.submit_named("retained draw storage retirement", move || {
+            let job = move || {
                 for item in &mut batch.items {
                     drop(item.take());
                 }
@@ -1057,9 +1057,19 @@ impl CxDrawListPool {
                 // that empty envelope still occurs here on the worker.
                 let _ = returned.try_send(batch);
                 counter.fetch_sub(1, Ordering::AcqRel);
+                #[cfg(not(target_os = "android"))]
                 crate::thread::SignalToUI::set_ui_signal();
-            })
-            .detach();
+            };
+            // Android serves the rest of the debt on its idle vsync beat
+            // (`opengl_maintain_instance_retirements`) and on every painted
+            // frame, so a finished batch needs no wake. The signal it used to
+            // raise (twice, with the pool's completion signal) arrived once per
+            // animation frame as an `Event::Signal` through the whole app,
+            // hosted modules included, and as an extra trip round the loop.
+            #[cfg(target_os = "android")]
+            slot.submit_detached_silent("retained draw storage retirement", job);
+            #[cfg(not(target_os = "android"))]
+            slot.submit_named("retained draw storage retirement", job).detach();
         }
         // Settlement includes rotating scans and completion/metadata debt,
         // not just the queue of freed CPU publications. Otherwise a view can
