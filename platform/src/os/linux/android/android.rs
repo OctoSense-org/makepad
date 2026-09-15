@@ -368,6 +368,9 @@ impl Cx {
         self.display_context.safe_area_insets = insets;
         self.update_safe_inset_script_values(insets);
         self.call_event_handler(&Event::Startup);
+        // After Startup: `warm_task_pool` sets this thread `UserInteractive`,
+        // which is nice 0 on Linux, and would undo an earlier boost.
+        boost_render_thread();
         self.redraw_all();
 
         self.start_network_live_file_watcher();
