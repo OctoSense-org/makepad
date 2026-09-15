@@ -14,11 +14,13 @@ pub(crate) struct GaussStack {
     chain: GaussChain,
 }
 
-pub(crate) fn gauss_render_texture_y_flip_for_os(os_type: &OsType) -> f32 {
-    match os_type {
-        OsType::Android(_) => 1.0,
-        _ => 0.0,
-    }
+/// The V flip a Gaussian consumer applies when sampling a render target.
+/// Zero on every backend: GL renders offscreen passes with an inverted
+/// projection Y, so its render targets hold top-left rows exactly like
+/// Metal/D3D (`opengl.rs`, `setup_render_pass`). Android kept the 1.0 it
+/// needed before that change, which mirrored every frosted backdrop.
+pub(crate) fn gauss_render_texture_y_flip_for_os(_os_type: &OsType) -> f32 {
+    0.0
 }
 
 impl GaussStack {

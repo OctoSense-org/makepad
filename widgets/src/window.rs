@@ -705,7 +705,8 @@ impl SsaaStack {
     /// supersized scene texture with LINEAR (== a 2x2 box for supersample==2).
     fn draw_resolve(&mut self, cx: &mut Cx2d, resolve: &mut DrawSsaaResolve, root_size: Vec2d) {
         // Scene texture is bottom-up — flip opposite to the gauss compositor or the UI shows upside-down.
-        let source_y_flip = 1.0 - gauss_render_texture_y_flip_for_os(cx.os_type());
+        // Unchanged per OS by the gauss orientation fix (Android 0, else 1).
+        let source_y_flip = if matches!(cx.os_type(), OsType::Android(_)) { 0.0 } else { 1.0 };
         resolve
             .draw_vars
             .set_uniform(cx, live_id!(source_y_flip), &[source_y_flip]);
@@ -1185,11 +1186,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gauss_render_texture_y_flip_is_platform_specific() {
+    fn gauss_render_targets_are_top_left_on_every_backend() {
+        // GL renders offscreen passes with an inverted projection Y, so its
+        // targets hold top-left rows like Metal/D3D: no consumer flips V.
         assert_eq!(gauss_render_texture_y_flip_for_os(&OsType::Macos), 0.0);
         assert_eq!(
             gauss_render_texture_y_flip_for_os(&OsType::Android(Default::default())),
-            1.0
+            0.0
         );
     }
 
