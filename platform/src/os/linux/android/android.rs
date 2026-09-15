@@ -318,13 +318,25 @@ impl Cx {
             // Wait for the next message, blocking until one is received.
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
             match from_java_rx.recv() {
-                Ok(FromJavaMessage::RenderLoop) => {
+                Ok(first @ (FromJavaMessage::RenderLoop | FromJavaMessage::Wake)) => {
+                    // Only the Choreographer's beat paints. A wake from another
+                    // thread dispatches its signal/timers now and leaves the
+                    // frame to the next vsync (see `FromJavaMessage::Wake`).
+                    let mut vsync = matches!(first, FromJavaMessage::RenderLoop);
                     // Drain all pending messages, coalescing consecutive touch-move
                     // events to avoid redundant event dispatch before painting.
                     // Start/Stop events are never dropped — only pure-Move events
                     // are replaced by the next one.
                     let mut pending_touch_move: Option<FromJavaMessage> = None;
                     while let Ok(msg) = from_java_rx.try_recv() {
+                        match msg {
+                            FromJavaMessage::RenderLoop => {
+                                vsync = true;
+                                continue;
+                            }
+                            FromJavaMessage::Wake => continue,
+                            _ => {}
+                        }
                         if let FromJavaMessage::Touch(ref touches) = msg {
                             if touches
                                 .iter()
@@ -364,6 +376,10 @@ impl Cx {
                     // is documented in `run_live_edit_if_needed`.
                     if self.pending_script_reapply || self.pending_live_edit_request {
                         self.run_live_edit_if_needed("android");
+                    }
+                    if !vsync {
+                        // A wake: whatever it dispatched paints on the next beat.
+                        continue;
                     }
                     // Drop the frame entirely if the window surface has been
                     // torn down (typically during background/foreground or a
@@ -508,7 +524,7 @@ impl Cx {
                     }
                 }
             }
-            FromJavaMessage::RenderLoop => {
+            FromJavaMessage::RenderLoop | FromJavaMessage::Wake => {
                 // This should not happen here, as it's handled in the main loop
             }
             FromJavaMessage::BackPressed => {
