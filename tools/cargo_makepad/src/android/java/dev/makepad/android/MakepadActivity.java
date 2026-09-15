@@ -1591,6 +1591,13 @@ public class MakepadActivity
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        // The device's Home button or gesture, with this app as the Home
+        // app: the running activity is told, so a shell can show its home
+        // page (Event::HomeIntent on the Rust side).
+        if (intent != null && Intent.ACTION_MAIN.equals(intent.getAction())
+                && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            MakepadNative.onHomeIntent();
+        }
         restoreSurfaceViewForWarmResumeIfNeeded();
         handleDeepLinkIntent(intent);
     }
