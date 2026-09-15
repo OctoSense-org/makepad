@@ -92,6 +92,9 @@ pub enum FromJavaMessage {
     Init(AndroidParams),
     SwitchedActivity(jni_sys::jobject, u64),
     BackPressed,
+    /// The activity received a new HOME intent while running: the device's
+    /// Home button or gesture, with this app as the Home app.
+    HomeIntent,
     SurfaceChanged {
         window: *mut ndk_sys::ANativeWindow,
         width: i32,
@@ -947,6 +950,14 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onBackPressed(
 ) {
     // crate::log!("Java_dev_makepad_android_MakepadNative_onBackPressed");
     send_from_java_message(FromJavaMessage::BackPressed);
+}
+
+#[no_mangle]
+unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onHomeIntent(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+) {
+    send_from_java_message(FromJavaMessage::HomeIntent);
 }
 
 #[no_mangle]

@@ -599,6 +599,9 @@ impl Cx {
                     handled: Cell::new(false),
                 });
             }
+            FromJavaMessage::HomeIntent => {
+                self.call_event_handler(&Event::HomeIntent);
+            }
             FromJavaMessage::SurfaceCreated { window } => {
                 #[cfg(use_vulkan)]
                 let _has_vulkan = self.os.vulkan.is_some();
