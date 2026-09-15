@@ -386,6 +386,13 @@ impl Cx {
             self.publications.set_envelope(allowance / 4);
             crate::log!("retained-upload budgets: adapter_bytes={} process_allowance={} allocation_limit={} source={}", reported, self.memory_budget(), allowance / 4, if reported != 0 { "GL_NVX_gpu_memory_info" } else { "process_allowance_fallback" });
         }
+        // Advance the completed serial before collecting. GL has no completion
+        // callback: the fence is the only thing that moves `completed`, and it
+        // moves only when polled. Unpolled, every released allocation record
+        // (`submitted > completed`) stays in the ledger forever, the ledger
+        // reports retirement debt on every render, and the debt below forced a
+        // repaint of every live pass at display rate on an idle app.
+        self.poll_texture_lifetimes();
         self.draw_lists.1.allocations.collect_for_frame(
             self.repaint_id,
             self.textures
@@ -406,7 +413,14 @@ impl Cx {
                 std::mem::take(&mut os.inst_vb)
             })
         {
-            self.demo_time_repaint = true;
+            // Retirement debt is maintenance, not ink. Android services it on
+            // idle vsync beats (`opengl_maintain_instance_retirements`) without
+            // painting; the desktop GL loops only wake for a repaint, so they
+            // keep the repaint as their wake until the debt settles.
+            #[cfg(not(target_os = "android"))]
+            {
+                self.demo_time_repaint = true;
+            }
         }
         self.render_view_inner(pass, list, zbias, step);
         let serial = self.textures.1.serials.submit();
@@ -4249,6 +4263,10 @@ type GlSync = *mut std::ffi::c_void;
 pub(crate) struct TextureFence {
     functions: Option<TextureFenceFunctions>,
     pending: Option<(u64, GlSync)>,
+    /// Idle maintenance beats served (`opengl_maintain_instance_retirements`);
+    /// their ledger frame keys count down from `u64::MAX`, apart from paints.
+    #[cfg(target_os = "android")]
+    maintenance_beats: u64,
     framebuffers: Vec<u32>,
 }
 #[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
@@ -4402,6 +4420,36 @@ impl Cx {
         }
     }
 
+    /// Service retained-upload retirement debt on a beat that paints nothing:
+    /// poll the completion fence, collect released allocation records, and
+    /// hand freed draw storage to the workers. Returns whether debt remains.
+    /// Call with this renderer's context current. The macOS backend has the
+    /// same beat (`maintain_instance_retirements`); a paint used to carry it.
+    #[cfg(target_os = "android")]
+    pub(crate) fn opengl_maintain_instance_retirements(&mut self) -> bool {
+        let fence_pending = self.textures.1.gl.pending.is_some() || !self.textures.1.retired.is_empty();
+        if !fence_pending && !self.draw_lists.has_pending_instance_retirements() {
+            return false;
+        }
+        self.poll_texture_lifetimes();
+        self.textures.1.gl.maintenance_beats += 1;
+        let beat = u64::MAX - self.textures.1.gl.maintenance_beats;
+        self.draw_lists.1.allocations.collect_for_frame(
+            beat,
+            self.textures.1.serials.completed.load(std::sync::atomic::Ordering::Acquire),
+        );
+        let pool = self.task_pool();
+        let gl = self.os.gl();
+        let pending = self.draw_lists.retire_free_items(&pool, beat, |os| {
+            if let Some(vao) = os.vao.take() {
+                vao.free(gl);
+            }
+            os.inst_vb.free_resources(gl);
+            std::mem::take(&mut os.inst_vb)
+        });
+        pending || self.textures.1.gl.pending.is_some() || !self.textures.1.retired.is_empty()
+    }
+
     pub(crate) fn poll_texture_lifetimes(&mut self) {
         // The adapter draws attached blocks here (no per-publication
         // backing): dropped blocks release from this poll, contract §3.3.
@@ -4424,7 +4472,17 @@ impl Cx {
                 let poll = get_proc(c"glClientWaitSync".as_ptr());
                 let delete = get_proc(c"glDeleteSync".as_ptr());
                 let current = get_proc(c"eglGetCurrentContext".as_ptr());
+                // eglGetCurrentContext is core EGL: Android's eglGetProcAddress
+                // resolves extension entry points only, so take it from libEGL.
+                let current = display
+                    .libegl
+                    .eglGetCurrentContext
+                    .map_or(current, |f| f as *mut std::ffi::c_void);
                 if create.is_null() || poll.is_null() || delete.is_null() || current.is_null() {
+                    static ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+                    if ONCE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                        crate::error!("GL completion fences unavailable (glFenceSync={:?} glClientWaitSync={:?} glDeleteSync={:?} eglGetCurrentContext={:?}): retired GL allocations are never reclaimed", create, poll, delete, current);
+                    }
                     return;
                 }
                 state.gl.functions = Some(TextureFenceFunctions {

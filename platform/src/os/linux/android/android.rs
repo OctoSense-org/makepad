@@ -1549,6 +1549,14 @@ impl Cx {
                     vm.gc();
                 }
             });
+        } else {
+            // Nothing to paint: retained-upload retirement debt (released GPU
+            // allocations waiting on their completion fence, freed draw
+            // storage) is served here, on the vsync beat, without a present.
+            #[cfg(not(use_vulkan))]
+            {
+                let _ = self.opengl_maintain_instance_retirements();
+            }
         }
     }
 
