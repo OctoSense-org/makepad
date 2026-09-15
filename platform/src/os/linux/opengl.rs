@@ -2017,6 +2017,13 @@ impl GlShader {
         os_type: &OsType,
     ) -> GlShaderState {
         if Self::supports_parallel_compile(gl) {
+            // A cached program binary links in a millisecond and is ready on
+            // this frame; the background compile skips its draws (and forces
+            // a repaint) until the driver finishes. The parallel path wrote
+            // the cache but never read it, so every launch recompiled.
+            if let Some(program) = Self::read_program_cache(gl, vertex, pixel, os_type) {
+                return GlShaderState::Ready(Self::build_from_program(gl, program, mapping));
+            }
             return GlShaderState::Pending(Self::start_pending_program_compile(
                 gl, vertex, pixel, os_type,
             ));
