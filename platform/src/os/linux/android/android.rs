@@ -1538,17 +1538,39 @@ impl Cx {
                 self.redraw_all();
             }
 
+            // PerfMonitor "draw": CPU-side pass encode (render_view and the GL
+            // driver calls it makes), without the swap timed as "wait".
+            let perf_t0 = self.perf_monitor.enabled().then(std::time::Instant::now);
+            self.os.perf_swap_us = 0;
             self.handle_repaint();
+            if let Some(t0) = perf_t0 {
+                let us = (t0.elapsed().as_micros() as u64).saturating_sub(self.os.perf_swap_us);
+                self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAW, us);
+            }
 
             // Run script-VM garbage collection at a safe point after paint, matching
             // the macOS backend, so the script object heap doesn't grow without bound:
             // every `eval` / `script_apply_eval!` allocates script objects that are
             // only reclaimed by `gc()`. `needs_gc()` gates the actual sweep.
+            let gc_t0 = std::time::Instant::now();
+            let mut did_gc = false;
             self.with_vm(|vm| {
                 if vm.heap().needs_gc() {
                     vm.gc();
+                    did_gc = true;
                 }
             });
+            if did_gc {
+                self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_GC, gc_t0.elapsed().as_micros() as u64);
+            }
+        } else {
+            // Nothing to paint: retained-upload retirement debt (released GPU
+            // allocations waiting on their completion fence, freed draw
+            // storage) is served here, on the vsync beat, without a present.
+            #[cfg(not(use_vulkan))]
+            {
+                let _ = self.opengl_maintain_instance_retirements();
+            }
         }
     }
 
@@ -1657,12 +1679,20 @@ impl Cx {
 
         #[cfg(not(use_vulkan))]
         unsafe {
+            let perf_t0 = self.perf_monitor.enabled().then(std::time::Instant::now);
             if let Some(display) = &mut self.os.display {
                 if display.is_surface_alive() {
                     let swapped = (display.libegl.eglSwapBuffers.unwrap())(
                         display.egl_display,
                         display.surface,
                     );
+                    // PerfMonitor "wait": eglSwapBuffers blocks on the buffer
+                    // queue (and, on tilers, on the GPU finishing the frame).
+                    if let Some(t0) = perf_t0 {
+                        let us = t0.elapsed().as_micros() as u64;
+                        self.os.perf_swap_us += us;
+                        self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAWABLE_WAIT, us);
+                    }
                     if swapped != 0 {
                         self.hide_android_surface_cover_after_first_present_if_needed();
                         self.request_android_surface_snapshot_refresh_after_present_if_needed();
@@ -3516,6 +3546,7 @@ impl Default for CxOs {
             location_updates_wanted: false,
             start_time: Instant::now(),
             first_after_resize: true,
+            perf_swap_us: 0,
             needs_first_draw: true,
             hide_surface_cover_after_first_present: false,
             refresh_surface_snapshot_after_first_present: true,
@@ -3635,6 +3666,8 @@ pub struct CxOs {
     /// the runtime permission dialog resolves (and to re-arm on resume).
     pub location_updates_wanted: bool,
     pub first_after_resize: bool,
+    /// eglSwapBuffers time inside the current repaint (PerfMonitor draw/wait split).
+    pub perf_swap_us: u64,
     /// Set to `true` when a `RenderLoop` callback arrives but the surface is not
     /// yet drawable. When the surface later becomes ready, this flag triggers a
     /// `redraw_all()` to ensure the first frame is painted. Without this, the app
