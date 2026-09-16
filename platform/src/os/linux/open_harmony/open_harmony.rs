@@ -234,12 +234,13 @@ impl Cx {
                     }
                 });
             }
-        } else {
-            // Nothing to paint: released GPU storage (allocations waiting on
-            // their completion fence, freed draw storage) is served here, on
-            // the beat, without a present — as Android does.
-            let _ = self.opengl_maintain_instance_retirements();
         }
+        // No idle retirement beat here: retiring released storage on a beat
+        // that paints nothing blanked the presented surface on this target.
+        // While retirement is pending the render path keeps the repaint as
+        // its wake (demo_time_repaint, the desktop GL route) and frame_wanted
+        // keeps asking for beats; with completion fences that settles within
+        // a frame or two.
     }
 
     fn handle_message(&mut self, msg: FromOhosMessage) {
