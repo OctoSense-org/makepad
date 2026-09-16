@@ -417,7 +417,7 @@ impl Cx {
             // idle vsync beats (`opengl_maintain_instance_retirements`) without
             // painting; the desktop GL loops only wake for a repaint, so they
             // keep the repaint as their wake until the debt settles.
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
             {
                 self.demo_time_repaint = true;
             }

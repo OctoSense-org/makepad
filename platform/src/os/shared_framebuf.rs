@@ -843,6 +843,16 @@ impl PollTimers {
         Cx::monotonic_now() - self.time_start
     }
 
+    /// Seconds until the earliest timer is due, for a loop that sleeps
+    /// between wakes instead of polling on every display beat.
+    pub fn next_due_in(&self) -> Option<f64> {
+        let now = Cx::monotonic_now();
+        self.timers
+            .values()
+            .map(|timer| timer.start_time + timer.interval * (timer.step + 1) as f64 - now)
+            .fold(None, |best: Option<f64>, due| Some(best.map_or(due, |b| b.min(due))))
+            .map(|due| due.max(0.0))
+    }
     pub fn get_dispatch(&mut self) -> Vec<TimerEvent> {
         let mut to_be_dispatched = Vec::with_capacity(self.timers.len());
         let mut to_be_removed = Vec::with_capacity(self.timers.len());
