@@ -72,14 +72,65 @@ pub(crate) fn connect_platform_socket_stream(
         )
     })?;
 
-    let factory = slot.as_ref().ok_or_else(|| {
-        io::Error::new(
+    match slot.as_ref() {
+        Some(factory) => factory.connect(host, port, use_tls, ignore_ssl_cert),
+        // OpenHarmony has no platform shim yet: plain TCP through the standard
+        // library is enough for the Studio websocket (PlainTcp transport) and
+        // any other clear-text stream; TLS stays unsupported until a shim
+        // registers one.
+        #[cfg(target_env = "ohos")]
+        None => std_tcp::connect(host, port, use_tls),
+        #[cfg(not(target_env = "ohos"))]
+        None => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "android socket stream shim not registered by makepad-platform",
-        )
-    })?;
+        )),
+    }
+}
 
-    factory.connect(host, port, use_tls, ignore_ssl_cert)
+#[cfg(target_env = "ohos")]
+mod std_tcp {
+    use super::PlatformSocketStream;
+    use std::{
+        io::{self, Read, Write},
+        net::{Shutdown, TcpStream},
+        time::Duration,
+    };
+
+    struct StdTcp(TcpStream);
+
+    impl PlatformSocketStream for StdTcp {
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.0.set_read_timeout(timeout)
+        }
+        fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            self.0.set_write_timeout(timeout)
+        }
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+        fn shutdown(&mut self) {
+            let _ = self.0.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub(super) fn connect(host: &str, port: &str, use_tls: bool) -> io::Result<Box<dyn PlatformSocketStream>> {
+        if use_tls {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS socket streams need a registered platform socket factory on OpenHarmony",
+            ));
+        }
+        let stream = TcpStream::connect(format!("{host}:{port}"))?;
+        stream.set_nodelay(true)?;
+        Ok(Box::new(StdTcp(stream)))
+    }
 }
 
 pub(crate) fn create_backend() -> Arc<dyn NetworkBackend> {
