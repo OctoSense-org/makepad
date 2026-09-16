@@ -375,6 +375,15 @@ impl Cx {
         std::thread::spawn(move || {
             let mut cx = startup();
             assert!(cx.wait_init(&from_ohos_rx));
+            // `startup` resolved the Studio host at module load, before the
+            // entry ability's onCreate turned the launch parameters into
+            // environment (STUDIO_HOST and friends). Now that Init has
+            // arrived they are set, so resolve again and dial the hub.
+            let studio_http = crate::resolve_studio_http();
+            if !studio_http.is_empty() {
+                crate::log!("studio host from launch parameters: {studio_http}");
+                cx.init_websockets(&studio_http);
+            }
             cx.ohos_load_dependencies();
 
             let window = cx.wait_surface_created(&from_ohos_rx);
