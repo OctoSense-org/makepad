@@ -293,33 +293,43 @@ impl Cx {
     }
 
     fn wait_init(&mut self, from_ohos_rx: &mpsc::Receiver<FromOhosMessage>) -> bool {
-        if let Ok(FromOhosMessage::Init {
-            device_type,
-            os_full_name,
-            display_density,
-            files_dir,
-            cache_dir,
-            temp_dir,
-            raw_env,
-            arkts_ref,
-            raw_file,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.dpi_factor = display_density;
-            self.os.raw_file = Some(raw_file);
-            self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
-                files_dir,
-                cache_dir,
-                temp_dir,
-                device_type,
-                os_full_name,
-                display_density,
-            });
-            self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
-            return true;
-        } else {
-            crate::error!("Failed to receive init message from ArkTS layer");
-            return false;
+        // Anything may wake the channel before the ability has sent Init
+        // (a signal posted from a background thread arrives as VSync), so
+        // skip what is not Init instead of giving up on the first message.
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::Init {
+                    device_type,
+                    os_full_name,
+                    display_density,
+                    files_dir,
+                    cache_dir,
+                    temp_dir,
+                    raw_env,
+                    arkts_ref,
+                    raw_file,
+                }) => {
+                    self.os.dpi_factor = display_density;
+                    self.os.raw_file = Some(raw_file);
+                    self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
+                        files_dir,
+                        cache_dir,
+                        temp_dir,
+                        device_type,
+                        os_full_name,
+                        display_density,
+                    });
+                    self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
+                    return true;
+                }
+                Ok(other) => {
+                    crate::log!("message before Init skipped: {}", ohos_message_name(&other));
+                }
+                Err(_) => {
+                    crate::error!("Failed to receive init message from ArkTS layer");
+                    return false;
+                }
+            }
         }
     }
 
@@ -327,25 +337,37 @@ impl Cx {
         &mut self,
         from_ohos_rx: &mpsc::Receiver<FromOhosMessage>,
     ) -> *mut c_void {
-        if let Ok(FromOhosMessage::SurfaceCreated {
-            window,
-            width,
-            height,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.display_size = dvec2(width as f64, height as f64);
-            crate::log!(
-                "handle surface created, width={}, height={}, display_density={}",
-                width,
-                height,
-                self.os.dpi_factor
-            );
-            return window;
-        } else {
-            crate::error!("Can't recv SurfaceCreated from arkts");
-            return null_mut();
+        // The Studio websocket connects between Init and the XComponent's
+        // surface and posts a wake-up through this channel; a single recv
+        // took that wake-up for the surface, handed EGL a null window and
+        // the app died in an assertion. Wait for the surface itself.
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::SurfaceCreated {
+                    window,
+                    width,
+                    height,
+                }) => {
+                    self.os.display_size = dvec2(width as f64, height as f64);
+                    crate::log!(
+                        "handle surface created, width={}, height={}, display_density={}",
+                        width,
+                        height,
+                        self.os.dpi_factor
+                    );
+                    return window;
+                }
+                Ok(other) => {
+                    crate::log!("message before SurfaceCreated skipped: {}", ohos_message_name(&other));
+                }
+                Err(_) => {
+                    crate::error!("Can't recv SurfaceCreated from arkts");
+                    return null_mut();
+                }
+            }
         }
     }
+
 
     pub fn ohos_init<F>(exports: JsObject, env: Env, startup: F)
     where
@@ -824,5 +846,20 @@ mod launch_parameter_tests {
             ]
         );
         assert!(super::flat_json_string_pairs("{}").is_empty());
+    }
+}
+
+/// The variant name of a channel message, for the startup log.
+fn ohos_message_name(message: &FromOhosMessage) -> &'static str {
+    match message {
+        FromOhosMessage::Init { .. } => "Init",
+        FromOhosMessage::SurfaceChanged { .. } => "SurfaceChanged",
+        FromOhosMessage::SurfaceCreated { .. } => "SurfaceCreated",
+        FromOhosMessage::SurfaceDestroyed => "SurfaceDestroyed",
+        FromOhosMessage::VSync => "VSync",
+        FromOhosMessage::Touch(_) => "Touch",
+        FromOhosMessage::TextInput(_) => "TextInput",
+        FromOhosMessage::DeleteLeft(_) => "DeleteLeft",
+        FromOhosMessage::ResizeTextIME(..) => "ResizeTextIME",
     }
 }
