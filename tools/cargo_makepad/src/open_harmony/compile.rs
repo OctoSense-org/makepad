@@ -210,6 +210,10 @@ fn label_json(label_name: &str) -> String {
     {{
       "name": "EntryAbility_label",
       "value": "{label_name}"
+    }},
+    {{
+      "name": "location_reason",
+      "value": "Use your location to show your position and update navigation directions."
     }}
   ]
 }}
@@ -233,6 +237,10 @@ fn label_zh_json(label_name: &str) -> String {
     {{
       "name": "EntryAbility_label",
       "value": "{label_name}"
+    }},
+    {{
+      "name": "location_reason",
+      "value": "使用您的位置来显示您所在的位置并更新导航方向。"
     }}
   ]
 }}
