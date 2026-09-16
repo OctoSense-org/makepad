@@ -14,7 +14,7 @@ use crate::{
 };
 use crate::makepad_draw::vector::{
     FACE_IMPLICIT_UV, FACE_TYPED_VERTEX_BYTES, FILL_TYPED_VERTEX_BYTES,
-    MAP_VERTEX_POSITION_SCALE, ROAD_TYPED_VERTEX_BYTES, VECTOR_FLOATS_PER_VERTEX,
+    MAP_VERTEX_POSITION_SCALE, ROAD_TYPED_VERTEX_BYTES,
     VECTOR_ZBIAS_STEP, SubdivisionBudget,
 };
 use crate::makepad_draw::event::{TouchState, TouchUpdateEvent};
@@ -23,7 +23,10 @@ use std::fs;
 use std::path::Path;
 use std::cell::RefCell;
 use std::rc::Rc;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
+use crate::makepad_draw::vector::VECTOR_FLOATS_PER_VERTEX;
 use crate::makepad_draw::text::fonts::{Fonts, FontsMemoryBytes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

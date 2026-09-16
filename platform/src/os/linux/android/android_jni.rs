@@ -107,7 +107,14 @@ pub enum FromJavaMessage {
     SurfaceDestroyed {
         ack: SurfaceAck,
     },
+    /// The Choreographer's vsync beat: dispatch, then paint.
     RenderLoop,
+    /// A thread woke the UI (`SignalToUI`, a scheduler timer): dispatch what
+    /// it signalled, but leave painting to the next vsync beat. Waking with
+    /// `RenderLoop` painted off-beat: with a frame loop running, every worker
+    /// signal drew and swapped an extra frame that blocked in eglSwapBuffers
+    /// until the next vsync and pushed the real beat's frame one vsync late.
+    Wake,
     LongClick {
         abs: Vec2d,
         pointer_id: u64,

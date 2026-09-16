@@ -866,9 +866,11 @@ impl ShaderFnCompiler {
             } else if let ShaderType::ScopeObject(obj) = instance_ty {
                 // Field access on a scope object (e.g., test_obj.p2 or test_obj.objfn or test_obj.sub_obj)
                 // Look up the field value
-                let value = vm.bx.heap.value(obj, field_id.into(), self.trap.pass());
+                // A probe: a miss falls back to the type-check lookup below, so it
+                // must not format a `suggest_property` list into the trap.
+                let value = vm.bx.heap.value(obj, field_id.into(), crate::trap::ScriptTrap::NoTrap);
 
-                if !value.is_nil() && self.trap.err_is_empty() {
+                if !value.is_nil() && !value.is_err() && self.trap.err_is_empty() {
                     // Check if this is an object
                     if let Some(value_obj) = value.as_object() {
                         // Check if this is a shader_io type - not supported for scope objects
@@ -903,12 +905,13 @@ impl ShaderFnCompiler {
 
                         // Check if this is a repr(u32) enum variant (has a 'repr_u32_enum_value' field)
                         // If so, emit the value directly as a u32 constant
+                        // A probe: most sub-objects are not enums.
                         let enum_value = vm.bx.heap.value(
                             value_obj,
                             id!(_repr_u32_enum_value).into(),
-                            self.trap.pass(),
+                            crate::trap::ScriptTrap::NoTrap,
                         );
-                        if !enum_value.is_nil() {
+                        if !enum_value.is_nil() && !enum_value.is_err() {
                             self.trap.err_take(); // Clear any error
                             if let Some(f) = enum_value.as_f64() {
                                 let mut s = self.stack.new_string();

@@ -522,13 +522,6 @@ impl LocalBbox {
         }
     }
 
-    /// Map a 0-1 objectBoundingBox coordinate to local space.
-    fn map(&self, u: f32, v: f32) -> (f32, f32) {
-        let w = self.max_x - self.min_x;
-        let h = self.max_y - self.min_y;
-        (self.min_x + u * w, self.min_y + v * h)
-    }
-
     fn width(&self) -> f32 {
         self.max_x - self.min_x
     }

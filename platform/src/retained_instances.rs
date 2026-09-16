@@ -18,10 +18,10 @@ pub fn retained_upload_limit() -> usize {
     const PROBE_BYTES: usize = 4 * 1024 * 1024;
     let source = vec![0x5au8; PROBE_BYTES];
     let mut destination = vec![0u8; PROBE_BYTES];
-    let start = std::time::Instant::now();
+    let start = crate::Cx::monotonic_now();
     destination.copy_from_slice(std::hint::black_box(&source));
     std::hint::black_box(&destination);
-    let nanos = start.elapsed().as_nanos().max(1);
+    let nanos = ((crate::Cx::monotonic_now() - start).max(0.0) * 1_000_000_000.0).max(1.0) as u128;
     ((PROBE_BYTES as u128 * 2_000_000 / nanos).min(PROBE_BYTES as u128) as usize) & !3
 }
 
