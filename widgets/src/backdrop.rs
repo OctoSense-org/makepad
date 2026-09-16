@@ -93,8 +93,11 @@ impl BackdropCompositor {
     }
 
     fn snapshot(&mut self, cx: &Cx2d, source: usize, level: f64) -> GaussBlurSnapshot {
-        // The shader samples floor(level) and floor(level)+1, even at integer levels.
-        let count = (level.floor() as usize + 1).min(GAUSS_VIEW_LEVELS);
+        // The shader samples floor(level) and floor(level)+1, and skips the
+        // second read at an integer level (`sample_blur`), whose weight is zero
+        // there: ceil(level) mips cover both cases, one mip and its smoothing
+        // stages fewer than floor+1 at integer levels.
+        let count = (level.max(0.0).ceil() as usize).min(GAUSS_VIEW_LEVELS);
         self.levels[source] = self.levels[source].max(count);
         self.stacks[source].snapshot(
             self.size,

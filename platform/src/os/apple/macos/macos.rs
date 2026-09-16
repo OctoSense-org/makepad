@@ -2095,6 +2095,13 @@ impl Cx {
                         browser.cleanup();
                     }
                 }
+                CxOsOp::InspectSystemBrowser { browser_id, result_path, snapshot_path, scroll_y } => {
+                    if let Some(browser) = self.os.system_browsers.get_mut(&browser_id) {
+                        browser.inspect(result_path, snapshot_path, scroll_y);
+                    } else {
+                        let _ = std::fs::write(result_path, r#"{"error":"native browser is closed"}"#);
+                    }
+                }
                 CxOsOp::SaveFileDialog(settings) => {
                     with_macos_app(|app| app.open_save_file_dialog(settings));
                 }

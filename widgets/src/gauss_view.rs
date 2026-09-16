@@ -466,6 +466,11 @@ script_mod! {
                 let l2 = min(base_level + 1.0, 6.0)
                 let blend = t * t * (3.0 - 2.0 * t)
                 let c1 = self.sample_level(l1, uv)
+                // An integer level (a settled sheet, Recents at rest) reads one
+                // level: the second bicubic read would be weighted zero.
+                if blend <= 0.0001 {
+                    return c1
+                }
                 let c2 = self.sample_level(l2, uv)
 
                 return c1.mix(c2, blend)

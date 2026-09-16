@@ -262,6 +262,7 @@ mod imp {
     // ------------------------------------------------------------------
 
     enum Cmd {
+        Custom { data: String, tx: Sender<Reply> },
         Input {
             window: Option<usize>,
             inputs: Vec<Input>,
@@ -1142,6 +1143,10 @@ mod imp {
 
     fn apply(cx: &mut Cx, cmd: Cmd) {
         match cmd {
+            Cmd::Custom { data, tx } => {
+                cx.call_event_handler(&crate::event::Event::Custom(data));
+                let _ = tx.send(Reply::Ok);
+            }
             Cmd::Input {
                 window,
                 inputs,
@@ -1770,6 +1775,13 @@ mod imp {
             "/k" | "/key" => route_key(p),
             "/t" | "/text" => route_text(p),
             "/drop" => route_drop(p),
+            "/event" => match p.get(&["data"]) {
+                Some(data) => {
+                    let data = data.to_string();
+                    reply_to_out(ask(move |tx| Cmd::Custom { data, tx }, 4))
+                }
+                None => err("event requires data"),
+            },
             "/log" => route_log(p),
             "/trace" => route_trace(p),
             "/d" | "/dump" => match ask(|tx| Cmd::Dump(tx), 4) {
@@ -1951,6 +1963,7 @@ mod imp {
              /click?x=&y=      alias for /m?k=click\n\
              /k?t=TEXT         type text. or /k?k=down|up&c=KeyA (Escape ReturnKey Tab Backspace ArrowLeft F1 Key1 ..)\n\
              /t?t=TEXT         same as /k?t=\n\
+             /event?data=TEXT   dispatch an application-defined Event::Custom (also POST with a data string)\n\
              /drop?path=&x=&y= drop one absolute file path through Drag/Drop/DragEnd; optional w= and wait=1; app validates/loads it\n\
              /log?n=50         {{\"n\":lastseq,\"l\":[lines]}}; /log?since=N for everything after seq N\n\
              /trace             get topics; ?topics=gpu.pass,wm sets them; ?off=1 clears them\n\
