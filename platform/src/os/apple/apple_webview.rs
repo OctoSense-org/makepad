@@ -5,6 +5,8 @@ use crate::{
     os::apple::{apple_sys::*, apple_util::str_to_nsstring},
 };
 use makepad_objc_sys::{class, msg_send};
+#[cfg(target_os = "macos")]
+use makepad_objc_sys::objc_block;
 
 #[link(name = "WebKit", kind = "framework")]
 unsafe extern "C" {}
@@ -210,6 +212,46 @@ impl MacosSystemBrowser {
         history_go(self.web_view, delta);
     }
 
+    pub(crate) fn inspect(&mut self, result_path: String, snapshot_path: Option<String>, scroll_y: Option<f64>) {
+        if self.web_view == nil { return; }
+        let scroll = scroll_y.filter(|y| y.is_finite())
+            .map(|y| format!("window.scrollTo(0,{y});")).unwrap_or_default();
+        let script = format!(r#"{scroll}JSON.stringify({{
+            readyState:document.readyState,title:document.title,
+            scrollY:window.scrollY,scrollHeight:document.documentElement.scrollHeight,
+            viewportHeight:window.innerHeight,viewportWidth:window.innerWidth,
+            text:document.body.innerText,tables:document.querySelectorAll('table').length,
+            bold:document.querySelectorAll('b,strong').length,
+            images:Array.from(document.images).map(i=>({{complete:i.complete,width:i.naturalWidth,height:i.naturalHeight}})),
+            emailScriptExecuted:typeof window.emailScriptExecuted!=='undefined'
+        }})"#);
+        unsafe {
+            let completion = objc_block!(move |value: ObjcId, error: ObjcId| {
+                let result = if error != nil || value == nil {
+                    "{\"error\":\"WebView evaluation failed\"}".to_string()
+                } else { crate::os::apple::apple_util::nsstring_to_string(value) };
+                let _ = std::fs::write(&result_path, result);
+            });
+            let () = msg_send![self.web_view, evaluateJavaScript: str_to_nsstring(&script) completionHandler: &completion];
+            if let Some(path) = snapshot_path {
+                let config: ObjcId = msg_send![class!(WKSnapshotConfiguration), new];
+                let () = msg_send![config, setAfterScreenUpdates: YES];
+                let completion = objc_block!(move |image: ObjcId, error: ObjcId| {
+                    if error != nil || image == nil { return; }
+                    let tiff: ObjcId = msg_send![image, TIFFRepresentation];
+                    let bitmap: ObjcId = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+                    let properties: ObjcId = msg_send![class!(NSDictionary), dictionary];
+                    let png: ObjcId = msg_send![bitmap, representationUsingType: 4u64 properties: properties];
+                    if png != nil {
+                        let _: BOOL = msg_send![png, writeToFile: str_to_nsstring(&path) atomically: YES];
+                    }
+                });
+                let () = msg_send![self.web_view, takeSnapshotWithConfiguration: config completionHandler: &completion];
+                let () = msg_send![config, release];
+            }
+        }
+    }
+
     pub(crate) fn cleanup(&mut self) {
         unsafe {
             if self.web_view != nil {
@@ -217,6 +259,10 @@ impl MacosSystemBrowser {
             }
         }
         self.detach();
+        unsafe {
+            if self.web_view != nil { let () = msg_send![self.web_view, release]; self.web_view = nil; }
+            if self.host_view != nil { let () = msg_send![self.host_view, release]; self.host_view = nil; }
+        }
     }
 }
 
