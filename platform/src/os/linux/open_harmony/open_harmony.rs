@@ -556,6 +556,41 @@ impl Cx {
 
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
 
+        // Studio screenshot: the shared GL context module that answers these
+        // on desktop is not built for OpenHarmony, so read the framebuffer
+        // here, before the swap, the same way it does.
+        let request_ids = self.take_studio_screenshot_request_ids(0);
+        if !request_ids.is_empty() {
+            let w = self.os.display_size.x as u32;
+            let h = self.os.display_size.y as u32;
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            let gl = self.os.gl();
+            unsafe {
+                (gl.glReadPixels)(
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    gl_sys::RGBA,
+                    gl_sys::UNSIGNED_BYTE,
+                    pixels.as_mut_ptr() as *mut _,
+                );
+            }
+            // GL reads bottom-up; the PNG wants rows top-down.
+            let stride = (w * 4) as usize;
+            for y in 0..(h as usize / 2) {
+                let top = y * stride;
+                let bot = (h as usize - 1 - y) * stride;
+                for x in 0..stride {
+                    pixels.swap(top + x, bot + x);
+                }
+            }
+            match Self::encode_rgba_as_png(w, h, &pixels) {
+                Ok(png) => Self::send_studio_screenshot_response(request_ids, w, h, png),
+                Err(err) => crate::error!("studio screenshot png encode failed: {err}"),
+            }
+        }
+
         unsafe { self.os.display.as_mut().unwrap().swap_buffers() };
 
         //unsafe {
