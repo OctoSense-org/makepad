@@ -18,6 +18,7 @@ public class MakepadNative {
     public native static void initChoreographer(float deviceRefreshRate, int sdkVersion);
 
     public native static void onBackPressed();
+    public native static void onHomeIntent();
 
     // belongs to QuadSurface class
     public native static void surfaceOnSurfaceCreated(Surface surface);
@@ -60,6 +61,39 @@ public class MakepadNative {
     // Called when user presses the action button on the soft keyboard
     public native static void onImeEditorAction(int actionCode);
 
+    // Native floating chat composer (an Android view floating over the GL
+    // surface) submitted its text — user tapped send or pressed IME "Send".
+    public native static void onComposerSubmit(String text);
+
+    // Composer control buttons: open another app / switch to the next app.
+    public native static void onComposerNewApp();
+    public native static void onComposerSwitch();
+
+    // The collapsed "+" FAB was tapped to unfold the composer (keeps the app's
+    // composer_shown state in sync with the native overlay).
+    public native static void onComposerExpand();
+
+    // A runhtml web-card's JS called octos.invoke(tool, args) — bridged in from the
+    // WebView's "octos_native" JavascriptInterface. Rust dispatches the tool and
+    // resolves the card-side promise (callId) via evalSystemBrowserJs.
+    public native static void onSystemBrowserInvoke(long browserId, long callId, String tool, String args);
+
+    // The app was opened/resumed via a deep link (ACTION_VIEW URL) or a share
+    // (ACTION_SEND text) — e.g. a YouTube link shared from another app.
+    public native static void onDeepLink(String url);
+
+    // Result of a native file picker (openFileDialog) — the picked file's name +
+    // text contents, or a cancel/error. Resolves the card's octos.invoke("dialog.open").
+    public native static void onDialogResult(long callId, String name, String content, boolean cancelled, String error);
+
+    // Native streaming download (downloadFile): periodic progress, then completion.
+    public native static void onDownloadProgress(long callId, long done, long total);
+    public native static void onDownloadComplete(long callId, String path, String error);
+
+    // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
+    // it; returns true if a QR was found (the caller then closes the scanner).
+    public native static boolean onQrCameraFrame(byte[] luma, int width, int height);
+
     // midi
     public native static void onMidiDeviceOpened(String name, Object midi_device);
     
@@ -78,6 +112,10 @@ public class MakepadNative {
         boolean hasBearing, float bearing,
         long timeMillis);
     public native static void onLocationError(int code, String message);
+
+    // location (GPS) — the Android LocationListener delivers each fix here; Rust
+    // stores it in makepad_platform::gps for the Splash sys.gps(...) helper.
+    public native static void onLocation(double lat, double lon, float acc);
 
     // video playback
     public static native void onVideoPlaybackPrepared(long videoId, int videoWidth, int videoHeight, long duration, VideoPlayer surfaceTexture);

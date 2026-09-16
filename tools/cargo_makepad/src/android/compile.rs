@@ -1246,10 +1246,19 @@ fn build_dex(
     let d8_jar = d8_jar_path(sdk_dir, urls);
     let android_jar = android_jar_path(sdk_dir, urls);
 
+    // Without --min-api, D8 defaults to API 1 and desugars interface DEFAULT
+    // methods into `<Interface>$-CC` companion classes — which it cannot emit
+    // for platform (android.jar) interfaces like LocationListener, so the
+    // first GPS fix on Android 14+ crashes with NoClassDefFoundError
+    // (LocationListener$-CC). Our min SDK is >= 24, where the runtime
+    // dispatches interface defaults natively — tell D8 so it skips desugaring.
+    let min_api = urls.sdk_version.to_string();
     let mut args: Vec<&str> = vec![
         "-cp",
         d8_jar.to_str().unwrap(),
         "com.android.tools.r8.D8",
+        "--min-api",
+        &min_api,
         "--classpath",
         android_jar.to_str().unwrap(),
         "--output",
@@ -1673,6 +1682,35 @@ fn add_rust_library(
             build_paths,
             &current_build_dir,
         )?;
+
+        // Bundle extra native-lib binaries named by the
+        // `MAKEPAD_ANDROID_EXTRA_LIBS` env var (format: `name=path` entries
+        // separated by `;`). Each `path` is copied into `lib/<abi>/<name>` and
+        // added to the APK exactly like `libmakepad.so`. Intended for shipping
+        // a helper *executable* as a `lib*.so` so it lands in the app's
+        // nativeLibraryDir — the only location an Android `untrusted_app` may
+        // exec a binary from. The bundled path must be the matching-ABI binary.
+        if let Ok(extra) = std::env::var("MAKEPAD_ANDROID_EXTRA_LIBS") {
+            for entry in extra.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                let (name, src) = entry.split_once('=').ok_or_else(|| {
+                    format!("MAKEPAD_ANDROID_EXTRA_LIBS: bad entry {entry:?} (want name=path)")
+                })?;
+                let binary_path = format!("lib/{abi}/{}", name.trim());
+                let dst_lib = build_paths.out_dir.join(&binary_path);
+                cp(Path::new(src.trim()), &dst_lib, false)?;
+                shell_env_cap(
+                    &[],
+                    &build_paths.out_dir,
+                    aapt_path(sdk_dir, urls).to_str().unwrap(),
+                    &[
+                        "add",
+                        build_paths.dst_unaligned_apk.to_str().unwrap(),
+                        &binary_path,
+                    ],
+                )?;
+                println!("  Bundled extra native lib: {} (for {abi})", name.trim());
+            }
+        }
     }
     // for the quest variant add the precompiled openXR loader
     if let AndroidVariant::Quest = variant {
@@ -2709,7 +2747,12 @@ pub fn build(
     // For APK builds, debuggable matches the cargo profile: release -> false,
     // anything else -> true (matches the historical behavior of `cargo makepad
     // android run`).
-    let debuggable = get_profile_from_args(args) != "release";
+    // Release APKs are non-debuggable; `MAKEPAD_FORCE_DEBUGGABLE` forces the
+    // debuggable manifest flag on an optimized release build (so WebView reads
+    // `/data/local/tmp/webview-command-line` — e.g. to disable SurfaceControl
+    // video compositing over the GL surface).
+    let debuggable = get_profile_from_args(args) != "release"
+        || std::env::var("MAKEPAD_FORCE_DEBUGGABLE").is_ok();
     let prep_opts = PrepareBuildOpts {
         build_crate,
         java_url: &resolved.java_url,
