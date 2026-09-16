@@ -44,6 +44,20 @@ pub fn ohos_ability_on_create(env: Env, ark_ts: JsObject) -> napi_ohos::Result<(
     let temp_dir = arkts_obj.get_string("tempDir").unwrap();
     let res_mgr = arkts_obj.get_property("resMgr").unwrap();
 
+    // The entry ability collects the Want's `makepad.*` parameters into
+    // `launchParameters` (a flat JSON object of strings). They become the
+    // environment the rest of the platform already reads — STUDIO_HOST,
+    // STUDIO_BUILD, STUDIO_CRATE and any app-level setting — before anything
+    // resolves them, exactly like `cargo makepad android run` passes extras.
+    if let Ok(parameters) = arkts_obj.get_string("launchParameters") {
+        for (key, value) in flat_json_string_pairs(&parameters) {
+            if let Some(name) = key.strip_prefix("makepad.") {
+                crate::log!("launch parameter {name}={value}");
+                std::env::set_var(name, value);
+            }
+        }
+    }
+
     let raw_file = RawFileMgr::new(raw_env, res_mgr);
 
     crate::log!("call onCreate, device_type = {}, os_full_name = {}, display_density = {}, files_dir = {}, cache_dir = {}, temp_dir = {}", device_type, os_full_name, display_density, files_dir,cache_dir,temp_dir);
@@ -738,5 +752,59 @@ impl CxOhosDisplay {
         {
             panic!();
         }
+    }
+}
+
+/// The `"key":"value"` pairs of a flat JSON object of strings, in order.
+/// Only `\"` and `\\` escapes are honoured — launch parameters are host
+/// names, build ids and paths, never structured text.
+fn flat_json_string_pairs(text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut strings = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut s = String::new();
+        loop {
+            match chars.next() {
+                Some('\\') => match chars.next() {
+                    Some('"') => s.push('"'),
+                    Some('\\') => s.push('\\'),
+                    Some(other) => {
+                        s.push('\\');
+                        s.push(other);
+                    }
+                    None => break,
+                },
+                Some('"') | None => break,
+                Some(other) => s.push(other),
+            }
+        }
+        strings.push(s);
+    }
+    let mut iter = strings.into_iter();
+    while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+        pairs.push((key, value));
+    }
+    pairs
+}
+
+#[cfg(test)]
+mod launch_parameter_tests {
+    #[test]
+    fn flat_pairs_come_out_in_order_with_escapes() {
+        let pairs = super::flat_json_string_pairs(
+            r#"{"makepad.STUDIO_HOST":"127.0.0.1:8002","makepad.PATH":"a\"b\\c"}"#,
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("makepad.STUDIO_HOST".into(), "127.0.0.1:8002".into()),
+                ("makepad.PATH".into(), "a\"b\\c".into())
+            ]
+        );
+        assert!(super::flat_json_string_pairs("{}").is_empty());
     }
 }
