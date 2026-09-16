@@ -109,6 +109,11 @@ impl Cx {
     }
 
     fn handle_other_events(&mut self) {
+        // Network runtime responses and Studio websocket messages. Every
+        // other backend pumps these from its event loop; this one never did,
+        // so a hub request (WidgetTreeDump, Screenshot, ...) sat unanswered.
+        self.dispatch_network_runtime_events();
+
         // Timers
         let events = self.os.timers.get_dispatch();
         for event in events {
