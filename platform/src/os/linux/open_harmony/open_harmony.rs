@@ -1,4 +1,6 @@
 use {
+    crate::TextInputConfig,
+    crate::cx::CxDependency,
     self::super::{
         super::gl_sys, super::gl_sys::LibGl, arkts_obj_ref::ArkTsObjRef, oh_callbacks::*,
         oh_media::CxOpenHarmonyMedia, raw_file::RawFileMgr,
@@ -44,6 +46,35 @@ pub fn ohos_ability_on_create(env: Env, ark_ts: JsObject) -> napi_ohos::Result<(
     let temp_dir = arkts_obj.get_string("tempDir").unwrap();
     let res_mgr = arkts_obj.get_property("resMgr").unwrap();
 
+    // The entry ability collects the Want's `makepad.*` parameters into
+    // `launchParameters` (a flat JSON object of strings). They become the
+    // environment the rest of the platform already reads — STUDIO_HOST,
+    // STUDIO_BUILD, STUDIO_CRATE and any app-level setting — before anything
+    // resolves them, exactly like `cargo makepad android run` passes extras.
+    if let Ok(parameters) = arkts_obj.get_string("launchParameters") {
+        for (key, value) in flat_json_string_pairs(&parameters) {
+            if let Some(name) = key.strip_prefix("makepad.") {
+                crate::log!("launch parameter {name}={value}");
+                // Both spellings Android's extras produce: `makepad.TRACE`
+                // is MAKEPAD_TRACE to the platform, and the Studio settings
+                // are read unprefixed (STUDIO_HOST, STUDIO_BUILD, STUDIO_CRATE).
+                std::env::set_var(format!("MAKEPAD_{name}"), &value);
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    // The process starts without a usable HOME. The ability's files
+    // directory is the app's home: where a bundled core keeps its state,
+    // where anything reading `$HOME` on this platform should land.
+    if std::env::var_os("HOME").map_or(true, |home| home.is_empty() || home == "/") {
+        std::env::set_var("HOME", &files_dir);
+    }
+    // The trace topics were read at module load, before these parameters
+    // existed; `--ps makepad.MAKEPAD_TRACE topic,topic` works from here on.
+    crate::makepad_error_log::set_trace_topics(
+        &std::env::var("MAKEPAD_TRACE").unwrap_or_default(),
+    );
+
     let raw_file = RawFileMgr::new(raw_env, res_mgr);
 
     crate::log!("call onCreate, device_type = {}, os_full_name = {}, display_density = {}, files_dir = {}, cache_dir = {}, temp_dir = {}", device_type, os_full_name, display_density, files_dir,cache_dir,temp_dir);
@@ -72,19 +103,55 @@ impl Cx {
         self.redraw_all();
 
         while !self.os.quit {
-            match from_ohos_rx.recv() {
+            // Sleep until something arrives or the earliest timer is due; the
+            // display is asked for a beat only when there is something to draw.
+            let wait = self
+                .os
+                .timers
+                .next_due_in()
+                .map_or(std::time::Duration::from_secs(3600), std::time::Duration::from_secs_f64);
+            match from_ohos_rx.recv_timeout(wait) {
                 Ok(FromOhosMessage::VSync) => {
                     self.handle_all_pending_messages(&from_ohos_rx);
                     self.handle_other_events();
+                    // Arm the next beat before this one's paint and swap, or
+                    // a continuous animation lands every other beat.
+                    if self.frame_wanted() {
+                        super::oh_callbacks::request_vsync();
+                    }
                     self.handle_drawing();
                 }
-                Ok(message) => self.handle_message(message),
-                Err(e) => {
-                    crate::error!("Error receiving message: {:?}", e);
+                Ok(FromOhosMessage::Wake) => {
+                    self.handle_all_pending_messages(&from_ohos_rx);
+                    self.handle_other_events();
                 }
+                Ok(message) => self.handle_message(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.handle_other_events();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::error!("the ArkTS channel closed");
+                    break;
+                }
+            }
+            if self.frame_wanted() {
+                super::oh_callbacks::request_vsync();
             }
         }
         self.call_event_handler(&Event::Shutdown);
+    }
+
+    /// Whether the next display beat has work: a dirty pass, a requested
+    /// redraw or next frame, a time-driven shader, a platform op, released
+    /// GPU storage still waiting to retire.
+    fn frame_wanted(&self) -> bool {
+        self.any_passes_dirty()
+            || self.need_redrawing()
+            || !self.new_next_frames.is_empty()
+            || self.demo_time_repaint
+            || self.os.first_after_resize
+            || !self.platform_ops.is_empty()
+            || self.opengl_retirement_pending()
     }
 
     fn handle_all_pending_messages(&mut self, from_ohos_rx: &mpsc::Receiver<FromOhosMessage>) {
@@ -95,6 +162,11 @@ impl Cx {
     }
 
     fn handle_other_events(&mut self) {
+        // Network runtime responses and Studio websocket messages. Every
+        // other backend pumps these from its event loop; this one never did,
+        // so a hub request (WidgetTreeDump, Screenshot, ...) sat unanswered.
+        self.dispatch_network_runtime_events();
+
         // Timers
         let events = self.os.timers.get_dispatch();
         for event in events {
@@ -131,7 +203,22 @@ impl Cx {
     }
 
     fn handle_drawing(&mut self) {
-        if self.any_passes_dirty() || self.need_redrawing() || !self.new_next_frames.is_empty() {
+        if self.any_passes_dirty()
+            || self.need_redrawing()
+            || !self.new_next_frames.is_empty()
+            || self.demo_time_repaint
+        {
+            if crate::makepad_error_log::trace_enabled("nextframe") {
+                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = (Cx::monotonic_now() * 1000.0) as u64;
+                if now.saturating_sub(LAST.load(std::sync::atomic::Ordering::Relaxed)) > 1000 {
+                    LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+                    crate::log!(
+                        "[paint] dirty_passes={} need_redraw={} next_frames={} demo_time={}",
+                        self.any_passes_dirty(), self.need_redrawing(), self.new_next_frames.len(), self.demo_time_repaint
+                    );
+                }
+            }
             let time_now = self.os.timers.time_now();
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(time_now);
@@ -147,6 +234,24 @@ impl Cx {
             }
 
             self.handle_repaint();
+
+            // Script-VM garbage collection at a safe point after paint, as the
+            // Android and macOS backends do: every eval allocates script
+            // objects that only gc() reclaims. needs_gc() gates the sweep.
+            if std::env::var_os("MAKEPAD_OHOS_GC").is_some() {
+                self.with_vm(|vm| {
+                    if vm.heap().needs_gc() {
+                        vm.gc();
+                    }
+                });
+            }
+        } else {
+            // Nothing to paint: released GPU storage (allocations waiting on
+            // their completion fence, freed draw storage) is served here, on
+            // the beat, without a present, as Android does. A hosted module
+            // that frees storage every frame settles here instead of keeping
+            // the repaint alive.
+            let _ = self.opengl_maintain_instance_retirements();
         }
     }
 
@@ -261,6 +366,7 @@ impl Cx {
                         },
                     ))
                 } else {
+                    self.os.last_ime_config = None;
                     self.text_ime_was_dismissed();
                     self.call_event_handler(&Event::VirtualKeyboard(
                         VirtualKeyboardEvent::DidHide {
@@ -274,33 +380,43 @@ impl Cx {
     }
 
     fn wait_init(&mut self, from_ohos_rx: &mpsc::Receiver<FromOhosMessage>) -> bool {
-        if let Ok(FromOhosMessage::Init {
-            device_type,
-            os_full_name,
-            display_density,
-            files_dir,
-            cache_dir,
-            temp_dir,
-            raw_env,
-            arkts_ref,
-            raw_file,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.dpi_factor = display_density;
-            self.os.raw_file = Some(raw_file);
-            self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
-                files_dir,
-                cache_dir,
-                temp_dir,
-                device_type,
-                os_full_name,
-                display_density,
-            });
-            self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
-            return true;
-        } else {
-            crate::error!("Failed to receive init message from ArkTS layer");
-            return false;
+        // Anything may wake the channel before the ability has sent Init
+        // (a signal posted from a background thread arrives as VSync), so
+        // skip what is not Init instead of giving up on the first message.
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::Init {
+                    device_type,
+                    os_full_name,
+                    display_density,
+                    files_dir,
+                    cache_dir,
+                    temp_dir,
+                    raw_env,
+                    arkts_ref,
+                    raw_file,
+                }) => {
+                    self.os.dpi_factor = display_density;
+                    self.os.raw_file = Some(raw_file);
+                    self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
+                        files_dir,
+                        cache_dir,
+                        temp_dir,
+                        device_type,
+                        os_full_name,
+                        display_density,
+                    });
+                    self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
+                    return true;
+                }
+                Ok(other) => {
+                    crate::log!("message before Init skipped: {}", ohos_message_name(&other));
+                }
+                Err(_) => {
+                    crate::error!("Failed to receive init message from ArkTS layer");
+                    return false;
+                }
+            }
         }
     }
 
@@ -308,34 +424,53 @@ impl Cx {
         &mut self,
         from_ohos_rx: &mpsc::Receiver<FromOhosMessage>,
     ) -> *mut c_void {
-        if let Ok(FromOhosMessage::SurfaceCreated {
-            window,
-            width,
-            height,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.display_size = dvec2(width as f64, height as f64);
-            crate::log!(
-                "handle surface created, width={}, height={}, display_density={}",
-                width,
-                height,
-                self.os.dpi_factor
-            );
-            return window;
-        } else {
-            crate::error!("Can't recv SurfaceCreated from arkts");
-            return null_mut();
+        // The Studio websocket connects between Init and the XComponent's
+        // surface and posts a wake-up through this channel; a single recv
+        // took that wake-up for the surface, handed EGL a null window and
+        // the app died in an assertion. Wait for the surface itself.
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::SurfaceCreated {
+                    window,
+                    width,
+                    height,
+                }) => {
+                    self.os.display_size = dvec2(width as f64, height as f64);
+                    crate::log!(
+                        "handle surface created, width={}, height={}, display_density={}",
+                        width,
+                        height,
+                        self.os.dpi_factor
+                    );
+                    return window;
+                }
+                Ok(other) => {
+                    crate::log!("message before SurfaceCreated skipped: {}", ohos_message_name(&other));
+                }
+                Err(_) => {
+                    crate::error!("Can't recv SurfaceCreated from arkts");
+                    return null_mut();
+                }
+            }
         }
     }
+
 
     pub fn ohos_init<F>(exports: JsObject, env: Env, startup: F)
     where
         F: FnOnce() -> Box<Cx> + Send + 'static,
     {
+        // The async log sink only exists after init_log; every other entry
+        // point starts it, this one never did, so every log record on
+        // OpenHarmony was counted as dropped and nothing reached hilog.
+        Cx::init_log();
         crate::log!("ohos init");
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(move || {
             std::panic::set_hook(Box::new(|info| {
+                // Synchronously: with panic = "abort" the async sink never
+                // gets to flush this line.
+                super::oh_util::hilog_sync(&format!("[E] panic: {info}"));
                 crate::log!("custom panic hook: {}", info);
             }));
             Cx::ohos_startup(startup);
@@ -361,6 +496,15 @@ impl Cx {
         std::thread::spawn(move || {
             let mut cx = startup();
             assert!(cx.wait_init(&from_ohos_rx));
+            // `startup` resolved the Studio host at module load, before the
+            // entry ability's onCreate turned the launch parameters into
+            // environment (STUDIO_HOST and friends). Now that Init has
+            // arrived they are set, so resolve again and dial the hub.
+            let studio_http = crate::resolve_studio_http();
+            if !studio_http.is_empty() {
+                crate::log!("studio host from launch parameters: {studio_http}");
+                cx.init_websockets(&studio_http);
+            }
             cx.ohos_load_dependencies();
 
             let window = cx.wait_surface_created(&from_ohos_rx);
@@ -425,21 +569,52 @@ impl Cx {
         });
     }
 
-    pub fn ohos_load_dependencies(&mut self) {
-        for (path, dep) in &mut self.dependencies {
-            let mut buffer = Vec::<u8>::new();
-            if let Ok(_) = self
-                .os
-                .raw_file
-                .as_mut()
-                .unwrap()
-                .read_to_end(path, &mut buffer)
-            {
-                dep.data = Some(Ok(Rc::new(buffer)));
-            } else {
-                dep.data = Some(Err("read_to_end failed".to_string()));
-            }
+    /// Ask the platform for a location fix. `sys.gps` in the widgets calls this
+    /// on every read; on Android the JNI `LocationListener` feeds
+    /// `makepad_platform::gps`. This line has no ArkTS location bridge yet (the
+    /// build-tool lane's DevEco template carries one), so the call is a logged
+    /// no-op and `gps::last_gps_fix()` stays `None` — cards see "no fix", never
+    /// a stale or fake position.
+    pub fn ohos_request_gps(&mut self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::log!("ohos_request_gps: no location bridge on this line; sys.gps reports no fix");
         }
+    }
+
+    /// Every packaged raw file, read now, while the native resource manager
+    /// is still usable. On HarmonyOS 6 the manager obtained at onCreate serves
+    /// reads until the window stage is up and aborts (a CFI check inside the
+    /// raw-file API) on any read after that, so nothing asks it later: script
+    /// resources, fonts and images are all served from this table.
+    pub fn ohos_load_dependencies(&mut self) {
+        let Some(raw_file) = self.os.raw_file.clone() else {
+            crate::error!("no resource manager: packaged resources unavailable");
+            return;
+        };
+        let started = std::time::Instant::now();
+        let root = self.package_root.clone().unwrap_or_else(|| "makepad".to_string());
+        let prefix = format!("{root}/");
+        let (mut files, mut bytes) = (0usize, 0usize);
+        for path in raw_file.list_files(&root) {
+            let mut data = Vec::new();
+            let entry = match raw_file.read_to_end(&path, &mut data) {
+                Ok(_) => {
+                    files += 1;
+                    bytes += data.len();
+                    Some(Ok(Rc::new(data)))
+                }
+                Err(err) => Some(Err(format!("rawfile {path}: {err}"))),
+            };
+            let key = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
+            self.dependencies.insert(key, CxDependency { data: entry });
+        }
+        crate::log!(
+            "packaged resources: {files} files, {} KiB, {:.0} ms",
+            bytes / 1024,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
@@ -487,6 +662,41 @@ impl Cx {
         let zbias_step = self.passes[draw_pass_id].zbias_step;
 
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
+
+        // Studio screenshot: the shared GL context module that answers these
+        // on desktop is not built for OpenHarmony, so read the framebuffer
+        // here, before the swap, the same way it does.
+        let request_ids = self.take_studio_screenshot_request_ids(0);
+        if !request_ids.is_empty() {
+            let w = self.os.display_size.x as u32;
+            let h = self.os.display_size.y as u32;
+            let mut pixels = vec![0u8; (w * h * 4) as usize];
+            let gl = self.os.gl();
+            unsafe {
+                (gl.glReadPixels)(
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    gl_sys::RGBA,
+                    gl_sys::UNSIGNED_BYTE,
+                    pixels.as_mut_ptr() as *mut _,
+                );
+            }
+            // GL reads bottom-up; the PNG wants rows top-down.
+            let stride = (w * 4) as usize;
+            for y in 0..(h as usize / 2) {
+                let top = y * stride;
+                let bot = (h as usize - 1 - y) * stride;
+                for x in 0..stride {
+                    pixels.swap(top + x, bot + x);
+                }
+            }
+            match Self::encode_rgba_as_png(w, h, &pixels) {
+                Ok(png) => Self::send_studio_screenshot_response(request_ids, w, h, png),
+                Err(err) => crate::error!("studio screenshot png encode failed: {err}"),
+            }
+        }
 
         unsafe { self.os.display.as_mut().unwrap().swap_buffers() };
 
@@ -577,14 +787,18 @@ impl Cx {
                 CxOsOp::Quit => {
                     self.os.quit = true;
                 }
-                CxOsOp::ShowTextIME(_area, _pos, _config) => {
-                    let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
-                        "showKeyBoard",
-                        0,
-                        std::ptr::null_mut(),
-                    );
+                CxOsOp::ShowTextIME(_area, _pos, config) => {
+                    if self.os.last_ime_config.as_ref() != Some(&config) {
+                        let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
+                            "showKeyBoard",
+                            0,
+                            std::ptr::null_mut(),
+                        );
+                        self.os.last_ime_config = Some(config);
+                    }
                 }
                 CxOsOp::HideTextIME => {
+                    self.os.last_ime_config = None;
                     let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
                         "hideKeyBoard",
                         0,
@@ -599,6 +813,9 @@ impl Cx {
                 }
                 // Track selection is currently implemented on Linux GStreamer only.
                 CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
+                // The IME keeps no copy of the field's text on this platform
+                // yet; there is nothing to bring in step.
+                CxOsOp::SyncImeState { .. } => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -644,6 +861,11 @@ pub struct CxOs {
     pub timers: PollTimers,
     pub raw_file: Option<RawFileMgr>,
     pub arkts_obj: Option<ArkTsObjRef>,
+    /// The keyboard config last shown, cleared when the keyboard goes down:
+    /// a focused TextInput re-issues ShowTextIME every draw, and each call
+    /// into ArkTS re-attaches the input method client, which drops what was
+    /// typed in between.
+    pub last_ime_config: Option<TextInputConfig>,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,
 }
@@ -665,6 +887,7 @@ impl Default for CxOs {
             timers: Default::default(),
             raw_file: None,
             arkts_obj: None,
+            last_ime_config: None,
             start_time: Instant::now(),
             display: None,
         }
@@ -726,3 +949,74 @@ impl CxOhosDisplay {
         }
     }
 }
+
+/// The `"key":"value"` pairs of a flat JSON object of strings, in order.
+/// Only `\"` and `\\` escapes are honoured — launch parameters are host
+/// names, build ids and paths, never structured text.
+fn flat_json_string_pairs(text: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut strings = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut s = String::new();
+        loop {
+            match chars.next() {
+                Some('\\') => match chars.next() {
+                    Some('"') => s.push('"'),
+                    Some('\\') => s.push('\\'),
+                    Some(other) => {
+                        s.push('\\');
+                        s.push(other);
+                    }
+                    None => break,
+                },
+                Some('"') | None => break,
+                Some(other) => s.push(other),
+            }
+        }
+        strings.push(s);
+    }
+    let mut iter = strings.into_iter();
+    while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+        pairs.push((key, value));
+    }
+    pairs
+}
+
+#[cfg(test)]
+mod launch_parameter_tests {
+    #[test]
+    fn flat_pairs_come_out_in_order_with_escapes() {
+        let pairs = super::flat_json_string_pairs(
+            r#"{"makepad.STUDIO_HOST":"127.0.0.1:8002","makepad.PATH":"a\"b\\c"}"#,
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("makepad.STUDIO_HOST".into(), "127.0.0.1:8002".into()),
+                ("makepad.PATH".into(), "a\"b\\c".into())
+            ]
+        );
+        assert!(super::flat_json_string_pairs("{}").is_empty());
+    }
+}
+
+/// The variant name of a channel message, for the startup log.
+fn ohos_message_name(message: &FromOhosMessage) -> &'static str {
+    match message {
+        FromOhosMessage::Init { .. } => "Init",
+        FromOhosMessage::SurfaceChanged { .. } => "SurfaceChanged",
+        FromOhosMessage::SurfaceCreated { .. } => "SurfaceCreated",
+        FromOhosMessage::SurfaceDestroyed => "SurfaceDestroyed",
+        FromOhosMessage::VSync => "VSync",
+        FromOhosMessage::Wake => "Wake",
+        FromOhosMessage::Touch(_) => "Touch",
+        FromOhosMessage::TextInput(_) => "TextInput",
+        FromOhosMessage::DeleteLeft(_) => "DeleteLeft",
+        FromOhosMessage::ResizeTextIME(..) => "ResizeTextIME",
+    }
+}
+

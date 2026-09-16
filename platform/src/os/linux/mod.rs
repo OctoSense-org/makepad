@@ -104,7 +104,7 @@ pub(crate) fn wake_ui_event_loop() {
 #[cfg(target_env = "ohos")]
 pub(crate) fn wake_ui_event_loop() {
     open_harmony::oh_callbacks::send_from_ohos_message(
-        open_harmony::oh_callbacks::FromOhosMessage::VSync,
+        open_harmony::oh_callbacks::FromOhosMessage::Wake,
     );
 }
 

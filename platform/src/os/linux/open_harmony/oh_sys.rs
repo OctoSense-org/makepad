@@ -63,6 +63,10 @@ extern "C" {
 
 // rawfile
 #[repr(C)]
+#[repr(C)]
+pub struct RawDir {
+    _unused: [u8; 0],
+}
 pub struct RawFile {
     _unused: [u8; 0],
 }
@@ -81,6 +85,20 @@ extern "C" {
     pub fn OH_ResourceManager_ReleaseNativeResourceManager(
         resMgr: *mut NativeResourceManager,
     ) -> ::core::ffi::c_void;
+    pub fn OH_ResourceManager_OpenRawDir(
+        mgr: *const NativeResourceManager,
+        dirName: *const ::core::ffi::c_char,
+    ) -> *mut RawDir;
+    pub fn OH_ResourceManager_GetRawFileCount(rawDir: *mut RawDir) -> ::core::ffi::c_int;
+    pub fn OH_ResourceManager_GetRawFileName(
+        rawDir: *mut RawDir,
+        index: ::core::ffi::c_int,
+    ) -> *const ::core::ffi::c_char;
+    pub fn OH_ResourceManager_CloseRawDir(rawDir: *mut RawDir);
+    pub fn OH_ResourceManager_IsRawDir(
+        mgr: *const NativeResourceManager,
+        path: *const ::core::ffi::c_char,
+    ) -> bool;
     pub fn OH_ResourceManager_OpenRawFile(
         mgr: *const NativeResourceManager,
         fileName: *const ::core::ffi::c_char,

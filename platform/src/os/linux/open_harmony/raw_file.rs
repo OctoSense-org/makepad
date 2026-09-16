@@ -22,7 +22,7 @@ impl RawFileMgr {
         }
     }
 
-    pub fn read_to_end<S: AsRef<str>>(&mut self, path: S, buf: &mut Vec<u8>) -> Result<usize> {
+    pub fn read_to_end<S: AsRef<str>>(&self, path: S, buf: &mut Vec<u8>) -> Result<usize> {
         if self.native_resource_manager.is_null() {
             return Err(Error::new(
                 ErrorKind::NotConnected,
@@ -63,6 +63,54 @@ impl Drop for RawFileMgr {
     fn drop(&mut self) {
         unsafe {
             OH_ResourceManager_ReleaseNativeResourceManager(self.native_resource_manager);
+        }
+    }
+}
+
+impl RawFileMgr {
+    /// Every raw file below `dir`, depth first, as full raw-file paths.
+    pub fn list_files(&self, dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.native_resource_manager.is_null() {
+            return out;
+        }
+        self.walk(dir, &mut out);
+        out
+    }
+
+    fn walk(&self, dir: &str, out: &mut Vec<String>) {
+        let Ok(dir_cstring) = std::ffi::CString::new(dir) else {
+            return;
+        };
+        let raw_dir = unsafe {
+            OH_ResourceManager_OpenRawDir(self.native_resource_manager, dir_cstring.as_ptr())
+        };
+        if raw_dir.is_null() {
+            return;
+        }
+        let count = unsafe { OH_ResourceManager_GetRawFileCount(raw_dir) };
+        let mut names = Vec::new();
+        for index in 0..count {
+            let name = unsafe { OH_ResourceManager_GetRawFileName(raw_dir, index) };
+            if !name.is_null() {
+                let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+                names.push(name);
+            }
+        }
+        unsafe { OH_ResourceManager_CloseRawDir(raw_dir) };
+        for name in names {
+            let path = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+            let Ok(path_cstring) = std::ffi::CString::new(path.as_str()) else {
+                continue;
+            };
+            let is_dir = unsafe {
+                OH_ResourceManager_IsRawDir(self.native_resource_manager, path_cstring.as_ptr())
+            };
+            if is_dir {
+                self.walk(&path, out);
+            } else {
+                out.push(path);
+            }
         }
     }
 }

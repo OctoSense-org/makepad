@@ -213,3 +213,20 @@ pub fn get_files_dir(raw_env: napi_env) -> Option<String> {
     }
     return str_val;
 }
+
+/// A line written to hilog on the calling thread. The async log sink cannot
+/// flush a record before an abort, so the panic hook and anything that may
+/// die right after speaking use this.
+pub(crate) fn hilog_sync(message: &str) {
+    let msg = format!("{message}\0");
+    unsafe {
+        hilog_sys::OH_LOG_Print(
+            hilog_sys::LogType::LOG_APP,
+            hilog_sys::LogLevel::LOG_ERROR,
+            0x03D00,
+            "makepad-ohos\0".as_ptr().cast(),
+            "%{public}s\0".as_ptr().cast(),
+            msg.as_ptr(),
+        )
+    };
+}
