@@ -114,6 +114,11 @@ impl Cx {
                 Ok(FromOhosMessage::VSync) => {
                     self.handle_all_pending_messages(&from_ohos_rx);
                     self.handle_other_events();
+                    // Arm the next beat before this one's paint and swap, or
+                    // a continuous animation lands every other beat.
+                    if self.frame_wanted() {
+                        super::oh_callbacks::request_vsync();
+                    }
                     self.handle_drawing();
                 }
                 Ok(FromOhosMessage::Wake) => {
@@ -222,14 +227,17 @@ impl Cx {
             // Script-VM garbage collection at a safe point after paint, as the
             // Android and macOS backends do: every eval allocates script
             // objects that only gc() reclaims. needs_gc() gates the sweep.
-            self.with_vm(|vm| {
-                if vm.heap().needs_gc() {
-                    vm.gc();
-                }
-            });
+            if std::env::var_os("MAKEPAD_OHOS_GC").is_some() {
+                self.with_vm(|vm| {
+                    if vm.heap().needs_gc() {
+                        vm.gc();
+                    }
+                });
+            }
         } else {
-            // Nothing to paint: released GPU storage is retired here, on the
-            // beat, without a present (see the impl at the end of this file).
+            // Nothing to paint: released GPU storage (allocations waiting on
+            // their completion fence, freed draw storage) is served here, on
+            // the beat, without a present — as Android does.
             let _ = self.opengl_maintain_instance_retirements();
         }
     }
@@ -847,8 +855,6 @@ pub struct CxOs {
     pub last_ime_config: Option<TextInputConfig>,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,
-    /// Idle retirement beats served (`opengl_maintain_instance_retirements`).
-    pub(crate) maintenance_beats: u64,
 }
 
 impl CxOs {
@@ -869,7 +875,6 @@ impl Default for CxOs {
             raw_file: None,
             arkts_obj: None,
             last_ime_config: None,
-            maintenance_beats: 0,
             start_time: Instant::now(),
             display: None,
         }
@@ -1002,44 +1007,3 @@ fn ohos_message_name(message: &FromOhosMessage) -> &'static str {
     }
 }
 
-// Released GPU storage on this backend. The GL texture-lifetime matrix
-// (completion fences, readbacks) is not built for OpenHarmony yet, so the
-// frame serials never complete on their own and a released draw-list
-// allocation would stay in the ledger forever — which used to force a
-// repaint of every live pass at display rate on an idle shell. The beat
-// below settles that debt without fences: it runs only when nothing paints,
-// when the GPU has none of our work queued, so finishing it is free and
-// every submitted frame is complete.
-impl Cx {
-    pub(crate) fn opengl_retirement_pending(&self) -> bool {
-        use std::sync::atomic::Ordering;
-        let serials = &self.textures.1.serials;
-        self.draw_lists.has_pending_instance_retirements()
-            || serials.submitted.load(Ordering::Acquire) > serials.completed.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn opengl_maintain_instance_retirements(&mut self) -> bool {
-        use std::sync::atomic::Ordering;
-        if !self.opengl_retirement_pending() {
-            return false;
-        }
-        let Some(display) = self.os.display.as_ref() else {
-            return false;
-        };
-        unsafe { (display.libgl.glFinish)() };
-        let submitted = self.textures.1.serials.submitted.load(Ordering::Acquire);
-        self.textures.1.serials.complete(submitted);
-        self.os.maintenance_beats += 1;
-        let beat = u64::MAX - self.os.maintenance_beats;
-        self.draw_lists.1.allocations.collect_for_frame(beat, submitted);
-        let pool = self.task_pool();
-        let gl = self.os.gl();
-        self.draw_lists.retire_free_items(&pool, beat, |os| {
-            if let Some(vao) = os.vao.take() {
-                vao.free(gl);
-            }
-            os.inst_vb.free_resources(gl);
-            std::mem::take(&mut os.inst_vb)
-        })
-    }
-}
