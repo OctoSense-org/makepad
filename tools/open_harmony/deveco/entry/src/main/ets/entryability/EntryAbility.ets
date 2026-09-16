@@ -1,11 +1,13 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
 import makepad from 'libmakepad.so'
 import {ArkGlue} from '../makepad/makepad'
 
 export default class EntryAbility extends UIAbility {
   private studioReview: boolean = false;
+  private immersive: boolean = false;
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     let x = ArkGlue.initInstance(this.context);
@@ -18,6 +20,9 @@ export default class EntryAbility extends UIAbility {
     }
     x.launchParameters = JSON.stringify(parameters);
     this.studioReview = (parameters['makepad.STUDIO_BUILD'] ?? '').length > 0;
+    // `--ps makepad.IMMERSIVE 1`: the app owns the whole screen, status bar
+    // included — for a shell that draws its own status bar and gesture band.
+    this.immersive = parameters['makepad.IMMERSIVE'] === '1';
     makepad.onCreate(x);
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onCreate');
   }
@@ -33,6 +38,16 @@ export default class EntryAbility extends UIAbility {
 
     // Studio input reaches the native app rather than the OS input dispatcher,
     // so it does not reset the device's screen timeout during a review session.
+    if (this.immersive) {
+      windowStage.getMainWindow().then((mainWindow) => {
+        mainWindow.setWindowLayoutFullScreen(true).catch((err: BusinessError) => {
+          hilog.warn(0x0000, 'testTag', 'Immersive layout failed: %{public}d', err.code);
+        });
+        mainWindow.setSpecificSystemBarEnabled('status', false).catch((err: BusinessError) => {
+          hilog.warn(0x0000, 'testTag', 'Hiding the status bar failed: %{public}d', err.code);
+        });
+      });
+    }
     if (this.studioReview) {
       windowStage.getMainWindow().then((mainWindow) => {
         mainWindow.setWindowKeepScreenOn(true, (err) => {
