@@ -530,7 +530,17 @@ fn value_or_nil(heap: &ScriptHeap, obj_ptr: ScriptObject, key: ScriptValue) -> S
 
 /// Format suggestions for a missing property on an object
 /// Returns a string like: `. Did you mean 'foo'? Available: bar(obj), baz(fn12:0), foo(#ff0000)`
+static SUGGESTIONS_BUILT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many "Did you mean" lists have been built so far. A probe lookup whose
+/// miss is expected (and discarded) must not build one: the list scores every
+/// property of the type by edit distance. For tests and diagnostics.
+pub fn suggestions_built() -> usize {
+    SUGGESTIONS_BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn suggest_property(heap: &ScriptHeap, obj_ptr: ScriptObject, key: ScriptValue) -> String {
+    SUGGESTIONS_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut candidates: Vec<FieldCandidate> = Vec::new();
 
     // Get the key as a string for comparison

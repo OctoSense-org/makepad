@@ -2021,7 +2021,27 @@ impl PoolSlot {
         self.submit_named(std::any::type_name::<F>(), f)
     }
 
-    pub fn submit_named<F, T>(mut self, label: &'static str, f: F) -> TaskHandle<T>
+    pub fn submit_named<F, T>(self, label: &'static str, f: F) -> TaskHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_inner(label, f, true)
+    }
+
+    /// Queue a fire-and-forget job whose completion the UI does not wait on:
+    /// no handle is returned and finishing does not raise the UI signal. Every
+    /// UI signal is an `Event::Signal` through the whole app (and, on Android,
+    /// a trip around the event loop), so per-frame housekeeping must not send
+    /// one when nothing is listening for its result.
+    pub fn submit_detached_silent<F>(self, label: &'static str, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.submit_inner(label, f, false).detach();
+    }
+
+    fn submit_inner<F, T>(mut self, label: &'static str, f: F, signal_ui: bool) -> TaskHandle<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -2042,7 +2062,9 @@ impl PoolSlot {
             run_priority_status.store(status as u8, Ordering::Release);
             if run_token.is_cancelled() {
                 run_state.complete(Err(TaskError::Cancelled));
-                signal_ui_completion();
+                if signal_ui {
+                    signal_ui_completion();
+                }
                 return;
             }
             let result = catch_unwind(AssertUnwindSafe(f)).map_err(|payload| {
@@ -2056,7 +2078,9 @@ impl PoolSlot {
                 TaskError::Panicked(report)
             });
             run_state.complete(result);
-            signal_ui_completion();
+            if signal_ui {
+                signal_ui_completion();
+            }
         };
         let job = PoolJob {
             lane: self.lane,

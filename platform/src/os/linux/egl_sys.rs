@@ -148,6 +148,7 @@ pub type PFNEGLGETCONFIGSPROC = ::std::option::Option<
     ) -> EGLBoolean,
 >;
 pub type PFNEGLGETCURRENTDISPLAYPROC = ::std::option::Option<unsafe extern "C" fn() -> EGLDisplay>;
+pub type PFNEGLGETCURRENTCONTEXTPROC = ::std::option::Option<unsafe extern "C" fn() -> EGLContext>;
 pub type PFNEGLGETCURRENTSURFACEPROC =
     ::std::option::Option<unsafe extern "C" fn(readdraw: EGLint) -> EGLSurface>;
 pub type PFNEGLGETDISPLAYPROC =
@@ -267,6 +268,7 @@ pub struct LibEgl {
     pub eglGetConfigAttrib: PFNEGLGETCONFIGATTRIBPROC,
     pub eglGetConfigs: PFNEGLGETCONFIGSPROC,
     pub eglGetCurrentDisplay: PFNEGLGETCURRENTDISPLAYPROC,
+    pub eglGetCurrentContext: PFNEGLGETCURRENTCONTEXTPROC,
     pub eglGetCurrentSurface: PFNEGLGETCURRENTSURFACEPROC,
     pub eglGetDisplay: PFNEGLGETDISPLAYPROC,
     pub eglGetError: PFNEGLGETERRORPROC,
@@ -335,6 +337,7 @@ impl LibEgl {
             eglGetConfigAttrib: module.get_symbol("eglGetConfigAttrib").ok(),
             eglGetConfigs: module.get_symbol("eglGetConfigs").ok(),
             eglGetCurrentDisplay: module.get_symbol("eglGetCurrentDisplay").ok(),
+            eglGetCurrentContext: module.get_symbol("eglGetCurrentContext").ok(),
             eglGetCurrentSurface: module.get_symbol("eglGetCurrentSurface").ok(),
             eglGetDisplay: module.get_symbol("eglGetDisplay").ok(),
             eglGetError: module.get_symbol("eglGetError").ok(),
