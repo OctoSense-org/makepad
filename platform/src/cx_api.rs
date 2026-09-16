@@ -2524,9 +2524,19 @@ mod stale_window_tests {
     }
 }
 
-#[cfg(all(target_os = "linux", not(target_os = "android")))]
+#[cfg(all(
+    target_os = "linux",
+    not(target_os = "android"),
+    not(target_env = "ohos")
+))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     crate::os::linux::linux_video_playback::can_play_type(mime)
+}
+
+/// OpenHarmony has no video-playback backend yet, so nothing is playable.
+#[cfg(target_env = "ohos")]
+fn can_play_type_impl(_mime: &str) -> &'static str {
+    ""
 }
 
 #[cfg(target_os = "android")]
