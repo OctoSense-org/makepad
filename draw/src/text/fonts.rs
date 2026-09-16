@@ -2,10 +2,9 @@ use {
     super::{
         font::{Font, FontId, GlyphId},
         font_family::{FontFamily, FontFamilyId},
-        image::{Bgra, Image},
+        image::Bgra,
         layouter::{self, LaidoutText, LayoutParams, Layouter},
         loader::{FontDefinition, FontFamilyDefinition},
-        msdfer::Msdfer,
         rasterizer::{CompletedMsdfJob, OutlineRasterizationMode, QueuedMsdfJob, Rasterizer},
         slug_atlas::{SlugAtlas, SlugGlyphCacheResult},
     },
@@ -13,6 +12,9 @@ use {
     fxhash::FxHashSet,
     std::{cell::RefCell, mem::ManuallyDrop, rc::Rc},
 };
+
+#[cfg(not(all(target_arch = "wasm32", not(target_feature = "atomics"))))]
+use super::{image::Image, msdfer::Msdfer};
 
 #[derive(Default)]
 struct LazyFontRequests {
@@ -76,11 +78,10 @@ pub struct Fonts {
 impl Fonts {
     pub fn new(cx: &mut Cx, settings: layouter::Settings) -> Self {
         let layouter = Layouter::new(settings);
-        let (atlas_size, msdfer_settings, slug_min_dpxs_per_em) = {
+        let (atlas_size, slug_min_dpxs_per_em) = {
             let rasterizer = layouter.rasterizer().borrow();
             (
                 rasterizer.color_atlas().size(),
-                rasterizer.msdfer().settings(),
                 default_slug_min_dpxs_per_em(cx, &rasterizer),
             )
         };
@@ -97,6 +98,7 @@ impl Fonts {
         }
         #[cfg(not(all(target_arch = "wasm32", not(target_feature = "atomics"))))]
         {
+        let msdfer_settings = layouter.rasterizer().borrow().msdfer().settings();
         let worker_rx = msdf_job_sender
             .receiver()
             .expect("MSDF worker receiver is taken exactly once");
