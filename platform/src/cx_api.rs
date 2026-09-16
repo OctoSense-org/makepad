@@ -1973,11 +1973,19 @@ impl Cx {
         }
     }
 
+    #[track_caller]
     pub fn redraw_all(&mut self) {
+        if crate::makepad_error_log::trace_enabled("nextframe") {
+            crate::log!("[redraw] redraw_all {}", std::panic::Location::caller());
+        }
         self.new_draw_event.redraw_all = true;
     }
 
+    #[track_caller]
     pub fn redraw_area(&mut self, area: Area) {
+        if crate::makepad_error_log::trace_enabled("nextframe") {
+            crate::log!("[redraw] redraw_area {}", std::panic::Location::caller());
+        }
         if let Some(draw_list_id) = area.draw_list_id() {
             self.redraw_list(draw_list_id);
         }
@@ -1989,13 +1997,21 @@ impl Cx {
         }
     }
 
+    #[track_caller]
     pub fn redraw_area_and_children(&mut self, area: Area) {
+        if crate::makepad_error_log::trace_enabled("nextframe") {
+            crate::log!("[redraw] redraw_area_and_children {}", std::panic::Location::caller());
+        }
         if let Some(draw_list_id) = area.draw_list_id() {
             self.redraw_list_and_children(draw_list_id);
         }
     }
 
+    #[track_caller]
     pub fn redraw_list(&mut self, draw_list_id: DrawListId) {
+        if crate::makepad_error_log::trace_enabled("nextframe") {
+            crate::log!("[redraw] redraw_list {}", std::panic::Location::caller());
+        }
         if self.in_draw_event {
             return;
         }
@@ -2015,7 +2031,11 @@ impl Cx {
         self.new_draw_event.draw_lists.push(draw_list_id);
     }
 
+    #[track_caller]
     pub fn redraw_list_and_children(&mut self, draw_list_id: DrawListId) {
+        if crate::makepad_error_log::trace_enabled("nextframe") {
+            crate::log!("[redraw] redraw_list_and_children {}", std::panic::Location::caller());
+        }
         if self.in_draw_event {
             return;
         }
@@ -2067,7 +2087,13 @@ impl Cx {
         self.keyboard.has_key_focus(focus_area)
     }
 
+    #[track_caller]
     pub fn new_next_frame(&mut self) -> NextFrame {
+        // `--ps makepad.TRACE nextframe`: who keeps the display awake. The
+        // direct caller is the widget or shell code asking for the frame.
+        if crate::makepad_error_log::trace_enabled("nextframe") {
+            crate::log!("[nextframe] {}", std::panic::Location::caller());
+        }
         let res = NextFrame(self.next_frame_id);
         self.next_frame_id += 1;
         self.new_next_frames.insert(res);

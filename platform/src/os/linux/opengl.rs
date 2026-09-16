@@ -552,6 +552,14 @@ impl Cx {
                 }
                 if sh.mapping.uses_time {
                     self.demo_time_repaint = true;
+                    if crate::makepad_error_log::trace_enabled("nextframe") {
+                        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let now = (crate::cx::Cx::monotonic_now() * 1000.0) as u64;
+                        if now.saturating_sub(LAST.load(std::sync::atomic::Ordering::Relaxed)) > 1000 {
+                            LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+                            crate::log!("[demo_time] shader {:?} reads time", sh.debug_id);
+                        }
+                    }
                 }
                 let shp = &mut self.draw_shaders.os_shaders[sh.os_shader_id.unwrap()];
                 shp.ensure_gl_shader_sources(self.os.gl(), &self.os_type);

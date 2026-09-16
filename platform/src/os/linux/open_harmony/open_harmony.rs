@@ -208,6 +208,17 @@ impl Cx {
             || !self.new_next_frames.is_empty()
             || self.demo_time_repaint
         {
+            if crate::makepad_error_log::trace_enabled("nextframe") {
+                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = (Cx::monotonic_now() * 1000.0) as u64;
+                if now.saturating_sub(LAST.load(std::sync::atomic::Ordering::Relaxed)) > 1000 {
+                    LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+                    crate::log!(
+                        "[paint] dirty_passes={} need_redraw={} next_frames={} demo_time={}",
+                        self.any_passes_dirty(), self.need_redrawing(), self.new_next_frames.len(), self.demo_time_repaint
+                    );
+                }
+            }
             let time_now = self.os.timers.time_now();
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(time_now);
