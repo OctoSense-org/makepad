@@ -8,6 +8,8 @@ use crate::ui_signal::SignalToUI;
 
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod android;
+#[cfg(target_env = "ohos")]
+mod ohos;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) use self::android::connect_platform_socket_stream;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
