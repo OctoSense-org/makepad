@@ -494,20 +494,39 @@ impl Cx {
     }
 
     pub fn ohos_load_dependencies(&mut self) {
+        let raw_file = self.os.raw_file.clone();
         for (path, dep) in &mut self.dependencies {
             let mut buffer = Vec::<u8>::new();
-            if let Ok(_) = self
-                .os
-                .raw_file
-                .as_mut()
-                .unwrap()
-                .read_to_end(path, &mut buffer)
-            {
-                dep.data = Some(Ok(Rc::new(buffer)));
-            } else {
-                dep.data = Some(Err("read_to_end failed".to_string()));
+            match raw_file.as_ref().map(|raw| raw.read_to_end(path, &mut buffer)) {
+                Some(Ok(_)) => dep.data = Some(Ok(Rc::new(buffer))),
+                Some(Err(err)) => dep.data = Some(Err(format!("rawfile {path}: {err}"))),
+                None => dep.data = Some(Err("no resource manager".to_string())),
             }
         }
+    }
+
+    /// A packaged resource by its dependency path, read from the HAP's
+    /// rawfile the way Android asks its asset manager: the dependency table
+    /// only ever holds what was declared before startup, and a script
+    /// resource (a font the policy selects, an image a theme names) is asked
+    /// for later, by path.
+    pub(crate) fn ohos_read_packaged(&self, path: &str) -> Option<Vec<u8>> {
+        let raw_file = self.os.raw_file.as_ref()?;
+        let mut candidates = Vec::new();
+        if let Some(root) = self.package_root.as_deref() {
+            let prefix = format!("{root}/");
+            if !path.starts_with(&prefix) {
+                candidates.push(format!("{root}/{path}"));
+            }
+        }
+        candidates.push(path.to_string());
+        for candidate in candidates {
+            let mut data = Vec::new();
+            if raw_file.read_to_end(&candidate, &mut data).is_ok() {
+                return Some(data);
+            }
+        }
+        None
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
