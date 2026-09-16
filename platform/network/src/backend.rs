@@ -6,18 +6,18 @@ use makepad_live_id::LiveId;
 use crate::types::{HttpRequest, NetworkError, NetworkResponse, WsSend};
 use crate::ui_signal::SignalToUI;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod android;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) use self::android::connect_platform_socket_stream;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use self::android::{
     clear_platform_backend, clear_platform_socket_factory, register_platform_backend,
     register_platform_socket_factory, PlatformSocketFactory, PlatformSocketStream,
 };
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "tvos"))]
 pub mod apple;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 // Linux socket workers are native-only and never compiled into a web app.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod linux;
@@ -147,14 +147,14 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
     web::create_backend()
 }
 
-#[cfg(all(not(target_arch = "wasm32"), target_os = "android"))]
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "android", target_env = "ohos")))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
     android::create_backend()
 }
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(target_os = "android"),
+    not(any(target_os = "android", target_env = "ohos")),
     target_os = "windows"
 ))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
@@ -163,7 +163,7 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(target_os = "android"),
+    not(any(target_os = "android", target_env = "ohos")),
     not(target_os = "windows"),
     any(target_os = "ios", target_os = "macos", target_os = "tvos")
 ))]
@@ -173,10 +173,10 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
 
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(target_os = "android"),
+    not(any(target_os = "android", target_env = "ohos")),
     not(target_os = "windows"),
     not(any(target_os = "ios", target_os = "macos", target_os = "tvos")),
-    target_os = "linux"
+    all(target_os = "linux", not(target_env = "ohos"))
 ))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
     linux::create_backend()
@@ -184,7 +184,7 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
 
 #[cfg(not(any(
     target_arch = "wasm32",
-    target_os = "android",
+    any(target_os = "android", target_env = "ohos"),
     target_os = "windows",
     target_os = "linux",
     target_os = "ios",
