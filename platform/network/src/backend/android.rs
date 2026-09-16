@@ -139,6 +139,10 @@ pub(crate) fn create_backend() -> Arc<dyn NetworkBackend> {
             return Arc::clone(backend);
         }
     }
+    // OpenHarmony without a registered shim still gets clear-text websockets.
+    #[cfg(target_env = "ohos")]
+    return super::ohos::create_backend();
+    #[cfg(not(target_env = "ohos"))]
     Arc::new(UnsupportedBackend::new(
         "android backend shim not registered by makepad-platform",
     ))
