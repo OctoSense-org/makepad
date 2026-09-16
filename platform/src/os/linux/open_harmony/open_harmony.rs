@@ -351,6 +351,10 @@ impl Cx {
     where
         F: FnOnce() -> Box<Cx> + Send + 'static,
     {
+        // The async log sink only exists after init_log; every other entry
+        // point starts it, this one never did, so every log record on
+        // OpenHarmony was counted as dropped and nothing reached hilog.
+        Cx::init_log();
         crate::log!("ohos init");
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(move || {
