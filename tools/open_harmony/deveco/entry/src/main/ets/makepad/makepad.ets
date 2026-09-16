@@ -593,14 +593,19 @@ export class ArkGlue{
     this.imcFlag = false;
   }
 
+  private keyboardHeightListening = false;
   private listenKeyboardHeightChange() {
+    // Once per attach cycle: every ShowTextIME used to add another listener.
+    if (this.keyboardHeightListening) { return; }
+    this.keyboardHeightListening = true;
     window.getLastWindow(getContext(this)).then(currentWindow => {
       try {
         currentWindow.on('keyboardHeightChange', (data) => {
-          console.info('Succeeded in enabling the listener for keyboard height changes. Data: ' + JSON.stringify(data));
-          if (data != 0) {
-            this.xComponentContext?.handleKeyboardStatus(true,data);
-          }
+          console.info('Keyboard height changed: ' + JSON.stringify(data));
+          // A height of 0 is the keyboard going away; the app must hear it,
+          // or its view stays panned up by the old height with nothing on
+          // screen (the IME switching panels, or dismissed by its own button).
+          this.xComponentContext?.handleKeyboardStatus(data != 0, data);
         });
       } catch (exception) {
         console.error(`Failed to enable the listener for keyboard height changes. Cause code: ${exception.code}, message: ${exception.message}`);
@@ -609,6 +614,7 @@ export class ArkGlue{
   }
 
   private cancelKeyboardHeightChange() {
+    this.keyboardHeightListening = false;
     window.getLastWindow(getContext(this)).then(currentWindow => {
       try {
         currentWindow.off('keyboardHeightChange');
