@@ -58,6 +58,17 @@ pub fn ohos_ability_on_create(env: Env, ark_ts: JsObject) -> napi_ohos::Result<(
             }
         }
     }
+    // The process starts without a usable HOME. The ability's files
+    // directory is the app's home: where a bundled core keeps its state,
+    // where anything reading `$HOME` on this platform should land.
+    if std::env::var_os("HOME").map_or(true, |home| home.is_empty() || home == "/") {
+        std::env::set_var("HOME", &files_dir);
+    }
+    // The trace topics were read at module load, before these parameters
+    // existed; `--ps makepad.MAKEPAD_TRACE topic,topic` works from here on.
+    crate::makepad_error_log::set_trace_topics(
+        &std::env::var("MAKEPAD_TRACE").unwrap_or_default(),
+    );
 
     let raw_file = RawFileMgr::new(raw_env, res_mgr);
 
