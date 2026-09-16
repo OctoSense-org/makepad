@@ -1064,11 +1064,6 @@ impl Cx {
             }
         }
 
-        #[cfg(target_env = "ohos")]
-        if let Some(data) = self.ohos_read_packaged(path) {
-            return Ok(Rc::new(data));
-        }
-
         #[cfg(target_os = "android")]
         {
             if let Some(data) =

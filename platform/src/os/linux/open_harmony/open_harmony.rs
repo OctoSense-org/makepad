@@ -1,4 +1,5 @@
 use {
+    crate::cx::CxDependency,
     self::super::{
         super::gl_sys, super::gl_sys::LibGl, arkts_obj_ref::ArkTsObjRef, oh_callbacks::*,
         oh_media::CxOpenHarmonyMedia, raw_file::RawFileMgr,
@@ -381,6 +382,9 @@ impl Cx {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(move || {
             std::panic::set_hook(Box::new(|info| {
+                // Synchronously: with panic = "abort" the async sink never
+                // gets to flush this line.
+                super::oh_util::hilog_sync(&format!("[E] panic: {info}"));
                 crate::log!("custom panic hook: {}", info);
             }));
             Cx::ohos_startup(startup);
@@ -493,40 +497,38 @@ impl Cx {
         }
     }
 
+    /// Every packaged raw file, read now, while the native resource manager
+    /// is still usable. On HarmonyOS 6 the manager obtained at onCreate serves
+    /// reads until the window stage is up and aborts (a CFI check inside the
+    /// raw-file API) on any read after that, so nothing asks it later: script
+    /// resources, fonts and images are all served from this table.
     pub fn ohos_load_dependencies(&mut self) {
-        let raw_file = self.os.raw_file.clone();
-        for (path, dep) in &mut self.dependencies {
-            let mut buffer = Vec::<u8>::new();
-            match raw_file.as_ref().map(|raw| raw.read_to_end(path, &mut buffer)) {
-                Some(Ok(_)) => dep.data = Some(Ok(Rc::new(buffer))),
-                Some(Err(err)) => dep.data = Some(Err(format!("rawfile {path}: {err}"))),
-                None => dep.data = Some(Err("no resource manager".to_string())),
-            }
-        }
-    }
-
-    /// A packaged resource by its dependency path, read from the HAP's
-    /// rawfile the way Android asks its asset manager: the dependency table
-    /// only ever holds what was declared before startup, and a script
-    /// resource (a font the policy selects, an image a theme names) is asked
-    /// for later, by path.
-    pub(crate) fn ohos_read_packaged(&self, path: &str) -> Option<Vec<u8>> {
-        let raw_file = self.os.raw_file.as_ref()?;
-        let mut candidates = Vec::new();
-        if let Some(root) = self.package_root.as_deref() {
-            let prefix = format!("{root}/");
-            if !path.starts_with(&prefix) {
-                candidates.push(format!("{root}/{path}"));
-            }
-        }
-        candidates.push(path.to_string());
-        for candidate in candidates {
+        let Some(raw_file) = self.os.raw_file.clone() else {
+            crate::error!("no resource manager: packaged resources unavailable");
+            return;
+        };
+        let started = std::time::Instant::now();
+        let root = self.package_root.clone().unwrap_or_else(|| "makepad".to_string());
+        let prefix = format!("{root}/");
+        let (mut files, mut bytes) = (0usize, 0usize);
+        for path in raw_file.list_files(&root) {
             let mut data = Vec::new();
-            if raw_file.read_to_end(&candidate, &mut data).is_ok() {
-                return Some(data);
-            }
+            let entry = match raw_file.read_to_end(&path, &mut data) {
+                Ok(_) => {
+                    files += 1;
+                    bytes += data.len();
+                    Some(Ok(Rc::new(data)))
+                }
+                Err(err) => Some(Err(format!("rawfile {path}: {err}"))),
+            };
+            let key = path.strip_prefix(&prefix).unwrap_or(&path).to_string();
+            self.dependencies.insert(key, CxDependency { data: entry });
         }
-        None
+        crate::log!(
+            "packaged resources: {files} files, {} KiB, {:.0} ms",
+            bytes / 1024,
+            started.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
