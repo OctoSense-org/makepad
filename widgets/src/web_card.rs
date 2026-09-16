@@ -554,7 +554,7 @@ impl WebCard {
             // OpenHarmony emits NativeDialogResult from its ArkTS
             // DocumentViewPicker, so dialog.open is live there too; `download`
             // has no OHOS result path yet and stays rejected.
-            "dialog.open" if !cfg!(mobile) => {
+            "dialog.open" if !cfg!(any(target_os = "android", target_env = "ohos")) => {
                 self.reject(cx, call_id, "dialog.open is not supported on this platform yet");
             }
             "download" if !cfg!(target_os = "android") => {

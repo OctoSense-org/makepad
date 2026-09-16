@@ -346,3 +346,8 @@ opt-level = 1
 #opt-level = 3
 #[profile.dev.package.ttf-parser]
 #opt-level = 3
+
+# The shared runtime prepares this sibling; avoid another framework node model
+# when building Makepad's own applications and tools from the workspace.
+[patch."https://github.com/OctoSense-org/Octoscript-Makepad.git"]
+octoscript-node = { path = "../octoscript-makepad/crates/octoscript-node" }
