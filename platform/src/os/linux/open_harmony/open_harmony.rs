@@ -1,4 +1,5 @@
 use {
+    crate::TextInputConfig,
     crate::cx::CxDependency,
     self::super::{
         super::gl_sys, super::gl_sys::LibGl, arkts_obj_ref::ArkTsObjRef, oh_callbacks::*,
@@ -54,6 +55,10 @@ pub fn ohos_ability_on_create(env: Env, ark_ts: JsObject) -> napi_ohos::Result<(
         for (key, value) in flat_json_string_pairs(&parameters) {
             if let Some(name) = key.strip_prefix("makepad.") {
                 crate::log!("launch parameter {name}={value}");
+                // Both spellings Android's extras produce: `makepad.TRACE`
+                // is MAKEPAD_TRACE to the platform, and the Studio settings
+                // are read unprefixed (STUDIO_HOST, STUDIO_BUILD, STUDIO_CRATE).
+                std::env::set_var(format!("MAKEPAD_{name}"), &value);
                 std::env::set_var(name, value);
             }
         }
@@ -292,6 +297,7 @@ impl Cx {
                         },
                     ))
                 } else {
+                    self.os.last_ime_config = None;
                     self.text_ime_was_dismissed();
                     self.call_event_handler(&Event::VirtualKeyboard(
                         VirtualKeyboardEvent::DidHide {
@@ -712,14 +718,18 @@ impl Cx {
                 CxOsOp::Quit => {
                     self.os.quit = true;
                 }
-                CxOsOp::ShowTextIME(_area, _pos, _config) => {
-                    let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
-                        "showKeyBoard",
-                        0,
-                        std::ptr::null_mut(),
-                    );
+                CxOsOp::ShowTextIME(_area, _pos, config) => {
+                    if self.os.last_ime_config.as_ref() != Some(&config) {
+                        let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
+                            "showKeyBoard",
+                            0,
+                            std::ptr::null_mut(),
+                        );
+                        self.os.last_ime_config = Some(config);
+                    }
                 }
                 CxOsOp::HideTextIME => {
+                    self.os.last_ime_config = None;
                     let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
                         "hideKeyBoard",
                         0,
@@ -734,6 +744,9 @@ impl Cx {
                 }
                 // Track selection is currently implemented on Linux GStreamer only.
                 CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
+                // The IME keeps no copy of the field's text on this platform
+                // yet; there is nothing to bring in step.
+                CxOsOp::SyncImeState { .. } => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -779,6 +792,11 @@ pub struct CxOs {
     pub timers: PollTimers,
     pub raw_file: Option<RawFileMgr>,
     pub arkts_obj: Option<ArkTsObjRef>,
+    /// The keyboard config last shown, cleared when the keyboard goes down:
+    /// a focused TextInput re-issues ShowTextIME every draw, and each call
+    /// into ArkTS re-attaches the input method client, which drops what was
+    /// typed in between.
+    pub last_ime_config: Option<TextInputConfig>,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,
 }
@@ -800,6 +818,7 @@ impl Default for CxOs {
             timers: Default::default(),
             raw_file: None,
             arkts_obj: None,
+            last_ime_config: None,
             start_time: Instant::now(),
             display: None,
         }
