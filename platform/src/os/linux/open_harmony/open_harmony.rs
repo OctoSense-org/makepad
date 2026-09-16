@@ -425,6 +425,20 @@ impl Cx {
         });
     }
 
+    /// Ask the platform for a location fix. `sys.gps` in the widgets calls this
+    /// on every read; on Android the JNI `LocationListener` feeds
+    /// `makepad_platform::gps`. This line has no ArkTS location bridge yet (the
+    /// build-tool lane's DevEco template carries one), so the call is a logged
+    /// no-op and `gps::last_gps_fix()` stays `None` — cards see "no fix", never
+    /// a stale or fake position.
+    pub fn ohos_request_gps(&mut self) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            crate::log!("ohos_request_gps: no location bridge on this line; sys.gps reports no fix");
+        }
+    }
+
     pub fn ohos_load_dependencies(&mut self) {
         for (path, dep) in &mut self.dependencies {
             let mut buffer = Vec::<u8>::new();
