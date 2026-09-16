@@ -9,6 +9,13 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ComponentCallbacks2;
 import android.content.Context;
+import android.app.NotificationManager;
+import android.app.NotificationChannel;
+import android.app.Notification;
+import android.app.PendingIntent;
+import android.net.Uri;
+import java.io.InputStream;
+import java.io.ByteArrayOutputStream;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
@@ -52,6 +59,19 @@ import android.view.PixelCopy;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CameraDevice;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.params.StreamConfigurationMap;
+import android.media.ImageReader;
+import android.media.Image;
+import android.graphics.ImageFormat;
+import android.util.Size;
+import android.view.Surface;
+import java.util.Arrays;
+import java.nio.ByteBuffer;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -74,6 +94,10 @@ import android.text.SpannableStringBuilder;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
+import android.widget.EditText;
+import android.widget.TextView;
+import android.view.Gravity;
+import android.util.TypedValue;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -83,6 +107,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.webkit.JavascriptInterface;
 
 // note: //% is a special miniquad's pre-processor for plugins
 // when there are no plugins - //% whatever will be replaced to an empty string
@@ -232,6 +261,14 @@ class MakepadImeInsets {
         int bottomOverlap = bottomOverlapPx(view, insets);
         boolean visible = isVisible(view, bottomOverlap);
         MakepadNative.surfaceOnResizeTextIME(bottomOverlap, visible);
+
+        // Reuse the same computed IME overlap to lift the native floating
+        // composer pill above the soft keyboard, so it tracks the show/hide
+        // animation (the window is SOFT_INPUT_ADJUST_NOTHING — nothing else
+        // moves for the keyboard). The report View's context is the activity.
+        if (view != null && view.getContext() instanceof MakepadActivity) {
+            ((MakepadActivity) view.getContext()).positionComposerForKeyboard(bottomOverlap);
+        }
     }
 }
 
@@ -1048,6 +1085,12 @@ public class MakepadActivity
     private ImageView mSurfaceSnapshotOverlay;
     private FrameLayout mCameraPreviewOverlay;
     private HashMap<Long, CameraPreviewSurface> mCameraPreviewViews = new HashMap<>();
+    // Native WebView overlays for web app cards (see spawnSystemBrowser).
+    private FrameLayout mSystemBrowserOverlay;
+    private HashMap<Long, WebView> mSystemBrowserViews = new HashMap<>();
+    // Fullscreen video state for web app cards (WebChromeClient custom view).
+    private View mSystemBrowserCustomView;
+    private WebChromeClient.CustomViewCallback mSystemBrowserCustomViewCallback;
     private Bitmap mLatestSurfaceSnapshot;
     private int mLatestSurfaceSnapshotOrientation = android.content.res.Configuration.ORIENTATION_UNDEFINED;
     private boolean mSurfaceSnapshotCopyInFlight = false;
@@ -1063,6 +1106,47 @@ public class MakepadActivity
     private SelectionHandleView mSelectionHandleStart;
     private SelectionHandleView mSelectionHandleEnd;
     private int mSelectionHandleSizePx;
+
+    // Native floating chat composer overlay. `mComposerOverlay` is a
+    // MATCH_PARENT, non-clickable FrameLayout sibling stacked above the GL
+    // surface (same pattern as `mSelectionHandleOverlay`). `mComposerPill` is
+    // the rounded EditText+send pill anchored to the bottom that gets lifted
+    // above the soft keyboard; `mComposerInput` is its EditText. Because the
+    // Android view tree dispatches touches, taps on the pill are consumed by
+    // it *before* Makepad's routing runs, and taps elsewhere fall through the
+    // non-clickable overlay to the full-screen Splash card.
+    private FrameLayout mComposerOverlay;
+    private LinearLayout mComposerPill;
+    private EditText mComposerInput;
+    // Collapsed state: a small round "+" button (bottom-right). Tapping it
+    // expands back to the full pill. Rust drives the collapse (while a card
+    // generates / after it renders) via expand/collapseComposer().
+    private TextView mComposerFab;
+    // QR scanner (LLM provisioning): a full-screen camera overlay that streams
+    // luma frames to Rust for a pure-Rust QR decode (see onQrCameraFrame).
+    private FrameLayout mQrScanOverlay;
+    private CameraDevice mQrCameraDevice;
+    private CameraCaptureSession mQrCaptureSession;
+    private ImageReader mQrImageReader;
+    private HandlerThread mQrBgThread;
+    private Handler mQrBgHandler;
+    private volatile boolean mQrScanning = false;
+    private long mQrLastFrameMs = 0;
+    private static final int QR_CAMERA_PERM_REQ = 0x51A2;
+
+    // GPS location (AppCard, automatic) — a LocationListener feeds each fix to Rust via
+    // MakepadNative.onLocation; the Splash sys.gps(...) helper reads it.
+    private LocationManager mGpsLocationManager;
+    private LocationListener mGpsLocationListener;
+    private static final int LOCATION_PERM_REQ = 0x10CA;
+    // Guard so the location runtime permission is requested AT MOST ONCE per
+    // process. startGpsLocationUpdates() runs on every onResume(); without this,
+    // a user who has DENIED location makes every resume call requestPermissions()
+    // again, and each call bounces activity focus (pause→resume→focus-change).
+    // That storm pins the window's HWUI layer redrawing continuously (~30fps on
+    // a static screen) — the composer/whole-screen flicker. Requesting once, then
+    // leaving the user's decision alone, lets the window go idle.
+    private boolean mLocationPermissionRequested = false;
 
     static {
         System.loadLibrary("makepad");
@@ -1227,9 +1311,33 @@ public class MakepadActivity
         if (Build.VERSION.SDK_INT >= 30) {
             setTheme(R.style.MakepadAppTheme);
         }
-        
+
         super.onCreate(savedInstanceState);
-        
+
+        // Route the app's OWN http (card background images fetched via
+        // MakepadNetwork's HttpURLConnection) through the same proxy as the
+        // embedded octos server when `--es makepad.OCTOS_PROXY http://host:port`
+        // is set — needed when the device has no direct internet route (e.g. an
+        // adb-reverse tunnel to the dev host). HttpURLConnection honours these
+        // JVM proxy system properties, so no per-request change is needed.
+        try {
+            Intent launchIntent = getIntent();
+            String proxy = launchIntent != null
+                ? launchIntent.getStringExtra("makepad.OCTOS_PROXY") : null;
+            if (proxy != null && proxy.length() > 0) {
+                String hp = proxy.replaceFirst("^https?://", "").replaceAll("/.*$", "");
+                int colon = hp.lastIndexOf(':');
+                if (colon > 0) {
+                    String host = hp.substring(0, colon);
+                    String port = hp.substring(colon + 1);
+                    System.setProperty("http.proxyHost", host);
+                    System.setProperty("http.proxyPort", port);
+                    System.setProperty("https.proxyHost", host);
+                    System.setProperty("https.proxyPort", port);
+                }
+            }
+        } catch (Exception e) { /* proxy is best-effort */ }
+
         this.requestWindowFeature(Window.FEATURE_NO_TITLE);
         getWindow().setSoftInputMode(
             LayoutParams.SOFT_INPUT_ADJUST_NOTHING
@@ -1300,6 +1408,11 @@ public class MakepadActivity
         mCameraPreviewOverlay = new FrameLayout(this);
         mRootLayout.addView(mCameraPreviewOverlay);
 
+        // Web app card overlays sit above the GL surface and camera previews,
+        // but below the selection handles and the chat composer.
+        mSystemBrowserOverlay = new FrameLayout(this);
+        mRootLayout.addView(mSystemBrowserOverlay);
+
         mSelectionHandleOverlay = new FrameLayout(this);
         mSelectionHandleOverlay.setLayoutParams(new FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1317,6 +1430,8 @@ public class MakepadActivity
         mSelectionHandleEnd.setOnTouchListener(createSelectionHandleDragListener(SELECTION_HANDLE_END));
         mSelectionHandleOverlay.addView(mSelectionHandleStart);
         mSelectionHandleOverlay.addView(mSelectionHandleEnd);
+
+        setupComposerOverlay();
 
         setContentView(mRootLayout);
         restoreWarmResumeSurfaceSnapshotIfAvailable();
@@ -1366,6 +1481,7 @@ public class MakepadActivity
         updateTaskDescription();
         MakepadNative.activityOnResume();
         reportPhysicalKeyboardIfChanged();
+        startGpsLocationUpdates();
 
         //% MAIN_ACTIVITY_ON_RESUME
     }
@@ -1374,6 +1490,7 @@ public class MakepadActivity
         prepareSurfaceSnapshotOverlayForPause();
         super.onPause();
         MakepadNative.activityOnPause();
+        stopGpsLocationUpdates();
 
         //% MAIN_ACTIVITY_ON_PAUSE
     }
@@ -1474,7 +1591,32 @@ public class MakepadActivity
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        // The device's Home button or gesture, with this app as the Home
+        // app: the running activity is told, so a shell can show its home
+        // page (Event::HomeIntent on the Rust side).
+        if (intent != null && Intent.ACTION_MAIN.equals(intent.getAction())
+                && intent.hasCategory(Intent.CATEGORY_HOME)) {
+            MakepadNative.onHomeIntent();
+        }
         restoreSurfaceViewForWarmResumeIfNeeded();
+        handleDeepLinkIntent(intent);
+    }
+
+    // Extract a URL from an ACTION_VIEW deep link or an ACTION_SEND share and hand
+    // it to Rust (delivered to the app as an AndroidDeepLink action). E.g. a YouTube
+    // link shared from another app → the youtube card plays it.
+    private void handleDeepLinkIntent(Intent intent) {
+        if (intent == null) return;
+        String action = intent.getAction();
+        String url = null;
+        if (Intent.ACTION_VIEW.equals(action)) {
+            url = intent.getDataString();
+        } else if (Intent.ACTION_SEND.equals(action) && "text/plain".equals(intent.getType())) {
+            url = intent.getStringExtra(Intent.EXTRA_TEXT);
+        }
+        if (url != null && url.length() > 0) {
+            try { MakepadNative.onDeepLink(url); } catch (Throwable t) {}
+        }
     }
 
     @Override
@@ -1484,6 +1626,30 @@ public class MakepadActivity
             return;
         }
         //% MAIN_ACTIVITY_ON_ACTIVITY_RESULT
+        if (requestCode == OCTOS_DIALOG_REQ) {
+            long callId = mPendingDialogCallId;
+            mPendingDialogCallId = 0;
+            try {
+                if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                    Uri uri = data.getData();
+                    String name = "";
+                    try {
+                        android.database.Cursor c = getContentResolver().query(uri, null, null, null, null);
+                        if (c != null) {
+                            int idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                            if (c.moveToFirst() && idx >= 0) name = c.getString(idx);
+                            c.close();
+                        }
+                    } catch (Throwable ignore) {}
+                    String content = readUriText(uri);
+                    MakepadNative.onDialogResult(callId, name, content, false, null);
+                } else {
+                    MakepadNative.onDialogResult(callId, null, null, true, null);
+                }
+            } catch (Throwable t) {
+                MakepadNative.onDialogResult(callId, null, null, false, "read failed: " + t.toString());
+            }
+        }
     }
 
     @Override
@@ -1505,6 +1671,26 @@ public class MakepadActivity
             
             // Use the new unified callback
             MakepadNative.onPermissionResult(permissions[i], requestId, status);
+        }
+
+        // QR-scanner camera permission: open the scanner once granted.
+        if (requestId == QR_CAMERA_PERM_REQ) {
+            for (int i = 0; i < permissions.length; i++) {
+                if (Manifest.permission.CAMERA.equals(permissions[i])
+                    && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    showQrScanner();
+                }
+            }
+        }
+
+        // Location permission granted → start GPS updates.
+        if (requestId == LOCATION_PERM_REQ) {
+            for (int i = 0; i < permissions.length; i++) {
+                if (grantResults[i] == PackageManager.PERMISSION_GRANTED) {
+                    startGpsLocationUpdates();
+                    break;
+                }
+            }
         }
     }
 
@@ -1643,6 +1829,112 @@ public class MakepadActivity
             // Not every provider offers a persistable grant. The URI is still
             // usable for this run, which is all most callers need.
             Log.w(LOG_TAG, "takePersistableUriPermission failed: " + e);
+        }
+    }
+
+    // ---- GPS location updates ----
+    // octos has no simulated location, so this feeds the DEVICE's real fix to the
+    // nav card (via sys.gps). Started in onResume once the runtime permission is
+    // granted, stopped in onPause so GPS isn't polled while backgrounded.
+    private void startGpsLocationUpdates() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+            && checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED
+            && checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            // Request only once per process. Re-requesting on every onResume()
+            // when the user has declined creates a pause/resume/focus storm that
+            // pins the window redrawing (the flicker). If granted later,
+            // onRequestPermissionsResult re-invokes this and the checks above pass.
+            if (!mLocationPermissionRequested) {
+                mLocationPermissionRequested = true;
+                requestPermissions(new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                }, LOCATION_PERM_REQ);
+            }
+            return; // re-invoked from onRequestPermissionsResult once granted
+        }
+        if (mGpsLocationManager == null) {
+            mGpsLocationManager = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+        }
+        if (mGpsLocationManager == null) {
+            return;
+        }
+        if (mGpsLocationListener == null) {
+            mGpsLocationListener = new LocationListener() {
+                @Override public void onLocationChanged(Location loc) {
+                    if (loc == null) return;
+                    final double lat = loc.getLatitude();
+                    final double lon = loc.getLongitude();
+                    final float acc = loc.hasAccuracy() ? loc.getAccuracy() : 0.0f;
+                    runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            // Apps that do not consume location don't implement the
+                            // native onLocation; a stray fix must not crash them.
+                            try { MakepadNative.onLocation(lat, lon, acc); }
+                            catch (Throwable t) { /* no location consumer */ }
+                        }
+                    });
+                }
+                // Required by the LocationListener interface on older API levels.
+                @Override public void onStatusChanged(String provider, int status, android.os.Bundle extras) {}
+                @Override public void onProviderEnabled(String provider) {}
+                @Override public void onProviderDisabled(String provider) {}
+                // API 31 added a BATCHED overload as an interface DEFAULT method.
+                // Leaving it to the default is what crashed the app: D8 rewrites a
+                // call to an interface default into its synthesised companion
+                // `LocationListener$-CC`, that class was not in the APK, and the
+                // first fix delivered after granting the location permission died
+                // with NoClassDefFoundError on the main looper — taking the whole
+                // process with it.
+                //
+                // Implementing it means D8 never needs the companion. No
+                // `@Override`: on an SDK where the interface does not declare this
+                // overload it is a harmless extra method, and annotating it would
+                // fail to compile there.
+                public void onLocationChanged(java.util.List<Location> locations) {
+                    if (locations == null || locations.isEmpty()) return;
+                    onLocationChanged(locations.get(locations.size() - 1));
+                }
+                // Same companion-class hazard as the batched overload above, so
+                // implement it too — and for the same reason, no `@Override`.
+                public void onFlushComplete(int requestCode) {}
+            };
+        }
+        try {
+            // Seed immediately with the freshest last-known fix so the card has a
+            // location before the first live update lands.
+            Location last = null;
+            for (String p : new String[]{ LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER }) {
+                if (mGpsLocationManager.isProviderEnabled(p)) {
+                    Location l = mGpsLocationManager.getLastKnownLocation(p);
+                    if (l != null && (last == null || l.getTime() > last.getTime())) {
+                        last = l;
+                    }
+                }
+            }
+            if (last != null) {
+                mGpsLocationListener.onLocationChanged(last);
+            }
+            // Subscribe to both providers: NETWORK is fast + coarse, GPS is precise.
+            for (String p : new String[]{ LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER }) {
+                if (mGpsLocationManager.isProviderEnabled(p)) {
+                    mGpsLocationManager.requestLocationUpdates(p, 2000L, 5.0f, mGpsLocationListener);
+                }
+            }
+        } catch (SecurityException e) {
+            // permission revoked between the check and the call — ignore
+        } catch (IllegalArgumentException e) {
+            // a provider is missing on this device — ignore
+        }
+    }
+
+    private void stopGpsLocationUpdates() {
+        if (mGpsLocationManager != null && mGpsLocationListener != null) {
+            try {
+                mGpsLocationManager.removeUpdates(mGpsLocationListener);
+            } catch (Exception e) {
+                // ignore
+            }
         }
     }
 
@@ -2214,6 +2506,148 @@ public class MakepadActivity
         clipboard.setPrimaryClip(clip);
     }
 
+    // Post a system notification. Called from Rust via
+    // android_jni::to_java_show_notification (the card's octos.invoke("notify", ...)).
+    public void showNotification(final String title, final String body) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+                    String chId = "octos_default";
+                    if (android.os.Build.VERSION.SDK_INT >= 26) {
+                        NotificationChannel ch = new NotificationChannel(chId, "octos",
+                            NotificationManager.IMPORTANCE_DEFAULT);
+                        nm.createNotificationChannel(ch);
+                    }
+                    Intent open = new Intent(MakepadActivity.this, MakepadActivity.this.getClass());
+                    open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+                    if (android.os.Build.VERSION.SDK_INT >= 23) piFlags |= PendingIntent.FLAG_IMMUTABLE;
+                    PendingIntent pi = PendingIntent.getActivity(MakepadActivity.this, 0, open, piFlags);
+                    Notification.Builder b = (android.os.Build.VERSION.SDK_INT >= 26)
+                        ? new Notification.Builder(MakepadActivity.this, chId)
+                        : new Notification.Builder(MakepadActivity.this);
+                    b.setSmallIcon(getApplicationInfo().icon)
+                        .setContentTitle(title == null ? "" : title)
+                        .setContentText(body == null ? "" : body)
+                        .setAutoCancel(true)
+                        .setContentIntent(pi);
+                    nm.notify((int) (System.currentTimeMillis() & 0x7fffffff), b.build());
+                } catch (Throwable t) {
+                    Log.e("Makepad", "showNotification failed: " + t.toString());
+                }
+            }
+        });
+    }
+
+    // Native file picker (Storage Access Framework). One dialog at a time; the
+    // pending call id is stored and read back in onActivityResult. Called from Rust
+    // via to_java_open_file_dialog (the card's octos.invoke("dialog.open", {mime})).
+    private static final int OCTOS_DIALOG_REQ = 0x0CD0;
+    private long mPendingDialogCallId = 0;
+    public void openFileDialog(final long callId, final String mime) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    mPendingDialogCallId = callId;
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    i.addCategory(Intent.CATEGORY_OPENABLE);
+                    i.setType((mime == null || mime.length() == 0) ? "*/*" : mime);
+                    startActivityForResult(i, OCTOS_DIALOG_REQ);
+                } catch (Throwable t) {
+                    MakepadNative.onDialogResult(callId, null, null, false, "open failed: " + t.toString());
+                }
+            }
+        });
+    }
+
+    // Read a content:// URI as UTF-8 text (bounded to ~8 MB to protect the bridge).
+    private String readUriText(Uri uri) throws Exception {
+        InputStream in = getContentResolver().openInputStream(uri);
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16384];
+            int n; int total = 0;
+            while ((n = in.read(buf)) != -1) {
+                total += n;
+                if (total > 8 * 1024 * 1024) throw new Exception("file too large (>8MB)");
+                out.write(buf, 0, n);
+            }
+            return new String(out.toByteArray(), "UTF-8");
+        } finally {
+            if (in != null) in.close();
+        }
+    }
+
+    // Stream a URL to a file on a background thread (constant memory — the bytes
+    // never touch JS). Reports progress + completion to Rust. Called from Rust via
+    // to_java_download_file (the card's octos.invoke("download", {url, dest})).
+    public void downloadFile(final long callId, final String url, final String dest) {
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                java.net.HttpURLConnection conn = null;
+                InputStream in = null;
+                java.io.OutputStream out = null;
+                try {
+                    java.io.File f = new java.io.File(dest);
+                    java.io.File parent = f.getParentFile();
+                    if (parent != null) parent.mkdirs();
+                    java.net.URL u = new java.net.URL(url);
+                    conn = (java.net.HttpURLConnection) u.openConnection();
+                    conn.setInstanceFollowRedirects(true);
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(30000);
+                    conn.connect();
+                    int code = conn.getResponseCode();
+                    if (code < 200 || code >= 300) {
+                        MakepadNative.onDownloadComplete(callId, null, "HTTP " + code);
+                        return;
+                    }
+                    long total = conn.getContentLengthLong();
+                    in = conn.getInputStream();
+                    out = new java.io.FileOutputStream(f);
+                    byte[] buf = new byte[65536];
+                    long done = 0, lastReport = 0;
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        out.write(buf, 0, n);
+                        done += n;
+                        if (done - lastReport >= 262144) { // ~every 256 KB
+                            lastReport = done;
+                            MakepadNative.onDownloadProgress(callId, done, total);
+                        }
+                    }
+                    out.flush();
+                    MakepadNative.onDownloadProgress(callId, done, total);
+                    MakepadNative.onDownloadComplete(callId, dest, null);
+                } catch (Throwable t) {
+                    MakepadNative.onDownloadComplete(callId, null, "download failed: " + t.toString());
+                } finally {
+                    try { if (out != null) out.close(); } catch (Throwable ignore) {}
+                    try { if (in != null) in.close(); } catch (Throwable ignore) {}
+                    if (conn != null) conn.disconnect();
+                }
+            }
+        }).start();
+    }
+
+    // Fire the system share sheet (ACTION_SEND) for social sharing. Called
+    // from Rust via `android_jni::to_java_share_text`.
+    public void shareText(String content) {
+        try {
+            Intent intent = new Intent(Intent.ACTION_SEND);
+            intent.setType("text/plain");
+            intent.putExtra(Intent.EXTRA_TEXT, content);
+            Intent chooser = Intent.createChooser(intent, "Share");
+            startActivity(chooser);
+        } catch (Exception e) {
+            Log.e("Makepad", "shareText failed: " + e.toString());
+        }
+    }
+
     public String pasteFromClipboard() {
         ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
         if (clipboard.hasPrimaryClip()) {
@@ -2488,6 +2922,534 @@ public class MakepadActivity
                 mSelectionHandleOverlay.setVisibility(View.GONE);
             }
         });
+    }
+
+    // ---- Native floating chat composer overlay ---------------------------
+    // Built once here from onCreate. A rounded translucent pill (EditText +
+    // send button) anchored to the bottom of a MATCH_PARENT, non-clickable
+    // overlay that floats over the full-screen GL surface. Its touches are
+    // dispatched by the Android view tree, so the pill consumes its own taps
+    // *before* Makepad's routing runs (the full-screen card's PortalList can't
+    // swallow them); taps outside the pill fall through to the card.
+    private void setupComposerOverlay() {
+        final float d = getResources().getDisplayMetrics().density;
+
+        mComposerOverlay = new FrameLayout(this);
+        mComposerOverlay.setLayoutParams(new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ));
+        mComposerOverlay.setClickable(false);
+        mComposerOverlay.setFocusable(false);
+        mComposerOverlay.setVisibility(View.GONE);
+        // NOTE: do NOT promote this MATCH_PARENT overlay to a hardware layer. A
+        // full-window hardware layer stacked over the punch-through GL SurfaceView
+        // defeats Android's static-window compositing optimisation — the window's
+        // RenderThread must re-sync the window-sized GPU layer with the surface
+        // every frame, so the native window redraws continuously (~22fps, janky)
+        // even on a static screen and the composer/FAB flicker. Independent
+        // SurfaceFlinger composition (no layer) stays idle when nothing changes.
+
+        // The pill: horizontal EditText + send button, translucent teal to
+        // match the app's liquid-glass composer so the card shows through.
+        mComposerPill = new LinearLayout(this);
+        mComposerPill.setOrientation(LinearLayout.HORIZONTAL);
+        mComposerPill.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable pillBg = new GradientDrawable();
+        pillBg.setColor(0xE60B4035);                    // ~90% opaque #0B4035
+        pillBg.setCornerRadius(24.0f * d);
+        pillBg.setStroke(Math.max(1, (int) (1.5f * d)), 0x5572E4FF);
+        mComposerPill.setBackground(pillBg);
+        int padH = (int) (16.0f * d);
+        int padV = (int) (8.0f * d);
+        mComposerPill.setPadding(padH, padV, (int) (8.0f * d), padV);
+        // Tap anywhere on the pill focuses the input + raises the keyboard;
+        // being clickable also stops card taps leaking through the pill band.
+        mComposerPill.setClickable(true);
+        mComposerPill.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                focusComposerInput();
+            }
+        });
+
+        FrameLayout.LayoutParams pillLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        pillLp.gravity = Gravity.BOTTOM;
+        int side = (int) (12.0f * d);
+        pillLp.setMargins(side, 0, side, (int) (12.0f * d));
+        mComposerPill.setLayoutParams(pillLp);
+
+        // EditText: the SOLE IME client while the composer is up. Makepad keeps
+        // no TextInput focused, so Rust never issues a competing ShowTextIME
+        // and there is no two-controller keyboard race.
+        mComposerInput = new EditText(this);
+        mComposerInput.setBackground(null);
+        // Placeholder "问任何事…" (matches the app's Makepad composer). The
+        // cargo-makepad javac runs under file.encoding=UTF-8, so the literal
+        // UTF-8 source is decoded correctly.
+        mComposerInput.setHint("问任何事…");
+        mComposerInput.setHintTextColor(0x88F3E3C7);
+        mComposerInput.setTextColor(0xFFF3E3C7);
+        mComposerInput.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.0f);
+        // Single line so the IME shows a "Send" action key (a multiline flag
+        // turns it into a newline key). Prompts here are short.
+        mComposerInput.setSingleLine(true);
+        mComposerInput.setInputType(InputType.TYPE_CLASS_TEXT
+            | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+        mComposerInput.setImeOptions(EditorInfo.IME_ACTION_SEND);
+        LinearLayout.LayoutParams inputLp = new LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f
+        );
+        mComposerInput.setLayoutParams(inputLp);
+        mComposerInput.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override
+            public boolean onEditorAction(TextView v, int actionId, KeyEvent event) {
+                if (actionId == EditorInfo.IME_ACTION_SEND
+                    || (event != null
+                        && event.getKeyCode() == KeyEvent.KEYCODE_ENTER
+                        && event.getAction() == KeyEvent.ACTION_DOWN)) {
+                    submitComposer();
+                    return true;
+                }
+                return false;
+            }
+        });
+
+        // Send button — gold paper-plane glyph.
+        TextView send = new TextView(this);
+        send.setText("➤");                                    // ➤
+        send.setTextColor(0xFFF3E3C7);
+        send.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20.0f);
+        send.setGravity(Gravity.CENTER);
+        int sendSize = (int) (40.0f * d);
+        send.setLayoutParams(new LinearLayout.LayoutParams(sendSize, sendSize));
+        send.setClickable(true);
+        send.setFocusable(true);
+        send.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                submitComposer();
+            }
+        });
+
+        // Layer 3 — new-app (＋) and switch (⟳) controls sit LEFT of the input,
+        // so all app-management lives in the composer (the rest of the screen is
+        // just the a2app card). They fold away with the pill; collapsed shows
+        // only the "+" FAB. Order: [＋][⟳][input][➤].
+        int ctlSize = (int) (40.0f * d);
+        TextView newAppBtn = new TextView(this);
+        newAppBtn.setText("＋");
+        newAppBtn.setTextColor(0xFF72E4FF);
+        newAppBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.0f);
+        newAppBtn.setGravity(Gravity.CENTER);
+        newAppBtn.setLayoutParams(new LinearLayout.LayoutParams(ctlSize, ctlSize));
+        newAppBtn.setClickable(true);
+        newAppBtn.setFocusable(true);
+        newAppBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                MakepadNative.onComposerNewApp();
+            }
+        });
+        TextView switchBtn = new TextView(this);
+        switchBtn.setText("⟳");
+        switchBtn.setTextColor(0xFFF3E3C7);
+        switchBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.0f);
+        switchBtn.setGravity(Gravity.CENTER);
+        switchBtn.setLayoutParams(new LinearLayout.LayoutParams(ctlSize, ctlSize));
+        switchBtn.setClickable(true);
+        switchBtn.setFocusable(true);
+        switchBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                MakepadNative.onComposerSwitch();
+            }
+        });
+        // QR scan (⛶) — opens the camera to scan an LLM-provisioning QR (see
+        // showQrScanner). Sits left of the input: [＋][⟳][⛶][input][➤].
+        TextView qrBtn = new TextView(this);
+        qrBtn.setText("⛶");
+        qrBtn.setTextColor(0xFFF3E3C7);
+        qrBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 19.0f);
+        qrBtn.setGravity(Gravity.CENTER);
+        qrBtn.setLayoutParams(new LinearLayout.LayoutParams(ctlSize, ctlSize));
+        qrBtn.setClickable(true);
+        qrBtn.setFocusable(true);
+        qrBtn.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                showQrScanner();
+            }
+        });
+
+        mComposerPill.addView(newAppBtn);
+        mComposerPill.addView(switchBtn);
+        mComposerPill.addView(qrBtn);
+        mComposerPill.addView(mComposerInput);
+        mComposerPill.addView(send);
+        mComposerOverlay.addView(mComposerPill);
+
+        // Collapsed "+" button — a round FAB in the bottom-right that replaces
+        // the pill when the composer collapses. Hidden by default (starts
+        // expanded, matching the app's composer_shown=true); tapping it expands.
+        mComposerFab = new TextView(this);
+        mComposerFab.setText("+");
+        mComposerFab.setTextColor(0xFFF3E3C7);
+        mComposerFab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28.0f);
+        mComposerFab.setGravity(Gravity.CENTER);
+        mComposerFab.setIncludeFontPadding(false);
+        GradientDrawable fabBg = new GradientDrawable();
+        fabBg.setShape(GradientDrawable.OVAL);
+        fabBg.setColor(0xE60B4035);                    // matches the pill teal
+        fabBg.setStroke(Math.max(1, (int) (1.5f * d)), 0x5572E4FF);
+        mComposerFab.setBackground(fabBg);
+        int fabSize = (int) (52.0f * d);
+        FrameLayout.LayoutParams fabLp = new FrameLayout.LayoutParams(fabSize, fabSize);
+        fabLp.gravity = Gravity.BOTTOM | Gravity.END;
+        int fabMargin = (int) (16.0f * d);
+        fabLp.setMargins(0, 0, fabMargin, fabMargin);
+        mComposerFab.setLayoutParams(fabLp);
+        mComposerFab.setClickable(true);
+        mComposerFab.setFocusable(true);
+        // Folded by default: only the round "+" FAB shows; the input pill stays
+        // hidden until the user taps "+" to unfold it. (Rust's boot
+        // composer_shown=false + sync_composer also drives this, but starting
+        // folded here avoids a launch flash of the expanded pill.)
+        mComposerFab.setVisibility(View.VISIBLE);
+        mComposerPill.setVisibility(View.GONE);
+        mComposerFab.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                // Explicit intent to type: show the pill AND raise the keyboard.
+                // (onClick already runs on the UI thread.)
+                mComposerFab.setVisibility(View.GONE);
+                mComposerPill.setVisibility(View.VISIBLE);
+                focusComposerInput();
+                // Keep the app's composer_shown state in sync with this manual
+                // unfold, so a later sync_composer won't re-fold the pill the
+                // user just opened.
+                MakepadNative.onComposerExpand();
+            }
+        });
+        mComposerOverlay.addView(mComposerFab);
+
+        mRootLayout.addView(mComposerOverlay);
+    }
+
+    // Open the QR scanner overlay (requesting CAMERA first). Rust decodes the
+    // streamed frames; on a hit it applies the LLM config (see onQrCameraFrame).
+    private void showQrScanner() {
+        if (mQrScanning) return;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
+            && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.CAMERA}, QR_CAMERA_PERM_REQ);
+            return; // re-opened from onRequestPermissionsResult once granted
+        }
+        runOnUiThread(new Runnable() { public void run() { startQrScanner(); } });
+    }
+
+    private void startQrScanner() {
+        if (mQrScanning) return;
+        mQrScanning = true;
+        final float d = getResources().getDisplayMetrics().density;
+        final SurfaceView sv = new SurfaceView(this);
+        mQrScanOverlay = new FrameLayout(this);
+        mQrScanOverlay.setLayoutParams(new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        mQrScanOverlay.setBackgroundColor(0xFF000000);
+        mQrScanOverlay.addView(sv, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        TextView hint = new TextView(this);
+        hint.setText("Scan your LLM QR   ·   tap to cancel");
+        hint.setTextColor(0xFFFFFFFF);
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16.0f);
+        hint.setGravity(Gravity.CENTER);
+        hint.setPadding(0, (int) (56 * d), 0, 0);
+        FrameLayout.LayoutParams hintLp = new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        hintLp.gravity = Gravity.TOP;
+        mQrScanOverlay.addView(hint, hintLp);
+        mQrScanOverlay.setClickable(true);
+        mQrScanOverlay.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { hideQrScanner(); }
+        });
+        mRootLayout.addView(mQrScanOverlay);
+
+        mQrBgThread = new HandlerThread("qr-camera");
+        mQrBgThread.start();
+        mQrBgHandler = new Handler(mQrBgThread.getLooper());
+
+        sv.getHolder().addCallback(new SurfaceHolder.Callback() {
+            @Override public void surfaceCreated(SurfaceHolder holder) {
+                openQrCamera2(holder.getSurface());
+            }
+            @Override public void surfaceChanged(SurfaceHolder holder, int fmt, int w, int h) {}
+            @Override public void surfaceDestroyed(SurfaceHolder holder) {}
+        });
+    }
+
+    // Camera2 capture: a preview on `previewSurface` + an ImageReader (YUV_420_888)
+    // whose Y plane (luma) is streamed to Rust for a pure-Rust QR decode. Camera2
+    // attributes via the app Context, unlike the deprecated `Camera` API (which is
+    // frame-blocked on some OEMs).
+    private void openQrCamera2(final Surface previewSurface) {
+        try {
+            final CameraManager mgr = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
+            String backId = null;
+            for (String id : mgr.getCameraIdList()) {
+                Integer f = mgr.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING);
+                if (f != null && f == CameraCharacteristics.LENS_FACING_BACK) { backId = id; break; }
+            }
+            if (backId == null) {
+                String[] ids = mgr.getCameraIdList();
+                if (ids.length == 0) { hideQrScanner(); return; }
+                backId = ids[0];
+            }
+            StreamConfigurationMap map = mgr.getCameraCharacteristics(backId)
+                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            Size chosen = new Size(640, 480);
+            if (map != null) {
+                Size[] sizes = map.getOutputSizes(ImageFormat.YUV_420_888);
+                if (sizes != null) {
+                    for (Size s : sizes) {
+                        if (s.getWidth() <= 1280 && s.getWidth() * s.getHeight()
+                                > chosen.getWidth() * chosen.getHeight()) {
+                            chosen = s;
+                        }
+                    }
+                }
+            }
+            mQrImageReader = ImageReader.newInstance(
+                chosen.getWidth(), chosen.getHeight(), ImageFormat.YUV_420_888, 2);
+            mQrImageReader.setOnImageAvailableListener(new ImageReader.OnImageAvailableListener() {
+                @Override public void onImageAvailable(ImageReader reader) {
+                    Image img = null;
+                    try {
+                        img = reader.acquireLatestImage();
+                        if (img == null || !mQrScanning) return;
+                        long now = System.currentTimeMillis();
+                        if (now - mQrLastFrameMs < 200) return; // ~5 fps
+                        mQrLastFrameMs = now;
+                        int w = img.getWidth(), h = img.getHeight();
+                        Image.Plane yp = img.getPlanes()[0];
+                        ByteBuffer buf = yp.getBuffer();
+                        int rowStride = yp.getRowStride();
+                        int pixStride = yp.getPixelStride();
+                        byte[] luma = new byte[w * h];
+                        byte[] rowBuf = new byte[rowStride];
+                        int out = 0;
+                        for (int row = 0; row < h; row++) {
+                            int toRead = Math.min(rowStride, buf.remaining());
+                            buf.get(rowBuf, 0, toRead);
+                            for (int col = 0; col < w; col++) luma[out++] = rowBuf[col * pixStride];
+                        }
+                        if (MakepadNative.onQrCameraFrame(luma, w, h)) {
+                            hideQrScanner();
+                        }
+                    } catch (Exception e) {
+                        // transient frame errors are fine; keep scanning
+                    } finally {
+                        if (img != null) img.close();
+                    }
+                }
+            }, mQrBgHandler);
+
+            mgr.openCamera(backId, new CameraDevice.StateCallback() {
+                @Override public void onOpened(CameraDevice device) {
+                    mQrCameraDevice = device;
+                    try {
+                        final CaptureRequest.Builder rb =
+                            device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                        rb.addTarget(previewSurface);
+                        rb.addTarget(mQrImageReader.getSurface());
+                        rb.set(CaptureRequest.CONTROL_AF_MODE,
+                            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                        device.createCaptureSession(
+                            Arrays.asList(previewSurface, mQrImageReader.getSurface()),
+                            new CameraCaptureSession.StateCallback() {
+                                @Override public void onConfigured(CameraCaptureSession session) {
+                                    if (mQrCameraDevice == null) return;
+                                    mQrCaptureSession = session;
+                                    try { session.setRepeatingRequest(rb.build(), null, mQrBgHandler); }
+                                    catch (Exception e) { hideQrScanner(); }
+                                }
+                                @Override public void onConfigureFailed(CameraCaptureSession s) {
+                                    hideQrScanner();
+                                }
+                            }, mQrBgHandler);
+                    } catch (Exception e) {
+                        android.util.Log.e("Makepad", "QR camera2 session failed: " + e);
+                        hideQrScanner();
+                    }
+                }
+                @Override public void onDisconnected(CameraDevice device) { device.close(); }
+                @Override public void onError(CameraDevice device, int error) {
+                    android.util.Log.e("Makepad", "QR camera2 error: " + error);
+                    device.close();
+                    hideQrScanner();
+                }
+            }, mQrBgHandler);
+        } catch (Exception e) {
+            android.util.Log.e("Makepad", "QR camera2 open failed: " + e);
+            hideQrScanner();
+        }
+    }
+
+    // Close the scanner + release the camera. Safe to call from any thread.
+    public void hideQrScanner() {
+        runOnUiThread(new Runnable() { public void run() {
+            mQrScanning = false;
+            try { if (mQrCaptureSession != null) mQrCaptureSession.close(); } catch (Exception ignore) {}
+            mQrCaptureSession = null;
+            try { if (mQrCameraDevice != null) mQrCameraDevice.close(); } catch (Exception ignore) {}
+            mQrCameraDevice = null;
+            try { if (mQrImageReader != null) mQrImageReader.close(); } catch (Exception ignore) {}
+            mQrImageReader = null;
+            if (mQrBgThread != null) {
+                try { mQrBgThread.quitSafely(); } catch (Exception ignore) {}
+                mQrBgThread = null;
+                mQrBgHandler = null;
+            }
+            if (mQrScanOverlay != null && mRootLayout != null) {
+                mRootLayout.removeView(mQrScanOverlay);
+                mQrScanOverlay = null;
+            }
+        }});
+    }
+
+    private void focusComposerInput() {
+        if (mComposerInput == null) {
+            return;
+        }
+        mComposerInput.requestFocus();
+        InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (imm != null) {
+            imm.showSoftInput(mComposerInput, InputMethodManager.SHOW_IMPLICIT);
+        }
+    }
+
+    private void submitComposer() {
+        if (mComposerInput == null) {
+            return;
+        }
+        String text = mComposerInput.getText().toString();
+        if (text.trim().length() == 0) {
+            return;
+        }
+        mComposerInput.setText("");
+        // Hand the text to Rust → the app's send path.
+        MakepadNative.onComposerSubmit(text);
+        // A card will render behind — collapse to the "+" button (this also drops
+        // the keyboard) so it's full-screen. Rust re-asserts this via sync_composer
+        // when streaming starts; collapsing here gives instant feedback on send.
+        collapseComposer();
+    }
+
+    private void hideComposerKeyboard() {
+        if (mComposerInput != null) {
+            mComposerInput.clearFocus();
+        }
+        // Match showKeyboard()'s hide path: WindowInsetsController on API 30+,
+        // where the legacy hideSoftInputFromWindow is unreliable (OxygenOS /
+        // edge-to-edge).
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = getWindow().getInsetsController();
+            if (controller != null) {
+                controller.hide(WindowInsets.Type.ime());
+            }
+        } else {
+            InputMethodManager imm = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+            if (imm != null && mComposerInput != null) {
+                imm.hideSoftInputFromWindow(mComposerInput.getWindowToken(), 0);
+            }
+        }
+    }
+
+    // Called from Rust via `android_jni::to_java_show_composer`.
+    public void showComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerOverlay == null) {
+                    return;
+                }
+                mComposerOverlay.setVisibility(View.VISIBLE);
+                mComposerOverlay.bringToFront();
+            }
+        });
+    }
+
+    // Called from Rust via `android_jni::to_java_hide_composer`.
+    public void hideComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerOverlay == null) {
+                    return;
+                }
+                hideComposerKeyboard();
+                mComposerOverlay.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    // Called from Rust via `android_jni::to_java_expand_composer`. Swap the "+"
+    // button for the full input pill. Does NOT raise the keyboard — this is used
+    // to reflect state (e.g. at boot), and popping the IME on launch is wrong.
+    // The FAB's own onClick raises the keyboard (explicit user intent to type).
+    public void expandComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerPill == null || mComposerFab == null) {
+                    return;
+                }
+                mComposerFab.setVisibility(View.GONE);
+                mComposerPill.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    // Called from Rust via `android_jni::to_java_collapse_composer`. Drop the
+    // keyboard, hide the pill, show the "+" button. The draft text is preserved
+    // (we never clear mComposerInput here) so expanding restores it.
+    public void collapseComposer() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                if (mComposerPill == null || mComposerFab == null) {
+                    return;
+                }
+                hideComposerKeyboard();
+                mComposerPill.setVisibility(View.GONE);
+                mComposerFab.setVisibility(View.VISIBLE);
+            }
+        });
+    }
+
+    // Lift the composer pill above the soft keyboard. Driven by the IME inset
+    // the host already computes (`MakepadImeInsets.report`), so the pill tracks
+    // the keyboard's show/hide animation. `keyboardOverlapPx` is the keyboard's
+    // overlap with the surface bottom (0 when the keyboard is down). Already on
+    // the UI thread (report() runs from layout / inset callbacks).
+    //
+    // We lift via the overlay's *bottom padding* (a real layout change) rather
+    // than `setTranslationY` on the pill: a translated wide ViewGroup with a
+    // drawable background does not recomposite over the GL SurfaceView (it stays
+    // functionally present but invisible), whereas a genuine relayout redraws it
+    // at the new position. The pill is BOTTOM-gravity inside the overlay, so
+    // bottom padding pushes it up above the keyboard.
+    public void positionComposerForKeyboard(int keyboardOverlapPx) {
+        if (mComposerOverlay == null) {
+            return;
+        }
+        int pad = Math.max(0, keyboardOverlapPx);
+        if (mComposerOverlay.getPaddingBottom() != pad) {
+            mComposerOverlay.setPadding(0, 0, 0, pad);
+        }
     }
 
     public void requestHttp(long id, long metadataId, String url, String method, String headers, byte[] body) {
@@ -2873,6 +3835,186 @@ public class MakepadActivity
                 lp.topMargin = top;
                 preview.setLayoutParams(lp);
                 preview.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+            }
+        });
+    }
+
+    // ---- System browser (web app card) overlays ----
+    //
+    // A web app card is an LLM-generated, self-contained HTML document rendered
+    // in a real android.webkit.WebView floated over the GL surface. Content is
+    // loaded with loadDataWithBaseURL against an https base so the document has
+    // a proper origin (YouTube and other referer-gated embeds refuse file:// /
+    // null-origin pages).
+
+    private WebView ensureSystemBrowser(long browserId) {
+        WebView view = mSystemBrowserViews.get(browserId);
+        if (view != null) {
+            return view;
+        }
+        // Remote debugging for web app cards (chrome://inspect via adb).
+        WebView.setWebContentsDebuggingEnabled(true);
+        WebView web = new WebView(this);
+        WebSettings settings = web.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setAllowFileAccess(false);
+        settings.setAllowContentAccess(false);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        web.setBackgroundColor(0xFF101418);
+        web.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onShowCustomView(View view, WebChromeClient.CustomViewCallback callback) {
+                // Fullscreen <video>: float the player's custom view over
+                // EVERYTHING (it is added last, so it is topmost) and hide the
+                // system bars while it is up.
+                if (mSystemBrowserCustomView != null) {
+                    callback.onCustomViewHidden();
+                    return;
+                }
+                mSystemBrowserCustomView = view;
+                mSystemBrowserCustomViewCallback = callback;
+                view.setBackgroundColor(0xFF000000);
+                mRootLayout.addView(view, new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                ));
+                applyFullScreen(true);
+            }
+
+            @Override
+            public void onHideCustomView() {
+                if (mSystemBrowserCustomView == null) {
+                    return;
+                }
+                mRootLayout.removeView(mSystemBrowserCustomView);
+                mSystemBrowserCustomView = null;
+                if (mSystemBrowserCustomViewCallback != null) {
+                    mSystemBrowserCustomViewCallback.onCustomViewHidden();
+                    mSystemBrowserCustomViewCallback = null;
+                }
+                applyFullScreen(false);
+            }
+        });
+        web.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView v, String url) {
+                // Keep top-level navigation inside the card: embeds/iframes are
+                // not affected by this callback, but a stray link click should
+                // not hijack the card into a full browsing session.
+                return true;
+            }
+        });
+        // JS→native bridge: the card calls window.octos_native.invoke(callId, tool, args);
+        // we forward it to Rust (WebCard widget dispatches the tool and resolves the
+        // card promise via evalSystemBrowserJs). @JavascriptInterface runs on a WebView
+        // worker thread, so this returns immediately — the result comes back async.
+        final long boundBrowserId = browserId;
+        web.addJavascriptInterface(new Object() {
+            @JavascriptInterface
+            public void invoke(long callId, String tool, String args) {
+                MakepadNative.onSystemBrowserInvoke(boundBrowserId, callId, tool, args);
+            }
+        }, "octos_native");
+        mSystemBrowserViews.put(browserId, web);
+        if (mSystemBrowserOverlay != null) {
+            mSystemBrowserOverlay.addView(web);
+        }
+        return web;
+    }
+
+    // Run JS inside a card's WebView (native→card channel). Called from Rust via
+    // android_jni::to_java_eval_system_browser_js to resolve octos.invoke promises.
+    public void evalSystemBrowserJs(final long browserId, final String js) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.get(browserId);
+                if (web != null) {
+                    web.evaluateJavascript(js, null);
+                }
+            }
+        });
+    }
+
+    public void spawnSystemBrowser(final long browserId, final String url) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = ensureSystemBrowser(browserId);
+                if (url != null && !url.isEmpty() && !url.equals("about:blank")) {
+                    web.loadUrl(url);
+                }
+            }
+        });
+    }
+
+    public void updateSystemBrowser(final long browserId, final int left, final int top, final int right, final int bottom, final boolean visible) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.get(browserId);
+                if (web == null) {
+                    return;
+                }
+                FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                    Math.max(1, right - left),
+                    Math.max(1, bottom - top)
+                );
+                lp.leftMargin = left;
+                lp.topMargin = top;
+                web.setLayoutParams(lp);
+                web.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+            }
+        });
+    }
+
+    public void detachSystemBrowser(final long browserId) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.get(browserId);
+                if (web != null) {
+                    web.setVisibility(View.GONE);
+                }
+            }
+        });
+    }
+
+    public void closeSystemBrowser(final long browserId) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = mSystemBrowserViews.remove(browserId);
+                if (web != null) {
+                    if (mSystemBrowserOverlay != null) {
+                        mSystemBrowserOverlay.removeView(web);
+                    }
+                    web.destroy();
+                }
+            }
+        });
+    }
+
+    public void setSystemBrowserUrl(final long browserId, final String url) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = ensureSystemBrowser(browserId);
+                web.loadUrl(url);
+            }
+        });
+    }
+
+    public void setSystemBrowserHtml(final long browserId, final String html, final String baseUrl) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                WebView web = ensureSystemBrowser(browserId);
+                String base = (baseUrl == null || baseUrl.isEmpty()) ? "https://octos-one.app/" : baseUrl;
+                web.loadDataWithBaseURL(base, html, "text/html", "utf-8", null);
             }
         });
     }
