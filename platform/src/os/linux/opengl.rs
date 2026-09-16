@@ -416,8 +416,11 @@ impl Cx {
             // Retirement debt is maintenance, not ink. Android services it on
             // idle vsync beats (`opengl_maintain_instance_retirements`) without
             // painting; the desktop GL loops only wake for a repaint, so they
-            // keep the repaint as their wake until the debt settles.
-            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+            // keep the repaint as their wake until the debt settles. OpenHarmony
+            // takes the desktop route: retiring on a beat that paints nothing
+            // blanked the presented surface there, and with completion fences
+            // the debt settles within a frame or two of repainting.
+            #[cfg(not(target_os = "android"))]
             {
                 self.demo_time_repaint = true;
             }
@@ -4441,7 +4444,7 @@ impl Cx {
             || self.draw_lists.has_pending_instance_retirements()
     }
 
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(target_os = "android")]
     pub(crate) fn opengl_maintain_instance_retirements(&mut self) -> bool {
         let fence_pending = self.textures.1.gl.pending.is_some() || !self.textures.1.retired.is_empty();
         if !fence_pending && !self.draw_lists.has_pending_instance_retirements() {
