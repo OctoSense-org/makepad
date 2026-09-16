@@ -23,6 +23,39 @@ struct VSyncParams {
     pub tx: mpsc::Sender<FromOhosMessage>,
 }
 
+/// The display's vsync source and the callback data it is armed with.
+/// Frames are requested on demand: one request per beat the app needs,
+/// none while it is idle, so an idle shell does not wake sixty times a
+/// second (the callback used to re-arm itself unconditionally).
+struct VSyncHandle {
+    vsync: *mut OH_NativeVSync,
+    data: *mut c_void,
+}
+unsafe impl Send for VSyncHandle {}
+static VSYNC_HANDLE: Mutex<Option<VSyncHandle>> = Mutex::new(None);
+static VSYNC_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask the display for one more beat, unless one is already on its way.
+pub fn request_vsync() {
+    use std::sync::atomic::Ordering;
+    if VSYNC_ARMED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let Ok(handle) = VSYNC_HANDLE.lock() else {
+        VSYNC_ARMED.store(false, Ordering::Release);
+        return;
+    };
+    let Some(handle) = handle.as_ref() else {
+        VSYNC_ARMED.store(false, Ordering::Release);
+        return;
+    };
+    let res = unsafe { OH_NativeVSync_RequestFrame(handle.vsync, on_vsync_cb, handle.data) };
+    if res != 0 {
+        VSYNC_ARMED.store(false, Ordering::Release);
+        crate::error!("Failed to request a vsync frame: {res}");
+    }
+}
+
 static OHOS_MSG_TX: Mutex<Option<mpsc::Sender<FromOhosMessage>>> = Mutex::new(None);
 
 pub fn send_from_ohos_message(message: FromOhosMessage) {
@@ -152,18 +185,14 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
 
 #[no_mangle]
 extern "C" fn on_vsync_cb(_timestamp: ::core::ffi::c_longlong, data: *mut c_void) {
+    // This beat is delivered; the main loop asks for the next one only if
+    // it has something to draw (`request_vsync`).
+    VSYNC_ARMED.store(false, std::sync::atomic::Ordering::Release);
     unsafe {
         let _ = (*(data as *mut VSyncParams))
             .tx
             .send(FromOhosMessage::VSync);
     }
-    let res = unsafe {
-        OH_NativeVSync_RequestFrame((*(data as *mut VSyncParams)).vsync, on_vsync_cb, data)
-    };
-    if res != 0 {
-        crate::error!("Failed to register vsync callbacks");
-    }
-    //crate::log!("OnVSyncCallBack, timestamp = {}, register call back = {}",timestamp,res);
 }
 
 #[no_mangle]
@@ -216,15 +245,12 @@ pub fn register_vsync_callback(from_ohos_tx: mpsc::Sender<FromOhosMessage>) {
         vsync: vsync,
         tx: from_ohos_tx,
     };
-    let data = Box::new(param);
-    let res = unsafe {
-        OH_NativeVSync_RequestFrame(vsync, on_vsync_cb, Box::into_raw(data) as *mut c_void)
-    };
-    if res != 0 {
-        crate::error!("Failed to register vsync callbacks");
-    } else {
-        crate::log!("Registerd vsync callbacks successfully");
+    let data = Box::into_raw(Box::new(param)) as *mut c_void;
+    if let Ok(mut handle) = VSYNC_HANDLE.lock() {
+        *handle = Some(VSyncHandle { vsync, data });
     }
+    request_vsync();
+    crate::log!("Registered vsync callbacks (on demand)");
 }
 
 #[allow(unused)]
@@ -266,6 +292,9 @@ pub enum FromOhosMessage {
     },
     SurfaceDestroyed,
     VSync,
+    /// Something happened off the main thread (a signal, a network
+    /// response, a finished task): dispatch it; paint only on a VSync.
+    Wake,
     Touch(Vec<TouchPoint>),
     TextInput(TextInputEvent),
     DeleteLeft(i32),

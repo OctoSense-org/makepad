@@ -480,7 +480,7 @@ impl FrameSerials {
         serial
     }
 
-    #[cfg(any(test, gpusim, use_vulkan, not(any(linux_direct, target_env = "ohos"))))]
+    #[cfg(any(test, gpusim, use_vulkan, not(linux_direct)))]
     pub(crate) fn complete(&self, serial: u64) {
         self.completed.fetch_max(
             serial.min(self.submitted.load(Ordering::Acquire)),
