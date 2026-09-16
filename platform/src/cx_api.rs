@@ -177,6 +177,15 @@ impl<'a> CxSystemBrowser<'a> {
             browser_id: self.id.0,
         });
     }
+
+    /// Inspect the app's own native WebView asynchronously. The snapshot is
+    /// captured by WebKit, including content absent from the Metal drawable.
+    #[cfg(target_os = "macos")]
+    pub fn inspect(&mut self, result_path: String, snapshot_path: Option<String>, scroll_y: Option<f64>) {
+        self.cx.platform_ops.push_back(CxOsOp::InspectSystemBrowser {
+            browser_id: self.id.0, result_path, snapshot_path, scroll_y,
+        });
+    }
 }
 
 pub trait CxOsApi {
@@ -474,6 +483,13 @@ pub enum CxOsOp {
     CloseSystemBrowser {
         browser_id: LiveId,
     },
+    #[cfg(target_os = "macos")]
+    InspectSystemBrowser {
+        browser_id: LiveId,
+        result_path: String,
+        snapshot_path: Option<String>,
+        scroll_y: Option<f64>,
+    },
     /// Load an inline HTML document, with `base_url` as the document origin so
     /// relative fetches and embeds resolve against a real https origin rather
     /// than about:blank.
@@ -617,6 +633,8 @@ impl std::fmt::Debug for CxOsOp {
             Self::SetSystemBrowserUrl { .. } => write!(f, "SetSystemBrowserUrl"),
             Self::SystemBrowserHistoryGo { .. } => write!(f, "SystemBrowserHistoryGo"),
             Self::CloseSystemBrowser { .. } => write!(f, "CloseSystemBrowser"),
+            #[cfg(target_os = "macos")]
+            Self::InspectSystemBrowser { .. } => write!(f, "InspectSystemBrowser"),
             Self::SetSystemBrowserHtml { .. } => write!(f, "SetSystemBrowserHtml"),
             Self::EvalSystemBrowserJs { .. } => write!(f, "EvalSystemBrowserJs"),
             Self::ShareText(..) => write!(f, "ShareText"),
@@ -1254,6 +1272,11 @@ impl Cx {
             cx: self,
             id: id.into(),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn system_browser_count(&self) -> usize {
+        self.os.system_browsers.len()
     }
 
     // Determines whether to show your application in the dock when it runs. The default value is true.

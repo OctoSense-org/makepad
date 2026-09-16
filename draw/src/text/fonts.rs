@@ -87,6 +87,16 @@ impl Fonts {
 
         let mut msdf_job_sender: FromUISender<QueuedMsdfJob> = Default::default();
         let msdf_result_receiver: ToUIReceiver<CompletedMsdfJob> = Default::default();
+        // Single-threaded browser builds intentionally use the existing SDF/SLUG
+        // path. Do not launch an unavailable worker or queue MSDF work for it.
+        #[cfg(all(target_arch = "wasm32", not(target_feature = "atomics")))]
+        {
+            layouter.rasterizer().borrow_mut()
+                .set_outline_rasterization_mode(OutlineRasterizationMode::Sdf);
+            drop(msdf_job_sender.receiver());
+        }
+        #[cfg(not(all(target_arch = "wasm32", not(target_feature = "atomics"))))]
+        {
         let worker_rx = msdf_job_sender
             .receiver()
             .expect("MSDF worker receiver is taken exactly once");
@@ -113,6 +123,7 @@ impl Fonts {
             }
         }) {
             task.detach();
+        }
         }
 
         Self {
