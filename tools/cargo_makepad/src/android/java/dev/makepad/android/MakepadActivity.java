@@ -111,6 +111,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceError;
 import android.webkit.JavascriptInterface;
 
 // note: //% is a special miniquad's pre-processor for plugins
@@ -1088,6 +1090,10 @@ public class MakepadActivity
     // Native WebView overlays for web app cards (see spawnSystemBrowser).
     private FrameLayout mSystemBrowserOverlay;
     private HashMap<Long, WebView> mSystemBrowserViews = new HashMap<>();
+    // Per browser: may it leave the document it was opened with? A web app
+    // card may not; a reader showing pages off the open web must, or a
+    // redirector URL never reaches the page it points at.
+    private HashMap<Long, Boolean> mSystemBrowserNavigable = new HashMap<>();
     // Fullscreen video state for web app cards (WebChromeClient custom view).
     private View mSystemBrowserCustomView;
     private WebChromeClient.CustomViewCallback mSystemBrowserCustomViewCallback;
@@ -3861,8 +3867,17 @@ public class MakepadActivity
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setLoadWithOverviewMode(true);
+        // The page's own viewport rules: with overview mode a page whose DOM
+        // overflows its declared width (GitHub's does) is zoomed out to fit
+        // the overflow, painting at a fraction of the view; without it a
+        // `width=device-width` page stays at scale 1 and the overflow pans.
+        // Pinch zoom is on for the pages that still need it, without the
+        // on-screen zoom buttons.
+        settings.setLoadWithOverviewMode(false);
         settings.setUseWideViewPort(true);
+        settings.setSupportZoom(true);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
         web.setBackgroundColor(0xFF101418);
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -3898,26 +3913,51 @@ public class MakepadActivity
                 applyFullScreen(false);
             }
         });
+        final long boundBrowserId = browserId;
         web.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, String url) {
-                // Keep top-level navigation inside the card: embeds/iframes are
-                // not affected by this callback, but a stray link click should
-                // not hijack the card into a full browsing session.
-                return true;
+                // This callback sees every navigation the WebView starts for
+                // itself: a link tap, a script navigation, and a server
+                // redirect. Returning true cancels it, which is what a card
+                // wants — a stray link should not hijack the card into a full
+                // browsing session. A navigable browser returns false and
+                // follows the hop; embeds/iframes are unaffected either way.
+                boolean blocked = !isSystemBrowserNavigable(boundBrowserId);
+                if (blocked) {
+                    // Without this the cancel is completely silent, which is
+                    // indistinguishable from a page that simply did not load.
+                    Log.i("MakepadWeb", "navigation blocked id=" + boundBrowserId + " url=" + url);
+                }
+                return blocked;
+            }
+
+            @Override
+            public void onReceivedError(WebView v, WebResourceRequest request, WebResourceError error) {
+                // Main frame only: a failed image or tracker is not a failed
+                // page, and reporting those would flicker the host's error view.
+                if (request == null || !request.isForMainFrame()) {
+                    return;
+                }
+                String url = request.getUrl() == null ? "" : request.getUrl().toString();
+                String description = error == null || error.getDescription() == null
+                    ? "" : error.getDescription().toString();
+                int code = error == null ? 0 : error.getErrorCode();
+                Log.i("MakepadWeb", "page error id=" + boundBrowserId + " code=" + code + " url=" + url);
+                MakepadNative.onSystemBrowserPageError(boundBrowserId, code, description, url);
             }
         });
         // JS→native bridge: the card calls window.octos_native.invoke(callId, tool, args);
         // we forward it to Rust (WebCard widget dispatches the tool and resolves the
         // card promise via evalSystemBrowserJs). @JavascriptInterface runs on a WebView
         // worker thread, so this returns immediately — the result comes back async.
-        final long boundBrowserId = browserId;
         web.addJavascriptInterface(new Object() {
             @JavascriptInterface
             public void invoke(long callId, String tool, String args) {
                 MakepadNative.onSystemBrowserInvoke(boundBrowserId, callId, tool, args);
             }
         }, "octos_native");
+        Log.i("MakepadWeb", "create id=" + browserId + " navigable=" + isSystemBrowserNavigable(browserId));
         mSystemBrowserViews.put(browserId, web);
         if (mSystemBrowserOverlay != null) {
             mSystemBrowserOverlay.addView(web);
@@ -3939,10 +3979,20 @@ public class MakepadActivity
         });
     }
 
-    public void spawnSystemBrowser(final long browserId, final String url) {
+    // Whether this browser may navigate away from the document it was opened
+    // with. Read by the WebViewClient, which outlives any single load, so the
+    // policy lives in a map rather than in the client instance.
+    private boolean isSystemBrowserNavigable(long browserId) {
+        return Boolean.TRUE.equals(mSystemBrowserNavigable.get(browserId));
+    }
+
+    public void spawnSystemBrowser(final long browserId, final String url, final boolean navigable) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                // Set before the view exists: ensureSystemBrowser's client
+                // reads the policy on every navigation, including the first.
+                mSystemBrowserNavigable.put(browserId, navigable);
                 WebView web = ensureSystemBrowser(browserId);
                 if (url != null && !url.isEmpty() && !url.equals("about:blank")) {
                     web.loadUrl(url);
@@ -3988,6 +4038,7 @@ public class MakepadActivity
             @Override
             public void run() {
                 WebView web = mSystemBrowserViews.remove(browserId);
+                mSystemBrowserNavigable.remove(browserId);
                 if (web != null) {
                     if (mSystemBrowserOverlay != null) {
                         mSystemBrowserOverlay.removeView(web);

@@ -261,6 +261,7 @@ pub enum FromJavaMessage {
     ComposerExpand,
     QrScanned { json: String },
     SystemBrowserInvoke { browser_id: i64, call_id: i64, tool: String, args: String },
+    SystemBrowserPageError { browser_id: i64, code: i32, description: String, url: String },
     DeepLink { url: String },
     DialogResult { call_id: i64, name: String, content: String, cancelled: bool, error: String },
     DownloadProgress { call_id: i64, done: i64, total: i64 },
@@ -2741,6 +2742,29 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserI
     });
 }
 
+/// A system browser's main-frame load failed (see `MakepadActivity`'s
+/// WebViewClient). Delivered as a `NativeSystemBrowserPageError` action so the
+/// widget hosting the browser can show that the page did not load, instead of
+/// leaving its background on screen.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onSystemBrowserPageError(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    browser_id: jni_sys::jlong,
+    code: jni_sys::jint,
+    description: jni_sys::jstring,
+    url: jni_sys::jstring,
+) {
+    let description = jstring_to_string(env, description);
+    let url = jstring_to_string(env, url);
+    send_from_java_message(FromJavaMessage::SystemBrowserPageError {
+        browser_id: browser_id as i64,
+        code: code as i32,
+        description,
+        url,
+    });
+}
+
 /// The app was launched/resumed via a deep link or share intent (ACTION_VIEW URL
 /// or ACTION_SEND text). Delivered to the app as a `NativeDeepLink` action.
 #[no_mangle]
@@ -2940,16 +2964,17 @@ pub unsafe fn to_java_collapse_composer() {
 
 // The system browser is a Java WebView the activity hosts over the GL surface
 // (`MakepadActivity.spawnSystemBrowser` and friends).
-pub unsafe fn to_java_spawn_system_browser(browser_id: LiveId, url: &str) {
+pub unsafe fn to_java_spawn_system_browser(browser_id: LiveId, url: &str, navigable: bool) {
     let env = attach_jni_env();
     let url = new_java_string(env, url);
     ndk_utils::call_void_method!(
         env,
         get_activity(),
         "spawnSystemBrowser",
-        "(JLjava/lang/String;)V",
+        "(JLjava/lang/String;Z)V",
         browser_id.get_value() as jni_sys::jlong,
-        url
+        url,
+        navigable as jni_sys::jboolean as std::ffi::c_uint
     );
 }
 
