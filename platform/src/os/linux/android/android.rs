@@ -2230,6 +2230,9 @@ impl Cx {
             };
 
             cx.os.dpi_factor = android_params.density;
+            // Storage and the per-user caches live in the app's files
+            // directory: HOME is not writable for an Android app.
+            crate::home::set_platform_data_dir(std::path::Path::new(&android_params.data_path));
             cx.os_type = OsType::Android(android_params);
             if let Some(connected) = initial_physical_keyboard {
                 cx.set_physical_keyboard_state(connected);
