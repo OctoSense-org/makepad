@@ -39,6 +39,7 @@ const ICONS: &[BundledIcon] = &[
     icon!("task"),
     icon!("sheets"),
     icon!("photos"),
+    icon!("news"),
     icon!("clock"),
     icon!("weather"),
     icon!("finance"),
