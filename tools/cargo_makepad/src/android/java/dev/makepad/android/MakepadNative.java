@@ -78,6 +78,11 @@ public class MakepadNative {
     // resolves the card-side promise (callId) via evalSystemBrowserJs.
     public native static void onSystemBrowserInvoke(long browserId, long callId, String tool, String args);
 
+    // A system browser's main-frame load failed (no network, host unresolved,
+    // server refused). Rust hands it to the widget hosting the browser so the
+    // failure is shown rather than leaving an empty view on screen.
+    public native static void onSystemBrowserPageError(long browserId, int code, String description, String url);
+
     // The app was opened/resumed via a deep link (ACTION_VIEW URL) or a share
     // (ACTION_SEND text) — e.g. a YouTube link shared from another app.
     public native static void onDeepLink(String url);
