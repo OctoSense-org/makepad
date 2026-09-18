@@ -20,7 +20,9 @@ use {
         video::*,
     },
     std::{
+        collections::VecDeque,
         ffi::{c_char, c_void, CStr, CString},
+        os::fd::AsRawFd,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex,
@@ -68,6 +70,101 @@ struct OutputCapability {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct CameraFrameRateRange {
+    min: u32,
+    max: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CameraVideoProfile {
+    format: i32,
+    size: CameraSize,
+    range: CameraFrameRateRange,
+}
+
+// OH_AVRecorder_Config and its parts (avrecorder_base.h)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AvProfile {
+    audio_bitrate: i32,
+    audio_channels: i32,
+    audio_codec: i32,
+    audio_sample_rate: i32,
+    file_format: i32,
+    video_bitrate: i32,
+    video_codec: i32,
+    video_frame_width: i32,
+    video_frame_height: i32,
+    video_frame_rate: i32,
+    is_hdr: bool,
+    enable_temporal_scale: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AvLocation {
+    latitude: f32,
+    longitude: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AvMetadataTemplate {
+    key: *mut c_char,
+    value: *mut c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AvMetadata {
+    genre: *mut c_char,
+    video_orientation: *mut c_char,
+    location: AvLocation,
+    custom_info: AvMetadataTemplate,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AvConfig {
+    audio_source_type: i32,
+    video_source_type: i32,
+    profile: AvProfile,
+    url: *mut c_char,
+    file_generation_mode: i32,
+    metadata: AvMetadata,
+    max_duration: i32,
+}
+
+type RecorderStateCb = unsafe extern "C" fn(*mut c_void, i32, i32, *mut c_void);
+type RecorderErrorCb = unsafe extern "C" fn(*mut c_void, i32, *const c_char, *mut c_void);
+
+unsafe extern "C" fn on_recorder_state(_recorder: *mut c_void, state: i32, reason: i32, _user: *mut c_void) {
+    crate::log!("ohos camera: recorder state {state} (reason {reason})");
+}
+
+unsafe extern "C" fn on_recorder_error(_recorder: *mut c_void, code: i32, msg: *const c_char, _user: *mut c_void) {
+    let msg = if msg.is_null() { String::new() } else { CStr::from_ptr(msg).to_string_lossy().into_owned() };
+    crate::error!("ohos camera: recorder error {code}: {msg}");
+}
+
+const AVRECORDER_MIC: i32 = 1;
+const AVRECORDER_SURFACE_YUV: i32 = 0;
+const AVRECORDER_VIDEO_AVC: i32 = 2;
+const AVRECORDER_AUDIO_AAC: i32 = 3;
+const AVRECORDER_CFT_MPEG_4: i32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CameraPhotoCaptureSetting {
+    quality: i32,
+    rotation: i32,
+    location: *mut c_void,
+    mirror: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct CameraPoint {
     x: f64,
     y: f64,
@@ -96,6 +193,7 @@ struct NativeBufferPlanes {
 }
 
 const CAMERA_FORMAT_YUV_420_SP: i32 = 1003;
+const CAMERA_FORMAT_JPEG: i32 = 2000;
 const CAMERA_POSITION_FRONT: i32 = 2;
 /// `OH_NativeBuffer_Format`: the semi-planar 4:2:0 layouts, in enum order.
 const NATIVEBUFFER_PIXEL_FMT_YCBCR_420_SP: i32 = 24;
@@ -146,6 +244,36 @@ struct OhCameraApi {
         Option<unsafe extern "C" fn(*mut c_void, *mut f32, *mut f32, *mut f32) -> Rc32>,
     set_exposure_bias: Option<unsafe extern "C" fn(*mut c_void, f32) -> Rc32>,
     set_flash_mode: Option<unsafe extern "C" fn(*mut c_void, i32) -> Rc32>,
+    // photo output
+    create_photo_output: Option<
+        unsafe extern "C" fn(*mut c_void, *const CameraProfile, *const c_char, *mut *mut c_void) -> Rc32,
+    >,
+    add_photo_output: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> Rc32>,
+    photo_capture: Option<unsafe extern "C" fn(*mut c_void, CameraPhotoCaptureSetting) -> Rc32>,
+    photo_rotation: Option<unsafe extern "C" fn(*mut c_void, i32, *mut i32) -> Rc32>,
+    photo_release: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    image_buffer_size: Option<unsafe extern "C" fn(*mut c_void, u32, *mut usize) -> Rc32>,
+    // video output + recorder (libavrecorder.so / libnative_window.so, API 18)
+    create_video_output: Option<
+        unsafe extern "C" fn(*mut c_void, *const CameraVideoProfile, *const c_char, *mut *mut c_void) -> Rc32,
+    >,
+    add_video_output: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> Rc32>,
+    remove_video_output: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> Rc32>,
+    video_output_start: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    video_output_stop: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    video_output_release: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    recorder_create: Option<unsafe extern "C" fn() -> *mut c_void>,
+    recorder_prepare: Option<unsafe extern "C" fn(*mut c_void, *mut AvConfig) -> Rc32>,
+    recorder_surface: Option<unsafe extern "C" fn(*mut c_void, *mut *mut c_void) -> Rc32>,
+    recorder_rotation: Option<unsafe extern "C" fn(*mut c_void, i32) -> Rc32>,
+    recorder_start: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    recorder_pause: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    recorder_resume: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    recorder_stop: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    recorder_release: Option<unsafe extern "C" fn(*mut c_void) -> Rc32>,
+    recorder_set_state_cb: Option<unsafe extern "C" fn(*mut c_void, RecorderStateCb, *mut c_void) -> Rc32>,
+    recorder_set_error_cb: Option<unsafe extern "C" fn(*mut c_void, RecorderErrorCb, *mut c_void) -> Rc32>,
+    window_surface_id: Option<unsafe extern "C" fn(*mut c_void, *mut u64) -> Rc32>,
     // image receiver
     opts_create: unsafe extern "C" fn(*mut *mut c_void) -> Rc32,
     opts_set_size: unsafe extern "C" fn(*mut c_void, ImageSize) -> Rc32,
@@ -183,6 +311,13 @@ fn api() -> Option<&'static OhCameraApi> {
         let receiver = load("libimage_receiver.so")?;
         let image = load("libohimage.so")?;
         let buffer = load("libnative_buffer.so")?;
+        let recorder = load("libavrecorder.so");
+        let window = load("libnative_window.so");
+        macro_rules! rsym {
+            ($name:literal) => {
+                recorder.as_ref().and_then(|l| l.get_symbol($name).ok())
+            };
+        }
         macro_rules! sym {
             ($lib:expr, $name:literal) => {
                 match $lib.get_symbol($name) {
@@ -228,6 +363,30 @@ fn api() -> Option<&'static OhCameraApi> {
             get_exposure_bias_range: camera.get_symbol("OH_CaptureSession_GetExposureBiasRange").ok(),
             set_exposure_bias: camera.get_symbol("OH_CaptureSession_SetExposureBias").ok(),
             set_flash_mode: camera.get_symbol("OH_CaptureSession_SetFlashMode").ok(),
+            create_photo_output: camera.get_symbol("OH_CameraManager_CreatePhotoOutput").ok(),
+            add_photo_output: camera.get_symbol("OH_CaptureSession_AddPhotoOutput").ok(),
+            photo_capture: camera.get_symbol("OH_PhotoOutput_Capture_WithCaptureSetting").ok(),
+            photo_rotation: camera.get_symbol("OH_PhotoOutput_GetPhotoRotation").ok(),
+            photo_release: camera.get_symbol("OH_PhotoOutput_Release").ok(),
+            image_buffer_size: image.get_symbol("OH_ImageNative_GetBufferSize").ok(),
+            create_video_output: camera.get_symbol("OH_CameraManager_CreateVideoOutput").ok(),
+            add_video_output: camera.get_symbol("OH_CaptureSession_AddVideoOutput").ok(),
+            remove_video_output: camera.get_symbol("OH_CaptureSession_RemoveVideoOutput").ok(),
+            video_output_start: camera.get_symbol("OH_VideoOutput_Start").ok(),
+            video_output_stop: camera.get_symbol("OH_VideoOutput_Stop").ok(),
+            video_output_release: camera.get_symbol("OH_VideoOutput_Release").ok(),
+            recorder_create: rsym!("OH_AVRecorder_Create"),
+            recorder_prepare: rsym!("OH_AVRecorder_Prepare"),
+            recorder_surface: rsym!("OH_AVRecorder_GetInputSurface"),
+            recorder_rotation: rsym!("OH_AVRecorder_UpdateRotation"),
+            recorder_start: rsym!("OH_AVRecorder_Start"),
+            recorder_pause: rsym!("OH_AVRecorder_Pause"),
+            recorder_resume: rsym!("OH_AVRecorder_Resume"),
+            recorder_stop: rsym!("OH_AVRecorder_Stop"),
+            recorder_release: rsym!("OH_AVRecorder_Release"),
+            recorder_set_state_cb: rsym!("OH_AVRecorder_SetStateCallback"),
+            recorder_set_error_cb: rsym!("OH_AVRecorder_SetErrorCallback"),
+            window_surface_id: window.as_ref().and_then(|l| l.get_symbol("OH_NativeWindow_GetSurfaceId").ok()),
             opts_create: sym!(receiver, "OH_ImageReceiverOptions_Create"),
             opts_set_size: sym!(receiver, "OH_ImageReceiverOptions_SetSize"),
             opts_set_capacity: sym!(receiver, "OH_ImageReceiverOptions_SetCapacity"),
@@ -247,7 +406,12 @@ fn api() -> Option<&'static OhCameraApi> {
             buffer_map: sym!(buffer, "OH_NativeBuffer_Map"),
             buffer_map_planes: sym!(buffer, "OH_NativeBuffer_MapPlanes"),
             buffer_unmap: sym!(buffer, "OH_NativeBuffer_Unmap"),
-            _libs: vec![camera, receiver, image, buffer],
+            _libs: {
+                let mut libs = vec![camera, receiver, image, buffer];
+                libs.extend(recorder);
+                libs.extend(window);
+                libs
+            },
         };
         Some(api)
     })
@@ -286,7 +450,45 @@ struct OhDevice {
     index: isize,
     front: bool,
     formats: Vec<OhFormat>,
+    /// JPEG still profiles the camera offers.
+    photo_profiles: Vec<CameraProfile>,
+    /// YUV video profiles (size + frame-rate range) for the recorder.
+    video_profiles: Vec<CameraVideoProfile>,
 }
+
+/// A recording in progress on the session.
+struct VideoRec {
+    recorder: *mut c_void,
+    output: *mut c_void,
+    path: String,
+    _file: std::fs::File,
+    _url: CString,
+    _strings: Vec<CString>,
+}
+
+/// Capture results waiting for the UI thread (`take_capture_results`).
+static CAPTURE_RESULTS: Mutex<Vec<(VideoInputId, CameraCaptureResult)>> = Mutex::new(Vec::new());
+
+pub fn take_capture_results() -> Vec<(VideoInputId, CameraCaptureResult)> {
+    CAPTURE_RESULTS.lock().map(|mut r| std::mem::take(&mut *r)).unwrap_or_default()
+}
+
+fn push_capture_result(input_id: VideoInputId, result: CameraCaptureResult) {
+    if let Ok(mut r) = CAPTURE_RESULTS.lock() {
+        r.push((input_id, result));
+    }
+    SignalToUI::set_ui_signal();
+}
+
+/// State shared with the photo receiver's callback thread.
+pub struct PhotoShared {
+    receiver: AtomicU64,
+    input_id: VideoInputId,
+    /// Paths of the captures in flight, oldest first.
+    pending: Mutex<VecDeque<(String, bool)>>,
+}
+
+static ACTIVE_PHOTO: Mutex<Option<Arc<PhotoShared>>> = Mutex::new(None);
 
 /// A frame ready for the GL upload: tightly packed I420.
 #[derive(Default)]
@@ -333,6 +535,15 @@ struct Session {
     receiver: *mut c_void,
     shared: Arc<FrameShared>,
     rotation_steps: f32,
+    front: bool,
+    /// Still capture: the JPEG output and its receiver (null when the NDK lacks it).
+    photo_output: *mut c_void,
+    photo_receiver: *mut c_void,
+    photo_shared: Option<Arc<PhotoShared>>,
+    /// The preview size, which the recording matches.
+    preview_size: CameraSize,
+    input_id: VideoInputId,
+    video: Option<VideoRec>,
 }
 
 /// The receiver callback gets only the receiver pointer, so the active
@@ -402,8 +613,22 @@ impl OhCameraAccess {
             let mut cap: *mut OutputCapability = std::ptr::null_mut();
             let rc = unsafe { (api.get_capability)(manager, device, &mut cap) };
             let mut formats = Vec::new();
+            let mut photo_profiles = Vec::new();
+            let mut video_profiles = Vec::new();
             if rc == 0 && !cap.is_null() {
                 let cap_ref = unsafe { &*cap };
+                for p in 0..cap_ref.video_profiles_size as isize {
+                    let profile = unsafe { *cap_ref.video_profiles.offset(p) } as *const CameraVideoProfile;
+                    if !profile.is_null() && unsafe { (*profile).format } == CAMERA_FORMAT_YUV_420_SP {
+                        video_profiles.push(unsafe { *profile });
+                    }
+                }
+                for p in 0..cap_ref.photo_profiles_size as isize {
+                    let profile = unsafe { *cap_ref.photo_profiles.offset(p) };
+                    if !profile.is_null() && unsafe { (*profile).format } == CAMERA_FORMAT_JPEG {
+                        photo_profiles.push(unsafe { *profile });
+                    }
+                }
                 for p in 0..cap_ref.preview_profiles_size as isize {
                     let profile = unsafe { *cap_ref.preview_profiles.offset(p) };
                     if profile.is_null() {
@@ -437,13 +662,15 @@ impl OhCameraAccess {
             } else {
                 crate::error!("ohos camera: {name}: capability: {}", cam_error(rc));
             }
-            crate::log!("ohos camera: {name}: {} preview sizes", formats.len());
+            crate::log!("ohos camera: {name}: {} preview sizes, {} photo sizes, {} video profiles", formats.len(), photo_profiles.len(), video_profiles.len());
             self.devices.push(OhDevice {
                 input_id: VideoInputId(LiveId::from_str(&id)),
                 name,
                 index: i,
                 front,
                 formats,
+                photo_profiles,
+                video_profiles,
             });
         }
     }
@@ -614,6 +841,14 @@ impl OhCameraAccess {
         let device_ptr = unsafe { self.device_list.offset(device.index) };
         let front = device.front;
         let name = device.name.clone();
+        // The still profile with the preview's aspect, largest first.
+        let aspect = format.profile.size.width as f64 / format.profile.size.height as f64;
+        let photo_profile = device
+            .photo_profiles
+            .iter()
+            .filter(|p| p.size.height > 0 && ((p.size.width as f64 / p.size.height as f64) - aspect).abs() < 0.03)
+            .max_by_key(|p| p.size.width as u64 * p.size.height as u64)
+            .copied();
 
         // Image receiver: the preview surface the camera streams into.
         let mut opts = std::ptr::null_mut();
@@ -655,6 +890,26 @@ impl OhCameraAccess {
             format: format.format,
         });
 
+        // The still output: a JPEG receiver of the photo size, added to the session before commit.
+        let mut photo_output: *mut c_void = std::ptr::null_mut();
+        let mut photo_receiver: *mut c_void = std::ptr::null_mut();
+        let mut photo_surface = 0u64;
+        if let (Some(profile), Some(_), Some(_)) = (photo_profile, api.create_photo_output, api.add_photo_output) {
+            let mut opts = std::ptr::null_mut();
+            if unsafe { (api.opts_create)(&mut opts) } == 0 && !opts.is_null() {
+                unsafe {
+                    (api.opts_set_size)(opts, ImageSize { width: profile.size.width, height: profile.size.height });
+                    (api.opts_set_capacity)(opts, 2);
+                }
+                let rc = unsafe { (api.receiver_create)(opts, &mut photo_receiver) };
+                unsafe { (api.opts_release)(opts) };
+                if rc != 0 || photo_receiver.is_null() || unsafe { (api.receiver_surface_id)(photo_receiver, &mut photo_surface) } != 0 {
+                    crate::error!("ohos camera: photo receiver: {rc}");
+                    photo_receiver = std::ptr::null_mut();
+                }
+            }
+        }
+
         // Camera pipeline: input → session → preview output on the receiver surface.
         let built = (|| -> Result<(*mut c_void, *mut c_void, *mut c_void), String> {
             let mut input = std::ptr::null_mut();
@@ -689,18 +944,37 @@ impl OhCameraAccess {
                 }
                 return Err(format!("session: {}", cam_error(rc)));
             }
-            let steps: [(&str, i32); 5] = [
+            if !photo_receiver.is_null() {
+                if let (Some(profile), Some(create), Some(_)) = (photo_profile, api.create_photo_output, api.add_photo_output) {
+                    let sid = CString::new(photo_surface.to_string()).unwrap();
+                    let rc = unsafe { create(self.manager, &profile, sid.as_ptr(), &mut photo_output) };
+                    if rc != 0 || photo_output.is_null() {
+                        crate::error!("ohos camera: photo output: {}", cam_error(rc));
+                        photo_output = std::ptr::null_mut();
+                    }
+                }
+            }
+            let mut steps: Vec<(&str, i32)> = vec![
                 ("beginConfig", unsafe { (api.begin_config)(session) }),
                 ("addInput", unsafe { (api.add_input)(session, input) }),
                 ("addPreviewOutput", unsafe { (api.add_preview)(session, output) }),
-                ("commitConfig", unsafe { (api.commit_config)(session) }),
-                ("start", unsafe { (api.session_start)(session) }),
             ];
+            if !photo_output.is_null() {
+                let rc = unsafe { (api.add_photo_output.unwrap())(session, photo_output) };
+                if rc != 0 {
+                    crate::error!("ohos camera: addPhotoOutput: {} (stills disabled)", cam_error(rc));
+                    unsafe { (api.photo_release.unwrap_or(noop_release))(photo_output) };
+                    photo_output = std::ptr::null_mut();
+                }
+            }
+            steps.push(("commitConfig", unsafe { (api.commit_config)(session) }));
+            steps.push(("start", unsafe { (api.session_start)(session) }));
             for (what, rc) in steps {
                 if rc != 0 {
                     unsafe {
                         (api.session_release)(session);
                         (api.preview_release)(output);
+                        if !photo_output.is_null() { (api.photo_release.unwrap_or(noop_release))(photo_output); }
                         (api.input_close)(input);
                         (api.input_release)(input);
                     }
@@ -712,9 +986,23 @@ impl OhCameraAccess {
         let (input, session, output) = match built {
             Ok(v) => v,
             Err(error) => {
-                unsafe { (api.receiver_release)(receiver) };
+                unsafe {
+                    (api.receiver_release)(receiver);
+                    if !photo_receiver.is_null() { (api.receiver_release)(photo_receiver); }
+                }
                 return Err(error);
             }
+        };
+        let photo_shared = if photo_output.is_null() {
+            if !photo_receiver.is_null() { unsafe { (api.receiver_release)(photo_receiver) }; photo_receiver = std::ptr::null_mut(); }
+            None
+        } else {
+            let shared = Arc::new(PhotoShared { receiver: AtomicU64::new(photo_receiver as usize as u64), input_id, pending: Mutex::new(VecDeque::new()) });
+            if let Ok(mut active) = ACTIVE_PHOTO.lock() { *active = Some(shared.clone()); }
+            let rc = unsafe { (api.receiver_on)(photo_receiver, on_photo_arrived) };
+            if rc != 0 { crate::error!("ohos camera: photo receiver callback: {rc}"); }
+            if let Some(p) = photo_profile { crate::log!("ohos camera: stills at {}x{}", p.size.width, p.size.height); }
+            Some(shared)
         };
 
         // The camera reports how far the sensor image must turn to be upright
@@ -744,27 +1032,244 @@ impl OhCameraAccess {
             receiver,
             shared,
             rotation_steps,
+            front,
+            photo_output,
+            photo_receiver,
+            photo_shared,
+            preview_size: format.profile.size,
+            input_id,
+            video: None,
         })
     }
 
+    /// Start recording the session into `path` through an AV recorder surface.
+    fn start_video(&mut self, path: String, audio: bool) -> Result<(), String> {
+        let api = api().ok_or("camera NDK not available")?;
+        let session = self.session.as_mut().ok_or("no camera session is running")?;
+        if session.video.is_some() {
+            return Err("already recording".into());
+        }
+        let (Some(create), Some(prepare), Some(get_surface), Some(start), Some(surface_id), Some(create_output), Some(add_output), Some(out_start)) = (
+            api.recorder_create, api.recorder_prepare, api.recorder_surface, api.recorder_start, api.window_surface_id,
+            api.create_video_output, api.add_video_output, api.video_output_start,
+        ) else {
+            return Err("the AV recorder NDK is not available on this device".into());
+        };
+        let device = self.devices.iter().find(|d| d.input_id == session.input_id).ok_or("unknown input")?;
+        let size = session.preview_size;
+        let profile = device
+            .video_profiles
+            .iter()
+            .filter(|p| p.size.width == size.width && p.size.height == size.height && p.range.min <= 30 && p.range.max >= 30)
+            .max_by_key(|p| p.range.max)
+            .or_else(|| device.video_profiles.iter().filter(|p| p.size.width == size.width && p.size.height == size.height).next())
+            .copied()
+            .ok_or_else(|| format!("no video profile at {}x{}", size.width, size.height))?;
+        let fps = 30i32.clamp(profile.range.min as i32, profile.range.max as i32);
+
+        std::path::Path::new(&path).parent().map(std::fs::create_dir_all);
+        // The MP4 muxer seeks back to write the header: the descriptor must be read-write.
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).map_err(|e| format!("create {path}: {e}"))?;
+        let url = CString::new(format!("fd://{}", file.as_raw_fd())).unwrap();
+        // The recorder reads every metadata string, so none may be null.
+        let strings: Vec<CString> = ["90", "", "", ""].iter().map(|t| CString::new(*t).unwrap()).collect();
+        let (orientation, genre, key, value) = (&strings[0], &strings[1], &strings[2], &strings[3]);
+        let recorder = unsafe { create() };
+        if recorder.is_null() {
+            return Err("recorder create".into());
+        }
+        let mut config = AvConfig {
+            audio_source_type: if audio { AVRECORDER_MIC } else { -1 },
+            video_source_type: AVRECORDER_SURFACE_YUV,
+            profile: AvProfile {
+                audio_bitrate: if audio { 96_000 } else { 0 },
+                audio_channels: if audio { 2 } else { 0 },
+                audio_codec: if audio { AVRECORDER_AUDIO_AAC } else { 0 },
+                audio_sample_rate: if audio { 48_000 } else { 0 },
+                file_format: AVRECORDER_CFT_MPEG_4,
+                video_bitrate: 12_000_000,
+                video_codec: AVRECORDER_VIDEO_AVC,
+                video_frame_width: size.width as i32,
+                video_frame_height: size.height as i32,
+                video_frame_rate: fps,
+                is_hdr: false,
+                enable_temporal_scale: false,
+            },
+            url: url.as_ptr() as *mut c_char,
+            file_generation_mode: 0,
+            metadata: AvMetadata {
+                genre: genre.as_ptr() as *mut c_char,
+                video_orientation: orientation.as_ptr() as *mut c_char,
+                location: AvLocation { latitude: 0.0, longitude: 0.0 },
+                custom_info: AvMetadataTemplate { key: key.as_ptr() as *mut c_char, value: value.as_ptr() as *mut c_char },
+            },
+            max_duration: 3600,
+        };
+        let release = api.recorder_release.unwrap_or(noop_release);
+        // The NDK insists on both callbacks before Prepare ("callback_ is nullptr").
+        if let Some(f) = api.recorder_set_state_cb { let _ = unsafe { f(recorder, on_recorder_state, std::ptr::null_mut()) }; }
+        if let Some(f) = api.recorder_set_error_cb { let _ = unsafe { f(recorder, on_recorder_error, std::ptr::null_mut()) }; }
+        let rc = unsafe { prepare(recorder, &mut config) };
+        if rc != 0 {
+            unsafe { release(recorder) };
+            return Err(format!("recorder prepare: {rc}"));
+        }
+        if let Some(rot) = api.recorder_rotation {
+            let _ = unsafe { rot(recorder, 90) };
+        }
+        let mut window = std::ptr::null_mut();
+        let rc = unsafe { get_surface(recorder, &mut window) };
+        let mut sid = 0u64;
+        if rc != 0 || window.is_null() || unsafe { surface_id(window, &mut sid) } != 0 {
+            unsafe { release(recorder) };
+            return Err(format!("recorder surface: {rc}"));
+        }
+        let sid = CString::new(sid.to_string()).unwrap();
+        let mut output = std::ptr::null_mut();
+        let rc = unsafe { create_output(self.manager, &profile, sid.as_ptr(), &mut output) };
+        if rc != 0 || output.is_null() {
+            unsafe { release(recorder) };
+            return Err(format!("video output: {}", cam_error(rc)));
+        }
+        let out_release = api.video_output_release.unwrap_or(noop_release);
+        let steps: [(&str, i32); 4] = [
+            ("beginConfig", unsafe { (api.begin_config)(session.session) }),
+            ("addVideoOutput", unsafe { add_output(session.session, output) }),
+            ("commitConfig", unsafe { (api.commit_config)(session.session) }),
+            ("start", unsafe { (api.session_start)(session.session) }),
+        ];
+        for (what, rc) in steps {
+            if rc != 0 {
+                unsafe {
+                    if let Some(remove) = api.remove_video_output { let _ = (api.begin_config)(session.session); let _ = remove(session.session, output); let _ = (api.commit_config)(session.session); }
+                    out_release(output);
+                    release(recorder);
+                }
+                return Err(format!("{what}: {}", cam_error(rc)));
+            }
+        }
+        let rc = unsafe { out_start(output) };
+        if rc != 0 {
+            unsafe { out_release(output); release(recorder) };
+            return Err(format!("video output start: {}", cam_error(rc)));
+        }
+        let rc = unsafe { start(recorder) };
+        if rc != 0 {
+            unsafe { let _ = api.video_output_stop.map(|f| f(output)); out_release(output); release(recorder) };
+            return Err(format!("recorder start: {rc}"));
+        }
+        crate::log!("ohos camera: recording {path} at {}x{} {fps} fps{}", size.width, size.height, if audio { " with audio" } else { "" });
+        session.video = Some(VideoRec { recorder, output, path, _file: file, _url: url, _strings: strings });
+        Ok(())
+    }
+
+    /// Stop the recording, take the video output out of the session again.
+    fn stop_video(&mut self) -> Result<String, String> {
+        let api = api().ok_or("camera NDK not available")?;
+        let session = self.session.as_mut().ok_or("no camera session is running")?;
+        let rec = session.video.take().ok_or("not recording")?;
+        unsafe {
+            if let Some(stop) = api.recorder_stop { let _ = stop(rec.recorder); }
+            if let Some(stop) = api.video_output_stop { let _ = stop(rec.output); }
+            if let Some(remove) = api.remove_video_output {
+                let _ = (api.begin_config)(session.session);
+                let _ = remove(session.session, rec.output);
+                let _ = (api.commit_config)(session.session);
+                let _ = (api.session_start)(session.session);
+            }
+            if let Some(release) = api.video_output_release { let _ = release(rec.output); }
+            if let Some(release) = api.recorder_release { let _ = release(rec.recorder); }
+        }
+        crate::log!("ohos camera: recording stopped: {}", rec.path);
+        Ok(rec.path)
+    }
+
+    /// Take a photo or drive a recording on the running session.
+    pub fn capture(&mut self, input_id: VideoInputId, request: CameraCaptureRequest) {
+        let Some(api) = api() else { return };
+        let fail = |what: &str, error: String| push_capture_result(input_id, CameraCaptureResult::Failed { what: what.into(), error });
+        let Some(session) = self.session.as_ref() else {
+            fail("capture", "no camera session is running".into());
+            return;
+        };
+        match request {
+            CameraCaptureRequest::Photo { path, library } => {
+                let (Some(shared), Some(capture)) = (session.photo_shared.as_ref(), api.photo_capture) else {
+                    fail("photo", "this camera session has no still output".into());
+                    return;
+                };
+                if session.photo_output.is_null() {
+                    fail("photo", "no photo output".into());
+                    return;
+                }
+                let mut rotation = 90;
+                if let Some(get) = api.photo_rotation {
+                    let mut r = 0i32;
+                    if unsafe { get(session.photo_output, 0, &mut r) } == 0 { rotation = r; }
+                }
+                if let Ok(mut pending) = shared.pending.lock() { pending.push_back((path.clone(), library)); }
+                let setting = CameraPhotoCaptureSetting { quality: 0, rotation, location: std::ptr::null_mut(), mirror: session.front };
+                let rc = unsafe { capture(session.photo_output, setting) };
+                if rc != 0 {
+                    if let Ok(mut pending) = shared.pending.lock() { pending.retain(|(p, _)| *p != path); }
+                    fail("photo", cam_error(rc));
+                } else {
+                    crate::log!("ohos camera: capturing {path} (rotation {rotation})");
+                }
+            }
+            CameraCaptureRequest::StartVideo { path, audio, .. } => match self.start_video(path.clone(), audio) {
+                Ok(()) => push_capture_result(input_id, CameraCaptureResult::VideoStarted { path }),
+                Err(error) => fail("video", error),
+            },
+            CameraCaptureRequest::StopVideo => match self.stop_video() {
+                Ok(path) => push_capture_result(input_id, CameraCaptureResult::VideoStopped { path }),
+                Err(error) => fail("video", error),
+            },
+            CameraCaptureRequest::PauseVideo | CameraCaptureRequest::ResumeVideo => {
+                let resume = matches!(request, CameraCaptureRequest::ResumeVideo);
+                let (Some(rec), Some(f)) = (session.video.as_ref(), if resume { api.recorder_resume } else { api.recorder_pause }) else {
+                    fail("video", "not recording".into());
+                    return;
+                };
+                let rc = unsafe { f(rec.recorder) };
+                if rc != 0 {
+                    fail("video", format!("recorder {}: {rc}", if resume { "resume" } else { "pause" }));
+                } else {
+                    push_capture_result(input_id, if resume { CameraCaptureResult::VideoResumed } else { CameraCaptureResult::VideoPaused });
+                }
+            }
+        }
+    }
+
     fn stop_session(&mut self) {
+        if self.session.as_ref().map_or(false, |s| s.video.is_some()) {
+            match self.stop_video() {
+                Ok(path) => push_capture_result(self.session.as_ref().unwrap().input_id, CameraCaptureResult::VideoStopped { path }),
+                Err(error) => crate::error!("ohos camera: {error}"),
+            }
+        }
         let Some(session) = self.session.take() else {
             return;
         };
         if let Ok(mut active) = ACTIVE.lock() {
             *active = None;
         }
-        // Park the receiver pointer so a callback in flight reads nothing.
+        // Park the receiver pointers so a callback in flight reads nothing.
         session.shared.receiver.store(0, Ordering::Release);
+        if let Some(photo) = &session.photo_shared { photo.receiver.store(0, Ordering::Release); }
+        if let Ok(mut active) = ACTIVE_PHOTO.lock() { *active = None; }
         let Some(api) = api() else { return };
         unsafe {
             (api.receiver_off)(session.receiver);
+            if !session.photo_receiver.is_null() { (api.receiver_off)(session.photo_receiver); }
             (api.session_stop)(session.session);
             (api.session_release)(session.session);
             (api.preview_release)(session.output);
+            if !session.photo_output.is_null() { (api.photo_release.unwrap_or(noop_release))(session.photo_output); }
             (api.input_close)(session.input);
             (api.input_release)(session.input);
             (api.receiver_release)(session.receiver);
+            if !session.photo_receiver.is_null() { (api.receiver_release)(session.photo_receiver); }
         }
         crate::log!("ohos camera: stopped");
     }
@@ -784,6 +1289,83 @@ impl Drop for OhCameraAccess {
             }
         }
     }
+}
+
+unsafe extern "C" fn noop_release(_: *mut c_void) -> Rc32 {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Still readback (photo receiver thread)
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn on_photo_arrived(receiver: *mut c_void) {
+    let shared = match ACTIVE_PHOTO.lock() {
+        Ok(active) => active.clone(),
+        Err(_) => None,
+    };
+    let Some(shared) = shared else { return };
+    if shared.receiver.load(Ordering::Acquire) != receiver as usize as u64 {
+        return;
+    }
+    let Some(api) = api() else { return };
+    let Some((path, _library)) = shared.pending.lock().ok().and_then(|mut p| p.pop_front()) else {
+        crate::log!("ohos camera: a still arrived that nobody asked for");
+        return;
+    };
+    let mut image = std::ptr::null_mut();
+    let rc = (api.receiver_read_latest)(receiver, &mut image);
+    if rc != 0 || image.is_null() {
+        push_capture_result(shared.input_id, CameraCaptureResult::Failed { what: "photo".into(), error: format!("read still: {rc}") });
+        return;
+    }
+    let result = read_jpeg(api, image, &path);
+    (api.image_release)(image);
+    match result {
+        Ok((width, height)) => {
+            crate::log!("ohos camera: still written to {path} ({width}x{height})");
+            push_capture_result(shared.input_id, CameraCaptureResult::Photo { path, width, height });
+        }
+        Err(error) => push_capture_result(shared.input_id, CameraCaptureResult::Failed { what: "photo".into(), error }),
+    }
+}
+
+/// Copy the image's JPEG component into `path`.
+unsafe fn read_jpeg(api: &OhCameraApi, image: *mut c_void, path: &str) -> Result<(u32, u32), String> {
+    let mut size = ImageSize { width: 0, height: 0 };
+    let _ = (api.image_size)(image, &mut size);
+    let mut type_count = 0usize;
+    if (api.image_component_types)(image, std::ptr::null_mut(), &mut type_count) != 0 || type_count == 0 {
+        return Err("still has no components".into());
+    }
+    let mut types = vec![0u32; type_count];
+    let mut types_out = types.as_mut_ptr();
+    if (api.image_component_types)(image, &mut types_out, &mut type_count) != 0 {
+        return Err("still component types".into());
+    }
+    let component = types[0];
+    let mut buffer = std::ptr::null_mut();
+    if (api.image_byte_buffer)(image, component, &mut buffer) != 0 || buffer.is_null() {
+        return Err("still byte buffer".into());
+    }
+    let mut len = 0usize;
+    if let Some(get_size) = api.image_buffer_size {
+        let _ = get_size(image, component, &mut len);
+    }
+    let mut base: *mut c_void = std::ptr::null_mut();
+    if (api.buffer_map)(buffer, &mut base) != 0 || base.is_null() {
+        return Err("still buffer map".into());
+    }
+    if len == 0 {
+        len = size.width as usize * size.height as usize;
+    }
+    let bytes = std::slice::from_raw_parts(base as *const u8, len);
+    // Trim to the JPEG end-of-image marker: the buffer is a fixed allocation.
+    let end = bytes.windows(2).rposition(|w| w == [0xFF, 0xD9]).map(|i| i + 2).unwrap_or(bytes.len());
+    let written = std::path::Path::new(path).parent().map(std::fs::create_dir_all).transpose().and_then(|_| std::fs::write(path, &bytes[..end]));
+    (api.buffer_unmap)(buffer);
+    written.map_err(|e| format!("write {path}: {e}"))?;
+    Ok((size.width, size.height))
 }
 
 // ---------------------------------------------------------------------------

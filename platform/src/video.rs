@@ -463,6 +463,38 @@ pub enum CameraFlashMode {
     Torch,
 }
 
+/// Capture on an open camera. Results arrive as a `CameraCaptureEvent`
+/// action on the next `Event::Actions`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CameraCaptureRequest {
+    /// Take a still into `path` (JPEG); with `library` the platform also
+    /// offers it to the system gallery once written.
+    Photo { path: String, library: bool },
+    /// Start recording into `path` (MP4), with or without the microphone.
+    StartVideo { path: String, audio: bool, library: bool },
+    PauseVideo,
+    ResumeVideo,
+    StopVideo,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CameraCaptureResult {
+    Photo { path: String, width: u32, height: u32 },
+    VideoStarted { path: String },
+    VideoPaused,
+    VideoResumed,
+    VideoStopped { path: String },
+    /// The system gallery took (or refused) a capture file.
+    SavedToLibrary { path: String, uri: Option<String> },
+    Failed { what: String, error: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct CameraCaptureEvent {
+    pub input_id: VideoInputId,
+    pub result: CameraCaptureResult,
+}
+
 /// Runtime controls of an open camera. Best effort: a backend applies what
 /// the device supports and ignores the rest.
 #[derive(Clone, Copy, Debug, PartialEq)]

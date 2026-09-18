@@ -254,6 +254,13 @@ impl Cx {
                     }
                 }
             }
+            FromOhosMessage::CaptureSaved { path, ok, uri } => {
+                crate::log!("ohos: gallery {} {path}", if ok { "took" } else { "refused" });
+                self.action(crate::video::CameraCaptureEvent {
+                    input_id: Default::default(),
+                    result: crate::video::CameraCaptureResult::SavedToLibrary { path, uri: if ok { Some(uri) } else { None } },
+                });
+            }
             FromOhosMessage::AvoidArea {
                 top,
                 right,

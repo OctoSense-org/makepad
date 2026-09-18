@@ -1,5 +1,5 @@
 use {
-    super::oh_camera::{OhCameraAccess, OhCameraPlayer},
+    super::oh_camera::{take_capture_results, OhCameraAccess, OhCameraPlayer},
     crate::{
         audio::*,
         cx::Cx,
@@ -39,6 +39,8 @@ impl OsMidiInput {
 pub struct CxOpenHarmonyMedia {
     camera: Option<Arc<Mutex<OhCameraAccess>>>,
     camera_descs_sent: bool,
+    /// Capture files that should go to the system gallery once written.
+    library_pending: std::collections::HashSet<String>,
     /// Video widgets bound to the camera stream, by video id.
     pub(crate) camera_players: HashMap<LiveId, OhCameraPlayer>,
 }
@@ -62,6 +64,26 @@ impl Cx {
             self.os.media.camera_descs_sent = true;
             let descs = self.os.media.camera().lock().unwrap().get_updated_descs();
             self.call_event_handler(&Event::VideoInputs(VideoInputsEvent { descs }));
+        }
+        // Stills and recordings finished on the camera threads.
+        for (input_id, result) in take_capture_results() {
+            if let CameraCaptureResult::Photo { path, .. } | CameraCaptureResult::VideoStopped { path } = &result {
+                if self.os.media.library_pending.remove(path) {
+                    self.ohos_offer_to_library(path.clone());
+                }
+            }
+            self.action(CameraCaptureEvent { input_id, result });
+        }
+    }
+
+    /// Hand a written capture to the system gallery through ArkTS
+    /// (`saveLatestCapture` → `takeCaptureToSave` → `handleCaptureSaved`).
+    fn ohos_offer_to_library(&mut self, path: String) {
+        super::oh_callbacks::queue_capture_to_save(path);
+        if let Some(arkts) = self.os.arkts_obj.as_mut() {
+            if let Err(e) = arkts.call_js_function("saveLatestCapture", 0, std::ptr::null_mut()) {
+                crate::error!("ohos: saveLatestCapture failed: {e:?}");
+            }
         }
     }
 
@@ -183,5 +205,15 @@ impl CxMediaApi for Cx {
 
     fn camera_control(&mut self, input_id: VideoInputId, control: CameraControl) {
         self.os.media.camera().lock().unwrap().control(input_id, control);
+    }
+
+    fn camera_capture(&mut self, input_id: VideoInputId, request: CameraCaptureRequest) {
+        match &request {
+            CameraCaptureRequest::Photo { path, library: true } | CameraCaptureRequest::StartVideo { path, library: true, .. } => {
+                self.os.media.library_pending.insert(path.clone());
+            }
+            _ => {}
+        }
+        self.os.media.camera().lock().unwrap().capture(input_id, request);
     }
 }
