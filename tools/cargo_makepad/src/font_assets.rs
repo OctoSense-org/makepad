@@ -19,6 +19,7 @@ impl FontAssetManifest {
     pub fn parse(bytes: &[u8]) -> Result<Self, String> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| format!("{MANIFEST_SECTION} is not valid UTF-8"))?;
+        let text = single_manifest(text)?;
         let mut format = None;
         let mut set = None;
         let mut assets = BTreeSet::new();
@@ -64,7 +65,33 @@ impl FontAssetManifest {
         }
         Ok(Self { set, assets })
     }
+}
 
+/// The manifest section of a binary that links the same app crate twice — a
+/// lib and a bin target built from one source, so `app_main!` expands in
+/// both — holds two copies of the manifest back to back. Identical copies
+/// are one manifest; copies that differ are a real conflict.
+fn single_manifest(text: &str) -> Result<&str, String> {
+    let mut starts = text
+        .match_indices("format=")
+        .filter(|(at, _)| *at == 0 || text.as_bytes()[at - 1] == b'\n')
+        .map(|(at, _)| at);
+    let Some(first) = starts.next() else {
+        return Ok(text);
+    };
+    let Some(second) = starts.next() else {
+        return Ok(text);
+    };
+    let record = &text[first..second];
+    let rest = &text[second..];
+    if rest.len() % record.len() == 0 && rest.as_bytes().chunks(record.len()).all(|c| c == record.as_bytes()) {
+        Ok(record)
+    } else {
+        Err(format!("conflicting copies of {MANIFEST_SECTION} in one binary"))
+    }
+}
+
+impl FontAssetManifest {
     pub fn from_wasm_file(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|error| {
             format!("cannot read wasm font manifest from {path:?}: {error}")
@@ -711,6 +738,24 @@ mod tests {
         assert!(FontAssetManifest::parse(traversal)
             .unwrap_err()
             .contains("invalid logical font asset path"));
+    }
+
+    #[test]
+    fn identical_manifest_copies_in_one_section_are_one_manifest() {
+        let once = b"format=makepad.font-assets.v1\nset=Latin\nasset=app/resources/font.ttf\n";
+        let twice = [once.as_slice(), once.as_slice()].concat();
+        assert_eq!(
+            FontAssetManifest::parse(&twice).unwrap(),
+            FontAssetManifest::parse(once).unwrap()
+        );
+        let other = b"format=makepad.font-assets.v1\nset=International\nasset=app/resources/font.ttf\n";
+        let conflicting = [once.as_slice(), other.as_slice()].concat();
+        assert!(FontAssetManifest::parse(&conflicting)
+            .unwrap_err()
+            .contains("conflicting copies"));
+        assert!(FontAssetManifest::parse(b"format=makepad.font-assets.v1\nformat=makepad.font-assets.v1\nset=Latin\n")
+            .unwrap_err()
+            .contains("conflicting copies"));
     }
 
     #[test]
