@@ -1,6 +1,7 @@
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
+import { BusinessError } from '@kit.BasicServicesKit';
 import makepad from 'libmakepad.so'
 import {ArkGlue} from '../makepad/makepad'
 
@@ -49,6 +50,48 @@ export default class EntryAbility extends UIAbility {
         return;
       }
       hilog.info(0x0000, 'testTag', 'Succeeded in loading the content.');
+    });
+
+    // Edge to edge, like the Android activity: the XComponent covers the whole
+    // display, the system bars are transparent, and their avoid areas reach the
+    // app as safe-area insets so it can keep its own chrome out of them.
+    windowStage.getMainWindow().then((mainWindow) => {
+      mainWindow.setWindowLayoutFullScreen(true).catch((e: BusinessError) => {
+        hilog.warn(0x0000, 'testTag', 'layout full screen failed: %{public}d', e.code);
+      });
+      // The app draws its own status strip and home indicator (as on Android),
+      // so the system's are hidden rather than overlapping them.
+      mainWindow.setSpecificSystemBarEnabled('status', false).catch((e: BusinessError) => {
+        hilog.warn(0x0000, 'testTag', 'hide status bar failed: %{public}d', e.code);
+      });
+      mainWindow.setSpecificSystemBarEnabled('navigationIndicator', false).catch((e: BusinessError) => {
+        hilog.warn(0x0000, 'testTag', 'hide navigation indicator failed: %{public}d', e.code);
+      });
+      mainWindow.setWindowSystemBarProperties({
+        statusBarColor: '#00000000',
+        navigationBarColor: '#00000000',
+        statusBarContentColor: '#FFFFFF',
+        navigationBarContentColor: '#FFFFFF'
+      }).catch((e: BusinessError) => {
+        hilog.warn(0x0000, 'testTag', 'system bar properties failed: %{public}d', e.code);
+      });
+      const report = () => {
+        try {
+          const system = mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
+          const nav = mainWindow.getWindowAvoidArea(window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR);
+          ArkGlue.getInstance().setAvoidArea(
+            Math.max(system.topRect.height, nav.topRect.height),
+            Math.max(system.rightRect.width, nav.rightRect.width),
+            Math.max(system.bottomRect.height, nav.bottomRect.height),
+            Math.max(system.leftRect.width, nav.leftRect.width));
+        } catch (e) {
+          hilog.warn(0x0000, 'testTag', 'avoid area query failed: %{public}s', JSON.stringify(e));
+        }
+      };
+      mainWindow.on('avoidAreaChange', () => report());
+      report();
+    }).catch((e: BusinessError) => {
+      hilog.warn(0x0000, 'testTag', 'main window unavailable: %{public}d', e.code);
     });
   }
 
