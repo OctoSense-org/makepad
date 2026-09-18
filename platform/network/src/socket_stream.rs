@@ -1,12 +1,12 @@
 use std::io::{self, Read, Write};
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub struct SocketStream {
     inner: crate::backend::linux::socket_stream::SocketStream,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl SocketStream {
     pub fn connect(
         host: &str,
@@ -43,14 +43,14 @@ impl SocketStream {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Read for SocketStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Write for SocketStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
@@ -296,5 +296,69 @@ impl Write for SocketStream {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+// OpenHarmony: a plain TCP stream. The sysroot has no OpenSSL, so TLS is
+// refused rather than linked; a native TLS backend (libnet_ssl) is future work.
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+pub struct SocketStream {
+    inner: std::net::TcpStream,
+}
+
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+impl SocketStream {
+    pub fn connect(
+        host: &str,
+        port: &str,
+        use_tls: bool,
+        _ignore_ssl_cert: bool,
+    ) -> io::Result<Self> {
+        if use_tls {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "TLS socket streams are not available on OpenHarmony yet",
+            ));
+        }
+        let inner = std::net::TcpStream::connect(format!("{host}:{port}"))?;
+        inner.set_nodelay(true)?;
+        Ok(Self { inner })
+    }
+
+    pub fn into_tls(self, _host: &str, _ignore_ssl_cert: bool) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "socket stream TLS upgrade is not available on this target",
+        ))
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_read_timeout(timeout)
+    }
+
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.inner.set_write_timeout(timeout)
+    }
+
+    pub fn shutdown(&mut self) {
+        let _ = self.inner.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+impl Read for SocketStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "ohos"))]
+impl Write for SocketStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
