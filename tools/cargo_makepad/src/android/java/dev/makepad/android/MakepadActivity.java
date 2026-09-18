@@ -470,8 +470,19 @@ class MakepadSurface
         Selection.setSelection(mEditable, 0, 0);
     }
 
+    // Whether the activity owning this view still speaks for the native
+    // side; a superseded activity's surface is not the one being drawn.
+    private boolean surfaceIsNative() {
+        Context context = getContext();
+        return !(context instanceof MakepadActivity)
+            || !((MakepadActivity) context).isSupersededForNative();
+    }
+
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        if (!surfaceIsNative()) {
+            return;
+        }
         Surface surface = holder.getSurface();
         //surface.setFrameRate(120f,0);
         MakepadNative.surfaceOnSurfaceCreated(surface);
@@ -479,6 +490,9 @@ class MakepadSurface
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        if (!surfaceIsNative()) {
+            return;
+        }
         Context context = getContext();
         if (context instanceof MakepadActivity) {
             MakepadActivity activity = (MakepadActivity) context;
@@ -495,6 +509,9 @@ class MakepadSurface
                                int format,
                                int width,
                                int height) {
+        if (!surfaceIsNative()) {
+            return;
+        }
         Surface surface = holder.getSurface();
         //surface.setFrameRate(120f,0);
         MakepadNative.surfaceOnSurfaceChanged(surface, width, height);
@@ -1047,6 +1064,19 @@ public class MakepadActivity
     //% MAIN_ACTIVITY_BODY
 
     private MakepadSurface view;
+    // The instance the native side draws through. Android can create a
+    // second instance of this activity in the same process: a Home app
+    // started by a plain component intent (`am start -n`) lives in a
+    // standard task, and the system's HOME start never reuses that task,
+    // so the Home button creates another instance in the home task. The
+    // native side keeps one Cx and one surface, so the newer instance
+    // takes over and the older one is superseded: its surface and
+    // lifecycle callbacks no longer reach native (its surfaceDestroyed
+    // would tear down the surface the new instance draws into, its onStop
+    // would background the app and its onDestroy would shut it down), and
+    // it finishes.
+    private static MakepadActivity sNativeActivity;
+    private boolean mSuperseded;
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private InputManager mInputManager;
     private InputManager.InputDeviceListener mInputDeviceListener;
@@ -1443,6 +1473,11 @@ public class MakepadActivity
         restoreWarmResumeSurfaceSnapshotIfAvailable();
         updateTaskDescription();
 
+        MakepadActivity previous = sNativeActivity;
+        sNativeActivity = this;
+        if (previous != null && previous != this) {
+            previous.supersede();
+        }
         MakepadNative.activityOnCreate(this);
         registerPhysicalKeyboardListener();
 
@@ -1473,9 +1508,32 @@ public class MakepadActivity
         
     }
 
+    // A newer instance of this activity took over the native side (see
+    // sNativeActivity). Nothing this instance reports from now on concerns
+    // the app, and its task has no reason to stay in Recents.
+    private void supersede() {
+        if (mSuperseded) {
+            return;
+        }
+        mSuperseded = true;
+        Log.i(LOG_TAG, "activity superseded by a newer instance; finishing");
+        if (!isFinishing()) {
+            finish();
+        }
+    }
+
+    // Whether the native side still listens to this instance. The surface
+    // view asks before forwarding its callbacks.
+    boolean isSupersededForNative() {
+        return mSuperseded;
+    }
+
     @Override
     protected void onStart() {
         super.onStart();
+        if (mSuperseded) {
+            return;
+        }
         restoreSurfaceViewForWarmResumeIfNeeded();
         MakepadNative.activityOnStart();
     }
@@ -1483,6 +1541,9 @@ public class MakepadActivity
     @Override
     protected void onResume() {
         super.onResume();
+        if (mSuperseded) {
+            return;
+        }
         restoreSurfaceViewForWarmResumeIfNeeded();
         updateTaskDescription();
         MakepadNative.activityOnResume();
@@ -1493,6 +1554,11 @@ public class MakepadActivity
     }
     @Override
     protected void onPause() {
+        if (mSuperseded) {
+            super.onPause();
+            stopGpsLocationUpdates();
+            return;
+        }
         prepareSurfaceSnapshotOverlayForPause();
         super.onPause();
         MakepadNative.activityOnPause();
@@ -1504,6 +1570,9 @@ public class MakepadActivity
     @Override
     protected void onStop() {
         super.onStop();
+        if (mSuperseded) {
+            return;
+        }
         MakepadNative.activityOnStop();
     }
 
@@ -1543,11 +1612,19 @@ public class MakepadActivity
         }
         cleanupVideoPlaybackState();
         shutdownVideoPlaybackThread();
-        if (!mIsSwitchingActivity) {
+        // The network state is static and shared with the instance that
+        // took over, as it is across an activity switch.
+        if (!mIsSwitchingActivity && !mSuperseded) {
             cleanupNetworkState();
             shutdownWebSocketsThread();
         }
         super.onDestroy();
+        if (mSuperseded) {
+            return;
+        }
+        if (sNativeActivity == this) {
+            sNativeActivity = null;
+        }
         MakepadNative.activityOnDestroy();
     }
 
@@ -1584,6 +1661,9 @@ public class MakepadActivity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (mSuperseded) {
+            return;
+        }
         MakepadNative.activityOnWindowFocusChanged(hasFocus);
     }
 

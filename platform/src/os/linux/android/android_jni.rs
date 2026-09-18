@@ -786,6 +786,15 @@ unsafe fn create_native_window_with_env(
 #[cfg(not(no_android_choreographer))]
 static mut CHOREOGRAPHER: *mut ndk_sys::AChoreographer = std::ptr::null_mut();
 
+/// Whether a render loop (a Choreographer callback chain or the paced
+/// thread) is running. Every activity instance's `onCreate` calls
+/// `initChoreographer`, and a second instance can be created while the
+/// first, and the app behind it, live on (`MakepadActivity.sNativeActivity`);
+/// one loop is enough, two would double the beat. A loop clears this when
+/// it stops, which it does once the message channel is gone.
+static RENDER_LOOP_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(not(no_android_choreographer))]
 static mut CHOREOGRAPHER_POST_CALLBACK_FN: Option<
     unsafe extern "C" fn(
@@ -811,6 +820,9 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographe
     device_refresh_rate: jni_sys::jfloat,
     sdk_version: jni_sys::jint,
 ) {
+    if RENDER_LOOP_ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     // If the Choreographer is not available (e.g. OHOS), use a manual render loop
     #[cfg(no_android_choreographer)]
     {
@@ -862,8 +874,11 @@ pub unsafe fn post_vsync_callback() {
     if let Some(post_callback) = CHOREOGRAPHER_POST_CALLBACK_FN {
         if !CHOREOGRAPHER.is_null() && from_java_messages_already_set() {
             post_callback(CHOREOGRAPHER, Some(vsync_callback), std::ptr::null_mut());
+            return;
         }
     }
+    // The chain ends here: the next `initChoreographer` starts a new one.
+    RENDER_LOOP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Fallback render loop used when the Android Choreographer isn't available
@@ -893,6 +908,7 @@ fn init_simple_render_loop(device_refresh_rate: f32) {
             // shutdown. The check is at the top of the loop, before the send,
             // so a shutdown during the sleep produces no stray send.
             if !from_java_messages_already_set() {
+                RENDER_LOOP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
 
