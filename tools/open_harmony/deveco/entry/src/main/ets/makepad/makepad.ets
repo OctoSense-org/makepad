@@ -86,6 +86,12 @@ export class ArkGlue{
     this.showTextInput();
   }
 
+  // EntryAbility reports foreground/background so a location session can
+  // pause; there is no location bridge on OpenHarmony yet, so this only keeps
+  // the ability compiling until one exists.
+  setLocationForeground(_foreground: boolean): void {
+  }
+
   hideKeyBoard(): void {
     this.hideTextInput();
   }
