@@ -52,6 +52,16 @@ pub fn handle_delete_left_event(length: i32) -> napi_ohos::Result<()> {
 }
 
 #[napi]
+pub fn handle_permission_result(permission: String, granted: bool, can_retry: bool) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::PermissionResult {
+        permission,
+        granted,
+        can_retry,
+    });
+    Ok(())
+}
+
+#[napi]
 pub fn handle_keyboard_status(is_open: bool, keyboard_height: i32) -> napi_ohos::Result<()> {
     send_from_ohos_message(FromOhosMessage::ResizeTextIME(is_open, keyboard_height));
     Ok(())
@@ -270,5 +280,12 @@ pub enum FromOhosMessage {
     TextInput(TextInputEvent),
     DeleteLeft(i32),
     ResizeTextIME(bool, i32),
+    /// ArkTS answered a `request*Permission` call: `permission` is the short
+    /// name the glue uses ("camera", "microphone", "location").
+    PermissionResult {
+        permission: String,
+        granted: bool,
+        can_retry: bool,
+    },
 }
 //TODO DIP
