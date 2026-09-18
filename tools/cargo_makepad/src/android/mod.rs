@@ -487,7 +487,7 @@ Custom AndroidManifest:\n\
   {min_sdk_version}, {target_sdk_version}, {version_code}, {version_name},\n\
   {debuggable}.\n\
 \n\
-build-aab signing options (defaults: bundled debug.keystore — Play Store will reject):\n\
+APK/AAB signing options (defaults: bundled development debug.keystore):\n\
   --keystore=<path>                       JKS/PKCS12 keystore file (alias auto-discovered\n\
                                           from a sibling `<keystore>.makepad`\n\
                                           metadata file if present)\n\
@@ -807,6 +807,9 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
             compile::base_apk(&sdk_dir, host_os, &args[1..])
         }*/
         "build" => {
+            let signing = if no_sign { None } else {
+                Some(resolve_aab_signing_opts(keystore, keystore_pass, keystore_key_alias, keystore_key_pass)?)
+            };
             compile::build(
                 &sdk_dir,
                 host_os,
@@ -820,6 +823,7 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
                 &variant,
                 &config,
                 &urls,
+                signing,
             )?;
             Ok(())
         }
@@ -865,6 +869,9 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "run" => {
+            let signing = if no_sign { None } else {
+                Some(resolve_aab_signing_opts(keystore, keystore_pass, keystore_key_alias, keystore_key_pass)?)
+            };
             let devices = resolve_devices_arg(&sdk_dir, &devices)?;
             compile::run(
                 &sdk_dir,
@@ -880,6 +887,7 @@ pub fn handle_android(mut args: &[String]) -> Result<(), String> {
                 &config,
                 &urls,
                 devices,
+                signing,
             )
         }
         _ => Err(format!(

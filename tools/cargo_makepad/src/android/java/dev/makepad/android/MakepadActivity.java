@@ -1112,6 +1112,55 @@ public class MakepadActivity
 
     // native camera preview overlays
     private FrameLayout mRootLayout;
+    private FrameLayout mApplicationOverlay;
+    private ApplicationExtension mApplicationExtension;
+
+    /** Optional app Java client. Implementations enqueue blocking work on workers. */
+    public interface ApplicationExtension {
+        void command(String channel, String payload);
+        void onResume();
+        void onPause();
+        void onIntent(Intent intent);
+        void onDestroy();
+        default boolean onActivityResult(int requestCode, int resultCode, Intent data) { return false; }
+        default boolean onBackPressed() { return false; }
+    }
+
+    private void createApplicationExtension() {
+        try {
+            Class<?> type = Class.forName(getPackageName() + ".MakepadAppExtension");
+            mApplicationExtension = (ApplicationExtension) type
+                .getConstructor(MakepadActivity.class).newInstance(this);
+        } catch (ClassNotFoundException absent) {
+            // Ordinary Makepad applications do not need an extension.
+        } catch (ReflectiveOperationException | ClassCastException failure) {
+            Log.e("Makepad", "Application extension could not initialize", failure);
+        }
+    }
+
+    /** Child views own only their bounds; empty overlay space passes touches through. */
+    public FrameLayout getApplicationOverlay() {
+        if (mApplicationOverlay == null) {
+            mApplicationOverlay = new FrameLayout(this);
+            mApplicationOverlay.setClipChildren(false);
+            mRootLayout.addView(mApplicationOverlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        }
+        return mApplicationOverlay;
+    }
+
+    public void androidIntegrationCommand(final String channel, final String payload) {
+        if (channel == null || payload == null || channel.length() > 128
+                || payload.length() > 256 * 1024) return;
+        runOnUiThread(() -> {
+            if (mApplicationExtension != null) {
+                mApplicationExtension.command(channel, payload);
+            } else {
+                MakepadNative.onAndroidIntegrationEvent("integration",
+                    "{\"kind\":\"unavailable\",\"reason\":\"extension_absent\"}");
+            }
+        });
+    }
     private FrameLayout mSurfaceCoverOverlay;
     private ImageView mSurfaceSnapshotBackdrop;
     private ImageView mSurfaceSnapshotOverlay;
@@ -1479,6 +1528,7 @@ public class MakepadActivity
             previous.supersede();
         }
         MakepadNative.activityOnCreate(this);
+        createApplicationExtension();
         registerPhysicalKeyboardListener();
 
         mVideoPlaybackThread = new HandlerThread("VideoPlayerThread");
@@ -1547,6 +1597,7 @@ public class MakepadActivity
         restoreSurfaceViewForWarmResumeIfNeeded();
         updateTaskDescription();
         MakepadNative.activityOnResume();
+        if (mApplicationExtension != null) mApplicationExtension.onResume();
         reportPhysicalKeyboardIfChanged();
         startGpsLocationUpdates();
 
@@ -1562,6 +1613,7 @@ public class MakepadActivity
         prepareSurfaceSnapshotOverlayForPause();
         super.onPause();
         MakepadNative.activityOnPause();
+        if (mApplicationExtension != null) mApplicationExtension.onPause();
         stopGpsLocationUpdates();
 
         //% MAIN_ACTIVITY_ON_PAUSE
@@ -1578,6 +1630,10 @@ public class MakepadActivity
 
     @Override
     protected void onDestroy() {
+        if (mApplicationExtension != null) {
+            mApplicationExtension.onDestroy();
+            mApplicationExtension = null;
+        }
         unregisterPhysicalKeyboardListener();
         if (mCameraPreviewOverlay != null) {
             for (Long videoId : mCameraPreviewViews.keySet()) {
@@ -1654,6 +1710,7 @@ public class MakepadActivity
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        if (mApplicationExtension != null && mApplicationExtension.onBackPressed()) return;
         super.onBackPressed();
         MakepadNative.onBackPressed();
     }
@@ -1677,6 +1734,7 @@ public class MakepadActivity
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        if (mApplicationExtension != null) mApplicationExtension.onIntent(intent);
         // The device's Home button or gesture, with this app as the Home
         // app: the running activity is told, so a shell can show its home
         // page (Event::HomeIntent on the Rust side).
@@ -1707,6 +1765,8 @@ public class MakepadActivity
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (mApplicationExtension != null
+                && mApplicationExtension.onActivityResult(requestCode, resultCode, data)) return;
         if (mFileDialogRequests.remove(requestCode)) {
             handleFileDialogResult(requestCode, resultCode, data);
             return;
