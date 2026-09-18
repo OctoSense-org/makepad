@@ -82,6 +82,10 @@ pub trait CxMediaApi {
     /// Backends without camera control keep the default no-op.
     fn camera_control(&mut self, _input_id: VideoInputId, _control: CameraControl) {}
 
+    /// Take a photo or record video on an open camera; results come back as
+    /// `CameraCaptureEvent` actions. Backends without capture keep the no-op.
+    fn camera_capture(&mut self, _input_id: VideoInputId, _request: CameraCaptureRequest) {}
+
     fn video_encoder_output<F>(&mut self, index: usize, config: VideoEncoderConfig, f: F)
     where
         F: for<'a> FnMut(EncodedVideoPacketRef<'a>) + Send + 'static,

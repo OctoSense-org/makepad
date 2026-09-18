@@ -5,6 +5,9 @@ import { window } from '@kit.ArkUI';
 import common from '@ohos.app.ability.common';
 import resourceManager from '@ohos.resourceManager';
 import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
+import photoAccessHelper from '@ohos.file.photoAccessHelper';
+import fileUri from '@ohos.file.fileuri';
+import fs from '@ohos.file.fs';
 
 declare type Any = ESObject;
 
@@ -15,6 +18,8 @@ export interface MakepadXComponentInterface{
   handleKeyboardStatus(isOpen:boolean, keyboardHeight:number):void;
   handlePermissionResult(permission: string, granted: boolean, canRetry: boolean): void;
   handleAvoidArea(top: number, right: number, bottom: number, left: number): void;
+  takeCaptureToSave(): string;
+  handleCaptureSaved(path: string, ok: boolean, uri: string): void;
 }
 
 
@@ -100,6 +105,42 @@ export class ArkGlue{
 
   hideKeyBoard(): void {
     this.hideTextInput();
+  }
+
+  // A photo or video the native app wrote into its sandbox: offer it to the
+  // system gallery (the user confirms in the system dialog) and copy it over.
+  saveLatestCapture(): void {
+    const spec = this.xComponentContext?.takeCaptureToSave() ?? '';
+    if (spec.length === 0) { return; }
+    const parts = spec.split('|');
+    const path = parts[0];
+    const ext = parts[1] ?? 'jpg';
+    const isVideo = (parts[2] ?? 'image') === 'video';
+    const helper = photoAccessHelper.getPhotoAccessHelper(this.context);
+    const config: photoAccessHelper.PhotoCreationConfig = {
+      fileNameExtension: ext,
+      photoType: isVideo ? photoAccessHelper.PhotoType.VIDEO : photoAccessHelper.PhotoType.IMAGE,
+    };
+    helper.showAssetsCreationDialog([fileUri.getUriFromPath(path)], [config]).then((uris: Array<string>) => {
+      if (uris.length === 0 || uris[0].length === 0) {
+        this.xComponentContext?.handleCaptureSaved(path, false, '');
+        return;
+      }
+      try {
+        const target = fs.openSync(uris[0], fs.OpenMode.WRITE_ONLY);
+        const source = fs.openSync(path, fs.OpenMode.READ_ONLY);
+        fs.copyFileSync(source.fd, target.fd);
+        fs.closeSync(source);
+        fs.closeSync(target);
+        this.xComponentContext?.handleCaptureSaved(path, true, uris[0]);
+      } catch (err) {
+        console.error('copy capture to gallery failed: ' + JSON.stringify(err));
+        this.xComponentContext?.handleCaptureSaved(path, false, '');
+      }
+    }).catch((err: Any) => {
+      console.error('gallery dialog failed: ' + JSON.stringify(err));
+      this.xComponentContext?.handleCaptureSaved(path, false, '');
+    });
   }
 
   setAvoidArea(top: number, right: number, bottom: number, left: number): void {
