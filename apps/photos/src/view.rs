@@ -603,7 +603,8 @@ impl Widget for PhotosView {
                         self.pictures = 0;
                         self.selected = None;
                         self.applied = None;
-                        self.set_status(cx, format!("{e} — {}", library::how_to_bake()));
+                        log!("photos: {e} — {}", library::how_to_bake_recipe());
+                        self.set_status(cx, library::how_to_bake());
                     }
                     TileGridAction::Clicked { item, title, link, .. } => {
                         let text = format!("#{item}  {}  {link}", title.chars().take(140).collect::<String>());

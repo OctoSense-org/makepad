@@ -95,6 +95,7 @@ pub enum FromJavaMessage {
     /// The activity received a new HOME intent while running: the device's
     /// Home button or gesture, with this app as the Home app.
     HomeIntent,
+    AndroidIntegration { channel: String, payload: String, generation: u32 },
     SurfaceChanged {
         window: *mut ndk_sys::ANativeWindow,
         width: i32,
@@ -270,6 +271,14 @@ pub enum FromJavaMessage {
 unsafe impl Send for FromJavaMessage {}
 
 static MESSAGES_TX: Mutex<Option<mpsc::Sender<FromJavaMessage>>> = Mutex::new(None);
+static INTEGRATION_PENDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn integration_message_consumed(generation: u32) {
+    let _ = INTEGRATION_PENDING.fetch_update(std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire, |state| {
+            ((state >> 32) as u32 == generation && state as u32 > 0).then(|| state - 1)
+        });
+}
 
 pub fn send_from_java_message(message: FromJavaMessage) {
     if let Ok(mut tx) = MESSAGES_TX.lock() {
@@ -315,7 +324,12 @@ pub fn jni_set_activity(activity_handle: jni_sys::jobject) {
 }
 
 pub fn jni_set_from_java_tx(from_java_tx: mpsc::Sender<FromJavaMessage>) {
-    *MESSAGES_TX.lock().unwrap() = Some(from_java_tx);
+    let mut tx = MESSAGES_TX.lock().unwrap();
+    *tx = Some(from_java_tx);
+    let _ = INTEGRATION_PENDING.fetch_update(std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire, |state| {
+            Some((((state >> 32) as u32).wrapping_add(1) as u64) << 32)
+        });
 }
 
 pub unsafe fn fetch_activity_handle(activity: *const std::ffi::c_void) -> jni_sys::jobject {
@@ -975,6 +989,30 @@ unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onHomeIntent(
     _: jni_sys::jobject,
 ) {
     send_from_java_message(FromJavaMessage::HomeIntent);
+}
+
+#[no_mangle]
+unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onAndroidIntegrationEvent(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    channel: jni_sys::jstring,
+    payload: jni_sys::jstring,
+) -> jni_sys::jboolean {
+    let channel = jstring_to_string(env, channel);
+    let payload = jstring_to_string(env, payload);
+    if channel.is_empty() || channel.len() > 128 || payload.len() > 256 * 1024 { return 0; }
+    let Ok(previous) = INTEGRATION_PENDING.fetch_update(std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire, |state| ((state as u32) < 64).then_some(state + 1)) else { return 0; };
+    let generation = (previous >> 32) as u32;
+    // The UI must never wait for another producer holding the JNI sender.
+    if let Ok(tx) = MESSAGES_TX.try_lock() {
+        if let Some(tx) = tx.as_ref() {
+            if (INTEGRATION_PENDING.load(std::sync::atomic::Ordering::Acquire) >> 32) as u32 == generation
+                && tx.send(FromJavaMessage::AndroidIntegration { channel, payload, generation }).is_ok() { return 1; }
+        }
+    }
+    integration_message_consumed(generation);
+    0
 }
 
 #[no_mangle]
@@ -2923,6 +2961,22 @@ pub unsafe fn to_java_show_notification(title: String, body: String) {
         title,
         body
     );
+}
+
+pub unsafe fn to_java_android_integration(channel: &str, payload: &str) {
+    let env = attach_jni_env();
+    let channel = new_java_string(env, channel);
+    let payload = new_java_string(env, payload);
+    ndk_utils::call_void_method!(
+        env,
+        get_activity(),
+        "androidIntegrationCommand",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        channel,
+        payload
+    );
+    ((**env).DeleteLocalRef.unwrap())(env, channel);
+    ((**env).DeleteLocalRef.unwrap())(env, payload);
 }
 
 // The octos buildtool's picker: `openFileDialog(long callId, String mime)`,
