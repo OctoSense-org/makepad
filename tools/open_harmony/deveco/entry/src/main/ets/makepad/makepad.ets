@@ -14,6 +14,7 @@ export interface MakepadXComponentInterface{
   handleDeleteLeftEvent(length: number):void;
   handleKeyboardStatus(isOpen:boolean, keyboardHeight:number):void;
   handlePermissionResult(permission: string, granted: boolean, canRetry: boolean): void;
+  handleAvoidArea(top: number, right: number, bottom: number, left: number): void;
 }
 
 
@@ -64,6 +65,9 @@ export class ArkGlue{
 
   keyboardHeight : number = 1020;
   xComponentContext : MakepadXComponentInterface | undefined = undefined;
+  // System bar avoid areas in px, kept here so they can be pushed once the
+  // XComponent has loaded (the window reports them before that).
+  private avoidArea: number[] = [0, 0, 0, 0];
 
   private inputMethodController : inputMethod.InputMethodController;
   private textConfig: inputMethod.TextConfig;
@@ -96,6 +100,16 @@ export class ArkGlue{
 
   hideKeyBoard(): void {
     this.hideTextInput();
+  }
+
+  setAvoidArea(top: number, right: number, bottom: number, left: number): void {
+    this.avoidArea = [top, right, bottom, left];
+    this.pushAvoidArea();
+  }
+
+  pushAvoidArea(): void {
+    const a = this.avoidArea;
+    this.xComponentContext?.handleAvoidArea(a[0], a[1], a[2], a[3]);
   }
 
   // Runtime (user_grant) permissions: Rust calls one of these without

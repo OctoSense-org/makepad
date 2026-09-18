@@ -455,6 +455,30 @@ impl<'a> CameraFrameRef<'a> {
 
 pub type CameraFrameInputFn = Box<dyn for<'a> FnMut(CameraFrameRef<'a>) + Send + 'static>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CameraFlashMode {
+    Off,
+    On,
+    Auto,
+    Torch,
+}
+
+/// Runtime controls of an open camera. Best effort: a backend applies what
+/// the device supports and ignores the rest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CameraControl {
+    /// Focus (and meter) on a point given in the preview as displayed,
+    /// normalised 0..1 with x to the right and y down.
+    FocusPoint { x: f64, y: f64 },
+    /// Back to continuous autofocus and auto exposure.
+    ContinuousFocus,
+    /// Optical/digital zoom ratio (1.0 = the main lens).
+    ZoomRatio(f32),
+    /// Exposure compensation in EV steps.
+    ExposureBias(f32),
+    Flash(CameraFlashMode),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VideoCodec {
     H264,

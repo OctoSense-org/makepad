@@ -180,4 +180,8 @@ impl CxMediaApi for Cx {
     fn use_video_input(&mut self, inputs: &[(VideoInputId, VideoFormatId)]) {
         self.os.media.camera().lock().unwrap().use_video_input(inputs);
     }
+
+    fn camera_control(&mut self, input_id: VideoInputId, control: CameraControl) {
+        self.os.media.camera().lock().unwrap().control(input_id, control);
+    }
 }
