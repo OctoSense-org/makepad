@@ -475,6 +475,11 @@ impl Cx {
         install_ios_panic_hook();
 
         let data_path = IosApp::get_ios_directory_paths();
+        // Storage and the per-user caches live in the app's Application
+        // Support directory: on a device the container root that HOME names
+        // is not writable (the simulator lets it pass), so without this
+        // every storage write fails with "Operation not permitted".
+        crate::home::set_platform_data_dir(std::path::Path::new(&data_path));
 
         // Get device info
         let device_model = unsafe {
