@@ -10,6 +10,11 @@ use crate::types::{
 };
 
 pub mod http;
+#[cfg(not(target_env = "ohos"))]
+pub(crate) mod socket_stream;
+// OpenHarmony has no OpenSSL: the same workers over plain TCP only.
+#[cfg(target_env = "ohos")]
+#[path = "linux/socket_stream_plain.rs"]
 pub(crate) mod socket_stream;
 pub mod web_socket;
 

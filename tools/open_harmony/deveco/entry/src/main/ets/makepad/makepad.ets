@@ -4,6 +4,7 @@ import inputMethod from '@ohos.inputMethod';
 import { window } from '@kit.ArkUI';
 import common from '@ohos.app.ability.common';
 import resourceManager from '@ohos.resourceManager';
+import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
 
 declare type Any = ESObject;
 
@@ -12,6 +13,7 @@ export interface MakepadXComponentInterface{
   handleInsertTextEvent(text:String):void;
   handleDeleteLeftEvent(length: number):void;
   handleKeyboardStatus(isOpen:boolean, keyboardHeight:number):void;
+  handlePermissionResult(permission: string, granted: boolean, canRetry: boolean): void;
 }
 
 
@@ -94,6 +96,36 @@ export class ArkGlue{
 
   hideKeyBoard(): void {
     this.hideTextInput();
+  }
+
+  // Runtime (user_grant) permissions: Rust calls one of these without
+  // arguments (napi values cannot be built off the JS thread) and the answer
+  // goes back through handlePermissionResult with the same short name.
+  requestCameraPermission(): void {
+    this.requestPermission('camera', 'ohos.permission.CAMERA');
+  }
+
+  requestMicrophonePermission(): void {
+    this.requestPermission('microphone', 'ohos.permission.MICROPHONE');
+  }
+
+  requestLocationPermission(): void {
+    this.requestPermission('location', 'ohos.permission.APPROXIMATELY_LOCATION');
+  }
+
+  private requestPermission(name: string, permission: Permissions): void {
+    const atManager = abilityAccessCtrl.createAtManager();
+    atManager.requestPermissionsFromUser(this.context, [permission]).then((data) => {
+      const results: Array<number> = data.authResults ?? [];
+      const dialogs: Array<boolean> = data.dialogShownResults ?? [];
+      const granted = results.length > 0 && results[0] === 0;
+      const dialogShown = dialogs.length > 0 && dialogs[0] === true;
+      console.info('permission ' + permission + ' granted=' + granted + ' dialog=' + dialogShown);
+      this.xComponentContext?.handlePermissionResult(name, granted, !granted && dialogShown);
+    }).catch((err: Any) => {
+      console.error('permission ' + permission + ' failed: ' + JSON.stringify(err));
+      this.xComponentContext?.handlePermissionResult(name, false, true);
+    });
   }
 
   private async showTextInput(): Promise<void> {
