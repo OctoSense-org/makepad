@@ -632,7 +632,7 @@ fn parse_status_line(line: &str) -> Result<u16, Error> {
 #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 enum Transport {
     Plain(TcpStream),
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     Tls(LinuxTls),
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     Tls(apple_tls::AppleTls),
@@ -644,7 +644,7 @@ impl Read for Transport {
         match self {
             Transport::Plain(s) => s.read(buf),
             #[cfg(any(
-                target_os = "linux",
+                all(target_os = "linux", not(target_env = "ohos")),
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "tvos"
@@ -660,7 +660,7 @@ impl Write for Transport {
         match self {
             Transport::Plain(s) => s.write(buf),
             #[cfg(any(
-                target_os = "linux",
+                all(target_os = "linux", not(target_env = "ohos")),
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "tvos"
@@ -672,7 +672,7 @@ impl Write for Transport {
         match self {
             Transport::Plain(s) => s.flush(),
             #[cfg(any(
-                target_os = "linux",
+                all(target_os = "linux", not(target_env = "ohos")),
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "tvos"
@@ -688,7 +688,7 @@ impl Transport {
         match self {
             Transport::Plain(s) => s.set_read_timeout(timeout),
             #[cfg(any(
-                target_os = "linux",
+                all(target_os = "linux", not(target_env = "ohos")),
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "tvos"
@@ -700,7 +700,7 @@ impl Transport {
         match self {
             Transport::Plain(s) => s.set_write_timeout(timeout),
             #[cfg(any(
-                target_os = "linux",
+                all(target_os = "linux", not(target_env = "ohos")),
                 target_os = "macos",
                 target_os = "ios",
                 target_os = "tvos"
@@ -720,7 +720,7 @@ fn socket_fetch(req: &Request, url: &ParsedUrl, deadline: Instant, writer: &mut 
 #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 fn connect(url: &ParsedUrl, cancel: &CancelToken, deadline: Instant) -> Result<Transport, Error> {
     if url.https {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             return linux_tls_connect(url, cancel, deadline);
         }
@@ -728,12 +728,11 @@ fn connect(url: &ParsedUrl, cancel: &CancelToken, deadline: Instant) -> Result<T
         {
             return apple_tls_connect(url, cancel, deadline);
         }
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos"
-        )))]
+        // OpenHarmony's sysroot has no OpenSSL (its TLS is libnet_ssl, a different API); https is unsupported there for now.
+        #[cfg(any(
+            not(any(target_os = "linux", target_os = "macos", target_os = "ios", target_os = "tvos")),
+            all(target_os = "linux", target_env = "ohos")
+        ))]
         {
             let _ = (url, cancel, deadline);
             return Err(Error::Unsupported);
@@ -743,7 +742,7 @@ fn connect(url: &ParsedUrl, cancel: &CancelToken, deadline: Instant) -> Result<T
     }
 }
 
-#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(target_arch = "wasm32")))]
 fn linux_tls_connect(
     url: &ParsedUrl,
     cancel: &CancelToken,
@@ -910,7 +909,7 @@ fn tcp_connect_plain(
     }
 }
 
-#[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(target_arch = "wasm32")))]
 mod linux_tls {
     use super::{check_watch, remaining, Error, IO_SLICE};
     use std::ffi::{c_char, c_int, c_long, c_ulong, c_void, CString};
@@ -1173,6 +1172,7 @@ mod linux_tls {
 }
 
 #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(target_arch = "wasm32")))]
 use linux_tls::LinuxTls;
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]

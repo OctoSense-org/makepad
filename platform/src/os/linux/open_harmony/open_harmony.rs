@@ -648,6 +648,18 @@ pub struct CxOs {
     pub(crate) display: Option<CxOhosDisplay>,
 }
 
+impl Cx {
+    /// `sys.gps` asks for a fix on every read; OpenHarmony has no location
+    /// bridge yet, so this only notes the request once and the card sees
+    /// "no fix" through `gps::last_gps_fix()`.
+    pub fn ohos_request_gps(&mut self) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("ohos: gps requested; no location service is wired up on OpenHarmony yet");
+        }
+    }
+}
+
 impl CxOs {
     pub(crate) fn gl(&self) -> &LibGl {
         &self.display.as_ref().unwrap().libgl
@@ -714,7 +726,7 @@ impl CxOhosDisplay {
         (self.libegl.eglSwapBuffers.unwrap())(self.egl_display, self.surface);
     }
 
-    unsafe fn make_current(&mut self) {
+    pub(crate) unsafe fn make_current(&mut self) {
         if (self.libegl.eglMakeCurrent.unwrap())(
             self.egl_display,
             self.surface,
