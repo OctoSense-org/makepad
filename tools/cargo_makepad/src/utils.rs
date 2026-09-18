@@ -255,14 +255,39 @@ pub fn get_crate_dep_dirs(
     build_dir: &Path,
     target: &str,
 ) -> HashMap<String, PathBuf> {
+    get_crate_dep_dirs_with(build_crate, build_dir, target, &[])
+}
+
+/// The feature flags of the build (`--features …`, `--all-features`,
+/// `--no-default-features`) picked out of the cargo args, so the dependency
+/// tree — and the resources staged from it — matches what was compiled.
+pub fn feature_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut take = false;
+    for a in args {
+        if take { out.push(a.clone()); take = false; continue; }
+        if a == "--features" || a == "-F" { out.push(a.clone()); take = true; }
+        else if a.starts_with("--features=") || a == "--all-features" || a == "--no-default-features" { out.push(a.clone()); }
+    }
+    out
+}
+
+pub fn get_crate_dep_dirs_with(
+    build_crate: &str,
+    build_dir: &Path,
+    target: &str,
+    extra: &[String],
+) -> HashMap<String, PathBuf> {
     let mut dependencies = HashMap::new();
     let cwd = std::env::current_dir().unwrap();
     let target = format!("--target={target}");
+    let mut tree_args: Vec<&str> = vec!["tree", "--color", "never", "-p", build_crate, &target];
+    for a in extra { tree_args.push(a.as_str()); }
     if let Ok(cargo_tree_output) = shell_env_cap(
         &[],
         &cwd,
         "cargo",
-        &["tree", "--color", "never", "-p", build_crate, &target],
+        &tree_args,
     ) {
         for line in cargo_tree_output.lines().skip(1) {
             if let Some((name, path)) = extract_dependency_paths(line) {

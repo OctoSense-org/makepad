@@ -1083,6 +1083,13 @@ impl Cx {
             }
         }
 
+
+        #[cfg(target_env = "ohos")]
+        {
+            if let Some(data) = self.ohos_read_raw(path) {
+                return Ok(Rc::new(data));
+            }
+        }
         Err(format!("Dependency not loaded {}", path))
     }
 
@@ -1116,6 +1123,13 @@ impl Cx {
             }
         }
 
+
+        #[cfg(target_env = "ohos")]
+        {
+            if let Some(data) = self.ohos_read_raw(path) {
+                return Ok(Rc::new(data));
+            }
+        }
         Err(format!("Dependency not loaded {}", path))
     }
 
@@ -1901,7 +1915,7 @@ impl Cx {
     /// Standalone macOS first records any already-pending Draw, then submits
     /// this window before later input, without advancing NextFrame. Other
     /// backends service this work on their ordinary next-render path.
-    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_env = "ohos")))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     pub(crate) fn request_remote_window_present(&mut self, window_id: WindowId) {
         if let Some(pass) = self.windows[window_id].main_pass_id {
             self.repaint_pass_and_child_passes(pass);

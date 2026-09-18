@@ -95,6 +95,8 @@ impl Cx {
     }
 
     fn handle_other_events(&mut self) {
+        // The remote instrument (hdc fport → 127.0.0.1) queues its commands off-thread.
+        self.poll_control_channel();
         // Timers
         let events = self.os.timers.get_dispatch();
         for event in events {
@@ -425,21 +427,42 @@ impl Cx {
         });
     }
 
-    pub fn ohos_load_dependencies(&mut self) {
-        for (path, dep) in &mut self.dependencies {
-            let mut buffer = Vec::<u8>::new();
-            if let Ok(_) = self
-                .os
-                .raw_file
-                .as_mut()
-                .unwrap()
-                .read_to_end(path, &mut buffer)
-            {
-                dep.data = Some(Ok(Rc::new(buffer)));
-            } else {
-                dep.data = Some(Err("read_to_end failed".to_string()));
+    /// A resource read straight from the HAP's rawfile, as the asset table
+    /// lays it out: `path`, then `<package_root>/path` (`makepad/<crate>/…`).
+    /// Dependencies register after startup (fonts, script resources), so
+    /// `get_dependency` reads them on demand, as the Android asset path does.
+    pub(crate) fn ohos_read_raw(&self, path: &str) -> Option<Vec<u8>> {
+        let raw_file = self.os.raw_file.as_ref()?;
+        let mut buffer = Vec::new();
+        if raw_file.read_to_end(path, &mut buffer).is_ok() && !buffer.is_empty() {
+            return Some(buffer);
+        }
+        if let Some(root) = self.package_root.as_deref() {
+            let prefix = format!("{root}/");
+            if !path.starts_with(&prefix) {
+                buffer.clear();
+                if raw_file.read_to_end(format!("{root}/{path}"), &mut buffer).is_ok() && !buffer.is_empty() {
+                    return Some(buffer);
+                }
             }
         }
+        None
+    }
+
+    pub fn ohos_load_dependencies(&mut self) {
+        let (mut ok, mut failed) = (0usize, 0usize);
+        for (path, dep) in &mut self.dependencies {
+            let mut buffer = Vec::<u8>::new();
+            match self.os.raw_file.as_ref().unwrap().read_to_end(path, &mut buffer) {
+                Ok(_) => { ok += 1; dep.data = Some(Ok(Rc::new(buffer))); }
+                Err(e) => {
+                    failed += 1;
+                    crate::error!("ohos: cannot load dependency {path} from rawfile: {e}");
+                    dep.data = Some(Err(format!("read_to_end failed: {e}")));
+                }
+            }
+        }
+        crate::log!("ohos: dependencies loaded: {ok} ok, {failed} failed");
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {

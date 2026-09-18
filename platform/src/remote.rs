@@ -27,7 +27,7 @@
 //!   not by the time their clients opened sockets. Each sequence deadline is
 //!   a new boundary; it does not freeze the app for the entire sequence.
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_env = "ohos")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 mod imp {
     use crate::cx::Cx;
     use crate::cx_api::CxOsApi;
@@ -425,6 +425,16 @@ mod imp {
                 return Some(parse(value));
             }
         }
+        // OpenHarmony apps get neither argv nor a shell environment: the bridge
+        // is asked for at build time (`MAKEPAD_REMOTE=<port> cargo makepad ohos …`)
+        // and reached through `hdc fport tcp:<port> tcp:<port>`.
+        #[cfg(target_env = "ohos")]
+        if let Some(v) = option_env!("MAKEPAD_REMOTE") {
+            let v = v.trim();
+            if !v.is_empty() && v != "0" {
+                return Some(parse(v));
+            }
+        }
         match std::env::var("MAKEPAD_REMOTE") {
             Ok(v) => {
                 let v = v.trim().to_string();
@@ -505,6 +515,7 @@ mod imp {
             Err(err) => {
                 println!("[makepad-remote] bind {host}:{port} failed: {err}");
                 let _ = std::io::stdout().flush();
+                crate::error!("[makepad-remote] bind {host}:{port} failed: {err}");
                 return;
             }
         };
@@ -532,6 +543,8 @@ mod imp {
             dir.display()
         );
         let _ = std::io::stdout().flush();
+        // Phones have no stdout: the same line through the platform log (hilog / logcat).
+        crate::log!("[makepad-remote] listening on {host}:{bound} pid={pid} app={app} grabs={}", dir.display());
 
         std::thread::Builder::new()
             .name("makepad-remote".to_string())
@@ -3211,7 +3224,7 @@ mod imp {
     }
 }
 
-#[cfg(any(target_arch = "wasm32", target_os = "android", target_env = "ohos"))]
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 mod imp {
     use crate::cx::Cx;
 
