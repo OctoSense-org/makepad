@@ -111,6 +111,8 @@ import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceError;
 import android.webkit.JavascriptInterface;
 
 // note: //% is a special miniquad's pre-processor for plugins
@@ -468,8 +470,19 @@ class MakepadSurface
         Selection.setSelection(mEditable, 0, 0);
     }
 
+    // Whether the activity owning this view still speaks for the native
+    // side; a superseded activity's surface is not the one being drawn.
+    private boolean surfaceIsNative() {
+        Context context = getContext();
+        return !(context instanceof MakepadActivity)
+            || !((MakepadActivity) context).isSupersededForNative();
+    }
+
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
+        if (!surfaceIsNative()) {
+            return;
+        }
         Surface surface = holder.getSurface();
         //surface.setFrameRate(120f,0);
         MakepadNative.surfaceOnSurfaceCreated(surface);
@@ -477,6 +490,9 @@ class MakepadSurface
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
+        if (!surfaceIsNative()) {
+            return;
+        }
         Context context = getContext();
         if (context instanceof MakepadActivity) {
             MakepadActivity activity = (MakepadActivity) context;
@@ -493,6 +509,9 @@ class MakepadSurface
                                int format,
                                int width,
                                int height) {
+        if (!surfaceIsNative()) {
+            return;
+        }
         Surface surface = holder.getSurface();
         //surface.setFrameRate(120f,0);
         MakepadNative.surfaceOnSurfaceChanged(surface, width, height);
@@ -1045,6 +1064,19 @@ public class MakepadActivity
     //% MAIN_ACTIVITY_BODY
 
     private MakepadSurface view;
+    // The instance the native side draws through. Android can create a
+    // second instance of this activity in the same process: a Home app
+    // started by a plain component intent (`am start -n`) lives in a
+    // standard task, and the system's HOME start never reuses that task,
+    // so the Home button creates another instance in the home task. The
+    // native side keeps one Cx and one surface, so the newer instance
+    // takes over and the older one is superseded: its surface and
+    // lifecycle callbacks no longer reach native (its surfaceDestroyed
+    // would tear down the surface the new instance draws into, its onStop
+    // would background the app and its onDestroy would shut it down), and
+    // it finishes.
+    private static MakepadActivity sNativeActivity;
+    private boolean mSuperseded;
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private InputManager mInputManager;
     private InputManager.InputDeviceListener mInputDeviceListener;
@@ -1088,6 +1120,10 @@ public class MakepadActivity
     // Native WebView overlays for web app cards (see spawnSystemBrowser).
     private FrameLayout mSystemBrowserOverlay;
     private HashMap<Long, WebView> mSystemBrowserViews = new HashMap<>();
+    // Per browser: may it leave the document it was opened with? A web app
+    // card may not; a reader showing pages off the open web must, or a
+    // redirector URL never reaches the page it points at.
+    private HashMap<Long, Boolean> mSystemBrowserNavigable = new HashMap<>();
     // Fullscreen video state for web app cards (WebChromeClient custom view).
     private View mSystemBrowserCustomView;
     private WebChromeClient.CustomViewCallback mSystemBrowserCustomViewCallback;
@@ -1437,6 +1473,11 @@ public class MakepadActivity
         restoreWarmResumeSurfaceSnapshotIfAvailable();
         updateTaskDescription();
 
+        MakepadActivity previous = sNativeActivity;
+        sNativeActivity = this;
+        if (previous != null && previous != this) {
+            previous.supersede();
+        }
         MakepadNative.activityOnCreate(this);
         registerPhysicalKeyboardListener();
 
@@ -1467,9 +1508,32 @@ public class MakepadActivity
         
     }
 
+    // A newer instance of this activity took over the native side (see
+    // sNativeActivity). Nothing this instance reports from now on concerns
+    // the app, and its task has no reason to stay in Recents.
+    private void supersede() {
+        if (mSuperseded) {
+            return;
+        }
+        mSuperseded = true;
+        Log.i(LOG_TAG, "activity superseded by a newer instance; finishing");
+        if (!isFinishing()) {
+            finish();
+        }
+    }
+
+    // Whether the native side still listens to this instance. The surface
+    // view asks before forwarding its callbacks.
+    boolean isSupersededForNative() {
+        return mSuperseded;
+    }
+
     @Override
     protected void onStart() {
         super.onStart();
+        if (mSuperseded) {
+            return;
+        }
         restoreSurfaceViewForWarmResumeIfNeeded();
         MakepadNative.activityOnStart();
     }
@@ -1477,6 +1541,9 @@ public class MakepadActivity
     @Override
     protected void onResume() {
         super.onResume();
+        if (mSuperseded) {
+            return;
+        }
         restoreSurfaceViewForWarmResumeIfNeeded();
         updateTaskDescription();
         MakepadNative.activityOnResume();
@@ -1487,6 +1554,11 @@ public class MakepadActivity
     }
     @Override
     protected void onPause() {
+        if (mSuperseded) {
+            super.onPause();
+            stopGpsLocationUpdates();
+            return;
+        }
         prepareSurfaceSnapshotOverlayForPause();
         super.onPause();
         MakepadNative.activityOnPause();
@@ -1498,6 +1570,9 @@ public class MakepadActivity
     @Override
     protected void onStop() {
         super.onStop();
+        if (mSuperseded) {
+            return;
+        }
         MakepadNative.activityOnStop();
     }
 
@@ -1537,11 +1612,19 @@ public class MakepadActivity
         }
         cleanupVideoPlaybackState();
         shutdownVideoPlaybackThread();
-        if (!mIsSwitchingActivity) {
+        // The network state is static and shared with the instance that
+        // took over, as it is across an activity switch.
+        if (!mIsSwitchingActivity && !mSuperseded) {
             cleanupNetworkState();
             shutdownWebSocketsThread();
         }
         super.onDestroy();
+        if (mSuperseded) {
+            return;
+        }
+        if (sNativeActivity == this) {
+            sNativeActivity = null;
+        }
         MakepadNative.activityOnDestroy();
     }
 
@@ -1578,6 +1661,9 @@ public class MakepadActivity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        if (mSuperseded) {
+            return;
+        }
         MakepadNative.activityOnWindowFocusChanged(hasFocus);
     }
 
@@ -3861,8 +3947,17 @@ public class MakepadActivity
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(false);
         settings.setMediaPlaybackRequiresUserGesture(false);
-        settings.setLoadWithOverviewMode(true);
+        // The page's own viewport rules: with overview mode a page whose DOM
+        // overflows its declared width (GitHub's does) is zoomed out to fit
+        // the overflow, painting at a fraction of the view; without it a
+        // `width=device-width` page stays at scale 1 and the overflow pans.
+        // Pinch zoom is on for the pages that still need it, without the
+        // on-screen zoom buttons.
+        settings.setLoadWithOverviewMode(false);
         settings.setUseWideViewPort(true);
+        settings.setSupportZoom(true);
+        settings.setBuiltInZoomControls(true);
+        settings.setDisplayZoomControls(false);
         web.setBackgroundColor(0xFF101418);
         web.setWebChromeClient(new WebChromeClient() {
             @Override
@@ -3898,26 +3993,51 @@ public class MakepadActivity
                 applyFullScreen(false);
             }
         });
+        final long boundBrowserId = browserId;
         web.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView v, String url) {
-                // Keep top-level navigation inside the card: embeds/iframes are
-                // not affected by this callback, but a stray link click should
-                // not hijack the card into a full browsing session.
-                return true;
+                // This callback sees every navigation the WebView starts for
+                // itself: a link tap, a script navigation, and a server
+                // redirect. Returning true cancels it, which is what a card
+                // wants — a stray link should not hijack the card into a full
+                // browsing session. A navigable browser returns false and
+                // follows the hop; embeds/iframes are unaffected either way.
+                boolean blocked = !isSystemBrowserNavigable(boundBrowserId);
+                if (blocked) {
+                    // Without this the cancel is completely silent, which is
+                    // indistinguishable from a page that simply did not load.
+                    Log.i("MakepadWeb", "navigation blocked id=" + boundBrowserId + " url=" + url);
+                }
+                return blocked;
+            }
+
+            @Override
+            public void onReceivedError(WebView v, WebResourceRequest request, WebResourceError error) {
+                // Main frame only: a failed image or tracker is not a failed
+                // page, and reporting those would flicker the host's error view.
+                if (request == null || !request.isForMainFrame()) {
+                    return;
+                }
+                String url = request.getUrl() == null ? "" : request.getUrl().toString();
+                String description = error == null || error.getDescription() == null
+                    ? "" : error.getDescription().toString();
+                int code = error == null ? 0 : error.getErrorCode();
+                Log.i("MakepadWeb", "page error id=" + boundBrowserId + " code=" + code + " url=" + url);
+                MakepadNative.onSystemBrowserPageError(boundBrowserId, code, description, url);
             }
         });
         // JS→native bridge: the card calls window.octos_native.invoke(callId, tool, args);
         // we forward it to Rust (WebCard widget dispatches the tool and resolves the
         // card promise via evalSystemBrowserJs). @JavascriptInterface runs on a WebView
         // worker thread, so this returns immediately — the result comes back async.
-        final long boundBrowserId = browserId;
         web.addJavascriptInterface(new Object() {
             @JavascriptInterface
             public void invoke(long callId, String tool, String args) {
                 MakepadNative.onSystemBrowserInvoke(boundBrowserId, callId, tool, args);
             }
         }, "octos_native");
+        Log.i("MakepadWeb", "create id=" + browserId + " navigable=" + isSystemBrowserNavigable(browserId));
         mSystemBrowserViews.put(browserId, web);
         if (mSystemBrowserOverlay != null) {
             mSystemBrowserOverlay.addView(web);
@@ -3939,10 +4059,20 @@ public class MakepadActivity
         });
     }
 
-    public void spawnSystemBrowser(final long browserId, final String url) {
+    // Whether this browser may navigate away from the document it was opened
+    // with. Read by the WebViewClient, which outlives any single load, so the
+    // policy lives in a map rather than in the client instance.
+    private boolean isSystemBrowserNavigable(long browserId) {
+        return Boolean.TRUE.equals(mSystemBrowserNavigable.get(browserId));
+    }
+
+    public void spawnSystemBrowser(final long browserId, final String url, final boolean navigable) {
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
+                // Set before the view exists: ensureSystemBrowser's client
+                // reads the policy on every navigation, including the first.
+                mSystemBrowserNavigable.put(browserId, navigable);
                 WebView web = ensureSystemBrowser(browserId);
                 if (url != null && !url.isEmpty() && !url.equals("about:blank")) {
                     web.loadUrl(url);
@@ -3988,6 +4118,7 @@ public class MakepadActivity
             @Override
             public void run() {
                 WebView web = mSystemBrowserViews.remove(browserId);
+                mSystemBrowserNavigable.remove(browserId);
                 if (web != null) {
                     if (mSystemBrowserOverlay != null) {
                         mSystemBrowserOverlay.removeView(web);

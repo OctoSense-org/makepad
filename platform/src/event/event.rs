@@ -543,6 +543,17 @@ pub struct NativeSystemBrowserInvoke {
     pub args: String,
 }
 
+/// A system browser failed to load a page in its main frame: the network is
+/// gone, the host does not resolve, the server refused. Without this the
+/// browser just keeps painting its background and the failure is invisible.
+#[derive(Clone, Debug, Default)]
+pub struct NativeSystemBrowserPageError {
+    pub browser_id: u64,
+    pub code: i32,
+    pub description: String,
+    pub url: String,
+}
+
 /// Result of a native file-picker dialog, carrying the `call_id` its
 /// `CxOsOp::OpenFileDialog` was issued with.
 #[derive(Clone, Debug, Default)]
