@@ -216,6 +216,10 @@ fn label_json(label_name: &str) -> String {
       "value": "Sound for video recordings"
     }},
     {{
+      "name": "gallery_reason",
+      "value": "Save photos and videos to the gallery"
+    }},
+    {{
       "name": "location_reason",
       "value": "Location for maps and navigation"
     }},
@@ -249,6 +253,10 @@ fn label_zh_json(label_name: &str) -> String {
     {{
       "name": "microphone_reason",
       "value": "录像时录制声音"
+    }},
+    {{
+      "name": "gallery_reason",
+      "value": "将照片和视频保存到图库"
     }},
     {{
       "name": "location_reason",
