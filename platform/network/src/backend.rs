@@ -17,9 +17,9 @@ pub use self::android::{
 };
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "tvos"))]
 pub mod apple;
-// Linux socket workers are native-only and never compiled into a web app;
-// they speak OpenSSL, which OpenHarmony's sysroot does not ship.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+// Linux socket workers are native-only and never compiled into a web app.
+// On OpenHarmony they run over plain TCP (no OpenSSL in the sysroot).
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod linux;
 #[cfg(target_arch = "wasm32")]
@@ -177,25 +177,21 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
     not(target_os = "android"),
     not(target_os = "windows"),
     not(any(target_os = "ios", target_os = "macos", target_os = "tvos")),
-    target_os = "linux",
-    not(target_env = "ohos")
+    target_os = "linux"
 ))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
     linux::create_backend()
 }
 
-#[cfg(any(
-    not(any(
-        target_arch = "wasm32",
-        target_os = "android",
-        target_os = "windows",
-        target_os = "linux",
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "tvos"
-    )),
-    all(target_os = "linux", target_env = "ohos")
-))]
+#[cfg(not(any(
+    target_arch = "wasm32",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "tvos"
+)))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
     Arc::new(UnsupportedBackend::new(
         "no default backend implemented for this target",
