@@ -275,6 +275,8 @@ struct BuildPaths {
     manifest_file: PathBuf,
     java_file: PathBuf,
     xr_file: PathBuf,
+    app_java_dir: PathBuf,
+    app_java_libs_dir: PathBuf,
     dst_unaligned_apk: PathBuf,
     dst_apk: PathBuf,
 }
@@ -1027,8 +1029,15 @@ fn prepare_build(opts: &PrepareBuildOpts<'_>) -> Result<BuildPaths, String> {
     // exists, use it after substituting `{key}` placeholders. Useful for declaring a
     // permissions/features set tailored to the app (Play Store rejects most of the
     // default kitchen-sink permission list without justification).
-    let custom_template = build_crate_dir.join("resources/android/AndroidManifest.xml.template");
-    let manifest_xml = if custom_template.is_file() {
+    // An explicit template also allows app-owned validation variants without
+    // declaring instrumentation in the application's normal manifest.
+    let template_override = std::env::var_os("MAKEPAD_ANDROID_MANIFEST_TEMPLATE");
+    let custom_template = build_crate_dir.join(
+        template_override
+            .as_deref()
+            .unwrap_or_else(|| std::ffi::OsStr::new("resources/android/AndroidManifest.xml.template")),
+    );
+    let manifest_xml = if template_override.is_some() || custom_template.is_file() {
         let template = fs::read_to_string(&custom_template)
             .map_err(|e| format!("Cant read custom manifest {:?}: {e}", custom_template))?;
         println!(
@@ -1066,6 +1075,8 @@ fn prepare_build(opts: &PrepareBuildOpts<'_>) -> Result<BuildPaths, String> {
         manifest_file,
         java_file,
         xr_file,
+        app_java_dir: build_crate_dir.join("resources/android/java"),
+        app_java_libs_dir: build_crate_dir.join("resources/android/libs"),
         dst_unaligned_apk,
         dst_apk,
     })
@@ -1122,7 +1133,7 @@ fn compile_java(
     let makepad_java_classes_dir = &cargo_manifest_dir
         .join("src/android/java/")
         .join(makepad_package_path);
-    let java_sources = vec![
+    let mut java_sources = vec![
         r_class_path.clone(),
         makepad_java_classes_dir.join("MakepadNative.java"),
         makepad_java_classes_dir.join("MakepadActivity.java"),
@@ -1141,11 +1152,28 @@ fn compile_java(
         build_paths.xr_file.clone(),
     ];
 
+    if build_paths.app_java_dir.is_dir() {
+        let mut app_sources: Vec<_> = ls(&build_paths.app_java_dir)?
+            .into_iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("java"))
+            .map(|p| build_paths.app_java_dir.join(p))
+            .collect();
+        app_sources.sort();
+        java_sources.extend(app_sources);
+    }
+    let app_jars = app_java_jars(build_paths)?;
+
     let mut hasher = DefaultHasher::new();
     for source in &java_sources {
         source.to_string_lossy().hash(&mut hasher);
         fs::read(source)
             .map_err(|e| format!("failed to read Java source {:?}: {e}", source))?
+            .hash(&mut hasher);
+    }
+    for jar in &app_jars {
+        jar.to_string_lossy().hash(&mut hasher);
+        fs::read(jar)
+            .map_err(|e| format!("failed to read app Java library {:?}: {e}", jar))?
             .hash(&mut hasher);
     }
     let java_inputs_hash = format!("{:016x}", hasher.finish());
@@ -1184,6 +1212,8 @@ fn compile_java(
     }
 
     let android_jar = android_jar_path(sdk_dir, urls);
+    let classpath = std::env::join_paths(std::iter::once(&android_jar).chain(app_jars.iter()))
+        .map_err(|e| format!("Invalid app Java classpath: {e}"))?;
     let _ = rmdir(&build_paths.java_out_dir);
     mkdir(&build_paths.java_out_dir)?;
     // Force UTF-8: Chinese Windows defaults javac to GBK, and UTF-8 comments
@@ -1197,7 +1227,7 @@ fn compile_java(
         "1.8",
         "-Xlint:-options",
         "-classpath",
-        android_jar.to_str().unwrap(),
+        classpath.to_str().ok_or("Java classpath is not UTF-8")?,
         "-Xlint:deprecation",
         "-d",
         build_paths.java_out_dir.to_str().unwrap(),
@@ -1215,6 +1245,19 @@ fn compile_java(
     write_text(&javac_stamp, &java_inputs_hash)?;
 
     Ok(())
+}
+
+fn app_java_jars(build_paths: &BuildPaths) -> Result<Vec<PathBuf>, String> {
+    if !build_paths.app_java_libs_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut jars: Vec<_> = ls(&build_paths.app_java_libs_dir)?
+        .into_iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jar"))
+        .map(|p| build_paths.app_java_libs_dir.join(p))
+        .collect();
+    jars.sort();
+    Ok(jars)
 }
 
 fn build_dex(
@@ -1267,6 +1310,10 @@ fn build_dex(
 
     for class_file in &class_files {
         args.push(class_file.to_str().unwrap());
+    }
+    let app_jars = app_java_jars(build_paths)?;
+    for jar in &app_jars {
+        args.push(jar.to_str().ok_or("App Java library path is not UTF-8")?);
     }
 
     shell_env_cap(
@@ -1938,13 +1985,14 @@ fn build_zipaligned_apk(
     Ok(())
 }
 
-fn sign_apk(sdk_dir: &Path, build_paths: &BuildPaths, urls: &AndroidSDKUrls) -> Result<(), String> {
+fn sign_apk(sdk_dir: &Path, build_paths: &BuildPaths, urls: &AndroidSDKUrls, opts: &AabSigningOpts) -> Result<(), String> {
     let cwd = std::env::current_dir().unwrap();
-    let cargo_manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let java_home = sdk_dir.join("openjdk");
 
     shell_env_cap(
-        &[("JAVA_HOME", (java_home.to_str().unwrap()))],
+        &[("JAVA_HOME", java_home.to_str().unwrap()),
+          ("MAKEPAD_APK_STORE_PASSWORD", &opts.storepass),
+          ("MAKEPAD_APK_KEY_PASSWORD", &opts.keypass)],
         &cwd,
         java_home.join("bin/java").to_str().unwrap(),
         &[
@@ -1953,11 +2001,13 @@ fn sign_apk(sdk_dir: &Path, build_paths: &BuildPaths, urls: &AndroidSDKUrls) -> 
             "sign",
             "-v",
             "-ks",
-            (cargo_manifest_dir.join("debug.keystore").to_str().unwrap()),
+            opts.keystore.to_str().ok_or("Invalid keystore path")?,
             "--ks-key-alias",
-            "androiddebugkey",
+            &opts.key_alias,
             "--ks-pass",
-            "pass:android",
+            "env:MAKEPAD_APK_STORE_PASSWORD",
+            "--key-pass",
+            "env:MAKEPAD_APK_KEY_PASSWORD",
             (build_paths.dst_apk.to_str().unwrap()),
         ],
     )?;
@@ -2703,6 +2753,7 @@ pub fn build(
     variant: &AndroidVariant,
     _config: &AndroidConfig,
     urls: &AndroidSDKUrls,
+    signing: Option<AabSigningOpts>,
 ) -> Result<BuildResult, String> {
     let build_crate = get_build_crate_from_args(args)?;
     let binary_name =
@@ -2798,7 +2849,8 @@ pub fn build(
         urls,
     )?;
     build_zipaligned_apk(sdk_dir, &build_paths, urls)?;
-    sign_apk(sdk_dir, &build_paths, urls)?;
+    if let Some(signing) = signing.as_ref() { sign_apk(sdk_dir, &build_paths, urls, signing)?; }
+    else { println!("APK is unsigned (--no-sign)"); }
 
     println!("APK Build completed");
     Ok(BuildResult {
@@ -2821,7 +2873,9 @@ pub fn run(
     config: &AndroidConfig,
     urls: &AndroidSDKUrls,
     devices: Vec<String>,
+    signing: Option<AabSigningOpts>,
 ) -> Result<(), String> {
+    if signing.is_none() { return Err("Cannot install/run an unsigned APK; remove --no-sign".into()); }
     let build_crate = get_build_crate_from_args(args)?;
     let result = build(
         sdk_dir,
@@ -2836,6 +2890,7 @@ pub fn run(
         android_variant,
         config,
         urls,
+        signing,
     )?;
 
     let cwd = std::env::current_dir().unwrap();
