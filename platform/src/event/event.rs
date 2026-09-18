@@ -267,6 +267,9 @@ pub enum Event {
     /// its home screen; other apps can ignore it.
     HomeIntent,
 
+    /// Application-owned Android integration packet, delivered asynchronously.
+    AndroidIntegration { channel: String, payload: String },
+
     /// Permission check or request result
     PermissionResult(PermissionResult),
 
@@ -360,6 +363,7 @@ impl Event {
             52 => "Actions",
             53 => "BackPressed",
             74 => "HomeIntent",
+            75 => "AndroidIntegration",
             54 => "PermissionResult",
 
             #[cfg(target_arch = "wasm32")]
@@ -455,6 +459,7 @@ impl Event {
             Self::Actions(_) => 52,
             Self::BackPressed { .. } => 53,
             Self::HomeIntent => 74,
+            Self::AndroidIntegration { .. } => 75,
             Self::PermissionResult(_) => 54,
             Self::LocationUpdate(_) => 69,
             Self::LocationError(_) => 70,

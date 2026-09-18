@@ -19,6 +19,7 @@ public class MakepadNative {
 
     public native static void onBackPressed();
     public native static void onHomeIntent();
+    public native static boolean onAndroidIntegrationEvent(String channel, String payload);
 
     // belongs to QuadSurface class
     public native static void surfaceOnSurfaceCreated(Surface surface);

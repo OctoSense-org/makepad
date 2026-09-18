@@ -527,6 +527,8 @@ pub enum CxOsOp {
     ShareText(String),
     /// Post a system notification. Ignored by backends that do not handle it.
     ShowNotification { title: String, body: String },
+    /// Send a packet to an optional application-owned Android extension.
+    AndroidIntegration { channel: String, payload: String },
     /// Open the native file picker. The result arrives later as a
     /// NativeDialogResult action carrying `call_id`.
     OpenFileDialog { call_id: i64, mime: String },
@@ -659,6 +661,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::EvalSystemBrowserJs { .. } => write!(f, "EvalSystemBrowserJs"),
             Self::ShareText(..) => write!(f, "ShareText"),
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),
+            Self::AndroidIntegration { .. } => write!(f, "AndroidIntegration"),
             Self::OpenFileDialog { .. } => write!(f, "OpenFileDialog"),
             Self::DownloadFile { .. } => write!(f, "DownloadFile"),
             Self::ShowNativeComposer => write!(f, "ShowNativeComposer"),
@@ -722,6 +725,15 @@ impl Cx {
         self.platform_ops.push_back(CxOsOp::ShowNotification {
             title: title.to_owned(),
             body: body.to_owned(),
+        });
+    }
+
+    /// Queue a command for the application's Android extension. Android invokes
+    /// the Java client asynchronously; other backends ignore this operation.
+    pub fn android_integration(&mut self, channel: &str, payload: &str) {
+        self.platform_ops.push_back(CxOsOp::AndroidIntegration {
+            channel: channel.to_owned(),
+            payload: payload.to_owned(),
         });
     }
 

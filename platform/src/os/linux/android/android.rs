@@ -602,6 +602,10 @@ impl Cx {
             FromJavaMessage::HomeIntent => {
                 self.call_event_handler(&Event::HomeIntent);
             }
+            FromJavaMessage::AndroidIntegration { channel, payload, generation } => {
+                integration_message_consumed(generation);
+                self.call_event_handler(&Event::AndroidIntegration { channel, payload });
+            }
             FromJavaMessage::SurfaceCreated { window } => {
                 #[cfg(use_vulkan)]
                 let _has_vulkan = self.os.vulkan.is_some();
@@ -2768,6 +2772,9 @@ impl Cx {
                 },
                 CxOsOp::ShowNotification { title, body } => unsafe {
                     android_jni::to_java_show_notification(title, body);
+                },
+                CxOsOp::AndroidIntegration { channel, payload } => unsafe {
+                    android_jni::to_java_android_integration(&channel, &payload);
                 },
                 CxOsOp::OpenFileDialog { call_id, mime } => unsafe {
                     android_jni::to_java_open_file_dialog_mime(call_id, &mime);

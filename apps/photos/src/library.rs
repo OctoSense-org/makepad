@@ -144,11 +144,15 @@ pub fn where_a_library_goes(collection: Option<&str>) -> String {
     format!("Put a baked library in photos/image-tiles/{name} under the makepad home.")
 }
 
-/// The one line the status shows when nothing is baked.
+/// The one line the status shows when nothing is baked: said for the
+/// person looking at an empty app, never as a command line. The recipe
+/// for a maintainer is `how_to_bake_recipe`.
 pub fn how_to_bake() -> String {
-    format!(
-        "No picture library found. Bake one: image-tiles-bake --root local/image-tiles/{DEFAULT_COLLECTION} <manifest.tsv>"
-    )
+    "No photos yet. Once a picture library is added, your photos show here.".to_string()
+}
+/// The maintainer's recipe (the log, never the screen).
+pub fn how_to_bake_recipe() -> String {
+    format!("No picture library found. Bake one: image-tiles-bake --root local/image-tiles/{DEFAULT_COLLECTION} <manifest.tsv>")
 }
 
 #[cfg(test)]
