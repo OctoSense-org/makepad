@@ -62,6 +62,17 @@ pub fn handle_permission_result(permission: String, granted: bool, can_retry: bo
 }
 
 #[napi]
+pub fn handle_avoid_area(top: f64, right: f64, bottom: f64, left: f64) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::AvoidArea {
+        top,
+        right,
+        bottom,
+        left,
+    });
+    Ok(())
+}
+
+#[napi]
 pub fn handle_keyboard_status(is_open: bool, keyboard_height: i32) -> napi_ohos::Result<()> {
     send_from_ohos_message(FromOhosMessage::ResizeTextIME(is_open, keyboard_height));
     Ok(())
@@ -286,6 +297,13 @@ pub enum FromOhosMessage {
         permission: String,
         granted: bool,
         can_retry: bool,
+    },
+    /// The system bars' avoid areas in physical pixels (edge-to-edge window).
+    AvoidArea {
+        top: f64,
+        right: f64,
+        bottom: f64,
+        left: f64,
     },
 }
 //TODO DIP

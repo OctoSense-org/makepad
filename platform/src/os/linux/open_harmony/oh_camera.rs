@@ -68,6 +68,13 @@ struct OutputCapability {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct CameraPoint {
+    x: f64,
+    y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ImageSize {
     width: u32,
     height: u32,
@@ -128,6 +135,17 @@ struct OhCameraApi {
     session_release: unsafe extern "C" fn(*mut c_void) -> Rc32,
     preview_release: unsafe extern "C" fn(*mut c_void) -> Rc32,
     preview_rotation: Option<unsafe extern "C" fn(*mut c_void, i32, *mut i32) -> Rc32>,
+    // session controls (all optional: older NDKs lack some)
+    set_focus_mode: Option<unsafe extern "C" fn(*mut c_void, i32) -> Rc32>,
+    set_focus_point: Option<unsafe extern "C" fn(*mut c_void, CameraPoint) -> Rc32>,
+    set_metering_point: Option<unsafe extern "C" fn(*mut c_void, CameraPoint) -> Rc32>,
+    set_exposure_mode: Option<unsafe extern "C" fn(*mut c_void, i32) -> Rc32>,
+    get_zoom_range: Option<unsafe extern "C" fn(*mut c_void, *mut f32, *mut f32) -> Rc32>,
+    set_zoom: Option<unsafe extern "C" fn(*mut c_void, f32) -> Rc32>,
+    get_exposure_bias_range:
+        Option<unsafe extern "C" fn(*mut c_void, *mut f32, *mut f32, *mut f32) -> Rc32>,
+    set_exposure_bias: Option<unsafe extern "C" fn(*mut c_void, f32) -> Rc32>,
+    set_flash_mode: Option<unsafe extern "C" fn(*mut c_void, i32) -> Rc32>,
     // image receiver
     opts_create: unsafe extern "C" fn(*mut *mut c_void) -> Rc32,
     opts_set_size: unsafe extern "C" fn(*mut c_void, ImageSize) -> Rc32,
@@ -201,6 +219,15 @@ fn api() -> Option<&'static OhCameraApi> {
             session_release: sym!(camera, "OH_CaptureSession_Release"),
             preview_release: sym!(camera, "OH_PreviewOutput_Release"),
             preview_rotation: camera.get_symbol("OH_PreviewOutput_GetPreviewRotation").ok(),
+            set_focus_mode: camera.get_symbol("OH_CaptureSession_SetFocusMode").ok(),
+            set_focus_point: camera.get_symbol("OH_CaptureSession_SetFocusPoint").ok(),
+            set_metering_point: camera.get_symbol("OH_CaptureSession_SetMeteringPoint").ok(),
+            set_exposure_mode: camera.get_symbol("OH_CaptureSession_SetExposureMode").ok(),
+            get_zoom_range: camera.get_symbol("OH_CaptureSession_GetZoomRatioRange").ok(),
+            set_zoom: camera.get_symbol("OH_CaptureSession_SetZoomRatio").ok(),
+            get_exposure_bias_range: camera.get_symbol("OH_CaptureSession_GetExposureBiasRange").ok(),
+            set_exposure_bias: camera.get_symbol("OH_CaptureSession_SetExposureBias").ok(),
+            set_flash_mode: camera.get_symbol("OH_CaptureSession_SetFlashMode").ok(),
             opts_create: sym!(receiver, "OH_ImageReceiverOptions_Create"),
             opts_set_size: sym!(receiver, "OH_ImageReceiverOptions_SetSize"),
             opts_set_capacity: sym!(receiver, "OH_ImageReceiverOptions_SetCapacity"),
@@ -449,6 +476,95 @@ impl OhCameraAccess {
 
     pub fn rotation_steps(&self) -> f32 {
         self.session.as_ref().map(|s| s.rotation_steps).unwrap_or(0.0)
+    }
+
+    /// Apply a runtime control to the running session.
+    pub fn control(&mut self, input_id: VideoInputId, control: CameraControl) {
+        let Some(api) = api() else { return };
+        let Some(session) = self.session.as_ref() else {
+            crate::log!("ohos camera: control {control:?} with no running session");
+            return;
+        };
+        if !self.active_inputs.iter().any(|(id, _)| *id == input_id) {
+            return;
+        }
+        let handle = session.session;
+        let steps = session.rotation_steps as i32;
+        let check = |what: &str, rc: Rc32| {
+            if rc != 0 {
+                crate::error!("ohos camera: {what}: {}", cam_error(rc));
+            }
+        };
+        unsafe {
+            match control {
+                CameraControl::FocusPoint { x, y } => {
+                    // The point is given on the rotated (displayed) preview;
+                    // the camera wants it on the sensor image.
+                    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+                    let point = match steps.rem_euclid(4) {
+                        1 => CameraPoint { x: y, y: 1.0 - x },
+                        2 => CameraPoint { x: 1.0 - x, y: 1.0 - y },
+                        3 => CameraPoint { x: 1.0 - y, y: x },
+                        _ => CameraPoint { x, y },
+                    };
+                    if let Some(f) = api.set_focus_mode {
+                        check("focus mode", f(handle, 2)); // FOCUS_MODE_AUTO
+                    }
+                    if let Some(f) = api.set_focus_point {
+                        check("focus point", f(handle, point));
+                    }
+                    if let Some(f) = api.set_exposure_mode {
+                        check("exposure mode", f(handle, 1)); // EXPOSURE_MODE_AUTO
+                    }
+                    if let Some(f) = api.set_metering_point {
+                        check("metering point", f(handle, point));
+                    }
+                }
+                CameraControl::ContinuousFocus => {
+                    if let Some(f) = api.set_focus_mode {
+                        check("focus mode", f(handle, 1)); // FOCUS_MODE_CONTINUOUS_AUTO
+                    }
+                    if let Some(f) = api.set_exposure_mode {
+                        check("exposure mode", f(handle, 2)); // EXPOSURE_MODE_CONTINUOUS_AUTO
+                    }
+                }
+                CameraControl::ZoomRatio(ratio) => {
+                    let (mut lo, mut hi) = (1.0f32, 1.0f32);
+                    if let Some(f) = api.get_zoom_range {
+                        if f(handle, &mut lo, &mut hi) != 0 || hi < lo {
+                            lo = 1.0;
+                            hi = ratio.max(1.0);
+                        }
+                    }
+                    if let Some(f) = api.set_zoom {
+                        check("zoom", f(handle, ratio.clamp(lo, hi)));
+                    }
+                }
+                CameraControl::ExposureBias(ev) => {
+                    let (mut lo, mut hi, mut step) = (-4.0f32, 4.0f32, 0.0f32);
+                    if let Some(f) = api.get_exposure_bias_range {
+                        if f(handle, &mut lo, &mut hi, &mut step) != 0 || hi < lo {
+                            lo = -4.0;
+                            hi = 4.0;
+                        }
+                    }
+                    if let Some(f) = api.set_exposure_bias {
+                        check("exposure bias", f(handle, ev.clamp(lo, hi)));
+                    }
+                }
+                CameraControl::Flash(mode) => {
+                    let mode = match mode {
+                        CameraFlashMode::Off => 0,
+                        CameraFlashMode::On => 1,
+                        CameraFlashMode::Auto => 2,
+                        CameraFlashMode::Torch => 3,
+                    };
+                    if let Some(f) = api.set_flash_mode {
+                        check("flash mode", f(handle, mode));
+                    }
+                }
+            }
+        }
     }
 
     /// Start (or stop, with an empty list) the preview stream. One stream at a

@@ -14,7 +14,10 @@ use {
         texture::TextureFormat,
         draw_pass::{CxDrawPassParent, DrawPassClearColor, DrawPassClearDepth, DrawPassId},
         egl_sys::{self, LibEgl, EGL_NONE},
-        event::{Event, KeyCode, KeyEvent, TouchUpdateEvent, VirtualKeyboardEvent, WindowGeom},
+        event::{
+            Event, KeyCode, KeyEvent, SafeAreaInsets, TouchUpdateEvent, VirtualKeyboardEvent,
+            WindowGeom,
+        },
         gpu_info::GpuPerformance,
         makepad_live_id::LiveId,
         makepad_math::*,
@@ -196,6 +199,7 @@ impl Cx {
 
                 let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
                 let size = self.os.display_size / dpi_factor;
+                let safe_area_insets = self.os.native_safe_area_insets.scale(1.0 / dpi_factor);
                 window.window_geom = WindowGeom {
                     dpi_factor,
                     can_fullscreen: false,
@@ -205,9 +209,12 @@ impl Cx {
                     position: dvec2(0.0, 0.0),
                     inner_size: size,
                     outer_size: size,
+                    safe_area_insets,
                     ..Default::default()
                 };
                 let new_geom = window.window_geom.clone();
+                self.display_context.safe_area_insets = safe_area_insets;
+                self.update_safe_inset_script_values(safe_area_insets);
                 self.call_event_handler(&Event::WindowGeomChange(WindowGeomChangeEvent {
                     window_id,
                     new_geom,
@@ -245,6 +252,24 @@ impl Cx {
                     } else {
                         self.os.pending_permissions.push((perm, request_id));
                     }
+                }
+            }
+            FromOhosMessage::AvoidArea {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                let insets = SafeAreaInsets {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                };
+                if self.os.native_safe_area_insets != insets {
+                    crate::log!("ohos: safe area px top {top} right {right} bottom {bottom} left {left}");
+                    self.os.native_safe_area_insets = insets;
+                    self.ohos_publish_safe_area();
                 }
             }
             FromOhosMessage::Touch(mut touches) => {
@@ -590,6 +615,8 @@ impl Cx {
                         self.os.display_size.x / self.os.dpi_factor,
                         self.os.display_size.y / self.os.dpi_factor,
                     );
+                    let safe_area_insets =
+                        self.os.native_safe_area_insets.scale(1.0 / self.os.dpi_factor);
                     window.window_geom = WindowGeom {
                         dpi_factor: self.os.dpi_factor,
                         can_fullscreen: false,
@@ -599,9 +626,12 @@ impl Cx {
                         position: dvec2(0.0, 0.0),
                         inner_size: size,
                         outer_size: size,
+                        safe_area_insets,
                         ..Default::default()
                     };
                     window.is_created = true;
+                    self.display_context.safe_area_insets = safe_area_insets;
+                    self.update_safe_inset_script_values(safe_area_insets);
                 }
                 CxOsOp::CreatePopupWindow {
                     window_id,
@@ -766,6 +796,8 @@ pub struct CxOs {
     pub arkts_obj: Option<ArkTsObjRef>,
     /// Permission requests waiting for ArkTS to answer, by request id.
     pub(crate) pending_permissions: Vec<(Permission, i32)>,
+    /// System bar avoid areas in physical pixels (the window is edge to edge).
+    pub(crate) native_safe_area_insets: SafeAreaInsets,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,
 }
@@ -804,6 +836,32 @@ fn ohos_permission_from_name(name: &str) -> Option<Permission> {
 }
 
 impl Cx {
+    /// New avoid areas: republish every window's geometry so the app lays its
+    /// chrome out inside the safe area.
+    fn ohos_publish_safe_area(&mut self) {
+        let window_ids: Vec<_> = self
+            .windows
+            .id_iter()
+            .filter(|id| self.windows[*id].is_created)
+            .collect();
+        for window_id in window_ids {
+            let window = &mut self.windows[window_id];
+            let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
+            let insets = self.os.native_safe_area_insets.scale(1.0 / dpi_factor);
+            let old_geom = window.window_geom.clone();
+            window.window_geom.safe_area_insets = insets;
+            let new_geom = window.window_geom.clone();
+            self.display_context.safe_area_insets = insets;
+            self.update_safe_inset_script_values(insets);
+            self.call_event_handler(&Event::WindowGeomChange(WindowGeomChangeEvent {
+                window_id,
+                new_geom,
+                old_geom,
+            }));
+        }
+        self.redraw_all();
+    }
+
     fn ohos_request_permission(&mut self, permission: Permission, request_id: i32) {
         let Some((_, function)) = ohos_permission_js_function(permission) else {
             self.call_event_handler(&Event::PermissionResult(PermissionResult {
@@ -904,6 +962,7 @@ impl Default for CxOs {
             quit: false,
             timers: Default::default(),
             pending_permissions: Vec::new(),
+            native_safe_area_insets: SafeAreaInsets::default(),
             raw_file: None,
             arkts_obj: None,
             start_time: Instant::now(),
