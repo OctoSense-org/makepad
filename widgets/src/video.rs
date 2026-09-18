@@ -172,7 +172,10 @@ script_mod! {
 
                 let mut scale = self.image_scale
                 let pan = self.image_pan
-                let source_aspect_ratio = self.source_size.x / self.source_size.y
+                // A quarter-turn rotation (camera sensors) swaps the displayed aspect.
+                let rotated_odd = step(0.5, self.yuv_rotation_steps) * step(self.yuv_rotation_steps, 1.5) + step(2.5, self.yuv_rotation_steps)
+                let shown_size = mix(self.source_size, vec2(self.source_size.y, self.source_size.x), rotated_odd)
+                let source_aspect_ratio = shown_size.x / shown_size.y
                 let target_aspect_ratio = self.target_size.x / self.target_size.y
 
                 // Adjust scale based on aspect ratio difference
