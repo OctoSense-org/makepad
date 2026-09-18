@@ -1290,7 +1290,13 @@ impl Cx {
                 CxOsOp::DetachCameraNativePreview { video_id } => {
                     IosApp::detach_camera_preview(video_id.0);
                 }
-                CxOsOp::SpawnSystemBrowser { browser_id, url } => {
+                // `navigable` is unenforced here: this backend installs no
+                // navigation policy, so every browser navigates.
+                CxOsOp::SpawnSystemBrowser {
+                    browser_id,
+                    url,
+                    navigable: _,
+                } => {
                     self.os
                         .system_browsers
                         .entry(browser_id)

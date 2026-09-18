@@ -106,10 +106,28 @@ impl<'a> CxSystemBrowser<'a> {
         self.id
     }
 
+    /// Open `url` in a browser that stays on that one document: a link tap,
+    /// a script navigation or a server redirect is cancelled. This is what a
+    /// web app card wants — a card is its own document, not a browsing
+    /// session.
     pub fn spawn(&mut self, url: &str) {
         self.cx.platform_ops.push_back(CxOsOp::SpawnSystemBrowser {
             browser_id: self.id.0,
             url: url.to_string(),
+            navigable: false,
+        });
+    }
+
+    /// Open `url` in a browser that may navigate: links, scripts and
+    /// redirects are followed. A reader showing pages off the open web needs
+    /// this — a redirector like a Google News RSS link never reaches its
+    /// article otherwise. Only Android enforces the distinction today; the
+    /// Apple backends have no navigation policy and always navigate.
+    pub fn spawn_navigable(&mut self, url: &str) {
+        self.cx.platform_ops.push_back(CxOsOp::SpawnSystemBrowser {
+            browser_id: self.id.0,
+            url: url.to_string(),
+            navigable: true,
         });
     }
 
@@ -462,6 +480,8 @@ pub enum CxOsOp {
     SpawnSystemBrowser {
         browser_id: LiveId,
         url: String,
+        /// Whether the browser may leave the document it was opened with.
+        navigable: bool,
     },
     UpdateSystemBrowser {
         browser_id: LiveId,

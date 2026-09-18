@@ -1539,6 +1539,23 @@ impl Cx {
                 });
                 self.handle_action_receiver();
             }
+            FromJavaMessage::SystemBrowserPageError {
+                browser_id,
+                code,
+                description,
+                url,
+            } => {
+                // A page failed to load. Deliver to the widget hosting the
+                // browser (drain this tick: the app is idle behind a browser
+                // that is showing nothing).
+                Cx::post_action(crate::event::NativeSystemBrowserPageError {
+                    browser_id: browser_id as u64,
+                    code,
+                    description,
+                    url,
+                });
+                self.handle_action_receiver();
+            }
             FromJavaMessage::DeepLink { url } => {
                 // App opened/resumed via a deep link or share — hand it to the app
                 // (it plays a shared YouTube URL in the card). Drain this tick.
@@ -2230,6 +2247,9 @@ impl Cx {
             };
 
             cx.os.dpi_factor = android_params.density;
+            // Storage and the per-user caches live in the app's files
+            // directory: HOME is not writable for an Android app.
+            crate::home::set_platform_data_dir(std::path::Path::new(&android_params.data_path));
             cx.os_type = OsType::Android(android_params);
             if let Some(connected) = initial_physical_keyboard {
                 cx.set_physical_keyboard_state(connected);
@@ -2767,8 +2787,12 @@ impl Cx {
                 CxOsOp::CollapseNativeComposer => unsafe {
                     android_jni::to_java_collapse_composer();
                 },
-                CxOsOp::SpawnSystemBrowser { browser_id, url } => unsafe {
-                    android_jni::to_java_spawn_system_browser(browser_id, &url);
+                CxOsOp::SpawnSystemBrowser {
+                    browser_id,
+                    url,
+                    navigable,
+                } => unsafe {
+                    android_jni::to_java_spawn_system_browser(browser_id, &url, navigable);
                 },
                 CxOsOp::UpdateSystemBrowser {
                     browser_id,
