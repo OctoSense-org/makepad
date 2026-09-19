@@ -2,7 +2,8 @@ use super::android_jni;
 use crate::makepad_live_id::LiveId;
 use crate::makepad_network::{
     plain_web_socket::PlainWebSocket, AndroidSocketStream, AndroidSocketStreamFactory, EventSink,
-    HttpError, HttpRequest, HttpResponse, NetworkBackend, NetworkError, NetworkResponse,
+    HttpError, HttpProgress, HttpRequest, HttpResponse, NetworkBackend, NetworkError,
+    NetworkResponse,
     ServerWebSocketMessage, ServerWebSocketMessageFormat, ServerWebSocketMessageHeader,
     WebSocketMessage, WebSocketParser, WebSocketTransport, WsMessage, WsSend,
 };
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 struct PendingHttp {
     public_request_id: LiveId,
+    metadata_id: LiveId,
     sink: EventSink,
 }
 
@@ -419,7 +421,8 @@ impl NetworkBackend for AndroidNetworkShimBackend {
                 internal_request_id,
                 PendingHttp {
                     public_request_id: request_id,
-                    sink,
+                    metadata_id: request.metadata_id,
+                    sink: sink.clone(),
                 },
             );
         }
@@ -427,16 +430,42 @@ impl NetworkBackend for AndroidNetworkShimBackend {
         unsafe {
             android_jni::to_java_http_request(internal_request_id, request);
         }
+        // Java cannot withdraw a request it has been handed, so it is on the
+        // wire from here. Callers that reorder their undispatched requests
+        // (the map archive reader) read this first progress event as
+        // "dispatched" and leave the request alone.
+        let _ = sink.emit(NetworkResponse::HttpProgress {
+            request_id,
+            progress: HttpProgress {
+                loaded: 0,
+                total: 0,
+            },
+        });
         Ok(())
     }
 
     fn http_cancel(&self, request_id: LiveId) -> Result<(), NetworkError> {
-        let mut state = self
-            .http
-            .lock()
-            .map_err(|_| NetworkError::backend("android shim http lock poisoned"))?;
-        if let Some(internal_id) = state.by_public.remove(&request_id) {
-            state.by_internal.remove(&internal_id);
+        let pending = {
+            let mut state = self
+                .http
+                .lock()
+                .map_err(|_| NetworkError::backend("android shim http lock poisoned"))?;
+            state
+                .by_public
+                .remove(&request_id)
+                .and_then(|internal_id| state.by_internal.remove(&internal_id))
+        };
+        // The other backends end a cancelled request with an error, and
+        // callers wait for it (the map archive reader requeues on it). Java's
+        // reply, if one still comes, finds no entry and is dropped.
+        if let Some(pending) = pending {
+            let _ = pending.sink.emit(NetworkResponse::HttpError {
+                request_id,
+                error: HttpError {
+                    message: "request cancelled".to_string(),
+                    metadata_id: pending.metadata_id,
+                },
+            });
         }
         Ok(())
     }
