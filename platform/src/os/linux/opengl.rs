@@ -689,15 +689,8 @@ impl Cx {
                 }
                 let geometry = &mut self.geometries[geometry_id];
                 // Typed geometry (a byte layout, u16 indices) uploads as-is;
-                // the GL attribute pointers still assume f32-lane records,
-                // so a compact shader layout stays gated.
-                if !crate::geometry::geometry_backend_supports_compact(
-                    geometry,
-                    "opengl",
-                    sh.mapping.geometry_is_compact(),
-                ) {
-                    continue;
-                }
+                // a compact shader layout binds one typed attribute per
+                // field (`opengl_get_typed_attributes`).
                 if !crate::geometry::geometry_layout_matches_shader(
                     geometry,
                     &sh.mapping.geometries,
@@ -786,80 +779,14 @@ impl Cx {
                         (gl.glBindBuffer)(gl_sys::ARRAY_BUFFER, vao.geom_vb.unwrap());
                         for attr in &shgl.geometries {
                             if let Some(loc) = attr.loc {
-                                match attr.attr_format {
-                                    DrawShaderAttrFormat::F32x1
-                                    | DrawShaderAttrFormat::F32x2
-                                    | DrawShaderAttrFormat::F32x3
-                                    | DrawShaderAttrFormat::F32x4 => {
-                                        (gl.glVertexAttribPointer)(
-                                            loc,
-                                            attr.size,
-                                            gl_sys::FLOAT,
-                                            0,
-                                            attr.stride,
-                                            attr.offset as *const () as *const _,
-                                        );
-                                    }
-                                    DrawShaderAttrFormat::U32x1 => {
-                                        (gl.glVertexAttribIPointer)(
-                                            loc,
-                                            attr.size,
-                                            gl_sys::UNSIGNED_INT,
-                                            attr.stride,
-                                            attr.offset as *const () as *const _,
-                                        );
-                                    }
-                                    DrawShaderAttrFormat::I32x1 => {
-                                        (gl.glVertexAttribIPointer)(
-                                            loc,
-                                            attr.size,
-                                            gl_sys::INT,
-                                            attr.stride,
-                                            attr.offset as *const () as *const _,
-                                        );
-                                    }
-                                    _ => {}
-                                }
+                                attr.bind_pointer(gl, loc);
                                 (gl.glEnableVertexAttribArray)(loc);
                             }
                         }
                         (gl.glBindBuffer)(gl_sys::ARRAY_BUFFER, vao.inst_vb.unwrap());
                         for attr in &shgl.instances {
                             if let Some(loc) = attr.loc {
-                                match attr.attr_format {
-                                    DrawShaderAttrFormat::F32x1
-                                    | DrawShaderAttrFormat::F32x2
-                                    | DrawShaderAttrFormat::F32x3
-                                    | DrawShaderAttrFormat::F32x4 => {
-                                        (gl.glVertexAttribPointer)(
-                                            loc,
-                                            attr.size,
-                                            gl_sys::FLOAT,
-                                            0,
-                                            attr.stride,
-                                            attr.offset as *const () as *const _,
-                                        );
-                                    }
-                                    DrawShaderAttrFormat::U32x1 => {
-                                        (gl.glVertexAttribIPointer)(
-                                            loc,
-                                            attr.size,
-                                            gl_sys::UNSIGNED_INT,
-                                            attr.stride,
-                                            attr.offset as *const () as *const _,
-                                        );
-                                    }
-                                    DrawShaderAttrFormat::I32x1 => {
-                                        (gl.glVertexAttribIPointer)(
-                                            loc,
-                                            attr.size,
-                                            gl_sys::INT,
-                                            attr.stride,
-                                            attr.offset as *const () as *const _,
-                                        );
-                                    }
-                                    _ => {}
-                                }
+                                attr.bind_pointer(gl, loc);
                                 (gl.glEnableVertexAttribArray)(loc);
                                 (gl.glVertexAttribDivisor)(loc, 1 as gl_sys::GLuint);
                             }
@@ -2000,22 +1927,38 @@ impl GlShader {
 
             (gl.glUseProgram)(0);
 
+            // A compact layout makes the GLSL generator declare one typed
+            // attribute per field, for the instances as well; every other
+            // shader keeps its packed vec4 lanes.
+            let compact = mapping.geometry_is_compact() || mapping.instances.has_compact();
+            let (geometries, instances) = if compact {
+                (
+                    Self::opengl_get_typed_attributes(gl, program, "geom", &mapping.geometries),
+                    Self::opengl_get_typed_attributes(gl, program, "inst", &mapping.instances),
+                )
+            } else {
+                (
+                    Self::opengl_get_attributes(
+                        gl,
+                        program,
+                        "packed_geometry_",
+                        mapping.geometries.total_slots,
+                        &mapping.geometries.inputs,
+                    ),
+                    Self::opengl_get_attributes(
+                        gl,
+                        program,
+                        "packed_instance_",
+                        mapping.instances.total_slots,
+                        &mapping.instances.inputs,
+                    ),
+                )
+            };
+
             Self {
                 program,
-                geometries: Self::opengl_get_attributes(
-                    gl,
-                    program,
-                    "packed_geometry_",
-                    mapping.geometries.total_slots,
-                    &mapping.geometries.inputs,
-                ),
-                instances: Self::opengl_get_attributes(
-                    gl,
-                    program,
-                    "packed_instance_",
-                    mapping.instances.total_slots,
-                    &mapping.instances.inputs,
-                ),
+                geometries,
+                instances,
                 textures: Self::opengl_get_texture_slots(gl, program, &mapping.textures),
                 samplers: Self::opengl_create_samplers(gl, mapping),
                 xr_depth_texture: Self::opengl_get_uniform(gl, program, "xr_depth_texture"),
@@ -2263,6 +2206,54 @@ impl GlShader {
             }
         }
         attribs
+    }
+
+    /// One attribute per input of a compact shader, at the input's byte
+    /// offset in the typed record, named as the GLSL generator names it
+    /// (`geom_<field>` / `inst_<field>`). The WebGL backend's
+    /// `webgl_typed_attribs` is the same table.
+    pub fn opengl_get_typed_attributes(
+        gl: &LibGl,
+        program: u32,
+        prefix: &str,
+        inputs: &crate::draw_shader::DrawShaderInputs,
+    ) -> Vec<OpenglAttribute> {
+        let stride = if inputs.stride_bytes != 0 {
+            inputs.stride_bytes
+        } else {
+            inputs.total_slots * mem::size_of::<f32>()
+        } as i32;
+        let trace_draw = crate::makepad_error_log::trace_enabled("gl.draw");
+        inputs
+            .inputs
+            .iter()
+            .map(|input| {
+                let name0 = format!("{}_{}\0", prefix, input.id);
+                let loc =
+                    unsafe { (gl.glGetAttribLocation)(program, name0.as_ptr() as *const _) };
+                if trace_draw {
+                    crate::trace!(
+                        "gl.draw",
+                        "GL attrib program={} name={} loc={} size={} stride={} offset={} format={:?}",
+                        program,
+                        name0.trim_end_matches('\0'),
+                        loc,
+                        input.attr_format.component_count(),
+                        stride,
+                        input.byte_offset,
+                        input.attr_format
+                    );
+                }
+                OpenglAttribute {
+                    name: name0,
+                    loc: if loc < 0 { None } else { Some(loc as u32) },
+                    offset: input.byte_offset,
+                    size: input.attr_format.component_count() as i32,
+                    stride,
+                    attr_format: input.attr_format,
+                }
+            })
+            .collect()
     }
 
     pub fn opengl_get_texture_slots(
@@ -2651,6 +2642,52 @@ pub struct OpenglAttribute {
     pub offset: usize,
     pub stride: i32,
     pub attr_format: DrawShaderAttrFormat,
+}
+
+impl OpenglAttribute {
+    /// Points `loc` at this attribute in the bound array buffer. Compact
+    /// formats convert to float at fetch, normalized where the format says
+    /// so; the 32-bit integer formats stay integers.
+    unsafe fn bind_pointer(&self, gl: &LibGl, loc: u32) {
+        let offset = self.offset as *const () as *const _;
+        let (gl_type, normalized) = match self.attr_format {
+            DrawShaderAttrFormat::F32x1
+            | DrawShaderAttrFormat::F32x2
+            | DrawShaderAttrFormat::F32x3
+            | DrawShaderAttrFormat::F32x4 => (gl_sys::FLOAT, false),
+            DrawShaderAttrFormat::F16x2 | DrawShaderAttrFormat::F16x4 => {
+                (gl_sys::HALF_FLOAT, false)
+            }
+            DrawShaderAttrFormat::U16x2 => (gl_sys::UNSIGNED_SHORT, false),
+            DrawShaderAttrFormat::U16x2Norm => (gl_sys::UNSIGNED_SHORT, true),
+            DrawShaderAttrFormat::I16x2 => (gl_sys::SHORT, false),
+            DrawShaderAttrFormat::I16x2Norm => (gl_sys::SHORT, true),
+            DrawShaderAttrFormat::U8x4Norm => (gl_sys::UNSIGNED_BYTE, true),
+            DrawShaderAttrFormat::I8x4Norm => (gl_sys::BYTE, true),
+            DrawShaderAttrFormat::U32x1 => {
+                (gl.glVertexAttribIPointer)(
+                    loc,
+                    self.size,
+                    gl_sys::UNSIGNED_INT,
+                    self.stride,
+                    offset,
+                );
+                return;
+            }
+            DrawShaderAttrFormat::I32x1 => {
+                (gl.glVertexAttribIPointer)(loc, self.size, gl_sys::INT, self.stride, offset);
+                return;
+            }
+        };
+        (gl.glVertexAttribPointer)(
+            loc,
+            self.size,
+            gl_type,
+            normalized as gl_sys::GLboolean,
+            self.stride,
+            offset,
+        );
+    }
 }
 
 #[derive(Debug, Default, Clone)]
