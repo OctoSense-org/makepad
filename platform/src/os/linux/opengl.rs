@@ -1163,7 +1163,22 @@ impl Cx {
         draw_pass_id: DrawPassId,
         override_pass_texture: Option<&Texture>,
     ) {
-        let draw_list_id = self.passes[draw_pass_id].main_draw_list_id.unwrap();
+        let Some(draw_list_id) = self.passes[draw_pass_id].main_draw_list_id else {
+            // A FROZEN texture, as in the Metal backend: its producer
+            // detached itself and dropped its list (a host keeping an app's
+            // last frame), while retained lists still ask the pass to
+            // repaint. Nothing to draw; the flag is cleared here because
+            // `setup_render_pass`, which clears it otherwise, never runs.
+            if matches!(
+                self.passes[draw_pass_id].parent,
+                crate::draw_pass::CxDrawPassParent::None
+            ) {
+                self.passes[draw_pass_id].paint_dirty = false;
+                return;
+            }
+            crate::error!("Draw pass has no draw list!");
+            return;
+        };
 
         let (pass_size, dpi_factor) = if let Some(pz) = self.setup_render_pass(draw_pass_id, true) {
             pz
