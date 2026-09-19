@@ -20,6 +20,7 @@
 use crate::makepad_draw::*;
 
 use super::geometry::{lon_lat_to_normalized, sample_polyline_point_at_distance};
+use super::overlay::MapPuck;
 use super::{decode_polyline5, haversine_m};
 
 /// Seconds since this process started: the sim clock the demo vehicle and the
@@ -143,9 +144,25 @@ pub(super) struct NavState {
     seg_t1: f64,
     /// Per-frame pump while a nav camera is live (or a glide is in flight).
     pub next_frame: NextFrame,
+    /// The overlay's puck is this layer's vehicle. A puck a host placed with
+    /// `MapView::set_puck` is not, and is never this layer's to clear.
+    pub owns_puck: bool,
 }
 
 impl NavState {
+    /// The vehicle goes on the overlay, over whatever puck was there.
+    pub fn place_puck(&mut self, slot: &mut Option<MapPuck>, vehicle: MapPuck) {
+        *slot = Some(vehicle);
+        self.owns_puck = true;
+    }
+
+    /// The vehicle leaves the overlay; a host's own puck stays.
+    pub fn release_puck(&mut self, slot: &mut Option<MapPuck>) {
+        if std::mem::take(&mut self.owns_puck) {
+            *slot = None;
+        }
+    }
+
     /// Adopt the declarative polyline + pins. Returns true when either
     /// changed, i.e. the overlay's route/markers need rebuilding.
     pub fn adopt(&mut self, polyline: &str, markers: &str) -> bool {
@@ -383,6 +400,28 @@ impl NavState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hosts_puck_survives_the_layer_being_off() {
+        let mut nav = NavState::default();
+        let mut slot = Some(MapPuck::new(-121.96, 37.37, None, 12.0));
+        nav.release_puck(&mut slot);
+        assert!(slot.is_some(), "the host's puck was cleared");
+    }
+
+    #[test]
+    fn the_layers_vehicle_leaves_with_the_layer() {
+        let mut nav = NavState::default();
+        let mut slot = None;
+        nav.place_puck(&mut slot, MapPuck::new(-121.96, 37.37, Some(90.0), 0.0));
+        assert!(slot.is_some() && nav.owns_puck);
+        nav.release_puck(&mut slot);
+        assert!(slot.is_none() && !nav.owns_puck);
+        // Released once: a puck the host sets afterwards is the host's.
+        slot = Some(MapPuck::new(-121.90, 37.40, None, 5.0));
+        nav.release_puck(&mut slot);
+        assert!(slot.is_some());
+    }
 
     #[test]
     fn route_markers_parse_and_drop_unresolved() {

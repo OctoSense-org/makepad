@@ -12011,6 +12011,9 @@ impl MapView {
 
     pub fn set_puck(&mut self, cx: &mut Cx, puck: Option<MapPuck>) {
         self.overlay.puck = puck;
+        // The host's from here on: the navigation layer clears only the
+        // vehicle it placed itself.
+        self.nav.owns_puck = false;
         self.redraw(cx);
     }
 }
@@ -13529,9 +13532,7 @@ impl MapView {
                 .collect();
         }
         if kind == NavKind::Off {
-            if self.overlay.puck.is_some() {
-                self.overlay.puck = None;
-            }
+            self.nav.release_puck(&mut self.overlay.puck);
             self.nav.next_frame = NextFrame::default();
             return;
         }
@@ -13602,7 +13603,10 @@ impl MapView {
             0.0
         };
         let (lon, lat) = normalized_to_lon_lat(car);
-        self.overlay.puck = Some(MapPuck::new(lon, lat, Some(bearing.to_degrees()), 0.0));
+        self.nav.place_puck(
+            &mut self.overlay.puck,
+            MapPuck::new(lon, lat, Some(bearing.to_degrees()), 0.0),
+        );
         let idx = self.nav.traveled_index(d);
         if let Some(route) = &mut self.overlay.route {
             route.traveled_index = idx;
@@ -13639,8 +13643,6 @@ impl MapView {
         self.wrap_and_clamp_center();
         self.rotation = 0.0;
         self.tilt = 0.0;
-        if self.overlay.puck.is_some() {
-            self.overlay.puck = None;
-        }
+        self.nav.release_puck(&mut self.overlay.puck);
     }
 }
