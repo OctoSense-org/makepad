@@ -273,6 +273,7 @@ pub fn gc_dead_splash_isolates(cx: &mut Cx) {
     // Script tweens: the isolate's host (its rooted apply objects), its
     // callback closures and its handle type go with it.
     crate::tween_script::gc_vms(cx, &dead);
+    crate::splash_policy::gc_policies(&dead_heaps);
     crate::desktop_style::gc_heaps(cx,&dead_heaps);
     crate::cached_widget::gc_heaps(cx, &dead_heaps);
     for heap in &dead_heaps {
