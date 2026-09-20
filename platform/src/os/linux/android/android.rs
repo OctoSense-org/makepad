@@ -3069,6 +3069,15 @@ impl Cx {
                             preview_window,
                             camera_access,
                         );
+                        // Opening the device is a separate step from registering the
+                        // preview: without it the NDK camera is never started and the
+                        // preview stays black (macOS does the same in its PrepareVideoPlayback).
+                        self.os
+                            .media
+                            .android_camera()
+                            .lock()
+                            .unwrap()
+                            .use_video_input(&[(input_id, format_id)]);
                         self.os.camera_players.insert(video_id, player);
                         self.call_event_handler(&Event::VideoYuvTexturesReady(
                             VideoYuvTexturesReady::planes(video_id, tex_y, tex_u, tex_v),
@@ -3225,6 +3234,10 @@ impl Cx {
                 CxOsOp::CleanupVideoPlaybackResources(video_id) => {
                     if let Some(mut player) = self.os.camera_players.remove(&video_id) {
                         player.cleanup();
+                        // Close the device when the last camera player goes away.
+                        if self.os.camera_players.is_empty() {
+                            self.os.media.android_camera().lock().unwrap().use_video_input(&[]);
+                        }
                         unsafe {
                             android_jni::to_java_detach_camera_preview(video_id);
                         }

@@ -314,6 +314,10 @@ impl CxMediaApi for Cx {
         )
     }
 
+    fn refresh_video_inputs(&mut self) {
+        self.os.media.android_camera_change.set();
+    }
+
     fn use_video_input(&mut self, inputs: &[(VideoInputId, VideoFormatId)]) {
         self.os
             .media
