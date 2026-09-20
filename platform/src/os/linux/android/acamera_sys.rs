@@ -22,7 +22,10 @@ pub struct ACameraMetadata {
 }
 
 pub const ACAMERA_LENS_FACING: u32 = 524293;
-pub const ACAMERA_SENSOR_ORIENTATION: u32 = 393217;
+// ACAMERA_SENSOR_START (section 14 << 16) + 14, per NdkCameraMetadataTags.h.
+// The old value named the hot-pixel section and returned nonsense (288 degrees
+// on a OnePlus 6), which left the preview a quarter or half turn out.
+pub const ACAMERA_SENSOR_ORIENTATION: u32 = 917518;
 pub const ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS: u32 = 851978;
 pub const ACAMERA_CONTROL_AE_TARGET_FPS_RANGE: u32 = 65541;
 pub const ACAMERA_JPEG_QUALITY: u32 = 458756;

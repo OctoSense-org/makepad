@@ -91,7 +91,14 @@ impl AndroidCameraPlayer {
         let frame_cb = i420_frames.as_ref().map(|frames| {
             let frame_ring = frames.ring();
             Box::new(move |frame_ref: CameraFrameRef<'_>| {
-                let _ = frame_ring.publish_i420_copy(frame_ref);
+                if frame_ring.publish_i420_copy(frame_ref) {
+                    // The event loop blocks on Java messages, so a frame that
+                    // arrives while the app is idle would never be uploaded and
+                    // the preview would freeze on the last drawn frame.
+                    super::android_jni::send_from_java_message(
+                        super::android_jni::FromJavaMessage::Wake,
+                    );
+                }
             }) as CameraFrameInputFn
         });
         let hardware_buffer_cb = hardware_buffer_frame.as_ref().map(|latest| {
@@ -105,7 +112,11 @@ impl AndroidCameraPlayer {
             let mut cam = camera_access.lock().unwrap();
             let (width, height) = cam.format_size(input_id, format_id).unwrap_or((0, 0));
             let sensor_orientation = cam.sensor_orientation_for_input(input_id).rem_euclid(360);
-            let yuv_rotation_steps = ((sensor_orientation / 90) % 4) as f32;
+            // 4.0 added means "mirror first" (see the sample_yuv shader): a front
+            // camera reads as a mirror, the way every phone shows a selfie.
+            let mirror = if cam.is_front_facing(input_id) { 4.0 } else { 0.0 };
+            let yuv_rotation_steps = ((sensor_orientation / 90) % 4) as f32 + mirror;
+            crate::log!("camera: {input_id:?} needs {sensor_orientation} deg{}", if mirror > 0.0 { " mirrored" } else { "" });
 
             match hardware_buffer_cb {
                 Some(hardware_buffer_cb) => cam.register_preview_hardware_buffer(

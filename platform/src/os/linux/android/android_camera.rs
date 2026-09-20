@@ -21,6 +21,7 @@ pub struct AndroidCameraDevice {
     camera_id_str: CString,
     desc: VideoInputDesc,
     sensor_orientation_degrees: i32,
+    front_facing: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1252,12 +1253,25 @@ impl AndroidCameraAccess {
         Ok(())
     }
 
+    /// Degrees the renderer must turn a frame by so it is upright in a portrait
+    /// window. ACAMERA_SENSOR_ORIENTATION is the CLOCKWISE angle the frame needs,
+    /// while the YUV shader turns counter-clockwise, so it is the complement.
+    /// Measured on a OnePlus 6: back 90, front 270 -> 270 and 90 quarter turns.
     pub fn sensor_orientation_for_input(&self, input_id: VideoInputId) -> i32 {
         self.devices
             .iter()
             .find(|device| device.desc.input_id == input_id)
-            .map(|device| device.sensor_orientation_degrees)
+            .map(|device| (360 - device.sensor_orientation_degrees).rem_euclid(360))
             .unwrap_or(0)
+    }
+
+    /// True for a camera whose frames read as a mirror (the selfie camera).
+    pub fn is_front_facing(&self, input_id: VideoInputId) -> bool {
+        self.devices
+            .iter()
+            .find(|device| device.desc.input_id == input_id)
+            .map(|device| device.front_facing)
+            .unwrap_or(false)
     }
 
     pub fn format_size(
@@ -1297,7 +1311,8 @@ impl AndroidCameraAccess {
                     continue;
                 };
 
-                let name = if (*entry.data.u8_) == ACAMERA_LENS_FACING_FRONT {
+                let front_facing = (*entry.data.u8_) == ACAMERA_LENS_FACING_FRONT;
+                let name = if front_facing {
                     "Front Camera"
                 } else if (*entry.data.u8_) == ACAMERA_LENS_FACING_BACK {
                     "Back Camera"
@@ -1363,6 +1378,7 @@ impl AndroidCameraAccess {
                         camera_id_str: camera_id_str.into(),
                         desc,
                         sensor_orientation_degrees,
+                        front_facing,
                     });
                 }
                 ACameraMetadata_free(meta_data);

@@ -75,13 +75,19 @@ script_mod! {
             }
 
             sample_yuv: fn(coord: vec2) -> vec4 {
+                // yuv_rotation_steps counts quarter turns counter-clockwise.
+                // A value of 4 or more also mirrors horizontally first, which is
+                // what a front camera needs (a selfie reads as a mirror).
+                let is_mirrored = step(3.5, self.yuv_rotation_steps)
+                let steps = self.yuv_rotation_steps - 4.0 * is_mirrored
+                let coord = vec2(mix(coord.x, 1.0 - coord.x, is_mirrored), coord.y)
                 let coord_90 = vec2(1.0 - coord.y, coord.x)
                 let coord_180 = vec2(1.0 - coord.x, 1.0 - coord.y)
                 let coord_270 = vec2(coord.y, 1.0 - coord.x)
 
-                let is_90 = step(0.5, self.yuv_rotation_steps) * step(self.yuv_rotation_steps, 1.5)
-                let is_180 = step(1.5, self.yuv_rotation_steps) * step(self.yuv_rotation_steps, 2.5)
-                let is_270 = step(2.5, self.yuv_rotation_steps)
+                let is_90 = step(0.5, steps) * step(steps, 1.5)
+                let is_180 = step(1.5, steps) * step(steps, 2.5)
+                let is_270 = step(2.5, steps)
                 let is_0 = 1.0 - is_90 - is_180 - is_270
                 let sample_coord = coord * is_0 + coord_90 * is_90 + coord_180 * is_180 + coord_270 * is_270
 
@@ -173,7 +179,8 @@ script_mod! {
                 let mut scale = self.image_scale
                 let pan = self.image_pan
                 // A quarter-turn rotation (camera sensors) swaps the displayed aspect.
-                let rotated_odd = step(0.5, self.yuv_rotation_steps) * step(self.yuv_rotation_steps, 1.5) + step(2.5, self.yuv_rotation_steps)
+                let turns = self.yuv_rotation_steps - 4.0 * step(3.5, self.yuv_rotation_steps)
+                let rotated_odd = step(0.5, turns) * step(turns, 1.5) + step(2.5, turns)
                 let shown_size = mix(self.source_size, vec2(self.source_size.y, self.source_size.x), rotated_odd)
                 let source_aspect_ratio = shown_size.x / shown_size.y
                 let target_aspect_ratio = self.target_size.x / self.target_size.y
