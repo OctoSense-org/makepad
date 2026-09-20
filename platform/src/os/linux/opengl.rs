@@ -290,6 +290,67 @@ impl DrawVars {
     }
 }
 
+/// A draw item the render loop passes over is otherwise invisible: the
+/// frame simply lacks it, and several of these reasons also ask for another
+/// repaint, so a screen can flash or stay half drawn with nothing in the log.
+/// Counted by reason and reported at most once a second, only while it is
+/// happening.
+mod skipped_draws {
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    pub const FREED_LIST: usize = 0;
+    pub const SHADER_FAILED: usize = 1;
+    pub const SHADER_NOT_READY: usize = 2;
+    pub const RESERVATION_REFUSED: usize = 3;
+    pub const NO_GEOMETRY: usize = 4;
+    pub const STALE_GEOMETRY: usize = 5;
+    pub const LAYOUT_MISMATCH: usize = 6;
+    const NAMES: [&str; 7] = [
+        "freed_list",
+        "shader_failed",
+        "shader_not_ready",
+        "reservation_refused",
+        "no_geometry",
+        "stale_geometry",
+        "layout_mismatch",
+    ];
+    static COUNTS: [AtomicU32; 7] = [
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+        AtomicU32::new(0),
+    ];
+    static LAST_REPORT_MS: AtomicU64 = AtomicU64::new(0);
+    static START: OnceLock<Instant> = OnceLock::new();
+
+    pub fn count(reason: usize) {
+        COUNTS[reason].fetch_add(1, Ordering::Relaxed);
+        let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+        let last = LAST_REPORT_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 1000
+            || LAST_REPORT_MS
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let report = NAMES
+            .iter()
+            .zip(COUNTS.iter())
+            .map(|(name, count)| (name, count.swap(0, Ordering::Relaxed)))
+            .filter(|(_, count)| *count != 0)
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        crate::log!("gl: draw items skipped since the last report: {report}");
+    }
+}
+
 impl Cx {
     /// Renderer-owned texture capture (see the metal backend): not
     /// implemented here — callers fall back to `debug_read_render_texture`
@@ -508,6 +569,7 @@ impl Cx {
                 // last record and this paint: the slot may already hold
                 // another widget's list. Nothing to draw here.
                 if self.draw_lists.is_id_freed(sub_list_id) {
+                    skipped_draws::count(skipped_draws::FREED_LIST);
                     continue;
                 }
                 let child_resets_zbias = self.draw_lists[sub_list_id].reset_zbias;
@@ -546,6 +608,7 @@ impl Cx {
                 let sh = &self.draw_shaders.shaders[draw_call.draw_shader_id.index];
                 if sh.os_shader_id.is_none() {
                     // shader didnt compile somehow
+                    skipped_draws::count(skipped_draws::SHADER_FAILED);
                     continue;
                 }
                 if sh.mapping.uses_time {
@@ -569,6 +632,7 @@ impl Cx {
                     .and_then(GlShaderState::as_ready)
                 else {
                     self.demo_time_repaint = true;
+                    skipped_draws::count(skipped_draws::SHADER_NOT_READY);
                     continue;
                 };
                 let trace_draw = crate::makepad_error_log::trace_enabled("gl.draw");
@@ -605,6 +669,7 @@ impl Cx {
                         let Some(charge) = upload_budget.allocations.reserve(capacity) else {
                             draw_item.instance_upload_pending = true;
                             self.demo_time_repaint = true;
+                            skipped_draws::count(skipped_draws::RESERVATION_REFUSED);
                             continue;
                         };
                         Some(charge)
@@ -681,10 +746,12 @@ impl Cx {
                 let geometry_id = if let Some(geometry_id) = draw_call.geometry_id {
                     geometry_id
                 } else {
+                    skipped_draws::count(skipped_draws::NO_GEOMETRY);
                     continue;
                 };
 
                 if self.geometries.skip_stale(geometry_id) {
+                    skipped_draws::count(skipped_draws::STALE_GEOMETRY);
                     continue;
                 }
                 let geometry = &mut self.geometries[geometry_id];
@@ -695,6 +762,7 @@ impl Cx {
                     geometry,
                     &sh.mapping.geometries,
                 ) {
+                    skipped_draws::count(skipped_draws::LAYOUT_MISMATCH);
                     continue;
                 }
                 let index_gl_type = match geometry.index_width {
