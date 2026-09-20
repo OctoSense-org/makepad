@@ -532,6 +532,13 @@ impl Cx {
     /// None while it loads. This lets generated DSL bind live data instead of
     /// the model hardcoding numbers.
     pub fn script_data_fetch(&mut self, url: &str) -> Option<Rc<Vec<u8>>> {
+        // The data behind `sys.*` is fetched on behalf of whichever isolate is
+        // running right now; it answers to that isolate's allowlist.
+        let heap_key = self.script_vm.as_ref().map(|vm| vm.heap.heap_key()).unwrap_or(0);
+        if !makepad_script_std::script_url_allowed(heap_key, url) {
+            crate::log!("Script data fetch refused by the host's allowlist: {url}");
+            return None;
+        }
         match self.script_data.resources.get_data_fetch(url) {
             Some(DataFetch::Loaded(bytes)) => return Some(bytes),
             Some(DataFetch::Loading(_)) => return None,
@@ -1316,6 +1323,14 @@ pub fn script_mod(vm: &mut ScriptVm) {
 
             if let Some(url_string) = vm.string_with(url, |_vm, s| s.to_string()) {
                 let heap_key = vm.bx.heap.heap_key();
+                // Artwork is a way out of the isolate too: a card with no
+                // network grant was seen fetching nine images through here.
+                if !makepad_script_std::script_url_allowed(heap_key, &url_string) {
+                    // Logged as well as raised: the widget that asked draws
+                    // nothing, and a silent blank is the hardest bug to find.
+                    crate::log!("Script resource refused by the host's allowlist: {url_string}");
+                    return script_err_io!(vm.trap(), "this app may not load {}", url_string);
+                }
                 let cx = vm.host.cx_mut();
                 if let Some(existing) = cx
                     .script_data
