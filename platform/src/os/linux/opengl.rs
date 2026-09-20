@@ -416,8 +416,10 @@ impl Cx {
             // Retirement debt is maintenance, not ink. Android services it on
             // idle vsync beats (`opengl_maintain_instance_retirements`) without
             // painting; the desktop GL loops only wake for a repaint, so they
-            // keep the repaint as their wake until the debt settles.
-            #[cfg(not(target_os = "android"))]
+            // keep the repaint as their wake until the debt settles. OpenHarmony
+            // serves it on idle beats like Android: a hosted module that frees
+            // storage every frame would otherwise keep the repaint alive for good.
+            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
             {
                 self.demo_time_repaint = true;
             }
@@ -428,11 +430,11 @@ impl Cx {
     }
 
     fn retained_adapter_bytes(&self) -> u64 {
-        #[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+        #[cfg(not(any(use_vulkan, linux_direct)))]
         {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let display = self.os.opengl_cx.as_ref();
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             let display = self.os.display.as_ref();
             let Some(display) = display else {
                 return 0;
@@ -550,6 +552,14 @@ impl Cx {
                 }
                 if sh.mapping.uses_time {
                     self.demo_time_repaint = true;
+                    if crate::makepad_error_log::trace_enabled("nextframe") {
+                        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let now = (crate::cx::Cx::monotonic_now() * 1000.0) as u64;
+                        if now.saturating_sub(LAST.load(std::sync::atomic::Ordering::Relaxed)) > 1000 {
+                            LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+                            crate::log!("[demo_time] shader {:?} reads time", sh.debug_id);
+                        }
+                    }
                 }
                 let shp = &mut self.draw_shaders.os_shaders[sh.os_shader_id.unwrap()];
                 shp.ensure_gl_shader_sources(self.os.gl(), &self.os_type);
@@ -1293,7 +1303,7 @@ impl Cx {
             (self.os.gl().glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);
             //(gl.glFinish)();
         }
-        #[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+        #[cfg(not(any(use_vulkan, linux_direct)))]
         if !self.textures.1.readbacks.slots.is_empty() {
             self.gl_capture_texture_readbacks(Some(draw_pass_id));
         }
@@ -3933,7 +3943,7 @@ impl EglRenderBridge {
 
 // Resolved only for clients using the lifetime API; LibGl's ordinary draw path
 // gains no queries, scans, or fence calls. A zero timeout never waits for GPU work.
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 #[derive(Default)]
 pub(crate) struct GlReadbacks {
     functions: Option<GlReadbackFunctions>,
@@ -3942,7 +3952,7 @@ pub(crate) struct GlReadbacks {
     device_lost: bool,
 }
 
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 struct GlReadback {
     work: crate::texture::ReadbackWork,
     framebuffer: u32,
@@ -3953,7 +3963,7 @@ struct GlReadback {
     receive: Option<std::sync::mpsc::Receiver<std::sync::Arc<[u8]>>>,
 }
 
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 #[derive(Clone, Copy)]
 struct GlReadbackFunctions {
     framebuffer_status: unsafe extern "C" fn(u32) -> u32,
@@ -3966,19 +3976,19 @@ struct GlReadbackFunctions {
     unmap: unsafe extern "C" fn(u32) -> u8,
 }
 
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 impl Cx {
     fn gl_readback_functions(
         &mut self,
     ) -> Result<GlReadbackFunctions, crate::texture::ReadbackError> {
         use crate::texture::ReadbackError;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let display = self
             .os
             .opengl_cx
             .as_ref()
             .ok_or(ReadbackError::DeviceLost)?;
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         let display = self.os.display.as_ref().ok_or(ReadbackError::DeviceLost)?;
         let get_proc = display
             .libegl
@@ -4315,35 +4325,35 @@ impl Cx {
     }
 }
 
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 type GlSync = *mut std::ffi::c_void;
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 #[derive(Default)]
 pub(crate) struct TextureFence {
     functions: Option<TextureFenceFunctions>,
     pending: Option<(u64, GlSync)>,
     /// Idle maintenance beats served (`opengl_maintain_instance_retirements`);
     /// their ledger frame keys count down from `u64::MAX`, apart from paints.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     maintenance_beats: u64,
     framebuffers: Vec<u32>,
 }
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 struct TextureFenceFunctions {
     create: unsafe extern "C" fn(u32, u32) -> GlSync,
     poll: unsafe extern "C" fn(GlSync, u32, u64) -> u32,
     delete: unsafe extern "C" fn(GlSync),
     current: unsafe extern "C" fn() -> GlSync,
 }
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 impl CxOsTexture {
     pub(crate) fn allocated_bytes(&self, cx: &Cx) -> Option<u64> {
         if self.gl_texture.is_none() && self.gl_renderbuffer.is_none() {
             return None;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let display = cx.os.opengl_cx.as_ref()?;
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         let display = cx.os.display.as_ref()?;
         let get_proc = display.libegl.eglGetProcAddress?;
         let gl = &display.libgl;
@@ -4458,7 +4468,7 @@ impl CxOsTexture {
         }
     }
 }
-#[cfg(not(any(use_vulkan, linux_direct, target_env = "ohos")))]
+#[cfg(not(any(use_vulkan, linux_direct)))]
 impl Cx {
     pub(crate) fn detach_released_texture(&mut self, id: crate::texture::TextureId) {
         for slot in &mut self.passes.0.pool {
@@ -4484,7 +4494,16 @@ impl Cx {
     /// hand freed draw storage to the workers. Returns whether debt remains.
     /// Call with this renderer's context current. The macOS backend has the
     /// same beat (`maintain_instance_retirements`); a paint used to carry it.
-    #[cfg(target_os = "android")]
+    /// Released GPU storage still waiting on its completion fence or a
+    /// worker: what keeps a mobile loop asking for beats without painting.
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    pub(crate) fn opengl_retirement_pending(&self) -> bool {
+        self.textures.1.gl.pending.is_some()
+            || !self.textures.1.retired.is_empty()
+            || self.draw_lists.has_pending_instance_retirements()
+    }
+
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) fn opengl_maintain_instance_retirements(&mut self) -> bool {
         let fence_pending = self.textures.1.gl.pending.is_some() || !self.textures.1.retired.is_empty();
         if !fence_pending && !self.draw_lists.has_pending_instance_retirements() {
@@ -4513,11 +4532,11 @@ impl Cx {
         // The adapter draws attached blocks here (no per-publication
         // backing): dropped blocks release from this poll, contract §3.3.
         self.publications.retire_without_backing();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let Some(display) = self.os.opengl_cx.as_ref() else {
             return;
         };
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         let Some(display) = self.os.display.as_ref() else {
             return;
         };
