@@ -533,6 +533,8 @@ macro_rules! app_main {
             exports: $crate::napi_ohos::JsObject,
             env: $crate::napi_ohos::Env,
         ) -> $crate::napi_ohos::Result<()> {
+            Cx::init_log();
+            $crate::remote::start_if_requested();
             Cx::ohos_init(exports, env, || {
                 let mut cx = Box::new($crate::new_cx_with_font_set(
                     $crate::_app_main_event_closure!($app, $configure),

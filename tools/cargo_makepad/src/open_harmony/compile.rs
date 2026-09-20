@@ -208,6 +208,22 @@ fn label_json(label_name: &str) -> String {
       "value": "description"
     }},
     {{
+      "name": "camera_reason",
+      "value": "Camera preview"
+    }},
+    {{
+      "name": "microphone_reason",
+      "value": "Sound for video recordings"
+    }},
+    {{
+      "name": "gallery_reason",
+      "value": "Save photos and videos to the gallery"
+    }},
+    {{
+      "name": "location_reason",
+      "value": "Location for maps and navigation"
+    }},
+    {{
       "name": "EntryAbility_label",
       "value": "{label_name}"
     }}
@@ -229,6 +245,22 @@ fn label_zh_json(label_name: &str) -> String {
     {{
       "name": "EntryAbility_desc",
       "value": "description"
+    }},
+    {{
+      "name": "camera_reason",
+      "value": "相机预览"
+    }},
+    {{
+      "name": "microphone_reason",
+      "value": "录像时录制声音"
+    }},
+    {{
+      "name": "gallery_reason",
+      "value": "将照片和视频保存到图库"
+    }},
+    {{
+      "name": "location_reason",
+      "value": "用于地图与导航的位置信息"
     }},
     {{
       "name": "EntryAbility_label",
@@ -472,7 +504,7 @@ fn add_dependencies(args: &[String], targets: &[OpenHarmonyTarget]) -> Result<()
         .join("target")
         .join(targets[0].target_triple_str())
         .join(profile.clone());
-    let deps = get_crate_dep_dirs(build_crate, &build_dir, &targets[0].target_triple_str());
+    let deps = crate::utils::get_crate_dep_dirs_with(build_crate, &build_dir, &targets[0].target_triple_str(), &crate::utils::feature_args(args));
     for (name, dep_dir) in deps.iter() {
         let resources_path = dep_dir.join("resources");
         if resources_path.is_dir() {

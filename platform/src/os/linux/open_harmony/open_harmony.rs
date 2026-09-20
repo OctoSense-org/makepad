@@ -1,15 +1,25 @@
 use {
     self::super::{
         super::gl_sys, super::gl_sys::LibGl, arkts_obj_ref::ArkTsObjRef, oh_callbacks::*,
-        oh_media::CxOpenHarmonyMedia, raw_file::RawFileMgr,
+        oh_camera::OhCameraPlayer, oh_media::CxOpenHarmonyMedia, raw_file::RawFileMgr,
     },
     crate::{
         cx::{Cx, OpenHarmonyParams, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
+        event::video_playback::{
+            VideoDecodingErrorEvent, VideoPlaybackResourcesReleasedEvent, VideoSource,
+            VideoYuvTexturesReady,
+        },
+        permission::{Permission, PermissionResult, PermissionStatus},
+        texture::TextureFormat,
         draw_pass::{CxDrawPassParent, DrawPassClearColor, DrawPassClearDepth, DrawPassId},
         egl_sys::{self, LibEgl, EGL_NONE},
-        event::{Event, KeyCode, KeyEvent, TouchUpdateEvent, VirtualKeyboardEvent, WindowGeom},
+        event::{
+            Event, KeyCode, KeyEvent, SafeAreaInsets, TouchUpdateEvent, VirtualKeyboardEvent,
+            WindowGeom,
+        },
         gpu_info::GpuPerformance,
+        makepad_live_id::LiveId,
         makepad_math::*,
         os::cx_native::EventFlow,
         shared_framebuf::{PollTimer, PollTimers},
@@ -95,6 +105,12 @@ impl Cx {
     }
 
     fn handle_other_events(&mut self) {
+        // The remote instrument (hdc fport → 127.0.0.1) queues its commands off-thread.
+        self.poll_control_channel();
+        // Camera frames read back by the image receiver since the last vsync.
+        self.poll_ohos_camera_players();
+        // HTTP / WebSocket / storage completions (http_resource assets, script fetches).
+        self.dispatch_network_runtime_events();
         // Timers
         let events = self.os.timers.get_dispatch();
         for event in events {
@@ -183,6 +199,7 @@ impl Cx {
 
                 let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
                 let size = self.os.display_size / dpi_factor;
+                let safe_area_insets = self.os.native_safe_area_insets.scale(1.0 / dpi_factor);
                 window.window_geom = WindowGeom {
                     dpi_factor,
                     can_fullscreen: false,
@@ -192,9 +209,12 @@ impl Cx {
                     position: dvec2(0.0, 0.0),
                     inner_size: size,
                     outer_size: size,
+                    safe_area_insets,
                     ..Default::default()
                 };
                 let new_geom = window.window_geom.clone();
+                self.display_context.safe_area_insets = safe_area_insets;
+                self.update_safe_inset_script_values(safe_area_insets);
                 self.call_event_handler(&Event::WindowGeomChange(WindowGeomChangeEvent {
                     window_id,
                     new_geom,
@@ -206,6 +226,58 @@ impl Cx {
                 self.redraw_all();
                 self.os.first_after_resize = true;
                 self.call_event_handler(&Event::ClearAtlasses);
+            }
+            FromOhosMessage::PermissionResult {
+                permission,
+                granted,
+                can_retry,
+            } => {
+                let status = if granted {
+                    PermissionStatus::Granted
+                } else if can_retry {
+                    PermissionStatus::DeniedCanRetry
+                } else {
+                    PermissionStatus::DeniedPermanent
+                };
+                let wanted = ohos_permission_from_name(&permission);
+                let pending: Vec<(Permission, i32)> = self.os.pending_permissions.drain(..).collect();
+                for (perm, request_id) in pending {
+                    if Some(perm) == wanted {
+                        crate::log!("ohos: permission {perm:?} → {status:?}");
+                        self.call_event_handler(&Event::PermissionResult(PermissionResult {
+                            permission: perm,
+                            request_id,
+                            status,
+                        }));
+                    } else {
+                        self.os.pending_permissions.push((perm, request_id));
+                    }
+                }
+            }
+            FromOhosMessage::CaptureSaved { path, ok, uri } => {
+                crate::log!("ohos: gallery {} {path}", if ok { "took" } else { "refused" });
+                self.action(crate::video::CameraCaptureEvent {
+                    input_id: Default::default(),
+                    result: crate::video::CameraCaptureResult::SavedToLibrary { path, uri: if ok { Some(uri) } else { None } },
+                });
+            }
+            FromOhosMessage::AvoidArea {
+                top,
+                right,
+                bottom,
+                left,
+            } => {
+                let insets = SafeAreaInsets {
+                    top,
+                    right,
+                    bottom,
+                    left,
+                };
+                if self.os.native_safe_area_insets != insets {
+                    crate::log!("ohos: safe area px top {top} right {right} bottom {bottom} left {left}");
+                    self.os.native_safe_area_insets = insets;
+                    self.ohos_publish_safe_area();
+                }
             }
             FromOhosMessage::Touch(mut touches) => {
                 let time = touches[0].time;
@@ -425,21 +497,42 @@ impl Cx {
         });
     }
 
-    pub fn ohos_load_dependencies(&mut self) {
-        for (path, dep) in &mut self.dependencies {
-            let mut buffer = Vec::<u8>::new();
-            if let Ok(_) = self
-                .os
-                .raw_file
-                .as_mut()
-                .unwrap()
-                .read_to_end(path, &mut buffer)
-            {
-                dep.data = Some(Ok(Rc::new(buffer)));
-            } else {
-                dep.data = Some(Err("read_to_end failed".to_string()));
+    /// A resource read straight from the HAP's rawfile, as the asset table
+    /// lays it out: `path`, then `<package_root>/path` (`makepad/<crate>/…`).
+    /// Dependencies register after startup (fonts, script resources), so
+    /// `get_dependency` reads them on demand, as the Android asset path does.
+    pub(crate) fn ohos_read_raw(&self, path: &str) -> Option<Vec<u8>> {
+        let raw_file = self.os.raw_file.as_ref()?;
+        let mut buffer = Vec::new();
+        if raw_file.read_to_end(path, &mut buffer).is_ok() && !buffer.is_empty() {
+            return Some(buffer);
+        }
+        if let Some(root) = self.package_root.as_deref() {
+            let prefix = format!("{root}/");
+            if !path.starts_with(&prefix) {
+                buffer.clear();
+                if raw_file.read_to_end(format!("{root}/{path}"), &mut buffer).is_ok() && !buffer.is_empty() {
+                    return Some(buffer);
+                }
             }
         }
+        None
+    }
+
+    pub fn ohos_load_dependencies(&mut self) {
+        let (mut ok, mut failed) = (0usize, 0usize);
+        for (path, dep) in &mut self.dependencies {
+            let mut buffer = Vec::<u8>::new();
+            match self.os.raw_file.as_ref().unwrap().read_to_end(path, &mut buffer) {
+                Ok(_) => { ok += 1; dep.data = Some(Ok(Rc::new(buffer))); }
+                Err(e) => {
+                    failed += 1;
+                    crate::error!("ohos: cannot load dependency {path} from rawfile: {e}");
+                    dep.data = Some(Err(format!("read_to_end failed: {e}")));
+                }
+            }
+        }
+        crate::log!("ohos: dependencies loaded: {ok} ok, {failed} failed");
     }
 
     pub fn draw_pass_to_fullscreen(&mut self, draw_pass_id: DrawPassId) {
@@ -529,6 +622,8 @@ impl Cx {
                         self.os.display_size.x / self.os.dpi_factor,
                         self.os.display_size.y / self.os.dpi_factor,
                     );
+                    let safe_area_insets =
+                        self.os.native_safe_area_insets.scale(1.0 / self.os.dpi_factor);
                     window.window_geom = WindowGeom {
                         dpi_factor: self.os.dpi_factor,
                         can_fullscreen: false,
@@ -538,9 +633,12 @@ impl Cx {
                         position: dvec2(0.0, 0.0),
                         inner_size: size,
                         outer_size: size,
+                        safe_area_insets,
                         ..Default::default()
                     };
                     window.is_created = true;
+                    self.display_context.safe_area_insets = safe_area_insets;
+                    self.update_safe_inset_script_values(safe_area_insets);
                 }
                 CxOsOp::CreatePopupWindow {
                     window_id,
@@ -599,6 +697,65 @@ impl Cx {
                 }
                 // Track selection is currently implemented on Linux GStreamer only.
                 CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
+                CxOsOp::CheckPermission { permission, request_id } => {
+                    // No NDK query for user_grant permissions without the
+                    // token machinery; ArkTS answers through the request path.
+                    self.ohos_request_permission(permission, request_id);
+                }
+                CxOsOp::RequestPermission { permission, request_id } => {
+                    self.ohos_request_permission(permission, request_id);
+                }
+                CxOsOp::PrepareVideoPlayback(
+                    video_id,
+                    source,
+                    _camera_preview_mode,
+                    _external_texture_id,
+                    _texture_id,
+                    autoplay,
+                    _should_loop,
+                ) => {
+                    if let Some(mut player) = self.os.media.camera_players.remove(&video_id) {
+                        self.ohos_release_camera_player(&mut player);
+                        self.call_event_handler(&Event::VideoPlaybackResourcesReleased(
+                            VideoPlaybackResourcesReleasedEvent { video_id },
+                        ));
+                    }
+                    match source {
+                        VideoSource::Camera(input_id, format_id) => {
+                            self.ohos_prepare_camera_playback(video_id, input_id, format_id, autoplay);
+                        }
+                        _ => {
+                            self.call_event_handler(&Event::VideoDecodingError(VideoDecodingErrorEvent {
+                                video_id,
+                                error: "video playback is not implemented on OpenHarmony (camera sources only)".into(),
+                            }));
+                        }
+                    }
+                }
+                CxOsOp::BeginVideoPlayback(video_id) | CxOsOp::ResumeVideoPlayback(video_id) => {
+                    if let Some(player) = self.os.media.camera_players.get_mut(&video_id) {
+                        player.playing = true;
+                    }
+                }
+                CxOsOp::PauseVideoPlayback(video_id) => {
+                    if let Some(player) = self.os.media.camera_players.get_mut(&video_id) {
+                        player.playing = false;
+                    }
+                }
+                CxOsOp::MuteVideoPlayback(_) | CxOsOp::UnmuteVideoPlayback(_) => {}
+                // Touch screens have no pointer to shape.
+                CxOsOp::SetCursor(_) => {}
+                CxOsOp::CleanupVideoPlaybackResources(video_id) => {
+                    if let Some(mut player) = self.os.media.camera_players.remove(&video_id) {
+                        self.ohos_release_camera_player(&mut player);
+                    }
+                    self.call_event_handler(&Event::VideoPlaybackResourcesReleased(
+                        VideoPlaybackResourcesReleasedEvent { video_id },
+                    ));
+                }
+                CxOsOp::AttachCameraNativePreview { .. }
+                | CxOsOp::UpdateCameraNativePreview { .. }
+                | CxOsOp::DetachCameraNativePreview { .. } => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
@@ -644,8 +801,156 @@ pub struct CxOs {
     pub timers: PollTimers,
     pub raw_file: Option<RawFileMgr>,
     pub arkts_obj: Option<ArkTsObjRef>,
+    /// Permission requests waiting for ArkTS to answer, by request id.
+    pub(crate) pending_permissions: Vec<(Permission, i32)>,
+    /// System bar avoid areas in physical pixels (the window is edge to edge).
+    pub(crate) native_safe_area_insets: SafeAreaInsets,
     pub(crate) start_time: Instant,
     pub(crate) display: Option<CxOhosDisplay>,
+}
+
+impl Cx {
+    /// `sys.gps` asks for a fix on every read; OpenHarmony has no location
+    /// bridge yet, so this only notes the request once and the card sees
+    /// "no fix" through `gps::last_gps_fix()`.
+    pub fn ohos_request_gps(&mut self) {
+        static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("ohos: gps requested; no location service is wired up on OpenHarmony yet");
+        }
+    }
+}
+
+/// The ArkTS glue exposes one zero-argument request function per permission
+/// (napi values cannot be built off the JS thread), and reports back with the
+/// same short name through `handlePermissionResult`.
+fn ohos_permission_js_function(permission: Permission) -> Option<(&'static str, &'static str)> {
+    match permission {
+        Permission::Camera => Some(("camera", "requestCameraPermission")),
+        Permission::AudioInput => Some(("microphone", "requestMicrophonePermission")),
+        Permission::Location => Some(("location", "requestLocationPermission")),
+        Permission::HeadsetCamera | Permission::SceneAccess => None,
+    }
+}
+
+fn ohos_permission_from_name(name: &str) -> Option<Permission> {
+    match name {
+        "camera" => Some(Permission::Camera),
+        "microphone" => Some(Permission::AudioInput),
+        "location" => Some(Permission::Location),
+        _ => None,
+    }
+}
+
+impl Cx {
+    /// New avoid areas: republish every window's geometry so the app lays its
+    /// chrome out inside the safe area.
+    fn ohos_publish_safe_area(&mut self) {
+        let window_ids: Vec<_> = self
+            .windows
+            .id_iter()
+            .filter(|id| self.windows[*id].is_created)
+            .collect();
+        for window_id in window_ids {
+            let window = &mut self.windows[window_id];
+            let dpi_factor = window.dpi_override.unwrap_or(self.os.dpi_factor);
+            let insets = self.os.native_safe_area_insets.scale(1.0 / dpi_factor);
+            let old_geom = window.window_geom.clone();
+            window.window_geom.safe_area_insets = insets;
+            let new_geom = window.window_geom.clone();
+            self.display_context.safe_area_insets = insets;
+            self.update_safe_inset_script_values(insets);
+            self.call_event_handler(&Event::WindowGeomChange(WindowGeomChangeEvent {
+                window_id,
+                new_geom,
+                old_geom,
+            }));
+        }
+        self.redraw_all();
+    }
+
+    fn ohos_request_permission(&mut self, permission: Permission, request_id: i32) {
+        let Some((_, function)) = ohos_permission_js_function(permission) else {
+            self.call_event_handler(&Event::PermissionResult(PermissionResult {
+                permission,
+                request_id,
+                status: PermissionStatus::DeniedPermanent,
+            }));
+            return;
+        };
+        let Some(arkts) = self.os.arkts_obj.as_mut() else {
+            crate::error!("ohos: no ArkTS bridge, cannot request {permission:?}");
+            self.call_event_handler(&Event::PermissionResult(PermissionResult {
+                permission,
+                request_id,
+                status: PermissionStatus::NotDetermined,
+            }));
+            return;
+        };
+        self.os.pending_permissions.push((permission, request_id));
+        if let Err(e) = arkts.call_js_function(function, 0, std::ptr::null_mut()) {
+            crate::error!("ohos: {function} failed: {e:?}");
+            self.os.pending_permissions.retain(|(_, id)| *id != request_id);
+            self.call_event_handler(&Event::PermissionResult(PermissionResult {
+                permission,
+                request_id,
+                status: PermissionStatus::NotDetermined,
+            }));
+        }
+    }
+
+    /// Bind a Video widget to the camera: three R8 plane textures, the
+    /// shared frame slot of the (started) stream, and the textures-ready
+    /// event the widget needs before the first `VideoTextureUpdated`.
+    fn ohos_prepare_camera_playback(
+        &mut self,
+        video_id: LiveId,
+        input_id: crate::video::VideoInputId,
+        format_id: crate::video::VideoFormatId,
+        autoplay: bool,
+    ) {
+        let camera = self.os.media.camera();
+        let (shared, rotation_steps, front) = {
+            let mut cam = camera.lock().unwrap();
+            cam.use_video_input(&[(input_id, format_id)]);
+            (cam.frame_shared(), cam.rotation_steps(), cam.is_front(input_id))
+        };
+        let Some(shared) = shared else {
+            self.call_event_handler(&Event::VideoDecodingError(VideoDecodingErrorEvent {
+                video_id,
+                error: "the camera could not be opened (see the ohos camera log lines)".into(),
+            }));
+            return;
+        };
+        let _ = front;
+        let tex_y = self.textures.alloc(TextureFormat::VideoYuvPlane);
+        let tex_u = self.textures.alloc(TextureFormat::VideoYuvPlane);
+        let tex_v = self.textures.alloc(TextureFormat::VideoYuvPlane);
+        let player = OhCameraPlayer {
+            video_id,
+            tex_y: tex_y.texture_id(),
+            tex_u: tex_u.texture_id(),
+            tex_v: tex_v.texture_id(),
+            shared,
+            rotation_steps,
+            width: 0,
+            height: 0,
+            prepared: false,
+            playing: autoplay,
+        };
+        self.os.media.camera_players.insert(video_id, player);
+        self.call_event_handler(&Event::VideoYuvTexturesReady(VideoYuvTexturesReady::planes(
+            video_id, tex_y, tex_u, tex_v,
+        )));
+    }
+
+    fn ohos_release_camera_player(&mut self, player: &mut OhCameraPlayer) {
+        player.playing = false;
+        // The stream itself stops when no Video widget is bound to it any more.
+        if self.os.media.camera_players.is_empty() {
+            self.os.media.camera().lock().unwrap().use_video_input(&[]);
+        }
+    }
 }
 
 impl CxOs {
@@ -663,6 +968,8 @@ impl Default for CxOs {
             media: Default::default(),
             quit: false,
             timers: Default::default(),
+            pending_permissions: Vec::new(),
+            native_safe_area_insets: SafeAreaInsets::default(),
             raw_file: None,
             arkts_obj: None,
             start_time: Instant::now(),
@@ -714,7 +1021,7 @@ impl CxOhosDisplay {
         (self.libegl.eglSwapBuffers.unwrap())(self.egl_display, self.surface);
     }
 
-    unsafe fn make_current(&mut self) {
+    pub(crate) unsafe fn make_current(&mut self) {
         if (self.libegl.eglMakeCurrent.unwrap())(
             self.egl_display,
             self.surface,

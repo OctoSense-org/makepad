@@ -52,6 +52,54 @@ pub fn handle_delete_left_event(length: i32) -> napi_ohos::Result<()> {
 }
 
 #[napi]
+pub fn handle_permission_result(permission: String, granted: bool, can_retry: bool) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::PermissionResult {
+        permission,
+        granted,
+        can_retry,
+    });
+    Ok(())
+}
+
+/// Capture files waiting for ArkTS to offer them to the gallery.
+static CAPTURES_TO_SAVE: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+
+pub(crate) fn queue_capture_to_save(path: String) {
+    if let Ok(mut q) = CAPTURES_TO_SAVE.lock() {
+        q.push_back(path);
+    }
+}
+
+/// ArkTS pulls the next capture to save: "path|extension|image-or-video".
+#[napi]
+pub fn take_capture_to_save() -> napi_ohos::Result<String> {
+    let path = CAPTURES_TO_SAVE.lock().ok().and_then(|mut q| q.pop_front()).unwrap_or_default();
+    if path.is_empty() {
+        return Ok(String::new());
+    }
+    let ext = std::path::Path::new(&path).extension().and_then(|e| e.to_str()).unwrap_or("jpg").to_lowercase();
+    let kind = if matches!(ext.as_str(), "mp4" | "mov" | "3gp") { "video" } else { "image" };
+    Ok(format!("{path}|{ext}|{kind}"))
+}
+
+#[napi]
+pub fn handle_capture_saved(path: String, ok: bool, uri: String) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::CaptureSaved { path, ok, uri });
+    Ok(())
+}
+
+#[napi]
+pub fn handle_avoid_area(top: f64, right: f64, bottom: f64, left: f64) -> napi_ohos::Result<()> {
+    send_from_ohos_message(FromOhosMessage::AvoidArea {
+        top,
+        right,
+        bottom,
+        left,
+    });
+    Ok(())
+}
+
+#[napi]
 pub fn handle_keyboard_status(is_open: bool, keyboard_height: i32) -> napi_ohos::Result<()> {
     send_from_ohos_message(FromOhosMessage::ResizeTextIME(is_open, keyboard_height));
     Ok(())
@@ -270,5 +318,25 @@ pub enum FromOhosMessage {
     TextInput(TextInputEvent),
     DeleteLeft(i32),
     ResizeTextIME(bool, i32),
+    /// ArkTS answered a `request*Permission` call: `permission` is the short
+    /// name the glue uses ("camera", "microphone", "location").
+    PermissionResult {
+        permission: String,
+        granted: bool,
+        can_retry: bool,
+    },
+    /// The gallery took (or refused) a capture file.
+    CaptureSaved {
+        path: String,
+        ok: bool,
+        uri: String,
+    },
+    /// The system bars' avoid areas in physical pixels (edge-to-edge window).
+    AvoidArea {
+        top: f64,
+        right: f64,
+        bottom: f64,
+        left: f64,
+    },
 }
 //TODO DIP

@@ -18,6 +18,7 @@ struct Index {
           .onLoad((xComponentContext) => {
             this.xComponentContext = xComponentContext as MakepadXComponentInterface;
             ArkGlue.getInstance().xComponentContext = this.xComponentContext;
+            ArkGlue.getInstance().pushAvoidArea();
             //this.xComponentContext.initMakepad(ArkGlue.getInstance());
           })
       }

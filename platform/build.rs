@@ -178,7 +178,10 @@ fn main() {
         }
         "linux" => {
             println!("cargo:rustc-cfg=use_gles_3");
-            println!("cargo:rustc-link-lib=xkbcommon");
+            // OpenHarmony's sysroot has no xkbcommon; its keyboard comes through ArkUI.
+            if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos") {
+                println!("cargo:rustc-link-lib=xkbcommon");
+            }
         }
         "android" => {
             println!("cargo:rustc-cfg=use_gles_3");
