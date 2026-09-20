@@ -29,6 +29,21 @@ pub const ACAMERA_SENSOR_ORIENTATION: u32 = 917518;
 pub const ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS: u32 = 851978;
 pub const ACAMERA_CONTROL_AE_TARGET_FPS_RANGE: u32 = 65541;
 pub const ACAMERA_JPEG_QUALITY: u32 = 458756;
+pub const ACAMERA_JPEG_ORIENTATION: u32 = 458755;
+// Controls applied to the repeating request (values from NdkCameraMetadataTags.h).
+pub const ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION: u32 = 65537;
+pub const ACAMERA_CONTROL_AE_MODE: u32 = 65539;
+pub const ACAMERA_CONTROL_AE_REGIONS: u32 = 65540;
+pub const ACAMERA_CONTROL_AE_PRECAPTURE_TRIGGER: u32 = 65542;
+pub const ACAMERA_CONTROL_AF_MODE: u32 = 65543;
+pub const ACAMERA_CONTROL_AF_REGIONS: u32 = 65544;
+pub const ACAMERA_CONTROL_AF_TRIGGER: u32 = 65545;
+pub const ACAMERA_CONTROL_ZOOM_RATIO: u32 = 65583;
+pub const ACAMERA_FLASH_MODE: u32 = 262146;
+pub const ACAMERA_SCALER_CROP_REGION: u32 = 851968;
+pub const ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE: u32 = 983040;
+pub const ACAMERA_CONTROL_AE_COMPENSATION_STEP: u32 = 65572;
+pub const ACAMERA_CONTROL_AE_COMPENSATION_RANGE: u32 = 65571;
 
 pub const ACAMERA_LENS_FACING_FRONT: u8 = 0;
 pub const ACAMERA_LENS_FACING_BACK: u8 = 1;
@@ -307,6 +322,10 @@ extern "C" {
         pixelStride: *mut ::std::os::raw::c_int,
     ) -> media_status_t;
     pub fn AImage_getFormat(image: *const AImage, format: *mut i32) -> media_status_t;
+
+    pub fn AImage_getWidth(image: *const AImage, width: *mut i32) -> media_status_t;
+
+    pub fn AImage_getHeight(image: *const AImage, height: *mut i32) -> media_status_t;
     pub fn AImage_getHardwareBuffer(
         image: *const AImage,
         buffer: *mut *mut AHardwareBuffer,
@@ -422,5 +441,27 @@ extern "C" {
         tag: u32,
         count: u32,
         data: *const u8,
+    ) -> camera_status_t;
+
+    pub fn ACaptureRequest_setEntry_i32(
+        request: *mut ACaptureRequest,
+        tag: u32,
+        count: u32,
+        data: *const i32,
+    ) -> camera_status_t;
+
+    pub fn ACaptureRequest_setEntry_float(
+        request: *mut ACaptureRequest,
+        tag: u32,
+        count: u32,
+        data: *const f32,
+    ) -> camera_status_t;
+
+    pub fn ACameraCaptureSession_capture(
+        session: *mut ACameraCaptureSession,
+        callbacks: *mut ACameraCaptureSession_captureCallbacks,
+        numRequests: ::std::os::raw::c_int,
+        requests: *mut *mut ACaptureRequest,
+        captureSequenceId: *mut ::std::os::raw::c_int,
     ) -> camera_status_t;
 }
