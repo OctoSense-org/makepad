@@ -80,6 +80,10 @@ pub trait CxMediaApi {
 
     /// Adjust an open camera (focus point, zoom, exposure bias, flash).
     /// Backends without camera control keep the default no-op.
+    /// Ask the backend to publish `Event::VideoInputs` again. A module that
+    /// mounts after the first enumeration would otherwise never see the list.
+    fn refresh_video_inputs(&mut self) {}
+
     fn camera_control(&mut self, _input_id: VideoInputId, _control: CameraControl) {}
 
     /// Take a photo or record video on an open camera; results come back as

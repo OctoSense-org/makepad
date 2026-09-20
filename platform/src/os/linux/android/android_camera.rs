@@ -1015,9 +1015,9 @@ impl AndroidCameraAccess {
         preview_window: Option<*mut ANativeWindow>,
     ) {
         let Some(stream) = self.key_for(input_id, format_id) else {
+            crate::log!("camera: no stream for this input and format; the preview stays empty");
             return;
         };
-
         if let Some(old) = self.preview_subscriptions.remove(&video_id) {
             if !old.preview_window.is_null() {
                 unsafe { ANativeWindow_release(old.preview_window) };
