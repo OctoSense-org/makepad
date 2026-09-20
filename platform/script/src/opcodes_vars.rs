@@ -36,11 +36,11 @@ impl<'a> ScriptVm<'a> {
         };
         let proto = if let ScriptMe::Object(object) = me {
             let object = *object;
-            let value = self.bx.heap.proto_field_from_value(
-                object,
-                field,
-                self.bx.threads.cur().trap.pass(),
-            );
+            // A probe: a miss falls back to the type-check default below, so
+            // it must not reach the trap, whose error formatting builds a
+            // `suggest_property` Levenshtein list over the whole type (seen
+            // costing ~25 ms on a hosted AppCard's first open on a phone).
+            let value = self.bx.heap.proto_field_from_value(object, field, ScriptTrap::NoTrap);
             if value.is_nil() || value.is_err() {
                 self.bx.threads.cur().trap.err_take();
                 if let Some(field_id) = field.as_id() {
@@ -403,10 +403,9 @@ impl<'a> ScriptVm<'a> {
         let field = self.bx.threads.cur().pop_stack_value();
         let object = self.bx.threads.cur().pop_stack_resolved(&self.bx.heap);
         if let Some(obj) = object.as_object() {
-            let value =
-                self.bx
-                    .heap
-                    .proto_field_from_value(obj, field, self.bx.threads.cur().trap.pass());
+            // A probe, as in `handle_proto_inherit_read`: the real error (and
+            // its suggestions) comes from the type-check fallback.
+            let value = self.bx.heap.proto_field_from_value(obj, field, ScriptTrap::NoTrap);
             if value.is_nil() || value.is_err() {
                 self.bx.threads.cur().trap.err_take();
                 if let Some(field_id) = field.as_id() {

@@ -176,10 +176,27 @@ pub fn source(cx: &mut Cx, style: DesktopStyle, name: &str) -> Arc<str> {
 struct CachedIcon {
     source: Arc<str>,
     draw: DrawSvg,
+    used: u64,
+}
+/// Tessellated geometry is kept per device-size bucket. `DrawSvg` bakes its
+/// anti-aliasing fringe for one scale and re-tessellates (on the UI thread)
+/// whenever the scale moves by more than 5 %, so one cache entry per identity
+/// thrashed as soon as the same icon was drawn at two sizes in a frame — a
+/// launcher cell and a dock slot, a placeholder, a switcher badge — and every
+/// frame re-ran the SVG tessellator for it. Buckets are 4 % apart, inside that
+/// tolerance, so a size seen once stays tessellated.
+const SIZE_BUCKET_STEP: f64 = 1.04;
+/// Entries kept before the least recently drawn are dropped (an animated size
+/// walks through buckets; the live set is a few per identity).
+const MAX_CACHED_ICONS: usize = 256;
+fn size_bucket(rect: Rect, dpi: f64) -> i32 {
+    let device = (rect.size.x.min(rect.size.y) * dpi).max(1.0);
+    (device.ln() / SIZE_BUCKET_STEP.ln()).round() as i32
 }
 #[derive(Default)]
 pub struct AppIconDraw {
-    icons: HashMap<(usize, String), CachedIcon>,
+    icons: HashMap<(usize, String, i32), CachedIcon>,
+    clock: u64,
 }
 impl AppIconDraw {
     /// Shared by widgets, window chrome, launchers and the compositor's shelves.
@@ -208,11 +225,19 @@ impl AppIconDraw {
     ) {
         let name = canonical_name(name);
         let source = source(cx, style, name);
-        let key = (style as usize, name.into());
+        let key = (style as usize, name.into(), size_bucket(rect, cx.current_dpi_factor()));
+        self.clock += 1;
+        if !self.icons.contains_key(&key) && self.icons.len() >= MAX_CACHED_ICONS {
+            if let Some(oldest) = self.icons.iter().min_by_key(|(_, icon)| icon.used).map(|(k, _)| k.clone()) {
+                self.icons.remove(&oldest);
+            }
+        }
         let cached = self.icons.entry(key).or_insert_with(|| CachedIcon {
             source: Arc::from(""),
             draw: cx.with_vm(|vm| DrawSvg::script_new_with_default(vm)),
+            used: 0,
         });
+        cached.used = self.clock;
         if !Arc::ptr_eq(&cached.source, &source) {
             cached.draw.load_from_str(&source);
             // Icon canvases include intentional optical padding. Keep that

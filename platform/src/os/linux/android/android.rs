@@ -170,6 +170,70 @@ pub fn set_current_thread_priority(priority: crate::CxThreadPriority) {
     }
 }
 
+/// The CPUs of the fastest cluster(s): every core whose maximum frequency is
+/// within 75 % of the fastest core's. `None` on a homogeneous SoC or when
+/// sysfs is unreadable. Read once.
+fn fast_cpu_mask() -> Option<u64> {
+    static MASK: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MASK.get_or_init(|| {
+        let freqs: Vec<(usize, u64)> = (0..64)
+            .filter_map(|cpu| {
+                std::fs::read_to_string(format!(
+                    "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
+                ))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|f| (cpu, f))
+            })
+            .collect();
+        let top = freqs.iter().map(|(_, f)| *f).max()?;
+        let mask = freqs
+            .iter()
+            .filter(|(_, f)| f * 4 >= top * 3)
+            .fold(0u64, |m, (cpu, _)| m | (1 << cpu));
+        (mask != 0 && (mask.count_ones() as usize) < freqs.len()).then_some(mask)
+    })
+}
+
+/// The render thread — events, layout, the GL encode and the swap all run
+/// here — at the priority HWUI's RenderThread gets (nice -10), and on the
+/// fastest cluster. Profiled on a Snapdragon 845 (OnePlus 6T), this thread ran
+/// nice 0 and spent 28 % of its animation time on the little cores, and most
+/// of its big-core time at 1.0-1.4 GHz: `schedutil` ramps from the idle frames
+/// between gestures, so the first frames of every transition ran slow. Called
+/// at startup and whenever a surface is created, because a cpuset move (the app
+/// going to the background) resets the affinity. Failures are logged once and
+/// otherwise ignored.
+pub(crate) fn boost_render_thread() {
+    use core::ffi::{c_int, c_uint};
+    const PRIO_PROCESS: c_int = 0;
+    const DISPLAY_NICE: c_int = -10;
+    unsafe extern "C" {
+        fn gettid() -> c_int;
+        fn setpriority(which: c_int, who: c_uint, prio: c_int) -> c_int;
+        fn sched_setaffinity(pid: c_int, cpusetsize: usize, mask: *const u64) -> c_int;
+    }
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let tid = unsafe { gettid() };
+    if tid <= 0 {
+        return;
+    }
+    let nice = unsafe { setpriority(PRIO_PROCESS, tid as c_uint, DISPLAY_NICE) } == 0;
+    let mask = fast_cpu_mask();
+    let affinity = mask.map(|mask| unsafe {
+        sched_setaffinity(tid, std::mem::size_of::<u64>(), &mask) == 0
+    });
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::log!(
+            "android render thread: nice {} ({}), fast cpus {:?} (affinity {:?})",
+            DISPLAY_NICE,
+            if nice { "set" } else { "refused" },
+            mask.map(|m| format!("{m:#x}")),
+            affinity
+        );
+    }
+}
+
 impl Cx {
     pub(crate) fn current_android_xr_options(&self) -> CxOpenXrOptions {
         CxOpenXrOptions {
@@ -304,6 +368,9 @@ impl Cx {
         self.display_context.safe_area_insets = insets;
         self.update_safe_inset_script_values(insets);
         self.call_event_handler(&Event::Startup);
+        // After Startup: `warm_task_pool` sets this thread `UserInteractive`,
+        // which is nice 0 on Linux, and would undo an earlier boost.
+        boost_render_thread();
         self.redraw_all();
 
         self.start_network_live_file_watcher();
@@ -318,13 +385,25 @@ impl Cx {
             // Wait for the next message, blocking until one is received.
             // This ensures we're in sync with the Android Choreographer when we receive a RenderLoop message.
             match from_java_rx.recv() {
-                Ok(FromJavaMessage::RenderLoop) => {
+                Ok(first @ (FromJavaMessage::RenderLoop | FromJavaMessage::Wake)) => {
+                    // Only the Choreographer's beat paints. A wake from another
+                    // thread dispatches its signal/timers now and leaves the
+                    // frame to the next vsync (see `FromJavaMessage::Wake`).
+                    let mut vsync = matches!(first, FromJavaMessage::RenderLoop);
                     // Drain all pending messages, coalescing consecutive touch-move
                     // events to avoid redundant event dispatch before painting.
                     // Start/Stop events are never dropped — only pure-Move events
                     // are replaced by the next one.
                     let mut pending_touch_move: Option<FromJavaMessage> = None;
                     while let Ok(msg) = from_java_rx.try_recv() {
+                        match msg {
+                            FromJavaMessage::RenderLoop => {
+                                vsync = true;
+                                continue;
+                            }
+                            FromJavaMessage::Wake => continue,
+                            _ => {}
+                        }
                         if let FromJavaMessage::Touch(ref touches) = msg {
                             if touches
                                 .iter()
@@ -364,6 +443,10 @@ impl Cx {
                     // is documented in `run_live_edit_if_needed`.
                     if self.pending_script_reapply || self.pending_live_edit_request {
                         self.run_live_edit_if_needed("android");
+                    }
+                    if !vsync {
+                        // A wake: whatever it dispatched paints on the next beat.
+                        continue;
                     }
                     // Drop the frame entirely if the window surface has been
                     // torn down (typically during background/foreground or a
@@ -508,7 +591,7 @@ impl Cx {
                     }
                 }
             }
-            FromJavaMessage::RenderLoop => {
+            FromJavaMessage::RenderLoop | FromJavaMessage::Wake => {
                 // This should not happen here, as it's handled in the main loop
             }
             FromJavaMessage::BackPressed => {
@@ -554,6 +637,8 @@ impl Cx {
                     if self.os.surface_alive {
                         self.request_android_surface_redraw();
                     }
+                    // Back in the foreground: the cpuset move reset affinity.
+                    boost_render_thread();
                 }
             }
             FromJavaMessage::SurfaceDestroyed { ack } => {
@@ -2254,6 +2339,7 @@ impl Cx {
             // drawable-surface state for the first frame. Do it explicitly here.
             cx.sync_android_surface_alive_from_backend();
 
+            boost_render_thread();
             cx.main_loop(from_java_rx);
             cx.stop_studio_websocket();
 
