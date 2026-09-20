@@ -303,21 +303,18 @@ mod skipped_draws {
     pub const FREED_LIST: usize = 0;
     pub const SHADER_FAILED: usize = 1;
     pub const SHADER_NOT_READY: usize = 2;
-    pub const RESERVATION_REFUSED: usize = 3;
-    pub const NO_GEOMETRY: usize = 4;
-    pub const STALE_GEOMETRY: usize = 5;
-    pub const LAYOUT_MISMATCH: usize = 6;
-    const NAMES: [&str; 7] = [
+    pub const NO_GEOMETRY: usize = 3;
+    pub const STALE_GEOMETRY: usize = 4;
+    pub const LAYOUT_MISMATCH: usize = 5;
+    const NAMES: [&str; 6] = [
         "freed_list",
         "shader_failed",
         "shader_not_ready",
-        "reservation_refused",
         "no_geometry",
         "stale_geometry",
         "layout_mismatch",
     ];
-    static COUNTS: [AtomicU32; 7] = [
-        AtomicU32::new(0),
+    static COUNTS: [AtomicU32; 6] = [
         AtomicU32::new(0),
         AtomicU32::new(0),
         AtomicU32::new(0),
@@ -666,13 +663,15 @@ impl Cx {
                         } else {
                             bytes
                         };
-                        let Some(charge) = upload_budget.allocations.reserve(capacity) else {
-                            draw_item.instance_upload_pending = true;
-                            self.demo_time_repaint = true;
-                            skipped_draws::count(skipped_draws::RESERVATION_REFUSED);
-                            continue;
-                        };
-                        Some(charge)
+                        // The backing of a draw item that is being drawn is
+                        // charged whatever the limit says, as the Metal backend
+                        // charges it. A refused reservation was a hole in the
+                        // frame, and the repaint it asked for met the same
+                        // refusal: over the limit, the screen flashed between
+                        // empty and half-drawn frames for as long as it stayed
+                        // there. Bringing the total back under the limit is the
+                        // producers' policy, not this loop's.
+                        Some(upload_budget.allocations.reserve_visible(capacity))
                     } else {
                         None
                     };
