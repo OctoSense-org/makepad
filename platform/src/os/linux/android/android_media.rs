@@ -314,6 +314,14 @@ impl CxMediaApi for Cx {
         )
     }
 
+    fn camera_control(&mut self, input_id: VideoInputId, control: CameraControl) {
+        self.os.media.android_camera().lock().unwrap().control(input_id, control);
+    }
+
+    fn camera_capture(&mut self, input_id: VideoInputId, request: CameraCaptureRequest) {
+        self.os.media.android_camera().lock().unwrap().capture(input_id, request);
+    }
+
     fn refresh_video_inputs(&mut self) {
         self.os.media.android_camera_change.set();
     }

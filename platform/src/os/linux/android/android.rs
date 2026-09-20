@@ -1858,6 +1858,11 @@ impl Cx {
             self.call_event_handler(&e);
         }
 
+        // Stills finished on a camera thread.
+        for (input_id, result) in super::android_camera::take_capture_results() {
+            self.action(crate::video::CameraCaptureEvent { input_id, result });
+        }
+
         // Camera player updates
         self.poll_camera_players();
 

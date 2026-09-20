@@ -22,6 +22,11 @@ pub struct AndroidCameraDevice {
     desc: VideoInputDesc,
     sensor_orientation_degrees: i32,
     front_facing: bool,
+    /// left, top, right, bottom of the sensor's active pixels: zoom crops and
+    /// focus regions are expressed in this rectangle.
+    active_array: [i32; 4],
+    /// The largest JPEG the device offers, used for stills.
+    still_size: Option<(i32, i32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -87,6 +92,7 @@ struct PreviewSubscription {
 struct CameraStreamNode {
     camera_id_str: CString,
     format: VideoFormat,
+    controls: CameraControlState,
     dispatch: Arc<Mutex<StreamDispatch>>,
     session: Option<AndroidCaptureSession>,
     preview_window: *mut ANativeWindow,
@@ -106,6 +112,47 @@ pub struct AndroidCaptureSession {
     image_reader: *mut AImageReader,
     capture_request: *mut ACaptureRequest,
     capture_context: *mut AndroidCaptureContext,
+    still_reader: *mut AImageReader,
+    still_window: *mut ANativeWindow,
+    still_output: *mut ACaptureSessionOutput,
+    still_target: *mut ACameraOutputTarget,
+    still_context: *mut AndroidStillContext,
+}
+
+/// What a still capture needs once its JPEG arrives: where to write it and
+/// which input to report it against.
+pub struct AndroidStillContext {
+    input_id: VideoInputId,
+    pending: Mutex<Option<String>>,
+    alive: Arc<AtomicBool>,
+}
+
+/// Controls applied to the repeating request of one camera.
+#[derive(Clone, Copy, Debug)]
+pub struct CameraControlState {
+    pub zoom: f32,
+    pub exposure_bias: f32,
+    pub flash: CameraFlashMode,
+    pub focus: Option<(f64, f64)>,
+}
+
+impl Default for CameraControlState {
+    fn default() -> Self {
+        Self { zoom: 1.0, exposure_bias: 0.0, flash: CameraFlashMode::Off, focus: None }
+    }
+}
+
+/// Stills and recordings finished on a camera thread, waiting for the UI thread.
+static CAPTURE_RESULTS: Mutex<Vec<(VideoInputId, CameraCaptureResult)>> = Mutex::new(Vec::new());
+
+pub fn take_capture_results() -> Vec<(VideoInputId, CameraCaptureResult)> {
+    std::mem::take(&mut *CAPTURE_RESULTS.lock().unwrap())
+}
+
+fn push_capture_result(input_id: VideoInputId, result: CameraCaptureResult) {
+    CAPTURE_RESULTS.lock().unwrap().push((input_id, result));
+    // The event loop blocks on Java messages; wake it so the action goes out.
+    super::android_jni::send_from_java_message(super::android_jni::FromJavaMessage::Wake);
 }
 
 pub struct AndroidCaptureContext {
@@ -128,6 +175,58 @@ impl AndroidCaptureSession {
         error: c_int,
     ) {
         crate::warning!("Android camera: device error {}", error);
+    }
+
+    /// A still arrived: write it to the path the request carried and report it.
+    unsafe extern "C" fn still_on_image_available(context: *mut c_void, reader: *mut AImageReader) {
+        let context = &*(context as *mut AndroidStillContext);
+        let mut image = std::ptr::null_mut();
+        if AImageReader_acquireNextImage(reader, &mut image) != 0 || image.is_null() {
+            return;
+        }
+        let path = context.pending.lock().unwrap().take();
+        if !context.alive.load(Ordering::Relaxed) || path.is_none() {
+            AImage_delete(image);
+            return;
+        }
+        let path = path.unwrap();
+        let mut data = std::ptr::null_mut();
+        let mut len = 0i32;
+        let ok = AImage_getPlaneData(image, 0, &mut data, &mut len) == 0 && !data.is_null() && len > 0;
+        let (mut width, mut height) = (0i32, 0i32);
+        AImage_getWidth(image, &mut width);
+        AImage_getHeight(image, &mut height);
+        let written = if ok {
+            let bytes = std::slice::from_raw_parts(data, len as usize);
+            // The caller names a file, not a folder: make the folder it asked for.
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&path, bytes) {
+                Ok(()) => true,
+                Err(error) => {
+                    crate::warning!("Android camera: writing {path} failed: {error}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        AImage_delete(image);
+        if written {
+            push_capture_result(
+                context.input_id,
+                CameraCaptureResult::Photo { path, width: width.max(0) as u32, height: height.max(0) as u32 },
+            );
+        } else {
+            push_capture_result(
+                context.input_id,
+                CameraCaptureResult::Failed {
+                    what: "photo".to_string(),
+                    error: "the still could not be written".to_string(),
+                },
+            );
+        }
     }
 
     unsafe extern "C" fn image_on_image_available(context: *mut c_void, reader: *mut AImageReader) {
@@ -462,6 +561,7 @@ impl AndroidCaptureSession {
         format: VideoFormat,
         preview_window: Option<*mut ANativeWindow>,
         needs_image_reader: bool,
+        still: Option<(VideoInputId, i32, i32)>,
     ) -> Option<Self> {
         let reader_mode = {
             let guard = dispatch.lock().unwrap();
@@ -592,8 +692,47 @@ impl AndroidCaptureSession {
             let _ = ACaptureSessionOutput_create(image_window, &mut image_output);
         }
 
+        // A still needs its own JPEG stream, declared before the session is
+        // configured: Android fixes the output set at that point.
+        let mut still_reader = std::ptr::null_mut();
+        let mut still_window = std::ptr::null_mut();
+        let mut still_output = std::ptr::null_mut();
+        let mut still_target = std::ptr::null_mut();
+        let mut still_context = std::ptr::null_mut();
+        if let Some((input_id, still_width, still_height)) = still {
+            if AImageReader_new(
+                still_width,
+                still_height,
+                AIMAGE_FORMAT_JPEG,
+                2,
+                &mut still_reader,
+            ) == 0
+                && !still_reader.is_null()
+            {
+                still_context = Box::into_raw(Box::new(AndroidStillContext {
+                    input_id,
+                    pending: Mutex::new(None),
+                    alive: Arc::new(AtomicBool::new(true)),
+                }));
+                let mut still_listener = AImageReader_ImageListener {
+                    context: still_context as *mut _,
+                    onImageAvailable: Some(Self::still_on_image_available),
+                };
+                AImageReader_setImageListener(still_reader, &mut still_listener);
+                AImageReader_getWindow(still_reader, &mut still_window);
+                ANativeWindow_acquire(still_window);
+                let _ = ACameraOutputTarget_create(still_window, &mut still_target);
+                let _ = ACaptureSessionOutput_create(still_window, &mut still_output);
+            } else {
+                crate::warning!("Android camera: no still stream at {still_width}x{still_height}");
+            }
+        }
+
         let mut output_container = std::ptr::null_mut();
         ACaptureSessionOutputContainer_create(&mut output_container);
+        if !still_output.is_null() {
+            ACaptureSessionOutputContainer_add(output_container, still_output);
+        }
 
         if !image_output.is_null() {
             ACaptureSessionOutputContainer_add(output_container, image_output);
@@ -671,13 +810,198 @@ impl AndroidCaptureSession {
             output_container,
             camera_device,
             capture_context,
+            still_reader,
+            still_window,
+            still_output,
+            still_target,
+            still_context,
         })
+    }
+
+    /// Apply the person's controls to the repeating request. `rotation` is the
+    /// quarter turns the preview is displayed with, so a tap maps to the sensor.
+    unsafe fn apply_controls(&self, state: &CameraControlState, active_array: [i32; 4], rotation: i32) {
+        if self.capture_request.is_null() || self.capture_session.is_null() {
+            return;
+        }
+        let (left, top, right, bottom) = (active_array[0], active_array[1], active_array[2], active_array[3]);
+        let (full_w, full_h) = ((right - left).max(1), (bottom - top).max(1));
+
+        // Zoom: crop the active array around its centre. CONTROL_ZOOM_RATIO is
+        // Android 11 and newer and many older HALs ignore it, the crop does not.
+        let zoom = state.zoom.max(1.0);
+        let crop_w = (full_w as f32 / zoom).round() as i32;
+        let crop_h = (full_h as f32 / zoom).round() as i32;
+        let crop = [
+            left + (full_w - crop_w) / 2,
+            top + (full_h - crop_h) / 2,
+            crop_w.max(1),
+            crop_h.max(1),
+        ];
+        ACaptureRequest_setEntry_i32(self.capture_request, ACAMERA_SCALER_CROP_REGION, 4, crop.as_ptr());
+        let zoom_ratio = zoom;
+        ACaptureRequest_setEntry_float(self.capture_request, ACAMERA_CONTROL_ZOOM_RATIO, 1, &zoom_ratio);
+
+        // Exposure compensation, in the device's own steps (usually 1/6 EV).
+        let steps = (state.exposure_bias / 0.1667).round() as i32;
+        ACaptureRequest_setEntry_i32(self.capture_request, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &steps);
+
+        // Flash. Torch stays on; auto and on are decided per capture by AE.
+        let (ae_mode, flash_mode): (u8, u8) = match state.flash {
+            CameraFlashMode::Off => (1, 0),
+            CameraFlashMode::On => (3, 0),
+            CameraFlashMode::Auto => (2, 0),
+            CameraFlashMode::Torch => (1, 2),
+        };
+        ACaptureRequest_setEntry_u8(self.capture_request, ACAMERA_CONTROL_AE_MODE, 1, &ae_mode);
+        ACaptureRequest_setEntry_u8(self.capture_request, ACAMERA_FLASH_MODE, 1, &flash_mode);
+
+        match state.focus {
+            Some((x, y)) => {
+                // The point comes from the preview as displayed; undo its turn.
+                let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+                let (sx, sy) = match rotation.rem_euclid(4) {
+                    1 => (y, 1.0 - x),
+                    2 => (1.0 - x, 1.0 - y),
+                    3 => (1.0 - y, x),
+                    _ => (x, y),
+                };
+                let cx = left + (sx * full_w as f64) as i32;
+                let cy = top + (sy * full_h as f64) as i32;
+                let half_w = (full_w / 10).max(1);
+                let half_h = (full_h / 10).max(1);
+                let region = [
+                    (cx - half_w).max(left),
+                    (cy - half_h).max(top),
+                    (cx + half_w).min(right),
+                    (cy + half_h).min(bottom),
+                    1000,
+                ];
+                ACaptureRequest_setEntry_i32(self.capture_request, ACAMERA_CONTROL_AF_REGIONS, 5, region.as_ptr());
+                ACaptureRequest_setEntry_i32(self.capture_request, ACAMERA_CONTROL_AE_REGIONS, 5, region.as_ptr());
+                let af_mode: u8 = 1; // AUTO
+                ACaptureRequest_setEntry_u8(self.capture_request, ACAMERA_CONTROL_AF_MODE, 1, &af_mode);
+                let trigger: u8 = 1; // START
+                ACaptureRequest_setEntry_u8(self.capture_request, ACAMERA_CONTROL_AF_TRIGGER, 1, &trigger);
+            }
+            None => {
+                let af_mode: u8 = 4; // CONTINUOUS_PICTURE
+                ACaptureRequest_setEntry_u8(self.capture_request, ACAMERA_CONTROL_AF_MODE, 1, &af_mode);
+                let trigger: u8 = 0; // IDLE
+                ACaptureRequest_setEntry_u8(self.capture_request, ACAMERA_CONTROL_AF_TRIGGER, 1, &trigger);
+            }
+        }
+
+        let mut request = self.capture_request;
+        let mut callbacks = Self::capture_callbacks(self.capture_context);
+        let status = ACameraCaptureSession_setRepeatingRequest(
+            self.capture_session,
+            &mut callbacks,
+            1,
+            &mut request,
+            std::ptr::null_mut(),
+        );
+        if status != 0 {
+            crate::warning!("Android camera: applying controls failed with {status}");
+        }
+    }
+
+    unsafe fn capture_callbacks(context: *mut AndroidCaptureContext) -> ACameraCaptureSession_captureCallbacks {
+        ACameraCaptureSession_captureCallbacks {
+            context: context as *mut _,
+            onCaptureStarted: Some(Self::capture_on_started),
+            onCaptureProgressed: Some(Self::capture_on_progressed),
+            onCaptureCompleted: Some(Self::capture_on_completed),
+            onCaptureFailed: Some(Self::capture_on_failed),
+            onCaptureSequenceCompleted: Some(Self::capture_on_sequence_completed),
+            onCaptureSequenceAborted: Some(Self::capture_on_sequence_aborted),
+            onCaptureBufferLost: Some(Self::capture_on_buffer_lost),
+        }
+    }
+
+    /// Take one still into `path`. `jpeg_orientation` is the sensor's own angle,
+    /// which is what the JPEG's orientation tag expects.
+    unsafe fn capture_still(
+        &self,
+        path: &str,
+        jpeg_orientation: i32,
+        state: &CameraControlState,
+        active_array: [i32; 4],
+    ) -> Result<(), String> {
+        if self.still_target.is_null() || self.still_context.is_null() {
+            return Err("this camera has no still stream".to_string());
+        }
+        *(*self.still_context).pending.lock().unwrap() = Some(path.to_string());
+
+        let mut request = std::ptr::null_mut();
+        let status = ACameraDevice_createCaptureRequest(self.camera_device, TEMPLATE_STILL_CAPTURE, &mut request);
+        if status != 0 || request.is_null() {
+            return Err(format!("the still request could not be built ({status})"));
+        }
+        ACaptureRequest_addTarget(request, self.still_target);
+
+        let quality: u8 = 95;
+        ACaptureRequest_setEntry_u8(request, ACAMERA_JPEG_QUALITY, 1, &quality);
+        ACaptureRequest_setEntry_i32(request, ACAMERA_JPEG_ORIENTATION, 1, &jpeg_orientation);
+
+        // Carry the live controls into the still: zoom crop and flash mainly.
+        let (left, top, right, bottom) = (active_array[0], active_array[1], active_array[2], active_array[3]);
+        let (full_w, full_h) = ((right - left).max(1), (bottom - top).max(1));
+        let zoom = state.zoom.max(1.0);
+        let crop_w = (full_w as f32 / zoom).round() as i32;
+        let crop_h = (full_h as f32 / zoom).round() as i32;
+        let crop = [left + (full_w - crop_w) / 2, top + (full_h - crop_h) / 2, crop_w.max(1), crop_h.max(1)];
+        ACaptureRequest_setEntry_i32(request, ACAMERA_SCALER_CROP_REGION, 4, crop.as_ptr());
+        let (ae_mode, flash_mode): (u8, u8) = match state.flash {
+            CameraFlashMode::Off => (1, 0),
+            CameraFlashMode::On => (3, 0),
+            CameraFlashMode::Auto => (2, 0),
+            CameraFlashMode::Torch => (1, 2),
+        };
+        ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_AE_MODE, 1, &ae_mode);
+        ACaptureRequest_setEntry_u8(request, ACAMERA_FLASH_MODE, 1, &flash_mode);
+
+        let mut callbacks = Self::capture_callbacks(self.capture_context);
+        let mut requests = request;
+        let status = ACameraCaptureSession_capture(
+            self.capture_session,
+            &mut callbacks,
+            1,
+            &mut requests,
+            std::ptr::null_mut(),
+        );
+        ACaptureRequest_free(request);
+        if status != 0 {
+            *(*self.still_context).pending.lock().unwrap() = None;
+            return Err(format!("the camera refused the still ({status})"));
+        }
+        Ok(())
     }
 
     unsafe fn stop(self) {
         (*self.capture_context)
             .alive
             .store(false, Ordering::Relaxed);
+        if !self.still_context.is_null() {
+            (*self.still_context).alive.store(false, Ordering::Relaxed);
+        }
+        if !self.still_reader.is_null() {
+            let mut none = AImageReader_ImageListener { context: std::ptr::null_mut(), onImageAvailable: None };
+            AImageReader_setImageListener(self.still_reader, &mut none);
+            AImageReader_delete(self.still_reader);
+        }
+        if !self.still_target.is_null() {
+            ACameraOutputTarget_free(self.still_target);
+        }
+        if !self.still_output.is_null() {
+            ACaptureSessionOutput_free(self.still_output);
+        }
+        if !self.still_window.is_null() {
+            ANativeWindow_release(self.still_window);
+        }
+        if !self.still_context.is_null() {
+            let _ = Box::from_raw(self.still_context);
+        }
 
         if !self.image_reader.is_null() {
             let mut image_listener = AImageReader_ImageListener {
@@ -920,6 +1244,11 @@ impl AndroidCameraAccess {
             return;
         }
 
+        let still = self
+            .devices
+            .iter()
+            .find(|device| device.desc.input_id == key.input_id)
+            .and_then(|device| device.still_size.map(|(w, h)| (key.input_id, w, h)));
         node.session = unsafe {
             AndroidCaptureSession::start(
                 node.dispatch.clone(),
@@ -932,8 +1261,91 @@ impl AndroidCameraAccess {
                     Some(desired_preview_window)
                 },
                 needs_image_reader,
+                still,
             )
         };
+        if let Some(session) = node.session.as_ref() {
+            let (active_array, rotation) = self
+                .devices
+                .iter()
+                .find(|device| device.desc.input_id == key.input_id)
+                .map(|device| {
+                    (
+                        device.active_array,
+                        ((360 - device.sensor_orientation_degrees).rem_euclid(360) / 90) % 4,
+                    )
+                })
+                .unwrap_or(([0, 0, 0, 0], 0));
+            unsafe { session.apply_controls(&node.controls, active_array, rotation) };
+        }
+    }
+
+    /// Apply a control to the stream serving this input.
+    pub fn control(&mut self, input_id: VideoInputId, control: CameraControl) {
+        let Some(key) = self
+            .streams
+            .keys()
+            .copied()
+            .find(|key| key.input_id == input_id)
+        else {
+            return;
+        };
+        let Some(device) = self.devices.iter().find(|d| d.desc.input_id == input_id) else { return };
+        let active_array = device.active_array;
+        let rotation = ((360 - device.sensor_orientation_degrees).rem_euclid(360) / 90) % 4;
+        let Some(node) = self.streams.get_mut(&key) else { return };
+        match control {
+            CameraControl::FocusPoint { x, y } => node.controls.focus = Some((x, y)),
+            CameraControl::ContinuousFocus => node.controls.focus = None,
+            CameraControl::ZoomRatio(zoom) => node.controls.zoom = zoom.max(1.0),
+            CameraControl::ExposureBias(ev) => node.controls.exposure_bias = ev,
+            CameraControl::Flash(mode) => node.controls.flash = mode,
+        }
+        let controls = node.controls;
+        if let Some(session) = node.session.as_ref() {
+            unsafe { session.apply_controls(&controls, active_array, rotation) };
+        }
+    }
+
+    /// Take a still, or report that recording is not implemented here yet.
+    pub fn capture(&mut self, input_id: VideoInputId, request: CameraCaptureRequest) {
+        let Some(key) = self.streams.keys().copied().find(|key| key.input_id == input_id) else {
+            push_capture_result(input_id, CameraCaptureResult::Failed {
+                what: "capture".to_string(),
+                error: "this camera is not open".to_string(),
+            });
+            return;
+        };
+        let Some(device) = self.devices.iter().find(|d| d.desc.input_id == input_id) else { return };
+        let active_array = device.active_array;
+        let jpeg_orientation = device.sensor_orientation_degrees.rem_euclid(360);
+        let Some(node) = self.streams.get(&key) else { return };
+        let controls = node.controls;
+        let Some(session) = node.session.as_ref() else {
+            push_capture_result(input_id, CameraCaptureResult::Failed {
+                what: "capture".to_string(),
+                error: "this camera has no running session".to_string(),
+            });
+            return;
+        };
+        match request {
+            CameraCaptureRequest::Photo { path, .. } => {
+                if let Err(error) = unsafe {
+                    session.capture_still(&path, jpeg_orientation, &controls, active_array)
+                } {
+                    push_capture_result(input_id, CameraCaptureResult::Failed { what: "photo".to_string(), error });
+                }
+            }
+            CameraCaptureRequest::StartVideo { .. }
+            | CameraCaptureRequest::PauseVideo
+            | CameraCaptureRequest::ResumeVideo
+            | CameraCaptureRequest::StopVideo => {
+                push_capture_result(input_id, CameraCaptureResult::Failed {
+                    what: "video".to_string(),
+                    error: "recording is not implemented on Android yet".to_string(),
+                });
+            }
+        }
     }
 
     fn reconcile_streams(&mut self) {
@@ -971,6 +1383,7 @@ impl AndroidCameraAccess {
                 CameraStreamNode {
                     camera_id_str,
                     format,
+                    controls: CameraControlState::default(),
                     dispatch: Arc::new(Mutex::new(StreamDispatch::default())),
                     session: None,
                     preview_window: std::ptr::null_mut(),
@@ -1335,12 +1748,28 @@ impl AndroidCameraAccess {
                     sensor_orientation_degrees = *orientation_entry.data.i32_;
                 }
 
+                let mut active_array = [0i32, 0, 0, 0];
+                let mut array_entry = std::mem::zeroed();
+                if ACameraMetadata_getConstEntry(
+                    meta_data,
+                    ACAMERA_SENSOR_INFO_ACTIVE_ARRAY_SIZE,
+                    &mut array_entry,
+                ) == 0
+                    && array_entry.count >= 4
+                    && !array_entry.data.i32_.is_null()
+                {
+                    for k in 0..4 {
+                        active_array[k] = *array_entry.data.i32_.offset(k as isize);
+                    }
+                }
+
                 let mut entry = std::mem::zeroed();
                 ACameraMetadata_getConstEntry(
                     meta_data,
                     ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS,
                     &mut entry,
                 );
+                let mut still_size: Option<(i32, i32)> = None;
                 let mut formats = Vec::new();
                 for j in (0..entry.count as isize).step_by(4) {
                     if (*entry.data.i32_.offset(j + 3)) != 0 {
@@ -1350,6 +1779,11 @@ impl AndroidCameraAccess {
                     let width = *entry.data.i32_.offset(j + 1);
                     let height = *entry.data.i32_.offset(j + 2);
 
+                    if format == AIMAGE_FORMAT_JPEG
+                        && still_size.map_or(true, |(w, h)| (width as i64 * height as i64) > (w as i64 * h as i64))
+                    {
+                        still_size = Some((width, height));
+                    }
                     if format == AIMAGE_FORMAT_YUV_420_888 || format == AIMAGE_FORMAT_JPEG {
                         let format_id =
                             LiveId::from_str(&format!("{} {} {:?}", width, height, format)).into();
@@ -1379,6 +1813,8 @@ impl AndroidCameraAccess {
                         desc,
                         sensor_orientation_degrees,
                         front_facing,
+                        active_array,
+                        still_size,
                     });
                 }
                 ACameraMetadata_free(meta_data);
