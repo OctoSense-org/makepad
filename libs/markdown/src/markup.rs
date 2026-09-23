@@ -152,6 +152,11 @@ impl TokenSink for Sanitizer<'_> {
                                 ("ol", "start") => {
                                     value.parse::<u32>().is_ok_and(|n| n <= 999_999_999)
                                 }
+                                ("table", "widths") => {
+                                    let widths: Vec<_> = value.split(',').collect();
+                                    widths.len() <= 64
+                                        && widths.iter().all(|w| w.parse::<u16>().is_ok_and(|n| n > 0 && n <= 1000))
+                                }
                                 ("td" | "th", "colspan" | "rowspan") => {
                                     value.parse::<u16>().is_ok_and(|n| n > 0 && n <= 1000)
                                 }

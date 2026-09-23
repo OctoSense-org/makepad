@@ -731,6 +731,9 @@ pub struct TextFlow {
     table_cell_layout: Layout,
     #[rust]
     pub table_num_columns: usize,
+    /// Relative widths of the current table's columns; empty for equal columns.
+    #[rust]
+    pub table_column_weights: Vec<f64>,
     /// Horizontal text alignment applied by the layouter within the
     /// currently active table cell. Set by `begin_table_cell`, cleared
     /// by `end_table_cell`. Outside a cell it is always 0.0 (left).
@@ -1720,6 +1723,7 @@ impl TextFlow {
 
     pub fn begin_table(&mut self, cx: &mut Cx2d, num_columns: usize) {
         self.table_num_columns = num_columns;
+        self.table_column_weights.clear();
         self.table_is_first_row = true;
         cx.begin_turtle(self.table_walk, self.table_layout);
     }
@@ -1727,6 +1731,7 @@ impl TextFlow {
     pub fn end_table(&mut self, cx: &mut Cx2d) {
         cx.end_turtle();
         self.table_num_columns = 0;
+        self.table_column_weights.clear();
         self.in_table_header = false;
         if self.selectable {
             self.selection_tracker.push_newline();
@@ -1812,7 +1817,12 @@ impl TextFlow {
     /// 1.0 = right. For wrapped multi-row content, the whole content block is
     /// shifted by the same amount (not aligned per-row).
     pub fn begin_table_cell(&mut self, cx: &mut Cx2d, align_x: f64) {
-        let cell_width = if self.table_num_columns > 0 {
+        let weights = &self.table_column_weights;
+        let column = self.table_row_cell_rects.len();
+        let cell_width = if self.table_num_columns > 0 && weights.len() == self.table_num_columns {
+            let total: f64 = weights.iter().sum();
+            cx.turtle().inner_width() * weights[column.min(weights.len() - 1)] / total
+        } else if self.table_num_columns > 0 {
             cx.turtle().inner_width() / self.table_num_columns as f64
         } else {
             100.0
