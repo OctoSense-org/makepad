@@ -487,6 +487,11 @@ impl Cx {
             crate::thread::UiPhase::DrawList,
             draw_list_id.index() as u32,
         );
+        // A cached parent can outlive a removed child widget. Its old list ID
+        // must not resolve to the next widget allocated in the same pool slot.
+        if self.draw_lists.is_id_freed(draw_list_id) {
+            return;
+        }
         // tad ugly otherwise the borrow checker locks 'self' and we can't recur
         let draw_order_len = self.draw_lists[draw_list_id].draw_item_order_len();
         // Exploded z-layer view: z comes from the call's nesting depth instead
