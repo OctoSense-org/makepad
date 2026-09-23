@@ -367,7 +367,10 @@ impl Widget for MarkdownCell {
             height: Size::fit(),
             ..Default::default()
         };
+        // Content that scales to fit (math, images, diagrams) fits this cell.
+        let outer = crate::CELL_WIDTH.replace(available);
         let _ = self.html.draw_walk(cx, &mut Scope::empty(), inner);
+        crate::CELL_WIDTH.set(outer);
         cx.end_turtle();
         if let Some(tf) = scope.data.get_mut::<TextFlow>() {
             tf.push_widget_text_for_selection(
