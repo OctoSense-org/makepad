@@ -501,6 +501,10 @@ impl Html {
                 tf.new_line_collapsed(cx);
                 let col_count = Self::count_table_columns(node.nodes, node.index);
                 tf.begin_table(cx, col_count);
+                // Relative column widths, as Markdown delimiter rows set them.
+                if let Some(widths) = node.find_attr_lc(live_id!(widths)) {
+                    tf.table_column_weights = widths.split(',').filter_map(|w| w.trim().parse::<f64>().ok()).filter(|w| *w > 0.0).collect();
+                }
                 trim_whitespace_in_text = TrimWhitespaceInText::Trim;
             }
             some_id!(thead) => {

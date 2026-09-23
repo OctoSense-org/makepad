@@ -295,6 +295,18 @@ pub fn render_with_dialect(
             };
         }
     }
+    // Relative column widths from each table's delimiter row (`|---|------|`).
+    // Collected before block separators are inserted; markers go in afterwards,
+    // so a marker never becomes a block of its own.
+    let mut table_widths = Vec::new();
+    for node in root.descendants() {
+        if let NodeValue::Table(table) = &node.data.borrow().value {
+            let line = node.data.borrow().sourcepos.start.line; // 1-based header line
+            if let Some(widths) = source.lines().nth(line).and_then(|row| column_weights(row, table.num_columns)) {
+                table_widths.push((node, widths));
+            }
+        }
+    }
     let mut source_lines = vec![0];
     for child in root.children().collect::<Vec<_>>() {
         if matches!(child.data.borrow().value, NodeValue::FootnoteDefinition(_)) {
@@ -307,8 +319,23 @@ pub fn render_with_dialect(
         })));
         child.insert_before(split);
     }
+    let mut table_markers = Vec::new();
+    for (index, (node, widths)) in table_widths.into_iter().enumerate() {
+        let marker = format!("<!--{prefix}TABLE{index}-->");
+        let mark = arena.alloc(AstNode::from(NodeValue::HtmlBlock(NodeHtmlBlock {
+            block_type: 7,
+            literal: format!("{marker}\n"),
+        })));
+        node.insert_before(mark);
+        table_markers.push((marker, widths));
+    }
     let mut html = String::new();
     comrak::format_html(root, &options, &mut html).expect("String formatting");
+    // The sanitizer keeps a valid `widths` attribute on tables.
+    for (marker, widths) in table_markers {
+        let widths = widths.iter().map(|w| w.to_string()).collect::<Vec<_>>().join(",");
+        html = html.replace(&format!("{marker}\n<table>"), &format!("<table widths=\"{widths}\">"));
+    }
     html.split(&separator)
         .enumerate()
         .filter_map(|(index, part)| {
@@ -350,9 +377,40 @@ pub fn render_with_dialect(
         .collect()
 }
 
+/// Relative column widths from a table's delimiter row, when its columns' dash counts
+/// differ (equal dashes keep the default equal columns). Blockquote markers are skipped.
+fn column_weights(row: &str, columns: usize) -> Option<Vec<u16>> {
+    let row = row.trim_start_matches(|c: char| c == '>' || c.is_whitespace()).trim();
+    let row = row.strip_prefix('|').unwrap_or(row);
+    let row = row.strip_suffix('|').unwrap_or(row);
+    let weights: Vec<u16> = row
+        .split('|')
+        .map(|cell| cell.trim())
+        .map(|cell| {
+            (!cell.is_empty() && cell.chars().all(|c| c == '-' || c == ':'))
+                .then(|| cell.chars().filter(|&c| c == '-').count().clamp(1, 1000) as u16)
+        })
+        .collect::<Option<_>>()?;
+    (weights.len() == columns && columns > 1 && weights.iter().any(|w| *w != weights[0]))
+        .then_some(weights)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{markdown_render, render::Renderer};
+
+    #[test]
+    fn delimiter_dashes_set_relative_column_widths() {
+        let html = |source: &str| markdown_render::render(source, &mut Plain).into_iter().map(|b| b.html).collect::<String>();
+        let wide = html("| a | b |\n| --- | :------: |\n| 1 | 2 |\n");
+        assert!(wide.contains("<table widths=\"3,6\">"), "{wide}");
+        // Equal dashes keep equal columns and plain markup.
+        assert!(html("| a | b |\n| --- | --- |\n| 1 | 2 |\n").contains("<table>"));
+        // Inside a blockquote too, and the marker never leaks.
+        let quoted = html("> | a | b |\n> |-|---|\n> | 1 | 2 |\n");
+        assert!(quoted.contains("<table widths=\"1,3\">") && !quoted.contains("TABLE0"), "{quoted}");
+        assert_eq!(super::column_weights("|--|x|", 2), None);
+    }
     struct Plain;
     impl Renderer for Plain {}
     #[test]

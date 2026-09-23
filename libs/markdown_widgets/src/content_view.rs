@@ -88,7 +88,7 @@ impl Widget for MarkdownImage {
     }
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
         if let Some((width, height)) = self.dimensions {
-            let ratio = (cx.turtle().inner_rect().size.x.max(1.0) / width).min(1.0);
+            let ratio = crate::fit_ratio(cx.turtle().inner_rect().size.x, width);
             walk.width = Size::Fixed(width * ratio);
             walk.height = Size::Fixed(height * ratio);
             self.image.draw_walk(cx, scope, walk)
@@ -367,7 +367,10 @@ impl Widget for MarkdownCell {
             height: Size::fit(),
             ..Default::default()
         };
+        // Content that scales to fit (math, images, diagrams) fits this cell.
+        let outer = crate::CELL_WIDTH.replace(available);
         let _ = self.html.draw_walk(cx, &mut Scope::empty(), inner);
+        crate::CELL_WIDTH.set(outer);
         cx.end_turtle();
         if let Some(tf) = scope.data.get_mut::<TextFlow>() {
             tf.push_widget_text_for_selection(

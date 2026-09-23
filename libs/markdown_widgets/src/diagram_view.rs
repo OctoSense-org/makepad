@@ -41,7 +41,7 @@ impl Widget for MarkdownDiagram {
     fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) {}
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, mut walk: Walk) -> DrawStep {
         let step = if let Some((width, height)) = self.dimensions {
-            let ratio = (cx.turtle().inner_rect().size.x.max(1.0) / width).min(1.0);
+            let ratio = crate::fit_ratio(cx.turtle().inner_rect().size.x, width);
             walk.width = Size::Fixed(width * ratio);
             walk.height = Size::Fixed(height * ratio);
             self.image.draw_walk(cx, scope, walk)
