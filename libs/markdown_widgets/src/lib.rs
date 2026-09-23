@@ -44,3 +44,24 @@ fn color(rgb: u32) -> makepad_widgets::Vec4f {
         1.0,
     )
 }
+
+/// How much to shrink content `width` wide to fit `available`. Inside a Fit
+/// container (such as a table cell) the available width is unknown (NaN) while
+/// laying out, so content keeps its natural size rather than collapsing to a pixel.
+pub(crate) fn fit_ratio(available: f64, width: f64) -> f64 {
+    if available.is_finite() && available >= 1.0 && width > 0.0 {
+        (available / width).min(1.0)
+    } else {
+        1.0
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    #[test]
+    fn unknown_width_keeps_natural_size() {
+        assert_eq!(super::fit_ratio(f64::NAN, 80.0), 1.0);
+        assert_eq!(super::fit_ratio(40.0, 80.0), 0.5);
+        assert_eq!(super::fit_ratio(200.0, 80.0), 1.0);
+    }
+}
