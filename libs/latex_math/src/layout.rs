@@ -1537,6 +1537,8 @@ fn char_math_class(c: char) -> MathClass {
     match c {
         '=' | '<' | '>' => MathClass::Relation,
         '+' | '-' | '*' | '/' => MathClass::Binary,
+        '∪' | '∩' | '⊔' | '⊓' | '⊎' | '∨' | '∧' | '⊕' | '⊖' | '⊗' | '⊘' | '⊙' | '†' | '‡' => MathClass::Binary,
+        '∴' | '∵' => MathClass::Relation,
         ',' | ';' | ':' => MathClass::Punctuation,
         _ => MathClass::Ordinary,
     }
