@@ -806,6 +806,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(Delimiter::None)
             }
+            // As in KaTeX, \left< and \right> are angle brackets.
+            '<' | '>' => {
+                self.advance();
+                Some(Delimiter::Angle)
+            }
             '\\' => {
                 self.advance();
                 match self.peek() {
@@ -1381,6 +1386,7 @@ mod tests {
     fn set_operators_greek_capitals_and_cr_are_supported() {
         assert_eq!(parse("A\\cup B")[1], MathNode::Char('∪'));
         assert_eq!(parse("30\\degree")[2], MathNode::Char('°'));
+        assert!(matches!(parse("\\left<v|w\\right>")[0], MathNode::LeftRight(Delimiter::Angle, _, Delimiter::Angle)));
         assert_eq!(parse("\\Alpha"), vec![MathNode::MathVariant(MathVariant::Roman, vec![MathNode::Char('A')])]);
         // \cr separates matrix rows like \\, but not as the start of a longer command.
         let MathNode::Matrix(_, rows) = &parse("\\begin{pmatrix}1\\cr2\\end{pmatrix}")[0] else { panic!() };
