@@ -334,6 +334,33 @@ pub struct LinuxWindowParams {
     pub custom_window_chrome: bool,
 }
 
+/// The GPU API this process renders with: the API the binary was built
+/// against (`MAKEPAD=…`; Android and Linux use OpenGL ES unless built with
+/// `MAKEPAD=vulkan`). What a consumer asks when a texture's row order or a
+/// capture's orientation depends on the renderer rather than the OS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuBackend {
+    Metal,
+    Direct3d11,
+    Vulkan,
+    OpenGl,
+    WebGl,
+    Gpusim,
+}
+
+impl GpuBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            GpuBackend::Metal => "Metal",
+            GpuBackend::Direct3d11 => "Direct3D 11",
+            GpuBackend::Vulkan => "Vulkan",
+            GpuBackend::OpenGl => "OpenGL",
+            GpuBackend::WebGl => "WebGL",
+            GpuBackend::Gpusim => "simulated GPU",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Script, ScriptHook)]
 pub enum OsType {
     #[pick]
