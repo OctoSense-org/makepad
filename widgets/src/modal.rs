@@ -177,32 +177,50 @@ impl Widget for Modal {
     /// that root — never from the slot a parent thought it was handing over.
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         let bounds = cx.global::<ModalBounds>().0;
+        // Bounded to part of the pass, the overlay also takes the view transform
+        // of the list it opens from: a host may draw the app shifted or scaled
+        // (a phone shell's app layer), and the bounds are in the app's coordinates.
+        let parent_transform = bounds.and_then(|_| {
+            cx.draw_list_stack.last().map(|id| cx.draw_lists[*id].draw_list_uniforms.view_transform)
+        });
         let draw_list = self.draw_list.as_mut().unwrap();
         draw_list.begin_overlay_reuse(cx);
-        match bounds {
-            None => cx.begin_root_turtle_for_pass(self.view.layout),
-            Some(bounds) => {
-                cx.begin_root_turtle_for_pass(Layout::default());
-                cx.begin_turtle(Walk::abs_rect(bounds), self.view.layout);
+        // Bounded, the overlay is sized explicitly: a `Fill` walk placed at an
+        // absolute position loses that position's offset from its size.
+        // Its root turtle clips, so it must also reach the bounds, which a host
+        // may place past the pass's own size (an app layer drawn shifted).
+        let walk = match bounds {
+            None => {
+                cx.begin_root_turtle_for_pass(self.view.layout);
+                Walk::fill()
             }
-        }
-        self.draw_bg.begin(cx, Walk::fill(), self.view.layout);
+            Some(bounds) => {
+                let pass = cx.current_pass_size();
+                let size = dvec2(pass.x.max(bounds.pos.x + bounds.size.x), pass.y.max(bounds.pos.y + bounds.size.y));
+                cx.begin_root_turtle(size, Layout::default());
+                Walk::abs_rect(bounds)
+            }
+        };
+        self.draw_bg.begin(cx, walk, self.view.layout);
 
         if self.is_open {
             let bg_view = self.view.widget(cx, ids!(bg_view));
-            let origin = bounds.map_or(Vec2d { x: 0., y: 0. }, |b| b.pos);
-            let _ = bg_view.draw_walk(cx, scope, Walk::fill().with_abs_pos(origin));
+            let bg_walk = match bounds {
+                None => Walk::fill().with_abs_pos(Vec2d { x: 0., y: 0. }),
+                Some(bounds) => Walk::abs_rect(bounds),
+            };
+            let _ = bg_view.draw_walk(cx, scope, bg_walk);
 
             let content = self.view.widget(cx, ids!(content));
             let _ = content.draw_all(cx, scope);
         }
 
         self.draw_bg.end(cx);
-        if bounds.is_some() {
-            cx.end_turtle();
-        }
         cx.end_pass_sized_turtle();
         self.draw_list.as_mut().unwrap().end(cx);
+        if let Some(transform) = parent_transform {
+            self.draw_list.as_ref().unwrap().set_view_transform(cx, &transform);
+        }
 
         // We must re-set the blocked scrolling area, as it might've changed after each draw.
         if self.is_open {
