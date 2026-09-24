@@ -107,6 +107,7 @@ mod tests {
                         storage: storage_a,
                         viewport: Viewport { size: dvec2(1240.0, 800.0) },
                         replies: replies_a,
+                        windows: Default::default(),
                     },
                 );
                 assert!(vm.take_errors().is_empty(), "the isolate evaluated MailView without errors");
@@ -123,6 +124,7 @@ mod tests {
                         storage: storage_b,
                         viewport: Viewport { size: dvec2(402.0, 780.0) },
                         replies: replies_b,
+                        windows: Default::default(),
                     },
                 )
             });

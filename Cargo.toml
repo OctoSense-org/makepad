@@ -1,4 +1,6 @@
 workspace.members = [
+    "libs/markdown",
+    "libs/markdown_widgets",
     # === app ===
     "apps/browser",
     "apps/terminal",

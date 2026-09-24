@@ -609,6 +609,10 @@ impl Html {
                     .entry(node.index)
                     .or_insert_with(|| Self::count_table_columns(node));
                 tf.begin_table(cx, col_count);
+                // Relative column widths, as Markdown delimiter rows set them.
+                if let Some(widths) = node.find_attr_lc(live_id!(widths)) {
+                    tf.table_column_weights = widths.split(',').filter_map(|w| w.trim().parse::<f64>().ok()).filter(|w| *w > 0.0).collect();
+                }
             }
             some_id!(thead) => {
                 tf.in_table_header = true;

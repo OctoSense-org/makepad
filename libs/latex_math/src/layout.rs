@@ -3,7 +3,7 @@
 /// This implements the core math typesetting algorithms from the OpenType MATH table spec
 /// and TeX's math layout rules. It reads metrics from the font's MATH table via ttf-parser,
 /// then produces a flat list of positioned items (glyphs, horizontal/vertical rules, rects).
-use crate::parser::{self, AccentKind, Delimiter, MathNode, MatrixKind, SpaceWidth, Symbol};
+use crate::parser::{self, AccentKind, Delimiter, MathNode, MathVariant, MatrixKind, SpaceWidth, Symbol};
 use ttf_parser::{Face, GlyphId};
 
 /// Display style vs inline (text) style, following TeX conventions
@@ -564,9 +564,20 @@ impl<'a> LayoutEngine<'a> {
             MathNode::Underline(content) => self.layout_underline(content, style),
             MathNode::Overbrace(content) => self.layout_overline(content, style), // simplified
             MathNode::Underbrace(content) => self.layout_underline(content, style), // simplified
+            MathNode::MathVariant(MathVariant::Roman, content) => {
+                // \mathrm (and upright Greek capitals): letters upright, not math italic.
+                let upright: Vec<MathNode> = content
+                    .iter()
+                    .map(|node| match node {
+                        MathNode::Char(c) if c.is_alphabetic() => MathNode::Text(c.to_string()),
+                        other => other.clone(),
+                    })
+                    .collect();
+                self.layout_nodes(&upright, style)
+            }
             MathNode::MathVariant(_variant, content) => {
-                // For now, just layout content normally
-                // A full implementation would switch font variant
+                // Other variants still lay out content normally; a full
+                // implementation would switch font variant.
                 self.layout_nodes(content, style)
             }
             MathNode::Color(_color, content) => {
@@ -812,7 +823,11 @@ impl<'a> LayoutEngine<'a> {
     }
 
     fn layout_char_impl(&self, c: char, style: MathStyle, use_math_italic: bool) -> LayoutBox {
-        let mapped = if use_math_italic {
+        // A hyphen in math is a minus sign; draw the font's U+2212 when it has one.
+        let c_drawn = if c == '-' && self.metrics.glyph_id('\u{2212}').is_some() { '\u{2212}' } else { c };
+        let mapped = if c != c_drawn {
+            c_drawn
+        } else if use_math_italic {
             map_math_italic_latin(c)
                 .and_then(|mc| self.metrics.glyph_id(mc).map(|_| mc))
                 .unwrap_or(c)
@@ -1537,6 +1552,8 @@ fn char_math_class(c: char) -> MathClass {
     match c {
         '=' | '<' | '>' => MathClass::Relation,
         '+' | '-' | '*' | '/' => MathClass::Binary,
+        '∪' | '∩' | '⊔' | '⊓' | '⊎' | '∨' | '∧' | '⊕' | '⊖' | '⊗' | '⊘' | '⊙' | '†' | '‡' => MathClass::Binary,
+        '∴' | '∵' => MathClass::Relation,
         ',' | ';' | ':' => MathClass::Punctuation,
         _ => MathClass::Ordinary,
     }

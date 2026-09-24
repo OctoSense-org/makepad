@@ -538,8 +538,17 @@ impl<'a> Parser<'a> {
                 }
                 Some(MathNode::Group(content))
             }
-            // These are handled by caller contexts
-            '}' | ']' => None,
+            // A closer is normally consumed by the context that opened it, which stops
+            // before it. One reaching here is unmatched: `]` is an ordinary bracket, as in
+            // `[a, b]`, and a stray `}` is skipped. Returning without advancing would loop.
+            ']' => {
+                self.advance();
+                Some(MathNode::Char(']'))
+            }
+            '}' => {
+                self.advance();
+                None
+            }
             '&' => {
                 self.advance();
                 Some(MathNode::Char('&')) // Column separator in matrices
@@ -707,6 +716,15 @@ impl<'a> Parser<'a> {
             return Some(MathNode::Symbol(sym));
         }
 
+        // Symbols typeset directly from their Unicode characters.
+        if let Some(c) = char_from_name(name) {
+            return Some(MathNode::Char(c));
+        }
+        // Capital Greek letters drawn as Latin ones, set upright as in TeX.
+        if let Some(c) = latin_greek_from_name(name) {
+            return Some(MathNode::MathVariant(MathVariant::Roman, vec![MathNode::Char(c)]));
+        }
+
         // Unknown command — try to render as text
         Some(MathNode::Text(format!("\\{}", name)))
     }
@@ -788,6 +806,11 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Some(Delimiter::None)
             }
+            // As in KaTeX, \left< and \right> are angle brackets.
+            '<' | '>' => {
+                self.advance();
+                Some(Delimiter::Angle)
+            }
             '\\' => {
                 self.advance();
                 match self.peek() {
@@ -837,6 +860,8 @@ impl<'a> Parser<'a> {
         let end_marker = format!("\\end{{{}}}", name);
 
         loop {
+            // Whitespace (such as a newline after a trailing row break) may precede \end.
+            self.skip_whitespace();
             if self.remaining().starts_with(&end_marker) {
                 self.pos += end_marker.len();
                 break;
@@ -845,9 +870,11 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            // Check for row separator \\
-            if self.remaining().starts_with("\\\\") {
-                self.pos += 2;
+            // Check for row separator \\ (or plain TeX's \cr)
+            let cr = self.remaining().starts_with("\\cr")
+                && !self.remaining()[3..].starts_with(|c: char| c.is_ascii_alphabetic());
+            if self.remaining().starts_with("\\\\") || cr {
+                self.pos += if cr { 3 } else { 2 };
                 current_row.push(std::mem::take(&mut current_cell));
                 rows.push(std::mem::take(&mut current_row));
                 continue;
@@ -939,6 +966,54 @@ fn operator_name(name: &str) -> Option<&str> {
         "mod" => Some("mod"),
         _ => None,
     }
+}
+
+/// Operators and marks without a dedicated [`Symbol`], as their Unicode characters.
+fn char_from_name(name: &str) -> Option<char> {
+    Some(match name {
+        "cup" => '∪',
+        "cap" => '∩',
+        "sqcup" => '⊔',
+        "sqcap" => '⊓',
+        "uplus" => '⊎',
+        "vee" | "lor" => '∨',
+        "wedge" | "land" => '∧',
+        "oplus" => '⊕',
+        "ominus" => '⊖',
+        "otimes" => '⊗',
+        "oslash" => '⊘',
+        "odot" => '⊙',
+        "dag" => '†',
+        "ddag" => '‡',
+        "degree" => '°',
+        "prime" | "rq" => '′',
+        "colon" => ':',
+        "therefore" => '∴',
+        "because" => '∵',
+        "lbrack" => '[',
+        "rbrack" => ']',
+        _ => return None,
+    })
+}
+
+/// Capital Greek letters whose glyphs are the Latin capitals.
+fn latin_greek_from_name(name: &str) -> Option<char> {
+    Some(match name {
+        "Alpha" => 'A',
+        "Beta" => 'B',
+        "Epsilon" => 'E',
+        "Zeta" => 'Z',
+        "Eta" => 'H',
+        "Iota" => 'I',
+        "Kappa" => 'K',
+        "Mu" => 'M',
+        "Nu" => 'N',
+        "Omicron" => 'O',
+        "Rho" => 'P',
+        "Tau" => 'T',
+        "Chi" => 'X',
+        _ => return None,
+    })
 }
 
 fn symbol_from_name(name: &str) -> Option<Symbol> {
@@ -1294,6 +1369,35 @@ pub fn parse(input: &str) -> Vec<MathNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmatched_closers_do_not_hang() {
+        // Each of these used to loop forever on the closer.
+        for input in ["[a]", "[\\ldots] (\\ldots)", "a]", "a}", "\\sqrt[3]{x} [y]"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let owned = input.to_string();
+            std::thread::spawn(move || { let _ = tx.send(parse(&owned)); });
+            assert!(rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok(), "hangs: {input}");
+        }
+        assert_eq!(parse("[a]"), vec![MathNode::Char('['), MathNode::Char('a'), MathNode::Char(']')]);
+    }
+
+    #[test]
+    fn set_operators_greek_capitals_and_cr_are_supported() {
+        assert_eq!(parse("A\\cup B")[1], MathNode::Char('∪'));
+        assert_eq!(parse("30\\degree")[2], MathNode::Char('°'));
+        assert!(matches!(parse("\\left<v|w\\right>")[0], MathNode::LeftRight(Delimiter::Angle, _, Delimiter::Angle)));
+        assert_eq!(parse("\\Alpha"), vec![MathNode::MathVariant(MathVariant::Roman, vec![MathNode::Char('A')])]);
+        // \cr separates matrix rows like \\, but not as the start of a longer command.
+        let MathNode::Matrix(_, rows) = &parse("\\begin{pmatrix}1\\cr2\\end{pmatrix}")[0] else { panic!() };
+        assert_eq!(rows.len(), 2);
+        let MathNode::Matrix(_, rows) = &parse("\\begin{pmatrix}1\\\\2\\end{pmatrix}")[0] else { panic!() };
+        assert_eq!(rows.len(), 2);
+        // A trailing row break and newline before \end add no row and no stray \end.
+        let MathNode::Matrix(_, rows) = &parse("\\begin{pmatrix}\n4 \\cr\n5 \\cr\n\\end{pmatrix}")[0] else { panic!() };
+        assert_eq!(rows.len(), 2);
+        assert!(!format!("{rows:?}").contains("end"));
+    }
 
     #[test]
     fn test_simple_chars() {

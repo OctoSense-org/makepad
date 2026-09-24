@@ -99,6 +99,7 @@ mod tests {
             storage,
             viewport: Viewport { size: dvec2(320.0, 200.0) },
             replies,
+            windows: Default::default(),
         };
         let open = NOTES_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts { root, executor, shutdown } = cx.with_script_vm_id_trusted(vm_id, |vm| {
@@ -116,6 +117,7 @@ mod tests {
             storage: storage_b,
             viewport: Viewport { size: dvec2(320.0, 200.0) },
             replies: replies_b,
+            windows: Default::default(),
         };
         let open_b = NOTES_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts { root: root_b, executor: executor_b, shutdown: shutdown_b } =
