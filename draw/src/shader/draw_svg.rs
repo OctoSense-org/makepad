@@ -561,6 +561,12 @@ impl DrawSvg {
         }
     }
 
+    /// The document has been tessellated for at least one device scale:
+    /// what a readiness check asks before trusting a drawn frame.
+    pub fn has_mesh(&self) -> bool {
+        !self.meshes.is_empty()
+    }
+
     pub fn svg_size(&self) -> Option<DVec2> {
         if self.svg_doc.is_some() {
             Some(self.content_size)
