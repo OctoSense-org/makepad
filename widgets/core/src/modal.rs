@@ -98,6 +98,13 @@ script_mod! {
     }
 }
 
+/// Confines modals to part of the pass. A host that seats an app in part of its
+/// window (such as a desktop tile) sets this while it draws that app, so the
+/// app's modals dim and centre within the app rather than over the whole window.
+/// `None` (the default) is the whole pass.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModalBounds(pub Option<Rect>);
+
 #[derive(Clone, Debug, Default)]
 pub enum ModalAction {
     Dismissed,
@@ -381,11 +388,18 @@ impl Widget for Modal {
     /// sized by the pass, so its geometry comes from `Walk::fill()` against
     /// that root — never from the slot a parent thought it was handing over.
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
+        let bounds = cx.global::<ModalBounds>().0;
         let draw_list = self.draw_list.as_mut().unwrap();
         // Tab stays inside an open modal.
         CxDraw::set_nav_trap(cx, draw_list.id(), self.is_open);
         draw_list.begin_popup_overlay(cx);
-        cx.begin_root_turtle_for_pass(self.view.layout);
+        match bounds {
+            None => cx.begin_root_turtle_for_pass(self.view.layout),
+            Some(bounds) => {
+                cx.begin_root_turtle_for_pass(Layout::default());
+                cx.begin_turtle(Walk::abs_rect(bounds), self.view.layout);
+            }
+        }
 
         // Even an invisible `draw_bg` costs the GPU a full-window pass every frame,
         // so a closed modal leaves its overlay empty.
@@ -398,17 +412,17 @@ impl Widget for Modal {
                 v.draw_bg.draw_vars.set_dyn_instance(cx, live_id!(fade), &[fade]);
                 v.draw_bg.draw_vars.set_dyn_instance(cx, live_id!(layer_opacity), &[fade]);
             }
-            let _ = bg_view.draw_walk(
-                cx,
-                scope,
-                Walk::fill().with_abs_pos(Vec2d { x: 0., y: 0. }),
-            );
+            let origin = bounds.map_or(Vec2d { x: 0., y: 0. }, |b| b.pos);
+            let _ = bg_view.draw_walk(cx, scope, Walk::fill().with_abs_pos(origin));
 
             let content = self.view.widget(cx, ids!(content));
             let _ = content.draw_all(cx, scope);
             self.draw_bg.end(cx);
         }
 
+        if bounds.is_some() {
+            cx.end_turtle();
+        }
         cx.end_pass_sized_turtle();
         self.draw_list.as_mut().unwrap().end(cx);
 
