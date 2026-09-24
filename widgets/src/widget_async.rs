@@ -95,6 +95,16 @@ pub fn register_splash_isolate_mod(f: fn(&mut ScriptVm)) {
     HOST_ISOLATE_MODS.with(|g| g.borrow_mut().push(f));
 }
 
+/// Reinstall trusted host vocabulary after a theme rebuild replaces mod.widgets.
+/// Clone first so an installer can register another module without borrowing the list.
+pub(crate) fn apply_splash_isolate_mods(vm: &mut ScriptVm) {
+    let host_mods = HOST_ISOLATE_MODS.with(|mods| mods.borrow().clone());
+    for install in host_mods {
+        install(vm);
+    }
+}
+
+
 /// Queue a Splash isolate for reclamation on the next isolate alloc. Called from
 /// `Splash::drop`, which has no `Cx`. Ignores the main VM (id 0), never an isolate.
 pub(crate) fn mark_splash_isolate_dead(vm_id: SplashVmId) {
@@ -507,11 +517,7 @@ impl CxSplashVmExt for Cx {
             // namespace and are not removed by the strip above. Collected first
             // so the thread-local is not borrowed while a mod runs — a mod is
             // free to register another.
-            let host_mods: Vec<fn(&mut ScriptVm)> =
-                HOST_ISOLATE_MODS.with(|g| g.borrow().clone());
-            for install in host_mods {
-                install(&mut vm);
-            }
+            apply_splash_isolate_mods(&mut vm);
             vm.bx
         };
         let std = std::mem::replace(&mut self.script_data.std, outer_std);

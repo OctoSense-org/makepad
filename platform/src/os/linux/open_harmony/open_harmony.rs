@@ -581,6 +581,33 @@ impl Cx {
 
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
 
+        // Read only this app's framebuffer, before EGL hands it to the
+        // compositor. The remote bridge's /g requests otherwise time out.
+        let window_id = self.get_pass_window_id(draw_pass_id).map(|window| window.id());
+        let requests = self.take_studio_screenshot_request_ids_for_window(0, window_id);
+        if !requests.is_empty() {
+            let width = self.os.display_size.x as u32;
+            let height = self.os.display_size.y as u32;
+            let stride = width as usize * 4;
+            let mut pixels = vec![0u8; stride * height as usize];
+            unsafe {
+                let gl = self.os.gl();
+                (gl.glReadPixels)(0, 0, width as i32, height as i32,
+                    gl_sys::RGBA, gl_sys::UNSIGNED_BYTE, pixels.as_mut_ptr() as *mut _);
+            }
+            // OpenGL's origin is bottom-left; PNG rows start at the top.
+            for row in 0..height as usize / 2 {
+                let top = row * stride;
+                let bottom = (height as usize - 1 - row) * stride;
+                for column in 0..stride {
+                    pixels.swap(top + column, bottom + column);
+                }
+            }
+            if let Ok(png) = Self::encode_rgba_as_png(width, height, &pixels) {
+                Self::send_studio_screenshot_response(requests, width, height, png);
+            }
+        }
+
         unsafe { self.os.display.as_mut().unwrap().swap_buffers() };
 
         //unsafe {
