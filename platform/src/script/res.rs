@@ -128,6 +128,11 @@ pub struct CxScriptResources {
     /// exponentially (1s, 2s, 4s, …). Bounded by [`DATA_FETCH_MAX_RETRIES`];
     /// the entry is dropped when the URL finally loads.
     pub data_fetch_retries: Rc<RefCell<HashMap<String, (u8, std::time::Instant)>>>,
+    /// Bumped whenever a resource is registered or its load state moves
+    /// (a load attempted, an HTTP response or error). A consumer that
+    /// caches a negative answer ("this resource cannot be read") keys it on
+    /// this, so a resource that appears later is asked for again.
+    pub generation: std::cell::Cell<u64>,
 }
 
 impl CxScriptResources {
@@ -277,6 +282,12 @@ impl CxScriptResources {
             resource.handles[0].1,
         );
         self.resources.borrow_mut().push(resource);
+        self.bump_generation();
+    }
+
+    /// See [`Self::generation`].
+    pub fn bump_generation(&self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
     }
 
     /// Attach an additional heap's local handle to an existing resource entry
@@ -322,6 +333,7 @@ impl CxScriptResources {
             let mut resources = self.resources.borrow_mut();
             if let Some(res) = resources.iter_mut().find(|r| r.abs_path == path) {
                 res.data = CxScriptResourceData::Loaded(Rc::new(data));
+                self.bump_generation();
                 return true;
             }
         }
@@ -340,6 +352,7 @@ impl CxScriptResources {
             let mut resources = self.resources.borrow_mut();
             if let Some(res) = resources.iter_mut().find(|r| r.abs_path == path) {
                 res.data = CxScriptResourceData::Error(error);
+                self.bump_generation();
                 return true;
             }
         }
@@ -608,6 +621,8 @@ impl Cx {
             if !matches!(res.data, CxScriptResourceData::NotLoaded) {
                 return;
             }
+            // Every path below leaves NotLoaded (Loaded, Loading or Error).
+            self.script_data.resources.bump_generation();
 
             #[cfg(target_arch = "wasm32")]
             if res.dependency_path.is_none() {
