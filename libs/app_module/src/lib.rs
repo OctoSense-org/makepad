@@ -155,6 +155,72 @@ pub struct InstanceHandles {
     pub storage: StorageHandle,
     pub viewport: Viewport,
     pub replies: ReplySink,
+    /// Extra windows the instance asks the host for (see [`ModuleWindows`]).
+    pub windows: ModuleWindows,
+}
+
+/// A request from an instance for one of its extra host windows.
+pub enum WindowRequest {
+    /// Show `root` (a widget of the instance, in its isolate) in a new host
+    /// window titled `title`, keyed `key` within the instance. `size` is a hint.
+    Open { key: LiveId, title: String, root: WidgetRef, size: Option<DVec2> },
+    /// Close the instance's window `key`, if it is open.
+    Close { key: LiveId },
+}
+
+#[derive(Default)]
+struct ModuleWindowsInner {
+    supported: bool,
+    requests: Vec<WindowRequest>,
+    closed: Vec<LiveId>,
+}
+
+/// Extra windows for an instance: a chat app's separate article or photo
+/// window on a desktop host, beside the instance's own window.
+///
+/// The instance queues requests; the host takes them on the UI thread, shows
+/// each root as a window of its own (drawn and fed events in the instance's
+/// isolate), and reports windows the person closed. A host that has no
+/// windows (a phone) never takes requests, so an instance should only use
+/// this where [`ModuleWindows::is_supported`] says so and fall back to its
+/// own full-screen views otherwise. Not `Send`: UI-thread only.
+#[derive(Clone, Default)]
+pub struct ModuleWindows(std::rc::Rc<std::cell::RefCell<ModuleWindowsInner>>);
+
+impl ModuleWindows {
+    /// Handles for a host that does (`true`) or does not show extra windows.
+    pub fn new(supported: bool) -> Self {
+        let windows = Self::default();
+        windows.set_supported(supported);
+        windows
+    }
+    /// Whether this host shows extra windows now. It can change while the
+    /// instance runs (a desktop host switching to its phone shell).
+    pub fn is_supported(&self) -> bool {
+        self.0.borrow().supported
+    }
+    /// The host starts or stops showing extra windows (host side).
+    pub fn set_supported(&self, supported: bool) {
+        self.0.borrow_mut().supported = supported;
+    }
+    pub fn open(&self, key: LiveId, title: &str, root: WidgetRef, size: Option<DVec2>) {
+        self.0.borrow_mut().requests.push(WindowRequest::Open { key, title: title.into(), root, size });
+    }
+    pub fn close(&self, key: LiveId) {
+        self.0.borrow_mut().requests.push(WindowRequest::Close { key });
+    }
+    /// Windows the person closed since the last call (instance side).
+    pub fn take_closed(&self) -> Vec<LiveId> {
+        std::mem::take(&mut self.0.borrow_mut().closed)
+    }
+    /// Pending requests (host side).
+    pub fn take_requests(&self) -> Vec<WindowRequest> {
+        std::mem::take(&mut self.0.borrow_mut().requests)
+    }
+    /// The person closed window `key` (host side).
+    pub fn notify_closed(&self, key: LiveId) {
+        self.0.borrow_mut().closed.push(key);
+    }
 }
 
 /// How a call ended, from the executor's side.

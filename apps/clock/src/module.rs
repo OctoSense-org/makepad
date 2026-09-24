@@ -127,6 +127,7 @@ mod tests {
             storage,
             viewport: Viewport { size: dvec2(320.0, 200.0) },
             replies,
+            windows: Default::default(),
         };
         let open = CLOCK_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts { root, executor, shutdown } = cx.with_script_vm_id_trusted(vm_id, |vm| {
@@ -176,6 +177,7 @@ mod tests {
             storage,
             viewport: Viewport { size: dvec2(402.0, 780.0) },
             replies,
+            windows: Default::default(),
         };
         let open = CLOCK_MODULE.open_schema().empty_open().unwrap();
         let sheet = |dark: bool| StyleSheet::load_with_appearance(DesktopStyle::Ios, dark);

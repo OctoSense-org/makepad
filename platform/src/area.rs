@@ -191,9 +191,13 @@ impl Area {
                     return Rect::default();
                 }
                 let draw_item = &draw_list.draw_items[inst.draw_item_id];
-                let draw_call = draw_item.draw_call().unwrap();
+                // The item was reused for a sub-list or emptied since this area
+                // was recorded (e.g. a restyle rebuilt the tree): nothing to measure.
+                let Some(draw_call) = draw_item.draw_call() else {
+                    return Rect::default();
+                };
 
-                if draw_item.instances.as_ref().unwrap().len() == 0 {
+                if draw_item.instances.as_ref().map_or(true, |i| i.len() == 0) {
                     error!("No instances but everything else valid?");
                     return Rect::default();
                 }
@@ -472,9 +476,13 @@ impl Area {
                     return Rect::default();
                 }
                 let draw_item = &draw_list.draw_items[inst.draw_item_id];
-                let draw_call = draw_item.draw_call().unwrap();
+                // The item was reused for a sub-list or emptied since this area
+                // was recorded (e.g. a restyle rebuilt the tree): nothing to measure.
+                let Some(draw_call) = draw_item.draw_call() else {
+                    return Rect::default();
+                };
 
-                if draw_item.instances.as_ref().unwrap().len() == 0 {
+                if draw_item.instances.as_ref().map_or(true, |i| i.len() == 0) {
                     error!("No instances but everything else valid?");
                     return Rect::default();
                 }
