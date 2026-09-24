@@ -272,8 +272,16 @@ impl Splash {
             if let Some(sheet)=sheet {
                 if crate::desktop_style::current(vm).as_ref()!=Some(&sheet) {
                     crate::desktop_style::install(vm,sheet);
-                    // Keep the isolate's existing prelude/resource handles and jail.
-                    vm.with_reload(|vm| {crate::widgets_mod(vm);crate::desktop_style::apply_widgets(vm);});
+                    // Trusted framework themes need their packaged font resolver.
+                    // Preserve the jail and expose only the resolver during theme
+                    // registration, removing it before evaluating the app body.
+                    vm.with_reload(|vm| {
+                        crate::script_eval!(vm, {mod.res = {crate_resource: mod.prelude.widgets.crate_resource}});
+                        crate::widgets_mod(vm);
+                        crate::desktop_style::apply_widgets(vm);
+                        crate::script_eval!(vm, {mod.res = nil});
+                        crate::widget_async::apply_splash_isolate_mods(vm);
+                    });
                 }
             }
             // Everything on `mod` that is not the body's own; whatever the run
@@ -281,6 +289,9 @@ impl Splash {
             let mut known = module_keys(vm);
             known.retain(|key| !body_modules.contains(key));
             let saved = if preserve { snapshot_modules(vm, &body_modules) } else { Vec::new() };
+            // Streaming evaluation silences console errors. Retain them so a
+            // completed card cannot fail with an unexplained blank surface.
+            let previous_errors = vm.bx.captured_errors.replace(Vec::new());
             let value = vm.with_instruction_limit(SPLASH_EVAL_INSTRUCTION_LIMIT, |vm| {
                 if preserve {
                     vm.with_reload(|vm| vm.eval_with_append_source(script_mod, &code, NIL.into()))
@@ -288,6 +299,8 @@ impl Splash {
                     vm.eval_with_append_source(script_mod, &code, NIL.into())
                 }
             });
+            let evaluation_errors = vm.take_errors();
+            vm.bx.captured_errors = previous_errors;
             if preserve {
                 restore_modules(vm, saved);
             }
@@ -310,7 +323,7 @@ impl Splash {
                 // its previous view — or nothing at all. Say so: a silent
                 // blank widget is the hardest bug in this file to find.
                 if value.is_err() {
-                    for e in vm.take_errors() {
+                    for e in evaluation_errors {
                         log!("splash: {}", e);
                     }
                 } else {
