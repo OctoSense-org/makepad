@@ -125,6 +125,7 @@ mod tests {
             storage,
             viewport: Viewport { size: dvec2(320.0, 200.0) },
             replies,
+            windows: Default::default(),
         };
         let open = WEATHER_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts { root, executor, shutdown } = cx.with_script_vm_id_trusted(vm_id, |vm| {
