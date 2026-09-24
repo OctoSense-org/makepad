@@ -78,7 +78,7 @@ impl ModuleHost {
         // instance (§3b's mount and the web's IndexedDB sit under it).
         let storage = cx.storage(&format!("{}.{}", module.id(), instance_no));
         let (replies, upstream) = ReplySink::pair();
-        let handles = InstanceHandles { scope, storage, viewport: Viewport { size: viewport }, replies };
+        let handles = InstanceHandles { scope, storage, viewport: Viewport { size: viewport }, replies, windows: Default::default() };
         // With the WM's system theme sheet the isolate registers its library once, styled, as for
         // a child process (not the stock library first and the sheet's over it).
         let vm_id = match self.style.clone() {

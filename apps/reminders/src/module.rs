@@ -119,6 +119,7 @@ mod tests {
                 size: dvec2(320.0, 200.0),
             },
             replies,
+            windows: Default::default(),
         };
         let open = REMINDERS_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts {
