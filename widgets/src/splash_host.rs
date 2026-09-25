@@ -136,6 +136,18 @@ pub fn take_splash_host_requests() -> Vec<SplashHostRequest> {
     BRIDGE.with(|b| std::mem::take(&mut b.borrow_mut().queue))
 }
 
+/// Drains only the requests from these isolates, leaving every other host's
+/// queued: a host that runs some isolates (an app runner) must not swallow
+/// the requests of isolates another host answers.
+pub fn take_splash_host_requests_for(heap_keys: &[usize]) -> Vec<SplashHostRequest> {
+    BRIDGE.with(|b| {
+        let mut b = b.borrow_mut();
+        let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut b.queue).into_iter().partition(|r| heap_keys.contains(&r.heap_key));
+        b.queue = rest;
+        mine
+    })
+}
+
 /// Answers one request: `Ok(json)` becomes `{ok: true, data: <parsed>}`,
 /// `Err(msg)` becomes `{ok: false, error: msg}`. Returns what happened, so a
 /// host can log undeliverable answers instead of wondering why an app hangs.
@@ -198,6 +210,11 @@ pub fn splash_host_respond(
         }
     });
     });
+    // What the callback asked of its widgets (`ui.list.render()`) is queued,
+    // and the queue is worked on the next event. An answer delivered after
+    // the host handled its event would otherwise wait for the person to
+    // touch the screen.
+    SignalToUI::set_ui_signal();
     if !contained {
         // The callback panicked; the panic was contained and that isolate is
         // suspect, but the host app carries on.
@@ -369,6 +386,19 @@ mod tests {
             assert!(!b.tags.contains_key(&11));
             assert!(!b.caps.contains_key(&11));
         });
+    }
+
+    #[test]
+    fn a_host_takes_only_its_own_isolates_requests() {
+        let _ = take_splash_host_requests();
+        queue_raw(31, 1, "mail.list");
+        queue_raw(32, 2, "weather.get");
+        let mine = take_splash_host_requests_for(&[31]);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].service, "mail.list");
+        let rest = take_splash_host_requests();
+        assert_eq!(rest.len(), 1, "the other host's request stays queued");
+        assert_eq!(rest[0].heap_key, 32);
     }
 
     #[test]
