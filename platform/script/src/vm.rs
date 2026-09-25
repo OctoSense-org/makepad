@@ -5,6 +5,7 @@ pub use crate::host::*;
 use crate::makepad_error_log::*;
 use crate::makepad_live_id::*;
 use crate::mod_gc::*;
+use crate::mod_feed::*;
 use crate::mod_html::*;
 use crate::mod_math::*;
 use crate::mod_pod::*;
@@ -3630,6 +3631,7 @@ impl ScriptVmBase {
         define_std_module(&mut heap, &mut native);
         define_regex_module(&mut heap, &mut native);
         define_html_module(&mut heap, &mut native);
+        define_feed_module(&mut heap, &mut native);
         define_shader_module(&mut heap, &mut native);
         define_gc_module(&mut heap, &mut native);
         let pod_builtins = define_pod_module(&mut heap, &mut native);
