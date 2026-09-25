@@ -4,7 +4,7 @@ use {
     crate::{
         area::Area,
         cursor::MouseCursor,
-        cx::{Cx, CxRef, OsType, XrCapabilities},
+        cx::{Cx, CxRef, GpuBackend, OsType, XrCapabilities},
         display_context::SystemBarAppearance,
         draw_list::DrawListId,
         draw_pass::{CxDrawPassParent, CxDrawPassRect, DrawPassId},
@@ -712,6 +712,45 @@ pub(crate) fn defer_platform_op(platform_ops: &mut VecDeque<CxOsOp>, op: CxOsOp)
 }
 
 impl Cx {
+    /// The GPU API this binary renders with (see [`GpuBackend`]).
+    pub fn gpu_backend(&self) -> GpuBackend {
+        #[cfg(gpusim)]
+        {
+            GpuBackend::Gpusim
+        }
+        #[cfg(not(gpusim))]
+        {
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+            {
+                GpuBackend::Metal
+            }
+            #[cfg(target_os = "windows")]
+            {
+                GpuBackend::Direct3d11
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                GpuBackend::WebGl
+            }
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "windows")),
+                not(target_arch = "wasm32"),
+                use_vulkan
+            ))]
+            {
+                GpuBackend::Vulkan
+            }
+            #[cfg(all(
+                not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "windows")),
+                not(target_arch = "wasm32"),
+                not(use_vulkan)
+            ))]
+            {
+                GpuBackend::OpenGl
+            }
+        }
+    }
+
     /// Open the OS share sheet with `content`. No-op on platforms whose backend
     /// does not handle `CxOsOp::ShareText`.
     pub fn share_text(&mut self, content: &str) {

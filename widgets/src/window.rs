@@ -705,8 +705,10 @@ impl SsaaStack {
     /// supersized scene texture with LINEAR (== a 2x2 box for supersample==2).
     fn draw_resolve(&mut self, cx: &mut Cx2d, resolve: &mut DrawSsaaResolve, root_size: Vec2d) {
         // Scene texture is bottom-up — flip opposite to the gauss compositor or the UI shows upside-down.
-        // Unchanged per OS by the gauss orientation fix (Android 0, else 1).
-        let source_y_flip = if matches!(cx.os_type(), OsType::Android(_)) { 0.0 } else { 1.0 };
+        // Unchanged per OS by the gauss orientation fix (Android on OpenGL ES 0, else 1): Android
+        // on Vulkan renders through the same backend as desktop Linux Vulkan, which flips.
+        let android_gl = matches!(cx.os_type(), OsType::Android(_)) && cx.gpu_backend() == GpuBackend::OpenGl;
+        let source_y_flip = if android_gl { 0.0 } else { 1.0 };
         resolve
             .draw_vars
             .set_uniform(cx, live_id!(source_y_flip), &[source_y_flip]);

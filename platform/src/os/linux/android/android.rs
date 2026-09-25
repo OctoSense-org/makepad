@@ -2617,6 +2617,15 @@ impl Cx {
                 }
             }
         }
+        // A repaint that ended without a window pass (captures only, or the
+        // window pass skipped its turn) still has to reach the GPU.
+        #[cfg(use_vulkan)]
+        if let Some(mut vulkan) = self.os.vulkan.take() {
+            if let Err(err) = vulkan.end_repaint() {
+                crate::error!("Android Vulkan repaint submit failed: {err}");
+            }
+            self.os.vulkan = Some(vulkan);
+        }
 
         let timestamp_ns = (self.os.timers.time_now().max(0.0) * 1_000_000_000.0) as u64;
         for index in 0..MAX_VIDEO_DEVICE_INDEX {
