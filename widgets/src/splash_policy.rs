@@ -158,6 +158,83 @@ pub fn hosts_for_heap(heap_key: usize) -> Option<Vec<String>> {
     POLICIES.with(|p| p.borrow().get(&heap_key).map(|policy| policy.hosts.clone()))
 }
 
+/// The host of `url` when it is https and names a public host: not loopback,
+/// private, link-local, shared or unspecified, not a single-label or
+/// `.local`/`.internal`/`.localhost` name, and not an IP written in a form
+/// only some resolvers read as one (`0x7f.1`). What a grant to reach "any
+/// public page" may reach, and nothing on the device's own network.
+pub fn public_https_host(url: &str) -> Result<String, String> {
+    if !url.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        return Err("only https:// URLs are allowed".into());
+    }
+    let host = makepad_script_std::url_host(url).ok_or("missing host")?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return if is_public_ip(ip) { Ok(host) } else { Err(format!("host not permitted (private/internal): {host}")) };
+    }
+    let last = host.rsplit('.').next().unwrap_or("");
+    let numeric = last.bytes().all(|b| b.is_ascii_digit()) || last.starts_with("0x");
+    if numeric || !host.contains('.') || host.starts_with('[') {
+        return Err(format!("host not permitted (not a public name): {host}"));
+    }
+    if host == "localhost" || [".localhost", ".internal", ".local", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s)) {
+        return Err(format!("host not permitted (private/internal): {host}"));
+    }
+    Ok(host)
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// May this heap load `url` as media (an image, artwork)? Its host list
+/// answers first; the `images` grant adds any public https host, for an app
+/// that shows pictures from wherever its content links (a feed reader's
+/// thumbnails). A load is still a request, so the grant is its own consent.
+pub fn media_allowed(heap_key: usize, url: &str) -> bool {
+    url_allowed(heap_key, url)
+        || (is_enforced(heap_key)
+            && may_run(heap_key)
+            && service_allowed(heap_key, "images.any").is_ok()
+            && public_https_host(url).is_ok())
+}
+
+/// May this heap open `url` as a page in the system WebView? Its host list
+/// answers first; the `web` grant adds any public https page, for a reader.
+/// Such a page gets no bridge into the app.
+pub fn page_allowed(heap_key: usize, url: &str) -> bool {
+    url_allowed(heap_key, url)
+        || (is_enforced(heap_key)
+            && may_run(heap_key)
+            && service_allowed(heap_key, "web.open").is_ok()
+            && public_https_host(url).is_ok())
+}
+
 /// Record `instructions` run by this heap. Returns false once the budget is
 /// spent, and stays false: the heap is exhausted from then on.
 pub fn charge(heap_key: usize, instructions: u64) -> bool {
@@ -191,6 +268,7 @@ pub(crate) fn install_url_gate() {
     INSTALLED.with(|installed| {
         if !installed.get() {
             makepad_script_std::set_script_url_gate(Some(url_allowed));
+            makepad_script_std::set_script_media_gate(Some(media_allowed));
             installed.set(true);
         }
     });
@@ -303,6 +381,52 @@ mod tests {
         assert!(local_path_for_heap(909, "../../etc/hosts").is_none(), "no climbing out");
         crate::splash_storage::set_root_for_heap(909, None);
         gc_policies(&[909]);
+    }
+
+    #[test]
+    fn a_public_host_is_https_and_off_the_devices_network() {
+        for ok in ["https://news.ycombinator.com/", "https://CDN.Example.org:8443/a.jpg", "https://8.8.8.8/", "https://[2606:4700::1111]/"] {
+            assert!(public_https_host(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com/",
+            "https://localhost/",
+            "https://127.0.0.1/",
+            "https://10.0.0.8/",
+            "https://172.20.1.1/",
+            "https://192.168.1.1/",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/",
+            "https://0.0.0.0/",
+            "https://[::1]/",
+            "https://[fd00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://0x7f.1/",
+            "https://2130706433/",
+            "https://router/",
+            "https://printer.local/",
+            "https://nas.home.arpa/",
+            "https://evil.com@127.0.0.1/",
+        ] {
+            assert!(public_https_host(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn images_and_web_grants_open_public_https_only() {
+        set_policy_for_heap(910, vec!["net".into()], vec!["hn.algolia.com".into()], None);
+        assert!(media_allowed(910, "https://hn.algolia.com/logo.png"), "its own hosts, as before");
+        assert!(!media_allowed(910, "https://cdn.example.org/a.jpg"));
+        assert!(!page_allowed(910, "https://example.org/story"));
+        set_policy_for_heap(910, vec!["net".into(), "images".into(), "web".into()], vec!["hn.algolia.com".into()], None);
+        assert!(media_allowed(910, "https://cdn.example.org/a.jpg"));
+        assert!(page_allowed(910, "https://example.org/story"));
+        assert!(!media_allowed(910, "https://192.168.1.1/a.jpg"), "never the device's network");
+        assert!(!page_allowed(910, "http://example.org/story"), "never plain http");
+        assert!(!url_allowed(910, "https://cdn.example.org/a.jpg"), "neither grant widens requests");
+        gc_policies(&[910]);
+        assert!(media_allowed(910, "https://anything.example/"), "an unpoliced heap, as before");
     }
 
     #[test]

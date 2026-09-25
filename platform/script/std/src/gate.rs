@@ -16,6 +16,23 @@ pub type ScriptUrlGate = fn(usize, &str) -> bool;
 
 thread_local! {
     static URL_GATE: Cell<Option<ScriptUrlGate>> = const { Cell::new(None) };
+    static MEDIA_GATE: Cell<Option<ScriptUrlGate>> = const { Cell::new(None) };
+}
+
+/// Install (or clear) the gate for media loads (`http_resource`: images and
+/// other artwork). A host can grant an app artwork from anywhere without
+/// granting it requests to anywhere. With no media gate, media answers to
+/// the URL gate like every other path.
+pub fn set_script_media_gate(gate: Option<ScriptUrlGate>) {
+    MEDIA_GATE.with(|g| g.set(gate));
+}
+
+/// Whether `heap_key` may load media from `url`.
+pub fn script_media_url_allowed(heap_key: usize, url: &str) -> bool {
+    match MEDIA_GATE.with(|g| g.get()) {
+        Some(gate) => gate(heap_key, url),
+        None => script_url_allowed(heap_key, url),
+    }
 }
 
 /// Install (or clear) the gate for this thread. Isolates are UI-thread-owned,
@@ -100,6 +117,23 @@ mod tests {
         set_script_url_gate(Some(only_heap_seven));
         assert!(script_url_allowed(7, "https://anything.example"));
         assert!(!script_url_allowed(8, "https://anything.example"));
+        set_script_url_gate(None);
+    }
+
+    #[test]
+    fn media_falls_back_to_the_url_gate_until_it_has_its_own() {
+        fn only_heap_seven(heap: usize, _url: &str) -> bool {
+            heap == 7
+        }
+        fn every_heap(_heap: usize, _url: &str) -> bool {
+            true
+        }
+        set_script_url_gate(Some(only_heap_seven));
+        assert!(!script_media_url_allowed(8, "https://cdn.example/a.jpg"));
+        set_script_media_gate(Some(every_heap));
+        assert!(script_media_url_allowed(8, "https://cdn.example/a.jpg"));
+        assert!(!script_url_allowed(8, "https://cdn.example/a.jpg"), "requests keep their own gate");
+        set_script_media_gate(None);
         set_script_url_gate(None);
     }
 }

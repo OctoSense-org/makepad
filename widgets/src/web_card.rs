@@ -95,42 +95,7 @@ const HTTP_FETCH_ALLOWED_HOSTS: &[&str] = &[
 /// adds the allowlist) and `download` (which doesn't — its bytes land in the
 /// sandbox, so the SSRF block is the protection that matters).
 fn check_https_public(url: &str) -> Result<String, String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| "only https:// URLs are allowed".to_string())?;
-    let host = rest
-        .split(|c| c == '/' || c == '?' || c == '#')
-        .next()
-        .unwrap_or("")
-        .split('@')
-        .next_back()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if host.is_empty() {
-        return Err("missing host".into());
-    }
-    let blocked_prefix = ["127.", "10.", "192.168.", "169.254.", "0."];
-    let private_172 = host.starts_with("172.")
-        && host
-            .split('.')
-            .nth(1)
-            .and_then(|o| o.parse::<u8>().ok())
-            .map(|o| (16..=31).contains(&o))
-            .unwrap_or(false);
-    if host == "localhost"
-        || host == "::1"
-        || host.ends_with(".localhost")
-        || host.ends_with(".internal")
-        || host.ends_with(".local")
-        || blocked_prefix.iter().any(|p| host.starts_with(p))
-        || private_172
-    {
-        return Err(format!("host not permitted (private/internal): {}", host));
-    }
-    Ok(host)
+    crate::splash_policy::public_https_host(url)
 }
 
 /// Enforce the `http.fetch` capability gate: SSRF guard + the host must be on the
@@ -398,7 +363,7 @@ impl WebCard {
         // inline HTML — used to isolate loadHTMLString from the overlay path.
         if let Some(url) = self.html.trim().strip_prefix("URLTEST:") {
             let url = url.trim().to_string();
-            if !crate::splash_policy::url_allowed(self.source.heap_key(), &url) {
+            if !crate::splash_policy::page_allowed(self.source.heap_key(), &url) {
                 log!("web_card navigation refused by the host's allowlist: {url}");
                 self.loaded_html = self.html.clone();
                 return;
@@ -799,11 +764,12 @@ impl Widget for WebCard {
         if self.html.is_empty()
             && !self.url.is_empty()
             && self.loaded_html != self.url
-            && !crate::splash_policy::url_allowed(self.source.heap_key(), &self.url)
+            && !crate::splash_policy::page_allowed(self.source.heap_key(), &self.url)
         {
-            // A card under a policy opens only pages on its host list. The
-            // top-level document is what the gate can see; the page's own
-            // subresources are the page's, as in any browser.
+            // A card under a policy opens only pages on its host list, or
+            // any public https page with the `web` grant. The top-level
+            // document is what the gate can see; the page's own subresources
+            // are the page's, as in any browser, and it gets no bridge.
             log!("web_card navigation refused by the host's allowlist: {}", self.url);
             self.loaded_html = self.url.clone();
         }

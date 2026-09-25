@@ -33,6 +33,7 @@ pub mod widget_tree;
 
 // Modules ordered to match script_mod calls
 pub mod rubber_view;
+pub mod gesture_view;
 pub mod scroll_bar;
 pub mod scroll_bars;
 pub mod scroll_motion;
@@ -363,6 +364,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::view_ui::script_mod(vm);
     crate::grid::script_mod(vm);
     crate::rubber_view::script_mod(vm);
+    crate::gesture_view::script_mod(vm);
 
     crate::label::script_mod(vm);
     crate::link_label::script_mod(vm);

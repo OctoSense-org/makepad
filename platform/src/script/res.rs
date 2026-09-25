@@ -1340,7 +1340,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 let heap_key = vm.bx.heap.heap_key();
                 // Artwork is a way out of the isolate too: a card with no
                 // network grant was seen fetching nine images through here.
-                if !makepad_script_std::script_url_allowed(heap_key, &url_string) {
+                if !makepad_script_std::script_media_url_allowed(heap_key, &url_string) {
                     // Logged as well as raised: the widget that asked draws
                     // nothing, and a silent blank is the hardest bug to find.
                     crate::log!("Script resource refused by the host's allowlist: {url_string}");
