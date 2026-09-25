@@ -4312,6 +4312,10 @@ struct LabelLists {
 
 // --- MapView widget ---
 
+/// How many Overpass mirrors a tile request tries before it gives up on the
+/// ones an app's policy does not list.
+const OVERPASS_MIRROR_TRIES: u8 = 8;
+
 #[derive(Script, Widget)]
 pub struct MapView {
     /// The @cam readout in the corner: the exact command to recreate this
@@ -9416,11 +9420,18 @@ impl MapView {
         }
 
         let query = overpass_query(tile_key);
-        let endpoint = overpass_endpoint(tile_key, attempts, cx.seconds_since_app_start() as u64);
-        if !crate::splash_policy::url_allowed(self.source.heap_key(), endpoint) {
+        // The endpoint rotates across mirrors per tile and attempt. An app
+        // under a policy may list only some of them: use the next one it may
+        // reach rather than failing the tile on the mirror it may not.
+        let now = cx.seconds_since_app_start() as u64;
+        let heap_key = self.source.heap_key();
+        let Some(endpoint) = (0..OVERPASS_MIRROR_TRIES)
+            .map(|k| overpass_endpoint(tile_key, attempts.wrapping_add(k), now))
+            .find(|endpoint| crate::splash_policy::url_allowed(heap_key, endpoint))
+        else {
             self.mark_tile_failed(tile_key, "refused by the host's allowlist");
             return false;
-        }
+        };
         let mut request = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
         request.set_header("Content-Type".to_string(), "text/plain".to_string());
         request.set_header("Accept".to_string(), "application/json".to_string());
