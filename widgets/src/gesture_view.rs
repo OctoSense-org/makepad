@@ -165,6 +165,19 @@ impl PinchTracker {
     }
 }
 
+/// One finger followed from the raw touch stream (see GestureView's
+/// handle_event): where and when it went down, and what it has become.
+#[derive(Clone, Copy, Debug)]
+struct TouchPress {
+    uid: u64,
+    start: DVec2,
+    time: f64,
+    panning: bool,
+    /// Spent on a long press: its release is no tap.
+    spent: bool,
+    last_sent: DVec2,
+}
+
 #[derive(Script, ScriptHook, Widget)]
 pub struct GestureView {
     #[deref]
@@ -196,6 +209,8 @@ pub struct GestureView {
     #[rust]
     pinch: PinchTracker,
     #[rust]
+    touch: Option<TouchPress>,
+    #[rust]
     pinch_sent: f64,
     /// A pinch happened during this press: the fingers' release is not a
     /// tap, a swipe or the end of a drag.
@@ -214,6 +229,81 @@ impl GestureView {
     fn local(&self, cx: &Cx, abs: DVec2) -> DVec2 {
         abs - self.view.area().rect(cx).pos
     }
+
+    fn handle_touches(&mut self, cx: &mut Cx, event: &TouchUpdateEvent) {
+        let area = self.view.area();
+        let bounds = area.clipped_rect(cx);
+        for t in &event.touches {
+            match t.state {
+                TouchState::Start => {
+                    if self.touch.is_some() || !bounds.contains(t.abs) {
+                        continue;
+                    }
+                    let claimed = t.handled.get();
+                    if !claimed.is_empty() && claimed != area && is_inside(cx, claimed, area) {
+                        continue;
+                    }
+                    if !self.pinch.holding() || self.pinch.contacts.len() <= 1 {
+                        self.pinched = false;
+                    }
+                    self.touch = Some(TouchPress { uid: t.uid, start: t.abs, time: t.time, panning: false, spent: false, last_sent: DVec2::default() });
+                }
+                TouchState::Move | TouchState::Stable => {
+                    let Some(mut press) = self.touch.filter(|p| p.uid == t.uid) else { continue };
+                    if self.pinch.pinching() || self.pinched {
+                        continue;
+                    }
+                    let delta = t.abs - press.start;
+                    if !press.panning && delta.length() > TAP_SLOP {
+                        press.panning = true;
+                        self.call(cx, &self.on_pan.clone(), &[0.0.into(), 0.0.into(), 0.0.into()]);
+                    }
+                    if press.panning && (delta - press.last_sent).length() >= 1.0 {
+                        press.last_sent = delta;
+                        self.call(cx, &self.on_pan.clone(), &[delta.x.into(), delta.y.into(), 1.0.into()]);
+                    }
+                    self.touch = Some(press);
+                }
+                TouchState::Stop => {
+                    let Some(press) = self.touch.filter(|p| p.uid == t.uid) else { continue };
+                    self.touch = None;
+                    if self.pinched {
+                        continue;
+                    }
+                    let delta = t.abs - press.start;
+                    if press.panning {
+                        self.call(cx, &self.on_pan.clone(), &[delta.x.into(), delta.y.into(), 2.0.into()]);
+                        if let Some((dx, dy)) = swipe(delta.x, delta.y, t.time - press.time) {
+                            self.call(cx, &self.on_swipe.clone(), &[dx.into(), dy.into()]);
+                        }
+                    } else if !press.spent && delta.length() <= TAP_SLOP && bounds.contains(t.abs) {
+                        self.tap(cx, t.abs, t.time);
+                    }
+                }
+            }
+        }
+    }
+
+    fn tap(&mut self, cx: &mut Cx, abs: DVec2, time: f64) {
+        let at = self.local(cx, abs);
+        self.call(cx, &self.on_tap.clone(), &[at.x.into(), at.y.into()]);
+        let double = self
+            .last_tap
+            .is_some_and(|(t, pos)| time - t <= DOUBLE_TAP_SECONDS && pos.distance(&abs) <= DOUBLE_TAP_DISTANCE);
+        if double {
+            self.last_tap = None;
+            self.call(cx, &self.on_double_tap.clone(), &[at.x.into(), at.y.into()]);
+        } else {
+            self.last_tap = Some((time, abs));
+        }
+    }
+}
+
+/// Whether `inner` is a widget drawn inside `outer` (not `outer`'s own
+/// rect, and not one around it).
+fn is_inside(cx: &Cx, inner: Area, outer: Area) -> bool {
+    let (rect, own) = (inner.rect(cx), outer.rect(cx));
+    rect.is_inside_of(own) && rect.size != own.size
 }
 
 impl Widget for GestureView {
@@ -255,6 +345,33 @@ impl Widget for GestureView {
                 }
                 PinchStep::Nothing => {}
             }
+        }
+
+        // Touch is read from the raw stream and never claimed. Claiming it,
+        // even with a capture overload, marks the touch handled, and the
+        // scroll view around this one then never starts its drag: a list of
+        // GestureView rows would not scroll. A child that claimed the touch
+        // (a Button inside) still keeps it.
+        match event {
+            Event::TouchUpdate(touches) => {
+                self.handle_touches(cx, touches);
+                return;
+            }
+            Event::LongPress(press) => {
+                let fire = match self.touch.as_mut() {
+                    Some(p) if p.uid == press.uid && !p.panning && !p.spent && !self.pinched => {
+                        p.spent = true;
+                        true
+                    }
+                    _ => false,
+                };
+                if fire {
+                    let at = self.local(cx, press.abs);
+                    self.call(cx, &self.on_long_press.clone(), &[at.x.into(), at.y.into()]);
+                }
+                return;
+            }
+            _ => {}
         }
 
         match event.hits_with_capture_overload(cx, self.view.area(), true) {
@@ -301,17 +418,7 @@ impl Widget for GestureView {
                     return;
                 }
                 if e.is_over && delta.length() <= TAP_SLOP && !e.has_long_press_occurred {
-                    let at = self.local(cx, e.abs);
-                    self.call(cx, &self.on_tap.clone(), &[at.x.into(), at.y.into()]);
-                    let double = self
-                        .last_tap
-                        .is_some_and(|(time, pos)| e.time - time <= DOUBLE_TAP_SECONDS && pos.distance(&e.abs) <= DOUBLE_TAP_DISTANCE);
-                    if double {
-                        self.last_tap = None;
-                        self.call(cx, &self.on_double_tap.clone(), &[at.x.into(), at.y.into()]);
-                    } else {
-                        self.last_tap = Some((e.time, e.abs));
-                    }
+                    self.tap(cx, e.abs, e.time);
                 }
             }
             _ => {}
@@ -322,14 +429,10 @@ impl Widget for GestureView {
 /// Whether a widget inside `area` (not `area` itself, not one around it)
 /// captured this press.
 fn child_owns_press(cx: &Cx, digit_id: DigitId, area: Area) -> bool {
-    let own = area.rect(cx);
-    cx.fingers.digit_capture_areas(digit_id).into_iter().any(|captured| {
-        if captured == area {
-            return false;
-        }
-        let rect = captured.rect(cx);
-        rect.is_inside_of(own) && rect.size != own.size
-    })
+    cx.fingers
+        .digit_capture_areas(digit_id)
+        .into_iter()
+        .any(|captured| captured != area && is_inside(cx, captured, area))
 }
 
 /// Of the sheet's own height: the peek, half and full resting heights.

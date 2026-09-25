@@ -2162,6 +2162,67 @@ mod isolate_tests {
     }
 
     #[test]
+    fn a_rerender_builds_each_child_from_its_new_template() {
+        const RERENDER: &str = r#"
+    let items = []
+    let WithExtra = View{ height: Fit extra := Label{ text: "x" } }
+    let Plain = View{ height: Fit }
+    fn load(){
+        host.request("t.items", {}, fn(r){
+            items = r.data.items
+            ui.item_list.render()
+        })
+    }
+    item_list := View{ height: Fit, on_render: || {
+        for it in items {
+            if it.extra { WithExtra{} } else { Plain{} }
+        }
+    } }
+"#;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{ splash := Splash{} }
+            });
+            vm.bx.heap.new_object_ref(v.as_object().unwrap())
+        });
+        let pane = cx.with_vm(|vm| {
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                View{ height: Fit }
+            });
+            WidgetRef::script_from_value(vm, v)
+        });
+        set_ui_root(&mut cx, &pane);
+        let host = cx.with_vm(|vm| WidgetRef::script_from_value(vm, template.as_object().into()));
+        cx.widget_tree_insert_child_deep(pane.widget_uid(), live_id!(apphost), host.clone());
+        host.widget(&cx, &[live_id!(splash)]).set_text(&mut cx, RERENDER);
+        let item_list = host.widget(&cx, &[live_id!(item_list)]);
+        assert!(!item_list.is_empty());
+        let splash = host.widget(&cx, &[live_id!(splash)]);
+        let mut render = |cx: &mut Cx, json: &str| {
+            assert!(splash.borrow_mut::<Splash>().unwrap().call_script_fn(cx, live_id!(load), &[]));
+            pump_widget_async(cx);
+            let reqs = crate::splash_host::take_splash_host_requests();
+            assert_eq!(reqs.len(), 1);
+            crate::splash_host::splash_host_respond(cx, reqs[0].heap_key, reqs[0].req_id, Ok(json));
+            pump_widget_async(cx);
+            let first = item_list.borrow::<View>().unwrap().children.first().map(|(_, w)| w.clone()).unwrap();
+            !first.widget(cx, &[live_id!(extra)]).is_empty()
+        };
+        assert!(render(&mut cx, r#"{"items":[{"extra":true}]}"#), "the first render has the extra child");
+        assert!(
+            !render(&mut cx, r#"{"items":[{"extra":false}]}"#),
+            "a slot whose template changed keeps nothing of the old one"
+        );
+        drop(host);
+        gc_dead_splash_isolates(&mut cx);
+    }
+
+    #[test]
     fn second_isolate_render_commits() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         let template = cx.with_vm(|vm| {

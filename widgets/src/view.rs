@@ -139,6 +139,10 @@ pub struct View {
     script_async: ScriptAsyncCalls,
     #[rust]
     applying_style_render: bool,
+    /// An `on_render` result is being applied: its children are built fresh
+    /// rather than applied over the previous render's (see `on_after_apply`).
+    #[rust]
+    applying_render: bool,
     #[rust]
     item_tap_live: bool,
 
@@ -214,6 +218,7 @@ impl ScriptHook for View {
         if !apply.is_eval() {
             if let Some(obj) = value.as_object() {
                 let mut anon_index = 0usize;
+                let rendering = self.applying_render;
                 vm.vec_with(obj, |vm, vec| {
                     for kv in vec {
                         // Determine the id: use prefixed id if available, otherwise use numbered id for anonymous children
@@ -240,7 +245,19 @@ impl ScriptHook for View {
                             if let Some((_, node)) =
                                 self.children.iter_mut().find(|(id2, _)| *id2 == id)
                             {
-                                node.script_apply(vm, apply, scope, kv.value);
+                                // An `on_render` result is built fresh, as the first
+                                // render was. Applied over the previous render's
+                                // instance, a child keeps what the new object does not
+                                // restate: a slot that held a card with a picture keeps
+                                // the picture's named child, and a label re-laid-out
+                                // with longer text lost its wrap width. A render is a
+                                // function of the app's state, not an edit of the
+                                // last one.
+                                if rendering {
+                                    *node = WidgetRef::script_from_value_scoped(vm, scope, kv.value);
+                                } else {
+                                    node.script_apply(vm, apply, scope, kv.value);
+                                }
                             } else {
                                 let widget =
                                     WidgetRef::script_from_value_scoped(vm, scope, kv.value);
@@ -942,8 +959,10 @@ impl Widget for View {
                 let declaration = self.source.clone();
                 let style=call.method()==id!(render_style);
                 self.applying_style_render=style;
+                self.applying_render=!style;
                 self.script_apply(vm, &if style {Apply::ScriptReapply}else{Apply::Reload}, &mut Scope::empty(), me_obj.into());
                 self.applying_style_render=false;
+                self.applying_render=false;
                 self.source = declaration;
                 self.redraw(vm.cx_mut());
             }
