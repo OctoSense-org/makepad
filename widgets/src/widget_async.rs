@@ -95,6 +95,58 @@ pub fn register_splash_isolate_mod(f: fn(&mut ScriptVm)) {
     HOST_ISOLATE_MODS.with(|g| g.borrow_mut().push(f));
 }
 
+thread_local! {
+    /// Host mods that only isolates holding a grant receive, with the grant.
+    static GRANTED_ISOLATE_MODS: RefCell<Vec<(&'static str, fn(&mut ScriptVm))>> = const { RefCell::new(Vec::new()) };
+    /// heap key -> indices into `GRANTED_ISOLATE_MODS` already installed there.
+    static GRANTED_INSTALLED: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
+}
+
+/// Install a script mod only into the isolates granted `grant`.
+///
+/// [`register_splash_isolate_mod`] reaches every isolate, so vocabulary a host
+/// registers for its own cards also lands in every installed app. A mod
+/// registered here is installed into an isolate under a policy only when that
+/// policy grants `grant` (a capability family such as `agent`, or an exact
+/// service name), and into an unpoliced isolate (the host's own surfaces)
+/// always.
+///
+/// The grant is known only once the host has seated the policy, which is
+/// after allocation, so these mods install when a Splash first evaluates its
+/// body, before the body runs. A later policy that drops the grant does not
+/// remove a mod already installed: set the policy before the body loads.
+pub fn register_splash_isolate_mod_for(grant: &'static str, f: fn(&mut ScriptVm)) {
+    GRANTED_ISOLATE_MODS.with(|g| g.borrow_mut().push((grant, f)));
+}
+
+/// Install the granted mods this isolate is entitled to and does not yet
+/// have. Cheap when there is nothing new to install.
+pub(crate) fn apply_granted_isolate_mods(vm: &mut ScriptVm) {
+    let heap_key = vm.bx.heap.heap_key();
+    let mods = GRANTED_ISOLATE_MODS.with(|mods| mods.borrow().clone());
+    for (index, (grant, install)) in mods.into_iter().enumerate() {
+        let installed = GRANTED_INSTALLED.with(|i| i.borrow().get(&heap_key).is_some_and(|done| done.contains(&index)));
+        if installed {
+            continue;
+        }
+        let entitled = !crate::splash_policy::is_enforced(heap_key)
+            || crate::splash_policy::service_allowed(heap_key, grant).is_ok();
+        if entitled {
+            install(vm);
+            GRANTED_INSTALLED.with(|i| i.borrow_mut().entry(heap_key).or_default().push(index));
+        }
+    }
+}
+
+/// Forget which granted mods a heap has, so the next
+/// [`apply_granted_isolate_mods`] installs them again: a theme rebuild
+/// replaces the modules they bound into.
+pub(crate) fn forget_granted_isolate_mods(heap_key: usize) {
+    GRANTED_INSTALLED.with(|i| {
+        i.borrow_mut().remove(&heap_key);
+    });
+}
+
 /// Reinstall trusted host vocabulary after a theme rebuild replaces mod.widgets.
 /// Clone first so an installer can register another module without borrowing the list.
 pub(crate) fn apply_splash_isolate_mods(vm: &mut ScriptVm) {
@@ -156,6 +208,9 @@ pub fn gc_dead_splash_isolates(cx: &mut Cx) {
     crate::splash_storage::gc_roots(&dead_heaps);
     crate::splash_host::gc_bridge(&dead_heaps);
     crate::splash_policy::gc_policies(&dead_heaps);
+    for heap in &dead_heaps {
+        forget_granted_isolate_mods(*heap);
+    }
     crate::desktop_style::gc_heaps(cx,&dead_heaps);
     // And the resource cache, which is keyed by heap ADDRESS: dropping a heap
     // frees that address for the next isolate, and a leftover entry would hand
@@ -1792,6 +1847,43 @@ mod isolate_entry_tests {
         cx.free_splash_vm(before);
         cx.free_splash_vm(after);
         cx.free_splash_vm(third);
+    }
+
+    #[test]
+    fn a_granted_mod_reaches_only_the_isolates_holding_its_grant() {
+        fn install_granted_probe(vm: &mut ScriptVm) {
+            vm.eval(crate::makepad_script::script! {
+                mod.granted_probe = 7
+            });
+        }
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        register_splash_isolate_mod_for("agent", install_granted_probe);
+
+        let has_probe = |cx: &mut Cx, vm_id| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                apply_granted_isolate_mods(vm);
+                !vm.eval(crate::makepad_script::script! { mod.granted_probe }).is_err()
+            })
+        };
+        let heap = |cx: &mut Cx, vm_id| cx.with_script_vm_id(vm_id, |vm| vm.bx.heap.heap_key());
+
+        let host_own = cx.alloc_splash_vm();
+        let denied = cx.alloc_splash_vm();
+        let granted = cx.alloc_splash_vm();
+        let denied_heap = heap(&mut cx, denied);
+        let granted_heap = heap(&mut cx, granted);
+        crate::splash_policy::set_policy_for_heap(denied_heap, vec!["net".into()], vec![], None);
+        crate::splash_policy::set_policy_for_heap(granted_heap, vec!["agent".into()], vec![], None);
+
+        assert!(has_probe(&mut cx, host_own), "an unpoliced isolate is the host's own");
+        assert!(!has_probe(&mut cx, denied), "a policy without the grant never sees it");
+        assert!(has_probe(&mut cx, granted));
+
+        crate::splash_policy::gc_policies(&[denied_heap, granted_heap]);
+        cx.free_splash_vm(host_own);
+        cx.free_splash_vm(denied);
+        cx.free_splash_vm(granted);
     }
 
     #[test]

@@ -111,6 +111,11 @@ pub(crate) fn gc_roots(dead_heaps: &[usize]) {
     });
 }
 
+/// The sandbox root assigned to a heap, if any.
+pub(crate) fn root_for_heap(heap_key: usize) -> Option<PathBuf> {
+    SANDBOX_ROOTS.with(|r| r.borrow().get(&heap_key).cloned())
+}
+
 fn root_for_vm(vm: &ScriptVm) -> Option<PathBuf> {
     let heap_key = vm.bx.heap.heap_key();
     SANDBOX_ROOTS.with(|r| r.borrow().get(&heap_key).cloned())
@@ -155,7 +160,7 @@ pub fn resolve_jailed(root: &Path, virtual_path: &str) -> Result<PathBuf, String
 /// be a plain file/dir. The API can't create links, but if one ever appears
 /// in the jail (a bug elsewhere, a hostile unpacker later), it must not
 /// redirect I/O outside.
-fn verify_no_symlinks(root: &Path, real: &Path) -> Result<(), String> {
+pub(crate) fn verify_no_symlinks(root: &Path, real: &Path) -> Result<(), String> {
     let mut cursor = root.to_path_buf();
     let rel = real.strip_prefix(root).map_err(|_| "path escapes the app's storage")?;
     for comp in rel.components() {

@@ -148,6 +148,54 @@ fn fetch_host_allowed(url: &str) -> Result<(), String> {
     }
 }
 
+/// The bridge tool a card under a policy may call, and the grant it needs.
+/// `None` = never, under a policy: the WebView bridge's files and downloads
+/// live outside the app's jail, and its share sheet and notices are the host's
+/// to raise. An unpoliced card (the host's own) keeps every tool.
+fn policed_tool_grant(tool: &str) -> Option<&'static str> {
+    match tool {
+        "ping" => Some(""),
+        "http.fetch" => Some("net.fetch"),
+        "clipboard.write" => Some("clipboard.write"),
+        _ => None,
+    }
+}
+
+/// A Content-Security-Policy that holds a policed card's own document to its
+/// host list. The WebView fetches for itself, out of reach of the script
+/// gate; this is how the same allowlist follows it there. Inline script and
+/// style stay allowed (the kit and the card are inline); nothing may frame,
+/// and nothing loads from a host the manifest does not name.
+fn policy_csp(hosts: &[String]) -> String {
+    let mut sources = String::new();
+    for host in hosts {
+        // A host list entry is a bare host (any port) or host:port.
+        if host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')) {
+            sources.push_str(" https://");
+            sources.push_str(host);
+        }
+    }
+    format!(
+        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'{sources}; \
+         img-src data: blob:{sources}; media-src blob:{sources}; font-src data:{sources}; \
+         connect-src{none}{sources}; frame-src 'none'; form-action 'none'; base-uri 'none'",
+        none = if sources.is_empty() { " 'none'" } else { "" },
+    )
+}
+
+/// Put `csp` at the very start of the head, ahead of anything that could
+/// fetch, so it governs the whole document.
+fn inject_csp(html: &str, csp: &str) -> String {
+    let tag = format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">");
+    match html.find("<head>") {
+        Some(i) => {
+            let at = i + "<head>".len();
+            format!("{}{}{}", &html[..at], tag, &html[at..])
+        }
+        None => format!("<head>{tag}</head>{html}"),
+    }
+}
+
 script_mod! {
     use mod.prelude.widgets_internal.*
 
@@ -350,6 +398,11 @@ impl WebCard {
         // inline HTML — used to isolate loadHTMLString from the overlay path.
         if let Some(url) = self.html.trim().strip_prefix("URLTEST:") {
             let url = url.trim().to_string();
+            if !crate::splash_policy::url_allowed(self.source.heap_key(), &url) {
+                log!("web_card navigation refused by the host's allowlist: {url}");
+                self.loaded_html = self.html.clone();
+                return;
+            }
             if !self.spawned {
                 cx.system_browser(id).spawn(&url);
                 self.spawned = true;
@@ -366,7 +419,10 @@ impl WebCard {
             cx.system_browser(id).spawn("about:blank");
             self.spawned = true;
         }
-        let html = inject_widget_kit(&self.html);
+        let mut html = inject_widget_kit(&self.html);
+        if let Some(hosts) = crate::splash_policy::hosts_for_heap(self.source.heap_key()) {
+            html = inject_csp(&html, &policy_csp(&hosts));
+        }
         let base = self.base_url_or_default().to_string();
         cx.system_browser(id).set_html(&html, &base);
         self.loaded_html = self.html.clone();
@@ -396,6 +452,19 @@ impl WebCard {
 
     /// Dispatch one `octos.invoke(tool, args)`. `args` is a JSON string from the card.
     fn handle_invoke(&mut self, cx: &mut Cx, call_id: i64, tool: &str, args: &str) {
+        let heap_key = self.source.heap_key();
+        if crate::splash_policy::is_enforced(heap_key) {
+            let allowed = match policed_tool_grant(tool) {
+                Some("") => Ok(()),
+                Some(grant) => crate::splash_policy::service_allowed(heap_key, grant),
+                None => Err(format!("{tool} is not available to installed apps")),
+            };
+            if let Err(why) = allowed {
+                log!("web_card {tool} DENIED: {why}");
+                self.reject(cx, call_id, &format!("{tool} denied: {why}"));
+                return;
+            }
+        }
         match tool {
             // Round-trip probe: echo the args object back untouched.
             "ping" => {
@@ -407,7 +476,19 @@ impl WebCard {
             // a host allowlist + SSRF guard before any request leaves the device.
             "http.fetch" => match FetchArgs::deserialize_json(args) {
                 Ok(a) => {
-                    if let Err(why) = fetch_host_allowed(&a.url) {
+                    let allowed = if crate::splash_policy::is_enforced(heap_key) {
+                        // The app's own host list, still https and public.
+                        check_https_public(&a.url).and_then(|_| {
+                            if crate::splash_policy::url_allowed(heap_key, &a.url) {
+                                Ok(())
+                            } else {
+                                Err("host not on this app's allowlist".to_string())
+                            }
+                        })
+                    } else {
+                        fetch_host_allowed(&a.url)
+                    };
+                    if let Err(why) = allowed {
                         log!("web_card http.fetch DENIED: {} ({})", a.url, why);
                         self.reject(cx, call_id, &format!("http.fetch denied: {}", why));
                     } else {
@@ -715,6 +796,17 @@ impl Widget for WebCard {
 
         // A DSL-set `url` (no inline html) navigates once on first draw, so a
         // runsplash card can embed a live web pane via `WebCard{ url: "…" }`.
+        if self.html.is_empty()
+            && !self.url.is_empty()
+            && self.loaded_html != self.url
+            && !crate::splash_policy::url_allowed(self.source.heap_key(), &self.url)
+        {
+            // A card under a policy opens only pages on its host list. The
+            // top-level document is what the gate can see; the page's own
+            // subresources are the page's, as in any browser.
+            log!("web_card navigation refused by the host's allowlist: {}", self.url);
+            self.loaded_html = self.url.clone();
+        }
         if self.html.is_empty() && !self.url.is_empty() && self.loaded_html != self.url {
             let id = self.browser_id();
             if !self.spawned {
@@ -771,6 +863,30 @@ impl WebCardRef {
     pub fn detach(&self, cx: &mut Cx) {
         if let Some(inner) = self.borrow() {
             cx.system_browser(inner.browser_id()).detach();
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn a_policed_document_may_reach_only_its_hosts() {
+        let csp = policy_csp(&["api.example.com".into(), "127.0.0.1:5000".into(), "evil.com; script-src *".into()]);
+        assert!(csp.contains("connect-src https://api.example.com https://127.0.0.1:5000;"));
+        assert!(!csp.contains("evil.com"), "a malformed host cannot extend the policy");
+        assert!(policy_csp(&[]).contains("connect-src 'none';"));
+        let html = inject_csp("<html><head><title>x</title></head></html>", &policy_csp(&[]));
+        assert!(html.starts_with("<html><head><meta http-equiv=\"Content-Security-Policy\""));
+    }
+
+    #[test]
+    fn a_policed_card_keeps_only_the_bridge_tools_it_can_be_granted() {
+        assert_eq!(policed_tool_grant("http.fetch"), Some("net.fetch"));
+        assert_eq!(policed_tool_grant("clipboard.write"), Some("clipboard.write"));
+        for tool in ["fs.read", "fs.write", "download", "dialog.open", "share", "notify"] {
+            assert_eq!(policed_tool_grant(tool), None, "{tool}");
         }
     }
 }

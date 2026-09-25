@@ -110,6 +110,54 @@ pub fn url_allowed(heap_key: usize, url: &str) -> bool {
     })
 }
 
+/// May this heap know where the device is? Location is a service family
+/// like any other, granted as `location`; an unpoliced heap keeps the old
+/// behaviour. Every reader of the platform fix on a script's behalf asks
+/// here: `sys.gps`, the blank-name geocode fallback, the map's follow camera.
+pub fn location_allowed(heap_key: usize) -> bool {
+    service_allowed(heap_key, "location.get").is_ok()
+}
+
+/// The device's last GPS fix as this heap may see it: `None` without the
+/// `location` grant, exactly as if the device had no fix yet, so a card's
+/// no-fix path is also its no-permission path.
+pub fn gps_fix_for_heap(heap_key: usize) -> Option<crate::makepad_draw::makepad_platform::gps::GpsFix> {
+    if location_allowed(heap_key) {
+        crate::makepad_draw::makepad_platform::gps::last_gps_fix()
+    } else {
+        None
+    }
+}
+
+/// May this heap read what the user keeps in the host: saved lists
+/// (`sys.watchlist`, cities, reading, topics), stored preferences and the page
+/// open in the reader. These are published process-wide for the host's own
+/// cards; an app under a policy needs the `profile` grant to see them.
+pub fn profile_allowed(heap_key: usize) -> bool {
+    service_allowed(heap_key, "profile.read").is_ok()
+}
+
+/// A file a widget was told to read, as this heap may read it. An unpoliced
+/// heap reads the path as given. A policed heap's paths are app-visible paths
+/// inside its storage jail, so a card cannot point a widget (a map archive,
+/// say) at a file of the host's; with no jail, it reads nothing.
+pub fn local_path_for_heap(heap_key: usize, path: &str) -> Option<String> {
+    if !is_enforced(heap_key) {
+        return Some(path.to_string());
+    }
+    let root = crate::splash_storage::root_for_heap(heap_key)?;
+    let real = crate::splash_storage::resolve_jailed(&root, path).ok()?;
+    crate::splash_storage::verify_no_symlinks(&root, &real).ok()?;
+    Some(real.to_string_lossy().into_owned())
+}
+
+/// The hosts a policed heap may reach, or `None` for an unpoliced heap. For
+/// a surface the gate cannot stand in front of — a system WebView fetches on
+/// its own — so it can be told the same list.
+pub fn hosts_for_heap(heap_key: usize) -> Option<Vec<String>> {
+    POLICIES.with(|p| p.borrow().get(&heap_key).map(|policy| policy.hosts.clone()))
+}
+
 /// Record `instructions` run by this heap. Returns false once the budget is
 /// spent, and stays false: the heap is exhausted from then on.
 pub fn charge(heap_key: usize, instructions: u64) -> bool {
@@ -224,6 +272,37 @@ mod tests {
         set_policy_for_heap(905, vec![], vec![], Some(50));
         assert!(!may_run(905), "lowering the budget below what is spent exhausts the heap");
         gc_policies(&[905]);
+    }
+
+    #[test]
+    fn location_needs_the_location_grant() {
+        gc_policies(&[908]);
+        assert!(location_allowed(908), "an unpoliced heap reads the fix as before");
+        set_policy_for_heap(908, vec!["net".into()], vec![], None);
+        assert!(!location_allowed(908));
+        assert!(gps_fix_for_heap(908).is_none(), "no grant reads as no fix");
+        set_policy_for_heap(908, vec!["location".into()], vec![], None);
+        assert!(location_allowed(908));
+        assert!(!profile_allowed(908), "location does not cover the user's saved lists");
+        set_policy_for_heap(908, vec!["profile".into()], vec![], None);
+        assert!(profile_allowed(908));
+        gc_policies(&[908]);
+    }
+
+    #[test]
+    fn a_policed_heap_reads_local_files_only_inside_its_jail() {
+        gc_policies(&[909]);
+        assert_eq!(local_path_for_heap(909, "/etc/hosts").as_deref(), Some("/etc/hosts"));
+        set_policy_for_heap(909, vec![], vec![], None);
+        assert!(local_path_for_heap(909, "maps/world.mkmap").is_none(), "no jail, no files");
+        crate::splash_storage::set_root_for_heap(909, Some("/jail/app".into()));
+        assert_eq!(
+            local_path_for_heap(909, "maps/world.mkmap").as_deref(),
+            Some("/jail/app/maps/world.mkmap")
+        );
+        assert!(local_path_for_heap(909, "../../etc/hosts").is_none(), "no climbing out");
+        crate::splash_storage::set_root_for_heap(909, None);
+        gc_policies(&[909]);
     }
 
     #[test]
