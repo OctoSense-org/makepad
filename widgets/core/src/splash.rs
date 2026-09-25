@@ -356,6 +356,9 @@ impl Splash {
                 });
             }
             let (view, body_modules, errors) = cx.with_script_vm_id(vm_id, |vm| {
+                // Vocabulary this app's grants entitle it to, now that its policy is seated
+                // (see `register_splash_isolate_mod_for`).
+                crate::widget_async::apply_granted_isolate_mods(vm);
                 // Everything on `mod` that is not the body's own; whatever the run
                 // adds beyond this is the body's.
                 let mut known = module_keys(vm);
@@ -924,12 +927,11 @@ impl Splash {
     /// Push the policy fields onto the live isolate. The URL gate is
     /// installed on first use, so an isolate with no policy is unaffected.
     fn apply_policy(&mut self, cx: &mut Cx, heap_key: usize) {
-        crate::splash_policy::install_url_gate();
         if let Some(hosts) = &self.policy_hosts {
             crate::splash_policy::set_policy_for_heap(heap_key, self.host_caps.clone(), hosts.clone(), self.instruction_budget);
         }
         if let Some(bytes) = self.memory_bytes {
-            cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.set_max_heap_bytes(Some(bytes)));
+            cx.with_script_vm_id(self.vm_id, |vm| vm.heap_mut().set_max_heap_bytes(Some(bytes)));
         }
     }
 
@@ -1338,6 +1340,36 @@ mod prefix_tests {
         assert_eq!(super::splash_prefix(false).matches('\n').count() as u32, super::SPLASH_PREFIX_LINES);
         assert_eq!(super::splash_prefix(true).matches('\n').count() as u32, super::SPLASH_NET_PREFIX_LINES);
     }
+}
+
+/// What a Splash body posts to its host.
+#[derive(Clone, Debug)]
+pub enum SplashAction {
+    /// `agent.notify(event, payload)` from an isolate granted `agent`: the host acts on
+    /// it as if its own card sent it (the payload is the JSON of the second argument).
+    Notify { event_id: String, payload: String },
+}
+
+/// `agent.notify` for isolates. A notify carries no sender, so the host acts on it as if
+/// its own card sent it; an app under a policy may only post one when it was granted
+/// `agent` (installed through `register_splash_isolate_mod_for("agent", ..)` or the host's
+/// own registration), anything else would let an installed app drive the host's agent.
+pub fn register_agent_module(vm: &mut ScriptVm) {
+    let agent = vm.new_module(id!(agent));
+    vm.add_method(agent, id_lut!(notify), script_args_def!(event = NIL, payload = NIL), |vm, args| {
+        let event_value = script_value!(vm, args.event);
+        let payload_value = script_value!(vm, args.payload);
+        let event_id = vm.cast_to_string(event_value);
+        let mut payload = String::new();
+        vm.heap().to_json_inner(payload_value, &mut payload);
+        if let Err(reason) = crate::splash_policy::service_allowed(vm.heap_key(), "agent.notify") {
+            log!("splash: refused agent.notify {event_id:?}: {reason}");
+            return NIL;
+        }
+        Cx::post_action(SplashAction::Notify { event_id, payload });
+        NIL
+    });
+    vm.set_injected_global(id!(agent), agent.into());
 }
 
 #[cfg(test)]
