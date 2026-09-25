@@ -211,8 +211,10 @@ pub fn gc_dead_splash_isolates(cx: &mut Cx) {
     for heap in &dead_heaps {
         forget_granted_isolate_mods(*heap);
     }
-    // Web views an app opened do not outlive it on the window.
-    crate::web_reader::gc_web_readers(cx, &dead_heaps);
+    // Web views and cameras an app opened do not outlive it.
+    for heap in &dead_heaps {
+        crate::camera_preview::release_isolate_devices(cx, *heap);
+    }
     crate::desktop_style::gc_heaps(cx,&dead_heaps);
     // And the resource cache, which is keyed by heap ADDRESS: dropping a heap
     // frees that address for the next isolate, and a leftover entry would hand
@@ -2203,7 +2205,7 @@ mod isolate_tests {
         let item_list = host.widget(&cx, &[live_id!(item_list)]);
         assert!(!item_list.is_empty());
         let splash = host.widget(&cx, &[live_id!(splash)]);
-        let mut render = |cx: &mut Cx, json: &str| {
+        let render = |cx: &mut Cx, json: &str| {
             assert!(splash.borrow_mut::<Splash>().unwrap().call_script_fn(cx, live_id!(load), &[]));
             pump_widget_async(cx);
             let reqs = crate::splash_host::take_splash_host_requests();

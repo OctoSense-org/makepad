@@ -96,7 +96,7 @@ struct Spread {
 
 /// What one touch update did to a pinch.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-enum PinchStep {
+pub(crate) enum PinchStep {
     #[default]
     Nothing,
     Began(DVec2),
@@ -106,13 +106,13 @@ enum PinchStep {
 
 /// Follows the fingers that started inside the view and reports a pinch.
 #[derive(Clone, Debug, Default)]
-struct PinchTracker {
+pub(crate) struct PinchTracker {
     contacts: Vec<Contact>,
     spread: Option<Spread>,
 }
 
 impl PinchTracker {
-    fn update(&mut self, event: &TouchUpdateEvent, bounds: Rect) -> PinchStep {
+    pub(crate) fn update(&mut self, event: &TouchUpdateEvent, bounds: Rect) -> PinchStep {
         for touch in &event.touches {
             match touch.state {
                 TouchState::Start => {
@@ -154,7 +154,7 @@ impl PinchTracker {
         }
     }
 
-    fn pinching(&self) -> bool {
+    pub(crate) fn pinching(&self) -> bool {
         self.spread.is_some()
     }
 

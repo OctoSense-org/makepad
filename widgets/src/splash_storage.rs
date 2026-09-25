@@ -111,6 +111,14 @@ pub(crate) fn gc_roots(dead_heaps: &[usize]) {
     });
 }
 
+/// Whether a heap's jail is under its byte quota: what a native writer
+/// into the jail (the camera) checks before it adds a file.
+pub(crate) fn heap_has_room(heap_key: usize) -> bool {
+    let Some(root) = root_for_heap(heap_key) else { return false };
+    let quota = JAIL_QUOTAS.with(|q| q.borrow().get(&heap_key).copied()).unwrap_or(MAX_TOTAL_BYTES);
+    jail_usage(&root).0 < quota
+}
+
 /// The sandbox root assigned to a heap, if any.
 pub(crate) fn root_for_heap(heap_key: usize) -> Option<PathBuf> {
     SANDBOX_ROOTS.with(|r| r.borrow().get(&heap_key).cloned())
@@ -239,6 +247,20 @@ pub fn script_mod(vm: &mut ScriptVm) {
         match target(vm, path) {
             Ok((_root, real)) => match std::fs::read_to_string(&real) {
                 Ok(text) => vm.bx.heap.new_string_from_str(&text).into(),
+                Err(_) => script_err_io!(vm.trap(), "file not found"),
+            },
+            Err(e) => script_err_io!(vm.trap(), "{}", e),
+        }
+    });
+
+    // `fs.read_bytes(path)`: a file as a byte array, for what is not text (a
+    // photo the camera took, to hand to an Image). Charged to the heap like
+    // any allocation.
+    vm.add_method(fs, id_lut!(read_bytes), script_args_def!(path = NIL), |vm, args| {
+        let path = script_value!(vm, args.path);
+        match target(vm, path) {
+            Ok((_root, real)) => match std::fs::read(&real) {
+                Ok(bytes) => vm.bx.heap.new_array_from_vec_u8(bytes).into(),
                 Err(_) => script_err_io!(vm.trap(), "file not found"),
             },
             Err(e) => script_err_io!(vm.trap(), "{}", e),
