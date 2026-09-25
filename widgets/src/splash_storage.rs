@@ -238,7 +238,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
         let path = script_value!(vm, args.path);
         match target(vm, path) {
             Ok((_root, real)) => match std::fs::read_to_string(&real) {
-                Ok(text) => vm.new_string_with(|_vm, s| s.push_str(&text)).into(),
+                Ok(text) => vm.bx.heap.new_string_from_str(&text).into(),
                 Err(_) => script_err_io!(vm.trap(), "file not found"),
             },
             Err(e) => script_err_io!(vm.trap(), "{}", e),

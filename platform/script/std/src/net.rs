@@ -14,6 +14,11 @@ use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
+
+/// The response body cap for a script request that names none: an isolate
+/// may not buffer an unbounded body, and 16 MiB is past any page or feed.
+pub const SCRIPT_DEFAULT_BODY_LIMIT: u64 = 16 * 1024 * 1024;
+
 pub struct ScriptWebSocket {
     #[allow(unused)]
     pub id: LiveId,
@@ -838,7 +843,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
             {
                 return script_err_type_mismatch!(vm.trap(), "invalid net arg type");
             }
-            let request = HttpRequest::script_from_value(vm, request);
+            let mut request = HttpRequest::script_from_value(vm, request);
+            // A script that never names a limit reads back 0, which refused
+            // every body with "response body exceeds configured limit".
+            if request.max_response_body_bytes == 0 {
+                request.max_response_body_bytes = SCRIPT_DEFAULT_BODY_LIMIT;
+            }
             let events = HttpEvents::script_from_value(vm, events);
             // The host's per-isolate allowlist, when one is installed: a
             // network grant that only opened this module would otherwise
@@ -893,12 +903,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
         }
         if prop == id!(error) {
             if let Some(error) = error {
-                return vm.new_string_with(|_vm, out| out.push_str(&error)).into();
+                return vm.bx.heap.new_string_from_str(&error).into();
             }
             return NIL;
         }
         if prop == id!(host) {
-            return vm.new_string_with(|_vm, out| out.push_str(&host)).into();
+            return vm.bx.heap.new_string_from_str(&host).into();
         }
         script_err_not_found!(vm.trap(), "invalid socket_stream prop")
     });
@@ -1071,7 +1081,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             match socket_stream_poll(vm, handle) {
                 SocketStreamPoll::Data(data) => {
                     let string = String::from_utf8_lossy(&data);
-                    vm.new_string_with(|_vm, out| out.push_str(&string)).into()
+                    vm.bx.heap.new_string_from_str(&string).into()
                 }
                 SocketStreamPoll::Closed(Some(err)) => script_err_io!(vm.trap(), "{err}"),
                 SocketStreamPoll::Closed(None) => NIL,

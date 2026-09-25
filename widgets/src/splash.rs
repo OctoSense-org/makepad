@@ -746,7 +746,7 @@ impl Splash {
             }
             let vals: Vec<ScriptValue> = args
                 .iter()
-                .map(|s| vm.new_string_with(|_vm, out| out.push_str(s)))
+                .map(|s| vm.bx.heap.new_string_from_str(s))
                 .collect();
             vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT, |vm| {
                 vm.call(fnval, &vals);

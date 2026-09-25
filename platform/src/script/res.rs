@@ -1189,11 +1189,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
                     _ if prop == id!(path) => {
                         let path = res.abs_path.clone();
                         drop(resources);
-                        return vm
-                            .new_string_with(|_vm, s| {
-                                s.push_str(&path);
-                            })
-                            .into();
+                        // Charged like any string: an isolate under a heap
+                        // cap refuses the unbounded builder outright.
+                        return vm.bx.heap.new_string_from_str(&path).into();
                     }
                     _ if prop == id!(is_loaded) => {
                         return matches!(res.data, CxScriptResourceData::Loaded(_)).into()
@@ -1205,11 +1203,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
                         if let CxScriptResourceData::Error(ref e) = res.data {
                             let err = e.clone();
                             drop(resources);
-                            return vm
-                                .new_string_with(|_vm, s| {
-                                    s.push_str(&err);
-                                })
-                                .into();
+                            return vm.bx.heap.new_string_from_str(&err).into();
                         }
                         return NIL;
                     }

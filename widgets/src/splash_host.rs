@@ -171,7 +171,7 @@ pub fn splash_host_respond(
                 let data = parser.read_json(json, &mut vm.bx.heap);
                 (true, data, NIL)
             }
-            Err(msg) => (false, NIL, vm.new_string_with(|_vm, s| s.push_str(msg))),
+            Err(msg) => (false, NIL, vm.bx.heap.new_string_from_str(msg)),
         };
         let obj = vm.bx.heap.new_object();
         let trap = vm.bx.threads.cur().trap.pass();
@@ -262,7 +262,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 return match callback {
                     Some(callback) => {
                         let obj = vm.bx.heap.new_object();
-                        let error = vm.new_string_with(|_vm, s| s.push_str(&reason));
+                        let error = vm.bx.heap.new_string_from_str(&reason);
                         let trap = vm.bx.threads.cur().trap.pass();
                         vm.bx.heap.set_value(obj, id!(is_ok).into(), false.into(), trap);
                         vm.bx.heap.set_value(obj, id!(data).into(), NIL, trap);
