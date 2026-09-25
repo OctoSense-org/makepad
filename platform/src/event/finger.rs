@@ -493,6 +493,13 @@ impl CxFingers {
         self.captures.iter().any(|v| v.digit_id == digit_id && v.area != area)
     }
 
+    /// Every area that captured this digit. A container that only wants to
+    /// yield to its own children (a Button inside it), not to the scroll view
+    /// around it, compares these rects with its own.
+    pub fn digit_capture_areas(&self, digit_id: DigitId) -> Vec<Area> {
+        self.captures.iter().filter(|v| v.digit_id == digit_id).map(|v| v.area).collect()
+    }
+
     /// The area that captured the touch with the given uid, if any.
     /// Lets a raw `Event::LongPress` handler check which widget owns the press.
     pub fn touch_capture_area(&self, uid: u64) -> Option<Area> {

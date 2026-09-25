@@ -34,7 +34,7 @@ use crate::{
     widget::*,
     widget_async::CxWidgetToScriptCallExt,
 };
-use crate::makepad_draw::makepad_platform::event::{TouchState, TouchUpdateEvent};
+use crate::makepad_draw::makepad_platform::event::{DigitId, TouchState, TouchUpdateEvent};
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -259,8 +259,10 @@ impl Widget for GestureView {
 
         match event.hits_with_capture_overload(cx, self.view.area(), true) {
             Hit::FingerDown(e) => {
-                // A child that already owns this press (a Button) keeps it.
-                self.live = !cx.fingers.is_digit_captured_elsewhere(e.digit_id, self.view.area());
+                // A child that already owns this press (a Button) keeps it. A
+                // scroll view around us captures every press too; that one is
+                // not a child, and the tap is still ours.
+                self.live = !child_owns_press(cx, e.digit_id, self.view.area());
                 self.panning = false;
                 self.pan_sent = DVec2::default();
                 if !self.pinch.holding() {
@@ -315,6 +317,19 @@ impl Widget for GestureView {
             _ => {}
         }
     }
+}
+
+/// Whether a widget inside `area` (not `area` itself, not one around it)
+/// captured this press.
+fn child_owns_press(cx: &Cx, digit_id: DigitId, area: Area) -> bool {
+    let own = area.rect(cx);
+    cx.fingers.digit_capture_areas(digit_id).into_iter().any(|captured| {
+        if captured == area {
+            return false;
+        }
+        let rect = captured.rect(cx);
+        rect.is_inside_of(own) && rect.size != own.size
+    })
 }
 
 /// Of the sheet's own height: the peek, half and full resting heights.
@@ -415,7 +430,7 @@ impl Widget for SheetView {
         }
         match event.hits_with_capture_overload(cx, self.view.area(), true) {
             Hit::FingerDown(e) => {
-                if !cx.fingers.is_digit_captured_elsewhere(e.digit_id, self.view.area()) {
+                if !child_owns_press(cx, e.digit_id, self.view.area()) {
                     self.drag = Some((self.height, e.time, self.height));
                     self.prev = None;
                 }

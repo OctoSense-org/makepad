@@ -211,6 +211,8 @@ pub fn gc_dead_splash_isolates(cx: &mut Cx) {
     for heap in &dead_heaps {
         forget_granted_isolate_mods(*heap);
     }
+    // Web views an app opened do not outlive it on the window.
+    crate::web_reader::gc_web_readers(cx, &dead_heaps);
     crate::desktop_style::gc_heaps(cx,&dead_heaps);
     // And the resource cache, which is keyed by heap ADDRESS: dropping a heap
     // frees that address for the next isolate, and a leftover entry would hand

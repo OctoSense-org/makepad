@@ -854,6 +854,28 @@ impl Widget for View {
         method: LiveId,
         args: ScriptValue,
     ) -> ScriptAsyncResult {
+        // `ui.panel.set_visible(false)`: show and hide from script, so an app
+        // can keep a stateful child (a reader's web view) instead of
+        // re-rendering it away.
+        if method == live_id!(set_visible) {
+            let mut visible = None;
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                visible = vm.bx.heap.vec_value(args_obj, 0, trap).as_bool();
+            }
+            if let Some(visible) = visible {
+                if visible != self.visible {
+                    self.visible = visible;
+                    // A view that was hidden has no drawn area to invalidate,
+                    // so its own redraw would repaint nothing.
+                    vm.with_cx_mut(|cx| cx.redraw_all());
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(is_visible) {
+            return ScriptAsyncResult::Return(self.visible.into());
+        }
         if method == live_id!(render) || method == live_id!(render_style) {
             // `me` protos off `self.source`, and the caller's `args` object
             // travels into the VM that owns `on_render` — both are heap values,
