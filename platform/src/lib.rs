@@ -2,6 +2,7 @@
 pub mod gl_render_bridge;
 pub mod home;
 pub mod accessibility;
+pub mod gps;
 mod input_provenance;
 pub use input_provenance::{trusted_user_input, with_untrusted_input};
 /// Allocator swaps (before/after loading something that replaces the process allocator).
