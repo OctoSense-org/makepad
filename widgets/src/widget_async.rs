@@ -1891,6 +1891,42 @@ mod isolate_entry_tests {
     }
 
     #[test]
+    fn a_contained_app_cannot_draw_a_password_field() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let field = |cx: &mut Cx, vm_id| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                let v = vm.eval(crate::makepad_script::script! {
+                    use mod.prelude.widgets.*
+                    View{
+                        secret := TextInput{is_password: true}
+                        plain := TextInput{}
+                        code := TextInput{content_type: TextInputContentType.OneTimeCode}
+                    }
+                });
+                WidgetRef::script_from_value(vm, v)
+            })
+        };
+        let refuses = |cx: &Cx, view: &WidgetRef, id| view.widget(cx, &[id]).borrow::<crate::text_input::TextInput>().unwrap().refuses_secret();
+        let host_own = cx.alloc_splash_vm();
+        let app = cx.alloc_splash_vm();
+        let app_heap = cx.with_script_vm_id(app, |vm| vm.bx.heap.heap_key());
+        crate::splash_policy::set_policy_for_heap(app_heap, vec!["storage".into()], vec![], None);
+
+        let sheet = field(&mut cx, host_own);
+        assert!(!refuses(&cx, &sheet, live_id!(secret)), "a host-owned sheet collects the password");
+        let contained = field(&mut cx, app);
+        assert!(refuses(&cx, &contained, live_id!(secret)), "an app's password field takes nothing");
+        assert!(refuses(&cx, &contained, live_id!(code)), "nor a one-time-code field, which invites autofill");
+        assert!(!refuses(&cx, &contained, live_id!(plain)));
+
+        drop((sheet, contained));
+        crate::splash_policy::gc_policies(&[app_heap]);
+        cx.free_splash_vm(host_own);
+        cx.free_splash_vm(app);
+    }
+
+    #[test]
     fn entering_an_isolate_makes_it_the_current_vm_and_leaving_restores_the_outer_one() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         cx.with_vm(crate::script_mod);

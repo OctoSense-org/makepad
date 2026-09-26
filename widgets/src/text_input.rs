@@ -525,6 +525,9 @@ script_mod! {
     }
 }
 
+/// What a refused secret field shows instead of its placeholder.
+const SECRET_REFUSED: &str = "Apps can't ask for passwords";
+
 #[derive(Script, Widget, Animator)]
 pub struct TextInput {
     #[uid]
@@ -890,6 +893,21 @@ impl TextInput {
         &self.empty_text
     }
 
+    /// A contained app may not collect a secret. A password field (or one
+    /// that asks the keyboard for a password or a one-time code, which also
+    /// invites autofill) inside a policed isolate takes no input: secrets are
+    /// typed on the host's own sheet and go to the service that needs them,
+    /// never through the app. Host-owned isolates (a service's sheet) and the
+    /// shell's own UI are not policed and keep working.
+    pub(crate) fn refuses_secret(&self) -> bool {
+        let secret = self.is_password
+            || matches!(
+                self.content_type,
+                TextInputContentType::Password | TextInputContentType::NewPassword | TextInputContentType::OneTimeCode
+            );
+        secret && crate::splash_policy::is_enforced(self.source.heap_key())
+    }
+
     /// Text presented by the input, including its placeholder and masking.
     pub fn display_text(&self) -> String {
         if self.text.is_empty() {
@@ -1084,7 +1102,10 @@ impl TextInput {
 
     fn draw_text(&mut self, cx: &mut Cx2d) -> Rect {
         let inner_walk = self.inner_walk();
-        let text_rect = if self.text.is_empty() {
+        let text_rect = if self.refuses_secret() {
+            self.draw_text
+                .draw_walk(cx, inner_walk, self.label_align, SECRET_REFUSED)
+        } else if self.text.is_empty() {
             self.draw_text
                 .draw_walk(cx, inner_walk, self.label_align, &self.empty_text)
         } else {
@@ -2484,6 +2505,14 @@ impl Widget for TextInput {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if self.refuses_secret() {
+            // Never focused, so no keyboard opens and nothing is typed.
+            if !self.text.is_empty() {
+                self.text.clear();
+                self.draw_bg.redraw(cx);
+            }
+            return;
+        }
         if self.animator_handle_event(cx, event).must_redraw() {
             self.draw_bg.redraw(cx);
             self.draw_cursor.redraw(cx);
