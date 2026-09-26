@@ -553,7 +553,8 @@ impl CxSplashVmExt for Cx {
             // loads) and the network (web_url/http resources) without going
             // through the gated net runtime. Raw sockets are gated separately:
             // the stdlib's `net.socket_stream` errors when no net runtime is
-            // configured, same as `net.http_request`.
+            // configured, same as `net.http_request`, and under a policy it
+            // and `net.http_server` are refused outright (splash_policy).
             // `cx.quit` would let any mini-app close the whole host process.
             let strip = crate::makepad_script::script! {
                 mod.fs = nil
@@ -1888,6 +1889,62 @@ mod isolate_entry_tests {
         cx.free_splash_vm(host_own);
         cx.free_splash_vm(denied);
         cx.free_splash_vm(granted);
+    }
+
+    /// A probe found `net.web_socket`, `net.socket_stream` and
+    /// `net.http_server` skipping the host list that `net.http_request`
+    /// answers to. Each is tried from a host-owned isolate and from a
+    /// contained app holding `net` and a listed host.
+    #[test]
+    fn a_contained_app_opens_sockets_and_servers_only_as_its_policy_allows() {
+        let run = |cx: &mut Cx, vm_id, code: String| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                let script_mod = crate::makepad_script::ScriptMod {
+                    cargo_manifest_path: String::new(),
+                    module_path: "net_policy_probe".into(),
+                    file: "net_policy_probe".into(),
+                    line: 0,
+                    column: 0,
+                    code,
+                    values: vec![],
+                };
+                !vm.eval(script_mod).is_err()
+            })
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let web_socket = |host: &str| format!(
+            "use mod.net\nnet.web_socket(\"ws://{host}:{port}/\" net.WebSocketEvents{{}})"
+        );
+        let raw_socket = format!(
+            "use mod.net\nnet.socket_stream(net.SocketStreamOptions{{host: \"127.0.0.1\" port: \"{port}\"}})"
+        );
+        let server = "use mod.net\nnet.http_server(net.HttpServerOptions{listen: \"127.0.0.1:0\"} net.HttpServerEvents{})".to_string();
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let host_own = cx.alloc_splash_vm_with_network(true);
+        let app = cx.alloc_splash_vm_with_network(true);
+        let app_heap = cx.with_script_vm_id(app, |vm| vm.bx.heap.heap_key());
+        crate::splash_policy::set_policy_for_heap(app_heap, vec!["net".into()], vec!["127.0.0.1".into()], None);
+
+        assert!(run(&mut cx, host_own, web_socket("127.0.0.1")), "a host-owned isolate opens a web socket");
+        assert!(run(&mut cx, host_own, web_socket("elsewhere.example")), "to any host, as before");
+        assert!(run(&mut cx, host_own, raw_socket.clone()), "and a raw socket");
+        assert!(run(&mut cx, host_own, server.clone()), "and listens");
+
+        assert!(run(&mut cx, app, web_socket("127.0.0.1")), "an app reaches its listed host over a web socket");
+        assert!(!run(&mut cx, app, web_socket("elsewhere.example")), "and no other");
+        assert!(!run(&mut cx, app, raw_socket.clone()), "a raw socket is refused even to a listed host");
+        assert!(!run(&mut cx, app, server.clone()), "and so is a listening server");
+
+        crate::splash_policy::set_policy_for_heap(app_heap, vec!["net".into()], vec![], None);
+        assert!(!run(&mut cx, app, web_socket("127.0.0.1")), "an empty host list reaches nothing");
+
+        crate::splash_policy::gc_policies(&[app_heap]);
+        cx.free_splash_vm(host_own);
+        cx.free_splash_vm(app);
+        drop(listener);
     }
 
     #[test]

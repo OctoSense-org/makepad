@@ -8,7 +8,13 @@
 //!
 //! - [`service_allowed`] — before a `host.request` is queued (ADR 0002 §2);
 //! - [`url_allowed`] — from every network path, through the gate installed
-//!   in `makepad-script-std` (ADR 0002 §3);
+//!   in `makepad-script-std` (ADR 0002 §3): `net.http_request`,
+//!   `net.web_socket`, `sys.*` data fetches, artwork, map tiles, web cards
+//!   and a `Video`'s network source;
+//! - [`sockets_allowed`] — before `net.http_server` listens or
+//!   `net.socket_stream` connects. Neither names a URL a host list could
+//!   judge, and no capability covers them (`net` is requests to the listed
+//!   hosts), so a policed isolate gets neither;
 //! - [`charge`] — after every evaluation and callback, against a cumulative
 //!   instruction budget (ADR 0002 §4).
 //!
@@ -42,6 +48,9 @@ thread_local! {
 /// Set (or replace) the policy for a heap. Enforcement starts here: a heap
 /// that never had this called is not enforced.
 pub fn set_policy_for_heap(heap_key: usize, capabilities: Vec<String>, hosts: Vec<String>, instruction_budget: Option<u64>) {
+    // A policy nothing consults is not a policy: whoever sets one, the gates
+    // that read it are in place from here on.
+    install_url_gate();
     POLICIES.with(|p| {
         let mut p = p.borrow_mut();
         let used = p.get(&heap_key).map(|old| old.instructions_used).unwrap_or(0);
@@ -108,6 +117,14 @@ pub fn url_allowed(heap_key: usize, url: &str) -> bool {
         let host_port = makepad_script_std::url_host_port(url);
         policy.hosts.iter().any(|h| Some(h) == host.as_ref() || Some(h) == host_port.as_ref())
     })
+}
+
+/// May this heap open a listening server or a raw socket? Only when it is
+/// not policed. A server answers whoever connects and a raw stream speaks any
+/// protocol to any port; a contained app's way out is a request to a listed
+/// host, and nothing wider.
+pub fn sockets_allowed(heap_key: usize) -> bool {
+    !is_enforced(heap_key)
 }
 
 /// May this heap know where the device is? Location is a service family
@@ -269,6 +286,7 @@ pub(crate) fn install_url_gate() {
         if !installed.get() {
             makepad_script_std::set_script_url_gate(Some(url_allowed));
             makepad_script_std::set_script_media_gate(Some(media_allowed));
+            makepad_script_std::set_script_socket_gate(Some(sockets_allowed));
             installed.set(true);
         }
     });
@@ -427,6 +445,18 @@ mod tests {
         assert!(!url_allowed(910, "https://cdn.example.org/a.jpg"), "neither grant widens requests");
         gc_policies(&[910]);
         assert!(media_allowed(910, "https://anything.example/"), "an unpoliced heap, as before");
+    }
+
+    #[test]
+    fn a_policed_heap_opens_no_server_and_no_raw_socket_whatever_it_holds() {
+        gc_policies(&[911]);
+        assert!(sockets_allowed(911), "an unpoliced heap, as before");
+        set_policy_for_heap(911, vec!["net".into(), "storage".into(), "web".into()], vec!["127.0.0.1".into()], None);
+        assert!(!sockets_allowed(911), "no grant and no listed host covers a socket");
+        assert!(!makepad_script_std::script_sockets_allowed(911), "setting a policy installs the gate");
+        assert!(makepad_script_std::script_url_allowed(911, "ws://127.0.0.1:9/"), "the url gate is in too");
+        gc_policies(&[911]);
+        assert!(makepad_script_std::script_sockets_allowed(911));
     }
 
     #[test]

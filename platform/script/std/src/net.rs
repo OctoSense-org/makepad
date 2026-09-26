@@ -791,7 +791,19 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 return script_err_type_mismatch!(vm.trap(), "invalid net arg type");
             }
 
+            // A server answers whoever connects; no host list describes that.
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::gate::script_sockets_allowed(heap_key) {
+                return script_err_io!(vm.trap(), "this app may not open a listening server");
+            }
+            if vm.std_mut::<ScriptStd>().net.is_none() {
+                return script_err_io!(vm.trap(), "script net runtime is not configured");
+            }
+
             let options = HttpServerOptions::script_from_value(vm, options);
+            let Ok(listen_address) = options.listen.parse() else {
+                return script_err_invalid_args!(vm.trap(), "invalid listen address {}", options.listen);
+            };
             let events = HttpServerEvents::script_from_value(vm, events);
 
             let (server_tx, server_rx) = channel();
@@ -805,7 +817,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             });
 
             let server = HttpServer {
-                listen_address: options.listen.parse().unwrap(),
+                listen_address,
                 post_max_size: 1024 * 1024 * 10,
                 post_max_size_overrides: Vec::new(),
                 pre_admit_posts: false,
@@ -1126,6 +1138,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 return script_err_type_mismatch!(vm.trap(), "invalid net arg type");
             }
             let events = WebSocketEvents::script_from_value(vm, events);
+            // The same per-isolate allowlist as `http_request`: a socket is
+            // a request that stays open.
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::gate::script_url_allowed(heap_key, &request.url) {
+                return script_err_io!(vm.trap(), "this app may not reach {}", request.url);
+            }
 
             let std = vm.std_mut::<ScriptStd>();
             let Some(runtime) = std.net.as_ref() else {
@@ -1152,6 +1170,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
             let options = script_value!(vm, args.options);
             if !script_has_proto!(vm, options, net.SocketStreamOptions) {
                 return script_err_type_mismatch!(vm.trap(), "invalid socket_stream arg type");
+            }
+            // A raw stream speaks any protocol to any port, so a host list
+            // cannot bound it: a policed isolate is refused outright.
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::gate::script_sockets_allowed(heap_key) {
+                return script_err_io!(vm.trap(), "this app may not open a raw socket");
             }
             // Raw sockets obey the same gate as http_request/web_socket, so a sandboxed
             // VM without a net runtime can't open TCP connections.

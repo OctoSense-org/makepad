@@ -1375,9 +1375,27 @@ impl Video {
                             return;
                         }
                     }
-                    VideoDataSource::Network { url } => VideoSource::Network(url.to_string()),
+                    // The platform player fetches and reads on its own, so the
+                    // isolate's policy is asked here, before it is handed a
+                    // source: a network URL answers to the host list like any
+                    // request, a path to the app's storage jail.
+                    VideoDataSource::Network { url } => {
+                        let heap_key = self.source_ref.heap_key();
+                        if !crate::splash_policy::url_allowed(heap_key, url) {
+                            error!("Video source refused by the host's allowlist: {url}");
+                            self.should_prepare_playback = false;
+                            return;
+                        }
+                        VideoSource::Network(url.to_string())
+                    }
                     VideoDataSource::Filesystem { path } => {
-                        VideoSource::Filesystem(path.to_string())
+                        let heap_key = self.source_ref.heap_key();
+                        let Some(path) = crate::splash_policy::local_path_for_heap(heap_key, path) else {
+                            error!("Video source refused: {path} is outside this app's storage");
+                            self.should_prepare_playback = false;
+                            return;
+                        };
+                        VideoSource::Filesystem(path)
                     }
                     VideoDataSource::Camera {
                         input_id,

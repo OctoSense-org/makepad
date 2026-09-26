@@ -1,10 +1,11 @@
 //! The one question every way out of an isolate asks: may THIS heap reach
 //! THIS URL?
 //!
-//! Three paths issue requests on a script's behalf — `net.http_request`,
-//! `res.http_resource` (artwork) and the data fetches behind `sys.*` — and
-//! a network grant that covers only the first is not a grant. All three ask
-//! here. The answer comes from a gate the embedding host installs; with no
+//! Four paths issue requests on a script's behalf — `net.http_request`,
+//! `net.web_socket`, `res.http_resource` (artwork) and the data fetches
+//! behind `sys.*` — and a network grant that covers only the first is not a
+//! grant. All of them ask here. Listening servers (`net.http_server`) and raw
+//! streams (`net.socket_stream`) name no URL, so they ask the socket gate. The answer comes from a gate the embedding host installs; with no
 //! gate installed, everything is allowed, which is the behaviour every
 //! existing host had. A host that installs a gate answers per heap, so an
 //! app's allowlist follows its isolate and nothing else.
@@ -17,6 +18,28 @@ pub type ScriptUrlGate = fn(usize, &str) -> bool;
 thread_local! {
     static URL_GATE: Cell<Option<ScriptUrlGate>> = const { Cell::new(None) };
     static MEDIA_GATE: Cell<Option<ScriptUrlGate>> = const { Cell::new(None) };
+    static SOCKET_GATE: Cell<Option<ScriptSocketGate>> = const { Cell::new(None) };
+}
+
+/// `heap_key -> allowed`: may this heap open what a host list cannot
+/// describe — a listening server (`net.http_server`) or a raw TCP/TLS stream
+/// (`net.socket_stream`)? A server answers whoever connects, and a raw
+/// stream speaks any protocol to any port, so neither fits a per-URL gate.
+pub type ScriptSocketGate = fn(usize) -> bool;
+
+/// Install (or clear) the gate for listening servers and raw sockets. With
+/// no socket gate, both are allowed, as they were for every existing host.
+pub fn set_script_socket_gate(gate: Option<ScriptSocketGate>) {
+    SOCKET_GATE.with(|g| g.set(gate));
+}
+
+/// Whether `heap_key` may listen or open a raw socket. True when no gate is
+/// installed.
+pub fn script_sockets_allowed(heap_key: usize) -> bool {
+    SOCKET_GATE.with(|g| match g.get() {
+        Some(gate) => gate(heap_key),
+        None => true,
+    })
 }
 
 /// Install (or clear) the gate for media loads (`http_resource`: images and
@@ -135,5 +158,18 @@ mod tests {
         assert!(!script_url_allowed(8, "https://cdn.example/a.jpg"), "requests keep their own gate");
         set_script_media_gate(None);
         set_script_url_gate(None);
+    }
+
+    #[test]
+    fn no_socket_gate_allows_sockets_and_a_gate_decides() {
+        set_script_socket_gate(None);
+        assert!(script_sockets_allowed(8));
+        fn only_heap_seven(heap: usize) -> bool {
+            heap == 7
+        }
+        set_script_socket_gate(Some(only_heap_seven));
+        assert!(script_sockets_allowed(7));
+        assert!(!script_sockets_allowed(8));
+        set_script_socket_gate(None);
     }
 }
