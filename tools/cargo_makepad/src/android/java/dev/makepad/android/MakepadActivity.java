@@ -1216,6 +1216,8 @@ public class MakepadActivity
     private HandlerThread mQrBgThread;
     private Handler mQrBgHandler;
     private volatile boolean mQrScanning = false;
+    // A CAMERA request for the scanner is in flight (dedupes repeat requests).
+    private boolean mQrPermPending = false;
     private long mQrLastFrameMs = 0;
     private static final int QR_CAMERA_PERM_REQ = 0x51A2;
 
@@ -1610,6 +1612,8 @@ public class MakepadActivity
             stopGpsLocationUpdates();
             return;
         }
+        // Never hold the camera in the background: close an open QR scanner.
+        if (mQrScanning) closeQrScanner("interrupted");
         prepareSurfaceSnapshotOverlayForPause();
         super.onPause();
         MakepadNative.activityOnPause();
@@ -1705,6 +1709,18 @@ public class MakepadActivity
     public void onLowMemory() {
         super.onLowMemory();
         trimSurfaceSnapshotCaches();
+    }
+
+    // Back closes an open QR scanner (and releases the camera). Intercepted
+    // here, before the view tree: the focused MakepadSurface consumes every
+    // key (BACK included) and forwards it to Rust, so onBackPressed never runs.
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (mQrScanning && event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+            if (event.getAction() == KeyEvent.ACTION_UP) closeQrScanner("cancelled");
+            return true;
+        }
+        return super.dispatchKeyEvent(event);
     }
 
     @Override
@@ -1819,13 +1835,21 @@ public class MakepadActivity
             MakepadNative.onPermissionResult(permissions[i], requestId, status);
         }
 
-        // QR-scanner camera permission: open the scanner once granted.
+        // QR-scanner camera permission: open the scanner once granted, else
+        // report the refusal so the caller is not left waiting.
         if (requestId == QR_CAMERA_PERM_REQ) {
+            mQrPermPending = false;
+            boolean granted = false;
             for (int i = 0; i < permissions.length; i++) {
                 if (Manifest.permission.CAMERA.equals(permissions[i])
                     && grantResults[i] == PackageManager.PERMISSION_GRANTED) {
-                    showQrScanner();
+                    granted = true;
                 }
+            }
+            if (granted) {
+                showQrScanner();
+            } else {
+                MakepadNative.onQrCancelled("permission_denied");
             }
         }
 
@@ -3227,7 +3251,7 @@ public class MakepadActivity
         qrBtn.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                showQrScanner();
+                requestQrScanner();
             }
         });
 
@@ -3285,16 +3309,26 @@ public class MakepadActivity
         mRootLayout.addView(mComposerOverlay);
     }
 
-    // Open the QR scanner overlay (requesting CAMERA first). Rust decodes the
-    // streamed frames; on a hit it applies the LLM config (see onQrCameraFrame).
+    // Open the QR scanner overlay: the single entry point for both the
+    // composer's ⛶ button and Rust's `Cx::show_qr_scanner` (CxOsOp::ShowQrScanner).
+    // Safe to call from any thread. Every open ends in exactly one
+    // MakepadNative.onQrCameraFrame hit (-> NativeQrScanned) or
+    // onQrCancelled(reason) (-> NativeQrCancelled).
+    public void requestQrScanner() {
+        runOnUiThread(new Runnable() { public void run() { showQrScanner(); } });
+    }
+
+    // UI thread: ask for CAMERA first when needed, then open the overlay. Rust
+    // decodes the streamed frames (see onQrCameraFrame).
     private void showQrScanner() {
-        if (mQrScanning) return;
+        if (mQrScanning || mQrPermPending) return;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M
             && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            mQrPermPending = true;
             requestPermissions(new String[]{Manifest.permission.CAMERA}, QR_CAMERA_PERM_REQ);
             return; // re-opened from onRequestPermissionsResult once granted
         }
-        runOnUiThread(new Runnable() { public void run() { startQrScanner(); } });
+        startQrScanner();
     }
 
     private void startQrScanner() {
@@ -3320,7 +3354,7 @@ public class MakepadActivity
         mQrScanOverlay.addView(hint, hintLp);
         mQrScanOverlay.setClickable(true);
         mQrScanOverlay.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { hideQrScanner(); }
+            @Override public void onClick(View v) { closeQrScanner("cancelled"); }
         });
         mRootLayout.addView(mQrScanOverlay);
 
@@ -3351,7 +3385,7 @@ public class MakepadActivity
             }
             if (backId == null) {
                 String[] ids = mgr.getCameraIdList();
-                if (ids.length == 0) { hideQrScanner(); return; }
+                if (ids.length == 0) { closeQrScanner("camera_error"); return; }
                 backId = ids[0];
             }
             StreamConfigurationMap map = mgr.getCameraCharacteristics(backId)
@@ -3393,7 +3427,9 @@ public class MakepadActivity
                             for (int col = 0; col < w; col++) luma[out++] = rowBuf[col * pixStride];
                         }
                         if (MakepadNative.onQrCameraFrame(luma, w, h)) {
-                            hideQrScanner();
+                            // Rust already posted NativeQrScanned: close silently.
+                            mQrScanning = false;
+                            closeQrScanner(null);
                         }
                     } catch (Exception e) {
                         // transient frame errors are fine; keep scanning
@@ -3420,34 +3456,51 @@ public class MakepadActivity
                                     if (mQrCameraDevice == null) return;
                                     mQrCaptureSession = session;
                                     try { session.setRepeatingRequest(rb.build(), null, mQrBgHandler); }
-                                    catch (Exception e) { hideQrScanner(); }
+                                    catch (Exception e) { closeQrScanner("camera_error"); }
                                 }
                                 @Override public void onConfigureFailed(CameraCaptureSession s) {
-                                    hideQrScanner();
+                                    closeQrScanner("camera_error");
                                 }
                             }, mQrBgHandler);
                     } catch (Exception e) {
                         android.util.Log.e("Makepad", "QR camera2 session failed: " + e);
-                        hideQrScanner();
+                        closeQrScanner("camera_error");
                     }
                 }
-                @Override public void onDisconnected(CameraDevice device) { device.close(); }
+                @Override public void onDisconnected(CameraDevice device) {
+                    // Another client took the camera (or it went away): the
+                    // overlay would be a dead black screen, so close it.
+                    device.close();
+                    closeQrScanner("camera_error");
+                }
                 @Override public void onError(CameraDevice device, int error) {
                     android.util.Log.e("Makepad", "QR camera2 error: " + error);
                     device.close();
-                    hideQrScanner();
+                    closeQrScanner("camera_error");
                 }
             }, mQrBgHandler);
         } catch (Exception e) {
             android.util.Log.e("Makepad", "QR camera2 open failed: " + e);
-            hideQrScanner();
+            closeQrScanner("camera_error");
         }
     }
 
-    // Close the scanner + release the camera. Safe to call from any thread.
+    // Close the scanner (reported to Rust as cancelled) + release the camera.
+    // Safe to call from any thread.
     public void hideQrScanner() {
+        closeQrScanner("cancelled");
+    }
+
+    // Close the scanner + release the camera. Safe to call from any thread.
+    // A non-null `reason` is reported once via onQrCancelled if the scanner was
+    // still open; null closes silently (after a successful decode).
+    private void closeQrScanner(final String reason) {
         runOnUiThread(new Runnable() { public void run() {
+            boolean wasScanning = mQrScanning;
             mQrScanning = false;
+            if (wasScanning && reason != null) {
+                MakepadNative.onQrCancelled(reason);
+            }
             try { if (mQrCaptureSession != null) mQrCaptureSession.close(); } catch (Exception ignore) {}
             mQrCaptureSession = null;
             try { if (mQrCameraDevice != null) mQrCameraDevice.close(); } catch (Exception ignore) {}

@@ -546,6 +546,12 @@ pub enum CxOsOp {
     HideNativeComposer,
     ExpandNativeComposer,
     CollapseNativeComposer,
+    /// Open the native full-screen QR scanner (camera permission prompt
+    /// first when needed). Only the Android backend handles it; on every other
+    /// backend `Cx::show_qr_scanner` never queues it and instead posts
+    /// `NativeQrCancelled { reason: "unsupported" }`, so the catch-alls that
+    /// ignore it are never reached.
+    ShowQrScanner,
     PrepareAudioPlayback(LiveId, VideoSource, bool, bool),
     BeginVideoPlayback(LiveId),
     PauseVideoPlayback(LiveId),
@@ -668,6 +674,7 @@ impl std::fmt::Debug for CxOsOp {
             Self::HideNativeComposer => write!(f, "HideNativeComposer"),
             Self::ExpandNativeComposer => write!(f, "ExpandNativeComposer"),
             Self::CollapseNativeComposer => write!(f, "CollapseNativeComposer"),
+            Self::ShowQrScanner => write!(f, "ShowQrScanner"),
             Self::PrepareAudioPlayback(..) => write!(f, "PrepareAudioPlayback"),
             Self::BeginVideoPlayback(..) => write!(f, "BeginVideoPlayback"),
             Self::PauseVideoPlayback(..) => write!(f, "PauseVideoPlayback"),
@@ -780,6 +787,31 @@ impl Cx {
     /// keyboard) so the full-screen card has more room.
     pub fn collapse_native_composer(&mut self) {
         self.platform_ops.push_back(CxOsOp::CollapseNativeComposer);
+    }
+
+    /// Open the native full-screen QR scanner.
+    ///
+    /// Exactly one bare action follows every call (handle it in
+    /// `handle_actions` with `action.downcast_ref::<T>()`):
+    /// - [`NativeQrScanned`](crate::event::NativeQrScanned) with the full
+    ///   decoded text when a code is read (the scanner then closes), or
+    /// - [`NativeQrCancelled`](crate::event::NativeQrCancelled) with a
+    ///   `reason` when it closes without a result: `"cancelled"` (back button
+    ///   or tap), `"interrupted"` (the app went to the background),
+    ///   `"permission_denied"` (CAMERA refused), `"camera_error"` (no camera,
+    ///   or it failed / was taken by another app) or `"unsupported"`.
+    ///
+    /// Android only (Camera2 preview + a pure-Rust `rqrr` decode). Every other
+    /// platform immediately posts `NativeQrCancelled { reason: "unsupported" }`
+    /// so callers never wait forever. A call while the scanner is already open
+    /// is ignored; the pending result still arrives once.
+    pub fn show_qr_scanner(&mut self) {
+        #[cfg(target_os = "android")]
+        self.platform_ops.push_back(CxOsOp::ShowQrScanner);
+        #[cfg(not(target_os = "android"))]
+        Cx::post_action(crate::event::NativeQrCancelled {
+            reason: "unsupported".to_string(),
+        });
     }
 
     pub fn in_draw_event(&self) -> bool {

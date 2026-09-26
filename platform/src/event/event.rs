@@ -533,10 +533,21 @@ pub struct NativeComposerSwitch;
 #[derive(Clone, Debug, Default)]
 pub struct NativeComposerExpand;
 
-/// The composer's QR scanner decoded a payload (the provisioning config JSON).
+/// The native QR scanner (`Cx::show_qr_scanner` or the composer's ⛶ button)
+/// decoded a code. A bare action.
 #[derive(Clone, Debug, Default)]
 pub struct NativeQrScanned {
+    /// The complete decoded text of the QR code, untruncated, whatever it is
+    /// (e.g. an `OCTOS1E:` provisioning string). Named `json` for
+    /// compatibility with its first user, which scanned a JSON config.
     pub json: String,
+}
+
+/// The native QR scanner closed without a result. A bare action; see
+/// `Cx::show_qr_scanner` for the `reason` values.
+#[derive(Clone, Debug, Default)]
+pub struct NativeQrCancelled {
+    pub reason: String,
 }
 
 /// A card's `octos.invoke` call arriving from the system browser document.

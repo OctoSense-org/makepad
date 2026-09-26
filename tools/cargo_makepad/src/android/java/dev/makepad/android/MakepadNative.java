@@ -99,6 +99,9 @@ public class MakepadNative {
     // A camera frame (NV21 luma plane) from the QR scanner overlay. Rust decodes
     // it; returns true if a QR was found (the caller then closes the scanner).
     public native static boolean onQrCameraFrame(byte[] luma, int width, int height);
+    // The QR scanner closed without a decode ("cancelled", "interrupted",
+    // "permission_denied", "camera_error"); posted to Rust as NativeQrCancelled.
+    public native static void onQrCancelled(String reason);
 
     // midi
     public native static void onMidiDeviceOpened(String name, Object midi_device);
