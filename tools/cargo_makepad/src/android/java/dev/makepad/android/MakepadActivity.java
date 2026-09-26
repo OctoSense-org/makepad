@@ -614,6 +614,10 @@ class MakepadSurface
     @SuppressWarnings("deprecation")
     @Override
     public boolean onKey(View v, int keyCode, KeyEvent event) {
+        // Back belongs to Activity / OnBackInvokedDispatcher. Forwarding the
+        // raw key as well delivers two native BackPressed events on API 33+:
+        // one closes the current panel and the next leaves the app.
+        if (keyCode == KeyEvent.KEYCODE_BACK) return false;
         if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode != 0) {
             int metaState = event.getMetaState();
             boolean isRepeat = event.getRepeatCount() > 0;
@@ -1114,6 +1118,7 @@ public class MakepadActivity
     private FrameLayout mRootLayout;
     private FrameLayout mApplicationOverlay;
     private ApplicationExtension mApplicationExtension;
+    private android.window.OnBackInvokedCallback mBackInvokedCallback;
 
     /** Optional app Java client. Implementations enqueue blocking work on workers. */
     public interface ApplicationExtension {
@@ -1128,7 +1133,16 @@ public class MakepadActivity
 
     private void createApplicationExtension() {
         try {
-            Class<?> type = Class.forName(getPackageName() + ".MakepadAppExtension");
+            String extensionClass = getPackageName() + ".MakepadAppExtension";
+            try {
+                android.content.pm.ApplicationInfo info = getPackageManager().getApplicationInfo(
+                    getPackageName(), android.content.pm.PackageManager.GET_META_DATA);
+                if (info.metaData != null) extensionClass = info.metaData.getString(
+                    "dev.makepad.android.APPLICATION_EXTENSION", extensionClass);
+            } catch (android.content.pm.PackageManager.NameNotFoundException absent) {
+                // Fall back to the package-local extension.
+            }
+            Class<?> type = Class.forName(extensionClass);
             mApplicationExtension = (ApplicationExtension) type
                 .getConstructor(MakepadActivity.class).newInstance(this);
         } catch (ClassNotFoundException absent) {
@@ -1529,6 +1543,11 @@ public class MakepadActivity
         }
         MakepadNative.activityOnCreate(this);
         createApplicationExtension();
+        if (Build.VERSION.SDK_INT >= 33) {
+            mBackInvokedCallback = this::dispatchBackPressed;
+            getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, mBackInvokedCallback);
+        }
         registerPhysicalKeyboardListener();
 
         mVideoPlaybackThread = new HandlerThread("VideoPlayerThread");
@@ -1630,6 +1649,10 @@ public class MakepadActivity
 
     @Override
     protected void onDestroy() {
+        if (Build.VERSION.SDK_INT >= 33 && mBackInvokedCallback != null) {
+            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(mBackInvokedCallback);
+            mBackInvokedCallback = null;
+        }
         if (mApplicationExtension != null) {
             mApplicationExtension.onDestroy();
             mApplicationExtension = null;
@@ -1710,8 +1733,13 @@ public class MakepadActivity
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        dispatchBackPressed();
+    }
+
+    private void dispatchBackPressed() {
         if (mApplicationExtension != null && mApplicationExtension.onBackPressed()) return;
-        super.onBackPressed();
+        // Navigation belongs to the native widget tree; Activity's default
+        // handler finishes/backgrounds it before widgets can consume Back.
         MakepadNative.onBackPressed();
     }
 
