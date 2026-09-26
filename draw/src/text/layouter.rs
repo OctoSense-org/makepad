@@ -383,7 +383,7 @@ impl LayoutContext {
             .enumerate()
         {
             if line_index != 0 {
-                self.finish_current_row(true);
+                self.finish_current_row(true, false);
             }
             if self.is_past_max_rows() {
                 break;
@@ -394,7 +394,7 @@ impl LayoutContext {
         if has_ellipsis_config {
             self.apply_ellipsis_truncation()
         } else {
-            self.finish_current_row(false);
+            self.finish_current_row(false, false);
             self.finish_with(false)
         }
     }
@@ -457,7 +457,7 @@ impl LayoutContext {
                     } else if self.current_row_is_empty() && !self.current_row_is_continuation() {
                         self.layout_by_grapheme(fitter.pop());
                     } else {
-                        self.finish_current_row(false);
+                        self.finish_current_row(false, true);
                     }
                 }
             }
@@ -482,7 +482,7 @@ impl LayoutContext {
                     if self.current_row_is_empty() {
                         self.layout_directly(fitter.pop());
                     } else {
-                        self.finish_current_row(false);
+                        self.finish_current_row(false, true);
                     }
                 }
             }
@@ -518,7 +518,8 @@ impl LayoutContext {
         self.current_row_end += text.text.len();
     }
 
-    fn finish_current_row(&mut self, newline: bool) {
+    /// `soft_wrap`: the row ends because the next word did not fit.
+    fn finish_current_row(&mut self, newline: bool, soft_wrap: bool) {
         let font = self.font_family.fonts().first();
         let font_size_in_lpxs = self.style.font_size_in_lpxs();
         let ascender_in_lpxs = font.map_or(0.0, |font| font.ascender_in_ems()) * font_size_in_lpxs;
@@ -531,10 +532,12 @@ impl LayoutContext {
             .text
             .substr(self.current_row_start..self.current_row_end);
         let mut width_in_lpxs = self.current_point_in_lpxs.x;
-        if self.options.wrap {
+        if soft_wrap {
             // A space consumed at a soft line break still belongs to the text
             // (and caret positions), but must not widen or offset the visible
             // line. Keep the glyphs and source text intact for hit testing.
+            // Only there: a run's last row keeps its trailing space, which is
+            // the gap before the next run (`to <b>Mail</b>`).
             let visible_end = text.trim_end().len();
             for glyph in self.glyphs.iter().rev() {
                 if glyph.cluster < visible_end {
@@ -722,7 +725,7 @@ impl LayoutContext {
         let has_pending_content =
             self.current_row_start != self.current_row_end || !self.glyphs.is_empty();
         if has_pending_content || self.rows.is_empty() {
-            self.finish_current_row(false);
+            self.finish_current_row(false, false);
         }
     }
 }
@@ -1496,6 +1499,16 @@ mod tests {
         assert_eq!(centered.rows[0].text.as_str(), "CARD ");
         assert!((centered.rows[0].width_in_lpxs - word.size_in_lpxs.width).abs() < 0.01);
         assert!((centered.rows[0].origin_in_lpxs.x - 0.05).abs() < 0.01);
+
+        // A run that ends in a space, laid out where it fits: the space is
+        // the gap before whatever run follows (`to <b>Mail</b>`), not a
+        // soft line break, so it keeps its width.
+        let spaced = layouter.get_or_layout(BorrowedLayoutParams {
+            text: "CARD ",
+            options: LayoutOptions {max_width_in_lpxs: Some(1000.0), wrap: true, ..params.options},
+            ..params
+        });
+        assert!(spaced.rows[0].width_in_lpxs > word.size_in_lpxs.width + 1.0);
     }
 
     #[test]
