@@ -33,6 +33,9 @@ pub mod widget_tree;
 
 // Modules ordered to match script_mod calls
 pub mod rubber_view;
+pub mod gesture_view;
+pub mod web_reader;
+pub mod camera_preview;
 pub mod scroll_bar;
 pub mod scroll_bars;
 pub mod scroll_motion;
@@ -363,6 +366,8 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::view_ui::script_mod(vm);
     crate::grid::script_mod(vm);
     crate::rubber_view::script_mod(vm);
+    crate::gesture_view::script_mod(vm);
+    crate::web_reader::script_mod(vm);
 
     crate::label::script_mod(vm);
     crate::link_label::script_mod(vm);
@@ -444,6 +449,7 @@ pub fn widgets_mod(vm: &mut ScriptVm) {
     crate::callout_tooltip::script_mod(vm);
     crate::popup_notification::script_mod(vm);
     crate::video::script_mod(vm);
+    crate::camera_preview::script_mod(vm);
     crate::page_flip::script_mod(vm);
     crate::hosted_view::script_mod(vm);
     crate::file_tree::script_mod(vm);

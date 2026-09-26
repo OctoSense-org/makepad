@@ -468,6 +468,10 @@ struct CachedHttpRange {
 /// HTTP `.mkmap` source using one whole-root GET and strict shard ranges.
 pub struct HttpRangeByteSource {
     root_url: String,
+    /// The script heap this source fetches for (0 = the host's own): every
+    /// request answers to that heap's allowlist, like the rest of the network
+    /// paths a card can reach.
+    heap_key: usize,
     disk_cache: Option<ArchiveCacheStore>,
     requests: HashMap<LiveId, HttpNetworkRead>,
     queued: Vec<PendingHttpRead>,
@@ -496,6 +500,7 @@ impl HttpRangeByteSource {
     ) -> Self {
         Self {
             root_url: root_url.into().trim_end_matches('/').to_string(),
+            heap_key: 0,
             disk_cache,
             requests: HashMap::new(),
             queued: Vec::new(),
@@ -575,6 +580,17 @@ impl HttpRangeByteSource {
                 (url, Some(format!("bytes={offset}-{end}")), len)
             }
         };
+        if !crate::splash_policy::url_allowed(self.heap_key, &url) {
+            crate::log!("map archive fetch refused by the host's allowlist: {url}");
+            for waiter in &pending.waiters {
+                self.ready.push_back(ReadCompletion {
+                    token: waiter.token,
+                    result: Err("refused by the host's allowlist".to_string()),
+                });
+            }
+            cx.redraw_all();
+            return;
+        }
         #[cfg(target_arch = "wasm32")]
         let url = format!(
             "{url}#makepad-http=archive&tiles={tile_label}&priority={priority}&bytes={max_body}"
@@ -2021,6 +2037,14 @@ impl MapTileArchive {
             HttpRangeByteSource::new(root_url),
             workers,
         ))
+    }
+
+    /// [`Self::http`] on behalf of a script heap, whose allowlist every
+    /// request then answers to.
+    pub fn http_for_heap(root_url: impl Into<String>, workers: ArchiveWorkerPool, heap_key: usize) -> Self {
+        let mut source = HttpRangeByteSource::new(root_url);
+        source.heap_key = heap_key;
+        Self::Http(TileArchive::new(source, workers))
     }
 
     pub fn request_tile(

@@ -1189,11 +1189,9 @@ pub fn script_mod(vm: &mut ScriptVm) {
                     _ if prop == id!(path) => {
                         let path = res.abs_path.clone();
                         drop(resources);
-                        return vm
-                            .new_string_with(|_vm, s| {
-                                s.push_str(&path);
-                            })
-                            .into();
+                        // Charged like any string: an isolate under a heap
+                        // cap refuses the unbounded builder outright.
+                        return vm.bx.heap.new_string_from_str(&path).into();
                     }
                     _ if prop == id!(is_loaded) => {
                         return matches!(res.data, CxScriptResourceData::Loaded(_)).into()
@@ -1205,11 +1203,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
                         if let CxScriptResourceData::Error(ref e) = res.data {
                             let err = e.clone();
                             drop(resources);
-                            return vm
-                                .new_string_with(|_vm, s| {
-                                    s.push_str(&err);
-                                })
-                                .into();
+                            return vm.bx.heap.new_string_from_str(&err).into();
                         }
                         return NIL;
                     }
@@ -1340,7 +1334,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 let heap_key = vm.bx.heap.heap_key();
                 // Artwork is a way out of the isolate too: a card with no
                 // network grant was seen fetching nine images through here.
-                if !makepad_script_std::script_url_allowed(heap_key, &url_string) {
+                if !makepad_script_std::script_media_url_allowed(heap_key, &url_string) {
                     // Logged as well as raised: the widget that asked draws
                     // nothing, and a silent blank is the hardest bug to find.
                     crate::log!("Script resource refused by the host's allowlist: {url_string}");

@@ -139,6 +139,10 @@ pub struct View {
     script_async: ScriptAsyncCalls,
     #[rust]
     applying_style_render: bool,
+    /// An `on_render` result is being applied: its children are built fresh
+    /// rather than applied over the previous render's (see `on_after_apply`).
+    #[rust]
+    applying_render: bool,
     #[rust]
     item_tap_live: bool,
 
@@ -214,6 +218,7 @@ impl ScriptHook for View {
         if !apply.is_eval() {
             if let Some(obj) = value.as_object() {
                 let mut anon_index = 0usize;
+                let rendering = self.applying_render;
                 vm.vec_with(obj, |vm, vec| {
                     for kv in vec {
                         // Determine the id: use prefixed id if available, otherwise use numbered id for anonymous children
@@ -240,7 +245,19 @@ impl ScriptHook for View {
                             if let Some((_, node)) =
                                 self.children.iter_mut().find(|(id2, _)| *id2 == id)
                             {
-                                node.script_apply(vm, apply, scope, kv.value);
+                                // An `on_render` result is built fresh, as the first
+                                // render was. Applied over the previous render's
+                                // instance, a child keeps what the new object does not
+                                // restate: a slot that held a card with a picture keeps
+                                // the picture's named child, and a label re-laid-out
+                                // with longer text lost its wrap width. A render is a
+                                // function of the app's state, not an edit of the
+                                // last one.
+                                if rendering {
+                                    *node = WidgetRef::script_from_value_scoped(vm, scope, kv.value);
+                                } else {
+                                    node.script_apply(vm, apply, scope, kv.value);
+                                }
                             } else {
                                 let widget =
                                     WidgetRef::script_from_value_scoped(vm, scope, kv.value);
@@ -854,6 +871,28 @@ impl Widget for View {
         method: LiveId,
         args: ScriptValue,
     ) -> ScriptAsyncResult {
+        // `ui.panel.set_visible(false)`: show and hide from script, so an app
+        // can keep a stateful child (a reader's web view) instead of
+        // re-rendering it away.
+        if method == live_id!(set_visible) {
+            let mut visible = None;
+            if let Some(args_obj) = args.as_object() {
+                let trap = vm.bx.threads.cur().trap.pass();
+                visible = vm.bx.heap.vec_value(args_obj, 0, trap).as_bool();
+            }
+            if let Some(visible) = visible {
+                if visible != self.visible {
+                    self.visible = visible;
+                    // A view that was hidden has no drawn area to invalidate,
+                    // so its own redraw would repaint nothing.
+                    vm.with_cx_mut(|cx| cx.redraw_all());
+                }
+            }
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(is_visible) {
+            return ScriptAsyncResult::Return(self.visible.into());
+        }
         if method == live_id!(render) || method == live_id!(render_style) {
             // `me` protos off `self.source`, and the caller's `args` object
             // travels into the VM that owns `on_render` — both are heap values,
@@ -920,8 +959,10 @@ impl Widget for View {
                 let declaration = self.source.clone();
                 let style=call.method()==id!(render_style);
                 self.applying_style_render=style;
+                self.applying_render=!style;
                 self.script_apply(vm, &if style {Apply::ScriptReapply}else{Apply::Reload}, &mut Scope::empty(), me_obj.into());
                 self.applying_style_render=false;
+                self.applying_render=false;
                 self.source = declaration;
                 self.redraw(vm.cx_mut());
             }

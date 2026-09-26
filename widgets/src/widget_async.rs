@@ -95,6 +95,58 @@ pub fn register_splash_isolate_mod(f: fn(&mut ScriptVm)) {
     HOST_ISOLATE_MODS.with(|g| g.borrow_mut().push(f));
 }
 
+thread_local! {
+    /// Host mods that only isolates holding a grant receive, with the grant.
+    static GRANTED_ISOLATE_MODS: RefCell<Vec<(&'static str, fn(&mut ScriptVm))>> = const { RefCell::new(Vec::new()) };
+    /// heap key -> indices into `GRANTED_ISOLATE_MODS` already installed there.
+    static GRANTED_INSTALLED: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
+}
+
+/// Install a script mod only into the isolates granted `grant`.
+///
+/// [`register_splash_isolate_mod`] reaches every isolate, so vocabulary a host
+/// registers for its own cards also lands in every installed app. A mod
+/// registered here is installed into an isolate under a policy only when that
+/// policy grants `grant` (a capability family such as `agent`, or an exact
+/// service name), and into an unpoliced isolate (the host's own surfaces)
+/// always.
+///
+/// The grant is known only once the host has seated the policy, which is
+/// after allocation, so these mods install when a Splash first evaluates its
+/// body, before the body runs. A later policy that drops the grant does not
+/// remove a mod already installed: set the policy before the body loads.
+pub fn register_splash_isolate_mod_for(grant: &'static str, f: fn(&mut ScriptVm)) {
+    GRANTED_ISOLATE_MODS.with(|g| g.borrow_mut().push((grant, f)));
+}
+
+/// Install the granted mods this isolate is entitled to and does not yet
+/// have. Cheap when there is nothing new to install.
+pub(crate) fn apply_granted_isolate_mods(vm: &mut ScriptVm) {
+    let heap_key = vm.bx.heap.heap_key();
+    let mods = GRANTED_ISOLATE_MODS.with(|mods| mods.borrow().clone());
+    for (index, (grant, install)) in mods.into_iter().enumerate() {
+        let installed = GRANTED_INSTALLED.with(|i| i.borrow().get(&heap_key).is_some_and(|done| done.contains(&index)));
+        if installed {
+            continue;
+        }
+        let entitled = !crate::splash_policy::is_enforced(heap_key)
+            || crate::splash_policy::service_allowed(heap_key, grant).is_ok();
+        if entitled {
+            install(vm);
+            GRANTED_INSTALLED.with(|i| i.borrow_mut().entry(heap_key).or_default().push(index));
+        }
+    }
+}
+
+/// Forget which granted mods a heap has, so the next
+/// [`apply_granted_isolate_mods`] installs them again: a theme rebuild
+/// replaces the modules they bound into.
+pub(crate) fn forget_granted_isolate_mods(heap_key: usize) {
+    GRANTED_INSTALLED.with(|i| {
+        i.borrow_mut().remove(&heap_key);
+    });
+}
+
 /// Reinstall trusted host vocabulary after a theme rebuild replaces mod.widgets.
 /// Clone first so an installer can register another module without borrowing the list.
 pub(crate) fn apply_splash_isolate_mods(vm: &mut ScriptVm) {
@@ -156,6 +208,13 @@ pub fn gc_dead_splash_isolates(cx: &mut Cx) {
     crate::splash_storage::gc_roots(&dead_heaps);
     crate::splash_host::gc_bridge(&dead_heaps);
     crate::splash_policy::gc_policies(&dead_heaps);
+    for heap in &dead_heaps {
+        forget_granted_isolate_mods(*heap);
+    }
+    // Web views and cameras an app opened do not outlive it.
+    for heap in &dead_heaps {
+        crate::camera_preview::release_isolate_devices(cx, *heap);
+    }
     crate::desktop_style::gc_heaps(cx,&dead_heaps);
     // And the resource cache, which is keyed by heap ADDRESS: dropping a heap
     // frees that address for the next isolate, and a leftover entry would hand
@@ -494,7 +553,8 @@ impl CxSplashVmExt for Cx {
             // loads) and the network (web_url/http resources) without going
             // through the gated net runtime. Raw sockets are gated separately:
             // the stdlib's `net.socket_stream` errors when no net runtime is
-            // configured, same as `net.http_request`.
+            // configured, same as `net.http_request`, and under a policy it
+            // and `net.http_server` are refused outright (splash_policy).
             // `cx.quit` would let any mini-app close the whole host process.
             let strip = crate::makepad_script::script! {
                 mod.fs = nil
@@ -1795,6 +1855,135 @@ mod isolate_entry_tests {
     }
 
     #[test]
+    fn a_granted_mod_reaches_only_the_isolates_holding_its_grant() {
+        fn install_granted_probe(vm: &mut ScriptVm) {
+            vm.eval(crate::makepad_script::script! {
+                mod.granted_probe = 7
+            });
+        }
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        register_splash_isolate_mod_for("agent", install_granted_probe);
+
+        let has_probe = |cx: &mut Cx, vm_id| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                apply_granted_isolate_mods(vm);
+                !vm.eval(crate::makepad_script::script! { mod.granted_probe }).is_err()
+            })
+        };
+        let heap = |cx: &mut Cx, vm_id| cx.with_script_vm_id(vm_id, |vm| vm.bx.heap.heap_key());
+
+        let host_own = cx.alloc_splash_vm();
+        let denied = cx.alloc_splash_vm();
+        let granted = cx.alloc_splash_vm();
+        let denied_heap = heap(&mut cx, denied);
+        let granted_heap = heap(&mut cx, granted);
+        crate::splash_policy::set_policy_for_heap(denied_heap, vec!["net".into()], vec![], None);
+        crate::splash_policy::set_policy_for_heap(granted_heap, vec!["agent".into()], vec![], None);
+
+        assert!(has_probe(&mut cx, host_own), "an unpoliced isolate is the host's own");
+        assert!(!has_probe(&mut cx, denied), "a policy without the grant never sees it");
+        assert!(has_probe(&mut cx, granted));
+
+        crate::splash_policy::gc_policies(&[denied_heap, granted_heap]);
+        cx.free_splash_vm(host_own);
+        cx.free_splash_vm(denied);
+        cx.free_splash_vm(granted);
+    }
+
+    /// A probe found `net.web_socket`, `net.socket_stream` and
+    /// `net.http_server` skipping the host list that `net.http_request`
+    /// answers to. Each is tried from a host-owned isolate and from a
+    /// contained app holding `net` and a listed host.
+    #[test]
+    fn a_contained_app_opens_sockets_and_servers_only_as_its_policy_allows() {
+        let run = |cx: &mut Cx, vm_id, code: String| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                let script_mod = crate::makepad_script::ScriptMod {
+                    cargo_manifest_path: String::new(),
+                    module_path: "net_policy_probe".into(),
+                    file: "net_policy_probe".into(),
+                    line: 0,
+                    column: 0,
+                    code,
+                    values: vec![],
+                };
+                !vm.eval(script_mod).is_err()
+            })
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let web_socket = |host: &str| format!(
+            "use mod.net\nnet.web_socket(\"ws://{host}:{port}/\" net.WebSocketEvents{{}})"
+        );
+        let raw_socket = format!(
+            "use mod.net\nnet.socket_stream(net.SocketStreamOptions{{host: \"127.0.0.1\" port: \"{port}\"}})"
+        );
+        let server = "use mod.net\nnet.http_server(net.HttpServerOptions{listen: \"127.0.0.1:0\"} net.HttpServerEvents{})".to_string();
+
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let host_own = cx.alloc_splash_vm_with_network(true);
+        let app = cx.alloc_splash_vm_with_network(true);
+        let app_heap = cx.with_script_vm_id(app, |vm| vm.bx.heap.heap_key());
+        crate::splash_policy::set_policy_for_heap(app_heap, vec!["net".into()], vec!["127.0.0.1".into()], None);
+
+        assert!(run(&mut cx, host_own, web_socket("127.0.0.1")), "a host-owned isolate opens a web socket");
+        assert!(run(&mut cx, host_own, web_socket("elsewhere.example")), "to any host, as before");
+        assert!(run(&mut cx, host_own, raw_socket.clone()), "and a raw socket");
+        assert!(run(&mut cx, host_own, server.clone()), "and listens");
+
+        assert!(run(&mut cx, app, web_socket("127.0.0.1")), "an app reaches its listed host over a web socket");
+        assert!(!run(&mut cx, app, web_socket("elsewhere.example")), "and no other");
+        assert!(!run(&mut cx, app, raw_socket.clone()), "a raw socket is refused even to a listed host");
+        assert!(!run(&mut cx, app, server.clone()), "and so is a listening server");
+
+        crate::splash_policy::set_policy_for_heap(app_heap, vec!["net".into()], vec![], None);
+        assert!(!run(&mut cx, app, web_socket("127.0.0.1")), "an empty host list reaches nothing");
+
+        crate::splash_policy::gc_policies(&[app_heap]);
+        cx.free_splash_vm(host_own);
+        cx.free_splash_vm(app);
+        drop(listener);
+    }
+
+    #[test]
+    fn a_contained_app_cannot_draw_a_password_field() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let field = |cx: &mut Cx, vm_id| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                let v = vm.eval(crate::makepad_script::script! {
+                    use mod.prelude.widgets.*
+                    View{
+                        secret := TextInput{is_password: true}
+                        plain := TextInput{}
+                        code := TextInput{content_type: TextInputContentType.OneTimeCode}
+                    }
+                });
+                WidgetRef::script_from_value(vm, v)
+            })
+        };
+        let refuses = |cx: &Cx, view: &WidgetRef, id| view.widget(cx, &[id]).borrow::<crate::text_input::TextInput>().unwrap().refuses_secret();
+        let host_own = cx.alloc_splash_vm();
+        let app = cx.alloc_splash_vm();
+        let app_heap = cx.with_script_vm_id(app, |vm| vm.bx.heap.heap_key());
+        crate::splash_policy::set_policy_for_heap(app_heap, vec!["storage".into()], vec![], None);
+
+        let sheet = field(&mut cx, host_own);
+        assert!(!refuses(&cx, &sheet, live_id!(secret)), "a host-owned sheet collects the password");
+        let contained = field(&mut cx, app);
+        assert!(refuses(&cx, &contained, live_id!(secret)), "an app's password field takes nothing");
+        assert!(refuses(&cx, &contained, live_id!(code)), "nor a one-time-code field, which invites autofill");
+        assert!(!refuses(&cx, &contained, live_id!(plain)));
+
+        drop((sheet, contained));
+        crate::splash_policy::gc_policies(&[app_heap]);
+        cx.free_splash_vm(host_own);
+        cx.free_splash_vm(app);
+    }
+
+    #[test]
     fn entering_an_isolate_makes_it_the_current_vm_and_leaving_restores_the_outer_one() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
         cx.with_vm(crate::script_mod);
@@ -2065,6 +2254,67 @@ mod isolate_tests {
         );
         eprintln!("### after pane refresh children = {n}");
         assert_eq!(n, 2, "render after pane refresh did not commit");
+    }
+
+    #[test]
+    fn a_rerender_builds_each_child_from_its_new_template() {
+        const RERENDER: &str = r#"
+    let items = []
+    let WithExtra = View{ height: Fit extra := Label{ text: "x" } }
+    let Plain = View{ height: Fit }
+    fn load(){
+        host.request("t.items", {}, fn(r){
+            items = r.data.items
+            ui.item_list.render()
+        })
+    }
+    item_list := View{ height: Fit, on_render: || {
+        for it in items {
+            if it.extra { WithExtra{} } else { Plain{} }
+        }
+    } }
+"#;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{ splash := Splash{} }
+            });
+            vm.bx.heap.new_object_ref(v.as_object().unwrap())
+        });
+        let pane = cx.with_vm(|vm| {
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                View{ height: Fit }
+            });
+            WidgetRef::script_from_value(vm, v)
+        });
+        set_ui_root(&mut cx, &pane);
+        let host = cx.with_vm(|vm| WidgetRef::script_from_value(vm, template.as_object().into()));
+        cx.widget_tree_insert_child_deep(pane.widget_uid(), live_id!(apphost), host.clone());
+        host.widget(&cx, &[live_id!(splash)]).set_text(&mut cx, RERENDER);
+        let item_list = host.widget(&cx, &[live_id!(item_list)]);
+        assert!(!item_list.is_empty());
+        let splash = host.widget(&cx, &[live_id!(splash)]);
+        let render = |cx: &mut Cx, json: &str| {
+            assert!(splash.borrow_mut::<Splash>().unwrap().call_script_fn(cx, live_id!(load), &[]));
+            pump_widget_async(cx);
+            let reqs = crate::splash_host::take_splash_host_requests();
+            assert_eq!(reqs.len(), 1);
+            crate::splash_host::splash_host_respond(cx, reqs[0].heap_key, reqs[0].req_id, Ok(json));
+            pump_widget_async(cx);
+            let first = item_list.borrow::<View>().unwrap().children.first().map(|(_, w)| w.clone()).unwrap();
+            !first.widget(cx, &[live_id!(extra)]).is_empty()
+        };
+        assert!(render(&mut cx, r#"{"items":[{"extra":true}]}"#), "the first render has the extra child");
+        assert!(
+            !render(&mut cx, r#"{"items":[{"extra":false}]}"#),
+            "a slot whose template changed keeps nothing of the old one"
+        );
+        drop(host);
+        gc_dead_splash_isolates(&mut cx);
     }
 
     #[test]

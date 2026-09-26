@@ -4312,6 +4312,10 @@ struct LabelLists {
 
 // --- MapView widget ---
 
+/// How many Overpass mirrors a tile request tries before it gives up on the
+/// ones an app's policy does not list.
+const OVERPASS_MIRROR_TRIES: u8 = 8;
+
 #[derive(Script, Widget)]
 pub struct MapView {
     /// The @cam readout in the corner: the exact command to recreate this
@@ -7542,7 +7546,8 @@ impl MapView {
             .overlays
             .iter()
             .map(|overlay| {
-                let (archive, local_mbtiles_path, filter) = match &overlay.source {
+                let source = self.jailed_tile_source(overlay.source.clone());
+                let (archive, local_mbtiles_path, filter) = match &source {
                     TileSourceConfig::LocalArchive { mbtiles_path, .. } => {
                         let (path, filter) = split_overlay_option(mbtiles_path);
                         if is_mkmap_path_shape(path) {
@@ -7558,7 +7563,7 @@ impl MapView {
                     TileSourceConfig::HttpArchive { root_url, .. } => {
                         let (root_url, filter) = split_overlay_option(root_url);
                         (
-                            Some(MapTileArchive::http(root_url, workers.clone())),
+                            Some(MapTileArchive::http_for_heap(root_url, workers.clone(), self.source.heap_key())),
                             None,
                             filter,
                         )
@@ -7575,7 +7580,33 @@ impl MapView {
         self.apply_archive_cache_budgets(cx);
     }
 
+    /// A local archive config as this map's script heap may read it: the
+    /// paths of a card under a policy resolve inside its storage jail, and a
+    /// path that cannot (no jail, or one that climbs out) reads nothing.
+    fn jailed_tile_source(&self, config: TileSourceConfig) -> TileSourceConfig {
+        let heap_key = self.source.heap_key();
+        let jail = |path: &str| {
+            if path.is_empty() {
+                return String::new();
+            }
+            crate::splash_policy::local_path_for_heap(heap_key, path).unwrap_or_default()
+        };
+        match config {
+            TileSourceConfig::LocalArchive { mbtiles_path, detail_mbtiles_path, bridge_dz_path } => {
+                TileSourceConfig::LocalArchive {
+                    mbtiles_path: jail(&mbtiles_path),
+                    detail_mbtiles_path: jail(&detail_mbtiles_path),
+                    bridge_dz_path: jail(&bridge_dz_path),
+                }
+            }
+            TileSourceConfig::HttpArchive { root_url, detail_root_url, bridge_dz_path } => {
+                TileSourceConfig::HttpArchive { root_url, detail_root_url, bridge_dz_path: jail(&bridge_dz_path) }
+            }
+        }
+    }
+
     fn install_archive_source(&mut self, cx: &mut Cx, config: TileSourceConfig) {
+        let config = self.jailed_tile_source(config);
         self.archive_generation = self.archive_generation.wrapping_add(1).max(1);
         self.style_epoch = self.style_epoch.wrapping_add(1).max(1);
         if let Some(archive) = self.base_archive.as_mut() {
@@ -7610,9 +7641,9 @@ impl MapView {
                 self.mbtiles_path.clear();
                 self.detail_mbtiles_path = detail_root_url.clone();
                 self.bridge_dz_mbtiles_path = bridge_dz_path.clone();
-                self.base_archive = Some(MapTileArchive::http(root_url, workers.clone()));
+                self.base_archive = Some(MapTileArchive::http_for_heap(root_url, workers.clone(), self.source.heap_key()));
                 self.detail_archive = needs_separate_detail_archive(&config)
-                    .then(|| MapTileArchive::http(detail_root_url, workers));
+                    .then(|| MapTileArchive::http_for_heap(detail_root_url, workers, self.source.heap_key()));
                 self.use_local_mbtiles = true;
                 self.use_network = false;
             }
@@ -9389,7 +9420,18 @@ impl MapView {
         }
 
         let query = overpass_query(tile_key);
-        let endpoint = overpass_endpoint(tile_key, attempts, cx.seconds_since_app_start() as u64);
+        // The endpoint rotates across mirrors per tile and attempt. An app
+        // under a policy may list only some of them: use the next one it may
+        // reach rather than failing the tile on the mirror it may not.
+        let now = cx.seconds_since_app_start() as u64;
+        let heap_key = self.source.heap_key();
+        let Some(endpoint) = (0..OVERPASS_MIRROR_TRIES)
+            .map(|k| overpass_endpoint(tile_key, attempts.wrapping_add(k), now))
+            .find(|endpoint| crate::splash_policy::url_allowed(heap_key, endpoint))
+        else {
+            self.mark_tile_failed(tile_key, "refused by the host's allowlist");
+            return false;
+        };
         let mut request = HttpRequest::new(endpoint.to_string(), HttpMethod::POST);
         request.set_header("Content-Type".to_string(), "text/plain".to_string());
         request.set_header("Accept".to_string(), "application/json".to_string());
@@ -13557,7 +13599,7 @@ impl MapView {
             // Where the DEVICE is: the last fix, else the card's declared
             // centre (a fact it observed), else nothing — the camera does not
             // move on its own.
-            let fix = crate::makepad_draw::makepad_platform::gps::last_gps_fix()
+            let fix = crate::splash_policy::gps_fix_for_heap(self.source.heap_key())
                 .map(|f| (f.lat, f.lon))
                 .filter(|(lat, lon)| is_a_place(*lat, *lon))
                 .or(Some((self.center_lat, self.center_lon)))

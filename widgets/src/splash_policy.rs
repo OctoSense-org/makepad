@@ -8,7 +8,13 @@
 //!
 //! - [`service_allowed`] — before a `host.request` is queued (ADR 0002 §2);
 //! - [`url_allowed`] — from every network path, through the gate installed
-//!   in `makepad-script-std` (ADR 0002 §3);
+//!   in `makepad-script-std` (ADR 0002 §3): `net.http_request`,
+//!   `net.web_socket`, `sys.*` data fetches, artwork, map tiles, web cards
+//!   and a `Video`'s network source;
+//! - [`sockets_allowed`] — before `net.http_server` listens or
+//!   `net.socket_stream` connects. Neither names a URL a host list could
+//!   judge, and no capability covers them (`net` is requests to the listed
+//!   hosts), so a policed isolate gets neither;
 //! - [`charge`] — after every evaluation and callback, against a cumulative
 //!   instruction budget (ADR 0002 §4).
 //!
@@ -42,6 +48,9 @@ thread_local! {
 /// Set (or replace) the policy for a heap. Enforcement starts here: a heap
 /// that never had this called is not enforced.
 pub fn set_policy_for_heap(heap_key: usize, capabilities: Vec<String>, hosts: Vec<String>, instruction_budget: Option<u64>) {
+    // A policy nothing consults is not a policy: whoever sets one, the gates
+    // that read it are in place from here on.
+    install_url_gate();
     POLICIES.with(|p| {
         let mut p = p.borrow_mut();
         let used = p.get(&heap_key).map(|old| old.instructions_used).unwrap_or(0);
@@ -110,6 +119,139 @@ pub fn url_allowed(heap_key: usize, url: &str) -> bool {
     })
 }
 
+/// May this heap open a listening server or a raw socket? Only when it is
+/// not policed. A server answers whoever connects and a raw stream speaks any
+/// protocol to any port; a contained app's way out is a request to a listed
+/// host, and nothing wider.
+pub fn sockets_allowed(heap_key: usize) -> bool {
+    !is_enforced(heap_key)
+}
+
+/// May this heap know where the device is? Location is a service family
+/// like any other, granted as `location`; an unpoliced heap keeps the old
+/// behaviour. Every reader of the platform fix on a script's behalf asks
+/// here: `sys.gps`, the blank-name geocode fallback, the map's follow camera.
+pub fn location_allowed(heap_key: usize) -> bool {
+    service_allowed(heap_key, "location.get").is_ok()
+}
+
+/// The device's last GPS fix as this heap may see it: `None` without the
+/// `location` grant, exactly as if the device had no fix yet, so a card's
+/// no-fix path is also its no-permission path.
+pub fn gps_fix_for_heap(heap_key: usize) -> Option<crate::makepad_draw::makepad_platform::gps::GpsFix> {
+    if location_allowed(heap_key) {
+        crate::makepad_draw::makepad_platform::gps::last_gps_fix()
+    } else {
+        None
+    }
+}
+
+/// May this heap read what the user keeps in the host: saved lists
+/// (`sys.watchlist`, cities, reading, topics), stored preferences and the page
+/// open in the reader. These are published process-wide for the host's own
+/// cards; an app under a policy needs the `profile` grant to see them.
+pub fn profile_allowed(heap_key: usize) -> bool {
+    service_allowed(heap_key, "profile.read").is_ok()
+}
+
+/// A file a widget was told to read, as this heap may read it. An unpoliced
+/// heap reads the path as given. A policed heap's paths are app-visible paths
+/// inside its storage jail, so a card cannot point a widget (a map archive,
+/// say) at a file of the host's; with no jail, it reads nothing.
+pub fn local_path_for_heap(heap_key: usize, path: &str) -> Option<String> {
+    if !is_enforced(heap_key) {
+        return Some(path.to_string());
+    }
+    let root = crate::splash_storage::root_for_heap(heap_key)?;
+    let real = crate::splash_storage::resolve_jailed(&root, path).ok()?;
+    crate::splash_storage::verify_no_symlinks(&root, &real).ok()?;
+    Some(real.to_string_lossy().into_owned())
+}
+
+/// The hosts a policed heap may reach, or `None` for an unpoliced heap. For
+/// a surface the gate cannot stand in front of — a system WebView fetches on
+/// its own — so it can be told the same list.
+pub fn hosts_for_heap(heap_key: usize) -> Option<Vec<String>> {
+    POLICIES.with(|p| p.borrow().get(&heap_key).map(|policy| policy.hosts.clone()))
+}
+
+/// The host of `url` when it is https and names a public host: not loopback,
+/// private, link-local, shared or unspecified, not a single-label or
+/// `.local`/`.internal`/`.localhost` name, and not an IP written in a form
+/// only some resolvers read as one (`0x7f.1`). What a grant to reach "any
+/// public page" may reach, and nothing on the device's own network.
+pub fn public_https_host(url: &str) -> Result<String, String> {
+    if !url.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
+        return Err("only https:// URLs are allowed".into());
+    }
+    let host = makepad_script_std::url_host(url).ok_or("missing host")?;
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return if is_public_ip(ip) { Ok(host) } else { Err(format!("host not permitted (private/internal): {host}")) };
+    }
+    let last = host.rsplit('.').next().unwrap_or("");
+    let numeric = last.bytes().all(|b| b.is_ascii_digit()) || last.starts_with("0x");
+    if numeric || !host.contains('.') || host.starts_with('[') {
+        return Err(format!("host not permitted (not a public name): {host}"));
+    }
+    if host == "localhost" || [".localhost", ".internal", ".local", ".lan", ".home.arpa"].iter().any(|s| host.ends_with(s)) {
+        return Err(format!("host not permitted (private/internal): {host}"));
+    }
+    Ok(host)
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || a == 0
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// May this heap load `url` as media (an image, artwork)? Its host list
+/// answers first; the `images` grant adds any public https host, for an app
+/// that shows pictures from wherever its content links (a feed reader's
+/// thumbnails). A load is still a request, so the grant is its own consent.
+pub fn media_allowed(heap_key: usize, url: &str) -> bool {
+    url_allowed(heap_key, url)
+        || (is_enforced(heap_key)
+            && may_run(heap_key)
+            && service_allowed(heap_key, "images.any").is_ok()
+            && public_https_host(url).is_ok())
+}
+
+/// May this heap open `url` as a page in the system WebView? Its host list
+/// answers first; the `web` grant adds any public https page, for a reader.
+/// Such a page gets no bridge into the app.
+pub fn page_allowed(heap_key: usize, url: &str) -> bool {
+    url_allowed(heap_key, url)
+        || (is_enforced(heap_key)
+            && may_run(heap_key)
+            && service_allowed(heap_key, "web.open").is_ok()
+            && public_https_host(url).is_ok())
+}
+
 /// Record `instructions` run by this heap. Returns false once the budget is
 /// spent, and stays false: the heap is exhausted from then on.
 pub fn charge(heap_key: usize, instructions: u64) -> bool {
@@ -143,6 +285,8 @@ pub(crate) fn install_url_gate() {
     INSTALLED.with(|installed| {
         if !installed.get() {
             makepad_script_std::set_script_url_gate(Some(url_allowed));
+            makepad_script_std::set_script_media_gate(Some(media_allowed));
+            makepad_script_std::set_script_socket_gate(Some(sockets_allowed));
             installed.set(true);
         }
     });
@@ -224,6 +368,95 @@ mod tests {
         set_policy_for_heap(905, vec![], vec![], Some(50));
         assert!(!may_run(905), "lowering the budget below what is spent exhausts the heap");
         gc_policies(&[905]);
+    }
+
+    #[test]
+    fn location_needs_the_location_grant() {
+        gc_policies(&[908]);
+        assert!(location_allowed(908), "an unpoliced heap reads the fix as before");
+        set_policy_for_heap(908, vec!["net".into()], vec![], None);
+        assert!(!location_allowed(908));
+        assert!(gps_fix_for_heap(908).is_none(), "no grant reads as no fix");
+        set_policy_for_heap(908, vec!["location".into()], vec![], None);
+        assert!(location_allowed(908));
+        assert!(!profile_allowed(908), "location does not cover the user's saved lists");
+        set_policy_for_heap(908, vec!["profile".into()], vec![], None);
+        assert!(profile_allowed(908));
+        gc_policies(&[908]);
+    }
+
+    #[test]
+    fn a_policed_heap_reads_local_files_only_inside_its_jail() {
+        gc_policies(&[909]);
+        assert_eq!(local_path_for_heap(909, "/etc/hosts").as_deref(), Some("/etc/hosts"));
+        set_policy_for_heap(909, vec![], vec![], None);
+        assert!(local_path_for_heap(909, "maps/world.mkmap").is_none(), "no jail, no files");
+        crate::splash_storage::set_root_for_heap(909, Some("/jail/app".into()));
+        assert_eq!(
+            local_path_for_heap(909, "maps/world.mkmap").as_deref(),
+            Some("/jail/app/maps/world.mkmap")
+        );
+        assert!(local_path_for_heap(909, "../../etc/hosts").is_none(), "no climbing out");
+        crate::splash_storage::set_root_for_heap(909, None);
+        gc_policies(&[909]);
+    }
+
+    #[test]
+    fn a_public_host_is_https_and_off_the_devices_network() {
+        for ok in ["https://news.ycombinator.com/", "https://CDN.Example.org:8443/a.jpg", "https://8.8.8.8/", "https://[2606:4700::1111]/"] {
+            assert!(public_https_host(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com/",
+            "https://localhost/",
+            "https://127.0.0.1/",
+            "https://10.0.0.8/",
+            "https://172.20.1.1/",
+            "https://192.168.1.1/",
+            "https://169.254.169.254/latest/meta-data",
+            "https://100.64.0.1/",
+            "https://0.0.0.0/",
+            "https://[::1]/",
+            "https://[fd00::1]/",
+            "https://[fe80::1]/",
+            "https://[::ffff:127.0.0.1]/",
+            "https://0x7f.1/",
+            "https://2130706433/",
+            "https://router/",
+            "https://printer.local/",
+            "https://nas.home.arpa/",
+            "https://evil.com@127.0.0.1/",
+        ] {
+            assert!(public_https_host(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn images_and_web_grants_open_public_https_only() {
+        set_policy_for_heap(910, vec!["net".into()], vec!["hn.algolia.com".into()], None);
+        assert!(media_allowed(910, "https://hn.algolia.com/logo.png"), "its own hosts, as before");
+        assert!(!media_allowed(910, "https://cdn.example.org/a.jpg"));
+        assert!(!page_allowed(910, "https://example.org/story"));
+        set_policy_for_heap(910, vec!["net".into(), "images".into(), "web".into()], vec!["hn.algolia.com".into()], None);
+        assert!(media_allowed(910, "https://cdn.example.org/a.jpg"));
+        assert!(page_allowed(910, "https://example.org/story"));
+        assert!(!media_allowed(910, "https://192.168.1.1/a.jpg"), "never the device's network");
+        assert!(!page_allowed(910, "http://example.org/story"), "never plain http");
+        assert!(!url_allowed(910, "https://cdn.example.org/a.jpg"), "neither grant widens requests");
+        gc_policies(&[910]);
+        assert!(media_allowed(910, "https://anything.example/"), "an unpoliced heap, as before");
+    }
+
+    #[test]
+    fn a_policed_heap_opens_no_server_and_no_raw_socket_whatever_it_holds() {
+        gc_policies(&[911]);
+        assert!(sockets_allowed(911), "an unpoliced heap, as before");
+        set_policy_for_heap(911, vec!["net".into(), "storage".into(), "web".into()], vec!["127.0.0.1".into()], None);
+        assert!(!sockets_allowed(911), "no grant and no listed host covers a socket");
+        assert!(!makepad_script_std::script_sockets_allowed(911), "setting a policy installs the gate");
+        assert!(makepad_script_std::script_url_allowed(911, "ws://127.0.0.1:9/"), "the url gate is in too");
+        gc_policies(&[911]);
+        assert!(makepad_script_std::script_sockets_allowed(911));
     }
 
     #[test]

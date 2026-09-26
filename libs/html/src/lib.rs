@@ -3417,7 +3417,13 @@ mod tests {
     /// Treating U+00A0 and U+3000 as collapsible ate `&nbsp;` runs and the
     /// full-width spaces in CJK text.
     #[test]
-    fn only_ascii_whitespace_collapses() {
+    fn a_space_before_an_inline_tag_is_kept() {
+        assert_eq!(text_of("<p>Welcome to <b>Mail</b> now</p>"), "Welcome to Mail now");
+        assert_eq!(text_of("<h2>Welcome to <b>Mail</b></h2><p>x</p>"), "Welcome to Mailx");
+    }
+
+    #[test]
+        fn only_ascii_whitespace_collapses() {
         assert_eq!(text_of("<p>a&nbsp; b</p>"), "a\u{a0} b");
         assert_eq!(text_of("<p>&nbsp;&nbsp;</p>"), "\u{a0}\u{a0}");
         assert_eq!(text_of("<p>\u{3000}x\u{3000}</p>"), "\u{3000}x\u{3000}");

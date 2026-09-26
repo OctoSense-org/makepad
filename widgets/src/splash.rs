@@ -281,9 +281,13 @@ impl Splash {
                         crate::desktop_style::apply_widgets(vm);
                         crate::script_eval!(vm, {mod.res = nil});
                         crate::widget_async::apply_splash_isolate_mods(vm);
+                        crate::widget_async::forget_granted_isolate_mods(heap_key);
                     });
                 }
             }
+            // Vocabulary this app's grants entitle it to, now that its policy
+            // is seated (see `register_splash_isolate_mod_for`).
+            crate::widget_async::apply_granted_isolate_mods(vm);
             // Everything on `mod` that is not the body's own; whatever the run
             // adds beyond this is the body's.
             let mut known = module_keys(vm);
@@ -742,7 +746,7 @@ impl Splash {
             }
             let vals: Vec<ScriptValue> = args
                 .iter()
-                .map(|s| vm.new_string_with(|_vm, out| out.push_str(s)))
+                .map(|s| vm.bx.heap.new_string_from_str(s))
                 .collect();
             vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT, |vm| {
                 vm.call(fnval, &vals);
@@ -1234,6 +1238,14 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let mut payload = String::new();
             vm.bx.heap.to_json_inner(payload_value, &mut payload);
 
+            // A notify carries no sender, so the host acts on it as if its own
+            // card sent it. An app under a policy may only post one when it
+            // was granted `agent`; anything else would let an installed app
+            // drive the host's agent.
+            if let Err(reason) = crate::splash_policy::service_allowed(vm.bx.heap.heap_key(), "agent.notify") {
+                log!("splash: refused agent.notify {event_id:?}: {reason}");
+                return NIL;
+            }
             Cx::post_action(SplashAction::Notify { event_id, payload });
             NIL
         },
@@ -1565,7 +1577,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let url = geocode_url(&name);
+            let url = geocode_url(&name, vm.bx.heap.heap_key());
             let out = match vm.host.cx_mut().script_data_fetch(&url) {
                 Some(bytes) => geocode_pluck(&bytes, field.trim())
                     .unwrap_or_else(|| "—".to_string()),
@@ -1617,7 +1629,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let url = geocode_url(&name);
+            let url = geocode_url(&name, vm.bx.heap.heap_key());
             let key = if field.trim() == "lon" { "lon" } else { "lat" };
             let n = vm
                 .host
@@ -3054,7 +3066,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let out = pref_at(field.trim()).unwrap_or_else(|| "\u{2014}".to_string());
+            let out = pref_at(vm.bx.heap.heap_key(), field.trim()).unwrap_or_else(|| "\u{2014}".to_string());
             vm.bx.heap.new_string_from_str(&out)
         },
     );
@@ -3079,7 +3091,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let Some(id) = collection_at("reading", index) else {
+            let Some(id) = collection_at(vm.bx.heap.heap_key(), "reading", index) else {
                 return vm.bx.heap.new_string_from_str("—");
             };
             let key = match field.trim().to_ascii_lowercase().as_str() {
@@ -3335,8 +3347,8 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let mut ticker = String::new();
             vm.bx.heap.cast_to_string(ticker_v, &mut ticker);
             let ticker = ticker.trim();
-            let held = (0..collection_len("watchlist"))
-                .filter_map(|i| collection_at("watchlist", i))
+            let held = (0..collection_len_for(vm.bx.heap.heap_key(), "watchlist"))
+                .filter_map(|i| collection_at(vm.bx.heap.heap_key(), "watchlist", i))
                 .any(|t| t == ticker);
             vm.bx.heap.new_string_from_str(if held { "1" } else { "0" })
         },
@@ -3360,7 +3372,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let Some(name) = collection_at("topics", index) else {
+            let Some(name) = collection_at(vm.bx.heap.heap_key(), "topics", index) else {
                 return vm.bx.heap.new_string_from_str("—");
             };
             // json_pluck walks a dot-path from the ROOT (it is not a text
@@ -3411,7 +3423,11 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         id_lut!(link),
         script_args_def!(field = NIL),
         |vm, _args| {
-            let url = LINK.read().map(|s| s.clone()).unwrap_or_default();
+            let url = if crate::splash_policy::profile_allowed(vm.bx.heap.heap_key()) {
+                LINK.read().map(|s| s.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            };
             vm.bx.heap.new_string_from_str(&url)
         },
     );
@@ -3725,7 +3741,9 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let fix = crate::makepad_draw::makepad_platform::gps::last_gps_fix();
+            // Without the `location` grant this reads as "no fix yet", the
+            // state every card already handles.
+            let fix = crate::splash_policy::gps_fix_for_heap(vm.bx.heap.heap_key());
             match field.trim().to_ascii_lowercase().as_str() {
                 "ok" => ScriptValue::from_f64(if fix.is_some() { 1.0 } else { 0.0 }),
                 "lon" => ScriptValue::from_f64(fix.map(|f| f.lon).unwrap_or(-9999.0)),
@@ -3756,7 +3774,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             let field_v = script_value!(vm, args.field);
             let mut field = String::new();
             vm.bx.heap.cast_to_string(field_v, &mut field);
-            let Some(ticker) = collection_at("watchlist", index) else {
+            let Some(ticker) = collection_at(vm.bx.heap.heap_key(), "watchlist", index) else {
                 // Past the end of the list. Empty rather than an em dash: a row
                 // that does not exist is not a row whose value failed to load.
                 return vm.bx.heap.new_string_from_str("");
@@ -3819,14 +3837,14 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
             } else {
                 vm.bx.heap.cast_to_string(unit_value, &mut unit);
             }
-            let Some(name) = collection_at("cities", index) else {
+            let Some(name) = collection_at(vm.bx.heap.heap_key(), "cities", index) else {
                 return vm.bx.heap.new_string_from_str("");
             };
             // The one field that needs no network: it IS what was stored.
             if field.trim() == "name" {
                 return vm.bx.heap.new_string_from_str(&name);
             }
-            let geo = geocode_url(&name);
+            let geo = geocode_url(&name, vm.bx.heap.heap_key());
             let (lat, lon) = match vm.host.cx_mut().script_data_fetch(&geo) {
                 None => {
                     let placeholder = vm.host.cx_mut().script_data_placeholder(&geo);
@@ -3879,7 +3897,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         sys,
         id_lut!(citiesnum),
         script_args_def!(),
-        |_vm, _args| ScriptValue::from_f64(collection_len("cities") as f64),
+        |vm, _args| ScriptValue::from_f64(collection_len_for(vm.bx.heap.heap_key(), "cities") as f64),
     );
 
     vm.add_method(
@@ -3959,7 +3977,7 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
         sys,
         id_lut!(watchlistnum),
         script_args_def!(),
-        |_vm, _args| ScriptValue::from_f64(collection_len("watchlist") as f64),
+        |vm, _args| ScriptValue::from_f64(collection_len_for(vm.bx.heap.heap_key(), "watchlist") as f64),
     );
 
     vm.set_injected_global(id!(sys), sys.into());
@@ -4017,7 +4035,10 @@ fn locale_field(field: &str) -> String {
     }
 }
 
-fn pref_at(field: &str) -> Option<String> {
+fn pref_at(heap_key: usize, field: &str) -> Option<String> {
+    if !crate::splash_policy::profile_allowed(heap_key) {
+        return None;
+    }
     PREFS.read().ok()?.as_ref()?.get(field).cloned()
 }
 
@@ -4048,7 +4069,20 @@ pub fn collection_len(name: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn collection_at(name: &str, index: usize) -> Option<String> {
+/// [`collection_len`] as a given isolate may see it: empty without the
+/// `profile` grant, like a user who saved nothing.
+fn collection_len_for(heap_key: usize, name: &str) -> usize {
+    if crate::splash_policy::profile_allowed(heap_key) {
+        collection_len(name)
+    } else {
+        0
+    }
+}
+
+fn collection_at(heap_key: usize, name: &str, index: usize) -> Option<String> {
+    if !crate::splash_policy::profile_allowed(heap_key) {
+        return None;
+    }
     COLLECTIONS
         .read()
         .ok()?
@@ -5502,7 +5536,7 @@ fn nav_step_field(route: &ParsedNavRoute, d: f64, field: &str) -> String {
 /// card's. Detecting CJK by codepoint range is enough: the alternative is asking
 /// the generating model to romanise names, which is another thing for it to get
 /// silently wrong.
-fn geocode_url(name: &str) -> String {
+fn geocode_url(name: &str, heap_key: usize) -> String {
     let name = name.trim();
     // An EMPTY name means "where the device is" — the weather exemplar's
     // `state city { shape: text, initial: "" }` is documented as exactly
@@ -5516,7 +5550,9 @@ fn geocode_url(name: &str) -> String {
     // search, which resolves to nothing and keeps the placeholder path:
     // never invent a place.
     if name.is_empty() {
-        if let Some(fix) = crate::makepad_draw::makepad_platform::gps::last_gps_fix() {
+        // The fix only for an app granted `location`: a blank name must not
+        // become a way to learn where the device is without asking.
+        if let Some(fix) = crate::splash_policy::gps_fix_for_heap(heap_key) {
             return format!(
                 "https://photon.komoot.io/reverse?lat={:.2}&lon={:.2}&lang=en",
                 fix.lat, fix.lon
@@ -5893,4 +5929,46 @@ pub(crate) fn sim_clock_secs() -> f64 {
     use std::sync::OnceLock;
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+#[cfg(test)]
+mod policy_gate_tests {
+    use super::*;
+
+    /// `sys.gps(...)`, `sys.watchlistnum()` and `agent.notify` run inside a
+    /// real isolate: first unpoliced (the host's own card), then under a
+    /// policy that lacks each grant, then with the grants.
+    #[test]
+    fn a_policed_isolate_needs_grants_for_location_the_users_lists_and_the_agent() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        crate::makepad_draw::makepad_platform::gps::set_gps_fix(52.37, 4.89, 10.0);
+        set_collections(std::collections::BTreeMap::from([(
+            "watchlist".to_string(),
+            vec!["NVDA".to_string(), "AAPL".to_string()],
+        )]));
+        let vm_id = cx.alloc_splash_vm();
+        let read = |cx: &mut Cx| {
+            cx.with_script_vm_id(vm_id, |vm| {
+                register_agent_module(vm);
+                let ok = vm.eval(crate::makepad_script::script! { sys.gps("ok") }).as_number();
+                let lists = vm.eval(crate::makepad_script::script! { sys.watchlistnum() }).as_number();
+                (ok, lists)
+            })
+        };
+        let heap = cx.with_script_vm_id(vm_id, |vm| vm.bx.heap.heap_key());
+
+        assert_eq!(read(&mut cx), (Some(1.0), Some(2.0)), "the host's own card sees both");
+
+        crate::splash_policy::set_policy_for_heap(heap, vec!["net".into()], vec![], None);
+        assert_eq!(read(&mut cx), (Some(0.0), Some(0.0)), "no grant reads as no fix and no saved lists");
+        assert!(crate::splash_policy::service_allowed(heap, "agent.notify").is_err());
+
+        crate::splash_policy::set_policy_for_heap(heap, vec!["location".into(), "profile".into()], vec![], None);
+        assert_eq!(read(&mut cx), (Some(1.0), Some(2.0)));
+
+        crate::splash_policy::gc_policies(&[heap]);
+        set_collections(Default::default());
+        cx.free_splash_vm(vm_id);
+    }
 }

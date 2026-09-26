@@ -14,6 +14,11 @@ use std::rc::Rc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
+
+/// The response body cap for a script request that names none: an isolate
+/// may not buffer an unbounded body, and 16 MiB is past any page or feed.
+pub const SCRIPT_DEFAULT_BODY_LIMIT: u64 = 16 * 1024 * 1024;
+
 pub struct ScriptWebSocket {
     #[allow(unused)]
     pub id: LiveId,
@@ -786,7 +791,19 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 return script_err_type_mismatch!(vm.trap(), "invalid net arg type");
             }
 
+            // A server answers whoever connects; no host list describes that.
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::gate::script_sockets_allowed(heap_key) {
+                return script_err_io!(vm.trap(), "this app may not open a listening server");
+            }
+            if vm.std_mut::<ScriptStd>().net.is_none() {
+                return script_err_io!(vm.trap(), "script net runtime is not configured");
+            }
+
             let options = HttpServerOptions::script_from_value(vm, options);
+            let Ok(listen_address) = options.listen.parse() else {
+                return script_err_invalid_args!(vm.trap(), "invalid listen address {}", options.listen);
+            };
             let events = HttpServerEvents::script_from_value(vm, events);
 
             let (server_tx, server_rx) = channel();
@@ -800,7 +817,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             });
 
             let server = HttpServer {
-                listen_address: options.listen.parse().unwrap(),
+                listen_address,
                 post_max_size: 1024 * 1024 * 10,
                 post_max_size_overrides: Vec::new(),
                 pre_admit_posts: false,
@@ -838,7 +855,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
             {
                 return script_err_type_mismatch!(vm.trap(), "invalid net arg type");
             }
-            let request = HttpRequest::script_from_value(vm, request);
+            let mut request = HttpRequest::script_from_value(vm, request);
+            // A script that never names a limit reads back 0, which refused
+            // every body with "response body exceeds configured limit".
+            if request.max_response_body_bytes == 0 {
+                request.max_response_body_bytes = SCRIPT_DEFAULT_BODY_LIMIT;
+            }
             let events = HttpEvents::script_from_value(vm, events);
             // The host's per-isolate allowlist, when one is installed: a
             // network grant that only opened this module would otherwise
@@ -893,12 +915,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
         }
         if prop == id!(error) {
             if let Some(error) = error {
-                return vm.new_string_with(|_vm, out| out.push_str(&error)).into();
+                return vm.bx.heap.new_string_from_str(&error).into();
             }
             return NIL;
         }
         if prop == id!(host) {
-            return vm.new_string_with(|_vm, out| out.push_str(&host)).into();
+            return vm.bx.heap.new_string_from_str(&host).into();
         }
         script_err_not_found!(vm.trap(), "invalid socket_stream prop")
     });
@@ -1071,7 +1093,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             match socket_stream_poll(vm, handle) {
                 SocketStreamPoll::Data(data) => {
                     let string = String::from_utf8_lossy(&data);
-                    vm.new_string_with(|_vm, out| out.push_str(&string)).into()
+                    vm.bx.heap.new_string_from_str(&string).into()
                 }
                 SocketStreamPoll::Closed(Some(err)) => script_err_io!(vm.trap(), "{err}"),
                 SocketStreamPoll::Closed(None) => NIL,
@@ -1116,6 +1138,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
                 return script_err_type_mismatch!(vm.trap(), "invalid net arg type");
             }
             let events = WebSocketEvents::script_from_value(vm, events);
+            // The same per-isolate allowlist as `http_request`: a socket is
+            // a request that stays open.
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::gate::script_url_allowed(heap_key, &request.url) {
+                return script_err_io!(vm.trap(), "this app may not reach {}", request.url);
+            }
 
             let std = vm.std_mut::<ScriptStd>();
             let Some(runtime) = std.net.as_ref() else {
@@ -1142,6 +1170,12 @@ pub fn script_mod(vm: &mut ScriptVm) {
             let options = script_value!(vm, args.options);
             if !script_has_proto!(vm, options, net.SocketStreamOptions) {
                 return script_err_type_mismatch!(vm.trap(), "invalid socket_stream arg type");
+            }
+            // A raw stream speaks any protocol to any port, so a host list
+            // cannot bound it: a policed isolate is refused outright.
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::gate::script_sockets_allowed(heap_key) {
+                return script_err_io!(vm.trap(), "this app may not open a raw socket");
             }
             // Raw sockets obey the same gate as http_request/web_socket, so a sandboxed
             // VM without a net runtime can't open TCP connections.
