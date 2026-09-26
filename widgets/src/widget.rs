@@ -787,6 +787,28 @@ impl WidgetRef {
         if method == live_id!(visible) {
             return ScriptAsyncResult::Return(self.visible().into());
         }
+        // Text likewise: a widget with `Widget::set_text` (an `Html` view's
+        // body, say) takes it from script without a `script_call` of its own.
+        if method == live_id!(set_text) {
+            let Some(args_obj) = args.as_object() else {
+                return ScriptAsyncResult::Return(NIL);
+            };
+            let trap = vm.bx.threads.cur().trap.pass();
+            let value = vm.bx.heap.vec_value(args_obj, 0, trap);
+            let Some(text) = vm.bx.heap.cast_to_owned_string(value, "copying widget text") else {
+                return ScriptAsyncResult::Return(script_err_wrong_value!(
+                    vm.trap(),
+                    "set_text expects a string, got {:?}",
+                    value.value_type()
+                ));
+            };
+            vm.with_cx_mut(|cx| self.set_text(cx, &text));
+            return ScriptAsyncResult::Return(NIL);
+        }
+        if method == live_id!(text) {
+            let text = self.text();
+            return ScriptAsyncResult::Return(vm.bx.heap.new_string_from_str(&text));
+        }
         ScriptAsyncResult::MethodNotFound
     }
 
