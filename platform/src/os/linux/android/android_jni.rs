@@ -261,6 +261,7 @@ pub enum FromJavaMessage {
     ComposerSwitch,
     ComposerExpand,
     QrScanned { json: String },
+    QrCancelled { reason: String },
     SystemBrowserInvoke { browser_id: i64, call_id: i64, tool: String, args: String },
     SystemBrowserPageError { browser_id: i64, code: i32, description: String, url: String },
     DeepLink { url: String },
@@ -2918,7 +2919,26 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onQrCameraFrame(
     }
 }
 
-/// Detect + decode a QR from an 8-bit greyscale (luma) buffer. Returns the text.
+/// The QR scanner overlay closed without a decode (back / tap / app paused /
+/// camera error / CAMERA permission denied). `reason` is the short code
+/// documented on `Cx::show_qr_scanner`.
+#[no_mangle]
+pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onQrCancelled(
+    env: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    reason: jni_sys::jstring,
+) {
+    let reason = if reason.is_null() {
+        "cancelled".to_string()
+    } else {
+        jstring_to_string(env, reason)
+    };
+    send_from_java_message(FromJavaMessage::QrCancelled { reason });
+}
+
+/// Detect + decode a QR from an 8-bit greyscale (luma) buffer. Returns the
+/// complete decoded text (rqrr decodes every segment of any version, so a
+/// 1000+ character alphanumeric payload comes back whole, not truncated).
 fn decode_qr_luma(luma: &[u8], w: usize, h: usize) -> Option<String> {
     let mut img = rqrr::PreparedImage::prepare_from_greyscale(w, h, |x, y| luma[y * w + x]);
     for grid in img.detect_grids() {
@@ -3030,6 +3050,13 @@ pub unsafe fn to_java_expand_composer() {
 pub unsafe fn to_java_collapse_composer() {
     let env = attach_jni_env();
     ndk_utils::call_void_method!(env, get_activity(), "collapseComposer", "()V");
+}
+
+// The full-screen QR scanner (`MakepadActivity.requestQrScanner`): asks for
+// CAMERA if needed, then reports back via onQrCameraFrame / onQrCancelled.
+pub unsafe fn to_java_request_qr_scanner() {
+    let env = attach_jni_env();
+    ndk_utils::call_void_method!(env, get_activity(), "requestQrScanner", "()V");
 }
 
 // The system browser is a Java WebView the activity hosts over the GL surface
