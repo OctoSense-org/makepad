@@ -1521,9 +1521,14 @@ impl Cx {
                 self.handle_action_receiver();
             }
             FromJavaMessage::QrScanned { json } => {
-                // The composer QR scanner decoded a payload — hand it to the app
-                // (it applies it as an LLM-provisioning config). Drain this tick.
+                // The QR scanner decoded a code — hand the full text to the app
+                // (e.g. an LLM-provisioning payload). Drain this tick.
                 Cx::post_action(crate::event::NativeQrScanned { json });
+                self.handle_action_receiver();
+            }
+            FromJavaMessage::QrCancelled { reason } => {
+                // The QR scanner closed without a result. Drain this tick.
+                Cx::post_action(crate::event::NativeQrCancelled { reason });
                 self.handle_action_receiver();
             }
             FromJavaMessage::SystemBrowserInvoke {
@@ -2798,6 +2803,9 @@ impl Cx {
                 },
                 CxOsOp::CollapseNativeComposer => unsafe {
                     android_jni::to_java_collapse_composer();
+                },
+                CxOsOp::ShowQrScanner => unsafe {
+                    android_jni::to_java_request_qr_scanner();
                 },
                 CxOsOp::SpawnSystemBrowser {
                     browser_id,
