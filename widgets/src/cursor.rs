@@ -119,15 +119,32 @@ script_mod! {
             return sdf.result
         }
 
+        // The match only picks a figure and its parameters; each figure is
+        // drawn from one call site below. Every inlined call is compiled
+        // again, and the match used to hold arrow() 4x, hand() 3x (31 path
+        // edges each) and resize() 19x: 0.86 s to compile on Adreno 630.
         pixel: fn() -> vec4 {
             let sdf = Sdf2d.viewport(self.pos * 24.0)
+            // 0: strokes built in sdf; 1: arrow; 2: hand; 3: resize;
+            // 4: wait; 5: move (two resize arrows); 6: help (strokes over the arrow)
+            var figure = 0.0
+            var hand_kind = 0.0
+            var axis = vec2(1.0, 0.0)
+            var double_head = 0.0
+            var divider = 0.0
             match self.shape {
                 CursorShape.Hidden => { return vec4(0.0) }
-                CursorShape.Default => { return self.arrow() }
-                CursorShape.Arrow => { return self.arrow() }
-                CursorShape.Hand => { return self.hand(0.0) }
-                CursorShape.Grab => { return self.hand(1.0) }
-                CursorShape.Grabbing => { return self.hand(2.0) }
+                CursorShape.Default => { figure = 1.0 }
+                CursorShape.Arrow => { figure = 1.0 }
+                CursorShape.Hand => { figure = 2.0 }
+                CursorShape.Grab => {
+                    figure = 2.0
+                    hand_kind = 1.0
+                }
+                CursorShape.Grabbing => {
+                    figure = 2.0
+                    hand_kind = 2.0
+                }
                 CursorShape.Text => {
                     sdf.move_to(8.0, 3.0)
                     sdf.line_to(16.0, 3.0)
@@ -143,24 +160,10 @@ script_mod! {
                     sdf.line_to(22.0, 12.0)
                 }
                 CursorShape.Move => {
-                    return self.resize(vec2(1.0, 0.0), 1.0, 0.0)
-                        + self.resize(vec2(0.0, 1.0), 1.0, 0.0)
-                            * (1.0 - self.resize(vec2(1.0, 0.0), 1.0, 0.0).w)
+                    figure = 5.0
+                    double_head = 1.0
                 }
-                CursorShape.Wait => {
-                    var path = vec2(1e20, 0.0)
-                    path = self.path_edge(path, vec2(6.0, 3.0), vec2(18.0, 3.0))
-                    path = self.path_edge(path, vec2(18.0, 3.0), vec2(18.0, 6.0))
-                    path = self.path_edge(path, vec2(18.0, 6.0), vec2(13.0, 12.0))
-                    path = self.path_edge(path, vec2(13.0, 12.0), vec2(18.0, 18.0))
-                    path = self.path_edge(path, vec2(18.0, 18.0), vec2(18.0, 21.0))
-                    path = self.path_edge(path, vec2(18.0, 21.0), vec2(6.0, 21.0))
-                    path = self.path_edge(path, vec2(6.0, 21.0), vec2(6.0, 18.0))
-                    path = self.path_edge(path, vec2(6.0, 18.0), vec2(11.0, 12.0))
-                    path = self.path_edge(path, vec2(11.0, 12.0), vec2(6.0, 6.0))
-                    path = self.path_edge(path, vec2(6.0, 6.0), vec2(6.0, 3.0))
-                    return self.path_pixel(path)
-                }
+                CursorShape.Wait => { figure = 4.0 }
                 CursorShape.NotAllowed => {
                     sdf.circle(12.0, 12.0, 8.0)
                     sdf.move_to(6.5, 6.5)
@@ -176,29 +179,118 @@ script_mod! {
                     sdf.line_to(18.0, 18.0)
                     sdf.move_to(18.0, 20.5)
                     sdf.line_to(18.0, 21.0)
-                    sdf.stroke_keep(self.border_color, 3.5)
-                    sdf.stroke(self.color, 1.75)
-                    return sdf.result + self.arrow() * (1.0 - sdf.result.w)
+                    figure = 6.0
                 }
-                CursorShape.NResize => { return self.resize(vec2(0.0, -1.0), 0.0, 0.0) }
-                CursorShape.NeResize => { return self.resize(vec2(0.707107, -0.707107), 0.0, 0.0) }
-                CursorShape.EResize => { return self.resize(vec2(1.0, 0.0), 0.0, 0.0) }
-                CursorShape.SeResize => { return self.resize(vec2(0.707107, 0.707107), 0.0, 0.0) }
-                CursorShape.SResize => { return self.resize(vec2(0.0, 1.0), 0.0, 0.0) }
-                CursorShape.SwResize => { return self.resize(vec2(-0.707107, 0.707107), 0.0, 0.0) }
-                CursorShape.WResize => { return self.resize(vec2(-1.0, 0.0), 0.0, 0.0) }
-                CursorShape.NwResize => { return self.resize(vec2(-0.707107, -0.707107), 0.0, 0.0) }
-                CursorShape.NsResize => { return self.resize(vec2(0.0, 1.0), 1.0, 0.0) }
-                CursorShape.NeswResize => { return self.resize(vec2(0.707107, -0.707107), 1.0, 0.0) }
-                CursorShape.EwResize => { return self.resize(vec2(1.0, 0.0), 1.0, 0.0) }
-                CursorShape.NwseResize => { return self.resize(vec2(0.707107, 0.707107), 1.0, 0.0) }
-                CursorShape.ColResize => { return self.resize(vec2(1.0, 0.0), 1.0, 1.0) }
-                CursorShape.RowResize => { return self.resize(vec2(0.0, 1.0), 1.0, 1.0) }
-                _ => { return self.arrow() }
+                CursorShape.NResize => {
+                    figure = 3.0
+                    axis = vec2(0.0, -1.0)
+                }
+                CursorShape.NeResize => {
+                    figure = 3.0
+                    axis = vec2(0.707107, -0.707107)
+                }
+                CursorShape.EResize => {
+                    figure = 3.0
+                    axis = vec2(1.0, 0.0)
+                }
+                CursorShape.SeResize => {
+                    figure = 3.0
+                    axis = vec2(0.707107, 0.707107)
+                }
+                CursorShape.SResize => {
+                    figure = 3.0
+                    axis = vec2(0.0, 1.0)
+                }
+                CursorShape.SwResize => {
+                    figure = 3.0
+                    axis = vec2(-0.707107, 0.707107)
+                }
+                CursorShape.WResize => {
+                    figure = 3.0
+                    axis = vec2(-1.0, 0.0)
+                }
+                CursorShape.NwResize => {
+                    figure = 3.0
+                    axis = vec2(-0.707107, -0.707107)
+                }
+                CursorShape.NsResize => {
+                    figure = 3.0
+                    axis = vec2(0.0, 1.0)
+                    double_head = 1.0
+                }
+                CursorShape.NeswResize => {
+                    figure = 3.0
+                    axis = vec2(0.707107, -0.707107)
+                    double_head = 1.0
+                }
+                CursorShape.EwResize => {
+                    figure = 3.0
+                    axis = vec2(1.0, 0.0)
+                    double_head = 1.0
+                }
+                CursorShape.NwseResize => {
+                    figure = 3.0
+                    axis = vec2(0.707107, 0.707107)
+                    double_head = 1.0
+                }
+                CursorShape.ColResize => {
+                    figure = 3.0
+                    axis = vec2(1.0, 0.0)
+                    double_head = 1.0
+                    divider = 1.0
+                }
+                CursorShape.RowResize => {
+                    figure = 3.0
+                    axis = vec2(0.0, 1.0)
+                    double_head = 1.0
+                    divider = 1.0
+                }
+                _ => { figure = 1.0 }
             }
-            sdf.stroke_keep(self.border_color, 3.5)
-            sdf.stroke(self.color, 1.75)
-            return sdf.result
+
+            // Text, crosshair, not-allowed and the help mark: stroked paths.
+            var over = vec4(0.0)
+            if figure < 0.5 || figure > 5.5 {
+                sdf.stroke_keep(self.border_color, 3.5)
+                sdf.stroke(self.color, 1.75)
+                if figure < 0.5 {
+                    return sdf.result
+                }
+                over = sdf.result
+            }
+            // Resize arrows; move draws the horizontal one over the vertical.
+            if figure > 2.5 && figure < 3.5 || figure > 4.5 && figure < 5.5 {
+                let passes = if figure > 4.5 {2.0} else {1.0}
+                var result = vec4(0.0)
+                var pass = 0.0
+                loop {
+                    if pass >= passes { break }
+                    let pass_axis = if pass > 0.5 {vec2(0.0, 1.0)} else {axis}
+                    let r = self.resize(pass_axis, double_head, divider)
+                    result = result + r * (1.0 - result.w)
+                    pass = pass + 1.0
+                }
+                return result
+            }
+            if figure > 1.5 && figure < 2.5 {
+                return self.hand(hand_kind)
+            }
+            if figure > 3.5 && figure < 4.5 {
+                var path = vec2(1e20, 0.0)
+                path = self.path_edge(path, vec2(6.0, 3.0), vec2(18.0, 3.0))
+                path = self.path_edge(path, vec2(18.0, 3.0), vec2(18.0, 6.0))
+                path = self.path_edge(path, vec2(18.0, 6.0), vec2(13.0, 12.0))
+                path = self.path_edge(path, vec2(13.0, 12.0), vec2(18.0, 18.0))
+                path = self.path_edge(path, vec2(18.0, 18.0), vec2(18.0, 21.0))
+                path = self.path_edge(path, vec2(18.0, 21.0), vec2(6.0, 21.0))
+                path = self.path_edge(path, vec2(6.0, 21.0), vec2(6.0, 18.0))
+                path = self.path_edge(path, vec2(6.0, 18.0), vec2(11.0, 12.0))
+                path = self.path_edge(path, vec2(11.0, 12.0), vec2(6.0, 6.0))
+                path = self.path_edge(path, vec2(6.0, 6.0), vec2(6.0, 3.0))
+                return self.path_pixel(path)
+            }
+            // Arrow, and help: its mark over the arrow.
+            return over + self.arrow() * (1.0 - over.w)
         }
     }
 }
