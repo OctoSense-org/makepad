@@ -672,6 +672,19 @@ impl MacosApp {
                         timer_id: REMOTE_CAPTURE_TIMER_ID,
                     }));
                 }
+                // The same holds for every background thread's SignalToUI:
+                // timer 0 stops after 200 ms idle, so a wake that ran no tick
+                // left the signal pending until the next unrelated event. A
+                // terminal answering a program's OSC 10/11 colour query then
+                // replied ~160 ms late, after the program had given up and
+                // read the reply as typed input. Run the paint tick, which
+                // drains the signal and restarts timer 0.
+                if crate::thread::SignalToUI::signal_pending() {
+                    MacosApp::do_callback(MacosEvent::Timer(TimerEvent {
+                        time: None,
+                        timer_id: 0,
+                    }));
+                }
             }
             NSEventType::NSKeyUp => {
                 let native_key: u16 = msg_send![ns_event, keyCode];

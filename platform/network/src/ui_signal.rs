@@ -70,6 +70,12 @@ impl SignalToUI {
         }
     }
 
+    /// Whether a UI or action signal is raised and not yet taken. Does not
+    /// clear it: the event loop uses it to decide whether a wake needs a tick.
+    pub fn signal_pending() -> bool {
+        UI_SIGNAL.load(Ordering::Acquire) || ACTION_SIGNAL.load(Ordering::Acquire)
+    }
+
     pub fn check_and_clear_ui_signal() -> bool {
         UI_SIGNAL.swap(false, Ordering::AcqRel)
     }
