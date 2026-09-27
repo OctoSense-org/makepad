@@ -34,6 +34,7 @@ tweaker = ["dep:makepad-widgets-tweaker", "makepad-widgets/data", "makepad-widge
 makepad-widgets = { path = "../../widgets", default-features = false }
 makepad-widgets-tweaker = { path = "../../widgets/families/tweaker", optional = true }
 makepad-ai-services = { path = "../../libs/ai/services" }
+makepad-app-module = { path = "../../libs/app_module" }
 makepad-strict-json = { path = "../../libs/strict_json" }
 makepad-cell-width = { path = "../../libs/cell_width" }
 makepad-wm-api = { path = "../../libs/wm_api" }
