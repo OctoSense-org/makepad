@@ -171,6 +171,12 @@ struct WidgetTreeInner {
     // Only set when tree topology changes (nodes added/removed, parent changes).
     // Property-only changes (name, widget ref, skip_search) are patched in-place.
     structure_dirty: bool,
+    /// The topology changed under a LOOKUP's flush (`mark_structure_dirty`
+    /// false: lookups only need the graph, and must not pay for a dense
+    /// rebuild). The dense index is then out of date, and whatever reads it
+    /// — `snapshot`, `compact_dump`, `flat_tree`, `query_rects`, the remote
+    /// bridge's `/snap` and `/d` — rebuilds it first (`sync_dense`).
+    dense_stale: bool,
 }
 
 struct WidgetTreeNode {
@@ -235,7 +241,7 @@ impl WidgetTree {
     /// colours, which are the only way to check contrast without guessing at
     /// pixels.
     pub fn geometry_json(&self, cx: &Cx) -> String {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
 
         let mut widget_type_names: HashMap<TypeId, LiveId> = HashMap::new();
@@ -1123,6 +1129,17 @@ impl WidgetTree {
         }
     }
 
+    /// `sync_dirty`, plus a dense rebuild when a lookup's flush changed the
+    /// topology since the last one. For everything that walks the dense
+    /// index rather than the graph.
+    fn sync_dense(&self) {
+        self.sync_dirty();
+        let mut inner = self.inner.borrow_mut();
+        if inner.dense_stale {
+            Self::rebuild_dense(&mut inner);
+        }
+    }
+
     /// Re-read every node whose children were flagged stale, so the graph
     /// matches the widget tree. Whatever this actually changes invalidates
     /// the path cache from inside `refresh_node_children_from_discovered`;
@@ -1727,6 +1744,8 @@ impl WidgetTree {
                     invalidate_uid_cache = true;
                     if mark_structure_dirty {
                         inner.structure_dirty = true;
+                    } else {
+                        inner.dense_stale = true;
                     }
                 }
             }
@@ -1736,6 +1755,8 @@ impl WidgetTree {
                 invalidate_uid_cache = true;
                 if mark_structure_dirty {
                     inner.structure_dirty = true;
+                } else {
+                    inner.dense_stale = true;
                 }
             }
 
@@ -1769,6 +1790,8 @@ impl WidgetTree {
                             prev_parent.children.remove(pos);
                             if mark_structure_dirty {
                                 inner.structure_dirty = true;
+                            } else {
+                                inner.dense_stale = true;
                             }
                         }
                     }
@@ -1812,6 +1835,8 @@ impl WidgetTree {
             invalidate_uid_cache = true;
             if mark_structure_dirty {
                 inner.structure_dirty = true;
+            } else {
+                inner.dense_stale = true;
             }
         }
 
@@ -1873,6 +1898,7 @@ impl WidgetTree {
         inner.uid_map.clear();
         inner.path_cache.clear();
 
+        inner.dense_stale = false;
         if inner.graph.is_empty() {
             inner.root_uid = WidgetUid(0);
             inner.structure_dirty = false;
@@ -2306,7 +2332,7 @@ impl WidgetTree {
 
     /// Check if the tree is empty (no indexed nodes yet).
     pub fn is_empty(&self) -> bool {
-        self.sync_dirty();
+        self.sync_dense();
         self.inner.borrow().names.is_empty()
     }
 
@@ -2316,7 +2342,7 @@ impl WidgetTree {
     }
 
     pub fn query_rects(&self, cx: &Cx, query: &str) -> Vec<String> {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
 
         let query = query.trim();
@@ -2447,7 +2473,7 @@ impl WidgetTree {
     }
 
     pub fn snapshot(&self, cx: &Cx) -> Vec<WidgetSnapshot> {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
         let widget_type_names = widget_type_names(cx);
 
@@ -2711,7 +2737,7 @@ impl WidgetTree {
     /// tree tab: (uid, name, type, depth). Every alive node appears; depth
     /// is the tree distance from its window root.
     pub fn flat_tree(&self, cx: &Cx) -> Vec<FlatTreeRow> {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
         let widget_type_names = widget_type_names(cx);
         let n = inner.nodes.len();
@@ -2752,7 +2778,7 @@ impl WidgetTree {
     }
 
     pub fn compact_dump(&self, cx: &Cx) -> String {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
 
         let mut widget_type_names: HashMap<TypeId, LiveId> = HashMap::new();
@@ -3399,6 +3425,55 @@ mod tests {
         let found = tree.find_within(uid, &[name("root")]);
         assert!(!found.is_empty());
         assert_eq!(found.widget_uid(), uid);
+    }
+
+    /// Children a View gains at runtime (an `on_render` result) mark the
+    /// View dirty. If a path LOOKUP is the first to flush that mark, the
+    /// graph learns the new children, but the dense index `snapshot`,
+    /// `flat_tree` and `compact_dump` walk (the remote bridge's `/snap` and
+    /// `/d`) must still be rebuilt: the drawn buttons were missing from `/snap` whenever a
+    /// `ui.<name>` lookup happened to run between the render and the snap.
+    #[test]
+    fn test_children_found_by_a_lookup_flush_reach_the_snapshot() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let panel_uid = WidgetUid::new();
+        let panel_children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let panel = make_dynamic_widget(panel_uid, panel_children.clone());
+        let root = make_widget(root_uid, vec![(name("panel"), panel.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        let names = |tree: &WidgetTree, cx: &Cx| -> Vec<LiveId> {
+            let tokens: Vec<String> = tree.flat_tree(cx).into_iter().map(|row| row.name).collect();
+            ["root", "panel", "a", "b"]
+                .into_iter()
+                .map(name)
+                .filter(|id| tokens.contains(&live_id_token(*id)))
+                .collect()
+        };
+        let ids = |list: &[&str]| -> Vec<LiveId> { list.iter().map(|s| name(s)).collect() };
+        assert_eq!(names(&tree, &cx), ids(&["root", "panel"]));
+
+        // The render: two new children, and the view marks itself dirty.
+        let a_uid = WidgetUid::new();
+        let b_uid = WidgetUid::new();
+        panel_children.borrow_mut().push((name("a"), make_widget(a_uid, vec![])));
+        panel_children.borrow_mut().push((name("b"), make_widget(b_uid, vec![])));
+        tree.mark_dirty(panel_uid);
+
+        // A script lookup runs first and flushes the mark...
+        assert_eq!(tree.find_within(root_uid, &[name("a")]).widget_uid(), a_uid);
+        // ...and the snapshot still sees what was drawn.
+        assert_eq!(names(&tree, &cx), ids(&["root", "panel", "a", "b"]));
+        let snap: Vec<String> = tree.snapshot(&cx).into_iter().map(|w| w.id).collect();
+        assert!(snap.contains(&live_id_token(name("b"))), "{snap:?}");
+
+        // The next render drops one of them.
+        panel_children.borrow_mut().retain(|(n, _)| *n != name("a"));
+        tree.mark_dirty(panel_uid);
+        assert!(tree.find_within(root_uid, &[name("b")]).widget_uid() == b_uid);
+        assert_eq!(names(&tree, &cx), ids(&["root", "panel", "b"]));
     }
 
     /// A lookup that finds its target while the target is borrowed (a
