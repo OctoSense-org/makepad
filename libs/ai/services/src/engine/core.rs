@@ -563,9 +563,14 @@ impl EngineCore {
             self.finish_call(&call_id, result, from_console);
             return None;
         }
-        let risk = def.risk.max(self.registry.risk_floor(&app));
+        let floor = self.registry.risk_floor(&app);
+        let risk = def.risk.max(floor);
+        // The app's own sheet is the person's one confirmation for a tool
+        // that confirms itself — unless the host raised this service's
+        // floor, which a declaration cannot talk its way past.
+        let app_confirms = def.risk == Risk::Destructive && def.confirms_itself() && floor < Risk::Destructive;
         let call = ServiceCall { call_id: call_id.clone(), tool: tool.clone(), args: args_json };
-        if risk == Risk::Destructive && !from_console {
+        if risk == Risk::Destructive && !from_console && !app_confirms {
             if let Some(t) = self.state.tool_mut(&call_id) {
                 t.status = ToolStatus::Confirm;
             }
@@ -574,6 +579,13 @@ impl EngineCore {
             return Some(EngineEvent::Confirm { call_id });
         }
         self.launch(endpoint, call, from_console, now);
+        if app_confirms && !from_console {
+            if let Some(t) = self.state.tool_mut(&call_id) {
+                if matches!(t.status, ToolStatus::Running { .. }) {
+                    t.status = ToolStatus::Running { note: "waiting for the person to confirm in the app".into(), permille: 0 };
+                }
+            }
+        }
         None
     }
 
@@ -1155,6 +1167,53 @@ mod tests {
         assert!(core.pump(0.1).contains(&EngineEvent::Confirm { call_id: "m1".into() }));
         core.confirm("m1", true, 0.2);
         assert!(matches!(&port.test_drain()[0], PortEvent::Call(c) if c.tool == "list_dir"));
+    }
+
+    #[test]
+    fn a_tool_that_confirms_itself_skips_the_card_and_others_still_wait() {
+        let manifest = || {
+            files().with_tool(
+                ToolDef::new("send", "Send a file to someone.", r#"{"type":"object","properties":{}}"#, Risk::Destructive)
+                    .confirmed_by_app(),
+            )
+        };
+        let setup = |manifest: ServiceManifest, script: Vec<Vec<ModelEvent>>| {
+            let reg = ServiceRegistry::new();
+            let (mut port, link) = AiServicePort::in_process(manifest).unwrap();
+            reg.register(link, "the Files tile", None).unwrap();
+            reg.pump();
+            port.test_drain();
+            let (model, _shared) = scripted(script);
+            (EngineCore::new(reg, model, None, 1), port)
+        };
+        // The app's own sheet is the only confirmation: the call reaches it at once.
+        let (mut core, mut port) = setup(manifest(), vec![vec![call("files.send", "{}"), ModelEvent::TurnDone { tool_calls: 1 }]]);
+        core.send("send it", 0.0);
+        let events = core.pump(0.1);
+        assert!(!events.iter().any(|e| matches!(e, EngineEvent::Confirm { .. })), "{events:?}");
+        assert!(matches!(&port.test_drain()[0], PortEvent::Call(c) if c.tool == "send"));
+        assert!(matches!(
+            core.state().tool("m1").map(|t| t.status.clone()),
+            Some(ToolStatus::Running { note, .. }) if note.contains("confirm in the app")
+        ));
+        // Every other destructive tool of the same service still waits for the card.
+        let (mut core, mut port) = setup(manifest(), vec![vec![call("files.trash", r#"{"path":"~/a"}"#), ModelEvent::TurnDone { tool_calls: 1 }]]);
+        core.send("trash it", 0.0);
+        assert!(core.pump(0.1).contains(&EngineEvent::Confirm { call_id: "m1".into() }));
+        assert!(port.test_drain().is_empty());
+        // A host floor overrides the claim.
+        let (mut core, mut port) = setup(manifest(), vec![vec![call("files.send", "{}"), ModelEvent::TurnDone { tool_calls: 1 }]]);
+        core.registry().set_risk_floor("files", Risk::Destructive);
+        core.send("send it", 0.0);
+        assert!(core.pump(0.1).contains(&EngineEvent::Confirm { call_id: "m1".into() }));
+        assert!(port.test_drain().is_empty());
+        // So does a host that cleared the claim of an untrusted registration.
+        let mut untrusted = manifest();
+        untrusted.clear_self_confirm();
+        let (mut core, mut port) = setup(untrusted, vec![vec![call("files.send", "{}"), ModelEvent::TurnDone { tool_calls: 1 }]]);
+        core.send("send it", 0.0);
+        assert!(core.pump(0.1).contains(&EngineEvent::Confirm { call_id: "m1".into() }));
+        assert!(port.test_drain().is_empty());
     }
 
     #[test]

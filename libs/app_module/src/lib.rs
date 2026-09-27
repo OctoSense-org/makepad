@@ -237,6 +237,14 @@ pub enum ExecOutcome {
 /// widget reference cannot lend out.
 pub trait ServiceExecutor {
     /// The manifest the host registers on the AI bus for this instance.
+    ///
+    /// A module is trusted code, so a destructive tool it marks
+    /// [`confirmed_by_app`](makepad_ai_services::wire::ToolDef::confirmed_by_app)
+    /// keeps that mark: the module's own sheet, showing the person the exact
+    /// effect, is then the only confirmation, and the chat pane does not ask
+    /// again. Such a tool answers `Pending` while its sheet is up, sends its
+    /// result through the [`ReplySink`], answers `Denied` on a no or a
+    /// timeout, and closes the sheet on [`cancel`](Self::cancel).
     fn manifest(&self) -> ServiceManifest;
     /// Run one call. `cx` is the host's; the executor may borrow its own
     /// widgets through it but must not run isolate script outside the
@@ -450,6 +458,17 @@ mod tests {
         let strict = OpenSchema::new(2).arg("file", OpenArgKind::FileHandle, true);
         assert!(strict.empty_open().unwrap_err().contains("required"));
         assert!(s.empty_open().is_ok());
+    }
+
+    #[test]
+    fn a_module_manifest_can_mark_a_destructive_tool_as_confirmed_by_the_app() {
+        use makepad_ai_services::wire::{Risk, ToolDef};
+        let manifest = ServiceManifest::new("chat", "Chat", "Messages.")
+            .with_tool(ToolDef::new("send", "Send a message.", r#"{"type":"object","properties":{}}"#, Risk::Destructive).confirmed_by_app())
+            .with_tool(ToolDef::new("delete", "Delete a message.", r#"{"type":"object","properties":{}}"#, Risk::Destructive));
+        manifest.validate().expect("valid");
+        assert!(manifest.tool("send").unwrap().confirms_itself());
+        assert!(!manifest.tool("delete").unwrap().confirms_itself(), "the default is the pane's confirm");
     }
 
     #[test]

@@ -227,8 +227,13 @@ impl AiBus {
         let Some(mut up) = HostedUp::parse(json) else { return Route::Drop };
         // The sender's claim is never used: the link IS the identity.
         up.from = Some(Self::endpoint_of(client));
-        match &up.msg {
+        match &mut up.msg {
             ServiceUp::Register { manifest, .. } => {
+                // Another process cannot vouch for the person's consent: its
+                // destructive tools wait for the pane's own confirm card. Only
+                // in-process modules (`register_local`, trusted native code)
+                // keep a tool's claim that its own sheet confirms it.
+                manifest.clear_self_confirm();
                 self.manifests.insert(client, manifest.clone());
             }
             ServiceUp::Unregister => {
@@ -496,5 +501,31 @@ mod local_tests {
         assert!(bye.contains("Unregister") && bye.contains("\"m4\""));
         assert!(bus.local_clients().is_empty());
         assert!(bus.client_died(4).is_none());
+    }
+
+    #[test]
+    fn only_an_in_process_module_keeps_a_self_confirmed_tool() {
+        let send = || {
+            sheets().with_tool(
+                ToolDef::new("send", "Send the sheet.", r#"{"type":"object","properties":{}}"#, Risk::Destructive)
+                    .confirmed_by_app(),
+            )
+        };
+        let registered = |json: &str| match HostedUp::parse(json).expect("valid").msg {
+            ServiceUp::Register { manifest, .. } => manifest,
+            _ => panic!("expected a registration"),
+        };
+        let mut bus = AiBus { pane_client: Some(9), ..Default::default() };
+        // A module in this process: its own sheet is the one confirmation.
+        let local = registered(&bus.register_local(4, send()));
+        assert!(local.tool("send").unwrap().confirms_itself());
+        // A process client's claim is dropped before the pane sees it, and in
+        // the replay, so the pane confirms its destructive tools itself.
+        let up = HostedUp { from: None, msg: ServiceUp::Register { manifest: send(), port_tag: 0 } };
+        let Route::ToPane(json) = bus.on_custom(5, &up.to_json()) else { panic!("expected ToPane") };
+        assert!(!registered(&json).tool("send").unwrap().confirms_itself());
+        let replay = bus.replay(AiBus::os_manifest(&[]));
+        assert!(registered(&replay[1]).tool("send").unwrap().confirms_itself(), "m4 keeps it");
+        assert!(!registered(&replay[2]).tool("send").unwrap().confirms_itself(), "w5 does not");
     }
 }
