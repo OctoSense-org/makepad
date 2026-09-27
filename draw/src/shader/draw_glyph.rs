@@ -398,18 +398,21 @@ script_mod! {
             // into 21 calls they made Adreno 630's compiler spend ~3.5 s on each
             // text program. Offsets match the unrolled ones: (i + 0.5) / grid - 0.5 px.
             let grid = if self.aa_4x4 > 0.5 {4.0} else if self.aa_2x2 > 0.5 {2.0} else {1.0}
-            let cell = vec2(px_x, px_y) / grid
+            // 1/grid is exact (1, 1/2, 1/4): offsets and the average round
+            // exactly as the unrolled sums did, and the row index is exact
+            // (no division, which some GPUs approximate).
+            let inv_grid = if self.aa_4x4 > 0.5 {0.25} else if self.aa_2x2 > 0.5 {0.5} else {1.0}
             var alpha_sum = 0.0
             var sample_index = 0.0
             loop {
                 if sample_index >= grid * grid { break }
-                let row = floor(sample_index / grid)
+                let row = floor(sample_index * inv_grid)
                 let col = sample_index - row * grid
-                let offset = (vec2(col, row) + 0.5) * cell - vec2(px_x, px_y) * 0.5
+                let offset = (vec2(col, row) + 0.5 - grid * 0.5) * inv_grid * vec2(px_x, px_y)
                 alpha_sum = alpha_sum + self.alpha_at(sample + offset, px_x, px_y)
                 sample_index = sample_index + 1.0
             }
-            let alpha_base = clamp(alpha_sum / (grid * grid), 0.0, 1.0)
+            let alpha_base = clamp(alpha_sum * inv_grid * inv_grid, 0.0, 1.0)
             let darken = clamp(max(px_x, px_y) * self.stem_darken, 0.0, self.stem_darken_max)
             let edge_weight = clamp(1.0 - abs(alpha_base * 2.0 - 1.0), 0.0, 1.0)
             let alpha = clamp(alpha_base + darken * edge_weight, 0.0, 1.0)
