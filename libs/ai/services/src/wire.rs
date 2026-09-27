@@ -31,6 +31,12 @@
 //! confirm) and keeps its own floors per service, since a declaration is
 //! self-reported; the app stays its own security boundary regardless — a
 //! closed match over tool names, typed arguments, path jails, bounded output.
+//! A destructive tool may instead say it CONFIRMS ITSELF
+//! ([`ToolDef::confirms_itself`]): the app shows the person its own sheet
+//! with the exact effect and runs only on their yes, so the router does not
+//! ask a second time. Only a host that trusts the app's code (an in-process
+//! module) may pass that claim on; a host clears it from every other
+//! registration with [`ServiceManifest::clear_self_confirm`].
 //!
 //! Bounds are enforced where a frame ARRIVES: [`HostedUp::parse`] refuses a
 //! frame over [`MAX_FRAME_BYTES`] before deserializing anything, and every
@@ -134,6 +140,10 @@ pub struct ToolDef {
     pub risk: Risk,
     /// A successful call wants a live preview of the app under its card.
     pub preview: bool,
+    /// A destructive tool whose app asks the person itself before it acts
+    /// (see [`ToolDef::confirmed_by_app`]). Absent on the wire unless set,
+    /// so frames of tools without it are unchanged.
+    pub self_confirm: Option<bool>,
 }
 
 /// One named stream a service may publish.
@@ -171,6 +181,7 @@ impl ToolDef {
             parameters: parameters.into(),
             risk,
             preview: false,
+            self_confirm: None,
         }
     }
 
@@ -178,6 +189,21 @@ impl ToolDef {
     pub fn with_preview(mut self) -> ToolDef {
         self.preview = true;
         self
+    }
+
+    /// The same destructive tool, confirmed by the app's own sheet: the
+    /// app shows the person exactly what will happen and acts only on
+    /// their yes, answering `Denied` otherwise. The router then skips its
+    /// own confirm card, unless the host cleared the claim or raised the
+    /// service's risk floor to destructive.
+    pub fn confirmed_by_app(mut self) -> ToolDef {
+        self.self_confirm = Some(true);
+        self
+    }
+
+    /// Whether the app confirms this tool itself.
+    pub fn confirms_itself(&self) -> bool {
+        self.self_confirm == Some(true)
     }
 }
 
@@ -223,6 +249,16 @@ impl ServiceManifest {
         self.tools.iter().find(|t| t.name == name)
     }
 
+    /// Drop every tool's claim to confirm itself. A host calls this on a
+    /// registration from code it does not trust with the person's consent
+    /// (another process, a script app), so each of its destructive tools
+    /// waits for the router's own confirm card.
+    pub fn clear_self_confirm(&mut self) {
+        for tool in &mut self.tools {
+            tool.self_confirm = None;
+        }
+    }
+
     /// Refuse anything the caps do not allow, naming the first problem.
     pub fn validate(&self) -> Result<(), String> {
         if !is_ident(&self.id, MAX_SERVICE_ID) {
@@ -255,6 +291,9 @@ impl ServiceManifest {
             }
             if tool.description.trim().is_empty() || tool.description.len() > MAX_DESCRIPTION_BYTES {
                 return Err(format!("tool '{}.{}' description must be 1..{} bytes", self.id, tool.name, MAX_DESCRIPTION_BYTES));
+            }
+            if tool.self_confirm.is_some() && !(tool.confirms_itself() && tool.risk == Risk::Destructive) {
+                return Err(format!("tool '{}.{}' may only confirm itself when it is destructive", self.id, tool.name));
             }
             if tool.parameters.len() > MAX_PARAMETERS_BYTES {
                 return Err(format!("tool '{}.{}' schema is {} bytes; the cap is {}", self.id, tool.name, tool.parameters.len(), MAX_PARAMETERS_BYTES));
@@ -885,6 +924,33 @@ mod tests {
 
     fn ep(s: &str) -> EndpointId {
         EndpointId(s.to_string())
+    }
+
+    #[test]
+    fn a_self_confirmed_tool_round_trips_and_older_frames_still_parse() {
+        let send = ToolDef::new("send", "Send a message.", r#"{"type":"object","properties":{}}"#, Risk::Destructive)
+            .confirmed_by_app();
+        let manifest = route().with_tool(send);
+        manifest.validate().expect("a destructive tool may confirm itself");
+        let json = HostedUp { from: None, msg: ServiceUp::Register { manifest: manifest.clone(), port_tag: 1 } }.to_json();
+        let ServiceUp::Register { manifest: back, .. } = HostedUp::parse(&json).expect("valid").msg else { panic!() };
+        assert!(back.tool("send").unwrap().confirms_itself());
+        assert!(!back.tool("plan").unwrap().confirms_itself());
+        // Tools without the claim serialize as before: no new key on the wire.
+        let plain = HostedUp { from: None, msg: ServiceUp::Register { manifest: route(), port_tag: 1 } }.to_json();
+        assert!(!plain.contains("self_confirm"));
+        // A frame from a sender that predates the flag parses (no such key).
+        assert!(HostedUp::parse(&plain).is_some());
+        // Only a destructive tool may make the claim.
+        let bad = route().with_tool(
+            ToolDef::new("peek", "Look.", r#"{"type":"object","properties":{}}"#, Risk::Act).confirmed_by_app(),
+        );
+        assert!(bad.validate().unwrap_err().contains("only confirm itself"));
+        // A host that does not trust the sender drops the claim.
+        let mut untrusted = manifest;
+        untrusted.clear_self_confirm();
+        assert!(!untrusted.tool("send").unwrap().confirms_itself());
+        untrusted.validate().expect("still valid");
     }
 
     #[test]
