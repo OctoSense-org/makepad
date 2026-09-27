@@ -19,7 +19,7 @@ use {
         makepad_script::{ScriptFnRef, ScriptRefOptionExt},
         scroll_bar::{ScrollAxis, ScrollBar},
         widget::*,
-        widget_async::{CxSplashVmExt, ScriptAsyncResult},
+        widget_async::{CxSplashVmExt, CxWidgetToScriptCallExt, ScriptAsyncResult},
     },
     std::{ops::Range, rc::Rc},
     unicode_segmentation::{GraphemeCursor, UnicodeSegmentation},
@@ -686,46 +686,42 @@ impl ScriptHook for TextInput {
 }
 
 impl TextInput {
+    // `on_change` / `on_return` go through the widget->script queue like
+    // every other widget handler (Button's `on_click`, CheckBox, ...), not a
+    // direct `vm.call`. These fire from inside an edit, while this input is
+    // mutably borrowed: a handler run right here could not resolve the input
+    // itself through `ui` (`ui.entry.text()` found a borrowed widget with no
+    // readable uid), and its `ui.*` calls had no `ui`/`self` call context.
+    // Queued, the handler runs once the edit has returned, with the text it
+    // was fired for.
     fn emit_change(&mut self, cx: &mut Cx, uid: WidgetUid) {
         cx.widget_action(uid, TextInputAction::Changed(self.text.clone()));
-        if let Some(handler) = self.on_change.as_object() {
-            let text = self.text.clone();
-            // Nothing to call into if the isolate that minted this input is
-            // already gone.
-            let Some(vm_id) = cx.script_ref_vm_id(&self.source) else {
-                return;
-            };
-            cx.with_script_vm_id(vm_id, |vm| {
-                let str_val = vm.bx.heap.new_string_from_str(&text);
-                vm.with_instruction_limit(
-                    crate::widget_async::WIDGET_SCRIPT_INSTRUCTION_LIMIT,
-                    |vm| {
-                        vm.call(ScriptValue::from(handler), &[ScriptValue::from(str_val)]);
-                    },
-                );
-            });
-        }
+        self.call_text_handler(cx, uid, self.on_change.clone());
     }
 
     fn emit_return(&mut self, cx: &mut Cx, uid: WidgetUid, mods: KeyModifiers) {
         cx.widget_action(uid, TextInputAction::Returned(self.text.clone(), mods));
-        if let Some(handler) = self.on_return.as_object() {
-            let text = self.text.clone();
-            // Nothing to call into if the isolate that minted this input is
-            // already gone.
-            let Some(vm_id) = cx.script_ref_vm_id(&self.source) else {
-                return;
-            };
-            cx.with_script_vm_id(vm_id, |vm| {
-                let str_val = vm.bx.heap.new_string_from_str(&text);
-                vm.with_instruction_limit(
-                    crate::widget_async::WIDGET_SCRIPT_INSTRUCTION_LIMIT,
-                    |vm| {
-                        vm.call(ScriptValue::from(handler), &[ScriptValue::from(str_val)]);
-                    },
-                );
-            });
+        self.call_text_handler(cx, uid, self.on_return.clone());
+    }
+
+    fn call_text_handler(&self, cx: &mut Cx, uid: WidgetUid, handler: Option<ScriptFnRef>) {
+        let Some(handler) = handler else {
+            return;
+        };
+        if handler.as_object() == ScriptObject::ZERO {
+            return;
         }
+        // Nothing to call into if the isolate that minted this input is
+        // already gone.
+        let Some(vm_id) = cx.script_ref_vm_id(&self.source) else {
+            return;
+        };
+        // The text is a heap value: mint it in the heap of the isolate that
+        // owns the handler (the queue routes the call to that same isolate).
+        let text = cx.with_script_vm_id(vm_id, |vm| {
+            ScriptValue::from(vm.bx.heap.new_string_from_str(&self.text))
+        });
+        cx.widget_to_script_call(uid, NIL, self.source.clone(), handler, &[text]);
     }
 
     pub fn is_multiline(&self) -> bool {

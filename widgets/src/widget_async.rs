@@ -2406,4 +2406,78 @@ mod isolate_tests {
             pump_widget_async(&mut cx);
         }
     }
+
+    /// OctoScript-Makepad#44: a TextInput whose `on_change` reads the input
+    /// itself through `ui` (`ui.entry.text()`). The handler fires while the
+    /// input is mid-edit (mutably borrowed), so it must run after the edit
+    /// returns, like every other widget->script handler, and the input must
+    /// stay reachable from later handlers.
+    #[test]
+    fn on_change_can_read_its_own_text_input_through_ui() {
+        use crate::text_input::TextInputWidgetRefExt;
+        const INPUT_BODY: &str = r#"
+    fn show(){ ui.out.set_text("read: " + ui.entry.text()) }
+    entry := TextInput{ on_change: |text| show() }
+    echo := TextInput{ on_change: |text| ui.out.set_text("echo: " + text) }
+    out := Label{ text: "-" }
+"#;
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let template = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                use mod.widgets.*
+                View{ splash := Splash{} }
+            });
+            let obj = v.as_object().expect("template did not eval to an object");
+            vm.bx.heap.new_object_ref(obj)
+        });
+        let pane = cx.with_vm(|vm| {
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                View{ height: Fit }
+            });
+            WidgetRef::script_from_value(vm, v)
+        });
+        set_ui_root(&mut cx, &pane);
+        let host = cx.with_vm(|vm| WidgetRef::script_from_value(vm, template.as_object().into()));
+        cx.widget_tree_insert_child_deep(pane.widget_uid(), live_id!(apphost), host.clone());
+        host.widget(&cx, &[live_id!(splash)]).set_text(&mut cx, INPUT_BODY);
+
+        let entry = host.widget(&cx, &[live_id!(entry)]).as_text_input();
+        let out = host.widget(&cx, &[live_id!(out)]);
+        assert!(!entry.is_empty() && !out.is_empty());
+        let out_text = |out: &WidgetRef| out.text();
+
+        // Typing fires on_change from inside the input's own edit.
+        entry
+            .replace_range(&mut cx, 0..0, "hi", crate::text_input::UndoGroup::New)
+            .unwrap();
+        pump_widget_async(&mut cx);
+        assert_eq!(out_text(&out), "read: hi", "on_change read its own input");
+
+        // And again: the first handler must not have broken the input.
+        entry
+            .replace_range(&mut cx, 2..2, "!", crate::text_input::UndoGroup::New)
+            .unwrap();
+        pump_widget_async(&mut cx);
+        assert_eq!(out_text(&out), "read: hi!");
+
+        // A later handler (a button's on_click, say) still reaches the input.
+        assert!(host
+            .widget(&cx, &[live_id!(splash)])
+            .borrow_mut::<Splash>()
+            .unwrap()
+            .call_script_fn(&mut cx, live_id!(show), &[]));
+        pump_widget_async(&mut cx);
+        assert_eq!(out_text(&out), "read: hi!");
+
+        // The handler still gets the new text as its argument.
+        host.widget(&cx, &[live_id!(echo)])
+            .as_text_input()
+            .replace_range(&mut cx, 0..0, "yo", crate::text_input::UndoGroup::New)
+            .unwrap();
+        pump_widget_async(&mut cx);
+        assert_eq!(out_text(&out), "echo: yo");
+    }
 }

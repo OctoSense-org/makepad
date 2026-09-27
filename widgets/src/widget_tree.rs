@@ -39,7 +39,7 @@ pub struct WidgetTreeStats {
     /// Path-cache invalidations (anything that could turn a miss into a hit).
     pub invalidations: u64,
     /// Walks whose result could not be cached because the walk itself
-    /// changed the graph underneath it.
+    /// changed the graph underneath it, or could not read part of it.
     pub stores_skipped: u64,
 }
 
@@ -161,6 +161,11 @@ struct WidgetTreeInner {
     /// nothing invalidated underneath it — otherwise the walk's own graph
     /// discoveries could persist a stale "not found" forever.
     path_cache_epoch: u64,
+    /// Bumped whenever a walk meets a node it cannot read right now (its
+    /// widget is borrowed: mid-draw, or mid-event handling a script
+    /// callback). Such a walk saw only part of the subtree, so its answer is
+    /// not exact and must not be cached — see `find_all_within_cached_graph`.
+    unreadable_epoch: u64,
     stats: WidgetTreeStats,
     dirty: HashSet<WidgetUid>,
     // Only set when tree topology changes (nodes added/removed, parent changes).
@@ -1180,6 +1185,7 @@ impl WidgetTree {
 
         let mut pending = Vec::new();
         if !Self::refresh_node_children(inner, uid, &mut pending, false) {
+            inner.unreadable_epoch = inner.unreadable_epoch.wrapping_add(1);
             return false;
         }
 
@@ -1553,17 +1559,26 @@ impl WidgetTree {
         // answer derived from a graph that no longer matches the tree — for
         // a MISS, forever. Snapshot the epoch and only store an unchallenged
         // result.
+        //
+        // Likewise a walk that met a node it could not read (a widget
+        // borrowed mid-draw or mid-event: a TextInput running a script
+        // handler, say) is partial. A matching widget that is borrowed has
+        // no readable uid; dropping it from the stored list recorded a MISS
+        // for a widget that exists, and every later lookup of that name was
+        // answered "not found" from the cache for the rest of the session.
         let epoch = inner.path_cache_epoch;
+        let unreadable_epoch = inner.unreadable_epoch;
         let mut results = Vec::new();
         Self::collect_within_graph(inner, root_uid, path, None, &mut results);
-        if inner.path_cache_epoch != epoch {
+        if inner.path_cache_epoch != epoch || inner.unreadable_epoch != unreadable_epoch {
             inner.stats.stores_skipped += 1;
             return results;
         }
         let mut matches = Vec::with_capacity(results.len());
         for widget in &results {
             let Some(uid) = widget.try_widget_uid() else {
-                continue;
+                inner.stats.stores_skipped += 1;
+                return results;
             };
             if uid == WidgetUid(0) {
                 continue;
@@ -3384,6 +3399,68 @@ mod tests {
         let found = tree.find_within(uid, &[name("root")]);
         assert!(!found.is_empty());
         assert_eq!(found.widget_uid(), uid);
+    }
+
+    /// A lookup that finds its target while the target is borrowed (a
+    /// TextInput running its own `on_change`, looked up by that handler) can
+    /// not read the target's uid. It may answer "not found" for now, but it
+    /// must not cache that as a MISS: once the borrow ends the widget has to
+    /// be found again (OctoScript-Makepad#44).
+    #[test]
+    fn test_lookup_of_a_borrowed_widget_does_not_cache_a_miss() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let entry_uid = WidgetUid::new();
+        let entry = make_widget(entry_uid, vec![]);
+        let root = make_widget(root_uid, vec![(name("entry"), entry.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(entry_uid, name("entry"), entry.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+
+        {
+            let _held = entry.borrow_mut::<TestWidget>().expect("test widget");
+            let found = tree.find_within(root_uid, &[name("entry")]);
+            assert_eq!(found.try_widget_uid(), None, "the match is borrowed");
+            let inner = tree.inner.borrow();
+            assert!(
+                cached_path_entry(&inner, root_uid, &[name("entry")]).is_none(),
+                "a walk that met a borrowed widget must not be cached"
+            );
+        }
+
+        let found = tree.find_within(root_uid, &[name("entry")]);
+        assert_eq!(found.widget_uid(), entry_uid, "found once the borrow ends");
+        // And now the answer is exact, so it is cached.
+        let inner = tree.inner.borrow();
+        let entry = cached_path_entry(&inner, root_uid, &[name("entry")]).expect("cached");
+        assert_eq!(entry.matches.len(), 1);
+    }
+
+    /// Same, for a dirty node that cannot be re-read because it is borrowed:
+    /// the walk cannot see below it, so its (partial) answer is not cached.
+    #[test]
+    fn test_walk_through_a_borrowed_dirty_node_does_not_cache_a_miss() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let panel_uid = WidgetUid::new();
+        let leaf_uid = WidgetUid::new();
+        let leaf = make_widget(leaf_uid, vec![]);
+        let panel = make_widget(panel_uid, vec![(name("leaf"), leaf.clone())]);
+        let root = make_widget(root_uid, vec![(name("panel"), panel.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(panel_uid, name("panel"), panel.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+        tree.mark_dirty(panel_uid);
+
+        {
+            let _held = panel.borrow_mut::<TestWidget>().expect("test widget");
+            let _ = tree.find_within(root_uid, &[name("leaf")]);
+            let inner = tree.inner.borrow();
+            assert!(cached_path_entry(&inner, root_uid, &[name("leaf")]).is_none());
+        }
+
+        let found = tree.find_within(root_uid, &[name("leaf")]);
+        assert_eq!(found.widget_uid(), leaf_uid);
     }
 
     #[test]
