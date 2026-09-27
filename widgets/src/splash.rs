@@ -201,6 +201,10 @@ impl Splash {
     fn eval_body(&mut self, cx: &mut Cx) {self.eval_styled_body(cx,false);}
 
     fn eval_styled_body(&mut self,cx:&mut Cx,preserve:bool) {
+        self.eval_styled_body_with_apply(cx, preserve, &Apply::ScriptReapply);
+    }
+
+    fn eval_styled_body_with_apply(&mut self, cx: &mut Cx, preserve: bool, apply: &Apply) {
         if self.body.as_ref().is_empty() {
             return;
         }
@@ -318,7 +322,7 @@ impl Splash {
             let view = if !value.is_err() && !value.is_nil() {
                 if preserve {
                     let walk=self.view.walk;
-                    self.view.script_apply(vm,&Apply::ScriptReapply,&mut Scope::empty(),value);
+                    self.view.script_apply(vm,apply,&mut Scope::empty(),value);
                     self.view.walk=walk;
                     None
                 } else {Some(View::script_from_value(vm, value))}
@@ -939,6 +943,24 @@ impl SplashRef {
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
+        }
+    }
+
+    /// Reconcile a host-generated UI into its existing named widgets. This
+    /// keeps focus, selection and scroll state while declarative data changes.
+    /// Use set_text("") to tear down the instance and revoke its callbacks.
+    pub fn reapply_text(&self, cx: &mut Cx, body: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.vm_id == MAIN_SPLASH_VM_ID || body.is_empty() {
+                inner.set_text(cx, body);
+            } else if inner.body.as_ref() != body {
+                inner.body.set(body);
+                // This is new declarative source, not a stylesheet reapply.
+                // Reload updates label data while reconciling named widgets;
+                // their Rust focus/selection/scroll state remains in place.
+                inner.eval_styled_body_with_apply(cx, true, &Apply::Reload);
+                inner.redraw(cx);
+            }
         }
     }
 
