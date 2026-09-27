@@ -39,7 +39,7 @@ pub struct WidgetTreeStats {
     /// Path-cache invalidations (anything that could turn a miss into a hit).
     pub invalidations: u64,
     /// Walks whose result could not be cached because the walk itself
-    /// changed the graph underneath it.
+    /// changed the graph underneath it, or could not read part of it.
     pub stores_skipped: u64,
 }
 
@@ -161,11 +161,22 @@ struct WidgetTreeInner {
     /// nothing invalidated underneath it — otherwise the walk's own graph
     /// discoveries could persist a stale "not found" forever.
     path_cache_epoch: u64,
+    /// Bumped whenever a walk meets a node it cannot read right now (its
+    /// widget is borrowed: mid-draw, or mid-event handling a script
+    /// callback). Such a walk saw only part of the subtree, so its answer is
+    /// not exact and must not be cached — see `find_all_within_cached_graph`.
+    unreadable_epoch: u64,
     stats: WidgetTreeStats,
     dirty: HashSet<WidgetUid>,
     // Only set when tree topology changes (nodes added/removed, parent changes).
     // Property-only changes (name, widget ref, skip_search) are patched in-place.
     structure_dirty: bool,
+    /// The topology changed under a LOOKUP's flush (`mark_structure_dirty`
+    /// false: lookups only need the graph, and must not pay for a dense
+    /// rebuild). The dense index is then out of date, and whatever reads it
+    /// — `snapshot`, `compact_dump`, `flat_tree`, `query_rects`, the remote
+    /// bridge's `/snap` and `/d` — rebuilds it first (`sync_dense`).
+    dense_stale: bool,
 }
 
 struct WidgetTreeNode {
@@ -230,7 +241,7 @@ impl WidgetTree {
     /// colours, which are the only way to check contrast without guessing at
     /// pixels.
     pub fn geometry_json(&self, cx: &Cx) -> String {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
 
         let mut widget_type_names: HashMap<TypeId, LiveId> = HashMap::new();
@@ -1118,6 +1129,17 @@ impl WidgetTree {
         }
     }
 
+    /// `sync_dirty`, plus a dense rebuild when a lookup's flush changed the
+    /// topology since the last one. For everything that walks the dense
+    /// index rather than the graph.
+    fn sync_dense(&self) {
+        self.sync_dirty();
+        let mut inner = self.inner.borrow_mut();
+        if inner.dense_stale {
+            Self::rebuild_dense(&mut inner);
+        }
+    }
+
     /// Re-read every node whose children were flagged stale, so the graph
     /// matches the widget tree. Whatever this actually changes invalidates
     /// the path cache from inside `refresh_node_children_from_discovered`;
@@ -1180,6 +1202,7 @@ impl WidgetTree {
 
         let mut pending = Vec::new();
         if !Self::refresh_node_children(inner, uid, &mut pending, false) {
+            inner.unreadable_epoch = inner.unreadable_epoch.wrapping_add(1);
             return false;
         }
 
@@ -1553,17 +1576,26 @@ impl WidgetTree {
         // answer derived from a graph that no longer matches the tree — for
         // a MISS, forever. Snapshot the epoch and only store an unchallenged
         // result.
+        //
+        // Likewise a walk that met a node it could not read (a widget
+        // borrowed mid-draw or mid-event: a TextInput running a script
+        // handler, say) is partial. A matching widget that is borrowed has
+        // no readable uid; dropping it from the stored list recorded a MISS
+        // for a widget that exists, and every later lookup of that name was
+        // answered "not found" from the cache for the rest of the session.
         let epoch = inner.path_cache_epoch;
+        let unreadable_epoch = inner.unreadable_epoch;
         let mut results = Vec::new();
         Self::collect_within_graph(inner, root_uid, path, None, &mut results);
-        if inner.path_cache_epoch != epoch {
+        if inner.path_cache_epoch != epoch || inner.unreadable_epoch != unreadable_epoch {
             inner.stats.stores_skipped += 1;
             return results;
         }
         let mut matches = Vec::with_capacity(results.len());
         for widget in &results {
             let Some(uid) = widget.try_widget_uid() else {
-                continue;
+                inner.stats.stores_skipped += 1;
+                return results;
             };
             if uid == WidgetUid(0) {
                 continue;
@@ -1712,6 +1744,8 @@ impl WidgetTree {
                     invalidate_uid_cache = true;
                     if mark_structure_dirty {
                         inner.structure_dirty = true;
+                    } else {
+                        inner.dense_stale = true;
                     }
                 }
             }
@@ -1721,6 +1755,8 @@ impl WidgetTree {
                 invalidate_uid_cache = true;
                 if mark_structure_dirty {
                     inner.structure_dirty = true;
+                } else {
+                    inner.dense_stale = true;
                 }
             }
 
@@ -1754,6 +1790,8 @@ impl WidgetTree {
                             prev_parent.children.remove(pos);
                             if mark_structure_dirty {
                                 inner.structure_dirty = true;
+                            } else {
+                                inner.dense_stale = true;
                             }
                         }
                     }
@@ -1797,6 +1835,8 @@ impl WidgetTree {
             invalidate_uid_cache = true;
             if mark_structure_dirty {
                 inner.structure_dirty = true;
+            } else {
+                inner.dense_stale = true;
             }
         }
 
@@ -1858,6 +1898,7 @@ impl WidgetTree {
         inner.uid_map.clear();
         inner.path_cache.clear();
 
+        inner.dense_stale = false;
         if inner.graph.is_empty() {
             inner.root_uid = WidgetUid(0);
             inner.structure_dirty = false;
@@ -2291,7 +2332,7 @@ impl WidgetTree {
 
     /// Check if the tree is empty (no indexed nodes yet).
     pub fn is_empty(&self) -> bool {
-        self.sync_dirty();
+        self.sync_dense();
         self.inner.borrow().names.is_empty()
     }
 
@@ -2301,7 +2342,7 @@ impl WidgetTree {
     }
 
     pub fn query_rects(&self, cx: &Cx, query: &str) -> Vec<String> {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
 
         let query = query.trim();
@@ -2432,7 +2473,7 @@ impl WidgetTree {
     }
 
     pub fn snapshot(&self, cx: &Cx) -> Vec<WidgetSnapshot> {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
         let widget_type_names = widget_type_names(cx);
 
@@ -2696,7 +2737,7 @@ impl WidgetTree {
     /// tree tab: (uid, name, type, depth). Every alive node appears; depth
     /// is the tree distance from its window root.
     pub fn flat_tree(&self, cx: &Cx) -> Vec<FlatTreeRow> {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
         let widget_type_names = widget_type_names(cx);
         let n = inner.nodes.len();
@@ -2737,7 +2778,7 @@ impl WidgetTree {
     }
 
     pub fn compact_dump(&self, cx: &Cx) -> String {
-        self.sync_dirty();
+        self.sync_dense();
         let inner = self.inner.borrow();
 
         let mut widget_type_names: HashMap<TypeId, LiveId> = HashMap::new();
@@ -3384,6 +3425,117 @@ mod tests {
         let found = tree.find_within(uid, &[name("root")]);
         assert!(!found.is_empty());
         assert_eq!(found.widget_uid(), uid);
+    }
+
+    /// Children a View gains at runtime (an `on_render` result) mark the
+    /// View dirty. If a path LOOKUP is the first to flush that mark, the
+    /// graph learns the new children, but the dense index `snapshot`,
+    /// `flat_tree` and `compact_dump` walk (the remote bridge's `/snap` and
+    /// `/d`) must still be rebuilt: the drawn buttons were missing from `/snap` whenever a
+    /// `ui.<name>` lookup happened to run between the render and the snap.
+    #[test]
+    fn test_children_found_by_a_lookup_flush_reach_the_snapshot() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let panel_uid = WidgetUid::new();
+        let panel_children = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let panel = make_dynamic_widget(panel_uid, panel_children.clone());
+        let root = make_widget(root_uid, vec![(name("panel"), panel.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        let names = |tree: &WidgetTree, cx: &Cx| -> Vec<LiveId> {
+            let tokens: Vec<String> = tree.flat_tree(cx).into_iter().map(|row| row.name).collect();
+            ["root", "panel", "a", "b"]
+                .into_iter()
+                .map(name)
+                .filter(|id| tokens.contains(&live_id_token(*id)))
+                .collect()
+        };
+        let ids = |list: &[&str]| -> Vec<LiveId> { list.iter().map(|s| name(s)).collect() };
+        assert_eq!(names(&tree, &cx), ids(&["root", "panel"]));
+
+        // The render: two new children, and the view marks itself dirty.
+        let a_uid = WidgetUid::new();
+        let b_uid = WidgetUid::new();
+        panel_children.borrow_mut().push((name("a"), make_widget(a_uid, vec![])));
+        panel_children.borrow_mut().push((name("b"), make_widget(b_uid, vec![])));
+        tree.mark_dirty(panel_uid);
+
+        // A script lookup runs first and flushes the mark...
+        assert_eq!(tree.find_within(root_uid, &[name("a")]).widget_uid(), a_uid);
+        // ...and the snapshot still sees what was drawn.
+        assert_eq!(names(&tree, &cx), ids(&["root", "panel", "a", "b"]));
+        let snap: Vec<String> = tree.snapshot(&cx).into_iter().map(|w| w.id).collect();
+        assert!(snap.contains(&live_id_token(name("b"))), "{snap:?}");
+
+        // The next render drops one of them.
+        panel_children.borrow_mut().retain(|(n, _)| *n != name("a"));
+        tree.mark_dirty(panel_uid);
+        assert!(tree.find_within(root_uid, &[name("b")]).widget_uid() == b_uid);
+        assert_eq!(names(&tree, &cx), ids(&["root", "panel", "b"]));
+    }
+
+    /// A lookup that finds its target while the target is borrowed (a
+    /// TextInput running its own `on_change`, looked up by that handler) can
+    /// not read the target's uid. It may answer "not found" for now, but it
+    /// must not cache that as a MISS: once the borrow ends the widget has to
+    /// be found again (OctoScript-Makepad#44).
+    #[test]
+    fn test_lookup_of_a_borrowed_widget_does_not_cache_a_miss() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let entry_uid = WidgetUid::new();
+        let entry = make_widget(entry_uid, vec![]);
+        let root = make_widget(root_uid, vec![(name("entry"), entry.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(entry_uid, name("entry"), entry.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+
+        {
+            let _held = entry.borrow_mut::<TestWidget>().expect("test widget");
+            let found = tree.find_within(root_uid, &[name("entry")]);
+            assert_eq!(found.try_widget_uid(), None, "the match is borrowed");
+            let inner = tree.inner.borrow();
+            assert!(
+                cached_path_entry(&inner, root_uid, &[name("entry")]).is_none(),
+                "a walk that met a borrowed widget must not be cached"
+            );
+        }
+
+        let found = tree.find_within(root_uid, &[name("entry")]);
+        assert_eq!(found.widget_uid(), entry_uid, "found once the borrow ends");
+        // And now the answer is exact, so it is cached.
+        let inner = tree.inner.borrow();
+        let entry = cached_path_entry(&inner, root_uid, &[name("entry")]).expect("cached");
+        assert_eq!(entry.matches.len(), 1);
+    }
+
+    /// Same, for a dirty node that cannot be re-read because it is borrowed:
+    /// the walk cannot see below it, so its (partial) answer is not cached.
+    #[test]
+    fn test_walk_through_a_borrowed_dirty_node_does_not_cache_a_miss() {
+        let tree = WidgetTree::default();
+        let root_uid = WidgetUid::new();
+        let panel_uid = WidgetUid::new();
+        let leaf_uid = WidgetUid::new();
+        let leaf = make_widget(leaf_uid, vec![]);
+        let panel = make_widget(panel_uid, vec![(name("leaf"), leaf.clone())]);
+        let root = make_widget(root_uid, vec![(name("panel"), panel.clone())]);
+        tree.observe_node(root_uid, name("root"), root.clone(), None);
+        tree.observe_node(panel_uid, name("panel"), panel.clone(), Some(root_uid));
+        stabilize_graph_cache(&tree);
+        tree.mark_dirty(panel_uid);
+
+        {
+            let _held = panel.borrow_mut::<TestWidget>().expect("test widget");
+            let _ = tree.find_within(root_uid, &[name("leaf")]);
+            let inner = tree.inner.borrow();
+            assert!(cached_path_entry(&inner, root_uid, &[name("leaf")]).is_none());
+        }
+
+        let found = tree.find_within(root_uid, &[name("leaf")]);
+        assert_eq!(found.widget_uid(), leaf_uid);
     }
 
     #[test]
