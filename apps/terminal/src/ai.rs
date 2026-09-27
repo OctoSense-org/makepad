@@ -31,7 +31,7 @@ pub fn manifest() -> ServiceManifest {
     ServiceManifest::new(
         "terminal",
         "Terminal",
-        "The live terminal. Its screen tools read what is visible now and its recent scrollback. run types a line into the live shell exactly as the person would: it runs for real and is not sandboxed; read_screen on the next turn reads the result.",
+        "The live terminal. Its screen tools read what is visible now and its recent scrollback. run types a line into the live shell exactly as the person would, once the person confirms the call: it runs for real and is not sandboxed; read_screen on the next turn reads the result.",
     )
     .with_tool(read_screen_tool())
     .with_tool(read_scrollback_tool())
@@ -72,9 +72,12 @@ fn read_scrollback_tool() -> ToolDef {
 fn run_tool() -> ToolDef {
     ToolDef::new(
     "run",
-    "Type a command followed by Enter into the live shell. This runs for real, is not sandboxed, and returns immediately; use read_screen on the next turn to see output.",
+    "Type a command followed by Enter into the live shell. The person confirms each call first; then it runs for real, is not sandboxed, and returns immediately; use read_screen on the next turn to see output.",
     r#"{"type":"object","properties":{"command":{"type":"string","maxLength":4096}},"required":["command"],"additionalProperties":false}"#,
-    Risk::Act,
+    // A command in a live, unsandboxed shell reaches past the app (it can
+    // delete, send, install): Destructive, so the router parks every call
+    // until the person confirms it. It was Act, which runs immediately.
+    Risk::Destructive,
 )
 }
 
@@ -218,6 +221,16 @@ fn validate_command(command: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_waits_for_the_person_and_reads_do_not() {
+        let manifest = manifest();
+        let risk = |name: &str| manifest.tools.iter().find(|t| t.name == name).map(|t| t.risk);
+        assert_eq!(risk("run"), Some(Risk::Destructive), "a live shell command is confirmed first");
+        assert_eq!(risk("read_screen"), Some(Risk::Read));
+        assert_eq!(risk("read_scrollback"), Some(Risk::Read));
+        assert!(manifest.tools.iter().find(|t| t.name == "run").is_some_and(|t| !t.confirms_itself()), "the host confirms, not the terminal");
+    }
     use makepad_ai_services::wire::ToolOutcome;
 
     struct FakeTarget;
