@@ -49,6 +49,11 @@ pub struct PerfGraph {
     #[redraw]
     #[live]
     draw_bg: DrawColor,
+    /// The bars: axis-aligned quads, one instance each. Vector `rect` +
+    /// `fill` per bar re-tessellated every bar on every frame, over a third
+    /// of a phone's main-thread CPU while the panel was up.
+    #[live]
+    draw_bar: DrawColor,
     #[live]
     draw_vector: DrawVector,
     #[live]
@@ -179,12 +184,13 @@ impl Widget for PerfGraph {
             } else {
                 vec4(0.90, 0.30, 0.28, 1.0)
             };
-            self.draw_vector.set_color(c.x, c.y, c.z, c.w);
             let h = frac as f64 * gap_h;
             let bx = x0 + i as f64 * bar_w as f64;
-            self.draw_vector
-                .rect(bx as f32, (gap_y0 + gap_h - h) as f32, bar_w.max(1.0), h as f32);
-            self.draw_vector.fill();
+            self.draw_bar.color = c;
+            self.draw_bar.draw_abs(cx, Rect {
+                pos: dvec2(bx, gap_y0 + gap_h - h),
+                size: dvec2(bar_w.max(1.0) as f64, h),
+            });
         }
         // budget guides at 8.33ms (120Hz) and 16.7ms (60Hz)
         for guide_ms in [8.33f32, 16.7] {
@@ -210,10 +216,11 @@ impl Widget for PerfGraph {
                     continue;
                 }
                 let h = (us as f64 / cpu_max as f64 * cpu_h) as f32;
-                let c = channel_color(channels[ch].color);
-                self.draw_vector.set_color(c.x, c.y, c.z, 1.0);
-                self.draw_vector.rect(bx, y - h, bar_w.max(1.0), h);
-                self.draw_vector.fill();
+                self.draw_bar.color = channel_color(channels[ch].color);
+                self.draw_bar.draw_abs(cx, Rect {
+                    pos: dvec2(bx as f64, (y - h) as f64),
+                    size: dvec2(bar_w.max(1.0) as f64, h as f64),
+                });
                 y -= h;
             }
         }
