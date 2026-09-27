@@ -16,7 +16,7 @@ use {
             },
             *,
         },
-        makepad_script::{ScriptFnRef, ScriptRefOptionExt},
+        makepad_script::ScriptFnRef,
         scroll_bar::{ScrollAxis, ScrollBar},
         widget::*,
         widget_async::{CxSplashVmExt, CxWidgetToScriptCallExt, ScriptAsyncResult},
