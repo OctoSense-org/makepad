@@ -26,6 +26,7 @@ path = "src/main.rs"
 [dependencies]
 makepad-widgets = { path = "../../widgets" }
 makepad-ai-services = { path = "../../libs/ai/services" }
+makepad-app-module = { path = "../../libs/app_module" }
 makepad-strict-json = { path = "../../libs/strict_json" }
 makepad-wm-theme = { path = "../../libs/wm_theme" }
 makepad-wm-api = { path = "../../libs/wm_api" }

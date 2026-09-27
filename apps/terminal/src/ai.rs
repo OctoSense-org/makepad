@@ -26,30 +26,65 @@ pub trait TerminalTarget {
     fn type_bytes(&mut self, bytes: &[u8]) -> bool;
 }
 
+/// Every tool the standalone terminal answers, `run` included.
 pub fn manifest() -> ServiceManifest {
     ServiceManifest::new(
         "terminal",
         "Terminal",
         "The live terminal. Its screen tools read what is visible now and its recent scrollback. run types a line into the live shell exactly as the person would: it runs for real and is not sandboxed; read_screen on the next turn reads the result.",
     )
-    .with_tool(ToolDef::new(
-        "read_screen",
-        "Read the terminal grid that is visible now, with trailing spaces removed from each row, plus cursor and working-directory context.",
-        r#"{"type":"object","properties":{},"additionalProperties":false}"#,
-        Risk::Read,
-    ))
-    .with_tool(ToolDef::new(
-        "read_scrollback",
-        "Read the last requested number of lines from the terminal's accessible scrollback plus screen (default 200, maximum 2000).",
-        r#"{"type":"object","properties":{"lines":{"type":"integer","minimum":1,"maximum":2000}},"additionalProperties":false}"#,
-        Risk::Read,
-    ))
-    .with_tool(ToolDef::new(
-        "run",
-        "Type a command followed by Enter into the live shell. This runs for real, is not sandboxed, and returns immediately; use read_screen on the next turn to see output.",
-        r#"{"type":"object","properties":{"command":{"type":"string","maxLength":4096}},"required":["command"],"additionalProperties":false}"#,
-        Risk::Act,
-    ))
+    .with_tool(read_screen_tool())
+    .with_tool(read_scrollback_tool())
+    .with_tool(run_tool())
+}
+
+/// The reads only: what the terminal offers when it is linked into a host
+/// as a system module. `run` types into a live, unsandboxed shell, so a host
+/// that ships the terminal by default does not hand it to the assistant.
+pub fn read_only_manifest() -> ServiceManifest {
+    ServiceManifest::new(
+        "terminal",
+        "Terminal",
+        "The live terminal. Its screen tools read what is visible now and its recent scrollback. They only read: nothing here types into the shell.",
+    )
+    .with_tool(read_screen_tool())
+    .with_tool(read_scrollback_tool())
+}
+
+fn read_screen_tool() -> ToolDef {
+    ToolDef::new(
+    "read_screen",
+    "Read the terminal grid that is visible now, with trailing spaces removed from each row, plus cursor and working-directory context.",
+    r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+    Risk::Read,
+)
+}
+
+fn read_scrollback_tool() -> ToolDef {
+    ToolDef::new(
+    "read_scrollback",
+    "Read the last requested number of lines from the terminal's accessible scrollback plus screen (default 200, maximum 2000).",
+    r#"{"type":"object","properties":{"lines":{"type":"integer","minimum":1,"maximum":2000}},"additionalProperties":false}"#,
+    Risk::Read,
+)
+}
+
+fn run_tool() -> ToolDef {
+    ToolDef::new(
+    "run",
+    "Type a command followed by Enter into the live shell. This runs for real, is not sandboxed, and returns immediately; use read_screen on the next turn to see output.",
+    r#"{"type":"object","properties":{"command":{"type":"string","maxLength":4096}},"required":["command"],"additionalProperties":false}"#,
+    Risk::Act,
+)
+}
+
+/// [`answer`] for a host that offered [`read_only_manifest`]: `run` is refused
+/// even if a caller names it.
+pub fn answer_read_only(call: &ServiceCall, target: &mut impl TerminalTarget) -> ToolResult {
+    if call.tool == "run" {
+        return ToolResult::refused(&call.call_id, "this terminal only offers its read tools");
+    }
+    answer(call, target)
 }
 
 /// Answer one terminal call. The match is intentionally closed: no caller can
@@ -230,5 +265,31 @@ mod tests {
         assert!(result.text.contains("control character"));
 
         assert!(validate_command("printf 'a\\nb'\n\t").is_ok());
+    }
+}
+
+impl TerminalTarget for crate::widget::MpTerm {
+    fn visible_screen(&self) -> Option<ScreenState> {
+        let (rows, cursor_row, cursor_col) = self.ai_screen_rows(None)?;
+        Some(ScreenState {
+            rows,
+            cursor_row,
+            cursor_col,
+            cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
+        })
+    }
+
+    fn recent_screen(&self, lines: usize) -> Option<ScreenState> {
+        let (rows, cursor_row, cursor_col) = self.ai_screen_rows(Some(lines))?;
+        Some(ScreenState {
+            rows,
+            cursor_row,
+            cursor_col,
+            cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
+        })
+    }
+
+    fn type_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.ai_type_bytes(bytes)
     }
 }
