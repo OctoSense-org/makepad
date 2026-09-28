@@ -332,9 +332,9 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             use mod.prelude.widgets_internal.*
             TextStyle{
                 font_family: FontFamily{
-                    primary := FontMember{ res: mod.res.file_resource(#(primary)) asc: 0.0 desc: 0.0 }
+                    primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
-                    cjk := FontMember{ res: mod.res.file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
                     symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
@@ -346,7 +346,7 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             use mod.prelude.widgets_internal.*
             TextStyle{
                 font_family: FontFamily{
-                    primary := FontMember{ res: mod.res.file_resource(#(primary)) asc: 0.0 desc: 0.0 }
+                    primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
@@ -360,7 +360,7 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             TextStyle{
                 font_family: FontFamily{
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
-                    cjk := FontMember{ res: mod.res.file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
                     symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
@@ -910,6 +910,13 @@ impl MpTerm {
                 .collect::<Vec<_>>();
             (TextStyle::script_from_value(vm, regular), TextStyle::script_from_value(vm, bold), roots)
         });
+        // A family that did not build (a host's script context without the
+        // resource functions) would draw nothing: keep the fonts in use.
+        if regular_style.font_family.member_ids().len() == 0 || bold_style.font_family.member_ids().len() == 0 {
+            error!("terminal: the font family could not be built; keeping the current fonts");
+            self.font_key = Some(key);
+            return;
+        }
         self.draw_text.text_style.font_family = regular_style.font_family;
         self.bold_text_style.font_family = bold_style.font_family;
         self.font_roots = roots;

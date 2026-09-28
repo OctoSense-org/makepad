@@ -32,19 +32,24 @@ impl State {
 
 /// The agent a pane runs, from its foreground program's name and the title
 /// the program set.
+/// The program comes first: a title outlives the program that set it (the
+/// shell does not reset it), so it only names an agent the program's name
+/// does not (Claude Code can run as `node`).
 pub fn detect_agent(job: Option<&str>, title: &str) -> Option<&'static str> {
-    let job = job.unwrap_or("").to_lowercase();
-    let title = title.to_lowercase();
-    let is = |name: &str| job == name || job.starts_with(&format!("{name}-")) || title.contains(name);
-    if is("octoscode") || job == "octos" {
-        Some("octoscode")
-    } else if is("claude") {
-        Some("claude")
-    } else if is("codex") {
-        Some("codex")
-    } else {
-        None
+    const AGENTS: &[&str] = &["octoscode", "claude", "codex"];
+    let job = job?.to_lowercase();
+    let by_job = AGENTS.iter().find(|name| job == **name || job.starts_with(&format!("{name}-")));
+    if let Some(name) = by_job {
+        return Some(name);
     }
+    if job == "octos" {
+        return Some("octoscode");
+    }
+    if matches!(job.as_str(), "node" | "bun" | "deno" | "python" | "python3") {
+        let title = title.to_lowercase();
+        return AGENTS.iter().find(|name| title.contains(**name)).copied();
+    }
+    None
 }
 
 /// Lines an approval or question dialog shows (lower case). Only the last
@@ -62,13 +67,20 @@ const BLOCKED: &[&str] = &[
     "(y/n)",
     "[y/n]",
     "press enter to confirm",
+    "enter to confirm",
+    "trust this folder",
+    "allow command",
 ];
 
 /// How many rows from the bottom hold the agent's input area and dialogs.
-const TAIL_ROWS: usize = 12;
+const TAIL_ROWS: usize = 16;
 /// A working agent redraws its spinner or elapsed-time counter at least
 /// once a second; a screen still for longer is waiting.
 const WORKING_WINDOW: f64 = 2.5;
+/// What Claude Code and Codex show in their status line while they work.
+const WORKING: &[&str] = &["esc to interrupt", "ctrl+c to interrupt"];
+/// Where that status line sits: just above the input box.
+const STATUS_ROWS: usize = 8;
 
 /// The state from the screen and how long ago it last changed. A working
 /// agent animates its status line, so a still screen is not working even
@@ -90,14 +102,21 @@ pub fn detect_state(
         .take(TAIL_ROWS)
         .map(|r| r.to_lowercase())
         .collect();
-    let shows = |needles: &[&str]| tail.iter().any(|row| needles.iter().any(|n| row.contains(n)));
+    let shows = |needles: &[&str], rows: usize| tail.iter().take(rows).any(|row| needles.iter().any(|n| row.contains(n)));
     if agent.is_none() {
         return if job.is_some() { State::Running } else { State::Idle };
     }
     let secs = since_change.map_or(f64::INFINITY, |d| d.as_secs_f64());
-    if shows(BLOCKED) {
-        State::Blocked
-    } else if secs < WORKING_WINDOW {
+    if shows(BLOCKED, TAIL_ROWS) {
+        return State::Blocked;
+    }
+    let working = match agent {
+        // These say so: their idle screens can animate (Codex's welcome),
+        // and a status line left behind on a still screen is stale.
+        Some("claude") | Some("codex") => shows(WORKING, STATUS_ROWS) && secs < 15.0,
+        _ => secs < WORKING_WINDOW,
+    };
+    if working {
         State::Working
     } else {
         State::Idle
@@ -111,7 +130,7 @@ pub fn refuse_prompt(text: &str) -> Option<&'static str> {
     if t.is_empty() {
         return Some("empty prompt");
     }
-    if matches!(t, "y" | "Y" | "n" | "N" | "s" | "S" | "yes" | "no") {
+    if matches!(t, "y" | "Y" | "n" | "N" | "s" | "S" | "yes" | "no" | "1" | "2" | "3" | "4") {
         return Some("a lone approval key is not a prompt");
     }
     None
@@ -129,6 +148,8 @@ mod tests {
     fn agents_are_known_by_program_or_title() {
         assert_eq!(detect_agent(Some("claude"), ""), Some("claude"));
         assert_eq!(detect_agent(Some("node"), "\u{2733} Claude Code"), Some("claude"));
+        assert_eq!(detect_agent(Some("codex"), "\u{2733} Claude Code"), Some("codex"), "a stale title");
+        assert_eq!(detect_agent(Some("zsh"), "Claude Code"), None, "the agent has exited");
         assert_eq!(detect_agent(Some("codex"), ""), Some("codex"));
         assert_eq!(detect_agent(Some("octoscode"), ""), Some("octoscode"));
         assert_eq!(detect_agent(Some("vim"), "notes.md"), None);
@@ -147,7 +168,10 @@ mod tests {
             State::Idle,
             "a status line left behind on a still screen"
         );
-        assert_eq!(detect_state(Some("codex"), Some("codex"), false, &idle, secs(1)), State::Working, "output moving");
+        assert_eq!(detect_state(Some("codex"), Some("codex"), false, &idle, secs(1)), State::Idle, "an animated idle screen");
+        assert_eq!(detect_state(Some("octoscode"), Some("octoscode"), false, &idle, secs(1)), State::Working, "output moving");
+        let trust = rows(&["Accessing workspace:", "\u{276f} No, exit", "  Yes, I trust this folder", "Enter to confirm \u{00b7} Esc to cancel"]);
+        assert_eq!(detect_state(Some("claude"), Some("claude"), false, &trust, None), State::Blocked);
         let asking = rows(&["Bash command", "  rm -rf build", "Do you want to proceed?", "\u{276f} 1. Yes", "  2. No"]);
         assert_eq!(detect_state(Some("claude"), Some("claude"), false, &asking, secs(0)), State::Blocked);
     }
@@ -164,6 +188,7 @@ mod tests {
     fn approval_keys_are_not_prompts() {
         assert!(refuse_prompt("y").is_some());
         assert!(refuse_prompt(" N ").is_some());
+        assert!(refuse_prompt("1").is_some(), "Claude Code answers dialogs with digits");
         assert!(refuse_prompt("").is_some());
         assert_eq!(refuse_prompt("yes, run the tests"), None);
         assert_eq!(refuse_prompt("summarize the diff"), None);
