@@ -15,7 +15,7 @@ pub use makepad_widgets;
 use makepad_widgets::*;
 use std::path::{Path, PathBuf};
 
-mod ai;
+use makepad_terminal::ai;
 
 app_main!(
     App,
@@ -273,32 +273,6 @@ impl AppMain for App {
         self.drain_ai_port(cx, event);
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
-    }
-}
-
-impl ai::TerminalTarget for MpTerm {
-    fn visible_screen(&self) -> Option<ai::ScreenState> {
-        let (rows, cursor_row, cursor_col) = self.ai_screen_rows(None)?;
-        Some(ai::ScreenState {
-            rows,
-            cursor_row,
-            cursor_col,
-            cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
-        })
-    }
-
-    fn recent_screen(&self, lines: usize) -> Option<ai::ScreenState> {
-        let (rows, cursor_row, cursor_col) = self.ai_screen_rows(Some(lines))?;
-        Some(ai::ScreenState {
-            rows,
-            cursor_row,
-            cursor_col,
-            cwd: self.cwd.as_ref().map(|path| path.display().to_string()),
-        })
-    }
-
-    fn type_bytes(&mut self, bytes: &[u8]) -> bool {
-        self.ai_type_bytes(bytes)
     }
 }
 

@@ -12,6 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitStatus},
     ptr,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -117,7 +118,16 @@ pub fn screen_helper() -> io::Result<PathBuf> {
     } else {
         directory
     };
-    Ok(directory.join("makepad-screen"))
+    let sibling = directory.join("makepad-screen");
+    // A process whose entry ran `exec_helper` (every `app_main!` app, via
+    // `Cx::pre_start`) is its own PTY helper, so a terminal hosted without a
+    // `makepad-screen` build beside it (a linked module, a fresh on-demand
+    // build) still starts its shell. A present sibling stays preferred: it is
+    // small, so exec-ing it is cheaper than re-entering a GUI binary.
+    if !sibling.is_file() && SELF_EXEC_HELPER.load(Ordering::Relaxed) {
+        return Ok(executable);
+    }
+    Ok(sibling)
 }
 
 /// Start a new session with `slave` as its controlling terminal and stdio.
@@ -323,11 +333,17 @@ fn wait_for_exec(pipe: &mut File) -> io::Result<()> {
     }
 }
 
-/// Called at makepad-screen entry, before any host, socket, worker or UI.
+/// Set once this process's entry has run `exec_helper` for an ordinary
+/// invocation: the executable then answers `--exec-pty` itself.
+static SELF_EXEC_HELPER: AtomicBool = AtomicBool::new(false);
+
+/// Called at process entry (makepad-screen's `main`, and `Cx::pre_start` for
+/// every `app_main!` app), before any host, socket, worker or UI.
 /// Returns for ordinary invocations; exec mode never returns.
 pub fn exec_helper() {
     let mut arguments = std::env::args_os().skip(1);
     if arguments.next().as_deref() != Some(std::ffi::OsStr::new("--exec-pty")) {
+        SELF_EXEC_HELPER.store(true, Ordering::Relaxed);
         return;
     }
     let result = (|| -> io::Result<()> {

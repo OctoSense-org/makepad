@@ -1904,7 +1904,24 @@ impl Widget for MpTerm {
             }
         }
 
-        match event.hits(cx, self.area) {
+        // An in-process host (a module tile in the OctoSense shell) forwards
+        // keys only to the tile it focused, and the click that opened this
+        // terminal can leave no widget holding the keyboard. Claim it on the
+        // first key then, and handle that key in this pass: a key-focus
+        // change only takes effect after the current event.
+        let orphan_key = self.session.is_some() && cx.key_focus() == Area::Empty;
+        let hit = match event {
+            Event::KeyDown(e) if orphan_key => {
+                cx.set_key_focus(self.area);
+                Hit::KeyDown(e.clone())
+            }
+            Event::TextInput(e) if orphan_key => {
+                cx.set_key_focus(self.area);
+                Hit::TextInput(e.clone())
+            }
+            _ => event.hits(cx, self.area),
+        };
+        match hit {
             Hit::FingerDown(e) => {
                 cx.set_key_focus(self.area);
                 if self.report_mouse(

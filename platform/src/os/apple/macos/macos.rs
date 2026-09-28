@@ -2461,6 +2461,10 @@ impl Cx {
 
 impl CxOsApi for Cx {
     fn pre_start() -> bool {
+        // A terminal hosted in this process spawns shells through its own
+        // executable (`pty_spawn::screen_helper`); that exec mode must run
+        // before any Objective-C class, window or thread exists.
+        crate::os::apple::pty_spawn::exec_helper();
         init_apple_classes_global();
         false
     }
