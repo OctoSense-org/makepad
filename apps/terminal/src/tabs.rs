@@ -25,7 +25,7 @@ use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
 
 use crate::settings::{self as term_settings, NewTabCwd, Settings, TabBar, TabTitle};
-use crate::settings_panel::{self, Row};
+use crate::settings_panel::{self, Choice, Row, RowKind};
 use crate::widget::{MpTerm, MpTermAction};
 
 script_mod! {
@@ -299,15 +299,90 @@ struct Panel {
     scroll: usize,
     rect: Rect,
     hits: Vec<(Rect, PanelHit)>,
-    /// Rows that fit, from the last draw.
+    /// Rows (or list entries) that fit, from the last draw.
     visible: usize,
+    mode: PanelMode,
+    /// Delete profile was pressed once; the next press deletes.
+    confirm_delete: bool,
+    /// The outcome of the last action, shown in the footer.
+    message: Option<String>,
+}
+
+#[derive(Default)]
+enum PanelMode {
+    #[default]
+    Rows,
+    /// A row's list, filtered by what is typed.
+    Choose(Chooser),
+    /// Typing a name to save the settings as a profile.
+    Name(String),
+}
+
+struct Chooser {
+    row: Row,
+    choices: Vec<Choice>,
+    filter: String,
+    /// Index into the filtered list.
+    selected: usize,
+    scroll: usize,
+    /// The settings when the list opened: Esc goes back to them.
+    original: Settings,
+    /// Opened before the font scan finished: refill when it has.
+    awaiting_fonts: bool,
+}
+
+struct PanelColors {
+    fg: Vec4f,
+    white: Vec4f,
+    card: Vec4f,
+    line: Vec4f,
+    dim: Vec4f,
+    accent: Vec4f,
+}
+
+/// How many rows fit in `height` from row `scroll` on, with the header of
+/// each section that has a row in view.
+fn rows_fitting(scroll: usize, height: f64, row_h: f64) -> usize {
+    let mut used = 0.0;
+    let mut fit = 0;
+    let mut index = 0;
+    for (_, rows) in settings_panel::SECTIONS {
+        let mut header = false;
+        for _ in rows.iter() {
+            let i = index;
+            index += 1;
+            if i < scroll {
+                continue;
+            }
+            let need = if header { row_h } else { row_h * 2.0 };
+            if used + need > height {
+                return fit.max(1);
+            }
+            used += need;
+            header = true;
+            fit += 1;
+        }
+    }
+    fit.max(1)
+}
+
+fn chooser_len(panel: &Option<Panel>) -> usize {
+    match panel.as_ref().map(|p| &p.mode) {
+        Some(PanelMode::Choose(chooser)) => chooser.choices.len(),
+        _ => 0,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PanelHit {
     Close,
     Select(usize),
+    /// Open a row's list or run its action.
+    Activate(usize),
     Step(usize, i32),
+    /// An entry of the open list (index into the filtered list).
+    Choice(usize),
+    Back,
     Reset,
 }
 
@@ -475,7 +550,7 @@ impl TermTabs {
         if generation != self.settings_gen {
             self.settings_gen = generation;
             self.settings = term_settings::current();
-            self.redraw(cx);
+            self.refresh(cx);
         }
     }
 
@@ -663,7 +738,13 @@ impl Widget for TermTabs {
                         self.panel_key(cx, key);
                         return;
                     }
-                    Event::KeyUp(_) | Event::TextInput(_) => return,
+                    Event::TextInput(input) => {
+                        if !input.was_paste || self.panel.as_ref().is_some_and(|p| !matches!(p.mode, PanelMode::Rows)) {
+                            self.panel_text(cx, &input.input);
+                        }
+                        return;
+                    }
+                    Event::KeyUp(_) => return,
                     _ => {}
                 }
             } else if let Event::KeyDown(key) = event {
@@ -710,13 +791,8 @@ impl Widget for TermTabs {
                     }
                 }
                 Hit::FingerScroll(e) => {
-                    let rows = settings_panel::rows().len();
-                    if let Some(panel) = self.panel.as_mut() {
-                        let max = rows.saturating_sub(panel.visible.max(1));
-                        let step = if e.scroll.y > 0.0 { 1 } else if e.scroll.y < 0.0 { -1 } else { 0 };
-                        panel.scroll = (panel.scroll as i64 + step).clamp(0, max as i64) as usize;
-                        self.refresh(cx);
-                    }
+                    let step = if e.scroll.y > 0.0 { 1 } else if e.scroll.y < 0.0 { -1 } else { 0 };
+                    self.panel_scroll(cx, step);
                 }
                 _ => {}
             }
@@ -756,6 +832,8 @@ impl Widget for TermTabs {
         }
         if self.poll_timer.is_empty() {
             self.poll_timer = cx.start_interval(1.0);
+            // Font settings and the font list need the installed fonts.
+            crate::fonts::warm();
         }
         cx.begin_turtle(walk, self.layout);
         self.hits.clear();
@@ -887,9 +965,13 @@ impl TermTabs {
         }
     }
 
-    /// Redraw the bar and terminal and the panel's overlay.
+    /// Redraw the bar, the selected terminal and the panel's overlay (the
+    /// bar's area is empty while it is hidden).
     fn refresh(&mut self, cx: &mut Cx) {
         self.redraw(cx);
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.term.redraw(cx);
+        }
         if let Some(list) = &self.panel_list {
             list.redraw(cx);
         }
@@ -898,24 +980,78 @@ impl TermTabs {
     fn toggle_panel(&mut self, cx: &mut Cx) {
         self.panel = match self.panel.take() {
             Some(_) => None,
-            None => Some(Panel::default()),
+            None => {
+                // The font rows list installed fonts: start looking now.
+                crate::fonts::warm();
+                Some(Panel::default())
+            }
         };
         self.refresh(cx);
     }
 
     fn panel_key(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        panel.message = None;
+        match &mut panel.mode {
+            PanelMode::Rows => self.rows_key(cx, key),
+            PanelMode::Choose(_) => self.chooser_key(cx, key),
+            PanelMode::Name(name) => match key.key_code {
+                KeyCode::ReturnKey => {
+                    let name = name.trim().to_owned();
+                    self.save_profile(cx, &name);
+                }
+                KeyCode::Escape => panel.mode = PanelMode::Rows,
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                _ => {}
+            },
+        }
+        self.refresh(cx);
+    }
+
+    /// Typed text goes to the list filter or the profile name.
+    fn panel_text(&mut self, cx: &mut Cx, input: &str) {
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        let typed: String = input.chars().filter(|c| !c.is_control()).collect();
+        match &mut panel.mode {
+            PanelMode::Choose(chooser) => {
+                chooser.filter.push_str(&typed);
+                chooser.selected = 0;
+                chooser.scroll = 0;
+            }
+            PanelMode::Name(name) => {
+                if name.chars().count() + typed.chars().count() <= 40 {
+                    name.push_str(&typed);
+                }
+            }
+            PanelMode::Rows => return,
+        }
+        self.refresh(cx);
+    }
+
+    fn rows_key(&mut self, cx: &mut Cx, key: &KeyEvent) {
         let rows = settings_panel::rows();
         let Some(panel) = self.panel.as_mut() else {
             return;
         };
         let selected = panel.selected.min(rows.len() - 1);
+        let row = rows[selected];
+        if !matches!(key.key_code, KeyCode::ReturnKey | KeyCode::Space) {
+            panel.confirm_delete = false;
+        }
         match key.key_code {
             KeyCode::Escape => self.panel = None,
             KeyCode::Comma if key.modifiers.control => self.panel = None,
             KeyCode::ArrowUp => panel.selected = selected.saturating_sub(1),
             KeyCode::ArrowDown => panel.selected = (selected + 1).min(rows.len() - 1),
-            KeyCode::ArrowLeft => self.apply_step(cx, rows[selected], -1),
-            KeyCode::ArrowRight | KeyCode::ReturnKey | KeyCode::Space => self.apply_step(cx, rows[selected], 1),
+            KeyCode::ArrowLeft if row.kind() == RowKind::Value => self.apply_step(cx, row, -1),
+            KeyCode::ArrowRight if row.kind() == RowKind::Value => self.apply_step(cx, row, 1),
+            KeyCode::ReturnKey | KeyCode::Space => self.activate_row(cx, selected),
             _ => return,
         }
         if let Some(panel) = self.panel.as_mut() {
@@ -926,11 +1062,152 @@ impl TermTabs {
                 panel.scroll = panel.selected + 1 - visible;
             }
         }
-        self.refresh(cx);
+    }
+
+    /// Enter on a row: flip a switch, open a long list, run an action, or
+    /// step a short value.
+    fn activate_row(&mut self, cx: &mut Cx, index: usize) {
+        let row = settings_panel::rows()[index];
+        match row.kind() {
+            RowKind::Toggle => self.apply_step(cx, row, 1),
+            RowKind::Action => self.row_action(cx, row),
+            RowKind::Value => match row.choices(&self.settings) {
+                Some(choices) => self.open_chooser(row, choices),
+                None => self.apply_step(cx, row, 1),
+            },
+        }
+    }
+
+    fn open_chooser(&mut self, row: Row, choices: Vec<Choice>) {
+        let current = row.current(&self.settings);
+        let selected = choices.iter().position(|c| c.value == current).unwrap_or(0);
+        if let Some(panel) = self.panel.as_mut() {
+            if choices.is_empty() && row == Row::Profile {
+                panel.message = Some("No saved profiles yet".into());
+                return;
+            }
+            panel.mode = PanelMode::Choose(Chooser {
+                row,
+                choices,
+                filter: String::new(),
+                selected,
+                scroll: selected.saturating_sub(4),
+                original: self.settings.clone(),
+                awaiting_fonts: matches!(row, Row::Font | Row::CjkFont) && !crate::fonts::ready(),
+            });
+        }
+    }
+
+    fn chooser_key(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        let Some(PanelMode::Choose(chooser)) = self.panel.as_mut().map(|p| &mut p.mode) else {
+            return;
+        };
+        let shown = settings_panel::filter_choices(&chooser.choices, &chooser.filter);
+        let last = shown.len().saturating_sub(1);
+        let before = chooser.selected;
+        match key.key_code {
+            KeyCode::ArrowUp => chooser.selected = chooser.selected.saturating_sub(1),
+            KeyCode::ArrowDown => chooser.selected = (chooser.selected + 1).min(last),
+            KeyCode::PageUp => chooser.selected = chooser.selected.saturating_sub(10),
+            KeyCode::PageDown => chooser.selected = (chooser.selected + 10).min(last),
+            KeyCode::Backspace => {
+                chooser.filter.pop();
+                chooser.selected = 0;
+                chooser.scroll = 0;
+            }
+            KeyCode::ReturnKey => {
+                if let Some(choice) = shown.get(chooser.selected) {
+                    let (row, value) = (chooser.row, choice.value.clone());
+                    self.pick(cx, row, &value);
+                }
+                return;
+            }
+            KeyCode::Escape => {
+                // Back out: undo the live preview.
+                let original = chooser.original.clone();
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.mode = PanelMode::Rows;
+                }
+                if original != self.settings {
+                    self.apply(cx, original);
+                }
+                return;
+            }
+            _ => return,
+        }
+        let (row, selected) = (chooser.row, chooser.selected);
+        if selected != before && row != Row::Profile {
+            // Preview as the selection moves (themes, fonts, the shell).
+            if let Some(choice) = shown.get(selected) {
+                let next = row.with_value(&self.settings, &choice.value);
+                self.apply(cx, next);
+            }
+        }
+    }
+
+    /// Take `value` for `row` and close its list.
+    fn pick(&mut self, cx: &mut Cx, row: Row, value: &str) {
+        let next = row.with_value(&self.settings, value);
+        if let Some(panel) = self.panel.as_mut() {
+            panel.mode = PanelMode::Rows;
+            if row == Row::Profile {
+                panel.message = Some(format!("Loaded \u{201c}{value}\u{201d}"));
+            }
+        }
+        self.apply(cx, next);
+    }
+
+    fn row_action(&mut self, cx: &mut Cx, row: Row) {
+        let profile = self.settings.profile.clone();
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        match row {
+            Row::SaveProfile => panel.mode = PanelMode::Name(profile),
+            Row::DeleteProfile if profile.is_empty() => panel.message = Some("No profile is loaded".into()),
+            Row::DeleteProfile if !panel.confirm_delete => panel.confirm_delete = true,
+            Row::DeleteProfile => {
+                panel.confirm_delete = false;
+                panel.message = Some(match term_settings::delete_profile(&profile) {
+                    Ok(()) => format!("Deleted \u{201c}{profile}\u{201d}"),
+                    Err(err) => format!("Could not delete: {err}"),
+                });
+                let next = Settings { profile: String::new(), ..self.settings.clone() };
+                self.apply(cx, next);
+            }
+            _ => {}
+        }
+    }
+
+    fn save_profile(&mut self, cx: &mut Cx, name: &str) {
+        if !term_settings::valid_profile_name(name) {
+            if let Some(panel) = self.panel.as_mut() {
+                panel.message = Some("Use 1\u{2013}40 characters, without / \\ : = #".into());
+            }
+            return;
+        }
+        let result = term_settings::save_profile(name, &self.settings);
+        if let Some(panel) = self.panel.as_mut() {
+            panel.mode = PanelMode::Rows;
+            panel.message = Some(match &result {
+                Ok(()) => format!("Saved \u{201c}{name}\u{201d}"),
+                Err(err) => format!("Could not save: {err}"),
+            });
+        }
+        if result.is_ok() {
+            let next = Settings { profile: name.to_owned(), ..self.settings.clone() };
+            self.apply(cx, next);
+        }
     }
 
     fn panel_click(&mut self, cx: &mut Cx, hit: PanelHit) {
         let rows = settings_panel::rows();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.message = None;
+            if !matches!(hit, PanelHit::Activate(i) if rows.get(i) == Some(&Row::DeleteProfile)) {
+                panel.confirm_delete = false;
+            }
+        }
         match hit {
             PanelHit::Close => self.panel = None,
             PanelHit::Select(i) => {
@@ -938,13 +1215,64 @@ impl TermTabs {
                     panel.selected = i;
                 }
             }
+            PanelHit::Activate(i) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.selected = i;
+                }
+                self.activate_row(cx, i);
+            }
             PanelHit::Step(i, dir) => {
                 if let Some(panel) = self.panel.as_mut() {
                     panel.selected = i;
                 }
                 self.apply_step(cx, rows[i], dir);
             }
-            PanelHit::Reset => self.apply(cx, Settings::default()),
+            PanelHit::Choice(i) => {
+                let picked = match self.panel.as_ref().map(|p| &p.mode) {
+                    Some(PanelMode::Choose(chooser)) => settings_panel::filter_choices(&chooser.choices, &chooser.filter)
+                        .get(i)
+                        .map(|choice| (chooser.row, choice.value.clone())),
+                    _ => None,
+                };
+                if let Some((row, value)) = picked {
+                    self.pick(cx, row, &value);
+                }
+            }
+            PanelHit::Back => {
+                let original = match self.panel.as_ref().map(|p| &p.mode) {
+                    Some(PanelMode::Choose(chooser)) => Some(chooser.original.clone()),
+                    _ => None,
+                };
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.mode = PanelMode::Rows;
+                }
+                if let Some(original) = original.filter(|o| *o != self.settings) {
+                    self.apply(cx, original);
+                }
+            }
+            PanelHit::Reset => {
+                let next = Settings { profile: self.settings.profile.clone(), ..Settings::default() };
+                self.apply(cx, next);
+            }
+        }
+        self.refresh(cx);
+    }
+
+    fn panel_scroll(&mut self, cx: &mut Cx, step: i64) {
+        let rows = settings_panel::rows().len();
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        match &mut panel.mode {
+            PanelMode::Choose(chooser) => {
+                let shown = settings_panel::filter_choices(&chooser.choices, &chooser.filter).len();
+                let max = shown.saturating_sub(panel.visible.max(1));
+                chooser.scroll = (chooser.scroll as i64 + step * 3).clamp(0, max as i64) as usize;
+            }
+            _ => {
+                let max = rows.saturating_sub(panel.visible.max(1));
+                panel.scroll = (panel.scroll as i64 + step).clamp(0, max as i64) as usize;
+            }
         }
         self.refresh(cx);
     }
@@ -968,10 +1296,14 @@ impl TermTabs {
         let dark = luminance(bg) < 0.5;
         let white = vec4(1.0, 1.0, 1.0, 1.0);
         let black = vec4(0.0, 0.0, 0.0, 1.0);
-        let card = mix(bg, if dark { white } else { black }, if dark { 0.06 } else { 0.04 });
-        let line = mix(card, fg, 0.12);
-        let dim = mix(card, fg, 0.6);
-        let accent = vec4(0.478, 0.635, 0.969, 1.0);
+        let colors = PanelColors {
+            fg,
+            white,
+            card: mix(bg, if dark { white } else { black }, if dark { 0.06 } else { 0.04 }),
+            line: mix(mix(bg, if dark { white } else { black }, if dark { 0.06 } else { 0.04 }), fg, 0.12),
+            dim: mix(mix(bg, if dark { white } else { black }, if dark { 0.06 } else { 0.04 }), fg, 0.6),
+            accent: vec4(0.478, 0.635, 0.969, 1.0),
+        };
 
         let width = (body.size.x - 24.0).clamp(200.0, 400.0);
         let rect = Rect {
@@ -980,9 +1312,8 @@ impl TermTabs {
         };
         let mut hits = Vec::new();
 
-        // New draw calls: the panel paints over the terminal's own layers.
         self.draw_panel.new_draw_call(cx);
-        self.draw_panel.color = card;
+        self.draw_panel.color = colors.card;
         self.draw_panel.draw_abs(cx, rect);
         self.draw_tab.new_draw_call(cx);
         self.draw_heading.new_draw_call(cx);
@@ -991,16 +1322,89 @@ impl TermTabs {
 
         let left = rect.pos.x + 16.0;
         let right = rect.pos.x + rect.size.x - 16.0;
-        self.draw_heading.color = fg;
-        self.draw_heading.draw_abs(cx, dvec2(left, rect.pos.y + 12.0), "Settings");
+        let footer_y = rect.pos.y + rect.size.y - 46.0;
+        let top = rect.pos.y + 40.0;
         let close = Rect { pos: dvec2(right - 18.0, rect.pos.y + 10.0), size: dvec2(20.0, 20.0) };
-        self.draw_icon.color = dim;
+        self.draw_icon.color = colors.dim;
         self.draw_icon.draw_abs(cx, dvec2(close.pos.x + 5.0, close.pos.y + 4.0), ICON_CLOSE);
         hits.push((close, PanelHit::Close));
 
-        let footer_y = rect.pos.y + rect.size.y - 46.0;
-        let (selected, scroll) = self.panel.as_ref().map_or((0, 0), |p| (p.selected, p.scroll));
-        let mut y = rect.pos.y + 40.0;
+        let mode = self.panel.as_ref().map(|p| match &p.mode {
+            PanelMode::Rows => 0,
+            PanelMode::Choose(_) => 1,
+            PanelMode::Name(_) => 2,
+        });
+        let (heading, keys, visible) = match mode {
+            Some(1) => {
+                let visible = self.draw_chooser(cx, &colors, left, right, top, footer_y, ROW_H, &mut hits);
+                ("Settings", "\u{2191}\u{2193} choose   type to filter   Enter pick   Esc back", visible)
+            }
+            Some(2) => {
+                self.draw_name_input(cx, &colors, left, right, top);
+                ("Save profile", "Enter save   Esc cancel", 0)
+            }
+            _ => {
+                let visible = self.draw_rows(cx, &colors, rect, left, right, top, footer_y, ROW_H, &mut hits);
+                ("Settings", "\u{2191}\u{2193} choose   \u{2190}\u{2192} change   Enter open   Esc close", visible)
+            }
+        };
+        self.draw_heading.color = colors.fg;
+        self.draw_heading.draw_abs(cx, dvec2(left, rect.pos.y + 12.0), heading);
+
+        self.draw_tab.tab = 0.0;
+        self.draw_tab.color = colors.line;
+        self.draw_tab.draw_abs(cx, Rect { pos: dvec2(left, footer_y), size: dvec2(right - left, 1.0) });
+        let message = self.panel.as_ref().and_then(|p| p.message.clone());
+        self.draw_label.color = if message.is_some() { colors.fg } else { colors.dim };
+        let first_line = message.unwrap_or_else(|| keys.to_owned());
+        let first_line = self.fit(cx, &first_line, right - left);
+        self.draw_label.draw_abs(cx, dvec2(left, footer_y + 8.0), &first_line);
+        self.draw_label.color = colors.dim;
+        let file = tilde(&term_settings::path());
+        let file = self.fit(cx, &file, right - left - 60.0);
+        self.draw_label.draw_abs(cx, dvec2(left, footer_y + 26.0), &file);
+        if mode == Some(0) {
+            let reset_w = self.text_width(cx, "Reset") + 16.0;
+            let reset = Rect { pos: dvec2(right - reset_w, footer_y + 20.0), size: dvec2(reset_w, 20.0) };
+            self.draw_tab.color = colors.line;
+            self.draw_tab.draw_abs(cx, reset);
+            self.draw_label.color = colors.fg;
+            self.draw_label.draw_abs(cx, dvec2(reset.pos.x + 8.0, reset.pos.y + 4.0), "Reset");
+            hits.push((reset, PanelHit::Reset));
+        }
+
+        if let Some(panel) = self.panel.as_mut() {
+            panel.rect = rect;
+            panel.hits = hits;
+            panel.visible = visible;
+        }
+    }
+
+    /// The rows, grouped under their sections; returns how many fit.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_rows(
+        &mut self,
+        cx: &mut Cx2d,
+        c: &PanelColors,
+        rect: Rect,
+        left: f64,
+        right: f64,
+        top: f64,
+        bottom: f64,
+        row_h: f64,
+        hits: &mut Vec<(Rect, PanelHit)>,
+    ) -> usize {
+        let (selected, mut scroll, confirm_delete) =
+            self.panel.as_ref().map_or((0, 0, false), |p| (p.selected, p.scroll, p.confirm_delete));
+        // Keep the selected row in view, counting section headers.
+        scroll = scroll.min(selected);
+        while selected >= scroll + rows_fitting(scroll, bottom - top, row_h) {
+            scroll += 1;
+        }
+        if let Some(panel) = self.panel.as_mut() {
+            panel.scroll = scroll;
+        }
+        let mut y = top;
         let mut index = 0;
         let mut visible = 0;
         'sections: for (title, rows) in settings_panel::SECTIONS {
@@ -1012,86 +1416,185 @@ impl TermTabs {
                     continue;
                 }
                 if !header_drawn {
-                    if y + ROW_H * 2.0 > footer_y {
+                    if y + row_h * 2.0 > bottom {
                         break 'sections;
                     }
-                    self.draw_label.color = dim;
+                    self.draw_label.color = c.dim;
                     self.draw_label.draw_abs(cx, dvec2(left, y + 8.0), &title.to_uppercase());
-                    y += ROW_H;
+                    y += row_h;
                     header_drawn = true;
                 }
-                if y + ROW_H > footer_y {
+                if y + row_h > bottom {
                     break 'sections;
                 }
                 visible += 1;
-                let row_rect = Rect { pos: dvec2(rect.pos.x + 8.0, y), size: dvec2(rect.size.x - 16.0, ROW_H) };
+                let row_rect = Rect { pos: dvec2(rect.pos.x + 8.0, y), size: dvec2(rect.size.x - 16.0, row_h) };
                 if i == selected {
                     self.draw_tab.tab = 0.0;
-                    self.draw_tab.color = line;
+                    self.draw_tab.color = c.line;
                     self.draw_tab.draw_abs(cx, row_rect);
                 }
-                hits.push((row_rect, PanelHit::Select(i)));
-                let text_y = y + (ROW_H - 12.0) * 0.5;
-                self.draw_label.color = fg;
-                self.draw_label.draw_abs(cx, dvec2(left, text_y), row.label());
-                let mut label_w = self.text_width(cx, row.label());
+                let text_y = y + (row_h - 12.0) * 0.5;
+                let label = if row == Row::DeleteProfile && confirm_delete && i == selected {
+                    format!("Press Enter again to delete \u{201c}{}\u{201d}", self.settings.profile)
+                } else {
+                    row.label().to_owned()
+                };
+                self.draw_label.color = if row == Row::DeleteProfile && confirm_delete { c.accent } else { c.fg };
+                self.draw_label.draw_abs(cx, dvec2(left, text_y), &label);
+                let mut label_w = self.text_width(cx, &label);
                 if row.new_shells_only() {
-                    self.draw_label.color = dim;
+                    self.draw_label.color = c.dim;
                     self.draw_label.draw_abs(cx, dvec2(left + label_w + 6.0, text_y), "new tabs");
                     label_w += 6.0 + self.text_width(cx, "new tabs");
                 }
-                if row.is_toggle() {
-                    let on = row.value(&self.settings) == "On";
-                    let pill = Rect { pos: dvec2(right - 30.0, y + 5.0), size: dvec2(30.0, 14.0) };
-                    self.draw_tab.tab = 0.0;
-                    self.draw_tab.radius = 7.0;
-                    self.draw_tab.color = if on { accent } else { line };
-                    self.draw_tab.draw_abs(cx, pill);
-                    let knob_x = if on { pill.pos.x + 17.0 } else { pill.pos.x + 1.0 };
-                    self.draw_tab.radius = 6.0;
-                    self.draw_tab.color = if on { white } else { dim };
-                    self.draw_tab.draw_abs(cx, Rect { pos: dvec2(knob_x, pill.pos.y + 1.0), size: dvec2(12.0, 12.0) });
-                    let toggle = Rect { pos: dvec2(pill.pos.x - 6.0, y), size: dvec2(42.0, ROW_H) };
-                    hits.push((toggle, PanelHit::Step(i, 1)));
-                } else {
-                    let room = (right - 40.0 - (left + label_w + 16.0)).max(40.0);
-                    let value = self.fit(cx, &row.value(&self.settings), room);
-                    let vw = self.text_width(cx, &value);
-                    let next = Rect { pos: dvec2(right - 16.0, y), size: dvec2(20.0, ROW_H) };
-                    let prev = Rect { pos: dvec2(right - 16.0 - vw - 24.0, y), size: dvec2(20.0, ROW_H) };
-                    self.draw_label.color = if i == selected { fg } else { dim };
-                    self.draw_label.draw_abs(cx, dvec2(right - 20.0 - vw, text_y), &value);
-                    self.draw_icon.color = dim;
-                    self.draw_icon.draw_abs(cx, dvec2(prev.pos.x + 6.0, text_y + 1.0), ICON_PREV);
-                    self.draw_icon.draw_abs(cx, dvec2(next.pos.x + 6.0, text_y + 1.0), ICON_NEXT);
-                    hits.push((prev, PanelHit::Step(i, -1)));
-                    hits.push((next, PanelHit::Step(i, 1)));
+                match row.kind() {
+                    RowKind::Toggle => {
+                        hits.push((row_rect, PanelHit::Select(i)));
+                        let on = row.value(&self.settings) == "On";
+                        let pill = Rect { pos: dvec2(right - 30.0, y + 5.0), size: dvec2(30.0, 14.0) };
+                        self.draw_tab.tab = 0.0;
+                        self.draw_tab.radius = 7.0;
+                        self.draw_tab.color = if on { c.accent } else { c.line };
+                        self.draw_tab.draw_abs(cx, pill);
+                        let knob_x = if on { pill.pos.x + 17.0 } else { pill.pos.x + 1.0 };
+                        self.draw_tab.radius = 6.0;
+                        self.draw_tab.color = if on { c.white } else { c.dim };
+                        self.draw_tab.draw_abs(cx, Rect { pos: dvec2(knob_x, pill.pos.y + 1.0), size: dvec2(12.0, 12.0) });
+                        let toggle = Rect { pos: dvec2(pill.pos.x - 6.0, y), size: dvec2(42.0, row_h) };
+                        hits.push((toggle, PanelHit::Step(i, 1)));
+                    }
+                    RowKind::Action => {
+                        hits.push((row_rect, PanelHit::Activate(i)));
+                    }
+                    RowKind::Value => {
+                        let has_list = matches!(row, Row::Theme | Row::Font | Row::CjkFont | Row::Shell | Row::Profile);
+                        hits.push((row_rect, if has_list { PanelHit::Activate(i) } else { PanelHit::Select(i) }));
+                        let room = (right - 40.0 - (left + label_w + 16.0)).max(40.0);
+                        let value = self.fit(cx, &row.value(&self.settings), room);
+                        let vw = self.text_width(cx, &value);
+                        let next = Rect { pos: dvec2(right - 16.0, y), size: dvec2(20.0, row_h) };
+                        let prev = Rect { pos: dvec2(right - 16.0 - vw - 24.0, y), size: dvec2(20.0, row_h) };
+                        self.draw_label.color = if i == selected { c.fg } else { c.dim };
+                        self.draw_label.draw_abs(cx, dvec2(right - 20.0 - vw, text_y), &value);
+                        self.draw_icon.color = c.dim;
+                        self.draw_icon.draw_abs(cx, dvec2(prev.pos.x + 6.0, text_y + 1.0), ICON_PREV);
+                        self.draw_icon.draw_abs(cx, dvec2(next.pos.x + 6.0, text_y + 1.0), ICON_NEXT);
+                        hits.push((prev, PanelHit::Step(i, -1)));
+                        hits.push((next, PanelHit::Step(i, 1)));
+                    }
                 }
-                y += ROW_H;
+                y += row_h;
             }
         }
+        visible
+    }
 
+    /// A row's filterable list; returns how many entries fit.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_chooser(
+        &mut self,
+        cx: &mut Cx2d,
+        c: &PanelColors,
+        left: f64,
+        right: f64,
+        top: f64,
+        bottom: f64,
+        row_h: f64,
+        hits: &mut Vec<(Rect, PanelHit)>,
+    ) -> usize {
+        let settings = self.settings.clone();
+        let Some(PanelMode::Choose(chooser)) = self.panel.as_mut().map(|p| &mut p.mode) else {
+            return 0;
+        };
+        if chooser.awaiting_fonts && crate::fonts::ready() {
+            chooser.awaiting_fonts = false;
+            chooser.choices = chooser.row.choices(&settings).unwrap_or_default();
+        }
+        let shown = settings_panel::filter_choices(&chooser.choices, &chooser.filter);
+        let visible = (((bottom - top - row_h * 2.0) / row_h).floor().max(1.0)) as usize;
+        chooser.selected = chooser.selected.min(shown.len().saturating_sub(1));
+        if chooser.selected < chooser.scroll {
+            chooser.scroll = chooser.selected;
+        } else if chooser.selected >= chooser.scroll + visible {
+            chooser.scroll = chooser.selected + 1 - visible;
+        }
+        let (row, filter, selected, scroll) = (chooser.row, chooser.filter.clone(), chooser.selected, chooser.scroll);
+        let current = row.current(&self.settings);
+
+        // Title with a back arrow, then the filter.
+        let back = Rect { pos: dvec2(left - 6.0, top), size: dvec2(right - left + 12.0, row_h) };
+        self.draw_icon.color = c.dim;
+        self.draw_icon.draw_abs(cx, dvec2(left, top + 7.0), ICON_PREV);
+        self.draw_label.color = c.fg;
+        self.draw_label.draw_abs(cx, dvec2(left + 16.0, top + 6.0), row.label());
+        let count = format!("{} of {}", shown.len(), chooser_len(&self.panel));
+        let cw = self.text_width(cx, &count);
+        self.draw_label.color = c.dim;
+        self.draw_label.draw_abs(cx, dvec2(right - cw, top + 6.0), &count);
+        hits.push((back, PanelHit::Back));
+        let field = Rect { pos: dvec2(left - 6.0, top + row_h + 2.0), size: dvec2(right - left + 12.0, row_h - 4.0) };
         self.draw_tab.tab = 0.0;
-        self.draw_tab.color = line;
-        self.draw_tab.draw_abs(cx, Rect { pos: dvec2(left, footer_y), size: dvec2(right - left, 1.0) });
-        self.draw_label.color = dim;
-        let keys = "\u{2191}\u{2193} choose   \u{2190}\u{2192} change   Esc close";
-        self.draw_label.draw_abs(cx, dvec2(left, footer_y + 8.0), keys);
-        let file = tilde(&term_settings::path());
-        let file = self.fit(cx, &file, right - left - 60.0);
-        self.draw_label.draw_abs(cx, dvec2(left, footer_y + 26.0), &file);
-        let reset_w = self.text_width(cx, "Reset") + 16.0;
-        let reset = Rect { pos: dvec2(right - reset_w, footer_y + 18.0), size: dvec2(reset_w, 22.0) };
-        self.draw_tab.color = line;
-        self.draw_tab.draw_abs(cx, reset);
-        self.draw_label.color = fg;
-        self.draw_label.draw_abs(cx, dvec2(reset.pos.x + 8.0, reset.pos.y + 5.0), "Reset");
-        hits.push((reset, PanelHit::Reset));
+        self.draw_tab.color = c.line;
+        self.draw_tab.draw_abs(cx, field);
+        let (text, color) = if filter.is_empty() { ("Type to filter".to_owned(), c.dim) } else { (format!("{filter}\u{258f}"), c.fg) };
+        self.draw_label.color = color;
+        self.draw_label.draw_abs(cx, dvec2(left, field.pos.y + 4.0), &text);
 
-        if let Some(panel) = self.panel.as_mut() {
-            panel.rect = rect;
-            panel.hits = hits;
-            panel.visible = visible;
+        let mut y = top + row_h * 2.0 + 4.0;
+        for (i, choice) in shown.iter().enumerate().skip(scroll).take(visible) {
+            let item = Rect { pos: dvec2(left - 8.0, y), size: dvec2(right - left + 16.0, row_h) };
+            if i == selected {
+                self.draw_tab.color = c.line;
+                self.draw_tab.draw_abs(cx, item);
+            }
+            let text_y = y + (row_h - 12.0) * 0.5;
+            if choice.value == current {
+                self.draw_label.color = c.accent;
+                self.draw_label.draw_abs(cx, dvec2(left, text_y), "\u{2713}");
+            }
+            let note_w = if choice.note.is_empty() { 0.0 } else { self.text_width(cx, choice.note) + 8.0 };
+            let label = self.fit(cx, &choice.label, right - left - 16.0 - note_w);
+            self.draw_label.color = if i == selected { c.fg } else { mix(c.dim, c.fg, 0.5) };
+            self.draw_label.draw_abs(cx, dvec2(left + 16.0, text_y), &label);
+            if !choice.note.is_empty() {
+                self.draw_label.color = c.dim;
+                self.draw_label.draw_abs(cx, dvec2(right - note_w + 8.0, text_y), choice.note);
+            }
+            hits.push((item, PanelHit::Choice(i)));
+            y += row_h;
+        }
+        if shown.is_empty() {
+            self.draw_label.color = c.dim;
+            let empty = if row == Row::Font && !crate::fonts::ready() { "Looking for installed fonts\u{2026}" } else { "Nothing matches" };
+            self.draw_label.draw_abs(cx, dvec2(left + 16.0, y + 6.0), empty);
+        }
+        visible
+    }
+
+    fn draw_name_input(&mut self, cx: &mut Cx2d, c: &PanelColors, left: f64, right: f64, top: f64) {
+        let Some(PanelMode::Name(name)) = self.panel.as_ref().map(|p| &p.mode) else {
+            return;
+        };
+        let name = name.clone();
+        self.draw_label.color = c.dim;
+        self.draw_label.draw_abs(cx, dvec2(left, top + 6.0), "Save the current settings as a profile named:");
+        let field = Rect { pos: dvec2(left - 6.0, top + 28.0), size: dvec2(right - left + 12.0, 24.0) };
+        self.draw_tab.tab = 0.0;
+        self.draw_tab.color = c.line;
+        self.draw_tab.draw_abs(cx, field);
+        self.draw_label.color = c.fg;
+        self.draw_label.draw_abs(cx, dvec2(left, field.pos.y + 6.0), &format!("{name}\u{258f}"));
+        let exists = term_settings::list_profiles().iter().any(|p| p.eq_ignore_ascii_case(name.trim()));
+        if exists {
+            self.draw_label.color = c.accent;
+            self.draw_label.draw_abs(cx, dvec2(left, field.pos.y + 34.0), "A profile with this name is replaced");
+        }
+        let saved = term_settings::list_profiles();
+        if !saved.is_empty() {
+            self.draw_label.color = c.dim;
+            let list = self.fit(cx, &format!("Saved: {}", saved.join(", ")), right - left);
+            self.draw_label.draw_abs(cx, dvec2(left, field.pos.y + 56.0), &list);
         }
     }
 

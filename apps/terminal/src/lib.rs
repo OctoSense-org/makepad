@@ -1,6 +1,7 @@
 //! terminal: terminal emulator for Makepad. See Cargo.toml for provenance.
 
 pub mod ai;
+pub mod fonts;
 pub mod module;
 pub mod procinfo;
 pub mod pty;

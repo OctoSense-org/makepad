@@ -8,12 +8,15 @@
 //! value set by hand in the file stays selectable.
 
 use crate::settings::{BellStyle, CursorShape, NewTabCwd, Settings, TabBar, TabTitle, THEME_DESKTOP};
+use crate::settings::{CJK_AUTO, CJK_NONE, DEFAULT_FONT};
 use crate::settings::{FONT_SIZE_RANGE, LINE_HEIGHT_RANGE};
 use crate::themes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Row {
     Theme,
+    Font,
+    CjkFont,
     Opacity,
     FontSize,
     LineHeight,
@@ -30,13 +33,42 @@ pub enum Row {
     NewTabDir,
     TabTitle,
     ConfirmClose,
+    Profile,
+    SaveProfile,
+    DeleteProfile,
+}
+
+/// What a row is: an on/off switch, a value stepped with the arrows (and,
+/// for long lists, chosen from a filtered list), or an action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    Toggle,
+    Value,
+    Action,
+}
+
+/// One entry of a row's list: the value it sets, what it shows, a hint.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Choice {
+    pub value: String,
+    pub label: String,
+    pub note: &'static str,
 }
 
 /// The panel, top to bottom: section titles and their rows.
 pub const SECTIONS: &[(&str, &[Row])] = &[
     (
         "Appearance",
-        &[Row::Theme, Row::Opacity, Row::FontSize, Row::LineHeight, Row::CursorShape, Row::CursorBlink],
+        &[
+            Row::Theme,
+            Row::Font,
+            Row::CjkFont,
+            Row::FontSize,
+            Row::LineHeight,
+            Row::Opacity,
+            Row::CursorShape,
+            Row::CursorBlink,
+        ],
     ),
     (
         "Emulation & shell",
@@ -51,6 +83,7 @@ pub const SECTIONS: &[(&str, &[Row])] = &[
         ],
     ),
     ("Tabs", &[Row::TabBar, Row::NewTabDir, Row::TabTitle, Row::ConfirmClose]),
+    ("Profiles", &[Row::Profile, Row::SaveProfile, Row::DeleteProfile]),
 ];
 
 /// Every row in panel order (keyboard navigation walks this).
@@ -92,14 +125,112 @@ fn cycle<T: PartialEq + Clone>(options: &[T], current: &T, dir: i32) -> T {
     options[next as usize].clone()
 }
 
+/// "Auto (PingFang SC)": what `auto` resolves to here.
+fn auto_cjk_label() -> String {
+    match crate::fonts::auto_cjk() {
+        Some(family) => format!("Auto ({})", family.name),
+        None if !crate::fonts::ready() => "Auto".into(),
+        None => "Auto (none found)".into(),
+    }
+}
+
 fn yes(b: bool) -> String {
     if b { "On" } else { "Off" }.into()
 }
 
+/// A list's entries matching `filter` (case-insensitive, anywhere).
+pub fn filter_choices(choices: &[Choice], filter: &str) -> Vec<Choice> {
+    let filter = filter.trim().to_lowercase();
+    choices.iter().filter(|c| filter.is_empty() || c.label.to_lowercase().contains(&filter)).cloned().collect()
+}
+
 impl Row {
+    pub fn kind(self) -> RowKind {
+        match self {
+            Row::CursorBlink | Row::OptionAsMeta | Row::CopyOnSelect | Row::LoginShell | Row::ConfirmClose => {
+                RowKind::Toggle
+            }
+            Row::SaveProfile | Row::DeleteProfile => RowKind::Action,
+            _ => RowKind::Value,
+        }
+    }
+
+    /// The row's full list, for rows too long to step through: Enter opens
+    /// it as a filterable list.
+    pub fn choices(self, s: &Settings) -> Option<Vec<Choice>> {
+        let fonts = || {
+            crate::fonts::families()
+                .iter()
+                .map(|f| Choice { value: f.name.clone(), label: f.name.clone(), note: if f.monospace { "mono" } else { "" } })
+        };
+        Some(match self {
+            Row::Theme => std::iter::once(Choice { value: THEME_DESKTOP.into(), label: "Desktop".into(), note: "host" })
+                .chain(themes::SCHEMES.iter().map(|scheme| Choice {
+                    value: scheme.id.into(),
+                    label: scheme.name.into(),
+                    note: if scheme.light { "light" } else { "dark" },
+                }))
+                .collect(),
+            Row::Font => std::iter::once(Choice { value: String::new(), label: DEFAULT_FONT.into(), note: "bundled" })
+                .chain(fonts().filter(|c| c.value != DEFAULT_FONT))
+                .collect(),
+            Row::CjkFont => [
+                Choice { value: CJK_AUTO.into(), label: auto_cjk_label(), note: "" },
+                Choice { value: CJK_NONE.into(), label: "None".into(), note: "" },
+            ]
+            .into_iter()
+            .chain(fonts())
+            .collect(),
+            Row::Shell => shell_choices(&s.shell)
+                .into_iter()
+                .map(|sh| Choice { label: if sh.is_empty() { "Default ($SHELL)".into() } else { sh.clone() }, value: sh, note: "" })
+                .collect(),
+            Row::Profile => crate::settings::list_profiles()
+                .into_iter()
+                .map(|name| Choice { value: name.clone(), label: name, note: "" })
+                .collect(),
+            _ => return None,
+        })
+    }
+
+    /// `s` with this row set to `value` (a `Choice::value`).
+    pub fn with_value(self, s: &Settings, value: &str) -> Settings {
+        let mut s = s.clone();
+        match self {
+            Row::Theme => s.theme = value.to_owned(),
+            Row::Font => s.font_family = value.to_owned(),
+            Row::CjkFont => s.cjk_font = value.to_owned(),
+            Row::Shell => s.shell = value.to_owned(),
+            Row::Profile => {
+                if let Some(profile) = crate::settings::load_profile(value) {
+                    s = profile;
+                }
+            }
+            _ => {}
+        }
+        s
+    }
+
+    /// The row's current value, as a `Choice::value`.
+    pub fn current(self, s: &Settings) -> String {
+        match self {
+            Row::Theme => s.theme.clone(),
+            Row::Font => s.font_family.clone(),
+            Row::CjkFont => s.cjk_font.clone(),
+            Row::Shell => s.shell.clone(),
+            Row::Profile => s.profile.clone(),
+            _ => String::new(),
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Row::Theme => "Theme",
+            Row::Font => "Font",
+            Row::CjkFont => "CJK font",
+            Row::Profile => "Profile",
+            Row::SaveProfile => "Save as profile\u{2026}",
+            Row::DeleteProfile => "Delete profile",
             Row::Opacity => "Background opacity",
             Row::FontSize => "Font size",
             Row::LineHeight => "Line height",
@@ -126,14 +257,29 @@ impl Row {
 
     /// An on/off row: Enter and a click flip it.
     pub fn is_toggle(self) -> bool {
-        matches!(
-            self,
-            Row::CursorBlink | Row::OptionAsMeta | Row::CopyOnSelect | Row::LoginShell | Row::ConfirmClose
-        )
+        self.kind() == RowKind::Toggle
     }
 
     pub fn value(self, s: &Settings) -> String {
         match self {
+            Row::Font => if s.font_family.is_empty() { DEFAULT_FONT.into() } else { s.font_family.clone() },
+            Row::CjkFont => match s.cjk_font.as_str() {
+                CJK_AUTO => auto_cjk_label(),
+                CJK_NONE => "None".into(),
+                name => name.to_owned(),
+            },
+            Row::Profile => {
+                if s.profile.is_empty() {
+                    "None".into()
+                } else if crate::settings::load_profile(&s.profile)
+                    .is_some_and(|saved| saved == Settings { profile: s.profile.clone(), ..s.clone() })
+                {
+                    s.profile.clone()
+                } else {
+                    format!("{} (changed)", s.profile)
+                }
+            }
+            Row::SaveProfile | Row::DeleteProfile => String::new(),
             Row::Theme => {
                 if s.theme == THEME_DESKTOP {
                     "Desktop".into()
@@ -189,9 +335,17 @@ impl Row {
 
     /// `s` with this row moved one step (`dir` is -1 or +1).
     pub fn step(self, s: &Settings, dir: i32) -> Settings {
+        if matches!(self, Row::Font | Row::CjkFont | Row::Profile) {
+            let values: Vec<String> = self.choices(s).unwrap_or_default().into_iter().map(|c| c.value).collect();
+            if values.is_empty() {
+                return s.clone();
+            }
+            return self.with_value(s, &cycle(&values, &self.current(s), dir));
+        }
         let mut s = s.clone();
         let up = dir > 0;
         match self {
+            Row::Font | Row::CjkFont | Row::Profile | Row::SaveProfile | Row::DeleteProfile => {}
             Row::Theme => {
                 let mut ids = vec![THEME_DESKTOP];
                 ids.extend(themes::SCHEMES.iter().map(|scheme| scheme.id));
@@ -242,7 +396,7 @@ mod tests {
     #[test]
     fn every_row_is_listed_once() {
         let rows = rows();
-        assert_eq!(rows.len(), 17);
+        assert_eq!(rows.len(), 22);
         for (i, row) in rows.iter().enumerate() {
             assert!(!rows[i + 1..].contains(row), "{row:?} twice");
         }
@@ -252,6 +406,9 @@ mod tests {
     fn stepping_changes_every_row_and_comes_back() {
         let base = Settings::default();
         for row in rows() {
+            if matches!(row.kind(), RowKind::Action) || matches!(row, Row::Font | Row::CjkFont | Row::Profile) {
+                continue; // depend on the machine's fonts and saved profiles
+            }
             let next = row.step(&base, 1);
             assert_ne!(next, base, "{row:?} did not change");
             assert_eq!(row.step(&next, -1), base, "{row:?} did not step back");

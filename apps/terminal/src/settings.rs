@@ -21,6 +21,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// Follow the host: the desktop style's colours inside OctoSense, the
 /// palette makepad-wm hands down, or the built-in default standalone.
 pub const THEME_DESKTOP: &str = "desktop";
+/// The platform's CJK font (`crate::fonts::auto_cjk`).
+pub const CJK_AUTO: &str = "auto";
+pub const CJK_NONE: &str = "none";
+/// The bundled font the terminal uses unless `font-family` names another.
+pub const DEFAULT_FONT: &str = "JetBrains Mono";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CursorShape {
@@ -64,6 +69,12 @@ pub struct Settings {
     pub theme: String,
     /// `None` keeps the host's opacity (makepad-wm's rule) or opaque.
     pub background_opacity: Option<f32>,
+    /// An installed family (`crate::fonts`); empty keeps the bundled
+    /// JetBrains Mono.
+    pub font_family: String,
+    /// The family CJK text falls back to: [`CJK_AUTO`], [`CJK_NONE`] or an
+    /// installed family.
+    pub cjk_font: String,
     pub font_size: f64,
     /// Row height as a multiple of the font's glyph height (the text
     /// style's `line_spacing`; 1.0 is the terminal's historical look).
@@ -87,6 +98,9 @@ pub struct Settings {
     pub confirm_close_running: bool,
     pub tab_title: TabTitle,
     pub tab_bar: TabBar,
+    /// The profile these settings were loaded from or saved as; empty when
+    /// none. Only a label: changing a setting does not touch the profile.
+    pub profile: String,
 }
 
 pub const FONT_SIZE_RANGE: (f64, f64) = (6.0, 48.0);
@@ -99,6 +113,8 @@ impl Default for Settings {
         Settings {
             theme: THEME_DESKTOP.into(),
             background_opacity: None,
+            font_family: String::new(),
+            cjk_font: CJK_AUTO.into(),
             font_size: 10.0,
             line_height: 1.0,
             cursor_shape: CursorShape::Block,
@@ -114,6 +130,7 @@ impl Default for Settings {
             confirm_close_running: true,
             tab_title: TabTitle::Program,
             tab_bar: TabBar::Auto,
+            profile: String::new(),
         }
     }
 }
@@ -159,6 +176,10 @@ impl Settings {
                             .map(|v| v.clamp(OPACITY_RANGE.0, OPACITY_RANGE.1))
                     }
                 }
+                "font-family" if !value.chars().any(char::is_control) => {
+                    s.font_family = if value.eq_ignore_ascii_case(DEFAULT_FONT) { String::new() } else { value.to_string() }
+                }
+                "cjk-font" if !value.is_empty() && !value.chars().any(char::is_control) => s.cjk_font = value.to_string(),
                 "font-size" => {
                     if let Some(v) = value.parse::<f64>().ok().filter(|v| v.is_finite()) {
                         s.font_size = v.clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1);
@@ -212,6 +233,7 @@ impl Settings {
                         _ => s.tab_title,
                     }
                 }
+                "profile" if value.is_empty() || valid_profile_name(value) => s.profile = value.to_string(),
                 "tab-bar" => {
                     s.tab_bar = match value {
                         "auto" => TabBar::Auto,
@@ -243,6 +265,11 @@ impl Settings {
             "background-opacity",
             self.background_opacity.map_or("default".into(), |v| format!("{v:.2}")),
         );
+        line(
+            "font-family",
+            if self.font_family.is_empty() { DEFAULT_FONT.into() } else { self.font_family.clone() },
+        );
+        line("cjk-font", self.cjk_font.clone());
         line("font-size", format!("{}", self.font_size));
         line("line-height", format!("{}", self.line_height));
         line(
@@ -294,8 +321,66 @@ impl Settings {
             }
             .into(),
         );
+        line("profile", self.profile.clone());
         out
     }
+}
+
+/// A profile name: short, and safe as a file name.
+pub fn valid_profile_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name.chars().count() <= 40
+        && !name.starts_with('.')
+        && !name.chars().any(|c| c.is_control() || matches!(c, '/' | '\\' | ':' | '=' | '#'))
+}
+
+/// `<makepad home>/terminal/profiles`: one `<name>.conf` per profile, in
+/// the settings file's format.
+pub fn profiles_dir() -> PathBuf {
+    path().with_file_name("profiles")
+}
+
+/// The saved profiles, by name.
+pub fn list_profiles() -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(profiles_dir())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.strip_suffix(".conf").filter(|n| valid_profile_name(n)).map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_by_key(|n| n.to_lowercase());
+    names
+}
+
+fn profile_path(name: &str) -> Option<PathBuf> {
+    valid_profile_name(name).then(|| profiles_dir().join(format!("{}.conf", name.trim())))
+}
+
+/// Save `settings` as profile `name` (replacing one of that name).
+pub fn save_profile(name: &str, settings: &Settings) -> std::io::Result<()> {
+    let path = profile_path(name).ok_or_else(|| std::io::Error::other("invalid profile name"))?;
+    std::fs::create_dir_all(profiles_dir())?;
+    let profile = Settings { profile: name.trim().to_owned(), ..settings.clone() };
+    let tmp = path.with_extension("conf.tmp");
+    std::fs::write(&tmp, profile.to_text())?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Profile `name`, labelled with its name.
+pub fn load_profile(name: &str) -> Option<Settings> {
+    let text = std::fs::read_to_string(profile_path(name)?).ok()?;
+    Some(Settings { profile: name.trim().to_owned(), ..Settings::parse(&text) })
+}
+
+pub fn delete_profile(name: &str) -> std::io::Result<()> {
+    let path = profile_path(name).ok_or_else(|| std::io::Error::other("invalid profile name"))?;
+    std::fs::remove_file(path)
 }
 
 /// `<makepad home>/terminal/settings.conf`.
@@ -332,6 +417,11 @@ pub fn current() -> Settings {
     }
     let mut guard = LIVE.write().unwrap_or_else(|e| e.into_inner());
     guard.get_or_insert_with(load).settings.clone()
+}
+
+/// Make every terminal re-apply its settings (fonts found by a scan).
+pub fn bump_generation() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Bumped on every change a widget must apply.
@@ -404,6 +494,8 @@ mod tests {
     fn every_setting_round_trips_through_the_file() {
         let s = Settings {
             theme: "dracula".into(),
+            font_family: "Menlo".into(),
+            cjk_font: "PingFang SC".into(),
             background_opacity: Some(0.85),
             font_size: 13.0,
             line_height: 1.5,
@@ -420,6 +512,7 @@ mod tests {
             confirm_close_running: false,
             tab_title: TabTitle::Directory,
             tab_bar: TabBar::Always,
+            profile: "Work".into(),
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(Settings::parse(&Settings::default().to_text()), Settings::default());
@@ -453,5 +546,24 @@ mod tests {
     fn default_opacity_and_non_finite_numbers_keep_the_default() {
         assert_eq!(Settings::parse("background-opacity = default").background_opacity, None);
         assert_eq!(Settings::parse("font-size = NaN").font_size, Settings::default().font_size);
+    }
+
+    #[test]
+    fn profiles_save_list_load_and_delete() {
+        let home = std::env::temp_dir().join(format!("terminal-profiles-{}", std::process::id()));
+        // Tests share the process: set the home only for this test's paths.
+        let dir = home.join("terminal").join("profiles");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = Settings { theme: "nord".into(), font_size: 14.0, ..Settings::default() };
+        std::fs::write(dir.join("Work.conf"), Settings { profile: "Work".into(), ..settings.clone() }.to_text()).unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+        let parsed = Settings::parse(&std::fs::read_to_string(dir.join("Work.conf")).unwrap());
+        assert_eq!(parsed.profile, "Work");
+        assert_eq!(Settings { profile: String::new(), ..parsed }, settings);
+        assert!(valid_profile_name("Presentation 2"));
+        for bad in ["", " ", "../x", "a/b", ".hidden", "a=b", &"x".repeat(41)] {
+            assert!(!valid_profile_name(bad), "{bad:?}");
+        }
+        std::fs::remove_dir_all(&home).ok();
     }
 }

@@ -319,6 +319,70 @@ pub enum MpTermAction {
     None,
 }
 
+/// Paths of the fonts a terminal draws with, beyond the bundled ones:
+/// (regular, bold, CJK fallback).
+type FontKey = (Option<String>, Option<String>, Option<String>);
+
+/// A text style whose family is `primary` (if any), then the bundled
+/// JetBrains Mono at `weight`, then `cjk` (if any), then the icon, emoji
+/// and symbol fonts. Script members cannot be conditional, hence the arms.
+fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&str>, weight: f64) -> ScriptValue {
+    match (primary.map(str::to_owned), cjk.map(str::to_owned)) {
+        (Some(primary), Some(cjk)) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    primary := FontMember{ res: mod.res.file_resource(#(primary)) asc: 0.0 desc: 0.0 }
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    cjk := FontMember{ res: mod.res.file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+        (Some(primary), None) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    primary := FontMember{ res: mod.res.file_resource(#(primary)) asc: 0.0 desc: 0.0 }
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+        (None, Some(cjk)) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    cjk := FontMember{ res: mod.res.file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+        (None, None) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CachedGlyph {
     rasterized: RasterizedGlyph,
@@ -502,6 +566,12 @@ pub struct MpTerm {
     /// option-as-meta already sent as a Meta key.
     #[rust]
     swallow_text_until: Option<Instant>,
+    /// The fonts applied from the settings, and the script objects that
+    /// keep their resources alive.
+    #[rust]
+    font_key: Option<FontKey>,
+    #[rust]
+    font_roots: Vec<ScriptObjectRef>,
 }
 
 impl ScriptHook for MpTerm {
@@ -792,8 +862,54 @@ impl MpTerm {
             session.terminal.set_scrollback(self.settings.scrollback_lines);
         }
         self.apply_colors();
+        self.apply_fonts(cx);
         self.glyph_cache.clear();
         self.draw_bg.redraw(cx);
+    }
+
+    /// Use the font families the settings name. Before the font scan has
+    /// finished the bundled font stays; the scan's end re-syncs.
+    fn apply_fonts(&mut self, cx: &mut Cx) {
+        use term_settings::{CJK_AUTO, CJK_NONE};
+        let s = &self.settings;
+        if s.font_family.is_empty() && s.cjk_font == CJK_NONE && self.font_key.is_none() {
+            return;
+        }
+        let cache = makepad_widgets::makepad_platform::home::makepad_home().join("terminal").join("fonts");
+        let path = |face: &crate::fonts::Face| {
+            crate::fonts::standalone_path(face, &cache).map(|p| p.to_string_lossy().into_owned())
+        };
+        let primary = (!s.font_family.is_empty()).then(|| crate::fonts::find(&s.font_family)).flatten();
+        let cjk = match s.cjk_font.as_str() {
+            CJK_NONE => None,
+            CJK_AUTO => crate::fonts::auto_cjk(),
+            name => crate::fonts::find(name),
+        };
+        let regular = primary.and_then(|family| path(&family.regular));
+        let bold = primary
+            .and_then(|family| family.bold.as_ref().and_then(|face| path(face)))
+            .or_else(|| regular.clone());
+        let cjk = cjk.and_then(|family| path(&family.regular)).filter(|p| Some(p) != regular.as_ref());
+        let key = (regular, bold, cjk);
+        if self.font_key.as_ref() == Some(&key) {
+            return;
+        }
+        let (regular_style, bold_style, roots) = cx.with_vm(|vm| {
+            let regular = terminal_text_style(vm, key.0.as_deref(), key.2.as_deref(), 400.0);
+            let bold = terminal_text_style(vm, key.1.as_deref(), key.2.as_deref(), 800.0);
+            let roots = [regular, bold]
+                .iter()
+                .filter_map(|v| v.as_object())
+                .map(|obj| vm.bx.heap.new_object_ref(obj))
+                .collect::<Vec<_>>();
+            (TextStyle::script_from_value(vm, regular), TextStyle::script_from_value(vm, bold), roots)
+        });
+        self.draw_text.text_style.font_family = regular_style.font_family;
+        self.bold_text_style.font_family = bold_style.font_family;
+        self.font_roots = roots;
+        self.font_key = Some(key);
+        self.glyph_cache.clear();
+        self.glyph_cache_key = (0, 0, 0);
     }
 
     /// The palette, default colours and cursor colour to use: a bundled
@@ -2041,6 +2157,7 @@ impl Widget for MpTerm {
         cx.begin_turtle(walk, self.layout);
         self.rect = cx.turtle().rect();
         self.sync_settings(cx);
+        self.apply_fonts(cx);
         self.refresh_metrics(cx);
         self.ensure_session(cx);
 
