@@ -586,6 +586,20 @@ impl Pty {
         }
     }
 
+    /// The process group in the PTY's foreground: the shell itself when it
+    /// is at its prompt, else the job it is running.
+    pub fn foreground_pgrp(&self) -> Option<i32> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let pgrp = unsafe { libc_ffi::tcgetpgrp(self.master_fd) };
+            (pgrp > 0).then_some(pgrp)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
     pub fn child_pid(&self) -> i32 {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
@@ -1000,6 +1014,7 @@ mod libc_ffi {
         #[cfg(target_os = "linux")]
         pub fn setsid() -> i32;
         pub fn killpg(pgrp: i32, sig: i32) -> i32;
+        pub fn tcgetpgrp(fd: i32) -> i32;
     }
 
     pub const SIGKILL: i32 = 9;

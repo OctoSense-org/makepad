@@ -1,0 +1,1186 @@
+//! Native tabs: several shells in one terminal window, drawn and switched by
+//! the terminal itself rather than by a window manager, so they work the
+//! same standalone, in makepad-wm and as an OctoSense module.
+//!
+//! `TermTabs{ term := MpTerm{} }` keeps the `term` template and mints one
+//! `MpTerm` per tab from it. Only the selected tab draws and receives input;
+//! every tab keeps pumping its PTY (signals, timers), so background jobs keep
+//! running and their output is there when the tab is selected again.
+//!
+//! Keys (while the terminal holds the keyboard):
+//!
+//! | Ctrl+Shift+T | new tab (in the current tab's directory by default) |
+//! | Ctrl+Shift+W | close tab (asks first while a program runs in it)    |
+//! | Ctrl+Tab / Ctrl+PageDown       | next tab                           |
+//! | Ctrl+Shift+Tab / Ctrl+PageUp   | previous tab                       |
+//! | Alt+1..8 / Alt+9               | that tab / the last tab            |
+//! | Ctrl+,       | settings                                             |
+//!
+//! Alt+digit is taken only while more than one tab is open, so a single
+//! shell keeps Meta+digit (readline's numeric argument).
+
+use std::path::{Path, PathBuf};
+
+use makepad_widgets::widget_tree::CxWidgetExt;
+use makepad_widgets::*;
+
+use crate::settings::{self as term_settings, NewTabCwd, Settings, TabBar, TabTitle};
+use crate::settings_panel::{self, Row};
+use crate::widget::{MpTerm, MpTermAction};
+
+script_mod! {
+    use mod.prelude.widgets_internal.*
+    use mod.widgets.*
+
+    set_type_default() do #(DrawTabShape::script_shader(vm)) {
+        ..mod.draw.DrawQuad
+        color: #x1a1b26
+        radius: 6.0
+        /** 1: round the top corners only (a tab), 0: all four (a button) */
+        tab: 1.0
+        pixel: fn() {
+            let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+            let extra = self.tab * self.radius
+            sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y + extra, self.radius)
+            sdf.fill(self.color)
+            return sdf.result
+        }
+    }
+
+    mod.widgets.TermTabsBase = #(TermTabs::register_widget(vm))
+
+    /** A terminal with native tabs. */
+    mod.widgets.TermTabs = set_type_default() do mod.widgets.TermTabsBase {
+        width: Fill
+        height: Fill
+        flow: Down
+        /** tab bar height in pixels 20..48 step 1 */
+        bar_height: 30.0
+        draw_bar +: { color: #x16161e }
+        draw_tab +: {}
+        draw_label +: {
+            text_style: theme.font_regular{ font_size: 9.0 }
+            color: #xa9b1d6
+        }
+        draw_icon +: {
+            text_style: theme.font_icons{ font_size: 8.5 }
+            color: #xa9b1d6
+        }
+        draw_panel +: { color: #x1f2335 }
+        draw_heading +: {
+            text_style: theme.font_bold{ font_size: 10.5 }
+            color: #xc0caf5
+        }
+        term := MpTerm{}
+    }
+}
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
+pub struct DrawTabShape {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    color: Vec4f,
+    #[live]
+    radius: f32,
+    #[live]
+    tab: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum TermTabsAction {
+    /// The last tab was closed (Ctrl+Shift+W). A standalone window quits; a
+    /// hosted one gets a fresh shell on its next frame.
+    LastTabClosed,
+    #[default]
+    None,
+}
+
+/// A tab bar command, from a key or a click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabCommand {
+    New,
+    Close,
+    Next,
+    Previous,
+    /// 0-based; `usize::MAX` is the last tab.
+    Select(usize),
+    Settings,
+}
+
+/// The tab command `key` asks for. `tabs` is how many are open: Alt+digit
+/// is left to the shell (Meta+digit) while there is only one.
+pub fn tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
+    let m = &key.modifiers;
+    if m.logo {
+        return None;
+    }
+    if m.control && !m.alt {
+        match key.key_code {
+            KeyCode::KeyT if m.shift => return Some(TabCommand::New),
+            KeyCode::KeyW if m.shift => return Some(TabCommand::Close),
+            KeyCode::Tab if m.shift => return Some(TabCommand::Previous),
+            KeyCode::Tab => return Some(TabCommand::Next),
+            KeyCode::PageDown if !m.shift => return Some(TabCommand::Next),
+            KeyCode::PageUp if !m.shift => return Some(TabCommand::Previous),
+            KeyCode::Comma if !m.shift => return Some(TabCommand::Settings),
+            _ => {}
+        }
+    }
+    if m.alt && !m.control && !m.shift && tabs > 1 {
+        let digit = match key.key_code {
+            KeyCode::Key1 => 1,
+            KeyCode::Key2 => 2,
+            KeyCode::Key3 => 3,
+            KeyCode::Key4 => 4,
+            KeyCode::Key5 => 5,
+            KeyCode::Key6 => 6,
+            KeyCode::Key7 => 7,
+            KeyCode::Key8 => 8,
+            KeyCode::Key9 => return Some(TabCommand::Select(usize::MAX)),
+            _ => return None,
+        };
+        return Some(TabCommand::Select(digit - 1));
+    }
+    None
+}
+
+/// `path` with the home directory shown as `~`.
+fn tilde(path: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        if path == home {
+            return "~".into();
+        }
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return format!("~/{}", rest.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// A directory as a tab title: its last component (`~` for home).
+fn dir_title(path: &Path) -> String {
+    let shown = tilde(path);
+    if shown == "~" || shown == "/" {
+        return shown;
+    }
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or(shown)
+}
+
+/// What a tab is called under `mode`: the program's own title (OSC 0/2) or
+/// the job's name, else the directory, else the shell's name.
+pub fn tab_label(mode: TabTitle, osc: &str, job: Option<&str>, dir: Option<&Path>, shell: Option<&str>) -> String {
+    let dir = dir.map(dir_title);
+    let label = match mode {
+        TabTitle::Program => {
+            if !osc.trim().is_empty() {
+                Some(osc.trim().to_owned())
+            } else {
+                job.map(str::to_owned).or(dir)
+            }
+        }
+        TabTitle::Directory => dir,
+    };
+    label.or_else(|| shell.map(str::to_owned)).unwrap_or_else(|| "shell".into())
+}
+
+struct Tab {
+    term: WidgetRef,
+    /// The program's own title (OSC 0/2); empty when it set none.
+    osc_title: String,
+    /// Polled: the foreground job (None at the prompt), the shell's name
+    /// and its directory.
+    job: Option<String>,
+    shell: Option<String>,
+    dir: Option<PathBuf>,
+    /// Rang the bell while in the background.
+    bell: bool,
+}
+
+impl Tab {
+    fn label(&self, mode: TabTitle) -> String {
+        tab_label(mode, &self.osc_title, self.job.as_deref(), self.dir.as_deref(), self.shell.as_deref())
+    }
+
+    fn with_term<R>(&self, f: impl FnOnce(&mut MpTerm) -> R) -> Option<R> {
+        self.term.borrow_mut::<MpTerm>().map(|mut term| f(&mut term))
+    }
+}
+
+/// What the pointer is over in the tab bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarHit {
+    Tab(usize),
+    CloseTab(usize),
+    NewTab,
+    Settings,
+    ConfirmClose,
+    CancelClose,
+}
+
+/// A close waiting for the person to confirm: the tab runs `job`.
+struct PendingClose {
+    tab: usize,
+    job: String,
+}
+
+#[derive(Script, Widget)]
+pub struct TermTabs {
+    #[uid]
+    uid: WidgetUid,
+    #[source]
+    source: ScriptObjectRef,
+    #[walk]
+    walk: Walk,
+    #[layout]
+    layout: Layout,
+
+    #[redraw]
+    #[live]
+    draw_bar: DrawColor,
+    #[live]
+    draw_tab: DrawTabShape,
+    #[live]
+    draw_label: DrawText,
+    #[live]
+    draw_icon: DrawText,
+    /// The settings panel's card (its area takes the panel's input).
+    #[live]
+    draw_panel: DrawColor,
+    #[live]
+    draw_heading: DrawText,
+    #[live(30.0)]
+    bar_height: f64,
+
+    /// The `term := MpTerm{}` template every tab is minted from.
+    #[rust]
+    template: Option<ScriptObjectRef>,
+    #[rust]
+    tabs: Vec<Tab>,
+    #[rust]
+    active: usize,
+    #[rust]
+    next_tab_id: u64,
+    /// Tabs off: a `--preview` pager is one job in one window.
+    #[rust(true)]
+    tabs_enabled: bool,
+    #[rust]
+    settings: Settings,
+    #[rust]
+    settings_gen: u64,
+    #[rust]
+    poll_timer: Timer,
+    #[rust]
+    hover: Option<BarHit>,
+    #[rust]
+    pending_close: Option<PendingClose>,
+    /// Hit rectangles of the last drawn bar.
+    #[rust]
+    hits: Vec<(Rect, BarHit)>,
+    /// The title last reported to the host for the selected tab.
+    #[rust]
+    reported_title: String,
+    #[rust]
+    panel: Option<Panel>,
+    /// The panel draws in an overlay list: above every terminal layer.
+    #[rust]
+    panel_list: Option<DrawList2d>,
+}
+
+/// The open settings panel.
+#[derive(Default)]
+struct Panel {
+    /// Index into `settings_panel::rows()`.
+    selected: usize,
+    /// Rows scrolled off the top.
+    scroll: usize,
+    rect: Rect,
+    hits: Vec<(Rect, PanelHit)>,
+    /// Rows that fit, from the last draw.
+    visible: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelHit {
+    Close,
+    Select(usize),
+    Step(usize, i32),
+    Reset,
+}
+
+impl ScriptHook for TermTabs {
+    fn on_after_new(&mut self, vm: &mut ScriptVm) {
+        self.panel_list = Some(DrawList2d::script_new(vm));
+    }
+
+    fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, value: ScriptValue) {
+        if apply.is_eval() {
+            return;
+        }
+        if let Some(obj) = value.as_object() {
+            vm.vec_with(obj, |vm, vec| {
+                for kv in vec {
+                    if kv.key.as_id() == Some(id!(term)) {
+                        if let Some(template) = kv.value.as_object() {
+                            self.template = Some(vm.bx.heap.new_object_ref(template));
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+impl TermTabs {
+    /// The selected tab's terminal, opening the first tab if none is open
+    /// yet (so a host can set its `cwd`/`command` before it starts).
+    pub fn active_term(&mut self, cx: &mut Cx) -> WidgetRef {
+        if self.tabs.is_empty() {
+            self.open_tab(cx, None);
+        }
+        self.tabs.get(self.active).map(|tab| tab.term.clone()).unwrap_or_default()
+    }
+
+    /// Turn the tab bar and its keys off (a preview window) or on.
+    pub fn set_tabs_enabled(&mut self, cx: &mut Cx, enabled: bool) {
+        self.tabs_enabled = enabled;
+        self.redraw(cx);
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    /// Carry out a tab command, as its key or click would.
+    pub fn run_command(&mut self, cx: &mut Cx, command: TabCommand) {
+        match command {
+            TabCommand::New => {
+                let cwd = match self.settings.new_tab_cwd {
+                    NewTabCwd::Inherit => self.tabs.get(self.active).and_then(|tab| {
+                        tab.with_term(|term| term.current_dir()).flatten().or_else(|| tab.dir.clone())
+                    }),
+                    NewTabCwd::Home => std::env::var_os("HOME").map(PathBuf::from),
+                };
+                self.open_tab(cx, cwd);
+            }
+            TabCommand::Close => self.request_close(cx, self.active),
+            TabCommand::Next if self.tabs.len() > 1 => self.select(cx, (self.active + 1) % self.tabs.len()),
+            TabCommand::Previous if self.tabs.len() > 1 => {
+                self.select(cx, (self.active + self.tabs.len() - 1) % self.tabs.len())
+            }
+            TabCommand::Select(index) if !self.tabs.is_empty() => {
+                self.select(cx, index.min(self.tabs.len() - 1))
+            }
+            TabCommand::Settings => self.toggle_panel(cx),
+            _ => {}
+        }
+    }
+
+    fn open_tab(&mut self, cx: &mut Cx, cwd: Option<PathBuf>) {
+        let Some(template) = self.template.as_ref() else {
+            error!("TermTabs has no `term` template");
+            return;
+        };
+        let value: ScriptValue = template.as_object().into();
+        let term = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
+        if let Some(mut t) = term.borrow_mut::<MpTerm>() {
+            t.cwd = cwd.clone();
+        }
+        self.next_tab_id += 1;
+        cx.widget_tree_insert_child(self.uid, LiveId(self.next_tab_id), term.clone());
+        let tab = Tab { term, osc_title: String::new(), job: None, shell: None, dir: cwd, bell: false };
+        let at = if self.tabs.is_empty() { 0 } else { self.active + 1 };
+        self.tabs.insert(at, tab);
+        self.select(cx, at);
+    }
+
+    fn select(&mut self, cx: &mut Cx, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index != self.active {
+            if let Some(old) = self.tabs.get(self.active) {
+                old.with_term(|term| term.cancel_gestures(cx));
+            }
+        }
+        self.active = index;
+        let tab = &mut self.tabs[index];
+        tab.bell = false;
+        tab.with_term(|term| term.focus(cx));
+        self.report_title(cx);
+        self.redraw(cx);
+    }
+
+    fn request_close(&mut self, cx: &mut Cx, index: usize) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if self.settings.confirm_close_running {
+            if let Some(job) = tab.with_term(|term| term.foreground_job()).flatten() {
+                self.pending_close = Some(PendingClose { tab: index, job });
+                if index != self.active {
+                    self.select(cx, index);
+                }
+                self.redraw(cx);
+                return;
+            }
+        }
+        self.close(cx, index);
+    }
+
+    fn close(&mut self, cx: &mut Cx, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        self.pending_close = None;
+        // Dropping the terminal drops its session: the shell and its jobs
+        // get SIGHUP'd with the PTY.
+        self.tabs.remove(index);
+        cx.widget_tree_mark_dirty(self.uid);
+        if self.tabs.is_empty() {
+            self.active = 0;
+            cx.widget_action(self.uid, TermTabsAction::LastTabClosed);
+            self.redraw(cx);
+            return;
+        }
+        if self.active > index || self.active >= self.tabs.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        let active = self.active;
+        self.active = usize::MAX;
+        self.select(cx, active);
+    }
+
+    /// Tell the host the selected tab's title (the window title).
+    fn report_title(&mut self, cx: &mut Cx) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let title = tab.label(self.settings.tab_title);
+        if title != self.reported_title {
+            self.reported_title = title.clone();
+            cx.widget_action(self.uid, MpTermAction::TitleChanged(title));
+        }
+    }
+
+    fn sync_settings(&mut self, cx: &mut Cx) {
+        let generation = term_settings::generation();
+        if generation != self.settings_gen {
+            self.settings_gen = generation;
+            self.settings = term_settings::current();
+            self.redraw(cx);
+        }
+    }
+
+    /// Refresh what each tab runs and where; redraw the bar if a label moved.
+    fn poll_tabs(&mut self, cx: &mut Cx) {
+        let mut changed = false;
+        for tab in &mut self.tabs {
+            let facts = tab.with_term(|term| (term.foreground_job(), term.foreground_name(), term.current_dir()));
+            if let Some((job, name, dir)) = facts {
+                let shell = if job.is_none() { name } else { tab.shell.clone() };
+                if (&job, &shell, &dir) != (&tab.job, &tab.shell, &tab.dir) {
+                    tab.job = job;
+                    tab.shell = shell;
+                    if dir.is_some() {
+                        tab.dir = dir;
+                    }
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.report_title(cx);
+            self.redraw(cx);
+        }
+    }
+
+    fn keyboard_is_ours(&self, cx: &Cx) -> bool {
+        cx.key_focus() == Area::Empty
+            || self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.with_term(|term| term.has_input_focus(cx)))
+                .unwrap_or(false)
+    }
+
+    fn show_bar(&self) -> bool {
+        self.tabs_enabled && (self.settings.tab_bar == TabBar::Always || self.tabs.len() > 1)
+    }
+
+    fn bar_hit(&self, abs: DVec2) -> Option<BarHit> {
+        self.hits.iter().rev().find(|(rect, _)| rect.contains(abs)).map(|(_, hit)| *hit)
+    }
+
+    fn on_bar_click(&mut self, cx: &mut Cx, hit: BarHit, middle: bool) {
+        match hit {
+            BarHit::Tab(i) if middle => self.request_close(cx, i),
+            BarHit::Tab(i) => self.select(cx, i),
+            BarHit::CloseTab(i) => self.request_close(cx, i),
+            BarHit::NewTab => self.run_command(cx, TabCommand::New),
+            BarHit::Settings => self.run_command(cx, TabCommand::Settings),
+            BarHit::ConfirmClose => {
+                if let Some(pending) = self.pending_close.take() {
+                    self.close(cx, pending.tab);
+                }
+            }
+            BarHit::CancelClose => {
+                self.pending_close = None;
+                self.redraw(cx);
+            }
+        }
+        // A click on the bar must not leave the keyboard with nobody.
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.with_term(|term| term.focus(cx));
+        }
+    }
+
+    /// Route a tab's actions: titles and bells update the tab; the selected
+    /// tab's actions also go on to the host.
+    fn take_tab_actions(&mut self, cx: &mut Cx, index: usize, actions: ActionsBuf, exited: &mut Vec<usize>) {
+        let selected = index == self.active;
+        let mut forward = ActionsBuf::new();
+        for action in actions {
+            let Some(wa) = action.as_widget_action() else {
+                forward.push(action);
+                continue;
+            };
+            match wa.cast::<MpTermAction>() {
+                MpTermAction::TitleChanged(title) => {
+                    let tab = &mut self.tabs[index];
+                    if tab.osc_title != title {
+                        tab.osc_title = title;
+                        self.redraw(cx);
+                        if selected {
+                            self.report_title(cx);
+                        }
+                    }
+                    continue;
+                }
+                MpTermAction::Bell if !selected => {
+                    self.tabs[index].bell = true;
+                    self.redraw(cx);
+                }
+                // A shell that exits closes its tab, unless it is the last:
+                // that one keeps the terminal's own exited state.
+                MpTermAction::Exited if self.tabs.len() > 1 => {
+                    exited.push(index);
+                    continue;
+                }
+                _ => {}
+            }
+            if selected {
+                forward.push(action);
+            }
+        }
+        if !forward.is_empty() {
+            cx.extend_actions(forward);
+        }
+    }
+}
+
+/// Events every tab needs, selected or not: only the selected tab gets
+/// input (its area is the only one drawn).
+fn is_input(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::MouseDown(_)
+            | Event::MouseMove(_)
+            | Event::MouseUp(_)
+            | Event::MouseLeave(_)
+            | Event::TouchUpdate(_)
+            | Event::LongPress(_)
+            | Event::Scroll(_)
+            | Event::KeyDown(_)
+            | Event::KeyUp(_)
+            | Event::TextInput(_)
+            | Event::TextRangeReplace(_)
+            | Event::TextCopy(_)
+            | Event::TextCut(_)
+            | Event::Drag(_)
+            | Event::Drop(_)
+    )
+}
+
+fn mix(a: Vec4f, b: Vec4f, t: f32) -> Vec4f {
+    vec4(
+        a.x + (b.x - a.x) * t,
+        a.y + (b.y - a.y) * t,
+        a.z + (b.z - a.z) * t,
+        a.w + (b.w - a.w) * t,
+    )
+}
+
+fn luminance(c: Vec4f) -> f32 {
+    0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
+}
+
+const ICON_PLUS: &str = "\u{f067}";
+const ICON_CLOSE: &str = "\u{f00d}";
+const ICON_GEAR: &str = "\u{f013}";
+const ICON_PREV: &str = "\u{f053}";
+const ICON_NEXT: &str = "\u{f054}";
+
+impl Widget for TermTabs {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.sync_settings(cx);
+        if self.poll_timer.is_event(event).is_some() {
+            self.poll_tabs(cx);
+        }
+
+        if self.tabs_enabled && self.keyboard_is_ours(cx) {
+            if let Some(pending) = self.pending_close.as_ref() {
+                // The confirmation owns the keyboard until it is answered.
+                match event {
+                    Event::KeyDown(key) => {
+                        match key.key_code {
+                            KeyCode::ReturnKey | KeyCode::KeyY => {
+                                let tab = pending.tab;
+                                self.close(cx, tab);
+                            }
+                            KeyCode::Escape | KeyCode::KeyN => {
+                                self.pending_close = None;
+                                self.redraw(cx);
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    Event::KeyUp(_) | Event::TextInput(_) => return,
+                    _ => {}
+                }
+            } else if self.panel.is_some() {
+                // The panel owns the keyboard while it is open.
+                match event {
+                    Event::KeyDown(key) => {
+                        self.panel_key(cx, key);
+                        return;
+                    }
+                    Event::KeyUp(_) | Event::TextInput(_) => return,
+                    _ => {}
+                }
+            } else if let Event::KeyDown(key) = event {
+                if let Some(command) = tab_command(key, self.tabs.len()) {
+                    self.run_command(cx, command);
+                    return;
+                }
+            }
+        }
+
+        match event.hits(cx, self.draw_bar.area()) {
+            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
+                let hover = self.bar_hit(e.abs);
+                if hover != self.hover {
+                    self.hover = hover;
+                    self.redraw(cx);
+                }
+            }
+            Hit::FingerHoverOut(_) => {
+                if self.hover.take().is_some() {
+                    self.redraw(cx);
+                }
+            }
+            Hit::FingerDown(e) => {
+                let middle = e.device.mouse_button().is_some_and(|b| b.contains(MouseButton::MIDDLE));
+                match self.bar_hit(e.abs) {
+                    Some(hit) => self.on_bar_click(cx, hit, middle),
+                    // A double click on the empty bar opens a tab.
+                    None if e.tap_count == 2 => self.on_bar_click(cx, BarHit::NewTab, false),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+
+        if self.panel.is_some() {
+            match event.hits(cx, self.draw_panel.area()) {
+                Hit::FingerDown(e) => {
+                    let hit = self.panel.as_ref().and_then(|panel| {
+                        panel.hits.iter().rev().find(|(rect, _)| rect.contains(e.abs)).map(|(_, hit)| *hit)
+                    });
+                    if let Some(hit) = hit {
+                        self.panel_click(cx, hit);
+                    }
+                }
+                Hit::FingerScroll(e) => {
+                    let rows = settings_panel::rows().len();
+                    if let Some(panel) = self.panel.as_mut() {
+                        let max = rows.saturating_sub(panel.visible.max(1));
+                        let step = if e.scroll.y > 0.0 { 1 } else if e.scroll.y < 0.0 { -1 } else { 0 };
+                        panel.scroll = (panel.scroll as i64 + step).clamp(0, max as i64) as usize;
+                        self.refresh(cx);
+                    }
+                }
+                _ => {}
+            }
+            // The terminal under the panel is inert; a click on it closes
+            // the panel.
+            if let Event::MouseDown(e) = event {
+                let inside = self.panel.as_ref().is_some_and(|panel| panel.rect.contains(e.abs))
+                    || self.hits.iter().any(|(rect, _)| rect.contains(e.abs));
+                if !inside {
+                    self.toggle_panel(cx);
+                }
+            }
+        }
+
+        let mut exited = Vec::new();
+        for index in 0..self.tabs.len() {
+            if (index != self.active || self.panel.is_some()) && is_input(event) {
+                continue;
+            }
+            let term = self.tabs[index].term.clone();
+            let actions = cx.capture_actions(|cx| term.handle_event(cx, event, scope));
+            if !actions.is_empty() {
+                self.take_tab_actions(cx, index, actions, &mut exited);
+            }
+        }
+        exited.sort_unstable();
+        exited.dedup();
+        for index in exited.into_iter().rev() {
+            self.close(cx, index);
+        }
+    }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.sync_settings(cx);
+        if self.tabs.is_empty() {
+            self.open_tab(cx, None);
+        }
+        if self.poll_timer.is_empty() {
+            self.poll_timer = cx.start_interval(1.0);
+        }
+        cx.begin_turtle(walk, self.layout);
+        self.hits.clear();
+        if self.show_bar() || self.pending_close.is_some() {
+            self.draw_tab_bar(cx);
+        }
+        let body = cx.peek_walk_turtle(Walk::fill());
+        if let Some(tab) = self.tabs.get(self.active) {
+            tab.term.draw_all(cx, scope);
+        }
+        cx.end_turtle();
+        if let Some(mut list) = self.panel_list.take() {
+            list.begin_overlay_reuse(cx);
+            // Cover the body's far corner: a host that seats the terminal
+            // in a tile draws it at an offset inside a larger pass.
+            let pass = cx.current_pass_size();
+            let size = dvec2(pass.x.max(body.pos.x + body.size.x), pass.y.max(body.pos.y + body.size.y));
+            cx.begin_root_turtle(size, Layout::default());
+            if self.panel.is_some() {
+                self.draw_settings_panel(cx, body);
+            }
+            cx.end_pass_sized_turtle();
+            list.end(cx);
+            self.panel_list = Some(list);
+        }
+        DrawStep::done()
+    }
+}
+
+impl TermTabs {
+    /// (background, foreground) of the selected tab's colours.
+    fn chrome(&self) -> (Vec4f, Vec4f) {
+        self.tabs
+            .get(self.active)
+            .and_then(|tab| tab.with_term(|term| term.chrome_colors()).flatten())
+            .unwrap_or((vec4(0.102, 0.106, 0.149, 1.0), vec4(0.663, 0.694, 0.839, 1.0)))
+    }
+
+    fn draw_tab_bar(&mut self, cx: &mut Cx2d) {
+        let (bg, fg) = self.chrome();
+        let dark = luminance(bg) < 0.5;
+        let bar_bg = mix(bg, vec4(0.0, 0.0, 0.0, 1.0), if dark { 0.35 } else { 0.08 });
+        let hover_bg = mix(bar_bg, fg, 0.08);
+        let dim_fg = mix(bar_bg, fg, 0.6);
+
+        let h = self.bar_height;
+        let bar = cx.walk_turtle(Walk::new(Size::fill(), Size::Fixed(h)));
+        self.draw_bar.color = bar_bg;
+        self.draw_bar.draw_abs(cx, bar);
+
+        if let Some(pending) = self.pending_close.as_ref() {
+            let message = format!("\u{201c}{}\u{201d} is running in this tab. Close it?", pending.job);
+            self.draw_label.color = fg;
+            self.draw_label.draw_abs(cx, dvec2(bar.pos.x + 12.0, bar.pos.y + (h - 12.0) * 0.5), &message);
+            let mut x = bar.pos.x + bar.size.x - 8.0;
+            for (text, hit, fill) in [
+                ("Cancel  (Esc)", BarHit::CancelClose, hover_bg),
+                ("Close  (Enter)", BarHit::ConfirmClose, vec4(0.85, 0.30, 0.35, 1.0)),
+            ] {
+                let width = self.text_width(cx, text) + 20.0;
+                x -= width;
+                let rect = Rect { pos: dvec2(x, bar.pos.y + 4.0), size: dvec2(width, h - 8.0) };
+                self.draw_tab.tab = 0.0;
+                self.draw_tab.color = if self.hover == Some(hit) { mix(fill, fg, 0.15) } else { fill };
+                self.draw_tab.draw_abs(cx, rect);
+                self.draw_label.color = if hit == BarHit::ConfirmClose { vec4(1.0, 1.0, 1.0, 1.0) } else { fg };
+                self.draw_label.draw_abs(cx, dvec2(x + 10.0, bar.pos.y + (h - 12.0) * 0.5), text);
+                self.hits.push((rect, hit));
+                x -= 8.0;
+            }
+            return;
+        }
+
+        let button = h - 6.0;
+        let pad = 6.0;
+        let gear = Rect { pos: dvec2(bar.pos.x + bar.size.x - pad - button, bar.pos.y + 3.0), size: dvec2(button, button) };
+        let tabs_room = (gear.pos.x - bar.pos.x - pad - button - 8.0).max(0.0);
+        let count = self.tabs.len().max(1) as f64;
+        let tab_w = (tabs_room / count).clamp(48.0, 220.0);
+        let mut x = bar.pos.x + pad;
+        for index in 0..self.tabs.len() {
+            let rect = Rect { pos: dvec2(x, bar.pos.y + 4.0), size: dvec2(tab_w - 2.0, h - 4.0) };
+            let selected = index == self.active;
+            let hovered = matches!(self.hover, Some(BarHit::Tab(i)) | Some(BarHit::CloseTab(i)) if i == index);
+            if selected || hovered {
+                self.draw_tab.tab = 1.0;
+                self.draw_tab.color = if selected { bg } else { hover_bg };
+                self.draw_tab.draw_abs(cx, rect);
+            }
+            self.hits.push((rect, BarHit::Tab(index)));
+
+            let close = Rect {
+                pos: dvec2(rect.pos.x + rect.size.x - 20.0, rect.pos.y + (rect.size.y - 16.0) * 0.5),
+                size: dvec2(16.0, 16.0),
+            };
+            let show_close = selected || hovered;
+            let tab = &self.tabs[index];
+            let mut label = tab.label(self.settings.tab_title);
+            if tab.bell {
+                label = format!("\u{2022} {label}");
+            }
+            let room = rect.size.x - 20.0 - if show_close { 20.0 } else { 0.0 };
+            let label = self.fit(cx, &label, room);
+            self.draw_label.color = if selected { fg } else { dim_fg };
+            self.draw_label.draw_abs(cx, dvec2(rect.pos.x + 10.0, rect.pos.y + (rect.size.y - 12.0) * 0.5), &label);
+            if show_close {
+                if self.hover == Some(BarHit::CloseTab(index)) {
+                    self.draw_tab.tab = 0.0;
+                    self.draw_tab.color = mix(bg, fg, 0.15);
+                    self.draw_tab.draw_abs(cx, close);
+                }
+                self.draw_icon.color = dim_fg;
+                self.draw_icon.draw_abs(cx, dvec2(close.pos.x + 4.0, close.pos.y + 3.0), ICON_CLOSE);
+                self.hits.push((close, BarHit::CloseTab(index)));
+            }
+            x += tab_w;
+        }
+
+        let plus = Rect { pos: dvec2(x + 2.0, bar.pos.y + 3.0), size: dvec2(button, button) };
+        for (rect, hit, icon) in [(plus, BarHit::NewTab, ICON_PLUS), (gear, BarHit::Settings, ICON_GEAR)] {
+            if self.hover == Some(hit) {
+                self.draw_tab.tab = 0.0;
+                self.draw_tab.color = hover_bg;
+                self.draw_tab.draw_abs(cx, rect);
+            }
+            self.draw_icon.color = dim_fg;
+            self.draw_icon.draw_abs(cx, dvec2(rect.pos.x + (button - 10.0) * 0.5, rect.pos.y + (button - 12.0) * 0.5), icon);
+            self.hits.push((rect, hit));
+        }
+    }
+
+    /// Redraw the bar and terminal and the panel's overlay.
+    fn refresh(&mut self, cx: &mut Cx) {
+        self.redraw(cx);
+        if let Some(list) = &self.panel_list {
+            list.redraw(cx);
+        }
+    }
+
+    fn toggle_panel(&mut self, cx: &mut Cx) {
+        self.panel = match self.panel.take() {
+            Some(_) => None,
+            None => Some(Panel::default()),
+        };
+        self.refresh(cx);
+    }
+
+    fn panel_key(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        let rows = settings_panel::rows();
+        let Some(panel) = self.panel.as_mut() else {
+            return;
+        };
+        let selected = panel.selected.min(rows.len() - 1);
+        match key.key_code {
+            KeyCode::Escape => self.panel = None,
+            KeyCode::Comma if key.modifiers.control => self.panel = None,
+            KeyCode::ArrowUp => panel.selected = selected.saturating_sub(1),
+            KeyCode::ArrowDown => panel.selected = (selected + 1).min(rows.len() - 1),
+            KeyCode::ArrowLeft => self.apply_step(cx, rows[selected], -1),
+            KeyCode::ArrowRight | KeyCode::ReturnKey | KeyCode::Space => self.apply_step(cx, rows[selected], 1),
+            _ => return,
+        }
+        if let Some(panel) = self.panel.as_mut() {
+            let visible = panel.visible.max(1);
+            if panel.selected < panel.scroll {
+                panel.scroll = panel.selected;
+            } else if panel.selected >= panel.scroll + visible {
+                panel.scroll = panel.selected + 1 - visible;
+            }
+        }
+        self.refresh(cx);
+    }
+
+    fn panel_click(&mut self, cx: &mut Cx, hit: PanelHit) {
+        let rows = settings_panel::rows();
+        match hit {
+            PanelHit::Close => self.panel = None,
+            PanelHit::Select(i) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.selected = i;
+                }
+            }
+            PanelHit::Step(i, dir) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.selected = i;
+                }
+                self.apply_step(cx, rows[i], dir);
+            }
+            PanelHit::Reset => self.apply(cx, Settings::default()),
+        }
+        self.refresh(cx);
+    }
+
+    fn apply_step(&mut self, cx: &mut Cx, row: Row, dir: i32) {
+        let next = row.step(&self.settings, dir);
+        self.apply(cx, next);
+    }
+
+    /// Save `settings`: the file, and every tab through the generation.
+    fn apply(&mut self, cx: &mut Cx, settings: Settings) {
+        if let Err(err) = term_settings::update(settings) {
+            error!("terminal: could not save settings to {}: {err}", term_settings::path().display());
+        }
+        self.sync_settings(cx);
+    }
+
+    fn draw_settings_panel(&mut self, cx: &mut Cx2d, body: Rect) {
+        const ROW_H: f64 = 24.0;
+        let (bg, fg) = self.chrome();
+        let dark = luminance(bg) < 0.5;
+        let white = vec4(1.0, 1.0, 1.0, 1.0);
+        let black = vec4(0.0, 0.0, 0.0, 1.0);
+        let card = mix(bg, if dark { white } else { black }, if dark { 0.06 } else { 0.04 });
+        let line = mix(card, fg, 0.12);
+        let dim = mix(card, fg, 0.6);
+        let accent = vec4(0.478, 0.635, 0.969, 1.0);
+
+        let width = (body.size.x - 24.0).clamp(200.0, 400.0);
+        let rect = Rect {
+            pos: dvec2(body.pos.x + body.size.x - width - 12.0, body.pos.y + 10.0),
+            size: dvec2(width, (body.size.y - 20.0).max(120.0)),
+        };
+        let mut hits = Vec::new();
+
+        // New draw calls: the panel paints over the terminal's own layers.
+        self.draw_panel.new_draw_call(cx);
+        self.draw_panel.color = card;
+        self.draw_panel.draw_abs(cx, rect);
+        self.draw_tab.new_draw_call(cx);
+        self.draw_heading.new_draw_call(cx);
+        self.draw_label.new_draw_call(cx);
+        self.draw_icon.new_draw_call(cx);
+
+        let left = rect.pos.x + 16.0;
+        let right = rect.pos.x + rect.size.x - 16.0;
+        self.draw_heading.color = fg;
+        self.draw_heading.draw_abs(cx, dvec2(left, rect.pos.y + 12.0), "Settings");
+        let close = Rect { pos: dvec2(right - 18.0, rect.pos.y + 10.0), size: dvec2(20.0, 20.0) };
+        self.draw_icon.color = dim;
+        self.draw_icon.draw_abs(cx, dvec2(close.pos.x + 5.0, close.pos.y + 4.0), ICON_CLOSE);
+        hits.push((close, PanelHit::Close));
+
+        let footer_y = rect.pos.y + rect.size.y - 46.0;
+        let (selected, scroll) = self.panel.as_ref().map_or((0, 0), |p| (p.selected, p.scroll));
+        let mut y = rect.pos.y + 40.0;
+        let mut index = 0;
+        let mut visible = 0;
+        'sections: for (title, rows) in settings_panel::SECTIONS {
+            let mut header_drawn = false;
+            for row in rows.iter().copied() {
+                let i = index;
+                index += 1;
+                if i < scroll {
+                    continue;
+                }
+                if !header_drawn {
+                    if y + ROW_H * 2.0 > footer_y {
+                        break 'sections;
+                    }
+                    self.draw_label.color = dim;
+                    self.draw_label.draw_abs(cx, dvec2(left, y + 8.0), &title.to_uppercase());
+                    y += ROW_H;
+                    header_drawn = true;
+                }
+                if y + ROW_H > footer_y {
+                    break 'sections;
+                }
+                visible += 1;
+                let row_rect = Rect { pos: dvec2(rect.pos.x + 8.0, y), size: dvec2(rect.size.x - 16.0, ROW_H) };
+                if i == selected {
+                    self.draw_tab.tab = 0.0;
+                    self.draw_tab.color = line;
+                    self.draw_tab.draw_abs(cx, row_rect);
+                }
+                hits.push((row_rect, PanelHit::Select(i)));
+                let text_y = y + (ROW_H - 12.0) * 0.5;
+                self.draw_label.color = fg;
+                self.draw_label.draw_abs(cx, dvec2(left, text_y), row.label());
+                let mut label_w = self.text_width(cx, row.label());
+                if row.new_shells_only() {
+                    self.draw_label.color = dim;
+                    self.draw_label.draw_abs(cx, dvec2(left + label_w + 6.0, text_y), "new tabs");
+                    label_w += 6.0 + self.text_width(cx, "new tabs");
+                }
+                if row.is_toggle() {
+                    let on = row.value(&self.settings) == "On";
+                    let pill = Rect { pos: dvec2(right - 30.0, y + 5.0), size: dvec2(30.0, 14.0) };
+                    self.draw_tab.tab = 0.0;
+                    self.draw_tab.radius = 7.0;
+                    self.draw_tab.color = if on { accent } else { line };
+                    self.draw_tab.draw_abs(cx, pill);
+                    let knob_x = if on { pill.pos.x + 17.0 } else { pill.pos.x + 1.0 };
+                    self.draw_tab.radius = 6.0;
+                    self.draw_tab.color = if on { white } else { dim };
+                    self.draw_tab.draw_abs(cx, Rect { pos: dvec2(knob_x, pill.pos.y + 1.0), size: dvec2(12.0, 12.0) });
+                    let toggle = Rect { pos: dvec2(pill.pos.x - 6.0, y), size: dvec2(42.0, ROW_H) };
+                    hits.push((toggle, PanelHit::Step(i, 1)));
+                } else {
+                    let room = (right - 40.0 - (left + label_w + 16.0)).max(40.0);
+                    let value = self.fit(cx, &row.value(&self.settings), room);
+                    let vw = self.text_width(cx, &value);
+                    let next = Rect { pos: dvec2(right - 16.0, y), size: dvec2(20.0, ROW_H) };
+                    let prev = Rect { pos: dvec2(right - 16.0 - vw - 24.0, y), size: dvec2(20.0, ROW_H) };
+                    self.draw_label.color = if i == selected { fg } else { dim };
+                    self.draw_label.draw_abs(cx, dvec2(right - 20.0 - vw, text_y), &value);
+                    self.draw_icon.color = dim;
+                    self.draw_icon.draw_abs(cx, dvec2(prev.pos.x + 6.0, text_y + 1.0), ICON_PREV);
+                    self.draw_icon.draw_abs(cx, dvec2(next.pos.x + 6.0, text_y + 1.0), ICON_NEXT);
+                    hits.push((prev, PanelHit::Step(i, -1)));
+                    hits.push((next, PanelHit::Step(i, 1)));
+                }
+                y += ROW_H;
+            }
+        }
+
+        self.draw_tab.tab = 0.0;
+        self.draw_tab.color = line;
+        self.draw_tab.draw_abs(cx, Rect { pos: dvec2(left, footer_y), size: dvec2(right - left, 1.0) });
+        self.draw_label.color = dim;
+        let keys = "\u{2191}\u{2193} choose   \u{2190}\u{2192} change   Esc close";
+        self.draw_label.draw_abs(cx, dvec2(left, footer_y + 8.0), keys);
+        let file = tilde(&term_settings::path());
+        let file = self.fit(cx, &file, right - left - 60.0);
+        self.draw_label.draw_abs(cx, dvec2(left, footer_y + 26.0), &file);
+        let reset_w = self.text_width(cx, "Reset") + 16.0;
+        let reset = Rect { pos: dvec2(right - reset_w, footer_y + 18.0), size: dvec2(reset_w, 22.0) };
+        self.draw_tab.color = line;
+        self.draw_tab.draw_abs(cx, reset);
+        self.draw_label.color = fg;
+        self.draw_label.draw_abs(cx, dvec2(reset.pos.x + 8.0, reset.pos.y + 5.0), "Reset");
+        hits.push((reset, PanelHit::Reset));
+
+        if let Some(panel) = self.panel.as_mut() {
+            panel.rect = rect;
+            panel.hits = hits;
+            panel.visible = visible;
+        }
+    }
+
+    fn text_width(&self, cx: &mut Cx2d, text: &str) -> f64 {
+        self.draw_label
+            .prepare_single_line_run(cx, text)
+            .map_or(0.0, |run| run.width_in_lpxs as f64)
+    }
+
+    /// `text` cut with an ellipsis to fit `width`.
+    fn fit(&self, cx: &mut Cx2d, text: &str, width: f64) -> String {
+        if self.text_width(cx, text) <= width {
+            return text.to_owned();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut keep = chars.len();
+        while keep > 0 {
+            keep -= 1;
+            let candidate: String = chars[..keep].iter().collect::<String>() + "\u{2026}";
+            if self.text_width(cx, &candidate) <= width {
+                return candidate;
+            }
+        }
+        String::new()
+    }
+}
+
+impl TermTabsRef {
+    pub fn active_term(&self, cx: &mut Cx) -> WidgetRef {
+        self.borrow_mut().map(|mut tabs| tabs.active_term(cx)).unwrap_or_default()
+    }
+
+    pub fn set_tabs_enabled(&self, cx: &mut Cx, enabled: bool) {
+        if let Some(mut tabs) = self.borrow_mut() {
+            tabs.set_tabs_enabled(cx, enabled);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(code: KeyCode, control: bool, shift: bool, alt: bool) -> KeyEvent {
+        KeyEvent {
+            key_code: code,
+            modifiers: KeyModifiers { control, shift, alt, logo: false },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_tab_keys_map_to_commands() {
+        let t = |code, c, s, a, n| tab_command(&key(code, c, s, a), n);
+        assert_eq!(t(KeyCode::KeyT, true, true, false, 1), Some(TabCommand::New));
+        assert_eq!(t(KeyCode::KeyW, true, true, false, 1), Some(TabCommand::Close));
+        assert_eq!(t(KeyCode::Tab, true, false, false, 2), Some(TabCommand::Next));
+        assert_eq!(t(KeyCode::Tab, true, true, false, 2), Some(TabCommand::Previous));
+        assert_eq!(t(KeyCode::PageDown, true, false, false, 2), Some(TabCommand::Next));
+        assert_eq!(t(KeyCode::PageUp, true, false, false, 2), Some(TabCommand::Previous));
+        assert_eq!(t(KeyCode::Key3, false, false, true, 4), Some(TabCommand::Select(2)));
+        assert_eq!(t(KeyCode::Key9, false, false, true, 4), Some(TabCommand::Select(usize::MAX)));
+        assert_eq!(t(KeyCode::Comma, true, false, false, 1), Some(TabCommand::Settings));
+    }
+
+    #[test]
+    fn the_shell_keeps_its_own_keys() {
+        let t = |code, c, s, a, n| tab_command(&key(code, c, s, a), n);
+        assert_eq!(t(KeyCode::KeyT, true, false, false, 1), None, "Ctrl+T is the shell's (transpose)");
+        assert_eq!(t(KeyCode::KeyW, true, false, false, 1), None, "Ctrl+W is the shell's (kill word)");
+        assert_eq!(t(KeyCode::Key3, false, false, true, 1), None, "Meta+digit with a single tab");
+        assert_eq!(t(KeyCode::Tab, false, false, false, 2), None);
+        let mut cmd = key(KeyCode::KeyT, true, true, false);
+        cmd.modifiers.logo = true;
+        assert_eq!(tab_command(&cmd, 1), None);
+    }
+
+    #[test]
+    fn a_tab_is_named_by_its_program_or_its_directory() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/u".into());
+        let src = PathBuf::from(&home).join("src");
+        let p = TabTitle::Program;
+        let d = TabTitle::Directory;
+        assert_eq!(tab_label(p, "vim notes.md", Some("vim"), Some(&src), Some("zsh")), "vim notes.md");
+        assert_eq!(tab_label(p, "", Some("htop"), Some(&src), Some("zsh")), "htop");
+        assert_eq!(tab_label(p, "", None, Some(&src), Some("zsh")), "src");
+        assert_eq!(tab_label(p, "", None, Some(Path::new(&home)), None), "~");
+        assert_eq!(tab_label(d, "vim notes.md", Some("vim"), Some(&src), None), "src");
+        assert_eq!(tab_label(d, "", None, None, Some("zsh")), "zsh");
+        assert_eq!(tab_label(p, "  ", None, None, None), "shell");
+    }
+}

@@ -77,6 +77,28 @@ impl Session {
     /// PID of this session’s shell, for exact host activity relationships.
     pub fn child_pid(&self) -> i32 { self.pty.child_pid() }
 
+    /// The name of the job the shell is running in the foreground, `None`
+    /// while the shell sits at its prompt (or when the platform can't tell).
+    pub fn foreground_job(&self) -> Option<String> {
+        let pgrp = self.pty.foreground_pgrp()?;
+        if pgrp == self.child_pid() || self.exited {
+            return None;
+        }
+        crate::procinfo::name(pgrp)
+    }
+
+    /// The name of whatever holds the foreground: the job, else the shell.
+    pub fn foreground_name(&self) -> Option<String> {
+        let pgrp = self.pty.foreground_pgrp().unwrap_or_else(|| self.child_pid());
+        crate::procinfo::name(pgrp).or_else(|| crate::procinfo::name(self.child_pid()))
+    }
+
+    /// The shell's working directory, read from the process table: shells
+    /// that never report it with OSC 7 still get a new tab opened there.
+    pub fn shell_cwd(&self) -> Option<std::path::PathBuf> {
+        crate::procinfo::cwd(self.child_pid())
+    }
+
     pub fn spawn(
         cols: usize,
         rows: usize,
@@ -241,6 +263,36 @@ mod tests {
         assert!(
             done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
             "Session::drop blocked with the reader thread parked in read()"
+        );
+    }
+
+    /// A tab asks its session what runs in it (confirm-before-close, the
+    /// program title) and where the shell is (a new tab opens there).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_session_reports_its_foreground_job_and_cwd() {
+        let dir = std::env::temp_dir().canonicalize().unwrap();
+        let options = SpawnOptions { shell: Some("/bin/sh".into()), login: false, ..SpawnOptions::default() };
+        let mut session = Session::spawn_with(80, 24, Some(&dir), None, &options).expect("a pty session");
+        let wait_for = |session: &mut Session, want: &dyn Fn(&Session) -> bool| {
+            for _ in 0..100 {
+                session.drain();
+                if want(session) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            false
+        };
+        assert!(wait_for(&mut session, &|s| s.foreground_name().is_some()), "the shell is named");
+        assert_eq!(session.foreground_job(), None, "an idle shell runs no job");
+        assert_eq!(session.shell_cwd().map(|p| p.canonicalize().unwrap()), Some(dir));
+
+        session.write(b"sleep 30\n");
+        assert!(
+            wait_for(&mut session, &|s| s.foreground_job().as_deref() == Some("sleep")),
+            "the running job is reported: {:?}",
+            session.foreground_job()
         );
     }
 }

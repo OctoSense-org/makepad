@@ -10,6 +10,7 @@
 //!                      viewer app claims.
 
 use makepad_ai_services::port::{AiServicePort, PortEvent};
+use makepad_terminal::tabs::{TermTabsAction, TermTabsWidgetRefExt};
 use makepad_terminal::widget::{MpTerm, MpTermAction};
 pub use makepad_widgets;
 use makepad_widgets::*;
@@ -43,7 +44,7 @@ script_mod! {
                 pass +: { clear_color: vec4(0.0, 0.0, 0.0, 0.0) }
                 body +: {
                     keyboard_resize: true
-                    term := MpTerm{}
+                    tabs := TermTabs{}
                 }
             }
         }
@@ -104,7 +105,7 @@ pub struct App {
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         let args = parse_args(std::env::args().skip(1));
-        if let Some(mut term) = self.ui.widget(cx, ids!(term)).borrow_mut::<MpTerm>() {
+        if let Some(mut term) = self.term(cx).borrow_mut::<MpTerm>() {
             term.cwd = args.cwd.clone();
             if let Some(path) = &args.preview {
                 term.command = Some(preview_command(path));
@@ -115,6 +116,7 @@ impl MatchEvent for App {
         }
         if let Some(path) = &args.preview {
             self.preview = true;
+            self.ui.term_tabs(cx, ids!(tabs)).set_tabs_enabled(cx, false);
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -139,6 +141,11 @@ impl MatchEvent for App {
             let Some(wa) = action.as_widget_action() else {
                 continue;
             };
+            match wa.cast::<TermTabsAction>() {
+                // Ctrl+Shift+W on the last tab closes the window.
+                TermTabsAction::LastTabClosed => cx.quit(),
+                TermTabsAction::None => {}
+            }
             match wa.cast::<MpTermAction>() {
                 MpTermAction::TitleChanged(title) if !self.preview => {
                     self.ui.window(cx, ids!(main_window)).set_title(cx, &title);
@@ -153,10 +160,16 @@ impl MatchEvent for App {
 }
 
 impl App {
+    /// The selected tab's terminal.
+    fn term(&self, cx: &mut Cx) -> WidgetRef {
+        self.ui.term_tabs(cx, ids!(tabs)).active_term(cx)
+    }
+
     fn refresh_ai_context(&mut self, cx: &mut Cx) {
         let cwd = self
             .ui
-            .widget(cx, ids!(term))
+            .term_tabs(cx, ids!(tabs))
+            .active_term(cx)
             .borrow::<MpTerm>()
             .and_then(|term| term.cwd.clone());
         let Some(cwd) = cwd else {
@@ -201,7 +214,8 @@ impl App {
                 PortEvent::Call(call) => {
                     let result = self
                         .ui
-                        .widget(cx, ids!(term))
+                        .term_tabs(cx, ids!(tabs))
+                        .active_term(cx)
                         .borrow_mut::<MpTerm>()
                         .map(|mut term| ai::answer(&call, &mut *term))
                         .unwrap_or_else(|| {
@@ -230,7 +244,8 @@ impl App {
             WmEvent::PreviewFile { path } => {
                 let path = PathBuf::from(path);
                 self.preview = true;
-                if let Some(mut term) = self.ui.widget(cx, ids!(term)).borrow_mut::<MpTerm>() {
+                self.ui.term_tabs(cx, ids!(tabs)).set_tabs_enabled(cx, false);
+                if let Some(mut term) = self.term(cx).borrow_mut::<MpTerm>() {
                     term.restart_with(
                         cx,
                         path.parent().map(Path::to_path_buf),
@@ -246,7 +261,7 @@ impl App {
                 makepad_wm_api::set_title(cx, &title);
             }
             WmEvent::PreviewUnload => {
-                if let Some(mut term) = self.ui.widget(cx, ids!(term)).borrow_mut::<MpTerm>() {
+                if let Some(mut term) = self.term(cx).borrow_mut::<MpTerm>() {
                     term.unload(cx);
                 }
             }
@@ -263,6 +278,7 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         makepad_wm_theme::apply(vm);
         makepad_terminal::widget::script_mod(vm);
+        makepad_terminal::tabs::script_mod(vm);
         self::script_mod(vm)
     }
 

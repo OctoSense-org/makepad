@@ -593,6 +593,45 @@ impl MpTerm {
         cx.has_key_focus(self.area)
     }
 
+    /// Send the keyboard here (a tab was selected). Before its first frame
+    /// the terminal takes focus as it draws.
+    pub fn focus(&mut self, cx: &mut Cx) {
+        if !self.area.is_empty() {
+            cx.set_key_focus(self.area);
+        }
+        self.draw_bg.redraw(cx);
+    }
+
+    /// The job running in the foreground, `None` at the shell prompt.
+    pub fn foreground_job(&self) -> Option<String> {
+        self.session.as_ref().and_then(Session::foreground_job)
+    }
+
+    /// The name of the job, else the shell.
+    pub fn foreground_name(&self) -> Option<String> {
+        self.session.as_ref().and_then(Session::foreground_name)
+    }
+
+    /// Where the shell is: its OSC 7 report, else the process table.
+    pub fn current_dir(&self) -> Option<PathBuf> {
+        self.session
+            .as_ref()
+            .and_then(Session::shell_cwd)
+            .or_else(|| self.cwd.clone())
+    }
+
+    /// Whether the session ran and has ended.
+    pub fn has_exited(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.exited)
+    }
+
+    /// (background, foreground) of the colours in use, for chrome drawn
+    /// around the terminal (the tab bar).
+    pub fn chrome_colors(&self) -> Option<(Vec4f, Vec4f)> {
+        let (_, fg, bg, _) = self.resolved_colors()?;
+        Some((Self::rgb_to_vec4(bg, 1.0), Self::rgb_to_vec4(fg, 1.0)))
+    }
+
     /// Rows currently painted in the widget, or the last `lines` rows of
     /// scrollback plus the active grid. Used by the terminal's AI service;
     /// row text comes from the same cell content the renderer uses.

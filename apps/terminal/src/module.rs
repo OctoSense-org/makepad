@@ -2,7 +2,9 @@
 //! an isolate of its own (the OctoSense shell links it as a system app).
 //!
 //! `register` adds the terminal's widget family to the isolate the host
-//! prepared; `create` mints one `MpTerm{}` root there. Unlike a pure-UI
+//! prepared; `create` mints one `TermTabs{}` root there: the terminal with
+//! its own tabs and settings panel (`crate::tabs`), so a tile holds several
+//! shells without the window manager's help. Unlike a pure-UI
 //! module, each instance starts a login shell in a PTY and a thread that
 //! reads it (`session`), which is why it declares `process`. On macOS the
 //! PTY helper is the host executable itself (`pty_spawn::screen_helper`): an
@@ -12,6 +14,7 @@
 //! `run` types into a live, unsandboxed shell, and a host that ships the
 //! terminal by default does not hand that to it.
 
+use crate::tabs::TermTabs;
 use crate::widget::MpTerm;
 use makepad_ai_services::wire::{ServiceCall, ServiceManifest, ToolResult};
 use makepad_app_module::*;
@@ -33,6 +36,7 @@ impl AppModule for TerminalModule {
 
     fn register(&self, vm: &mut ScriptVm) {
         crate::widget::script_mod(vm);
+        crate::tabs::script_mod(vm);
     }
 
     fn open_schema(&self) -> OpenSchema {
@@ -42,7 +46,7 @@ impl AppModule for TerminalModule {
     fn create(&self, vm: &mut ScriptVm, _open: ValidatedOpen, _handles: InstanceHandles) -> InstanceParts {
         let value = script_eval!(vm, {
             use mod.widgets.*
-            MpTerm {}
+            TermTabs {}
         });
         let root = WidgetRef::script_from_value(vm, value);
         InstanceParts {
@@ -69,10 +73,12 @@ impl ServiceExecutor for TerminalExecutor {
         crate::ai::read_only_manifest()
     }
 
-    fn execute(&mut self, _cx: &mut Cx, call: &ServiceCall) -> ExecOutcome {
-        let result = self
-            .root
-            .borrow_mut::<MpTerm>()
+    fn execute(&mut self, cx: &mut Cx, call: &ServiceCall) -> ExecOutcome {
+        // The assistant reads the selected tab.
+        let term = self.root.borrow_mut::<TermTabs>().map(|mut tabs| tabs.active_term(cx));
+        let result = term
+            .as_ref()
+            .and_then(|term| term.borrow_mut::<MpTerm>())
             .map(|mut term| crate::ai::answer_read_only(call, &mut *term))
             .unwrap_or_else(|| ToolResult::unavailable(&call.call_id, "the terminal is not open"));
         ExecOutcome::Done(result)

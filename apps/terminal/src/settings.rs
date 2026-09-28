@@ -1,6 +1,8 @@
-//! The terminal's settings: one file shared by every terminal window of a
-//! person, standalone or hosted (`<makepad home>/terminal/settings.conf`;
-//! `MAKEPAD_HOME` redirects the home, e.g. in tests).
+//! The terminal's settings: one file shared by every terminal window and
+//! tab under one Makepad home (`<makepad home>/terminal/settings.conf`,
+//! normally `~/.makepad`). A host can move the home: the OctoSense shell
+//! points it at its own (`~/.octosense`), so its terminals keep their
+//! settings there. `MAKEPAD_HOME` redirects it in tests too.
 //!
 //! The format is `key = value` lines with `#` comments. Unknown keys and
 //! values that do not parse are ignored (the default stays), so an older
@@ -36,7 +38,7 @@ pub enum BellStyle {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NewTabCwd {
-    /// The directory the focused tab's shell reported last (OSC 7).
+    /// The focused tab's shell directory.
     Inherit,
     Home,
 }
@@ -47,6 +49,13 @@ pub enum TabTitle {
     Program,
     /// Always the working directory.
     Directory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabBar {
+    /// Shown once there is more than one tab.
+    Auto,
+    Always,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -77,6 +86,7 @@ pub struct Settings {
     /// Ask before closing a tab whose shell is running another program.
     pub confirm_close_running: bool,
     pub tab_title: TabTitle,
+    pub tab_bar: TabBar,
 }
 
 pub const FONT_SIZE_RANGE: (f64, f64) = (6.0, 48.0);
@@ -103,6 +113,7 @@ impl Default for Settings {
             new_tab_cwd: NewTabCwd::Inherit,
             confirm_close_running: true,
             tab_title: TabTitle::Program,
+            tab_bar: TabBar::Auto,
         }
     }
 }
@@ -201,6 +212,13 @@ impl Settings {
                         _ => s.tab_title,
                     }
                 }
+                "tab-bar" => {
+                    s.tab_bar = match value {
+                        "auto" => TabBar::Auto,
+                        "always" => TabBar::Always,
+                        _ => s.tab_bar,
+                    }
+                }
                 _ => {}
             }
         }
@@ -265,6 +283,14 @@ impl Settings {
             match self.tab_title {
                 TabTitle::Program => "program",
                 TabTitle::Directory => "directory",
+            }
+            .into(),
+        );
+        line(
+            "tab-bar",
+            match self.tab_bar {
+                TabBar::Auto => "auto",
+                TabBar::Always => "always",
             }
             .into(),
         );
@@ -393,6 +419,7 @@ mod tests {
             new_tab_cwd: NewTabCwd::Home,
             confirm_close_running: false,
             tab_title: TabTitle::Directory,
+            tab_bar: TabBar::Always,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(Settings::parse(&Settings::default().to_text()), Settings::default());
