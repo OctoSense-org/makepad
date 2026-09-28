@@ -1060,10 +1060,15 @@ impl MpTerm {
                     - g.rasterized.atlas_image_bounds.size.height as f32 * 0.5)
                     * font_size
                     / g.rasterized.dpxs_per_em;
+                // A glyph starts inside its own cells whatever the font
+                // says (some proportional CJK fonts report pen offsets far
+                // past one character).
+                let x_offset = (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit;
+                let x_offset = if x_offset.abs() > available { 0.0 } else { x_offset };
                 CachedGlyph {
                     rasterized: g.rasterized,
                     font_size_in_lpxs: font_size * fit,
-                    x_offset_in_lpxs: (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit,
+                    x_offset_in_lpxs: x_offset,
                     y_offset_in_lpxs: center_y * (1.0 - fit),
                 }
             })
