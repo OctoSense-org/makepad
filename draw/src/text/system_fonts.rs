@@ -402,9 +402,12 @@ fn copy_out(face: &Face, cache_dir: &Path) -> Option<PathBuf> {
 
 
 /// Whether system fonts back up the bundled ones (`MAKEPAD_SYSTEM_FONTS=0`
-/// turns it off; never on the web, which has no font files to read).
+/// turns it off; never on the web, which has no font files to read, nor in
+/// this crate's unit tests, whose layouts must not depend on the host's
+/// fonts).
 pub fn fallback_enabled() -> bool {
-    !cfg!(target_arch = "wasm32") && std::env::var("MAKEPAD_SYSTEM_FONTS").map_or(true, |v| v != "0")
+    !cfg!(any(target_arch = "wasm32", test))
+        && std::env::var("MAKEPAD_SYSTEM_FONTS").map_or(true, |v| v != "0")
 }
 
 /// The platform's fonts to fall back to, most wanted first: its CJK font,
@@ -474,24 +477,36 @@ fn fallback_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
         for name in ["HarmonyOS_Sans_SC.ttf", "NotoSansCJK-Regular.ttc", "NotoSansSC-Regular.otf", "DroidSansFallback.ttf"] {
             push(dir.join(name), SC);
         }
-        // One regular face per script the platform ships.
-        let mut scripts: Vec<PathBuf> = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                (n.starts_with("Noto") || n.starts_with("HarmonyOS_Sans"))
-                    && (n.contains("-Regular.") || n.contains("-VF."))
-                    && !n.contains("Emoji")
-                    && !n.contains("CJK")
-                    && is_font_file(p)
-            })
-            .collect();
-        scripts.sort();
-        for path in scripts.into_iter().take(200) {
-            push(path, ANY);
+        // The major scripts, UI variants first. Not every font the platform
+        // ships (about 160 on Android): each one here is parsed once when
+        // the first text is laid out.
+        for name in [
+            "NotoNaskhArabicUI-Regular.ttf",
+            "NotoNaskhArabic-Regular.ttf",
+            "NotoSansHebrew-Regular.ttf",
+            "NotoSansThaiUI-Regular.ttf",
+            "NotoSansThai-Regular.ttf",
+            "NotoSansDevanagariUI-VF.ttf",
+            "NotoSansDevanagari-VF.ttf",
+            "NotoSansBengaliUI-VF.ttf",
+            "NotoSansTamilUI-VF.ttf",
+            "NotoSansTeluguUI-VF.ttf",
+            "NotoSansKannadaUI-VF.ttf",
+            "NotoSansMalayalamUI-VF.ttf",
+            "NotoSansGujaratiUI-Regular.ttf",
+            "NotoSansGurmukhiUI-VF.ttf",
+            "NotoSansSinhalaUI-VF.ttf",
+            "NotoSansKhmerUI-VF.ttf",
+            "NotoSansLaoUI-Regular.ttf",
+            "NotoSansMyanmarUI-Regular.otf",
+            "NotoSansEthiopic-VF.ttf",
+            "NotoSansArmenian-VF.ttf",
+            "NotoSansGeorgian-VF.ttf",
+            "NotoSansSymbols-Regular-Subsetted.ttf",
+            "NotoSansSymbols-Regular-Subsetted2.ttf",
+            "NotoSansMath-Regular.otf",
+        ] {
+            push(dir.join(name), ANY);
         }
     } else if cfg!(windows) {
         if let Some(windir) = std::env::var_os("WINDIR") {
