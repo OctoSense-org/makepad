@@ -36,6 +36,7 @@ pub enum Row {
     Profile,
     SaveProfile,
     DeleteProfile,
+    ExternalControl,
 }
 
 /// What a row is: an on/off switch, a value stepped with the arrows (and,
@@ -84,6 +85,7 @@ pub const SECTIONS: &[(&str, &[Row])] = &[
     ),
     ("Tabs", &[Row::TabBar, Row::NewTabDir, Row::TabTitle, Row::ConfirmClose]),
     ("Profiles", &[Row::Profile, Row::SaveProfile, Row::DeleteProfile]),
+    ("Automation", &[Row::ExternalControl]),
 ];
 
 /// Every row in panel order (keyboard navigation walks this).
@@ -147,7 +149,12 @@ pub fn filter_choices(choices: &[Choice], filter: &str) -> Vec<Choice> {
 impl Row {
     pub fn kind(self) -> RowKind {
         match self {
-            Row::CursorBlink | Row::OptionAsMeta | Row::CopyOnSelect | Row::LoginShell | Row::ConfirmClose => {
+            Row::CursorBlink
+            | Row::OptionAsMeta
+            | Row::CopyOnSelect
+            | Row::LoginShell
+            | Row::ConfirmClose
+            | Row::ExternalControl => {
                 RowKind::Toggle
             }
             Row::SaveProfile | Row::DeleteProfile => RowKind::Action,
@@ -231,6 +238,7 @@ impl Row {
             Row::Profile => "Profile",
             Row::SaveProfile => "Save as profile\u{2026}",
             Row::DeleteProfile => "Delete profile",
+            Row::ExternalControl => "Allow terminal-ctl",
             Row::Opacity => "Background opacity",
             Row::FontSize => "Font size",
             Row::LineHeight => "Line height",
@@ -280,6 +288,7 @@ impl Row {
                 }
             }
             Row::SaveProfile | Row::DeleteProfile => String::new(),
+            Row::ExternalControl => yes(s.external_control),
             Row::Theme => {
                 if s.theme == THEME_DESKTOP {
                     "Desktop".into()
@@ -346,6 +355,7 @@ impl Row {
         let up = dir > 0;
         match self {
             Row::Font | Row::CjkFont | Row::Profile | Row::SaveProfile | Row::DeleteProfile => {}
+            Row::ExternalControl => s.external_control = !s.external_control,
             Row::Theme => {
                 let mut ids = vec![THEME_DESKTOP];
                 ids.extend(themes::SCHEMES.iter().map(|scheme| scheme.id));
@@ -396,7 +406,7 @@ mod tests {
     #[test]
     fn every_row_is_listed_once() {
         let rows = rows();
-        assert_eq!(rows.len(), 22);
+        assert_eq!(rows.len(), 23);
         for (i, row) in rows.iter().enumerate() {
             assert!(!rows[i + 1..].contains(row), "{row:?} twice");
         }

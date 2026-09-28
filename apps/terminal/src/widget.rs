@@ -690,6 +690,12 @@ impl MpTerm {
             .or_else(|| self.cwd.clone())
     }
 
+    /// Paste `text` the way a person's paste arrives (bracketed when the
+    /// program asked for that).
+    pub fn ai_paste(&mut self, text: &str) -> bool {
+        self.paste_bytes(text)
+    }
+
     /// Whether the session ran and has ended.
     pub fn has_exited(&self) -> bool {
         self.session.as_ref().is_some_and(|session| session.exited)

@@ -23,6 +23,11 @@ path = "src/lib.rs"
 name = "terminal"
 path = "src/main.rs"
 
+# The client of the terminal's control socket (src/control.rs).
+[[bin]]
+name = "terminal-ctl"
+path = "src/bin/terminal-ctl.rs"
+
 [dependencies]
 makepad-widgets = { path = "../../widgets" }
 makepad-ai-services = { path = "../../libs/ai/services" }

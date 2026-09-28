@@ -101,6 +101,9 @@ pub struct Settings {
     /// The profile these settings were loaded from or saved as; empty when
     /// none. Only a label: changing a setting does not touch the profile.
     pub profile: String,
+    /// Other programs of this user may list, read and type into panes
+    /// (`crate::control`, `terminal-ctl`).
+    pub external_control: bool,
 }
 
 pub const FONT_SIZE_RANGE: (f64, f64) = (6.0, 48.0);
@@ -131,6 +134,7 @@ impl Default for Settings {
             tab_title: TabTitle::Program,
             tab_bar: TabBar::Auto,
             profile: String::new(),
+            external_control: false,
         }
     }
 }
@@ -233,6 +237,7 @@ impl Settings {
                         _ => s.tab_title,
                     }
                 }
+                "external-control" => s.external_control = parse_bool(value).unwrap_or(s.external_control),
                 "profile" if value.is_empty() || valid_profile_name(value) => s.profile = value.to_string(),
                 "tab-bar" => {
                     s.tab_bar = match value {
@@ -321,6 +326,7 @@ impl Settings {
             }
             .into(),
         );
+        line("external-control", yes(self.external_control).into());
         line("profile", self.profile.clone());
         out
     }
@@ -513,6 +519,7 @@ mod tests {
             tab_title: TabTitle::Directory,
             tab_bar: TabBar::Always,
             profile: "Work".into(),
+            external_control: true,
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(Settings::parse(&Settings::default().to_text()), Settings::default());

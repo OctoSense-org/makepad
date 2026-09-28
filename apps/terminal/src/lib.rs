@@ -1,8 +1,11 @@
 //! terminal: terminal emulator for Makepad. See Cargo.toml for provenance.
 
+pub mod agent;
 pub mod ai;
+pub mod control;
 pub mod fonts;
 pub mod module;
+pub mod panes;
 pub mod procinfo;
 pub mod pty;
 // The platform's own module, not a second copy by source path: `Cx::pre_start`

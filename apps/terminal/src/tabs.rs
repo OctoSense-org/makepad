@@ -25,7 +25,9 @@ use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
 
 use crate::settings::{self as term_settings, NewTabCwd, Settings, TabBar, TabTitle};
+use crate::panes::{self, Dir, Divider, Node};
 use crate::settings_panel::{self, Choice, Row, RowKind};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::widget::{MpTerm, MpTermAction};
 
 script_mod! {
@@ -67,6 +69,7 @@ script_mod! {
             color: #xa9b1d6
         }
         draw_panel +: { color: #x1f2335 }
+        draw_divider +: { color: #x16161e }
         draw_heading +: {
             text_style: theme.font_bold{ font_size: 10.5 }
             color: #xc0caf5
@@ -107,6 +110,13 @@ pub enum TabCommand {
     /// 0-based; `usize::MAX` is the last tab.
     Select(usize),
     Settings,
+    /// Split the focused pane: side by side, or stacked.
+    SplitRight,
+    SplitDown,
+    /// Move to the pane in that direction.
+    Focus(Dir),
+    /// Show only the focused pane (again: all of them).
+    Zoom,
 }
 
 /// The tab command `key` asks for. `tabs` is how many are open: Alt+digit
@@ -125,6 +135,13 @@ pub fn tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
             KeyCode::PageDown if !m.shift => return Some(TabCommand::Next),
             KeyCode::PageUp if !m.shift => return Some(TabCommand::Previous),
             KeyCode::Comma if !m.shift => return Some(TabCommand::Settings),
+            KeyCode::KeyD if m.shift => return Some(TabCommand::SplitRight),
+            KeyCode::KeyE if m.shift => return Some(TabCommand::SplitDown),
+            KeyCode::KeyZ if m.shift => return Some(TabCommand::Zoom),
+            KeyCode::ArrowLeft if m.shift => return Some(TabCommand::Focus(Dir::Left)),
+            KeyCode::ArrowRight if m.shift => return Some(TabCommand::Focus(Dir::Right)),
+            KeyCode::ArrowUp if m.shift => return Some(TabCommand::Focus(Dir::Up)),
+            KeyCode::ArrowDown if m.shift => return Some(TabCommand::Focus(Dir::Down)),
             _ => {}
         }
     }
@@ -187,26 +204,85 @@ pub fn tab_label(mode: TabTitle, osc: &str, job: Option<&str>, dir: Option<&Path
     label.or_else(|| shell.map(str::to_owned)).unwrap_or_else(|| "shell".into())
 }
 
-struct Tab {
-    term: WidgetRef,
+/// Pane ids are unique in the process: the control socket names panes by
+/// them (`crate::control`).
+static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One terminal in a tab.
+pub(crate) struct Pane {
+    pub(crate) id: u64,
+    pub(crate) term: WidgetRef,
     /// The program's own title (OSC 0/2); empty when it set none.
-    osc_title: String,
+    pub(crate) osc_title: String,
     /// Polled: the foreground job (None at the prompt), the shell's name
     /// and its directory.
-    job: Option<String>,
-    shell: Option<String>,
-    dir: Option<PathBuf>,
-    /// Rang the bell while in the background.
+    pub(crate) job: Option<String>,
+    pub(crate) shell: Option<String>,
+    pub(crate) dir: Option<PathBuf>,
+    /// Rang the bell while not in view.
     bell: bool,
+    /// The screen at the last poll, and when it last changed (an agent
+    /// printing is working).
+    screen_hash: u64,
+    changed_at: Option<std::time::Instant>,
 }
 
-impl Tab {
-    fn label(&self, mode: TabTitle) -> String {
+impl Pane {
+    pub(crate) fn label(&self, mode: TabTitle) -> String {
         tab_label(mode, &self.osc_title, self.job.as_deref(), self.dir.as_deref(), self.shell.as_deref())
     }
 
-    fn with_term<R>(&self, f: impl FnOnce(&mut MpTerm) -> R) -> Option<R> {
+    pub(crate) fn with_term<R>(&self, f: impl FnOnce(&mut MpTerm) -> R) -> Option<R> {
         self.term.borrow_mut::<MpTerm>().map(|mut term| f(&mut term))
+    }
+}
+
+/// A tab: one or more panes, split in a tree.
+pub(crate) struct Tab {
+    pub(crate) panes: Vec<Pane>,
+    tree: Node,
+    pub(crate) focused: u64,
+    /// Only the focused pane is shown.
+    zoomed: bool,
+}
+
+impl Tab {
+    fn new(pane: Pane) -> Tab {
+        Tab { tree: Node::Leaf(pane.id), focused: pane.id, zoomed: false, panes: vec![pane] }
+    }
+
+    pub(crate) fn focused_pane(&self) -> &Pane {
+        self.panes.iter().find(|p| p.id == self.focused).unwrap_or(&self.panes[0])
+    }
+
+    fn pane_mut(&mut self, id: u64) -> Option<&mut Pane> {
+        self.panes.iter_mut().find(|p| p.id == id)
+    }
+
+    fn label(&self, mode: TabTitle) -> String {
+        let label = self.focused_pane().label(mode);
+        if self.panes.len() > 1 {
+            format!("{label} \u{00b7} {}", self.panes.len())
+        } else {
+            label
+        }
+    }
+
+    fn bell(&self) -> bool {
+        self.panes.iter().any(|p| p.bell)
+    }
+
+    fn with_term<R>(&self, f: impl FnOnce(&mut MpTerm) -> R) -> Option<R> {
+        self.focused_pane().with_term(f)
+    }
+
+    /// The panes in view and where, within `body`.
+    fn layout(&self, body: Rect) -> Vec<(u64, Rect)> {
+        if self.zoomed || self.panes.len() == 1 {
+            vec![(self.focused, body)]
+        } else {
+            self.tree.layout(body)
+        }
     }
 }
 
@@ -224,6 +300,8 @@ enum BarHit {
 /// A close waiting for the person to confirm: the tab runs `job`.
 struct PendingClose {
     tab: usize,
+    /// One pane of the tab, or (None) the whole tab.
+    pane: Option<u64>,
     job: String,
 }
 
@@ -252,6 +330,16 @@ pub struct TermTabs {
     draw_panel: DrawColor,
     #[live]
     draw_heading: DrawText,
+    #[live]
+    draw_divider: DrawColor,
+    /// The selected tab's dividers and body, from the last draw.
+    #[rust]
+    dividers: Vec<Divider>,
+    #[rust]
+    body: Rect,
+    /// A divider being dragged.
+    #[rust]
+    drag: Option<Divider>,
     #[live(30.0)]
     bar_height: f64,
 
@@ -262,8 +350,6 @@ pub struct TermTabs {
     tabs: Vec<Tab>,
     #[rust]
     active: usize,
-    #[rust]
-    next_tab_id: u64,
     /// Tabs off: a `--preview` pager is one job in one window.
     #[rust(true)]
     tabs_enabled: bool,
@@ -416,7 +502,7 @@ impl TermTabs {
         if self.tabs.is_empty() {
             self.open_tab(cx, None);
         }
-        self.tabs.get(self.active).map(|tab| tab.term.clone()).unwrap_or_default()
+        self.tabs.get(self.active).map(|tab| tab.focused_pane().term.clone()).unwrap_or_default()
     }
 
     /// Turn the tab bar and its keys off (a preview window) or on.
@@ -437,15 +523,22 @@ impl TermTabs {
     pub fn run_command(&mut self, cx: &mut Cx, command: TabCommand) {
         match command {
             TabCommand::New => {
-                let cwd = match self.settings.new_tab_cwd {
-                    NewTabCwd::Inherit => self.tabs.get(self.active).and_then(|tab| {
-                        tab.with_term(|term| term.current_dir()).flatten().or_else(|| tab.dir.clone())
-                    }),
-                    NewTabCwd::Home => std::env::var_os("HOME").map(PathBuf::from),
-                };
+                let cwd = self.new_cwd();
                 self.open_tab(cx, cwd);
             }
-            TabCommand::Close => self.request_close(cx, self.active),
+            TabCommand::Close => {
+                let pane = self.tabs.get(self.active).filter(|t| t.panes.len() > 1).map(|t| t.focused);
+                self.request_close(cx, self.active, pane)
+            }
+            TabCommand::SplitRight => self.split(cx, true),
+            TabCommand::SplitDown => self.split(cx, false),
+            TabCommand::Focus(dir) => self.focus_towards(cx, dir),
+            TabCommand::Zoom => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.zoomed = !tab.zoomed && tab.panes.len() > 1;
+                }
+                self.refresh(cx);
+            }
             TabCommand::Next if self.tabs.len() > 1 => self.select(cx, (self.active + 1) % self.tabs.len()),
             TabCommand::Previous if self.tabs.len() > 1 => {
                 self.select(cx, (self.active + self.tabs.len() - 1) % self.tabs.len())
@@ -458,22 +551,128 @@ impl TermTabs {
         }
     }
 
-    fn open_tab(&mut self, cx: &mut Cx, cwd: Option<PathBuf>) {
+    /// Where a new tab or pane starts: the focused pane's directory, or
+    /// home, as the settings say.
+    fn new_cwd(&self) -> Option<PathBuf> {
+        match self.settings.new_tab_cwd {
+            NewTabCwd::Inherit => self.tabs.get(self.active).and_then(|tab| {
+                let pane = tab.focused_pane();
+                pane.with_term(|term| term.current_dir()).flatten().or_else(|| pane.dir.clone())
+            }),
+            NewTabCwd::Home => std::env::var_os("HOME").map(PathBuf::from),
+        }
+    }
+
+    fn new_pane(&mut self, cx: &mut Cx, cwd: Option<PathBuf>) -> Option<Pane> {
         let Some(template) = self.template.as_ref() else {
             error!("TermTabs has no `term` template");
-            return;
+            return None;
         };
         let value: ScriptValue = template.as_object().into();
         let term = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
         if let Some(mut t) = term.borrow_mut::<MpTerm>() {
             t.cwd = cwd.clone();
         }
-        self.next_tab_id += 1;
-        cx.widget_tree_insert_child(self.uid, LiveId(self.next_tab_id), term.clone());
-        let tab = Tab { term, osc_title: String::new(), job: None, shell: None, dir: cwd, bell: false };
+        let id = NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed);
+        cx.widget_tree_insert_child(self.uid, LiveId(id), term.clone());
+        Some(Pane {
+            id,
+            term,
+            osc_title: String::new(),
+            job: None,
+            shell: None,
+            dir: cwd,
+            bell: false,
+            screen_hash: 0,
+            changed_at: None,
+        })
+    }
+
+    fn open_tab(&mut self, cx: &mut Cx, cwd: Option<PathBuf>) {
+        let Some(pane) = self.new_pane(cx, cwd) else {
+            return;
+        };
         let at = if self.tabs.is_empty() { 0 } else { self.active + 1 };
-        self.tabs.insert(at, tab);
+        self.tabs.insert(at, Tab::new(pane));
         self.select(cx, at);
+    }
+
+    /// Split the focused pane; the new pane takes the keyboard.
+    fn split(&mut self, cx: &mut Cx, side_by_side: bool) {
+        if self.tabs.is_empty() {
+            return;
+        }
+        let cwd = self.new_cwd();
+        let Some(pane) = self.new_pane(cx, cwd) else {
+            return;
+        };
+        let tab = &mut self.tabs[self.active];
+        let (at, id) = (tab.focused, pane.id);
+        tab.tree.split(at, id, side_by_side);
+        tab.panes.push(pane);
+        tab.focused = id;
+        tab.zoomed = false;
+        self.report_title(cx);
+        self.refresh(cx);
+    }
+
+    fn focus_pane(&mut self, cx: &mut Cx, id: u64) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if let Some(pane) = tab.pane_mut(id) {
+            pane.bell = false;
+            pane.with_term(|term| term.focus(cx));
+            tab.focused = id;
+        }
+        self.report_title(cx);
+        self.refresh(cx);
+    }
+
+    fn focus_towards(&mut self, cx: &mut Cx, dir: Dir) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if tab.zoomed {
+            return;
+        }
+        if let Some(id) = panes::neighbour(&tab.tree.layout(self.body), tab.focused, dir) {
+            self.focus_pane(cx, id);
+        }
+    }
+
+    /// Close one pane; the last pane of a tab closes the tab.
+    fn close_pane(&mut self, cx: &mut Cx, index: usize, id: u64) {
+        let Some(tab) = self.tabs.get_mut(index) else {
+            return;
+        };
+        if tab.panes.len() <= 1 {
+            self.close(cx, index);
+            return;
+        }
+        self.pending_close = None;
+        let old = tab.layout(self.body);
+        tab.panes.retain(|p| p.id != id);
+        crate::control::forget(id);
+        if let Some(tree) = std::mem::replace(&mut tab.tree, Node::Leaf(0)).remove(id) {
+            tab.tree = tree;
+        }
+        tab.zoomed = false;
+        cx.widget_tree_mark_dirty(self.uid);
+        if tab.focused == id {
+            // The keyboard goes to a neighbour, else the first pane left.
+            let next = [Dir::Left, Dir::Up, Dir::Right, Dir::Down]
+                .into_iter()
+                .find_map(|dir| panes::neighbour(&old, id, dir))
+                .filter(|n| tab.panes.iter().any(|p| p.id == *n))
+                .unwrap_or(tab.panes[0].id);
+            if index == self.active {
+                self.focus_pane(cx, next);
+            } else {
+                tab.focused = next;
+            }
+        }
+        self.refresh(cx);
     }
 
     fn select(&mut self, cx: &mut Cx, index: usize) {
@@ -482,24 +681,34 @@ impl TermTabs {
         }
         if index != self.active {
             if let Some(old) = self.tabs.get(self.active) {
-                old.with_term(|term| term.cancel_gestures(cx));
+                for pane in &old.panes {
+                    pane.with_term(|term| term.cancel_gestures(cx));
+                }
             }
         }
         self.active = index;
         let tab = &mut self.tabs[index];
-        tab.bell = false;
+        for pane in &mut tab.panes {
+            pane.bell = false;
+        }
         tab.with_term(|term| term.focus(cx));
         self.report_title(cx);
-        self.redraw(cx);
+        self.refresh(cx);
     }
 
-    fn request_close(&mut self, cx: &mut Cx, index: usize) {
+    /// Close a tab, or one pane of it, asking first while a job runs there.
+    fn request_close(&mut self, cx: &mut Cx, index: usize, pane: Option<u64>) {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
         if self.settings.confirm_close_running {
-            if let Some(job) = tab.with_term(|term| term.foreground_job()).flatten() {
-                self.pending_close = Some(PendingClose { tab: index, job });
+            let job = tab
+                .panes
+                .iter()
+                .filter(|p| pane.is_none_or(|id| p.id == id))
+                .find_map(|p| p.with_term(|term| term.foreground_job()).flatten());
+            if let Some(job) = job {
+                self.pending_close = Some(PendingClose { tab: index, pane, job });
                 if index != self.active {
                     self.select(cx, index);
                 }
@@ -507,7 +716,14 @@ impl TermTabs {
                 return;
             }
         }
-        self.close(cx, index);
+        self.finish_close(cx, index, pane);
+    }
+
+    fn finish_close(&mut self, cx: &mut Cx, index: usize, pane: Option<u64>) {
+        match pane {
+            Some(id) => self.close_pane(cx, index, id),
+            None => self.close(cx, index),
+        }
     }
 
     fn close(&mut self, cx: &mut Cx, index: usize) {
@@ -517,6 +733,9 @@ impl TermTabs {
         self.pending_close = None;
         // Dropping the terminal drops its session: the shell and its jobs
         // get SIGHUP'd with the PTY.
+        for pane in &self.tabs[index].panes {
+            crate::control::forget(pane.id);
+        }
         self.tabs.remove(index);
         cx.widget_tree_mark_dirty(self.uid);
         if self.tabs.is_empty() {
@@ -550,6 +769,7 @@ impl TermTabs {
         if generation != self.settings_gen {
             self.settings_gen = generation;
             self.settings = term_settings::current();
+            crate::control::set_enabled(self.settings.external_control);
             self.refresh(cx);
         }
     }
@@ -558,22 +778,135 @@ impl TermTabs {
     fn poll_tabs(&mut self, cx: &mut Cx) {
         let mut changed = false;
         for tab in &mut self.tabs {
-            let facts = tab.with_term(|term| (term.foreground_job(), term.foreground_name(), term.current_dir()));
-            if let Some((job, name, dir)) = facts {
-                let shell = if job.is_none() { name } else { tab.shell.clone() };
-                if (&job, &shell, &dir) != (&tab.job, &tab.shell, &tab.dir) {
-                    tab.job = job;
-                    tab.shell = shell;
-                    if dir.is_some() {
-                        tab.dir = dir;
+            for pane in &mut tab.panes {
+                let facts = pane.with_term(|term| (term.foreground_job(), term.foreground_name(), term.current_dir()));
+                if let Some((job, name, dir)) = facts {
+                    let shell = if job.is_none() { name } else { pane.shell.clone() };
+                    if (&job, &shell, &dir) != (&pane.job, &pane.shell, &pane.dir) {
+                        pane.job = job;
+                        pane.shell = shell;
+                        if dir.is_some() {
+                            pane.dir = dir;
+                        }
+                        changed = true;
                     }
-                    changed = true;
                 }
             }
         }
         if changed {
             self.report_title(cx);
             self.redraw(cx);
+        }
+        if self.settings.external_control {
+            self.publish_panes();
+        }
+    }
+
+    /// A pane's agent and state, from its program, title and screen.
+    fn pane_state(pane: &mut Pane) -> (Option<&'static str>, crate::agent::State) {
+        use std::hash::{Hash, Hasher};
+        let (rows, exited) = pane
+            .with_term(|term| (term.ai_screen_rows(None).map(|(rows, _, _)| rows).unwrap_or_default(), term.has_exited()))
+            .unwrap_or_default();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        rows.hash(&mut hasher);
+        let hash = hasher.finish();
+        if hash != pane.screen_hash {
+            if pane.screen_hash != 0 {
+                pane.changed_at = Some(std::time::Instant::now());
+            }
+            pane.screen_hash = hash;
+        }
+        let since_change = pane.changed_at.map(|at| at.elapsed());
+        let agent = crate::agent::detect_agent(pane.job.as_deref(), &pane.osc_title);
+        let state = crate::agent::detect_state(agent, pane.job.as_deref(), exited, &rows, since_change);
+        (agent, state)
+    }
+
+    /// Tell the control socket about every pane.
+    fn publish_panes(&mut self) {
+        let mode = self.settings.tab_title;
+        let active = self.active;
+        let mut infos = Vec::new();
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let focused = tab.focused;
+            for pane in &mut tab.panes {
+                let (agent, state) = Self::pane_state(pane);
+                infos.push(crate::control::PaneInfo {
+                    pane: pane.id,
+                    tab: index,
+                    title: pane.label(mode),
+                    cwd: pane.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
+                    program: pane.job.clone().or_else(|| pane.shell.clone()).unwrap_or_default(),
+                    agent,
+                    state: state.as_str(),
+                    focused: index == active && pane.id == focused,
+                });
+            }
+        }
+        crate::control::publish(infos);
+    }
+
+    /// Answer the control socket's requests for this widget's panes.
+    fn answer_control(&mut self, cx: &mut Cx) {
+        use crate::control::{err, ok, Request};
+        use makepad_strict_json::{s, Value};
+        let ids: Vec<u64> = self.tabs.iter().flat_map(|t| t.panes.iter().map(|p| p.id)).collect();
+        for (request, reply) in crate::control::take_requests(|id| ids.contains(&id)) {
+            let Some(pane) = self.tabs.iter_mut().flat_map(|t| t.panes.iter_mut()).find(|p| p.id == request.pane()) else {
+                let _ = reply.send(err("no such pane"));
+                continue;
+            };
+            let answer = match request {
+                Request::Read { lines, .. } => {
+                    // The screen (lines = 0), or its last `lines` lines of
+                    // text and scrollback: blank rows below the output are
+                    // not lines.
+                    let recent = (lines > 0).then_some(lines + 1000);
+                    match pane.with_term(|term| term.ai_screen_rows(recent)).flatten() {
+                        Some((mut rows, cursor_row, cursor_col)) => {
+                            while rows.last().is_some_and(|r| r.trim().is_empty()) {
+                                rows.pop();
+                            }
+                            if lines > 0 {
+                                rows.drain(..rows.len().saturating_sub(lines));
+                            }
+                            ok(vec![
+                            ("text", s(rows.join("\n").trim_end())),
+                            ("cursor", Value::Arr(vec![Value::Int(cursor_row as i64), Value::Int(cursor_col as i64)])),
+                            ])
+                        }
+                        None => err("the pane has no session"),
+                    }
+                }
+                Request::Prompt { text, submit, force, .. } => {
+                    let (agent, state) = Self::pane_state(pane);
+                    if let Some(why) = crate::agent::refuse_prompt(&text) {
+                        err(why)
+                    } else if state == crate::agent::State::Blocked && !force {
+                        err("an approval or question is on screen (state: blocked)")
+                    } else if state == crate::agent::State::Exited {
+                        err("the pane's program has exited")
+                    } else {
+                        let typed = pane
+                            .with_term(|term| {
+                                let pasted = term.ai_paste(&text);
+                                if pasted && submit {
+                                    term.ai_type_bytes(b"\r");
+                                }
+                                pasted
+                            })
+                            .unwrap_or(false);
+                        pane.term.redraw(cx);
+                        if typed {
+                            ok(vec![("agent", agent.map_or(Value::Null, s)), ("state", s(state.as_str()))])
+                        } else {
+                            err("the pane could not take input")
+                        }
+                    }
+                }
+            };
+            let _ = reply.send(answer);
         }
     }
 
@@ -582,8 +915,7 @@ impl TermTabs {
             || self
                 .tabs
                 .get(self.active)
-                .and_then(|tab| tab.with_term(|term| term.has_input_focus(cx)))
-                .unwrap_or(false)
+                .is_some_and(|tab| tab.panes.iter().any(|p| p.with_term(|term| term.has_input_focus(cx)) == Some(true)))
     }
 
     fn show_bar(&self) -> bool {
@@ -596,14 +928,14 @@ impl TermTabs {
 
     fn on_bar_click(&mut self, cx: &mut Cx, hit: BarHit, middle: bool) {
         match hit {
-            BarHit::Tab(i) if middle => self.request_close(cx, i),
+            BarHit::Tab(i) if middle => self.request_close(cx, i, None),
             BarHit::Tab(i) => self.select(cx, i),
-            BarHit::CloseTab(i) => self.request_close(cx, i),
+            BarHit::CloseTab(i) => self.request_close(cx, i, None),
             BarHit::NewTab => self.run_command(cx, TabCommand::New),
             BarHit::Settings => self.run_command(cx, TabCommand::Settings),
             BarHit::ConfirmClose => {
                 if let Some(pending) = self.pending_close.take() {
-                    self.close(cx, pending.tab);
+                    self.finish_close(cx, pending.tab, pending.pane);
                 }
             }
             BarHit::CancelClose => {
@@ -617,10 +949,10 @@ impl TermTabs {
         }
     }
 
-    /// Route a tab's actions: titles and bells update the tab; the selected
-    /// tab's actions also go on to the host.
-    fn take_tab_actions(&mut self, cx: &mut Cx, index: usize, actions: ActionsBuf, exited: &mut Vec<usize>) {
-        let selected = index == self.active;
+    /// Route a pane's actions: titles and bells update the pane; the
+    /// focused pane of the selected tab also passes them on to the host.
+    fn take_pane_actions(&mut self, cx: &mut Cx, index: usize, id: u64, actions: ActionsBuf, exited: &mut Vec<(usize, u64)>) {
+        let selected = index == self.active && self.tabs[index].focused == id;
         let mut forward = ActionsBuf::new();
         for action in actions {
             let Some(wa) = action.as_widget_action() else {
@@ -629,9 +961,11 @@ impl TermTabs {
             };
             match wa.cast::<MpTermAction>() {
                 MpTermAction::TitleChanged(title) => {
-                    let tab = &mut self.tabs[index];
-                    if tab.osc_title != title {
-                        tab.osc_title = title;
+                    let Some(pane) = self.tabs[index].pane_mut(id) else {
+                        continue;
+                    };
+                    if pane.osc_title != title {
+                        pane.osc_title = title;
                         self.redraw(cx);
                         if selected {
                             self.report_title(cx);
@@ -640,13 +974,16 @@ impl TermTabs {
                     continue;
                 }
                 MpTermAction::Bell if !selected => {
-                    self.tabs[index].bell = true;
+                    if let Some(pane) = self.tabs[index].pane_mut(id) {
+                        pane.bell = true;
+                    }
                     self.redraw(cx);
                 }
-                // A shell that exits closes its tab, unless it is the last:
-                // that one keeps the terminal's own exited state.
-                MpTermAction::Exited if self.tabs.len() > 1 => {
-                    exited.push(index);
+                // A shell that exits closes its pane, unless it is the last
+                // of the last tab: that one keeps the terminal's own exited
+                // state.
+                MpTermAction::Exited if self.tabs.len() > 1 || self.tabs[index].panes.len() > 1 => {
+                    exited.push((index, id));
                     continue;
                 }
                 _ => {}
@@ -659,6 +996,19 @@ impl TermTabs {
             cx.extend_actions(forward);
         }
     }
+}
+
+/// Keyboard events: the focused pane's alone.
+fn is_key_input(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::KeyDown(_)
+            | Event::KeyUp(_)
+            | Event::TextInput(_)
+            | Event::TextRangeReplace(_)
+            | Event::TextCopy(_)
+            | Event::TextCut(_)
+    )
 }
 
 /// Events every tab needs, selected or not: only the selected tab gets
@@ -706,6 +1056,10 @@ const ICON_NEXT: &str = "\u{f054}";
 impl Widget for TermTabs {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.sync_settings(cx);
+        self.follow_key_focus(cx);
+        if self.settings.external_control {
+            self.answer_control(cx);
+        }
         if self.poll_timer.is_event(event).is_some() {
             self.poll_tabs(cx);
         }
@@ -717,8 +1071,8 @@ impl Widget for TermTabs {
                     Event::KeyDown(key) => {
                         match key.key_code {
                             KeyCode::ReturnKey | KeyCode::KeyY => {
-                                let tab = pending.tab;
-                                self.close(cx, tab);
+                                let (tab, pane) = (pending.tab, pending.pane);
+                                self.finish_close(cx, tab, pane);
                             }
                             KeyCode::Escape | KeyCode::KeyN => {
                                 self.pending_close = None;
@@ -807,21 +1161,40 @@ impl Widget for TermTabs {
             }
         }
 
+        if self.panel.is_none() && self.drag_divider(cx, event) {
+            return;
+        }
+
         let mut exited = Vec::new();
         for index in 0..self.tabs.len() {
-            if (index != self.active || self.panel.is_some()) && is_input(event) {
-                continue;
-            }
-            let term = self.tabs[index].term.clone();
-            let actions = cx.capture_actions(|cx| term.handle_event(cx, event, scope));
-            if !actions.is_empty() {
-                self.take_tab_actions(cx, index, actions, &mut exited);
+            let in_view = index == self.active && self.panel.is_none();
+            let (focused, zoomed) = (self.tabs[index].focused, self.tabs[index].zoomed);
+            let ids: Vec<(u64, WidgetRef)> = self.tabs[index].panes.iter().map(|p| (p.id, p.term.clone())).collect();
+            for (id, term) in ids {
+                // Every pane pumps its PTY; the keyboard goes to the focused
+                // pane, the pointer to the panes in view.
+                let deliver = if !is_input(event) {
+                    true
+                } else if !in_view {
+                    false
+                } else if is_key_input(event) {
+                    id == focused
+                } else {
+                    !zoomed || id == focused
+                };
+                if !deliver {
+                    continue;
+                }
+                let actions = cx.capture_actions(|cx| term.handle_event(cx, event, scope));
+                if !actions.is_empty() {
+                    self.take_pane_actions(cx, index, id, actions, &mut exited);
+                }
             }
         }
         exited.sort_unstable();
         exited.dedup();
-        for index in exited.into_iter().rev() {
-            self.close(cx, index);
+        for (index, id) in exited.into_iter().rev() {
+            self.close_pane(cx, index, id);
         }
     }
 
@@ -840,10 +1213,9 @@ impl Widget for TermTabs {
         if self.show_bar() || self.pending_close.is_some() {
             self.draw_tab_bar(cx);
         }
-        let body = cx.peek_walk_turtle(Walk::fill());
-        if let Some(tab) = self.tabs.get(self.active) {
-            tab.term.draw_all(cx, scope);
-        }
+        let body = cx.walk_turtle(Walk::fill());
+        self.body = body;
+        self.draw_panes(cx, scope, body);
         cx.end_turtle();
         if let Some(mut list) = self.panel_list.take() {
             list.begin_overlay_reuse(cx);
@@ -864,6 +1236,93 @@ impl Widget for TermTabs {
 }
 
 impl TermTabs {
+    /// The selected tab's panes, the dividers between them; unfocused
+    /// panes dimmed a little.
+    fn draw_panes(&mut self, cx: &mut Cx2d, scope: &mut Scope, body: Rect) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            self.dividers.clear();
+            return;
+        };
+        let layout = tab.layout(body);
+        let split = layout.len() > 1;
+        self.dividers = if split { tab.tree.dividers(body) } else { Vec::new() };
+        if split {
+            let (bg, _) = self.chrome();
+            self.draw_divider.color = mix(bg, vec4(0.0, 0.0, 0.0, 1.0), if luminance(bg) < 0.5 { 0.45 } else { 0.15 });
+            for divider in &self.dividers {
+                self.draw_divider.draw_abs(cx, divider.rect);
+            }
+        }
+        for (id, rect) in layout {
+            let Some(pane) = tab.panes.iter().find(|p| p.id == id) else {
+                continue;
+            };
+            let dim = if split && id != tab.focused { 0.18 } else { 0.0 };
+            pane.with_term(|term| term.set_background_dimming(cx, dim));
+            let walk = Walk::new(Size::Fixed(rect.size.x), Size::Fixed(rect.size.y)).with_abs_pos(rect.pos);
+            pane.term.draw_walk_all(cx, scope, walk);
+        }
+    }
+
+    /// A click in another pane moved the keyboard there (the focus change
+    /// lands after the click's own event): make that pane the focused one.
+    fn follow_key_focus(&mut self, cx: &mut Cx) {
+        let moved = self.tabs.get(self.active).filter(|tab| tab.panes.len() > 1).and_then(|tab| {
+            tab.panes
+                .iter()
+                .find(|p| p.id != tab.focused && p.with_term(|term| term.has_input_focus(cx)) == Some(true))
+                .map(|p| p.id)
+        });
+        if let Some(id) = moved {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.focused = id;
+                if let Some(pane) = tab.pane_mut(id) {
+                    pane.bell = false;
+                }
+            }
+            self.report_title(cx);
+            self.refresh(cx);
+        }
+    }
+
+    /// Resize splits by dragging the gap between panes. True when the event
+    /// was the drag's.
+    fn drag_divider(&mut self, cx: &mut Cx, event: &Event) -> bool {
+        match event {
+            Event::MouseDown(e) => {
+                let grab = self.dividers.iter().find(|d| {
+                    let r = d.rect;
+                    let pad = 2.0;
+                    Rect { pos: dvec2(r.pos.x - pad, r.pos.y - pad), size: dvec2(r.size.x + pad * 2.0, r.size.y + pad * 2.0) }
+                        .contains(e.abs)
+                });
+                if let Some(divider) = grab {
+                    self.drag = Some(divider.clone());
+                    return true;
+                }
+                false
+            }
+            Event::MouseMove(e) => {
+                if let Some(divider) = &self.drag {
+                    let at = if divider.side_by_side { e.abs.x } else { e.abs.y };
+                    let ratio = panes::ratio_at(divider, at);
+                    let path = divider.path.clone();
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        tab.tree.set_ratio(&path, ratio);
+                    }
+                    self.refresh(cx);
+                    return true;
+                }
+                if let Some(divider) = self.dividers.iter().find(|d| d.rect.contains(e.abs)) {
+                    cx.set_cursor(if divider.side_by_side { MouseCursor::ColResize } else { MouseCursor::RowResize });
+                }
+                false
+            }
+            Event::MouseUp(_) => self.drag.take().is_some(),
+            _ => false,
+        }
+    }
+
     /// (background, foreground) of the selected tab's colours.
     fn chrome(&self) -> (Vec4f, Vec4f) {
         self.tabs
@@ -885,7 +1344,8 @@ impl TermTabs {
         self.draw_bar.draw_abs(cx, bar);
 
         if let Some(pending) = self.pending_close.as_ref() {
-            let message = format!("\u{201c}{}\u{201d} is running in this tab. Close it?", pending.job);
+            let what = if pending.pane.is_some() { "pane" } else { "tab" };
+            let message = format!("\u{201c}{}\u{201d} is running in this {what}. Close it?", pending.job);
             self.draw_label.color = fg;
             self.draw_label.draw_abs(cx, dvec2(bar.pos.x + 12.0, bar.pos.y + (h - 12.0) * 0.5), &message);
             let mut x = bar.pos.x + bar.size.x - 8.0;
@@ -932,7 +1392,7 @@ impl TermTabs {
             let show_close = selected || hovered;
             let tab = &self.tabs[index];
             let mut label = tab.label(self.settings.tab_title);
-            if tab.bell {
+            if tab.bell() {
                 label = format!("\u{2022} {label}");
             }
             let room = rect.size.x - 20.0 - if show_close { 20.0 } else { 0.0 };
@@ -970,7 +1430,9 @@ impl TermTabs {
     fn refresh(&mut self, cx: &mut Cx) {
         self.redraw(cx);
         if let Some(tab) = self.tabs.get(self.active) {
-            tab.term.redraw(cx);
+            for pane in &tab.panes {
+                pane.term.redraw(cx);
+            }
         }
         if let Some(list) = &self.panel_list {
             list.redraw(cx);
@@ -1658,6 +2120,11 @@ mod tests {
         assert_eq!(t(KeyCode::Key3, false, false, true, 4), Some(TabCommand::Select(2)));
         assert_eq!(t(KeyCode::Key9, false, false, true, 4), Some(TabCommand::Select(usize::MAX)));
         assert_eq!(t(KeyCode::Comma, true, false, false, 1), Some(TabCommand::Settings));
+        assert_eq!(t(KeyCode::KeyD, true, true, false, 1), Some(TabCommand::SplitRight));
+        assert_eq!(t(KeyCode::KeyE, true, true, false, 1), Some(TabCommand::SplitDown));
+        assert_eq!(t(KeyCode::ArrowLeft, true, true, false, 1), Some(TabCommand::Focus(Dir::Left)));
+        assert_eq!(t(KeyCode::KeyZ, true, true, false, 1), Some(TabCommand::Zoom));
+        assert_eq!(t(KeyCode::ArrowLeft, true, false, false, 1), None, "Ctrl+Left is the shell's (word left)");
     }
 
     #[test]
