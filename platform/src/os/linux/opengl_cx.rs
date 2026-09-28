@@ -325,6 +325,9 @@ impl Cx {
         pix_width: f64,
         pix_height: f64,
     ) -> bool {
+        // PerfMonitor "draw" (pass encode and the GL calls it makes) and "wait"
+        // (eglSwapBuffers: vsync and back-pressure), as the Android backend reports them.
+        let perf_t0 = self.perf_monitor.enabled().then(std::time::Instant::now);
         let draw_list_id = self.passes[draw_pass_id].main_draw_list_id.unwrap();
 
         unsafe {
@@ -519,10 +522,17 @@ impl Cx {
 
         unsafe {
             let opengl_cx = self.os.opengl_cx.as_ref().unwrap();
+            let swap_t0 = perf_t0.map(|_| std::time::Instant::now());
             let swap_ok = {
                 let _phase = crate::thread::ui_phase(crate::thread::UiPhase::GpuWait);
                 (opengl_cx.libegl.eglSwapBuffers.unwrap())(opengl_cx.egl_display, egl_surface)
             };
+            if let (Some(t0), Some(swap_t0)) = (perf_t0, swap_t0) {
+                let wait_us = swap_t0.elapsed().as_micros() as u64;
+                let draw_us = (t0.elapsed().as_micros() as u64).saturating_sub(wait_us);
+                self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAW, draw_us);
+                self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAWABLE_WAIT, wait_us);
+            }
             // PerfMonitor: a presented window frame ends here (macOS marks it at nextDrawable);
             // without it the monitor's ring stays empty and PerfGraph draws nothing on this backend.
             if swap_ok != 0 {
