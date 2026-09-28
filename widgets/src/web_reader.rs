@@ -4,7 +4,7 @@
 //! ```text
 //! reader := WebReader{width: Fill height: Fill on_error: || show(ui.reader.error())}
 //! ui.reader.open("https://example.org/story")   // true when it opened
-//! ui.reader.close()
+//! ui.reader.close()                             // ends the page
 //! ui.reader.is_open()
 //! ui.reader.error()                              // why the last page failed
 //! ```
@@ -139,12 +139,25 @@ impl WebReader {
         true
     }
 
+    /// Close the page: its web view is destroyed, not hidden, so nothing it
+    /// was doing (a playing video, a timer, a socket) outlives the reader.
+    /// The next `open` starts a fresh view.
     pub fn close(&mut self, cx: &mut Cx) {
         if !self.open {
             return;
         }
         self.open = false;
         self.hide_overlay(cx);
+        if self.spawned {
+            let (heap, id) = (self.heap_key(), self.browser_id());
+            cx.system_browser(id).close();
+            OPENED.with(|o| {
+                if let Some(ids) = o.borrow_mut().get_mut(&heap) {
+                    ids.retain(|opened| *opened != id);
+                }
+            });
+            self.spawned = false;
+        }
         if let Some(timer) = self.timer.take() {
             cx.stop_timer(timer);
         }
