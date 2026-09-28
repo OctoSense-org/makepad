@@ -388,91 +388,74 @@ script_mod! {
                 return omf * omf * omf / 6.0 + (f2 * f * 3.0 - f2 * 6.0 + 4.0) / 6.0
             }
 
+            // One tap of mip `level` (1..6). Only the texture differs per
+            // level; the reconstruction around it is written once below.
+            sample_mip: fn(level: float, uv: vec2) -> vec4 {
+                if level < 1.5 { return self.mip0_texture.sample_as_bgra(uv) }
+                if level < 2.5 { return self.mip1_texture.sample_as_bgra(uv) }
+                if level < 3.5 { return self.mip2_texture.sample_as_bgra(uv) }
+                if level < 4.5 { return self.mip3_texture.sample_as_bgra(uv) }
+                if level < 5.5 { return self.mip4_texture.sample_as_bgra(uv) }
+                return self.mip5_texture.sample_as_bgra(uv)
+            }
+
+            mip_size: fn(level: float) -> vec2 {
+                if level < 1.5 { return self.mip0_texture.size() }
+                if level < 2.5 { return self.mip1_texture.size() }
+                if level < 3.5 { return self.mip2_texture.size() }
+                if level < 4.5 { return self.mip3_texture.size() }
+                if level < 5.5 { return self.mip4_texture.size() }
+                return self.mip5_texture.size()
+            }
+
+            // Level 0 is the scene itself; levels 1..6 read mip0..mip5 with
+            // the bicubic reconstruction. It used to be written out per level
+            // (six copies), and every sample_blur call inlined it twice: the
+            // glass programs took ~0.65 s each to compile on Adreno 630.
             sample_level: fn(level: float, uv: vec2) -> vec4 {
                 let source_uv = vec2(uv.x, mix(uv.y, 1.0 - uv.y, self.source_y_flip))
                 let safe_uv = clamp(source_uv, vec2(0.0, 0.0), vec2(1.0, 1.0))
                 if level < 0.5 {
                     return self.scene_texture.sample_as_bgra(safe_uv)
                 }
-                if level < 1.5 {
-                    let size = max(self.mip0_texture.size(), vec2(1.0, 1.0))
-                    let h = self.bicubic_h(safe_uv, size)
-                    let g0 = self.bicubic_g0(safe_uv, size)
-                    let g1 = 1.0 - g0
-                    return self.mip0_texture.sample_as_bgra(vec2(h.x, h.y)) * (g0.x * g0.y)
-                        + self.mip0_texture.sample_as_bgra(vec2(h.z, h.y)) * (g1.x * g0.y)
-                        + self.mip0_texture.sample_as_bgra(vec2(h.x, h.w)) * (g0.x * g1.y)
-                        + self.mip0_texture.sample_as_bgra(vec2(h.z, h.w)) * (g1.x * g1.y)
-                }
-                if level < 2.5 {
-                    let size = max(self.mip1_texture.size(), vec2(1.0, 1.0))
-                    let h = self.bicubic_h(safe_uv, size)
-                    let g0 = self.bicubic_g0(safe_uv, size)
-                    let g1 = 1.0 - g0
-                    return self.mip1_texture.sample_as_bgra(vec2(h.x, h.y)) * (g0.x * g0.y)
-                        + self.mip1_texture.sample_as_bgra(vec2(h.z, h.y)) * (g1.x * g0.y)
-                        + self.mip1_texture.sample_as_bgra(vec2(h.x, h.w)) * (g0.x * g1.y)
-                        + self.mip1_texture.sample_as_bgra(vec2(h.z, h.w)) * (g1.x * g1.y)
-                }
-                if level < 3.5 {
-                    let size = max(self.mip2_texture.size(), vec2(1.0, 1.0))
-                    let h = self.bicubic_h(safe_uv, size)
-                    let g0 = self.bicubic_g0(safe_uv, size)
-                    let g1 = 1.0 - g0
-                    return self.mip2_texture.sample_as_bgra(vec2(h.x, h.y)) * (g0.x * g0.y)
-                        + self.mip2_texture.sample_as_bgra(vec2(h.z, h.y)) * (g1.x * g0.y)
-                        + self.mip2_texture.sample_as_bgra(vec2(h.x, h.w)) * (g0.x * g1.y)
-                        + self.mip2_texture.sample_as_bgra(vec2(h.z, h.w)) * (g1.x * g1.y)
-                }
-                if level < 4.5 {
-                    let size = max(self.mip3_texture.size(), vec2(1.0, 1.0))
-                    let h = self.bicubic_h(safe_uv, size)
-                    let g0 = self.bicubic_g0(safe_uv, size)
-                    let g1 = 1.0 - g0
-                    return self.mip3_texture.sample_as_bgra(vec2(h.x, h.y)) * (g0.x * g0.y)
-                        + self.mip3_texture.sample_as_bgra(vec2(h.z, h.y)) * (g1.x * g0.y)
-                        + self.mip3_texture.sample_as_bgra(vec2(h.x, h.w)) * (g0.x * g1.y)
-                        + self.mip3_texture.sample_as_bgra(vec2(h.z, h.w)) * (g1.x * g1.y)
-                }
-                if level < 5.5 {
-                    let size = max(self.mip4_texture.size(), vec2(1.0, 1.0))
-                    let h = self.bicubic_h(safe_uv, size)
-                    let g0 = self.bicubic_g0(safe_uv, size)
-                    let g1 = 1.0 - g0
-                    return self.mip4_texture.sample_as_bgra(vec2(h.x, h.y)) * (g0.x * g0.y)
-                        + self.mip4_texture.sample_as_bgra(vec2(h.z, h.y)) * (g1.x * g0.y)
-                        + self.mip4_texture.sample_as_bgra(vec2(h.x, h.w)) * (g0.x * g1.y)
-                        + self.mip4_texture.sample_as_bgra(vec2(h.z, h.w)) * (g1.x * g1.y)
-                }
-                let size = max(self.mip5_texture.size(), vec2(1.0, 1.0))
+                let size = max(self.mip_size(level), vec2(1.0, 1.0))
                 let h = self.bicubic_h(safe_uv, size)
                 let g0 = self.bicubic_g0(safe_uv, size)
                 let g1 = 1.0 - g0
-                return self.mip5_texture.sample_as_bgra(vec2(h.x, h.y)) * (g0.x * g0.y)
-                    + self.mip5_texture.sample_as_bgra(vec2(h.z, h.y)) * (g1.x * g0.y)
-                    + self.mip5_texture.sample_as_bgra(vec2(h.x, h.w)) * (g0.x * g1.y)
-                    + self.mip5_texture.sample_as_bgra(vec2(h.z, h.w)) * (g1.x * g1.y)
+                return self.sample_mip(level, vec2(h.x, h.y)) * (g0.x * g0.y)
+                    + self.sample_mip(level, vec2(h.z, h.y)) * (g1.x * g0.y)
+                    + self.sample_mip(level, vec2(h.x, h.w)) * (g0.x * g1.y)
+                    + self.sample_mip(level, vec2(h.z, h.w)) * (g1.x * g1.y)
             }
 
+            // Blends the two levels around `level`, read in one loop so
+            // sample_level is inlined once. Level 6 and integer levels (a
+            // settled sheet, Recents at rest) read one level only.
             sample_blur: fn(level: float, uv: vec2) -> vec4 {
                 let safe_level = clamp(level, 0.0, 6.0)
-                if safe_level >= 5.999 {
-                    return self.sample_level(6.0, uv)
-                }
+                let top = safe_level >= 5.999
                 let base_level = floor(safe_level)
                 let t = safe_level - base_level
-
-                let l1 = base_level
-                let l2 = min(base_level + 1.0, 6.0)
                 let blend = t * t * (3.0 - 2.0 * t)
-                let c1 = self.sample_level(l1, uv)
-                // An integer level (a settled sheet, Recents at rest) reads one
-                // level: the second bicubic read would be weighted zero.
-                if blend <= 0.0001 {
+                let l1 = if top {6.0} else {base_level}
+                let l2 = min(base_level + 1.0, 6.0)
+                let reads = if top || blend <= 0.0001 {1.0} else {2.0}
+                var c1 = vec4(0.0)
+                var c2 = vec4(0.0)
+                var read = 0.0
+                loop {
+                    if read >= reads { break }
+                    let c = self.sample_level(if read > 0.5 {l2} else {l1}, uv)
+                    if read < 0.5 {
+                        c1 = c
+                    } else {
+                        c2 = c
+                    }
+                    read = read + 1.0
+                }
+                if reads < 1.5 {
                     return c1
                 }
-                let c2 = self.sample_level(l2, uv)
-
                 return c1.mix(c2, blend)
             }
 
@@ -571,12 +554,25 @@ script_mod! {
                 let displaced = screen_pos + normal * (edge * strength) + self.ripple_offset(depth)
                 let q = clamp(displaced / src, vec2(0.0, 0.0), vec2(1.0, 1.0))
                 let level = mix(self.blur_level, self.edge_blur_level, edge)
-                var sampled = self.sample_blur(level, q)
-                if self.diffraction_strength > 0.001 {
-                    let chroma = normal * (min(self.diffraction_strength, 0.25) * edge) / src
-                    let sr = self.sample_blur(level, clamp(q + chroma, vec2(0.0, 0.0), vec2(1.0, 1.0)))
-                    let sb = self.sample_blur(level, clamp(q - chroma, vec2(0.0, 0.0), vec2(1.0, 1.0)))
-                    sampled = vec4(sr.r, sampled.g, sb.b, sampled.a)
+                // Centre, then the red and blue taps of the diffraction
+                // fringe, from one sample_blur call site.
+                let chroma = normal * (min(self.diffraction_strength, 0.25) * edge) / src
+                let taps = if self.diffraction_strength > 0.001 {3.0} else {1.0}
+                var sampled = vec4(0.0)
+                var tap = 0.0
+                loop {
+                    if tap >= taps { break }
+                    let offset = if tap < 0.5 {vec2(0.0, 0.0)} else if tap < 1.5 {chroma} else {chroma * -1.0}
+                    let tap_uv = if tap < 0.5 {q} else {clamp(q + offset, vec2(0.0, 0.0), vec2(1.0, 1.0))}
+                    let s = self.sample_blur(level, tap_uv)
+                    if tap < 0.5 {
+                        sampled = s
+                    } else if tap < 1.5 {
+                        sampled = vec4(s.r, sampled.g, sampled.b, sampled.a)
+                    } else {
+                        sampled = vec4(sampled.r, sampled.g, s.b, sampled.a)
+                    }
+                    tap = tap + 1.0
                 }
                 let fallback = vec4(self.fallback_color.rgb, 1.0)
                 let transmitted = fallback.mix(sampled, self.has_gauss * (1.0 - self.opaque_surface))
