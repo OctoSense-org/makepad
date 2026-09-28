@@ -448,8 +448,8 @@ impl Apply for ContextLookup<'_> {
                 let coverages_len = coverages.len();
 
                 let match_func = |glyph, index| {
-                    let coverage = coverages.get(index).unwrap();
-                    coverage.get(glyph).is_some()
+                    // Makepad: a corrupt font's entry that does not parse matches nothing.
+                    coverages.get(index).map_or(false, |coverage| coverage.get(glyph).is_some())
                 };
 
                 let mut match_end = 0;
@@ -602,18 +602,18 @@ impl Apply for ChainedContextLookup<'_> {
                 coverage.get(glyph)?;
 
                 let back = |glyph, index| {
-                    let coverage = backtrack_coverages.get(index).unwrap();
-                    coverage.contains(glyph)
+                    // Makepad: a corrupt font's entry that does not parse matches nothing.
+                    backtrack_coverages.get(index).map_or(false, |coverage| coverage.contains(glyph))
                 };
 
                 let ahead = |glyph, index| {
-                    let coverage = lookahead_coverages.get(index).unwrap();
-                    coverage.contains(glyph)
+                    // Makepad: a corrupt font's entry that does not parse matches nothing.
+                    lookahead_coverages.get(index).map_or(false, |coverage| coverage.contains(glyph))
                 };
 
                 let input = |glyph, index| {
-                    let coverage = input_coverages.get(index).unwrap();
-                    coverage.contains(glyph)
+                    // Makepad: a corrupt font's entry that does not parse matches nothing.
+                    input_coverages.get(index).map_or(false, |coverage| coverage.contains(glyph))
                 };
 
                 let mut end_index = ctx.buffer.idx;
@@ -741,8 +741,8 @@ fn apply_context(
     lookups: LazyArray16<SequenceLookupRecord>,
 ) -> Option<()> {
     let match_func = |glyph, index| {
-        let value = input.get(index).unwrap();
-        match_func(glyph, value)
+        // Makepad: an index past a corrupt font's array matches nothing.
+        input.get(index).map_or(false, |value| match_func(glyph, value))
     };
 
     let mut match_end = 0;
@@ -782,18 +782,18 @@ fn apply_chain_context(
     // NOTE: Whenever something in this method changes, we also need to
     // change it in the `apply` implementation for ChainedContextLookup.
     let f1 = |glyph, index| {
-        let value = backtrack.get(index).unwrap();
-        match_funcs[0](glyph, value)
+        // Makepad: an index past a corrupt font's array matches nothing.
+        backtrack.get(index).map_or(false, |value| match_funcs[0](glyph, value))
     };
 
     let f2 = |glyph, index| {
-        let value = lookahead.get(index).unwrap();
-        match_funcs[2](glyph, value)
+        // Makepad: an index past a corrupt font's array matches nothing.
+        lookahead.get(index).map_or(false, |value| match_funcs[2](glyph, value))
     };
 
     let f3 = |glyph, index| {
-        let value = input.get(index).unwrap();
-        match_funcs[1](glyph, value)
+        // Makepad: an index past a corrupt font's array matches nothing.
+        input.get(index).map_or(false, |value| match_funcs[1](glyph, value))
     };
 
     let mut end_index = ctx.buffer.idx;

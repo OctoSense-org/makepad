@@ -91,7 +91,9 @@ impl<const shift: u8> hb_set_digest_ext for hb_set_digest_bits_pattern_t<shift> 
             return false;
         }
 
-        if (b.0 as mask_t >> shift) - (a.0 as mask_t >> shift)
+        // Unsigned, wrapping, as in HarfBuzz: a corrupt range (b < a) wraps
+        // to "may contain anything" instead of overflowing.
+        if (b.0 as mask_t >> shift).wrapping_sub(a.0 as mask_t >> shift)
             >= hb_set_digest_bits_pattern_t::<shift>::mask_bits() - 1
         {
             self.mask = mask_t::MAX;
@@ -99,7 +101,7 @@ impl<const shift: u8> hb_set_digest_ext for hb_set_digest_bits_pattern_t<shift> 
         } else {
             let ma = hb_set_digest_bits_pattern_t::<shift>::mask_for(a);
             let mb = hb_set_digest_bits_pattern_t::<shift>::mask_for(b);
-            self.mask |= mb + mb.wrapping_sub(ma) - mask_t::from(mb < ma);
+            self.mask |= mb.wrapping_add(mb.wrapping_sub(ma)).wrapping_sub(mask_t::from(mb < ma));
             true
         }
     }
