@@ -616,7 +616,24 @@ impl MultiPlaneAllocator {
         self.round_robin_cursor = 0;
     }
 
+    /// Past this many free rectangles in a plane the atlas is fragmented
+    /// (a flood of distinct glyphs: random bytes in a terminal, a font
+    /// browser): searching it costs seconds per glyph, since the packer's
+    /// work grows with the free list and the shared slot intersects the
+    /// free lists of all four planes. Failing instead makes the caller reset
+    /// the atlas, which re-rasterizes what is in view once.
+    const MAX_FREE_RECTS: usize = 1024;
+    /// A bound on the shared slot's intersected candidates.
+    const MAX_CANDIDATES: usize = 2048;
+
+    fn fragmented(&self) -> bool {
+        self.planes.iter().any(|plane| plane.free_rects().len() > Self::MAX_FREE_RECTS)
+    }
+
     fn allocate_sdf_slot(&mut self, size: Size<usize>) -> Option<AtlasSlot> {
+        if self.fragmented() {
+            return None;
+        }
         let mut best_plane = None;
         let mut best_rank = (usize::MAX, usize::MAX, usize::MAX, usize::MAX, usize::MAX);
         for offset in 0..4 {
@@ -649,7 +666,7 @@ impl MultiPlaneAllocator {
     }
 
     fn allocate_shared_slot(&mut self, size: Size<usize>) -> Option<Rect<usize>> {
-        if size.width == 0 || size.height == 0 {
+        if size.width == 0 || size.height == 0 || self.fragmented() {
             return None;
         }
         let mut candidates = self.planes[0].free_rects().to_vec();
@@ -665,6 +682,9 @@ impl MultiPlaneAllocator {
                     }
                 }
             }
+            // Any candidate is a valid place: keeping a bounded number keeps
+            // the next intersection and the prune bounded too.
+            next.truncate(Self::MAX_CANDIDATES);
             prune_contained_rects(&mut next);
             if next.is_empty() {
                 return None;
