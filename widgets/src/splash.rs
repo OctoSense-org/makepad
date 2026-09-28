@@ -12,6 +12,12 @@ use crate::{
 // `vm.host.cx_mut()` — reach the host Cx from a script helper.
 use crate::makepad_draw::makepad_platform::script::vm::ScriptVmCx;
 
+// `sys.dataset` and `sys.news_digest`: they share this module's helpers.
+#[path = "splash_dataset.rs"]
+mod splash_dataset;
+#[path = "splash_news.rs"]
+mod splash_news;
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -1279,6 +1285,8 @@ pub fn register_agent_module(vm: &mut ScriptVm) {
     // and teach the LLM to call them in the A2App prompt.
     let sys = vm.new_module(id!(sys));
     crate::splash_l0::install(vm, sys);
+    splash_dataset::install(vm, sys);
+    splash_news::install(vm, sys);
 
     // sys.photo("tokyo skyline sunset") -> a full-screen 9:16 image URL for that
     // subject (pollinations.ai renders the prompt with an AI model, so the photo
