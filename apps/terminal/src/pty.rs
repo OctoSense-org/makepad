@@ -105,17 +105,33 @@ impl Pty {
         env: &[(&str, &str)],
         cwd: Option<&std::path::Path>,
     ) -> io::Result<Self> {
+        Self::spawn_opts(cols, rows, shell, true, command, env, cwd)
+    }
+
+    /// [`spawn`](Self::spawn) with the login flag explicit: `login` runs the
+    /// shell as a login shell (`-l`, the default); off, it reads only its
+    /// interactive startup files. Windows shells have no such flag.
+    pub fn spawn_opts(
+        cols: u16,
+        rows: u16,
+        shell: Option<&str>,
+        login: bool,
+        command: Option<&str>,
+        env: &[(&str, &str)],
+        cwd: Option<&std::path::Path>,
+    ) -> io::Result<Self> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            Self::spawn_unix(cols, rows, shell, command, env, cwd)
+            Self::spawn_unix(cols, rows, shell, login, command, env, cwd)
         }
         #[cfg(windows)]
         {
+            let _ = login;
             Self::spawn_windows(cols, rows, shell, command, env, cwd)
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
-            let _ = (cols, rows, shell, command, env, cwd);
+            let _ = (cols, rows, shell, login, command, env, cwd);
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "PTY not implemented for this platform",
@@ -263,6 +279,7 @@ impl Pty {
         cols: u16,
         rows: u16,
         shell: Option<&str>,
+        login: bool,
         command: Option<&str>,
         env: &[(&str, &str)],
         cwd: Option<&std::path::Path>,
@@ -297,7 +314,9 @@ impl Pty {
         let slave_file = unsafe { std::fs::File::from_raw_fd(slave) };
 
         let mut cmd = Command::new(&shell);
-        cmd.arg("-l");
+        if login {
+            cmd.arg("-l");
+        }
         if let Some(command) = command {
             cmd.arg("-c").arg(command);
         }

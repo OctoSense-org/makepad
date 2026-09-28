@@ -8,7 +8,9 @@ pub mod pty;
 #[cfg(target_os = "macos")]
 pub use makepad_widgets::makepad_platform::os::apple::pty_spawn;
 pub mod session;
+pub mod settings;
 pub mod term;
+pub mod themes;
 pub mod widget;
 
 pub use module::TERMINAL_MODULE;

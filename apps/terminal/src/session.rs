@@ -39,6 +39,40 @@ pub struct Session {
     pub exited: bool,
 }
 
+/// How a session's shell starts. The default is the historical behaviour:
+/// `$SHELL -l`, `TERM=xterm-256color`, the emulator's default scrollback.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpawnOptions {
+    /// `None`: `$SHELL`, else `/bin/zsh`.
+    pub shell: Option<String>,
+    pub login: bool,
+    pub term: String,
+    pub scrollback: usize,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        SpawnOptions {
+            shell: None,
+            login: true,
+            term: "xterm-256color".into(),
+            scrollback: crate::term::terminal::DEFAULT_SCROLLBACK,
+        }
+    }
+}
+
+impl SpawnOptions {
+    /// The options the person's settings ask for.
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        SpawnOptions {
+            shell: (!settings.shell.trim().is_empty()).then(|| settings.shell.trim().to_owned()),
+            login: settings.login_shell,
+            term: settings.term.clone(),
+            scrollback: settings.scrollback_lines,
+        }
+    }
+}
+
 impl Session {
     /// PID of this session’s shell, for exact host activity relationships.
     pub fn child_pid(&self) -> i32 { self.pty.child_pid() }
@@ -50,12 +84,26 @@ impl Session {
         shell: Option<&str>,
         command: Option<&str>,
     ) -> io::Result<Session> {
-        let mut pty = Pty::spawn(
+        let options = SpawnOptions { shell: shell.map(str::to_owned), ..SpawnOptions::default() };
+        Self::spawn_with(cols, rows, cwd, command, &options)
+    }
+
+    /// Spawn with the person's terminal settings: shell, login flag, `TERM`
+    /// and scrollback (see `crate::settings`).
+    pub fn spawn_with(
+        cols: usize,
+        rows: usize,
+        cwd: Option<&Path>,
+        command: Option<&str>,
+        options: &SpawnOptions,
+    ) -> io::Result<Session> {
+        let mut pty = Pty::spawn_opts(
             cols.max(2) as u16,
             rows.max(2) as u16,
-            shell,
+            options.shell.as_deref(),
+            options.login,
             command,
-            &[],
+            &[("TERM", options.term.as_str())],
             cwd,
         )?;
         let writer = pty.writer_clone();
@@ -76,7 +124,7 @@ impl Session {
             })
             .ok();
         Ok(Session {
-            terminal: Terminal::new(cols.max(2), rows.max(2)),
+            terminal: Terminal::with_scrollback(cols.max(2), rows.max(2), options.scrollback),
             stream: Stream::new(),
             pty,
             writer,

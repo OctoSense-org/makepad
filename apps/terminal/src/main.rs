@@ -36,6 +36,8 @@ script_mod! {
             main_window := Window{
                 window.inner_size: vec2(980, 640)
                 window.title: "terminal"
+                // Lets `background-opacity` show the desktop through.
+                window.transparent: true
                 // Transparent clear: the terminal paints its own background
                 // at the compositor-given opacity into the shared swapchain.
                 pass +: { clear_color: vec4(0.0, 0.0, 0.0, 0.0) }
