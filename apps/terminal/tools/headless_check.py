@@ -141,7 +141,10 @@ class Harness:
         return out if code == 0 else ""
 
     def wait_ready(self):
-        for _ in range(100):
+        # OctoSense builds the terminal on its first launch in a fresh home
+        # (about a minute), so its first pane can take far longer than the
+        # standalone app's.
+        for _ in range(1800 if self.args.octosense else 100):
             if self.focused():
                 return True
             time.sleep(0.1)
@@ -345,6 +348,15 @@ def s_all_fonts(h):
     print(f"      last font: {font}")
 
 
+def wait_for(cond, seconds=5.0):
+    """Poll `cond`: keys reach a hosted terminal later than a standalone one."""
+    for _ in range(int(seconds / 0.1)):
+        if cond():
+            return True
+        time.sleep(0.1)
+    return cond()
+
+
 def s_profiles(h):
     h.key("Comma", ctrl=1)
     time.sleep(0.5)
@@ -355,8 +367,8 @@ def s_profiles(h):
     h.key("ReturnKey")
     h.type("hl-test")
     h.key("ReturnKey")
-    time.sleep(0.4)
-    saved = os.path.exists(os.path.join(h.settings_dir(), "profiles", "hl-test.conf"))
+    profile = os.path.join(h.settings_dir(), "profiles", "hl-test.conf")
+    saved = wait_for(lambda: os.path.exists(profile))
     h.check("profile saved", saved)
     h.key("ReturnKey")  # save again, bad name
     for _ in range(10):
@@ -368,8 +380,7 @@ def s_profiles(h):
     h.key("ArrowDown")  # Delete profile
     h.key("ReturnKey")
     h.key("ReturnKey")
-    time.sleep(0.4)
-    h.check("profile deleted", not os.path.exists(os.path.join(h.settings_dir(), "profiles", "hl-test.conf")))
+    h.check("profile deleted", wait_for(lambda: not os.path.exists(profile)))
     h.key("Escape")
 
 
