@@ -461,6 +461,8 @@ impl Cx {
 
         unsafe {
             direct_app.drm.swap_buffers_and_wait(&direct_app.egl);
+            // PerfMonitor: a presented frame ends here (see opengl_cx.rs).
+            self.perf_monitor.frame_boundary(Cx::time_now());
         }
     }
 

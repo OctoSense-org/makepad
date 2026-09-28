@@ -958,6 +958,11 @@ impl Cx {
                 app.frame_trace.present(now);
             }
         });
+        // PerfMonitor: a presented window frame ends here (macOS marks it at nextDrawable);
+        // without it the monitor's ring stays empty and PerfGraph draws nothing on this backend.
+        if presented {
+            self.perf_monitor.frame_boundary(Cx::time_now());
+        }
         // Reveal the window only once a frame reached the compositor; showing it
         // earlier would flash an uncomposited black window.
         if presented && d3d11_window.first_draw {

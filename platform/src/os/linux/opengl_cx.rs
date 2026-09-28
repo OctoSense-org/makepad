@@ -523,6 +523,11 @@ impl Cx {
                 let _phase = crate::thread::ui_phase(crate::thread::UiPhase::GpuWait);
                 (opengl_cx.libegl.eglSwapBuffers.unwrap())(opengl_cx.egl_display, egl_surface)
             };
+            // PerfMonitor: a presented window frame ends here (macOS marks it at nextDrawable);
+            // without it the monitor's ring stays empty and PerfGraph draws nothing on this backend.
+            if swap_ok != 0 {
+                self.perf_monitor.frame_boundary(Cx::time_now());
+            }
             if swap_ok == 0 {
                 // `eglGetError` is called outside the latch: it clears EGL's per-thread
                 // error, and skipping it would leak a stale code into the next report.
