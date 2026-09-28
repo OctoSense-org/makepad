@@ -143,7 +143,9 @@ pub(crate) use self::android::android_midi::{OsMidiInput, OsMidiOutput};
 //pub(crate) use self::open_harmony::oh_media::{OsMidiInput, OsMidiOutput};
 
 // Vulkan hosts upload the existing shared-memory transport on both display paths.
-#[cfg(all(not(any(target_env = "ohos", target_os = "android")), all(linux_direct, not(use_vulkan))))]
+// (Wayland and X11 with GL provide their own in x11/opengl_x11.rs; every Vulkan
+// build, windowed or direct, needs this one.)
+#[cfg(all(not(any(target_env = "ohos", target_os = "android")), any(all(linux_direct, not(use_vulkan)), use_vulkan)))]
 mod presentable;
 #[cfg(all(linux_direct, use_vulkan))]
 #[path = "x11/linux_x11_stdin.rs"]
