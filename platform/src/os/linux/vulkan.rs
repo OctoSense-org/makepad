@@ -2849,6 +2849,11 @@ impl CxVulkan {
         if !matches!(result, Ok(true)) {
             cx.passes[draw_pass_id].paint_dirty = true;
         }
+        // PerfMonitor: a presented window frame ends here (macOS marks it at nextDrawable);
+        // without it the monitor's ring stays empty and PerfGraph draws nothing on this backend.
+        if matches!(result, Ok(true)) {
+            cx.perf_monitor.frame_boundary(Cx::time_now());
+        }
         result
     }
 
