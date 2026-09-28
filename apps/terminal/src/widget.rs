@@ -352,13 +352,6 @@ pub fn default_theme() -> ([Rgb; 16], Rgb, Rgb) {
     )
 }
 
-const SELECTION_COLOR: Vec4f = Vec4f {
-    x: 0x29 as f32 / 255.0,
-    y: 0x2e as f32 / 255.0,
-    z: 0x42 as f32 / 255.0,
-    w: 1.0,
-};
-
 /// Optional host frame. Padding belongs to the terminal grid, so drawing,
 /// pointer input and IME use the same full-sized rounded surface.
 #[derive(Clone, Copy, PartialEq)]
@@ -446,6 +439,17 @@ pub struct MpTerm {
     sel_cursor: Option<(u64, usize)>,
     #[rust]
     selecting: bool,
+    /// The word or line a double or triple click grabbed, as (row, start,
+    /// end) with `end` exclusive: a drag extends the selection from it.
+    #[rust]
+    sel_unit: Option<(u64, usize, usize)>,
+    /// The current press started a local selection (double or triple
+    /// click), so neither it nor its release goes to the app.
+    #[rust]
+    local_press: bool,
+    /// Fingers on a touchscreen, by digit, at their last y.
+    #[rust]
+    touches: Vec<(makepad_widgets::makepad_platform::event::DigitId, f64)>,
     #[rust]
     last_finger: Option<Vec2d>,
     #[rust]
@@ -1259,6 +1263,72 @@ impl MpTerm {
     /// to a line of cell height before one is sent, so resting on the device
     /// never scrolls a mouse-reporting app like Claude Code; a notched wheel
     /// stays at least one line per notch.
+    /// Select the word (or, for a line, the whole row) at `abs` and start a
+    /// drag that extends by that unit.
+    fn begin_unit_selection(&mut self, cx: &mut Cx, abs: Vec2d, whole_line: bool) {
+        let Some(pos) = self.pick(abs) else {
+            return;
+        };
+        let (start, end) = if whole_line {
+            (0, self.session.as_ref().map(|s| s.terminal.cols()).unwrap_or(80))
+        } else {
+            self.word_range(pos)
+        };
+        self.sel_unit = Some((pos.0, start, end));
+        self.sel_anchor = Some((pos.0, start));
+        self.sel_cursor = Some((pos.0, end));
+        self.selecting = true;
+        self.last_finger = Some(abs);
+        self.select_scroll_frame = cx.new_next_frame();
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Extend the selection from the grabbed unit to the cell at `abs`,
+    /// across as many lines as the pointer has moved.
+    fn extend_selection(&mut self, abs: Vec2d) {
+        let Some(pos) = self.pick(abs) else {
+            return;
+        };
+        let Some((row, start, end)) = self.sel_unit else {
+            self.sel_cursor = Some(pos);
+            return;
+        };
+        let cols = self.session.as_ref().map(|s| s.terminal.cols()).unwrap_or(80);
+        let whole_line = start == 0 && end >= cols;
+        if pos < (row, start) {
+            self.sel_anchor = Some((row, end));
+            self.sel_cursor = Some(if whole_line { (pos.0, 0) } else { pos });
+        } else {
+            self.sel_anchor = Some((row, start));
+            self.sel_cursor = Some(if whole_line || pos.0 == row && pos.1 < end {
+                (pos.0, if whole_line { cols } else { end })
+            } else {
+                (pos.0, (pos.1 + 1).min(cols))
+            });
+        }
+    }
+
+    /// A finger of a two-finger drag on a touchscreen moved by `dy`: the
+    /// screen follows the fingers, by whole lines of the drag.
+    fn touch_scroll(&mut self, cx: &mut Cx, abs: Vec2d, dy: f64, modifiers: &KeyModifiers) {
+        let Some((alt_scroll, max)) = self.session.as_ref().map(|session| {
+            let term = &session.terminal;
+            (
+                matches!(term.active, crate::term::terminal::ActiveScreen::Alternate)
+                    && term.modes.get(Mode::MouseAlternateScroll),
+                term.screen().scrollback.len(),
+            )
+        }) else {
+            return;
+        };
+        // Both fingers report the drag; each carries half of it. Fingers
+        // moving up show newer output, as on any touch list.
+        let share = -dy / self.touches.len().max(1) as f64;
+        if let Some((lines, down)) = scroll_step(&mut self.scroll_accum, share, false, false, self.cell_h) {
+            self.scroll_by(cx, abs, lines, down, modifiers, alt_scroll, max);
+        }
+    }
+
     fn scroll_lines(&mut self, e: &FingerScrollEvent) -> Option<(usize, bool)> {
         scroll_step(
             &mut self.scroll_accum,
@@ -1283,16 +1353,31 @@ impl MpTerm {
         let Some((lines, down)) = self.scroll_lines(e) else {
             return;
         };
+        self.scroll_by(cx, e.abs, lines, down, &e.modifiers, alt_scroll, max);
+    }
 
+    /// Move `lines` towards newer output (`down`) or older: wheel reports to
+    /// an app that asked for the mouse, arrow keys under alternate scroll,
+    /// else the scrollback view.
+    fn scroll_by(
+        &mut self,
+        cx: &mut Cx,
+        abs: Vec2d,
+        lines: usize,
+        down: bool,
+        modifiers: &KeyModifiers,
+        alt_scroll: bool,
+        max: usize,
+    ) {
         let (tracking, _) = self.mouse_tracking();
-        if tracking != MouseTracking::None && !e.modifiers.shift {
+        if tracking != MouseTracking::None && !modifiers.shift {
             let button = if down {
                 TermMouseButton::WheelDown
             } else {
                 TermMouseButton::WheelUp
             };
             for _ in 0..lines.min(8) {
-                self.report_mouse(cx, e.abs, MouseEventKind::Press, button, &e.modifiers);
+                self.report_mouse(cx, abs, MouseEventKind::Press, button, modifiers);
             }
             return;
         }
@@ -1473,8 +1558,17 @@ impl MpTerm {
                     Some(c) => Self::resolve_colors(session, &c.style, global_inverse),
                     None => (None, None),
                 };
-                let selected = self.cell_selected(abs, col);
-                let bg = if selected { Some(SELECTION_COLOR) } else { bg };
+                // Selected cells draw in inverse video (the default text
+                // color behind the default background color), so the text
+                // stays readable in light and dark themes alike.
+                let (fg, bg) = if self.cell_selected(abs, col) {
+                    (
+                        fg.map(|_| Self::rgb_to_vec4(default_bg, 1.0)),
+                        Some(Self::rgb_to_vec4(default_fg, 1.0)),
+                    )
+                } else {
+                    (fg, bg)
+                };
 
                 // Merge bg runs.
                 match (&mut run, bg) {
@@ -1914,9 +2008,7 @@ impl Widget for MpTerm {
                 } else if abs.y > bottom {
                     self.view_offset = self.view_offset.saturating_sub(1);
                 }
-                if let Some(pos) = self.pick(abs) {
-                    self.sel_cursor = Some(pos);
-                }
+                self.extend_selection(abs);
                 self.draw_bg.redraw(cx);
             }
         }
@@ -1941,68 +2033,93 @@ impl Widget for MpTerm {
         match hit {
             Hit::FingerDown(e) => {
                 cx.set_key_focus(self.area);
-                if self.report_mouse(
-                    cx,
-                    e.abs,
-                    MouseEventKind::Press,
-                    TermMouseButton::Left,
-                    &e.modifiers,
-                ) {
+                if e.device.is_touch() {
+                    self.touches.retain(|(id, _)| *id != e.digit_id);
+                    self.touches.push((e.digit_id, e.abs.y));
+                    if self.touches.len() >= 2 {
+                        // A second finger: the gesture is a scroll, whatever
+                        // the first finger started.
+                        self.scroll_accum = 0.0;
+                        self.selecting = false;
+                        self.local_press = true;
+                        return;
+                    }
+                }
+                // Double click selects a word, triple click a line; holding
+                // and dragging extends it. Local: the app never sees it.
+                if e.tap_count >= 2 {
+                    self.local_press = true;
+                    self.begin_unit_selection(cx, e.abs, e.tap_count >= 3);
                     return;
                 }
-                if let Some(pos) = self.pick(e.abs) {
-                    if e.tap_count >= 3 {
-                        // Line selection.
-                        self.sel_anchor = Some((pos.0, 0));
-                        self.sel_cursor = Some((
-                            pos.0,
-                            self.session
-                                .as_ref()
-                                .map(|s| s.terminal.cols())
-                                .unwrap_or(80),
-                        ));
-                        self.selecting = false;
-                    } else if e.tap_count == 2 {
-                        let (start, end) = self.word_range(pos);
-                        self.sel_anchor = Some((pos.0, start));
-                        self.sel_cursor = Some((pos.0, end));
-                        self.selecting = false;
-                    } else {
-                        self.sel_anchor = Some(pos);
-                        self.sel_cursor = Some(pos);
-                        self.selecting = true;
-                        self.last_finger = Some(e.abs);
-                        self.select_scroll_frame = cx.new_next_frame();
-                    }
+                // A single click or touch selects nothing and clears what
+                // was selected; an app that asked for the mouse gets it.
+                self.local_press = false;
+                if self.sel_anchor.is_some() {
+                    self.sel_anchor = None;
+                    self.sel_cursor = None;
                     self.draw_bg.redraw(cx);
+                }
+                self.sel_unit = None;
+                if !e.device.is_touch() {
+                    self.report_mouse(
+                        cx,
+                        e.abs,
+                        MouseEventKind::Press,
+                        TermMouseButton::Left,
+                        &e.modifiers,
+                    );
                 }
             }
             Hit::FingerMove(e) => {
-                if self.report_mouse(
-                    cx,
-                    e.abs,
-                    MouseEventKind::Motion,
-                    TermMouseButton::Left,
-                    &e.modifiers,
-                ) {
-                    return;
+                if e.device.is_touch() {
+                    let mut dy = None;
+                    if let Some(t) = self.touches.iter_mut().find(|(id, _)| *id == e.digit_id) {
+                        dy = Some(e.abs.y - t.1);
+                        t.1 = e.abs.y;
+                    }
+                    if self.touches.len() >= 2 {
+                        if let Some(dy) = dy {
+                            self.touch_scroll(cx, e.abs, dy, &e.modifiers);
+                        }
+                        return;
+                    }
                 }
                 if self.selecting {
-                    if let Some(pos) = self.pick(e.abs) {
-                        self.sel_cursor = Some(pos);
-                    }
+                    self.extend_selection(e.abs);
                     self.last_finger = Some(e.abs);
                     self.draw_bg.redraw(cx);
+                    return;
+                }
+                // A single-click drag selects nothing; a mouse drag still
+                // reaches an app that tracks buttons. A single finger does
+                // neither: it never moves the screen.
+                if !self.local_press && !e.device.is_touch() {
+                    self.report_mouse(
+                        cx,
+                        e.abs,
+                        MouseEventKind::Motion,
+                        TermMouseButton::Left,
+                        &e.modifiers,
+                    );
                 }
             }
             Hit::FingerUp(e) => {
-                self.report_mouse(
-                    cx,
-                    e.abs,
-                    MouseEventKind::Release,
-                    TermMouseButton::Left,
-                    &e.modifiers,
-                );
+                if e.device.is_touch() {
+                    self.touches.retain(|(id, _)| *id != e.digit_id);
+                }
+                if !self.local_press && !e.device.is_touch() {
+                    self.report_mouse(
+                        cx,
+                        e.abs,
+                        MouseEventKind::Release,
+                        TermMouseButton::Left,
+                        &e.modifiers,
+                    );
+                }
+                if self.touches.is_empty() {
+                    self.local_press = false;
+                }
                 self.selecting = false;
                 self.last_finger = None;
             }
