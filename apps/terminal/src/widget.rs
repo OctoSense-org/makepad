@@ -219,6 +219,13 @@ script_mod! {
                         res: crate_resource("self:../../widgets/resources/Inter.ttf")
                         asc: 0.0 desc: 0.0
                     }
+                    // Chinese, Japanese kanji and other CJK ideographs: the
+                    // same font makepad's theme falls back to. The grid
+                    // gives each of them two cells.
+                    chinese := FontMember{
+                        res: crate_resource("self:../../widgets/resources/LXGWWenKaiRegular.ttf")
+                        asc: 0.0 desc: 0.0
+                    }
                 }
                 line_spacing: 1.0
             }
@@ -239,6 +246,10 @@ script_mod! {
                 }
                 symbols := FontMember{
                     res: crate_resource("self:../../widgets/resources/Inter.ttf")
+                    asc: 0.0 desc: 0.0
+                }
+                chinese := FontMember{
+                    res: crate_resource("self:../../widgets/resources/LXGWWenKaiBold.ttf")
                     asc: 0.0 desc: 0.0
                 }
             }
