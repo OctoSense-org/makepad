@@ -262,12 +262,23 @@ fn start_listener() {
 #[cfg(not(unix))]
 fn start_listener() {}
 
+/// Tests that switch the socket on or off hold this: the switch is global.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The switch without the listener (tests).
+#[cfg(test)]
+pub(crate) fn set_enabled_for_tests(on: bool) {
+    lock().enabled = on;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn requests_are_checked_before_they_queue() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled_for_test(false);
         assert_eq!(answer(r#"{"cmd":"list"}"#).get("ok"), Some(&Value::Bool(false)), "off by default");
         set_enabled_for_test(true);

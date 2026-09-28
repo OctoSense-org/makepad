@@ -371,6 +371,17 @@ pub struct TermTabs {
     reported_title: String,
     #[rust]
     panel: Option<Panel>,
+    /// Tabs or panes changed: tell the control socket at the end of the
+    /// event (its `list` must not lag a second behind a switch).
+    #[rust]
+    publish_soon: bool,
+    /// A font change waiting for the selection to rest: rasterizing every
+    /// font passed on the way costs the text engine's glyph atlas (it keeps
+    /// them all), so fonts preview once browsing pauses.
+    #[rust]
+    pending_apply: Option<Settings>,
+    #[rust]
+    apply_timer: Timer,
     /// The panel draws in an overlay list: above every terminal layer.
     #[rust]
     panel_list: Option<DrawList2d>,
@@ -658,6 +669,7 @@ impl TermTabs {
             tab.tree = tree;
         }
         tab.zoomed = false;
+        self.publish_soon = true;
         cx.widget_tree_mark_dirty(self.uid);
         if tab.focused == id {
             // The keyboard goes to a neighbour, else the first pane left.
@@ -737,6 +749,7 @@ impl TermTabs {
             crate::control::forget(pane.id);
         }
         self.tabs.remove(index);
+        self.publish_soon = true;
         cx.widget_tree_mark_dirty(self.uid);
         if self.tabs.is_empty() {
             self.active = 0;
@@ -754,6 +767,7 @@ impl TermTabs {
 
     /// Tell the host the selected tab's title (the window title).
     fn report_title(&mut self, cx: &mut Cx) {
+        self.publish_soon = true;
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -910,12 +924,16 @@ impl TermTabs {
         }
     }
 
+    /// Keys are this widget's when nobody holds the keyboard or one of its
+    /// panes does (any tab: a focus change to the selected tab may still be
+    /// pending).
     fn keyboard_is_ours(&self, cx: &Cx) -> bool {
         cx.key_focus() == Area::Empty
             || self
                 .tabs
-                .get(self.active)
-                .is_some_and(|tab| tab.panes.iter().any(|p| p.with_term(|term| term.has_input_focus(cx)) == Some(true)))
+                .iter()
+                .flat_map(|tab| tab.panes.iter())
+                .any(|p| p.with_term(|term| term.has_input_focus(cx)) == Some(true))
     }
 
     fn show_bar(&self) -> bool {
@@ -1055,10 +1073,20 @@ const ICON_NEXT: &str = "\u{f054}";
 
 impl Widget for TermTabs {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Changes an earlier event made (shortcuts return early), published
+        // before this one runs: the key-up follows within milliseconds.
+        if std::mem::take(&mut self.publish_soon) && self.settings.external_control {
+            self.publish_panes();
+        }
         self.sync_settings(cx);
-        self.follow_key_focus(cx);
         if self.settings.external_control {
             self.answer_control(cx);
+        }
+        if self.apply_timer.is_event(event).is_some() {
+            if let Some(next) = self.pending_apply.take() {
+                self.apply(cx, next);
+                self.refresh(cx);
+            }
         }
         if self.poll_timer.is_event(event).is_some() {
             self.poll_tabs(cx);
@@ -1164,6 +1192,18 @@ impl Widget for TermTabs {
         if self.panel.is_none() && self.drag_divider(cx, event) {
             return;
         }
+        // A click in another pane focuses it: decided by where it landed,
+        // not by the key focus (that change lands after this event).
+        if let (Event::MouseDown(e), None) = (event, self.panel.as_ref()) {
+            let clicked = self
+                .tabs
+                .get(self.active)
+                .and_then(|tab| tab.layout(self.body).into_iter().find(|(_, r)| r.contains(e.abs)).map(|(id, _)| id))
+                .filter(|id| self.tabs.get(self.active).is_some_and(|t| t.focused != *id));
+            if let Some(id) = clicked {
+                self.focus_pane(cx, id);
+            }
+        }
 
         let mut exited = Vec::new();
         for index in 0..self.tabs.len() {
@@ -1185,7 +1225,18 @@ impl Widget for TermTabs {
                 if !deliver {
                     continue;
                 }
+                let route = in_view && id == focused && is_key_input(event);
+                if route {
+                    if let Some(mut t) = term.borrow_mut::<MpTerm>() {
+                        t.route_keys_here = true;
+                    }
+                }
                 let actions = cx.capture_actions(|cx| term.handle_event(cx, event, scope));
+                if route {
+                    if let Some(mut t) = term.borrow_mut::<MpTerm>() {
+                        t.route_keys_here = false;
+                    }
+                }
                 if !actions.is_empty() {
                     self.take_pane_actions(cx, index, id, actions, &mut exited);
                 }
@@ -1195,6 +1246,9 @@ impl Widget for TermTabs {
         exited.dedup();
         for (index, id) in exited.into_iter().rev() {
             self.close_pane(cx, index, id);
+        }
+        if std::mem::take(&mut self.publish_soon) && self.settings.external_control {
+            self.publish_panes();
         }
     }
 
@@ -1261,27 +1315,6 @@ impl TermTabs {
             pane.with_term(|term| term.set_background_dimming(cx, dim));
             let walk = Walk::new(Size::Fixed(rect.size.x), Size::Fixed(rect.size.y)).with_abs_pos(rect.pos);
             pane.term.draw_walk_all(cx, scope, walk);
-        }
-    }
-
-    /// A click in another pane moved the keyboard there (the focus change
-    /// lands after the click's own event): make that pane the focused one.
-    fn follow_key_focus(&mut self, cx: &mut Cx) {
-        let moved = self.tabs.get(self.active).filter(|tab| tab.panes.len() > 1).and_then(|tab| {
-            tab.panes
-                .iter()
-                .find(|p| p.id != tab.focused && p.with_term(|term| term.has_input_focus(cx)) == Some(true))
-                .map(|p| p.id)
-        });
-        if let Some(id) = moved {
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                tab.focused = id;
-                if let Some(pane) = tab.pane_mut(id) {
-                    pane.bell = false;
-                }
-            }
-            self.report_title(cx);
-            self.refresh(cx);
         }
     }
 
@@ -1482,7 +1515,8 @@ impl TermTabs {
         let typed: String = input.chars().filter(|c| !c.is_control()).collect();
         match &mut panel.mode {
             PanelMode::Choose(chooser) => {
-                chooser.filter.push_str(&typed);
+                let room = 64usize.saturating_sub(chooser.filter.chars().count());
+                chooser.filter.extend(typed.chars().take(room));
                 chooser.selected = 0;
                 chooser.scroll = 0;
             }
@@ -1601,15 +1635,19 @@ impl TermTabs {
         if selected != before && row != Row::Profile {
             // Preview as the selection moves (themes, fonts, the shell).
             if let Some(choice) = shown.get(selected) {
-                let next = row.with_value(&self.settings, &choice.value);
-                self.apply(cx, next);
+                let next = row.with_value(&self.current_settings(), &choice.value);
+                if matches!(row, Row::Font | Row::CjkFont) {
+                    self.apply_later(cx, next);
+                } else {
+                    self.apply(cx, next);
+                }
             }
         }
     }
 
     /// Take `value` for `row` and close its list.
     fn pick(&mut self, cx: &mut Cx, row: Row, value: &str) {
-        let next = row.with_value(&self.settings, value);
+        let next = row.with_value(&self.current_settings(), value);
         if let Some(panel) = self.panel.as_mut() {
             panel.mode = PanelMode::Rows;
             if row == Row::Profile {
@@ -1740,12 +1778,30 @@ impl TermTabs {
     }
 
     fn apply_step(&mut self, cx: &mut Cx, row: Row, dir: i32) {
-        let next = row.step(&self.settings, dir);
-        self.apply(cx, next);
+        let next = row.step(&self.current_settings(), dir);
+        if matches!(row, Row::Font | Row::CjkFont) {
+            self.apply_later(cx, next);
+        } else {
+            self.apply(cx, next);
+        }
+    }
+
+    /// The settings as the panel shows them: a waiting font change included.
+    fn current_settings(&self) -> Settings {
+        self.pending_apply.clone().unwrap_or_else(|| self.settings.clone())
+    }
+
+    /// Apply `settings` once the selection has rested.
+    fn apply_later(&mut self, cx: &mut Cx, settings: Settings) {
+        self.pending_apply = Some(settings);
+        cx.stop_timer(self.apply_timer);
+        self.apply_timer = cx.start_timeout(0.18);
+        self.refresh(cx);
     }
 
     /// Save `settings`: the file, and every tab through the generation.
     fn apply(&mut self, cx: &mut Cx, settings: Settings) {
+        self.pending_apply = None;
         if let Err(err) = term_settings::update(settings) {
             error!("terminal: could not save settings to {}: {err}", term_settings::path().display());
         }
@@ -1856,6 +1912,7 @@ impl TermTabs {
         row_h: f64,
         hits: &mut Vec<(Rect, PanelHit)>,
     ) -> usize {
+        let shown_settings = self.current_settings();
         let (selected, mut scroll, confirm_delete) =
             self.panel.as_ref().map_or((0, 0, false), |p| (p.selected, p.scroll, p.confirm_delete));
         // Keep the selected row in view, counting section headers.
@@ -1913,7 +1970,7 @@ impl TermTabs {
                 match row.kind() {
                     RowKind::Toggle => {
                         hits.push((row_rect, PanelHit::Select(i)));
-                        let on = row.value(&self.settings) == "On";
+                        let on = row.value(&shown_settings) == "On";
                         let pill = Rect { pos: dvec2(right - 30.0, y + 5.0), size: dvec2(30.0, 14.0) };
                         self.draw_tab.tab = 0.0;
                         self.draw_tab.radius = 7.0;
@@ -1933,7 +1990,7 @@ impl TermTabs {
                         let has_list = matches!(row, Row::Theme | Row::Font | Row::CjkFont | Row::Shell | Row::Profile);
                         hits.push((row_rect, if has_list { PanelHit::Activate(i) } else { PanelHit::Select(i) }));
                         let room = (right - 40.0 - (left + label_w + 16.0)).max(40.0);
-                        let value = self.fit(cx, &row.value(&self.settings), room);
+                        let value = self.fit(cx, &row.value(&shown_settings), room);
                         let vw = self.text_width(cx, &value);
                         let next = Rect { pos: dvec2(right - 16.0, y), size: dvec2(20.0, row_h) };
                         let prev = Rect { pos: dvec2(right - 16.0 - vw - 24.0, y), size: dvec2(20.0, row_h) };
@@ -1965,7 +2022,8 @@ impl TermTabs {
         row_h: f64,
         hits: &mut Vec<(Rect, PanelHit)>,
     ) -> usize {
-        let settings = self.settings.clone();
+        let settings = self.current_settings();
+        let shown_settings = settings.clone();
         let Some(PanelMode::Choose(chooser)) = self.panel.as_mut().map(|p| &mut p.mode) else {
             return 0;
         };
@@ -1982,7 +2040,7 @@ impl TermTabs {
             chooser.scroll = chooser.selected + 1 - visible;
         }
         let (row, filter, selected, scroll) = (chooser.row, chooser.filter.clone(), chooser.selected, chooser.scroll);
-        let current = row.current(&self.settings);
+        let current = row.current(&shown_settings);
 
         // Title with a back arrow, then the filter.
         let back = Rect { pos: dvec2(left - 6.0, top), size: dvec2(right - left + 12.0, row_h) };
@@ -1999,7 +2057,16 @@ impl TermTabs {
         self.draw_tab.tab = 0.0;
         self.draw_tab.color = c.line;
         self.draw_tab.draw_abs(cx, field);
-        let (text, color) = if filter.is_empty() { ("Type to filter".to_owned(), c.dim) } else { (format!("{filter}\u{258f}"), c.fg) };
+        let (text, color) = if filter.is_empty() {
+            ("Type to filter".to_owned(), c.dim)
+        } else {
+            // The end of what was typed, where the caret is.
+            let mut shown: String = filter.clone();
+            while shown.chars().count() > 1 && self.text_width(cx, &shown) > right - left - 12.0 {
+                shown.remove(0);
+            }
+            (format!("{shown}\u{258f}"), c.fg)
+        };
         self.draw_label.color = color;
         self.draw_label.draw_abs(cx, dvec2(left, field.pos.y + 4.0), &text);
 

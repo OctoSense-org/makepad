@@ -568,6 +568,9 @@ pub struct MpTerm {
     swallow_text_until: Option<Instant>,
     /// The fonts applied from the settings, and the script objects that
     /// keep their resources alive.
+    /// Set by a host for the one event it routes here (`crate::tabs`).
+    #[rust]
+    pub route_keys_here: bool,
     #[rust]
     font_key: Option<FontKey>,
     #[rust]
@@ -882,8 +885,16 @@ impl MpTerm {
             return;
         }
         let cache = makepad_widgets::makepad_platform::home::makepad_home().join("terminal").join("fonts");
-        let path = |face: &crate::fonts::Face| {
-            crate::fonts::standalone_path(face, &cache).map(|p| p.to_string_lossy().into_owned())
+        // Fonts are prepared off the UI thread; until they all are, the
+        // terminal keeps drawing with the fonts it has (the preparation
+        // re-syncs every terminal when it is done).
+        let mut pending = false;
+        let mut path = |face: &crate::fonts::Face| match crate::fonts::prepared_path(face, &cache) {
+            crate::fonts::Prepared::Ready(path) => path.map(|p| p.to_string_lossy().into_owned()),
+            crate::fonts::Prepared::Pending => {
+                pending = true;
+                None
+            }
         };
         let primary = (!s.font_family.is_empty()).then(|| crate::fonts::find(&s.font_family)).flatten();
         let cjk = match s.cjk_font.as_str() {
@@ -896,6 +907,9 @@ impl MpTerm {
             .and_then(|family| family.bold.as_ref().and_then(|face| path(face)))
             .or_else(|| regular.clone());
         let cjk = cjk.and_then(|family| path(&family.regular)).filter(|p| Some(p) != regular.as_ref());
+        if pending {
+            return;
+        }
         let key = (regular, bold, cjk);
         if self.font_key.as_ref() == Some(&key) {
             return;
@@ -2312,7 +2326,12 @@ impl Widget for MpTerm {
         // terminal can leave no widget holding the keyboard. Claim it on the
         // first key then, and handle that key in this pass: a key-focus
         // change only takes effect after the current event.
-        let orphan_key = self.session.is_some() && cx.key_focus() == Area::Empty;
+        //
+        // A host that routes keys itself (the tab widget, which knows which
+        // pane is focused) sets `route_keys_here`: this terminal takes the
+        // key whoever holds the keyboard, since a focus change the host made
+        // is still pending until this event is over.
+        let orphan_key = self.session.is_some() && (cx.key_focus() == Area::Empty || self.route_keys_here);
         let hit = match event {
             Event::KeyDown(e) if orphan_key => {
                 cx.set_key_focus(self.area);

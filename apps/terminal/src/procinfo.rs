@@ -52,6 +52,9 @@ mod platform {
         fn proc_name(pid: c_int, buffer: *mut c_void, size: u32) -> c_int;
     }
 
+    // Layout checked against <sys/proc_info.h> (macOS 26): sizeof(struct
+    // vnode_info) = 152, sizeof(struct proc_vnodepathinfo) = 2352, the cwd
+    // path at offset 152, MAXPATHLEN = 1024.
     const PROC_PIDVNODEPATHINFO: c_int = 9;
     /// `struct vnode_info` precedes each path in `vnode_info_path`.
     const VNODE_INFO_SIZE: usize = 152;
@@ -79,7 +82,8 @@ mod platform {
     pub fn path(pid: i32) -> Option<PathBuf> {
         let mut buf = vec![0u8; 4096];
         let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
-        (n > 0).then(|| PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).into_owned()))
+        // The kernel never reports more than it wrote; clamp anyway.
+        (n > 0).then(|| PathBuf::from(String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned()))
     }
 
     pub fn name(pid: i32) -> Option<String> {
@@ -88,7 +92,7 @@ mod platform {
         if n <= 0 {
             return None;
         }
-        Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+        Some(String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned())
     }
 }
 

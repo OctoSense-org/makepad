@@ -357,6 +357,42 @@ fn names(table: &[u8]) -> (Option<String>, Option<String>) {
     (get(16).or_else(|| get(1)), get(17).or_else(|| get(2)))
 }
 
+/// A face's loadable file, prepared off the UI thread: copying a face out
+/// of a large collection and checking it takes up to a second (PingFang,
+/// STHeiti, the Toppan and Yu families). `Ready(None)`: it cannot be used.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Prepared {
+    Ready(Option<PathBuf>),
+    Pending,
+}
+
+pub fn prepared_path(face: &Face, cache_dir: &Path) -> Prepared {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static PREPARED: Mutex<Option<HashMap<(PathBuf, u32), Prepared>>> = Mutex::new(None);
+    let key = (face.path.clone(), face.index);
+    {
+        let mut map = PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(HashMap::new);
+        if let Some(state) = map.get(&key) {
+            return state.clone();
+        }
+        map.insert(key.clone(), Prepared::Pending);
+    }
+    let (face, cache_dir) = (face.clone(), cache_dir.to_path_buf());
+    let spawned = std::thread::Builder::new().name("terminal-font-prepare".into()).spawn(move || {
+        let path = standalone_path(&face, &cache_dir);
+        PREPARED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(key, Prepared::Ready(path));
+        // Every terminal re-applies its fonts, now with this one ready.
+        crate::settings::bump_generation();
+        makepad_widgets::makepad_platform::thread::SignalToUI::set_ui_signal();
+    });
+    if spawned.is_err() {
+        return Prepared::Ready(None);
+    }
+    Prepared::Pending
+}
+
 /// Whether the text engine can load the font file at `path` (its first
 /// face). It panics on a font it cannot parse, so nothing it rejects may
 /// reach it. Remembered per path.
