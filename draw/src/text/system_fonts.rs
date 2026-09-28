@@ -479,34 +479,47 @@ fn fallback_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
         }
         // The major scripts, UI variants first. Not every font the platform
         // ships (about 160 on Android): each one here is parsed once when
-        // the first text is laid out.
-        for name in [
-            "NotoNaskhArabicUI-Regular.ttf",
-            "NotoNaskhArabic-Regular.ttf",
-            "NotoSansHebrew-Regular.ttf",
-            "NotoSansThaiUI-Regular.ttf",
-            "NotoSansThai-Regular.ttf",
-            "NotoSansDevanagariUI-VF.ttf",
-            "NotoSansDevanagari-VF.ttf",
-            "NotoSansBengaliUI-VF.ttf",
-            "NotoSansTamilUI-VF.ttf",
-            "NotoSansTeluguUI-VF.ttf",
-            "NotoSansKannadaUI-VF.ttf",
-            "NotoSansMalayalamUI-VF.ttf",
-            "NotoSansGujaratiUI-Regular.ttf",
-            "NotoSansGurmukhiUI-VF.ttf",
-            "NotoSansSinhalaUI-VF.ttf",
-            "NotoSansKhmerUI-VF.ttf",
-            "NotoSansLaoUI-Regular.ttf",
-            "NotoSansMyanmarUI-Regular.otf",
-            "NotoSansEthiopic-VF.ttf",
-            "NotoSansArmenian-VF.ttf",
-            "NotoSansGeorgian-VF.ttf",
-            "NotoSansSymbols-Regular-Subsetted.ttf",
-            "NotoSansSymbols-Regular-Subsetted2.ttf",
-            "NotoSansMath-Regular.otf",
+        // the first text is laid out. Releases name a script's file
+        // differently (Android 11 `NotoSansDevanagariUI-Regular.otf`,
+        // Android 15 `NotoSansDevanagariUI-VF.ttf`): the first that exists
+        // is used.
+        for base in [
+            "NotoNaskhArabicUI",
+            "NotoNaskhArabic",
+            "NotoSansHebrew",
+            "NotoSansThaiUI",
+            "NotoSansThai",
+            "NotoSansDevanagariUI",
+            "NotoSansDevanagari",
+            "NotoSansBengaliUI",
+            "NotoSansTamilUI",
+            "NotoSansTeluguUI",
+            "NotoSansKannadaUI",
+            "NotoSansMalayalamUI",
+            "NotoSansGujaratiUI",
+            "NotoSansGurmukhiUI",
+            "NotoSansSinhalaUI",
+            "NotoSansKhmerUI",
+            "NotoSansLaoUI",
+            "NotoSansMyanmarUI",
+            "NotoSansEthiopic",
+            "NotoSansArmenian",
+            "NotoSansGeorgian",
+            "NotoSansSymbols-Regular-Subsetted",
+            "NotoSansSymbols-Regular-Subsetted2",
+            "NotoSansMath",
         ] {
-            push(dir.join(name), ANY);
+            let found = if base.contains("-Regular") {
+                [format!("{base}.ttf")].into_iter().map(|name| dir.join(name)).find(|path| path.is_file())
+            } else {
+                ["-VF.ttf", "-Regular.ttf", "-Regular.otf"]
+                    .into_iter()
+                    .map(|suffix| dir.join(format!("{base}{suffix}")))
+                    .find(|path| path.is_file())
+            };
+            if let Some(path) = found {
+                push(path, ANY);
+            }
         }
     } else if cfg!(windows) {
         if let Some(windir) = std::env::var_os("WINDIR") {
