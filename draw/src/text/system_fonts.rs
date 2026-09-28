@@ -474,15 +474,22 @@ fn fallback_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
         }
     } else if cfg!(any(target_os = "android", target_env = "ohos")) {
         let dir = Path::new("/system/fonts");
-        for name in ["HarmonyOS_Sans_SC.ttf", "NotoSansCJK-Regular.ttc", "NotoSansSC-Regular.otf", "DroidSansFallback.ttf"] {
+        for name in [
+            "HarmonyOS_Sans_SC.ttf",
+            "NotoSansCJK-Regular.ttc",
+            "NotoSansSC-Regular.otf",
+            "DroidSansFallback.ttf",
+            "HarmonyOS_Sans_Naskh_Arabic_UI.ttf",
+            "HarmonyOS_Sans_Naskh_Arabic.ttf",
+        ] {
             push(dir.join(name), SC);
         }
         // The major scripts, UI variants first. Not every font the platform
-        // ships (about 160 on Android): each one here is parsed once when
-        // the first text is laid out. Releases name a script's file
-        // differently (Android 11 `NotoSansDevanagariUI-Regular.otf`,
-        // Android 15 `NotoSansDevanagariUI-VF.ttf`): the first that exists
-        // is used.
+        // ships (about 160 on Android, 200 on HarmonyOS): each one here is
+        // parsed once when the first text is laid out. Releases name a
+        // script's file differently (Android 11 `NotoSansDevanagariUI-
+        // Regular.otf`, Android 15 `NotoSansDevanagariUI-VF.ttf`, HarmonyOS
+        // `NotoSansThai[wdth,wght].ttf`): the first that exists is used.
         for base in [
             "NotoNaskhArabicUI",
             "NotoNaskhArabic",
@@ -492,27 +499,40 @@ fn fallback_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
             "NotoSansDevanagariUI",
             "NotoSansDevanagari",
             "NotoSansBengaliUI",
+            "NotoSansBengali",
             "NotoSansTamilUI",
+            "NotoSansTamil",
             "NotoSansTeluguUI",
+            "NotoSansTelugu",
             "NotoSansKannadaUI",
+            "NotoSansKannada",
             "NotoSansMalayalamUI",
+            "NotoSansMalayalam",
             "NotoSansGujaratiUI",
+            "NotoSansGujarati",
             "NotoSansGurmukhiUI",
+            "NotoSansGurmukhi",
             "NotoSansSinhalaUI",
+            "NotoSansSinhala",
             "NotoSansKhmerUI",
+            "NotoSansKhmer",
             "NotoSansLaoUI",
+            "NotoSansLao",
             "NotoSansMyanmarUI",
+            "NotoSansMyanmar",
             "NotoSansEthiopic",
             "NotoSansArmenian",
             "NotoSansGeorgian",
             "NotoSansSymbols-Regular-Subsetted",
             "NotoSansSymbols-Regular-Subsetted2",
+            "NotoSansSymbols",
+            "NotoSansSymbols2",
             "NotoSansMath",
         ] {
             let found = if base.contains("-Regular") {
                 [format!("{base}.ttf")].into_iter().map(|name| dir.join(name)).find(|path| path.is_file())
             } else {
-                ["-VF.ttf", "-Regular.ttf", "-Regular.otf"]
+                ["-VF.ttf", "-Regular.ttf", "-Regular.otf", "[wdth,wght].ttf", "[wght].ttf"]
                     .into_iter()
                     .map(|suffix| dir.join(format!("{base}{suffix}")))
                     .find(|path| path.is_file())
