@@ -36,6 +36,12 @@ makepad-strict-json = { path = "../../libs/strict_json" }
 makepad-wm-theme = { path = "../../libs/wm_theme" }
 makepad-wm-api = { path = "../../libs/wm_api" }
 
+# The font parser and shaper the text engine uses, for fuzzing corrupt
+# fonts through glyph outlining and shaping (src/robustness.rs).
+[dev-dependencies]
+ttf-parser = { path = "../../libs/ttf-parser" }
+rustybuzz = { path = "../../libs/rustybuzz" }
+
 [target.'cfg(windows)'.dependencies.windows]
 path = "../../libs/windows/windows-rs"
 version = "0.62.2"
