@@ -289,6 +289,24 @@ fn check_deveco_prj(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Where cargo writes this build: `CARGO_TARGET_DIR` when set, else the
+/// working directory's `target`. It is passed to cargo explicitly, because
+/// inside a workspace cargo would otherwise write to the workspace root's
+/// `target` while the packaging below looks here.
+fn cargo_target_root(cwd: &std::path::Path) -> std::path::PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) => {
+            let dir = std::path::PathBuf::from(dir);
+            if dir.is_absolute() {
+                dir
+            } else {
+                cwd.join(dir)
+            }
+        }
+        None => cwd.join("target"),
+    }
+}
+
 pub fn rust_build(
     deveco_home: &Option<String>,
     host_os: &HostOs,
@@ -343,6 +361,7 @@ pub fn rust_build(
         };
 
         let target_opt = format!("--target={target_triple}");
+        let target_dir_opt = format!("--target-dir={}", cargo_target_root(&cwd).display());
         let toolchain = target_triple.replace('-', "_");
 
         let base_args = &[
@@ -354,6 +373,7 @@ pub fn rust_build(
             "--lib",
             "--crate-type=cdylib",
             &target_opt,
+            &target_dir_opt,
         ];
         let mut args_out = Vec::new();
         args_out.extend_from_slice(base_args);
@@ -500,8 +520,7 @@ fn add_dependencies(args: &[String], targets: &[OpenHarmonyTarget]) -> Result<()
         mkdir(&dst_dir)?;
         cp_all(&local_resources_path, &dst_dir, false)?;
     }
-    let build_dir = cwd
-        .join("target")
+    let build_dir = cargo_target_root(&cwd)
         .join(targets[0].target_triple_str())
         .join(profile.clone());
     let deps = crate::utils::get_crate_dep_dirs_with(build_crate, &build_dir, &targets[0].target_triple_str(), &crate::utils::feature_args(args));
@@ -522,8 +541,7 @@ fn add_dependencies(args: &[String], targets: &[OpenHarmonyTarget]) -> Result<()
             OpenHarmonyTarget::Aarch64 => "arm64-v8a",
             OpenHarmonyTarget::X86_64 => "x86_64",
         };
-        let src_lib = cwd
-            .join("target")
+        let src_lib = cargo_target_root(&cwd)
             .join(target_dir)
             .join(profile.clone())
             .join(format!("lib{underscore_build_crate}.so"));
