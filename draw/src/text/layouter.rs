@@ -1337,6 +1337,20 @@ impl LaidoutRow {
             * next_row.line_spacing_scale
     }
 
+    /// Where the text of the cluster starting at `start` ends: the next
+    /// cluster's start in text order. Glyphs come in visual order, so in a
+    /// right-to-left run (Arabic, Hebrew) the next glyph's cluster lies
+    /// before this one, not after it.
+    fn cluster_end(&self, start: usize) -> usize {
+        self.glyphs
+            .iter()
+            .map(|glyph| glyph.cluster)
+            .filter(|&cluster| cluster > start)
+            .min()
+            .unwrap_or(self.text.len())
+            .max(start)
+    }
+
     pub fn x_in_lpxs_to_index(&self, x_in_lpxs: f32) -> usize {
         use {super::slice::SliceExt, unicode_segmentation::UnicodeSegmentation};
 
@@ -1348,14 +1362,15 @@ impl LaidoutRow {
             let start = glyph_group[0].cluster;
             let start_x_in_lpxs = glyph_group[0].origin_in_lpxs.x;
             let next_glyph_group = glyph_groups.peek();
-            let end = next_glyph_group.map_or(self.text.len(), |next_glyph_group| {
-                next_glyph_group[0].cluster
-            });
+            let end = self.cluster_end(start);
             let end_x_in_lpxs = next_glyph_group.map_or(self.width_in_lpxs, |next_glyph_group| {
                 next_glyph_group[0].origin_in_lpxs.x
             });
             let width_in_lpxs = end_x_in_lpxs - start_x_in_lpxs;
             let grapheme_count = self.text[start..end].graphemes(true).count();
+            if grapheme_count == 0 {
+                continue;
+            }
             let grapheme_width_in_lpxs = width_in_lpxs / grapheme_count as f32;
             let mut current_x_in_lpxs = start_x_in_lpxs;
             for (grapheme_start, _) in self.text[start..end].grapheme_indices(true) {
@@ -1378,11 +1393,7 @@ impl LaidoutRow {
         while let Some(glyph_group) = glyph_groups.next() {
             let start = glyph_group[0].cluster;
             let start_x_in_lpxs = glyph_group[0].origin_in_lpxs.x;
-            let end = glyph_groups
-                .peek()
-                .map_or(self.text.len(), |next_glyph_group| {
-                    next_glyph_group[0].cluster
-                });
+            let end = self.cluster_end(start);
             let end_x_in_lpxs = glyph_groups
                 .peek()
                 .map_or(self.width_in_lpxs, |next_glyph_group| {
@@ -1390,6 +1401,9 @@ impl LaidoutRow {
                 });
             let width_in_lpxs = end_x_in_lpxs - start_x_in_lpxs;
             let grapheme_count = self.text[start..end].graphemes(true).count();
+            if grapheme_count == 0 {
+                continue;
+            }
             let grapheme_width_in_lpxs = width_in_lpxs / grapheme_count as f32;
             let mut current_x_in_lpxs = start_x_in_lpxs;
             for (grapheme_start, _) in self.text[start..end].grapheme_indices(true) {
