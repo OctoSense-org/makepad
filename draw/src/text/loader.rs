@@ -115,12 +115,50 @@ impl Loader {
             .get(&id)
             .cloned()
             .unwrap_or_else(|| panic!("font family {:?} is not defined", id));
-        let fonts = definition
+        let mut fonts: Vec<Rc<Font>> = definition
             .font_ids
             .into_iter()
             .map(|font_id| self.get_or_load_font(font_id).clone())
             .collect();
-        FontFamily::new(id, self.shaper.clone(), fonts, definition.diagnostics)
+        // Behind the family's own fonts, the platform's: a character none
+        // of the bundled fonts has (a script the app did not ship a font
+        // for) draws with the system's font instead of an empty box.
+        for font_id in self.system_fallback_font_ids() {
+            let font = self.get_or_load_font(font_id).clone();
+            if !fonts.iter().any(|f| Rc::ptr_eq(f, &font)) {
+                fonts.push(font);
+            }
+        }
+        FontFamily::new(id, self.shaper.clone(), fonts.into(), definition.diagnostics)
+    }
+
+    /// The system fallback fonts as loader fonts, defined on first use and
+    /// shared by every family (each file is mapped and parsed once).
+    fn system_fallback_font_ids(&mut self) -> Vec<FontId> {
+        let mut ids = Vec::new();
+        for face in super::system_fonts::fallback_faces() {
+            let mut hasher = fxhash::FxHasher::default();
+            std::hash::Hash::hash(&("makepad-system-font", &face.path, face.index), &mut hasher);
+            let id = FontId::from(std::hash::Hasher::finish(&hasher));
+            if !self.is_font_known(id) {
+                let Ok(data) = crate::makepad_platform::SharedBytes::from_file_mmap_or_read(&face.path) else {
+                    continue;
+                };
+                self.define_font(
+                    id,
+                    FontDefinition {
+                        data,
+                        index: face.index,
+                        ascender_fudge_in_ems: 0.0,
+                        descender_fudge_in_ems: 0.0,
+                        weight: None,
+                        variations: Vec::new(),
+                    },
+                );
+            }
+            ids.push(id);
+        }
+        ids
     }
 
     pub fn get_or_load_font(&mut self, id: FontId) -> &Rc<Font> {

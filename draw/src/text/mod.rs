@@ -20,6 +20,7 @@ pub mod shaper;
 pub mod slice;
 pub mod slug_atlas;
 pub mod substr;
+pub mod system_fonts;
 
 // Debug test commented out - requires png encoder
 // #[cfg(test)]
