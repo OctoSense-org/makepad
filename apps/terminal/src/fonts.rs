@@ -45,11 +45,33 @@ static SCANNING: std::sync::Once = std::sync::Once::new();
 pub fn warm() {
     SCANNING.call_once(|| {
         let _ = std::thread::Builder::new().name("terminal-font-scan".into()).spawn(|| {
-            FAMILIES.get_or_init(|| group(scan(&font_dirs())));
+            FAMILIES.get_or_init(scan_usable);
             crate::settings::bump_generation();
             makepad_widgets::makepad_platform::thread::SignalToUI::set_ui_signal();
         });
     });
+}
+
+/// The installed families whose regular face the text engine can load.
+fn scan_usable() -> Vec<Family> {
+    let mut families = group(scan(&font_dirs()));
+    families.retain(|family| face_loadable(&family.regular));
+    for family in &mut families {
+        if family.bold.as_ref().is_some_and(|bold| !face_loadable(bold)) {
+            family.bold = None;
+        }
+    }
+    families
+}
+
+/// Whether the text engine can parse `face` in its file (collections too).
+pub fn face_loadable(face: &Face) -> bool {
+    use makepad_widgets::makepad_draw::text::font_face::FontFace;
+    use makepad_widgets::makepad_platform::SharedBytes;
+    SharedBytes::from_file_mmap_or_read(&face.path)
+        .ok()
+        .and_then(|data| FontFace::from_data_and_index(data, face.index))
+        .is_some()
 }
 
 /// Every installed family, monospace first, then by name; empty until the
@@ -232,6 +254,11 @@ pub fn read_faces(path: &Path) -> Option<Vec<Face>> {
             continue;
         };
         let find = |tag: &[u8; 4]| tables.iter().find(|(t, _, _)| t == tag).map(|(_, o, l)| (*o, *l));
+        // Bitmap-only faces (no outlines: GB18030 Bitmap, Apple Braille…)
+        // are no text font the renderer can draw.
+        if find(b"glyf").is_none() && find(b"CFF ").is_none() && find(b"CFF2").is_none() {
+            continue;
+        }
         let Some((name_off, name_len)) = find(b"name") else {
             continue;
         };
@@ -330,10 +357,45 @@ fn names(table: &[u8]) -> (Option<String>, Option<String>) {
     (get(16).or_else(|| get(1)), get(17).or_else(|| get(2)))
 }
 
-/// A file holding just `face`, loadable by the text engine (which reads the
+/// Whether the text engine can load the font file at `path` (its first
+/// face). It panics on a font it cannot parse, so nothing it rejects may
+/// reach it. Remembered per path.
+pub fn loadable(path: &Path) -> bool {
+    use makepad_widgets::makepad_draw::text::font_face::FontFace;
+    use makepad_widgets::makepad_platform::SharedBytes;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static CHECKED: Mutex<Option<HashMap<PathBuf, bool>>> = Mutex::new(None);
+    if let Some(known) = CHECKED.lock().ok().and_then(|c| c.as_ref().and_then(|m| m.get(path).copied())) {
+        return known;
+    }
+    let ok = SharedBytes::from_file_mmap_or_read(path)
+        .ok()
+        .and_then(|data| FontFace::from_data_and_index(data, 0))
+        .is_some();
+    if let Ok(mut checked) = CHECKED.lock() {
+        checked.get_or_insert_with(HashMap::new).insert(path.to_path_buf(), ok);
+    }
+    ok
+}
+
+/// A file holding just `face` that the text engine can load (it reads the
 /// first face of a file): the file itself for a single-face font, else a
-/// copy of the face's tables under `cache_dir`, written once.
+/// copy of the face's tables under `cache_dir`, written once. `None` when
+/// the engine would reject it.
 pub fn standalone_path(face: &Face, cache_dir: &Path) -> Option<PathBuf> {
+    let path = copy_out(face, cache_dir)?;
+    if loadable(&path) {
+        Some(path)
+    } else {
+        if path.starts_with(cache_dir) {
+            let _ = std::fs::remove_file(&path);
+        }
+        None
+    }
+}
+
+fn copy_out(face: &Face, cache_dir: &Path) -> Option<PathBuf> {
     let mut file = File::open(&face.path).ok()?;
     let offsets = face_offsets(&mut file)?;
     if offsets.len() == 1 && face.index == 0 {
@@ -414,13 +476,15 @@ mod tests {
         name.extend_from_slice(&s);
         let mut post = vec![0u8; 32];
         post[12..16].copy_from_slice(&(fixed as u32).to_be_bytes());
+        let glyf = vec![0u8; 4];
         let mut out = Vec::new();
         out.extend_from_slice(&0x00010000u32.to_be_bytes());
-        out.extend_from_slice(&2u16.to_be_bytes());
+        out.extend_from_slice(&3u16.to_be_bytes());
         out.extend_from_slice(&[0; 6]);
-        let name_at = 12 + 32;
+        let name_at = 12 + 48;
         let post_at = name_at + name.len();
-        for (tag, at, len) in [(b"name", name_at, name.len()), (b"post", post_at, post.len())] {
+        let glyf_at = post_at + post.len();
+        for (tag, at, len) in [(b"glyf", glyf_at, glyf.len()), (b"name", name_at, name.len()), (b"post", post_at, post.len())] {
             out.extend_from_slice(tag);
             out.extend_from_slice(&0u32.to_be_bytes());
             out.extend_from_slice(&(at as u32).to_be_bytes());
@@ -428,6 +492,7 @@ mod tests {
         }
         out.extend_from_slice(&name);
         out.extend_from_slice(&post);
+        out.extend_from_slice(&glyf);
         out
     }
 
@@ -445,8 +510,10 @@ mod tests {
         assert!(families[0].monospace && !families[1].monospace);
         assert_eq!(families[0].regular.style, "Regular");
         assert_eq!(families[0].bold.as_ref().map(|f| f.style.as_str()), Some("Bold"));
-        // A single-face file is used as it is.
-        assert_eq!(standalone_path(&families[0].regular, &dir), Some(dir.join("a.ttf")));
+        // A single-face file is used as it is; one the engine cannot load
+        // (these test fonts have no real glyphs) is never offered to it.
+        assert_eq!(copy_out(&families[0].regular, &dir), Some(dir.join("a.ttf")));
+        assert_eq!(standalone_path(&families[0].regular, &dir), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -466,7 +533,7 @@ mod tests {
         ttc.extend_from_slice(&((header + a.len()) as u32).to_be_bytes());
         for (font, base) in [(&a, header), (&b, header + a.len())] {
             let mut f = font.clone();
-            for i in 0..2 {
+            for i in 0..3 {
                 let at = 12 + i * 16 + 8;
                 let off = u32::from_be_bytes(f[at..at + 4].try_into().unwrap()) + base as u32;
                 f[at..at + 4].copy_from_slice(&off.to_be_bytes());
@@ -477,7 +544,7 @@ mod tests {
         let faces = read_faces(&dir.join("both.ttc")).unwrap();
         assert_eq!(faces.iter().map(|f| f.family.as_str()).collect::<Vec<_>>(), ["Coll A", "Coll B"]);
         let cache = dir.join("cache");
-        let out = standalone_path(&faces[1], &cache).expect("copied out");
+        let out = copy_out(&faces[1], &cache).expect("copied out");
         let copied = read_faces(&out).unwrap();
         assert_eq!(copied.len(), 1);
         assert_eq!(copied[0].family, "Coll B");
@@ -488,9 +555,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_has_menlo_and_a_cjk_fallback() {
-        FAMILIES.get_or_init(|| group(scan(&font_dirs())));
+        FAMILIES.get_or_init(scan_usable);
         let menlo = find("Menlo").expect("Menlo ships with macOS");
         assert!(menlo.monospace);
+        assert!(find("GB18030 Bitmap").is_none(), "a bitmap-only font is not offered");
+        let dir = std::env::temp_dir().join(format!("terminal-menlo-{}", std::process::id()));
+        assert!(standalone_path(&menlo.regular, &dir).is_some(), "Menlo loads");
+        std::fs::remove_dir_all(&dir).ok();
         if let Some(cjk) = auto_cjk() {
             let dir = std::env::temp_dir().join(format!("terminal-cjk-{}", std::process::id()));
             let path = standalone_path(&cjk.regular, &dir).expect("loadable");
