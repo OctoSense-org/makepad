@@ -23,6 +23,11 @@ path = "src/lib.rs"
 name = "terminal"
 path = "src/main.rs"
 
+# The client of the terminal's control socket (src/control.rs).
+[[bin]]
+name = "terminal-ctl"
+path = "src/bin/terminal-ctl.rs"
+
 [dependencies]
 makepad-widgets = { path = "../../widgets" }
 makepad-ai-services = { path = "../../libs/ai/services" }
@@ -30,6 +35,12 @@ makepad-app-module = { path = "../../libs/app_module" }
 makepad-strict-json = { path = "../../libs/strict_json" }
 makepad-wm-theme = { path = "../../libs/wm_theme" }
 makepad-wm-api = { path = "../../libs/wm_api" }
+
+# The font parser and shaper the text engine uses, for fuzzing corrupt
+# fonts through glyph outlining and shaping (src/robustness.rs).
+[dev-dependencies]
+ttf-parser = { path = "../../libs/ttf-parser" }
+rustybuzz = { path = "../../libs/rustybuzz" }
 
 [target.'cfg(windows)'.dependencies.windows]
 path = "../../libs/windows/windows-rs"

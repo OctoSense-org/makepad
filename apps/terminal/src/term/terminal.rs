@@ -91,12 +91,23 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    /// Change the primary screen's history limit (the alternate screen
+    /// keeps none).
+    pub fn set_scrollback(&mut self, lines: usize) {
+        self.primary.set_max_scrollback(lines);
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::with_scrollback(cols, rows, DEFAULT_SCROLLBACK)
+    }
+
+    /// A terminal whose primary screen keeps `scrollback` rows of history.
+    pub fn with_scrollback(cols: usize, rows: usize, scrollback: usize) -> Self {
         let palette = default_palette();
         let fg = Rgb::new(0xa9, 0xb1, 0xd6);
         let bg = Rgb::new(0x1a, 0x1b, 0x26);
         Self {
-            primary: Screen::new(cols, rows, DEFAULT_SCROLLBACK),
+            primary: Screen::new(cols, rows, scrollback),
             alternate: Screen::new(cols, rows, 0),
             active: ActiveScreen::Primary,
             modes: ModeState::new(),

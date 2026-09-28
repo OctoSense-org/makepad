@@ -13,7 +13,10 @@ use makepad_widgets::text::geom::Point;
 use makepad_widgets::text::rasterizer::RasterizedGlyph;
 use makepad_widgets::*;
 
-use crate::session::Session;
+use crate::session::{Session, SpawnOptions};
+use crate::settings::{self as term_settings, BellStyle, CursorShape, Settings};
+use crate::themes;
+use std::time::{Duration, Instant};
 use crate::term::color::Rgb;
 use crate::term::key_encode::{
     encode_key, Key, KeyAction, KeyEncodeOptions, KeyEvent as TermKeyEvent, KeyMods, KittyFlags,
@@ -327,6 +330,70 @@ pub enum MpTermAction {
     None,
 }
 
+/// Paths of the fonts a terminal draws with, beyond the bundled ones:
+/// (regular, bold, CJK fallback).
+type FontKey = (Option<String>, Option<String>, Option<String>);
+
+/// A text style whose family is `primary` (if any), then the bundled
+/// JetBrains Mono at `weight`, then `cjk` (if any), then the icon, emoji
+/// and symbol fonts. Script members cannot be conditional, hence the arms.
+fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&str>, weight: f64) -> ScriptValue {
+    match (primary.map(str::to_owned), cjk.map(str::to_owned)) {
+        (Some(primary), Some(cjk)) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+        (Some(primary), None) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+        (None, Some(cjk)) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+        (None, None) => script_eval!(vm, {
+            use mod.prelude.widgets_internal.*
+            TextStyle{
+                font_family: FontFamily{
+                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                }
+                line_spacing: 1.0
+            }
+        }),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CachedGlyph {
     rasterized: RasterizedGlyph,
@@ -490,6 +557,35 @@ pub struct MpTerm {
     style_colors: Option<(Rgb, Rgb)>,
     #[rust]
     original_colors: Option<([Rgb; 16], Rgb, Rgb)>,
+    /// The cursor colour the host handed down (MAKEPAD_TERMINAL_COLORS).
+    #[rust]
+    original_cursor: Option<Rgb>,
+    /// The person's terminal settings as last applied (`crate::settings`)
+    /// and the generation they came from.
+    #[rust]
+    settings: Settings,
+    #[rust]
+    settings_gen: u64,
+    /// A blinking cursor's phase starts here; typing restarts it on.
+    #[rust]
+    blink_epoch: Option<Instant>,
+    #[rust]
+    blink_timer: Timer,
+    #[rust]
+    blink_armed: bool,
+    /// The composed character macOS delivers right after an Option+key that
+    /// option-as-meta already sent as a Meta key.
+    #[rust]
+    swallow_text_until: Option<Instant>,
+    /// The fonts applied from the settings, and the script objects that
+    /// keep their resources alive.
+    /// Set by a host for the one event it routes here (`crate::tabs`).
+    #[rust]
+    pub route_keys_here: bool,
+    #[rust]
+    font_key: Option<FontKey>,
+    #[rust]
+    font_roots: Vec<ScriptObjectRef>,
 }
 
 impl ScriptHook for MpTerm {
@@ -522,14 +618,7 @@ impl ScriptHook for MpTerm {
         } else {
             None
         };
-        if let (Some(session), Some((mut palette, fg, bg))) =
-            (&mut self.session, self.original_colors)
-        {
-            let (fg, bg) = self.style_colors.unwrap_or((fg, bg));
-            palette[0] = bg;
-            palette[7] = fg;
-            session.terminal.set_theme(&palette, fg, bg);
-        }
+        self.apply_colors();
     }
 }
 
@@ -586,6 +675,51 @@ impl MpTerm {
     /// Whether keyboard input currently goes to this terminal's PTY area.
     pub fn has_input_focus(&self, cx: &Cx) -> bool {
         cx.has_key_focus(self.area)
+    }
+
+    /// Send the keyboard here (a tab was selected). Before its first frame
+    /// the terminal takes focus as it draws.
+    pub fn focus(&mut self, cx: &mut Cx) {
+        if !self.area.is_empty() {
+            cx.set_key_focus(self.area);
+        }
+        self.draw_bg.redraw(cx);
+    }
+
+    /// The job running in the foreground, `None` at the shell prompt.
+    pub fn foreground_job(&self) -> Option<String> {
+        self.session.as_ref().and_then(Session::foreground_job)
+    }
+
+    /// The name of the job, else the shell.
+    pub fn foreground_name(&self) -> Option<String> {
+        self.session.as_ref().and_then(Session::foreground_name)
+    }
+
+    /// Where the shell is: its OSC 7 report, else the process table.
+    pub fn current_dir(&self) -> Option<PathBuf> {
+        self.session
+            .as_ref()
+            .and_then(Session::shell_cwd)
+            .or_else(|| self.cwd.clone())
+    }
+
+    /// Paste `text` the way a person's paste arrives (bracketed when the
+    /// program asked for that).
+    pub fn ai_paste(&mut self, text: &str) -> bool {
+        self.paste_bytes(text)
+    }
+
+    /// Whether the session ran and has ended.
+    pub fn has_exited(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.exited)
+    }
+
+    /// (background, foreground) of the colours in use, for chrome drawn
+    /// around the terminal (the tab bar).
+    pub fn chrome_colors(&self) -> Option<(Vec4f, Vec4f)> {
+        let (_, fg, bg, _) = self.resolved_colors()?;
+        Some((Self::rgb_to_vec4(bg, 1.0), Self::rgb_to_vec4(fg, 1.0)))
     }
 
     /// Rows currently painted in the widget, or the last `lines` rows of
@@ -678,14 +812,15 @@ impl MpTerm {
                 self.bg_opacity = (active.clamp(0.0, 1.0), inactive.clamp(0.0, 1.0));
             }
         }
-        match Session::spawn(
+        self.load_settings();
+        match Session::spawn_with(
             cols,
             rows,
             self.cwd.as_deref(),
-            None,
             self.command.as_deref(),
+            &SpawnOptions::from_settings(&self.settings),
         ) {
-            Ok(mut session) => {
+            Ok(session) => {
                 // makepad-wm hands the splash theme's terminal palette down
                 // via MAKEPAD_TERMINAL_COLORS; standalone runs use the bundled default.
                 let (mut base16, mut fg, mut bg) = default_theme();
@@ -708,24 +843,161 @@ impl MpTerm {
                         } else if key == "background" {
                             bg = rgb;
                         } else if key == "cursor" {
-                            session.terminal.cursor_color = Some(rgb);
+                            self.original_cursor = Some(rgb);
                         }
                     }
                 }
                 self.original_colors = Some((base16, fg, bg));
-                if let Some((style_fg, style_bg)) = self.style_colors {
-                    fg = style_fg;
-                    bg = style_bg;
-                    base16[0] = bg;
-                    base16[7] = fg;
-                }
-                session.terminal.set_theme(&base16, fg, bg);
                 self.session = Some(session);
+                self.apply_colors();
             }
             Err(err) => {
                 error!("terminal: failed to spawn shell: {}", err);
             }
         }
+    }
+
+    /// Read the live settings once (first draw or spawn).
+    fn load_settings(&mut self) {
+        if self.settings_gen == 0 {
+            self.settings_gen = term_settings::generation();
+            self.settings = term_settings::current();
+            self.font_size = self.settings.font_size;
+            self.draw_text.text_style.line_spacing = self.settings.line_height as f32;
+        }
+    }
+
+    /// Apply a settings change: the live copy's generation moved past the
+    /// one this terminal applied (a panel edit, or the file changed).
+    fn sync_settings(&mut self, cx: &mut Cx) {
+        let generation = term_settings::generation();
+        if generation == self.settings_gen {
+            return;
+        }
+        self.settings_gen = generation;
+        self.settings = term_settings::current();
+        self.font_size = self.settings.font_size;
+        self.draw_text.text_style.line_spacing = self.settings.line_height as f32;
+        if let Some(session) = self.session.as_mut() {
+            session.terminal.set_scrollback(self.settings.scrollback_lines);
+        }
+        self.apply_colors();
+        self.apply_fonts(cx);
+        self.glyph_cache.clear();
+        self.draw_bg.redraw(cx);
+    }
+
+    /// Use the font families the settings name. Before the font scan has
+    /// finished the bundled font stays; the scan's end re-syncs.
+    fn apply_fonts(&mut self, cx: &mut Cx) {
+        use term_settings::{CJK_AUTO, CJK_NONE};
+        let s = &self.settings;
+        if s.font_family.is_empty() && s.cjk_font == CJK_NONE && self.font_key.is_none() {
+            return;
+        }
+        let cache = makepad_widgets::makepad_platform::home::makepad_home().join("terminal").join("fonts");
+        // Fonts are prepared off the UI thread; until they all are, the
+        // terminal keeps drawing with the fonts it has (the preparation
+        // re-syncs every terminal when it is done).
+        let mut pending = false;
+        let mut path = |face: &crate::fonts::Face| match crate::fonts::prepared_path(face, &cache) {
+            crate::fonts::Prepared::Ready(path) => path.map(|p| p.to_string_lossy().into_owned()),
+            crate::fonts::Prepared::Pending => {
+                pending = true;
+                None
+            }
+        };
+        let primary = (!s.font_family.is_empty()).then(|| crate::fonts::find(&s.font_family)).flatten();
+        let cjk = match s.cjk_font.as_str() {
+            CJK_NONE => None,
+            CJK_AUTO => crate::fonts::auto_cjk(),
+            name => crate::fonts::find(name),
+        };
+        let regular = primary.and_then(|family| path(&family.regular));
+        let bold = primary
+            .and_then(|family| family.bold.as_ref().and_then(|face| path(face)))
+            .or_else(|| regular.clone());
+        let cjk = cjk.and_then(|family| path(&family.regular)).filter(|p| Some(p) != regular.as_ref());
+        if pending {
+            return;
+        }
+        let key = (regular, bold, cjk);
+        if self.font_key.as_ref() == Some(&key) {
+            return;
+        }
+        let (regular_style, bold_style, roots) = cx.with_vm(|vm| {
+            let regular = terminal_text_style(vm, key.0.as_deref(), key.2.as_deref(), 400.0);
+            let bold = terminal_text_style(vm, key.1.as_deref(), key.2.as_deref(), 800.0);
+            let roots = [regular, bold]
+                .iter()
+                .filter_map(|v| v.as_object())
+                .map(|obj| vm.bx.heap.new_object_ref(obj))
+                .collect::<Vec<_>>();
+            (TextStyle::script_from_value(vm, regular), TextStyle::script_from_value(vm, bold), roots)
+        });
+        // A family that did not build (a host's script context without the
+        // resource functions) would draw nothing: keep the fonts in use.
+        if regular_style.font_family.member_ids().len() == 0 || bold_style.font_family.member_ids().len() == 0 {
+            error!("terminal: the font family could not be built; keeping the current fonts");
+            self.font_key = Some(key);
+            return;
+        }
+        self.draw_text.text_style.font_family = regular_style.font_family;
+        self.bold_text_style.font_family = bold_style.font_family;
+        self.font_roots = roots;
+        self.font_key = Some(key);
+        self.glyph_cache.clear();
+        self.glyph_cache_key = (0, 0, 0);
+    }
+
+    /// The palette, default colours and cursor colour to use: a bundled
+    /// scheme the person chose, else the host's (desktop style, the palette
+    /// makepad-wm hands down, or the built-in default).
+    fn resolved_colors(&self) -> Option<([Rgb; 16], Rgb, Rgb, Option<Rgb>)> {
+        if self.settings.theme != term_settings::THEME_DESKTOP {
+            if let Some(scheme) = themes::find(&self.settings.theme) {
+                let rgb = |c: u32| Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8);
+                let mut base16 = [Rgb::default(); 16];
+                for (slot, c) in base16.iter_mut().zip(scheme.base16) {
+                    *slot = rgb(c);
+                }
+                return Some((base16, rgb(scheme.foreground), rgb(scheme.background), Some(rgb(scheme.cursor))));
+            }
+        }
+        let (mut palette, fg, bg) = self.original_colors?;
+        let (fg, bg) = match self.style_colors {
+            Some((style_fg, style_bg)) => {
+                palette[0] = style_bg;
+                palette[7] = style_fg;
+                (style_fg, style_bg)
+            }
+            None => (fg, bg),
+        };
+        Some((palette, fg, bg, self.original_cursor))
+    }
+
+    fn apply_colors(&mut self) {
+        let Some((palette, fg, bg, cursor)) = self.resolved_colors() else {
+            return;
+        };
+        if let Some(session) = self.session.as_mut() {
+            session.terminal.cursor_color = cursor;
+            session.terminal.set_theme(&palette, fg, bg);
+        }
+    }
+
+    /// (focused, unfocused) background alpha: the person's setting, else
+    /// the host's rule (makepad-wm) or opaque.
+    fn effective_opacity(&self) -> (f32, f32) {
+        match self.settings.background_opacity {
+            Some(a) => (a, (a - 0.08).max(term_settings::OPACITY_RANGE.0)),
+            None => self.bg_opacity,
+        }
+    }
+
+    fn blink_phase_on(&mut self) -> bool {
+        let t = self.blink_epoch.get_or_insert_with(Instant::now).elapsed().as_secs_f64();
+        ((t / BLINK_HALF_PERIOD) as u64) % 2 == 0
     }
 
     fn refresh_metrics(&mut self, cx: &mut Cx2d) {
@@ -813,10 +1085,15 @@ impl MpTerm {
                     - g.rasterized.atlas_image_bounds.size.height as f32 * 0.5)
                     * font_size
                     / g.rasterized.dpxs_per_em;
+                // A glyph starts inside its own cells whatever the font
+                // says (some proportional CJK fonts report pen offsets far
+                // past one character).
+                let x_offset = (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit;
+                let x_offset = if x_offset.abs() > available { 0.0 } else { x_offset };
                 CachedGlyph {
                     rasterized: g.rasterized,
                     font_size_in_lpxs: font_size * fit,
-                    x_offset_in_lpxs: (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit,
+                    x_offset_in_lpxs: x_offset,
                     y_offset_in_lpxs: center_y * (1.0 - fit),
                 }
             })
@@ -1454,8 +1731,8 @@ impl MpTerm {
 
     fn draw_terminal_background(&mut self, cx: &mut Cx2d, bg: Rgb, inverse: bool) {
         let alpha = if self.opaque_style { 1.0 }
-            else if cx.has_key_focus(self.area) { self.bg_opacity.0 }
-            else { self.bg_opacity.1 };
+            else if cx.has_key_focus(self.area) { self.effective_opacity().0 }
+            else { self.effective_opacity().1 };
         let mut v = Self::rgb_to_vec4(bg, alpha);
         if !inverse {
             let scale = 1.0 - self.background_dimming;
@@ -1508,6 +1785,17 @@ impl MpTerm {
                 t.cursor_style,
             )
         };
+        let cursor_style = effective_cursor_style(cursor_style, &self.settings);
+        let blinking = has_focus
+            && matches!(
+                cursor_style,
+                CursorStyle::BlinkingBlock | CursorStyle::BlinkingBar | CursorStyle::BlinkingUnderline
+            );
+        let blink_on = !blinking || self.blink_phase_on();
+        if blinking && !self.blink_armed {
+            self.blink_armed = true;
+            self.blink_timer = cx.start_timeout(BLINK_HALF_PERIOD);
+        }
 
         // Background fill honoring DECSCNM.
         let bg_fill = if global_inverse {
@@ -1679,7 +1967,7 @@ impl MpTerm {
         }
 
         // Cursor (only when the live bottom is in view).
-        let cursor = if self.view_offset == 0 && cursor_visible && !session.exited {
+        let cursor = if self.view_offset == 0 && cursor_visible && blink_on && !session.exited {
             let s = session.terminal.screen();
             Some((s.cursor.x.min(cols - 1), s.cursor.y))
         } else {
@@ -1867,7 +2155,9 @@ impl MpTerm {
                         actions.push(MpTermAction::TitleChanged(title))
                     }
                     TermEvent::Bell => {
-                        self.bell_frames = 6;
+                        if self.settings.bell == BellStyle::Visual {
+                            self.bell_frames = 6;
+                        }
                         actions.push(MpTermAction::Bell);
                         needs_redraw = true;
                     }
@@ -1909,6 +2199,8 @@ impl Widget for MpTerm {
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
         cx.begin_turtle(walk, self.layout);
         self.rect = cx.turtle().rect();
+        self.sync_settings(cx);
+        self.apply_fonts(cx);
         self.refresh_metrics(cx);
         self.ensure_session(cx);
 
@@ -1960,6 +2252,22 @@ impl Widget for MpTerm {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if self.blink_timer.is_event(event).is_some() {
+            self.blink_armed = false;
+            self.draw_bg.redraw(cx);
+        }
+        if matches!(event, Event::KeyDown(_) | Event::TextInput(_)) {
+            self.blink_epoch = None;
+        }
+        if matches!(event, Event::KeyDown(_) | Event::KeyUp(_)) {
+            // The composed text an Option key produces arrives before its
+            // key-up, so any later key event ends the swallow window.
+            self.swallow_text_until = None;
+        }
+        if matches!(event, Event::KeyDown(_)) {
+            term_settings::poll();
+            self.sync_settings(cx);
+        }
         if matches!(event, Event::Drag(_) | Event::Drop(_)) {
             match event.drag_hits(cx, self.area) {
                 DragHit::Drag(drag) => {
@@ -2029,7 +2337,12 @@ impl Widget for MpTerm {
         // terminal can leave no widget holding the keyboard. Claim it on the
         // first key then, and handle that key in this pass: a key-focus
         // change only takes effect after the current event.
-        let orphan_key = self.session.is_some() && cx.key_focus() == Area::Empty;
+        //
+        // A host that routes keys itself (the tab widget, which knows which
+        // pane is focused) sets `route_keys_here`: this terminal takes the
+        // key whoever holds the keyboard, since a focus change the host made
+        // is still pending until this event is over.
+        let orphan_key = self.session.is_some() && (cx.key_focus() == Area::Empty || self.route_keys_here);
         let hit = match event {
             Event::KeyDown(e) if orphan_key => {
                 cx.set_key_focus(self.area);
@@ -2128,6 +2441,11 @@ impl Widget for MpTerm {
                         &e.modifiers,
                     );
                 }
+                if self.selecting && self.settings.copy_on_select {
+                    if let Some(text) = self.selected_text().filter(|t| !t.is_empty()) {
+                        cx.copy_to_clipboard(&text);
+                    }
+                }
                 if self.touches.is_empty() {
                     self.local_press = false;
                 }
@@ -2141,6 +2459,8 @@ impl Widget for MpTerm {
                 self.handle_scroll(cx, &e);
             }
             Hit::KeyFocus(_) => {
+                term_settings::reload_if_changed();
+                self.sync_settings(cx);
                 if let Some(session) = self.session.as_mut() {
                     if session.terminal.modes.get(Mode::FocusEvent) {
                         session.write(b"\x1b[I");
@@ -2179,6 +2499,24 @@ impl Widget for MpTerm {
                         KeyAction::Press
                     };
                     self.send_key(cx, key, &e.modifiers, action, "", 0);
+                } else if self.settings.option_as_meta
+                    && e.modifiers.alt
+                    && !e.modifiers.control
+                    && !e.modifiers.logo
+                {
+                    // Option as Meta: the key goes out ESC-prefixed (or as a
+                    // kitty Alt chord), not as the character macOS composes.
+                    if let Some(ch) = e.key_code.to_char(e.modifiers.shift) {
+                        let key = letter_key(ch).unwrap_or(Key::Unidentified);
+                        let action = if e.is_repeat {
+                            KeyAction::Repeat
+                        } else {
+                            KeyAction::Press
+                        };
+                        let text = ch.to_string();
+                        self.send_key(cx, key, &e.modifiers, action, &text, ch.to_ascii_lowercase() as u32);
+                        self.swallow_text_until = Some(Instant::now() + Duration::from_millis(100));
+                    }
                 } else if e.modifiers.control && !e.modifiers.logo {
                     if let Some(ch) = e.key_code.to_char(e.modifiers.shift) {
                         let key = letter_key(ch).unwrap_or(Key::Unidentified);
@@ -2201,6 +2539,11 @@ impl Widget for MpTerm {
             Hit::TextInput(e) => {
                 if e.replace_last {
                     return;
+                }
+                if let Some(until) = self.swallow_text_until.take() {
+                    if !e.was_paste && Instant::now() <= until {
+                        return;
+                    }
                 }
                 if e.was_paste {
                     self.paste(cx, &e.input);
@@ -2370,4 +2713,23 @@ fn scroll_step(
     let down = *accum > 0.0;
     *accum -= lines * line * accum.signum();
     Some((lines as usize, down))
+}
+
+/// Half of a cursor blink cycle, in seconds (on, then off).
+const BLINK_HALF_PERIOD: f64 = 0.53;
+
+/// The shape a cursor draws with: a program's DECSCUSR choice wins; with
+/// none (`Default`) the person's settings decide shape and blink.
+fn effective_cursor_style(style: CursorStyle, settings: &Settings) -> CursorStyle {
+    if style != CursorStyle::Default {
+        return style;
+    }
+    match (settings.cursor_shape, settings.cursor_blink) {
+        (CursorShape::Block, true) => CursorStyle::BlinkingBlock,
+        (CursorShape::Block, false) => CursorStyle::SteadyBlock,
+        (CursorShape::Bar, true) => CursorStyle::BlinkingBar,
+        (CursorShape::Bar, false) => CursorStyle::SteadyBar,
+        (CursorShape::Underline, true) => CursorStyle::BlinkingUnderline,
+        (CursorShape::Underline, false) => CursorStyle::SteadyUnderline,
+    }
 }

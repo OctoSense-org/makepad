@@ -77,6 +77,16 @@ pub struct Screen {
 }
 
 impl Screen {
+    /// Change the history limit, dropping the oldest rows over it now
+    /// (counted in `evicted`, as scrolling off the front is).
+    pub fn set_max_scrollback(&mut self, max: usize) {
+        self.max_scrollback = max;
+        while self.scrollback.len() > max {
+            self.scrollback.pop_front();
+            self.evicted += 1;
+        }
+    }
+
     pub fn new(cols: usize, rows: usize, max_scrollback: usize) -> Self {
         let cols = cols.max(1);
         let rows = rows.max(1);
