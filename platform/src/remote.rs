@@ -339,6 +339,9 @@ mod imp {
             /// Hardware-faithful: route through the same pointer-lock/pin
             /// transform physical mouse events take (`/m?hw=1`).
             hw: bool,
+            /// Scroll as a precise device (trackpad, Magic Mouse) instead of a
+            /// notched wheel (`/m?k=scroll&precise=1`).
+            precise: bool,
         },
         Key {
             down: bool,
@@ -1194,6 +1197,7 @@ mod imp {
                         dy,
                         mods,
                         hw: true,
+                        precise,
                     } = input
                     {
                         let raw = dvec2(x, y);
@@ -1251,7 +1255,7 @@ mod imp {
                                         y,
                                         sx: dx,
                                         sy: dy,
-                                        is_mouse: true,
+                                        is_mouse: !precise,
                                         modifiers: mods,
                                     }),
                                     window_id,
@@ -1271,6 +1275,7 @@ mod imp {
                             dy,
                             mods,
                             hw: _,
+                            precise,
                         } => {
                             // Remote /click and /m are window-local layout points.
                             // dispatch_studio_msg calls stdin_pointer_abs ->
@@ -1307,7 +1312,7 @@ mod imp {
                                     y: native.y,
                                     sx: dx,
                                     sy: dy,
-                                    is_mouse: true,
+                                    is_mouse: !precise,
                                     modifiers: mods,
                                 }),
                             }
@@ -1971,7 +1976,7 @@ mod imp {
              /gseq?n=8&every_ms=50&scale=1  a separate present per deadline; n=1..64, every_ms>=8, span<=60s; {{\"png\":[paths],\"frames\":[per-frame timings]}}\n\
              \x20                 scheduled_ms and pixels_ms share the request origin; capture_ms = pixels_ms - scheduled_ms; cadence never waits for PNG encoding\n\
              \x20                 commands follow UI queue order (concurrent sockets have no client-time order); macOS wait=1 input replies after submitting its applied frame\n\
-             /m?k=&x=&y=&w=    mouse. k=move|down|up|click|scroll  b=0 left,1 right,2 middle  scroll: dx=,dy=\n\
+             /m?k=&x=&y=&w=    mouse. k=move|down|up|click|scroll  b=0 left,1 right,2 middle  scroll: dx=,dy= (precise=1: trackpad deltas)\n\
                                add hw=1 to take the hardware pointer path (pointer-lock/pin transform included)\n\
              /click?x=&y=      alias for /m?k=click\n\
              /k?t=TEXT         type text. or /k?k=down|up&c=KeyA (Escape ReturnKey Tab Backspace ArrowLeft F1 Key1 ..)\n\
@@ -2145,6 +2150,7 @@ mod imp {
         let dy = p.f64(&["dy", "sy"], 0.0);
         let mods = p.mods();
         let hw = p.flag(&["hw"]);
+        let precise = p.flag(&["precise"]);
         let mouse = |kind| Input::Mouse {
             kind,
             x,
@@ -2154,6 +2160,7 @@ mod imp {
             dy,
             mods,
             hw,
+            precise,
         };
         let inputs = match kind.as_str() {
             "move" => vec![mouse(MouseKind::Move)],

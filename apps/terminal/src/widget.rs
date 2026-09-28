@@ -454,6 +454,9 @@ pub struct MpTerm {
     bell_frames: u8,
     #[rust]
     last_mouse_cell: Option<(u32, u32, u8)>,
+    /// Precise (trackpad, Magic Mouse) vertical scroll not yet worth a line.
+    #[rust]
+    scroll_accum: f64,
     /// Background alpha (focused, unfocused): Omarchy's window opacity rule
     /// "0.78 0.70", handed down by makepad-wm via MAKEPAD_TERMINAL_OPACITY. Standalone
     /// runs are opaque. The shared swapchain is BGRA and the compositor
@@ -1249,6 +1252,23 @@ impl MpTerm {
         true
     }
 
+    /// Whole lines a scroll event is worth, and whether they go down. None
+    /// when it moves nothing: a trackpad or Magic Mouse sends zero-delta
+    /// contact events (and sub-pixel drift) while a finger merely rests on
+    /// it, and a sideways swipe has no vertical part. Precise deltas add up
+    /// to a line of cell height before one is sent, so resting on the device
+    /// never scrolls a mouse-reporting app like Claude Code; a notched wheel
+    /// stays at least one line per notch.
+    fn scroll_lines(&mut self, e: &FingerScrollEvent) -> Option<(usize, bool)> {
+        scroll_step(
+            &mut self.scroll_accum,
+            e.scroll.y,
+            e.is_mouse,
+            matches!(e.phase, makepad_widgets::makepad_platform::event::ScrollPhase::Began),
+            self.cell_h,
+        )
+    }
+
     fn handle_scroll(&mut self, cx: &mut Cx, e: &FingerScrollEvent) {
         let Some((alt_scroll, max)) = self.session.as_ref().map(|session| {
             let term = &session.terminal;
@@ -1260,12 +1280,9 @@ impl MpTerm {
         }) else {
             return;
         };
-        let lines = if e.device.is_mouse() {
-            (e.scroll.y / 40.0).abs().ceil().max(1.0) as usize
-        } else {
-            ((e.scroll.y.abs() / self.cell_h).ceil()).max(1.0) as usize
+        let Some((lines, down)) = self.scroll_lines(e) else {
+            return;
         };
-        let down = e.scroll.y > 0.0;
 
         let (tracking, _) = self.mouse_tracking();
         if tracking != MouseTracking::None && !e.modifiers.shift {
@@ -2191,4 +2208,38 @@ fn letter_key(ch: char) -> Option<Key> {
         },
         _ => return None,
     })
+}
+
+/// One scroll event's worth of terminal lines, and whether they go down.
+/// `notched` is a classic wheel: every notch is at least one line. Precise
+/// deltas (trackpad, Magic Mouse) add up in `accum` until they reach a line
+/// of height `line`; a new gesture or a change of direction starts over.
+/// None when nothing moves: zero-delta contact events, sideways swipes and
+/// sub-line drift while a finger rests on the device.
+fn scroll_step(
+    accum: &mut f64,
+    dy: f64,
+    notched: bool,
+    gesture_start: bool,
+    line: f64,
+) -> Option<(usize, bool)> {
+    if notched {
+        *accum = 0.0;
+        if dy == 0.0 {
+            return None;
+        }
+        return Some(((dy / 40.0).abs().ceil().max(1.0) as usize, dy > 0.0));
+    }
+    if gesture_start || dy * *accum < 0.0 {
+        *accum = 0.0;
+    }
+    *accum += dy;
+    let line = line.max(1.0);
+    let lines = (accum.abs() / line).floor();
+    if lines < 1.0 {
+        return None;
+    }
+    let down = *accum > 0.0;
+    *accum -= lines * line * accum.signum();
+    Some((lines as usize, down))
 }
