@@ -889,6 +889,10 @@ pub struct FingerScrollEvent {
     pub time: f64,
     pub rect: Rect,
     pub phase: ScrollPhase,
+    /// A notched wheel (true) or precise deltas from a trackpad or Magic
+    /// Mouse (false), from `ScrollEvent::is_mouse`. `device` is always the
+    /// mouse digit for scrolls and cannot tell the two apart.
+    pub is_mouse: bool,
 }
 
 /*
@@ -1112,6 +1116,7 @@ impl Event {
                         time: e.time,
                         scroll: e.scroll,
                         phase: e.phase,
+                        is_mouse: e.is_mouse,
                     });
                 }
             }
