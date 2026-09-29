@@ -278,6 +278,24 @@ impl Widget for KeyboardView {
                     self.animate_to_zero(cx, *time, *duration, *ease);
                 }
                 VirtualKeyboardEvent::DidShow { time, height } => {
+                    // A keyboard sliding away after focus went elsewhere (a
+                    // search the person cancelled): a reflowing body takes the
+                    // whole window at once and the keyboard slides off over
+                    // it. Tracking the shrinking height instead left the body
+                    // short, and the strip below it unpainted (black), until
+                    // the hide finished, because the focused-field reconcile
+                    // below has no field to measure.
+                    if self.keyboard_resize
+                        && cx.key_focus().is_empty()
+                        && *height < self.keyboard_height
+                    {
+                        self.keyboard_height = *height;
+                        self.anim_state = AnimState::Open;
+                        self.set_keyboard_shift(cx, 0.0);
+                        self.redraw(cx);
+                        self.view.handle_event(cx, event, scope);
+                        return;
+                    }
                     if *height <= 0.0 {
                         self.keyboard_height = 0.0;
                         self.animate_to_shift(
