@@ -251,6 +251,19 @@ impl Widget for KeyboardView {
                 _ => (),
             }
         }
+        // Focus left every editor (a search the person cancelled): a
+        // reflowing body takes the whole window in this frame, before the
+        // keyboard's hide animation reports anything, and the keyboard
+        // slides away over it instead of uncovering an unpainted strip.
+        if self.keyboard_resize
+            && self.keyboard_shift > 0.0
+            && matches!(event, Event::KeyFocusLost(_))
+            && cx.key_focus().is_empty()
+        {
+            self.anim_state = AnimState::Open;
+            self.set_keyboard_shift(cx, 0.0);
+            self.redraw(cx);
+        }
         if let Event::VirtualKeyboard(vk) = event {
             match vk {
                 VirtualKeyboardEvent::WillShow {
@@ -278,20 +291,22 @@ impl Widget for KeyboardView {
                     self.animate_to_zero(cx, *time, *duration, *ease);
                 }
                 VirtualKeyboardEvent::DidShow { time, height } => {
-                    // A keyboard sliding away after focus went elsewhere (a
-                    // search the person cancelled): a reflowing body takes the
-                    // whole window at once and the keyboard slides off over
-                    // it. Tracking the shrinking height instead left the body
-                    // short, and the strip below it unpainted (black), until
-                    // the hide finished, because the focused-field reconcile
-                    // below has no field to measure.
-                    if self.keyboard_resize
-                        && cx.key_focus().is_empty()
-                        && *height < self.keyboard_height
-                    {
+                    // A keyboard sliding away: a reflowing body follows it
+                    // down frame by frame (or, with focus gone, e.g. a search
+                    // the person cancelled, takes the whole window at once).
+                    // Left to the focused-field reconcile below, the body
+                    // stayed short while the keyboard slid off and the strip
+                    // between them showed unpainted (black): that reconcile
+                    // runs only on frames where the field itself redrew.
+                    // Opening keeps the reconcile: applying heights directly
+                    // there moves a just-focused field and restarts the input
+                    // connection, losing keystrokes.
+                    if self.keyboard_resize && *height < self.keyboard_height {
+                        let shift = if cx.key_focus().is_empty() { 0.0 } else { height.max(0.0) };
                         self.keyboard_height = *height;
+                        self.last_reconciled_keyboard_height = *height;
                         self.anim_state = AnimState::Open;
-                        self.set_keyboard_shift(cx, 0.0);
+                        self.set_keyboard_shift(cx, shift);
                         self.redraw(cx);
                         self.view.handle_event(cx, event, scope);
                         return;
