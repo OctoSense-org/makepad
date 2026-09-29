@@ -15,6 +15,12 @@ makepad-live-id = { path = "../../libs/live_id", version = "1.0.0" }
 makepad-micro-serde = { path = "../../libs/micro_serde", version = "1.0.0" }
 makepad-script = { path = "../script", version = "1.0.0", optional = true }
 
+# OpenHarmony: TLS for the Linux backend's socket stream (no OpenSSL in the
+# app sysroot). ring, not aws-lc-rs: it cross-builds for aarch64-unknown-linux-ohos.
+[target.'cfg(target_env = "ohos")'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+
 [target.'cfg(windows)'.dependencies.makepad-futures-legacy]
 path = "../../libs/futures_legacy"
 version = "1.0.0"

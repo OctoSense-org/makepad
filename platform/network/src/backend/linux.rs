@@ -12,9 +12,9 @@ use crate::types::{
 pub mod http;
 #[cfg(not(target_env = "ohos"))]
 pub(crate) mod socket_stream;
-// OpenHarmony has no OpenSSL: the same workers over plain TCP only.
+// OpenHarmony has no OpenSSL for apps: the same workers, TLS through rustls.
 #[cfg(target_env = "ohos")]
-#[path = "linux/socket_stream_plain.rs"]
+#[path = "linux/socket_stream_ohos.rs"]
 pub(crate) mod socket_stream;
 pub mod web_socket;
 
