@@ -4484,6 +4484,11 @@ pub struct MapView {
     /// can point its MapView at its own tile archive.
     #[live]
     mbtiles_path: String,
+    /// Hosted `.mkmap` archive root (e.g. `https://makepad.nl/maps/world-20260926.mkmap`).
+    /// When set, tiles come from that archive by range reads instead of the
+    /// Overpass network path, so a script-hosted map gets pre-baked tiles.
+    #[live]
+    archive_url: String,
     /// Geodata overlays share the base archive plane. Hosted/local `.mkmap`
     /// sources use `MapTileArchive`; only native `.mbtiles` development
     /// overrides take the legacy worker-side reader path.
@@ -4886,6 +4891,11 @@ impl ScriptHook for MapView {
         self.zoom = self.zoom.clamp(min_zoom, max_zoom);
         self.center_norm = lon_lat_to_normalized(self.center_lon, self.center_lat);
         self.wrap_and_clamp_center();
+        if !self.archive_url.is_empty() {
+            // The archive plane is the "local" source path, fed over HTTP.
+            self.use_local_mbtiles = true;
+            self.use_network = false;
+        }
         self.normalize_source_mode();
 
         let previous_light = self.compiled_style_light.clone();
@@ -7503,6 +7513,16 @@ impl MapView {
     }
 
     fn ensure_archive_source(&mut self, cx: &mut Cx) {
+        if !self.archive_url.is_empty() {
+            let current = matches!(
+                &self.tile_source_config,
+                Some(TileSourceConfig::HttpArchive { root_url, .. }) if *root_url == self.archive_url
+            );
+            if !current {
+                self.set_source_config(cx, TileSourceConfig::http_archive(self.archive_url.clone()));
+            }
+            return;
+        }
         if self.tile_source_config.is_some() {
             return;
         }
