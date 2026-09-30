@@ -1334,6 +1334,9 @@ impl App {
                 log!("wm: notify from client {}: {} — {}", client, title, body);
             }
             WmRequest::Close => self.request_close(cx, client),
+            // This WM still closes with CloseRequested + Kill: it neither
+            // waits for an answer nor needs the app's refusal.
+            WmRequest::AsksBeforeClose | WmRequest::CloseRefused => {}
             WmRequest::SetFloating { floating } => {
                 let area = self.desk_area(cx);
                 let gap = self.state_mut().gap;
