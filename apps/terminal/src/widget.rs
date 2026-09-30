@@ -14,7 +14,8 @@ use makepad_widgets::text::rasterizer::RasterizedGlyph;
 use makepad_widgets::makepad_draw::shader::draw_text::{ShapedTextGlyph, ShapedTextRun};
 use makepad_widgets::*;
 
-use crate::gesture::{boundary_col, MoveAction, Press, PressInfo};
+use crate::gesture::{boundary_col, past_threshold, MoveAction, Press, PressInfo};
+use crate::links::{self, LinkHit};
 use crate::pty::InputRejected;
 use crate::session::{Session, SpawnOptions};
 use crate::settings::{self as term_settings, BellStyle, CursorShape, Settings};
@@ -765,6 +766,17 @@ pub struct MpTerm {
     pub titled_by_host: bool,
     #[rust]
     font_key: Option<FontKey>,
+    /// The link under the pointer while the link modifier is held
+    /// (`crate::links`): underlined, its target in the status line.
+    #[rust]
+    link_hover: Option<LinkHit>,
+    /// Where the pointer hovers over this terminal, and whether the link
+    /// modifier was held there.
+    #[rust]
+    link_pointer: Option<(Vec2d, bool)>,
+    /// A modifier press on a link: it opens on release unless it drags.
+    #[rust]
+    link_press: Option<(LinkHit, Vec2d)>,
     #[rust]
     font_roots: Vec<ScriptObjectRef>,
 }
@@ -2213,6 +2225,7 @@ impl MpTerm {
         };
         self.draw_terminal_inner(cx, &mut session);
         self.session = Some(session);
+        self.draw_link_status(cx);
         self.draw_input_notice(cx);
     }
 
@@ -2322,6 +2335,7 @@ impl MpTerm {
             .sel_ordered()
             .map(|(start, end)| session.terminal.screen().snap_selection(start, end));
         let min_contrast = self.settings.minimum_contrast;
+        let link_hover = self.link_hover.clone();
         let bg_fill_color = Self::rgb_to_vec4(bg_fill, 1.0);
         // Neighbouring cells mostly share colours: adjust each pair once.
         let mut contrast_memo: Option<(Vec4f, Vec4f, Vec4f)> = None;
@@ -2463,6 +2477,22 @@ impl MpTerm {
                             strike: true,
                         });
                     }
+                }
+                // The hovered link underlines (unless already underlined).
+                if underline == crate::term::style::Underline::None
+                    && cell.content.width() > 0
+                    && link_hover
+                        .as_ref()
+                        .is_some_and(|h| h.covers(abs, col, cell.hyperlink))
+                {
+                    decos.push(DecoDraw {
+                        x: origin_x + col as f64 * cell_w,
+                        y,
+                        w: cell.content.width() as f64 * cell_w,
+                        color: fg,
+                        kind: 1.0,
+                        strike: false,
+                    });
                 }
 
                 // Text: narrow text cells are shaped with their neighbours
@@ -2827,6 +2857,9 @@ impl MpTerm {
         self.arm_sync_timer(cx);
         if needs_redraw {
             self.draw_bg.redraw(cx);
+            if self.link_hover.is_some() {
+                self.update_link_hover(cx);
+            }
         }
     }
 
@@ -2931,6 +2964,9 @@ impl Widget for MpTerm {
             // key-up, so any later key event ends the swallow window.
             self.swallow_text_until = None;
         }
+        if let Event::KeyDown(e) | Event::KeyUp(e) = event {
+            self.link_modifier_changed(cx, e);
+        }
         if matches!(event, Event::KeyDown(_)) {
             term_settings::poll();
             self.sync_settings(cx);
@@ -3025,6 +3061,9 @@ impl Widget for MpTerm {
         match hit {
             Hit::FingerDown(e) => {
                 cx.set_key_focus(self.area);
+                if self.link_press_down(&e) {
+                    return;
+                }
                 if e.device.is_touch() {
                     self.touches.retain(|(id, _)| *id != e.digit_id);
                     self.touches.push((e.digit_id, e.abs.y));
@@ -3069,6 +3108,12 @@ impl Widget for MpTerm {
                 }
             }
             Hit::FingerMove(e) => {
+                if let Some((_, origin)) = &self.link_press {
+                    if past_threshold((origin.x, origin.y), (e.abs.x, e.abs.y)) {
+                        self.link_press = None;
+                    }
+                    return;
+                }
                 if e.device.is_touch() {
                     let mut dy = None;
                     if let Some(t) = self.touches.iter_mut().find(|(id, _)| *id == e.digit_id) {
@@ -3115,6 +3160,10 @@ impl Widget for MpTerm {
                 if e.device.is_touch() {
                     self.touches.retain(|(id, _)| *id != e.digit_id);
                 }
+                if let Some((hit, _)) = self.link_press.take() {
+                    self.open_link(cx, hit);
+                    return;
+                }
                 if self.press.reports() {
                     self.report_mouse(
                         cx,
@@ -3135,8 +3184,14 @@ impl Widget for MpTerm {
                 self.selecting = false;
                 self.last_finger = None;
             }
-            Hit::FingerHoverIn(_) | Hit::FingerHoverOver(_) => {
-                cx.set_cursor(MouseCursor::Text);
+            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
+                let held = links::link_modifier(e.modifiers.logo, e.modifiers.control);
+                self.link_pointer = Some((e.abs, held));
+                self.update_link_hover(cx);
+            }
+            Hit::FingerHoverOut(_) => {
+                self.link_pointer = None;
+                self.update_link_hover(cx);
             }
             Hit::FingerScroll(e) => {
                 self.handle_scroll(cx, &e);
@@ -3336,6 +3391,120 @@ impl MpTerm {
 
     fn redraw(&mut self, cx: &mut Cx) {
         self.draw_bg.redraw(cx);
+    }
+}
+
+// ------------------------------------------------------------------
+// Links (`crate::links`): modifier hover underlines, modifier click opens
+// ------------------------------------------------------------------
+
+impl MpTerm {
+    /// The link at a window position, if the pointer is over one.
+    fn link_under(&self, abs: Vec2d) -> Option<LinkHit> {
+        let (row, col) = self.pick(abs)?;
+        links::link_at(&self.session.as_ref()?.terminal, row, col)
+    }
+
+    /// Recompute the hovered link from the pointer and the modifier, and
+    /// show a pointing hand over a link.
+    fn update_link_hover(&mut self, cx: &mut Cx) {
+        let hover = match self.link_pointer {
+            Some((abs, true)) => self.link_under(abs),
+            _ => None,
+        };
+        if self.link_pointer.is_some() {
+            cx.set_cursor(if hover.is_some() {
+                MouseCursor::Hand
+            } else {
+                MouseCursor::Text
+            });
+        }
+        if hover != self.link_hover {
+            self.link_hover = hover;
+            self.draw_bg.redraw(cx);
+        }
+    }
+
+    /// The link modifier went down or up while the pointer rests here.
+    fn link_modifier_changed(&mut self, cx: &mut Cx, e: &KeyEvent) {
+        if !matches!(e.key_code, KeyCode::Logo | KeyCode::Control) {
+            return;
+        }
+        if let Some((abs, _)) = self.link_pointer {
+            let held = links::link_modifier(e.modifiers.logo, e.modifiers.control);
+            self.link_pointer = Some((abs, held));
+            self.update_link_hover(cx);
+        }
+    }
+
+    /// A press with the link modifier held on a link is ours, even when the
+    /// program has mouse reporting on; it opens on release.
+    fn link_press_down(&mut self, e: &FingerDownEvent) -> bool {
+        self.link_press = None;
+        if e.device.is_touch() || !links::link_modifier(e.modifiers.logo, e.modifiers.control) {
+            return false;
+        }
+        let Some(hit) = self.link_under(e.abs) else {
+            return false;
+        };
+        self.link_press = Some((hit, e.abs));
+        self.press = Press::Idle;
+        true
+    }
+
+    fn open_link(&mut self, cx: &mut Cx, hit: LinkHit) {
+        let result = match &hit.target {
+            Ok(target) => links::open(target)
+                .map_err(|e| format!("Could not open {}: {e}", links::describe(target))),
+            Err(refused) => Err(refused.to_string()),
+        };
+        if let Err(notice) = result {
+            self.input_notice = Some(notice);
+            self.input_notice_armed = false;
+            self.draw_bg.redraw(cx);
+        }
+    }
+
+    /// The hovered link's target along the bottom left, as browsers do.
+    fn draw_link_status(&mut self, cx: &mut Cx2d) {
+        // A notice (a refused link, say) takes the bottom of the view.
+        let Some(label) = self
+            .link_hover
+            .as_ref()
+            .map(LinkHit::label)
+            .filter(|_| self.input_notice.is_none())
+        else {
+            return;
+        };
+        let pad = 4.0;
+        let fit = ((self.rect.size.x - 4.0 * pad) / self.cell_w.max(1.0)).max(4.0) as usize;
+        let label = if label.chars().count() > fit {
+            let mut short: String = label.chars().take(fit - 1).collect();
+            short.push('…');
+            short
+        } else {
+            label
+        };
+        let width = label.chars().count() as f64 * self.cell_w + 2.0 * pad;
+        let height = self.cell_h + 2.0 * pad;
+        let pos = dvec2(
+            self.rect.pos.x + pad,
+            self.rect.pos.y + (self.rect.size.y - height - pad).max(0.0),
+        );
+        self.draw_cell_bg.new_draw_call(cx);
+        self.draw_cell_bg.color = vec4(0.12, 0.13, 0.17, 0.94);
+        self.draw_cell_bg.draw_abs(
+            cx,
+            Rect {
+                pos,
+                size: dvec2(width, height),
+            },
+        );
+        self.draw_text.new_draw_call(cx);
+        let color = self.draw_text.color;
+        self.draw_text.color = vec4(0.86, 0.88, 0.95, 1.0);
+        self.draw_text.draw_abs(cx, pos + dvec2(pad, pad), &label);
+        self.draw_text.color = color;
     }
 }
 

@@ -58,6 +58,7 @@
 //! replies can echo the same terminator kind (`OscTerminator`).
 
 use crate::term::color::{parse_color_spec, Rgb};
+use crate::term::hyperlink::{valid_uri, MAX_ID_LEN};
 
 pub const MAX_OSC_DATA: usize = 4096;
 
@@ -393,6 +394,13 @@ fn parse_hyperlink(payload: &str) -> Option<OscCommand> {
         if id.is_some() {
             return None;
         }
+        return Some(OscCommand::HyperlinkEnd);
+    }
+
+    // A link we refuse to store (overlong, control characters, an overlong
+    // id) closes any open one instead of being ignored: otherwise the text
+    // meant for it would join the previous link.
+    if !valid_uri(uri) || id.as_ref().is_some_and(|id| id.len() > MAX_ID_LEN) {
         return Some(OscCommand::HyperlinkEnd);
     }
 
@@ -978,6 +986,48 @@ mod tests {
     #[test]
     fn osc8_hyperlink_end() {
         assert_eq!(osc("8;;"), Some(OscCommand::HyperlinkEnd));
+    }
+
+    #[test]
+    fn osc8_terminators() {
+        let link = Some(OscCommand::Hyperlink {
+            id: Some("a".into()),
+            uri: "https://x.y/".into(),
+        });
+        // BEL, ESC \ (ST) and C1 ST all end the string the same way.
+        for term in [Some(0x07), Some(0x1b), Some(0x9c)] {
+            assert_eq!(parse_str("8;id=a;https://x.y/", term), link);
+        }
+    }
+
+    #[test]
+    fn osc8_uri_keeps_semicolons_and_colons() {
+        // Only the first `;` after the params splits; the URI keeps the rest.
+        assert_eq!(
+            osc("8;id=a:foo=b;https://x.y/?a=1;b=2"),
+            Some(OscCommand::Hyperlink {
+                id: Some("a".into()),
+                uri: "https://x.y/?a=1;b=2".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn osc8_refused_links_close() {
+        // Overlong URI, control characters, an overlong id: the link is
+        // refused and any open one closes.
+        let long = format!(
+            "8;;https://x/{}",
+            "a".repeat(crate::term::hyperlink::MAX_URI_LEN)
+        );
+        assert_eq!(osc(&long), Some(OscCommand::HyperlinkEnd));
+        assert_eq!(osc("8;;https://x/\u{1}y"), Some(OscCommand::HyperlinkEnd));
+        assert_eq!(osc("8;;https://x/\u{85}y"), Some(OscCommand::HyperlinkEnd));
+        let long_id = format!("8;id={};https://x/", "i".repeat(MAX_ID_LEN + 1));
+        assert_eq!(osc(&long_id), Some(OscCommand::HyperlinkEnd));
+        // Past the OSC buffer the whole string is dropped, as ghostty does.
+        let huge = format!("8;;https://x/{}", "a".repeat(MAX_OSC_DATA));
+        assert_eq!(osc(&huge), None);
     }
 
     #[test]

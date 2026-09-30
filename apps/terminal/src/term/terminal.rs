@@ -6,6 +6,7 @@
 
 use crate::term::charsets::{Charset, Slot};
 use crate::term::color::{default_palette, encode_color_reply, Palette, Rgb};
+use crate::term::hyperlink::HyperlinkTable;
 use crate::term::modes::{mode_from_int, Mode, ModeState};
 use crate::term::osc::{ColorKind, ColorOp, OscCommand, OscTerminator};
 use crate::term::page::{Cell, CellContent, Cluster, SemanticPrompt};
@@ -73,8 +74,9 @@ pub struct Terminal {
     /// xterm modifyOtherKeys state (CSI > 4 ; m), 0/1/2.
     pub modify_other_keys: u8,
 
-    /// Hyperlink table; cells store 1-based ids into this.
-    pub hyperlinks: Vec<String>,
+    /// OSC 8 link table; cells store 1-based ids into this (0 = none).
+    /// Shared by both screens and collected against them.
+    pub hyperlinks: HyperlinkTable,
     current_hyperlink: u32,
 
     /// Last printed codepoint, for REP.
@@ -132,7 +134,7 @@ impl Terminal {
             kitty_flags_primary: Vec::new(),
             kitty_flags_alternate: Vec::new(),
             modify_other_keys: 0,
-            hyperlinks: Vec::new(),
+            hyperlinks: HyperlinkTable::new(),
             current_hyperlink: 0,
             previous_printed: None,
             outbound: Vec::new(),
@@ -157,6 +159,32 @@ impl Terminal {
         self.background_override = false;
         self.known_theme_colors.fill(true);
         self.dirty = true;
+    }
+
+    /// Free the links no stored row refers to any more: rows that scrolled
+    /// out of the scrollback, were erased or overwritten. Runs by itself
+    /// when the table has doubled since the last collection.
+    pub fn gc_hyperlinks(&mut self) {
+        let mut used = vec![false; self.hyperlinks.capacity() + 1];
+        used[self.current_hyperlink as usize] = true;
+        let rows = self.primary.scrollback.iter().chain(&self.primary.active);
+        for row in rows
+            .chain(&self.alternate.scrollback)
+            .chain(&self.alternate.active)
+        {
+            for cell in &row.cells {
+                if let Some(mark) = used.get_mut(cell.hyperlink as usize) {
+                    *mark = true;
+                }
+            }
+        }
+        used[0] = false;
+        self.hyperlinks.retain(&used);
+    }
+
+    /// The URI of the link a cell id points at.
+    pub fn hyperlink_uri(&self, id: u32) -> Option<&str> {
+        self.hyperlinks.get(id).map(|link| &*link.uri)
     }
 
     pub fn screen(&self) -> &Screen {
@@ -1754,9 +1782,14 @@ impl Terminal {
             }
             OscCommand::ChangeWindowIcon(_) => {}
             OscCommand::Colors { ops, terminator } => self.color_ops(ops, terminator),
-            OscCommand::Hyperlink { id: _, uri } => {
-                self.hyperlinks.push(uri);
-                self.current_hyperlink = self.hyperlinks.len() as u32;
+            OscCommand::Hyperlink { id, uri } => {
+                // Close the previous link first so a collection can free it.
+                self.current_hyperlink = 0;
+                if self.hyperlinks.needs_gc() {
+                    self.gc_hyperlinks();
+                }
+                // A full table prints the text unlinked.
+                self.current_hyperlink = self.hyperlinks.intern(id.as_deref(), &uri).unwrap_or(0);
             }
             OscCommand::HyperlinkEnd => self.current_hyperlink = 0,
             OscCommand::ClipboardContents {
