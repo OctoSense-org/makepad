@@ -1,4 +1,6 @@
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
 
 #[cfg(target_os = "macos")]
 use crate::pty_spawn;
@@ -12,7 +14,7 @@ use std::{
     fs::File,
     io::{Read, Write},
     os::windows::io::FromRawHandle,
-    sync::{mpsc, Arc, Mutex},
+    sync::Mutex,
 };
 #[cfg(windows)]
 use windows::{
@@ -35,37 +37,185 @@ use windows::{
     },
 };
 
-/// PTY writer handle for optional cross-thread input forwarding.
-#[derive(Clone)]
+/// Input bytes that may wait in a session's writer queue before a paste is
+/// refused. A program that stops reading (raw mode, then busy or asleep)
+/// never drains the queue; without a bound, every further paste would pile
+/// up in memory for as long as it stays that way.
+pub const PASTE_QUEUE_LIMIT: usize = 16 << 20;
+
+/// Above this backlog, terminal-generated replies (DA, DSR, …) are dropped:
+/// a program that asks without ever reading its input can otherwise grow the
+/// queue without bound. Twice the paste limit, so a full paste queue alone
+/// never costs a reply.
+pub const REPLY_QUEUE_LIMIT: usize = 2 * PASTE_QUEUE_LIMIT;
+
+/// Why the writer turned input away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputRejected {
+    /// The PTY is gone (the writer hit EOF/EIO, or never started).
+    Closed,
+    /// The program is not reading; `pending` bytes are already queued.
+    QueueFull { pending: usize },
+}
+
+/// The UI thread's handle to a session's writer thread.
+///
+/// Every write to the PTY happens on that thread, never on the caller's:
+/// the master can take only as much as the tty's input queue holds (about
+/// 1 KiB on macOS, 4 KiB on Linux) and a program in raw mode that stops
+/// reading leaves it full indefinitely. A synchronous write there parked
+/// the UI thread, and with it every tab and pane of the window.
+///
+/// Calls never block and never take a lock: bytes travel over an unbounded
+/// channel, and the backlog is an atomic byte counter the writer lowers as
+/// the program consumes its input. One FIFO carries keys, pastes and
+/// replies, so they reach the program in exactly the order they were sent.
+/// What is bounded is the backlog:
+///
+/// - [`PtyWriter::send`] (keys, mouse and focus reports, typed text) is
+///   never refused while the PTY lives. It arrives at human speed, and
+///   losing a keystroke silently is worse than queueing it.
+/// - [`PtyWriter::send_paste`] is refused, whole, while the backlog is at
+///   [`PASTE_QUEUE_LIMIT`] or above. A paste is never cut in two (half a
+///   bracketed paste would leave the program in paste mode); a refused one
+///   is reported so the widget can say so.
+/// - [`PtyWriter::send_reply`] is dropped above [`REPLY_QUEUE_LIMIT`].
+///
+/// Dropping the handle ends the thread even with bytes still queued:
+/// closing a tab never waits for a program that stopped reading.
 pub struct PtyWriter {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    master_fd: i32,
-    #[cfg(windows)]
-    stdin: Arc<Mutex<File>>,
+    tx: Option<mpsc::Sender<Vec<u8>>>,
+    pending: Arc<AtomicUsize>,
+    /// Set by this handle's drop: the thread stops, queue or not.
+    closed: Arc<AtomicBool>,
+    /// Set by the thread when the PTY stopped taking input for good.
+    dead: Arc<AtomicBool>,
 }
 
 impl PtyWriter {
-    pub fn send(&self, data: Vec<u8>) -> io::Result<()> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            return write_all_fd(self.master_fd, &data);
+    /// Keys and other small, interactive input. `Err` only once the PTY is
+    /// gone.
+    pub fn send(&self, data: Vec<u8>) -> Result<(), InputRejected> {
+        self.push(data, usize::MAX)
+    }
+
+    /// Paste (and programmatic insertions that behave like one). Accepted
+    /// whole while the backlog is below [`PASTE_QUEUE_LIMIT`], whatever its
+    /// own size; refused whole otherwise.
+    pub fn send_paste(&self, data: Vec<u8>) -> Result<(), InputRejected> {
+        self.push(data, PASTE_QUEUE_LIMIT)
+    }
+
+    /// Replies the emulator generates (device attributes, cursor reports).
+    pub fn send_reply(&self, data: Vec<u8>) -> Result<(), InputRejected> {
+        self.push(data, REPLY_QUEUE_LIMIT)
+    }
+
+    /// Bytes accepted but not yet taken by the program.
+    pub fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+
+    fn push(&self, data: Vec<u8>, limit: usize) -> Result<(), InputRejected> {
+        let tx = self.tx.as_ref().ok_or(InputRejected::Closed)?;
+        if self.dead.load(Ordering::Acquire) {
+            return Err(InputRejected::Closed);
         }
-        #[cfg(windows)]
-        {
-            let mut stdin = self.stdin.lock().map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "terminal stdin lock poisoned")
-            })?;
-            stdin.write_all(&data)?;
-            stdin.flush()?;
+        if data.is_empty() {
             return Ok(());
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        {
-            let _ = data;
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "PTY not implemented for this platform",
-            ));
+        let pending = self.pending();
+        if pending >= limit {
+            return Err(InputRejected::QueueFull { pending });
+        }
+        let len = data.len();
+        self.pending.fetch_add(len, Ordering::AcqRel);
+        tx.send(data).map_err(|_| {
+            self.pending.fetch_sub(len, Ordering::AcqRel);
+            InputRejected::Closed
+        })
+    }
+
+    /// Start the writer thread. `write` does one write on that thread; see
+    /// [`WriterThread::run`].
+    fn spawn(write: impl FnMut(&[u8]) -> io::Result<usize> + Send + 'static) -> io::Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
+        let thread = WriterThread {
+            rx,
+            pending: pending.clone(),
+            closed: closed.clone(),
+            dead: dead.clone(),
+        };
+        std::thread::Builder::new()
+            .name("terminal-pty-write".into())
+            .spawn(move || thread.run(write))?;
+        Ok(PtyWriter {
+            tx: Some(tx),
+            pending,
+            closed,
+            dead,
+        })
+    }
+
+    /// A writer that refuses everything (no PTY to write to).
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    fn refusing() -> Self {
+        PtyWriter {
+            tx: None,
+            pending: Arc::new(AtomicUsize::new(0)),
+            closed: Arc::new(AtomicBool::new(true)),
+            dead: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl Drop for PtyWriter {
+    fn drop(&mut self) {
+        // The flag stops a writer waiting for the program to read; dropping
+        // the sender wakes one waiting for input.
+        self.closed.store(true, Ordering::Release);
+        self.tx = None;
+    }
+}
+
+/// The writer thread's end: its own descriptor (or handle) and the queue.
+struct WriterThread {
+    rx: mpsc::Receiver<Vec<u8>>,
+    pending: Arc<AtomicUsize>,
+    closed: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
+}
+
+impl WriterThread {
+    /// Write every chunk in order, as fast as the program takes them.
+    /// `write` hands back how many bytes went out, `Ok(0)` meaning "not
+    /// now", and waits (briefly) for room itself.
+    fn run(self, write: impl FnMut(&[u8]) -> io::Result<usize>) {
+        self.pump(write);
+        // Refuse further input from here on. The receiver drops with `self`.
+        self.dead.store(true, Ordering::Release);
+    }
+
+    fn pump(&self, mut write: impl FnMut(&[u8]) -> io::Result<usize>) {
+        while let Ok(chunk) = self.rx.recv() {
+            let mut offset = 0;
+            while offset < chunk.len() {
+                if self.closed.load(Ordering::Acquire) {
+                    return;
+                }
+                match write(&chunk[offset..]) {
+                    Ok(n) => {
+                        offset += n;
+                        self.pending.fetch_sub(n, Ordering::AcqRel);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                    // EIO/EOF: the program and its tty are gone.
+                    Err(_) => return,
+                }
+            }
         }
     }
 }
@@ -74,7 +224,10 @@ impl PtyWriter {
 ///
 /// macOS uses `openpty` and direct `posix_spawn` file actions, never fork.
 /// Linux uses `openpty` plus `std::process::Command::spawn`.
-/// I/O is done directly on a nonblocking master fd (no background worker threads).
+/// The master fd is nonblocking for its whole life. Output is read by one
+/// thread (`take_reader`), input written by another (`start_writer`); each
+/// holds its own `dup` and waits for readiness with `poll`, so neither ever
+/// parks the UI thread.
 pub struct Pty {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     master_fd: i32,
@@ -413,36 +566,73 @@ impl Pty {
         Ok(())
     }
 
-    pub fn writer_clone(&self) -> PtyWriter {
+    /// Start this PTY's writer thread and return its handle (see
+    /// [`PtyWriter`]). Call once; the thread ends when the handle drops.
+    pub fn start_writer(&self) -> io::Result<PtyWriter> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            return PtyWriter {
-                master_fd: self.master_fd,
-            };
+            // Its own descriptor, closed when the thread ends, for the
+            // reason `take_reader` gives. The file description (and so
+            // O_NONBLOCK) is shared with the master.
+            let fd = unsafe { libc_ffi::dup(self.master_fd) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            unsafe { set_cloexec(fd) };
+            let owned = OwnedFd(fd);
+            return PtyWriter::spawn(move |data| {
+                let fd = owned.raw();
+                match write_fd_once(fd, data) {
+                    Ok(n) => Ok(n),
+                    // The tty's input queue is full: the program is not
+                    // reading. Wait for room, but only briefly, so the
+                    // thread notices a closed session.
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        wait_ready(fd, libc_ffi::POLLOUT, WRITER_POLL_MS)?;
+                        Ok(0)
+                    }
+                    Err(err) => Err(err),
+                }
+            });
         }
         #[cfg(windows)]
         {
-            return PtyWriter {
-                stdin: self.stdin.clone(),
-            };
+            let stdin = self.stdin.clone();
+            return PtyWriter::spawn(move |data| {
+                let mut stdin = stdin.lock().map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "terminal stdin lock poisoned")
+                })?;
+                let n = stdin.write(data)?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "PTY write returned 0",
+                    ));
+                }
+                stdin.flush()?;
+                Ok(n)
+            });
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
-            unreachable!()
+            Ok(PtyWriter::refusing())
         }
     }
 
-    /// Take a blocking reader for a dedicated reader thread. On Unix this
-    /// switches the master fd to blocking mode (reads park in the kernel;
-    /// writes on the same fd stay fine). On Windows it hands over the
-    /// ConPTY output channel. May only be called once.
+    /// Take a blocking reader for a dedicated reader thread. On Unix the
+    /// master stays NONBLOCKING — `O_NONBLOCK` belongs to the open file
+    /// description, which every dup shares, so clearing it for the reader
+    /// would make the writer's `write()` block as well (it once did, and a
+    /// big paste into a raw-mode program that stopped reading froze the
+    /// whole window). The reader waits in `poll` instead. On Windows it
+    /// hands over the ConPTY output channel. May only be called once.
     ///
     /// The reader gets its OWN `dup` of the master, and closes it when its
     /// loop ends. That ownership is what keeps a teardown from deadlocking:
     /// `close()` on the last descriptor of a pty master BLOCKS IN THE KERNEL
-    /// while a thread is parked in `read()` on it, and the reader can only
-    /// leave `read()` once the slave side is gone — so the UI thread would
-    /// wait on the reader while the reader waits on the shell. With a dup
+    /// while a thread is parked on it, and the reader can only leave its
+    /// wait once the slave side is gone — so the UI thread would wait on
+    /// the reader while the reader waits on the shell. With a dup
     /// outstanding, `Pty::drop`'s close is a refcount decrement that returns
     /// at once, and the tty is torn down by the reader's own close after its
     /// `read()` has returned. (Sharing one raw fd number across threads and
@@ -452,16 +642,6 @@ impl Pty {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             unsafe {
-                // O_NONBLOCK lives on the open file description, which the
-                // dup shares — clear it once, for both.
-                let flags = libc_ffi::fcntl_int(self.master_fd, libc_ffi::F_GETFL, 0);
-                if flags >= 0 {
-                    libc_ffi::fcntl_int(
-                        self.master_fd,
-                        libc_ffi::F_SETFL,
-                        flags & !libc_ffi::O_NONBLOCK,
-                    );
-                }
                 // A dup does not inherit FD_CLOEXEC: set it, or the next
                 // shell we spawn inherits this master and holds the tty open.
                 let read_fd = libc_ffi::dup(self.master_fd);
@@ -645,6 +825,12 @@ impl PtyReader {
                 let err = io::Error::last_os_error();
                 match err.raw_os_error() {
                     Some(code) if code == libc_ffi::EINTR => continue,
+                    // Nothing yet: wait for output (or hang-up).
+                    Some(code) if code == libc_ffi::EAGAIN || code == libc_ffi::EWOULDBLOCK => {
+                        if wait_ready(self.master_fd, libc_ffi::POLLIN, -1).is_err() {
+                            return None;
+                        }
+                    }
                     // EIO on the master is how Linux signals slave close.
                     _ => return None,
                 }
@@ -894,32 +1080,55 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(mut reader: R, tx: mpsc::Sender<V
     });
 }
 
+/// How long the writer thread waits for the program to make room before it
+/// checks whether its session has closed.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn write_all_fd(fd: i32, data: &[u8]) -> io::Result<()> {
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let n = unsafe {
-            libc_ffi::write(fd, data[offset..].as_ptr() as *const _, data.len() - offset)
-        };
-        if n > 0 {
-            offset += n as usize;
-            continue;
-        }
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "PTY write returned 0",
-            ));
-        }
+const WRITER_POLL_MS: i32 = 100;
 
-        let err = io::Error::last_os_error();
-        match err.raw_os_error() {
-            Some(code) if code == libc_ffi::EINTR => continue,
-            Some(code) if code == libc_ffi::EAGAIN || code == libc_ffi::EWOULDBLOCK => {
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, err));
-            }
-            _ => return Err(err),
+/// A descriptor the writer thread owns and closes when it ends.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct OwnedFd(i32);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl OwnedFd {
+    /// A method, not the field: the writer closure must capture (own) the
+    /// whole value, or edition-2021 capture would take just the `i32` and
+    /// close the descriptor as soon as the closure is built.
+    fn raw(&self) -> i32 {
+        self.0
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Drop for OwnedFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc_ffi::close(self.0);
         }
+    }
+}
+
+/// Wait up to `timeout_ms` (-1: forever) for `events` on `fd`. `Err` once
+/// the other side has hung up or the fd is unusable and `events` cannot
+/// happen any more; `Ok` on readiness, timeout or a signal.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_ready(fd: i32, events: i16, timeout_ms: i32) -> io::Result<()> {
+    let mut pfd = libc_ffi::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    let n = unsafe { libc_ffi::poll(&mut pfd, 1, timeout_ms) };
+    if n < 0 {
+        let err = io::Error::last_os_error();
+        return match err.raw_os_error() {
+            Some(code) if code == libc_ffi::EINTR => Ok(()),
+            _ => Err(err),
+        };
+    }
+    let gone = libc_ffi::POLLHUP | libc_ffi::POLLERR | libc_ffi::POLLNVAL;
+    if pfd.revents & events == 0 && pfd.revents & gone != 0 {
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY hung up"));
     }
     Ok(())
 }
@@ -1011,6 +1220,7 @@ mod libc_ffi {
         pub fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
         pub fn ioctl(fd: i32, request: usize, ...) -> i32;
         pub fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        pub fn poll(fds: *mut pollfd, nfds: NfdsT, timeout: i32) -> i32;
         #[cfg(target_os = "linux")]
         pub fn setsid() -> i32;
         pub fn killpg(pgrp: i32, sig: i32) -> i32;
@@ -1050,6 +1260,24 @@ mod libc_ffi {
     pub const TIOCSWINSZ: usize = 0x5414;
     #[cfg(target_os = "linux")]
     pub const TIOCSCTTY: usize = 0x540E;
+
+    #[cfg(target_os = "macos")]
+    pub type NfdsT = std::ffi::c_uint;
+    #[cfg(target_os = "linux")]
+    pub type NfdsT = std::ffi::c_ulong;
+
+    pub const POLLIN: i16 = 0x1;
+    pub const POLLOUT: i16 = 0x4;
+    pub const POLLERR: i16 = 0x8;
+    pub const POLLHUP: i16 = 0x10;
+    pub const POLLNVAL: i16 = 0x20;
+
+    #[repr(C)]
+    pub struct pollfd {
+        pub fd: i32,
+        pub events: i16,
+        pub revents: i16,
+    }
 
     #[repr(C)]
     pub struct winsize {
