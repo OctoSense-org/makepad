@@ -85,6 +85,10 @@ public class MakepadNetwork {
                 connection = (HttpURLConnection) (proxy != null
                         ? urlObj.openConnection(proxy)
                         : urlObj.openConnection());
+                // One hop, as on Apple, Windows and Linux: a 3xx reaches the
+                // caller as-is. Following it would take an app's request to a
+                // host its policy never allowed.
+                connection.setInstanceFollowRedirects(false);
                 connection.setRequestMethod(method);
 
                 String[] headerPairs = headers.split("\r\n");
