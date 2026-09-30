@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use crate::term::charsets::CharsetState;
 use crate::term::page::{Cell, Row, SemanticPrompt};
 use crate::term::style::Style;
+use crate::term::unicode::is_syllable_script;
 
 /// DECSCUSR cursor styles (ghostty ansi.zig CursorStyle + cursor.zig).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -148,6 +149,72 @@ impl Screen {
 
     pub fn virtual_of_absolute(&self, abs: u64) -> Option<usize> {
         abs.checked_sub(self.evicted).map(|v| v as usize)
+    }
+
+    /// The row at an absolute id, if it is still stored.
+    fn row_absolute(&self, abs: u64) -> Option<&Row> {
+        self.row_virtual(self.virtual_of_absolute(abs)?)
+    }
+
+    // ------------------------------------------------------------------
+    // Selection
+    // ------------------------------------------------------------------
+
+    /// A selection from `start` to `end` ((absolute row, column), `end`
+    /// exclusive, `start <= end`) widened so it never cuts a wide char or
+    /// a multi-cell cluster: it starts at the head of the unit under its
+    /// first cell and ends after the unit under its last. A cluster is
+    /// selected, highlighted and copied whole or not at all.
+    pub fn snap_selection(
+        &self,
+        start: (u64, usize),
+        end: (u64, usize),
+    ) -> ((u64, usize), (u64, usize)) {
+        let (mut start, mut end) = (start, end);
+        if let Some(row) = self.row_absolute(start.0) {
+            start.1 = row.span_at(start.1).0;
+        }
+        if end.1 > 0 {
+            if let Some(row) = self.row_absolute(end.0) {
+                let (head, width) = row.span_at(end.1 - 1);
+                end.1 = end.1.max(head + width).min(self.cols.max(end.1));
+            }
+        }
+        (start, end)
+    }
+
+    /// The text of a selection (as for [`Screen::snap_selection`]): each
+    /// cell's text once (a cluster's tails and spacer heads add nothing),
+    /// trailing blanks of each line trimmed, and no newline where a row
+    /// soft-wraps.
+    pub fn selection_text(&self, start: (u64, usize), end: (u64, usize)) -> String {
+        let ((sr, sc), (er, ec)) = self.snap_selection(start, end);
+        let mut out = String::new();
+        for abs in sr..=er {
+            let Some(row) = self.row_absolute(abs) else {
+                continue;
+            };
+            let from = if abs == sr { sc } else { 0 };
+            let to = if abs == er { ec } else { self.cols };
+            let mut line = String::new();
+            for col in from..to.min(self.cols) {
+                match row.cell(col) {
+                    Some(cell) => cell.content.push_text(&mut line),
+                    None => line.push(' '),
+                }
+            }
+            // A soft-wrapped row continues logically: no newline, and a
+            // space at its edge is part of the text.
+            if abs < er && row.wrapped {
+                out.push_str(&line);
+            } else {
+                out.push_str(line.trim_end());
+                if abs < er {
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     // ------------------------------------------------------------------
@@ -290,14 +357,12 @@ impl Screen {
         for row in &mut self.active {
             if row.cells.len() > cols {
                 row.cells.truncate(cols);
-                // Never leave half a wide char at the edge.
-                if row
-                    .cells
-                    .last()
-                    .map(|c| c.content.is_wide_head())
-                    .unwrap_or(false)
-                {
-                    *row.cells.last_mut().unwrap() = Cell::default();
+                // Never leave part of a wide char or cluster at the edge.
+                let (head, width) = row.span_at(cols - 1);
+                if head + width > cols {
+                    for cell in &mut row.cells[head..] {
+                        *cell = Cell::default();
+                    }
                 }
                 row.wrapped = false;
             }
@@ -355,14 +420,14 @@ impl Screen {
                 let x = self.cursor.x + self.cursor.pending_wrap as usize;
                 cursor_pos = Some((logical.len(), current.len() + x));
             }
-            // Drop a spacer head at the join point: it only existed
-            // because of the old width.
+            // Drop the spacer heads at the join point: they only existed
+            // because of the old width (a cluster wider than two cells can
+            // leave several).
             let mut cells = row.cells;
             if row.wrapped {
-                if cells
+                while cells
                     .last()
-                    .map(|c| c.content == crate::term::page::CellContent::WideSpacerHead)
-                    .unwrap_or(false)
+                    .is_some_and(|c| c.content == crate::term::page::CellContent::WideSpacerHead)
                 {
                     cells.pop();
                 }
@@ -381,10 +446,10 @@ impl Screen {
         }
 
         // 2. Re-wrap each logical line at the new width. A wide head and
-        //    its tail move as one unit: the tail always lands right after
-        //    its head, and a wide char that no longer fits at the end of a
-        //    row wraps whole, leaving a spacer head, exactly as printing it
-        //    fresh at the new width would.
+        //    its tails move as one unit: the tails always land right after
+        //    their head, and a wide char or cluster that no longer fits at
+        //    the end of a row wraps whole, leaving spacer heads, exactly as
+        //    printing it fresh at the new width would.
         use crate::term::page::CellContent;
         let mut new_rows: Vec<Row> = Vec::new();
         // (row, col, pending_wrap)
@@ -400,20 +465,35 @@ impl Screen {
             // Index of `cell` within the source logical line.
             let mut cell_index = 0usize;
             let mut iter = cells.into_iter().peekable();
+            let mut tails: Vec<Cell> = Vec::new();
             while let Some(mut cell) = iter.next() {
-                // The source tail of a wide head is consumed with it.
-                let tail = if cell.content.is_wide_head()
-                    && iter.peek().map(|c| c.content == CellContent::WideTail).unwrap_or(false)
-                {
-                    iter.next()
-                } else {
-                    None
-                };
-                let span = 1 + tail.is_some() as usize;
+                // The source tails of a wide head are consumed with it.
+                tails.clear();
+                if cell.content.is_wide_head() {
+                    let want = cell.content.width() as usize - 1;
+                    while tails.len() < want
+                        && iter
+                            .peek()
+                            .is_some_and(|c| c.content == CellContent::WideTail)
+                    {
+                        tails.extend(iter.next());
+                    }
+                }
+                let span = 1 + tails.len();
                 match cell.content {
                     // A tail without its head, or a stray spacer: blank.
                     CellContent::WideTail | CellContent::WideSpacerHead => {
                         cell.content = CellContent::Empty;
+                    }
+                    // A syllable cluster wider than the screen narrows to
+                    // fit it, keeping its text.
+                    CellContent::Cluster(ref mut c)
+                        if c.width as usize > cols
+                            && c.cps
+                                .first()
+                                .is_some_and(|&ch| is_syllable_script(ch as u32)) =>
+                    {
+                        c.width = cols as u8;
                     }
                     // A 1-wide screen can't hold a wide char.
                     _ if cell.content.is_wide_head() && cols < 2 => {
@@ -421,13 +501,16 @@ impl Screen {
                     }
                     _ => {}
                 }
-                let width = if cell.content.is_wide_head() { 2 } else { 1 };
+                let width = cell.content.width().max(1) as usize;
                 if x > 0 && x + width > cols {
-                    // Wrap. A wide char that doesn't fit leaves a spacer.
-                    if width == 2 && x < cols {
-                        let mut spacer = Cell::blank_with_bg(&cell.style);
-                        spacer.content = CellContent::WideSpacerHead;
-                        *row.cell_mut(x) = spacer;
+                    // Wrap. A wide char or cluster that doesn't fit leaves
+                    // spacers in the columns it could not use.
+                    if width >= 2 {
+                        for col in x..cols {
+                            let mut spacer = Cell::blank_with_bg(&cell.style);
+                            spacer.content = CellContent::WideSpacerHead;
+                            *row.cell_mut(col) = spacer;
+                        }
                     }
                     row.wrapped = true;
                     new_rows.push(std::mem::take(&mut row));
@@ -436,19 +519,23 @@ impl Screen {
                 }
                 if let Some(off) = cursor_off {
                     if off >= cell_index && off < cell_index + span {
-                        new_cursor = Some((new_rows.len(), x + (off - cell_index), false));
+                        new_cursor =
+                            Some((new_rows.len(), x + (off - cell_index).min(width - 1), false));
                     }
                 }
-                if width == 2 {
-                    let tail = tail.unwrap_or(Cell {
-                        content: CellContent::WideTail,
-                        style: cell.style,
-                        hyperlink: cell.hyperlink,
-                    });
-                    *row.cell_mut(x) = cell;
-                    *row.cell_mut(x + 1) = tail;
-                } else {
-                    *row.cell_mut(x) = cell;
+                let (style, hyperlink) = (cell.style, cell.hyperlink);
+                *row.cell_mut(x) = cell;
+                for col in 1..width {
+                    let tail = if col <= tails.len() {
+                        std::mem::take(&mut tails[col - 1])
+                    } else {
+                        Cell {
+                            content: CellContent::WideTail,
+                            style,
+                            hyperlink,
+                        }
+                    };
+                    *row.cell_mut(x + col) = tail;
                 }
                 x += width;
                 cell_index += span;

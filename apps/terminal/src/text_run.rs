@@ -19,6 +19,7 @@
 //! tested without a GPU; `widget.rs` shapes and draws.
 
 use crate::cell_glyph::CellGlyph;
+use crate::term::unicode::is_syllable_script;
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
@@ -58,27 +59,36 @@ pub fn shapes_with_neighbours(glyph: CellGlyph, columns: u8) -> bool {
             None => return false,
         },
     };
-    columns == 1 && base < '\u{2500}'
+    match glyph {
+        // A syllable cluster (Devanagari..Sinhala, one cell per base
+        // letter) is text however many cells it has: its run keeps its
+        // tail cells, so its glyphs are drawn across them at full size.
+        CellGlyph::Cluster(_) if columns > 1 => is_syllable_script(base as u32),
+        _ => columns == 1 && base < '\u{2500}',
+    }
 }
 
 /// Split a row into runs (ranges of cells). A run is a maximal stretch of
 /// `Text` cells with one style and one selection state, so a selection edge
 /// never moves a glyph from one cell to another: a ligature half selected
 /// is shaped as two halves, each drawn in its own cell's colours. The
-/// cursor's cell is always a run of its own, which breaks a ligature under
-/// the cursor so the cell it is on shows its own character.
-pub fn segment_row(cells: &[SegCell], cursor: Option<usize>, out: &mut Vec<Range<usize>>) {
+/// cursor's cells (`cursor`: one, or every cell of the wide cluster it is
+/// on) are always a run of their own, which breaks a ligature under the
+/// cursor so the cell it is on shows its own character.
+pub fn segment_row(cells: &[SegCell], cursor: Option<Range<usize>>, out: &mut Vec<Range<usize>>) {
     out.clear();
     let mut start: Option<(usize, RunStyle, bool)> = None;
     for (col, cell) in cells.iter().enumerate() {
-        let at_cursor = cursor == Some(col);
         let key = match *cell {
             SegCell::Text { style, selected } => Some((style, selected)),
             _ => None,
         };
         let continues = match (start, key) {
             (Some((_, style, selected)), Some(key)) => {
-                key == (style, selected) && !at_cursor && cursor != Some(col.wrapping_sub(1))
+                key == (style, selected)
+                    && !cursor
+                        .as_ref()
+                        .is_some_and(|c| col == c.start || col == c.end)
             }
             _ => false,
         };
@@ -450,7 +460,7 @@ mod tests {
 
     fn runs(cells: &[SegCell], cursor: Option<usize>) -> Vec<Range<usize>> {
         let mut out = Vec::new();
-        segment_row(cells, cursor, &mut out);
+        segment_row(cells, cursor.map(|c| c..c + 1), &mut out);
         out
     }
 
@@ -789,6 +799,8 @@ mod tests {
         let row = term.screen().row(0);
         let (mut seg, mut texts, mut widths) = (Vec::new(), Vec::new(), Vec::new());
         let empty = CellContent::Empty;
+        // The tails of a syllable cluster stay in its run, as in widget.rs.
+        let mut tails_until = 0;
         for col in 0..term.cols() {
             let content = row.cell(col).map_or(&empty, |cell| &cell.content);
             let cell_text = match content {
@@ -797,11 +809,18 @@ mod tests {
                 _ => String::new(),
             };
             seg.push(match cell_glyph(content) {
-                None => SegCell::Blank,
-                Some(g) if shapes_with_neighbours(g, content.width()) => SegCell::Text {
+                None if col < tails_until && *content == CellContent::WideTail => SegCell::Text {
                     style: RunStyle::default(),
                     selected: false,
                 },
+                None => SegCell::Blank,
+                Some(g) if shapes_with_neighbours(g, content.width()) => {
+                    tails_until = col + content.width() as usize;
+                    SegCell::Text {
+                        style: RunStyle::default(),
+                        selected: false,
+                    }
+                }
                 Some(_) => SegCell::Own,
             });
             texts.push(cell_text);
@@ -811,15 +830,18 @@ mod tests {
     }
 
     /// Arabic and Devanagari keep the widths the grid gives them: the runs
-    /// cover exactly the printed cells, in logical order, one column each,
-    /// and the cursor ends where the cells do.
+    /// cover exactly the printed cells, in logical order, and the cursor
+    /// ends where the cells do. With mode 2027 a Devanagari syllable takes
+    /// one cell per base letter and its run keeps its tail cells.
     #[test]
     fn arabic_and_devanagari_runs_match_the_grid() {
         for (text, mode_2027, cells) in [
             ("مرحبا بالعالم", true, 13),
             ("مرحبا بالعالم", false, 13),
-            // Mode 2027: a conjunct and its vowel signs are one cluster.
-            ("क्षत्रिय स्त्री नमस्ते", true, 9),
+            // Mode 2027: a conjunct and its vowel signs are one cluster,
+            // one cell per base letter: क्ष 2, त्रि 1, य 1, स्त्री 2,
+            // न 1, म 1, स्ते 2, and the two spaces.
+            ("क्षत्रिय स्त्री नमस्ते", true, 12),
             // Without it: per-codepoint wcwidth, spacing vowel signs take
             // a column, a virama none, so conjuncts span cells.
             ("क्षत्रिय स्त्री नमस्ते", false, 16),
@@ -835,10 +857,12 @@ mod tests {
             let words: Vec<String> = out.iter().map(|run| texts[run.clone()].concat()).collect();
             let expected: Vec<&str> = text.split(' ').collect();
             assert_eq!(words, expected, "{text} 2027={mode_2027}");
-            assert!(out
-                .iter()
-                .flat_map(|run| run.clone())
-                .all(|col| widths[col] == 1));
+            // Every column of a run is a narrow cell, a cluster's head or
+            // one of its tails: the widths add up to the run's length.
+            for run in &out {
+                let total: usize = widths[run.clone()].iter().map(|&w| w as usize).sum();
+                assert_eq!(total, run.len(), "{text} 2027={mode_2027}");
+            }
         }
     }
 
@@ -899,6 +923,14 @@ mod tests {
                 // Each glyph is in the cell its cluster starts in.
                 for p in &placed {
                     assert_eq!(p.cell, cell_of_cluster(&starts, glyphs[p.glyph].cluster));
+                }
+                // A syllable given a cell per base letter is drawn across
+                // its cells at full size, not squeezed.
+                for p in &placed {
+                    let spans = cell_texts.get(p.cell + 1).is_some_and(|t| t.is_empty());
+                    if spans {
+                        assert_eq!(p.scale, 1.0, "{run_text}: cell {} shrunk", p.cell);
+                    }
                 }
             }
         }

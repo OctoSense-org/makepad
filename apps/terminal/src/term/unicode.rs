@@ -323,6 +323,85 @@ pub fn grapheme_break(cp1: u32, cp2: u32, state: &mut GraphemeState) -> bool {
     true
 }
 
+// ------------------------------------------------------------------
+// Syllable width (mode 2027)
+// ------------------------------------------------------------------
+//
+// A grapheme cluster normally takes the width of its widest codepoint,
+// clamped to 2, as in ghostty. In the Brahmic scripts of India and Sri
+// Lanka that puts a whole syllable into one cell: GB9c keeps a conjunct
+// such as क्ष or स्त्री together, and the conjunct is then squeezed into a
+// single column. So a cluster in one of those scripts instead gets one
+// cell per *base letter* in it:
+//
+// - A base letter is a codepoint whose Grapheme_Cluster_Break is Other
+//   (neither Extend, SpacingMark, ZWJ nor Prepend): the consonants and
+//   independent vowels. Nonspacing marks (Mn/Me: nukta, anusvara, the
+//   virama itself, above and below vowel signs), ZWJ and ZWNJ never count.
+// - A spacing vowel sign (Mc: ा ि ी ো ொ ...) never counts either: a
+//   dependent vowel attaches to its consonant, in its cell. That is the
+//   maintainer's choice; it keeps कि and का at one cell, like क. The same
+//   goes for the other spacing marks (the spacing anusvara and visarga of
+//   the southern scripts, as in മലയാളം).
+// - A RA right after a linker (C + virama + RA) does not count: it is
+//   written as a mark on the consonant before it (the Devanagari rakar,
+//   Bengali and Oriya ra-phala, the Telugu and Kannada RA vattu, the
+//   Malayalam ra sign), so त्र is one cell and स्त्री two. A RA before the
+//   virama (the reph of र्म) still counts, so र्म is two cells, as the
+//   maintainer's धर्म example pins it: only the post-virama RA is exempt.
+// - Every other consonant counts, joined by a virama or not, whatever
+//   ligature a font may make of it (क्ष is 2): the width must not depend on
+//   the font.
+// - The result is at least 1 and at most MAX_SYLLABLE_CELLS.
+//
+// Scripts: Devanagari, Bengali, Gurmukhi, Gujarati, Oriya, Tamil, Telugu,
+// Kannada, Malayalam and Sinhala, which are exactly U+0900..U+0DFF. With
+// Unicode 15.1's GB9c only Devanagari, Bengali, Gujarati, Oriya, Telugu and
+// Malayalam (the scripts with Indic_Conjunct_Break values) ever join two
+// consonants into one cluster; in the other four a cluster holds one base
+// letter and keeps its single cell, so the rule is the same there.
+// Myanmar and Khmer are left out: their stacker (U+1039) and coeng
+// (U+17D2) write the next consonant *below*, taking no advance, so a count
+// of consonants would over-widen them, and in 15.1 those clusters never
+// hold two consonants anyway.
+
+/// The most cells one syllable cluster takes.
+pub const MAX_SYLLABLE_CELLS: u8 = 4;
+
+/// Whether `cp` belongs to a script whose clusters take one cell per base
+/// letter (Devanagari through Sinhala, U+0900..U+0DFF).
+pub fn is_syllable_script(cp: u32) -> bool {
+    (0x0900..=0x0DFF).contains(&cp)
+}
+
+/// RA in each covered script: written as a mark when it follows a linker.
+/// Tamil has no such form.
+const SYLLABLE_RA: [u32; 10] = [
+    0x0930, 0x09B0, 0x09F0, 0x0A30, 0x0AB0, 0x0B30, 0x0C30, 0x0CB0, 0x0D30, 0x0DBB,
+];
+
+/// Cells for a grapheme cluster under mode 2027 when its first codepoint is
+/// in a syllable script (see the rule above); `None` for any other cluster,
+/// which keeps the widest-codepoint rule.
+pub fn syllable_width<I: IntoIterator<Item = u32>>(cps: I) -> Option<u8> {
+    let mut cps = cps.into_iter();
+    let first = cps.next()?;
+    if !is_syllable_script(first) {
+        return None;
+    }
+    let mut letters = 0u8;
+    let mut after_linker = false;
+    for cp in core::iter::once(first).chain(cps) {
+        let counts = matches!(grapheme_class(cp), GraphemeClass::Other)
+            && !(after_linker && SYLLABLE_RA.contains(&cp));
+        if counts {
+            letters = letters.saturating_add(1);
+        }
+        after_linker = range_contains(&INCB_LINKER, cp);
+    }
+    Some(letters.clamp(1, MAX_SYLLABLE_CELLS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +747,120 @@ mod tests {
         assert_ne!(state, GraphemeState::default());
         state.reset();
         assert_eq!(state, GraphemeState::default());
+    }
+
+    // ---------------------------------------------------- syllable width
+
+    /// Split `text` into clusters and give each its mode-2027 width under
+    /// the syllable rule: (cluster, cells).
+    fn syllables(text: &str) -> Vec<(String, u8)> {
+        let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
+        clusters(&cps)
+            .into_iter()
+            .map(|c| {
+                let s: String = c.iter().map(|&cp| char::from_u32(cp).unwrap()).collect();
+                let w = syllable_width(c.iter().copied()).expect("a syllable script");
+                (s, w)
+            })
+            .collect()
+    }
+
+    fn cells(text: &str) -> Vec<u8> {
+        syllables(text).into_iter().map(|(_, w)| w).collect()
+    }
+
+    #[test]
+    fn syllable_width_devanagari() {
+        assert_eq!(syllables("क"), vec![("क".into(), 1)]);
+        // A spacing vowel sign stays in its consonant's cell.
+        assert_eq!(syllables("कि"), vec![("कि".into(), 1)]);
+        assert_eq!(syllables("का"), vec![("का".into(), 1)]);
+        // क्ष: two consonants, whatever ligature the font makes.
+        assert_eq!(syllables("क्ष"), vec![("क्ष".into(), 2)]);
+        // स्त्री: स and त; the RA after a virama is the rakar mark.
+        assert_eq!(syllables("स्त्री"), vec![("स्त्री".into(), 2)]);
+        // नमस्ते: न, म, स्ते.
+        assert_eq!(
+            syllables("नमस्ते"),
+            vec![("न".into(), 1), ("म".into(), 1), ("स्ते".into(), 2)]
+        );
+        // धर्म: ध, र्म (the reph's RA counts).
+        assert_eq!(syllables("धर्म"), vec![("ध".into(), 1), ("र्म".into(), 2)]);
+        // क्षत्रिय: क्ष, त्रि, य.
+        assert_eq!(cells("क्षत्रिय"), vec![2, 1, 1]);
+        // Marks never count: nukta, anusvara, candrabindu, a lone virama.
+        assert_eq!(cells("क़"), vec![1]);
+        assert_eq!(cells("हिंदी"), vec![1, 1]);
+        assert_eq!(cells("चाँद"), vec![1, 1]);
+        assert_eq!(cells("क्"), vec![1]);
+        // An independent vowel is a base letter.
+        assert_eq!(cells("आ"), vec![1]);
+    }
+
+    #[test]
+    fn syllable_width_bengali() {
+        // বাংলা: বাং, লা: a vowel sign and an anusvara add nothing.
+        assert_eq!(cells("বাংলা"), vec![1, 1]);
+        // ক্ষমা: ক্ষ is two consonants.
+        assert_eq!(syllables("ক্ষমা"), vec![("ক্ষ".into(), 2), ("মা".into(), 1)]);
+        // স্ত্রী: the ra-phala does not count.
+        assert_eq!(cells("স্ত্রী"), vec![2]);
+        // ো is a two-part vowel sign, still one vowel sign.
+        assert_eq!(cells("কো"), vec![1]);
+    }
+
+    #[test]
+    fn syllable_width_tamil() {
+        // Tamil has no InCB values in Unicode 15.1, so a pulli (virama)
+        // ends the cluster: every cluster holds one letter.
+        assert_eq!(
+            syllables("நன்றி"),
+            vec![("ந".into(), 1), ("ன்".into(), 1), ("றி".into(), 1)]
+        );
+        assert_eq!(cells("க்ஷ"), vec![1, 1]);
+        assert_eq!(cells("மொழி"), vec![1, 1]);
+    }
+
+    #[test]
+    fn syllable_width_malayalam() {
+        assert_eq!(cells("ക്ഷമ"), vec![2, 1]);
+        // സ്ത്രീ: the ra sign after the virama does not count.
+        assert_eq!(cells("സ്ത്രീ"), vec![2]);
+        // മലയാളം: മ, ല, യാ, ളം.
+        assert_eq!(cells("മലയാളം"), vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn syllable_width_is_capped() {
+        // Five consonants chained by viramas: one cluster, capped at 4.
+        let chain = "क्क्क्क्क";
+        assert_eq!(syllables(chain), vec![(chain.into(), MAX_SYLLABLE_CELLS)]);
+    }
+
+    #[test]
+    fn syllable_width_leaves_other_scripts_alone() {
+        for text in [
+            "a",
+            "e\u{301}",
+            "漢",
+            "한",
+            "\u{1100}\u{1161}\u{11A8}",
+            "👍🏽",
+            "👨\u{200D}👩\u{200D}👧",
+            "#\u{FE0F}\u{20E3}",
+            "مرحبا",
+            // Myanmar က္က (stacked) and Khmer ក្ក (coeng) are left out.
+            "\u{1000}\u{1039}\u{1000}",
+            "\u{1780}\u{17D2}\u{1780}",
+        ] {
+            let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
+            for c in clusters(&cps) {
+                assert_eq!(syllable_width(c.iter().copied()), None, "{text}");
+            }
+        }
+        assert_eq!(syllable_width(core::iter::empty()), None);
+        assert!(is_syllable_script(0x0900) && is_syllable_script(0x0DFF));
+        assert!(!is_syllable_script(0x08FF) && !is_syllable_script(0x0E00));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::term::screen::{CursorStyle, SavedCursor, Screen};
 use crate::term::sgr::{attributes, Attribute};
 use crate::term::style::{StyleColor, StyleFlags};
 use crate::term::unicode::{
-    char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, GraphemeState,
+    char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, syllable_width, GraphemeState,
 };
 
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -400,8 +400,21 @@ impl Terminal {
         // (UTS #51). A skin tone (which only joins a modifier base) asks
         // for emoji presentation too, so it widens a narrow base (☝🏽).
         let old_width = prev_content.width();
+        let ch = match char::from_u32(cp) {
+            Some(ch) => ch,
+            None => return true,
+        };
+        let mut new_cps = cps;
+        new_cps.push(ch);
         let mut new_width = old_width;
-        if cp == 0xfe0f && old_width == 1 && is_emoji_vs_base(prev_cp) {
+        // A syllable cluster (Devanagari..Sinhala) takes one cell per base
+        // letter instead (`unicode::syllable_width`); it only ever grows as
+        // codepoints arrive. It never takes more than the printable region.
+        let syllable = syllable_width(new_cps.iter().map(|&c| c as u32));
+        if let Some(width) = syllable {
+            let region = right_limit.saturating_sub(self.screen().left_margin).max(1);
+            new_width = width.min(region.min(u8::MAX as usize) as u8).max(old_width);
+        } else if cp == 0xfe0f && old_width == 1 && is_emoji_vs_base(prev_cp) {
             new_width = 2;
         } else if cp == 0xfe0e && old_width == 2 && is_emoji_vs_base(prev_cp) {
             new_width = 1;
@@ -409,95 +422,144 @@ impl Terminal {
             new_width = 2;
         }
 
-        let ch = match char::from_u32(cp) {
-            Some(ch) => ch,
-            None => return true,
-        };
-        let mut new_cps = cps;
-        new_cps.push(ch);
-        let cluster = CellContent::Cluster(Box::new(Cluster {
-            cps: new_cps,
-            width: new_width,
-        }));
-
         if new_width == old_width {
+            let cluster = CellContent::Cluster(Box::new(Cluster {
+                cps: new_cps,
+                width: new_width,
+            }));
             let sm = self.screen_mut();
             sm.row_mut(py).cell_mut(px).content = cluster;
             return true;
         }
 
-        // Width changed. Narrow->wide needs room for a tail; wide->narrow
-        // frees its tail.
-        if new_width == 2 {
-            let cols = self.cols();
-            if px + 1 >= right_limit.min(cols) {
-                // No room: wrap the (now wide) cluster to the next line.
-                if !wraparound {
-                    return true;
-                }
-                let pen = self.screen().cursor.style;
-                {
-                    let sm = self.screen_mut();
-                    sm.cursor.x = px;
-                    sm.cursor.y = py;
-                    let row = sm.row_mut(py);
-                    *row.cell_mut(px) = Cell {
-                        content: if right_limit == cols {
-                            CellContent::WideSpacerHead
-                        } else {
-                            CellContent::Empty
-                        },
-                        style: crate::term::style::Style {
-                            bg_color: pen.bg_color,
-                            ..Default::default()
-                        },
-                        hyperlink: 0,
-                    };
-                    if right_limit == cols {
-                        row.wrapped = true;
-                    }
-                }
-                self.print_wrap();
-                let sm = self.screen_mut();
-                let (x, y) = (sm.cursor.x, sm.cursor.y);
-                sm.row_mut(y).cell_mut(x).content = cluster;
-                sm.cursor.x = x + 1;
-                let ry = sm.cursor.y;
-                let rx = sm.cursor.x;
-                sm.row_mut(ry).cell_mut(rx).content = CellContent::WideTail;
-                let rl = if sm.cursor.x > sm.right_margin {
-                    sm.cols
-                } else {
-                    sm.right_margin + 1
-                };
-                if sm.cursor.x == rl - 1 {
-                    sm.cursor.pending_wrap = true;
-                } else {
-                    sm.cursor.x += 1;
-                }
-            } else {
-                let sm = self.screen_mut();
-                sm.row_mut(py).cell_mut(px).content = cluster;
-                let tail = sm.row_mut(py).cell_mut(px + 1);
-                tail.content = CellContent::WideTail;
-                // The cursor sits after the tail now.
-                sm.cursor.x = (px + 2).min(sm.cols - 1);
-                sm.cursor.pending_wrap = px + 2 >= right_limit;
-            }
-        } else {
-            // Wide -> narrow: drop the tail.
+        if new_width < old_width {
+            // Wide -> narrow: drop the tails.
+            let cluster = CellContent::Cluster(Box::new(Cluster {
+                cps: new_cps,
+                width: new_width,
+            }));
             let sm = self.screen_mut();
             sm.row_mut(py).cell_mut(px).content = cluster;
-            if px + 1 < sm.cols {
-                let tail = sm.row_mut(py).cell_mut(px + 1);
+            for col in px + new_width as usize..(px + old_width as usize).min(sm.cols) {
+                let tail = sm.row_mut(py).cell_mut(col);
                 if tail.content == CellContent::WideTail {
                     tail.content = CellContent::Empty;
                 }
             }
             sm.cursor.pending_wrap = false;
-            sm.cursor.x = (px + 1).min(right_limit - 1);
+            sm.cursor.x = (px + new_width as usize).min(right_limit - 1);
+            return true;
         }
+
+        // Narrow -> wide, or a syllable gaining a cell: the new tails need
+        // room on this row.
+        let cols = self.cols();
+        let limit = right_limit.min(cols);
+        if px + new_width as usize > limit {
+            if !wraparound {
+                // Nowhere to go. An emoji's presentation selector is dropped
+                // (as before); a syllable keeps its text in the cells left.
+                if syllable.is_none() {
+                    return true;
+                }
+                new_width = (limit - px).max(old_width as usize) as u8;
+            } else {
+                // Wrap the whole cluster to the next line, leaving spacer
+                // heads (at the true screen edge) where it stood.
+                let pen = self.screen().cursor.style;
+                let (style, link) = {
+                    let cell = self.screen().row(py).cell(px);
+                    (
+                        cell.map(|c| c.style).unwrap_or_default(),
+                        cell.map_or(0, |c| c.hyperlink),
+                    )
+                };
+                {
+                    let sm = self.screen_mut();
+                    sm.cursor.x = px;
+                    sm.cursor.y = py;
+                    let row = sm.row_mut(py);
+                    for col in px..limit {
+                        *row.cell_mut(col) = Cell {
+                            content: if right_limit == cols {
+                                CellContent::WideSpacerHead
+                            } else {
+                                CellContent::Empty
+                            },
+                            style: crate::term::style::Style {
+                                bg_color: pen.bg_color,
+                                ..Default::default()
+                            },
+                            hyperlink: 0,
+                        };
+                    }
+                    if right_limit == cols {
+                        row.wrapped = true;
+                    }
+                }
+                self.print_wrap();
+                let (x, y) = {
+                    let s = self.screen();
+                    (s.cursor.x, s.cursor.y)
+                };
+                let right_limit = self.right_limit();
+                self.place_cluster(x, y, new_cps, new_width, style, link, right_limit);
+                return true;
+            }
+        }
+        let (style, link) = {
+            let cell = self.screen().row(py).cell(px);
+            (
+                cell.map(|c| c.style).unwrap_or_default(),
+                cell.map_or(0, |c| c.hyperlink),
+            )
+        };
+        self.place_cluster(px, py, new_cps, new_width, style, link, right_limit);
         true
+    }
+
+    /// Write a cluster `width` cells wide at (`x`, `y`), its tails after it
+    /// in its style, and put the cursor after it: on the next cell, or
+    /// with a deferred wrap when it ends at the right limit.
+    #[allow(clippy::too_many_arguments)]
+    fn place_cluster(
+        &mut self,
+        x: usize,
+        y: usize,
+        cps: Vec<char>,
+        width: u8,
+        style: crate::term::style::Style,
+        hyperlink: u32,
+        right_limit: usize,
+    ) {
+        let sm = self.screen_mut();
+        let cols = sm.cols;
+        let end = (x + width as usize).min(cols);
+        let row = sm.row_mut(y);
+        // Whatever the last tail covers must not leave half of itself.
+        if end > x + 1 {
+            row.split_wide_at(end - 1, &style);
+        }
+        *row.cell_mut(x) = Cell {
+            content: CellContent::Cluster(Box::new(Cluster { cps, width })),
+            style,
+            hyperlink,
+        };
+        for col in x + 1..end {
+            *row.cell_mut(col) = Cell {
+                content: CellContent::WideTail,
+                style,
+                hyperlink,
+            };
+        }
+        if end >= right_limit {
+            sm.cursor.x = right_limit - 1;
+            sm.cursor.pending_wrap = true;
+        } else {
+            sm.cursor.x = end;
+            sm.cursor.pending_wrap = false;
+        }
+        sm.cursor.y = y;
     }
 
     /// Attach a zero-width codepoint to the previous cell (non-2027 path).
@@ -957,14 +1019,13 @@ impl Terminal {
         for col in x..x + count {
             row.cells[col] = blank.clone();
         }
-        // A wide char split across the right margin can't survive.
-        row.split_wide_at(right, &pen);
-        if row
-            .cell(right)
-            .map(|c| c.content.is_wide_head())
-            .unwrap_or(false)
-        {
-            row.cells[right] = blank;
+        // A wide char or cluster split across the right margin can't
+        // survive.
+        let (head, width) = row.span_at(right);
+        if head + width > right + 1 {
+            for col in head..=right {
+                row.cells[col] = blank.clone();
+            }
         }
     }
 
@@ -990,13 +1051,11 @@ impl Terminal {
                 row.cells[col] = Cell::blank_with_bg(&pen);
             }
         }
-        // Don't leave a dangling tail at the start of the shifted span.
-        if row
-            .cell(x)
-            .map(|c| c.content == CellContent::WideTail)
-            .unwrap_or(false)
-        {
-            row.cells[x] = Cell::blank_with_bg(&pen);
+        // Don't leave dangling tails at the start of the shifted span.
+        let mut col = x;
+        while col <= right && row.cells[col].content == CellContent::WideTail {
+            row.cells[col] = Cell::blank_with_bg(&pen);
+            col += 1;
         }
     }
 
@@ -1032,13 +1091,10 @@ impl Terminal {
                 (x, cols)
             }
             1 => {
-                // Left: include the tail of a wide char under the cursor.
-                let extra = s
-                    .row(y)
-                    .cell(x)
-                    .map(|c| c.content.is_wide_head())
-                    .unwrap_or(false);
-                (0, x + 1 + extra as usize)
+                // Left: include the tails of a wide char or cluster under
+                // the cursor.
+                let (head, width) = s.row(y).span_at(x);
+                (0, (x + 1).max(head + width))
             }
             2 => {
                 s.row_mut(y).wrapped = false;
@@ -2376,6 +2432,183 @@ mod tests {
         assert_reflow_matches_fresh("a😀b😀😀c".as_bytes(), 10, &[4, 3, 9], 6);
         // Grapheme clusters (mode 2027) are wide heads too.
         assert_reflow_matches_fresh("\x1b[?2027hab👍🏽c👍🏽".as_bytes(), 10, &[3, 4, 12], 6);
+    }
+
+    // ------------------------------------------------ syllable clusters
+
+    /// Mode 2027 gives a syllable (Devanagari..Sinhala) one cell per base
+    /// letter; the widths come from `unicode::syllable_width`.
+    #[test]
+    fn syllable_widths_with_2027() {
+        let (mut s, mut t) = term(40, 2);
+        feed(&mut s, &mut t, "क्षत्रिय स्त्री नमस्ते धर्म".as_bytes());
+        let cells: Vec<(String, u8)> = head_cells(&t);
+        let expected: Vec<(String, u8)> = [
+            ("क्ष", 2),
+            ("त्रि", 1),
+            ("य", 1),
+            (" ", 1),
+            ("स्त्री", 2),
+            (" ", 1),
+            ("न", 1),
+            ("म", 1),
+            ("स्ते", 2),
+            (" ", 1),
+            ("ध", 1),
+            ("र्म", 2),
+        ]
+        .iter()
+        .map(|&(text, w)| (text.to_string(), w))
+        .collect();
+        assert_eq!(cells, expected);
+        // 4 + 1 + 2 + 1 + 4 + 1 + 3 cells, the cursor right after them.
+        assert_eq!(t.screen().cursor.x, 16);
+        assert_eq!(row_text(&t, 0), "क्षत्रिय स्त्री नमस्ते धर्म");
+        // The tails are there, in the head's style.
+        let row = t.screen().row(0);
+        assert!(row.cell(0).unwrap().content.is_wide_head());
+        assert_eq!(row.cell(1).unwrap().content, CellContent::WideTail);
+        assert_eq!(row.span_at(1), (0, 2));
+
+        // Bengali, Tamil, Malayalam.
+        for (text, widths) in [
+            ("ক্ষমা স্ত্রী", &[2, 1, 1, 2][..]),
+            ("நன்றி க்ஷ", &[1, 1, 1, 1, 1, 1][..]),
+            ("ക്ഷമ സ്ത്രീ", &[2, 1, 1, 2][..]),
+        ] {
+            let (cells, cursor) = print_graphemes(text, true);
+            let got: Vec<u8> = cells.iter().map(|&(_, w)| w).collect();
+            assert_eq!(got, widths, "{text}");
+            assert_eq!(
+                cursor,
+                widths.iter().map(|&w| w as usize).sum::<usize>(),
+                "{text}"
+            );
+        }
+    }
+
+    /// Without mode 2027 cells keep plain per-codepoint wcwidth: the
+    /// virama and marks attach, each consonant and spacing sign is a cell.
+    #[test]
+    fn syllable_widths_without_2027() {
+        let (cells, cursor) = print_graphemes("स्त्री", false);
+        assert_eq!(
+            cells,
+            vec![
+                ("स्".to_string(), 1),
+                ("त्".to_string(), 1),
+                ("र".to_string(), 1),
+                ("ी".to_string(), 1)
+            ]
+        );
+        assert_eq!(cursor, 4);
+    }
+
+    /// A syllable that grows past the right edge while it is being typed
+    /// wraps whole, leaving spacer heads, and the cursor follows it.
+    #[test]
+    fn syllable_wraps_whole_at_the_edge() {
+        let (mut s, mut t) = term(5, 3);
+        feed(&mut s, &mut t, "abcdस्ते".as_bytes());
+        let dump = screen_dump(&t);
+        let mut lines = dump.lines();
+        assert_eq!(lines.next(), Some("a b c d S >"));
+        assert_eq!(lines.next(), Some("[स्ते] T"));
+        assert_eq!(t.screen().cursor.x, 2);
+        assert_eq!(t.screen().cursor.y, 1);
+
+        // A four-consonant chain that stops fitting after two cells
+        // leaves every column it could not use as a spacer.
+        let (mut s, mut t) = term(5, 3);
+        feed(&mut s, &mut t, "abcक्क्क्क".as_bytes());
+        let dump = screen_dump(&t);
+        let mut lines = dump.lines();
+        assert_eq!(lines.next(), Some("a b c S S >"));
+        assert_eq!(lines.next(), Some("[क्क्क्क] T T T"));
+        assert_eq!(t.screen().cursor.x, 4);
+
+        // Ending exactly at the edge defers the wrap, as a narrow char does.
+        let (mut s, mut t) = term(5, 3);
+        feed(&mut s, &mut t, "abcस्त".as_bytes());
+        assert_eq!(screen_dump(&t).lines().next(), Some("a b c [स्त] T"));
+        assert!(t.screen().cursor.pending_wrap);
+        assert_eq!(t.screen().cursor.x, 4);
+    }
+
+    #[test]
+    fn reflow_keeps_syllables_whole() {
+        let text = "नमस्ते स्त्री धर्म क्षत्रिय";
+        assert_reflow_matches_fresh(text.as_bytes(), 30, &[7, 5, 3, 9, 4, 30], 12);
+        assert_reflow_matches_fresh("ক্ষমা স্ত্রী ക്ഷമ".as_bytes(), 20, &[3, 6, 5, 20], 10);
+        // A multi-cell cluster at a row edge wraps whole on reflow too.
+        let (mut s, mut t) = term(20, 4);
+        feed(&mut s, &mut t, "abcdस्ते".as_bytes());
+        t.resize(5, 4);
+        let dump = screen_dump(&t);
+        let mut lines = dump.lines();
+        assert_eq!(lines.next(), Some("a b c d S >"));
+        assert_eq!(lines.next(), Some("[स्ते] T"));
+        // And joins back up when there is room again.
+        t.resize(20, 4);
+        assert_eq!(screen_dump(&t).lines().next(), Some("a b c d [स्ते] T"));
+        // A four-cell chain.
+        assert_reflow_matches_fresh("ab क्क्क्क cd".as_bytes(), 20, &[5, 6, 4, 11], 8);
+    }
+
+    /// Copy gives the original text back: a cluster's tails and spacer
+    /// heads add nothing, and a selection that starts or ends inside a
+    /// cluster takes all of it.
+    #[test]
+    fn copy_multi_cell_clusters() {
+        let (mut s, mut t) = term(12, 4);
+        let text = "नमस्ते स्त्री";
+        feed(&mut s, &mut t, text.as_bytes());
+        let sc = t.screen();
+        let abs = |y: usize| sc.absolute_of_virtual(sc.scrollback.len() + y);
+        assert_eq!(sc.selection_text((abs(0), 0), (abs(0), 12)), text);
+        // न म [स्ते T] _ [स्त्री T]: from स्ते's tail to स्त्री's head.
+        assert_eq!(sc.selection_text((abs(0), 3), (abs(0), 6)), "स्ते स्त्री");
+        assert_eq!(
+            sc.snap_selection((abs(0), 3), (abs(0), 6)),
+            ((abs(0), 2), (abs(0), 7))
+        );
+        // One tail alone copies its whole cluster.
+        assert_eq!(sc.selection_text((abs(0), 6), (abs(0), 7)), "स्त्री");
+
+        // Across a forced wrap: the spacer heads copy as nothing.
+        let (mut s, mut t) = term(5, 4);
+        feed(&mut s, &mut t, "abcक्क्क्क स्ते".as_bytes());
+        let sc = t.screen();
+        let abs = |y: usize| sc.absolute_of_virtual(sc.scrollback.len() + y);
+        assert_eq!(sc.selection_text((abs(0), 0), (abs(2), 5)), "abcक्क्क्क स्ते");
+    }
+
+    /// Overwriting, erasing or inserting into part of a multi-cell cluster
+    /// removes all of it: no half syllables are left behind.
+    #[test]
+    fn edits_treat_a_syllable_as_one_unit() {
+        // Overwrite its tail.
+        let (mut s, mut t) = term(10, 2);
+        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[2Cx".as_bytes());
+        assert_eq!(screen_dump(&t).lines().next(), Some("a _ x b"));
+        // EL 1 (erase left) from its head takes its tails too.
+        let (mut s, mut t) = term(10, 2);
+        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[C\x1b[1K".as_bytes());
+        assert_eq!(screen_dump(&t).lines().next(), Some("_ _ _ b"));
+        // ICH pushing it across the right margin blanks it.
+        let (mut s, mut t) = term(6, 2);
+        feed(&mut s, &mut t, "abcस्ते\r\x1b[C\x1b[2@".as_bytes());
+        assert_eq!(screen_dump(&t).lines().next(), Some("a _ _ b c"));
+        // DCH pulling a tail to the cursor blanks it.
+        let (mut s, mut t) = term(10, 2);
+        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[C\x1b[P".as_bytes());
+        assert_eq!(screen_dump(&t).lines().next(), Some("a _ b"));
+        // A narrower screen without reflow (alternate screen) never keeps
+        // part of a cluster.
+        let (mut s, mut t) = term(10, 2);
+        feed(&mut s, &mut t, "\x1b[?1049habcक्क्क्क".as_bytes());
+        t.resize(5, 2);
+        assert_eq!(screen_dump(&t).lines().next(), Some("a b c"));
     }
 
     #[test]

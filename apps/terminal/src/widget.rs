@@ -1681,56 +1681,10 @@ impl MpTerm {
         Some(if a <= c { (a, c) } else { (c, a) })
     }
 
-    fn cell_selected(&self, abs_row: u64, col: usize) -> bool {
-        let Some(((sr, sc), (er, ec))) = self.sel_ordered() else {
-            return false;
-        };
-        if abs_row < sr || abs_row > er {
-            return false;
-        }
-        if sr == er {
-            return col >= sc && col < ec;
-        }
-        if abs_row == sr {
-            return col >= sc;
-        }
-        if abs_row == er {
-            return col < ec;
-        }
-        true
-    }
-
     fn selected_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
-        let screen = session.terminal.screen();
-        let ((sr, sc), (er, ec)) = self.sel_ordered()?;
-        let mut out = String::new();
-        for abs in sr..=er {
-            let Some(virt) = screen.virtual_of_absolute(abs) else {
-                continue;
-            };
-            let Some(row) = screen.row_virtual(virt) else {
-                continue;
-            };
-            let from = if abs == sr { sc } else { 0 };
-            let to = if abs == er { ec } else { screen.cols };
-            let mut line = String::new();
-            for col in from..to.min(screen.cols) {
-                if let Some(cell) = row.cell(col) {
-                    cell.content.push_text(&mut line);
-                } else {
-                    line.push(' ');
-                }
-            }
-            let line = line.trim_end();
-            out.push_str(line);
-            if abs < er {
-                // A soft-wrapped row continues logically: no newline.
-                if !row.wrapped {
-                    out.push('\n');
-                }
-            }
-        }
+        let (start, end) = self.sel_ordered()?;
+        let out = session.terminal.screen().selection_text(start, end);
         if out.is_empty() {
             None
         } else {
@@ -2348,6 +2302,10 @@ impl MpTerm {
             strike: bool,
         }
         let (sel_bg, sel_fg) = self.selection_colors(default_fg, default_bg);
+        // Widened to whole wide chars and clusters, as copy sees it.
+        let selection = self
+            .sel_ordered()
+            .map(|(start, end)| session.terminal.screen().snap_selection(start, end));
         let min_contrast = self.settings.minimum_contrast;
         let bg_fill_color = Self::rgb_to_vec4(bg_fill, 1.0);
         // Neighbouring cells mostly share colours: adjust each pair once.
@@ -2367,15 +2325,19 @@ impl MpTerm {
             seg,
             seg_runs,
         } = &mut scratch;
-        // Each text cell's colour and content in this row.
-        let mut row_text: Vec<Option<(Vec4f, CellGlyph)>> = Vec::with_capacity(cols);
+        // Each text cell's colour and content in this row; `None` content
+        // for the tail columns of a syllable cluster shaped in a run.
+        let mut row_text: Vec<Option<(Vec4f, Option<CellGlyph>)>> = Vec::with_capacity(cols);
 
         // The cursor's cell, blinking or not: a ligature under it is broken
         // (shaped cell by cell) whichever phase the blink is in, so the
         // text does not change shape as the cursor blinks.
+        // On a wide char or a multi-cell cluster it covers the whole unit,
+        // from its head: (column, row, width).
         let cursor_cell = if self.view_offset == 0 && cursor_visible && !session.exited {
             let s = session.terminal.screen();
-            Some((s.cursor.x.min(cols - 1), s.cursor.y))
+            let (col, width) = s.row(s.cursor.y).span_at(s.cursor.x.min(cols - 1));
+            Some((col, s.cursor.y, width.min(cols - col)))
         } else {
             None
         };
@@ -2394,10 +2356,23 @@ impl MpTerm {
             let mut run: Option<(usize, usize, Vec4f)> = None;
             seg.clear();
             row_text.clear();
+            // The run cell and colour a syllable cluster's tails continue,
+            // and up to which column.
+            let mut tail_of: Option<(SegCell, Vec4f, usize)> = None;
             for col in 0..cols {
                 seg.push(SegCell::Blank);
                 row_text.push(None);
                 let cell = row.cell(col);
+                if let Some((seg_cell, color, end)) = tail_of {
+                    if col < end
+                        && cell.is_some_and(|c| c.content == crate::term::CellContent::WideTail)
+                    {
+                        seg[col] = seg_cell;
+                        row_text[col] = Some((color, None));
+                    } else {
+                        tail_of = None;
+                    }
+                }
                 let (fg, bg) = match cell {
                     Some(c) => Self::resolve_colors(session, &c.style, global_inverse),
                     None => (None, None),
@@ -2405,7 +2380,7 @@ impl MpTerm {
                 // Selected cells take the selection colours: by default
                 // inverse video (the default text color behind the default
                 // background color), readable in light and dark themes alike.
-                let selected = self.cell_selected(abs, col);
+                let selected = in_selection(selection, abs, col);
                 let (fg, bg) = if selected {
                     (fg.map(|_| sel_fg), Some(sel_bg))
                 } else {
@@ -2502,7 +2477,13 @@ impl MpTerm {
                         },
                         selected,
                     };
-                    row_text[col] = Some((fg, glyph));
+                    row_text[col] = Some((fg, Some(glyph)));
+                    // A syllable cluster's tails stay in its run, so its
+                    // glyphs span its cells (`text_run::place_run`).
+                    let width = cell.content.width() as usize;
+                    if width > 1 {
+                        tail_of = Some((seg[col], fg, col + width));
+                    }
                 } else if let Some(glyph) = glyph {
                     seg[col] = SegCell::Own;
                     let mut columns = cell.content.width();
@@ -2536,8 +2517,8 @@ impl MpTerm {
             // Text runs: shaped across cells, split at blanks, styles, the
             // selection's edges and the cursor.
             let cursor_col = cursor_cell
-                .filter(|&(_, cy)| cy == vis_row)
-                .map(|(cx, _)| cx);
+                .filter(|&(_, cy, _)| cy == vis_row)
+                .map(|(cx, _, width)| cx..cx + width);
             text_run::segment_row(seg, cursor_col, seg_runs);
             for range in seg_runs.iter() {
                 let text_start = run_text.len();
@@ -2546,10 +2527,12 @@ impl MpTerm {
                     run_starts.push(run_text.len() - text_start);
                     run_colors.push(*color);
                     match glyph {
-                        CellGlyph::Char(ch) => run_text.push(*ch),
-                        CellGlyph::Cluster(cps) => run_text.extend(cps.iter()),
+                        Some(CellGlyph::Char(ch)) => run_text.push(*ch),
+                        Some(CellGlyph::Cluster(cps)) => run_text.extend(cps.iter()),
+                        // A tail: no text, so its cluster's glyphs span it.
+                        None => {}
                     }
-                    run_centered.push(matches!(glyph, CellGlyph::Cluster(_)));
+                    run_centered.push(matches!(glyph, Some(CellGlyph::Cluster(_))));
                 }
                 let SegCell::Text { style, .. } = seg[range.start] else {
                     continue;
@@ -2588,8 +2571,10 @@ impl MpTerm {
         }
 
         // Layer 2: cursor under text (block) — text stays readable on top.
-        if let Some((cx_col, cx_row)) = cursor {
+        if let Some((cx_col, cx_row, cx_width)) = cursor {
             let x = origin_x + cx_col as f64 * cell_w;
+            // A block or underline covers every cell of the unit under it.
+            let unit_w = cx_width.max(1) as f64 * cell_w;
             let y = origin_y + cx_row as f64 * cell_h;
             let color = Self::rgb_to_vec4(cursor_color, 1.0);
             self.draw_cursor.new_draw_call(cx);
@@ -2606,14 +2591,14 @@ impl MpTerm {
                 CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => (
                     Rect {
                         pos: dvec2(x, y + cell_h - (cell_h * 0.12).max(2.0)),
-                        size: dvec2(cell_w, (cell_h * 0.12).max(2.0)),
+                        size: dvec2(unit_w, (cell_h * 0.12).max(2.0)),
                     },
                     Some(0.0),
                 ),
                 _ => (
                     Rect {
                         pos: dvec2(x, y),
-                        size: dvec2(cell_w, cell_h),
+                        size: dvec2(unit_w, cell_h),
                     },
                     None,
                 ),
@@ -2638,7 +2623,7 @@ impl MpTerm {
         for g in &glyphs {
             // A block cursor inverts the glyph on top of it for contrast.
             let mut color = g.color;
-            if let Some((ccol, crow)) = cursor {
+            if let Some((ccol, crow, _)) = cursor {
                 let gx = ((g.x - origin_x) / cell_w).round() as usize;
                 let gy = ((g.y - origin_y) / cell_h).round() as usize;
                 if gx == ccol
@@ -2707,7 +2692,9 @@ impl MpTerm {
             for glyph in glyphs {
                 let cell = glyph.cell as usize;
                 // A block cursor inverts the glyph on top of it for contrast.
-                let color = if block_cursor && cursor == Some((r.col + cell, r.row)) {
+                let color = if block_cursor
+                    && cursor.is_some_and(|(ccol, crow, _)| (ccol, crow) == (r.col + cell, r.row))
+                {
                     Self::rgb_to_vec4(default_bg, 1.0)
                 } else {
                     colors[cell]
@@ -3314,8 +3301,11 @@ impl MpTerm {
         let Some(row) = screen.row_virtual(virt) else {
             return (pos.1, pos.1 + 1);
         };
+        // A wide char's or cluster's tails belong to its word.
         let kind_of = |col: usize| -> Option<bool> {
-            let c = row.cell(col).and_then(|c| c.content.primary())?;
+            let c = row
+                .cell(row.head_of(col))
+                .and_then(|c| c.content.primary())?;
             if c.is_whitespace() {
                 None
             } else {
@@ -3456,6 +3446,27 @@ const INPUT_NOTICE_SECONDS: f64 = 4.0;
 
 /// The shape a cursor draws with: a program's DECSCUSR choice wins; with
 /// none (`Default`) the person's settings decide shape and blink.
+/// Whether cell (`abs_row`, `col`) lies in the ordered selection `sel`
+/// (`end` exclusive).
+fn in_selection(sel: Option<((u64, usize), (u64, usize))>, abs_row: u64, col: usize) -> bool {
+    let Some(((sr, sc), (er, ec))) = sel else {
+        return false;
+    };
+    if abs_row < sr || abs_row > er {
+        return false;
+    }
+    if sr == er {
+        return col >= sc && col < ec;
+    }
+    if abs_row == sr {
+        return col >= sc;
+    }
+    if abs_row == er {
+        return col < ec;
+    }
+    true
+}
+
 fn effective_cursor_style(style: CursorStyle, settings: &Settings) -> CursorStyle {
     if style != CursorStyle::Default {
         return style;
