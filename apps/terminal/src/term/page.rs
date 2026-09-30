@@ -18,10 +18,13 @@ pub enum CellContent {
     Char(char),
     /// Single codepoint, width 2. The following cell must be `WideTail`.
     WideChar(char),
-    /// The second column of a wide char.
+    /// A column after the first of a wide char or a wide cluster: a
+    /// cluster `width` cells wide is followed by `width - 1` of these.
     WideTail,
-    /// Last column of a row when a wide char had to wrap: renders as blank,
-    /// marks that the wrap was forced by width (ghostty `spacer_head`).
+    /// The columns left at the end of a row when a wide char or cluster
+    /// had to wrap: renders as blank, marks that the wrap was forced by
+    /// width (ghostty `spacer_head`). A cluster wider than 2 can leave more
+    /// than one.
     WideSpacerHead,
     /// A multi-codepoint grapheme cluster (mode 2027 or combining marks).
     Cluster(Box<Cluster>),
@@ -46,10 +49,11 @@ impl CellContent {
         }
     }
 
+    /// A cell whose content continues into `WideTail` cells after it.
     pub fn is_wide_head(&self) -> bool {
         match self {
             CellContent::WideChar(_) => true,
-            CellContent::Cluster(c) => c.width == 2,
+            CellContent::Cluster(c) => c.width >= 2,
             _ => false,
         }
     }
@@ -163,39 +167,54 @@ impl Row {
 
     /// If `col` lands on a wide tail, step back to its head column.
     pub fn head_of(&self, col: usize) -> usize {
-        if col > 0 {
-            if let Some(cell) = self.cell(col) {
-                if cell.content == CellContent::WideTail {
-                    return col - 1;
-                }
-            }
+        let mut col = col;
+        while col > 0
+            && self
+                .cell(col)
+                .is_some_and(|c| c.content == CellContent::WideTail)
+        {
+            col -= 1;
         }
         col
     }
 
-    /// Clearing/overwriting `col` must not leave halves of wide chars:
-    /// if `col` is a wide head, blank its tail; if a tail, blank its head.
-    /// Returns nothing; the caller writes `col` itself afterwards.
+    /// The columns the character or cluster covering `col` occupies, as
+    /// (head column, width): a wide char or a multi-cell cluster is one
+    /// unit for the cursor, the selection and copy. Width is at least 1.
+    pub fn span_at(&self, col: usize) -> (usize, usize) {
+        let head = self.head_of(col);
+        let width = self
+            .cell(head)
+            .map_or(1, |c| c.content.width().max(1) as usize);
+        // A stray tail (its head overwritten) stands for itself.
+        if head + width <= col {
+            return (col, 1);
+        }
+        (head, width)
+    }
+
+    /// Clearing/overwriting `col` must not leave pieces of a wide char or
+    /// cluster: every other cell of the unit covering `col` is blanked (its
+    /// head, its tails). The caller writes `col` itself afterwards.
     pub fn split_wide_at(&mut self, col: usize, style: &Style) {
         let len = self.cells.len();
-        if col < len {
-            match self.cells[col].content {
-                CellContent::WideChar(_) => {
-                    if col + 1 < len && self.cells[col + 1].content == CellContent::WideTail {
-                        self.cells[col + 1] = Cell::blank_with_bg(style);
-                    }
-                }
-                CellContent::Cluster(ref c) if c.width == 2 => {
-                    if col + 1 < len && self.cells[col + 1].content == CellContent::WideTail {
-                        self.cells[col + 1] = Cell::blank_with_bg(style);
-                    }
-                }
-                CellContent::WideTail => {
-                    if col > 0 {
-                        self.cells[col - 1] = Cell::blank_with_bg(style);
-                    }
-                }
-                _ => {}
+        if col >= len {
+            return;
+        }
+        let head = self.head_of(col);
+        let width = self.cells[head].content.width().max(1) as usize;
+        let tail = self.cells[col].content == CellContent::WideTail;
+        if head == col && width < 2 {
+            return;
+        }
+        // A tail's head (even a narrow one, if the tail was orphaned) and
+        // the tails of the unit.
+        if tail && head < col {
+            self.cells[head] = Cell::blank_with_bg(style);
+        }
+        for c in head + 1..(head + width.max(col - head + 1)).min(len) {
+            if c != col && self.cells[c].content == CellContent::WideTail {
+                self.cells[c] = Cell::blank_with_bg(style);
             }
         }
     }
@@ -232,6 +251,62 @@ mod tests {
         row.split_wide_at(1, &Style::default());
         assert_eq!(row.cells[0].content, CellContent::Empty);
         assert_eq!(row.cells[1].content, CellContent::WideTail);
+    }
+
+    fn cluster_row(width: u8) -> Row {
+        let mut row = Row::new();
+        *row.cell_mut(0) = Cell {
+            content: CellContent::Char('a'),
+            ..Default::default()
+        };
+        *row.cell_mut(1) = Cell {
+            content: CellContent::Cluster(Box::new(Cluster {
+                cps: "स्ते".chars().collect(),
+                width,
+            })),
+            ..Default::default()
+        };
+        for col in 2..1 + width as usize {
+            row.cell_mut(col).content = CellContent::WideTail;
+        }
+        *row.cell_mut(1 + width as usize) = Cell {
+            content: CellContent::Char('b'),
+            ..Default::default()
+        };
+        row
+    }
+
+    #[test]
+    fn multi_cell_cluster_is_one_unit() {
+        let row = cluster_row(3);
+        assert!(row.cells[1].content.is_wide_head());
+        for col in 1..4 {
+            assert_eq!(row.head_of(col), 1);
+            assert_eq!(row.span_at(col), (1, 3));
+        }
+        assert_eq!(row.span_at(0), (0, 1));
+        assert_eq!(row.span_at(4), (4, 1));
+        assert_eq!(row.text(), "aस्तेb");
+    }
+
+    #[test]
+    fn multi_cell_split() {
+        // Overwriting the middle tail blanks the head and the other tail.
+        let mut row = cluster_row(3);
+        row.split_wide_at(2, &Style::default());
+        let contents: Vec<_> = row.cells.iter().map(|c| c.content.clone()).collect();
+        assert_eq!(contents[1], CellContent::Empty);
+        assert_eq!(contents[2], CellContent::WideTail);
+        assert_eq!(contents[3], CellContent::Empty);
+        assert_eq!(contents[4], CellContent::Char('b'));
+        // Overwriting the head blanks every tail.
+        let mut row = cluster_row(4);
+        row.split_wide_at(1, &Style::default());
+        assert!(row.cells[2..5]
+            .iter()
+            .all(|c| c.content == CellContent::Empty));
+        assert_eq!(row.cells[5].content, CellContent::Char('b'));
+        assert_eq!(row.cells[0].content, CellContent::Char('a'));
     }
 
     #[test]

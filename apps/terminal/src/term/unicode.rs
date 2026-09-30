@@ -103,7 +103,7 @@ pub fn is_emoji_modifier(cp: u32) -> bool {
 /// it: one value per codepoint, with Extended_Pictographic folded in where
 /// the break property itself is `Other`, and CR/LF folded into `Control`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GraphemeClass {
+pub(crate) enum GraphemeClass {
     Other,
     /// Control, CR and LF. The printer never sees these; they behave
     /// exactly like `Other` in the rules below, matching ghostty's
@@ -125,7 +125,7 @@ enum GraphemeClass {
     EmojiModifier,
 }
 
-fn grapheme_class(cp: u32) -> GraphemeClass {
+pub(crate) fn grapheme_class(cp: u32) -> GraphemeClass {
     use GraphemeClass::*;
 
     // ASCII and Latin-1: only controls are interesting, combining marks
@@ -321,6 +321,43 @@ pub fn grapheme_break(cp1: u32, cp2: u32, state: &mut GraphemeState) -> bool {
 
     // GB999: otherwise, break.
     true
+}
+
+// ------------------------------------------------------------------
+// Syllable scripts in the grid (mode 2027)
+// ------------------------------------------------------------------
+//
+// In the Brahmic scripts of India and Sri Lanka, GB9c keeps a conjunct
+// (क्ष, स्त्री) in one grapheme cluster. The grid does not: a consonant
+// after a virama starts a cell of its own, so each cell holds one base
+// letter (a consonant or independent vowel) with its marks (virama, nukta,
+// vowel signs, spacing or not). That is one cell per base letter, and it is
+// exactly how line editors count: zsh (with `combiningchars`, macOS's
+// default) and readline give each base letter one column and each mark
+// none, and redraw a mark by backing up one column and rewriting the base
+// letter with it. A conjunct held as one multi-cell cluster puts that
+// backspace inside the cluster, and the rewrite erases the letters before
+// it; held as one single-cell cluster, the cursor drifts from the editor's.
+// The conjunct is still drawn as one: `text_run` shapes the cells of a word
+// together, so the font makes its ligatures and half forms across cells.
+//
+// Scripts: Devanagari through Sinhala, U+0900..U+0DFF. Myanmar and Khmer
+// are left out; their stacked consonants (after U+1039, U+17D2) take no
+// column in any editor either, and GB9c does not join them in Unicode 15.1.
+
+/// Whether `cp` belongs to a script whose cells hold one base letter each
+/// (Devanagari through Sinhala, U+0900..U+0DFF).
+pub fn is_syllable_script(cp: u32) -> bool {
+    (0x0900..=0x0DFF).contains(&cp)
+}
+
+/// [`grapheme_break`] for the grid: the same boundaries, plus one before a
+/// consonant that GB9c would join to a conjunct in a syllable script (see
+/// above). Only GB9c joins such a consonant (it is `Other`, and these
+/// scripts have no Prepend), so it is the boundary GB9c removed.
+pub fn cell_break(cp1: u32, cp2: u32, state: &mut GraphemeState) -> bool {
+    grapheme_break(cp1, cp2, state)
+        || (is_syllable_script(cp2) && range_contains(&INCB_CONSONANT, cp2))
 }
 
 #[cfg(test)]
@@ -668,6 +705,83 @@ mod tests {
         assert_ne!(state, GraphemeState::default());
         state.reset();
         assert_eq!(state, GraphemeState::default());
+    }
+
+    // ------------------------------------------------ syllable cells
+
+    /// Split `text` into grid cells the way the printer does under mode
+    /// 2027 (`cell_break`).
+    fn grid_cells(text: &str) -> Vec<String> {
+        let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
+        let mut out: Vec<String> = Vec::new();
+        let mut state = GraphemeState::default();
+        for (i, &cp) in cps.iter().enumerate() {
+            let ch = char::from_u32(cp).unwrap();
+            if i == 0 || cell_break(cps[i - 1], cp, &mut state) {
+                state.reset();
+                out.push(ch.to_string());
+            } else {
+                out.last_mut().unwrap().push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn syllable_cells_hold_one_base_letter() {
+        let cases: [(&str, &[&str]); 12] = [
+            ("क", &["क"]),
+            // A vowel sign, spacing or not, stays in its consonant's cell.
+            ("कि", &["कि"]),
+            ("का", &["का"]),
+            // A virama stays with the consonant before it; the consonant
+            // after it takes a cell, whatever ligature the font makes.
+            ("क्ष", &["क्", "ष"]),
+            ("स्त्री", &["स्", "त्", "री"]),
+            ("नमस्ते", &["न", "म", "स्", "ते"]),
+            ("धर्म", &["ध", "र्", "म"]),
+            ("क्षत्रिय", &["क्", "ष", "त्", "रि", "य"]),
+            // Nukta, anusvara, candrabindu and a lone virama are marks.
+            ("हिंदी चाँद", &["हिं", "दी", " ", "चाँ", "द"]),
+            ("ক্ষমা স্ত্রী", &["ক্", "ষ", "মা", " ", "স্", "ত্", "রী"]),
+            ("நன்றி", &["ந", "ன்", "றி"]),
+            ("ക്ഷമ", &["ക്", "ഷ", "മ"]),
+        ];
+        for (text, cells) in cases {
+            assert_eq!(grid_cells(text), cells, "{text}");
+            // Exactly one cell per base letter, as zsh and readline count.
+            let letters = text
+                .chars()
+                .filter(|&c| matches!(grapheme_class(c as u32), GraphemeClass::Other))
+                .count();
+            assert_eq!(grid_cells(text).len(), letters, "{text}");
+        }
+    }
+
+    #[test]
+    fn cell_break_leaves_other_scripts_alone() {
+        for text in [
+            "a",
+            "e\u{301}",
+            "漢",
+            "\u{1100}\u{1161}\u{11A8}",
+            "👍🏽",
+            "👨\u{200D}👩\u{200D}👧",
+            "#\u{FE0F}\u{20E3}",
+            "مرحبا",
+            // Myanmar က္က (stacked) and Khmer ក្ក (coeng) are left out.
+            "\u{1000}\u{1039}\u{1000}",
+            "\u{1780}\u{17D2}\u{1780}",
+        ] {
+            let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
+            let joined: Vec<String> = clusters(&cps)
+                .iter()
+                .map(|c| c.iter().map(|&cp| char::from_u32(cp).unwrap()).collect())
+                .collect();
+            assert_eq!(grid_cells(text), joined, "{text}");
+        }
+        assert!(is_syllable_script(0x0900) && is_syllable_script(0x0DFF));
+        assert!(!is_syllable_script(0x08FF) && !is_syllable_script(0x0E00));
     }
 
     #[test]

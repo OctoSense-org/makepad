@@ -77,6 +77,11 @@ pub struct Settings {
     /// The family CJK text falls back to: [`CJK_AUTO`], [`CJK_NONE`] or an
     /// installed family.
     pub cjk_font: String,
+    /// OpenType features for text, as Ghostty's `font-feature` and CSS
+    /// take them: `-calt, -liga` turns programming ligatures off, `ss01`
+    /// picks a stylistic set (`crate::text_run::parse_font_features`).
+    /// Empty: the font's defaults, ligatures on.
+    pub font_features: String,
     pub font_size: f64,
     /// Row height as a multiple of the font's glyph height (the text
     /// style's `line_spacing`; 1.0 is the terminal's historical look).
@@ -128,6 +133,7 @@ impl Default for Settings {
             background_opacity: None,
             font_family: String::new(),
             cjk_font: CJK_AUTO.into(),
+            font_features: String::new(),
             font_size: 10.0,
             line_height: 1.0,
             minimum_contrast: crate::contrast::OFF,
@@ -242,6 +248,9 @@ impl Settings {
                     s.font_family = if value.eq_ignore_ascii_case(DEFAULT_FONT) { String::new() } else { value.to_string() }
                 }
                 "cjk-font" if !value.is_empty() && !value.chars().any(char::is_control) => s.cjk_font = value.to_string(),
+                "font-features" if !value.chars().any(char::is_control) => {
+                    s.font_features = value.to_string()
+                }
                 "font-size" => {
                     if let Some(v) = value.parse::<f64>().ok().filter(|v| v.is_finite()) {
                         s.font_size = v.clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1);
@@ -344,6 +353,7 @@ impl Settings {
             if self.font_family.is_empty() { DEFAULT_FONT.into() } else { self.font_family.clone() },
         );
         line("cjk-font", self.cjk_font.clone());
+        line("font-features", self.font_features.clone());
         line("font-size", format!("{}", self.font_size));
         line("line-height", format!("{}", self.line_height));
         line("minimum-contrast", format!("{}", self.minimum_contrast));
@@ -586,6 +596,7 @@ mod tests {
             theme: "dracula".into(),
             font_family: "Menlo".into(),
             cjk_font: "PingFang SC".into(),
+            font_features: "-calt, ss01, cv05=2".into(),
             background_opacity: Some(0.85),
             font_size: 13.0,
             line_height: 1.5,

@@ -25,6 +25,7 @@ pub mod sprites;
 pub mod sync_output;
 pub mod tabs;
 pub mod term;
+pub mod text_run;
 pub mod themes;
 pub mod widget;
 

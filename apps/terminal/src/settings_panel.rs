@@ -10,6 +10,7 @@
 use crate::settings::{BellStyle, CursorShape, NewTabCwd, Settings, TabBar, TabTitle, THEME_DESKTOP};
 use crate::settings::{CJK_AUTO, CJK_NONE, DEFAULT_FONT};
 use crate::settings::{FONT_SIZE_RANGE, LINE_HEIGHT_RANGE};
+use crate::text_run::{ligatures_on, with_ligatures};
 use crate::themes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub enum Row {
     Theme,
     Font,
     CjkFont,
+    Ligatures,
     Opacity,
     FontSize,
     LineHeight,
@@ -65,6 +67,7 @@ pub const SECTIONS: &[(&str, &[Row])] = &[
             Row::Theme,
             Row::Font,
             Row::CjkFont,
+            Row::Ligatures,
             Row::FontSize,
             Row::LineHeight,
             Row::Opacity,
@@ -155,6 +158,7 @@ impl Row {
     pub fn kind(self) -> RowKind {
         match self {
             Row::CursorBlink
+            | Row::Ligatures
             | Row::OptionAsMeta
             | Row::CopyOnSelect
             | Row::LoginShell
@@ -240,6 +244,7 @@ impl Row {
             Row::Theme => "Theme",
             Row::Font => "Font",
             Row::CjkFont => "CJK font",
+            Row::Ligatures => "Ligatures",
             Row::Profile => "Profile",
             Row::SaveProfile => "Save as profile\u{2026}",
             Row::DeleteProfile => "Delete profile",
@@ -319,6 +324,7 @@ impl Row {
             }
             .into(),
             Row::CursorBlink => yes(s.cursor_blink),
+            Row::Ligatures => yes(ligatures_on(&s.font_features)),
             Row::Term => s.term.clone(),
             Row::Scrollback => format!("{} lines", s.scrollback_lines),
             Row::OptionAsMeta => yes(s.option_as_meta),
@@ -404,6 +410,9 @@ impl Row {
                 s.cursor_shape = cycle(&[CursorShape::Block, CursorShape::Bar, CursorShape::Underline], &s.cursor_shape, dir)
             }
             Row::CursorBlink => s.cursor_blink = !s.cursor_blink,
+            Row::Ligatures => {
+                s.font_features = with_ligatures(&s.font_features, !ligatures_on(&s.font_features))
+            }
             Row::Term => {
                 let mut terms: Vec<String> = TERMS.iter().map(|t| (*t).to_owned()).collect();
                 if !terms.contains(&s.term) {
@@ -436,7 +445,7 @@ mod tests {
     #[test]
     fn every_row_is_listed_once() {
         let rows = rows();
-        assert_eq!(rows.len(), 24);
+        assert_eq!(rows.len(), 25);
         for (i, row) in rows.iter().enumerate() {
             assert!(!rows[i + 1..].contains(row), "{row:?} twice");
         }
@@ -468,6 +477,20 @@ mod tests {
         assert_eq!(seen.len(), themes::SCHEMES.len() + 1);
         assert!(seen.iter().skip(1).all(|id| themes::find(id).is_some()));
         assert_eq!(Row::Theme.value(&Settings { theme: "tokyo-night".into(), ..Settings::default() }), "Tokyo Night");
+    }
+
+    #[test]
+    fn the_ligature_toggle_keeps_other_features() {
+        let s = Settings {
+            font_features: "ss01".into(),
+            ..Settings::default()
+        };
+        assert_eq!(Row::Ligatures.value(&s), "On");
+        let off = Row::Ligatures.step(&s, 1);
+        assert_eq!(off.font_features, "ss01, -calt, -liga, -dlig");
+        assert_eq!(Row::Ligatures.value(&off), "Off");
+        assert_eq!(Row::Ligatures.step(&off, 1).font_features, "ss01");
+        assert!(Row::Ligatures.is_toggle());
     }
 
     #[test]

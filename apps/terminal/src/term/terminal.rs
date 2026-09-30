@@ -14,7 +14,7 @@ use crate::term::screen::{CursorStyle, SavedCursor, Screen};
 use crate::term::sgr::{attributes, Attribute};
 use crate::term::style::{StyleColor, StyleFlags};
 use crate::term::unicode::{
-    char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, GraphemeState,
+    cell_break, char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, GraphemeState,
 };
 
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -391,7 +391,9 @@ impl Terminal {
             let _ = grapheme_break(prev_cp, c as u32, &mut state);
             prev_cp = c as u32;
         }
-        if grapheme_break(prev_cp, cp, &mut state) {
+        // The grid's boundaries: a syllable script's conjunct takes a cell
+        // per consonant (`unicode::cell_break`).
+        if cell_break(prev_cp, cp, &mut state) {
             return false;
         }
 
@@ -400,6 +402,12 @@ impl Terminal {
         // (UTS #51). A skin tone (which only joins a modifier base) asks
         // for emoji presentation too, so it widens a narrow base (☝🏽).
         let old_width = prev_content.width();
+        let ch = match char::from_u32(cp) {
+            Some(ch) => ch,
+            None => return true,
+        };
+        let mut new_cps = cps;
+        new_cps.push(ch);
         let mut new_width = old_width;
         if cp == 0xfe0f && old_width == 1 && is_emoji_vs_base(prev_cp) {
             new_width = 2;
@@ -409,95 +417,139 @@ impl Terminal {
             new_width = 2;
         }
 
-        let ch = match char::from_u32(cp) {
-            Some(ch) => ch,
-            None => return true,
-        };
-        let mut new_cps = cps;
-        new_cps.push(ch);
-        let cluster = CellContent::Cluster(Box::new(Cluster {
-            cps: new_cps,
-            width: new_width,
-        }));
-
         if new_width == old_width {
+            let cluster = CellContent::Cluster(Box::new(Cluster {
+                cps: new_cps,
+                width: new_width,
+            }));
             let sm = self.screen_mut();
             sm.row_mut(py).cell_mut(px).content = cluster;
             return true;
         }
 
-        // Width changed. Narrow->wide needs room for a tail; wide->narrow
-        // frees its tail.
-        if new_width == 2 {
-            let cols = self.cols();
-            if px + 1 >= right_limit.min(cols) {
-                // No room: wrap the (now wide) cluster to the next line.
-                if !wraparound {
-                    return true;
-                }
-                let pen = self.screen().cursor.style;
-                {
-                    let sm = self.screen_mut();
-                    sm.cursor.x = px;
-                    sm.cursor.y = py;
-                    let row = sm.row_mut(py);
-                    *row.cell_mut(px) = Cell {
-                        content: if right_limit == cols {
-                            CellContent::WideSpacerHead
-                        } else {
-                            CellContent::Empty
-                        },
-                        style: crate::term::style::Style {
-                            bg_color: pen.bg_color,
-                            ..Default::default()
-                        },
-                        hyperlink: 0,
-                    };
-                    if right_limit == cols {
-                        row.wrapped = true;
-                    }
-                }
-                self.print_wrap();
-                let sm = self.screen_mut();
-                let (x, y) = (sm.cursor.x, sm.cursor.y);
-                sm.row_mut(y).cell_mut(x).content = cluster;
-                sm.cursor.x = x + 1;
-                let ry = sm.cursor.y;
-                let rx = sm.cursor.x;
-                sm.row_mut(ry).cell_mut(rx).content = CellContent::WideTail;
-                let rl = if sm.cursor.x > sm.right_margin {
-                    sm.cols
-                } else {
-                    sm.right_margin + 1
-                };
-                if sm.cursor.x == rl - 1 {
-                    sm.cursor.pending_wrap = true;
-                } else {
-                    sm.cursor.x += 1;
-                }
-            } else {
-                let sm = self.screen_mut();
-                sm.row_mut(py).cell_mut(px).content = cluster;
-                let tail = sm.row_mut(py).cell_mut(px + 1);
-                tail.content = CellContent::WideTail;
-                // The cursor sits after the tail now.
-                sm.cursor.x = (px + 2).min(sm.cols - 1);
-                sm.cursor.pending_wrap = px + 2 >= right_limit;
-            }
-        } else {
-            // Wide -> narrow: drop the tail.
+        if new_width < old_width {
+            // Wide -> narrow: drop the tails.
+            let cluster = CellContent::Cluster(Box::new(Cluster {
+                cps: new_cps,
+                width: new_width,
+            }));
             let sm = self.screen_mut();
             sm.row_mut(py).cell_mut(px).content = cluster;
-            if px + 1 < sm.cols {
-                let tail = sm.row_mut(py).cell_mut(px + 1);
+            for col in px + new_width as usize..(px + old_width as usize).min(sm.cols) {
+                let tail = sm.row_mut(py).cell_mut(col);
                 if tail.content == CellContent::WideTail {
                     tail.content = CellContent::Empty;
                 }
             }
             sm.cursor.pending_wrap = false;
-            sm.cursor.x = (px + 1).min(right_limit - 1);
+            sm.cursor.x = (px + new_width as usize).min(right_limit - 1);
+            return true;
         }
+
+        // Narrow -> wide: the new tail needs room on this row.
+        let cols = self.cols();
+        let limit = right_limit.min(cols);
+        if px + new_width as usize > limit {
+            if !wraparound {
+                // Nowhere to go: the presentation selector is dropped.
+                return true;
+            } else {
+                // Wrap the whole cluster to the next line, leaving spacer
+                // heads (at the true screen edge) where it stood.
+                let pen = self.screen().cursor.style;
+                let (style, link) = {
+                    let cell = self.screen().row(py).cell(px);
+                    (
+                        cell.map(|c| c.style).unwrap_or_default(),
+                        cell.map_or(0, |c| c.hyperlink),
+                    )
+                };
+                {
+                    let sm = self.screen_mut();
+                    sm.cursor.x = px;
+                    sm.cursor.y = py;
+                    let row = sm.row_mut(py);
+                    for col in px..limit {
+                        *row.cell_mut(col) = Cell {
+                            content: if right_limit == cols {
+                                CellContent::WideSpacerHead
+                            } else {
+                                CellContent::Empty
+                            },
+                            style: crate::term::style::Style {
+                                bg_color: pen.bg_color,
+                                ..Default::default()
+                            },
+                            hyperlink: 0,
+                        };
+                    }
+                    if right_limit == cols {
+                        row.wrapped = true;
+                    }
+                }
+                self.print_wrap();
+                let (x, y) = {
+                    let s = self.screen();
+                    (s.cursor.x, s.cursor.y)
+                };
+                let right_limit = self.right_limit();
+                self.place_cluster(x, y, new_cps, new_width, style, link, right_limit);
+                return true;
+            }
+        }
+        let (style, link) = {
+            let cell = self.screen().row(py).cell(px);
+            (
+                cell.map(|c| c.style).unwrap_or_default(),
+                cell.map_or(0, |c| c.hyperlink),
+            )
+        };
+        self.place_cluster(px, py, new_cps, new_width, style, link, right_limit);
         true
+    }
+
+    /// Write a cluster `width` cells wide at (`x`, `y`), its tails after it
+    /// in its style, and put the cursor after it: on the next cell, or
+    /// with a deferred wrap when it ends at the right limit.
+    #[allow(clippy::too_many_arguments)]
+    fn place_cluster(
+        &mut self,
+        x: usize,
+        y: usize,
+        cps: Vec<char>,
+        width: u8,
+        style: crate::term::style::Style,
+        hyperlink: u32,
+        right_limit: usize,
+    ) {
+        let sm = self.screen_mut();
+        let cols = sm.cols;
+        let end = (x + width as usize).min(cols);
+        let row = sm.row_mut(y);
+        // Whatever the last tail covers must not leave half of itself.
+        if end > x + 1 {
+            row.split_wide_at(end - 1, &style);
+        }
+        *row.cell_mut(x) = Cell {
+            content: CellContent::Cluster(Box::new(Cluster { cps, width })),
+            style,
+            hyperlink,
+        };
+        for col in x + 1..end {
+            *row.cell_mut(col) = Cell {
+                content: CellContent::WideTail,
+                style,
+                hyperlink,
+            };
+        }
+        if end >= right_limit {
+            sm.cursor.x = right_limit - 1;
+            sm.cursor.pending_wrap = true;
+        } else {
+            sm.cursor.x = end;
+            sm.cursor.pending_wrap = false;
+        }
+        sm.cursor.y = y;
     }
 
     /// Attach a zero-width codepoint to the previous cell (non-2027 path).
@@ -957,14 +1009,13 @@ impl Terminal {
         for col in x..x + count {
             row.cells[col] = blank.clone();
         }
-        // A wide char split across the right margin can't survive.
-        row.split_wide_at(right, &pen);
-        if row
-            .cell(right)
-            .map(|c| c.content.is_wide_head())
-            .unwrap_or(false)
-        {
-            row.cells[right] = blank;
+        // A wide char or cluster split across the right margin can't
+        // survive.
+        let (head, width) = row.span_at(right);
+        if head + width > right + 1 {
+            for col in head..=right {
+                row.cells[col] = blank.clone();
+            }
         }
     }
 
@@ -990,13 +1041,11 @@ impl Terminal {
                 row.cells[col] = Cell::blank_with_bg(&pen);
             }
         }
-        // Don't leave a dangling tail at the start of the shifted span.
-        if row
-            .cell(x)
-            .map(|c| c.content == CellContent::WideTail)
-            .unwrap_or(false)
-        {
-            row.cells[x] = Cell::blank_with_bg(&pen);
+        // Don't leave dangling tails at the start of the shifted span.
+        let mut col = x;
+        while col <= right && row.cells[col].content == CellContent::WideTail {
+            row.cells[col] = Cell::blank_with_bg(&pen);
+            col += 1;
         }
     }
 
@@ -1032,13 +1081,10 @@ impl Terminal {
                 (x, cols)
             }
             1 => {
-                // Left: include the tail of a wide char under the cursor.
-                let extra = s
-                    .row(y)
-                    .cell(x)
-                    .map(|c| c.content.is_wide_head())
-                    .unwrap_or(false);
-                (0, x + 1 + extra as usize)
+                // Left: include the tails of a wide char or cluster under
+                // the cursor.
+                let (head, width) = s.row(y).span_at(x);
+                (0, (x + 1).max(head + width))
             }
             2 => {
                 s.row_mut(y).wrapped = false;
@@ -2376,6 +2422,145 @@ mod tests {
         assert_reflow_matches_fresh("a😀b😀😀c".as_bytes(), 10, &[4, 3, 9], 6);
         // Grapheme clusters (mode 2027) are wide heads too.
         assert_reflow_matches_fresh("\x1b[?2027hab👍🏽c👍🏽".as_bytes(), 10, &[3, 4, 12], 6);
+    }
+
+    // ------------------------------------------------ syllable clusters
+
+    /// What zsh (with `combiningchars`, macOS's default) writes while a
+    /// person types `text`: each base letter as it is, each mark (virama,
+    /// vowel sign, Mn or Mc) as a backspace, the base letter again, then
+    /// the mark. zsh counts one column per base letter and none per mark.
+    fn zsh_typing(text: &str) -> (Vec<u8>, usize) {
+        let mut out = Vec::new();
+        let mut base = None;
+        let mut columns = 0;
+        for ch in text.chars() {
+            let mark = matches!(
+                crate::term::unicode::grapheme_class(ch as u32),
+                crate::term::unicode::GraphemeClass::Extend
+                    | crate::term::unicode::GraphemeClass::SpacingMark
+            );
+            if let (true, Some(b)) = (mark, base) {
+                out.push(0x08);
+                out.extend_from_slice(format!("{b}{ch}").as_bytes());
+            } else {
+                out.extend_from_slice(ch.to_string().as_bytes());
+                base = Some(ch);
+                columns += 1;
+            }
+        }
+        (out, columns)
+    }
+
+    /// A line editor that thinks in wcwidth columns (zsh, readline) redraws
+    /// a Devanagari line letter by letter; the grid must keep every letter
+    /// and put the cursor where the editor thinks it is.
+    #[test]
+    fn zsh_typing_devanagari_keeps_every_letter() {
+        for text in ["नमस्ते क्षत्रिय स्त्री", "ক্ষমা স্ত্রী", "ക്ഷമ സ്ത്രീ", "धर्म"]
+        {
+            let (bytes, columns) = zsh_typing(text);
+            let (mut s, mut t) = term(40, 2);
+            feed(&mut s, &mut t, &bytes);
+            assert_eq!(row_text(&t, 0), text, "{text}");
+            assert_eq!(t.screen().cursor.x, columns, "{text}");
+        }
+    }
+
+    /// Mode 2027 gives a syllable script (Devanagari..Sinhala) one cell
+    /// per base letter: a conjunct's consonants take a cell each, marks
+    /// (the virama, vowel signs) stay in their letter's cell.
+    #[test]
+    fn syllable_cells_with_2027() {
+        let (cells, cursor) = print_graphemes("क्षत्रिय स्त्री", true);
+        let expected: Vec<(String, u8)> = ["क्", "ष", "त्", "रि", "य", " ", "स्", "त्", "री"]
+            .iter()
+            .map(|&text| (text.to_string(), 1))
+            .collect();
+        assert_eq!(cells, expected);
+        assert_eq!(cursor, 9);
+        for (text, cells) in [
+            ("नमस्ते धर्म", 8),
+            ("ক্ষমা স্ত্রী", 7),
+            ("நன்றி க்ஷ", 6),
+            ("ക്ഷമ സ്ത്രീ", 7),
+        ] {
+            let (got, cursor) = print_graphemes(text, true);
+            assert!(got.iter().all(|&(_, w)| w == 1), "{text}");
+            assert_eq!((got.len(), cursor), (cells, cells), "{text}");
+        }
+    }
+
+    /// Without mode 2027 cells keep plain per-codepoint wcwidth: the
+    /// virama and marks attach, each consonant and spacing sign is a cell.
+    #[test]
+    fn syllable_widths_without_2027() {
+        let (cells, cursor) = print_graphemes("स्त्री", false);
+        assert_eq!(
+            cells,
+            vec![
+                ("स्".to_string(), 1),
+                ("त्".to_string(), 1),
+                ("र".to_string(), 1),
+                ("ी".to_string(), 1)
+            ]
+        );
+        assert_eq!(cursor, 4);
+    }
+
+    /// A syllable at the right edge wraps letter by letter, the virama
+    /// staying with its letter; reflow keeps the text and the cells.
+    #[test]
+    fn syllables_wrap_and_reflow_by_letter() {
+        let (mut s, mut t) = term(5, 3);
+        feed(&mut s, &mut t, "abcdस्ते".as_bytes());
+        assert_eq!(row_text(&t, 0), "abcdस्");
+        assert_eq!(row_text(&t, 1), "ते");
+        assert_eq!((t.screen().cursor.x, t.screen().cursor.y), (1, 1));
+        assert_reflow_matches_fresh(
+            "नमस्ते स्त्री धर्म क्षत्रिय".as_bytes(),
+            30,
+            &[7, 5, 3, 9, 4, 30],
+            12,
+        );
+        assert_reflow_matches_fresh("ক্ষমা স্ত্রী ക്ഷമ".as_bytes(), 20, &[3, 6, 5, 20], 10);
+    }
+
+    /// Copy gives the original text back, across wide chars, clusters and
+    /// a forced wrap; a selection starting on a wide tail takes its head.
+    #[test]
+    fn copy_multi_cell_clusters() {
+        let (mut s, mut t) = term(12, 4);
+        let text = "नमस्ते 漢字👍🏽";
+        feed(&mut s, &mut t, text.as_bytes());
+        let sc = t.screen();
+        let abs = |y: usize| sc.absolute_of_virtual(sc.scrollback.len() + y);
+        assert_eq!(sc.selection_text((abs(0), 0), (abs(0), 12)), text);
+        // न म स् ते _ [漢 T] [字 T] [👍🏽 T]: from 漢's tail.
+        assert_eq!(sc.selection_text((abs(0), 6), (abs(0), 8)), "漢字");
+        assert_eq!(
+            sc.snap_selection((abs(0), 6), (abs(0), 8)),
+            ((abs(0), 5), (abs(0), 9))
+        );
+
+        // Across a forced wrap: the spacer head copies as nothing.
+        let (mut s, mut t) = term(5, 4);
+        feed(&mut s, &mut t, "abcd漢字 स्ते".as_bytes());
+        let sc = t.screen();
+        let abs = |y: usize| sc.absolute_of_virtual(sc.scrollback.len() + y);
+        assert_eq!(sc.selection_text((abs(0), 0), (abs(2), 5)), "abcd漢字 स्ते");
+    }
+
+    /// Overwriting one letter of a conjunct leaves the others: each is its
+    /// own cell, as the line editor that wrote it believes.
+    #[test]
+    fn edits_touch_one_letter_of_a_syllable() {
+        let (mut s, mut t) = term(10, 2);
+        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[2Cx".as_bytes());
+        assert_eq!(row_text(&t, 0), "aस्xरीb");
+        let (mut s, mut t) = term(10, 2);
+        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[2C\x1b[P".as_bytes());
+        assert_eq!(row_text(&t, 0), "aस्रीb");
     }
 
     #[test]
