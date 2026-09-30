@@ -61,6 +61,13 @@ impl AppModule for TerminalModule {
     fn capabilities(&self) -> &'static [&'static str] {
         &["process", "clipboard"]
     }
+
+    /// Dropping the root SIGHUPs every shell and its jobs: while a job
+    /// runs (and `confirm-close-running` is on) the tabs ask first and
+    /// emit [`ModuleCloseAction::Confirmed`] on a yes.
+    fn close_requested(&self, cx: &mut Cx, root: &WidgetRef) -> CloseDecision {
+        root.borrow_mut::<TermTabs>().map(|mut tabs| tabs.request_close_all(cx)).unwrap_or_default()
+    }
 }
 
 /// The instance's read tools, answered from the live emulator at call time.
@@ -108,6 +115,12 @@ mod tests {
         let schema = m.open_schema();
         assert_eq!(schema.version, 1);
         assert!(schema.empty_open().is_ok(), "no argument is required");
+    }
+
+    #[test]
+    fn a_root_that_is_not_the_tabs_never_blocks_a_close() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        assert_eq!(TERMINAL_MODULE.close_requested(&mut cx, &WidgetRef::empty()), CloseDecision::Allow);
     }
 
     #[test]

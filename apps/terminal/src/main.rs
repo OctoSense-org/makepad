@@ -10,6 +10,7 @@
 //!                      viewer app claims.
 
 use makepad_ai_services::port::{AiServicePort, PortEvent};
+use makepad_app_module::{CloseDecision, ModuleCloseAction};
 use makepad_terminal::tabs::{TermTabsAction, TermTabsWidgetRefExt};
 use makepad_terminal::widget::{MpTerm, MpTermAction};
 pub use makepad_widgets;
@@ -141,6 +142,10 @@ impl MatchEvent for App {
             let Some(wa) = action.as_widget_action() else {
                 continue;
             };
+            // The person said yes to ending the running jobs: close now.
+            if let ModuleCloseAction::Confirmed = wa.cast::<ModuleCloseAction>() {
+                cx.quit();
+            }
             match wa.cast::<TermTabsAction>() {
                 // Ctrl+Shift+W on the last tab closes the window.
                 TermTabsAction::LastTabClosed => cx.quit(),
@@ -267,7 +272,11 @@ impl App {
                     term.unload(cx);
                 }
             }
-            WmEvent::CloseRequested => cx.quit(),
+            WmEvent::CloseRequested => {
+                if self.ask_before_closing(cx) == CloseDecision::Allow {
+                    cx.quit();
+                }
+            }
             // Adopted into a real tile: now it is a running Terminal.
             WmEvent::Adopted => self.open_ai_port(cx),
             _ => {}
@@ -285,6 +294,25 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        match event {
+            // Cmd+Q, the app menu's Quit, a script's quit: not quitting keeps
+            // the jobs. A termination signal (Ctrl+C in the launching shell,
+            // SIGTERM at logout) is never refused.
+            Event::QuitRequested(request)
+                if !matches!(request.reason, QuitReason::Signal)
+                    && !request.handled.get()
+                    && self.ask_before_closing(cx) == CloseDecision::Veto =>
+            {
+                request.handle();
+            }
+            // The window's close button (the one window is the app).
+            Event::WindowCloseRequested(request)
+                if request.accept_close.get() && self.ask_before_closing(cx) == CloseDecision::Veto =>
+            {
+                request.accept_close.set(false);
+            }
+            _ => {}
+        }
         if let Event::Custom(json) = event {
             if let Some(wm) = makepad_wm_api::WmEvent::parse(json) {
                 self.handle_wm_event(cx, &wm);
@@ -317,6 +345,12 @@ mod tests {
 }
 
 impl App {
+    /// Closing the whole terminal: `Veto` while jobs run and the tabs are
+    /// asking (a yes arrives as [`ModuleCloseAction::Confirmed`]).
+    fn ask_before_closing(&mut self, cx: &mut Cx) -> CloseDecision {
+        self.ui.term_tabs(cx, ids!(tabs)).request_close_all(cx)
+    }
+
     /// The service toward the assistant: at startup for a real launch, on
     /// adoption for a warm-pool standby, never twice.
     fn open_ai_port(&mut self, cx: &mut Cx) {

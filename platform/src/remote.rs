@@ -1552,6 +1552,21 @@ mod imp {
                         return;
                     }
                 };
+                // The normal way: the app is asked first, as the close
+                // button asks it, and may refuse (unsaved work, a running
+                // job it wants to confirm).
+                let accept_close = std::rc::Rc::new(std::cell::Cell::new(true));
+                cx.call_event_handler(&crate::event::Event::WindowCloseRequested(
+                    crate::event::WindowCloseRequestedEvent { window_id, accept_close: accept_close.clone() },
+                ));
+                if !accept_close.get() {
+                    let line = format!("[makepad-remote] remote close of window {} refused by the app", window_id.id());
+                    println!("{line}");
+                    let _ = std::io::stdout().flush();
+                    push_log_line(line);
+                    let _ = tx.send(Reply::Text("{\"ok\":1,\"refused\":1}".to_string()));
+                    return;
+                }
                 let line = format!("[makepad-remote] remote closed window {}", window_id.id());
                 println!("{line}");
                 let _ = std::io::stdout().flush();
@@ -1996,7 +2011,7 @@ mod imp {
              /tweak/grab       window grab with the overlay composited (same as /g while tweaking)\n\
              /shader/consts    the compiled shaders' hot-patchable constants (annotated literals): {{\"shaders\":[{{\"id\",\"consts\":[{{\"i\",\"name\",\"value\",\"min\",\"max\",\"step\",\"file\",\"line\"}}]}}]}}; shader=ID for one\n\
              /shader/const     ?shader=ID&i=N&v=VALUE patches one constant on the GPU (no recompile, source untouched); reset=1 puts the literal back\n\
-             /close?w=ID       close one window the normal way\n\
+             /close?w=ID       close one window the normal way (the app is asked first; {{\"refused\":1}} if it said no)\n\
              /gq[?scale=&w=]   FINISH HERE: grab every window, then quit. {{\"png\":[paths],\"quit\":1}}\n\
              /quit             shut the app down gracefully (no final grab)\n\
              if you launched this app, you MUST end with /gq (or /quit) — never leave test windows on the user's screen, never pkill\n\
