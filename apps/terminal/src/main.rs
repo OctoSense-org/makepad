@@ -149,6 +149,10 @@ impl MatchEvent for App {
             match wa.cast::<MpTermAction>() {
                 MpTermAction::TitleChanged(title) if !self.preview => {
                     self.ui.window(cx, ids!(main_window)).set_title(cx, &title);
+                    // Hosted in a window manager (makepad-wm, the OctoSense
+                    // desktop), the tile's title bar is the WM's: tell it too
+                    // (a no-op standalone).
+                    makepad_wm_api::set_title(cx, &title);
                 }
                 MpTermAction::PwdChanged(_) => self.refresh_ai_context(cx),
                 // The pager quit: the preview popup goes with it.
