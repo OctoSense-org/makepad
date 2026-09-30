@@ -134,14 +134,14 @@ pub(crate) fn resolve_studio_build() -> Option<String> {
 
 /// The env var a host sets when it writes this launch's connect token as
 /// the first line of the child's stdin.
-pub const STUDIO_TOKEN_STDIN_ENV: &str = "STUDIO_TOKEN_STDIN";
+pub const STUDIO_HANDSHAKE_STDIN_ENV: &str = "STUDIO_HANDSHAKE_STDIN";
 
 /// The header a `--stdin-loop` child presents its launch token in when it
 /// opens the studio websocket.
 pub const STUDIO_TOKEN_HEADER: &str = "X-Studio-Token";
 
 /// This launch's connect token: the first line of stdin when the host set
-/// `STUDIO_TOKEN_STDIN=1` (a host that hands out a per-launch secret, such
+/// `STUDIO_HANDSHAKE_STDIN=1` (a host that hands out a per-launch secret, such
 /// as OctoSense's window manager), read once; `None` otherwise. It travels
 /// over stdin, never the environment or the command line, so neither
 /// `ps` nor this app's own children see it.
@@ -151,7 +151,7 @@ pub fn studio_launch_token() -> Option<String> {
         .get_or_init(|| {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let wanted = std::env::var(STUDIO_TOKEN_STDIN_ENV).is_ok_and(|v| {
+                let wanted = std::env::var(STUDIO_HANDSHAKE_STDIN_ENV).is_ok_and(|v| {
                     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
                 });
                 if !wanted {
