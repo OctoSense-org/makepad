@@ -13,7 +13,9 @@ use crate::term::parser::{Action, Csi, Dcs, Esc};
 use crate::term::screen::{CursorStyle, SavedCursor, Screen};
 use crate::term::sgr::{attributes, Attribute};
 use crate::term::style::{StyleColor, StyleFlags};
-use crate::term::unicode::{char_width, grapheme_break, GraphemeState};
+use crate::term::unicode::{
+    char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, GraphemeState,
+};
 
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
 
@@ -393,13 +395,18 @@ impl Terminal {
             return false;
         }
 
-        // No boundary: append. Emoji variation selectors can change width.
+        // No boundary: append. Emoji variation selectors can change width,
+        // but only after a codepoint that has an emoji presentation to pick
+        // (UTS #51). A skin tone (which only joins a modifier base) asks
+        // for emoji presentation too, so it widens a narrow base (☝🏽).
         let old_width = prev_content.width();
         let mut new_width = old_width;
-        if cp == 0xfe0f && old_width == 1 {
+        if cp == 0xfe0f && old_width == 1 && is_emoji_vs_base(prev_cp) {
             new_width = 2;
-        } else if cp == 0xfe0e && old_width == 2 {
+        } else if cp == 0xfe0e && old_width == 2 && is_emoji_vs_base(prev_cp) {
             new_width = 1;
+        } else if is_emoji_modifier(cp) && old_width == 1 {
+            new_width = 2;
         }
 
         let ch = match char::from_u32(cp) {
@@ -2106,6 +2113,107 @@ mod tests {
             other => panic!("expected cluster, got {:?}", other),
         }
         assert_eq!(t.screen().cursor.x, 1);
+    }
+
+    /// The drawn cells of row 0 as (text, width), wide tails skipped.
+    fn head_cells(t: &Terminal) -> Vec<(String, u8)> {
+        use crate::term::page::CellContent;
+        let row = t.screen().row(0);
+        (0..t.cols())
+            .filter_map(|x| {
+                let cell = row.cell(x)?;
+                let text: String = match &cell.content {
+                    CellContent::Char(c) | CellContent::WideChar(c) => c.to_string(),
+                    CellContent::Cluster(c) => c.cps.iter().collect(),
+                    _ => return None,
+                };
+                Some((text, cell.content.width()))
+            })
+            .collect()
+    }
+
+    /// Print `text` with grapheme clustering (mode 2027) on or off; the
+    /// cells it made and where the cursor ended up.
+    fn print_graphemes(text: &str, mode_2027: bool) -> (Vec<(String, u8)>, usize) {
+        let (mut s, mut t) = term(20, 2);
+        if mode_2027 {
+            feed(&mut s, &mut t, b"\x1b[?2027h");
+        }
+        feed(&mut s, &mut t, text.as_bytes());
+        let cells = head_cells(&t);
+        (cells, t.screen().cursor.x)
+    }
+
+    fn one_cell(text: &str, width: u8) -> (Vec<(String, u8)>, usize) {
+        (vec![(text.to_string(), width)], width as usize)
+    }
+
+    #[test]
+    fn grapheme_widths_with_2027() {
+        for (text, width) in [
+            ("👨\u{200D}👩\u{200D}👧", 2),   // ZWJ family
+            ("🏳\u{FE0F}\u{200D}🌈", 2),      // rainbow flag: VS16 widens the text-default 🏳
+            ("👍🏽", 2),                       // skin tone
+            ("🇯🇵", 2),                       // regional indicator pair
+            ("e\u{0301}", 1),                // e + combining acute
+            ("\u{1112}\u{1161}\u{11AB}", 2), // 한 spelled in jamo
+            ("\u{0928}\u{093F}", 1),         // नि: na + vowel sign i
+            ("☝🏽", 2),                       // skin tone on a narrow base widens it
+            ("#\u{FE0F}\u{20E3}", 2),        // keycap
+        ] {
+            assert_eq!(
+                print_graphemes(text, true),
+                one_cell(text, width),
+                "{text:?}"
+            );
+        }
+        // Precomposed 한 is a plain wide char.
+        assert_eq!(print_graphemes("한", true), one_cell("한", 2));
+    }
+
+    #[test]
+    fn variation_selectors_only_change_emoji_width() {
+        // VS16 after a letter or VS15 after an ideograph selects nothing.
+        assert_eq!(print_graphemes("a\u{FE0F}", true), one_cell("a\u{FE0F}", 1));
+        assert_eq!(
+            print_graphemes("漢\u{FE0E}", true),
+            one_cell("漢\u{FE0E}", 2)
+        );
+        // On emoji they do.
+        assert_eq!(print_graphemes("❤\u{FE0F}", true), one_cell("❤\u{FE0F}", 2));
+        assert_eq!(
+            print_graphemes("⌚\u{FE0E}", true),
+            one_cell("⌚\u{FE0E}", 1)
+        );
+    }
+
+    /// Without mode 2027 cells follow per-codepoint wcwidth, the way shells
+    /// and most programs count: only zero-width codepoints join a cell.
+    #[test]
+    fn grapheme_widths_without_2027() {
+        let cells = |text| print_graphemes(text, false);
+        let own = |parts: &[(&str, u8)]| {
+            let v: Vec<(String, u8)> = parts.iter().map(|(t, w)| (t.to_string(), *w)).collect();
+            let x = parts.iter().map(|(_, w)| *w as usize).sum();
+            (v, x)
+        };
+        assert_eq!(
+            cells("👨\u{200D}👩\u{200D}👧"),
+            own(&[("👨\u{200D}", 2), ("👩\u{200D}", 2), ("👧", 2)])
+        );
+        assert_eq!(cells("👍🏽"), own(&[("👍", 2), ("🏽", 2)]));
+        assert_eq!(cells("🇯🇵"), own(&[("🇯", 2), ("🇵", 2)]));
+        assert_eq!(cells("e\u{0301}"), one_cell("e\u{0301}", 1));
+        assert_eq!(
+            cells("\u{1112}\u{1161}\u{11AB}"),
+            one_cell("\u{1112}\u{1161}\u{11AB}", 2)
+        );
+        assert_eq!(cells("한"), one_cell("한", 2));
+        // The vowel sign is a spacing mark (Mc), so wcwidth gives it a cell.
+        assert_eq!(
+            cells("\u{0928}\u{093F}"),
+            own(&[("\u{0928}", 1), ("\u{093F}", 1)])
+        );
     }
 
     #[test]
