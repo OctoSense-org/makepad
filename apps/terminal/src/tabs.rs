@@ -394,6 +394,9 @@ struct Panel {
     selected: usize,
     /// Rows scrolled off the top.
     scroll: usize,
+    /// The selection last scrolled into view: the draw keeps a NEW
+    /// selection visible, but leaves a mouse-wheel scroll alone.
+    shown_selected: Option<usize>,
     rect: Rect,
     hits: Vec<(Rect, PanelHit)>,
     /// Rows (or list entries) that fit, from the last draw.
@@ -422,6 +425,8 @@ struct Chooser {
     /// Index into the filtered list.
     selected: usize,
     scroll: usize,
+    /// The selection last scrolled into view (see `Panel::shown_selected`).
+    shown_selected: Option<usize>,
     /// The settings when the list opened: Esc goes back to them.
     original: Settings,
     /// Opened before the font scan finished: refill when it has.
@@ -1588,6 +1593,7 @@ impl TermTabs {
                 filter: String::new(),
                 selected,
                 scroll: selected.saturating_sub(4),
+                shown_selected: Some(selected),
                 original: self.settings.clone(),
                 awaiting_fonts: matches!(row, Row::Font | Row::CjkFont) && !crate::fonts::ready(),
             });
@@ -1913,15 +1919,19 @@ impl TermTabs {
         hits: &mut Vec<(Rect, PanelHit)>,
     ) -> usize {
         let shown_settings = self.current_settings();
-        let (selected, mut scroll, confirm_delete) =
-            self.panel.as_ref().map_or((0, 0, false), |p| (p.selected, p.scroll, p.confirm_delete));
-        // Keep the selected row in view, counting section headers.
-        scroll = scroll.min(selected);
-        while selected >= scroll + rows_fitting(scroll, bottom - top, row_h) {
-            scroll += 1;
+        let (selected, mut scroll, confirm_delete, shown) =
+            self.panel.as_ref().map_or((0, 0, false, None), |p| (p.selected, p.scroll, p.confirm_delete, p.shown_selected));
+        // Keep a newly selected row in view, counting section headers; a
+        // mouse-wheel scroll (same selection) stays where it was put.
+        if shown != Some(selected) {
+            scroll = scroll.min(selected);
+            while selected >= scroll + rows_fitting(scroll, bottom - top, row_h) {
+                scroll += 1;
+            }
         }
         if let Some(panel) = self.panel.as_mut() {
             panel.scroll = scroll;
+            panel.shown_selected = Some(selected);
         }
         let mut y = top;
         let mut index = 0;
@@ -2034,11 +2044,17 @@ impl TermTabs {
         let shown = settings_panel::filter_choices(&chooser.choices, &chooser.filter);
         let visible = (((bottom - top - row_h * 2.0) / row_h).floor().max(1.0)) as usize;
         chooser.selected = chooser.selected.min(shown.len().saturating_sub(1));
-        if chooser.selected < chooser.scroll {
-            chooser.scroll = chooser.selected;
-        } else if chooser.selected >= chooser.scroll + visible {
-            chooser.scroll = chooser.selected + 1 - visible;
+        // Keep a newly selected entry in view; a mouse-wheel scroll (same
+        // selection) stays where it was put.
+        if chooser.shown_selected != Some(chooser.selected) {
+            if chooser.selected < chooser.scroll {
+                chooser.scroll = chooser.selected;
+            } else if chooser.selected >= chooser.scroll + visible {
+                chooser.scroll = chooser.selected + 1 - visible;
+            }
+            chooser.shown_selected = Some(chooser.selected);
         }
+        chooser.scroll = chooser.scroll.min(shown.len().saturating_sub(visible));
         let (row, filter, selected, scroll) = (chooser.row, chooser.filter.clone(), chooser.selected, chooser.scroll);
         let current = row.current(&shown_settings);
 
