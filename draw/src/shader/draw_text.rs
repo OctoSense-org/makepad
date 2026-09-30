@@ -1776,6 +1776,8 @@ impl ScriptHook for DrawText {}
 pub struct PreparedTextGlyph {
     pub pen_x_in_lpxs: f32,
     pub offset_x_in_lpxs: f32,
+    /// The shaper's vertical offset, y down (a raised mark is negative).
+    pub offset_y_in_lpxs: f32,
     pub advance_in_lpxs: f32,
     pub font_size_in_lpxs: f32,
     pub rasterized: RasterizedGlyph,
@@ -2184,6 +2186,7 @@ impl DrawText {
             glyphs.push(PreparedTextGlyph {
                 pen_x_in_lpxs: glyph.origin_in_lpxs.x * self.font_scale,
                 offset_x_in_lpxs: glyph.offset_in_lpxs() * self.font_scale,
+                offset_y_in_lpxs: glyph.origin_in_lpxs.y * self.font_scale,
                 advance_in_lpxs: glyph.advance_in_lpxs() * self.font_scale,
                 font_size_in_lpxs: glyph.font_size_in_lpxs * self.font_scale,
                 rasterized,

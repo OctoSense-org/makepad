@@ -501,6 +501,7 @@ impl LayoutContext {
 
     fn append_text(&mut self, text: &ShapedText) {
         for glyph in &text.glyphs {
+            let y_offset_in_ems = glyph.y_offset_in_ems;
             let mut glyph = LaidoutGlyph {
                 origin_in_lpxs: Point::ZERO,
                 font: glyph.font.clone(),
@@ -512,6 +513,9 @@ impl LayoutContext {
                 offset_in_ems: glyph.offset_in_ems,
             };
             glyph.origin_in_lpxs.x = self.current_point_in_lpxs.x;
+            // The shaper's vertical offset (GPOS: a stacked mark, a Thai
+            // tone mark raised over a vowel) is y-up; rows are y-down.
+            glyph.origin_in_lpxs.y = -y_offset_in_ems * glyph.font_size_in_lpxs;
             self.current_point_in_lpxs.x += glyph.advance_in_lpxs();
             self.glyphs.push(glyph);
         }
@@ -1464,6 +1468,73 @@ mod tests {
     };
     use std::rc::Rc;
     use unicode_segmentation::UnicodeSegmentation;
+
+    /// GPOS moves a mark up or down (a mark stacked on a capital, Thai tone
+    /// marks); the layouter keeps that offset, and plain text stays on the
+    /// baseline.
+    #[test]
+    fn marks_keep_the_shapers_vertical_offset() {
+        use super::*;
+        use crate::makepad_platform::SharedBytes;
+        let mut layouter = Layouter::new(Settings::default());
+        let font_id = FontId::from(0x7A12_u64);
+        let family_id = FontFamilyId::from(0x7A12_u64);
+        layouter.define_font(
+            font_id,
+            FontDefinition {
+                data: SharedBytes::from_file_mmap_or_read(
+                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../widgets/resources/NotoSans-Regular.ttf"),
+                )
+                .unwrap(),
+                index: 0,
+                ascender_fudge_in_ems: 0.0,
+                descender_fudge_in_ems: 0.0,
+                weight: None,
+                variations: Vec::new(),
+            },
+        );
+        layouter.define_font_family(
+            family_id,
+            FontFamilyDefinition {
+                font_ids: vec![font_id],
+                expected_member_count: 1,
+                diagnostics: FontDiagnostics::default(),
+            },
+        );
+        let layout = |layouter: &mut Layouter, text: &'static str| {
+            layouter.get_or_layout(BorrowedLayoutParams {
+                text,
+                style: Style {
+                    font_family_id: family_id,
+                    font_size_in_pts: 12.0,
+                    color: None,
+                },
+                options: LayoutOptions::default(),
+            })
+        };
+        let plain = layout(&mut layouter, "Hamburgefonts");
+        assert!(plain.rows[0]
+            .glyphs
+            .iter()
+            .all(|glyph| glyph.origin_in_lpxs.y == 0.0));
+        // A combining acute over a capital sits higher than over a
+        // lowercase letter: the font raises it through GPOS.
+        let upper = layout(&mut layouter, "X\u{301}");
+        let lower = layout(&mut layouter, "x\u{301}");
+        let mark_y = |text: &LaidoutText| text.rows[0].glyphs[1].origin_in_lpxs.y;
+        assert_eq!(upper.rows[0].glyphs.len(), 2);
+        assert!(
+            mark_y(&upper) < mark_y(&lower) - 1.0,
+            "capital {} lowercase {}",
+            mark_y(&upper),
+            mark_y(&lower)
+        );
+        assert_eq!(
+            upper.rows[0].glyphs[0].origin_in_lpxs.y, 0.0,
+            "the base stays"
+        );
+    }
 
     #[test]
     fn letter_spacing_changes_layout_cache_and_wrapping() {
