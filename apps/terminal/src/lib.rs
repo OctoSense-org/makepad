@@ -8,6 +8,7 @@ pub mod control;
 pub mod fonts;
 pub mod gesture;
 pub mod kitty_input;
+pub mod links;
 pub mod module;
 pub mod panes;
 pub mod procinfo;

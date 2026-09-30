@@ -15,6 +15,7 @@
 //!   charsets  G0..G3 slots, DEC Special Graphics
 //!   tabstops  tab stop bitmap
 //!   unicode   codepoint width + grapheme break (mode 2027)
+//!   hyperlink OSC 8 link table (cells hold ids), collected with scrollback
 //!   page      cell/row storage with scrollback
 //!   screen    cursor + page view (primary/alternate), selection
 //!   terminal  the control functions (CSI/ESC/OSC semantics)
@@ -27,6 +28,7 @@
 
 pub mod charsets;
 pub mod color;
+pub mod hyperlink;
 pub mod key_encode;
 pub mod modes;
 pub mod mouse_encode;
