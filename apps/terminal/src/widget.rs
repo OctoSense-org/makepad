@@ -14,6 +14,7 @@ use makepad_widgets::text::rasterizer::RasterizedGlyph;
 use makepad_widgets::makepad_draw::shader::draw_text::{ShapedTextGlyph, ShapedTextRun};
 use makepad_widgets::*;
 
+use crate::gesture::{boundary_col, MoveAction, Press, PressInfo};
 use crate::pty::InputRejected;
 use crate::session::{Session, SpawnOptions};
 use crate::settings::{self as term_settings, BellStyle, CursorShape, Settings};
@@ -672,10 +673,10 @@ pub struct MpTerm {
     /// end) with `end` exclusive: a drag extends the selection from it.
     #[rust]
     sel_unit: Option<(u64, usize, usize)>,
-    /// The current press started a local selection (double or triple
-    /// click), so neither it nor its release goes to the app.
+    /// What the current press is doing: a click, a selection drag, or a
+    /// press that belongs to a mouse-reporting program.
     #[rust]
-    local_press: bool,
+    press: Press,
     /// Fingers on a touchscreen, by digit, at their last y.
     #[rust]
     touches: Vec<(makepad_widgets::makepad_platform::event::DigitId, f64)>,
@@ -842,6 +843,7 @@ impl MpTerm {
     /// A hosting presentation is hiding this terminal: end any selection
     /// drag and its edge auto-scroll so nothing keeps requesting frames.
     pub fn cancel_gestures(&mut self, cx: &mut Cx) {
+        self.press = Press::Idle;
         if self.selecting || self.last_finger.is_some() {
             self.selecting = false;
             self.last_finger = None;
@@ -1693,6 +1695,15 @@ impl MpTerm {
         }
     }
 
+    /// Abs row + nearest column boundary (0..=cols) at a window position:
+    /// where a character selection starts or ends.
+    fn pick_boundary(&self, abs_pos: Vec2d) -> Option<(u64, usize)> {
+        let (row, _) = self.pick(abs_pos)?;
+        let cols = self.session.as_ref()?.terminal.screen().cols;
+        let local_x = abs_pos.x - self.rect.pos.x - self.inner_padding().x;
+        Some((row, boundary_col(local_x, self.cell_w, cols)))
+    }
+
     /// Abs row + col at a window position.
     fn pick(&self, abs_pos: Vec2d) -> Option<(u64, usize)> {
         let session = self.session.as_ref()?;
@@ -2013,7 +2024,10 @@ impl MpTerm {
             return;
         };
         let Some((row, start, end)) = self.sel_unit else {
-            self.sel_cursor = Some(pos);
+            // A character selection runs between column boundaries.
+            if let Some(pos) = self.pick_boundary(abs) {
+                self.sel_cursor = Some(pos);
+            }
             return;
         };
         let cols = self.session.as_ref().map(|s| s.terminal.cols()).unwrap_or(80);
@@ -3019,27 +3033,32 @@ impl Widget for MpTerm {
                         // the first finger started.
                         self.scroll_accum = 0.0;
                         self.selecting = false;
-                        self.local_press = true;
+                        self.press = Press::Touch;
                         return;
                     }
                 }
+                let info = PressInfo {
+                    tap_count: e.tap_count,
+                    touch: e.device.is_touch(),
+                    mouse_reporting: self.mouse_tracking().0 != MouseTracking::None,
+                    shift: e.modifiers.shift,
+                };
+                self.press = Press::down(info, (e.abs.x, e.abs.y));
                 // Double click selects a word, triple click a line; holding
                 // and dragging extends it. Local: the app never sees it.
-                if e.tap_count >= 2 {
-                    self.local_press = true;
+                if self.press == Press::Unit {
                     self.begin_unit_selection(cx, e.abs, e.tap_count >= 3);
                     return;
                 }
-                // A single click or touch selects nothing and clears what
-                // was selected; an app that asked for the mouse gets it.
-                self.local_press = false;
+                // Any other press clears what was selected: a click only
+                // focuses; a drag selects anew once it passes the threshold.
                 if self.sel_anchor.is_some() {
                     self.sel_anchor = None;
                     self.sel_cursor = None;
                     self.draw_bg.redraw(cx);
                 }
                 self.sel_unit = None;
-                if !e.device.is_touch() {
+                if self.press.reports() {
                     self.report_mouse(
                         cx,
                         e.abs,
@@ -3063,30 +3082,40 @@ impl Widget for MpTerm {
                         return;
                     }
                 }
-                if self.selecting {
-                    self.extend_selection(e.abs);
-                    self.last_finger = Some(e.abs);
-                    self.draw_bg.redraw(cx);
-                    return;
-                }
-                // A single-click drag selects nothing; a mouse drag still
-                // reaches an app that tracks buttons. A single finger does
-                // neither: it never moves the screen.
-                if !self.local_press && !e.device.is_touch() {
-                    self.report_mouse(
-                        cx,
-                        e.abs,
-                        MouseEventKind::Motion,
-                        TermMouseButton::Left,
-                        &e.modifiers,
-                    );
+                match self.press.moved((e.abs.x, e.abs.y)) {
+                    MoveAction::None => {}
+                    MoveAction::Report => {
+                        self.report_mouse(
+                            cx,
+                            e.abs,
+                            MouseEventKind::Motion,
+                            TermMouseButton::Left,
+                            &e.modifiers,
+                        );
+                    }
+                    MoveAction::StartChars { origin } => {
+                        // The press became a drag: select characters from
+                        // where it started, with edge auto-scroll.
+                        self.sel_anchor = self.pick_boundary(dvec2(origin.0, origin.1));
+                        self.sel_cursor = self.sel_anchor;
+                        self.selecting = true;
+                        self.select_scroll_frame = cx.new_next_frame();
+                        self.extend_selection(e.abs);
+                        self.last_finger = Some(e.abs);
+                        self.draw_bg.redraw(cx);
+                    }
+                    MoveAction::Extend => {
+                        self.extend_selection(e.abs);
+                        self.last_finger = Some(e.abs);
+                        self.draw_bg.redraw(cx);
+                    }
                 }
             }
             Hit::FingerUp(e) => {
                 if e.device.is_touch() {
                     self.touches.retain(|(id, _)| *id != e.digit_id);
                 }
-                if !self.local_press && !e.device.is_touch() {
+                if self.press.reports() {
                     self.report_mouse(
                         cx,
                         e.abs,
@@ -3101,7 +3130,7 @@ impl Widget for MpTerm {
                     }
                 }
                 if self.touches.is_empty() {
-                    self.local_press = false;
+                    self.press = Press::Idle;
                 }
                 self.selecting = false;
                 self.last_finger = None;
