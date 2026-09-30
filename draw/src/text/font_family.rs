@@ -87,6 +87,24 @@ impl FontFamily {
         })
     }
 
+    /// Shape `text` with OpenType `features` (tag, value) applied, e.g.
+    /// `calt` off to turn programming ligatures off.
+    pub fn get_or_shape_with_features(
+        &self,
+        text: Substr,
+        features: Rc<Vec<(u32, u32)>>,
+    ) -> Rc<ShapedText> {
+        self.shaper.borrow_mut().get_or_shape(ShapeParams {
+            text,
+            fonts: self.fonts.clone(),
+            direction: Direction::default(),
+            letter_spacing: Ems(0.0),
+            word_spacing: Ems(0.0),
+            features,
+            diagnostics: self.diagnostics.clone(),
+        })
+    }
+
     pub fn fonts(&self) -> &[Rc<Font>] {
         &self.fonts
     }

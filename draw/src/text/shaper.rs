@@ -104,10 +104,40 @@ pub struct Shaper {
     // empty in practice and rarely changes across calls when it isn't.
     cached_features_source: Vec<(u32, u32)>,
     cached_rb_features: Vec<rustybuzz::Feature>,
+    // Compiled shaping plans. `rustybuzz::shape` builds a plan on every
+    // call, which costs several times what shaping a short word does; a
+    // plan depends only on the font, direction, script, language and
+    // features, so it is kept and reused while those stay the same.
+    cached_plans: Vec<CachedPlan>,
     cache_size: usize,
     cache_tick: u64,
     cached_results: FxHashMap<ShapeParams, CachedShape>,
     cache_lru_order: BTreeMap<u64, ShapeParams>,
+}
+
+/// At most this many plans are kept; past it they are all rebuilt as used.
+const MAX_CACHED_PLANS: usize = 64;
+
+/// A compiled plan and what it was compiled for. The font is held, so the
+/// pointer it is matched by cannot be reused by another font meanwhile.
+struct CachedPlan {
+    font: Rc<Font>,
+    direction: rustybuzz::Direction,
+    script: Option<rustybuzz::Script>,
+    language: Option<rustybuzz::Language>,
+    features: Vec<(u32, u32)>,
+    plan: rustybuzz::ShapePlan,
+}
+
+impl std::fmt::Debug for CachedPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedPlan")
+            .field("font", &self.font.id())
+            .field("direction", &self.direction)
+            .field("script", &self.script)
+            .field("features", &self.features)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A shaping cache entry, tracked with its position in the least-recently-used
@@ -125,6 +155,7 @@ impl Shaper {
             reusable_unicode_buffer: UnicodeBuffer::new(),
             cached_features_source: Vec::new(),
             cached_rb_features: Vec::new(),
+            cached_plans: Vec::new(),
             cache_size: settings.cache_size,
             cache_tick: 0,
             cached_results: FxHashMap::with_capacity_and_hasher(
@@ -456,8 +487,48 @@ impl Shaper {
                 }));
         }
         let rb_features = &self.cached_rb_features;
+        // What `rustybuzz::shape` does, with the plan reused: the same
+        // segment properties pick the same plan.
+        unicode_buffer.guess_segment_properties();
+        let direction = unicode_buffer.direction();
+        let script = Some(unicode_buffer.script()).filter(|&s| s != rustybuzz::script::UNKNOWN);
+        let language = unicode_buffer.language();
+        let cached = self.cached_plans.iter().position(|cached| {
+            Rc::ptr_eq(&cached.font, font)
+                && cached.direction == direction
+                && cached.script == script
+                && cached.language == language
+                && cached.features == features
+        });
+        let plan_index = match cached {
+            Some(index) => index,
+            None => {
+                if self.cached_plans.len() >= MAX_CACHED_PLANS {
+                    self.cached_plans.clear();
+                }
+                let plan = font.with_rustybuzz_face(|face| {
+                    rustybuzz::ShapePlan::new(
+                        face,
+                        direction,
+                        script,
+                        language.as_ref(),
+                        rb_features,
+                    )
+                });
+                self.cached_plans.push(CachedPlan {
+                    font: font.clone(),
+                    direction,
+                    script,
+                    language,
+                    features: features.to_vec(),
+                    plan,
+                });
+                self.cached_plans.len() - 1
+            }
+        };
+        let plan = &self.cached_plans[plan_index].plan;
         let glyph_buffer =
-            font.with_rustybuzz_face(|face| rustybuzz::shape(face, rb_features, unicode_buffer));
+            font.with_rustybuzz_face(|face| rustybuzz::shape_with_plan(face, plan, unicode_buffer));
         let units_per_em = font.units_per_em();
         out_glyphs.extend(
             glyph_buffer
@@ -537,6 +608,99 @@ mod tests {
             missing_glyph_message('中', &diagnostics),
             "font miss U+4E2D role=regular set=Latin tried=[ibm_plex_text]"
         );
+    }
+
+    /// A plan kept from an earlier call shapes exactly as the fresh plan
+    /// `rustybuzz::shape` builds, whichever features came in between.
+    #[test]
+    fn reused_plans_shape_like_fresh_ones() {
+        use crate::makepad_platform::SharedBytes;
+        use crate::text::{
+            font::FontId,
+            font_family::FontFamilyId,
+            layouter::{Layouter, Settings},
+            loader::{FontDefinition, FontFamilyDefinition},
+        };
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../widgets/resources/NotoSans-Regular.ttf");
+        let mut layouter = Layouter::new(Settings::default());
+        let font_id = FontId::from(0x7A13_u64);
+        let family_id = FontFamilyId::from(0x7A13_u64);
+        layouter.define_font(
+            font_id,
+            FontDefinition {
+                data: SharedBytes::from_file_mmap_or_read(path.clone()).unwrap(),
+                index: 0,
+                ascender_fudge_in_ems: 0.0,
+                descender_fudge_in_ems: 0.0,
+                weight: None,
+                variations: Vec::new(),
+            },
+        );
+        layouter.define_font_family(
+            family_id,
+            FontFamilyDefinition {
+                font_ids: vec![font_id],
+                expected_member_count: 1,
+                diagnostics: FontDiagnostics::default(),
+            },
+        );
+        let family = layouter.get_or_load_font_family(family_id);
+        let bytes = std::fs::read(&path).unwrap();
+        let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+        let tag = |name: &[u8; 4]| u32::from_be_bytes(*name);
+        let cases: [(&str, Vec<(u32, u32)>); 6] = [
+            ("office AVATAR", vec![]),
+            ("X\u{301} x\u{301}", vec![]),
+            ("office AVATAR", vec![(tag(b"liga"), 0)]),
+            ("AVATAR", vec![(tag(b"kern"), 0)]),
+            ("office AVATAR", vec![]),
+            ("\u{391}\u{3B8}\u{3AE}\u{3BD}\u{3B1}", vec![]),
+        ];
+        for (text, features) in cases {
+            let ours = family.get_or_shape_with_features(text.into(), Rc::new(features.clone()));
+            let mut buffer = UnicodeBuffer::new();
+            buffer.push_str(text);
+            let rb_features: Vec<_> = features
+                .iter()
+                .map(|&(t, v)| {
+                    rustybuzz::Feature::new(
+                        rustybuzz::ttf_parser::Tag::from_bytes(&t.to_be_bytes()),
+                        v,
+                        ..,
+                    )
+                })
+                .collect();
+            let fresh = rustybuzz::shape(&face, &rb_features, buffer);
+            let upem = face.units_per_em() as f32;
+            let expected: Vec<_> = fresh
+                .glyph_infos()
+                .iter()
+                .zip(fresh.glyph_positions())
+                .map(|(info, pos)| {
+                    (
+                        info.glyph_id as u16,
+                        pos.x_advance as f32 / upem,
+                        pos.x_offset as f32 / upem,
+                        pos.y_offset as f32 / upem,
+                    )
+                })
+                .collect();
+            let got: Vec<_> = ours
+                .glyphs
+                .iter()
+                .map(|g| (g.id, g.advance_in_ems, g.offset_in_ems, g.y_offset_in_ems))
+                .collect();
+            assert_eq!(got, expected, "{text:?} {features:?}");
+        }
+        // The features reach the shaper: `liga` off keeps `ffi` apart.
+        let count = |features: Vec<(u32, u32)>| {
+            family
+                .get_or_shape_with_features("office".into(), Rc::new(features))
+                .glyphs
+                .len()
+        };
+        assert!(count(vec![(tag(b"liga"), 0)]) > count(vec![]));
     }
 
     #[test]
