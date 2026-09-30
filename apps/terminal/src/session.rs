@@ -1,6 +1,8 @@
 //! A terminal session: PTY + emulator + reader thread, glued to the Makepad
 //! UI thread via SignalToUI. All emulation runs on the UI thread; the reader
-//! thread only moves bytes.
+//! and writer threads only move bytes. Nothing here blocks the UI thread on
+//! the PTY: input is queued for the writer thread (see [`PtyWriter`]), which
+//! feeds it to the program as fast as the program reads it.
 
 use std::io;
 use std::path::Path;
@@ -9,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use makepad_widgets::makepad_platform::thread::SignalToUI;
 
-use crate::pty::{Pty, PtyWriter};
+use crate::pty::{InputRejected, Pty, PtyWriter};
 use crate::term::stream::Stream;
 use crate::term::terminal::{TermEvent, Terminal};
 
@@ -128,7 +130,7 @@ impl Session {
             &[("TERM", options.term.as_str())],
             cwd,
         )?;
-        let writer = pty.writer_clone();
+        let writer = pty.start_writer()?;
         let mut reader = pty.take_reader();
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(BACKLOG_CHUNKS);
         std::thread::Builder::new()
@@ -187,10 +189,11 @@ impl Session {
                 }
             }
         }
-        // Terminal-generated replies go straight back to the shell.
+        // Terminal-generated replies go back to the shell, queued behind
+        // any input already on its way.
         let outbound = self.terminal.take_outbound();
         if !outbound.is_empty() {
-            let _ = self.writer.send(outbound);
+            let _ = self.writer.send_reply(outbound);
         }
         // Unfinished work must wake the UI again by itself: the reader
         // thread only signals on a fresh read, and with a full backlog it
@@ -205,18 +208,26 @@ impl Session {
         self.terminal.take_events()
     }
 
-    /// Write input bytes (key encodings, paste) to the shell.
+    /// Queue typed input (key encodings, mouse and focus reports) for the
+    /// shell. Never blocks, and never refused while the PTY lives.
     pub fn write(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
         let _ = self.writer.send(bytes.to_vec());
     }
 
-    /// Whether the full input was accepted by this live PTY, for acknowledged
-    /// file drops. Does not infer that the application consumed the input.
-    pub fn try_write(&mut self, bytes: &[u8]) -> bool {
-        !self.exited && !bytes.is_empty() && self.writer.send(bytes.to_vec()).is_ok()
+    /// Queue a paste (or a file drop) for the shell, whole or not at all.
+    /// Never blocks: `Ok` means the live PTY's writer accepted every byte,
+    /// not that the program has read them yet. Refused while the program
+    /// leaves [`crate::pty::PASTE_QUEUE_LIMIT`] bytes or more unread.
+    pub fn write_paste(&mut self, bytes: &[u8]) -> Result<(), InputRejected> {
+        if self.exited || bytes.is_empty() {
+            return Err(InputRejected::Closed);
+        }
+        self.writer.send_paste(bytes.to_vec())
+    }
+
+    /// Input bytes queued but not yet read by the program.
+    pub fn pending_input(&self) -> usize {
+        self.writer.pending()
     }
 
     pub fn resize(&mut self, cols: usize, rows: usize) {
@@ -263,6 +274,152 @@ mod tests {
         assert!(
             done_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
             "Session::drop blocked with the reader thread parked in read()"
+        );
+    }
+
+    /// Wait (draining) until `want` holds, up to `secs`.
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn drain_until(session: &mut Session, secs: u64, want: impl Fn(&Session) -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            session.drain();
+            if want(session) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    fn screen_text(session: &Session) -> String {
+        let screen = session.terminal.screen();
+        (0..screen.rows)
+            .map(|y| screen.row(y).text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A program in raw mode that is not reading leaves the tty's input
+    /// queue full: a write to the master then waits until it reads. Input
+    /// used to be written synchronously on the UI thread (and the reader
+    /// had switched the shared master to blocking), so a large paste froze
+    /// the whole window — every tab and pane — for as long as the program
+    /// slept. Now every input call returns at once, the bytes wait in the
+    /// session's writer queue, and they reach the program, all of them and
+    /// in order (paste, keys, paste), once it reads.
+    #[test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn input_to_a_program_that_is_not_reading_never_blocks() {
+        let dir = std::env::temp_dir().join(format!("mpterm-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("received");
+        let _ = std::fs::remove_file(&out);
+
+        let paste: Vec<u8> = (0..(1usize << 20) / 8)
+            .flat_map(|i| format!("{:07}\n", i % 10_000_000).into_bytes())
+            .collect();
+        let keys = b"typed-after-the-paste";
+        let tail = b"and-a-second-paste";
+        let total = paste.len() + keys.len() + tail.len();
+        // Raw mode, say so, then don't read for a while; then read exactly
+        // what we will send.
+        let command = format!(
+            "stty raw -echo; printf READY; sleep 3; head -c {total} > '{}'; printf DONE; sleep 30",
+            out.display()
+        );
+        let mut session =
+            Session::spawn(80, 24, None, None, Some(&command)).expect("a pty session");
+        assert!(
+            drain_until(&mut session, 10, |s| screen_text(s).contains("READY")),
+            "raw mode set"
+        );
+
+        // Do the writes on another thread so a regression FAILS here
+        // instead of hanging the test binary.
+        let (tx, rx) = mpsc::channel();
+        let (paste_c, keys_c, tail_c) = (paste.clone(), keys.to_vec(), tail.to_vec());
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let first = session.write_paste(&paste_c);
+            session.write(&keys_c);
+            let second = session.write_paste(&tail_c);
+            let _ = tx.send((t0.elapsed(), first, second, session));
+        });
+        let (took, first, second, mut session) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writing a 1 MiB paste blocked the caller");
+        assert!(
+            took < Duration::from_millis(200),
+            "input calls took {took:?}"
+        );
+        assert_eq!((first, second), (Ok(()), Ok(())));
+        assert!(session.pending_input() > 0, "the program has not read yet");
+
+        // Once the program reads, everything arrives, in order.
+        assert!(
+            drain_until(&mut session, 30, |s| screen_text(s).contains("DONE")),
+            "the program got all its input: {} bytes still queued",
+            session.pending_input()
+        );
+        assert_eq!(session.pending_input(), 0);
+        let received = std::fs::read(&out).unwrap();
+        let mut expected = paste;
+        expected.extend_from_slice(keys);
+        expected.extend_from_slice(tail);
+        assert!(
+            received == expected,
+            "{} bytes received, {} sent, in order",
+            received.len(),
+            expected.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the program not reading, pastes are bounded — a refused one is
+    /// refused whole and reported — while keys are still accepted; and a
+    /// session with input stuck in its queue closes at once.
+    #[test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn a_full_input_queue_refuses_pastes_not_keys_and_closes_promptly() {
+        let mut session = Session::spawn(
+            80,
+            24,
+            None,
+            None,
+            Some("stty raw -echo; printf READY; sleep 30"),
+        )
+        .expect("a pty session");
+        assert!(
+            drain_until(&mut session, 10, |s| screen_text(s).contains("READY")),
+            "raw mode set"
+        );
+
+        let big = vec![b'x'; crate::pty::PASTE_QUEUE_LIMIT];
+        assert_eq!(
+            session.write_paste(&big),
+            Ok(()),
+            "one paste of any size is accepted"
+        );
+        match session.write_paste(b"more") {
+            Err(InputRejected::QueueFull { pending }) => assert!(pending > 0),
+            other => panic!("a paste over the limit must be refused, got {other:?}"),
+        }
+        let before = session.pending_input();
+        session.write(b"k");
+        assert_eq!(
+            session.pending_input(),
+            before + 1,
+            "a key is never refused"
+        );
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(session);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "closing a session with unread input queued blocked"
         );
     }
 

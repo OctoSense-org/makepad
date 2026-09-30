@@ -13,6 +13,7 @@ use makepad_widgets::text::geom::Point;
 use makepad_widgets::text::rasterizer::RasterizedGlyph;
 use makepad_widgets::*;
 
+use crate::pty::InputRejected;
 use crate::session::{Session, SpawnOptions};
 use crate::settings::{self as term_settings, BellStyle, CursorShape, Settings};
 use crate::themes;
@@ -573,6 +574,14 @@ pub struct MpTerm {
     blink_timer: Timer,
     #[rust]
     blink_armed: bool,
+    /// Shown over the terminal for a few seconds when input was turned
+    /// away: a paste refused because the program has stopped reading.
+    #[rust]
+    input_notice: Option<String>,
+    #[rust]
+    input_notice_timer: Timer,
+    #[rust]
+    input_notice_armed: bool,
     /// The composed character macOS delivers right after an Option+key that
     /// option-as-meta already sent as a Meta key.
     #[rust]
@@ -1426,7 +1435,7 @@ impl MpTerm {
     }
 
     fn paste(&mut self, cx: &mut Cx, text: &str) {
-        if self.paste_bytes(text) {
+        if self.paste_bytes(text) || self.input_notice.is_some() {
             self.redraw(cx);
         }
     }
@@ -1453,9 +1462,22 @@ impl MpTerm {
             }
         }
         self.scroll_to_bottom();
-        self.session
-            .as_mut()
-            .is_some_and(|session| session.try_write(&bytes))
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        match session.write_paste(&bytes) {
+            Ok(()) => true,
+            // Never silently: say that (and why) the paste went nowhere.
+            Err(InputRejected::QueueFull { pending }) => {
+                self.input_notice = Some(format!(
+                    "Paste dropped: the program is not reading its input ({} KiB still queued)",
+                    pending.div_ceil(1024)
+                ));
+                self.input_notice_armed = false;
+                false
+            }
+            Err(InputRejected::Closed) => false,
+        }
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -1769,6 +1791,38 @@ impl MpTerm {
         };
         self.draw_terminal_inner(cx, &mut session);
         self.session = Some(session);
+        self.draw_input_notice(cx);
+    }
+
+    fn draw_input_notice(&mut self, cx: &mut Cx2d) {
+        let Some(notice) = self.input_notice.clone() else {
+            return;
+        };
+        if !self.input_notice_armed {
+            self.input_notice_armed = true;
+            self.input_notice_timer = cx.start_timeout(INPUT_NOTICE_SECONDS);
+        }
+        let pad = 6.0;
+        let width = (notice.chars().count() as f64 * self.cell_w + 2.0 * pad).min(self.rect.size.x);
+        let height = self.cell_h + 2.0 * pad;
+        let pos = dvec2(
+            self.rect.pos.x + (self.rect.size.x - width).max(0.0) * 0.5,
+            self.rect.pos.y + (self.rect.size.y - height - 8.0).max(0.0),
+        );
+        self.draw_cell_bg.new_draw_call(cx);
+        self.draw_cell_bg.color = vec4(0.55, 0.12, 0.10, 0.92);
+        self.draw_cell_bg.draw_abs(
+            cx,
+            Rect {
+                pos,
+                size: dvec2(width, height),
+            },
+        );
+        self.draw_text.new_draw_call(cx);
+        let color = self.draw_text.color;
+        self.draw_text.color = vec4(1.0, 1.0, 1.0, 1.0);
+        self.draw_text.draw_abs(cx, pos + dvec2(pad, pad), &notice);
+        self.draw_text.color = color;
     }
 
     fn draw_terminal_inner(&mut self, cx: &mut Cx2d, session: &mut Session) {
@@ -2263,6 +2317,11 @@ impl Widget for MpTerm {
             self.blink_armed = false;
             self.draw_bg.redraw(cx);
         }
+        if self.input_notice_timer.is_event(event).is_some() {
+            self.input_notice = None;
+            self.input_notice_armed = false;
+            self.draw_bg.redraw(cx);
+        }
         if matches!(event, Event::KeyDown(_) | Event::TextInput(_)) {
             self.blink_epoch = None;
         }
@@ -2724,6 +2783,8 @@ fn scroll_step(
 
 /// Half of a cursor blink cycle, in seconds (on, then off).
 const BLINK_HALF_PERIOD: f64 = 0.53;
+/// How long a refused-input notice stays up.
+const INPUT_NOTICE_SECONDS: f64 = 4.0;
 
 /// The shape a cursor draws with: a program's DECSCUSR choice wins; with
 /// none (`Default`) the person's settings decide shape and blink.
