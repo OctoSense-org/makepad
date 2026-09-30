@@ -6,6 +6,7 @@ pub mod cell_glyph;
 pub mod contrast;
 pub mod control;
 pub mod fonts;
+pub mod gesture;
 pub mod kitty_input;
 pub mod module;
 pub mod panes;
