@@ -1783,6 +1783,31 @@ pub struct PreparedTextGlyph {
     pub rasterized: RasterizedGlyph,
 }
 
+/// One glyph of a [`ShapedTextRun`].
+#[derive(Clone, Debug)]
+pub struct ShapedTextGlyph {
+    /// The byte in the run's text where this glyph's cluster starts.
+    pub cluster: usize,
+    pub pen_x_in_lpxs: f32,
+    pub offset_x_in_lpxs: f32,
+    /// The shaper's vertical offset, y down (a raised mark is negative).
+    pub offset_y_in_lpxs: f32,
+    pub advance_in_lpxs: f32,
+    pub font_size_in_lpxs: f32,
+    /// `None` for a glyph with nothing to draw (a space).
+    pub rasterized: Option<RasterizedGlyph>,
+}
+
+/// A run shaped by `DrawText::prepare_shaped_run`, glyphs in the shaper's
+/// (visual) order.
+#[derive(Clone, Debug)]
+pub struct ShapedTextRun {
+    pub width_in_lpxs: f32,
+    pub ascender_in_lpxs: f32,
+    pub descender_in_lpxs: f32,
+    pub glyphs: Vec<ShapedTextGlyph>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedTextRun {
     pub width_in_lpxs: f32,
@@ -2200,6 +2225,67 @@ impl DrawText {
             width_in_lpxs: row.width_in_lpxs * self.font_scale,
             ascender_in_lpxs: row.ascender_in_lpxs * self.font_scale,
             descender_in_lpxs: row.descender_in_lpxs * self.font_scale,
+            glyphs,
+        })
+    }
+
+    /// Shape `text` as one run with the OpenType `features` (tag, value)
+    /// given, and rasterize its glyphs: for callers that place glyphs
+    /// themselves (a terminal putting a run back on its cell grid). Unlike
+    /// [`Self::prepare_single_line_run`] every glyph is kept, with the byte
+    /// in `text` where its cluster starts, so a caller can map glyphs back
+    /// to its own units; a glyph with nothing to draw has no raster.
+    pub fn prepare_shaped_run(
+        &self,
+        cx: &mut Cx2d,
+        text: &str,
+        features: &Rc<Vec<(u32, u32)>>,
+    ) -> Option<ShapedTextRun> {
+        self.text_style.font_family.ensure_fonts_loaded(cx);
+        let fonts = cx.get_global::<Rc<RefCell<Fonts>>>().clone();
+        let family = fonts
+            .borrow_mut()
+            .get_or_load_font_family(self.text_style.font_family.to_font_family_id());
+        let shaped = family.get_or_shape_with_features(text.into(), features.clone());
+        let has_missing_glyph = shaped.glyphs.iter().any(|glyph| glyph.id == 0);
+        self.text_style
+            .font_family
+            .request_lazy_fonts_for_glyph_miss(cx, text, has_missing_glyph);
+        if shaped.glyphs.is_empty() {
+            return None;
+        }
+        let font_size_in_lpxs = Style {
+            font_family_id: self.text_style.font_family.to_font_family_id(),
+            font_size_in_pts: self.text_style.font_size,
+            color: None,
+        }
+        .font_size_in_lpxs()
+            * self.font_scale;
+        let dpx_per_em = font_size_in_lpxs * cx.current_dpi_factor() as f32;
+        let mut pen_x_in_lpxs = 0.0;
+        let glyphs = shaped
+            .glyphs
+            .iter()
+            .map(|glyph| {
+                let advance_in_lpxs = glyph.advance_in_ems * font_size_in_lpxs;
+                let prepared = ShapedTextGlyph {
+                    cluster: glyph.cluster,
+                    pen_x_in_lpxs,
+                    offset_x_in_lpxs: glyph.offset_in_ems * font_size_in_lpxs,
+                    offset_y_in_lpxs: -glyph.y_offset_in_ems * font_size_in_lpxs,
+                    advance_in_lpxs,
+                    font_size_in_lpxs,
+                    rasterized: glyph.font.rasterize_glyph(glyph.id, dpx_per_em),
+                };
+                pen_x_in_lpxs += advance_in_lpxs;
+                prepared
+            })
+            .collect();
+        let font = family.fonts().first();
+        Some(ShapedTextRun {
+            width_in_lpxs: pen_x_in_lpxs,
+            ascender_in_lpxs: font.map_or(0.0, |font| font.ascender_in_ems()) * font_size_in_lpxs,
+            descender_in_lpxs: font.map_or(0.0, |font| font.descender_in_ems()) * font_size_in_lpxs,
             glyphs,
         })
     }

@@ -1041,7 +1041,7 @@ pub struct Style {
 }
 
 impl Style {
-    fn font_size_in_lpxs(&self) -> f32 {
+    pub fn font_size_in_lpxs(&self) -> f32 {
         self.font_size_in_pts * LPXS_PER_INCH / PTS_PER_INCH
     }
 }
