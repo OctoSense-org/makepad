@@ -144,11 +144,11 @@ impl MatchEvent for App {
             };
             // The person said yes to ending the running jobs: close now.
             if let ModuleCloseAction::Confirmed = wa.cast::<ModuleCloseAction>() {
-                cx.quit();
+                close_self(cx);
             }
             match wa.cast::<TermTabsAction>() {
                 // Ctrl+Shift+W on the last tab closes the window.
-                TermTabsAction::LastTabClosed => cx.quit(),
+                TermTabsAction::LastTabClosed => close_self(cx),
                 TermTabsAction::None => {}
             }
             match wa.cast::<MpTermAction>() {
@@ -163,6 +163,16 @@ impl MatchEvent for App {
                 _ => {}
             }
         }
+    }
+}
+
+/// End this terminal. Standalone it quits. Hosted, the window manager owns
+/// the process and its tile, and the hosted runtime does not act on
+/// `cx.quit()`: the terminal asks the WM to close it (`WmRequest::Close`,
+/// "the app finished"), which the WM carries out without asking back.
+fn close_self(cx: &mut Cx) {
+    if !makepad_wm_api::send(cx, &makepad_wm_api::WmRequest::Close) {
+        cx.quit();
     }
 }
 
@@ -272,11 +282,20 @@ impl App {
                     term.unload(cx);
                 }
             }
-            WmEvent::CloseRequested => {
-                if self.ask_before_closing(cx) == CloseDecision::Allow {
-                    cx.quit();
-                }
+            // The WM greets a hosted app: tell it a close is answered here,
+            // so it waits for the answer instead of killing running jobs.
+            WmEvent::Hosted { .. } => {
+                makepad_wm_api::asks_before_close(cx);
             }
+            // Allow: close. Veto: the bar asks the person; the WM hears
+            // "asking" so it neither kills nor gives up on us, and every
+            // repeated close is answered again (a live terminal re-asks).
+            WmEvent::CloseRequested => match self.ask_before_closing(cx) {
+                CloseDecision::Allow => close_self(cx),
+                CloseDecision::Veto => {
+                    makepad_wm_api::close_refused(cx);
+                }
+            },
             // Adopted into a real tile: now it is a running Terminal.
             WmEvent::Adopted => self.open_ai_port(cx),
             _ => {}

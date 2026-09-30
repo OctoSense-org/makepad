@@ -46,6 +46,19 @@ pub enum WmRequest {
     /// Ask the WM to float / tile / fullscreen this window.
     SetFloating { floating: bool },
     SetFullscreen { fullscreen: bool },
+    /// This app answers [`WmEvent::CloseRequested`] itself: it agrees with
+    /// [`WmRequest::Close`], or refuses with [`WmRequest::CloseRefused`]
+    /// while it asks the person (the terminal, with jobs running). Sent in
+    /// reply to [`WmEvent::Hosted`]. A WM that heard it sends
+    /// `CloseRequested` alone and waits for the answer instead of following
+    /// it with a kill; a WM that did not keeps closing the app as before.
+    AsksBeforeClose,
+    /// The answer to a [`WmEvent::CloseRequested`]: not now — the app is
+    /// showing the person a question in its own window. On a yes it sends
+    /// [`WmRequest::Close`] (a hosted app cannot end its own process with
+    /// `cx.quit()`); a no leaves it running. Sent on every refusal, so a WM
+    /// can tell an app that is asking from one that stopped answering.
+    CloseRefused,
 }
 
 /// What the window manager tells an app.
@@ -141,6 +154,18 @@ pub fn send(cx: &Cx, req: &WmRequest) -> bool {
     }
     Cx::send_studio_message(AppToStudio::Custom(req.to_json()));
     true
+}
+
+/// Tell the WM this app answers `CloseRequested` itself
+/// ([`WmRequest::AsksBeforeClose`]); call it on [`WmEvent::Hosted`].
+pub fn asks_before_close(cx: &Cx) -> bool {
+    send(cx, &WmRequest::AsksBeforeClose)
+}
+
+/// Answer a `CloseRequested` with "not now": the app is asking the person
+/// ([`WmRequest::CloseRefused`]). No-op standalone.
+pub fn close_refused(cx: &Cx) -> bool {
+    send(cx, &WmRequest::CloseRefused)
 }
 
 /// Quick Look `path`. Hosted: the WM floats the associated viewer over the
@@ -290,6 +315,17 @@ mod tests {
         };
         assert_eq!(WmEvent::parse(&ev.to_json()), Some(ev));
         assert_eq!(WmEvent::parse(&WmEvent::CloseRequested.to_json()), Some(WmEvent::CloseRequested));
+    }
+
+    #[test]
+    fn close_answers_round_trip() {
+        // The wire form is part of the contract: a WM pinned before these
+        // variants recognises them by this exact text.
+        assert_eq!(WmRequest::AsksBeforeClose.to_json(), r#"{"wm":{"AsksBeforeClose":[]}}"#);
+        assert_eq!(WmRequest::CloseRefused.to_json(), r#"{"wm":{"CloseRefused":[]}}"#);
+        for req in [WmRequest::AsksBeforeClose, WmRequest::CloseRefused] {
+            assert_eq!(WmRequest::parse(&req.to_json()), Some(req));
+        }
     }
 
     #[test]
