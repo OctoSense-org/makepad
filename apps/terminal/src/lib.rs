@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod ai;
+pub mod cell_glyph;
 pub mod control;
 pub mod fonts;
 pub mod module;

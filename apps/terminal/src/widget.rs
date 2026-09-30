@@ -6,7 +6,6 @@
 //! styles drawn by a dedicated shader, block/bar/underline cursor with a
 //! hollow variant when unfocused.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use makepad_widgets::text::geom::Point;
@@ -27,7 +26,7 @@ use crate::term::mouse_encode::{
     encode_mouse, MouseButton as TermMouseButton, MouseEventKind, MouseFormat, MouseReport,
     MouseTracking,
 };
-use crate::term::page::CellContent;
+use crate::cell_glyph::{cell_glyph, fit_run, CellGlyph, GlyphCache};
 use crate::term::screen::CursorStyle;
 use crate::term::style::{StyleColor, StyleFlags};
 use crate::term::terminal::TermEvent;
@@ -505,7 +504,7 @@ pub struct MpTerm {
     #[rust]
     cell_baseline: f64,
     #[rust]
-    glyph_cache: HashMap<(char, bool, u8), Option<CachedGlyph>>,
+    glyph_cache: GlyphCache<CachedGlyph>,
     #[rust]
     glyph_cache_key: (u64, u64, u64),
     /// Lines scrolled back from the bottom (0 = live).
@@ -1060,6 +1059,7 @@ impl MpTerm {
             .clamp(0.1, 8.0)
     }
 
+    /// Fast path: one codepoint, one glyph, cached by the char.
     fn cached_glyph(
         &mut self,
         cx: &mut Cx2d,
@@ -1067,13 +1067,68 @@ impl MpTerm {
         bold: bool,
         columns: u8,
     ) -> Option<CachedGlyph> {
-        if let Some(hit) = self.glyph_cache.get(&(ch, bold, columns)) {
+        if let Some(hit) = self.glyph_cache.char(ch, bold, columns) {
             return *hit;
         }
         let mut buf = [0u8; 4];
         let text: &str = ch.encode_utf8(&mut buf);
-        // Rasterize at the actual screen size, then retain local-grid metrics.
-        // Canvas zoom otherwise scales a low-resolution glyph cached at 1x.
+        let cached = self
+            .prepare_cell_run(cx, text, bold, columns, false)
+            .and_then(|run| run.first().copied());
+        self.glyph_cache.insert_char(ch, bold, columns, cached);
+        cached
+    }
+
+    /// Slow path: a grapheme cluster (combining marks, a ZWJ emoji sequence,
+    /// a flag, a skin tone) shaped as one run and cached by the cluster, so
+    /// the font joins and places its parts instead of stacking them.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cluster_glyphs(
+        &mut self,
+        cx: &mut Cx2d,
+        cps: &[char],
+        bold: bool,
+        columns: u8,
+        x: f64,
+        y: f64,
+        color: Vec4f,
+    ) {
+        if self.glyph_cache.cluster(cps, bold, columns).is_none() {
+            let text: String = cps.iter().collect();
+            let run = self.prepare_cell_run(cx, &text, bold, columns, true);
+            self.glyph_cache.insert_cluster(cps, bold, columns, run);
+        }
+        let baseline = y + self.cell_baseline;
+        if let Some(Some(run)) = self.glyph_cache.cluster(cps, bold, columns) {
+            for glyph in run {
+                let point = Point::new(
+                    (x + glyph.x_offset_in_lpxs as f64) as f32,
+                    baseline as f32 + glyph.y_offset_in_lpxs,
+                );
+                self.draw_text.draw_rasterized_glyph_abs(
+                    cx,
+                    point,
+                    glyph.font_size_in_lpxs,
+                    glyph.rasterized,
+                    color,
+                );
+            }
+        }
+    }
+
+    /// Shape `text` as one run and fit it into `columns` cells: each glyph
+    /// relative to the cell's left edge and baseline. Rasterized at the
+    /// actual screen size, with local-grid metrics kept (canvas zoom would
+    /// otherwise scale a low-resolution glyph cached at 1x). With `center`,
+    /// a run narrower than its cells is centred in them.
+    fn prepare_cell_run(
+        &mut self,
+        cx: &mut Cx2d,
+        text: &str,
+        bold: bool,
+        columns: u8,
+        center: bool,
+    ) -> Option<Vec<CachedGlyph>> {
         let scale = self.raster_scale() as f32;
         let style = self.draw_text.text_style.clone();
         if bold {
@@ -1082,38 +1137,51 @@ impl MpTerm {
         self.draw_text.text_style.font_size *= scale;
         let prepared = self.draw_text.prepare_single_line_run(cx, text);
         self.draw_text.text_style = style;
-        let cached = prepared.and_then(|run| {
-            run.glyphs.first().map(|g| {
-                // Proportional fallback symbols must stay inside the cells
-                // allocated by the terminal, without shrinking normal mono
-                // glyphs for small rounding differences in the grid advance.
-                let available = self.cell_w as f32 * columns.max(1) as f32;
-                let advance = run.width_in_lpxs / scale;
-                let fit = if advance > available * 1.05 {
-                    available / advance
-                } else {
-                    1.0
-                };
-                let font_size = g.font_size_in_lpxs / scale;
-                let center_y = (-g.rasterized.origin_in_dpxs.y
-                    - g.rasterized.atlas_image_bounds.size.height as f32 * 0.5)
-                    * font_size
-                    / g.rasterized.dpxs_per_em;
-                // A glyph starts inside its own cells whatever the font
-                // says (some proportional CJK fonts report pen offsets far
-                // past one character).
-                let x_offset = (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit;
-                let x_offset = if x_offset.abs() > available { 0.0 } else { x_offset };
-                CachedGlyph {
+        let run = prepared?;
+        // Proportional fallback symbols must stay inside the cells
+        // allocated by the terminal, without shrinking normal mono glyphs
+        // for small rounding differences in the grid advance.
+        let available = self.cell_w as f32 * columns.max(1) as f32;
+        let fit = fit_run(run.width_in_lpxs / scale, available, center);
+        // The vertical middle of the run's ink, so a shrunk run stays
+        // centred on the line instead of sinking to the baseline.
+        let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+        for g in &run.glyphs {
+            let per_dpx = g.font_size_in_lpxs / scale / g.rasterized.dpxs_per_em;
+            let upper = -g.rasterized.origin_in_dpxs.y * per_dpx;
+            let lower = upper - g.rasterized.atlas_image_bounds.size.height as f32 * per_dpx;
+            top = top.min(lower);
+            bottom = bottom.max(upper);
+        }
+        let center_y = if top <= bottom {
+            (top + bottom) * 0.5
+        } else {
+            0.0
+        };
+        // A run starts inside its own cells whatever the font says (some
+        // proportional CJK fonts report pen offsets far past one character).
+        let first_x = run
+            .glyphs
+            .first()
+            .map(|g| (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit.scale)?;
+        let x_origin = if first_x.abs() > available {
+            first_x
+        } else {
+            0.0
+        };
+        Some(
+            run.glyphs
+                .iter()
+                .map(|g| CachedGlyph {
                     rasterized: g.rasterized,
-                    font_size_in_lpxs: font_size * fit,
-                    x_offset_in_lpxs: x_offset,
-                    y_offset_in_lpxs: center_y * (1.0 - fit),
-                }
-            })
-        });
-        self.glyph_cache.insert((ch, bold, columns), cached);
-        cached
+                    font_size_in_lpxs: g.font_size_in_lpxs / scale * fit.scale,
+                    x_offset_in_lpxs: (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit.scale
+                        - x_origin
+                        + fit.x_shift,
+                    y_offset_in_lpxs: center_y * (1.0 - fit.scale),
+                })
+                .collect(),
+        )
     }
 
     /// Cell geometry, rather than a font's side bearings/line gap, joins
@@ -1878,10 +1946,10 @@ impl MpTerm {
             w: f64,
             color: Vec4f,
         }
-        struct GlyphDraw {
+        struct GlyphDraw<'a> {
             x: f64,
             y: f64,
-            ch: char,
+            glyph: CellGlyph<'a>,
             color: Vec4f,
             bold: bool,
             columns: u8,
@@ -1984,35 +2052,17 @@ impl MpTerm {
                     }
                 }
 
-                // Text.
-                match &cell.content {
-                    CellContent::Char(c) | CellContent::WideChar(c) => {
-                        if *c != ' ' {
-                            glyphs.push(GlyphDraw {
-                                x: origin_x + col as f64 * cell_w,
-                                y,
-                                ch: *c,
-                                color: fg,
-                                bold: cell.style.flags.has(StyleFlags::BOLD),
-                                columns: cell.content.width(),
-                            });
-                        }
-                    }
-                    CellContent::Cluster(cluster) => {
-                        // First codepoint via the cache; combining marks are
-                        // drawn over it.
-                        for c in &cluster.cps {
-                            glyphs.push(GlyphDraw {
-                                x: origin_x + col as f64 * cell_w,
-                                y,
-                                ch: *c,
-                                color: fg,
-                                bold: cell.style.flags.has(StyleFlags::BOLD),
-                                columns: cell.content.width(),
-                            });
-                        }
-                    }
-                    _ => {}
+                // Text: one glyph for a codepoint, one shaped run for a
+                // grapheme cluster.
+                if let Some(glyph) = cell_glyph(&cell.content) {
+                    glyphs.push(GlyphDraw {
+                        x: origin_x + col as f64 * cell_w,
+                        y,
+                        glyph,
+                        color: fg,
+                        bold: cell.style.flags.has(StyleFlags::BOLD),
+                        columns: cell.content.width(),
+                    });
                 }
             }
             if let Some((start, end, color)) = run.take() {
@@ -2112,13 +2162,20 @@ impl MpTerm {
                     color = Self::rgb_to_vec4(default_bg, 1.0);
                 }
             }
-            if self.draw_box_glyph(cx, g.ch, g.x, g.y, color) {
+            let ch = match g.glyph {
+                CellGlyph::Char(ch) => ch,
+                CellGlyph::Cluster(cps) => {
+                    self.draw_cluster_glyphs(cx, cps, g.bold, g.columns, g.x, g.y, color);
+                    continue;
+                }
+            };
+            if self.draw_box_glyph(cx, ch, g.x, g.y, color) {
                 continue;
             }
-            if self.draw_braille_glyph(g.ch, g.x, g.y, color) {
+            if self.draw_braille_glyph(ch, g.x, g.y, color) {
                 continue;
             }
-            if let Some(glyph) = self.cached_glyph(cx, g.ch, g.bold, g.columns) {
+            if let Some(glyph) = self.cached_glyph(cx, ch, g.bold, g.columns) {
                 let point = Point::new(
                     (g.x + glyph.x_offset_in_lpxs as f64) as f32,
                     (g.y + baseline) as f32 + glyph.y_offset_in_lpxs,

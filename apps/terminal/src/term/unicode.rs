@@ -86,6 +86,19 @@ pub fn char_width(cp: u32) -> u8 {
     1
 }
 
+/// Whether a variation selector after `cp` picks its presentation (UTS #51
+/// emoji variation sequences): an Extended_Pictographic codepoint or a
+/// keycap base. Only then does VS16 widen a cell or VS15 narrow it, as in
+/// ghostty; `a` + VS16 or `漢` + VS15 keep their width.
+pub fn is_emoji_vs_base(cp: u32) -> bool {
+    matches!(cp, 0x23 | 0x2A | 0x30..=0x39) || range_contains(&GB_EXTENDED_PICTOGRAPHIC, cp)
+}
+
+/// A skin-tone modifier (U+1F3FB..U+1F3FF).
+pub fn is_emoji_modifier(cp: u32) -> bool {
+    range_contains(&EMOJI_MODIFIER, cp)
+}
+
 /// Grapheme_Cluster_Break property class, as ghostty's uucode tables model
 /// it: one value per codepoint, with Extended_Pictographic folded in where
 /// the break property itself is `Other`, and CR/LF folded into `Control`.
@@ -633,6 +646,19 @@ mod tests {
         assert_eq!(cluster_widths(&['#' as u32, 0xFE0F, 0x20E3]), vec![1]);
         // 1 + keycap without the selector still clusters.
         assert_eq!(clusters(&['1' as u32, 0x20E3]).len(), 1);
+    }
+
+    #[test]
+    fn emoji_vs_bases() {
+        assert!(is_emoji_vs_base(0x1F3F3)); // 🏳 white flag, text by default
+        assert!(is_emoji_vs_base(0x2764)); // ❤
+        assert!(is_emoji_vs_base(0x231A)); // ⌚
+        assert!(is_emoji_vs_base('#' as u32));
+        assert!(is_emoji_vs_base('7' as u32));
+        assert!(!is_emoji_vs_base('a' as u32));
+        assert!(!is_emoji_vs_base('漢' as u32));
+        assert!(is_emoji_modifier(0x1F3FD));
+        assert!(!is_emoji_modifier(0x1F44D));
     }
 
     #[test]
