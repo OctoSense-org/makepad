@@ -12,7 +12,9 @@
 //! changes: widgets compare the generation they last applied and re-read on
 //! a change, so a settings panel's edit reaches every open tab at once.
 
+use crate::term::color::Rgb;
 use crate::term::terminal::DEFAULT_SCROLLBACK;
+use crate::themes::Scheme;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
@@ -79,6 +81,13 @@ pub struct Settings {
     /// Row height as a multiple of the font's glyph height (the text
     /// style's `line_spacing`; 1.0 is the terminal's historical look).
     pub line_height: f64,
+    /// The WCAG contrast ratio text is raised to against its background,
+    /// 1..=21; 1 is off (`crate::contrast`).
+    pub minimum_contrast: f32,
+    /// Selected cells' colours (0xRRGGBB); `None` takes the theme's, and a
+    /// theme without them draws the selection in inverse video.
+    pub selection_background: Option<u32>,
+    pub selection_foreground: Option<u32>,
     /// The shape a program that sets none (DECSCUSR 0) gets.
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
@@ -109,6 +118,7 @@ pub struct Settings {
 pub const FONT_SIZE_RANGE: (f64, f64) = (6.0, 48.0);
 pub const LINE_HEIGHT_RANGE: (f64, f64) = (1.0, 2.0);
 pub const OPACITY_RANGE: (f32, f32) = (0.2, 1.0);
+pub const CONTRAST_RANGE: (f32, f32) = (crate::contrast::OFF, crate::contrast::MAX);
 pub const SCROLLBACK_MAX: usize = 1_000_000;
 
 impl Default for Settings {
@@ -120,6 +130,9 @@ impl Default for Settings {
             cjk_font: CJK_AUTO.into(),
             font_size: 10.0,
             line_height: 1.0,
+            minimum_contrast: crate::contrast::OFF,
+            selection_background: None,
+            selection_foreground: None,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             term: "xterm-256color".into(),
@@ -145,6 +158,51 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" | "no" | "off" | "0" => Some(false),
         _ => None,
     }
+}
+
+/// `#rrggbb` (or `rrggbb`) as 0xRRGGBB.
+pub fn parse_hex_color(value: &str) -> Option<u32> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// A colour setting: `default` (or nothing) is `None`, a hex colour is
+/// that colour, and anything else keeps `current`.
+fn parse_color_setting(value: &str, current: Option<u32>) -> Option<u32> {
+    if value.is_empty() || value == "default" {
+        return None;
+    }
+    parse_hex_color(value).or(current)
+}
+
+fn color_setting_text(color: Option<u32>) -> String {
+    color.map_or("default".into(), |c| format!("#{c:06x}"))
+}
+
+fn rgb(c: u32) -> Rgb {
+    Rgb::new((c >> 16) as u8, (c >> 8) as u8, c as u8)
+}
+
+/// Selected cells' (background, text) colours: the settings' own, else the
+/// theme's (`scheme`, when one is chosen), else inverse video: the default
+/// text colour behind the default background colour. Each of the two falls
+/// back on its own.
+pub fn selection_colors(
+    s: &Settings,
+    scheme: Option<&Scheme>,
+    default_fg: Rgb,
+    default_bg: Rgb,
+) -> (Rgb, Rgb) {
+    let bg = s
+        .selection_background
+        .or(scheme.and_then(|t| t.selection_background));
+    let fg = s
+        .selection_foreground
+        .or(scheme.and_then(|t| t.selection_foreground));
+    (bg.map_or(default_fg, rgb), fg.map_or(default_bg, rgb))
 }
 
 /// A `TERM` value: short, and only characters terminfo names use.
@@ -193,6 +251,17 @@ impl Settings {
                     if let Some(v) = value.parse::<f64>().ok().filter(|v| v.is_finite()) {
                         s.line_height = v.clamp(LINE_HEIGHT_RANGE.0, LINE_HEIGHT_RANGE.1);
                     }
+                }
+                "minimum-contrast" => {
+                    if let Some(v) = value.parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        s.minimum_contrast = v.clamp(CONTRAST_RANGE.0, CONTRAST_RANGE.1);
+                    }
+                }
+                "selection-background" => {
+                    s.selection_background = parse_color_setting(value, s.selection_background)
+                }
+                "selection-foreground" => {
+                    s.selection_foreground = parse_color_setting(value, s.selection_foreground)
                 }
                 "cursor-shape" => {
                     s.cursor_shape = match value {
@@ -277,6 +346,15 @@ impl Settings {
         line("cjk-font", self.cjk_font.clone());
         line("font-size", format!("{}", self.font_size));
         line("line-height", format!("{}", self.line_height));
+        line("minimum-contrast", format!("{}", self.minimum_contrast));
+        line(
+            "selection-background",
+            color_setting_text(self.selection_background),
+        );
+        line(
+            "selection-foreground",
+            color_setting_text(self.selection_foreground),
+        );
         line(
             "cursor-shape",
             match self.cursor_shape {
@@ -511,6 +589,9 @@ mod tests {
             background_opacity: Some(0.85),
             font_size: 13.0,
             line_height: 1.5,
+            minimum_contrast: 4.5,
+            selection_background: Some(0x33467c),
+            selection_foreground: Some(0xc0caf5),
             cursor_shape: CursorShape::Bar,
             cursor_blink: true,
             term: "xterm-ghostty".into(),
@@ -546,6 +627,77 @@ mod tests {
         assert_eq!(s.bell, d.bell);
         assert_eq!(s.term, d.term, "a TERM with shell syntax is refused");
         assert_eq!(s.copy_on_select, d.copy_on_select);
+    }
+
+    #[test]
+    fn contrast_and_selection_colours_parse() {
+        let d = Settings::default();
+        assert_eq!(d.minimum_contrast, 1.0, "off by default");
+        assert_eq!(
+            (d.selection_background, d.selection_foreground),
+            (None, None),
+            "inverse by default"
+        );
+        let s = Settings::parse(
+            "minimum-contrast = 50\nselection-background = #33467C\nselection-foreground = c0caf5\n",
+        );
+        assert_eq!(s.minimum_contrast, CONTRAST_RANGE.1);
+        assert_eq!(s.selection_background, Some(0x33467c));
+        assert_eq!(s.selection_foreground, Some(0xc0caf5));
+        let s = Settings::parse("minimum-contrast = 0.2\nselection-background = default\nselection-foreground = #12345\n");
+        assert_eq!(s.minimum_contrast, CONTRAST_RANGE.0);
+        assert_eq!(s.selection_background, None);
+        assert_eq!(
+            s.selection_foreground, None,
+            "a malformed colour keeps the default"
+        );
+        assert_eq!(
+            Settings::parse("minimum-contrast = NaN").minimum_contrast,
+            d.minimum_contrast
+        );
+    }
+
+    #[test]
+    fn selection_colours_come_from_settings_then_theme_then_inverse() {
+        let (fg, bg) = (Rgb::new(0xa9, 0xb1, 0xd6), Rgb::new(0x1a, 0x1b, 0x26));
+        let d = Settings::default();
+        assert_eq!(
+            selection_colors(&d, None, fg, bg),
+            (fg, bg),
+            "inverse video by default"
+        );
+        // Every bundled theme keeps today's inverse video.
+        for scheme in crate::themes::SCHEMES {
+            assert_eq!(
+                selection_colors(&d, Some(scheme), fg, bg),
+                (fg, bg),
+                "{}",
+                scheme.id
+            );
+        }
+        let themed = Scheme {
+            selection_background: Some(0x33467c),
+            selection_foreground: Some(0xc0caf5),
+            ..crate::themes::find("tokyo-night").copied().unwrap()
+        };
+        let (sel_bg, sel_fg) = (Rgb::new(0x33, 0x46, 0x7c), Rgb::new(0xc0, 0xca, 0xf5));
+        assert_eq!(
+            selection_colors(&d, Some(&themed), fg, bg),
+            (sel_bg, sel_fg)
+        );
+        // The settings win over the theme, each colour on its own.
+        let s = Settings {
+            selection_background: Some(0xff0000),
+            ..d.clone()
+        };
+        assert_eq!(
+            selection_colors(&s, Some(&themed), fg, bg),
+            (Rgb::new(0xff, 0, 0), sel_fg)
+        );
+        assert_eq!(
+            selection_colors(&s, None, fg, bg),
+            (Rgb::new(0xff, 0, 0), bg)
+        );
     }
 
     #[test]

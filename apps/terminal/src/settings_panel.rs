@@ -20,6 +20,7 @@ pub enum Row {
     Opacity,
     FontSize,
     LineHeight,
+    MinimumContrast,
     CursorShape,
     CursorBlink,
     Term,
@@ -67,6 +68,7 @@ pub const SECTIONS: &[(&str, &[Row])] = &[
             Row::FontSize,
             Row::LineHeight,
             Row::Opacity,
+            Row::MinimumContrast,
             Row::CursorShape,
             Row::CursorBlink,
         ],
@@ -95,6 +97,9 @@ pub fn rows() -> Vec<Row> {
 
 const TERMS: &[&str] = &["xterm-256color", "xterm", "screen-256color", "tmux-256color", "xterm-kitty", "xterm-ghostty"];
 const SCROLLBACK: &[usize] = &[1_000, 5_000, 10_000, 50_000, 100_000, 1_000_000];
+/// Minimum contrast ratios: off, then WCAG's large-text (3), AA (4.5) and
+/// AAA (7) levels among others.
+const CONTRAST: &[f32] = &[1.0, 1.5, 2.0, 3.0, 4.5, 7.0, 10.0, 21.0];
 const OPACITY: &[Option<f32>] =
     &[None, Some(1.0), Some(0.95), Some(0.9), Some(0.85), Some(0.8), Some(0.75), Some(0.7), Some(0.6), Some(0.5)];
 
@@ -242,6 +247,7 @@ impl Row {
             Row::Opacity => "Background opacity",
             Row::FontSize => "Font size",
             Row::LineHeight => "Line height",
+            Row::MinimumContrast => "Minimum contrast",
             Row::CursorShape => "Cursor",
             Row::CursorBlink => "Cursor blink",
             Row::Term => "TERM",
@@ -299,6 +305,13 @@ impl Row {
             Row::Opacity => s.background_opacity.map_or("Host default".into(), |a| format!("{:.0}%", a * 100.0)),
             Row::FontSize => format!("{}", s.font_size),
             Row::LineHeight => format!("{:.1}", s.line_height),
+            Row::MinimumContrast => {
+                if s.minimum_contrast <= crate::contrast::OFF {
+                    "Off".into()
+                } else {
+                    format!("{}:1", s.minimum_contrast)
+                }
+            }
             Row::CursorShape => match s.cursor_shape {
                 CursorShape::Block => "Block",
                 CursorShape::Bar => "Bar",
@@ -370,6 +383,23 @@ impl Row {
                 let v = ((s.line_height * 10.0).round() + if up { 1.0 } else { -1.0 }) / 10.0;
                 s.line_height = v.clamp(LINE_HEIGHT_RANGE.0, LINE_HEIGHT_RANGE.1);
             }
+            Row::MinimumContrast => {
+                // A hand-set ratio steps to the nearest listed one first.
+                let near = CONTRAST
+                    .iter()
+                    .copied()
+                    .min_by(|a, b| {
+                        (a - s.minimum_contrast)
+                            .abs()
+                            .total_cmp(&(b - s.minimum_contrast).abs())
+                    })
+                    .unwrap_or(1.0);
+                s.minimum_contrast = if near == s.minimum_contrast {
+                    cycle(CONTRAST, &near, dir)
+                } else {
+                    near
+                };
+            }
             Row::CursorShape => {
                 s.cursor_shape = cycle(&[CursorShape::Block, CursorShape::Bar, CursorShape::Underline], &s.cursor_shape, dir)
             }
@@ -406,7 +436,7 @@ mod tests {
     #[test]
     fn every_row_is_listed_once() {
         let rows = rows();
-        assert_eq!(rows.len(), 23);
+        assert_eq!(rows.len(), 24);
         for (i, row) in rows.iter().enumerate() {
             assert!(!rows[i + 1..].contains(row), "{row:?} twice");
         }
@@ -448,6 +478,32 @@ mod tests {
         assert_eq!(s.font_size, FONT_SIZE_RANGE.1);
         assert_eq!(s.line_height, LINE_HEIGHT_RANGE.0);
         assert_eq!(Row::LineHeight.step(&s, 1).line_height, 1.1);
+    }
+
+    #[test]
+    fn minimum_contrast_steps_through_the_wcag_levels() {
+        let s = Settings::default();
+        assert_eq!(Row::MinimumContrast.value(&s), "Off");
+        let up = Row::MinimumContrast.step(&s, 1);
+        assert_eq!(up.minimum_contrast, 1.5);
+        let aa = Settings {
+            minimum_contrast: 3.0,
+            ..s.clone()
+        };
+        assert_eq!(Row::MinimumContrast.step(&aa, 1).minimum_contrast, 4.5);
+        assert_eq!(
+            Row::MinimumContrast.value(&Row::MinimumContrast.step(&aa, 1)),
+            "4.5:1"
+        );
+        let hand = Settings {
+            minimum_contrast: 4.2,
+            ..s
+        };
+        assert_eq!(
+            Row::MinimumContrast.step(&hand, 1).minimum_contrast,
+            4.5,
+            "snaps first"
+        );
     }
 
     #[test]

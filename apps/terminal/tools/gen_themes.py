@@ -79,16 +79,20 @@ def emit(src_dir, commit):
     print("    pub foreground: u32,")
     print("    pub background: u32,")
     print("    pub cursor: u32,")
+    print("    /// Selected cells' colours; `None` draws the selection in inverse")
+    print("    /// video (the default foreground behind the default background).")
+    print("    pub selection_background: Option<u32>,")
+    print("    pub selection_foreground: Option<u32>,")
     print("}")
     print()
     print("pub const SCHEMES: &[Scheme] = &[")
     for sid, pal in pals.items():
         name = NAMES.get(sid, sid.replace("-", " ").title())
-        print('    Scheme { id: "%s", name: "%s", light: %s, base16: [%s], foreground: %s, background: %s, cursor: %s },' % (
+        print('    Scheme { id: "%s", name: "%s", light: %s, base16: [%s], foreground: %s, background: %s, cursor: %s, selection_background: None, selection_foreground: None },' % (
             sid, name, "true" if pal["light"] else "false", ", ".join(h(c) for c in pal["base16"]),
             h(pal["fg"]), h(pal["bg"]), h(pal["cursor"])))
     for sid, name, light, b16, fg, bg, cur in CLASSICS:
-        print('    Scheme { id: "%s", name: "%s", light: %s, base16: [%s], foreground: 0x%s, background: 0x%s, cursor: 0x%s },' % (
+        print('    Scheme { id: "%s", name: "%s", light: %s, base16: [%s], foreground: 0x%s, background: 0x%s, cursor: 0x%s, selection_background: None, selection_foreground: None },' % (
             sid, name, "true" if light else "false", ", ".join("0x" + x for x in b16.split()), fg, bg, cur))
     print("];")
     print()

@@ -6,7 +6,6 @@
 //! styles drawn by a dedicated shader, block/bar/underline cursor with a
 //! hollow variant when unfocused.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use makepad_widgets::text::geom::Point;
@@ -29,7 +28,10 @@ use crate::term::mouse_encode::{
     encode_mouse, MouseButton as TermMouseButton, MouseEventKind, MouseFormat, MouseReport,
     MouseTracking,
 };
-use crate::term::page::CellContent;
+use crate::cell_glyph::{
+    cell_glyph, fit_glyphs, icon_columns, is_private_use, CellGlyph, Fit, GlyphCache,
+};
+use crate::{contrast, sprites};
 use crate::term::screen::CursorStyle;
 use crate::term::style::{StyleColor, StyleFlags};
 use crate::term::terminal::TermEvent;
@@ -87,6 +89,56 @@ script_mod! {
                     let bottom = if self.arms.w > 0.0 {10000.0} else {half}
                     distance = min(distance, max(abs(d.x) - half, max(top - d.y, d.y - bottom)))
                 }
+            }
+            let coverage = clamp(0.5 - distance / self.pixel_size, 0.0, 1.0)
+            let alpha = self.color.a * coverage
+            return vec4(self.color.rgb * alpha, alpha)
+        }
+    }
+
+    // Powerline separators and shade blocks (`crate::sprites`): the shape's
+    // straight sides are the quad's, so it meets its neighbours with no seam;
+    // diagonals and curves are anti-aliased over one device pixel. The
+    // distance functions match `Sprite::distance`.
+    set_type_default() do #(DrawTermSprite::script_shader(vm)) {
+        ..mod.draw.DrawQuad
+        draw_call_group: @term_sprite
+        color: #fff
+        shape: 0.0
+        flip: vec2(0.0, 0.0)
+        thickness: 1.0
+        pixel_size: 1.0
+        pixel: fn() {
+            let size = self.rect_size
+            var p = self.pos * size
+            if self.flip.x > 0.5 {
+                p.x = size.x - p.x
+            }
+            if self.flip.y > 0.5 {
+                p.y = size.y - p.y
+            }
+            let half = self.thickness * 0.5
+            var distance = -1.0
+            if self.shape > 0.5 && self.shape < 2.5 {
+                // Arrow: the edge from the top-left corner to the right
+                // middle, folded about the middle row.
+                let hh = size.y * 0.5
+                let fy = abs(p.y - hh)
+                let d = (p.x * hh + fy * size.x - size.x * hh) / length(vec2(hh, size.x))
+                distance = if self.shape < 1.5 {d} else {abs(d) - half}
+            } else if self.shape > 2.5 && self.shape < 4.5 {
+                // Half ellipse on the left edge's middle, radii w and h/2.
+                let hh = size.y * 0.5
+                let q = vec2(p.x / size.x, (p.y - hh) / hh)
+                let k = length(q)
+                let g = max(length(vec2(q.x / size.x, q.y / hh)), 0.000001)
+                let d = (k - 1.0) * k / g
+                distance = if self.shape < 3.5 {d} else {abs(d) - half}
+            } else if self.shape > 4.5 {
+                // Wedge under, or stroke along, the top-left to bottom-right
+                // diagonal.
+                let d = (p.x * size.y - p.y * size.x) / length(size)
+                distance = if self.shape < 5.5 {d} else {abs(d) - half}
             }
             let coverage = clamp(0.5 - distance / self.pixel_size, 0.0, 1.0)
             let alpha = self.color.a * coverage
@@ -204,14 +256,21 @@ script_mod! {
             draw_call_group: @term_text
             // The shell and Omarchy prompts are designed around JetBrains
             // Mono. Liberation Mono lacks even common prompt symbols such as
-            // U+276F; keep Font Awesome as a fallback for the icon codepoints
-            // it does cover. The distro package can add a full Nerd Font
-            // member here without making terminal depend on host fontconfig.
+            // U+276F. Symbols Nerd Font Mono (bundled, MIT; its icon sets
+            // are MIT, OFL, CC BY and Apache, see resources/) draws the Nerd
+            // Font icons prompts and file listers print, ahead of Font
+            // Awesome and Inter, which map other glyphs to some of the same
+            // private-use codepoints. Powerline separators are drawn as
+            // sprites (`crate::sprites`), not from a font.
             text_style: TextStyle{
                 font_family: FontFamily{
                     latin := FontMember{
                         res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf")
                         asc: 0.0 desc: 0.0 weight: 400.0
+                    }
+                    nerd := FontMember{
+                        res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf")
+                        asc: 0.0 desc: 0.0
                     }
                     icons := FontMember{
                         res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf")
@@ -241,6 +300,10 @@ script_mod! {
                 latin := FontMember{
                     res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf")
                     asc: 0.0 desc: 0.0 weight: 800.0
+                }
+                nerd := FontMember{
+                    res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf")
+                    asc: 0.0 desc: 0.0
                 }
                 icons := FontMember{
                     res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf")
@@ -310,6 +373,23 @@ struct DrawTermBox {
 
 #[derive(Script, ScriptHook)]
 #[repr(C)]
+struct DrawTermSprite {
+    #[deref]
+    draw_super: DrawQuad,
+    #[live]
+    color: Vec4f,
+    #[live]
+    shape: f32,
+    #[live]
+    flip: Vec2f,
+    #[live]
+    thickness: f32,
+    #[live]
+    pixel_size: f32,
+}
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
 struct DrawTermCursor {
     #[deref]
     draw_super: DrawQuad,
@@ -349,6 +429,7 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
                     primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
                     symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
@@ -362,6 +443,7 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
                 font_family: FontFamily{
                     primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
                     symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
@@ -375,6 +457,7 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
                 font_family: FontFamily{
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
+                    nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
                     symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
@@ -387,6 +470,7 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             TextStyle{
                 font_family: FontFamily{
                     latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
                     icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
                     emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
                     symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
@@ -463,6 +547,8 @@ pub struct MpTerm {
     #[live]
     draw_boxes: DrawTermBox,
     #[live]
+    draw_sprites: DrawTermSprite,
+    #[live]
     draw_dots: DrawVector,
     #[live]
     draw_cell_bg: DrawTermBg,
@@ -507,7 +593,10 @@ pub struct MpTerm {
     #[rust]
     cell_baseline: f64,
     #[rust]
-    glyph_cache: HashMap<(char, bool, u8), Option<CachedGlyph>>,
+    glyph_cache: GlyphCache<CachedGlyph>,
+    /// This frame's sprite draw call has been opened.
+    #[rust]
+    sprites_open: bool,
     #[rust]
     glyph_cache_key: (u64, u64, u64),
     /// Lines scrolled back from the bottom (0 = live).
@@ -1008,6 +1097,16 @@ impl MpTerm {
         Some((palette, fg, bg, self.original_cursor))
     }
 
+    /// Selected cells' (background, text) colours (`settings::selection_colors`).
+    fn selection_colors(&self, default_fg: Rgb, default_bg: Rgb) -> (Vec4f, Vec4f) {
+        let scheme = (self.settings.theme != term_settings::THEME_DESKTOP)
+            .then(|| themes::find(&self.settings.theme))
+            .flatten();
+        let (bg, fg) =
+            term_settings::selection_colors(&self.settings, scheme, default_fg, default_bg);
+        (Self::rgb_to_vec4(bg, 1.0), Self::rgb_to_vec4(fg, 1.0))
+    }
+
     fn apply_colors(&mut self) {
         let Some((palette, fg, bg, cursor)) = self.resolved_colors() else {
             return;
@@ -1078,6 +1177,7 @@ impl MpTerm {
             .clamp(0.1, 8.0)
     }
 
+    /// Fast path: one codepoint, one glyph, cached by the char.
     fn cached_glyph(
         &mut self,
         cx: &mut Cx2d,
@@ -1085,13 +1185,73 @@ impl MpTerm {
         bold: bool,
         columns: u8,
     ) -> Option<CachedGlyph> {
-        if let Some(hit) = self.glyph_cache.get(&(ch, bold, columns)) {
+        if let Some(hit) = self.glyph_cache.char(ch, bold, columns) {
             return *hit;
         }
         let mut buf = [0u8; 4];
         let text: &str = ch.encode_utf8(&mut buf);
-        // Rasterize at the actual screen size, then retain local-grid metrics.
-        // Canvas zoom otherwise scales a low-resolution glyph cached at 1x.
+        let fit = if is_private_use(ch) {
+            Fit::Icon
+        } else {
+            Fit::Text
+        };
+        let cached = self
+            .prepare_cell_run(cx, text, bold, columns, fit)
+            .and_then(|run| run.first().copied());
+        self.glyph_cache.insert_char(ch, bold, columns, cached);
+        cached
+    }
+
+    /// Slow path: a grapheme cluster (combining marks, a ZWJ emoji sequence,
+    /// a flag, a skin tone) shaped as one run and cached by the cluster, so
+    /// the font joins and places its parts instead of stacking them.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cluster_glyphs(
+        &mut self,
+        cx: &mut Cx2d,
+        cps: &[char],
+        bold: bool,
+        columns: u8,
+        x: f64,
+        y: f64,
+        color: Vec4f,
+    ) {
+        if self.glyph_cache.cluster(cps, bold, columns).is_none() {
+            let text: String = cps.iter().collect();
+            let run = self.prepare_cell_run(cx, &text, bold, columns, Fit::Centered);
+            self.glyph_cache.insert_cluster(cps, bold, columns, run);
+        }
+        let baseline = y + self.cell_baseline;
+        if let Some(Some(run)) = self.glyph_cache.cluster(cps, bold, columns) {
+            for glyph in run {
+                let point = Point::new(
+                    (x + glyph.x_offset_in_lpxs as f64) as f32,
+                    baseline as f32 + glyph.y_offset_in_lpxs,
+                );
+                self.draw_text.draw_rasterized_glyph_abs(
+                    cx,
+                    point,
+                    glyph.font_size_in_lpxs,
+                    glyph.rasterized,
+                    color,
+                );
+            }
+        }
+    }
+
+    /// Shape `text` as one run and fit it into `columns` cells: each glyph
+    /// relative to the cell's left edge and baseline. Rasterized at the
+    /// actual screen size, with local-grid metrics kept (canvas zoom would
+    /// otherwise scale a low-resolution glyph cached at 1x). `fit` says
+    /// whether a run is kept left, centred, or fitted as an icon.
+    fn prepare_cell_run(
+        &mut self,
+        cx: &mut Cx2d,
+        text: &str,
+        bold: bool,
+        columns: u8,
+        fit: Fit,
+    ) -> Option<Vec<CachedGlyph>> {
         let scale = self.raster_scale() as f32;
         let style = self.draw_text.text_style.clone();
         if bold {
@@ -1100,38 +1260,97 @@ impl MpTerm {
         self.draw_text.text_style.font_size *= scale;
         let prepared = self.draw_text.prepare_single_line_run(cx, text);
         self.draw_text.text_style = style;
-        let cached = prepared.and_then(|run| {
-            run.glyphs.first().map(|g| {
-                // Proportional fallback symbols must stay inside the cells
-                // allocated by the terminal, without shrinking normal mono
-                // glyphs for small rounding differences in the grid advance.
-                let available = self.cell_w as f32 * columns.max(1) as f32;
-                let advance = run.width_in_lpxs / scale;
-                let fit = if advance > available * 1.05 {
-                    available / advance
-                } else {
-                    1.0
-                };
-                let font_size = g.font_size_in_lpxs / scale;
-                let center_y = (-g.rasterized.origin_in_dpxs.y
-                    - g.rasterized.atlas_image_bounds.size.height as f32 * 0.5)
-                    * font_size
-                    / g.rasterized.dpxs_per_em;
-                // A glyph starts inside its own cells whatever the font
-                // says (some proportional CJK fonts report pen offsets far
-                // past one character).
-                let x_offset = (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit;
-                let x_offset = if x_offset.abs() > available { 0.0 } else { x_offset };
-                CachedGlyph {
+        let run = prepared?;
+        // Proportional fallback symbols must stay inside the cells
+        // allocated by the terminal, without shrinking normal mono glyphs
+        // for small rounding differences in the grid advance.
+        let available = self.cell_w as f32 * columns.max(1) as f32;
+        let fit = fit_glyphs(fit, run.width_in_lpxs / scale, self.cell_w as f32, columns);
+        // The vertical middle of the run's ink, so a shrunk run stays
+        // centred on the line instead of sinking to the baseline.
+        let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+        for g in &run.glyphs {
+            let per_dpx = g.font_size_in_lpxs / scale / g.rasterized.dpxs_per_em;
+            let upper = -g.rasterized.origin_in_dpxs.y * per_dpx;
+            let lower = upper - g.rasterized.atlas_image_bounds.size.height as f32 * per_dpx;
+            top = top.min(lower);
+            bottom = bottom.max(upper);
+        }
+        let center_y = if top <= bottom {
+            (top + bottom) * 0.5
+        } else {
+            0.0
+        };
+        // A run starts inside its own cells whatever the font says (some
+        // proportional CJK fonts report pen offsets far past one character).
+        let first_x = run
+            .glyphs
+            .first()
+            .map(|g| (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit.scale)?;
+        let x_origin = if first_x.abs() > available {
+            first_x
+        } else {
+            0.0
+        };
+        Some(
+            run.glyphs
+                .iter()
+                .map(|g| CachedGlyph {
                     rasterized: g.rasterized,
-                    font_size_in_lpxs: font_size * fit,
-                    x_offset_in_lpxs: x_offset,
-                    y_offset_in_lpxs: center_y * (1.0 - fit),
-                }
-            })
-        });
-        self.glyph_cache.insert((ch, bold, columns), cached);
-        cached
+                    font_size_in_lpxs: g.font_size_in_lpxs / scale * fit.scale,
+                    x_offset_in_lpxs: (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit.scale
+                        - x_origin
+                        + fit.x_shift,
+                    y_offset_in_lpxs: center_y * (1.0 - fit.scale),
+                })
+                .collect(),
+        )
+    }
+
+    /// A rule's thickness in whole device pixels, and the device pixels per
+    /// layout point (canvas zoom included).
+    fn rule_pixels(&self, cx: &Cx2d, heavy: bool) -> (f64, f64) {
+        let physical = cx.current_dpi_factor().max(0.1) * self.raster_scale();
+        let pixels = (self.font_size * self.presentation_font_scale * 0.07 * physical)
+            .round()
+            .max(1.0)
+            * if heavy { 2.0 } else { 1.0 };
+        (pixels, physical)
+    }
+
+    /// Powerline separators and shade blocks, drawn to fill their cells
+    /// exactly (`crate::sprites`); thin separators use the light box rule.
+    fn draw_sprite_glyph(
+        &mut self,
+        cx: &mut Cx2d,
+        ch: char,
+        x: f64,
+        y: f64,
+        columns: u8,
+        color: Vec4f,
+    ) -> bool {
+        let Some(sprite) = sprites::sprite_for(ch) else {
+            return false;
+        };
+        // Most screens have none: open the draw call on the first one.
+        if !self.sprites_open {
+            self.sprites_open = true;
+            self.draw_sprites.new_draw_call(cx);
+        }
+        let (pixels, physical) = self.rule_pixels(cx, false);
+        self.draw_sprites.color = vec4(color.x, color.y, color.z, color.w * sprite.alpha);
+        self.draw_sprites.shape = sprite.shape as u8 as f32;
+        self.draw_sprites.flip = vec2(sprite.flip_x as u8 as f32, sprite.flip_y as u8 as f32);
+        self.draw_sprites.thickness = (pixels / physical) as f32;
+        self.draw_sprites.pixel_size = (1.0 / physical) as f32;
+        self.draw_sprites.draw_abs(
+            cx,
+            Rect {
+                pos: dvec2(x, y),
+                size: dvec2(self.cell_w * columns.max(1) as f64, self.cell_h),
+            },
+        );
+        true
     }
 
     /// Cell geometry, rather than a font's side bearings/line gap, joins
@@ -1169,11 +1388,7 @@ impl MpTerm {
         };
         let scale = self.raster_scale();
         let dpi = cx.current_dpi_factor().max(0.1);
-        let physical = dpi * scale;
-        let pixels = ((self.font_size * self.presentation_font_scale * 0.07 * physical)
-            .round()
-            .max(1.0))
-            * if heavy { 2.0 } else { 1.0 };
+        let (pixels, physical) = self.rule_pixels(cx, heavy);
         let thickness = pixels / physical;
         let (mx, my) = (x + self.cell_w * 0.5, y + self.cell_h * 0.5);
         let translation = self
@@ -1962,10 +2177,10 @@ impl MpTerm {
             w: f64,
             color: Vec4f,
         }
-        struct GlyphDraw {
+        struct GlyphDraw<'a> {
             x: f64,
             y: f64,
-            ch: char,
+            glyph: CellGlyph<'a>,
             color: Vec4f,
             bold: bool,
             columns: u8,
@@ -1978,6 +2193,11 @@ impl MpTerm {
             kind: f32,
             strike: bool,
         }
+        let (sel_bg, sel_fg) = self.selection_colors(default_fg, default_bg);
+        let min_contrast = self.settings.minimum_contrast;
+        let bg_fill_color = Self::rgb_to_vec4(bg_fill, 1.0);
+        // Neighbouring cells mostly share colours: adjust each pair once.
+        let mut contrast_memo: Option<(Vec4f, Vec4f, Vec4f)> = None;
         let mut bg_runs: Vec<BgRun> = Vec::new();
         let mut glyphs: Vec<GlyphDraw> = Vec::with_capacity(rows * cols / 2);
         let mut decos: Vec<DecoDraw> = Vec::new();
@@ -2000,14 +2220,12 @@ impl MpTerm {
                     Some(c) => Self::resolve_colors(session, &c.style, global_inverse),
                     None => (None, None),
                 };
-                // Selected cells draw in inverse video (the default text
-                // color behind the default background color), so the text
-                // stays readable in light and dark themes alike.
-                let (fg, bg) = if self.cell_selected(abs, col) {
-                    (
-                        fg.map(|_| Self::rgb_to_vec4(default_bg, 1.0)),
-                        Some(Self::rgb_to_vec4(default_fg, 1.0)),
-                    )
+                // Selected cells take the selection colours: by default
+                // inverse video (the default text color behind the default
+                // background color), readable in light and dark themes alike.
+                let selected = self.cell_selected(abs, col);
+                let (fg, bg) = if selected {
+                    (fg.map(|_| sel_fg), Some(sel_bg))
                 } else {
                     (fg, bg)
                 };
@@ -2034,6 +2252,27 @@ impl MpTerm {
 
                 let Some(cell) = cell else { continue };
                 let Some(fg) = fg else { continue };
+                let glyph = cell_glyph(&cell.content);
+
+                // Minimum contrast: text only (not a selection's chosen
+                // colours, nor box, block and Powerline shapes, whose colour
+                // is a fill matched to their neighbours).
+                let fg = if min_contrast > contrast::OFF
+                    && !selected
+                    && !matches!(glyph, Some(CellGlyph::Char(ch)) if sprites::is_graphic(ch))
+                {
+                    let back = bg.unwrap_or(bg_fill_color);
+                    match contrast_memo {
+                        Some((f, b, out)) if f == fg && b == back => out,
+                        _ => {
+                            let out = contrast_fg(fg, back, min_contrast);
+                            contrast_memo = Some((fg, back, out));
+                            out
+                        }
+                    }
+                } else {
+                    fg
+                };
 
                 // Decorations.
                 let underline = cell.style.flags.underline();
@@ -2068,35 +2307,26 @@ impl MpTerm {
                     }
                 }
 
-                // Text.
-                match &cell.content {
-                    CellContent::Char(c) | CellContent::WideChar(c) => {
-                        if *c != ' ' {
-                            glyphs.push(GlyphDraw {
-                                x: origin_x + col as f64 * cell_w,
-                                y,
-                                ch: *c,
-                                color: fg,
-                                bold: cell.style.flags.has(StyleFlags::BOLD),
-                                columns: cell.content.width(),
-                            });
-                        }
+                // Text: one glyph for a codepoint, one shaped run for a
+                // grapheme cluster.
+                if let Some(glyph) = glyph {
+                    let mut columns = cell.content.width();
+                    let icon = matches!(glyph, CellGlyph::Char(ch) if is_private_use(ch) && !sprites::is_graphic(ch));
+                    if icon {
+                        let next_is_blank = col + 1 < cols
+                            && row
+                                .cell(col + 1)
+                                .is_none_or(|next| cell_glyph(&next.content).is_none());
+                        columns = icon_columns(columns, next_is_blank);
                     }
-                    CellContent::Cluster(cluster) => {
-                        // First codepoint via the cache; combining marks are
-                        // drawn over it.
-                        for c in &cluster.cps {
-                            glyphs.push(GlyphDraw {
-                                x: origin_x + col as f64 * cell_w,
-                                y,
-                                ch: *c,
-                                color: fg,
-                                bold: cell.style.flags.has(StyleFlags::BOLD),
-                                columns: cell.content.width(),
-                            });
-                        }
-                    }
-                    _ => {}
+                    glyphs.push(GlyphDraw {
+                        x: origin_x + col as f64 * cell_w,
+                        y,
+                        glyph,
+                        color: fg,
+                        bold: cell.style.flags.has(StyleFlags::BOLD),
+                        columns,
+                    });
                 }
             }
             if let Some((start, end, color)) = run.take() {
@@ -2173,6 +2403,7 @@ impl MpTerm {
 
         // Layer 3: glyphs, one batch.
         self.draw_boxes.new_draw_call(cx);
+        self.sprites_open = false;
         self.draw_dots.begin();
         self.draw_text.new_draw_call(cx);
         self.draw_text.begin_many_instances(cx);
@@ -2196,13 +2427,26 @@ impl MpTerm {
                     color = Self::rgb_to_vec4(default_bg, 1.0);
                 }
             }
-            if self.draw_box_glyph(cx, g.ch, g.x, g.y, color) {
-                continue;
+            let ch = match g.glyph {
+                CellGlyph::Char(ch) => ch,
+                CellGlyph::Cluster(cps) => {
+                    self.draw_cluster_glyphs(cx, cps, g.bold, g.columns, g.x, g.y, color);
+                    continue;
+                }
+            };
+            // Everything drawn without a font sits at U+2500 and above.
+            if ch >= '\u{2500}' {
+                if self.draw_sprite_glyph(cx, ch, g.x, g.y, g.columns, color) {
+                    continue;
+                }
+                if self.draw_box_glyph(cx, ch, g.x, g.y, color) {
+                    continue;
+                }
+                if self.draw_braille_glyph(ch, g.x, g.y, color) {
+                    continue;
+                }
             }
-            if self.draw_braille_glyph(g.ch, g.x, g.y, color) {
-                continue;
-            }
-            if let Some(glyph) = self.cached_glyph(cx, g.ch, g.bold, g.columns) {
+            if let Some(glyph) = self.cached_glyph(cx, ch, g.bold, g.columns) {
                 let point = Point::new(
                     (g.x + glyph.x_offset_in_lpxs as f64) as f32,
                     (g.y + baseline) as f32 + glyph.y_offset_in_lpxs,
@@ -2829,6 +3073,12 @@ impl MpTerm {
     fn redraw(&mut self, cx: &mut Cx) {
         self.draw_bg.redraw(cx);
     }
+}
+
+/// `fg` raised to `min` contrast against `bg`, its alpha (faint) kept.
+fn contrast_fg(fg: Vec4f, bg: Vec4f, min: f32) -> Vec4f {
+    let [r, g, b] = contrast::ensure([fg.x, fg.y, fg.z], [bg.x, bg.y, bg.z], min);
+    vec4(r, g, b, fg.w)
 }
 
 fn parse_hex_rgb(s: &str) -> Option<Rgb> {
