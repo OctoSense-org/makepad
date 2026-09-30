@@ -4796,6 +4796,14 @@ pub struct MapView {
     pending_ready_tiles: Vec<(TileKey, TileBuffers)>,
     #[rust]
     last_tile_upload_frame: u64,
+    /// The drawn frame the upload continuation last asked for a frame on.
+    #[rust]
+    continued_at_frame: u64,
+    /// The tile fade timer is running, and the map drew since its last tick.
+    #[rust]
+    fade_armed: bool,
+    #[rust]
+    fade_drawn: bool,
     /// Web-only bounded degradation/retry state. Kept on every target so
     /// native unit tests can exercise the policy without cfg-shaped APIs.
     #[rust]
@@ -5146,7 +5154,14 @@ impl Widget for MapView {
         self.handle_archive_watch(cx, event);
         if self.tile_fade_timer.is_event(event).is_some() {
             self.redraw(cx);
-            if self.tiles.values().any(|entry| entry.fade.is_some()) {
+            // Fades end in the draw (`ensure_visible_tiles`): tick again only
+            // if the map drew since the last tick. A map that is not drawn
+            // (Maps in the background) would otherwise redraw every 16 ms
+            // forever; its next draw restarts the ticks (`draw_walk`).
+            self.fade_armed = self.fade_drawn
+                && self.tiles.values().any(|entry| entry.fade.is_some());
+            self.fade_drawn = false;
+            if self.fade_armed {
                 self.tile_fade_timer = cx.start_timeout(0.016);
             }
         }
@@ -5435,6 +5450,17 @@ impl Widget for MapView {
             }
         }
         self.perf_last_frame = Some(perf_start);
+        // Ready tiles left over while the map was not drawn: continue the
+        // upload now that it is (see the continuation in handle_event).
+        if !self.pending_ready_tiles.is_empty() {
+            cx.new_next_frame();
+        }
+        // Tile fades left waiting while the map was not drawn: tick again.
+        self.fade_drawn = true;
+        if !self.fade_armed && self.tiles.values().any(|entry| entry.fade.is_some()) {
+            self.fade_armed = true;
+            self.tile_fade_timer = cx.start_timeout(0.016);
+        }
 
         // The map's own draw list carries the clip: hosted as a pane beside
         // other content, every tile/terrain/label draw clamps against
@@ -6932,6 +6958,7 @@ impl MapView {
         }
         cx.stop_timer(self.tile_fade_timer);
         self.tile_fade_timer = cx.start_timeout(0.016);
+        self.fade_armed = true;
 
         self.tiles.insert(
             tile_key,
@@ -7488,10 +7515,17 @@ impl MapView {
             }
             redraw = true;
         }
-        if !self.pending_ready_tiles.is_empty() {
+        if !self.pending_ready_tiles.is_empty()
+            && self.continued_at_frame != self.frame_counter
+        {
             // A pass runs once per frame, and a draw alone never re-enters
             // handle_event: the continuation has to be an event that arrives
             // after the next frame, or the queue waits for an unrelated timer.
+            // Only while the map draws: uploads wait for a drawn frame, so a
+            // map that is not drawn (a hosted app sent to the background)
+            // would otherwise ask for a frame and a full redraw every frame
+            // forever. Its draw re-arms the continuation (`draw_walk`).
+            self.continued_at_frame = self.frame_counter;
             cx.new_next_frame();
             cx.redraw_all();
             redraw = true;
