@@ -93,6 +93,12 @@ pub struct Settings {
     /// theme without them draws the selection in inverse video.
     pub selection_background: Option<u32>,
     pub selection_foreground: Option<u32>,
+    /// Scrollback search highlights (0xRRGGBB): every match, and the
+    /// current one. `None` takes Ghostty's defaults ([`search_colors`]).
+    pub search_background: Option<u32>,
+    pub search_foreground: Option<u32>,
+    pub search_selected_background: Option<u32>,
+    pub search_selected_foreground: Option<u32>,
     /// The shape a program that sets none (DECSCUSR 0) gets.
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
@@ -139,6 +145,10 @@ impl Default for Settings {
             minimum_contrast: crate::contrast::OFF,
             selection_background: None,
             selection_foreground: None,
+            search_background: None,
+            search_foreground: None,
+            search_selected_background: None,
+            search_selected_foreground: None,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             term: "xterm-256color".into(),
@@ -211,6 +221,23 @@ pub fn selection_colors(
     (bg.map_or(default_fg, rgb), fg.map_or(default_bg, rgb))
 }
 
+/// Search highlights as ((background, text) of every match, (background,
+/// text) of the current one): the settings' own, else Ghostty's defaults,
+/// light amber and orange under black text, which read on light and dark
+/// themes alike.
+pub fn search_colors(s: &Settings) -> ((Rgb, Rgb), (Rgb, Rgb)) {
+    (
+        (
+            rgb(s.search_background.unwrap_or(0xffe082)),
+            rgb(s.search_foreground.unwrap_or(0x000000)),
+        ),
+        (
+            rgb(s.search_selected_background.unwrap_or(0xf2a57e)),
+            rgb(s.search_selected_foreground.unwrap_or(0x000000)),
+        ),
+    )
+}
+
 /// A `TERM` value: short, and only characters terminfo names use.
 fn valid_term(value: &str) -> bool {
     !value.is_empty()
@@ -271,6 +298,20 @@ impl Settings {
                 }
                 "selection-foreground" => {
                     s.selection_foreground = parse_color_setting(value, s.selection_foreground)
+                }
+                "search-background" => {
+                    s.search_background = parse_color_setting(value, s.search_background)
+                }
+                "search-foreground" => {
+                    s.search_foreground = parse_color_setting(value, s.search_foreground)
+                }
+                "search-selected-background" => {
+                    s.search_selected_background =
+                        parse_color_setting(value, s.search_selected_background)
+                }
+                "search-selected-foreground" => {
+                    s.search_selected_foreground =
+                        parse_color_setting(value, s.search_selected_foreground)
                 }
                 "cursor-shape" => {
                     s.cursor_shape = match value {
@@ -364,6 +405,22 @@ impl Settings {
         line(
             "selection-foreground",
             color_setting_text(self.selection_foreground),
+        );
+        line(
+            "search-background",
+            color_setting_text(self.search_background),
+        );
+        line(
+            "search-foreground",
+            color_setting_text(self.search_foreground),
+        );
+        line(
+            "search-selected-background",
+            color_setting_text(self.search_selected_background),
+        );
+        line(
+            "search-selected-foreground",
+            color_setting_text(self.search_selected_foreground),
         );
         line(
             "cursor-shape",
@@ -603,6 +660,10 @@ mod tests {
             minimum_contrast: 4.5,
             selection_background: Some(0x33467c),
             selection_foreground: Some(0xc0caf5),
+            search_background: Some(0x223344),
+            search_foreground: Some(0xeeeeee),
+            search_selected_background: Some(0xaa5500),
+            search_selected_foreground: Some(0x000001),
             cursor_shape: CursorShape::Bar,
             cursor_blink: true,
             term: "xterm-ghostty".into(),
@@ -666,6 +727,27 @@ mod tests {
             Settings::parse("minimum-contrast = NaN").minimum_contrast,
             d.minimum_contrast
         );
+    }
+
+    #[test]
+    fn search_colours_parse_and_default_to_ghosttys() {
+        let d = Settings::default();
+        let black = Rgb::new(0, 0, 0);
+        assert_eq!(
+            search_colors(&d),
+            (
+                (Rgb::new(0xff, 0xe0, 0x82), black),
+                (Rgb::new(0xf2, 0xa5, 0x7e), black)
+            )
+        );
+        let s =
+            Settings::parse("search-background = #112233\nsearch-selected-foreground = ffffff\n");
+        assert_eq!(s.search_background, Some(0x112233));
+        assert_eq!(s.search_selected_foreground, Some(0xffffff));
+        assert_eq!(Settings::parse(&s.to_text()), s);
+        assert!(d
+            .to_text()
+            .contains("search-selected-background = default\n"));
     }
 
     #[test]

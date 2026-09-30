@@ -41,6 +41,13 @@ use crate::term::screen::CursorStyle;
 use crate::term::style::{StyleColor, StyleFlags};
 use crate::term::terminal::TermEvent;
 
+// The scrollback search bar: a child module, so it reaches the widget's
+// fields (the matching itself is `crate::search`).
+#[path = "search_bar.rs"]
+mod search_bar;
+use crate::search::Search;
+use search_bar::SearchUi;
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -779,6 +786,11 @@ pub struct MpTerm {
     link_press: Option<(LinkHit, Vec2d)>,
     #[rust]
     font_roots: Vec<ScriptObjectRef>,
+    /// Scrollback search (Cmd+F / Ctrl+Shift+F): the matches and the bar.
+    #[rust]
+    search: Search,
+    #[rust]
+    search_ui: SearchUi,
 }
 
 impl ScriptHook for MpTerm {
@@ -2261,7 +2273,9 @@ impl MpTerm {
     }
 
     fn draw_terminal_inner(&mut self, cx: &mut Cx2d, session: &mut Session) {
-        session.terminal.dirty = false;
+        let output_changed = std::mem::take(&mut session.terminal.dirty);
+        // Search: matches follow the output; history is read a step a frame.
+        self.search_frame(cx, &session.terminal, output_changed);
 
         let has_focus = cx.has_key_focus(self.area);
         let padding = self.inner_padding();
@@ -2334,6 +2348,8 @@ impl MpTerm {
         let selection = self
             .sel_ordered()
             .map(|(start, end)| session.terminal.screen().snap_selection(start, end));
+        let search_colors = self.search_colors();
+        let mut search_marks: Vec<u8> = Vec::new();
         let min_contrast = self.settings.minimum_contrast;
         let link_hover = self.link_hover.clone();
         let bg_fill_color = Self::rgb_to_vec4(bg_fill, 1.0);
@@ -2384,6 +2400,7 @@ impl MpTerm {
             let mut run: Option<(usize, usize, Vec4f)> = None;
             seg.clear();
             row_text.clear();
+            self.search_row_marks(abs, cols, &mut search_marks);
             for col in 0..cols {
                 seg.push(SegCell::Blank);
                 row_text.push(None);
@@ -2396,10 +2413,13 @@ impl MpTerm {
                 // inverse video (the default text color behind the default
                 // background color), readable in light and dark themes alike.
                 let selected = in_selection(selection, abs, col);
-                let (fg, bg) = if selected {
-                    (fg.map(|_| sel_fg), Some(sel_bg))
-                } else {
-                    (fg, bg)
+                // Search matches: the selection wins over them.
+                let mark = search_marks.get(col).copied().unwrap_or(0);
+                let found = Self::search_cell_colors(search_colors, mark);
+                let (fg, bg) = match found {
+                    _ if selected => (fg.map(|_| sel_fg), Some(sel_bg)),
+                    Some((found_bg, found_fg)) => (fg.map(|_| found_fg), Some(found_bg)),
+                    None => (fg, bg),
                 };
 
                 // Merge bg runs.
@@ -2431,6 +2451,7 @@ impl MpTerm {
                 // is a fill matched to their neighbours).
                 let fg = if min_contrast > contrast::OFF
                     && !selected
+                    && found.is_none()
                     && !matches!(glyph, Some(CellGlyph::Char(ch)) if sprites::is_graphic(ch))
                 {
                     let back = bg.unwrap_or(bg_fill_color);
@@ -2506,7 +2527,7 @@ impl MpTerm {
                             bold: cell.style.flags.has(StyleFlags::BOLD),
                             italic: cell.style.flags.has(StyleFlags::ITALIC),
                         },
-                        selected,
+                        selected: selected || found.is_some(),
                     };
                     row_text[col] = Some((fg, glyph));
                 } else if let Some(glyph) = glyph {
@@ -2792,6 +2813,8 @@ impl MpTerm {
             );
         }
 
+        self.draw_search_bar(cx, session.terminal.screen(), default_fg, default_bg);
+
         // Exited banner.
         if session.exited {
             self.draw_cell_bg.new_draw_call(cx);
@@ -2922,10 +2945,10 @@ impl Widget for MpTerm {
                     (sc.cursor.x, sc.cursor.y)
                 })
                 .unwrap_or((0, 0));
-            let ime = self.inner_padding() + dvec2(
-                s.0 as f64 * self.cell_w,
-                (s.1 + 1) as f64 * self.cell_h,
-            );
+            let ime = self.search_ui.caret.unwrap_or_else(|| {
+                self.inner_padding()
+                    + dvec2(s.0 as f64 * self.cell_w, (s.1 + 1) as f64 * self.cell_h)
+            });
             if let Some((anchor, transform)) = self.canvas_ime_anchor {
                 let screen = (self.rect.pos + ime) * transform.scale
                     + transform.translation;
@@ -2939,6 +2962,7 @@ impl Widget for MpTerm {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        self.search_next_frame(cx, event);
         if self.blink_timer.is_event(event).is_some() {
             self.blink_armed = false;
             self.draw_bg.redraw(cx);
@@ -3058,6 +3082,11 @@ impl Widget for MpTerm {
             Event::KeyUp(e) if orphan_key => Hit::KeyUp(*e),
             _ => event.hits(cx, self.area),
         };
+        // The search bar, while open, takes the keyboard: the program gets
+        // no keys until it closes.
+        if self.search_event(cx, &hit) {
+            return;
+        }
         match hit {
             Hit::FingerDown(e) => {
                 cx.set_key_focus(self.area);

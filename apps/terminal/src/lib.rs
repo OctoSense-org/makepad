@@ -15,6 +15,7 @@ pub mod procinfo;
 #[cfg(test)]
 mod robustness;
 pub mod pty;
+pub mod search;
 // The platform's own module, not a second copy by source path: `Cx::pre_start`
 // records there that this executable is its own PTY helper.
 #[cfg(target_os = "macos")]
