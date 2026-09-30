@@ -35,6 +35,8 @@ makepad-app-module = { path = "../../libs/app_module" }
 makepad-strict-json = { path = "../../libs/strict_json" }
 makepad-wm-theme = { path = "../../libs/wm_theme" }
 makepad-wm-api = { path = "../../libs/wm_api" }
+# Scrollback search's regex mode (already in the tree via makepad-script).
+makepad-regex = { path = "../../libs/regex" }
 
 # The font parser and shaper the text engine uses, for fuzzing corrupt
 # fonts through glyph outlining and shaping (src/robustness.rs).
