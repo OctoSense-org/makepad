@@ -163,6 +163,15 @@ where
     }
 }
 
+/// A host that hands this launch a connect token (see
+/// `studio_launch_token`) gets it back in the websocket handshake.
+#[allow(dead_code)]
+fn set_studio_token_header(request: &mut HttpRequest) {
+    if let Some(token) = crate::app_main::studio_launch_token() {
+        request.set_header(crate::app_main::STUDIO_TOKEN_HEADER.to_string(), token);
+    }
+}
+
 fn studio_ws_send_binary(data: Vec<u8>) -> Result<(), ()> {
     let runtime = STUDIO_NET_RUNTIME
         .lock()
@@ -329,6 +338,7 @@ impl Cx {
             STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
             let mut request = HttpRequest::new(studio_http.to_string(), HttpMethod::GET);
             request.set_websocket_transport(WebSocketTransport::PlainTcp);
+            set_studio_token_header(&mut request);
             let network = self.net.clone();
             #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(gpusim), linux_direct, use_vulkan))]
             let network = if crate::app_main::should_run_stdin_loop_from_env() {
@@ -376,6 +386,7 @@ impl Cx {
         STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
         let mut request = HttpRequest::new(self.studio_http.clone(), HttpMethod::GET);
         request.set_websocket_transport(WebSocketTransport::PlainTcp);
+        set_studio_token_header(&mut request);
         *STUDIO_NET_RUNTIME.lock().unwrap() = Some(self.net.clone());
         match self.net.ws_open(LiveId(STUDIO_SOCKET_ID), request) {
             Ok(()) => self.run_studio_websocket_thread(),

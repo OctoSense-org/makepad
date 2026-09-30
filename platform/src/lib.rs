@@ -121,7 +121,8 @@ pub mod screen_capture;
 pub mod audio_output_tap;
 pub mod shader_error;
 pub use crate::app_main::{
-    new_cx_with_font_set, resolve_studio_http, should_run_stdin_loop_from_env,
+    new_cx_with_font_set, resolve_studio_http, should_run_stdin_loop_from_env, studio_launch_token,
+    STUDIO_TOKEN_HEADER, STUDIO_TOKEN_STDIN_ENV,
 };
 // Working-tree startup instrumentation (`MAKEPAD_TRACE=startup`).
 pub use crate::cx::{

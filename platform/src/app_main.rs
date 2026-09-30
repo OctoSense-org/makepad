@@ -132,6 +132,55 @@ pub(crate) fn resolve_studio_build() -> Option<String> {
         })
 }
 
+/// The env var a host sets when it writes this launch's connect token as
+/// the first line of the child's stdin.
+pub const STUDIO_TOKEN_STDIN_ENV: &str = "STUDIO_TOKEN_STDIN";
+
+/// The header a `--stdin-loop` child presents its launch token in when it
+/// opens the studio websocket.
+pub const STUDIO_TOKEN_HEADER: &str = "X-Studio-Token";
+
+/// This launch's connect token: the first line of stdin when the host set
+/// `STUDIO_TOKEN_STDIN=1` (a host that hands out a per-launch secret, such
+/// as OctoSense's window manager), read once; `None` otherwise. It travels
+/// over stdin, never the environment or the command line, so neither
+/// `ps` nor this app's own children see it.
+pub fn studio_launch_token() -> Option<String> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let wanted = std::env::var(STUDIO_TOKEN_STDIN_ENV).is_ok_and(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+                });
+                if !wanted {
+                    return None;
+                }
+                // One byte at a time, up to the newline: nothing past the
+                // token is consumed, and a long line cannot grow unbounded.
+                use std::io::Read;
+                let mut stdin = std::io::stdin().lock();
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while line.len() < 512 {
+                    match stdin.read(&mut byte) {
+                        Ok(1) if byte[0] == b'\n' => break,
+                        Ok(1) => line.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let token = String::from_utf8(line).ok()?.trim().to_string();
+                (!token.is_empty() && token.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(token)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                None
+            }
+        })
+        .clone()
+}
+
 pub(crate) fn resolve_studio_crate() -> Option<String> {
     std::env::var("STUDIO_CRATE")
         .ok()
