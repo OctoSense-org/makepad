@@ -25,7 +25,10 @@
 //! Hosting one is the host's job (the WM's `module_host.rs`): allocate the
 //! isolate, apply the theme, `register`, `create`, seat the root in a tile,
 //! bridge the executor onto the AI bus, and tear the instance down in the
-//! order §3 lists. A module is trusted native code: the isolate bounds its
+//! order §3 lists. Before a teardown the person asked for (a tile closed, the
+//! host quitting) the host asks [`AppModule::close_requested`] and keeps the
+//! instance on a [`CloseDecision::Veto`] until its root emits
+//! [`ModuleCloseAction::Confirmed`]. A module is trusted native code: the isolate bounds its
 //! SCRIPT, the host's grant bounds its capabilities, and the rule that it
 //! never touches the filesystem, processes, sockets or threads directly is
 //! what makes one module run in every host, the web included.
@@ -65,6 +68,52 @@ pub trait AppModule: Sync + 'static {
     /// `location`, `clipboard`, `net`… A trusted-code declaration the
     /// host's grant checks; the isolate does not enforce it.
     fn capabilities(&self) -> &'static [&'static str];
+    /// The host is about to close the instance whose root is `root`: its
+    /// tile is being closed, its window dismissed, or the host is quitting.
+    /// Ask BEFORE dropping anything; the default allows every close, so a
+    /// module with nothing to lose needs no code.
+    ///
+    /// [`CloseDecision::Veto`] means the instance holds something a close
+    /// would destroy (a terminal's running job, an unsaved draft) and is now
+    /// showing its own confirmation in `root`. The host then keeps the
+    /// instance, its tile and its isolate exactly as they are, and:
+    ///
+    /// - when the person confirms, the root emits
+    ///   [`ModuleCloseAction::Confirmed`] (a widget action from
+    ///   `root.widget_uid()`); the host closes the instance then, without
+    ///   asking again (asking again is harmless: a confirmed instance
+    ///   answers `Allow`);
+    /// - when the person cancels, nothing is emitted and nothing closes.
+    ///
+    /// A host that must end the instance anyway (the process is being
+    /// killed) may skip the question; a host quitting as a whole asks every
+    /// instance and waits while any of them vetoes.
+    ///
+    /// Called on the UI thread, outside the isolate's script entry, like
+    /// [`ServiceExecutor::execute`].
+    fn close_requested(&self, _cx: &mut Cx, _root: &WidgetRef) -> CloseDecision {
+        CloseDecision::Allow
+    }
+}
+
+/// A module's answer to [`AppModule::close_requested`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloseDecision {
+    /// Close now.
+    #[default]
+    Allow,
+    /// Keep the instance: it is asking the person first and emits
+    /// [`ModuleCloseAction::Confirmed`] if they agree.
+    Veto,
+}
+
+/// What a module's root emits about a close it vetoed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ModuleCloseAction {
+    #[default]
+    None,
+    /// The person confirmed the close the module vetoed: close it now.
+    Confirmed,
 }
 
 /// The owner token of one instance. Every lease the host opens for the
@@ -421,6 +470,36 @@ mod tests {
             .arg("sheet", OpenArgKind::Text, false)
             .arg("row", OpenArgKind::Number, false)
             .arg("readonly", OpenArgKind::Bool, false)
+    }
+
+    struct Plain;
+
+    impl AppModule for Plain {
+        fn id(&self) -> &'static str {
+            "plain"
+        }
+        fn label(&self) -> &'static str {
+            "Plain"
+        }
+        fn register(&self, _vm: &mut ScriptVm) {}
+        fn open_schema(&self) -> OpenSchema {
+            OpenSchema::new(1)
+        }
+        fn create(&self, _vm: &mut ScriptVm, _open: ValidatedOpen, _handles: InstanceHandles) -> InstanceParts {
+            unreachable!("not hosted in this test")
+        }
+        fn capabilities(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn a_module_that_says_nothing_allows_every_close() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let module: &dyn AppModule = &Plain;
+        assert_eq!(module.close_requested(&mut cx, &WidgetRef::empty()), CloseDecision::Allow);
+        assert_eq!(CloseDecision::default(), CloseDecision::Allow);
+        assert_eq!(ModuleCloseAction::default(), ModuleCloseAction::None);
     }
 
     #[test]
