@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 use crate::term::charsets::CharsetState;
 use crate::term::page::{Cell, Row, SemanticPrompt};
 use crate::term::style::Style;
-use crate::term::unicode::is_syllable_script;
 
 /// DECSCUSR cursor styles (ghostty ansi.zig CursorStyle + cursor.zig).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -484,16 +483,6 @@ impl Screen {
                     // A tail without its head, or a stray spacer: blank.
                     CellContent::WideTail | CellContent::WideSpacerHead => {
                         cell.content = CellContent::Empty;
-                    }
-                    // A syllable cluster wider than the screen narrows to
-                    // fit it, keeping its text.
-                    CellContent::Cluster(ref mut c)
-                        if c.width as usize > cols
-                            && c.cps
-                                .first()
-                                .is_some_and(|&ch| is_syllable_script(ch as u32)) =>
-                    {
-                        c.width = cols as u8;
                     }
                     // A 1-wide screen can't hold a wide char.
                     _ if cell.content.is_wide_head() && cols < 2 => {

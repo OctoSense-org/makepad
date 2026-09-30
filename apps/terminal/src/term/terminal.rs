@@ -14,7 +14,7 @@ use crate::term::screen::{CursorStyle, SavedCursor, Screen};
 use crate::term::sgr::{attributes, Attribute};
 use crate::term::style::{StyleColor, StyleFlags};
 use crate::term::unicode::{
-    char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, syllable_width, GraphemeState,
+    cell_break, char_width, grapheme_break, is_emoji_modifier, is_emoji_vs_base, GraphemeState,
 };
 
 pub const DEFAULT_SCROLLBACK: usize = 10_000;
@@ -391,7 +391,9 @@ impl Terminal {
             let _ = grapheme_break(prev_cp, c as u32, &mut state);
             prev_cp = c as u32;
         }
-        if grapheme_break(prev_cp, cp, &mut state) {
+        // The grid's boundaries: a syllable script's conjunct takes a cell
+        // per consonant (`unicode::cell_break`).
+        if cell_break(prev_cp, cp, &mut state) {
             return false;
         }
 
@@ -407,14 +409,7 @@ impl Terminal {
         let mut new_cps = cps;
         new_cps.push(ch);
         let mut new_width = old_width;
-        // A syllable cluster (Devanagari..Sinhala) takes one cell per base
-        // letter instead (`unicode::syllable_width`); it only ever grows as
-        // codepoints arrive. It never takes more than the printable region.
-        let syllable = syllable_width(new_cps.iter().map(|&c| c as u32));
-        if let Some(width) = syllable {
-            let region = right_limit.saturating_sub(self.screen().left_margin).max(1);
-            new_width = width.min(region.min(u8::MAX as usize) as u8).max(old_width);
-        } else if cp == 0xfe0f && old_width == 1 && is_emoji_vs_base(prev_cp) {
+        if cp == 0xfe0f && old_width == 1 && is_emoji_vs_base(prev_cp) {
             new_width = 2;
         } else if cp == 0xfe0e && old_width == 2 && is_emoji_vs_base(prev_cp) {
             new_width = 1;
@@ -451,18 +446,13 @@ impl Terminal {
             return true;
         }
 
-        // Narrow -> wide, or a syllable gaining a cell: the new tails need
-        // room on this row.
+        // Narrow -> wide: the new tail needs room on this row.
         let cols = self.cols();
         let limit = right_limit.min(cols);
         if px + new_width as usize > limit {
             if !wraparound {
-                // Nowhere to go. An emoji's presentation selector is dropped
-                // (as before); a syllable keeps its text in the cells left.
-                if syllable.is_none() {
-                    return true;
-                }
-                new_width = (limit - px).max(old_width as usize) as u8;
+                // Nowhere to go: the presentation selector is dropped.
+                return true;
             } else {
                 // Wrap the whole cluster to the next line, leaving spacer
                 // heads (at the true screen edge) where it stood.
@@ -2436,54 +2426,68 @@ mod tests {
 
     // ------------------------------------------------ syllable clusters
 
-    /// Mode 2027 gives a syllable (Devanagari..Sinhala) one cell per base
-    /// letter; the widths come from `unicode::syllable_width`.
-    #[test]
-    fn syllable_widths_with_2027() {
-        let (mut s, mut t) = term(40, 2);
-        feed(&mut s, &mut t, "क्षत्रिय स्त्री नमस्ते धर्म".as_bytes());
-        let cells: Vec<(String, u8)> = head_cells(&t);
-        let expected: Vec<(String, u8)> = [
-            ("क्ष", 2),
-            ("त्रि", 1),
-            ("य", 1),
-            (" ", 1),
-            ("स्त्री", 2),
-            (" ", 1),
-            ("न", 1),
-            ("म", 1),
-            ("स्ते", 2),
-            (" ", 1),
-            ("ध", 1),
-            ("र्म", 2),
-        ]
-        .iter()
-        .map(|&(text, w)| (text.to_string(), w))
-        .collect();
-        assert_eq!(cells, expected);
-        // 4 + 1 + 2 + 1 + 4 + 1 + 3 cells, the cursor right after them.
-        assert_eq!(t.screen().cursor.x, 16);
-        assert_eq!(row_text(&t, 0), "क्षत्रिय स्त्री नमस्ते धर्म");
-        // The tails are there, in the head's style.
-        let row = t.screen().row(0);
-        assert!(row.cell(0).unwrap().content.is_wide_head());
-        assert_eq!(row.cell(1).unwrap().content, CellContent::WideTail);
-        assert_eq!(row.span_at(1), (0, 2));
-
-        // Bengali, Tamil, Malayalam.
-        for (text, widths) in [
-            ("ক্ষমা স্ত্রী", &[2, 1, 1, 2][..]),
-            ("நன்றி க்ஷ", &[1, 1, 1, 1, 1, 1][..]),
-            ("ക്ഷമ സ്ത്രീ", &[2, 1, 1, 2][..]),
-        ] {
-            let (cells, cursor) = print_graphemes(text, true);
-            let got: Vec<u8> = cells.iter().map(|&(_, w)| w).collect();
-            assert_eq!(got, widths, "{text}");
-            assert_eq!(
-                cursor,
-                widths.iter().map(|&w| w as usize).sum::<usize>(),
-                "{text}"
+    /// What zsh (with `combiningchars`, macOS's default) writes while a
+    /// person types `text`: each base letter as it is, each mark (virama,
+    /// vowel sign, Mn or Mc) as a backspace, the base letter again, then
+    /// the mark. zsh counts one column per base letter and none per mark.
+    fn zsh_typing(text: &str) -> (Vec<u8>, usize) {
+        let mut out = Vec::new();
+        let mut base = None;
+        let mut columns = 0;
+        for ch in text.chars() {
+            let mark = matches!(
+                crate::term::unicode::grapheme_class(ch as u32),
+                crate::term::unicode::GraphemeClass::Extend
+                    | crate::term::unicode::GraphemeClass::SpacingMark
             );
+            if let (true, Some(b)) = (mark, base) {
+                out.push(0x08);
+                out.extend_from_slice(format!("{b}{ch}").as_bytes());
+            } else {
+                out.extend_from_slice(ch.to_string().as_bytes());
+                base = Some(ch);
+                columns += 1;
+            }
+        }
+        (out, columns)
+    }
+
+    /// A line editor that thinks in wcwidth columns (zsh, readline) redraws
+    /// a Devanagari line letter by letter; the grid must keep every letter
+    /// and put the cursor where the editor thinks it is.
+    #[test]
+    fn zsh_typing_devanagari_keeps_every_letter() {
+        for text in ["नमस्ते क्षत्रिय स्त्री", "ক্ষমা স্ত্রী", "ക്ഷമ സ്ത്രീ", "धर्म"]
+        {
+            let (bytes, columns) = zsh_typing(text);
+            let (mut s, mut t) = term(40, 2);
+            feed(&mut s, &mut t, &bytes);
+            assert_eq!(row_text(&t, 0), text, "{text}");
+            assert_eq!(t.screen().cursor.x, columns, "{text}");
+        }
+    }
+
+    /// Mode 2027 gives a syllable script (Devanagari..Sinhala) one cell
+    /// per base letter: a conjunct's consonants take a cell each, marks
+    /// (the virama, vowel signs) stay in their letter's cell.
+    #[test]
+    fn syllable_cells_with_2027() {
+        let (cells, cursor) = print_graphemes("क्षत्रिय स्त्री", true);
+        let expected: Vec<(String, u8)> = ["क्", "ष", "त्", "रि", "य", " ", "स्", "त्", "री"]
+            .iter()
+            .map(|&text| (text.to_string(), 1))
+            .collect();
+        assert_eq!(cells, expected);
+        assert_eq!(cursor, 9);
+        for (text, cells) in [
+            ("नमस्ते धर्म", 8),
+            ("ক্ষমা স্ত্রী", 7),
+            ("நன்றி க்ஷ", 6),
+            ("ക്ഷമ സ്ത്രീ", 7),
+        ] {
+            let (got, cursor) = print_graphemes(text, true);
+            assert!(got.iter().all(|&(_, w)| w == 1), "{text}");
+            assert_eq!((got.len(), cursor), (cells, cells), "{text}");
         }
     }
 
@@ -2504,111 +2508,59 @@ mod tests {
         assert_eq!(cursor, 4);
     }
 
-    /// A syllable that grows past the right edge while it is being typed
-    /// wraps whole, leaving spacer heads, and the cursor follows it.
+    /// A syllable at the right edge wraps letter by letter, the virama
+    /// staying with its letter; reflow keeps the text and the cells.
     #[test]
-    fn syllable_wraps_whole_at_the_edge() {
+    fn syllables_wrap_and_reflow_by_letter() {
         let (mut s, mut t) = term(5, 3);
         feed(&mut s, &mut t, "abcdस्ते".as_bytes());
-        let dump = screen_dump(&t);
-        let mut lines = dump.lines();
-        assert_eq!(lines.next(), Some("a b c d S >"));
-        assert_eq!(lines.next(), Some("[स्ते] T"));
-        assert_eq!(t.screen().cursor.x, 2);
-        assert_eq!(t.screen().cursor.y, 1);
-
-        // A four-consonant chain that stops fitting after two cells
-        // leaves every column it could not use as a spacer.
-        let (mut s, mut t) = term(5, 3);
-        feed(&mut s, &mut t, "abcक्क्क्क".as_bytes());
-        let dump = screen_dump(&t);
-        let mut lines = dump.lines();
-        assert_eq!(lines.next(), Some("a b c S S >"));
-        assert_eq!(lines.next(), Some("[क्क्क्क] T T T"));
-        assert_eq!(t.screen().cursor.x, 4);
-
-        // Ending exactly at the edge defers the wrap, as a narrow char does.
-        let (mut s, mut t) = term(5, 3);
-        feed(&mut s, &mut t, "abcस्त".as_bytes());
-        assert_eq!(screen_dump(&t).lines().next(), Some("a b c [स्त] T"));
-        assert!(t.screen().cursor.pending_wrap);
-        assert_eq!(t.screen().cursor.x, 4);
-    }
-
-    #[test]
-    fn reflow_keeps_syllables_whole() {
-        let text = "नमस्ते स्त्री धर्म क्षत्रिय";
-        assert_reflow_matches_fresh(text.as_bytes(), 30, &[7, 5, 3, 9, 4, 30], 12);
+        assert_eq!(row_text(&t, 0), "abcdस्");
+        assert_eq!(row_text(&t, 1), "ते");
+        assert_eq!((t.screen().cursor.x, t.screen().cursor.y), (1, 1));
+        assert_reflow_matches_fresh(
+            "नमस्ते स्त्री धर्म क्षत्रिय".as_bytes(),
+            30,
+            &[7, 5, 3, 9, 4, 30],
+            12,
+        );
         assert_reflow_matches_fresh("ক্ষমা স্ত্রী ക്ഷമ".as_bytes(), 20, &[3, 6, 5, 20], 10);
-        // A multi-cell cluster at a row edge wraps whole on reflow too.
-        let (mut s, mut t) = term(20, 4);
-        feed(&mut s, &mut t, "abcdस्ते".as_bytes());
-        t.resize(5, 4);
-        let dump = screen_dump(&t);
-        let mut lines = dump.lines();
-        assert_eq!(lines.next(), Some("a b c d S >"));
-        assert_eq!(lines.next(), Some("[स्ते] T"));
-        // And joins back up when there is room again.
-        t.resize(20, 4);
-        assert_eq!(screen_dump(&t).lines().next(), Some("a b c d [स्ते] T"));
-        // A four-cell chain.
-        assert_reflow_matches_fresh("ab क्क्क्क cd".as_bytes(), 20, &[5, 6, 4, 11], 8);
     }
 
-    /// Copy gives the original text back: a cluster's tails and spacer
-    /// heads add nothing, and a selection that starts or ends inside a
-    /// cluster takes all of it.
+    /// Copy gives the original text back, across wide chars, clusters and
+    /// a forced wrap; a selection starting on a wide tail takes its head.
     #[test]
     fn copy_multi_cell_clusters() {
         let (mut s, mut t) = term(12, 4);
-        let text = "नमस्ते स्त्री";
+        let text = "नमस्ते 漢字👍🏽";
         feed(&mut s, &mut t, text.as_bytes());
         let sc = t.screen();
         let abs = |y: usize| sc.absolute_of_virtual(sc.scrollback.len() + y);
         assert_eq!(sc.selection_text((abs(0), 0), (abs(0), 12)), text);
-        // न म [स्ते T] _ [स्त्री T]: from स्ते's tail to स्त्री's head.
-        assert_eq!(sc.selection_text((abs(0), 3), (abs(0), 6)), "स्ते स्त्री");
+        // न म स् ते _ [漢 T] [字 T] [👍🏽 T]: from 漢's tail.
+        assert_eq!(sc.selection_text((abs(0), 6), (abs(0), 8)), "漢字");
         assert_eq!(
-            sc.snap_selection((abs(0), 3), (abs(0), 6)),
-            ((abs(0), 2), (abs(0), 7))
+            sc.snap_selection((abs(0), 6), (abs(0), 8)),
+            ((abs(0), 5), (abs(0), 9))
         );
-        // One tail alone copies its whole cluster.
-        assert_eq!(sc.selection_text((abs(0), 6), (abs(0), 7)), "स्त्री");
 
-        // Across a forced wrap: the spacer heads copy as nothing.
+        // Across a forced wrap: the spacer head copies as nothing.
         let (mut s, mut t) = term(5, 4);
-        feed(&mut s, &mut t, "abcक्क्क्क स्ते".as_bytes());
+        feed(&mut s, &mut t, "abcd漢字 स्ते".as_bytes());
         let sc = t.screen();
         let abs = |y: usize| sc.absolute_of_virtual(sc.scrollback.len() + y);
-        assert_eq!(sc.selection_text((abs(0), 0), (abs(2), 5)), "abcक्क्क्क स्ते");
+        assert_eq!(sc.selection_text((abs(0), 0), (abs(2), 5)), "abcd漢字 स्ते");
     }
 
-    /// Overwriting, erasing or inserting into part of a multi-cell cluster
-    /// removes all of it: no half syllables are left behind.
+    /// Overwriting one letter of a conjunct leaves the others: each is its
+    /// own cell, as the line editor that wrote it believes.
     #[test]
-    fn edits_treat_a_syllable_as_one_unit() {
-        // Overwrite its tail.
+    fn edits_touch_one_letter_of_a_syllable() {
         let (mut s, mut t) = term(10, 2);
         feed(&mut s, &mut t, "aस्त्रीb\r\x1b[2Cx".as_bytes());
-        assert_eq!(screen_dump(&t).lines().next(), Some("a _ x b"));
-        // EL 1 (erase left) from its head takes its tails too.
+        assert_eq!(row_text(&t, 0), "aस्xरीb");
         let (mut s, mut t) = term(10, 2);
-        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[C\x1b[1K".as_bytes());
-        assert_eq!(screen_dump(&t).lines().next(), Some("_ _ _ b"));
-        // ICH pushing it across the right margin blanks it.
-        let (mut s, mut t) = term(6, 2);
-        feed(&mut s, &mut t, "abcस्ते\r\x1b[C\x1b[2@".as_bytes());
-        assert_eq!(screen_dump(&t).lines().next(), Some("a _ _ b c"));
-        // DCH pulling a tail to the cursor blanks it.
-        let (mut s, mut t) = term(10, 2);
-        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[C\x1b[P".as_bytes());
-        assert_eq!(screen_dump(&t).lines().next(), Some("a _ b"));
-        // A narrower screen without reflow (alternate screen) never keeps
-        // part of a cluster.
-        let (mut s, mut t) = term(10, 2);
-        feed(&mut s, &mut t, "\x1b[?1049habcक्क्क्क".as_bytes());
-        t.resize(5, 2);
-        assert_eq!(screen_dump(&t).lines().next(), Some("a b c"));
+        feed(&mut s, &mut t, "aस्त्रीb\r\x1b[2C\x1b[P".as_bytes());
+        assert_eq!(row_text(&t, 0), "aस्रीb");
     }
 
     #[test]

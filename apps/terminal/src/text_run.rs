@@ -59,13 +59,7 @@ pub fn shapes_with_neighbours(glyph: CellGlyph, columns: u8) -> bool {
             None => return false,
         },
     };
-    match glyph {
-        // A syllable cluster (Devanagari..Sinhala, one cell per base
-        // letter) is text however many cells it has: its run keeps its
-        // tail cells, so its glyphs are drawn across them at full size.
-        CellGlyph::Cluster(_) if columns > 1 => is_syllable_script(base as u32),
-        _ => columns == 1 && base < '\u{2500}',
-    }
+    columns == 1 && base < '\u{2500}'
 }
 
 /// Split a row into runs (ranges of cells). A run is a maximal stretch of
@@ -154,11 +148,19 @@ pub struct Placed {
 /// or conjunct spanning cells. When they are wider than those cells by more
 /// than 5% (a proportional fallback font) they are shrunk to fit, and kept
 /// vertically centred on the line, exactly as a single character was.
+///
+/// A `flow` run (a word in a syllable script: Devanagari..Sinhala) is laid
+/// out whole instead, at the font's own spacing from the run's left edge,
+/// and shrunk only when it is wider than its cells. Its letters take one
+/// cell each in the grid, but the font joins them into conjuncts and a
+/// headline of its own width: placing each cell's glyphs at the cell's edge
+/// would open gaps inside the word, or squeeze a conjunct into one cell.
 pub fn place_run(
     cell_starts: &[usize],
     centered: &[bool],
     glyphs: &[GlyphIn],
     cell_w: f32,
+    flow: bool,
     out: &mut Vec<Placed>,
 ) {
     out.clear();
@@ -171,6 +173,22 @@ pub fn place_run(
         .iter()
         .map(|g| cell_of_cluster(cell_starts, g.cluster))
         .collect();
+    if flow {
+        let anchor = glyphs.iter().map(|g| g.pen_x).fold(f32::MAX, f32::min);
+        let advance: f32 = glyphs.iter().map(|g| g.advance).sum();
+        let fit = crate::cell_glyph::fit_run(advance, cell_w * cells as f32, false);
+        let center_y = ink_center(glyphs.iter());
+        for (i, g) in glyphs.iter().enumerate() {
+            out.push(Placed {
+                glyph: i,
+                cell: owner[i],
+                x: (g.pen_x + g.offset_x - anchor) * fit.scale,
+                y: g.offset_y * fit.scale + center_y * (1.0 - fit.scale),
+                scale: fit.scale,
+            });
+        }
+        return;
+    }
     let mut has_glyphs = vec![false; cells];
     for &cell in &owner {
         has_glyphs[cell] = true;
@@ -201,18 +219,7 @@ pub fn place_run(
         );
         // The middle of the cell's ink, so shrunk glyphs stay centred on
         // the line instead of sinking to the baseline.
-        let (mut top, mut bottom) = (f32::MAX, f32::MIN);
-        for i in mine() {
-            if let Some((t, b)) = glyphs[i].ink {
-                top = top.min(t + glyphs[i].offset_y);
-                bottom = bottom.max(b + glyphs[i].offset_y);
-            }
-        }
-        let center_y = if top <= bottom {
-            (top + bottom) * 0.5
-        } else {
-            0.0
-        };
+        let center_y = ink_center(mine().map(|i| &glyphs[i]));
         // A cell's glyphs start inside it whatever the font says (some
         // proportional fonts report pen offsets far past one character).
         let first = mine()
@@ -231,6 +238,29 @@ pub fn place_run(
             });
         }
     }
+}
+
+/// The middle of some glyphs' ink, relative to the baseline (0 without
+/// ink): shrunk glyphs are kept centred on it.
+fn ink_center<'a>(glyphs: impl Iterator<Item = &'a GlyphIn>) -> f32 {
+    let (mut top, mut bottom) = (f32::MAX, f32::MIN);
+    for g in glyphs {
+        if let Some((t, b)) = g.ink {
+            top = top.min(t + g.offset_y);
+            bottom = bottom.max(b + g.offset_y);
+        }
+    }
+    if top <= bottom {
+        (top + bottom) * 0.5
+    } else {
+        0.0
+    }
+}
+
+/// Whether a run of text is laid out whole ([`place_run`]'s `flow`): it
+/// holds a syllable script (Devanagari..Sinhala).
+pub fn flows(text: &str) -> bool {
+    text.chars().any(|c| is_syllable_script(c as u32))
 }
 
 /// A run's cache key: a hash of its text, plus its style. The text and
@@ -553,8 +583,57 @@ mod tests {
 
     fn place(starts: &[usize], centered: &[bool], glyphs: &[GlyphIn], cell_w: f32) -> Vec<Placed> {
         let mut out = Vec::new();
-        place_run(starts, centered, glyphs, cell_w, &mut out);
+        place_run(starts, centered, glyphs, cell_w, false, &mut out);
         out
+    }
+
+    /// A flowing word (Devanagari) keeps the font's spacing across its
+    /// cells: a conjunct glyph narrower than its two cells leaves no gap
+    /// before the next letter, and a word wider than its cells is shrunk
+    /// as a whole.
+    #[test]
+    fn a_flowing_word_keeps_its_own_spacing() {
+        // क् ष म: cells of 6; the font's क्ष is 8 wide, म 5.
+        let glyphs = [glyph(0, 0.0, 8.0), glyph(6, 8.0, 5.0)];
+        let mut out = Vec::new();
+        place_run(
+            &[0, 3, 6],
+            &[true, false, false],
+            &glyphs,
+            6.0,
+            true,
+            &mut out,
+        );
+        assert_eq!(
+            out.iter()
+                .map(|p| (p.cell, p.x, p.scale))
+                .collect::<Vec<_>>(),
+            vec![(0, 0.0, 1.0), (2, 8.0, 1.0)]
+        );
+        // The same word per cell: म jumps to its cell's edge, a gap of 4.
+        place_run(
+            &[0, 3, 6],
+            &[true, false, false],
+            &glyphs,
+            6.0,
+            false,
+            &mut out,
+        );
+        assert_eq!(out[1].x, 12.0);
+        // 26 wide in 18: shrunk as one, still contiguous.
+        let glyphs = [glyph(0, 0.0, 13.0), glyph(6, 13.0, 13.0)];
+        place_run(
+            &[0, 3, 6],
+            &[true, false, false],
+            &glyphs,
+            6.0,
+            true,
+            &mut out,
+        );
+        let k = 18.0 / 26.0;
+        assert!(out.iter().all(|p| (p.scale - k).abs() < 1e-6));
+        assert!((out[1].x - 13.0 * k).abs() < 1e-5);
+        assert!(flows("नमस्ते") && flows("x स") && !flows("abc") && !flows("漢字"));
     }
 
     #[test]
@@ -729,7 +808,14 @@ mod tests {
             pen += pos.x_advance as f32 / upem;
         }
         let mut placed = Vec::new();
-        place_run(cell_starts, centered, &glyphs, cell_w, &mut placed);
+        place_run(
+            cell_starts,
+            centered,
+            &glyphs,
+            cell_w,
+            flows(text),
+            &mut placed,
+        );
         (ids, glyphs, placed)
     }
 
@@ -799,8 +885,6 @@ mod tests {
         let row = term.screen().row(0);
         let (mut seg, mut texts, mut widths) = (Vec::new(), Vec::new(), Vec::new());
         let empty = CellContent::Empty;
-        // The tails of a syllable cluster stay in its run, as in widget.rs.
-        let mut tails_until = 0;
         for col in 0..term.cols() {
             let content = row.cell(col).map_or(&empty, |cell| &cell.content);
             let cell_text = match content {
@@ -809,18 +893,11 @@ mod tests {
                 _ => String::new(),
             };
             seg.push(match cell_glyph(content) {
-                None if col < tails_until && *content == CellContent::WideTail => SegCell::Text {
+                None => SegCell::Blank,
+                Some(g) if shapes_with_neighbours(g, content.width()) => SegCell::Text {
                     style: RunStyle::default(),
                     selected: false,
                 },
-                None => SegCell::Blank,
-                Some(g) if shapes_with_neighbours(g, content.width()) => {
-                    tails_until = col + content.width() as usize;
-                    SegCell::Text {
-                        style: RunStyle::default(),
-                        selected: false,
-                    }
-                }
                 Some(_) => SegCell::Own,
             });
             texts.push(cell_text);
@@ -832,16 +909,15 @@ mod tests {
     /// Arabic and Devanagari keep the widths the grid gives them: the runs
     /// cover exactly the printed cells, in logical order, and the cursor
     /// ends where the cells do. With mode 2027 a Devanagari syllable takes
-    /// one cell per base letter and its run keeps its tail cells.
+    /// one cell per base letter.
     #[test]
     fn arabic_and_devanagari_runs_match_the_grid() {
         for (text, mode_2027, cells) in [
             ("مرحبا بالعالم", true, 13),
             ("مرحبا بالعالم", false, 13),
-            // Mode 2027: a conjunct and its vowel signs are one cluster,
-            // one cell per base letter: क्ष 2, त्रि 1, य 1, स्त्री 2,
-            // न 1, म 1, स्ते 2, and the two spaces.
-            ("क्षत्रिय स्त्री नमस्ते", true, 12),
+            // Mode 2027: one cell per base letter, its marks with it:
+            // क् ष त् रि य, स् त् री, न म स् ते, and the two spaces.
+            ("क्षत्रिय स्त्री नमस्ते", true, 14),
             // Without it: per-codepoint wcwidth, spacing vowel signs take
             // a column, a virama none, so conjuncts span cells.
             ("क्षत्रिय स्त्री नमस्ते", false, 16),
@@ -857,12 +933,10 @@ mod tests {
             let words: Vec<String> = out.iter().map(|run| texts[run.clone()].concat()).collect();
             let expected: Vec<&str> = text.split(' ').collect();
             assert_eq!(words, expected, "{text} 2027={mode_2027}");
-            // Every column of a run is a narrow cell, a cluster's head or
-            // one of its tails: the widths add up to the run's length.
-            for run in &out {
-                let total: usize = widths[run.clone()].iter().map(|&w| w as usize).sum();
-                assert_eq!(total, run.len(), "{text} 2027={mode_2027}");
-            }
+            assert!(out
+                .iter()
+                .flat_map(|run| run.clone())
+                .all(|col| widths[col] == 1));
         }
     }
 
@@ -924,12 +998,17 @@ mod tests {
                 for p in &placed {
                     assert_eq!(p.cell, cell_of_cluster(&starts, glyphs[p.glyph].cluster));
                 }
-                // A syllable given a cell per base letter is drawn across
-                // its cells at full size, not squeezed.
-                for p in &placed {
-                    let spans = cell_texts.get(p.cell + 1).is_some_and(|t| t.is_empty());
-                    if spans {
-                        assert_eq!(p.scale, 1.0, "{run_text}: cell {} shrunk", p.cell);
+                // A Devanagari word is laid out whole: every glyph starts
+                // where the one before it ends (no gap inside the word),
+                // at one scale.
+                if flows(&run_text) {
+                    let scale = placed[0].scale;
+                    for pair in placed.windows(2) {
+                        let (a, b) = (&glyphs[pair[0].glyph], &glyphs[pair[1].glyph]);
+                        let gap = (pair[1].x - b.offset_x * scale)
+                            - (pair[0].x - a.offset_x * scale + a.advance * scale);
+                        assert!(gap.abs() < 1e-4, "{run_text}: gap {gap}");
+                        assert_eq!(pair[1].scale, scale);
                     }
                 }
             }

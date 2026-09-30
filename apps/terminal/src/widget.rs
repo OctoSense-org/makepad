@@ -1384,6 +1384,7 @@ impl MpTerm {
             centered,
             &glyphs,
             self.cell_w as f32,
+            text_run::flows(text),
             &mut placed,
         );
         placed
@@ -2325,9 +2326,8 @@ impl MpTerm {
             seg,
             seg_runs,
         } = &mut scratch;
-        // Each text cell's colour and content in this row; `None` content
-        // for the tail columns of a syllable cluster shaped in a run.
-        let mut row_text: Vec<Option<(Vec4f, Option<CellGlyph>)>> = Vec::with_capacity(cols);
+        // Each text cell's colour and content in this row.
+        let mut row_text: Vec<Option<(Vec4f, CellGlyph)>> = Vec::with_capacity(cols);
 
         // The cursor's cell, blinking or not: a ligature under it is broken
         // (shaped cell by cell) whichever phase the blink is in, so the
@@ -2356,23 +2356,10 @@ impl MpTerm {
             let mut run: Option<(usize, usize, Vec4f)> = None;
             seg.clear();
             row_text.clear();
-            // The run cell and colour a syllable cluster's tails continue,
-            // and up to which column.
-            let mut tail_of: Option<(SegCell, Vec4f, usize)> = None;
             for col in 0..cols {
                 seg.push(SegCell::Blank);
                 row_text.push(None);
                 let cell = row.cell(col);
-                if let Some((seg_cell, color, end)) = tail_of {
-                    if col < end
-                        && cell.is_some_and(|c| c.content == crate::term::CellContent::WideTail)
-                    {
-                        seg[col] = seg_cell;
-                        row_text[col] = Some((color, None));
-                    } else {
-                        tail_of = None;
-                    }
-                }
                 let (fg, bg) = match cell {
                     Some(c) => Self::resolve_colors(session, &c.style, global_inverse),
                     None => (None, None),
@@ -2477,13 +2464,7 @@ impl MpTerm {
                         },
                         selected,
                     };
-                    row_text[col] = Some((fg, Some(glyph)));
-                    // A syllable cluster's tails stay in its run, so its
-                    // glyphs span its cells (`text_run::place_run`).
-                    let width = cell.content.width() as usize;
-                    if width > 1 {
-                        tail_of = Some((seg[col], fg, col + width));
-                    }
+                    row_text[col] = Some((fg, glyph));
                 } else if let Some(glyph) = glyph {
                     seg[col] = SegCell::Own;
                     let mut columns = cell.content.width();
@@ -2527,12 +2508,10 @@ impl MpTerm {
                     run_starts.push(run_text.len() - text_start);
                     run_colors.push(*color);
                     match glyph {
-                        Some(CellGlyph::Char(ch)) => run_text.push(*ch),
-                        Some(CellGlyph::Cluster(cps)) => run_text.extend(cps.iter()),
-                        // A tail: no text, so its cluster's glyphs span it.
-                        None => {}
+                        CellGlyph::Char(ch) => run_text.push(*ch),
+                        CellGlyph::Cluster(cps) => run_text.extend(cps.iter()),
                     }
-                    run_centered.push(matches!(glyph, Some(CellGlyph::Cluster(_))));
+                    run_centered.push(matches!(glyph, CellGlyph::Cluster(_)));
                 }
                 let SegCell::Text { style, .. } = seg[range.start] else {
                     continue;

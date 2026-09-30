@@ -33,8 +33,7 @@ pub enum CellContent {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cluster {
     pub cps: Vec<char>,
-    /// 1 or 2, or up to `unicode::MAX_SYLLABLE_CELLS` for a syllable
-    /// cluster (mode 2027, one cell per base letter).
+    /// 1 or 2.
     pub width: u8,
 }
 
