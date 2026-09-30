@@ -350,7 +350,10 @@ impl Screen {
             if is_cursor_row {
                 // Cursor offset within the logical line. May point past
                 // the trimmed content; store the raw offset.
-                cursor_pos = Some((logical.len(), current.len() + self.cursor.x));
+                // A deferred wrap means the cursor is logically one past
+                // the last column.
+                let x = self.cursor.x + self.cursor.pending_wrap as usize;
+                cursor_pos = Some((logical.len(), current.len() + x));
             }
             // Drop a spacer head at the join point: it only existed
             // because of the old width.
@@ -377,34 +380,53 @@ impl Screen {
             logical.push((Vec::new(), SemanticPrompt::Output));
         }
 
-        // 2. Re-wrap each logical line at the new width.
+        // 2. Re-wrap each logical line at the new width. A wide head and
+        //    its tail move as one unit: the tail always lands right after
+        //    its head, and a wide char that no longer fits at the end of a
+        //    row wraps whole, leaving a spacer head, exactly as printing it
+        //    fresh at the new width would.
+        use crate::term::page::CellContent;
         let mut new_rows: Vec<Row> = Vec::new();
-        let mut new_cursor: Option<(usize, usize)> = None;
+        // (row, col, pending_wrap)
+        let mut new_cursor: Option<(usize, usize, bool)> = None;
         for (line_idx, (cells, semantic)) in logical.into_iter().enumerate() {
             let cursor_off = match cursor_pos {
                 Some((l, off)) if l == line_idx => Some(off),
                 _ => None,
             };
-            let first_new_row = new_rows.len();
             let mut row = Row::new();
             row.semantic = semantic;
             let mut x = 0usize;
+            // Index of `cell` within the source logical line.
             let mut cell_index = 0usize;
-            let total = cells.len();
             let mut iter = cells.into_iter().peekable();
-            loop {
-                if let Some(off) = cursor_off {
-                    if off == cell_index {
-                        new_cursor = Some((new_rows.len(), x.min(cols - 1)));
+            while let Some(mut cell) = iter.next() {
+                // The source tail of a wide head is consumed with it.
+                let tail = if cell.content.is_wide_head()
+                    && iter.peek().map(|c| c.content == CellContent::WideTail).unwrap_or(false)
+                {
+                    iter.next()
+                } else {
+                    None
+                };
+                let span = 1 + tail.is_some() as usize;
+                match cell.content {
+                    // A tail without its head, or a stray spacer: blank.
+                    CellContent::WideTail | CellContent::WideSpacerHead => {
+                        cell.content = CellContent::Empty;
                     }
+                    // A 1-wide screen can't hold a wide char.
+                    _ if cell.content.is_wide_head() && cols < 2 => {
+                        cell = Cell::blank_with_bg(&cell.style);
+                    }
+                    _ => {}
                 }
-                let Some(cell) = iter.next() else { break };
-                let width = cell.content.width().max(1) as usize;
-                if x + width > cols {
+                let width = if cell.content.is_wide_head() { 2 } else { 1 };
+                if x > 0 && x + width > cols {
                     // Wrap. A wide char that doesn't fit leaves a spacer.
                     if width == 2 && x < cols {
                         let mut spacer = Cell::blank_with_bg(&cell.style);
-                        spacer.content = crate::term::page::CellContent::WideSpacerHead;
+                        spacer.content = CellContent::WideSpacerHead;
                         *row.cell_mut(x) = spacer;
                     }
                     row.wrapped = true;
@@ -412,29 +434,38 @@ impl Screen {
                     row.semantic = semantic;
                     x = 0;
                 }
-                let is_tail =
-                    cell.content == crate::term::page::CellContent::WideTail;
-                if !is_tail {
-                    *row.cell_mut(x) = cell;
-                    x += width;
-                } else {
-                    // Tail cells re-emerge from their heads.
-                    *row.cell_mut(x) = cell;
-                    x += 1;
+                if let Some(off) = cursor_off {
+                    if off >= cell_index && off < cell_index + span {
+                        new_cursor = Some((new_rows.len(), x + (off - cell_index), false));
+                    }
                 }
-                cell_index += 1;
-                let _ = total;
+                if width == 2 {
+                    let tail = tail.unwrap_or(Cell {
+                        content: CellContent::WideTail,
+                        style: cell.style,
+                        hyperlink: cell.hyperlink,
+                    });
+                    *row.cell_mut(x) = cell;
+                    *row.cell_mut(x + 1) = tail;
+                } else {
+                    *row.cell_mut(x) = cell;
+                }
+                x += width;
+                cell_index += span;
             }
-            // Cursor past the end of the line's content.
+            // Cursor past the end of the line's content. Right after a
+            // full row it is the deferred-wrap position, as after printing.
             if let Some(off) = cursor_off {
                 if off >= cell_index && new_cursor.is_none() {
-                    let extra = off - cell_index;
-                    let cx = (x + extra).min(cols - 1);
-                    new_cursor = Some((new_rows.len(), cx));
+                    let cx = x + (off - cell_index);
+                    new_cursor = Some(if cx < cols {
+                        (new_rows.len(), cx, false)
+                    } else {
+                        (new_rows.len(), cols - 1, off == cell_index)
+                    });
                 }
             }
             new_rows.push(row);
-            let _ = first_new_row;
         }
 
         // Trailing blank rows are dropped, not history: without this a
@@ -444,7 +475,7 @@ impl Screen {
         while keep > 1 && new_rows[keep - 1].cells.is_empty() {
             keep -= 1;
         }
-        if let Some((cy, _)) = new_cursor {
+        if let Some((cy, _, _)) = new_cursor {
             keep = keep.max(cy + 1);
         }
         new_rows.truncate(keep);
@@ -453,7 +484,7 @@ impl Screen {
         //    cursor inside the active area.
         let total = new_rows.len();
         let mut start = total.saturating_sub(rows);
-        if let Some((cy, _)) = new_cursor {
+        if let Some((cy, _, _)) = new_cursor {
             if cy < start {
                 start = cy;
             }
@@ -491,14 +522,15 @@ impl Screen {
         self.rows = rows;
         self.scrollback = scrollback;
         self.active = active;
-        if let Some((cy, cx)) = new_cursor {
+        self.cursor.pending_wrap = false;
+        if let Some((cy, cx, pending_wrap)) = new_cursor {
             self.cursor.y = cy.saturating_sub(start).min(rows - 1);
             self.cursor.x = cx.min(cols - 1);
+            self.cursor.pending_wrap = pending_wrap;
         } else {
             self.cursor.y = self.cursor.y.min(rows - 1);
             self.cursor.x = self.cursor.x.min(cols - 1);
         }
-        self.cursor.pending_wrap = false;
         // Saved cursor: clamp (precision here is not worth the complexity).
         if let Some(saved) = &mut self.saved_cursor {
             saved.x = saved.x.min(cols - 1);
