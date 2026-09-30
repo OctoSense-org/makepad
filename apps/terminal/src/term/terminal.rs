@@ -1133,6 +1133,34 @@ impl Terminal {
         row.trim();
     }
 
+    /// Ghostty's `clear_screen` away from a prompt: the rows above the
+    /// cursor go into history, then the history goes; the cursor's row
+    /// becomes the top row and the program is not told. On the alternate
+    /// screen nothing happens: a full-screen program owns it. Returns
+    /// whether anything was cleared.
+    pub fn clear_screen_history(&mut self) -> bool {
+        if self.active == ActiveScreen::Alternate {
+            return false;
+        }
+        self.dirty = true;
+        let pen = self.screen().cursor.style;
+        let s = self.screen_mut();
+        let y = s.cursor.y;
+        if y > 0 {
+            // Scrolled like output (the whole screen as the region), so
+            // absolute row numbers stay what search and links expect.
+            let (top, bottom) = (s.scroll_top, s.scroll_bottom);
+            s.scroll_top = 0;
+            s.scroll_bottom = s.rows - 1;
+            s.scroll_up(y, &pen);
+            s.scroll_top = top;
+            s.scroll_bottom = bottom;
+            s.cursor.y = 0;
+        }
+        self.erase_display(3);
+        true
+    }
+
     /// ED.
     fn erase_display(&mut self, mode: u16) {
         self.dirty = true;
@@ -2028,6 +2056,31 @@ mod tests {
 
     fn feed(s: &mut Stream, t: &mut Terminal, bytes: &[u8]) {
         s.process(bytes, t);
+    }
+
+    #[test]
+    fn clear_screen_keeps_the_cursor_row_at_the_top_and_drops_history() {
+        let mut s = Stream::new();
+        let mut t = Terminal::with_scrollback(20, 5, 100);
+        for i in 0..12 {
+            feed(&mut s, &mut t, format!("line {i}\r\n").as_bytes());
+        }
+        feed(&mut s, &mut t, b"$ prompt");
+        let before = t.screen().scrollback.len() as u64 + t.screen().evicted;
+        assert!(t.screen().scrollback.len() > 0 && t.screen().cursor.y > 0);
+        let x = t.screen().cursor.x;
+        assert!(t.clear_screen_history());
+        let screen = t.screen();
+        assert_eq!(screen.scrollback.len(), 0);
+        assert_eq!((screen.cursor.y, screen.cursor.x), (0, x));
+        assert_eq!(screen.row(0).text().trim_end(), "$ prompt");
+        assert!((1..screen.rows).all(|y| screen.row(y).text().trim().is_empty()));
+        // Rows went through history: absolute numbering moved on, not back.
+        assert!(screen.evicted >= before);
+        // A full-screen program's alternate screen is left alone.
+        feed(&mut s, &mut t, b"\x1b[?1049hfull screen");
+        assert!(!t.clear_screen_history());
+        assert!(t.screen().row(0).text().starts_with("full screen"));
     }
 
     fn row_text(t: &Terminal, y: usize) -> String {

@@ -7,6 +7,7 @@ pub mod contrast;
 pub mod control;
 pub mod fonts;
 pub mod gesture;
+pub mod keybinds;
 pub mod kitty_input;
 pub mod links;
 pub mod module;

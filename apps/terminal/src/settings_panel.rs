@@ -6,7 +6,12 @@
 //! Nothing here needs typing: free-form values (`TERM`, the shell) are
 //! chosen from lists — the usual terminfo names, `/etc/shells` — and a
 //! value set by hand in the file stays selectable.
+//!
+//! Keyboard shortcuts are listed, not edited: their row opens the
+//! effective table (defaults plus the file's `keybind` lines, and any line
+//! that was skipped); they are changed in `settings.conf`.
 
+use crate::keybinds::{self, Keybinds};
 use crate::settings::{BellStyle, CursorShape, NewTabCwd, Settings, TabBar, TabTitle, THEME_DESKTOP};
 use crate::settings::{CJK_AUTO, CJK_NONE, DEFAULT_FONT};
 use crate::settings::{FONT_SIZE_RANGE, LINE_HEIGHT_RANGE};
@@ -14,8 +19,7 @@ use crate::text_run::{ligatures_on, with_ligatures};
 use crate::themes;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Row {
-    Theme,
+pub enum Row {    Theme,
     Font,
     CjkFont,
     Ligatures,
@@ -40,6 +44,8 @@ pub enum Row {
     SaveProfile,
     DeleteProfile,
     ExternalControl,
+    /// The keyboard shortcuts in force: opens their list (read-only).
+    Shortcuts,
 }
 
 /// What a row is: an on/off switch, a value stepped with the arrows (and,
@@ -56,7 +62,7 @@ pub enum RowKind {
 pub struct Choice {
     pub value: String,
     pub label: String,
-    pub note: &'static str,
+    pub note: String,
 }
 
 /// The panel, top to bottom: section titles and their rows.
@@ -89,6 +95,7 @@ pub const SECTIONS: &[(&str, &[Row])] = &[
         ],
     ),
     ("Tabs", &[Row::TabBar, Row::NewTabDir, Row::TabTitle, Row::ConfirmClose]),
+    ("Keyboard", &[Row::Shortcuts]),
     ("Profiles", &[Row::Profile, Row::SaveProfile, Row::DeleteProfile]),
     ("Automation", &[Row::ExternalControl]),
 ];
@@ -148,10 +155,94 @@ fn yes(b: bool) -> String {
     if b { "On" } else { "Off" }.into()
 }
 
-/// A list's entries matching `filter` (case-insensitive, anywhere).
+/// A list's entries matching `filter` (case-insensitive, anywhere in the
+/// label or the note: a shortcut is found by its keys too).
 pub fn filter_choices(choices: &[Choice], filter: &str) -> Vec<Choice> {
     let filter = filter.trim().to_lowercase();
-    choices.iter().filter(|c| filter.is_empty() || c.label.to_lowercase().contains(&filter)).cloned().collect()
+    choices
+        .iter()
+        .filter(|c| {
+            filter.is_empty()
+                || c.label.to_lowercase().contains(&filter)
+                || c.note.to_lowercase().contains(&filter)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The values of the shortcuts list's entries that are not actions: none
+/// equals a row's current value, so none shows as chosen.
+const SKIPPED: &str = "!skipped";
+const FIXED: &str = "!fixed";
+
+/// The keyboard shortcuts list: skipped `keybind` lines first (with why),
+/// then every bound action with its keys and its name in the file, then
+/// the fixed keys (the system's clipboard, the search bar's own), then
+/// the actions nothing is bound to, for discovery.
+pub fn shortcut_choices(s: &Settings, mac: bool) -> Vec<Choice> {
+    let table = Keybinds::build(&s.keybinds, mac);
+    let mut out: Vec<Choice> = table
+        .errors
+        .iter()
+        .map(|e| Choice {
+            value: SKIPPED.into(),
+            label: format!("keybind = {}: {}", e.line, e.message),
+            note: "skipped".into(),
+        })
+        .collect();
+    let described = table.describe(mac);
+    for (label, name, keys) in &described {
+        out.push(Choice {
+            value: name.clone(),
+            label: format!("{label} \u{b7} {name}"),
+            note: keys.clone(),
+        });
+    }
+    let (copy, paste) = if mac {
+        ("Cmd+C", "Cmd+V")
+    } else {
+        ("Ctrl+C", "Ctrl+V")
+    };
+    let fixed = [
+        ("Copy the selection (system)", copy),
+        ("Paste (system)", paste),
+        (
+            "Search bar: older / newer match",
+            "Enter, Shift+Enter, F3, \u{2191}, \u{2193}",
+        ),
+        ("Search bar: close", "Esc"),
+        ("Search bar: regex on or off", "Ctrl+R"),
+        ("Rename tab", "double-click or long press"),
+    ];
+    for (label, keys) in fixed {
+        out.push(Choice {
+            value: FIXED.into(),
+            label: format!("{label} \u{b7} fixed"),
+            note: keys.into(),
+        });
+    }
+    for action in keybinds::available_actions() {
+        let name = action.config_name();
+        // Bound with another amount (increase_font_size:4) is bound.
+        let amount = matches!(
+            action,
+            keybinds::Action::IncreaseFontSize(_)
+                | keybinds::Action::DecreaseFontSize(_)
+                | keybinds::Action::ScrollPageLines(_)
+        );
+        let bound = table.bindings.iter().any(|b| {
+            b.action == action
+                || amount && std::mem::discriminant(&b.action) == std::mem::discriminant(&action)
+        });
+        if !bound {
+            out.push(Choice {
+                value: name.clone(),
+                label: format!("{} \u{b7} {name}", action.label()),
+                note: "not bound".into(),
+            });
+        }
+    }
+    out
 }
 
 impl Row {
@@ -166,7 +257,7 @@ impl Row {
             | Row::ExternalControl => {
                 RowKind::Toggle
             }
-            Row::SaveProfile | Row::DeleteProfile => RowKind::Action,
+            Row::SaveProfile | Row::DeleteProfile | Row::Shortcuts => RowKind::Action,
             _ => RowKind::Value,
         }
     }
@@ -177,33 +268,34 @@ impl Row {
         let fonts = || {
             crate::fonts::families()
                 .iter()
-                .map(|f| Choice { value: f.name.clone(), label: f.name.clone(), note: if f.monospace { "mono" } else { "" } })
+                .map(|f| Choice { value: f.name.clone(), label: f.name.clone(), note: if f.monospace { "mono" } else { "" }.into() })
         };
         Some(match self {
-            Row::Theme => std::iter::once(Choice { value: THEME_DESKTOP.into(), label: "Desktop".into(), note: "host" })
+            Row::Theme => std::iter::once(Choice { value: THEME_DESKTOP.into(), label: "Desktop".into(), note: "host".into() })
                 .chain(themes::SCHEMES.iter().map(|scheme| Choice {
                     value: scheme.id.into(),
                     label: scheme.name.into(),
-                    note: if scheme.light { "light" } else { "dark" },
+                    note: if scheme.light { "light" } else { "dark" }.into(),
                 }))
                 .collect(),
-            Row::Font => std::iter::once(Choice { value: String::new(), label: DEFAULT_FONT.into(), note: "bundled" })
+            Row::Font => std::iter::once(Choice { value: String::new(), label: DEFAULT_FONT.into(), note: "bundled".into() })
                 .chain(fonts().filter(|c| c.value != DEFAULT_FONT))
                 .collect(),
             Row::CjkFont => [
-                Choice { value: CJK_AUTO.into(), label: auto_cjk_label(), note: "" },
-                Choice { value: CJK_NONE.into(), label: "None".into(), note: "" },
+                Choice { value: CJK_AUTO.into(), label: auto_cjk_label(), note: String::new() },
+                Choice { value: CJK_NONE.into(), label: "None".into(), note: String::new() },
             ]
             .into_iter()
             .chain(fonts())
             .collect(),
             Row::Shell => shell_choices(&s.shell)
                 .into_iter()
-                .map(|sh| Choice { label: if sh.is_empty() { "Default ($SHELL)".into() } else { sh.clone() }, value: sh, note: "" })
+                .map(|sh| Choice { label: if sh.is_empty() { "Default ($SHELL)".into() } else { sh.clone() }, value: sh, note: String::new() })
                 .collect(),
+            Row::Shortcuts => shortcut_choices(s, cfg!(target_os = "macos")),
             Row::Profile => crate::settings::list_profiles()
                 .into_iter()
-                .map(|name| Choice { value: name.clone(), label: name, note: "" })
+                .map(|name| Choice { value: name.clone(), label: name, note: String::new() })
                 .collect(),
             _ => return None,
         })
@@ -249,6 +341,7 @@ impl Row {
             Row::SaveProfile => "Save as profile\u{2026}",
             Row::DeleteProfile => "Delete profile",
             Row::ExternalControl => "Allow terminal-ctl",
+            Row::Shortcuts => "Keyboard shortcuts\u{2026}",
             Row::Opacity => "Background opacity",
             Row::FontSize => "Font size",
             Row::LineHeight => "Line height",
@@ -267,6 +360,11 @@ impl Row {
             Row::TabTitle => "Tab title",
             Row::ConfirmClose => "Confirm closing a busy tab",
         }
+    }
+
+    /// A list to read, not a value to choose: nothing is applied or saved.
+    pub fn read_only(self) -> bool {
+        self == Row::Shortcuts
     }
 
     /// The row applies to shells started after the change only.
@@ -299,6 +397,15 @@ impl Row {
                 }
             }
             Row::SaveProfile | Row::DeleteProfile => String::new(),
+            Row::Shortcuts => {
+                let table = Keybinds::for_lines(&s.keybinds);
+                let bound = format!("{} bound", table.bindings.len());
+                match table.errors.len() {
+                    0 => bound,
+                    1 => format!("{bound}, 1 line skipped"),
+                    n => format!("{bound}, {n} lines skipped"),
+                }
+            }
             Row::ExternalControl => yes(s.external_control),
             Row::Theme => {
                 if s.theme == THEME_DESKTOP {
@@ -373,7 +480,7 @@ impl Row {
         let mut s = s.clone();
         let up = dir > 0;
         match self {
-            Row::Font | Row::CjkFont | Row::Profile | Row::SaveProfile | Row::DeleteProfile => {}
+            Row::Font | Row::CjkFont | Row::Profile | Row::SaveProfile | Row::DeleteProfile | Row::Shortcuts => {}
             Row::ExternalControl => s.external_control = !s.external_control,
             Row::Theme => {
                 let mut ids = vec![THEME_DESKTOP];
@@ -443,9 +550,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_shortcuts_row_lists_the_table_and_saves_nothing() {
+        let s = Settings {
+            keybinds: vec![
+                "cmd+t=new_tab".into(),
+                "ctrl+shift+t=unbind".into(),
+                "oops".into(),
+            ],
+            ..Settings::default()
+        };
+        let list = shortcut_choices(&s, false);
+        assert!(
+            list[0]
+                .label
+                .starts_with("keybind = oops: expected TRIGGER=ACTION"),
+            "{:?}",
+            list[0]
+        );
+        assert_eq!(list[0].note, "skipped");
+        let current = Row::Shortcuts.current(&s);
+        assert!(
+            list.iter().all(|c| c.value != current),
+            "nothing shows as chosen"
+        );
+        let new_tab = list.iter().find(|c| c.value == "new_tab").unwrap();
+        assert_eq!(
+            new_tab.note, "Super+T",
+            "the remap, and Ctrl+Shift+T no longer"
+        );
+        assert_eq!(new_tab.label, "New tab \u{b7} new_tab");
+        let unbound = list.iter().find(|c| c.value == "select_all").unwrap();
+        assert_eq!(unbound.note, "not bound");
+        assert!(list.iter().any(|c| c.label.starts_with("Paste (system)")));
+        let s2 = Settings {
+            keybinds: vec![
+                "cmd+equal=increase_font_size:4".into(),
+                r"ctrl+alt+l=text:ls\r".into(),
+            ],
+            ..Settings::default()
+        };
+        let list2 = shortcut_choices(&s2, true);
+        assert!(!list2
+            .iter()
+            .any(|c| c.value.starts_with("increase_font_size") && c.note == "not bound"));
+        let text = list2.iter().find(|c| c.note == "Ctrl+Opt+L").unwrap();
+        assert_eq!(text.label, "Type text \u{b7} text:ls\\r");
+        // Found by its keys, too.
+        assert!(filter_choices(&list, "ctrl+shift+d")
+            .iter()
+            .any(|c| c.value == "new_split:right"));
+        let bound = crate::keybinds::Keybinds::for_lines(&s.keybinds)
+            .bindings
+            .len();
+        assert_eq!(
+            Row::Shortcuts.value(&s),
+            format!("{bound} bound, 1 line skipped")
+        );
+        assert!(Row::Shortcuts.read_only());
+        assert_eq!(Row::Shortcuts.step(&s, 1), s, "no stepping, nothing saved");
+        assert_eq!(Row::Shortcuts.with_value(&s, "new_tab"), s);
+    }
+
+    #[test]
     fn every_row_is_listed_once() {
         let rows = rows();
-        assert_eq!(rows.len(), 25);
+        assert_eq!(rows.len(), 26);
         for (i, row) in rows.iter().enumerate() {
             assert!(!rows[i + 1..].contains(row), "{row:?} twice");
         }

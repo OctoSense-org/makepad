@@ -22,6 +22,7 @@ use crate::settings::{self as term_settings, BellStyle, CursorShape, Settings};
 use crate::themes;
 use std::time::{Duration, Instant};
 use crate::term::color::Rgb;
+use crate::keybinds::{self, Keybinds};
 use crate::kitty_input::{self, TextKeyPairing, TextOutcome};
 use crate::term::key_encode::{
     encode_key, encode_text, Key, KeyAction, KeyEncodeOptions, KeyEvent as TermKeyEvent, KeyMods,
@@ -726,6 +727,9 @@ pub struct MpTerm {
     settings: Settings,
     #[rust]
     settings_gen: u64,
+    /// The shortcut table from the settings' `keybind` lines.
+    #[rust]
+    keys: Keybinds,
     /// A blinking cursor's phase starts here; typing restarts it on.
     #[rust]
     blink_epoch: Option<Instant>,
@@ -1068,6 +1072,7 @@ impl MpTerm {
         if self.settings_gen == 0 {
             self.settings_gen = term_settings::generation();
             self.settings = term_settings::current();
+            self.keys = Keybinds::for_lines(&self.settings.keybinds);
             self.font_size = self.settings.font_size;
             self.draw_text.text_style.line_spacing = self.settings.line_height as f32;
             self.font_features =
@@ -1089,6 +1094,7 @@ impl MpTerm {
         }
         self.settings_gen = generation;
         self.settings = term_settings::current();
+        self.keys = Keybinds::for_lines(&self.settings.keybinds);
         self.font_size = self.settings.font_size;
         self.draw_text.text_style.line_spacing = self.settings.line_height as f32;
         if let Some(session) = self.session.as_mut() {
@@ -3082,6 +3088,16 @@ impl Widget for MpTerm {
             Event::KeyUp(e) if orphan_key => Hit::KeyUp(*e),
             _ => event.hits(cx, self.area),
         };
+        // Shortcuts (`crate::keybinds`): an open search bar's own keys
+        // first, then this pane's share of the table (the tab widget ran
+        // its share before the key got here). What neither takes goes to
+        // the program below.
+        if let Hit::KeyDown(e) = &hit {
+            let bar_key = self.search_ui.open && crate::search::bar_key(e).is_some();
+            if !bar_key && self.key_shortcut(cx, e) {
+                return;
+            }
+        }
         // The search bar, while open, takes the keyboard: the program gets
         // no keys until it closes.
         if self.search_event(cx, &hit) {
@@ -3308,7 +3324,7 @@ impl Widget for MpTerm {
                         };
                         let text = ch.to_string();
                         self.send_key(cx, key, &e.modifiers, action, &text, ch.to_ascii_lowercase() as u32);
-                        self.swallow_text_until = Some(Instant::now() + Duration::from_millis(100));
+                        self.swallow_key_text();
                     }
                 } else if e.modifiers.control && !e.modifiers.logo {
                     if let Some(ch) = e.key_code.to_char(e.modifiers.shift) {
@@ -3420,6 +3436,134 @@ impl MpTerm {
 
     fn redraw(&mut self, cx: &mut Cx) {
         self.draw_bg.redraw(cx);
+    }
+}
+
+// ------------------------------------------------------------------
+// Shortcuts (`crate::keybinds`): the pane's actions
+// ------------------------------------------------------------------
+
+impl MpTerm {
+    /// Whether this pane's search bar is open (it has the keyboard).
+    pub fn search_open(&self) -> bool {
+        self.search_ui.open
+    }
+
+    /// A shortcut took a key press: the text the platform types for that
+    /// same press (an Option or Alt character) is not the program's either.
+    /// The key's own release ends the window, as for Option as Meta.
+    pub fn swallow_key_text(&mut self) {
+        self.swallow_text_until = Some(Instant::now() + Duration::from_millis(100));
+    }
+
+    /// A key press bound to one of this pane's shortcuts: run it. True when
+    /// the key goes no further. A consumed press never reaches the Kitty
+    /// encoder, so the program sees neither it nor its release.
+    fn key_shortcut(&mut self, cx: &mut Cx, e: &KeyEvent) -> bool {
+        let ctx = keybinds::Context {
+            tabs: 0,
+            search_open: self.search_ui.open,
+        };
+        let keybinds::Decision::Run { action, consume } =
+            self.keys.decide(e, keybinds::Scope::Pane, &ctx)
+        else {
+            return false;
+        };
+        self.run_shortcut(cx, &action);
+        if consume {
+            self.swallow_key_text();
+        }
+        consume
+    }
+
+    /// Carry out a pane action, as its shortcut would.
+    pub fn run_shortcut(&mut self, cx: &mut Cx, action: &keybinds::Action) {
+        use keybinds::Action as A;
+        if self.search_shortcut(cx, action) {
+            return;
+        }
+        match action {
+            A::CopyToClipboard => {
+                if let Some(text) = self.selected_text().filter(|t| !t.is_empty()) {
+                    cx.copy_to_clipboard(&text);
+                }
+            }
+            A::SelectAll => self.select_all(cx),
+            A::ClearScreen => {
+                let cleared = self
+                    .session
+                    .as_mut()
+                    .is_some_and(|s| s.terminal.clear_screen_history());
+                if cleared {
+                    self.view_offset = 0;
+                    self.sel_anchor = None;
+                    self.sel_cursor = None;
+                    self.redraw(cx);
+                }
+            }
+            A::IncreaseFontSize(points) => self.set_font_size(cx, self.font_size + points),
+            A::DecreaseFontSize(points) => self.set_font_size(cx, self.font_size - points),
+            A::ResetFontSize => self.set_font_size(cx, self.settings.font_size),
+            A::ScrollPageUp => self.scroll_view(cx, self.page_lines()),
+            A::ScrollPageDown => self.scroll_view(cx, -self.page_lines()),
+            A::ScrollToTop => self.scroll_view(cx, i64::MAX / 2),
+            A::ScrollToBottom => self.scroll_view(cx, i64::MIN / 2),
+            A::ScrollPageLines(lines) => self.scroll_view(cx, -(*lines as i64)),
+            A::ReloadConfig => {
+                term_settings::reload();
+                self.sync_settings(cx);
+            }
+            A::Text { bytes, .. } => self.write_key_bytes(cx, bytes),
+            A::Ignore => {}
+            // The tab widget's.
+            _ => {}
+        }
+    }
+
+    fn page_lines(&self) -> i64 {
+        self.session
+            .as_ref()
+            .map_or(1, |s| s.terminal.screen().rows.max(1) as i64)
+    }
+
+    /// Move the view `up` lines into history (negative: towards the live
+    /// screen), within what there is.
+    fn scroll_view(&mut self, cx: &mut Cx, up: i64) {
+        let max = self
+            .session
+            .as_ref()
+            .map_or(0, |s| s.terminal.screen().scrollback.len()) as i64;
+        let offset = (self.view_offset as i64).saturating_add(up).clamp(0, max) as usize;
+        if offset != self.view_offset {
+            self.view_offset = offset;
+            self.redraw(cx);
+        }
+    }
+
+    /// Select everything: the scrollback and the screen.
+    fn select_all(&mut self, cx: &mut Cx) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let screen = session.terminal.screen();
+        let last = screen.total_rows().saturating_sub(1);
+        self.sel_anchor = Some((screen.absolute_of_virtual(0), 0));
+        self.sel_cursor = Some((screen.absolute_of_virtual(last), screen.cols));
+        self.sel_unit = None;
+        self.redraw(cx);
+    }
+
+    /// This pane's text size, until the settings change.
+    fn set_font_size(&mut self, cx: &mut Cx, size: f64) {
+        let size = size.clamp(
+            term_settings::FONT_SIZE_RANGE.0,
+            term_settings::FONT_SIZE_RANGE.1,
+        );
+        if size != self.font_size {
+            self.font_size = size;
+            self.clear_glyph_caches();
+            self.redraw(cx);
+        }
     }
 }
 

@@ -37,6 +37,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use makepad_regex::{ParseOptions, Regex};
 use makepad_widgets::{KeyCode, KeyEvent};
 
+use crate::keybinds::Action;
 use crate::term::page::{CellContent, Row};
 use crate::term::screen::Screen;
 
@@ -686,29 +687,13 @@ pub enum SearchKey {
     Clear,
 }
 
-/// The scrollback search's key bindings, all in this one place (the
-/// configurable-shortcuts work moves them into its table). `open`: the
-/// bar has the keyboard; the keys for editing and stepping apply only
-/// then. Search starts at the newest output, so Enter goes up.
-pub fn search_key(key: &KeyEvent, open: bool) -> Option<SearchKey> {
-    search_key_for(key, open, cfg!(target_os = "macos"))
-}
-
-pub fn search_key_for(key: &KeyEvent, open: bool, mac: bool) -> Option<SearchKey> {
+/// The search bar's own keys, while it is open: editing the query and
+/// stepping with Enter. They win over every shortcut (`crate::keybinds`),
+/// which holds the rest: opening the bar (Cmd+F on macOS, Ctrl+Shift+F
+/// elsewhere) and Cmd+G / Cmd+Shift+G. Search starts at the newest
+/// output, so Enter goes up.
+pub fn bar_key(key: &KeyEvent) -> Option<SearchKey> {
     let m = &key.modifiers;
-    let code = key.key_code;
-    // Open: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
-    let open_key = if mac {
-        m.logo && !m.control && !m.alt && !m.shift
-    } else {
-        m.control && m.shift && !m.alt && !m.logo
-    };
-    if code == KeyCode::KeyF && open_key {
-        return Some(SearchKey::Open);
-    }
-    if !open {
-        return None;
-    }
     let plain = !m.control && !m.alt && !m.logo;
     let step = |shift: bool| {
         if shift {
@@ -717,12 +702,9 @@ pub fn search_key_for(key: &KeyEvent, open: bool, mac: bool) -> Option<SearchKey
             SearchKey::Older
         }
     };
-    match code {
+    match key.key_code {
         KeyCode::Escape => Some(SearchKey::Close),
         KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::F3 if plain => Some(step(m.shift)),
-        // Cmd+G / Cmd+Shift+G on macOS; Ctrl+Shift+G / Ctrl+Alt+Shift+G is
-        // left alone elsewhere (Enter and F3 step).
-        KeyCode::KeyG if mac && m.logo && !m.control && !m.alt => Some(step(m.shift)),
         KeyCode::ArrowUp if plain && !m.shift => Some(SearchKey::Older),
         KeyCode::ArrowDown if plain && !m.shift => Some(SearchKey::Newer),
         KeyCode::KeyR if m.control && !m.alt && !m.logo && !m.shift => Some(SearchKey::ToggleRegex),
@@ -732,6 +714,37 @@ pub fn search_key_for(key: &KeyEvent, open: bool, mac: bool) -> Option<SearchKey
         KeyCode::KeyU if m.control && !m.alt && !m.logo => Some(SearchKey::Clear),
         KeyCode::KeyW if m.control && !m.alt && !m.logo && !m.shift => Some(SearchKey::DeleteWord),
         _ => None,
+    }
+}
+
+/// A shortcut's effect on the search, if it is a search action.
+pub fn search_action(action: &Action) -> Option<SearchKey> {
+    match action {
+        Action::StartSearch => Some(SearchKey::Open),
+        Action::NavigateSearch { next: true } => Some(SearchKey::Older),
+        Action::NavigateSearch { next: false } => Some(SearchKey::Newer),
+        Action::EndSearch => Some(SearchKey::Close),
+        _ => None,
+    }
+}
+
+/// What `key` does to the search under the platform's default shortcuts
+/// (`mac`): the bar's keys while it is `open`, then the table's.
+#[cfg(test)]
+pub fn search_key_for(key: &KeyEvent, open: bool, mac: bool) -> Option<SearchKey> {
+    use crate::keybinds::{Context, Decision, Keybinds, Scope};
+    if open {
+        if let Some(k) = bar_key(key) {
+            return Some(k);
+        }
+    }
+    let ctx = Context {
+        tabs: 1,
+        search_open: open,
+    };
+    match Keybinds::defaults(mac).decide(key, Scope::Pane, &ctx) {
+        Decision::Run { action, .. } => search_action(&action),
+        Decision::Pass => None,
     }
 }
 
@@ -1140,6 +1153,77 @@ mod tests {
             Some(SearchKey::Clear)
         );
         assert_eq!(open(KeyCode::KeyA, false, false, false, false), None);
+    }
+
+    /// The search keys before shortcuts were configurable, verbatim.
+    fn legacy_search_key_for(key: &KeyEvent, open: bool, mac: bool) -> Option<SearchKey> {
+        let m = &key.modifiers;
+        let code = key.key_code;
+        // Open: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
+        let open_key = if mac {
+            m.logo && !m.control && !m.alt && !m.shift
+        } else {
+            m.control && m.shift && !m.alt && !m.logo
+        };
+        if code == KeyCode::KeyF && open_key {
+            return Some(SearchKey::Open);
+        }
+        if !open {
+            return None;
+        }
+        let plain = !m.control && !m.alt && !m.logo;
+        let step = |shift: bool| {
+            if shift {
+                SearchKey::Newer
+            } else {
+                SearchKey::Older
+            }
+        };
+        match code {
+            KeyCode::Escape => Some(SearchKey::Close),
+            KeyCode::ReturnKey | KeyCode::NumpadEnter | KeyCode::F3 if plain => Some(step(m.shift)),
+            // Cmd+G / Cmd+Shift+G on macOS; Ctrl+Shift+G / Ctrl+Alt+Shift+G is
+            // left alone elsewhere (Enter and F3 step).
+            KeyCode::KeyG if mac && m.logo && !m.control && !m.alt => Some(step(m.shift)),
+            KeyCode::ArrowUp if plain && !m.shift => Some(SearchKey::Older),
+            KeyCode::ArrowDown if plain && !m.shift => Some(SearchKey::Newer),
+            KeyCode::KeyR if m.control && !m.alt && !m.logo && !m.shift => {
+                Some(SearchKey::ToggleRegex)
+            }
+            KeyCode::Backspace if m.logo => Some(SearchKey::Clear),
+            KeyCode::Backspace if m.alt || m.control => Some(SearchKey::DeleteWord),
+            KeyCode::Backspace => Some(SearchKey::DeleteChar),
+            KeyCode::KeyU if m.control && !m.alt && !m.logo => Some(SearchKey::Clear),
+            KeyCode::KeyW if m.control && !m.alt && !m.logo && !m.shift => {
+                Some(SearchKey::DeleteWord)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_default_table_and_the_bar_take_exactly_the_old_search_keys() {
+        for mac in [false, true] {
+            for &code in crate::keybinds::ALL_KEY_CODES {
+                for bits in 0..16u8 {
+                    let k = key(
+                        code,
+                        bits & 1 != 0,
+                        bits & 2 != 0,
+                        bits & 4 != 0,
+                        bits & 8 != 0,
+                    );
+                    for open in [false, true] {
+                        assert_eq!(
+                            search_key_for(&k, open, mac),
+                            legacy_search_key_for(&k, open, mac),
+                            "mac {mac}, open {open}: {code:?} {:?}",
+                            k.modifiers
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

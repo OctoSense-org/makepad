@@ -1,6 +1,7 @@
 //! The scrollback search bar of a terminal pane: its keys, its query, the
 //! highlight colours and its drawing. The matching is `crate::search`; the
-//! key bindings are `crate::search::search_key`.
+//! bar's own keys are `crate::search::bar_key`, and opening and stepping
+//! are shortcuts (`crate::keybinds`, run through [`MpTerm::search_shortcut`]).
 //!
 //! While the bar is open it has the keyboard: every key and all typed or
 //! pasted text go to the query, none to the program. Escape closes it and
@@ -56,7 +57,7 @@ impl MpTerm {
         let open = self.search_ui.open;
         match hit {
             Hit::KeyDown(e) => {
-                if let Some(key) = search::search_key(e, open) {
+                if let Some(key) = search::bar_key(e).filter(|_| open) {
                     self.search_command(cx, key);
                     return true;
                 }
@@ -86,6 +87,21 @@ impl MpTerm {
                 true
             }
             _ => false,
+        }
+    }
+
+    /// A search shortcut (open, step, close): true when it was one.
+    pub(super) fn search_shortcut(
+        &mut self,
+        cx: &mut Cx,
+        action: &crate::keybinds::Action,
+    ) -> bool {
+        match search::search_action(action) {
+            Some(key) => {
+                self.search_command(cx, key);
+                true
+            }
+            None => false,
         }
     }
 
