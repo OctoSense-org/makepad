@@ -123,6 +123,21 @@ pub fn encode_key(event: &KeyEvent, opts: &KeyEncodeOptions) -> Vec<u8> {
     }
 }
 
+/// Encode text that no key event carries: an IME commit or other composed
+/// text. Plain UTF-8 unless the kitty flags ask for every key as an escape
+/// code with its text, in which case it is reported against key number 0.
+pub fn encode_text(text: &str, opts: &KeyEncodeOptions) -> Vec<u8> {
+    let event = KeyEvent {
+        action: KeyAction::Press,
+        key: Key::Unidentified,
+        mods: KeyMods::default(),
+        consumed_mods: KeyMods::default(),
+        utf8: text.to_string(),
+        unshifted_codepoint: 0,
+    };
+    encode_key(&event, opts)
+}
+
 // ---------------------------------------------------------------------------
 // Modifier helpers (ghostty `key_mods.zig`)
 // ---------------------------------------------------------------------------
@@ -1367,6 +1382,20 @@ fn kitty(event: &KeyEvent, opts: &KeyEncodeOptions) -> Vec<u8> {
             if event.action == KeyAction::Release {
                 return Vec::new();
             }
+            // Text no known key produced (an IME commit, a dead-key
+            // composition, text the OS made from a chord). The spec: "If no
+            // known key is associated with the text the key number 0 must
+            // be used." That is only expressible with the text embedded, so
+            // it needs report-associated-text on top of report-all; without
+            // it the text still goes out as UTF-8 rather than being lost.
+            if flags.has(KittyFlags::REPORT_ALL)
+                && flags.has(KittyFlags::REPORT_ASSOCIATED)
+                && event.utf8.chars().any(|c| !is_control(c as u32))
+            {
+                let mut seq = KittySequence::new(0, b'u');
+                seq.text = event.utf8.clone();
+                return seq.encode();
+            }
             return event.utf8.as_bytes().to_vec();
         }
     };
@@ -1780,11 +1809,19 @@ mod tests {
         );
     }
 
+    /// Composed text with no key behind it: ghostty sends it raw, the spec
+    /// asks for key number 0 with the text embedded when both report-all and
+    /// report-associated-text are on. We follow the spec.
     #[test]
     fn kitty_composed_text_with_report_all() {
         expect(
             &with_utf8(ev(Key::Unidentified), "û"),
             &kitty_opts(ALL_KITTY),
+            "\x1b[0;;251u",
+        );
+        expect(
+            &with_utf8(ev(Key::Unidentified), "û"),
+            &kitty_opts(ALL_KITTY & !KittyFlags::REPORT_ASSOCIATED),
             "û",
         );
     }
@@ -2718,5 +2755,162 @@ mod tests {
             &legacy_opts(),
             "b",
         );
+    }
+
+    // -- phase 2: kitty paths the terminal frontend now drives -------------
+
+    fn act(mut event: KeyEvent, action: KeyAction) -> KeyEvent {
+        event.action = action;
+        event
+    }
+
+    /// Legacy (flags 0) bytes are pinned: the kitty work must not move them.
+    #[test]
+    fn legacy_bytes_are_unchanged() {
+        let o = KeyEncodeOptions {
+            alt_esc_prefix: true,
+            ..Default::default()
+        };
+        let app = KeyEncodeOptions {
+            cursor_key_application: true,
+            ..o
+        };
+        let a = with_unshifted(with_utf8(ev(Key::KeyA), "a"), 'a' as u32);
+        expect(&a, &o, "a");
+        expect(&act(a.clone(), KeyAction::Repeat), &o, "a");
+        expect(&act(a.clone(), KeyAction::Release), &o, "");
+        expect(
+            &with_unshifted(with_mods(ev(Key::KeyC), ctrl()), 'c' as u32),
+            &o,
+            "\x03",
+        );
+        expect(&with_mods(a.clone(), alt()), &o, "\x1ba");
+        expect(&with_utf8(ev(Key::Digit1), "1"), &o, "1");
+        expect(&ev(Key::ArrowUp), &o, "\x1b[A");
+        expect(&ev(Key::ArrowUp), &app, "\x1bOA");
+        expect(&with_mods(ev(Key::ArrowLeft), ctrl()), &o, "\x1b[1;5D");
+        expect(&ev(Key::F1), &o, "\x1bOP");
+        expect(&ev(Key::F5), &o, "\x1b[15~");
+        expect(&with_mods(ev(Key::F5), shift()), &o, "\x1b[15;2~");
+        expect(&with_mods(ev(Key::Tab), shift()), &o, "\x1b[Z");
+        expect(&ev(Key::Enter), &o, "\r");
+        expect(&ev(Key::Backspace), &o, "\x7f");
+        expect(&ev(Key::Escape), &o, "\x1b");
+        expect(&act(ev(Key::Escape), KeyAction::Release), &o, "");
+        assert_eq!(encode_text("你好", &o), "你好".as_bytes());
+    }
+
+    #[test]
+    fn kitty_function_and_arrow_keys_across_flags() {
+        let up = ev(Key::ArrowUp);
+        let f5 = ev(Key::F5);
+        let f1 = ev(Key::F1);
+        for flags in [1u8, 8, 1 | 8] {
+            expect(&up, &kitty_opts(flags), "\x1b[A");
+            expect(&f5, &kitty_opts(flags), "\x1b[15~");
+            expect(&f1, &kitty_opts(flags), "\x1b[P");
+            expect(
+                &with_mods(up.clone(), ctrl()),
+                &kitty_opts(flags),
+                "\x1b[1;5A",
+            );
+            expect(
+                &with_mods(f5.clone(), alt()),
+                &kitty_opts(flags),
+                "\x1b[15;3~",
+            );
+            expect(&act(up.clone(), KeyAction::Release), &kitty_opts(flags), "");
+        }
+        for flags in [2u8, 1 | 2, 2 | 8] {
+            expect(
+                &act(up.clone(), KeyAction::Repeat),
+                &kitty_opts(flags),
+                "\x1b[1;1:2A",
+            );
+            expect(
+                &act(up.clone(), KeyAction::Release),
+                &kitty_opts(flags),
+                "\x1b[1;1:3A",
+            );
+            expect(
+                &act(f5.clone(), KeyAction::Release),
+                &kitty_opts(flags),
+                "\x1b[15;1:3~",
+            );
+            expect(
+                &act(with_mods(f5.clone(), shift()), KeyAction::Repeat),
+                &kitty_opts(flags),
+                "\x1b[15;2:2~",
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_enter_tab_backspace_release_needs_report_all() {
+        for key in [Key::Enter, Key::Tab, Key::Backspace] {
+            expect(&act(ev(key), KeyAction::Release), &kitty_opts(2), "");
+            expect(&act(ev(key), KeyAction::Release), &kitty_opts(1 | 2), "");
+        }
+        expect(
+            &act(ev(Key::Enter), KeyAction::Release),
+            &kitty_opts(2 | 8),
+            "\x1b[13;1:3u",
+        );
+        expect(
+            &act(ev(Key::Tab), KeyAction::Release),
+            &kitty_opts(2 | 8),
+            "\x1b[9;1:3u",
+        );
+        expect(
+            &act(ev(Key::Backspace), KeyAction::Release),
+            &kitty_opts(2 | 8),
+            "\x1b[127;1:3u",
+        );
+        // Report all: even plain Enter is a code.
+        expect(&ev(Key::Enter), &kitty_opts(8), "\x1b[13u");
+        expect(&ev(Key::Enter), &kitty_opts(1), "\r");
+    }
+
+    #[test]
+    fn kitty_text_key_through_the_encoder() {
+        let a = with_unshifted(with_utf8(ev(Key::KeyA), "a"), 'a' as u32);
+        let shift_a = KeyEvent {
+            consumed_mods: shift(),
+            ..with_unshifted(
+                with_utf8(with_mods(ev(Key::KeyA), shift()), "A"),
+                'a' as u32,
+            )
+        };
+        let digit = with_unshifted(with_utf8(ev(Key::Digit7), "7"), '7' as u32);
+        expect(&a, &kitty_opts(1), "a");
+        expect(&shift_a, &kitty_opts(1), "A");
+        expect(&digit, &kitty_opts(1), "7");
+        expect(&a, &kitty_opts(8), "\x1b[97u");
+        expect(&shift_a, &kitty_opts(8), "\x1b[97;2u");
+        expect(&digit, &kitty_opts(8), "\x1b[55u");
+        expect(&a, &kitty_opts(8 | 16), "\x1b[97;;97u");
+        expect(&shift_a, &kitty_opts(8 | 16), "\x1b[97;2;65u");
+        expect(
+            &act(a.clone(), KeyAction::Repeat),
+            &kitty_opts(2 | 8 | 16),
+            "\x1b[97;1:2;97u",
+        );
+        expect(
+            &act(a.clone(), KeyAction::Release),
+            &kitty_opts(2 | 8 | 16),
+            "\x1b[97;1:3u",
+        );
+        // Alternates: the shifted key rides along.
+        expect(&shift_a, &kitty_opts(4 | 8), "\x1b[97:65;2u");
+    }
+
+    #[test]
+    fn kitty_unassociated_text_uses_key_zero() {
+        let ime = with_utf8(ev(Key::Unidentified), "日本");
+        expect(&ime, &kitty_opts(1), "日本");
+        expect(&ime, &kitty_opts(8), "日本");
+        expect(&ime, &kitty_opts(8 | 16), "\x1b[0;;26085:26412u");
+        expect(&act(ime.clone(), KeyAction::Release), &kitty_opts(31), "");
+        assert_eq!(encode_text("\x01", &kitty_opts(8 | 16)), b"\x01");
     }
 }

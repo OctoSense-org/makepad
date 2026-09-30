@@ -18,8 +18,10 @@ use crate::settings::{self as term_settings, BellStyle, CursorShape, Settings};
 use crate::themes;
 use std::time::{Duration, Instant};
 use crate::term::color::Rgb;
+use crate::kitty_input::{self, TextKeyPairing, TextOutcome};
 use crate::term::key_encode::{
-    encode_key, Key, KeyAction, KeyEncodeOptions, KeyEvent as TermKeyEvent, KeyMods, KittyFlags,
+    encode_key, encode_text, Key, KeyAction, KeyEncodeOptions, KeyEvent as TermKeyEvent, KeyMods,
+    KittyFlags,
 };
 use crate::term::modes::Mode;
 use crate::term::mouse_encode::{
@@ -675,6 +677,22 @@ pub struct MpTerm {
     /// option-as-meta already sent as a Meta key.
     #[rust]
     swallow_text_until: Option<Instant>,
+    /// Kitty report-all: pairs a key-down with the text it typed, so the
+    /// program gets one key event (see `crate::kitty_input`).
+    #[rust]
+    kitty_pairing: TextKeyPairing,
+    /// Flushes a text no key-down claimed (an IME commit).
+    #[rust]
+    kitty_text_timer: Timer,
+    /// Keys whose press reached the program: only these report a release.
+    #[rust]
+    kitty_pressed: Vec<KeyCode>,
+    /// Wakes the widget when a held synchronized frame (mode 2026) times
+    /// out, so a program that died mid-frame can't freeze the screen.
+    #[rust]
+    sync_timer: Timer,
+    #[rust]
+    sync_timer_for: Option<f64>,
     /// The fonts applied from the settings, and the script objects that
     /// keep their resources alive.
     /// Set by a host for the one event it routes here (`crate::tabs`).
@@ -1649,6 +1667,72 @@ impl MpTerm {
         }
     }
 
+    /// Write already-encoded key bytes, as a typed key does.
+    fn write_key_bytes(&mut self, cx: &mut Cx, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.sel_anchor = None;
+        self.sel_cursor = None;
+        self.scroll_to_bottom();
+        if let Some(session) = self.session.as_mut() {
+            session.write(bytes);
+        }
+        self.redraw(cx);
+    }
+
+    /// Kitty report-all: a text, numpad or modifier key as one key event,
+    /// with the text the platform typed for it when there is one.
+    fn send_kitty_text_key(
+        &mut self,
+        cx: &mut Cx,
+        e: &KeyEvent,
+        action: KeyAction,
+        text: Option<String>,
+    ) {
+        let opts = self.key_opts();
+        let Some((event, composed)) =
+            kitty_input::text_key_event(e.key_code, &e.modifiers, action, text.as_deref())
+        else {
+            if let Some(text) = text {
+                self.write_key_bytes(cx, &encode_text(&text, &opts));
+            }
+            return;
+        };
+        let mut bytes = encode_key(&event, &opts);
+        if let Some(composed) = composed {
+            if opts.kitty_flags.has(KittyFlags::REPORT_ASSOCIATED) {
+                bytes.extend(encode_text(&composed, &opts));
+            }
+        }
+        self.write_key_bytes(cx, &bytes);
+    }
+
+    /// A release, under kitty report-event-types, for a key whose press the
+    /// program saw.
+    fn send_key_release(&mut self, cx: &mut Cx, e: &KeyEvent) {
+        let Some(at) = self.kitty_pressed.iter().position(|k| *k == e.key_code) else {
+            return;
+        };
+        self.kitty_pressed.swap_remove(at);
+        if !self.key_opts().kitty_flags.has(KittyFlags::REPORT_EVENTS) {
+            return;
+        }
+        if let Some(key) = Self::map_keycode(e.key_code) {
+            self.send_key(cx, key, &e.modifiers, KeyAction::Release, "", 0);
+        } else {
+            self.send_kitty_text_key(cx, e, KeyAction::Release, None);
+        }
+    }
+
+    /// Kitty report-all: the held text no key-down claimed goes out as text.
+    fn flush_unpaired_text(&mut self, cx: &mut Cx) {
+        if let Some(text) = self.kitty_pairing.take_unpaired() {
+            let bytes = encode_text(&text, &self.key_opts());
+            self.write_key_bytes(cx, &bytes);
+        }
+    }
+
     fn paste(&mut self, cx: &mut Cx, text: &str) {
         if self.paste_bytes(text) || self.input_notice.is_some() {
             self.redraw(cx);
@@ -2494,9 +2578,27 @@ impl MpTerm {
         for action in actions {
             cx.widget_action(self.uid, action);
         }
+        self.arm_sync_timer(cx);
         if needs_redraw {
             self.draw_bg.redraw(cx);
         }
+    }
+
+    /// Keep a timer on the held synchronized frame's deadline. The drain
+    /// that timer triggers shows the frame if its end never came.
+    fn arm_sync_timer(&mut self, cx: &mut Cx) {
+        let deadline = self.session.as_ref().and_then(|s| s.sync_deadline());
+        if deadline == self.sync_timer_for {
+            return;
+        }
+        cx.stop_timer(self.sync_timer);
+        self.sync_timer = Timer::default();
+        if let Some(deadline) = deadline {
+            let wait = (deadline - Cx::monotonic_now()).max(0.0);
+            // A hair past the deadline, so the drain it wakes finds it due.
+            self.sync_timer = cx.start_timeout(wait + 0.005);
+        }
+        self.sync_timer_for = deadline;
     }
 }
 
@@ -2514,6 +2616,7 @@ impl Widget for MpTerm {
             session.resize(cols, rows);
             session.drain();
         }
+        self.arm_sync_timer(cx);
 
         self.draw_terminal(cx);
 
@@ -2560,6 +2663,14 @@ impl Widget for MpTerm {
         if self.blink_timer.is_event(event).is_some() {
             self.blink_armed = false;
             self.draw_bg.redraw(cx);
+        }
+        if self.sync_timer.is_event(event).is_some() {
+            // The held frame's deadline: the drain releases it.
+            self.sync_timer_for = None;
+            self.pump_session(cx);
+        }
+        if self.kitty_text_timer.is_event(event).is_some() {
+            self.flush_unpaired_text(cx);
         }
         if self.input_notice_timer.is_event(event).is_some() {
             self.input_notice = None;
@@ -2662,6 +2773,7 @@ impl Widget for MpTerm {
                 cx.set_key_focus(self.area);
                 Hit::TextInput(e.clone())
             }
+            Event::KeyUp(e) if orphan_key => Hit::KeyUp(*e),
             _ => event.hits(cx, self.area),
         };
         match hit {
@@ -2779,6 +2891,7 @@ impl Widget for MpTerm {
                 self.draw_bg.redraw(cx);
             }
             Hit::KeyFocusLost(_) => {
+                self.kitty_pressed.clear();
                 if let Some(session) = self.session.as_mut() {
                     if session.terminal.modes.get(Mode::FocusEvent) {
                         session.write(b"\x1b[O");
@@ -2798,8 +2911,33 @@ impl Widget for MpTerm {
                 {
                     cx.widget_action(self.uid, MpTermAction::PromptSubmitted);
                 }
-                // Clear selection on typing.
-                if Self::is_special(e.key_code) {
+                let action = if e.is_repeat {
+                    KeyAction::Repeat
+                } else {
+                    KeyAction::Press
+                };
+                // Kitty: only a press the program saw reports its release.
+                if !e.modifiers.logo && !self.kitty_pressed.contains(&e.key_code) {
+                    self.kitty_pressed.push(e.key_code);
+                }
+                // Kitty report-all: typed text becomes part of the key event.
+                let report_all = kitty_input::text_as_key_events(self.key_opts().kitty_flags);
+                let text_key = report_all
+                    && !Self::is_special(e.key_code)
+                    && !e.modifiers.logo
+                    && !e.modifiers.control
+                    && !(self.settings.option_as_meta && e.modifiers.alt)
+                    && kitty_input::kitty_key_of(e.key_code).is_some();
+                let held = if report_all {
+                    self.kitty_pairing
+                        .on_key_down(text_key, Cx::monotonic_now())
+                } else {
+                    None
+                };
+                if text_key {
+                    self.send_kitty_text_key(cx, &e, action, held);
+                } else if Self::is_special(e.key_code) {
+                    // Clear selection on typing.
                     self.sel_anchor = None;
                     self.sel_cursor = None;
                     let key = Self::map_keycode(e.key_code).unwrap();
@@ -2846,6 +2984,10 @@ impl Widget for MpTerm {
                     }
                 }
             }
+            Hit::KeyUp(e) => {
+                self.kitty_pairing.on_key_up();
+                self.send_key_release(cx, &e);
+            }
             Hit::TextInput(e) => {
                 if e.replace_last {
                     return;
@@ -2863,7 +3005,17 @@ impl Widget for MpTerm {
                         .chars()
                         .filter(|c| *c != '\n' && *c != '\r')
                         .collect();
-                    if !filtered.is_empty() {
+                    if !filtered.is_empty()
+                        && kitty_input::text_as_key_events(self.key_opts().kitty_flags)
+                    {
+                        // Kitty report-all: wait for the key-down this text
+                        // belongs to; text none claims is IME text.
+                        if self.kitty_pairing.on_text(&filtered, Cx::monotonic_now())
+                            == TextOutcome::Hold
+                        {
+                            self.kitty_text_timer = cx.start_timeout(kitty_input::PAIRING_WINDOW);
+                        }
+                    } else if !filtered.is_empty() {
                         self.sel_anchor = None;
                         self.sel_cursor = None;
                         self.scroll_to_bottom();

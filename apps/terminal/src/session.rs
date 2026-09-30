@@ -10,8 +10,10 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use makepad_widgets::makepad_platform::thread::SignalToUI;
+use makepad_widgets::Cx;
 
 use crate::pty::{InputRejected, Pty, PtyWriter};
+use crate::sync_output::SyncGate;
 use crate::term::stream::Stream;
 use crate::term::terminal::{TermEvent, Terminal};
 
@@ -38,6 +40,8 @@ pub struct Session {
     pty: Pty,
     writer: PtyWriter,
     rx: Receiver<Vec<u8>>,
+    /// Holds a synchronized-output frame (mode 2026) until it is complete.
+    sync: SyncGate,
     pub exited: bool,
 }
 
@@ -153,6 +157,7 @@ impl Session {
             pty,
             writer,
             rx,
+            sync: SyncGate::default(),
             exited: false,
         })
     }
@@ -167,13 +172,18 @@ impl Session {
     /// tick continues where this one stopped.
     pub fn drain(&mut self) -> bool {
         let deadline = Instant::now() + DRAIN_BUDGET;
-        let mut changed = false;
+        let now = Cx::monotonic_now();
+        // A frame held past its timeout is shown as it is.
+        let mut changed = self.sync.expire(&mut self.stream, &mut self.terminal, now);
         let mut backlog = false;
         loop {
             match self.rx.try_recv() {
                 Ok(bytes) => {
-                    self.stream.process(&bytes, &mut self.terminal);
-                    changed = true;
+                    // Bytes of an open synchronized frame are held, not
+                    // parsed: nothing changes on screen until it ends.
+                    changed |= self
+                        .sync
+                        .feed(&bytes, &mut self.stream, &mut self.terminal, now);
                     if Instant::now() >= deadline {
                         backlog = true;
                         break;
@@ -181,6 +191,8 @@ impl Session {
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    // The program is gone: show whatever it left.
+                    changed |= self.sync.release(&mut self.stream, &mut self.terminal);
                     if !self.exited && self.pty.child_exited() {
                         self.exited = true;
                         changed = true;
@@ -202,6 +214,12 @@ impl Session {
             SignalToUI::set_ui_signal();
         }
         changed
+    }
+
+    /// When a held synchronized frame will be shown even if it never ends;
+    /// the UI must drain again then.
+    pub fn sync_deadline(&self) -> Option<f64> {
+        self.sync.deadline()
     }
 
     pub fn take_events(&mut self) -> Vec<TermEvent> {
@@ -236,6 +254,9 @@ impl Session {
         if cols == self.terminal.cols() && rows == self.terminal.rows() {
             return;
         }
+        // A held frame was drawn for the old size and the program redraws
+        // for the new one: show it now rather than hold across the reflow.
+        self.sync.release(&mut self.stream, &mut self.terminal);
         self.terminal.resize(cols, rows);
         let _ = self.pty.resize(cols as u16, rows as u16);
     }
@@ -421,6 +442,66 @@ mod tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "closing a session with unread input queued blocked"
         );
+    }
+
+    /// Mode 2026 through a real PTY: a frame drawn in pieces with pauses
+    /// is never visible half done; the end shows it whole. A frame whose
+    /// end never comes is shown after the timeout.
+    #[test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn synchronized_frames_are_shown_whole() {
+        let command = "printf 'OLD'; sleep 0.5; \
+             printf '\\033[?2026h\\033[H\\033[2JNEW-top'; sleep 0.6; \
+             printf ' NEW-bottom\\033[?2026l'; sleep 0.6; \
+             printf '\\033[?2026h STUCK'; sleep 30";
+        let options = SpawnOptions {
+            shell: Some("/bin/sh".into()),
+            login: false,
+            ..SpawnOptions::default()
+        };
+        let mut session =
+            Session::spawn_with(40, 4, None, Some(command), &options).expect("a pty session");
+        assert!(
+            drain_until(&mut session, 10, |s| screen_text(s).contains("OLD")),
+            "first frame"
+        );
+        // While the frame is open the screen keeps the old one.
+        assert!(
+            drain_until(&mut session, 5, |s| s.sync_deadline().is_some()),
+            "frame opened"
+        );
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_millis(300) {
+            session.drain();
+            let text = screen_text(&session);
+            assert!(
+                text.contains("OLD") && !text.contains("NEW"),
+                "half frame shown: {text:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            drain_until(&mut session, 5, |s| screen_text(s)
+                .contains("NEW-top NEW-bottom")),
+            "whole frame at its end"
+        );
+        // An unterminated frame: held, then shown once its timeout passes.
+        assert!(
+            drain_until(&mut session, 5, |s| s.sync_deadline().is_some()),
+            "stuck frame opened"
+        );
+        let opened = Instant::now();
+        assert!(!screen_text(&session).contains("STUCK"));
+        assert!(
+            drain_until(&mut session, 5, |s| screen_text(s).contains("STUCK")),
+            "released"
+        );
+        assert!(
+            opened.elapsed()
+                >= Duration::from_secs_f64(crate::sync_output::SYNC_TIMEOUT)
+                    - Duration::from_millis(100)
+        );
+        assert_eq!(session.sync_deadline(), None);
     }
 
     /// A tab asks its session what runs in it (confirm-before-close, the

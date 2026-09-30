@@ -1291,6 +1291,10 @@ impl Terminal {
             // Cursor position and pen carry over (xterm shares the cursor).
             let cursor = self.primary.cursor.clone();
             self.active = ActiveScreen::Alternate;
+            // A full-screen program starts with its own, empty keyboard
+            // stack: one that crashed without popping must not leave the
+            // next one receiving kitty codes it never asked for.
+            self.kitty_flags_alternate.clear();
             let s = self.screen_mut();
             s.cursor = cursor;
             s.cursor.x = s.cursor.x.min(s.cols - 1);
@@ -1320,6 +1324,8 @@ impl Terminal {
         if enable && self.active == ActiveScreen::Primary {
             self.save_cursor();
             self.active = ActiveScreen::Alternate;
+            // Its own, empty keyboard stack (see `switch_screen`).
+            self.kitty_flags_alternate.clear();
             // Clear alt and home the cursor, keeping the pen.
             let pen = self.primary.cursor.style;
             let s = self.screen_mut();
@@ -2402,6 +2408,39 @@ mod tests {
         assert_eq!(t.take_outbound(), b"\x1b[?1u");
         feed(&mut s, &mut t, b"\x1b[<1u");
         assert_eq!(t.kitty_flags(), 0);
+    }
+
+    /// The spec: "The main and alternate screens in the terminal emulator
+    /// must maintain their own, independent, keyboard mode stacks."
+    #[test]
+    fn kitty_keyboard_stacks_are_per_screen() {
+        let (mut s, mut t) = term(10, 3);
+        feed(&mut s, &mut t, b"\x1b[>1u");
+        feed(&mut s, &mut t, b"\x1b[?1049h");
+        assert_eq!(t.kitty_flags(), 0, "the alternate screen starts clean");
+        feed(&mut s, &mut t, b"\x1b[>11u\x1b[>31u");
+        feed(&mut s, &mut t, b"\x1b[?u");
+        assert_eq!(t.take_outbound(), b"\x1b[?31u");
+        feed(&mut s, &mut t, b"\x1b[<u");
+        assert_eq!(t.kitty_flags(), 11);
+        // Leaving without popping (a crashed full-screen app) must not leak
+        // its flags into the shell.
+        feed(&mut s, &mut t, b"\x1b[?1049l");
+        feed(&mut s, &mut t, b"\x1b[?u");
+        assert_eq!(t.take_outbound(), b"\x1b[?1u");
+        feed(&mut s, &mut t, b"\x1b[=3;2u");
+        assert_eq!(t.kitty_flags(), 3, "=flags;2 sets bits on the top entry");
+        feed(&mut s, &mut t, b"\x1b[=1;3u");
+        assert_eq!(t.kitty_flags(), 2, "=flags;3 clears bits");
+        // Popping more than the stack holds empties it: all flags reset.
+        feed(&mut s, &mut t, b"\x1b[<5u");
+        assert_eq!(t.kitty_flags(), 0);
+        // Entering the alternate screen again starts a fresh stack: the
+        // crashed program's 11 is gone. The primary one is untouched.
+        feed(&mut s, &mut t, b"\x1b[>1u\x1b[?1049h");
+        assert_eq!(t.kitty_flags(), 0);
+        feed(&mut s, &mut t, b"\x1b[?47l");
+        assert_eq!(t.kitty_flags(), 1);
     }
 
     #[test]
