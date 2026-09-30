@@ -2146,6 +2146,135 @@ mod tests {
         assert!(all.iter().any(|l| l == "line"));
     }
 
+    /// The active screen as one line per row (`[漢]` wide head, `T` tail,
+    /// `S` spacer head, `_` blank, `>` soft-wrapped) plus the cursor, so a
+    /// reflowed screen can be compared cell for cell with a fresh print.
+    fn screen_dump(t: &Terminal) -> String {
+        use crate::term::page::CellContent;
+        let sc = t.screen();
+        let mut out = String::new();
+        for y in 0..t.rows() {
+            let row = sc.row(y);
+            let mut cells: Vec<String> = row
+                .cells
+                .iter()
+                .map(|c| match &c.content {
+                    CellContent::Empty => "_".to_string(),
+                    CellContent::Char(ch) => ch.to_string(),
+                    CellContent::WideChar(ch) => format!("[{ch}]"),
+                    CellContent::WideTail => "T".to_string(),
+                    CellContent::WideSpacerHead => "S".to_string(),
+                    CellContent::Cluster(c) => format!("[{}]", c.cps.iter().collect::<String>()),
+                })
+                .collect();
+            while cells.last().map(|c| c == "_").unwrap_or(false) {
+                cells.pop();
+            }
+            out.push_str(&cells.join(" "));
+            if row.wrapped {
+                out.push_str(" >");
+            }
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "cursor x={} y={} pending_wrap={}",
+            sc.cursor.x, sc.cursor.y, sc.cursor.pending_wrap
+        ));
+        out
+    }
+
+    /// Print `bytes` at `from` cols, resize to each width in `to`, and
+    /// check the result matches printing the same bytes fresh there.
+    fn assert_reflow_matches_fresh(bytes: &[u8], from: usize, to: &[usize], rows: usize) {
+        let (mut s, mut t) = term(from, rows);
+        feed(&mut s, &mut t, bytes);
+        for &cols in to {
+            t.resize(cols, rows);
+            let (mut s2, mut fresh) = term(cols, rows);
+            feed(&mut s2, &mut fresh, bytes);
+            assert_eq!(
+                screen_dump(&t),
+                screen_dump(&fresh),
+                "reflow {from} -> {to:?} (now {cols} cols) differs from a fresh print"
+            );
+        }
+    }
+
+    #[test]
+    fn reflow_narrower_keeps_wide_chars_whole() {
+        let (mut s, mut t) = term(10, 3);
+        feed(&mut s, &mut t, "漢字ab".as_bytes());
+        t.resize(8, 3);
+        assert_eq!(row_text(&t, 0), "漢字ab");
+        assert_eq!(t.screen().cursor.x, 6);
+        assert_eq!(screen_dump(&t).lines().next().unwrap(), "[漢] T [字] T a b");
+        assert_reflow_matches_fresh("漢字ab".as_bytes(), 10, &[8], 3);
+    }
+
+    #[test]
+    fn reflow_wraps_a_wide_char_that_no_longer_fits() {
+        // 漢 would straddle the new edge: it wraps whole behind a spacer.
+        assert_reflow_matches_fresh("abc漢字d".as_bytes(), 10, &[4], 4);
+        assert_reflow_matches_fresh("abc漢字d".as_bytes(), 10, &[6], 4);
+        assert_reflow_matches_fresh("漢字ab漢字ab".as_bytes(), 20, &[7, 5, 3], 8);
+        let (mut s, mut t) = term(10, 4);
+        feed(&mut s, &mut t, "abc漢字d".as_bytes());
+        t.resize(4, 4);
+        let dump = screen_dump(&t);
+        let mut lines = dump.lines();
+        assert_eq!(lines.next(), Some("a b c S >"));
+        assert_eq!(lines.next(), Some("[漢] T [字] T >"));
+        assert_eq!(lines.next(), Some("d"));
+    }
+
+    #[test]
+    fn reflow_wider_joins_wide_chars_back() {
+        // Printed narrow (with spacer heads), then widened.
+        assert_reflow_matches_fresh("abc漢字d漢".as_bytes(), 4, &[10], 4);
+        assert_reflow_matches_fresh("漢字ab漢字ab".as_bytes(), 5, &[7, 12, 30], 6);
+    }
+
+    #[test]
+    fn reflow_round_trip_restores_the_original() {
+        for text in ["漢字ab漢字ab", "abc漢字d漢", "a😀b😀😀c"] {
+            let (mut s, mut t) = term(10, 6);
+            feed(&mut s, &mut t, text.as_bytes());
+            let before = screen_dump(&t);
+            for cols in [7, 3, 5, 10] {
+                t.resize(cols, 6);
+            }
+            assert_eq!(screen_dump(&t), before, "round trip of {text:?}");
+        }
+    }
+
+    #[test]
+    fn reflow_keeps_emoji_whole() {
+        assert_reflow_matches_fresh("a😀b😀😀c".as_bytes(), 10, &[4, 3, 9], 6);
+        // Grapheme clusters (mode 2027) are wide heads too.
+        assert_reflow_matches_fresh("\x1b[?2027hab👍🏽c👍🏽".as_bytes(), 10, &[3, 4, 12], 6);
+    }
+
+    #[test]
+    fn reflow_cursor_tracks_its_cell() {
+        // Cursor parked on a wide head mid-line (4 columns back: on 字).
+        assert_reflow_matches_fresh("漢字ab\x1b[4D".as_bytes(), 10, &[8, 12], 3);
+        // Cursor on a head that wraps to the next row: it stays on 字.
+        // (A fresh print is no oracle here: its CUB counts columns of the
+        // narrow layout.)
+        let (mut s, mut t) = term(10, 4);
+        feed(&mut s, &mut t, "abc漢字\x1b[2D".as_bytes());
+        assert_eq!((t.screen().cursor.x, t.screen().cursor.y), (5, 0));
+        t.resize(4, 4);
+        assert_eq!((t.screen().cursor.x, t.screen().cursor.y), (2, 1));
+        t.resize(10, 4);
+        assert_eq!((t.screen().cursor.x, t.screen().cursor.y), (5, 0));
+        // Deferred wrap after a full row, narrower and wider.
+        assert_reflow_matches_fresh("漢字ab".as_bytes(), 10, &[6], 3);
+        assert_reflow_matches_fresh("abcdef".as_bytes(), 6, &[4, 10], 3);
+        // Cursor beyond the content, on a later row.
+        assert_reflow_matches_fresh("漢字ab漢字ab\r\n漢x".as_bytes(), 12, &[5, 9], 6);
+    }
+
     #[test]
     fn kitty_keyboard_stack() {
         let (mut s, mut t) = term(10, 3);
