@@ -486,6 +486,7 @@ impl Pty {
         cmd.env_remove("STUDIO_HOST");
         cmd.env_remove("STUDIO_BUILD");
         cmd.env_remove("STUDIO_CRATE");
+        cmd.env_remove("STUDIO_HANDSHAKE_STDIN");
         cmd.env_remove("MAKEPAD_STDIN_LOOP");
         for (k, v) in env {
             cmd.env(k, v);
