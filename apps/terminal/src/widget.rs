@@ -598,6 +598,12 @@ pub struct MpTerm {
     /// Keys whose press reached the program: only these report a release.
     #[rust]
     kitty_pressed: Vec<KeyCode>,
+    /// Wakes the widget when a held synchronized frame (mode 2026) times
+    /// out, so a program that died mid-frame can't freeze the screen.
+    #[rust]
+    sync_timer: Timer,
+    #[rust]
+    sync_timer_for: Option<f64>,
     /// The fonts applied from the settings, and the script objects that
     /// keep their resources alive.
     /// Set by a host for the one event it routes here (`crate::tabs`).
@@ -2328,9 +2334,27 @@ impl MpTerm {
         for action in actions {
             cx.widget_action(self.uid, action);
         }
+        self.arm_sync_timer(cx);
         if needs_redraw {
             self.draw_bg.redraw(cx);
         }
+    }
+
+    /// Keep a timer on the held synchronized frame's deadline. The drain
+    /// that timer triggers shows the frame if its end never came.
+    fn arm_sync_timer(&mut self, cx: &mut Cx) {
+        let deadline = self.session.as_ref().and_then(|s| s.sync_deadline());
+        if deadline == self.sync_timer_for {
+            return;
+        }
+        cx.stop_timer(self.sync_timer);
+        self.sync_timer = Timer::default();
+        if let Some(deadline) = deadline {
+            let wait = (deadline - Cx::monotonic_now()).max(0.0);
+            // A hair past the deadline, so the drain it wakes finds it due.
+            self.sync_timer = cx.start_timeout(wait + 0.005);
+        }
+        self.sync_timer_for = deadline;
     }
 }
 
@@ -2348,6 +2372,7 @@ impl Widget for MpTerm {
             session.resize(cols, rows);
             session.drain();
         }
+        self.arm_sync_timer(cx);
 
         self.draw_terminal(cx);
 
@@ -2394,6 +2419,11 @@ impl Widget for MpTerm {
         if self.blink_timer.is_event(event).is_some() {
             self.blink_armed = false;
             self.draw_bg.redraw(cx);
+        }
+        if self.sync_timer.is_event(event).is_some() {
+            // The held frame's deadline: the drain releases it.
+            self.sync_timer_for = None;
+            self.pump_session(cx);
         }
         if self.kitty_text_timer.is_event(event).is_some() {
             self.flush_unpaired_text(cx);
