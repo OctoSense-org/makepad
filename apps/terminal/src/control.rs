@@ -72,14 +72,25 @@ impl Request {
 
 pub type Reply = mpsc::Sender<Value>;
 
+/// A request waiting for the UI thread. Leaving the queue is its claim,
+/// made exactly once under the registry lock: either the UI thread takes
+/// it (and runs it) or its asker's timeout cancels it (and it never runs).
+struct Queued {
+    id: u64,
+    request: Request,
+    reply: Reply,
+}
+
 struct Registry {
     /// Pane id → (info, when it was last published).
     panes: BTreeMap<u64, (PaneInfo, Instant)>,
-    queue: Vec<(Request, Reply)>,
+    queue: Vec<Queued>,
+    next_id: u64,
     enabled: bool,
 }
 
-static REGISTRY: Mutex<Registry> = Mutex::new(Registry { panes: BTreeMap::new(), queue: Vec::new(), enabled: false });
+static REGISTRY: Mutex<Registry> =
+    Mutex::new(Registry { panes: BTreeMap::new(), queue: Vec::new(), next_id: 0, enabled: false });
 static STARTED: std::sync::Once = std::sync::Once::new();
 
 /// A pane's id outside the process: `<pid>.<pane>`.
@@ -127,15 +138,26 @@ pub fn forget(pane: u64) {
     lock().panes.remove(&pane);
 }
 
-/// The requests for panes `owns` claims, taken off the queue.
+/// The requests for panes `owns` claims, taken off the queue. Taking one
+/// commits to running it: its asker waits for the reply from then on. A
+/// request whose asker timed out is no longer queued (`cancel`).
 pub fn take_requests(owns: impl Fn(u64) -> bool) -> Vec<(Request, Reply)> {
     let mut registry = lock();
     if registry.queue.is_empty() {
         return Vec::new();
     }
-    let (mine, rest): (Vec<_>, Vec<_>) = registry.queue.drain(..).partition(|(req, _)| owns(req.pane()));
+    let (mine, rest): (Vec<_>, Vec<_>) = registry.queue.drain(..).partition(|queued| owns(queued.request.pane()));
     registry.queue = rest;
-    mine
+    mine.into_iter().map(|queued| (queued.request, queued.reply)).collect()
+}
+
+/// Take request `id` back off the queue so it never runs. False when the
+/// UI thread already took it: then it runs, and replies.
+fn cancel(id: u64) -> bool {
+    let mut registry = lock();
+    let before = registry.queue.len();
+    registry.queue.retain(|queued| queued.id != id);
+    registry.queue.len() != before
 }
 
 pub fn ok(fields: Vec<(&str, Value)>) -> Value {
@@ -152,10 +174,15 @@ pub fn err(message: impl Into<String>) -> Value {
 const STALE: Duration = Duration::from_secs(5);
 /// How long a request waits for the UI thread.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
+const NOT_ANSWERED: &str = "the terminal did not answer";
 
 /// Answer one request line. `list` is answered here; `read` and `prompt`
 /// wait for the UI thread (`take_requests`).
 pub fn answer(line: &str) -> Value {
+    answer_within(line, ANSWER_TIMEOUT)
+}
+
+fn answer_within(line: &str, timeout: Duration) -> Value {
     let Ok(request) = json::parse(line.as_bytes()) else {
         return err("the request is not JSON");
     };
@@ -194,9 +221,24 @@ pub fn answer(line: &str) -> Value {
         return err("no such pane in this terminal");
     }
     let (tx, rx) = mpsc::channel();
-    lock().queue.push((queued, tx));
+    let id = {
+        let mut registry = lock();
+        registry.next_id += 1;
+        let id = registry.next_id;
+        registry.queue.push(Queued { id, request: queued, reply: tx });
+        id
+    };
     makepad_widgets::makepad_platform::thread::SignalToUI::set_ui_signal();
-    rx.recv_timeout(ANSWER_TIMEOUT).unwrap_or_else(|_| err("the terminal did not answer"))
+    if let Ok(reply) = rx.recv_timeout(timeout) {
+        return reply;
+    }
+    // Still queued: the UI thread never saw it, and now never will.
+    if cancel(id) {
+        return err(NOT_ANSWERED);
+    }
+    // The UI thread took it first: it runs, so report how it went. (The UI
+    // thread replies or drops the sender as soon as it has handled it.)
+    rx.recv().unwrap_or_else(|_| err("the terminal took the request but did not answer"))
 }
 
 #[cfg(unix)]
@@ -272,7 +314,9 @@ pub(crate) fn set_enabled_for_tests(on: bool) {
     lock().enabled = on;
 }
 
+// Host-only tests: std clocks are fine here (the lints guard wasm).
 #[cfg(test)]
+#[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
@@ -323,6 +367,119 @@ mod tests {
 
     fn set_enabled_for_test(on: bool) {
         lock().enabled = on;
+    }
+
+    fn publish_pane(pane: u64) {
+        publish(vec![PaneInfo {
+            pane,
+            tab: 0,
+            title: "sh".into(),
+            cwd: "/tmp".into(),
+            program: "sh".into(),
+            agent: None,
+            state: "idle",
+            focused: true,
+        }]);
+    }
+
+    fn prompt_line(pane: u64, text: &str) -> String {
+        format!(r#"{{"cmd":"prompt","pane":"{}","text":"{text}","submit":true}}"#, pane_id(pane))
+    }
+
+    /// The UI thread was busy past the timeout: the asker got an error, so
+    /// the prompt must not be typed when the UI thread wakes up.
+    #[test]
+    fn a_timed_out_prompt_never_runs_later() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled_for_test(true);
+        publish_pane(9);
+        let started = Instant::now();
+        let reply = answer_within(&prompt_line(9, "rm -rf build"), Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(reply.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(reply.get("error").and_then(Value::as_str), Some(NOT_ANSWERED));
+        let late = take_requests(|pane| pane == 9);
+        assert!(late.is_empty(), "a timed-out prompt is still queued: {:?}", late.iter().map(|(r, _)| r).collect::<Vec<_>>());
+        forget(9);
+    }
+
+    /// Normal path for a prompt: taken in time, the asker gets the reply.
+    #[test]
+    fn a_prompt_answered_in_time_gets_its_reply() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled_for_test(true);
+        publish_pane(10);
+        let asker = std::thread::spawn(|| answer(&prompt_line(10, "make test")));
+        let mut taken = Vec::new();
+        for _ in 0..400 {
+            taken = take_requests(|pane| pane == 10);
+            if !taken.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(taken.len(), 1);
+        let (request, reply) = taken.pop().unwrap();
+        assert_eq!(request, Request::Prompt { pane: 10, text: "make test".into(), submit: true, force: false });
+        reply.send(ok(vec![])).unwrap();
+        assert_eq!(asker.join().unwrap().get("ok"), Some(&Value::Bool(true)));
+        assert!(take_requests(|pane| pane == 10).is_empty(), "taken exactly once");
+        forget(10);
+    }
+
+    /// Taken just before the timeout, answered after it: the request ran,
+    /// so the asker gets the real reply, not a timeout.
+    #[test]
+    fn a_request_taken_before_the_timeout_reports_its_real_reply() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled_for_test(true);
+        publish_pane(11);
+        let asker = std::thread::spawn(|| answer_within(&prompt_line(11, "ls"), Duration::from_millis(200)));
+        let mut taken = Vec::new();
+        while taken.is_empty() {
+            taken = take_requests(|pane| pane == 11);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        taken.pop().unwrap().1.send(ok(vec![("typed", Value::Bool(true))])).unwrap();
+        let reply = asker.join().unwrap();
+        assert_eq!(reply.get("typed"), Some(&Value::Bool(true)), "{}", reply.to_json());
+        forget(11);
+    }
+
+    /// The timeout and the UI thread race for the same entry: exactly one
+    /// wins. Either the request ran and the asker got its reply, or it
+    /// never ran and the asker got the timeout.
+    #[test]
+    fn timeout_and_take_never_both_win() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled_for_test(true);
+        publish_pane(13);
+        let (mut ran, mut timed_out) = (0, 0);
+        for round in 0..300u64 {
+            let asker = std::thread::spawn(|| answer_within(&prompt_line(13, "echo"), Duration::from_millis(2)));
+            // One take, somewhere around the 2 ms deadline.
+            std::thread::sleep(Duration::from_micros(1000 + (round * 37) % 2500));
+            let mut taken = take_requests(|pane| pane == 13);
+            // Past the asker's wait, nothing is left to take.
+            let reply = if taken.is_empty() {
+                let reply = asker.join().unwrap();
+                assert!(take_requests(|pane| pane == 13).is_empty(), "round {round}: queued after its timeout");
+                reply
+            } else {
+                assert_eq!(taken.len(), 1);
+                taken.pop().unwrap().1.send(ok(vec![("ran", Value::Bool(true))])).unwrap();
+                asker.join().unwrap()
+            };
+            if reply.get("ran") == Some(&Value::Bool(true)) {
+                ran += 1;
+            } else {
+                assert_eq!(reply.get("error").and_then(Value::as_str), Some(NOT_ANSWERED), "round {round}");
+                timed_out += 1;
+            }
+        }
+        forget(13);
+        assert_eq!(ran + timed_out, 300);
     }
 
     #[test]
