@@ -23,8 +23,17 @@
 //! place: Enter or a click elsewhere takes the name, Esc drops it, and an
 //! empty name gives the tab its automatic label back. A name lives as long
 //! as its tab, and a program's own title never replaces it.
+//!
+//! Closing the whole terminal (Cmd+Q, the window's close button, a window
+//! manager's close, a host closing the module) goes through
+//! [`TermTabs::request_close_all`]: while any tab or pane runs a job and
+//! `confirm-close-running` is on, it answers [`CloseDecision::Veto`] and
+//! asks in the bar, naming every job it would end; a yes emits
+//! [`ModuleCloseAction::Confirmed`] and the caller closes then.
 
 use std::path::{Path, PathBuf};
+
+use makepad_app_module::{CloseDecision, ModuleCloseAction};
 
 use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::widget_tree::CxWidgetExt;
@@ -406,12 +415,62 @@ enum BarHit {
     CancelClose,
 }
 
-/// A close waiting for the person to confirm: the tab runs `job`.
-struct PendingClose {
-    tab: usize,
-    /// One pane of the tab, or (None) the whole tab.
-    pane: Option<u64>,
-    job: String,
+/// A close waiting for the person to confirm.
+enum PendingClose {
+    /// Tab `tab` (or one pane of it) runs `job`.
+    Tab {
+        tab: usize,
+        /// One pane of the tab, or (None) the whole tab.
+        pane: Option<u64>,
+        job: String,
+    },
+    /// The whole terminal (quit, window close, host close) would end
+    /// `jobs`: (tab label, job) in tab order.
+    All { jobs: Vec<(String, String)> },
+}
+
+/// Every running job, as (tab label, job), from each tab's label and the
+/// foreground job of each of its panes (None: at the prompt). Tab order,
+/// then pane order; a split tab with two jobs lists both.
+pub fn collect_running_jobs<I, P>(tabs: I) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, P)>,
+    P: IntoIterator<Item = Option<String>>,
+{
+    tabs.into_iter()
+        .flat_map(|(label, panes)| panes.into_iter().flatten().map(move |job| (label.clone(), job)))
+        .collect()
+}
+
+/// Whether closing the whole terminal must ask first: only while a job
+/// runs, `confirm-close-running` is on, and the person has not already said
+/// yes to this close.
+pub fn close_all_decision(confirm_running: bool, confirmed: bool, jobs: &[(String, String)]) -> CloseDecision {
+    if confirm_running && !confirmed && !jobs.is_empty() {
+        CloseDecision::Veto
+    } else {
+        CloseDecision::Allow
+    }
+}
+
+/// The question the bar asks before closing the whole terminal.
+pub fn close_all_message(jobs: &[(String, String)]) -> String {
+    // A tab named after its job says nothing more: "“sleep”", not
+    // "“sleep” in sleep".
+    let named: Vec<String> = jobs
+        .iter()
+        .map(|(tab, job)| {
+            if tab == job {
+                format!("\u{201c}{job}\u{201d}")
+            } else {
+                format!("\u{201c}{job}\u{201d} in {tab}")
+            }
+        })
+        .collect();
+    match jobs.len() {
+        1 => format!("Closing the terminal ends {}. Close anyway?", named[0]),
+        n => format!("Closing the terminal ends {n} running jobs: {}. Close anyway?", named.join(", ")),
+    }
 }
 
 #[derive(Script, Widget)]
@@ -472,6 +531,10 @@ pub struct TermTabs {
     hover: Option<BarHit>,
     #[rust]
     pending_close: Option<PendingClose>,
+    /// The person said yes to closing the whole terminal: a second ask
+    /// (a host asking again before it closes) is allowed.
+    #[rust]
+    close_confirmed: bool,
     /// Hit rectangles of the last drawn bar.
     #[rust]
     hits: Vec<(Rect, BarHit)>,
@@ -667,6 +730,56 @@ impl TermTabs {
 
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
+    }
+
+    /// Every job running in any tab or pane, as (tab label, job): what
+    /// closing the whole terminal would end.
+    pub fn running_jobs(&self) -> Vec<(String, String)> {
+        let mode = self.settings.tab_title;
+        collect_running_jobs(self.tabs.iter().map(|tab| {
+            let jobs: Vec<Option<String>> = tab.panes.iter().map(|p| p.with_term(|term| term.foreground_job()).flatten()).collect();
+            (tab.label(mode), jobs)
+        }))
+    }
+
+    /// The whole terminal is asked to close: Cmd+Q, the window's close
+    /// button, a window manager's close, a host closing the module. `Allow`:
+    /// close now. `Veto`: a job runs and the bar now asks; a yes emits
+    /// [`ModuleCloseAction::Confirmed`], a no leaves everything running.
+    /// A preview pager never asks (it is one throwaway job).
+    pub fn request_close_all(&mut self, cx: &mut Cx) -> CloseDecision {
+        if !self.tabs_enabled {
+            return CloseDecision::Allow;
+        }
+        let jobs = self.running_jobs();
+        let decision = close_all_decision(self.settings.confirm_close_running, self.close_confirmed, &jobs);
+        if decision == CloseDecision::Veto {
+            self.commit_rename(cx);
+            self.pending_close = Some(PendingClose::All { jobs });
+            // The bar may be hidden (one tab): the whole terminal relays
+            // out around it, not just the bar's last area.
+            self.refresh(cx);
+        }
+        decision
+    }
+
+    /// The person answered the question [`Self::request_close_all`] asked.
+    fn answer_close_all(&mut self, cx: &mut Cx, close: bool) {
+        self.pending_close = None;
+        if close {
+            self.close_confirmed = true;
+            cx.widget_action(self.uid, ModuleCloseAction::Confirmed);
+        }
+        self.refresh(cx);
+    }
+
+    /// Confirm the question in the bar (Enter, the red button).
+    fn confirm_pending(&mut self, cx: &mut Cx) {
+        match self.pending_close.take() {
+            Some(PendingClose::Tab { tab, pane, .. }) => self.finish_close(cx, tab, pane),
+            Some(PendingClose::All { .. }) => self.answer_close_all(cx, true),
+            None => {}
+        }
     }
 
     pub fn active_index(&self) -> usize {
@@ -867,7 +980,7 @@ impl TermTabs {
                 .filter(|p| pane.is_none_or(|id| p.id == id))
                 .find_map(|p| p.with_term(|term| term.foreground_job()).flatten());
             if let Some(job) = job {
-                self.pending_close = Some(PendingClose { tab: index, pane, job });
+                self.pending_close = Some(PendingClose::Tab { tab: index, pane, job });
                 if index != self.active {
                     self.select(cx, index);
                 }
@@ -1104,11 +1217,7 @@ impl TermTabs {
             BarHit::CloseTab(i) => self.request_close(cx, i, None),
             BarHit::NewTab => self.run_command(cx, TabCommand::New),
             BarHit::Settings => self.run_command(cx, TabCommand::Settings),
-            BarHit::ConfirmClose => {
-                if let Some(pending) = self.pending_close.take() {
-                    self.finish_close(cx, pending.tab, pending.pane);
-                }
-            }
+            BarHit::ConfirmClose => self.confirm_pending(cx),
             BarHit::CancelClose => {
                 self.pending_close = None;
                 self.redraw(cx);
@@ -1319,15 +1428,12 @@ impl Widget for TermTabs {
         }
 
         if self.tabs_enabled && self.keyboard_is_ours(cx) {
-            if let Some(pending) = self.pending_close.as_ref() {
+            if self.pending_close.is_some() {
                 // The confirmation owns the keyboard until it is answered.
                 match event {
                     Event::KeyDown(key) => {
                         match key.key_code {
-                            KeyCode::ReturnKey | KeyCode::KeyY => {
-                                let (tab, pane) = (pending.tab, pending.pane);
-                                self.finish_close(cx, tab, pane);
-                            }
+                            KeyCode::ReturnKey | KeyCode::KeyY => self.confirm_pending(cx),
                             KeyCode::Escape | KeyCode::KeyN => {
                                 self.pending_close = None;
                                 self.redraw(cx);
@@ -1661,11 +1767,20 @@ impl TermTabs {
         self.draw_bar.draw_abs(cx, bar);
 
         if let Some(pending) = self.pending_close.as_ref() {
-            let what = if pending.pane.is_some() { "pane" } else { "tab" };
-            let message = format!("\u{201c}{}\u{201d} is running in this {what}. Close it?", pending.job);
+            let message = match pending {
+                PendingClose::Tab { pane, job, .. } => {
+                    let what = if pane.is_some() { "pane" } else { "tab" };
+                    format!("\u{201c}{job}\u{201d} is running in this {what}. Close it?")
+                }
+                PendingClose::All { jobs } => close_all_message(jobs),
+            };
+            let mut x = bar.pos.x + bar.size.x - 8.0;
+            // The buttons' room first, so a long list of jobs is cut short
+            // rather than drawn under them.
+            let buttons: f64 = ["Cancel  (Esc)", "Close  (Enter)"].iter().map(|t| self.text_width(cx, t) + 28.0).sum();
+            let message = self.fit(cx, &message, (bar.size.x - 8.0 - buttons - 24.0).max(0.0));
             self.draw_label.color = fg;
             self.draw_label.draw_abs(cx, dvec2(bar.pos.x + 12.0, bar.pos.y + (h - 12.0) * 0.5), &message);
-            let mut x = bar.pos.x + bar.size.x - 8.0;
             for (text, hit, fill) in [
                 ("Cancel  (Esc)", BarHit::CancelClose, hover_bg),
                 ("Close  (Enter)", BarHit::ConfirmClose, vec4(0.85, 0.30, 0.35, 1.0)),
@@ -2500,6 +2615,11 @@ impl TermTabsRef {
         self.borrow_mut().map(|mut tabs| tabs.active_term(cx)).unwrap_or_default()
     }
 
+    /// See [`TermTabs::request_close_all`]; no widget: nothing to lose.
+    pub fn request_close_all(&self, cx: &mut Cx) -> CloseDecision {
+        self.borrow_mut().map(|mut tabs| tabs.request_close_all(cx)).unwrap_or_default()
+    }
+
     pub fn set_tabs_enabled(&self, cx: &mut Cx, enabled: bool) {
         if let Some(mut tabs) = self.borrow_mut() {
             tabs.set_tabs_enabled(cx, enabled);
@@ -2517,6 +2637,46 @@ mod tests {
             modifiers: KeyModifiers { control, shift, alt, logo: false },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn running_jobs_are_gathered_from_every_tab_and_pane() {
+        let none: Vec<(String, Vec<Option<String>>)> = vec![("~".into(), vec![None]), ("src".into(), vec![None, None])];
+        assert!(collect_running_jobs(none).is_empty(), "every shell at its prompt");
+        let tabs = vec![
+            ("~".to_string(), vec![None]),
+            ("build".to_string(), vec![Some("cargo".to_string()), None, Some("sleep".to_string())]),
+            ("vim".to_string(), vec![Some("vim".to_string())]),
+        ];
+        assert_eq!(
+            collect_running_jobs(tabs),
+            vec![
+                ("build".to_string(), "cargo".to_string()),
+                ("build".to_string(), "sleep".to_string()),
+                ("vim".to_string(), "vim".to_string()),
+            ],
+            "tab order, then pane order; both jobs of a split tab"
+        );
+    }
+
+    #[test]
+    fn closing_everything_asks_only_while_a_job_runs_and_confirmation_is_on() {
+        let jobs = vec![("build".to_string(), "cargo".to_string())];
+        assert_eq!(close_all_decision(true, false, &jobs), CloseDecision::Veto, "running + confirm on");
+        assert_eq!(close_all_decision(true, false, &[]), CloseDecision::Allow, "nothing running");
+        assert_eq!(close_all_decision(false, false, &jobs), CloseDecision::Allow, "confirmation off");
+        assert_eq!(close_all_decision(true, true, &jobs), CloseDecision::Allow, "already confirmed");
+    }
+
+    #[test]
+    fn the_close_question_names_every_job() {
+        let one = vec![("sleep".to_string(), "sleep".to_string())];
+        assert_eq!(close_all_message(&one), "Closing the terminal ends \u{201c}sleep\u{201d}. Close anyway?");
+        let two = vec![("build".to_string(), "cargo".to_string()), ("notes".to_string(), "vim".to_string())];
+        assert_eq!(
+            close_all_message(&two),
+            "Closing the terminal ends 2 running jobs: \u{201c}cargo\u{201d} in build, \u{201c}vim\u{201d} in notes. Close anyway?"
+        );
     }
 
     #[test]
