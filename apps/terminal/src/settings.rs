@@ -437,18 +437,24 @@ pub fn generation() -> u64 {
 
 /// Save and apply: the file is replaced whole (write, then rename), so a
 /// reader never sees half of it.
+///
+/// The change applies to this process even when the file cannot be written
+/// (a read-only or sandboxed home): the error is returned for the caller to
+/// report, but the person's choice still takes effect until they quit.
 pub fn update(settings: Settings) -> std::io::Result<()> {
     let path = path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("conf.tmp");
-    std::fs::write(&tmp, settings.to_text())?;
-    std::fs::rename(&tmp, &path)?;
+    let saved = (|| {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension("conf.tmp");
+        std::fs::write(&tmp, settings.to_text())?;
+        std::fs::rename(&tmp, &path)
+    })();
     let mut guard = LIVE.write().unwrap_or_else(|e| e.into_inner());
     *guard = Some(Live { settings, mtime: file_mtime() });
     GENERATION.fetch_add(1, Ordering::AcqRel);
-    Ok(())
+    saved
 }
 
 static LAST_POLL: Mutex<Option<Instant>> = Mutex::new(None);
