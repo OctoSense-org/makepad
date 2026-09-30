@@ -582,6 +582,11 @@ pub struct MpTerm {
     /// Set by a host for the one event it routes here (`crate::tabs`).
     #[rust]
     pub route_keys_here: bool,
+    /// Set by a host that reports the title itself (`crate::tabs`: a tab's
+    /// given name wins over the program's); the program's title then only
+    /// goes to that host, not straight to the window manager.
+    #[rust]
+    pub titled_by_host: bool,
     #[rust]
     font_key: Option<FontKey>,
     #[rust]
@@ -2151,7 +2156,9 @@ impl MpTerm {
                 match event {
                     TermEvent::TitleChanged(title) => {
                         // Hosted in wm: the bar shows it (no-op standalone).
-                        makepad_wm_api::set_title(cx, &title);
+                        if !self.titled_by_host {
+                            makepad_wm_api::set_title(cx, &title);
+                        }
                         actions.push(MpTermAction::TitleChanged(title))
                     }
                     TermEvent::Bell => {

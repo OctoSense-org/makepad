@@ -148,6 +148,8 @@ impl MatchEvent for App {
             }
             match wa.cast::<MpTermAction>() {
                 MpTermAction::TitleChanged(title) if !self.preview => {
+                    // The tabs tell a window manager themselves (`crate::tabs`,
+                    // also when the terminal is a module).
                     self.ui.window(cx, ids!(main_window)).set_title(cx, &title);
                 }
                 MpTermAction::PwdChanged(_) => self.refresh_ai_context(cx),

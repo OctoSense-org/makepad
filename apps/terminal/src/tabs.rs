@@ -18,9 +18,15 @@
 //!
 //! Alt+digit is taken only while more than one tab is open, so a single
 //! shell keeps Meta+digit (readline's numeric argument).
+//!
+//! A long press (held 0.5 s) or a double click on a tab renames it in
+//! place: Enter or a click elsewhere takes the name, Esc drops it, and an
+//! empty name gives the tab its automatic label back. A name lives as long
+//! as its tab, and a program's own title never replaces it.
 
 use std::path::{Path, PathBuf};
 
+use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
 
@@ -204,9 +210,95 @@ pub fn tab_label(mode: TabTitle, osc: &str, job: Option<&str>, dir: Option<&Path
     label.or_else(|| shell.map(str::to_owned)).unwrap_or_else(|| "shell".into())
 }
 
+/// What a tab is called: the name the person gave it, else its
+/// [`tab_label`]. A program's title never replaces a given name.
+pub fn tab_title(
+    custom: Option<&str>,
+    mode: TabTitle,
+    osc: &str,
+    job: Option<&str>,
+    dir: Option<&Path>,
+    shell: Option<&str>,
+) -> String {
+    match custom.map(str::trim).filter(|c| !c.is_empty()) {
+        Some(custom) => custom.to_owned(),
+        None => tab_label(mode, osc, job, dir, shell),
+    }
+}
+
+/// The longest name a tab takes, in characters.
+const TAB_NAME_MAX: usize = 64;
+
+/// A tab's name being typed in the tab bar: the text and the caret (in
+/// characters).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NameEdit {
+    text: String,
+    caret: usize,
+}
+
+/// What a key did to a name being typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NameKey {
+    Editing,
+    /// Take the name; None (nothing typed) gives the tab its automatic
+    /// label back.
+    Commit(Option<String>),
+    Cancel,
+}
+
+impl NameEdit {
+    fn new(text: &str) -> NameEdit {
+        let text: String = text.chars().take(TAB_NAME_MAX).collect();
+        NameEdit { caret: text.chars().count(), text }
+    }
+
+    fn byte_at(&self, caret: usize) -> usize {
+        self.text.char_indices().nth(caret).map_or(self.text.len(), |(i, _)| i)
+    }
+
+    /// Typed or pasted text, at the caret (control characters and line
+    /// breaks dropped, the length capped).
+    fn insert(&mut self, typed: &str) {
+        let room = TAB_NAME_MAX.saturating_sub(self.text.chars().count());
+        let typed: String = typed.chars().filter(|c| !c.is_control()).take(room).collect();
+        let at = self.byte_at(self.caret);
+        self.text.insert_str(at, &typed);
+        self.caret += typed.chars().count();
+    }
+
+    fn key(&mut self, key: &KeyEvent) -> NameKey {
+        let len = self.text.chars().count();
+        match key.key_code {
+            KeyCode::ReturnKey | KeyCode::NumpadEnter => return NameKey::Commit(self.committed()),
+            KeyCode::Escape => return NameKey::Cancel,
+            KeyCode::Backspace if self.caret > 0 => {
+                self.caret -= 1;
+                let at = self.byte_at(self.caret);
+                self.text.remove(at);
+            }
+            KeyCode::Delete if self.caret < len => {
+                let at = self.byte_at(self.caret);
+                self.text.remove(at);
+            }
+            KeyCode::ArrowLeft => self.caret = self.caret.saturating_sub(1),
+            KeyCode::ArrowRight => self.caret = (self.caret + 1).min(len),
+            KeyCode::Home | KeyCode::ArrowUp => self.caret = 0,
+            KeyCode::End | KeyCode::ArrowDown => self.caret = len,
+            _ => {}
+        }
+        NameKey::Editing
+    }
+
+    fn committed(&self) -> Option<String> {
+        Some(self.text.trim().to_owned()).filter(|t| !t.is_empty())
+    }
+}
+
 /// Pane ids are unique in the process: the control socket names panes by
 /// them (`crate::control`).
 static NEXT_PANE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_TAB_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One terminal in a tab.
 pub(crate) struct Pane {
@@ -239,6 +331,12 @@ impl Pane {
 
 /// A tab: one or more panes, split in a tree.
 pub(crate) struct Tab {
+    /// Unique in the process: a rename in progress follows its tab while
+    /// others open and close.
+    id: u64,
+    /// The name the person gave the tab (in memory only); None: the
+    /// automatic label.
+    custom_title: Option<String>,
     pub(crate) panes: Vec<Pane>,
     tree: Node,
     pub(crate) focused: u64,
@@ -248,7 +346,14 @@ pub(crate) struct Tab {
 
 impl Tab {
     fn new(pane: Pane) -> Tab {
-        Tab { tree: Node::Leaf(pane.id), focused: pane.id, zoomed: false, panes: vec![pane] }
+        Tab {
+            id: NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed),
+            custom_title: None,
+            tree: Node::Leaf(pane.id),
+            focused: pane.id,
+            zoomed: false,
+            panes: vec![pane],
+        }
     }
 
     pub(crate) fn focused_pane(&self) -> &Pane {
@@ -259,9 +364,13 @@ impl Tab {
         self.panes.iter_mut().find(|p| p.id == id)
     }
 
+    /// The tab's name (see [`tab_title`]); an automatic one counts the
+    /// panes of a split.
     fn label(&self, mode: TabTitle) -> String {
-        let label = self.focused_pane().label(mode);
-        if self.panes.len() > 1 {
+        let pane = self.focused_pane();
+        let custom = self.custom_title.as_deref();
+        let label = tab_title(custom, mode, &pane.osc_title, pane.job.as_deref(), pane.dir.as_deref(), pane.shell.as_deref());
+        if custom.is_none() && self.panes.len() > 1 {
             format!("{label} \u{00b7} {}", self.panes.len())
         } else {
             label
@@ -385,7 +494,36 @@ pub struct TermTabs {
     /// The panel draws in an overlay list: above every terminal layer.
     #[rust]
     panel_list: Option<DrawList2d>,
+    /// A tab's name being typed; it owns the keyboard meanwhile.
+    #[rust]
+    rename: Option<Rename>,
+    /// A press on a tab, and the timer that makes it a long one.
+    #[rust]
+    press: Option<TabPress>,
+    #[rust]
+    press_timer: Timer,
 }
+
+/// A tab being renamed in the tab bar.
+struct Rename {
+    /// `Tab::id`.
+    tab: u64,
+    edit: NameEdit,
+    /// The field, from the last draw: a click outside it takes the name.
+    rect: Rect,
+}
+
+/// A press on a tab that becomes a rename if held without moving.
+struct TabPress {
+    /// `Tab::id`.
+    tab: u64,
+    abs: DVec2,
+}
+
+/// How long a press on a tab is held to rename it, and how far it may
+/// wander meanwhile (desktop platforms send no `LongPress` for a mouse).
+const HOLD_TO_RENAME: f64 = 0.5;
+const HOLD_SLOP: f64 = 6.0;
 
 /// The open settings panel.
 #[derive(Default)]
@@ -588,6 +726,9 @@ impl TermTabs {
         let term = cx.with_vm(|vm| WidgetRef::script_from_value(vm, value));
         if let Some(mut t) = term.borrow_mut::<MpTerm>() {
             t.cwd = cwd.clone();
+            // The tab reports its title (a name given to it wins over the
+            // program's).
+            t.titled_by_host = true;
         }
         let id = NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed);
         cx.widget_tree_insert_child(self.uid, LiveId(id), term.clone());
@@ -715,6 +856,7 @@ impl TermTabs {
 
     /// Close a tab, or one pane of it, asking first while a job runs there.
     fn request_close(&mut self, cx: &mut Cx, index: usize, pane: Option<u64>) {
+        self.commit_rename(cx);
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
@@ -779,6 +921,12 @@ impl TermTabs {
         let title = tab.label(self.settings.tab_title);
         if title != self.reported_title {
             self.reported_title = title.clone();
+            // Hosted by a window manager (makepad-wm, the OctoSense
+            // desktop), the tile's title bar is the WM's (a no-op
+            // standalone). A preview keeps the title its host gave it.
+            if self.tabs_enabled {
+                makepad_wm_api::set_title(cx, &title);
+            }
             cx.widget_action(self.uid, MpTermAction::TitleChanged(title));
         }
     }
@@ -848,13 +996,13 @@ impl TermTabs {
         let active = self.active;
         let mut infos = Vec::new();
         for (index, tab) in self.tabs.iter_mut().enumerate() {
-            let focused = tab.focused;
+            let (focused, custom) = (tab.focused, tab.custom_title.clone());
             for pane in &mut tab.panes {
                 let (agent, state) = Self::pane_state(pane);
                 infos.push(crate::control::PaneInfo {
                     pane: pane.id,
                     tab: index,
-                    title: pane.label(mode),
+                    title: custom.clone().unwrap_or_else(|| pane.label(mode)),
                     cwd: pane.dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default(),
                     program: pane.job.clone().or_else(|| pane.shell.clone()).unwrap_or_default(),
                     agent,
@@ -969,6 +1117,71 @@ impl TermTabs {
         // A click on the bar must not leave the keyboard with nobody.
         if let Some(tab) = self.tabs.get(self.active) {
             tab.with_term(|term| term.focus(cx));
+        }
+    }
+
+    /// Start typing a name for tab `index` (a long press or a double click
+    /// on it): the tab's label becomes a field.
+    fn begin_rename(&mut self, cx: &mut Cx, index: usize) {
+        self.cancel_press(cx);
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if !self.tabs_enabled || self.rename.as_ref().is_some_and(|r| r.tab == tab.id) {
+            return;
+        }
+        let (id, name) = (tab.id, tab.custom_title.clone().unwrap_or_default());
+        self.commit_rename(cx);
+        if index != self.active {
+            self.select(cx, index);
+        }
+        self.rename = Some(Rename { tab: id, edit: NameEdit::new(&name), rect: Rect::default() });
+        self.redraw(cx);
+    }
+
+    /// Take the name being typed (a click elsewhere, a close).
+    fn commit_rename(&mut self, cx: &mut Cx) {
+        if let Some(rename) = self.rename.take() {
+            self.name_tab(cx, rename.tab, rename.edit.committed());
+        }
+    }
+
+    /// Give tab `id` a name; None gives it its automatic label back.
+    fn name_tab(&mut self, cx: &mut Cx, id: u64, name: Option<String>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            tab.custom_title = name;
+        }
+        self.report_title(cx);
+        self.redraw(cx);
+    }
+
+    /// A key while a name is typed: it never reaches the shell.
+    fn rename_key(&mut self, cx: &mut Cx, key: &KeyEvent) {
+        let Some(rename) = self.rename.as_mut() else {
+            return;
+        };
+        match rename.edit.key(key) {
+            NameKey::Editing => {}
+            NameKey::Commit(name) => {
+                let id = rename.tab;
+                self.rename = None;
+                self.name_tab(cx, id, name);
+            }
+            NameKey::Cancel => self.rename = None,
+        }
+        self.redraw(cx);
+    }
+
+    fn rename_text(&mut self, cx: &mut Cx, input: &str) {
+        if let Some(rename) = self.rename.as_mut() {
+            rename.edit.insert(input);
+            self.redraw(cx);
+        }
+    }
+
+    fn cancel_press(&mut self, cx: &mut Cx) {
+        if self.press.take().is_some() {
+            cx.stop_timer(self.press_timer);
         }
     }
 
@@ -1096,6 +1309,14 @@ impl Widget for TermTabs {
         if self.poll_timer.is_event(event).is_some() {
             self.poll_tabs(cx);
         }
+        // A press held on a tab: rename it.
+        if self.press_timer.is_event(event).is_some() {
+            if let Some(press) = self.press.take() {
+                if let Some(index) = self.tabs.iter().position(|t| t.id == press.tab) {
+                    self.begin_rename(cx, index);
+                }
+            }
+        }
 
         if self.tabs_enabled && self.keyboard_is_ours(cx) {
             if let Some(pending) = self.pending_close.as_ref() {
@@ -1116,6 +1337,21 @@ impl Widget for TermTabs {
                         return;
                     }
                     Event::KeyUp(_) | Event::TextInput(_) => return,
+                    _ => {}
+                }
+            } else if self.rename.is_some() {
+                // The name being typed owns the keyboard: nothing reaches
+                // the shell until it is taken or dropped.
+                match event {
+                    Event::KeyDown(key) => {
+                        self.rename_key(cx, key);
+                        return;
+                    }
+                    Event::TextInput(input) => {
+                        self.rename_text(cx, &input.input);
+                        return;
+                    }
+                    Event::KeyUp(_) | Event::TextRangeReplace(_) | Event::TextCopy(_) | Event::TextCut(_) => return,
                     _ => {}
                 }
             } else if self.panel.is_some() {
@@ -1142,6 +1378,20 @@ impl Widget for TermTabs {
             }
         }
 
+        // A click or touch outside the name being typed takes it.
+        if let Some(rect) = self.rename.as_ref().map(|r| r.rect) {
+            let outside = match event {
+                Event::MouseDown(e) => !rect.contains(e.abs),
+                Event::TouchUpdate(e) => {
+                    e.touches.iter().any(|t| t.state == TouchState::Start && !rect.contains(t.abs))
+                }
+                _ => false,
+            };
+            if outside {
+                self.commit_rename(cx);
+            }
+        }
+
         match event.hits(cx, self.draw_bar.area()) {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 let hover = self.bar_hit(e.abs);
@@ -1155,13 +1405,42 @@ impl Widget for TermTabs {
                     self.redraw(cx);
                 }
             }
+            // A press in the name being typed stays with it.
+            Hit::FingerDown(e) if self.rename.as_ref().is_some_and(|r| r.rect.contains(e.abs)) => {}
             Hit::FingerDown(e) => {
                 let middle = e.device.mouse_button().is_some_and(|b| b.contains(MouseButton::MIDDLE));
+                let primary = !middle && e.device.mouse_button().is_none_or(|b| b.contains(MouseButton::PRIMARY));
+                self.cancel_press(cx);
                 match self.bar_hit(e.abs) {
+                    // A double click on a tab renames it (as does a long
+                    // press: held, below).
+                    Some(BarHit::Tab(i)) if primary && e.tap_count == 2 => {
+                        self.on_bar_click(cx, BarHit::Tab(i), false);
+                        self.begin_rename(cx, i);
+                    }
+                    Some(BarHit::Tab(i)) if primary => {
+                        self.on_bar_click(cx, BarHit::Tab(i), false);
+                        if let Some(tab) = self.tabs.get(i) {
+                            self.press = Some(TabPress { tab: tab.id, abs: e.abs });
+                            self.press_timer = cx.start_timeout(HOLD_TO_RENAME);
+                        }
+                    }
                     Some(hit) => self.on_bar_click(cx, hit, middle),
                     // A double click on the empty bar opens a tab.
                     None if e.tap_count == 2 => self.on_bar_click(cx, BarHit::NewTab, false),
                     None => {}
+                }
+            }
+            Hit::FingerMove(e) => {
+                if self.press.as_ref().is_some_and(|p| (e.abs - p.abs).length() > HOLD_SLOP) {
+                    self.cancel_press(cx);
+                }
+            }
+            Hit::FingerUp(_) => self.cancel_press(cx),
+            // A touch platform's own long press (Android, iOS).
+            Hit::FingerLongPress(e) => {
+                if let Some(BarHit::Tab(i)) = self.bar_hit(e.abs) {
+                    self.begin_rename(cx, i);
                 }
             }
             _ => {}
@@ -1427,8 +1706,16 @@ impl TermTabs {
                 pos: dvec2(rect.pos.x + rect.size.x - 20.0, rect.pos.y + (rect.size.y - 16.0) * 0.5),
                 size: dvec2(16.0, 16.0),
             };
-            let show_close = selected || hovered;
             let tab = &self.tabs[index];
+            if self.rename.as_ref().is_some_and(|r| r.tab == tab.id) {
+                // Nothing typed: the automatic label, dimmed, is what the
+                // tab is called once the field is taken empty.
+                let placeholder = tab.focused_pane().label(self.settings.tab_title);
+                self.draw_name_field(cx, rect, bg, fg, dim_fg, &placeholder);
+                x += tab_w;
+                continue;
+            }
+            let show_close = selected || hovered;
             let mut label = tab.label(self.settings.tab_title);
             if tab.bell() {
                 label = format!("\u{2022} {label}");
@@ -1460,6 +1747,47 @@ impl TermTabs {
             self.draw_icon.color = dim_fg;
             self.draw_icon.draw_abs(cx, dvec2(rect.pos.x + (button - 10.0) * 0.5, rect.pos.y + (button - 12.0) * 0.5), icon);
             self.hits.push((rect, hit));
+        }
+    }
+
+    /// The name being typed, in place of tab `rect`'s label: a field with
+    /// the text and a caret, kept in view as it grows past the tab.
+    fn draw_name_field(&mut self, cx: &mut Cx2d, rect: Rect, bg: Vec4f, fg: Vec4f, dim_fg: Vec4f, placeholder: &str) {
+        let Some(edit) = self.rename.as_ref().map(|r| r.edit.clone()) else {
+            return;
+        };
+        let field = Rect { pos: dvec2(rect.pos.x + 3.0, rect.pos.y + 2.0), size: dvec2(rect.size.x - 6.0, rect.size.y - 5.0) };
+        self.draw_tab.tab = 1.0;
+        self.draw_tab.color = bg;
+        self.draw_tab.draw_abs(cx, rect);
+        self.draw_tab.tab = 0.0;
+        self.draw_tab.color = mix(bg, fg, 0.14);
+        self.draw_tab.draw_abs(cx, field);
+        let text_x = field.pos.x + 7.0;
+        let text_y = rect.pos.y + (rect.size.y - 12.0) * 0.5;
+        let room = field.size.x - 14.0;
+        let chars: Vec<char> = edit.text.chars().collect();
+        let caret = edit.caret.min(chars.len());
+        let caret_x = if chars.is_empty() {
+            self.draw_label.color = mix(bg, dim_fg, 0.7);
+            let shown = self.fit(cx, placeholder, room);
+            self.draw_label.draw_abs(cx, dvec2(text_x, text_y), &shown);
+            text_x
+        } else {
+            // Scroll the text so the caret stays in the field.
+            let mut start = 0;
+            while start < caret && self.text_width(cx, &chars[start..caret].iter().collect::<String>()) > room - 2.0 {
+                start += 1;
+            }
+            let shown = self.fit(cx, &chars[start..].iter().collect::<String>(), room);
+            self.draw_label.color = fg;
+            self.draw_label.draw_abs(cx, dvec2(text_x, text_y), &shown);
+            text_x + self.text_width(cx, &chars[start..caret].iter().collect::<String>())
+        };
+        self.draw_label.color = fg;
+        self.draw_label.draw_abs(cx, dvec2(caret_x - 1.0, text_y), "\u{258f}");
+        if let Some(rename) = self.rename.as_mut() {
+            rename.rect = rect;
         }
     }
 
@@ -2235,5 +2563,54 @@ mod tests {
         assert_eq!(tab_label(d, "vim notes.md", Some("vim"), Some(&src), None), "src");
         assert_eq!(tab_label(d, "", None, None, Some("zsh")), "zsh");
         assert_eq!(tab_label(p, "  ", None, None, None), "shell");
+    }
+
+    #[test]
+    fn a_given_name_wins_over_the_program_the_job_and_the_directory() {
+        let src = PathBuf::from("/tmp/src");
+        let p = TabTitle::Program;
+        let t = |custom| tab_title(custom, p, "vim notes.md", Some("vim"), Some(&src), Some("zsh"));
+        assert_eq!(t(Some("build box")), "build box", "a name beats the program's own title");
+        assert_eq!(t(Some("  build box ")), "build box");
+        assert_eq!(t(None), "vim notes.md", "no name: the program's title");
+        assert_eq!(t(Some("  ")), "vim notes.md", "a blank name is no name");
+        assert_eq!(tab_title(Some("ops"), TabTitle::Directory, "", None, Some(&src), None), "ops");
+        assert_eq!(tab_title(None, p, "", Some("htop"), Some(&src), None), "htop");
+        assert_eq!(tab_title(None, p, "", None, Some(&src), None), "src");
+    }
+
+    #[test]
+    fn a_name_is_typed_edited_taken_or_dropped() {
+        let k = |code| key(code, false, false, false);
+        let mut edit = NameEdit::new("");
+        edit.insert("build box");
+        assert_eq!(edit.text, "build box");
+        for _ in 0..3 {
+            assert_eq!(edit.key(&k(KeyCode::ArrowLeft)), NameKey::Editing);
+        }
+        edit.key(&k(KeyCode::Backspace));
+        edit.insert("-");
+        assert_eq!(edit.text, "build-box");
+        edit.key(&k(KeyCode::Home));
+        edit.key(&k(KeyCode::Delete));
+        edit.insert("\u{00e9}\n\t");
+        assert_eq!(edit.text, "\u{00e9}uild-box", "line breaks and tabs are dropped");
+        edit.key(&k(KeyCode::End));
+        edit.key(&k(KeyCode::ArrowRight));
+        edit.insert("!");
+        assert_eq!(edit.text, "\u{00e9}uild-box!");
+        assert_eq!(edit.key(&k(KeyCode::ReturnKey)), NameKey::Commit(Some("\u{00e9}uild-box!".into())));
+        assert_eq!(edit.key(&k(KeyCode::Escape)), NameKey::Cancel);
+
+        let mut cleared = NameEdit::new("ops");
+        for _ in 0..5 {
+            cleared.key(&k(KeyCode::Backspace));
+        }
+        assert_eq!(cleared.key(&k(KeyCode::ReturnKey)), NameKey::Commit(None), "empty: the automatic label again");
+        assert_eq!(NameEdit::new("  ").committed(), None);
+
+        let mut long = NameEdit::new("");
+        long.insert(&"x".repeat(100));
+        assert_eq!(long.text.chars().count(), TAB_NAME_MAX);
     }
 }
