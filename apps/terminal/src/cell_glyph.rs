@@ -152,6 +152,47 @@ pub fn fit_run(advance: f32, available: f32, center: bool) -> RunFit {
     RunFit { scale, x_shift }
 }
 
+/// A private-use codepoint: Nerd Font and other icon-font glyphs.
+pub fn is_private_use(ch: char) -> bool {
+    matches!(ch as u32, 0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD)
+}
+
+/// How a glyph is fitted into its cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// Text: kept at the left, shrunk only when it overflows.
+    Text,
+    /// A cluster: shrunk to fit, and centred when narrower.
+    Centered,
+    /// An icon (a private-use codepoint): a glyph one cell wide stays text;
+    /// a wider one (a Nerd Font icon) is shrunk into, and centred in, the
+    /// cells it may use.
+    Icon,
+}
+
+/// Fit a run `advance` wide into `columns` cells of `cell` width.
+pub fn fit_glyphs(fit: Fit, advance: f32, cell: f32, columns: u8) -> RunFit {
+    let available = cell * columns.max(1) as f32;
+    match fit {
+        Fit::Text => fit_run(advance, available, false),
+        Fit::Centered => fit_run(advance, available, true),
+        Fit::Icon if advance <= cell * 1.05 => fit_run(advance, cell, false),
+        Fit::Icon => fit_run(advance, available, true),
+    }
+}
+
+/// The cells an icon may draw across: two when it is one cell wide and the
+/// cell after it is blank (as Nerd Fonts' wide icons are drawn in most
+/// terminals), else its own. The grid is not changed: the icon is still one
+/// cell for the cursor and for what the program printed.
+pub fn icon_columns(columns: u8, next_is_blank: bool) -> u8 {
+    if columns == 1 && next_is_blank {
+        2
+    } else {
+        columns
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +313,41 @@ mod tests {
         // The newest one survives the reset.
         let last = char::from_u32(0x4E00 + MAX_CACHED_CLUSTERS as u32 + 9).unwrap();
         assert!(cache.cluster(&[last, '\u{0301}'], false, 2).is_some());
+    }
+
+    #[test]
+    fn icons_fit_one_or_two_cells() {
+        assert!(is_private_use('\u{F113}'));
+        assert!(is_private_use('\u{F0A5F}'));
+        assert!(!is_private_use('a'));
+        assert!(!is_private_use('漢'));
+        // A Nerd Font Mono icon is an em wide: 10 against a 6 cell.
+        let one = fit_glyphs(Fit::Icon, 10.0, 6.0, 1);
+        assert!((one.scale - 0.6).abs() < 1e-6 && one.x_shift.abs() < 1e-6);
+        let two = fit_glyphs(Fit::Icon, 10.0, 6.0, 2);
+        assert_eq!(
+            two,
+            RunFit {
+                scale: 1.0,
+                x_shift: 1.0
+            },
+            "whole, centred in two cells"
+        );
+        // A private-use glyph a text font draws one cell wide (Powerline's
+        // branch symbol in JetBrains Mono) stays where text would be.
+        assert_eq!(
+            fit_glyphs(Fit::Icon, 6.0, 6.0, 2),
+            RunFit {
+                scale: 1.0,
+                x_shift: 0.0
+            }
+        );
+        // Text never moves right; clusters centre.
+        assert_eq!(fit_glyphs(Fit::Text, 3.0, 6.0, 2).x_shift, 0.0);
+        assert_eq!(fit_glyphs(Fit::Centered, 6.0, 6.0, 2).x_shift, 3.0);
+        assert_eq!(icon_columns(1, true), 2);
+        assert_eq!(icon_columns(1, false), 1);
+        assert_eq!(icon_columns(2, true), 2);
     }
 
     #[test]

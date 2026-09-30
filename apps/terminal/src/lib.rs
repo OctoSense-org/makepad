@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod ai;
 pub mod cell_glyph;
+pub mod contrast;
 pub mod control;
 pub mod fonts;
 pub mod module;
@@ -18,6 +19,7 @@ pub use makepad_widgets::makepad_platform::os::apple::pty_spawn;
 pub mod session;
 pub mod settings;
 pub mod settings_panel;
+pub mod sprites;
 pub mod tabs;
 pub mod term;
 pub mod themes;
