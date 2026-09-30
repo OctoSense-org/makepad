@@ -95,7 +95,10 @@ pub fn mode_entry(mode: Mode) -> (u16, bool, bool) {
         AltScreenSaveCursorClearEnter => (1049, false, false),
         BracketedPaste => (2004, false, false),
         SynchronizedOutput => (2026, false, false),
-        GraphemeCluster => (2027, false, false),
+        // On by default, as in Ghostty: joined emoji, flags, skin tones and
+        // combining marks take one cluster's width (a program may still
+        // turn it off with CSI ? 2027 l).
+        GraphemeCluster => (2027, false, true),
         ReportColorScheme => (2031, false, false),
         InBandSizeReports => (2048, false, false),
     }
@@ -363,6 +366,7 @@ mod tests {
             Mode::MouseAlternateScroll,
             Mode::IgnoreKeypadWithNumlock,
             Mode::AltEscPrefix,
+            Mode::GraphemeCluster,
         ];
         let state = ModeState::new();
         for mode in ALL_MODES {
@@ -414,8 +418,8 @@ mod tests {
     fn reset_restores_defaults_and_clears_saved() {
         let mut state = ModeState::new();
 
-        state.set(Mode::GraphemeCluster, true);
-        state.save(Mode::GraphemeCluster);
+        state.set(Mode::BracketedPaste, true);
+        state.save(Mode::BracketedPaste);
         state.set(Mode::Wraparound, false);
         state.save(Mode::Wraparound);
         state.set(Mode::CursorVisible, false);
@@ -423,12 +427,12 @@ mod tests {
         state.reset();
 
         // Current values are back to the defaults...
-        assert!(!state.get(Mode::GraphemeCluster));
+        assert!(!state.get(Mode::BracketedPaste));
         assert!(state.get(Mode::Wraparound));
         assert!(state.get(Mode::CursorVisible));
 
         // ...and so are the saved slots.
-        assert!(!state.restore(Mode::GraphemeCluster));
+        assert!(!state.restore(Mode::BracketedPaste));
         assert!(state.restore(Mode::Wraparound));
     }
 

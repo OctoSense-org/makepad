@@ -2136,9 +2136,8 @@ mod tests {
     /// cells it made and where the cursor ended up.
     fn print_graphemes(text: &str, mode_2027: bool) -> (Vec<(String, u8)>, usize) {
         let (mut s, mut t) = term(20, 2);
-        if mode_2027 {
-            feed(&mut s, &mut t, b"\x1b[?2027h");
-        }
+        // Set explicitly either way: 2027 is on by default.
+        feed(&mut s, &mut t, if mode_2027 { b"\x1b[?2027h" } else { b"\x1b[?2027l" });
         feed(&mut s, &mut t, text.as_bytes());
         let cells = head_cells(&t);
         (cells, t.screen().cursor.x)
@@ -2189,6 +2188,17 @@ mod tests {
 
     /// Without mode 2027 cells follow per-codepoint wcwidth, the way shells
     /// and most programs count: only zero-width codepoints join a cell.
+    #[test]
+    fn grapheme_clustering_is_on_by_default() {
+        // Without any mode escape, a ZWJ family is one wide cluster.
+        let (mut s, mut t) = term(20, 2);
+        feed(&mut s, &mut t, "👨\u{200D}👩\u{200D}👧".as_bytes());
+        assert_eq!(
+            (head_cells(&t), t.screen().cursor.x),
+            one_cell("👨\u{200D}👩\u{200D}👧", 2)
+        );
+    }
+
     #[test]
     fn grapheme_widths_without_2027() {
         let cells = |text| print_graphemes(text, false);
