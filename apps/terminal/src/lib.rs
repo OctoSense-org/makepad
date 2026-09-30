@@ -4,6 +4,7 @@ pub mod agent;
 pub mod ai;
 pub mod control;
 pub mod fonts;
+pub mod kitty_input;
 pub mod module;
 pub mod panes;
 pub mod procinfo;
