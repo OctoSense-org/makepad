@@ -7,9 +7,11 @@
 //! hollow variant when unfocused.
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use makepad_widgets::text::geom::Point;
 use makepad_widgets::text::rasterizer::RasterizedGlyph;
+use makepad_widgets::makepad_draw::shader::draw_text::{ShapedTextGlyph, ShapedTextRun};
 use makepad_widgets::*;
 
 use crate::pty::InputRejected;
@@ -31,6 +33,7 @@ use crate::term::mouse_encode::{
 use crate::cell_glyph::{
     cell_glyph, fit_glyphs, icon_columns, is_private_use, CellGlyph, Fit, GlyphCache,
 };
+use crate::text_run::{self, GlyphIn, Placed, RunCache, RunStyle, SegCell};
 use crate::{contrast, sprites};
 use crate::term::screen::CursorStyle;
 use crate::term::style::{StyleColor, StyleFlags};
@@ -481,6 +484,54 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
     }
 }
 
+/// A glyph of a shaped run, placed on the grid: relative to the run's
+/// left edge and the baseline, and the cell (from the run's start) whose
+/// colours it takes.
+#[derive(Clone, Copy)]
+struct RunGlyph {
+    cell: u16,
+    x: f32,
+    y: f32,
+    font_size_in_lpxs: f32,
+    rasterized: RasterizedGlyph,
+}
+
+/// Neighbouring text cells shaped as one (`crate::text_run`): its text,
+/// cell starts, colours and cluster flags are ranges of [`RunScratch`].
+struct RunDraw {
+    x: f64,
+    y: f64,
+    col: usize,
+    row: usize,
+    text: std::ops::Range<usize>,
+    cells: std::ops::Range<usize>,
+    style: RunStyle,
+}
+
+/// A frame's text runs, kept from frame to frame so drawing allocates
+/// nothing for them once warm.
+#[derive(Default)]
+struct RunScratch {
+    runs: Vec<RunDraw>,
+    text: String,
+    starts: Vec<usize>,
+    colors: Vec<Vec4f>,
+    centered: Vec<bool>,
+    /// A row's cells as run segmentation sees them, and its runs.
+    seg: Vec<SegCell>,
+    seg_runs: Vec<std::ops::Range<usize>>,
+}
+
+impl RunScratch {
+    fn clear(&mut self) {
+        self.runs.clear();
+        self.text.clear();
+        self.starts.clear();
+        self.colors.clear();
+        self.centered.clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CachedGlyph {
     rasterized: RasterizedGlyph,
@@ -594,6 +645,14 @@ pub struct MpTerm {
     cell_baseline: f64,
     #[rust]
     glyph_cache: GlyphCache<CachedGlyph>,
+    /// Shaped runs of neighbouring text cells (`crate::text_run`).
+    #[rust]
+    run_cache: RunCache<RunGlyph>,
+    /// The OpenType features text is shaped with (`font-features`).
+    #[rust]
+    font_features: Rc<Vec<text_run::FontFeature>>,
+    #[rust]
+    run_scratch: RunScratch,
     /// This frame's sprite draw call has been opened.
     #[rust]
     sprites_open: bool,
@@ -717,7 +776,7 @@ impl ScriptHook for MpTerm {
         _scope: &mut Scope,
         _value: ScriptValue,
     ) {
-        self.glyph_cache.clear();
+        self.clear_glyph_caches();
         let style = desktop_style::current_style(vm);
         let retro = matches!(
             style,
@@ -985,7 +1044,14 @@ impl MpTerm {
             self.settings = term_settings::current();
             self.font_size = self.settings.font_size;
             self.draw_text.text_style.line_spacing = self.settings.line_height as f32;
+            self.font_features =
+                Rc::new(text_run::parse_font_features(&self.settings.font_features));
         }
+    }
+
+    fn clear_glyph_caches(&mut self) {
+        self.glyph_cache.clear();
+        self.run_cache.clear();
     }
 
     /// Apply a settings change: the live copy's generation moved past the
@@ -1003,8 +1069,9 @@ impl MpTerm {
             session.terminal.set_scrollback(self.settings.scrollback_lines);
         }
         self.apply_colors();
+        self.font_features = Rc::new(text_run::parse_font_features(&self.settings.font_features));
         self.apply_fonts(cx);
-        self.glyph_cache.clear();
+        self.clear_glyph_caches();
         self.draw_bg.redraw(cx);
     }
 
@@ -1067,7 +1134,7 @@ impl MpTerm {
         self.bold_text_style.font_family = bold_style.font_family;
         self.font_roots = roots;
         self.font_key = Some(key);
-        self.glyph_cache.clear();
+        self.clear_glyph_caches();
         self.glyph_cache_key = (0, 0, 0);
     }
 
@@ -1140,7 +1207,7 @@ impl MpTerm {
             self.raster_scale().to_bits(),
         );
         if key != self.glyph_cache_key {
-            self.glyph_cache.clear();
+            self.clear_glyph_caches();
             self.glyph_cache_key = key;
         }
         if let Some(run) = self.draw_text.prepare_single_line_run(cx, "M") {
@@ -1239,11 +1306,104 @@ impl MpTerm {
         }
     }
 
+    /// Shape `text` with the text style (bold or not) at the actual screen
+    /// size and the settings' font features. Rasterized at the screen size
+    /// with local-grid metrics kept (canvas zoom would otherwise scale a
+    /// low-resolution glyph cached at 1x): returns the raster scale that
+    /// divides the run's lengths back to grid points.
+    fn shape_text(
+        &mut self,
+        cx: &mut Cx2d,
+        text: &str,
+        bold: bool,
+    ) -> Option<(ShapedTextRun, f32)> {
+        let scale = self.raster_scale() as f32;
+        // Swapped in and out rather than cloned: a family is a list of
+        // members, and runs are shaped by the hundred when a screen of new
+        // text arrives.
+        let font_size = self.draw_text.text_style.font_size;
+        if bold {
+            std::mem::swap(
+                &mut self.draw_text.text_style.font_family,
+                &mut self.bold_text_style.font_family,
+            );
+        }
+        self.draw_text.text_style.font_size = font_size * scale;
+        let shaped = self
+            .draw_text
+            .prepare_shaped_run(cx, text, &self.font_features);
+        self.draw_text.text_style.font_size = font_size;
+        if bold {
+            std::mem::swap(
+                &mut self.draw_text.text_style.font_family,
+                &mut self.bold_text_style.font_family,
+            );
+        }
+        Some((shaped?, scale))
+    }
+
+    /// A glyph's ink as (top, bottom) from the baseline, y down, in grid
+    /// points.
+    fn glyph_ink(glyph: &ShapedTextGlyph, scale: f32) -> Option<(f32, f32)> {
+        let raster = glyph.rasterized.as_ref()?;
+        let per_dpx = glyph.font_size_in_lpxs / scale / raster.dpxs_per_em;
+        let bottom = -raster.origin_in_dpxs.y * per_dpx;
+        let top = bottom - raster.atlas_image_bounds.size.height as f32 * per_dpx;
+        Some((top, bottom))
+    }
+
+    /// Shape a run of neighbouring text cells as one and put its glyphs
+    /// back on the grid (`crate::text_run::place_run`). `cell_starts` maps
+    /// the cells to bytes of `text`; `centered` marks cluster cells.
+    fn prepare_text_run(
+        &mut self,
+        cx: &mut Cx2d,
+        text: &str,
+        cell_starts: &[usize],
+        centered: &[bool],
+        bold: bool,
+    ) -> Vec<RunGlyph> {
+        let Some((run, scale)) = self.shape_text(cx, text, bold) else {
+            return Vec::new();
+        };
+        let glyphs: Vec<GlyphIn> = run
+            .glyphs
+            .iter()
+            .map(|g| GlyphIn {
+                cluster: g.cluster,
+                pen_x: g.pen_x_in_lpxs / scale,
+                offset_x: g.offset_x_in_lpxs / scale,
+                offset_y: g.offset_y_in_lpxs / scale,
+                advance: g.advance_in_lpxs / scale,
+                ink: Self::glyph_ink(g, scale),
+            })
+            .collect();
+        let mut placed: Vec<Placed> = Vec::with_capacity(glyphs.len());
+        text_run::place_run(
+            cell_starts,
+            centered,
+            &glyphs,
+            self.cell_w as f32,
+            &mut placed,
+        );
+        placed
+            .iter()
+            .filter_map(|p| {
+                let g = &run.glyphs[p.glyph];
+                Some(RunGlyph {
+                    cell: p.cell as u16,
+                    x: p.x,
+                    y: p.y,
+                    font_size_in_lpxs: g.font_size_in_lpxs / scale * p.scale,
+                    rasterized: g.rasterized?,
+                })
+            })
+            .collect()
+    }
+
     /// Shape `text` as one run and fit it into `columns` cells: each glyph
-    /// relative to the cell's left edge and baseline. Rasterized at the
-    /// actual screen size, with local-grid metrics kept (canvas zoom would
-    /// otherwise scale a low-resolution glyph cached at 1x). `fit` says
-    /// whether a run is kept left, centred, or fitted as an icon.
+    /// relative to the cell's left edge and baseline. `fit` says whether a
+    /// run is kept left, centred, or fitted as an icon.
     fn prepare_cell_run(
         &mut self,
         cx: &mut Cx2d,
@@ -1252,15 +1412,7 @@ impl MpTerm {
         columns: u8,
         fit: Fit,
     ) -> Option<Vec<CachedGlyph>> {
-        let scale = self.raster_scale() as f32;
-        let style = self.draw_text.text_style.clone();
-        if bold {
-            self.draw_text.text_style.font_family = self.bold_text_style.font_family.clone();
-        }
-        self.draw_text.text_style.font_size *= scale;
-        let prepared = self.draw_text.prepare_single_line_run(cx, text);
-        self.draw_text.text_style = style;
-        let run = prepared?;
+        let (run, scale) = self.shape_text(cx, text, bold)?;
         // Proportional fallback symbols must stay inside the cells
         // allocated by the terminal, without shrinking normal mono glyphs
         // for small rounding differences in the grid advance.
@@ -1270,11 +1422,10 @@ impl MpTerm {
         // centred on the line instead of sinking to the baseline.
         let (mut top, mut bottom) = (f32::MAX, f32::MIN);
         for g in &run.glyphs {
-            let per_dpx = g.font_size_in_lpxs / scale / g.rasterized.dpxs_per_em;
-            let upper = -g.rasterized.origin_in_dpxs.y * per_dpx;
-            let lower = upper - g.rasterized.atlas_image_bounds.size.height as f32 * per_dpx;
-            top = top.min(lower);
-            bottom = bottom.max(upper);
+            if let Some((upper, lower)) = Self::glyph_ink(g, scale) {
+                top = top.min(upper + g.offset_y_in_lpxs / scale);
+                bottom = bottom.max(lower + g.offset_y_in_lpxs / scale);
+            }
         }
         let center_y = if top <= bottom {
             (top + bottom) * 0.5
@@ -1292,19 +1443,22 @@ impl MpTerm {
         } else {
             0.0
         };
-        Some(
-            run.glyphs
-                .iter()
-                .map(|g| CachedGlyph {
-                    rasterized: g.rasterized,
+        let glyphs: Vec<CachedGlyph> = run
+            .glyphs
+            .iter()
+            .filter_map(|g| {
+                Some(CachedGlyph {
+                    rasterized: g.rasterized?,
                     font_size_in_lpxs: g.font_size_in_lpxs / scale * fit.scale,
                     x_offset_in_lpxs: (g.pen_x_in_lpxs + g.offset_x_in_lpxs) / scale * fit.scale
                         - x_origin
                         + fit.x_shift,
-                    y_offset_in_lpxs: center_y * (1.0 - fit.scale),
+                    y_offset_in_lpxs: g.offset_y_in_lpxs / scale * fit.scale
+                        + center_y * (1.0 - fit.scale),
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        (!glyphs.is_empty()).then_some(glyphs)
     }
 
     /// A rule's thickness in whole device pixels, and the device pixels per
@@ -2201,6 +2355,30 @@ impl MpTerm {
         let mut bg_runs: Vec<BgRun> = Vec::new();
         let mut glyphs: Vec<GlyphDraw> = Vec::with_capacity(rows * cols / 2);
         let mut decos: Vec<DecoDraw> = Vec::new();
+        // The frame's text runs, in buffers kept from frame to frame.
+        let mut scratch = std::mem::take(&mut self.run_scratch);
+        scratch.clear();
+        let RunScratch {
+            runs,
+            text: run_text,
+            starts: run_starts,
+            colors: run_colors,
+            centered: run_centered,
+            seg,
+            seg_runs,
+        } = &mut scratch;
+        // Each text cell's colour and content in this row.
+        let mut row_text: Vec<Option<(Vec4f, CellGlyph)>> = Vec::with_capacity(cols);
+
+        // The cursor's cell, blinking or not: a ligature under it is broken
+        // (shaped cell by cell) whichever phase the blink is in, so the
+        // text does not change shape as the cursor blinks.
+        let cursor_cell = if self.view_offset == 0 && cursor_visible && !session.exited {
+            let s = session.terminal.screen();
+            Some((s.cursor.x.min(cols - 1), s.cursor.y))
+        } else {
+            None
+        };
 
         for vis_row in 0..rows {
             let virt = top_virtual + vis_row;
@@ -2214,7 +2392,11 @@ impl MpTerm {
             };
             let y = origin_y + vis_row as f64 * cell_h;
             let mut run: Option<(usize, usize, Vec4f)> = None;
+            seg.clear();
+            row_text.clear();
             for col in 0..cols {
+                seg.push(SegCell::Blank);
+                row_text.push(None);
                 let cell = row.cell(col);
                 let (fg, bg) = match cell {
                     Some(c) => Self::resolve_colors(session, &c.style, global_inverse),
@@ -2307,9 +2489,22 @@ impl MpTerm {
                     }
                 }
 
-                // Text: one glyph for a codepoint, one shaped run for a
-                // grapheme cluster.
-                if let Some(glyph) = glyph {
+                // Text: narrow text cells are shaped with their neighbours
+                // below; anything else is drawn on its own, one glyph for a
+                // codepoint, one shaped run for a grapheme cluster.
+                if let Some(glyph) =
+                    glyph.filter(|&g| text_run::shapes_with_neighbours(g, cell.content.width()))
+                {
+                    seg[col] = SegCell::Text {
+                        style: RunStyle {
+                            bold: cell.style.flags.has(StyleFlags::BOLD),
+                            italic: cell.style.flags.has(StyleFlags::ITALIC),
+                        },
+                        selected,
+                    };
+                    row_text[col] = Some((fg, glyph));
+                } else if let Some(glyph) = glyph {
+                    seg[col] = SegCell::Own;
                     let mut columns = cell.content.width();
                     let icon = matches!(glyph, CellGlyph::Char(ch) if is_private_use(ch) && !sprites::is_graphic(ch));
                     if icon {
@@ -2337,15 +2532,47 @@ impl MpTerm {
                     color,
                 });
             }
+
+            // Text runs: shaped across cells, split at blanks, styles, the
+            // selection's edges and the cursor.
+            let cursor_col = cursor_cell
+                .filter(|&(_, cy)| cy == vis_row)
+                .map(|(cx, _)| cx);
+            text_run::segment_row(seg, cursor_col, seg_runs);
+            for range in seg_runs.iter() {
+                let text_start = run_text.len();
+                let cells_start = run_starts.len();
+                for (color, glyph) in row_text[range.clone()].iter().flatten() {
+                    run_starts.push(run_text.len() - text_start);
+                    run_colors.push(*color);
+                    match glyph {
+                        CellGlyph::Char(ch) => run_text.push(*ch),
+                        CellGlyph::Cluster(cps) => run_text.extend(cps.iter()),
+                    }
+                    run_centered.push(matches!(glyph, CellGlyph::Cluster(_)));
+                }
+                let SegCell::Text { style, .. } = seg[range.start] else {
+                    continue;
+                };
+                runs.push(RunDraw {
+                    x: origin_x + range.start as f64 * cell_w,
+                    y,
+                    col: range.start,
+                    row: vis_row,
+                    text: text_start..run_text.len(),
+                    cells: cells_start..run_starts.len(),
+                    style,
+                });
+            }
         }
 
         // Cursor (only when the live bottom is in view).
-        let cursor = if self.view_offset == 0 && cursor_visible && blink_on && !session.exited {
-            let s = session.terminal.screen();
-            Some((s.cursor.x.min(cols - 1), s.cursor.y))
-        } else {
-            None
-        };
+        let cursor = cursor_cell.filter(|_| blink_on);
+        let block_cursor = has_focus
+            && matches!(
+                cursor_style,
+                CursorStyle::Default | CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock
+            );
 
         // Layer 1: backgrounds.
         self.draw_cell_bg.new_draw_call(cx);
@@ -2460,6 +2687,45 @@ impl MpTerm {
                 );
             }
         }
+        for r in runs.iter() {
+            let text = &run_text[r.text.clone()];
+            let starts = &run_starts[r.cells.clone()];
+            if self.run_cache.get(text, starts, r.style).is_none() {
+                let placed = self.prepare_text_run(
+                    cx,
+                    text,
+                    starts,
+                    &run_centered[r.cells.clone()],
+                    r.style.bold,
+                );
+                self.run_cache.insert(text, starts, r.style, placed);
+            }
+            let Some(glyphs) = self.run_cache.get(text, starts, r.style) else {
+                continue;
+            };
+            let colors = &run_colors[r.cells.clone()];
+            for glyph in glyphs {
+                let cell = glyph.cell as usize;
+                // A block cursor inverts the glyph on top of it for contrast.
+                let color = if block_cursor && cursor == Some((r.col + cell, r.row)) {
+                    Self::rgb_to_vec4(default_bg, 1.0)
+                } else {
+                    colors[cell]
+                };
+                let point = Point::new(
+                    (r.x + glyph.x as f64) as f32,
+                    (r.y + baseline) as f32 + glyph.y,
+                );
+                self.draw_text.draw_rasterized_glyph_abs(
+                    cx,
+                    point,
+                    glyph.font_size_in_lpxs,
+                    glyph.rasterized,
+                    color,
+                );
+            }
+        }
+        self.run_scratch = scratch;
         self.draw_text.end_many_instances(cx);
         self.draw_dots.end(cx);
 
