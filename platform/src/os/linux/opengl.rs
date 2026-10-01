@@ -4564,6 +4564,15 @@ impl Cx {
     /// hand freed draw storage to the workers. Returns whether debt remains.
     /// Call with this renderer's context current. The macOS backend has the
     /// same beat (`maintain_instance_retirements`); a paint used to carry it.
+    /// Released GPU storage still waiting on its completion fence or a
+    /// worker: what keeps a mobile loop asking for beats without painting.
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    pub(crate) fn opengl_retirement_pending(&self) -> bool {
+        self.textures.1.gl.pending.is_some()
+            || !self.textures.1.retired.is_empty()
+            || self.draw_lists.has_pending_instance_retirements()
+    }
+
     #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) fn opengl_maintain_instance_retirements(&mut self) -> bool {
         let fence_pending = self.textures.1.gl.pending.is_some() || !self.textures.1.retired.is_empty();

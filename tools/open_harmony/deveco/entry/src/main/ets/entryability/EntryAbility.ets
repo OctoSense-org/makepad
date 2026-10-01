@@ -18,7 +18,11 @@ export default class EntryAbility extends UIAbility {
       }
     }
     x.launchParameters = JSON.stringify(parameters);
-    this.studioReview = (parameters['makepad.STUDIO_BUILD'] ?? '').length > 0;
+    // A Studio review session, or `--ps makepad.KEEP_SCREEN_ON 1` for an
+    // unattended measurement run: injected input does not reset the OS's
+    // screen timeout, so the window keeps the screen on itself.
+    this.studioReview = (parameters['makepad.STUDIO_BUILD'] ?? '').length > 0
+      || parameters['makepad.KEEP_SCREEN_ON'] === '1';
     makepad.onCreate(x);
     hilog.info(0x0000, 'testTag', '%{public}s', 'Ability onCreate');
   }
