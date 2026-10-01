@@ -4,6 +4,7 @@ use {
         oh_camera::OhCameraPlayer, oh_media::CxOpenHarmonyMedia, raw_file::RawFileMgr,
     },
     crate::{
+        TextInputConfig,
         cx::{Cx, OpenHarmonyParams, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
         event::video_playback::{
@@ -333,6 +334,7 @@ impl Cx {
                         },
                     ))
                 } else {
+                    self.os.last_ime_config = None;
                     self.text_ime_was_dismissed();
                     self.call_event_handler(&Event::VirtualKeyboard(
                         VirtualKeyboardEvent::DidHide {
@@ -702,14 +704,18 @@ impl Cx {
                 CxOsOp::Quit => {
                     self.os.quit = true;
                 }
-                CxOsOp::ShowTextIME(_area, _pos, _config) => {
-                    let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
-                        "showKeyBoard",
-                        0,
-                        std::ptr::null_mut(),
-                    );
+                CxOsOp::ShowTextIME(_area, _pos, config) => {
+                    if self.os.last_ime_config.as_ref() != Some(&config) {
+                        let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
+                            "showKeyBoard",
+                            0,
+                            std::ptr::null_mut(),
+                        );
+                        self.os.last_ime_config = Some(config);
+                    }
                 }
                 CxOsOp::HideTextIME => {
+                    self.os.last_ime_config = None;
                     let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
                         "hideKeyBoard",
                         0,
@@ -724,6 +730,9 @@ impl Cx {
                 }
                 // Track selection is currently implemented on Linux GStreamer only.
                 CxOsOp::SelectVideoTrack(_, _) | CxOsOp::SelectAudioTrack(_, _) => {}
+                // The IME keeps no copy of the field's text on this platform
+                // yet; there is nothing to bring in step.
+                CxOsOp::SyncImeState { .. } => {}
                 CxOsOp::CheckPermission { permission, request_id } => {
                     // No NDK query for user_grant permissions without the
                     // token machinery; ArkTS answers through the request path.
@@ -828,6 +837,11 @@ pub struct CxOs {
     pub timers: PollTimers,
     pub raw_file: Option<RawFileMgr>,
     pub arkts_obj: Option<ArkTsObjRef>,
+    /// The keyboard config last shown, cleared when the keyboard goes down:
+    /// a focused TextInput re-issues ShowTextIME every draw, and each call
+    /// into ArkTS re-attaches the input method client, which drops what was
+    /// typed in between.
+    pub last_ime_config: Option<TextInputConfig>,
     /// Permission requests waiting for ArkTS to answer, by request id.
     pub(crate) pending_permissions: Vec<(Permission, i32)>,
     /// System bar avoid areas in physical pixels (the window is edge to edge).
@@ -999,6 +1013,7 @@ impl Default for CxOs {
             native_safe_area_insets: SafeAreaInsets::default(),
             raw_file: None,
             arkts_obj: None,
+            last_ime_config: None,
             start_time: Instant::now(),
             display: None,
         }
