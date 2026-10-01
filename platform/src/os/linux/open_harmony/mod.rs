@@ -1,5 +1,8 @@
 pub mod arkts_obj_ref;
 pub mod oh_callbacks;
+pub mod oh_env;
+pub mod oh_ime;
+pub mod oh_web;
 pub mod oh_camera;
 pub mod oh_media;
 pub mod oh_sys;
