@@ -1,7 +1,5 @@
-import display from '@ohos.display';
-import deviceInfo from '@ohos.deviceInfo';
-import inputMethod from '@ohos.inputMethod';
 import { window } from '@kit.ArkUI';
+import { webview } from '@kit.ArkWeb';
 import common from '@ohos.app.ability.common';
 import resourceManager from '@ohos.resourceManager';
 import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
@@ -13,35 +11,19 @@ declare type Any = ESObject;
 
 export interface MakepadXComponentInterface{
   onCreate(ark_ts: object):void;
-  handleInsertTextEvent(text:String):void;
-  handleDeleteLeftEvent(length: number):void;
+  mountContent(content: object):void;
   handleKeyboardStatus(isOpen:boolean, keyboardHeight:number):void;
   handlePermissionResult(permission: string, granted: boolean, canRetry: boolean): void;
   handleAvoidArea(top: number, right: number, bottom: number, left: number): void;
   takeCaptureToSave(): string;
+  webViewList(): Array<string>;
+  webViewTakeCommands(): Array<string>;
+  webViewAttached(tag: string): void;
+  webViewReady(tag: string): void;
+  webViewMayNavigate(tag: string, url: string): boolean;
+  webViewNavigation(tag: string, url: string, title: string, loading: boolean): void;
+  webViewPageError(tag: string, code: number, description: string, url: string): void;
   handleCaptureSaved(path: string, ok: boolean, uri: string): void;
-}
-
-
-function getDensity(): number {
-  try {
-    let displayClass = display.getDefaultDisplaySync();
-    console.info('Test densityDPI:' + JSON.stringify(displayClass.densityDPI));
-    return displayClass.densityDPI / 160;
-  } catch (exception) {
-    console.error('Failed to obtain the default display object. Code: ' + JSON.stringify(exception));
-    return 3;
-  }
-}
-
-function getDeviceType(): string {
-  let device_type: string = deviceInfo.deviceType;
-  if (device_type == "") {
-    console.error("deviceInfo.deviceType is empty string!")
-  } else {
-    console.info("Device type is " + device_type)
-  }
-  return device_type;
 }
 
 export class ArkGlue{
@@ -59,10 +41,9 @@ export class ArkGlue{
 
   context: common.Context;
 
-  deviceType = getDeviceType();
-  osFullName = deviceInfo.osFullName;
-  displayDensity = getDensity();
   resMgr : resourceManager.ResourceManager;
+  // The module's directories (haps/<module>/...): the NDK only reports the
+  // application's, and the app's data lives here.
   filesDir : string;
   cacheDir : string;
   tempDir : string;
@@ -74,9 +55,6 @@ export class ArkGlue{
   // XComponent has loaded (the window reports them before that).
   private avoidArea: number[] = [0, 0, 0, 0];
 
-  private inputMethodController : inputMethod.InputMethodController;
-  private textConfig: inputMethod.TextConfig;
-  private imcFlag = false;
 
   constructor(context: common.Context) {
     this.context = context;
@@ -84,27 +62,12 @@ export class ArkGlue{
     this.filesDir = this.context.filesDir;
     this.cacheDir = this.context.cacheDir;
     this.tempDir = this.context.tempDir;
-    this.inputMethodController = inputMethod.getController();
-    this.textConfig = {
-      inputAttribute: {
-        textInputType: 0,
-        enterKeyType: 1
-      }
-    };
-  }
-
-  showKeyBoard(): void {
-    this.showTextInput();
   }
 
   // EntryAbility reports foreground/background so a location session can
   // pause; there is no location bridge on OpenHarmony yet, so this only keeps
   // the ability compiling until one exists.
   setLocationForeground(_foreground: boolean): void {
-  }
-
-  hideKeyBoard(): void {
-    this.hideTextInput();
   }
 
   // A photo or video the native app wrote into its sandbox: offer it to the
@@ -173,6 +136,7 @@ export class ArkGlue{
   pushAvoidArea(): void {
     const a = this.avoidArea;
     this.xComponentContext?.handleAvoidArea(a[0], a[1], a[2], a[3]);
+    this.listenKeyboardHeightChange();
   }
 
   // Runtime (user_grant) permissions: Rust calls one of these without
@@ -205,88 +169,87 @@ export class ArkGlue{
     });
   }
 
-  private async showTextInput(): Promise<void> {
-    this.listenKeyboardHeightChange();
-    await this.attach(true);
-      if (this.imcFlag != true) {
-      this.listenKeyBoardEvent();
+  // ---- System browsers (platform oh_web.rs) ----
+  // The NDK has no web node, so the page declares one `Web` per browser from
+  // the list Rust keeps; ArkWeb's NDK then serves the page bridge and script
+  // evaluation natively. What it cannot do (load a URL or HTML, history)
+  // Rust queues and this runs.
+  private webControllers: Map<string, webview.WebviewController> = new Map();
+  private webTags: Array<string> = [];
+
+  webController(tag: string): webview.WebviewController {
+    let controller = this.webControllers.get(tag);
+    if (controller === undefined) {
+      // Named with the tag: Rust addresses this webview by it through the NDK.
+      controller = new webview.WebviewController(tag);
+      this.webControllers.set(tag, controller);
     }
-    this.inputMethodController.showTextInput().then(() => {
-      console.debug("Succeeded in showing softKeyboard");
-    }).catch((err: Any) => {
-      console.error("Failed to show softKeyboard:" + JSON.stringify(err));
-    });
+    return controller;
   }
 
-  private async hideTextInput(): Promise<void> {
-    this.inputMethodController.hideTextInput().then(() => {
-      console.debug("Succeeded in hide softKeyboard");
-    }).catch((err: Any) => {
-      console.error("Failed to hide softKeyboard:" + JSON.stringify(err));
-    })
-    this.cancelKeyboardHeightChange();
-  }
-
-  private async attach(showKeyboard: boolean): Promise<void> {
-    try {
-      await this.inputMethodController.attach(showKeyboard, this.textConfig);
-    } catch (err) {
-      console.error("Failed to attach:" + JSON.stringify(err));
+  // Rust calls this when the browsers changed or loads are due.
+  syncWebViews(): void {
+    const list: Array<string> = this.xComponentContext?.webViewList() ?? [];
+    const tags: Array<string> = [];
+    const geometry: Record<string, string> = {};
+    for (const entry of list) {
+      const i = entry.indexOf('|');
+      tags.push(entry.substring(0, i));
+      geometry[entry.substring(0, i)] = entry.substring(i + 1);
     }
-  }
-
-  private listenKeyBoardEvent(): void {
-    try {
-      this.inputMethodController.on('insertText', (text) => {
-      this.xComponentContext?.handleInsertTextEvent(text);
-      console.debug("insertText: " + text);
-    });
-    } catch (err) {
-      console.error("Failed to subscribe insertText:" + JSON.stringify(err));
-      this.cancelListenKeyBoardEvent();
-      return;
-    }
-
-    try {
-      this.inputMethodController.on('deleteLeft', (length) => {
-        this.xComponentContext?.handleDeleteLeftEvent(length);
-        console.debug("deleteLeft, length:" + JSON.stringify(length));
-      })
-    } catch (err) {
-      console.error("Failed to subscribe deleteLeft:" + JSON.stringify(err));
-      this.cancelListenKeyBoardEvent();
-      return;
-    }
-
-    try {
-      this.inputMethodController.on('sendKeyboardStatus', (state) => {
-        if (state == inputMethod.KeyboardStatus.HIDE) {
-          this.xComponentContext?.handleKeyboardStatus(false, 0);
-          this.inputMethodController.detach();
-          this.cancelListenKeyBoardEvent();
+    if (tags.join(',') !== this.webTags.join(',')) {
+      for (const tag of this.webTags) {
+        if (tags.indexOf(tag) < 0) {
+          this.webControllers.delete(tag);
         }
-        console.debug("sendKeyboardStatus, state:" + JSON.stringify(state));
-      })
-    } catch (err) {
-      console.error("Failed to subscribe sendKeyboardStatus:" + JSON.stringify(err));
-      this.cancelListenKeyBoardEvent();
-      return;
+      }
+      this.webTags = tags;
+      AppStorage.setOrCreate('makepadWebTags', tags);
     }
-
-    console.debug("listenKeyBoardEvent success");
-    this.imcFlag = true;
+    AppStorage.setOrCreate('makepadWebGeometry', geometry);
+    this.flushWebCommands();
   }
 
-  private cancelListenKeyBoardEvent(): void {
-    this.inputMethodController.off('insertText');
-    this.inputMethodController.off('deleteLeft');
-    this.inputMethodController.off('sendKeyboardStatus');
-    this.imcFlag = false;
+  webAttached(tag: string): void {
+    this.xComponentContext?.webViewAttached(tag);
   }
 
+  // The first page (about:blank) finished: loading earlier would race it and
+  // be aborted.
+  webReady(tag: string): void {
+    this.xComponentContext?.webViewReady(tag);
+    this.flushWebCommands();
+  }
+
+  private flushWebCommands(): void {
+    const commands: Array<string> = this.xComponentContext?.webViewTakeCommands() ?? [];
+    for (const command of commands) {
+      const a = command.indexOf('|');
+      const b = command.indexOf('|', a + 1);
+      const tag = command.substring(0, a);
+      const kind = command.substring(a + 1, b);
+      const payload = command.substring(b + 1);
+      try {
+        const controller = this.webController(tag);
+        if (kind === 'url') {
+          controller.loadUrl(payload);
+        } else if (kind === 'html') {
+          const c = payload.indexOf('|');
+          controller.loadData(payload.substring(c + 1), 'text/html', 'UTF-8', payload.substring(0, c), ' ');
+        } else if (kind === 'history') {
+          controller.backOrForward(Number(payload));
+        }
+      } catch (err) {
+        console.error('makepad web ' + kind + ' failed: ' + JSON.stringify(err));
+      }
+    }
+  }
+
+  // The input method itself is native (platform oh_ime.rs, the NDK's
+  // libohinputmethod); only the window's keyboard height has no NDK callback.
   private keyboardHeightListening = false;
+
   private listenKeyboardHeightChange() {
-    // Once per attach cycle: every ShowTextIME used to add another listener.
     if (this.keyboardHeightListening) { return; }
     this.keyboardHeightListening = true;
     window.getLastWindow(getContext(this)).then(currentWindow => {
@@ -304,21 +267,4 @@ export class ArkGlue{
     })
   }
 
-  private cancelKeyboardHeightChange() {
-    this.keyboardHeightListening = false;
-    window.getLastWindow(getContext(this)).then(currentWindow => {
-      try {
-        currentWindow.off('keyboardHeightChange');
-      } catch (exception) {
-        console.error(`Failed to enable the listener for keyboard height changes. Cause code: ${exception.code}, message: ${exception.message}`);
-      }
-    })
-  }
-
-}
-
-export interface XComponentAttrs {
-  id: string;
-  type: number;
-  libraryname: string;
 }
