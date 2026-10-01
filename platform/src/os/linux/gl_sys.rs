@@ -74,6 +74,11 @@ pub const ONE: GLenum = 1;
 pub const ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
 pub const BLEND: GLenum = 0x0BE2;
 pub const FRAMEBUFFER: GLenum = 0x8D40;
+// GL_EXT_disjoint_timer_query: GPU time per pass and per draw (gl_timer.rs).
+pub const TIME_ELAPSED_EXT: GLenum = 0x88BF;
+pub const QUERY_RESULT: GLenum = 0x8866;
+pub const QUERY_RESULT_AVAILABLE: GLenum = 0x8867;
+pub const GPU_DISJOINT_EXT: GLenum = 0x8FBB;
 pub const COLOR_BUFFER_BIT: GLenum = 0x00004000;
 pub const DEPTH_BUFFER_BIT: GLenum = 0x00000100;
 pub const RENDERBUFFER: GLenum = 0x8D41;
@@ -194,6 +199,12 @@ pub type TglClearColor =
     unsafe extern "C" fn(red: GLfloat, green: GLfloat, blue: GLfloat, alpha: GLfloat) -> ();
 pub type TglClear = unsafe extern "C" fn(mask: GLbitfield) -> ();
 pub type TglGenFramebuffers = unsafe extern "C" fn(n: GLsizei, framebuffers: *mut GLuint) -> ();
+pub type TglGenQueries = unsafe extern "C" fn(n: GLsizei, ids: *mut GLuint) -> ();
+pub type TglBeginQuery = unsafe extern "C" fn(target: GLenum, id: GLuint) -> ();
+pub type TglEndQuery = unsafe extern "C" fn(target: GLenum) -> ();
+pub type TglGetQueryObjectuiv = unsafe extern "C" fn(id: GLuint, pname: GLenum, params: *mut GLuint) -> ();
+pub type TglGetQueryObjectui64v = unsafe extern "C" fn(id: GLuint, pname: GLenum, params: *mut u64) -> ();
+pub type TglGetIntegervQuery = unsafe extern "C" fn(pname: GLenum, data: *mut GLint) -> ();
 pub type TglGenRenderbuffers = unsafe extern "C" fn(n: GLsizei, renderbuffers: *mut GLuint) -> ();
 pub type TglBindRenderbuffer = unsafe extern "C" fn(target: GLenum, renderbuffer: GLuint) -> ();
 pub type TglRenderbufferStorage = unsafe extern "C" fn(
@@ -496,6 +507,14 @@ pub struct LibGl {
     pub glFramebufferTextureMultiviewOVR: Option<TglFramebufferTextureMultiviewOVR>,
     pub glFramebufferTextureMultisampleMultiviewOVR:
         Option<TglFramebufferTextureMultisampleMultiviewOVR>,
+    // Timer queries (GL_EXT_disjoint_timer_query; GLES3 core for the
+    // query objects themselves). Optional: only the GPU timing traces use them.
+    pub glGenQueries: Option<TglGenQueries>,
+    pub glBeginQuery: Option<TglBeginQuery>,
+    pub glEndQuery: Option<TglEndQuery>,
+    pub glGetQueryObjectuiv: Option<TglGetQueryObjectuiv>,
+    pub glGetQueryObjectui64v: Option<TglGetQueryObjectui64v>,
+    pub glGetIntegervQuery: Option<TglGetIntegervQuery>,
 }
 
 macro_rules! load {
@@ -833,6 +852,24 @@ impl LibGl {
                 "glFramebufferTextureMultisampleMultiviewOVR"
             )
             .ok(),
+            glGenQueries: load!(loadfn, TglGenQueries, "glGenQueries", "glGenQueriesEXT").ok(),
+            glBeginQuery: load!(loadfn, TglBeginQuery, "glBeginQuery", "glBeginQueryEXT").ok(),
+            glEndQuery: load!(loadfn, TglEndQuery, "glEndQuery", "glEndQueryEXT").ok(),
+            glGetQueryObjectuiv: load!(
+                loadfn,
+                TglGetQueryObjectuiv,
+                "glGetQueryObjectuiv",
+                "glGetQueryObjectuivEXT"
+            )
+            .ok(),
+            glGetQueryObjectui64v: load!(
+                loadfn,
+                TglGetQueryObjectui64v,
+                "glGetQueryObjectui64vEXT",
+                "glGetQueryObjectui64v"
+            )
+            .ok(),
+            glGetIntegervQuery: load!(loadfn, TglGetIntegervQuery, "glGetIntegerv").ok(),
         })
     }
 }

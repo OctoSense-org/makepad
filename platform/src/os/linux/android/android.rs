@@ -2555,7 +2555,10 @@ impl Cx {
         let mut zbias = 0.0;
         let zbias_step = self.passes[draw_pass_id].zbias_step;
 
+        let timed = super::super::gl_timer::begin_pass(self.os.gl(), &self.passes[draw_pass_id].debug_name);
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
+        super::super::gl_timer::end(self.os.gl(), timed);
+        super::super::gl_timer::poll(self.os.gl());
 
         //to_java.swap_buffers();
         //unsafe {
