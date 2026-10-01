@@ -975,6 +975,16 @@ pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onAndroidParams(
     }));
 }
 
+/// The render thread's Linux id (0 before it has started), for the hint
+/// session MakepadActivity opens on it.
+#[no_mangle]
+unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_renderThreadTid(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jobject,
+) -> jni_sys::jint {
+    super::android::RENDER_THREAD_TID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[no_mangle]
 unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_onBackPressed(
     _: *mut jni_sys::JNIEnv,

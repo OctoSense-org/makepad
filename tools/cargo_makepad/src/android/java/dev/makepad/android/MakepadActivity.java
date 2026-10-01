@@ -519,6 +519,57 @@ class MakepadSurface
 
     }
 
+    // A touch-down comes before anything moves, and a phone idles its
+    // clocks between gestures: the first frames of a swipe ran at the idle
+    // GPU clock (55-60 ms of GPU each on a Snapdragon 685). At touch-down
+    // the render thread's hint session (ADPF) reports one heavy frame, CPU
+    // and, from Android 15, GPU time, so the power HAL raises the clocks for
+    // the frames that follow. A device without hint sessions ignores it.
+    private Object mTouchHintSession;
+    private boolean mTouchHintUnavailable;
+    private static final long TOUCH_HINT_TARGET_NANOS = 16_666_667L;
+    private static final long TOUCH_HINT_HEAVY_NANOS = 3 * TOUCH_HINT_TARGET_NANOS;
+
+    private void hintTouchLoad() {
+        if (Build.VERSION.SDK_INT < 31 || mTouchHintUnavailable) return;
+        try {
+            if (mTouchHintSession == null) {
+                int tid = MakepadNative.renderThreadTid();
+                if (tid <= 0) return;
+                android.os.PerformanceHintManager manager =
+                    (android.os.PerformanceHintManager) getContext().getSystemService(Context.PERFORMANCE_HINT_SERVICE);
+                android.os.PerformanceHintManager.Session session = manager == null ? null
+                    : manager.createHintSession(new int[] { tid }, TOUCH_HINT_TARGET_NANOS);
+                if (session == null) {
+                    mTouchHintUnavailable = true;
+                    Log.i("Makepad", "touch hints: no hint session on this device");
+                    return;
+                }
+                mTouchHintSession = session;
+                Log.i("Makepad", "touch hints: hint session on render thread " + tid);
+            }
+            android.os.PerformanceHintManager.Session session =
+                (android.os.PerformanceHintManager.Session) mTouchHintSession;
+            if (Build.VERSION.SDK_INT >= 35) {
+                // WorkDuration (API 35) carries GPU time; built by reflection
+                // because this is compiled against an older platform.
+                Class<?> workClass = Class.forName("android.os.WorkDuration");
+                Object work = workClass.getConstructor().newInstance();
+                long now = System.nanoTime();
+                workClass.getMethod("setWorkPeriodStartTimestampNanos", long.class).invoke(work, now - TOUCH_HINT_HEAVY_NANOS);
+                workClass.getMethod("setActualTotalDurationNanos", long.class).invoke(work, TOUCH_HINT_HEAVY_NANOS);
+                workClass.getMethod("setActualCpuDurationNanos", long.class).invoke(work, TOUCH_HINT_HEAVY_NANOS);
+                workClass.getMethod("setActualGpuDurationNanos", long.class).invoke(work, TOUCH_HINT_HEAVY_NANOS);
+                session.getClass().getMethod("reportActualWorkDuration", workClass).invoke(session, work);
+            } else {
+                session.reportActualWorkDuration(TOUCH_HINT_HEAVY_NANOS);
+            }
+        } catch (Throwable e) {
+            mTouchHintUnavailable = true;
+            Log.w("Makepad", "touch hints: off (" + e + ")");
+        }
+    }
+
     @Override
     public boolean onTouch(View view, MotionEvent event) {
         // By default, we return false so that `onLongClick` will trigger.
@@ -550,6 +601,7 @@ class MakepadSurface
             }
         }
 
+        if (actionMasked == MotionEvent.ACTION_DOWN) hintTouchLoad();
         MakepadNative.surfaceOnTouch(event);
         return retval;
     }

@@ -204,6 +204,10 @@ fn fast_cpu_mask() -> Option<u64> {
 /// at startup and whenever a surface is created, because a cpuset move (the app
 /// going to the background) resets the affinity. Failures are logged once and
 /// otherwise ignored.
+/// The render thread's Linux id, for the Java side's performance hints
+/// (`MakepadNative.renderThreadTid`): 0 until the thread has started.
+pub(crate) static RENDER_THREAD_TID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 pub(crate) fn boost_render_thread() {
     use core::ffi::{c_int, c_uint};
     const PRIO_PROCESS: c_int = 0;
@@ -218,6 +222,7 @@ pub(crate) fn boost_render_thread() {
     if tid <= 0 {
         return;
     }
+    RENDER_THREAD_TID.store(tid, std::sync::atomic::Ordering::Relaxed);
     let nice = unsafe { setpriority(PRIO_PROCESS, tid as c_uint, DISPLAY_NICE) } == 0;
     let mask = fast_cpu_mask();
     let affinity = mask.map(|mask| unsafe {
