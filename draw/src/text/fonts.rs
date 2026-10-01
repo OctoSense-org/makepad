@@ -48,9 +48,15 @@ fn default_slug_new_glyphs_per_redraw(cx: &Cx) -> usize {
 
 fn default_slug_min_dpxs_per_em(cx: &Cx, rasterizer: &Rasterizer) -> f32 {
     match cx.os_type() {
-        OsType::LinuxWindow(_) | OsType::LinuxDirect | OsType::Windows => {
-            rasterizer.msdf_resolution().max_dpxs_per_em
-        }
+        // Phone GPUs too: SLUG evaluates every curve of a glyph per pixel,
+        // which made text 40% of a Snapdragon 685's frame (Adreno 610). Text
+        // up to the atlas's resolution reads its SDF/MSDF atlas instead; only
+        // larger text keeps the curves.
+        OsType::LinuxWindow(_)
+        | OsType::LinuxDirect
+        | OsType::Windows
+        | OsType::Android(_)
+        | OsType::OpenHarmony(_) => rasterizer.msdf_resolution().max_dpxs_per_em,
         _ => 0.0,
     }
 }
