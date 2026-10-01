@@ -488,10 +488,16 @@ impl Pty {
         cmd.env_remove("STUDIO_CRATE");
         cmd.env_remove("STUDIO_HANDSHAKE_STDIN");
         cmd.env_remove("MAKEPAD_STDIN_LOOP");
+        // Where the platform gives the app a data directory of its own, that
+        // is the shell's home and where it starts.
+        let platform_home = makepad_widgets::makepad_platform::home::platform_data_dir();
+        if let Some(home) = &platform_home {
+            cmd.env("HOME", home);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = cwd.or(platform_home.as_deref()) {
             cmd.current_dir(cwd);
         }
 

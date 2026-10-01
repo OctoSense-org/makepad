@@ -159,3 +159,55 @@ mod tests {
         assert_eq!(name(-1), None);
     }
 }
+
+/// ^C, ^\\ and ^Z typed alone: SIGINT, SIGQUIT and SIGTSTP to every process
+/// under the shell, as a terminal's line discipline would to its foreground
+/// group. SIGINT also goes to the shell, which is in that group: it drops the
+/// line it is reading or stops a builtin it is running (toybox's `sleep` runs
+/// inside the shell), and an interactive shell survives it.
+/// For OpenHarmony, where the PTY never becomes a controlling terminal and
+/// the kernel therefore delivers none of them.
+#[cfg(target_env = "ohos")]
+pub fn signal_jobs_for_control_key(shell: i32, bytes: &[u8]) {
+    let signal = match bytes {
+        [0x03] => 2,  // SIGINT
+        [0x1c] => 3,  // SIGQUIT
+        [0x1a] => 20, // SIGTSTP
+        _ => return,
+    };
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    for pid in descendants(shell) {
+        unsafe { kill(pid, signal) };
+    }
+    if signal == 2 {
+        unsafe { kill(shell, signal) };
+    }
+}
+
+/// Every process below `root`, from the parent links in /proc.
+#[cfg(target_env = "ohos")]
+fn descendants(root: i32) -> Vec<i32> {
+    let mut parents = Vec::new();
+    if let Ok(dir) = std::fs::read_dir("/proc") {
+        for entry in dir.flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
+            // stat: `pid (comm) state ppid ...`; comm may contain spaces.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+            let Some(rest) = stat.rsplit_once(')').map(|(_, rest)| rest) else { continue };
+            if let Some(ppid) = rest.split_whitespace().nth(1).and_then(|p| p.parse::<i32>().ok()) {
+                parents.push((pid, ppid));
+            }
+        }
+    }
+    let mut found = vec![root];
+    let mut i = 0;
+    while i < found.len() {
+        let parent = found[i];
+        found.extend(parents.iter().filter(|(_, ppid)| *ppid == parent).map(|(pid, _)| *pid));
+        i += 1;
+    }
+    found.remove(0);
+    found
+}

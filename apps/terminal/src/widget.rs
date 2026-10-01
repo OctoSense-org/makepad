@@ -277,7 +277,7 @@ script_mod! {
             text_style: TextStyle{
                 font_family: FontFamily{
                     latin := FontMember{
-                        res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf")
+                        res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf")
                         asc: 0.0 desc: 0.0 weight: 400.0
                     }
                     nerd := FontMember{
@@ -285,22 +285,22 @@ script_mod! {
                         asc: 0.0 desc: 0.0
                     }
                     icons := FontMember{
-                        res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf")
+                        res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf")
                         asc: 0.0 desc: 0.0
                     }
                     emoji := FontMember{
-                        res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf")
+                        res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf")
                         asc: 0.0 desc: 0.0
                     }
                     symbols := FontMember{
-                        res: crate_resource("self:../../widgets/resources/Inter.ttf")
+                        res: crate_resource("makepad_widgets:resources/Inter.ttf")
                         asc: 0.0 desc: 0.0
                     }
                     // Chinese, Japanese kanji and other CJK ideographs: the
                     // same font makepad's theme falls back to. The grid
                     // gives each of them two cells.
                     chinese := FontMember{
-                        res: crate_resource("self:../../widgets/resources/LXGWWenKaiRegular.ttf")
+                        res: crate_resource("makepad_widgets:resources/LXGWWenKaiRegular.ttf")
                         asc: 0.0 desc: 0.0
                     }
                 }
@@ -310,7 +310,7 @@ script_mod! {
         bold_text_style: TextStyle{
             font_family: FontFamily{
                 latin := FontMember{
-                    res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf")
+                    res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf")
                     asc: 0.0 desc: 0.0 weight: 800.0
                 }
                 nerd := FontMember{
@@ -318,19 +318,19 @@ script_mod! {
                     asc: 0.0 desc: 0.0
                 }
                 icons := FontMember{
-                    res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf")
+                    res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf")
                     asc: 0.0 desc: 0.0
                 }
                 emoji := FontMember{
-                    res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf")
+                    res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf")
                     asc: 0.0 desc: 0.0
                 }
                 symbols := FontMember{
-                    res: crate_resource("self:../../widgets/resources/Inter.ttf")
+                    res: crate_resource("makepad_widgets:resources/Inter.ttf")
                     asc: 0.0 desc: 0.0
                 }
                 chinese := FontMember{
-                    res: crate_resource("self:../../widgets/resources/LXGWWenKaiBold.ttf")
+                    res: crate_resource("makepad_widgets:resources/LXGWWenKaiBold.ttf")
                     asc: 0.0 desc: 0.0
                 }
             }
@@ -439,12 +439,12 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             TextStyle{
                 font_family: FontFamily{
                     primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
-                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    latin := FontMember{ res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
                     nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
-                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
-                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
-                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("makepad_widgets:resources/Inter.ttf") asc: 0.0 desc: 0.0 }
                 }
                 line_spacing: 1.0
             }
@@ -454,11 +454,11 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             TextStyle{
                 font_family: FontFamily{
                     primary := FontMember{ res: file_resource(#(primary)) asc: 0.0 desc: 0.0 }
-                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    latin := FontMember{ res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
-                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
-                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
-                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("makepad_widgets:resources/Inter.ttf") asc: 0.0 desc: 0.0 }
                 }
                 line_spacing: 1.0
             }
@@ -467,12 +467,12 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             use mod.prelude.widgets_internal.*
             TextStyle{
                 font_family: FontFamily{
-                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    latin := FontMember{ res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     cjk := FontMember{ res: file_resource(#(cjk)) asc: 0.0 desc: 0.0 }
                     nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
-                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
-                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
-                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("makepad_widgets:resources/Inter.ttf") asc: 0.0 desc: 0.0 }
                 }
                 line_spacing: 1.0
             }
@@ -481,11 +481,11 @@ fn terminal_text_style(vm: &mut ScriptVm, primary: Option<&str>, cjk: Option<&st
             use mod.prelude.widgets_internal.*
             TextStyle{
                 font_family: FontFamily{
-                    latin := FontMember{ res: crate_resource("self:../../widgets/resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
+                    latin := FontMember{ res: crate_resource("makepad_widgets:resources/jetbrains_mono_variable.ttf") asc: 0.0 desc: 0.0 weight: #(weight) }
                     nerd := FontMember{ res: crate_resource("self:resources/SymbolsNerdFontMono-Regular.ttf") asc: 0.0 desc: 0.0 }
-                    icons := FontMember{ res: crate_resource("self:../../widgets/resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
-                    emoji := FontMember{ res: crate_resource("self:../../widgets/resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
-                    symbols := FontMember{ res: crate_resource("self:../../widgets/resources/Inter.ttf") asc: 0.0 desc: 0.0 }
+                    icons := FontMember{ res: crate_resource("makepad_widgets:resources/fa-solid-900.ttf") asc: 0.0 desc: 0.0 }
+                    emoji := FontMember{ res: crate_resource("makepad_widgets:resources/NotoColorEmoji.ttf") asc: 0.0 desc: 0.0 }
+                    symbols := FontMember{ res: crate_resource("makepad_widgets:resources/Inter.ttf") asc: 0.0 desc: 0.0 }
                 }
                 line_spacing: 1.0
             }
