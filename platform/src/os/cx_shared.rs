@@ -585,6 +585,25 @@ impl Cx {
             return;
         }
         self.try_send_studio_widget_snapshot_responses();
+        if self.widget_snapshot_requests.contains(&request_id) {
+            // Deferred until a widget is visible with a size. Say so once,
+            // with what the callback saw: a request that never answers is
+            // otherwise indistinguishable from one that never arrived.
+            let widgets = self.widget_snapshot_callback.map(|callback| callback(self));
+            let sample = widgets
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .take(6)
+                .map(|w| format!("{}:{} visible={} {}x{}", w.id, w.widget_type, w.visible, w.width, w.height))
+                .collect::<Vec<_>>()
+                .join(", ");
+            crate::log!(
+                "widget snapshot {request_id} deferred: callback {}, {} widgets: {sample}",
+                if widgets.is_some() { "set" } else { "missing" },
+                widgets.as_ref().map_or(0, |w| w.len())
+            );
+        }
     }
 
     fn studio_key_focus_rect_response(&self) -> RunViewKeyFocusRect {
