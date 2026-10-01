@@ -15,11 +15,12 @@ use {
         draw_pass::{CxDrawPassParent, DrawPassClearColor, DrawPassClearDepth, DrawPassId},
         egl_sys::{self, LibEgl, EGL_NONE},
         event::{
-            Event, KeyCode, KeyEvent, SafeAreaInsets, TouchUpdateEvent, VirtualKeyboardEvent,
-            WindowGeom,
+            Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollEvent,
+            SafeAreaInsets, TouchUpdateEvent, VirtualKeyboardEvent, WindowGeom,
         },
         gpu_info::GpuPerformance,
-        makepad_live_id::LiveId,
+        area::Area,
+        makepad_live_id::{live_id, LiveId},
         makepad_math::*,
         os::cx_native::EventFlow,
         shared_framebuf::{PollTimer, PollTimers},
@@ -29,7 +30,7 @@ use {
     },
     napi_derive_ohos::napi,
     napi_ohos::{sys::*, Env, JsObject, NapiRaw},
-    std::{ffi::CString, os::raw::c_void, ptr::null_mut, rc::Rc, sync::mpsc, time::Instant},
+    std::{cell::Cell, ffi::CString, os::raw::c_void, ptr::null_mut, rc::Rc, sync::mpsc, time::Instant},
 };
 
 #[napi(js_name = "onCreate")]
@@ -42,16 +43,16 @@ pub fn ohos_ability_on_create(env: Env, ark_ts: JsObject) -> napi_ohos::Result<(
     assert!(status == 0);
 
     let arkts_obj = ArkTsObjRef::new(raw_env, arkts_ref);
-    let device_type = arkts_obj
-        .get_string("deviceType")
-        .unwrap_or("phone".to_string());
-    let os_full_name = arkts_obj
-        .get_string("osFullName")
-        .unwrap_or("OpenHarmony".to_string());
-    let display_density = arkts_obj.get_number("displayDensity").unwrap_or(3.25);
-    let files_dir = arkts_obj.get_string("filesDir").unwrap();
-    let cache_dir = arkts_obj.get_string("cacheDir").unwrap();
-    let temp_dir = arkts_obj.get_string("tempDir").unwrap();
+    // Device and display come from the NDK (oh_env.rs). The directories
+    // are the module's (`haps/<module>/files`), which only ArkTS's context
+    // reports: the NDK has the application's, a different place, and the
+    // app's data must not move. The resource manager is an ArkTS object.
+    let device_type = super::oh_env::device_type();
+    let os_full_name = super::oh_env::os_full_name();
+    let display_density = super::oh_env::display_density();
+    let files_dir = arkts_obj.get_string("filesDir").unwrap_or_else(|_| super::oh_env::files_dir());
+    let cache_dir = arkts_obj.get_string("cacheDir").unwrap_or_else(|_| super::oh_env::cache_dir());
+    let temp_dir = arkts_obj.get_string("tempDir").unwrap_or_else(|_| super::oh_env::temp_dir());
     let res_mgr = arkts_obj.get_property("resMgr").unwrap();
 
     let raw_file = RawFileMgr::new(raw_env, res_mgr);
@@ -305,12 +306,109 @@ impl Cx {
                 };
                 self.fingers.process_touch_update_end(&e.touches);
             }
+            FromOhosMessage::Key { down, code, modifiers } => {
+                let Some(key_code) = oh_key_code(code) else { return };
+                let time = self.os.timers.time_now();
+                // A press can reach us both as a key and as an input-method
+                // message (Backspace as deleteLeft, Enter as a function key):
+                // whichever comes second within 150 ms is the same press.
+                if down {
+                    if key_code == KeyCode::Backspace && time - self.os.last_ime_backspace < 0.15 { return; }
+                    if let Some((ime_code, ime_time)) = self.os.last_ime_key {
+                        if ime_code == key_code && time - ime_time < 0.15 { return; }
+                    }
+                    if key_code == KeyCode::Backspace { self.os.last_key_backspace = time; }
+                    self.os.last_native_key = Some((key_code, time));
+                }
+                self.key_event(key_code, modifiers, down, time);
+            }
+            FromOhosMessage::ImeKey { code, modifiers } => {
+                let Some(key_code) = oh_key_code(code) else { return };
+                let time = self.os.timers.time_now();
+                if let Some((native_code, native_time)) = self.os.last_native_key {
+                    if native_code == key_code && time - native_time < 0.15 { return; }
+                }
+                self.os.last_ime_key = Some((key_code, time));
+                self.key_event(key_code, modifiers, true, time);
+                self.key_event(key_code, modifiers, false, time);
+            }
+            FromOhosMessage::WebNavigation { id, url, title, loading } => {
+                Cx::post_action(crate::event::NativeSystemBrowserNavigation {
+                    browser_id: id,
+                    url,
+                    title,
+                    loading,
+                    error: None,
+                });
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::WebPageError { id, code, description, url } => {
+                Cx::post_action(crate::event::NativeSystemBrowserPageError {
+                    browser_id: id,
+                    code,
+                    description,
+                    url,
+                });
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::WebInvoke { id, call_id, tool, args } => {
+                Cx::post_action(crate::event::NativeSystemBrowserInvoke { browser_id: id, call_id, tool, args });
+                self.handle_action_receiver();
+            }
+            FromOhosMessage::Scroll { scroll, is_mouse } => {
+                let time = self.os.timers.time_now();
+                self.call_event_handler(&Event::Scroll(ScrollEvent {
+                    window_id: CxWindowPool::id_zero(),
+                    scroll,
+                    abs: self.os.last_mouse_abs,
+                    modifiers: Default::default(),
+                    handled_x: Cell::new(false),
+                    handled_y: Cell::new(false),
+                    is_mouse,
+                    time,
+                    phase: Default::default(),
+                }));
+            }
+            FromOhosMessage::Mouse { action, button, abs, time } => {
+                let window_id = CxWindowPool::id_zero();
+                let dpi_factor = self.windows[window_id].dpi_override.unwrap_or(self.os.dpi_factor);
+                let abs = abs / dpi_factor;
+                self.os.last_mouse_abs = abs;
+                let button = MouseButton::from_bits_retain(button);
+                let modifiers = Default::default();
+                match action {
+                    MouseAction::Down => {
+                        self.fingers.process_tap_count(abs, time);
+                        self.fingers.mouse_down(button, window_id);
+                        self.call_event_handler(&Event::MouseDown(MouseDownEvent {
+                            abs, button, window_id, modifiers, time, handled: Cell::new(Area::Empty),
+                        }));
+                    }
+                    MouseAction::Move => {
+                        self.call_event_handler(&Event::MouseMove(MouseMoveEvent {
+                            abs, lock_delta: Vec2d::default(), window_id, modifiers, time,
+                            handled: Cell::new(Area::Empty),
+                        }));
+                        self.fingers.cycle_hover_area(live_id!(mouse).into());
+                        self.fingers.switch_captures();
+                    }
+                    MouseAction::Up => {
+                        self.call_event_handler(&Event::MouseUp(MouseUpEvent {
+                            abs, button, window_id, modifiers, time,
+                        }));
+                        self.fingers.mouse_up(button);
+                        self.fingers.cycle_hover_area(live_id!(mouse).into());
+                    }
+                }
+            }
             FromOhosMessage::TextInput(e) => {
                 self.call_event_handler(&Event::TextInput(e));
             }
             FromOhosMessage::DeleteLeft(length) => {
                 for _ in 0..length {
                     let time = self.os.timers.time_now();
+                    if time - self.os.last_key_backspace < 0.15 { continue; }
+                    self.os.last_ime_backspace = time;
                     let e = KeyEvent {
                         key_code: KeyCode::Backspace,
                         is_repeat: false,
@@ -360,6 +458,9 @@ impl Cx {
         {
             self.os.dpi_factor = display_density;
             self.os.raw_file = Some(raw_file);
+            // `HOME` (the person's shared files) is not the app's to write:
+            // its own files directory is, as on Android and iOS.
+            crate::home::set_platform_data_dir(std::path::Path::new(&files_dir));
             self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
                 files_dir,
                 cache_dir,
@@ -369,6 +470,9 @@ impl Cx {
                 display_density,
             });
             self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
+            if let Some(uv_loop) = super::oh_util::get_uv_loop(raw_env) {
+                super::oh_ime::init(uv_loop);
+            }
             return true;
         } else {
             crate::error!("Failed to receive init message from ArkTS layer");
@@ -380,23 +484,30 @@ impl Cx {
         &mut self,
         from_ohos_rx: &mpsc::Receiver<FromOhosMessage>,
     ) -> *mut c_void {
-        if let Ok(FromOhosMessage::SurfaceCreated {
-            window,
-            width,
-            height,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.display_size = dvec2(width as f64, height as f64);
-            crate::log!(
-                "handle surface created, width={}, height={}, display_density={}",
-                width,
-                height,
-                self.os.dpi_factor
-            );
-            return window;
-        } else {
-            crate::error!("Can't recv SurfaceCreated from arkts");
-            return null_mut();
+        // Other messages can come first (the page reports its avoid area as
+        // it mounts the XComponent): keep them for after the surface exists.
+        let mut early = Vec::new();
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::SurfaceCreated { window, width, height }) => {
+                    self.os.display_size = dvec2(width as f64, height as f64);
+                    crate::log!(
+                        "handle surface created, width={}, height={}, display_density={}",
+                        width,
+                        height,
+                        self.os.dpi_factor
+                    );
+                    for message in early {
+                        send_from_ohos_message(message);
+                    }
+                    return window;
+                }
+                Ok(message) => early.push(message),
+                Err(_) => {
+                    crate::error!("Can't recv SurfaceCreated from arkts");
+                    return null_mut();
+                }
+            }
         }
     }
 
@@ -639,6 +750,9 @@ impl Cx {
     }
 
     fn handle_platform_ops(&mut self) -> EventFlow {
+        // System browsers that appeared, moved, hid or closed this round:
+        // ArkTS re-reads the list once, after the loop.
+        let mut web_changed = false;
         while let Some(op) = self.platform_ops.pop_front() {
             //crate::log!("============ handle_platform_ops");
             match op {
@@ -703,18 +817,10 @@ impl Cx {
                     self.os.quit = true;
                 }
                 CxOsOp::ShowTextIME(_area, _pos, _config) => {
-                    let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
-                        "showKeyBoard",
-                        0,
-                        std::ptr::null_mut(),
-                    );
+                    super::oh_ime::show();
                 }
                 CxOsOp::HideTextIME => {
-                    let _ = self.os.arkts_obj.as_mut().unwrap().call_js_function(
-                        "hideKeyBoard",
-                        0,
-                        std::ptr::null_mut(),
-                    );
+                    super::oh_ime::hide();
                     //self.os.keyboard_visible = false;
                     //unsafe {android_jni::to_java_show_keyboard(false);}
                 }
@@ -780,12 +886,45 @@ impl Cx {
                         VideoPlaybackResourcesReleasedEvent { video_id },
                     ));
                 }
+                CxOsOp::SpawnSystemBrowser { browser_id, url, navigable } => {
+                    web_changed |= super::oh_web::spawn(browser_id.0, &url, navigable);
+                }
+                CxOsOp::UpdateSystemBrowser { browser_id, area, visible } => {
+                    // Logical points are ArkUI's vp: the page is the window.
+                    let rect = area.clipped_rect(self);
+                    web_changed |= super::oh_web::update(browser_id.0, rect, visible);
+                }
+                CxOsOp::DetachSystemBrowser { browser_id } => {
+                    web_changed |= super::oh_web::hide(browser_id.0);
+                }
+                CxOsOp::CloseSystemBrowser { browser_id } => {
+                    web_changed |= super::oh_web::close(browser_id.0);
+                }
+                CxOsOp::SetSystemBrowserUrl { browser_id, url, replace: _ } => {
+                    super::oh_web::set_url(browser_id.0, &url);
+                }
+                CxOsOp::SetSystemBrowserHtml { browser_id, html, base_url } => {
+                    super::oh_web::set_html(browser_id.0, &html, &base_url);
+                }
+                CxOsOp::SystemBrowserHistoryGo { browser_id, delta } => {
+                    super::oh_web::history_go(browser_id.0, delta);
+                }
+                CxOsOp::EvalSystemBrowserJs { browser_id, js } => {
+                    super::oh_web::eval_js(browser_id.0, &js);
+                }
                 CxOsOp::AttachCameraNativePreview { .. }
                 | CxOsOp::UpdateCameraNativePreview { .. }
                 | CxOsOp::DetachCameraNativePreview { .. } => {}
                 e => {
                     crate::error!("Not implemented on this platform: CxOsOp::{:?}", e);
                 }
+            }
+        }
+        if web_changed || super::oh_web::has_commands() {
+            // ArkTS declares the `Web` components and runs the loads ArkWeb's
+            // NDK cannot; it pulls both from oh_web.rs.
+            if let Some(arkts) = self.os.arkts_obj.as_mut() {
+                let _ = arkts.call_js_function("syncWebViews", 0, std::ptr::null_mut());
             }
         }
         EventFlow::Poll
@@ -820,6 +959,15 @@ pub struct CxOhosDisplay {
 }
 
 pub struct CxOs {
+    /// When Backspace last arrived as a key and as the input method's
+    /// deleteLeft: one press can come both ways.
+    pub last_key_backspace: f64,
+    pub last_ime_backspace: f64,
+    /// The last key down from the XComponent and from the input method.
+    /// Where the mouse last was (logical points): scrolls go there.
+    pub last_mouse_abs: Vec2d,
+    pub last_native_key: Option<(KeyCode, f64)>,
+    pub last_ime_key: Option<(KeyCode, f64)>,
     pub first_after_resize: bool,
     pub display_size: Vec2d,
     pub dpi_factor: f64,
@@ -989,6 +1137,11 @@ impl CxOs {
 impl Default for CxOs {
     fn default() -> Self {
         Self {
+            last_key_backspace: f64::MIN,
+            last_ime_backspace: f64::MIN,
+            last_mouse_abs: Vec2d::default(),
+            last_native_key: None,
+            last_ime_key: None,
             first_after_resize: true,
             display_size: dvec2(1260 as f64, 2503 as f64),
             dpi_factor: 3.25,
@@ -1059,4 +1212,83 @@ impl CxOhosDisplay {
             panic!();
         }
     }
+}
+
+impl Cx {
+    fn key_event(&mut self, key_code: KeyCode, modifiers: u64, down: bool, time: f64) {
+        let e = KeyEvent {
+            key_code,
+            is_repeat: false,
+            modifiers: KeyModifiers {
+                control: modifiers & 1 != 0,
+                shift: modifiers & 2 != 0,
+                alt: modifiers & 4 != 0,
+                logo: false,
+            },
+            time,
+        };
+        if down {
+            self.keyboard.process_key_down(e.clone());
+            self.call_event_handler(&Event::KeyDown(e));
+        } else {
+            self.keyboard.process_key_up(e.clone());
+            self.call_event_handler(&Event::KeyUp(e));
+        }
+    }
+}
+
+/// An OpenHarmony `KeyCode` (OH_NativeXComponent_KeyCode) as makepad's.
+fn oh_key_code(code: i32) -> Option<KeyCode> {
+    const LETTERS: [KeyCode; 26] = [
+        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF,
+        KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL,
+        KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR,
+        KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX,
+        KeyCode::KeyY, KeyCode::KeyZ,
+    ];
+    const DIGITS: [KeyCode; 10] = [
+        KeyCode::Key0, KeyCode::Key1, KeyCode::Key2, KeyCode::Key3, KeyCode::Key4,
+        KeyCode::Key5, KeyCode::Key6, KeyCode::Key7, KeyCode::Key8, KeyCode::Key9,
+    ];
+    const FKEYS: [KeyCode; 12] = [
+        KeyCode::F1, KeyCode::F2, KeyCode::F3, KeyCode::F4, KeyCode::F5, KeyCode::F6,
+        KeyCode::F7, KeyCode::F8, KeyCode::F9, KeyCode::F10, KeyCode::F11, KeyCode::F12,
+    ];
+    Some(match code {
+        2000..=2009 => DIGITS[(code - 2000) as usize],
+        2017..=2042 => LETTERS[(code - 2017) as usize],
+        2090..=2101 => FKEYS[(code - 2090) as usize],
+        2012 => KeyCode::ArrowUp,
+        2013 => KeyCode::ArrowDown,
+        2014 => KeyCode::ArrowLeft,
+        2015 => KeyCode::ArrowRight,
+        2043 => KeyCode::Comma,
+        2044 => KeyCode::Period,
+        2045 | 2046 => KeyCode::Alt,
+        2047 | 2048 => KeyCode::Shift,
+        2049 => KeyCode::Tab,
+        2050 => KeyCode::Space,
+        2054 => KeyCode::ReturnKey,
+        2055 => KeyCode::Backspace,
+        2056 => KeyCode::Backtick,
+        2057 => KeyCode::Minus,
+        2058 => KeyCode::Equals,
+        2059 => KeyCode::LBracket,
+        2060 => KeyCode::RBracket,
+        2061 => KeyCode::Backslash,
+        2062 => KeyCode::Semicolon,
+        2063 => KeyCode::Quote,
+        2064 => KeyCode::Slash,
+        2068 => KeyCode::PageUp,
+        2069 => KeyCode::PageDown,
+        2070 => KeyCode::Escape,
+        2071 => KeyCode::Delete,
+        2072 | 2073 => KeyCode::Control,
+        2074 => KeyCode::Capslock,
+        2076 | 2077 => KeyCode::Logo,
+        2081 => KeyCode::Home,
+        2082 => KeyCode::End,
+        2083 => KeyCode::Insert,
+        _ => return None,
+    })
 }
