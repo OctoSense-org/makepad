@@ -7,7 +7,8 @@
 //! every tab keeps pumping its PTY (signals, timers), so background jobs keep
 //! running and their output is there when the tab is selected again.
 //!
-//! Keys (while the terminal holds the keyboard):
+//! Keys (while the terminal holds the keyboard), by default; every one is
+//! a shortcut in `crate::keybinds` and can be changed in `settings.conf`:
 //!
 //! | Ctrl+Shift+T | new tab (in the current tab's directory by default) |
 //! | Ctrl+Shift+W | close tab (asks first while a program runs in it)    |
@@ -16,8 +17,8 @@
 //! | Alt+1..8 / Alt+9               | that tab / the last tab            |
 //! | Ctrl+,       | settings                                             |
 //!
-//! Alt+digit is taken only while more than one tab is open, so a single
-//! shell keeps Meta+digit (readline's numeric argument).
+//! Alt+digit is taken only while more than one tab is open (`performable:`),
+//! so a single shell keeps Meta+digit (readline's numeric argument).
 //!
 //! A long press (held 0.5 s) or a double click on a tab renames it in
 //! place: Enter or a click elsewhere takes the name, Esc drops it, and an
@@ -39,6 +40,8 @@ use makepad_widgets::makepad_platform::event::TouchState;
 use makepad_widgets::widget_tree::CxWidgetExt;
 use makepad_widgets::*;
 
+use crate::keybinds::{self, Keybinds};
+use crate::search;
 use crate::settings::{self as term_settings, NewTabCwd, Settings, TabBar, TabTitle};
 use crate::panes::{self, Dir, Divider, Node};
 use crate::settings_panel::{self, Choice, Row, RowKind};
@@ -117,8 +120,7 @@ pub enum TermTabsAction {
 
 /// A tab bar command, from a key or a click.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TabCommand {
-    New,
+pub enum TabCommand {    New,
     Close,
     Next,
     Previous,
@@ -132,11 +134,38 @@ pub enum TabCommand {
     Focus(Dir),
     /// Show only the focused pane (again: all of them).
     Zoom,
+    /// The whole selected tab, every pane in it.
+    CloseTab,
+    /// Type a name for the selected tab.
+    Rename,
 }
 
-/// The tab command `key` asks for. `tabs` is how many are open: Alt+digit
-/// is left to the shell (Meta+digit) while there is only one.
-pub fn tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
+/// The tab command a shortcut's action is, if it is one of the tab
+/// widget's (`crate::keybinds::Scope::Tabs`).
+pub fn tab_command_of(action: &keybinds::Action) -> Option<TabCommand> {
+    use keybinds::Action as A;
+    Some(match action {
+        A::NewTab => TabCommand::New,
+        A::CloseSurface => TabCommand::Close,
+        A::CloseTab => TabCommand::CloseTab,
+        A::NextTab => TabCommand::Next,
+        A::PreviousTab => TabCommand::Previous,
+        A::GotoTab(n) => TabCommand::Select(n.saturating_sub(1)),
+        A::LastTab => TabCommand::Select(usize::MAX),
+        A::NewSplit(Dir::Down) => TabCommand::SplitDown,
+        A::NewSplit(_) => TabCommand::SplitRight,
+        A::GotoSplit(dir) => TabCommand::Focus(*dir),
+        A::ToggleSplitZoom => TabCommand::Zoom,
+        A::OpenConfig => TabCommand::Settings,
+        A::PromptTabTitle => TabCommand::Rename,
+        _ => return None,
+    })
+}
+
+/// The keys the tab widget took before shortcuts were configurable; the
+/// default table must answer the same (`the_tab_keys_map_to_commands`).
+#[cfg(test)]
+fn legacy_tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
     let m = &key.modifiers;
     if m.logo {
         return None;
@@ -525,6 +554,9 @@ pub struct TermTabs {
     settings: Settings,
     #[rust]
     settings_gen: u64,
+    /// The shortcut table from the settings' `keybind` lines.
+    #[rust]
+    keys: Keybinds,
     #[rust]
     poll_timer: Timer,
     #[rust]
@@ -814,8 +846,46 @@ impl TermTabs {
                 self.select(cx, index.min(self.tabs.len() - 1))
             }
             TabCommand::Settings => self.toggle_panel(cx),
+            TabCommand::CloseTab => self.request_close(cx, self.active, None),
+            TabCommand::Rename => self.begin_rename(cx, self.active),
             _ => {}
         }
+    }
+
+    /// A key press bound to one of this widget's shortcuts (tabs, splits,
+    /// the settings panel): run it. True when the key goes no further;
+    /// the rest goes to the focused pane, which runs its own shortcuts and
+    /// sends what is left to the program.
+    fn key_shortcut(&mut self, cx: &mut Cx, key: &KeyEvent) -> bool {
+        let search_open = self
+            .tabs
+            .get(self.active)
+            .and_then(|tab| tab.focused_pane().with_term(|t| t.search_open()))
+            == Some(true);
+        // An open search bar's own keys win over every shortcut.
+        if search_open && search::bar_key(key).is_some() {
+            return false;
+        }
+        let ctx = keybinds::Context {
+            tabs: self.tabs.len(),
+            search_open,
+        };
+        let keybinds::Decision::Run { action, consume } =
+            self.keys.decide(key, keybinds::Scope::Tabs, &ctx)
+        else {
+            return false;
+        };
+        if let Some(command) = tab_command_of(&action) {
+            self.run_command(cx, command);
+        }
+        if consume {
+            // Whatever text the platform types for this press is not the
+            // program's either.
+            if let Some(tab) = self.tabs.get(self.active) {
+                tab.focused_pane().with_term(|t| t.swallow_key_text());
+            }
+        }
+        consume
     }
 
     /// Where a new tab or pane starts: the focused pane's directory, or
@@ -1049,6 +1119,7 @@ impl TermTabs {
         if generation != self.settings_gen {
             self.settings_gen = generation;
             self.settings = term_settings::current();
+            self.keys = Keybinds::for_lines(&self.settings.keybinds);
             crate::control::set_enabled(self.settings.external_control);
             self.refresh(cx);
         }
@@ -1477,8 +1548,7 @@ impl Widget for TermTabs {
                     _ => {}
                 }
             } else if let Event::KeyDown(key) = event {
-                if let Some(command) = tab_command(key, self.tabs.len()) {
-                    self.run_command(cx, command);
+                if self.key_shortcut(cx, key) {
                     return;
                 }
             }
@@ -1990,7 +2060,8 @@ impl TermTabs {
         }
         match key.key_code {
             KeyCode::Escape => self.panel = None,
-            KeyCode::Comma if key.modifiers.control => self.panel = None,
+            // The settings shortcut (Ctrl+, by default) closes it again.
+            _ if self.keys.lookup(key).is_some_and(|b| b.action == keybinds::Action::OpenConfig) => self.panel = None,
             KeyCode::ArrowUp => panel.selected = selected.saturating_sub(1),
             KeyCode::ArrowDown => panel.selected = (selected + 1).min(rows.len() - 1),
             KeyCode::ArrowLeft if row.kind() == RowKind::Value => self.apply_step(cx, row, -1),
@@ -2081,7 +2152,7 @@ impl TermTabs {
             _ => return,
         }
         let (row, selected) = (chooser.row, chooser.selected);
-        if selected != before && row != Row::Profile {
+        if selected != before && row != Row::Profile && !row.read_only() {
             // Preview as the selection moves (themes, fonts, the shell).
             if let Some(choice) = shown.get(selected) {
                 let next = row.with_value(&self.current_settings(), &choice.value);
@@ -2099,6 +2170,10 @@ impl TermTabs {
         let next = row.with_value(&self.current_settings(), value);
         if let Some(panel) = self.panel.as_mut() {
             panel.mode = PanelMode::Rows;
+            if row.read_only() {
+                // A list to read: nothing to take, nothing to save.
+                return;
+            }
             if row == Row::Profile {
                 panel.message = Some(format!("Loaded \u{201c}{value}\u{201d}"));
             }
@@ -2112,6 +2187,10 @@ impl TermTabs {
             return;
         };
         match row {
+            Row::Shortcuts => {
+                let choices = row.choices(&self.settings).unwrap_or_default();
+                self.open_chooser(row, choices);
+            }
             Row::SaveProfile => panel.mode = PanelMode::Name(profile),
             Row::DeleteProfile if profile.is_empty() => panel.message = Some("No profile is loaded".into()),
             Row::DeleteProfile if !panel.confirm_delete => panel.confirm_delete = true,
@@ -2200,7 +2279,13 @@ impl TermTabs {
                 }
             }
             PanelHit::Reset => {
-                let next = Settings { profile: self.settings.profile.clone(), ..Settings::default() };
+                // Shortcuts are the file's to change, not the panel's: a
+                // reset keeps the `keybind` lines it cannot show again.
+                let next = Settings {
+                    profile: self.settings.profile.clone(),
+                    keybinds: self.settings.keybinds.clone(),
+                    ..Settings::default()
+                };
                 self.apply(cx, next);
             }
         }
@@ -2438,6 +2523,15 @@ impl TermTabs {
                     }
                     RowKind::Action => {
                         hits.push((row_rect, PanelHit::Activate(i)));
+                        // A summary beside an action that opens a list.
+                        let value = row.value(&shown_settings);
+                        if !value.is_empty() {
+                            let room = (right - (left + label_w + 16.0)).max(40.0);
+                            let value = self.fit(cx, &value, room);
+                            let vw = self.text_width(cx, &value);
+                            self.draw_label.color = c.dim;
+                            self.draw_label.draw_abs(cx, dvec2(right - vw, text_y), &value);
+                        }
                     }
                     RowKind::Value => {
                         let has_list = matches!(row, Row::Theme | Row::Font | Row::CjkFont | Row::Shell | Row::Profile);
@@ -2541,13 +2635,13 @@ impl TermTabs {
                 self.draw_label.color = c.accent;
                 self.draw_label.draw_abs(cx, dvec2(left, text_y), "\u{2713}");
             }
-            let note_w = if choice.note.is_empty() { 0.0 } else { self.text_width(cx, choice.note) + 8.0 };
+            let note_w = if choice.note.is_empty() { 0.0 } else { self.text_width(cx, &choice.note) + 8.0 };
             let label = self.fit(cx, &choice.label, right - left - 16.0 - note_w);
             self.draw_label.color = if i == selected { c.fg } else { mix(c.dim, c.fg, 0.5) };
             self.draw_label.draw_abs(cx, dvec2(left + 16.0, text_y), &label);
             if !choice.note.is_empty() {
                 self.draw_label.color = c.dim;
-                self.draw_label.draw_abs(cx, dvec2(right - note_w + 8.0, text_y), choice.note);
+                self.draw_label.draw_abs(cx, dvec2(right - note_w + 8.0, text_y), &choice.note);
             }
             hits.push((item, PanelHit::Choice(i)));
             y += row_h;
@@ -2671,11 +2765,93 @@ mod tests {
     #[test]
     fn the_close_question_names_every_job() {
         let one = vec![("sleep".to_string(), "sleep".to_string())];
-        assert_eq!(close_all_message(&one), "Closing the terminal ends \u{201c}sleep\u{201d}. Close anyway?");
-        let two = vec![("build".to_string(), "cargo".to_string()), ("notes".to_string(), "vim".to_string())];
+        assert_eq!(
+            close_all_message(&one),
+            "Closing the terminal ends \u{201c}sleep\u{201d}. Close anyway?"
+        );
+        let two = vec![
+            ("build".to_string(), "cargo".to_string()),
+            ("notes".to_string(), "vim".to_string()),
+        ];
         assert_eq!(
             close_all_message(&two),
             "Closing the terminal ends 2 running jobs: \u{201c}cargo\u{201d} in build, \u{201c}vim\u{201d} in notes. Close anyway?"
+        );
+    }
+
+    /// What the default table has the tab widget do with `key`.
+    fn tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
+        table_tab_command(
+            &Keybinds::defaults(cfg!(target_os = "macos")),
+            key,
+            tabs,
+            false,
+        )
+    }
+
+    fn table_tab_command(
+        keys: &Keybinds,
+        key: &KeyEvent,
+        tabs: usize,
+        search_open: bool,
+    ) -> Option<TabCommand> {
+        let ctx = keybinds::Context { tabs, search_open };
+        match keys.decide(key, keybinds::Scope::Tabs, &ctx) {
+            keybinds::Decision::Run { action, .. } => tab_command_of(&action),
+            keybinds::Decision::Pass => None,
+        }
+    }
+
+    #[test]
+    fn the_default_table_takes_exactly_the_old_tab_keys() {
+        // Every key, every modifier combination, one to four tabs, both
+        // platforms: the table answers what the hard-coded match did.
+        for mac in [false, true] {
+            let keys = Keybinds::defaults(mac);
+            for &code in keybinds::ALL_KEY_CODES {
+                for bits in 0..16u8 {
+                    let mut k = key(code, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+                    k.modifiers.logo = bits & 8 != 0;
+                    for tabs in 1..=4 {
+                        assert_eq!(
+                            table_tab_command(&keys, &k, tabs, false),
+                            legacy_tab_command(&k, tabs),
+                            "mac {mac}, {tabs} tabs: {:?} {:?}",
+                            k.key_code,
+                            k.modifiers
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_remap_moves_a_tab_command_and_an_open_search_bar_keeps_its_keys() {
+        let keys = Keybinds::for_lines(&[
+            "cmd+t=new_tab".into(),
+            "ctrl+shift+t=unbind".into(),
+            "ctrl+r=next_tab".into(),
+        ]);
+        let mut cmd_t = key(KeyCode::KeyT, false, false, false);
+        cmd_t.modifiers.logo = true;
+        assert_eq!(
+            table_tab_command(&keys, &cmd_t, 1, false),
+            Some(TabCommand::New)
+        );
+        assert_eq!(
+            table_tab_command(&keys, &key(KeyCode::KeyT, true, true, false), 1, false),
+            None
+        );
+        // Ctrl+R toggles regex in an open search bar, whatever is bound.
+        let ctrl_r = key(KeyCode::KeyR, true, false, false);
+        assert_eq!(
+            table_tab_command(&keys, &ctrl_r, 2, false),
+            Some(TabCommand::Next)
+        );
+        assert!(
+            search::bar_key(&ctrl_r).is_some(),
+            "key_shortcut passes it to the bar"
         );
     }
 

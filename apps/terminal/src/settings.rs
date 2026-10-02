@@ -124,6 +124,10 @@ pub struct Settings {
     /// Other programs of this user may list, read and type into panes
     /// (`crate::control`, `terminal-ctl`).
     pub external_control: bool,
+    /// The `keybind` lines, in file order, as written: Ghostty's syntax,
+    /// applied on top of the default shortcuts (`crate::keybinds`). Kept
+    /// verbatim so a save by the panel writes them back unchanged.
+    pub keybinds: Vec<String>,
 }
 
 pub const FONT_SIZE_RANGE: (f64, f64) = (6.0, 48.0);
@@ -164,6 +168,7 @@ impl Default for Settings {
             tab_bar: TabBar::Auto,
             profile: String::new(),
             external_control: false,
+            keybinds: Vec::new(),
         }
     }
 }
@@ -365,6 +370,9 @@ impl Settings {
                         _ => s.tab_bar,
                     }
                 }
+                // Validated where the table is built (`crate::keybinds`):
+                // a bad line is reported there and skipped, not lost here.
+                "keybind" if !value.chars().any(char::is_control) => s.keybinds.push(value.to_string()),
                 _ => {}
             }
         }
@@ -473,6 +481,16 @@ impl Settings {
         );
         line("external-control", yes(self.external_control).into());
         line("profile", self.profile.clone());
+        out.push_str(
+            "\n# Keyboard shortcuts, Ghostty's syntax, on top of the defaults (the settings\n\
+             # panel lists them): keybind = ctrl+shift+t=new_tab, keybind = cmd+d=unbind,\n\
+             # keybind = alt+left=text:\\x1bb, keybind = clear (drops every default).\n",
+        );
+        for bind in &self.keybinds {
+            out.push_str("keybind = ");
+            out.push_str(bind);
+            out.push('\n');
+        }
         out
     }
 }
@@ -558,7 +576,20 @@ fn load() -> Live {
     let settings = std::fs::read_to_string(path())
         .map(|text| Settings::parse(&text))
         .unwrap_or_default();
+    warn_keybinds(&settings);
     Live { settings, mtime: file_mtime() }
+}
+
+/// Say which `keybind` lines were skipped, and why: the rest still apply.
+fn warn_keybinds(settings: &Settings) {
+    for err in crate::keybinds::Keybinds::for_lines(&settings.keybinds).errors {
+        makepad_widgets::warning!(
+            "terminal: {}: skipped `keybind = {}`: {}",
+            path().display(),
+            err.line,
+            err.message
+        );
+    }
 }
 
 /// The live settings (read from the file on first use).
@@ -616,6 +647,21 @@ pub fn poll() {
         *last = Some(now);
     }
     reload_if_changed();
+}
+
+/// Read the file again now (the `reload_config` shortcut), whatever its
+/// modification time says.
+pub fn reload() {
+    let fresh = load();
+    let mut guard = LIVE.write().unwrap_or_else(|e| e.into_inner());
+    if guard
+        .as_ref()
+        .map(|live| live.settings != fresh.settings)
+        .unwrap_or(true)
+    {
+        GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+    *guard = Some(fresh);
 }
 
 /// Pick up an edit made outside this process (another terminal window, a
@@ -679,6 +725,13 @@ mod tests {
             tab_bar: TabBar::Always,
             profile: "Work".into(),
             external_control: true,
+            keybinds: vec![
+                "clear".into(),
+                "cmd+t=new_tab".into(),
+                r"alt+left=text:\x1bb".into(),
+                "ctrl+shift+d=unbind".into(),
+                "not a keybind".into(),
+            ],
         };
         assert_eq!(Settings::parse(&s.to_text()), s);
         assert_eq!(Settings::parse(&Settings::default().to_text()), Settings::default());
@@ -797,7 +850,44 @@ mod tests {
     fn unknown_keys_and_malformed_lines_are_ignored() {
         let s = Settings::parse("future-option = 7\nno equals sign here\ntheme = nord\n");
         assert_eq!(s.theme, "nord");
-        assert_eq!(Settings { theme: THEME_DESKTOP.into(), ..s }, Settings::default());
+        assert_eq!(
+            Settings {
+                theme: THEME_DESKTOP.into(),
+                ..s
+            },
+            Settings::default()
+        );
+    }
+
+    #[test]
+    fn keybind_lines_are_kept_in_order_and_written_back() {
+        let text = "keybind = cmd+t=new_tab\ntheme = nord\nkeybind=ctrl+==reset_font_size\nkeybind = clear\n\
+                    keybind = alt+left=text:\\x1bb\nkeybind = nonsense\n";
+        let s = Settings::parse(text);
+        assert_eq!(
+            s.keybinds,
+            [
+                "cmd+t=new_tab",
+                "ctrl+==reset_font_size",
+                "clear",
+                r"alt+left=text:\x1bb",
+                "nonsense"
+            ]
+        );
+        assert_eq!(
+            Settings::parse(&s.to_text()),
+            s,
+            "a panel save keeps them, invalid ones too"
+        );
+        assert_eq!(Settings::default().keybinds, Vec::<String>::new());
+        assert!(
+            !Settings::default().to_text().contains("\nkeybind ="),
+            "no binding lines by default"
+        );
+        // The invalid line is reported where the table is built.
+        let table = crate::keybinds::Keybinds::for_lines(&s.keybinds);
+        assert_eq!(table.errors.len(), 1);
+        assert_eq!(table.errors[0].line, "nonsense");
     }
 
     #[test]
