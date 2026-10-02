@@ -101,13 +101,23 @@ const TOOL_TABLE: [(&str, &str, &str, Risk); 7] = [
     ),
 ];
 
-/// The tools, exactly as the panel's own model is told about them.
+/// The tools, exactly as the panel's own model is told about them: the ones
+/// that only read. Nothing confirms a call between that model and the disk
+/// (the desktop assistant's router confirms the mutations, `ai_service.rs`),
+/// so the panel only looks, as its prompt tells the model.
 #[cfg(feature = "chat")]
 pub fn tools() -> Vec<ToolSpec> {
     TOOL_TABLE
         .iter()
+        .filter(|(.., risk)| *risk == Risk::Read)
         .map(|(name, description, schema, _)| ToolSpec::new(*name, *description, *schema))
         .collect()
+}
+
+/// Whether the panel's own model may run `name`: a tool that only reads.
+#[cfg(feature = "chat")]
+fn only_reads(name: &str) -> bool {
+    TOOL_TABLE.iter().any(|(n, .., risk)| *n == name && *risk == Risk::Read)
 }
 
 /// The same seven tools as the desktop assistant learns them over the bus
@@ -164,7 +174,19 @@ impl ToolRunner {
             },
             move || {
                 while let Ok(job) = job_rx.recv() {
-                    if result_tx.send(run(&job)).is_err() {
+                    // A mutation the model names although it was not offered
+                    // is refused: the panel only looks.
+                    let outcome = if only_reads(&job.name) {
+                        run(&job)
+                    } else {
+                        ToolOutcome {
+                            note: format!("refused {}: the panel only looks", job.name),
+                            text: format!("{} is not available here: this panel can only look. Tell the user what to click instead.", job.name),
+                            is_error: true,
+                            mutated: false,
+                        }
+                    };
+                    if result_tx.send(outcome).is_err() {
                         return;
                     }
                     makepad_widgets::makepad_platform::thread::SignalToUI::set_ui_signal();
@@ -857,7 +879,8 @@ mod tests {
     #[test]
     fn every_tool_has_a_schema_and_a_safe_name() {
         let tools = tools();
-        assert_eq!(tools.len(), 7);
+        // The panel's own model only looks: the four read tools.
+        assert_eq!(tools.len(), 4);
         for tool in &tools {
             assert!(tool
                 .name
@@ -867,9 +890,9 @@ mod tests {
             assert!(tool.parameters.contains("\"properties\""));
             assert!(!tool.description.is_empty());
         }
-        assert!(tools.iter().any(|tool| tool.name == "mkdir"));
-        assert!(tools.iter().any(|tool| tool.name == "rename"));
-        assert!(tools.iter().any(|tool| tool.name == "trash"));
+        for mutation in ["mkdir", "rename", "trash"] {
+            assert!(tools.iter().all(|tool| tool.name != mutation), "{mutation} is offered to the panel");
+        }
     }
 
     #[test]
