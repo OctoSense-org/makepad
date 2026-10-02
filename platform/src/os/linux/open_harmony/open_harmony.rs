@@ -110,19 +110,55 @@ impl Cx {
         self.redraw_all();
 
         while !self.os.quit {
-            match from_ohos_rx.recv() {
+            // Sleep until something arrives or the earliest timer is due; the
+            // display is asked for a beat only when there is something to draw.
+            let wait = self
+                .os
+                .timers
+                .next_due_in()
+                .map_or(std::time::Duration::from_secs(3600), std::time::Duration::from_secs_f64);
+            match from_ohos_rx.recv_timeout(wait) {
                 Ok(FromOhosMessage::VSync) => {
                     self.handle_all_pending_messages(&from_ohos_rx);
                     self.handle_other_events();
+                    // Arm the next beat before this one's paint and swap, or
+                    // a continuous animation lands every other beat.
+                    if self.frame_wanted() {
+                        super::oh_callbacks::request_vsync();
+                    }
                     self.handle_drawing();
                 }
-                Ok(message) => self.handle_message(message),
-                Err(e) => {
-                    crate::error!("Error receiving message: {:?}", e);
+                Ok(FromOhosMessage::Wake) => {
+                    self.handle_all_pending_messages(&from_ohos_rx);
+                    self.handle_other_events();
                 }
+                Ok(message) => self.handle_message(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.handle_other_events();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    crate::error!("the ArkTS channel closed");
+                    break;
+                }
+            }
+            if self.frame_wanted() {
+                super::oh_callbacks::request_vsync();
             }
         }
         self.call_event_handler(&Event::Shutdown);
+    }
+
+    /// Whether the next display beat has work: a dirty pass, a requested
+    /// redraw or next frame, a time-driven shader, a platform op, released
+    /// GPU storage still waiting to retire.
+    fn frame_wanted(&self) -> bool {
+        self.any_passes_dirty()
+            || self.need_redrawing()
+            || !self.new_next_frames.is_empty()
+            || self.demo_time_repaint
+            || self.os.first_after_resize
+            || !self.platform_ops.is_empty()
+            || self.opengl_retirement_pending()
     }
 
     fn handle_all_pending_messages(&mut self, from_ohos_rx: &mpsc::Receiver<FromOhosMessage>) {
@@ -175,7 +211,11 @@ impl Cx {
     }
 
     fn handle_drawing(&mut self) {
-        if self.any_passes_dirty() || self.need_redrawing() || !self.new_next_frames.is_empty() {
+        if self.any_passes_dirty()
+            || self.need_redrawing()
+            || !self.new_next_frames.is_empty()
+            || self.demo_time_repaint
+        {
             let time_now = self.os.timers.time_now();
             if !self.new_next_frames.is_empty() {
                 self.call_next_frame_event(time_now);
@@ -1190,6 +1230,7 @@ fn ohos_message_name(message: &FromOhosMessage) -> &'static str {
         FromOhosMessage::SurfaceCreated { .. } => "SurfaceCreated",
         FromOhosMessage::SurfaceDestroyed => "SurfaceDestroyed",
         FromOhosMessage::VSync => "VSync",
+        FromOhosMessage::Wake => "Wake",
         FromOhosMessage::Touch(_) => "Touch",
         FromOhosMessage::TextInput(_) => "TextInput",
         FromOhosMessage::DeleteLeft(_) => "DeleteLeft",
