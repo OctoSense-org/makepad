@@ -15,6 +15,12 @@ version = "0.1.0"
 edition = "2021"
 default-run = "browser"
 
+# An empty library beside the binary: a workspace that pins this app (OctoSense's
+# process apps) depends on the package to build the binary held to its own lock,
+# and cargo takes a dependency only on a package with a library.
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "browser"
 path = "src/main.rs"
