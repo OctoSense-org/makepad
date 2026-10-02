@@ -36,6 +36,8 @@ impl AppModule for NotesModule {
         if let Some(mut view) = root.borrow_mut::<NotesView>() {
             view.set_storage(handles.storage);
             view.open_agent(vm.cx_mut());
+            // A host's Notes is the person's own: no sample notes.
+            view.set_starts_empty(true);
         }
         InstanceParts {
             root: root.clone(),

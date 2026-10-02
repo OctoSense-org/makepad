@@ -40,6 +40,8 @@ impl AppModule for RemindersModule {
         if let Some(mut view) = root.borrow_mut::<RemindersView>() {
             view.set_storage(handles.storage);
             view.open_agent(vm.cx_mut());
+            // A host's Reminders is the person's own: no sample reminders.
+            view.set_starts_empty(true);
         }
         let shutdown_root = root.clone();
         InstanceParts {

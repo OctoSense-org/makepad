@@ -436,6 +436,11 @@ pub struct RemindersView {
     /// one: the agent calls its tools over it.
     #[rust]
     agent: Option<makepad_ai_services::peer::OctosPeer>,
+    /// A first run starts with the lists but no reminders rather than the
+    /// sample ones (a module a host runs; the standalone window keeps its
+    /// samples).
+    #[rust]
+    starts_empty: bool,
     #[rust]
     machine: StorageMachine,
     #[rust]
@@ -485,6 +490,11 @@ impl RemindersView {
     /// it, and nothing arrives on it).
     pub fn open_agent(&mut self, cx: &mut Cx) {
         self.agent = Some(makepad_ai_services::peer::OctosPeer::open(cx));
+    }
+
+    /// A first run starts with the lists but no reminders.
+    pub fn set_starts_empty(&mut self, empty: bool) {
+        self.starts_empty = empty;
     }
 
     pub fn ai_summary(&self) -> String {
@@ -1618,7 +1628,7 @@ impl RemindersView {
     fn apply_load(&mut self, cx: &mut Cx, outcome: LoadOutcome) {
         match outcome {
             LoadOutcome::Seed => {
-                let doc = seed(self.now.day);
+                let doc = if self.starts_empty { crate::seed::empty(self.now.day) } else { seed(self.now.day) };
                 self.machine.saved_revision = 0;
                 self.machine.dirty_revision = doc.revision;
                 self.document = Some(doc);

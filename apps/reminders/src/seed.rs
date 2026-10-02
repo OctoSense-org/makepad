@@ -53,15 +53,36 @@ const ROWS: &[SeedRow] = &[
     SeedRow { id: 35, list_id: TRAVEL_LIST_ID, title: "Save boarding pass", notes: "", due_offset: Some(-1), due_minute: None, flagged: false, priority: Priority::None, completed: true },
 ];
 
-/// Build the first-run document for civil day `D`. Absolute dates are stored
-/// and never shifted on later launches.
-pub fn seed(day: Day) -> Document {
-    let lists = vec![
+/// The four lists every first run starts with (lists cannot be created in
+/// the app yet).
+fn starter_lists() -> Vec<ReminderList> {
+    vec![
         ReminderList { id: GROCERIES_LIST_ID, name: "Groceries".into(), colour: ListColour::Green, order: 0 },
         ReminderList { id: WORK_LIST_ID, name: "Work".into(), colour: ListColour::Blue, order: 1 },
         ReminderList { id: HOME_LIST_ID, name: "Home".into(), colour: ListColour::Orange, order: 2 },
         ReminderList { id: TRAVEL_LIST_ID, name: "Travel".into(), colour: ListColour::Purple, order: 3 },
-    ];
+    ]
+}
+
+/// The first-run document of a person's own Reminders (a module a host
+/// runs): the starter lists and no reminders.
+pub fn empty(day: Day) -> Document {
+    Document {
+        schema_version: SCHEMA_VERSION,
+        seed_version: SEED_VERSION,
+        seed_day: day,
+        revision: 1,
+        next_reminder_id: 1,
+        lists: starter_lists(),
+        reminders: Vec::new(),
+        show_completed: false,
+    }
+}
+
+/// Build the first-run document for civil day `D`. Absolute dates are stored
+/// and never shifted on later launches.
+pub fn seed(day: Day) -> Document {
+    let lists = starter_lists();
     let mut order_in_list = [0u32; 5];
     let reminders = ROWS
         .iter()

@@ -39,6 +39,10 @@ pub struct NotesView {
     /// one: the agent calls its tools over it.
     #[rust]
     agent: Option<makepad_ai_services::peer::OctosPeer>,
+    /// A first run starts with no notes rather than the sample ones (a
+    /// module a host runs; the standalone window keeps its samples).
+    #[rust]
+    starts_empty: bool,
     #[rust]
     load_req: Option<StorageRequestId>,
     #[rust]
@@ -102,6 +106,11 @@ impl NotesView {
     /// it, and nothing arrives on it).
     pub fn open_agent(&mut self, cx: &mut Cx) {
         self.agent = Some(makepad_ai_services::peer::OctosPeer::open(cx));
+    }
+
+    /// A first run starts with no notes instead of the samples.
+    pub fn set_starts_empty(&mut self, empty: bool) {
+        self.starts_empty = empty;
     }
 
     pub fn document(&self) -> &NotesDocument {
@@ -211,7 +220,11 @@ impl NotesView {
                 match &response.result {
                     Ok(StorageResult::Value(bytes)) => match load_from_storage(bytes.as_deref()) {
                         LoadOutcome::Missing => {
-                            self.doc = seed::generate(now_ms());
+                            self.doc = if self.starts_empty {
+                                NotesDocument::empty(seed::seed_anchor_ms(now_ms()))
+                            } else {
+                                seed::generate(now_ms())
+                            };
                             self.ui = engine::initial_ui(&self.doc);
                             self.load = LoadState::Ready;
                             self.save.current = self.doc.revision;
@@ -989,6 +1002,11 @@ impl NotesView {
         list.set_item_range(cx, 0, self.list_rows.len().max(1));
         while let Some(index) = list.next_visible_item(cx) {
             if self.list_rows.is_empty() {
+                // One placeholder: the list may hand out more indices to
+                // fill its height, and each would draw it again.
+                if index != 0 {
+                    continue;
+                }
                 let item = list.item(cx, index, live_id!(Empty));
                 item.widget(cx, ids!(title)).set_text(
                     cx,
