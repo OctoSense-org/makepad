@@ -1269,6 +1269,22 @@ impl CxVulkan {
         if !self.debug_utils_enabled {
             return;
         }
+        // A driver can list VK_EXT_debug_utils and still resolve no
+        // vkCreateDebugUtilsMessengerEXT (Adreno 610 on HyperOS 2). ash then
+        // loads a stub that panics, and the panic aborts the process inside
+        // the stub's `extern "system"` frame before the first frame is drawn.
+        let create_fn = unsafe {
+            self._entry.get_instance_proc_addr(
+                self.instance.handle(),
+                b"vkCreateDebugUtilsMessengerEXT\0".as_ptr() as *const c_char,
+            )
+        };
+        if create_fn.is_none() {
+            crate::warning!(
+                "Android Vulkan: VK_EXT_debug_utils is listed but vkCreateDebugUtilsMessengerEXT does not resolve; continuing without a debug messenger"
+            );
+            return;
+        }
         let debug_loader = ash::ext::debug_utils::Instance::new(&self._entry, &self.instance);
         let create_info = vulkan_debug_messenger_create_info();
         match unsafe { debug_loader.create_debug_utils_messenger(&create_info, None) } {
