@@ -1043,6 +1043,16 @@ impl Cx {
                         );
                     }
 
+                    // A shader has no name here: its index and first
+                    // instance fields tell the kinds apart (text, quads, images).
+                    let timed = super::gl_timer::begin_draw(gl, || {
+                        // Past the fields every quad shares.
+                        let common = [live_id!(rect_pos), live_id!(rect_size), live_id!(draw_clip), live_id!(depth_clip), live_id!(draw_depth)];
+                        let fields: Vec<String> = sh.mapping.instances.inputs.iter()
+                            .filter(|input| !common.contains(&input.id))
+                            .take(5).map(|input| format!("{}", input.id)).collect();
+                        format!("#{}[{}]", draw_call.draw_shader_id.index, fields.join(","))
+                    });
                     (gl.glDrawElementsInstanced)(
                         gl_sys::TRIANGLES,
                         indices as i32,
@@ -1050,6 +1060,7 @@ impl Cx {
                         ptr::null(),
                         instances as i32,
                     );
+                    super::gl_timer::end(gl, timed);
                     draw_item.consumed_instance_id = draw_item.retained_instance_id;
                     draw_item.consumed_schema = draw_item.resident_schema;
                     draw_item.consumed_serial = self
@@ -1354,7 +1365,9 @@ impl Cx {
         let mut zbias = 0.0;
         let zbias_step = self.passes[draw_pass_id].zbias_step;
 
+        let timed = super::gl_timer::begin_pass(self.os.gl(), &self.passes[draw_pass_id].debug_name);
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
+        super::gl_timer::end(self.os.gl(), timed);
 
         unsafe {
             (self.os.gl().glBindFramebuffer)(gl_sys::FRAMEBUFFER, 0);

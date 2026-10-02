@@ -44,6 +44,7 @@ pub(crate) mod va_dmabuf_modifier;
 pub mod libc_sys;
 pub mod module_loader;
 pub mod opengl;
+pub(crate) mod gl_timer;
 #[cfg(use_vulkan)]
 pub mod vulkan;
 #[cfg(use_vulkan)]
