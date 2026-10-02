@@ -463,6 +463,10 @@ pub struct CalculatorView {
     ui: UiState,
     #[rust]
     storage: Option<StorageHandle>,
+    /// The link to its agent, when a host runs it as a module and grants it
+    /// one: the agent calls its tools over it.
+    #[rust]
+    agent: Option<makepad_ai_services::peer::OctosPeer>,
     #[rust]
     load_id: Option<StorageRequestId>,
     #[rust]
@@ -494,6 +498,12 @@ pub struct CalculatorView {
 impl CalculatorView {
     pub fn set_storage(&mut self, storage: StorageHandle) {
         self.storage = Some(storage);
+    }
+
+    /// Open the link to the app's agent (a host that grants none refuses
+    /// it, and nothing arrives on it).
+    pub fn open_agent(&mut self, cx: &mut Cx) {
+        self.agent = Some(makepad_ai_services::peer::OctosPeer::open(cx));
     }
 
     pub fn doc(&self) -> &CalculatorDoc {
@@ -1159,6 +1169,11 @@ fn command_from_char(ch: char) -> Option<Command> {
 
 impl Widget for CalculatorView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Its agent's tool calls, answered as its AI bus service answers them.
+        if let Some(agent) = self.agent.as_mut() {
+            let doc = &self.doc;
+            agent.serve_tools(cx, event, |call| crate::ai::answer(doc, call));
+        }
         self.ensure_started(cx);
         if let Event::Storage(responses) = event {
             self.on_storage(cx, responses);

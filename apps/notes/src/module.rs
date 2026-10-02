@@ -35,6 +35,7 @@ impl AppModule for NotesModule {
         let root = WidgetRef::script_from_value(vm, value);
         if let Some(mut view) = root.borrow_mut::<NotesView>() {
             view.set_storage(handles.storage);
+            view.open_agent(vm.cx_mut());
             // A host's Notes is the person's own: no sample notes.
             view.set_starts_empty(true);
         }
@@ -45,8 +46,11 @@ impl AppModule for NotesModule {
         }
     }
 
+    /// `octos.*`: the app's own agent, which the host's "Ask <app>" and its
+    /// system agent reach while the app is open, if the host grants it (one
+    /// that grants none gives the app no agent).
     fn capabilities(&self) -> &'static [&'static str] {
-        &["storage"]
+        &["storage", "octos.session.open", "octos.session.history", "octos.turn.start", "octos.turn.interrupt"]
     }
 }
 
