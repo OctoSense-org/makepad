@@ -69,8 +69,11 @@ impl AppModule for ClockModule {
         }
     }
 
+    /// `octos.*`: the app's own agent, which the host's "Ask <app>" and its
+    /// system agent reach while the app is open, if the host grants it (one
+    /// that grants none gives the app no agent).
     fn capabilities(&self) -> &'static [&'static str] {
-        &["storage"]
+        &["storage", "octos.session.open", "octos.session.history", "octos.turn.start", "octos.turn.interrupt"]
     }
 }
 
