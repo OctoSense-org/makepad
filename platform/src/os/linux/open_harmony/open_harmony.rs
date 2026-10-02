@@ -191,6 +191,13 @@ impl Cx {
             }
 
             self.handle_repaint();
+        } else {
+            // Nothing to paint: retained-upload retirement debt (released GPU
+            // allocations waiting on their completion fence, freed draw
+            // storage) is served here, on the vsync beat, without a present,
+            // as on Android. Repainting for it recorded new debt every frame:
+            // an idle Home drew at display rate.
+            let _ = self.opengl_maintain_instance_retirements();
         }
     }
 
