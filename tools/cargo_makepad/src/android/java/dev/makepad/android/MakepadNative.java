@@ -26,6 +26,8 @@ public class MakepadNative {
     public native static void surfaceOnSurfaceDestroyed(Surface surface);
     public static native void surfaceOnLongClick(float x, float y, int pointerId, long timeMillis);
     public static native void surfaceOnTouch(MotionEvent event);
+    // The render thread's Linux id, 0 before it has started (touch hints).
+    public static native int renderThreadTid();
     public native static void surfaceOnSurfaceChanged(Surface surface, int width, int height);
     public native static void surfaceOnKeyDown(int keycode, int meta_state, boolean is_repeat);
     public native static void surfaceOnKeyUp(int keycode, int meta_state);
