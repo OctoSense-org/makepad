@@ -3,6 +3,12 @@ name = "makepad-files"
 version = "0.1.0"
 edition = "2021"
 
+# An empty library beside the binary: a workspace that pins this app (OctoSense's
+# process apps) depends on the package to build the binary held to its own lock,
+# and cargo takes a dependency only on a package with a library.
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "files"
 path = "src/main.rs"
