@@ -35,6 +35,7 @@ impl AppModule for NotesModule {
         let root = WidgetRef::script_from_value(vm, value);
         if let Some(mut view) = root.borrow_mut::<NotesView>() {
             view.set_storage(handles.storage);
+            view.open_agent(vm.cx_mut());
         }
         InstanceParts {
             root: root.clone(),

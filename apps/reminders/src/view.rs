@@ -432,6 +432,10 @@ pub struct RemindersView {
     started: bool,
     #[rust]
     storage: Option<StorageHandle>,
+    /// The link to its agent, when a host runs it as a module and grants it
+    /// one: the agent calls its tools over it.
+    #[rust]
+    agent: Option<makepad_ai_services::peer::OctosPeer>,
     #[rust]
     machine: StorageMachine,
     #[rust]
@@ -475,6 +479,12 @@ pub struct RemindersView {
 impl RemindersView {
     pub fn set_storage(&mut self, storage: StorageHandle) {
         self.storage = Some(storage);
+    }
+
+    /// Open the link to the app's agent (a host that grants none refuses
+    /// it, and nothing arrives on it).
+    pub fn open_agent(&mut self, cx: &mut Cx) {
+        self.agent = Some(makepad_ai_services::peer::OctosPeer::open(cx));
     }
 
     pub fn ai_summary(&self) -> String {
@@ -1831,6 +1841,13 @@ impl RemindersView {
 
 impl Widget for RemindersView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Its agent's tool calls, answered as its AI bus service answers
+        // them (the link is set aside so the answer may read the whole view).
+        if let Some(mut agent) = self.agent.take() {
+            let this = &*self;
+            agent.serve_tools(cx, event, |call| this.ai_answer(call));
+            self.agent = Some(agent);
+        }
         self.ensure_started(cx);
         if let Event::Storage(responses) = event {
             self.on_storage(cx, responses);

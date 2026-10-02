@@ -53,6 +53,7 @@ impl AppModule for WeatherModule {
             // persists there, on every host the same way (the browser's
             // store on the web).
             view.set_storage(handles.storage);
+            view.open_agent(vm.cx_mut());
         }
         let shutdown_root = root.clone();
         InstanceParts {

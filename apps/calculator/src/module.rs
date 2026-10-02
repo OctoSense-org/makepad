@@ -36,6 +36,7 @@ impl AppModule for CalculatorModule {
         let root = WidgetRef::script_from_value(vm, value);
         if let Some(mut view) = root.borrow_mut::<CalculatorView>() {
             view.set_storage(handles.storage);
+            view.open_agent(vm.cx_mut());
         }
         let shutdown_root = root.clone();
         InstanceParts {
