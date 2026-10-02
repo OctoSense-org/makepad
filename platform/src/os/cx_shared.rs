@@ -353,18 +353,15 @@ impl Cx {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn take_studio_screenshot_request_ids(&mut self, kind_id: u32) -> Vec<u64> {
-        self.take_studio_screenshot_request_ids_for_window(kind_id, None)
-    }
-
     /// Drain the pending screenshot requests this pass can answer.
     ///
     /// `window_id` is the window the presenting pass belongs to (None for
-    /// offscreen/stdin passes). A `--remote` `/g?w=N` grab only matches its own
-    /// window, so a multi-window app can be captured window by window instead of
-    /// whichever pass happens to present first. Studio and file-sink requests
-    /// are untargeted and match any pass, exactly as before.
+    /// offscreen/stdin passes). Every `--remote` grab targets one window
+    /// (`/g?w=N`, or the first window when `w` is omitted) and matches only
+    /// that window's pass, so a multi-window app can be captured window by
+    /// window instead of whichever pass happens to present first. A window
+    /// pass must therefore pass its own id: with None it never answers a
+    /// grab. Studio and file-sink requests are untargeted and match any pass.
     #[allow(dead_code)]
     pub(crate) fn take_studio_screenshot_request_ids_for_window(
         &mut self,
