@@ -1243,12 +1243,18 @@ fn accelerated_paint_available() -> bool {
     false
 }
 
-/// The user's home: `HOME`, or `USERPROFILE` on Windows.
-fn home_dir() -> Option<PathBuf> {
+/// Where stable browser profiles live: `cef/` in an explicit `MAKEPAD_HOME`,
+/// else `.makepad-cef/` in the user's home (`HOME`, or `USERPROFILE` on
+/// Windows). A host that gives an app its own Makepad home, such as a
+/// sandbox jail where the user's home is closed, keeps the profile there.
+fn profiles_dir() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("MAKEPAD_HOME").filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home).join("cef"));
+    }
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
+        .map(|home| PathBuf::from(home).join(".makepad-cef"))
 }
 
 /// Whether detailed CEF tracing is enabled.
@@ -1513,11 +1519,12 @@ fn temp_root_cache_path() -> Result<PathBuf> {
 }
 
 /// The browser profile directory: stable across launches so cookies and
-/// logins persist. `MAKEPAD_CEF_PROFILE_DIR` overrides; `MAKEPAD_CEF_
-/// EPHEMERAL=1` (or no resolvable home) falls back to the per-pid temp
-/// profile. Chromium locks a profile per process — if the stable dir is
-/// locked by a live sibling (SingletonLock points at a running pid on this
-/// host), fall back to ephemeral instead of failing CEF init.
+/// logins persist, one per executable in [`profiles_dir`].
+/// `MAKEPAD_CEF_PROFILE_DIR` overrides; `MAKEPAD_CEF_EPHEMERAL=1` (or no
+/// resolvable home) falls back to the per-pid temp profile. Chromium locks
+/// a profile per process — if the stable dir is locked by a live sibling
+/// (SingletonLock points at a running pid on this host), fall back to
+/// ephemeral instead of failing CEF init.
 fn profile_root_cache_path() -> Result<PathBuf> {
     if env::var("MAKEPAD_CEF_EPHEMERAL").is_ok() {
         return temp_root_cache_path();
@@ -1528,7 +1535,7 @@ fn profile_root_cache_path() -> Result<PathBuf> {
             .map_err(|err| Error::new(format!("failed to create {}: {err}", path.display())))?;
         return Ok(path);
     }
-    let Some(home) = home_dir() else {
+    let Some(profiles) = profiles_dir() else {
         return temp_root_cache_path();
     };
     let exe = env::current_exe()
@@ -1538,7 +1545,7 @@ fn profile_root_cache_path() -> Result<PathBuf> {
         .and_then(|stem| stem.to_str())
         .unwrap_or("makepad-cef")
         .to_string();
-    let path = home.join(".makepad-cef").join(&stem);
+    let path = profiles.join(&stem);
     std::fs::create_dir_all(&path)
         .map_err(|err| Error::new(format!("failed to create {}: {err}", path.display())))?;
     // Live-lock check: Chromium's SingletonLock is a symlink "host-pid"
