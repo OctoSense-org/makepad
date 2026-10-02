@@ -1230,6 +1230,7 @@ fn ohos_message_name(message: &FromOhosMessage) -> &'static str {
         FromOhosMessage::SurfaceCreated { .. } => "SurfaceCreated",
         FromOhosMessage::SurfaceDestroyed => "SurfaceDestroyed",
         FromOhosMessage::VSync => "VSync",
+        FromOhosMessage::Wake => "Wake",
         FromOhosMessage::Touch(_) => "Touch",
         FromOhosMessage::TextInput(_) => "TextInput",
         FromOhosMessage::DeleteLeft(_) => "DeleteLeft",
