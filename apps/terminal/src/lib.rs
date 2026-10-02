@@ -21,6 +21,14 @@ pub mod search;
 // records there that this executable is its own PTY helper.
 #[cfg(target_os = "macos")]
 pub use makepad_widgets::makepad_platform::os::apple::pty_spawn;
+
+/// The shell's home: the app's own data directory where the platform gives
+/// one (Android, iOS, OpenHarmony: `HOME` there is not the app's to write),
+/// else `HOME`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    makepad_widgets::makepad_platform::home::platform_data_dir()
+        .or_else(|| std::env::var_os("HOME").filter(|h| !h.is_empty()).map(std::path::PathBuf::from))
+}
 pub mod session;
 pub mod settings;
 pub mod settings_panel;

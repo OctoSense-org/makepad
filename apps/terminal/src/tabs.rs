@@ -209,7 +209,7 @@ fn legacy_tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
 
 /// `path` with the home directory shown as `~`.
 fn tilde(path: &Path) -> String {
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    if let Some(home) = crate::home_dir() {
         if path == home {
             return "~".into();
         }
@@ -896,7 +896,7 @@ impl TermTabs {
                 let pane = tab.focused_pane();
                 pane.with_term(|term| term.current_dir()).flatten().or_else(|| pane.dir.clone())
             }),
-            NewTabCwd::Home => std::env::var_os("HOME").map(PathBuf::from),
+            NewTabCwd::Home => crate::home_dir(),
         }
     }
 

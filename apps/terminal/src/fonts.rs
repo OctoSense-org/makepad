@@ -1,7 +1,7 @@
 //! The fonts installed on the machine, for the terminal's font settings:
 //! a primary font (any family — monospace ones are listed first) and a CJK
-//! fallback (PingFang on macOS, Noto/Source Han CJK on Linux, found by
-//! `auto_cjk`).
+//! fallback (PingFang on macOS, Noto/Source Han CJK on Linux, HarmonyOS Sans
+//! SC on HarmonyOS, found by `auto_cjk`).
 //!
 //! The scan reads only each file's table directory, `name` and `post`
 //! tables. Font collections (`.ttc`) hold several faces and the text
@@ -67,6 +67,7 @@ pub fn auto_cjk() -> Option<&'static Family> {
     const PREFERRED: &[&str] = &[
         "PingFang SC",
         "Hiragino Sans GB",
+        "HarmonyOS Sans SC",
         "Noto Sans CJK SC",
         "Noto Sans SC",
         "Source Han Sans SC",

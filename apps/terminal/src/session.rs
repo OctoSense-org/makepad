@@ -230,6 +230,10 @@ impl Session {
     /// shell. Never blocks, and never refused while the PTY lives.
     pub fn write(&mut self, bytes: &[u8]) {
         let _ = self.writer.send(bytes.to_vec());
+        // OpenHarmony gives an app's PTY no controlling terminal, so the line
+        // discipline cannot turn ^C, ^\ or ^Z into signals: send them here.
+        #[cfg(target_env = "ohos")]
+        crate::procinfo::signal_jobs_for_control_key(self.child_pid(), bytes);
     }
 
     /// Queue a paste (or a file drop) for the shell, whole or not at all.

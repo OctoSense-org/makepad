@@ -609,7 +609,7 @@ pub fn link_at(term: &Terminal, abs: u64, col: usize) -> Option<LinkHit> {
     let target = match &found.kind {
         FoundKind::Url(url) => classify_uri(url),
         FoundKind::Path { path, line, col } => {
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let home = crate::home_dir();
             classify_path(path, *line, *col, home.as_deref())
         }
     };

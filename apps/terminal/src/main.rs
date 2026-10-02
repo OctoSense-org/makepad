@@ -192,9 +192,9 @@ impl App {
         let Some(cwd) = cwd else {
             return;
         };
-        let shown = std::env::var_os("HOME")
+        let shown = makepad_terminal::home_dir()
             .and_then(|home| {
-                cwd.strip_prefix(PathBuf::from(home))
+                cwd.strip_prefix(home)
                     .ok()
                     .map(Path::to_path_buf)
             })
