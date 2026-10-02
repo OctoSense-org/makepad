@@ -36,6 +36,7 @@ impl AppModule for CalculatorModule {
         let root = WidgetRef::script_from_value(vm, value);
         if let Some(mut view) = root.borrow_mut::<CalculatorView>() {
             view.set_storage(handles.storage);
+            view.open_agent(vm.cx_mut());
         }
         let shutdown_root = root.clone();
         InstanceParts {
@@ -49,8 +50,11 @@ impl AppModule for CalculatorModule {
         }
     }
 
+    /// `octos.*`: the app's own agent, which the host's "Ask <app>" and its
+    /// system agent reach while the app is open, if the host grants it (one
+    /// that grants none gives the app no agent).
     fn capabilities(&self) -> &'static [&'static str] {
-        &["storage"]
+        &["storage", "octos.session.open", "octos.session.history", "octos.turn.start", "octos.turn.interrupt"]
     }
 }
 

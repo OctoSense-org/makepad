@@ -490,6 +490,10 @@ pub struct ClockView {
     /// window's startup.
     #[rust]
     storage: Option<StorageHandle>,
+    /// The link to its agent, when a host runs it as a module and grants it
+    /// one: the agent calls its tools over it.
+    #[rust]
+    agent: Option<makepad_ai_services::peer::OctosPeer>,
 }
 
 impl ClockView {
@@ -497,6 +501,12 @@ impl ClockView {
     /// to it from now on.
     pub fn set_storage(&mut self, storage: StorageHandle) {
         self.storage = Some(storage);
+    }
+
+    /// Open the link to the app's agent (a host that grants none refuses
+    /// it, and nothing arrives on it).
+    pub fn open_agent(&mut self, cx: &mut Cx) {
+        self.agent = Some(makepad_ai_services::peer::OctosPeer::open(cx));
     }
 
     /// The face the host asked for (`HostedViewMode`, read off the
@@ -1068,6 +1078,13 @@ impl ClockView {
 
 impl Widget for ClockView {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Its agent's tool calls, answered as its AI bus service answers
+        // them (the link is set aside so the answer may read the whole view).
+        if let Some(mut agent) = self.agent.take() {
+            let this = &*self;
+            agent.serve_tools(cx, event, |call| crate::ai::answer(this, call));
+            self.agent = Some(agent);
+        }
         self.ensure_started(cx);
         if let Event::Storage(responses) = event {
             self.on_storage(cx, responses);
