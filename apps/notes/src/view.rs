@@ -992,6 +992,11 @@ impl NotesView {
         list.set_item_range(cx, 0, self.list_rows.len().max(1));
         while let Some(index) = list.next_visible_item(cx) {
             if self.list_rows.is_empty() {
+                // One placeholder: the list may hand out more indices to
+                // fill its height, and each would draw it again.
+                if index != 0 {
+                    continue;
+                }
                 let item = list.item(cx, index, live_id!(Empty));
                 item.widget(cx, ids!(title)).set_text(
                     cx,
