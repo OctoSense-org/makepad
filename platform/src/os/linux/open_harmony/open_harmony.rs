@@ -55,6 +55,33 @@ pub fn ohos_ability_on_create(env: Env, ark_ts: JsObject) -> napi_ohos::Result<(
     let temp_dir = arkts_obj.get_string("tempDir").unwrap();
     let res_mgr = arkts_obj.get_property("resMgr").unwrap();
 
+    // The entry ability collects the Want's `makepad.*` parameters into
+    // `launchParameters` (a flat JSON object of strings). They become the
+    // environment the rest of the platform already reads, before anything
+    // resolves them, the way `cargo makepad android run` passes extras:
+    // `makepad.NAME` is both MAKEPAD_NAME (TRACE and app settings, as
+    // Android's extras) and NAME (STUDIO_HOST, STUDIO_BUILD, STUDIO_CRATE).
+    if let Ok(parameters) = arkts_obj.get_string("launchParameters") {
+        for (key, value) in flat_json_string_pairs(&parameters) {
+            if let Some(name) = key.strip_prefix("makepad.") {
+                crate::log!("launch parameter {name}={value}");
+                std::env::set_var(format!("MAKEPAD_{name}"), &value);
+                std::env::set_var(name, value);
+            }
+        }
+    }
+    // The process starts without a usable HOME. The ability's files
+    // directory is the app's home: where a bundled core keeps its state,
+    // where anything reading `$HOME` on this platform should land.
+    if std::env::var_os("HOME").map_or(true, |home| home.is_empty() || home == "/") {
+        std::env::set_var("HOME", &files_dir);
+    }
+    // The trace topics were read at module load, before these parameters
+    // existed; `--ps makepad.TRACE topic,topic` works from here on.
+    crate::makepad_error_log::set_trace_topics(
+        &std::env::var("MAKEPAD_TRACE").unwrap_or_default(),
+    );
+
     let raw_file = RawFileMgr::new(raw_env, res_mgr);
 
     crate::log!("call onCreate, device_type = {}, os_full_name = {}, display_density = {}, files_dir = {}, cache_dir = {}, temp_dir = {}", device_type, os_full_name, display_density, files_dir,cache_dir,temp_dir);
@@ -348,33 +375,43 @@ impl Cx {
     }
 
     fn wait_init(&mut self, from_ohos_rx: &mpsc::Receiver<FromOhosMessage>) -> bool {
-        if let Ok(FromOhosMessage::Init {
-            device_type,
-            os_full_name,
-            display_density,
-            files_dir,
-            cache_dir,
-            temp_dir,
-            raw_env,
-            arkts_ref,
-            raw_file,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.dpi_factor = display_density;
-            self.os.raw_file = Some(raw_file);
-            self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
-                files_dir,
-                cache_dir,
-                temp_dir,
-                device_type,
-                os_full_name,
-                display_density,
-            });
-            self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
-            return true;
-        } else {
-            crate::error!("Failed to receive init message from ArkTS layer");
-            return false;
+        // Anything may wake the channel before the ability has sent Init
+        // (a signal posted from a background thread arrives as VSync), so
+        // skip what is not Init instead of giving up on the first message.
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::Init {
+                    device_type,
+                    os_full_name,
+                    display_density,
+                    files_dir,
+                    cache_dir,
+                    temp_dir,
+                    raw_env,
+                    arkts_ref,
+                    raw_file,
+                }) => {
+                    self.os.dpi_factor = display_density;
+                    self.os.raw_file = Some(raw_file);
+                    self.os_type = OsType::OpenHarmony(OpenHarmonyParams {
+                        files_dir,
+                        cache_dir,
+                        temp_dir,
+                        device_type,
+                        os_full_name,
+                        display_density,
+                    });
+                    self.os.arkts_obj = Some(ArkTsObjRef::new(raw_env, arkts_ref));
+                    return true;
+                }
+                Ok(other) => {
+                    crate::log!("message before Init skipped: {}", ohos_message_name(&other));
+                }
+                Err(_) => {
+                    crate::error!("Failed to receive init message from ArkTS layer");
+                    return false;
+                }
+            }
         }
     }
 
@@ -382,23 +419,37 @@ impl Cx {
         &mut self,
         from_ohos_rx: &mpsc::Receiver<FromOhosMessage>,
     ) -> *mut c_void {
-        if let Ok(FromOhosMessage::SurfaceCreated {
-            window,
-            width,
-            height,
-        }) = from_ohos_rx.recv()
-        {
-            self.os.display_size = dvec2(width as f64, height as f64);
-            crate::log!(
-                "handle surface created, width={}, height={}, display_density={}",
-                width,
-                height,
-                self.os.dpi_factor
-            );
-            return window;
-        } else {
-            crate::error!("Can't recv SurfaceCreated from arkts");
-            return null_mut();
+        // The Studio websocket connects between Init and the XComponent's
+        // surface and posts a wake-up through this channel; a single recv
+        // took that wake-up for the surface, handed EGL a null window and
+        // the app died in an assertion. Wait for the surface itself.
+        loop {
+            match from_ohos_rx.recv() {
+                Ok(FromOhosMessage::SurfaceCreated {
+                    window,
+                    width,
+                    height,
+                }) => {
+                    self.os.display_size = dvec2(width as f64, height as f64);
+                    crate::log!(
+                        "handle surface created, width={}, height={}, display_density={}",
+                        width,
+                        height,
+                        self.os.dpi_factor
+                    );
+                    return window;
+                }
+                Ok(other) => {
+                    crate::log!(
+                        "message before SurfaceCreated skipped: {}",
+                        ohos_message_name(&other)
+                    );
+                }
+                Err(_) => {
+                    crate::error!("Can't recv SurfaceCreated from arkts");
+                    return null_mut();
+                }
+            }
         }
     }
 
@@ -410,6 +461,9 @@ impl Cx {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(move || {
             std::panic::set_hook(Box::new(|info| {
+                // Synchronously: with panic = "abort" the async sink never
+                // gets to flush this line.
+                super::oh_util::hilog_sync(&format!("[E] panic: {info}"));
                 crate::log!("custom panic hook: {}", info);
             }));
             Cx::ohos_startup(startup);
@@ -435,6 +489,15 @@ impl Cx {
         std::thread::spawn(move || {
             let mut cx = startup();
             assert!(cx.wait_init(&from_ohos_rx));
+            // `startup` resolved the Studio host before the entry ability's
+            // onCreate turned the launch parameters into environment
+            // (STUDIO_HOST and friends). Now that Init has arrived they are
+            // set, so resolve again and dial the hub.
+            let studio_http = crate::resolve_studio_http();
+            if !studio_http.is_empty() && cx.studio_http.is_empty() {
+                crate::log!("studio host from launch parameters: {studio_http}");
+                cx.init_websockets(&studio_http);
+            }
             cx.ohos_load_dependencies();
 
             let window = cx.wait_surface_created(&from_ohos_rx);
@@ -1073,5 +1136,77 @@ impl CxOhosDisplay {
         {
             panic!();
         }
+    }
+}
+
+/// The `"key":"value"` pairs of a flat JSON object of strings, in order.
+/// Only `\"` and `\\` escapes are honoured: launch parameters are host
+/// names, build ids and paths, never structured text.
+fn flat_json_string_pairs(text: &str) -> Vec<(String, String)> {
+    let mut strings = Vec::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        let mut s = String::new();
+        loop {
+            match chars.next() {
+                Some('\\') => match chars.next() {
+                    Some('"') => s.push('"'),
+                    Some('\\') => s.push('\\'),
+                    Some(other) => {
+                        s.push('\\');
+                        s.push(other);
+                    }
+                    None => break,
+                },
+                Some('"') | None => break,
+                Some(other) => s.push(other),
+            }
+        }
+        strings.push(s);
+    }
+    let mut pairs = Vec::new();
+    let mut iter = strings.into_iter();
+    while let (Some(key), Some(value)) = (iter.next(), iter.next()) {
+        pairs.push((key, value));
+    }
+    pairs
+}
+
+/// The variant name of a channel message, for the startup log.
+fn ohos_message_name(message: &FromOhosMessage) -> &'static str {
+    match message {
+        FromOhosMessage::Init { .. } => "Init",
+        FromOhosMessage::SurfaceChanged { .. } => "SurfaceChanged",
+        FromOhosMessage::SurfaceCreated { .. } => "SurfaceCreated",
+        FromOhosMessage::SurfaceDestroyed => "SurfaceDestroyed",
+        FromOhosMessage::VSync => "VSync",
+        FromOhosMessage::Touch(_) => "Touch",
+        FromOhosMessage::TextInput(_) => "TextInput",
+        FromOhosMessage::DeleteLeft(_) => "DeleteLeft",
+        FromOhosMessage::ResizeTextIME(..) => "ResizeTextIME",
+        FromOhosMessage::PermissionResult { .. } => "PermissionResult",
+        FromOhosMessage::CaptureSaved { .. } => "CaptureSaved",
+        FromOhosMessage::AvoidArea { .. } => "AvoidArea",
+    }
+}
+
+#[cfg(test)]
+mod launch_parameter_tests {
+    #[test]
+    fn flat_pairs_come_out_in_order_with_escapes() {
+        let pairs = super::flat_json_string_pairs(
+            r#"{"makepad.STUDIO_HOST":"127.0.0.1:8002","makepad.PATH":"a\"b\\c"}"#,
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("makepad.STUDIO_HOST".into(), "127.0.0.1:8002".into()),
+                ("makepad.PATH".into(), "a\"b\\c".into())
+            ]
+        );
+        assert!(super::flat_json_string_pairs("{}").is_empty());
     }
 }
