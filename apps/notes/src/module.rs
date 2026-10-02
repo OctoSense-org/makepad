@@ -35,6 +35,8 @@ impl AppModule for NotesModule {
         let root = WidgetRef::script_from_value(vm, value);
         if let Some(mut view) = root.borrow_mut::<NotesView>() {
             view.set_storage(handles.storage);
+            // A host's Notes is the person's own: no sample notes.
+            view.set_starts_empty(true);
         }
         InstanceParts {
             root: root.clone(),

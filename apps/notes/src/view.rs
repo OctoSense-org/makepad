@@ -35,6 +35,10 @@ pub struct NotesView {
     applied_reduced_motion: bool,
     #[rust]
     storage: Option<StorageHandle>,
+    /// A first run starts with no notes rather than the sample ones (a
+    /// module a host runs; the standalone window keeps its samples).
+    #[rust]
+    starts_empty: bool,
     #[rust]
     load_req: Option<StorageRequestId>,
     #[rust]
@@ -92,6 +96,11 @@ fn now_ms() -> i64 {
 impl NotesView {
     pub fn set_storage(&mut self, storage: StorageHandle) {
         self.storage = Some(storage);
+    }
+
+    /// A first run starts with no notes instead of the samples.
+    pub fn set_starts_empty(&mut self, empty: bool) {
+        self.starts_empty = empty;
     }
 
     pub fn document(&self) -> &NotesDocument {
@@ -201,7 +210,11 @@ impl NotesView {
                 match &response.result {
                     Ok(StorageResult::Value(bytes)) => match load_from_storage(bytes.as_deref()) {
                         LoadOutcome::Missing => {
-                            self.doc = seed::generate(now_ms());
+                            self.doc = if self.starts_empty {
+                                NotesDocument::empty(seed::seed_anchor_ms(now_ms()))
+                            } else {
+                                seed::generate(now_ms())
+                            };
                             self.ui = engine::initial_ui(&self.doc);
                             self.load = LoadState::Ready;
                             self.save.current = self.doc.revision;
