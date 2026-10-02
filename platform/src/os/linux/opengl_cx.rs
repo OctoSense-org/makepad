@@ -453,8 +453,10 @@ impl Cx {
         }
 
         // Studio screenshot readback: read framebuffer pixels before swap.
+        // The drain names this pass's window: every `--remote` grab targets a
+        // window, and a drain that names none never answers it.
         let capture_window_id = self.get_pass_window_id(draw_pass_id).map(|w| w.id());
-        let request_ids = self.take_studio_screenshot_request_ids(0);
+        let request_ids = self.take_studio_screenshot_request_ids_for_window(0, capture_window_id);
         // A continuous capture sink (the ScreenCap recorder) is standing
         // permission rather than a queued request, so it is asked separately.
         let wants_capture = crate::screen_capture::capture_wants_window(capture_window_id);
