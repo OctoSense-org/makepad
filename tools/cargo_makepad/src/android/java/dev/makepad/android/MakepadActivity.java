@@ -667,6 +667,13 @@ class MakepadSurface
     @SuppressWarnings("deprecation")
     @Override
     public boolean onKey(View v, int keyCode, KeyEvent event) {
+        // Back is not a surface key. Left unhandled it reaches the activity,
+        // which delivers it once through dispatchBackPressed: from onKeyUp ->
+        // onBackPressed below API 33, or from the OnBackInvokedCallback on
+        // API 33+ (which also carries the system edge gesture). Forwarding it
+        // here as well produced a second native BackPressed: one closed the
+        // current panel and the next left the app.
+        if (keyCode == KeyEvent.KEYCODE_BACK) return false;
         if (event.getAction() == KeyEvent.ACTION_DOWN && keyCode != 0) {
             int metaState = event.getMetaState();
             boolean isRepeat = event.getRepeatCount() > 0;
@@ -1167,6 +1174,7 @@ public class MakepadActivity
     private FrameLayout mRootLayout;
     private FrameLayout mApplicationOverlay;
     private ApplicationExtension mApplicationExtension;
+    private android.window.OnBackInvokedCallback mBackInvokedCallback;
 
     /** Optional app Java client. Implementations enqueue blocking work on workers. */
     public interface ApplicationExtension {
@@ -1176,7 +1184,16 @@ public class MakepadActivity
         void onIntent(Intent intent);
         void onDestroy();
         default boolean onActivityResult(int requestCode, int resultCode, Intent data) { return false; }
+        /** Return true to consume Back before it reaches the native widget tree. */
         default boolean onBackPressed() { return false; }
+        /**
+         * True when the extension registers its own Android 13+
+         * OnBackInvokedCallback (calling {@link MakepadActivity#onBackPressed}).
+         * The activity then registers none and drops the compatibility Back
+         * key, so each Back is delivered once. Most extensions should leave
+         * this false and implement {@link #onBackPressed} instead.
+         */
+        default boolean usesSystemBackCallback() { return false; }
     }
 
     private void createApplicationExtension() {
@@ -1584,6 +1601,7 @@ public class MakepadActivity
         }
         MakepadNative.activityOnCreate(this);
         createApplicationExtension();
+        registerBackInvokedCallback();
         registerPhysicalKeyboardListener();
 
         mVideoPlaybackThread = new HandlerThread("VideoPlayerThread");
@@ -1687,6 +1705,7 @@ public class MakepadActivity
 
     @Override
     protected void onDestroy() {
+        unregisterBackInvokedCallback();
         if (mApplicationExtension != null) {
             mApplicationExtension.onDestroy();
             mApplicationExtension = null;
@@ -1769,6 +1788,12 @@ public class MakepadActivity
     // key (BACK included) and forwards it to Rust, so onBackPressed never runs.
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        // An extension that owns the system Back callback receives every Back
+        // through it; its compatibility key must not navigate a second time.
+        if (Build.VERSION.SDK_INT >= 33 && event.getKeyCode() == KeyEvent.KEYCODE_BACK
+                && extensionOwnsSystemBack()) {
+            return true;
+        }
         if (mQrScanning && event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
             if (event.getAction() == KeyEvent.ACTION_UP) closeQrScanner("cancelled");
             return true;
@@ -1779,9 +1804,45 @@ public class MakepadActivity
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        dispatchBackPressed();
+    }
+
+    /** The single delivery point for Back: key, button and system gesture. */
+    private void dispatchBackPressed() {
+        if (mQrScanning) {
+            closeQrScanner("cancelled");
+            return;
+        }
         if (mApplicationExtension != null && mApplicationExtension.onBackPressed()) return;
-        super.onBackPressed();
+        // No super.onBackPressed(): Activity's default finishes (or, on API
+        // 31+, backgrounds) the activity before the widget tree has seen the
+        // event. Navigation belongs to the native BackPressed handlers.
         MakepadNative.onBackPressed();
+    }
+
+    private boolean extensionOwnsSystemBack() {
+        return mApplicationExtension != null && mApplicationExtension.usesSystemBackCallback();
+    }
+
+    // Android 13+ delivers Back, including the system edge gesture, to
+    // OnBackInvokedCallbacks when the manifest opts in
+    // (android:enableOnBackInvokedCallback, which cargo-makepad writes);
+    // onBackPressed is then no longer called. PRIORITY_DEFAULT leaves the
+    // IME's own Back (dismissing the keyboard) ahead of app navigation.
+    private void registerBackInvokedCallback() {
+        if (Build.VERSION.SDK_INT < 33 || mBackInvokedCallback != null || extensionOwnsSystemBack()) {
+            return;
+        }
+        mBackInvokedCallback = this::dispatchBackPressed;
+        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, mBackInvokedCallback);
+    }
+
+    private void unregisterBackInvokedCallback() {
+        if (Build.VERSION.SDK_INT >= 33 && mBackInvokedCallback != null) {
+            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(mBackInvokedCallback);
+            mBackInvokedCallback = null;
+        }
     }
 
     @Override
