@@ -453,7 +453,7 @@ script_mod! {
 
 const STORAGE_KEY: &str = "calculator.json";
 
-#[derive(Script, ScriptHook, Widget)]
+#[derive(Script, Widget)]
 pub struct CalculatorView {
     #[deref]
     view: View,
@@ -493,6 +493,15 @@ pub struct CalculatorView {
     last_size: Vec2d,
     #[rust]
     chrome_gen: u64,
+}
+
+impl ScriptHook for CalculatorView {
+    /// Every apply (the first, a hot reload, a host's style reapply) writes
+    /// the DSL's sizes back over the keypad: the next draw lays it out for
+    /// its size again instead of trusting the layout it applied before.
+    fn on_after_apply(&mut self, _vm: &mut ScriptVm, _apply: &Apply, _scope: &mut Scope, _value: ScriptValue) {
+        self.last_layout = None;
+    }
 }
 
 impl CalculatorView {
