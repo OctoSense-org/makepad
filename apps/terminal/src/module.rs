@@ -49,6 +49,9 @@ impl AppModule for TerminalModule {
             TermTabs {}
         });
         let root = WidgetRef::script_from_value(vm, value);
+        if let Some(mut tabs) = root.borrow_mut::<TermTabs>() {
+            tabs.open_agent(vm.cx_mut());
+        }
         InstanceParts {
             root: root.clone(),
             executor: Box::new(TerminalExecutor { root }),
@@ -59,7 +62,14 @@ impl AppModule for TerminalModule {
     }
 
     fn capabilities(&self) -> &'static [&'static str] {
-        &["process", "clipboard"]
+        &[
+            "process",
+            "clipboard",
+            "octos.session.open",
+            "octos.session.history",
+            "octos.turn.start",
+            "octos.turn.interrupt",
+        ]
     }
 
     /// Dropping the root SIGHUPs every shell and its jobs: while a job
@@ -108,9 +118,11 @@ mod tests {
         assert_eq!(m.id(), "terminal");
         assert_eq!(m.label(), "Terminal");
         assert!(m.capabilities().contains(&"process"), "it starts a shell");
-        assert!(
-            !m.capabilities().iter().any(|c| c.starts_with("octos.")),
-            "it asks for no assistant service of its own"
+        let octos: Vec<&str> = m.capabilities().iter().copied().filter(|c| c.starts_with("octos.")).collect();
+        assert_eq!(
+            octos,
+            ["octos.session.open", "octos.session.history", "octos.turn.start", "octos.turn.interrupt"],
+            "its own agent's conversation and nothing more: the agent reads through the read tools only"
         );
         let schema = m.open_schema();
         assert_eq!(schema.version, 1);
