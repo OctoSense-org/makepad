@@ -8,6 +8,9 @@
 //!   0004 §5): requests, streamed turn events, both lanes of the app's
 //!   conversation (§6) and the agent's tool calls, hosted over the hub
 //!   socket or in-process; not the bus.
+//! - [`ui_port`] — an app that is itself an octos client (OctosCode): its
+//!   connection to the host's kernel in the kernel's UI protocol, filtered
+//!   by the host; in-process.
 //! - `engine` (feature `engine`) — what a host runs: the registry of
 //!   connected services, the router that sends each call to its owner and
 //!   gates the risky ones, and the session over the hub's providers.
@@ -18,6 +21,7 @@ pub mod engine;
 pub mod peer;
 pub mod port;
 pub mod state;
+pub mod ui_port;
 pub mod wire;
 
 pub use engine::{EngineCore, EngineEvent, Model, ModelEvent, ServiceRegistry, ToolDefinition};
@@ -31,6 +35,7 @@ pub use state::{
     EngineState, Entry, EventEntry, ProviderChoice, ProviderRow, ServiceInfo, Status, ToolEntry,
     ToolStatus,
 };
+pub use ui_port::{OctosUiPort, PendingUiPorts, UiPortDown, UiPortEvent, UiPortLink, UiPortSender};
 pub use wire::{
     api_name, canonical_name, split_name, Disposition, EndpointId, HostedDown, HostedUp,
     InstanceMeta, Message, Risk, ServiceCall, ServiceContext, ServiceDown, ServiceManifest,
