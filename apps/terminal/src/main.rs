@@ -378,5 +378,7 @@ impl App {
         }
         self.ai_port = AiServicePort::open(cx, ai::manifest());
         self.refresh_ai_context(cx);
+        // Its own agent's link, when the host grants one (read tools only).
+        self.ui.term_tabs(cx, ids!(tabs)).open_agent(cx);
     }
 }

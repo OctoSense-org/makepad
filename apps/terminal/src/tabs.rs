@@ -537,6 +537,10 @@ pub struct TermTabs {
     /// A divider being dragged.
     #[rust]
     drag: Option<Divider>,
+    /// The link to the terminal's own agent, when its host grants one: the
+    /// agent may call the read tools only (`run` stays with the host).
+    #[rust]
+    agent: Option<makepad_ai_services::peer::OctosPeer>,
     #[live(30.0)]
     bar_height: f64,
 
@@ -745,6 +749,15 @@ impl ScriptHook for TermTabs {
 }
 
 impl TermTabs {
+    /// Open the link to the terminal's own agent (a host that grants none
+    /// refuses it, and nothing arrives on it). Once: a second call keeps
+    /// the open link.
+    pub fn open_agent(&mut self, cx: &mut Cx) {
+        if self.agent.is_none() {
+            self.agent = Some(makepad_ai_services::peer::OctosPeer::open(cx));
+        }
+    }
+
     /// The selected tab's terminal, opening the first tab if none is open
     /// yet (so a host can set its `cwd`/`command` before it starts).
     pub fn active_term(&mut self, cx: &mut Cx) -> WidgetRef {
@@ -1471,6 +1484,20 @@ const ICON_NEXT: &str = "\u{f054}";
 
 impl Widget for TermTabs {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        // Its own agent's tool calls, answered from the selected tab's
+        // emulator with the read tools only (`answer_read_only` refuses
+        // `run`); the link is set aside so the answer may read the tabs.
+        if let Some(mut agent) = self.agent.take() {
+            let (tabs, active) = (&self.tabs, self.active);
+            agent.serve_tools(cx, event, |call| {
+                let term = tabs.get(active).map(|tab| tab.focused_pane().term.clone());
+                term.as_ref()
+                    .and_then(|term| term.borrow_mut::<MpTerm>())
+                    .map(|mut term| crate::ai::answer_read_only(call, &mut *term))
+                    .unwrap_or_else(|| makepad_ai_services::wire::ToolResult::unavailable(&call.call_id, "the terminal has no open tab"))
+            });
+            self.agent = Some(agent);
+        }
         // Changes an earlier event made (shortcuts return early), published
         // before this one runs: the key-up follows within milliseconds.
         if std::mem::take(&mut self.publish_soon) && self.settings.external_control {
@@ -2705,6 +2732,13 @@ impl TermTabs {
 }
 
 impl TermTabsRef {
+    /// See [`TermTabs::open_agent`]; no widget: nothing to open.
+    pub fn open_agent(&self, cx: &mut Cx) {
+        if let Some(mut tabs) = self.borrow_mut() {
+            tabs.open_agent(cx);
+        }
+    }
+
     pub fn active_term(&self, cx: &mut Cx) -> WidgetRef {
         self.borrow_mut().map(|mut tabs| tabs.active_term(cx)).unwrap_or_default()
     }
