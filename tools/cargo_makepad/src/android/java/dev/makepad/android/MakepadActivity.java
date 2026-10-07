@@ -3496,7 +3496,8 @@ public class MakepadActivity
 
     private void fitQrPreview(SurfaceView preview, Size buffer, int sensorOrientation, int width, int height) {
         if (width <= 0 || height <= 0) return;
-        int displayRotation = getWindowManager().getDefaultDisplay().getRotation() * 90;
+        Display display = preview.getDisplay();
+        int displayRotation = (display == null ? Surface.ROTATION_0 : display.getRotation()) * 90;
         boolean swapped = ((sensorOrientation - displayRotation + 360) % 180) != 0;
         int shownWidth = swapped ? buffer.getHeight() : buffer.getWidth();
         int shownHeight = swapped ? buffer.getWidth() : buffer.getHeight();
