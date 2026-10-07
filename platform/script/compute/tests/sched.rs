@@ -90,8 +90,21 @@ fn near_jobs_preempt_far_ones_which_resume_and_finish_identically() {
     let fast = compile(FIELD).unwrap();
     let exec: Arc<dyn Executor> = Arc::new(ThreadExecutor::new(3));
     let s = sched(exec, 1);
-    // ~20 k elements x 20 µs = 0.4 s of work: long enough to be caught running.
-    let n = 20_000;
+    // Enough work to still be running when the near job lands, sized on this
+    // machine: the fixed upstream count (~20 k elements x 20 µs = 0.4 s) ran
+    // in 30 ms on an idle M-series core, so the far job was done before the
+    // near one and the re-queue assert failed; a bigger fixed count starves
+    // the stream test running in parallel on a slow vCPU. ~0.5 s of measured
+    // work holds the race open everywhere and keeps the suite short.
+    let n = {
+        let probe = 2_000;
+        let mut j = Job::new(slow.clone(), probe);
+        j.output("o", vec![0.0; probe]).unwrap();
+        let t = Instant::now();
+        j.run(&InlineExecutor, 1).unwrap();
+        let per = t.elapsed().as_secs_f64() / probe as f64;
+        ((0.5 / per) as usize).clamp(20_000, 400_000)
+    };
     let mut far = Job::new(slow.clone(), n);
     far.output("o", vec![0.0; n]).unwrap();
     let far = s.submit(far, Priority::Far, Origin::Host, ANY).map_err(|(_, e)| e).unwrap();
