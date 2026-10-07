@@ -1121,6 +1121,7 @@ impl Cx {
                     }
 
                     // check signals
+                    needs_timer |= SignalToUI::check_and_clear_renderer_signal();
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_termination_signal();
                         self.handle_media_signals();

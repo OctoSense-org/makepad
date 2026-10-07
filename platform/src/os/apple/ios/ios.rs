@@ -717,6 +717,7 @@ impl Cx {
                     }
                     self.drain_ios_text_events();
                     // check signals
+                    SignalToUI::check_and_clear_renderer_signal();
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_media_signals();
                         self.handle_script_signals();
