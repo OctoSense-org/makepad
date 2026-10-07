@@ -3619,6 +3619,9 @@ public class MakepadActivity
     private void closeQrScanner(final int generation, final String reason) {
         runOnUiThread(new Runnable() { public void run() {
             if (generation != mQrGeneration) return;
+            // Removing the SurfaceView synchronously calls surfaceDestroyed.
+            // Retire this session first so teardown cannot re-enter removal.
+            ++mQrGeneration;
             boolean wasScanning = mQrScanning;
             mQrScanning = false;
             if (wasScanning && reason != null) {
@@ -3635,9 +3638,10 @@ public class MakepadActivity
                 mQrBgThread = null;
                 mQrBgHandler = null;
             }
-            if (mQrScanOverlay != null && mRootLayout != null) {
-                mRootLayout.removeView(mQrScanOverlay);
-                mQrScanOverlay = null;
+            FrameLayout overlay = mQrScanOverlay;
+            mQrScanOverlay = null;
+            if (overlay != null && mRootLayout != null) {
+                mRootLayout.removeView(overlay);
             }
         }});
     }
