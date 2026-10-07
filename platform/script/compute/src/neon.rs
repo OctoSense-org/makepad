@@ -112,7 +112,7 @@ mod v {
     }
     pub const UMAXV: u32 = 0x6EB0_A800;
     pub const UMINV: u32 = 0x6EB1_A800;
-    /// eor3 vd.16b, vn, vm, va (SHA3: every M-series core).
+    /// eor3 vd.16b, vn, vm, va (FEAT_SHA3; emitted only when has_sha3()).
     pub fn eor3(d: u8, n: u8, m: u8, a: u8) -> u32 {
         0xCE00_0000 | (m as u32) << 16 | (a as u32) << 10 | (n as u32) << 5 | d as u32
     }
@@ -175,6 +175,13 @@ mod v {
     pub fn ld1r(t: u8, n: u8) -> u32 {
         0x4D40_C800 | (n as u32) << 5 | t as u32
     }
+}
+
+/// Whether this core runs FEAT_SHA3 vector ops (EOR3). Apple cores all do;
+/// Cortex-A55/A7x do not, and take SIGILL. Asked once, at the first fusion.
+fn has_sha3() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| std::arch::is_aarch64_feature_detected!("sha3"))
 }
 
 // Scalar helpers not in `enc`.
@@ -1055,13 +1062,17 @@ impl Em {
     /// `x + c` (proven below 32) shifts by `-c - x` computed with one SUB
     /// (a right shift is a left shift by the negated amount). Returns 2
     /// when it emitted both, else 0.
+    ///
+    /// EOR3 needs FEAT_SHA3: every Apple core has it, Cortex-A55 through
+    /// A78 take SIGILL on it, so the fusion asks the host first (the
+    /// two-EOR path emits the same bits).
     fn pair(&mut self, b: &[Stmt]) -> usize {
         let (Some(Stmt::Def(t, op1)), Some(Stmt::Def(v, op2))) = (b.first(), b.get(1)) else { return 0 };
         if self.uses[t.0 as usize] != 1 || self.packed.contains_key(&t.0) {
             return 0;
         }
         match (*op1, *op2) {
-            (Op::Bin(Bin::XorI, a, a2), Op::Bin(Bin::XorI, x, y)) if (x == *t) != (y == *t) => {
+            (Op::Bin(Bin::XorI, a, a2), Op::Bin(Bin::XorI, x, y)) if (x == *t) != (y == *t) && has_sha3() => {
                 let c = if x == *t { y } else { x };
                 let ra = self.vsrc(a, VS0);
                 let rb = self.vsrc(a2, VS1);

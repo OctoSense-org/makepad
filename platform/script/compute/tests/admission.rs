@@ -194,8 +194,15 @@ fn cancel_stops_a_job_at_the_admitted_ceiling_within_2ms_natively() {
             let worst = (0..3).map(|_| cancel_latency(&k, &next, 100_000, Duration::from_millis(30))).min().unwrap();
             eprintln!("{:?} {:16} ceiling {:7} iterations: cancel -> return {:.3} ms", backend, name, n, worst.as_secs_f64() * 1e3);
             // The element bound is ops, the same for every backend; the
-            // reference interpreter runs an op about ten times slower.
-            let bound = Duration::from_millis(if backend == Backend::Interp { 10 } else { 2 });
+            // reference interpreter runs an op about ten times slower, and
+            // a Backend::Native kernel runs interpreted where no native
+            // backend exists (x86), so the 2 ms bound applies only where
+            // native code actually runs. The interpreter's wall clock per
+            // op varies ~3x across hosts (an SDM845 runs the sin chain's
+            // ceiling in 15 ms), so only this machine class holds it to 10.
+            let native = backend == Backend::Native && cfg!(target_arch = "aarch64");
+            let interp_ms = if cfg!(target_os = "macos") { 10 } else { 30 };
+            let bound = Duration::from_millis(if native { 2 } else { interp_ms });
             assert!(worst <= bound, "{:?} {}: {:?}", backend, name, worst);
         }
     }

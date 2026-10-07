@@ -45,8 +45,34 @@ mod sys {
         pub fn pthread_jit_write_protect_np(enabled: i32);
         #[cfg(target_os = "macos")]
         pub fn sys_icache_invalidate(start: *mut c_void, len: usize);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
         pub fn __clear_cache(start: *mut c_void, end: *mut c_void);
+    }
+
+    // Bionic has no __clear_cache (it is a compiler-rt builtin, and Rust
+    // links -nodefaultlibs), so Android runs the same sequence compiler-rt
+    // would: clean D-cache to the point of unification, invalidate I-cache,
+    // line sizes from CTR_EL0 (readable at EL0).
+    #[cfg(target_os = "android")]
+    pub unsafe fn clear_cache(start: *mut c_void, end: *mut c_void) {
+        use std::arch::asm;
+        let (start, end) = (start as usize, end as usize);
+        let ctr: u64;
+        asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let iline = 4usize << (ctr & 0xf);
+        let mut p = start & !(dline - 1);
+        while p < end {
+            asm!("dc cvau, {}", in(reg) p, options(nostack));
+            p += dline;
+        }
+        asm!("dsb ish", options(nostack));
+        let mut p = start & !(iline - 1);
+        while p < end {
+            asm!("ic ivau, {}", in(reg) p, options(nostack));
+            p += iline;
+        }
+        asm!("dsb ish", "isb", options(nostack));
     }
 }
 
@@ -68,12 +94,12 @@ type Entry = unsafe extern "C" fn(*mut u32, *mut u32, *mut u32, *const *mut f32,
 
 impl Code {
     pub(crate) fn new(words: &[u32]) -> Option<Code> {
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
         {
             let _ = words;
             return None;
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
         unsafe {
             let len = words.len() * 4;
             let map_len = (len + 16383) & !16383;
@@ -105,7 +131,10 @@ impl Code {
                     sys::munmap(ptr, map_len);
                     return None;
                 }
+                #[cfg(target_os = "linux")]
                 sys::__clear_cache(ptr, (ptr as *mut u8).add(len) as *mut _);
+                #[cfg(target_os = "android")]
+                sys::clear_cache(ptr, (ptr as *mut u8).add(len) as *mut _);
             }
             Some(Code { ptr: ptr as *mut u8, map_len, len })
         }
