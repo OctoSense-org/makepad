@@ -226,6 +226,13 @@ pub struct ScriptTokenPos {
     pub preceded_by_newline: bool,
 }
 
+impl ScriptTokenPos {
+    /// Where the token starts in its body's code (a character index).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
 /// One captured `/** ... */` doc annotation (see `ScriptTokenizer::docs`).
 #[derive(Clone, Debug)]
 pub struct ScriptTokDoc {
@@ -234,7 +241,7 @@ pub struct ScriptTokDoc {
     pub text: String,
 }
 
-#[derive(Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 enum State {
     #[default]
     Whitespace,
@@ -268,6 +275,10 @@ pub struct ScriptTokenizer {
     /// Set when a newline is consumed; stamped onto (and cleared by) the next
     /// emitted token as `preceded_by_newline`.
     newline_pending: bool,
+    /// Same for any whitespace (`preceded_by_space`).
+    space_pending: bool,
+    /// The last token is the provisional one `push_pending_token` added.
+    provisional: bool,
     pub tokens: Vec<ScriptTokenPos>,
     /// Captured `/** ... */` doc annotations, keyed by the index the NEXT
     /// token gets (`tokens.len()` at capture end). ONE form; position
@@ -292,6 +303,8 @@ impl ScriptTokenizer {
     pub fn clear(&mut self) {
         self.pos = 0;
         self.newline_pending = false;
+        self.space_pending = false;
+        self.provisional = false;
         self.tokens.clear();
         self.docs.clear();
         self.original.clear();
@@ -310,6 +323,24 @@ impl ScriptTokenizer {
                 None
             }
         })
+    }
+
+    /// The zero-based row and column of `char_index` in the body's code:
+    /// where a token's first character is written (a token's `pos` may sit
+    /// a character into it, so `fn_text` walks back to the start first).
+    pub fn pos_to_row_col(&self, char_index: usize) -> Option<(u32, u32)> {
+        let mut line = 0;
+        let mut line_start = 0;
+        for (i, c) in self.original.chars().enumerate() {
+            if i >= char_index {
+                return Some((line as u32, (i - line_start) as u32));
+            }
+            if c == '\n' {
+                line_start = i + 1;
+                line += 1;
+            }
+        }
+        None
     }
 
     pub fn token_index_to_row_col(&self, tok_index: u32) -> Option<(u32, u32)> {
@@ -394,6 +425,67 @@ impl ScriptTokenizer {
             }
         }
         None
+    }
+
+    /// Whether lexing stopped inside a string literal.
+    fn in_string(&self) -> bool {
+        matches!(
+            self.state,
+            State::String(_)
+                | State::EscapeInString(_)
+                | State::UnicodeHexInString(_)
+                | State::UnicodeCurlyInString(_)
+                | State::AsciiHexInString(_)
+        )
+    }
+
+    /// The source is complete: emit the token still being lexed at its end.
+    /// A number, identifier, operator or color is only emitted by the
+    /// character after it, so a source ending in one without a trailing
+    /// newline lost it (`x * 100` parsed as `x *`). An unterminated string
+    /// stays StringUnfinished.
+    pub fn finish(&mut self, heap: &mut ScriptHeap) {
+        if self.state != State::Whitespace && !self.in_string() {
+            self.tokenize("\n", heap);
+        }
+    }
+
+    /// Streaming: push the token still being lexed at the end of the source
+    /// so far, lexed as if the source ended there, as a provisional last
+    /// token (more source may still extend it: `12`, then `3`). The next
+    /// `tokenize` drops it and lexes on; it stays until then so error
+    /// locations can still resolve it. Returns whether one was pushed. See
+    /// `finish`.
+    pub fn push_pending_token(&mut self, heap: &mut ScriptHeap) -> bool {
+        if self.provisional {
+            // no new source since the last push
+            return true;
+        }
+        if self.state == State::Whitespace || self.in_string() {
+            return false;
+        }
+        let pos = self.pos;
+        let newline_pending = self.newline_pending;
+        let space_pending = self.space_pending;
+        let temp = self.temp.clone();
+        let state = self.state.clone();
+        let (tokens_len, docs_len, original_len) =
+            (self.tokens.len(), self.docs.len(), self.original.len());
+        self.tokenize("\n", heap);
+        let token = self.tokens.get(tokens_len).copied();
+        self.pos = pos;
+        self.newline_pending = newline_pending;
+        self.space_pending = space_pending;
+        self.temp = temp;
+        self.state = state;
+        self.tokens.truncate(tokens_len);
+        self.docs.truncate(docs_len);
+        self.original.truncate(original_len);
+        if let Some(token) = token {
+            self.tokens.push(token);
+            self.provisional = true;
+        }
+        self.provisional
     }
 
     fn emit_rust_value(&mut self) {
@@ -620,6 +712,10 @@ impl ScriptTokenizer {
     }
 
     pub fn tokenize(&mut self, new_chars: &str, heap: &mut ScriptHeap) -> &[ScriptTokenPos] {
+        if self.provisional {
+            self.provisional = false;
+            self.tokens.pop();
+        }
         let mut iter = new_chars.chars();
 
         fn is_operator(c: char) -> bool {
