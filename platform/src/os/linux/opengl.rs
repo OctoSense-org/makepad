@@ -708,13 +708,22 @@ impl Cx {
                 }
 
                 // update the zbias uniform if we have it.
-                draw_call.resolve_zbias(*zbias, sploded, uniforms_gen);
+                let zbias_changed = draw_call.resolve_zbias(*zbias, sploded, uniforms_gen);
                 *zbias += zbias_step;
 
-                draw_item
-                    .os
-                    .draw_call_uniforms
-                    .update_uniform_buffer(gl, draw_call.draw_call_uniforms.as_slice());
+                // This buffer contains only draw-call uniforms (including zbias).
+                // Upload once when changed: a second BufferData for the same
+                // bytes in the uniforms_dirty branch stalls mobile GL drivers.
+                // A cached draw still needs an upload if its paint order changed.
+                if zbias_changed
+                    || draw_call.uniforms_dirty
+                    || draw_item.os.draw_call_uniforms.gl_buffer.is_none()
+                {
+                    draw_item
+                        .os
+                        .draw_call_uniforms
+                        .update_uniform_buffer(gl, draw_call.draw_call_uniforms.as_slice());
+                }
 
                 let instances = if draw_item.retained_instances.is_some() {
                     draw_item.retained_instance_count as u64
@@ -796,10 +805,6 @@ impl Cx {
 
                 if draw_call.uniforms_dirty {
                     draw_call.uniforms_dirty = false;
-                    draw_item
-                        .os
-                        .draw_call_uniforms
-                        .update_uniform_buffer(gl, draw_call.draw_call_uniforms.as_slice());
                     draw_item
                         .os
                         .user_uniforms
