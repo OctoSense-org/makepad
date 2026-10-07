@@ -174,6 +174,8 @@ workspace.members = [
     "tools/screen",
     "tools/dj_pack",
     "libs/system_speech",
+    "libs/tween",
+    "platform/script/compute",
     # === tests ===
     "platform/script/test",
 ]
