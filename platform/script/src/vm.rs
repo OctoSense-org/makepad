@@ -99,6 +99,7 @@ pub struct ScriptCode {
     pub script_mod_overrides: Rc<RefCell<HashMap<ScriptModKey, String>>>,
 }
 
+#[derive(Clone, PartialEq)]
 pub struct ScriptLoc {
     pub file: String,
     pub col: u32,
@@ -114,6 +115,52 @@ impl std::fmt::Debug for ScriptLoc {
 impl std::fmt::Display for ScriptLoc {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}:{}:{}", self.file, self.line, self.col)
+    }
+}
+
+/// An error a script raised (or a parse error), with where it is: its
+/// source location (zero-based line and column, like [`ScriptLoc`]) and
+/// its message apart, and the text the VM has always reported it as
+/// (`file:line:col: message (origin)`), which `Display` prints.
+#[derive(Clone)]
+pub struct ScriptErrorRecord {
+    pub loc: Option<ScriptLoc>,
+    /// The message without its location or the interpreter's origin.
+    pub message: String,
+    pub text: String,
+}
+
+impl std::fmt::Display for ScriptErrorRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+/// A host's own message, at no place in the source.
+impl From<String> for ScriptErrorRecord {
+    fn from(message: String) -> Self {
+        Self::plain(message)
+    }
+}
+
+impl std::fmt::Debug for ScriptErrorRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.text, f)
+    }
+}
+
+impl ScriptErrorRecord {
+    /// An error a host raises itself, at no place in the source.
+    pub fn plain(message: String) -> Self {
+        Self { loc: None, text: message.clone(), message }
+    }
+
+    /// A parse error: its formatted text and, when the parser kept it, its
+    /// structured diagnostic.
+    pub fn parse(text: String, diagnostic: Option<&crate::parser::ScriptParserDiagnostic>, file: &str) -> Self {
+        let loc = diagnostic.map(|d| ScriptLoc { file: file.to_string(), line: d.line, col: d.column });
+        let message = diagnostic.map_or_else(|| text.clone(), |d| d.message.clone());
+        Self { loc, message, text }
     }
 }
 
@@ -169,6 +216,67 @@ impl ScriptCode {
         // Include the header line (e.g. `pixel: fn() {`) from its own start.
         let line_start = rest[..open].rfind('\n').map(|i| i + 1).unwrap_or(0);
         let text = rest[line_start..end].to_string();
+        Some((loc, text))
+    }
+
+    /// The exact text of the fn whose body starts at `ip`, from its `fn`
+    /// keyword to its closing brace (`fn(uv: vec2) -> vec4 { ... }`), and
+    /// where the `fn` keyword is. For hosts that take a document's function
+    /// as code of their own (a shader pass compiled elsewhere): they keep the
+    /// text and report its errors at the document's lines.
+    pub fn fn_text(&self, ip: ScriptIp) -> Option<(ScriptLoc, String)> {
+        let bodies = self.bodies.borrow();
+        let body = bodies.get(ip.body as usize)?;
+        let source_map = &body.parser.source_map;
+        let ip_index = (ip.index as usize).min(source_map.len().saturating_sub(1));
+        let token_index = (0..=ip_index)
+            .rev()
+            .find_map(|i| source_map.get(i).and_then(|slot| *slot))
+            .or_else(|| ((ip_index + 1)..source_map.len()).find_map(|i| source_map.get(i).and_then(|slot| *slot)))? as usize;
+        let tokens = &body.tokenizer.tokens;
+        // Back to the header's `fn` (a parameter list holds none).
+        let mut k = token_index.min(tokens.len().checked_sub(1)?);
+        while !matches!(tokens[k].token, ScriptToken::Identifier(id) if id == id!(fn)) {
+            k = k.checked_sub(1)?;
+        }
+        // From the `fn` keyword (a token's position may sit a character into
+        // it) through the body's matching `}` (comments skipped).
+        let chars: Vec<char> = body.effective_code.chars().collect();
+        let mut start = tokens[k].pos().min(chars.len());
+        while start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+            start -= 1;
+        }
+        let mut i = start;
+        let mut depth = 0i32;
+        let mut end = None;
+        while i < chars.len() {
+            match chars[i] {
+                '/' if chars.get(i + 1) == Some(&'/') => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let end = end?;
+        let text: String = chars[start..end].iter().collect();
+        // Where the `fn` keyword is written (its first character).
+        let (row, col) = body.tokenizer.pos_to_row_col(start)?;
+        let loc = match &body.source {
+            ScriptSource::Mod(script_mod) => ScriptLoc { file: script_mod.file.clone(), line: row + script_mod.line as u32, col },
+            _ => ScriptLoc { file: "generated".into(), line: row, col },
+        };
         Some((loc, text))
     }
 
@@ -721,19 +829,20 @@ impl<'a> ScriptVm<'a> {
         self.call_with_scope(scope, me)
     }
 
-    fn format_error(&self, err: &crate::trap::ScriptError) -> String {
+    fn format_error(&self, err: &crate::trap::ScriptError) -> ScriptErrorRecord {
         let loc = err
             .value
             .as_err()
             .and_then(|ptr| self.bx.code.ip_to_loc(ptr.ip));
-        if let Some(loc) = loc {
+        let text = if let Some(loc) = &loc {
             format!(
                 "{}:{}:{}: {} ({}:{})",
                 loc.file, loc.line, loc.col, err.message, err.origin_file, err.origin_line
             )
         } else {
             format!("{}: {}", err.origin_file, err.message)
-        }
+        };
+        ScriptErrorRecord { loc, message: err.message.clone(), text }
     }
 
     /// Drain pending errors into formatted strings instead of logging them.
@@ -743,6 +852,11 @@ impl<'a> ScriptVm<'a> {
     /// need reliable capture install a sink: `vm.bx.captured_errors =
     /// Some(Vec::new())` before running, then take it after.
     pub fn take_errors(&mut self) -> Vec<String> {
+        self.take_error_records().into_iter().map(|e| e.text).collect()
+    }
+
+    /// [`Self::take_errors`] with each error's location and message apart.
+    pub fn take_error_records(&mut self) -> Vec<ScriptErrorRecord> {
         let mut out = std::mem::take(&mut self.bx.captured_errors).unwrap_or_default();
         loop {
             let err = self.bx.threads.cur().trap.err_pop_front();
@@ -1584,9 +1698,14 @@ impl<'a> ScriptVm<'a> {
             // surface them to a captured-diagnostics sink here or a validating
             // host reports success for a script that failed to parse.
             let parse_errors = std::mem::take(&mut body.parser.parse_errors);
+            let parse_records: Vec<ScriptErrorRecord> = parse_errors
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| ScriptErrorRecord::parse(text, body.parser.diagnostics.get(i), &body.parser.file))
+                .collect();
             drop(bodies);
             if let Some(sink) = self.bx.captured_errors.as_mut() {
-                sink.extend(parse_errors);
+                sink.extend(parse_records);
             }
             // lets point our thread to it
             let result = self.run_root(body_id);
@@ -1707,9 +1826,12 @@ impl<'a> ScriptVm<'a> {
             // (`let loop` recovered into an infinite empty loop and burned
             // the instruction budget). Live-typing paths install no sink and
             // keep the log-only tolerance.
-            let new_parse_errors: Vec<String> =
-                body.parser.parse_errors[errors_before.min(body.parser.parse_errors.len())..]
-                    .to_vec();
+            let from = errors_before.min(body.parser.parse_errors.len());
+            let new_parse_errors: Vec<ScriptErrorRecord> = body.parser.parse_errors[from..]
+                .iter()
+                .enumerate()
+                .map(|(i, text)| ScriptErrorRecord::parse(text.clone(), body.parser.diagnostics.get(from + i), &body.parser.file))
+                .collect();
 
             drop(bodies);
             if let Some(sink) = &mut self.bx.captured_errors {
@@ -1749,7 +1871,7 @@ pub struct ScriptVmBase {
     /// logged or dropped — even under `silence_errors`. Install before an
     /// eval/call, take after, to feed diagnostics back to a host (e.g. an AI
     /// agent editing the script live).
-    pub captured_errors: Option<Vec<String>>,
+    pub captured_errors: Option<Vec<ScriptErrorRecord>>,
     /// Uncaught errors, including those suppressed from logs.
     pub uncaught_error_count: usize,
     pub run_budget: Option<ScriptRunBudget>,

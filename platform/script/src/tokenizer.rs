@@ -226,6 +226,13 @@ pub struct ScriptTokenPos {
     pub preceded_by_newline: bool,
 }
 
+impl ScriptTokenPos {
+    /// Where the token starts in its body's code (a character index).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
+
 /// One captured `/** ... */` doc annotation (see `ScriptTokenizer::docs`).
 #[derive(Clone, Debug)]
 pub struct ScriptTokDoc {
@@ -310,6 +317,24 @@ impl ScriptTokenizer {
                 None
             }
         })
+    }
+
+    /// The zero-based row and column of `char_index` in the body's code:
+    /// where a token's first character is written (a token's `pos` may sit
+    /// a character into it, so `fn_text` walks back to the start first).
+    pub fn pos_to_row_col(&self, char_index: usize) -> Option<(u32, u32)> {
+        let mut line = 0;
+        let mut line_start = 0;
+        for (i, c) in self.original.chars().enumerate() {
+            if i >= char_index {
+                return Some((line as u32, (i - line_start) as u32));
+            }
+            if c == '\n' {
+                line_start = i + 1;
+                line += 1;
+            }
+        }
+        None
     }
 
     pub fn token_index_to_row_col(&self, tok_index: u32) -> Option<(u32, u32)> {
