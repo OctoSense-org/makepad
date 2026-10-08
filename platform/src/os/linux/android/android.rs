@@ -1786,6 +1786,7 @@ impl Cx {
                                 display.surface,
                             );
                             if swapped != 0 {
+                                self.perf_monitor.frame_boundary(Cx::monotonic_now());
                                 self.hide_android_surface_cover_after_first_present_if_needed();
                                 self.request_android_surface_snapshot_refresh_after_present_if_needed();
                             }
@@ -1813,6 +1814,7 @@ impl Cx {
                         self.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAWABLE_WAIT, us);
                     }
                     if swapped != 0 {
+                        self.perf_monitor.frame_boundary(Cx::monotonic_now());
                         self.hide_android_surface_cover_after_first_present_if_needed();
                         self.request_android_surface_snapshot_refresh_after_present_if_needed();
                     }
@@ -2623,6 +2625,24 @@ impl Cx {
                         vertex_buffer_bytes: metrics.vertex_buffer_bytes,
                         texture_bytes: metrics.texture_bytes,
                     }));
+                    // Android has its own GL window path, so it must also drain
+                    // explicit app-frame captures before swapping the surface.
+                    #[cfg(not(use_vulkan))]
+                    if self.os.has_drawable_surface() {
+                        self.opengl_capture_window(
+                            Some(window_id.id()),
+                            self.os.display_size.x as u32,
+                            self.os.display_size.y as u32,
+                        );
+                    }
+                    #[cfg(use_vulkan)]
+                    if self.os.vulkan.is_none() && self.os.has_drawable_surface() {
+                        self.opengl_capture_window(
+                            Some(window_id.id()),
+                            self.os.display_size.x as u32,
+                            self.os.display_size.y as u32,
+                        );
+                    }
                     self.present_window_for_active_backend();
                 }
                 CxDrawPassParent::DrawPass(_) => {
