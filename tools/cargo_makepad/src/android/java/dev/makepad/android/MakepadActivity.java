@@ -49,7 +49,6 @@ import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 import android.view.ActionMode;
-import android.view.Choreographer;
 import android.view.Display;
 import android.view.InputDevice;
 import android.view.Menu;
@@ -1127,19 +1126,6 @@ public class MakepadActivity
     // would background the app and its onDestroy would shut it down), and
     // it finishes.
     private static MakepadActivity sNativeActivity;
-    // Use the same Choreographer as ViewRootImpl: its batched touch input runs
-    // before our animation-phase callback sends the native render beat. A
-    // separate NDK Choreographer can beat Java input and miss a scrolling frame.
-    // Static ownership avoids retaining an Activity or starting a second chain
-    // when a replacement Activity takes over the same native app.
-    private static final Choreographer.FrameCallback sRenderLoop = new Choreographer.FrameCallback() {
-        @Override
-        public void doFrame(long frameTimeNanos) {
-            if (MakepadNative.onRenderLoop()) {
-                Choreographer.getInstance().postFrameCallback(this);
-            }
-        }
-    };
     private boolean mSuperseded;
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private InputManager mInputManager;
@@ -1621,9 +1607,7 @@ public class MakepadActivity
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
         float refreshRate = getDeviceRefreshRate();
-        if (MakepadNative.initChoreographer(refreshRate, sdkVersion)) {
-            Choreographer.getInstance().postFrameCallback(sRenderLoop);
-        }
+        MakepadNative.initChoreographer(refreshRate, sdkVersion);
         //% MAIN_ACTIVITY_ON_CREATE
         
     }

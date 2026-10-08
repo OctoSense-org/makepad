@@ -1,6 +1,7 @@
 package dev.makepad.android;
 
 import android.view.Surface;
+import android.view.Choreographer;
 import android.view.MotionEvent;
 
 public class MakepadNative {
@@ -15,7 +16,25 @@ public class MakepadNative {
     public static native void onAndroidParams(String cache_path, String data_path, float density, boolean isEmulator, String androidVersion, String buildNumber,
         String kernelVersion);
 
-    public native static boolean initChoreographer(float deviceRefreshRate, int sdkVersion);
+    public native static void initChoreographer(float deviceRefreshRate, int sdkVersion);
+
+    // Called by the native bootstrap when this bridge is available. Share the
+    // View input scheduler so batched MotionEvents reach Rust before its beat.
+    // Static ownership avoids retaining an Activity or duplicating the callback
+    // chain when a replacement Activity takes over the same native app.
+    private static final Choreographer.FrameCallback renderLoop = new Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long frameTimeNanos) {
+            if (onRenderLoop()) {
+                Choreographer.getInstance().postFrameCallback(this);
+            }
+        }
+    };
+
+    private static void startRenderLoop() {
+        Choreographer.getInstance().postFrameCallback(renderLoop);
+    }
+
     public native static boolean onRenderLoop();
 
     public native static void onBackPressed();
