@@ -485,9 +485,11 @@ impl Cx {
 
                 live_id!(ToWasmSignal) => {
                     let tw = ToWasmSignal::read_to_wasm(&mut to_wasm);
-                    if tw.flags & 1 != 0 {
+                    if tw.flags & (1 | 4) != 0 {
                         self.handle_media_signals();
                         self.handle_script_signals();
+                    }
+                    if tw.flags & 1 != 0 {
                         self.call_event_handler(&Event::Signal);
                         self.dispatch_network_runtime_events();
                     }
@@ -1730,7 +1732,7 @@ pub unsafe extern "C" fn wasm_get_js_message_bridge(cx_ptr: u32) -> u32 {
 #[cfg(target_arch = "wasm32")]
 pub unsafe extern "C" fn wasm_check_signal() -> u32 {
     let mut x = 0;
-    if SignalToUI::check_and_clear_renderer_signal() {
+    if SignalToUI::check_and_clear_internal_signal() {
         x |= 4; // Pump backend maintenance without forwarding Event::Signal.
     }
     if SignalToUI::check_and_clear_ui_signal() {

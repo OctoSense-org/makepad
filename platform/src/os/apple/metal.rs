@@ -2422,7 +2422,7 @@ fn spawn_submitter(
                 if let Some(trace) = &trace { trace.mark(PresentStage::CommitReturned); }
                 drop(submission);
                 let _: () = unsafe { msg_send![pool, release] };
-                crate::thread::SignalToUI::set_renderer_signal();
+                crate::thread::SignalToUI::set_internal_signal();
             }
         })
         .expect("Metal submission worker");
@@ -3509,7 +3509,7 @@ impl MetalPipelines {
         crate::error!("Metal shader: {}", error);
         let _ = self.blend.set(Err(error.clone()));
         let _ = self.solid.set(Err(error));
-        crate::thread::SignalToUI::set_renderer_signal();
+        crate::thread::SignalToUI::set_internal_signal();
     }
 
     fn compile(
@@ -3662,7 +3662,7 @@ impl MetalPipelines {
                         } else {
                             ready.solid.set(result)
                         };
-                        crate::thread::SignalToUI::set_renderer_signal();
+                        crate::thread::SignalToUI::set_internal_signal();
                     });
                     unsafe {
                         let _: () = msg_send![callback_device.as_id(),
@@ -4195,7 +4195,7 @@ fn spawn_allocator() -> (std::sync::mpsc::SyncSender<MetalAllocationRequest>, st
                     }
                 }
                 let _: () = unsafe { msg_send![pool, release] };
-                crate::thread::SignalToUI::set_renderer_signal();
+                crate::thread::SignalToUI::set_internal_signal();
             }
         }).expect("Metal instance allocation worker");
         (tx, thread)

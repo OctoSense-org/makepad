@@ -183,10 +183,13 @@ impl Cx {
         }
 
         // Signals
-        SignalToUI::check_and_clear_renderer_signal();
-        if SignalToUI::check_and_clear_ui_signal() {
+        let internal_signal = SignalToUI::check_and_clear_internal_signal();
+        let ui_signal = SignalToUI::check_and_clear_ui_signal();
+        if internal_signal || ui_signal {
             self.handle_media_signals();
             self.handle_script_signals();
+        }
+        if ui_signal {
             self.call_event_handler(&Event::Signal);
         }
         if SignalToUI::check_and_clear_action_signal() {

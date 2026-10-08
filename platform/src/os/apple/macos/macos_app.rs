@@ -679,7 +679,7 @@ impl MacosApp {
                 // replied ~160 ms late, after the program had given up and
                 // read the reply as typed input. Run the paint tick, which
                 // drains the signal and restarts timer 0.
-                if crate::thread::SignalToUI::signal_pending() {
+                if crate::thread::SignalToUI::any_pending() {
                     MacosApp::do_callback(MacosEvent::Timer(TimerEvent {
                         time: None,
                         timer_id: 0,

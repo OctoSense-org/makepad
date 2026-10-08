@@ -44,7 +44,9 @@ pub fn install_ui_waker(waker: Option<UiWaker>) {
     }
 }
 
-fn wake_ui() {
+/// Wake the event loop and nothing else, for a worker whose result the next
+/// beat picks up by itself (a render worker whose pass is already dirty).
+pub fn wake_ui_loop() {
     let waker = UI_WAKER.lock().ok().and_then(|slot| slot.clone());
     if let Some(waker) = waker {
         waker.wake();
@@ -55,49 +57,61 @@ fn wake_ui() {
 pub struct SignalToUI(Arc<AtomicBool>);
 
 static UI_SIGNAL: AtomicBool = AtomicBool::new(false);
+static INTERNAL_SIGNAL: AtomicBool = AtomicBool::new(false);
 static ACTION_SIGNAL: AtomicBool = AtomicBool::new(false);
-static RENDERER_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 impl SignalToUI {
+    /// An app-facing channel has something for the UI thread. The next beat
+    /// dispatches `Event::Signal` to the whole widget tree, so raise this only
+    /// for data an app polls on that event: a `ToUISender`, a task result, a
+    /// texture readback. Makepad's own queues raise `set_internal_signal`.
     pub fn set_ui_signal() {
         if !UI_SIGNAL.swap(true, Ordering::AcqRel) {
-            wake_ui();
+            wake_ui_loop();
         }
     }
 
-    /// Wake backend maintenance without delivering an application `Event::Signal`.
-    /// Renderers use this after asynchronous submission, allocation, or compilation;
-    /// completed application work must continue to use `set_ui_signal`.
+    /// One of makepad's own queues has something for the UI thread: media
+    /// device changes, the script pump, a termination request. The next beat
+    /// services those without waking every widget with an `Event::Signal`.
+    pub fn set_internal_signal() {
+        if !INTERNAL_SIGNAL.swap(true, Ordering::AcqRel) {
+            wake_ui_loop();
+        }
+    }
+
+    /// Compatibility alias for the renderer-specific name used by older fork consumers.
     pub fn set_renderer_signal() {
-        if !RENDERER_SIGNAL.swap(true, Ordering::AcqRel) {
-            wake_ui();
-        }
+        Self::set_internal_signal();
     }
 
-    /// Consume a renderer wake in the platform event loop, before servicing paints.
     pub fn check_and_clear_renderer_signal() -> bool {
-        RENDERER_SIGNAL.swap(false, Ordering::AcqRel)
+        Self::check_and_clear_internal_signal()
+    }
+
+    pub fn signal_pending() -> bool {
+        Self::any_pending()
     }
 
     pub fn set_action_signal() {
         if !ACTION_SIGNAL.swap(true, Ordering::AcqRel) {
-            wake_ui();
+            wake_ui_loop();
         }
     }
 
-    /// Whether an application, action, or renderer wake is pending. Does not
-    /// clear it: the event loop uses it to decide whether a wake needs a tick.
-    pub fn signal_pending() -> bool {
+    /// Whether any of the UI thread's signals is raised (without clearing).
+    pub fn any_pending() -> bool {
         UI_SIGNAL.load(Ordering::Acquire)
+            || INTERNAL_SIGNAL.load(Ordering::Acquire)
             || ACTION_SIGNAL.load(Ordering::Acquire)
-            || RENDERER_SIGNAL.load(Ordering::Acquire)
     }
 
-    /// Platform event-loop consumption only. Application `Event::Signal` handlers
-    /// must drain their own queues or check an owned `SignalToUI` instance instead:
-    /// the global flag has already been consumed before that event is dispatched.
     pub fn check_and_clear_ui_signal() -> bool {
         UI_SIGNAL.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn check_and_clear_internal_signal() -> bool {
+        INTERNAL_SIGNAL.swap(false, Ordering::AcqRel)
     }
 
     pub fn check_and_clear_action_signal() -> bool {
@@ -355,6 +369,19 @@ impl<T> std::ops::Deref for FromUIReceiver<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn internal_and_ui_signals_are_independent() {
+        SignalToUI::check_and_clear_ui_signal();
+        SignalToUI::check_and_clear_internal_signal();
+        SignalToUI::set_internal_signal();
+        assert!(!SignalToUI::check_and_clear_ui_signal());
+        assert!(SignalToUI::check_and_clear_internal_signal());
+        assert!(!SignalToUI::check_and_clear_internal_signal());
+        SignalToUI::set_ui_signal();
+        assert!(!SignalToUI::check_and_clear_internal_signal());
+        assert!(SignalToUI::check_and_clear_ui_signal());
+    }
 
     #[test]
     fn oneshot_delivers_once() {

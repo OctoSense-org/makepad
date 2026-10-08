@@ -1058,7 +1058,7 @@ impl CxDrawListPool {
                 let _ = returned.try_send(batch);
                 counter.fetch_sub(1, Ordering::AcqRel);
                 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
-                crate::thread::SignalToUI::set_renderer_signal();
+                crate::thread::SignalToUI::set_internal_signal();
             };
             // Android and OpenHarmony serve the rest of the debt on the idle vsync beat
             // (`opengl_maintain_instance_retirements`) and on every painted
