@@ -2595,8 +2595,17 @@ impl Cx {
                     if self.windows[window_id].is_popup {
                         continue;
                     }
-                    let start = self.seconds_since_app_start();
-                    let metrics = self.collect_gpu_pass_metrics(*draw_pass_id);
+                    // Collecting Studio statistics walks the full draw tree and
+                    // allocates geometry/texture inventories. Normal rendering
+                    // has no consumer for this work; local captures still opt in.
+                    let profile = (Cx::has_studio_web_socket()
+                        || Cx::local_profile_capture_enabled())
+                        .then(|| {
+                            (
+                                self.seconds_since_app_start(),
+                                self.collect_gpu_pass_metrics(*draw_pass_id),
+                            )
+                        });
                     self.draw_pass_to_window_for_active_backend(*draw_pass_id);
 
                     // Draw popup window passes as overlays on the same surface
@@ -2613,18 +2622,20 @@ impl Cx {
                         }
                     }
 
-                    let end = self.seconds_since_app_start();
-                    Cx::send_studio_message(AppToStudio::GPUSample(GPUSample {
-                        start,
-                        end,
-                        draw_calls: metrics.draw_calls,
-                        instances: metrics.instances,
-                        vertices: metrics.vertices,
-                        instance_bytes: metrics.instance_bytes,
-                        uniform_bytes: metrics.uniform_bytes,
-                        vertex_buffer_bytes: metrics.vertex_buffer_bytes,
-                        texture_bytes: metrics.texture_bytes,
-                    }));
+                    if let Some((start, metrics)) = profile {
+                        let end = self.seconds_since_app_start();
+                        Cx::send_studio_message(AppToStudio::GPUSample(GPUSample {
+                            start,
+                            end,
+                            draw_calls: metrics.draw_calls,
+                            instances: metrics.instances,
+                            vertices: metrics.vertices,
+                            instance_bytes: metrics.instance_bytes,
+                            uniform_bytes: metrics.uniform_bytes,
+                            vertex_buffer_bytes: metrics.vertex_buffer_bytes,
+                            texture_bytes: metrics.texture_bytes,
+                        }));
+                    }
                     // Android has its own GL window path, so it must also drain
                     // explicit app-frame captures before swapping the surface.
                     #[cfg(not(use_vulkan))]
