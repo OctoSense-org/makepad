@@ -41,7 +41,7 @@ const SMOOTH_SCROLL_MAXIMUM_WINDOW: usize = 20;
 /// How many frames a `smooth_scroll_to_end` animation takes, whatever the
 /// distance, so a long list doesn't crawl at a fixed pixels-per-frame rate.
 const SMOOTH_SCROLL_TO_END_FRAMES: f64 = 24.0;
-const SMOOTH_SCROLL_TOLERANCE: f64 = 0.01;
+const SMOOTH_SCROLL_TOLERANCE: f64 = 0.1;
 const VIEWPORT_END_TOLERANCE: f64 = 1.0;
 
 enum ScrollState {
