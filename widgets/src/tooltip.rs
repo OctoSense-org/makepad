@@ -122,6 +122,12 @@ impl Widget for Tooltip {
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         let draw_list = self.draw_list.as_mut().unwrap();
         draw_list.begin_overlay_reuse(cx);
+        // Retire a previously visible tip without painting a transparent
+        // fullscreen background while the tooltip is closed.
+        if !self.opened {
+            draw_list.end(cx);
+            return DrawStep::done();
+        }
 
         let size = cx.current_pass_size();
         cx.begin_root_turtle(size, self.view.layout);
