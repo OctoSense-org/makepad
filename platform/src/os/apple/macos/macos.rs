@@ -125,7 +125,7 @@ impl DrawableWorker {
                 let drawable = NonNull::new(drawable).map(RcObjcId::from_unowned);
                 unsafe { let _: () = msg_send![pool, release]; }
                 if ready.try_send(drawable).is_err() { break; }
-                SignalToUI::set_renderer_signal();
+                SignalToUI::set_internal_signal();
             }
         }).expect("drawable acquisition worker");
         Self { request, ready: replies, pending: false, wait_ns, started: None }
@@ -1130,7 +1130,7 @@ impl Cx {
                     }
 
                     // check signals
-                    needs_timer |= SignalToUI::check_and_clear_renderer_signal();
+                    needs_timer |= SignalToUI::check_and_clear_internal_signal();
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_termination_signal();
                         self.handle_media_signals();

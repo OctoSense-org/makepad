@@ -680,7 +680,8 @@ pub struct TextInput {
 impl ScriptHook for TextInput {
     fn on_after_new(&mut self, vm: &mut ScriptVm) {
         vm.with_cx_mut(|cx| {
-            self.check_text_is_empty(cx);
+            // A new input has no earlier look to fade from.
+            self.check_text_is_empty(cx, Animate::No);
         });
     }
 }
@@ -1888,7 +1889,7 @@ impl TextInput {
         }
         self.needs_scroll_to_cursor = true;
         self.laidout_text = None;
-        self.check_text_is_empty(cx);
+        self.check_text_is_empty(cx, Animate::Yes);
         self.draw_bg.redraw(cx);
         self.emit_change(cx, uid);
         cx.hide_clipboard_actions();
@@ -2146,7 +2147,7 @@ impl TextInput {
         self.needs_scroll_to_cursor = true;
         self.history.apply_edit(edit, &mut self.text);
         self.laidout_text = None;
-        self.check_text_is_empty(cx);
+        self.check_text_is_empty(cx, Animate::Yes);
     }
 
     fn char_range_to_byte_range(&self, start: usize, end: usize) -> (usize, usize) {
@@ -2257,7 +2258,7 @@ impl TextInput {
         };
         self.needs_scroll_to_cursor = true;
         self.laidout_text = None;
-        self.check_text_is_empty(cx);
+        self.check_text_is_empty(cx, Animate::Yes);
     }
 
     fn undo(&mut self, cx: &mut Cx) -> bool {
@@ -2267,7 +2268,7 @@ impl TextInput {
             self.laidout_text = None;
             self.selection = new_selection;
             self.needs_scroll_to_cursor = true;
-            self.check_text_is_empty(cx);
+            self.check_text_is_empty(cx, Animate::Yes);
             true
         } else {
             false
@@ -2280,19 +2281,15 @@ impl TextInput {
             self.laidout_text = None;
             self.selection = new_selection;
             self.needs_scroll_to_cursor = true;
-            self.check_text_is_empty(cx);
+            self.check_text_is_empty(cx, Animate::Yes);
             true
         } else {
             false
         }
     }
 
-    fn check_text_is_empty(&mut self, cx: &mut Cx) {
-        if self.text.is_empty() {
-            self.animator_play(cx, ids!(empty.on));
-        } else {
-            self.animator_play(cx, ids!(empty.off));
-        }
+    fn check_text_is_empty(&mut self, cx: &mut Cx, animate: Animate) {
+        self.animator_toggle(cx, self.text.is_empty(), animate, ids!(empty.on), ids!(empty.off));
     }
 
     fn handle_navigation_key(&mut self, cx: &mut Cx, uid: WidgetUid, event: KeyEvent) -> bool {
@@ -2434,7 +2431,7 @@ impl Widget for TextInput {
         self.history.clear();
         self.laidout_text = None;
         self.draw_bg.redraw(cx);
-        self.check_text_is_empty(cx);
+        self.check_text_is_empty(cx, Animate::Yes);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -3108,7 +3105,7 @@ impl Widget for TextInput {
                     }
 
                     // This path bypasses apply_edit(), so keep placeholder/color state in sync.
-                    self.check_text_is_empty(cx);
+                    self.check_text_is_empty(cx, Animate::Yes);
                     self.draw_bg.redraw(cx);
                     if text_changed {
                         self.emit_change(cx, uid);

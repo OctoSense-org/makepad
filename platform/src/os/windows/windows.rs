@@ -378,7 +378,7 @@ impl Cx {
                 self.call_event_handler(&Event::Timer(e))
             }
             Win32Event::Signal => {
-                SignalToUI::check_and_clear_renderer_signal();
+                SignalToUI::check_and_clear_internal_signal();
                 if SignalToUI::check_and_clear_ui_signal() {
                     self.handle_termination_signal();
                     self.handle_media_signals();

@@ -168,7 +168,7 @@ impl Cx {
             // The wake pipe signals completed worker/hosted-app work. Drain
             // it on wake, before paint, rather than delaying child frames
             // until the 8 ms maintenance timer (which would cap them at 125 Hz).
-            SignalToUI::check_and_clear_renderer_signal();
+            SignalToUI::check_and_clear_internal_signal();
             if SignalToUI::check_and_clear_ui_signal() {
                 cx.handle_termination_signal();
                 cx.handle_media_signals();
