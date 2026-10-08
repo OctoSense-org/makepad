@@ -1256,6 +1256,7 @@ impl PortalList {
         // When a selection is active (but drag finished), keep selected items alive
         // so their selection state persists when scrolled back into view.
         if !self.keep_invisible && !self.is_selecting {
+            let previous_item_count = self.items.len();
             let selection_range = self.get_selection_range();
             self.cached_item_order.truncate(self.cache_items);
             if self.reuse_items {
@@ -1274,7 +1275,12 @@ impl PortalList {
             } else {
                 self.items.retain_visible();
             }
-            cx.widget_tree_mark_dirty(self.uid);
+            // Retaining existing rows does not change the widget tree. New or
+            // replaced rows are registered by item_with_existed; this pass can
+            // only remove rows, so refresh the tree only when it did so.
+            if self.items.len() != previous_item_count {
+                cx.widget_tree_mark_dirty(self.uid);
+            }
         }
 
         cx.end_turtle_with_area(&mut self.area);
