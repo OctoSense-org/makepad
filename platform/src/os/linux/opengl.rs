@@ -608,6 +608,9 @@ impl Cx {
                     skipped_draws::count(skipped_draws::SHADER_FAILED);
                     continue;
                 }
+                if sh.mapping.uses_time {
+                    self.demo_time_repaint = true;
+                }
                 let shp = &mut self.draw_shaders.os_shaders[sh.os_shader_id.unwrap()];
                 shp.ensure_gl_shader_sources(self.os.gl(), &self.os_type);
                 shp.refresh_scope_uniforms(self.os.gl(), &sh.mapping);
@@ -731,11 +734,6 @@ impl Cx {
 
                 if instances == 0 {
                     continue;
-                }
-
-                // Only a shader with actual instances needs the next time tick.
-                if sh.mapping.uses_time {
-                    self.demo_time_repaint = true;
                 }
 
                 if sh.mapping.flags.debug_draw {

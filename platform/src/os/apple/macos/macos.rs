@@ -921,7 +921,11 @@ impl Cx {
                             // A normal paint can satisfy an input frame that
                             // initially had to wait for a drawable. Its old
                             // acquisition deadline must not poison a later input.
-                            if self.os.remote_present_waiting.is_some_and(|(id, _)| id == window_id) {
+                            if self
+                                .os
+                                .remote_present_waiting
+                                .is_some_and(|(id, _)| id == window_id)
+                            {
                                 self.os.remote_present_waiting = None;
                             }
                         }
