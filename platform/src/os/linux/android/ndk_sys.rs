@@ -58,8 +58,7 @@ extern "C" {
     // It is API 30+; a plain `extern "C"` strong reference to it would break
     // `dlopen` of libmakepad.so on API 26-29 devices. If surface frame-rate
     // control is wanted, resolve it via `dlsym(libandroid.so, ...)` gated on
-    // `sdk_version >= 30`, the same way the Choreographer post-callbacks are
-    // handled below.
+    // `sdk_version >= 30`, rather than linking newer symbols at the minSdk floor.
 
     // AHardwareBuffer_acquire / _release are API 26 — safe at the minSdk floor.
     pub fn AHardwareBuffer_acquire(buffer: *mut AHardwareBuffer);
@@ -69,38 +68,6 @@ extern "C" {
 pub const AHARDWAREBUFFER_USAGE_CPU_READ_RARELY: u64 = 2;
 pub const AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN: u64 = 3;
 pub const AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE: u64 = 1 << 8;
-
-pub type AChoreographer = c_void;
-pub type AChoreographerFrameCallbackData = c_void;
-
-pub type AChoreographer_vsyncCallback =
-    unsafe extern "C" fn(callbackData: *mut AChoreographerFrameCallbackData, data: *mut c_void);
-
-/// The function type for posting callbacks to the AChoreographer
-pub type AChoreographerPostCallbackFn = unsafe extern "C" fn(
-    *mut AChoreographer,
-    Option<unsafe extern "C" fn(*mut AChoreographerFrameCallbackData, *mut std::ffi::c_void)>,
-    *mut std::ffi::c_void,
-) -> i32;
-
-#[cfg(not(no_android_choreographer))]
-extern "C" {
-    // AChoreographer_getInstance was introduced in API 24, so it's safe to
-    // link directly at our minSdk floor (26).
-    pub fn AChoreographer_getInstance() -> *mut AChoreographer;
-}
-
-// AChoreographer_postVsyncCallback (API 33) and AChoreographer_postFrameCallback64
-// (API 29) are deliberately NOT declared in an `extern "C"` block.
-//
-// A strong undefined reference to a symbol that doesn't exist on API 26-28
-// devices makes the entire `libmakepad.so` fail to `dlopen` at process start
-// (`UnsatisfiedLinkError: cannot locate symbol ...`), even if the call site is
-// runtime-gated behind an `sdk_version >= 29` check — the relocation is still
-// emitted. Rust's `extern "C"` can't express weak linkage on stable, so these
-// are instead resolved at runtime with `dlsym(libandroid.so, ...)` in
-// android_jni.rs, typed via `AChoreographerPostCallbackFn`, only on devices
-// where they actually exist.
 
 #[repr(C)]
 pub struct ANativeActivity {

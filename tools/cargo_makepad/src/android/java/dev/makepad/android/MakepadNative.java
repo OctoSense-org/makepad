@@ -15,7 +15,8 @@ public class MakepadNative {
     public static native void onAndroidParams(String cache_path, String data_path, float density, boolean isEmulator, String androidVersion, String buildNumber,
         String kernelVersion);
 
-    public native static void initChoreographer(float deviceRefreshRate, int sdkVersion);
+    public native static boolean initChoreographer(float deviceRefreshRate, int sdkVersion);
+    public native static boolean onRenderLoop();
 
     public native static void onBackPressed();
     public native static void onHomeIntent();

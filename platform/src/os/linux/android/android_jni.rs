@@ -1,4 +1,3 @@
-use crate::module_loader::ModuleLoader;
 use makepad_jni_sys as jni_sys;
 
 use {
@@ -798,107 +797,40 @@ unsafe fn create_native_window_with_env(
     ndk_sys::ANativeWindow_fromSurface(env, surface)
 }
 
-#[cfg(not(no_android_choreographer))]
-static mut CHOREOGRAPHER: *mut ndk_sys::AChoreographer = std::ptr::null_mut();
-
-/// Whether a render loop (a Choreographer callback chain or the paced
-/// thread) is running. Every activity instance's `onCreate` calls
-/// `initChoreographer`, and a second instance can be created while the
-/// first, and the app behind it, live on (`MakepadActivity.sNativeActivity`);
-/// one loop is enough, two would double the beat. A loop clears this when
-/// it stops, which it does once the message channel is gone.
+/// One render beat for the native app, including activity replacements. Java's
+/// Choreographer shares the View input phase; an independent NDK Choreographer
+/// can run first and paint before that frame's batched MotionEvents arrive.
 static RENDER_LOOP_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(not(no_android_choreographer))]
-static mut CHOREOGRAPHER_POST_CALLBACK_FN: Option<
-    unsafe extern "C" fn(
-        *mut ndk_sys::AChoreographer,
-        Option<
-            unsafe extern "C" fn(
-                *mut ndk_sys::AChoreographerFrameCallbackData,
-                *mut std::ffi::c_void,
-            ),
-        >,
-        *mut std::ffi::c_void,
-    ) -> i32,
-> = None;
-
-/// Initializes the render loop which used the Android Choreographer when available to ensure proper vsync.
-/// If `no_android_choreographer` is present (e.g. OHOS with non-compatiblity), we fallback to a simple loop with frame pacing.
-/// This will be replaced by proper a vsync mechanism once we firgure it out for that OHOS.
-#[allow(unused)]
+/// Returns true when Java should start its Choreographer callback chain.
+/// The no-Choreographer compatibility path retains its paced native thread.
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographer(
     _: *mut jni_sys::JNIEnv,
     _: jni_sys::jclass,
     device_refresh_rate: jni_sys::jfloat,
-    sdk_version: jni_sys::jint,
-) {
+    _sdk_version: jni_sys::jint,
+) -> jni_sys::jboolean {
     if RENDER_LOOP_ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        return;
+        return 0;
     }
-    // If the Choreographer is not available (e.g. OHOS), use a manual render loop
     #[cfg(no_android_choreographer)]
     {
         init_simple_render_loop(device_refresh_rate);
-        return;
+        0
     }
-    #[allow(unused)]
     #[cfg(not(no_android_choreographer))]
     {
-        // Otherwise use the actual Choreographer.
-        CHOREOGRAPHER = ndk_sys::AChoreographer_getInstance();
-        // AChoreographer_postFrameCallback64 (API 29) and
-        // AChoreographer_postVsyncCallback (API 33) must be resolved via dlsym,
-        // never declared as `extern "C"` — see the note in ndk_sys.rs. On API
-        // 26-28 neither symbol exists, so the callback fn stays None and we
-        // fall back to the manual frame loop below.
-        if sdk_version >= 29 {
-            if let Ok(lib) = ModuleLoader::load("libandroid.so") {
-                // Prefer the newer vsync callback (API 33+); fall back to the
-                // API 29 frame callback when it isn't available.
-                let vsync: Option<ndk_sys::AChoreographerPostCallbackFn> = if sdk_version >= 33 {
-                    lib.get_symbol("AChoreographer_postVsyncCallback").ok()
-                } else {
-                    None
-                };
-                let frame_callback_64: Option<ndk_sys::AChoreographerPostCallbackFn> =
-                    lib.get_symbol("AChoreographer_postFrameCallback64").ok();
-                CHOREOGRAPHER_POST_CALLBACK_FN = vsync.or(frame_callback_64);
-            }
-        }
-        match CHOREOGRAPHER_POST_CALLBACK_FN {
-            Some(_) => post_vsync_callback(),
-            None => init_simple_render_loop(device_refresh_rate),
-        }
+        let _ = device_refresh_rate;
+        1
     }
-}
-
-#[cfg(not(no_android_choreographer))]
-unsafe extern "C" fn vsync_callback(
-    _data: *mut ndk_sys::AChoreographerFrameCallbackData,
-    _user_data: *mut std::ffi::c_void,
-) {
-    send_from_java_message(FromJavaMessage::RenderLoop);
-    post_vsync_callback();
-}
-
-#[cfg(not(no_android_choreographer))]
-pub unsafe fn post_vsync_callback() {
-    if let Some(post_callback) = CHOREOGRAPHER_POST_CALLBACK_FN {
-        if !CHOREOGRAPHER.is_null() && from_java_messages_already_set() {
-            post_callback(CHOREOGRAPHER, Some(vsync_callback), std::ptr::null_mut());
-            return;
-        }
-    }
-    // The chain ends here: the next `initChoreographer` starts a new one.
-    RENDER_LOOP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Fallback render loop used when the Android Choreographer isn't available
-/// (API < 29, and `no_android_choreographer` builds such as OHOS). A dedicated
+/// (`no_android_choreographer` builds such as OHOS). A dedicated
 /// thread paces frames manually, since there is no system vsync callback.
+#[cfg(no_android_choreographer)]
 fn init_simple_render_loop(device_refresh_rate: f32) {
     std::thread::spawn(move || {
         let mut last_frame_time = std::time::Instant::now();
@@ -907,7 +839,7 @@ fn init_simple_render_loop(device_refresh_rate: f32) {
             // Exit the thread once the app has shut down and the Java->native
             // message channel has been torn down by `from_java_messages_clear()`
             // (called when the main event loop quits). This mirrors
-            // `post_vsync_callback`, which likewise stops re-arming the
+            // Java's frame callback, which likewise stops re-arming the
             // Choreographer once `from_java_messages_already_set()` is false.
             //
             // Without this, the thread spins forever after the activity is
@@ -1291,9 +1223,14 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnSafeAreaInsets(
 #[no_mangle]
 extern "C" fn Java_dev_makepad_android_MakepadNative_onRenderLoop(
     _: *mut jni_sys::JNIEnv,
-    _: jni_sys::jobject,
-) {
+    _: jni_sys::jclass,
+) -> jni_sys::jboolean {
+    if !from_java_messages_already_set() {
+        RENDER_LOOP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        return 0;
+    }
     send_from_java_message(FromJavaMessage::RenderLoop);
+    1
 }
 
 #[no_mangle]
