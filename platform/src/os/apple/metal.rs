@@ -1222,6 +1222,7 @@ impl Cx {
         }
 
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
+            crate::trace!("gpu.trace", "pass {:?} skipped empty rectangle {:?}", draw_pass_id, pass_rect);
             if !matches!(&mode, DrawPassMode::MTKView(_)) {
                 self.passes[draw_pass_id].paint_dirty = false;
             }
