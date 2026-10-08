@@ -2,7 +2,6 @@
 #![allow(non_snake_case)]
 
 use makepad_jni_sys as jni_sys;
-use std::ffi::c_void;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
