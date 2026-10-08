@@ -728,7 +728,21 @@ impl WidgetRef {
 
     pub fn handle_event(&self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         if let Some(inner) = self.0.borrow_mut().as_mut() {
+            let perf = if cx.perf_monitor.enabled() {
+                let operation = match event {
+                    Event::Actions(_) => "widget.event.actions",
+                    Event::NextFrame(_) => "widget.event.next_frame",
+                    Event::TouchUpdate(_) | Event::MouseMove(_) | Event::Scroll(_) => {
+                        "widget.event.pointer"
+                    }
+                    _ => "widget.event.other",
+                };
+                cx.perf_monitor.begin_work(operation, inner.widget.widget_type_name())
+            } else {
+                None
+            };
             inner.widget.handle_event(cx, event, scope);
+            cx.perf_monitor.end_work(perf);
         }
     }
 
