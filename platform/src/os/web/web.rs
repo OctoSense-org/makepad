@@ -485,9 +485,11 @@ impl Cx {
 
                 live_id!(ToWasmSignal) => {
                     let tw = ToWasmSignal::read_to_wasm(&mut to_wasm);
-                    if tw.flags & 1 != 0 {
+                    if tw.flags & (1 | 4) != 0 {
                         self.handle_media_signals();
                         self.handle_script_signals();
+                    }
+                    if tw.flags & 1 != 0 {
                         self.call_event_handler(&Event::Signal);
                         self.dispatch_network_runtime_events();
                     }

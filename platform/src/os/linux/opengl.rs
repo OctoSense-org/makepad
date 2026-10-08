@@ -167,9 +167,8 @@ impl DrawVars {
             let mut compiled_vulkan_shader: [Option<CxVulkanShaderBinary>;
                 NUM_SHADER_VARIANTS] = std::array::from_fn(|_| None);
 
-            // Only while this process renders with Vulkan; a Vulkan-capable
-            // desktop Linux build that fell back to OpenGL ES compiles GLSL
-            // above instead. Android and Quest have no such fallback.
+            // Compile SPIR-V only after shader-code deduplication. This fork
+            // selects its rendering backend at compile time.
             #[cfg(use_vulkan)]
             {
                 for (shader_variant, xr_multiview) in [false, true].into_iter().enumerate() {
