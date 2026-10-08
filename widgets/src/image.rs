@@ -229,6 +229,9 @@ impl Image {
     /// useful for widgets owned by an isolated VM: their typed Rust state can
     /// be changed safely even while the host VM is active.
     pub fn set_walk_and_fit(&mut self, cx: &mut Cx, walk: Walk, fit: ImageFit) {
+        if self.walk == walk && self.fit == fit {
+            return;
+        }
         self.walk = walk;
         self.fit = fit;
         self.redraw(cx);

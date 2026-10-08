@@ -170,7 +170,7 @@ pub struct TouchUpdateEvent {
 
 /// Inset represents spacing values for all four edges (left, top, right, bottom).
 /// Used for both margin (outer spacing) and padding (inner spacing).
-#[derive(Clone, Copy, Default, Debug, Script)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Script)]
 pub struct Inset {
     /// The left inset.
     #[live]

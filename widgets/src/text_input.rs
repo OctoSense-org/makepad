@@ -742,6 +742,9 @@ impl TextInput {
     }
 
     pub fn set_is_multiline(&mut self, cx: &mut Cx, is_multiline: bool) {
+        if self.is_multiline == is_multiline {
+            return;
+        }
         self.is_multiline = is_multiline;
         if !is_multiline {
             self.scroll_y = 0.0;
@@ -816,6 +819,9 @@ impl TextInput {
     /// the wrong text. Overflow is clipped, so pick a whole number of lines or
     /// the last one is sliced through the middle of its glyphs.
     pub fn set_height(&mut self, cx: &mut Cx, height: Size) {
+        if self.walk.height == height {
+            return;
+        }
         self.walk.height = height;
         self.draw_bg.redraw(cx);
     }
@@ -842,6 +848,9 @@ impl TextInput {
     }
 
     pub fn set_is_password(&mut self, cx: &mut Cx, is_password: bool) {
+        if self.is_password == is_password {
+            return;
+        }
         self.is_password = is_password;
         self.laidout_text = None;
         self.draw_bg.redraw(cx);
@@ -877,6 +886,9 @@ impl TextInput {
     }
 
     pub fn set_is_numeric_only(&mut self, cx: &mut Cx, is_numeric_only: bool) {
+        if self.is_numeric_only == is_numeric_only {
+            return;
+        }
         self.is_numeric_only = is_numeric_only;
         self.laidout_text = None;
         self.draw_bg.redraw(cx);

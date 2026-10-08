@@ -1,6 +1,6 @@
 use crate::makepad_draw::*;
 
-#[derive(Clone, Copy, Debug, Default, Script, ScriptHook)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Script, ScriptHook)]
 pub enum ImageFit {
     /// Draws the image into the widget's requested bounds without preserving
     /// the image's aspect ratio.

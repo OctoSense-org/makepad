@@ -26,6 +26,10 @@ impl WidgetUid {
 }
 
 pub trait WidgetNode: ScriptApply {
+    /// Static component name for opt-in diagnostics; contains no UI content.
+    fn widget_type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
     fn widget_uid(&self) -> WidgetUid;
     /// Enumerate direct children for widget-tree indexing.
     fn children(&self, _visit: &mut dyn FnMut(LiveId, WidgetRef)) {}
@@ -1120,7 +1124,14 @@ impl WidgetRef {
                 let depth = cx.nesting_depth;
                 cx.sploded_note_depth(uid.0, depth);
             }
+            let perf = if cx.perf_monitor.enabled() {
+                cx.perf_monitor
+                    .begin_work("widget.draw", inner.widget.widget_type_name())
+            } else {
+                None
+            };
             let step = inner.widget.draw_walk(cx, scope, walk).step();
+            cx.perf_monitor.end_work(perf);
             cx.exit_nesting_depth();
             if let Some(nd) = step {
                 if nd.is_empty() {
@@ -1143,7 +1154,14 @@ impl WidgetRef {
                 let depth = cx.nesting_depth;
                 cx.sploded_note_depth(uid.0, depth);
             }
+            let perf = if cx.perf_monitor.enabled() {
+                cx.perf_monitor
+                    .begin_work("widget.draw", inner.widget.widget_type_name())
+            } else {
+                None
+            };
             inner.widget.draw_walk_all(cx, scope, walk);
+            cx.perf_monitor.end_work(perf);
             cx.exit_nesting_depth();
         }
     }
@@ -1174,7 +1192,14 @@ impl WidgetRef {
                 let depth = cx.nesting_depth;
                 cx.sploded_note_depth(uid.0, depth);
             }
+            let perf = if cx.perf_monitor.enabled() {
+                cx.perf_monitor
+                    .begin_work("widget.draw", inner.widget.widget_type_name())
+            } else {
+                None
+            };
             let step = inner.widget.draw(cx, scope).step();
+            cx.perf_monitor.end_work(perf);
             cx.exit_nesting_depth();
             if let Some(nd) = step {
                 if nd.is_empty() {
@@ -1194,7 +1219,14 @@ impl WidgetRef {
                 let depth = cx.nesting_depth;
                 cx.sploded_note_depth(uid.0, depth);
             }
+            let perf = if cx.perf_monitor.enabled() {
+                cx.perf_monitor
+                    .begin_work("widget.draw", inner.widget.widget_type_name())
+            } else {
+                None
+            };
             let step = inner.widget.draw(cx, &mut Scope::empty()).step();
+            cx.perf_monitor.end_work(perf);
             cx.exit_nesting_depth();
             if let Some(nd) = step {
                 if nd.is_empty() {
@@ -1286,7 +1318,14 @@ impl WidgetRef {
 
     pub fn draw_all(&self, cx: &mut Cx2d, scope: &mut Scope) {
         if let Some(inner) = self.0.borrow_mut().as_mut() {
-            return inner.widget.draw_all(cx, scope);
+            let perf = if cx.perf_monitor.enabled() {
+                cx.perf_monitor
+                    .begin_work("widget.draw", inner.widget.widget_type_name())
+            } else {
+                None
+            };
+            inner.widget.draw_all(cx, scope);
+            cx.perf_monitor.end_work(perf);
         }
     }
 
@@ -1306,7 +1345,14 @@ impl WidgetRef {
 
     pub fn draw_all_unscoped(&self, cx: &mut Cx2d) {
         if let Some(inner) = self.0.borrow_mut().as_mut() {
-            return inner.widget.draw_all_unscoped(cx);
+            let perf = if cx.perf_monitor.enabled() {
+                cx.perf_monitor
+                    .begin_work("widget.draw", inner.widget.widget_type_name())
+            } else {
+                None
+            };
+            inner.widget.draw_all_unscoped(cx);
+            cx.perf_monitor.end_work(perf);
         }
     }
 
@@ -1367,6 +1413,30 @@ impl WidgetRef {
     }
 
     fn script_apply(
+        &self,
+        vm: &mut ScriptVm,
+        apply: &Apply,
+        scope: &mut Scope,
+        value: ScriptValue,
+    ) {
+        let perf = if vm.cx_mut().perf_monitor.enabled() {
+            let component = self
+                .0
+                .borrow()
+                .as_ref()
+                .map(|inner| inner.widget.widget_type_name())
+                .unwrap_or("WidgetRef");
+            vm.cx_mut()
+                .perf_monitor
+                .begin_work("widget.apply", component)
+        } else {
+            None
+        };
+        self.script_apply_inner(vm, apply, scope, value);
+        vm.cx_mut().perf_monitor.end_work(perf);
+    }
+
+    fn script_apply_inner(
         &self,
         vm: &mut ScriptVm,
         apply: &Apply,

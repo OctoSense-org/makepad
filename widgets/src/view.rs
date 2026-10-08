@@ -373,6 +373,9 @@ impl ViewRef {
     /// Updates this view's typed walk without evaluating script.
     pub fn set_walk(&self, cx: &mut Cx, walk: Walk) {
         if let Some(mut inner) = self.borrow_mut() {
+            if inner.walk == walk {
+                return;
+            }
             inner.walk = walk;
             inner.redraw(cx);
         }
