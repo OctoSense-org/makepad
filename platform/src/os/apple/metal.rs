@@ -590,9 +590,6 @@ impl Cx {
                     }
                 }
 
-                if sh.mapping.uses_time {
-                    self.demo_time_repaint = true;
-                }
 
                 if debug_dump {
                     println!(
@@ -634,8 +631,18 @@ impl Cx {
                         }),
                 });
 
+                if sh.mapping.uses_time {
+                    crate::trace!("gpu.time", "shader={:?} list={:?} item={} instances={}", sh.debug_id, draw_list_id, draw_item_id, instances);
+                }
+
                 if instances == 0 {
                     continue;
+                }
+
+                // Empty calls left behind by a hidden spinner must not keep
+                // the entire window repainting at display rate.
+                if sh.mapping.uses_time {
+                    self.demo_time_repaint = true;
                 }
 
                 let encoder = encoders.group(draw_call.draw_shader_id.index, sh);
@@ -1222,7 +1229,6 @@ impl Cx {
         }
 
         if pass_rect.size.x < 0.5 || pass_rect.size.y < 0.5 {
-            crate::trace!("gpu.trace", "pass {:?} skipped empty rectangle {:?}", draw_pass_id, pass_rect);
             if !matches!(&mode, DrawPassMode::MTKView(_)) {
                 self.passes[draw_pass_id].paint_dirty = false;
             }

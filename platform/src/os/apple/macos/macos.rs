@@ -808,7 +808,6 @@ impl Cx {
                             }
                             drawable
                         };
-                        crate::trace!("gpu.drawable", "window={} pass={:?} acquired={} occluded={} in_flight={} size={:?}", window_id.id(), draw_pass_id, acquired.is_some(), occlusion & NS_WINDOW_OCCLUSION_STATE_VISIBLE == 0, in_flight, metal_window.cal_size);
                         // A ready drawable proves compositor capacity even if
                         // presented callbacks are late/lost. Acquisition is on
                         // the worker, so callback debt cannot starve this beat.
