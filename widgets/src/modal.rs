@@ -176,6 +176,16 @@ impl Widget for Modal {
     /// sized by the pass, so its geometry comes from `Walk::fill()` against
     /// that root — never from the slot a parent thought it was handing over.
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
+        if !self.is_open {
+            // Clear a previously open overlay even when its parent draw list
+            // is retained. A closed modal needs no hit target: drawing the
+            // transparent background here repainted the whole window for each
+            // closed modal on every frame, despite producing no visible ink.
+            let draw_list = self.draw_list.as_mut().unwrap();
+            draw_list.begin_overlay_reuse(cx);
+            draw_list.end(cx);
+            return DrawStep::done();
+        }
         let bounds = cx.global::<ModalBounds>().0;
         // Bounded to part of the pass, the overlay also takes the view transform
         // of the list it opens from: a host may draw the app shifted or scaled
