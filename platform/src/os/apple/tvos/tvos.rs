@@ -136,6 +136,7 @@ impl Cx {
         match &event {
             TvosEvent::Timer(te) => {
                 if te.timer_id == 0 {
+                    SignalToUI::check_and_clear_renderer_signal();
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_media_signals();
                         self.handle_script_signals();

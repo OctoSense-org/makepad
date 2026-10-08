@@ -1058,7 +1058,7 @@ impl CxDrawListPool {
                 let _ = returned.try_send(batch);
                 counter.fetch_sub(1, Ordering::AcqRel);
                 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
-                crate::thread::SignalToUI::set_ui_signal();
+                crate::thread::SignalToUI::set_renderer_signal();
             };
             // Android and OpenHarmony serve the rest of the debt on the idle vsync beat
             // (`opengl_maintain_instance_retirements`) and on every painted
@@ -1066,10 +1066,9 @@ impl CxDrawListPool {
             // raise (twice, with the pool's completion signal) arrived once per
             // animation frame as an `Event::Signal` through the whole app,
             // hosted modules included, and as an extra trip round the loop.
-            #[cfg(any(target_os = "android", target_env = "ohos"))]
+            // Other backends wake only their maintenance path above. The pool
+            // must not publish an application signal for this detached job.
             slot.submit_detached_silent("retained draw storage retirement", job);
-            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
-            slot.submit_named("retained draw storage retirement", job).detach();
         }
         // Settlement includes rotating scans and completion/metadata debt,
         // not just the queue of freed CPU publications. Otherwise a view can

@@ -56,6 +56,7 @@ pub struct SignalToUI(Arc<AtomicBool>);
 
 static UI_SIGNAL: AtomicBool = AtomicBool::new(false);
 static ACTION_SIGNAL: AtomicBool = AtomicBool::new(false);
+static RENDERER_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 impl SignalToUI {
     pub fn set_ui_signal() {
@@ -64,18 +65,37 @@ impl SignalToUI {
         }
     }
 
+    /// Wake backend maintenance without delivering an application `Event::Signal`.
+    /// Renderers use this after asynchronous submission, allocation, or compilation;
+    /// completed application work must continue to use `set_ui_signal`.
+    pub fn set_renderer_signal() {
+        if !RENDERER_SIGNAL.swap(true, Ordering::AcqRel) {
+            wake_ui();
+        }
+    }
+
+    /// Consume a renderer wake in the platform event loop, before servicing paints.
+    pub fn check_and_clear_renderer_signal() -> bool {
+        RENDERER_SIGNAL.swap(false, Ordering::AcqRel)
+    }
+
     pub fn set_action_signal() {
         if !ACTION_SIGNAL.swap(true, Ordering::AcqRel) {
             wake_ui();
         }
     }
 
-    /// Whether a UI or action signal is raised and not yet taken. Does not
+    /// Whether an application, action, or renderer wake is pending. Does not
     /// clear it: the event loop uses it to decide whether a wake needs a tick.
     pub fn signal_pending() -> bool {
-        UI_SIGNAL.load(Ordering::Acquire) || ACTION_SIGNAL.load(Ordering::Acquire)
+        UI_SIGNAL.load(Ordering::Acquire)
+            || ACTION_SIGNAL.load(Ordering::Acquire)
+            || RENDERER_SIGNAL.load(Ordering::Acquire)
     }
 
+    /// Platform event-loop consumption only. Application `Event::Signal` handlers
+    /// must drain their own queues or check an owned `SignalToUI` instance instead:
+    /// the global flag has already been consumed before that event is dispatched.
     pub fn check_and_clear_ui_signal() -> bool {
         UI_SIGNAL.swap(false, Ordering::AcqRel)
     }

@@ -310,6 +310,7 @@ impl X11Cx {
             XlibEvent::Timer(e) => {
                 let mut cx = self.cx.borrow_mut();
                 if e.timer_id == 0 {
+                    SignalToUI::check_and_clear_renderer_signal();
                     if SignalToUI::check_and_clear_ui_signal() {
                         cx.handle_termination_signal();
                         cx.handle_media_signals();

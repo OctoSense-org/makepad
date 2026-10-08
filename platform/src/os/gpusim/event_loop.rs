@@ -134,6 +134,7 @@ impl Cx {
 
         let mut completed_cycles = 0usize;
         while running && completed_cycles < draw_cycles {
+            SignalToUI::check_and_clear_renderer_signal();
             if SignalToUI::check_and_clear_ui_signal() {
                 self.handle_termination_signal();
                 self.handle_script_signals();
@@ -400,6 +401,7 @@ impl Cx {
                 }
                 StudioToApp::RunViewFrameRequest(_) => {}
                 StudioToApp::Tick => {
+                    SignalToUI::check_and_clear_renderer_signal();
                     if SignalToUI::check_and_clear_ui_signal() {
                         self.handle_termination_signal();
                         self.handle_script_signals();

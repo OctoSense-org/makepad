@@ -1730,6 +1730,9 @@ pub unsafe extern "C" fn wasm_get_js_message_bridge(cx_ptr: u32) -> u32 {
 #[cfg(target_arch = "wasm32")]
 pub unsafe extern "C" fn wasm_check_signal() -> u32 {
     let mut x = 0;
+    if SignalToUI::check_and_clear_renderer_signal() {
+        x |= 4; // Pump backend maintenance without forwarding Event::Signal.
+    }
     if SignalToUI::check_and_clear_ui_signal() {
         x |= 1
     }
