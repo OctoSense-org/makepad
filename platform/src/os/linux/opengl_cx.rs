@@ -390,7 +390,13 @@ impl Cx {
         let mut zbias = 0.0;
         let zbias_step = self.passes[draw_pass_id].zbias_step;
 
+        // GPU time per pass and per shader (`MAKEPAD_TRACE=gpu.pass,gpu.draws`),
+        // as Android reports it; polling also reads back the texture passes'
+        // intervals, which nothing else on this backend collects.
+        let timed = super::gl_timer::begin_pass(self.os.gl(), &self.passes[draw_pass_id].debug_name);
         self.render_view(draw_pass_id, draw_list_id, &mut zbias, zbias_step);
+        super::gl_timer::end(self.os.gl(), timed);
+        super::gl_timer::poll(self.os.gl());
 
         if crate::makepad_error_log::trace_enabled("gl.readback") {
             let mut pixel = [0u8; 4];
