@@ -1850,7 +1850,7 @@ mod tests {
             let page_ref = nav.view_by_id(&mut cx, page);
             page_ref
                 .as_stack_navigation_view()
-                .show_at_rest(&mut cx, size.x);
+                .show_at_rest(&mut cx);
             let actions = cx.capture_actions(|cx| {
                 cx.widget_action(
                     page_ref.widget_uid(),
