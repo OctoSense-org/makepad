@@ -563,28 +563,39 @@ impl Fling {
 
     /// Advance the fling to wall-clock time `now` (the NextFrame event time).
     ///
-    /// Returns `None` on the first frame, which only establishes the time base. Afterwards
-    /// returns `Some(displacement)` in pixels, with `velocity` decayed for the next step.
+    /// Returns `Some(displacement)` in pixels, with `velocity` decayed for the next step.
+    /// Like the bounce clock, the first frame advances by a nominal frame interval.
+    /// Spending it only establishing a time base freezes the list for one refresh
+    /// at the drag-to-fling handoff. Subsequent frames use measured intervals.
     ///
     /// Frame delivery is not perfectly vsync-uniform (e.g. Windows `Present(1,0)` can return
     /// early or span more than one vblank), so the raw inter-frame dt jitters. We track an EMA
     /// of the interval and clamp the dt used to a tight band around it, so a single late or
     /// early frame can't produce a visible jump or stall.
     pub fn step(&mut self, now: f64) -> Option<f64> {
-        if self.last_time <= 0.0 {
-            self.last_time = now;
-            self.dt_ema = 0.0;
-            return None;
-        }
-        let raw_dt = (now - self.last_time).clamp(0.0, FLING_MAX_DT);
-        self.last_time = now;
-        if self.dt_ema <= 0.0 {
-            self.dt_ema = raw_dt;
+        let first_step = self.last_time <= 0.0;
+        let raw_dt = if first_step {
+            // Input timestamps and NextFrame timestamps need not share an epoch
+            // (Android touch events use uptime). Seed from the animation clock,
+            // using the same first-step policy as a mid-motion bounce.
+            FRAME_CLOCK_FIRST_STEP
         } else {
-            self.dt_ema =
-                self.dt_ema * (1.0 - FLING_DT_EMA_ALPHA) + raw_dt * FLING_DT_EMA_ALPHA;
-        }
-        let dt = raw_dt.clamp(self.dt_ema * FLING_DT_BAND.0, self.dt_ema * FLING_DT_BAND.1);
+            (now - self.last_time).clamp(0.0, FLING_MAX_DT)
+        };
+        self.last_time = now;
+        let dt = if first_step {
+            // Let the next measured interval seed the EMA, including on displays
+            // whose refresh rate differs from the nominal first step.
+            raw_dt
+        } else {
+            if self.dt_ema <= 0.0 {
+                self.dt_ema = raw_dt;
+            } else {
+                self.dt_ema =
+                    self.dt_ema * (1.0 - FLING_DT_EMA_ALPHA) + raw_dt * FLING_DT_EMA_ALPHA;
+            }
+            raw_dt.clamp(self.dt_ema * FLING_DT_BAND.0, self.dt_ema * FLING_DT_BAND.1)
+        };
         if USE_ANDROID_FLING_SPLINE {
             self.age += dt;
             return Some(self.step_android_spline());
