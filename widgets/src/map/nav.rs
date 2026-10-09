@@ -6,7 +6,14 @@
 //!   `route_markers` (`"lat,lon,kind;…"`, kind 0 origin / 1 stop / 2
 //!   destination), `route_badge`, and the `nav_*` tuning numbers;
 //! * script methods — `ui.<map>.set_nav_polyline(s)`, `set_route_markers(s)`,
-//!   `set_nav_recenter(_)`, `nav_zoom_by(delta)`, `nav_center_origin()`.
+//!   `set_nav_recenter(_)`, `nav_zoom_by(delta)`, `nav_center_origin()`;
+//! * for a plain map only (no `nav_mode`; with one the nav camera owns the
+//!   view and these do nothing) — `fly_to(lat, lon, zoom)` (zoom optional)
+//!   and `fit_route()` (frame the route once, as `"plan"` does, then leave
+//!   the camera alone);
+//! * on any map — `clear_route()` (the route and any pending fit; the pins
+//!   stay) and the callbacks `on_tap`, `on_long_press`, `on_marker`,
+//!   `on_viewport` (see `MapView`).
 //!
 //! It renders through the map's own overlay (route ribbon, puck, pins) and
 //! camera (center / rotation / tilt / zoom) rather than the dedicated pinhole
@@ -182,6 +189,13 @@ impl NavState {
             changed = true;
         }
         changed
+    }
+
+    /// Drop the route as adopting an empty polyline would, now rather than
+    /// at the next draw.
+    pub fn forget_route(&mut self) {
+        self.poly_seen.clear();
+        self.set_route_coords(Vec::new());
     }
 
     /// `(lat, lon)` route -> resampled normalized points + cumulative metres.
