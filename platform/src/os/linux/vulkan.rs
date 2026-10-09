@@ -559,6 +559,46 @@ impl PresentStats {
     }
 }
 
+/// The present mode of a windowed swapchain: mailbox when the surface offers
+/// it, else FIFO. The Wayland loop already paces presents on the compositor's
+/// frame callbacks, one per vblank; a FIFO swapchain adds the driver's own
+/// wait for the previous image to be presented, and the two in series cost two
+/// vblanks per frame (60 presents per second on a 120 Hz output, measured with
+/// a wheel step every 8 ms). Mailbox leaves the pacing to the loop, as GL's
+/// swap interval of zero does, and the compositor still composes without
+/// tearing. `MAKEPAD_VULKAN_PRESENT_MODE=fifo|mailbox|immediate` overrides.
+#[cfg(target_os = "linux")]
+fn window_present_mode(available: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    let requested = match std::env::var("MAKEPAD_VULKAN_PRESENT_MODE").ok().as_deref() {
+        Some("fifo") => Some(vk::PresentModeKHR::FIFO),
+        Some("mailbox") => Some(vk::PresentModeKHR::MAILBOX),
+        Some("immediate") => Some(vk::PresentModeKHR::IMMEDIATE),
+        Some(other) => {
+            crate::warning!("MAKEPAD_VULKAN_PRESENT_MODE={other:?} is not fifo, mailbox or immediate");
+            None
+        }
+        None => None,
+    };
+    let preferred = [vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO];
+    let mode = requested
+        .into_iter()
+        .chain(preferred)
+        .find(|mode| available.contains(mode))
+        .or_else(|| available.first().copied())
+        .unwrap_or(vk::PresentModeKHR::FIFO);
+    crate::log!("Vulkan swapchain present mode: {mode:?} (available {available:?})");
+    mode
+}
+
+#[cfg(not(target_os = "linux"))]
+fn window_present_mode(available: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    if available.contains(&vk::PresentModeKHR::FIFO) {
+        vk::PresentModeKHR::FIFO
+    } else {
+        available.first().copied().unwrap_or(vk::PresentModeKHR::FIFO)
+    }
+}
+
 impl CxVulkan {
     /// A present attempt that found the GPU or the compositor busy: the frame
     /// stays dirty and the event loop comes back for it.
@@ -7845,14 +7885,7 @@ impl CxVulkan {
                 .get_physical_device_surface_present_modes(self.physical_device, self.surface)
         }
         .map_err(|e| format!("get_surface_present_modes failed: {e:?}"))?;
-        let present_mode = if present_modes.contains(&vk::PresentModeKHR::FIFO) {
-            vk::PresentModeKHR::FIFO
-        } else {
-            present_modes
-                .first()
-                .copied()
-                .unwrap_or(vk::PresentModeKHR::FIFO)
-        };
+        let present_mode = window_present_mode(&present_modes);
 
         let usage = capabilities.supported_usage_flags;
         if !usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
