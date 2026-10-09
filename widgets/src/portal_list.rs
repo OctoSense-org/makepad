@@ -1256,6 +1256,7 @@ impl PortalList {
         // When a selection is active (but drag finished), keep selected items alive
         // so their selection state persists when scrolled back into view.
         if !self.keep_invisible && !self.is_selecting {
+            let previous_item_count = self.items.len();
             let selection_range = self.get_selection_range();
             self.cached_item_order.truncate(self.cache_items);
             if self.reuse_items {
@@ -1274,7 +1275,12 @@ impl PortalList {
             } else {
                 self.items.retain_visible();
             }
-            cx.widget_tree_mark_dirty(self.uid);
+            // Retaining existing rows does not change the widget tree. New or
+            // replaced rows are registered by item_with_existed; this pass can
+            // only remove rows, so refresh the tree only when it did so.
+            if self.items.len() != previous_item_count {
+                cx.widget_tree_mark_dirty(self.uid);
+            }
         }
 
         cx.end_turtle_with_area(&mut self.area);
@@ -1839,6 +1845,45 @@ impl PortalList {
         self.caught_fling = None;
     }
 
+    /// A child can take the finger (for example, a long-press text selection)
+    /// without this list receiving FingerUp. Retire that drag immediately so its
+    /// samples cannot classify the next press as a catch and suppress child moves.
+    fn cancel_drag_without_capture(&mut self, cx: &mut Cx) {
+        if !matches!(self.scroll_state, ScrollState::Drag { .. })
+            || cx.fingers.is_area_captured(self.area)
+        {
+            return;
+        }
+        self.was_scrolling = false;
+        self.suppress_child_events = false;
+        self.stretching = false;
+        self.caught_fling = None;
+        self.momentum = MomentumStream::Idle;
+        self.scroll_state = if self.bounce_at_start
+            && self.first_id == self.range_start && self.first_scroll > 0.0
+        {
+            ScrollState::Pulldown {
+                next_frame: cx.new_next_frame(),
+                x0: self.first_scroll,
+                v0: 0.0,
+                clock: FrameClock::default(),
+                at_start: true,
+                touch: true,
+            }
+        } else if self.bounce_at_end && self.bounce_overshoot > 0.0 {
+            ScrollState::Pulldown {
+                next_frame: cx.new_next_frame(),
+                x0: self.bounce_overshoot,
+                v0: 0.0,
+                clock: FrameClock::default(),
+                at_start: false,
+                touch: true,
+            }
+        } else {
+            ScrollState::Stopped
+        };
+    }
+
     /// Whether a press at `time` belongs to a touch that just stopped live motion.
     fn press_is_catch(&self, time: f64) -> bool {
         self.touch_caught_motion_at
@@ -2003,6 +2048,13 @@ impl PortalList {
     /// Enables or disables auto-tracking the last item in the list.
     pub fn set_tail_range(&mut self, tail_range: bool) {
         self.tail_range = tail_range;
+    }
+
+    /// Controls whether the list may take pointer capture from a child.
+    /// This only changes input routing: it does not redraw, reapply templates,
+    /// or reset the current scroll position and auto-tail state.
+    pub fn set_capture_overload(&mut self, capture_overload: bool) {
+        self.capture_overload = capture_overload;
     }
 
     /// Sets the flow direction, e.g. to switch a list between a vertical
@@ -2639,6 +2691,7 @@ impl WidgetNode for PortalList {
 impl Widget for PortalList {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let uid = self.widget_uid();
+        self.cancel_drag_without_capture(cx);
 
         // Selection autoscroll is driven by next-frame ticks. If pointer-up happens outside
         // hit testing, selection can get "stuck" and keep scheduling frames. Clear it on
@@ -2853,6 +2906,8 @@ impl Widget for PortalList {
             }
             self.event_item_ids = item_ids;
         }
+        // Capture may have moved to a child during the dispatch above.
+        self.cancel_drag_without_capture(cx);
 
         // Handle auto-scroll during selection
         if let Some(mut scroll_state) = self.select_scroll_state.take() {
@@ -3703,6 +3758,13 @@ impl PortalListRef {
     pub fn set_tail_range(&self, tail_range: bool) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.tail_range = tail_range;
+        }
+    }
+
+    /// See [`PortalList::set_capture_overload`].
+    pub fn set_capture_overload(&self, capture_overload: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_capture_overload(capture_overload);
         }
     }
 

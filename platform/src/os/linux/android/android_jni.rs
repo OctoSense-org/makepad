@@ -830,12 +830,19 @@ static mut CHOREOGRAPHER_POST_CALLBACK_FN: Option<
 #[allow(unused)]
 #[no_mangle]
 pub unsafe extern "C" fn Java_dev_makepad_android_MakepadNative_initChoreographer(
-    _: *mut jni_sys::JNIEnv,
-    _: jni_sys::jclass,
+    env: *mut jni_sys::JNIEnv,
+    class: jni_sys::jclass,
     device_refresh_rate: jni_sys::jfloat,
     sdk_version: jni_sys::jint,
 ) {
     if RENDER_LOOP_ACTIVE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    // ViewRootImpl batches touch input on Java's Choreographer. Prefer its
+    // animation phase so the render beat follows that input in the same frame.
+    // Keep the existing JNI signature and NDK fallback for older packagers.
+    #[cfg(not(no_android_choreographer))]
+    if start_java_choreographer(env, class) {
         return;
     }
     // If the Choreographer is not available (e.g. OHOS), use a manual render loop
@@ -896,6 +903,31 @@ pub unsafe fn post_vsync_callback() {
     RENDER_LOOP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Older cargo-makepad Java sources lack this bridge. Clear the lookup's
+/// NoSuchMethodError and retain native scheduling rather than freezing their UI.
+#[cfg(not(no_android_choreographer))]
+unsafe fn start_java_choreographer(
+    env: *mut jni_sys::JNIEnv,
+    class: jni_sys::jclass,
+) -> bool {
+    let method = ((**env).GetStaticMethodID.unwrap())(
+        env,
+        class,
+        c"startRenderLoop".as_ptr(),
+        c"()V".as_ptr(),
+    );
+    if method.is_null() {
+        ((**env).ExceptionClear.unwrap())(env);
+        return false;
+    }
+    ((**env).CallStaticVoidMethod.unwrap())(env, class, method);
+    if ((**env).ExceptionCheck.unwrap())(env) != 0 {
+        ((**env).ExceptionClear.unwrap())(env);
+        return false;
+    }
+    true
+}
+
 /// Fallback render loop used when the Android Choreographer isn't available
 /// (API < 29, and `no_android_choreographer` builds such as OHOS). A dedicated
 /// thread paces frames manually, since there is no system vsync callback.
@@ -907,7 +939,7 @@ fn init_simple_render_loop(device_refresh_rate: f32) {
             // Exit the thread once the app has shut down and the Java->native
             // message channel has been torn down by `from_java_messages_clear()`
             // (called when the main event loop quits). This mirrors
-            // `post_vsync_callback`, which likewise stops re-arming the
+            // Java's frame callback, which likewise stops re-arming the
             // Choreographer once `from_java_messages_already_set()` is false.
             //
             // Without this, the thread spins forever after the activity is
@@ -1291,9 +1323,14 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnSafeAreaInsets(
 #[no_mangle]
 extern "C" fn Java_dev_makepad_android_MakepadNative_onRenderLoop(
     _: *mut jni_sys::JNIEnv,
-    _: jni_sys::jobject,
-) {
+    _: jni_sys::jclass,
+) -> jni_sys::jboolean {
+    if !from_java_messages_already_set() {
+        RENDER_LOOP_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+        return 0;
+    }
     send_from_java_message(FromJavaMessage::RenderLoop);
+    1
 }
 
 #[no_mangle]

@@ -88,7 +88,7 @@ pub enum AlignEntry {
 }
 
 /// Specifies how a turtle should walk.
-#[derive(Copy, Clone, Default, Debug, Script, ScriptHook)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Script, ScriptHook)]
 pub struct Walk {
     #[doc(hidden)]
     #[live]
@@ -254,7 +254,7 @@ impl Walk {
     }
 }
 
-#[derive(Copy, Clone, Debug, Script, ScriptHook)]
+#[derive(Copy, Clone, Debug, PartialEq, Script, ScriptHook)]
 pub struct Metrics {
     #[live]
     pub descender: f64,

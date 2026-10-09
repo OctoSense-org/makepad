@@ -15,10 +15,35 @@
 //! Collection is off until something (normally the PerfGraph widget) calls
 //! `set_enabled(true)`; disabled adds are a single branch.
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 pub const PERF_MONITOR_HISTORY: usize = 240;
 pub const PERF_MONITOR_MAX_CHANNELS: usize = 12;
+// A full application has more than 256 operation/type pairs even though
+// repeated row instances share entries. Keep captures bounded without losing
+// most of their attribution before the first conversation is opened.
+pub const PERF_MONITOR_MAX_WORK: usize = 1024;
+
+/// Aggregate by operation and static component type, never by user content or
+/// instance ID. Scrolling through new widgets cannot grow this table unbounded.
+#[derive(Clone)]
+pub struct PerfWorkSample {
+    pub operation: &'static str,
+    pub component: &'static str,
+    pub calls: u64,
+    pub total_ns: u64,
+    pub self_ns: u64,
+    pub max_ns: u64,
+}
+
+/// A main-thread measurement. Finish descendants before their parents.
+pub struct PerfWorkToken {
+    slot: usize,
+    started: f64,
+    completed_self_ns: u64,
+    generation: u64,
+    owner: Rc<Cell<u32>>,
+}
 
 /// GPU completion handlers run off-thread; they park each presented frame's
 /// GPU time here and the next `frame_boundary` folds it into the ring.
@@ -79,6 +104,11 @@ pub struct PerfMonitor {
     event_deduct: u32,
     /// Window repaints seen since enabling (see `frames_painted`).
     frames_painted: u64,
+    work: Vec<PerfWorkSample>,
+    work_index: HashMap<(&'static str, &'static str), usize>,
+    completed_self_ns: u64,
+    work_generation: u64,
+    work_overflow: u64,
 }
 
 impl Default for PerfMonitor {
@@ -100,12 +130,20 @@ impl Default for PerfMonitor {
             event_depth: Rc::new(Cell::new(0)),
             event_deduct: 0,
             frames_painted: 0,
+            work: Vec::new(),
+            work_index: HashMap::new(),
+            completed_self_ns: 0,
+            work_generation: 0,
+            work_overflow: 0,
         }
     }
 }
 
 impl PerfMonitor {
     pub fn set_enabled(&mut self, on: bool) {
+        if self.enabled != on {
+            self.work_generation = self.work_generation.wrapping_add(1);
+        }
         self.enabled = on;
         GPU_COLLECT.store(on, std::sync::atomic::Ordering::Relaxed);
         if !on {
@@ -118,6 +156,86 @@ impl PerfMonitor {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    fn work_slot(&mut self, operation: &'static str, component: &'static str) -> Option<usize> {
+        if !self.enabled {
+            return None;
+        }
+        let key = (operation, component);
+        if let Some(slot) = self.work_index.get(&key) {
+            return Some(*slot);
+        }
+        if self.work.len() == PERF_MONITOR_MAX_WORK {
+            self.work_overflow = self.work_overflow.saturating_add(1);
+            return None;
+        }
+        let slot = self.work.len();
+        self.work.push(PerfWorkSample {
+            operation,
+            component,
+            calls: 0,
+            total_ns: 0,
+            self_ns: 0,
+            max_ns: 0,
+        });
+        self.work_index.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Disabled measurements neither read the clock nor allocate. Component
+    /// names should be static type names, not per-message identifiers.
+    pub fn begin_work(
+        &mut self,
+        operation: &'static str,
+        component: &'static str,
+    ) -> Option<PerfWorkToken> {
+        let slot = self.work_slot(operation, component)?;
+        Some(PerfWorkToken {
+            slot,
+            started: crate::cx::Cx::monotonic_now(),
+            completed_self_ns: self.completed_self_ns,
+            generation: self.work_generation,
+            owner: self.event_depth.clone(),
+        })
+    }
+
+    pub fn end_work(&mut self, token: Option<PerfWorkToken>) {
+        let Some(token) = token else { return };
+        if !self.enabled
+            || token.generation != self.work_generation
+            || !Rc::ptr_eq(&token.owner, &self.event_depth)
+        {
+            return;
+        }
+        let elapsed = ((crate::cx::Cx::monotonic_now() - token.started).max(0.0) * 1e9) as u64;
+        // Descendant exclusive times sum to their whole subtree exactly once.
+        let own = elapsed.saturating_sub(
+            self.completed_self_ns
+                .saturating_sub(token.completed_self_ns),
+        );
+        let sample = &mut self.work[token.slot];
+        sample.calls = sample.calls.saturating_add(1);
+        sample.total_ns = sample.total_ns.saturating_add(elapsed);
+        sample.self_ns = sample.self_ns.saturating_add(own);
+        sample.max_ns = sample.max_ns.max(elapsed);
+        self.completed_self_ns = self.completed_self_ns.saturating_add(own);
+    }
+
+    /// Count work without timing it. Counter rows have zero timing fields.
+    pub fn count_work(&mut self, operation: &'static str, component: &'static str, count: u64) {
+        if let Some(slot) = self.work_slot(operation, component) {
+            self.work[slot].calls = self.work[slot].calls.saturating_add(count);
+        }
+    }
+
+    pub fn work(&self) -> &[PerfWorkSample] {
+        &self.work
+    }
+
+    /// Measurements omitted because the bounded operation/type table is full.
+    pub fn work_overflow(&self) -> u64 {
+        self.work_overflow
     }
 
     /// Number of window repaints (frame boundaries) recorded while enabled.

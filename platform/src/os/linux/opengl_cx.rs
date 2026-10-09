@@ -452,47 +452,11 @@ impl Cx {
             }
         }
 
-        // Studio screenshot readback: read framebuffer pixels before swap.
-        // The drain names this pass's window: every `--remote` grab targets a
-        // window, and a drain that names none never answers it.
-        let capture_window_id = self.get_pass_window_id(draw_pass_id).map(|w| w.id());
-        let request_ids = self.take_studio_screenshot_request_ids_for_window(0, capture_window_id);
-        // A continuous capture sink (the ScreenCap recorder) is standing
-        // permission rather than a queued request, so it is asked separately.
-        let wants_capture = crate::screen_capture::capture_wants_window(capture_window_id);
-        if !request_ids.is_empty() || wants_capture {
-            let w = pix_width.floor() as u32;
-            let h = pix_height.floor() as u32;
-            let mut pixels = vec![0u8; (w * h * 4) as usize];
-            unsafe {
-                let gl = self.os.gl();
-                (gl.glReadPixels)(
-                    0,
-                    0,
-                    w as i32,
-                    h as i32,
-                    gl_sys::RGBA,
-                    gl_sys::UNSIGNED_BYTE,
-                    pixels.as_mut_ptr() as *mut _,
-                );
-            }
-            // OpenGL reads bottom-up; flip rows for top-down PNG.
-            let stride = (w * 4) as usize;
-            for y in 0..(h as usize / 2) {
-                let top = y * stride;
-                let bot = ((h as usize) - 1 - y) * stride;
-                for x in 0..stride {
-                    pixels.swap(top + x, bot + x);
-                }
-            }
-            crate::screen_capture::deliver_capture_frame(capture_window_id, w, h, &pixels);
-            // Encode as PNG.
-            if !request_ids.is_empty() {
-                if let Ok(png) = Self::encode_rgba_as_png(w, h, &pixels) {
-                    Self::send_studio_screenshot_response(request_ids, w, h, png);
-                }
-            }
-        }
+        self.opengl_capture_window(
+            self.get_pass_window_id(draw_pass_id).map(|w| w.id()),
+            pix_width.floor() as u32,
+            pix_height.floor() as u32,
+        );
 
         #[cfg(target_os = "android")]
         if let Some(request) = self.take_studio_run_view_frame_request(0) {

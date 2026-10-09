@@ -130,6 +130,35 @@ impl ScriptHook for DrawVars {
 }
 
 impl DrawVars {
+    /// Instance slots can carry packed integer bits, including NaN payloads.
+    /// Preserve signed zero and bit patterns while avoiding identical GPU writes.
+    fn copy_changed_slots(
+        target: &mut [f32],
+        value: &[f32],
+        perf: &mut crate::perf_monitor::PerfMonitor,
+    ) -> bool {
+        debug_assert_eq!(target.len(), value.len());
+        let changed = !target
+            .iter()
+            .zip(value)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        if perf.enabled() {
+            perf.count_work(
+                if changed {
+                    "shader.write.changed"
+                } else {
+                    "shader.write.unchanged"
+                },
+                "DrawVars",
+                1,
+            );
+        }
+        if changed {
+            target.copy_from_slice(value);
+        }
+        changed
+    }
+
     /// Loud report for a failed draw-shader compile. A shader that fails
     /// must never fall back silently: the draw is skipped from then on and
     /// the only on-screen symptom is a flat clear-color region where the
@@ -243,12 +272,13 @@ impl DrawVars {
                     let key: ScriptValue = input.id.into();
                     if obj_map.contains_key(&key) {
                         for j in 0..repeat {
-                            for i in 0..input.slots {
-                                instances[input.offset + i + j * stride] =
-                                    inst_slice[input.offset + i]
-                            }
+                            let offset = input.offset + j * stride;
+                            any_updated |= Self::copy_changed_slots(
+                                &mut instances[offset..offset + input.slots],
+                                &inst_slice[input.offset..input.offset + input.slots],
+                                &mut cx.perf_monitor,
+                            );
                         }
-                        any_updated = true;
                     }
                 }
 
@@ -288,11 +318,12 @@ impl DrawVars {
                 for input in &sh.mapping.dyn_uniforms.inputs {
                     let key: ScriptValue = input.id.into();
                     if obj_map.contains_key(&key) {
-                        for i in 0..input.slots {
-                            draw_call.dyn_uniforms[input.offset + i] =
-                                self.dyn_uniforms[input.offset + i]
-                        }
-                        any_updated = true;
+                        let range = input.offset..input.offset + input.slots;
+                        any_updated |= Self::copy_changed_slots(
+                            &mut draw_call.dyn_uniforms[range.clone()],
+                            &self.dyn_uniforms[range],
+                            &mut cx.perf_monitor,
+                        );
                     }
                 }
 
@@ -525,8 +556,12 @@ impl DrawVars {
                     return;
                 };
 
-                    for i in 0..slots {
-                        draw_call.dyn_uniforms[offset + i] = value[i];
+                    if !Self::copy_changed_slots(
+                        &mut draw_call.dyn_uniforms[offset..offset + slots],
+                        &value[..slots],
+                        &mut cx.perf_monitor,
+                    ) {
+                        return;
                     }
                     draw_call.mark_uniforms_dirty(uniforms_gen);
                     if let Some(pass_id) = draw_list.draw_pass_id {
@@ -570,7 +605,14 @@ impl DrawVars {
         if draw_call.draw_shader_id != draw_shader_id {
             return false;
         }
-        draw_call.dyn_uniforms[offset..offset + slots].copy_from_slice(&value[..slots]);
+        if !Self::copy_changed_slots(
+            &mut draw_call.dyn_uniforms[offset..offset + slots],
+            &value[..slots],
+            &mut cx.perf_monitor,
+        ) {
+            // Success means a valid target, including an already-current value.
+            return true;
+        }
         draw_call.mark_uniforms_dirty(uniforms_gen);
         if let Some(pass_id) = draw_list.draw_pass_id {
             cx.passes[pass_id].paint_dirty = true;
@@ -677,8 +719,12 @@ impl DrawVars {
             if draw_call.draw_shader_id != draw_shader_id {
                 continue;
             }
-            for i in 0..slots {
-                draw_call.dyn_uniforms[offset + i] = value[i];
+            if !Self::copy_changed_slots(
+                &mut draw_call.dyn_uniforms[offset..offset + slots],
+                &value[..slots],
+                &mut cx.perf_monitor,
+            ) {
+                continue;
             }
             draw_call.mark_uniforms_dirty(Cx::next_uniform_gen_from(uniform_gen));
             touched = true;
@@ -728,13 +774,18 @@ impl DrawVars {
 
                     let instances = &mut all_instances[inst.instance_offset..];
 
-                    // Update all instances in this area
+                    let mut changed = false;
                     for j in 0..inst.instance_count {
-                        for i in 0..slots {
-                            instances[input.offset + i + j * stride] = value[i];
-                        }
+                        let offset = input.offset + j * stride;
+                        changed |= Self::copy_changed_slots(
+                            &mut instances[offset..offset + slots],
+                            &value[..slots],
+                            &mut cx.perf_monitor,
+                        );
                     }
-
+                    if !changed {
+                        return;
+                    }
                     draw_call.instance_dirty = true;
                     if let Some(pass_id) = draw_list.draw_pass_id {
                         cx.passes[pass_id].paint_dirty = true;
