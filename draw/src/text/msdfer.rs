@@ -18,8 +18,21 @@ const COLOR_WHITE: u8 = CHANNEL_R | CHANNEL_G | CHANNEL_B;
 
 const EDGE_COLORS: [u8; 3] = [COLOR_CYAN, COLOR_MAGENTA, COLOR_YELLOW];
 
+const CHANNELS: [u8; 3] = [CHANNEL_R, CHANNEL_G, CHANNEL_B];
+
 const QUADRATIC_FLATTEN_STEPS: usize = 64;
 const CUBIC_FLATTEN_STEPS: usize = 96;
+
+/// Flattened segments of one edge are culled in runs of at most this many,
+/// each with its own bounding box. Shorter runs hug the curve but add boxes to
+/// test at every pixel; 32 was fastest on Latin and CJK glyphs (4: 12x, 8: 19x,
+/// 16: 26x, 32: 28x, 64: 24x faster than the full scan).
+const SEGMENT_RUN_LEN: usize = 32;
+/// Slack (in pixels) on the culling bound, far above f32 rounding of these
+/// distances, so a segment that could tie the winner is never culled.
+const CULL_EPSILON: f32 = 1.0 / 64.0;
+/// A flattened segment this short (squared, in pixels) has no distance.
+const DEGENERATE_SEGMENT_LEN_SQ: f32 = 0.000_000_1;
 
 pub struct Msdfer {
     settings: Settings,
@@ -40,6 +53,22 @@ impl Msdfer {
         dpxs_per_em: f32,
         output: &mut SubimageMut<'_, Bgra>,
     ) {
+        self.render(outline, dpxs_per_em, output, true);
+    }
+
+    /// With `cull`, a pixel skips each run of segments whose bounding box lies
+    /// beyond every nearest distance the run could still improve. Those
+    /// segments are strictly farther than the winners, and the remaining ones
+    /// keep their order, so the image is identical to scanning every segment
+    /// (`cull == false`), which costs pixels x segments: ~10^7 distance
+    /// evaluations for one CJK glyph.
+    fn render(
+        &mut self,
+        outline: &GlyphOutline,
+        dpxs_per_em: f32,
+        output: &mut SubimageMut<'_, Bgra>,
+        cull: bool,
+    ) {
         let output_size = output.size();
         let inner_size = output_size
             .width
@@ -51,9 +80,11 @@ impl Msdfer {
         let mut shape = Shape::from_outline(outline);
         color_shape_edges(&mut shape, self.settings.corner_angle_threshold);
         let transform = outline.rasterize_transform(dpxs_per_em);
-        let segments = flatten_shape(&shape, transform, inner_size.height);
+        let (segments, runs) = flatten_shape(&shape, transform, inner_size.height);
 
         for y in 0..output_size.height {
+            // Nearest |distance| (R, G, B, overall) at the previous pixel of the row.
+            let mut previous: Option<[f32; 4]> = None;
             for x in 0..output_size.width {
                 let point = Point::new(
                     x as f32 - self.settings.padding as f32 + 0.5,
@@ -64,33 +95,65 @@ impl Msdfer {
                 let mut selector_b = ChannelSelector::default();
                 let mut min_distance = SignedDistance::inf();
 
-                for (segment_index, segment) in segments.iter().enumerate() {
-                    let (distance, param) = segment.signed_distance(point);
-                    if distance_is_better(distance, min_distance) {
-                        min_distance = distance;
+                // Upper bounds on this pixel's nearest distances. A distance
+                // moves by at most the one-pixel step, so the previous pixel's
+                // bound this one; a row's first pixel takes the closest of the
+                // runs' farthest box corners.
+                let bound = match (cull, previous) {
+                    (false, _) => [f32::INFINITY; 4],
+                    (true, Some(previous)) => previous.map(|distance| distance + 1.0 + CULL_EPSILON),
+                    (true, None) => far_corner_bounds_sq(&runs, point)
+                        .map(|bound_sq| bound_sq.sqrt() + CULL_EPSILON),
+                };
+
+                for run in &runs {
+                    if cull {
+                        let mut limit = bound[3];
+                        for channel in 0..3 {
+                            if run.color & CHANNELS[channel] != 0 {
+                                limit = limit.max(bound[channel]);
+                            }
+                        }
+                        if run.near_distance_sq(point) > limit * limit {
+                            continue;
+                        }
                     }
-                    if segment.color & CHANNEL_R != 0
-                        && distance_is_better(distance, selector_r.min_distance)
-                    {
-                        selector_r.min_distance = distance;
-                        selector_r.near_segment_index = Some(segment_index);
-                        selector_r.near_param = param;
-                    }
-                    if segment.color & CHANNEL_G != 0
-                        && distance_is_better(distance, selector_g.min_distance)
-                    {
-                        selector_g.min_distance = distance;
-                        selector_g.near_segment_index = Some(segment_index);
-                        selector_g.near_param = param;
-                    }
-                    if segment.color & CHANNEL_B != 0
-                        && distance_is_better(distance, selector_b.min_distance)
-                    {
-                        selector_b.min_distance = distance;
-                        selector_b.near_segment_index = Some(segment_index);
-                        selector_b.near_param = param;
+                    for segment_index in run.segments.clone() {
+                        let segment = &segments[segment_index];
+                        let (distance, param) = segment.signed_distance(point);
+                        if distance_is_better(distance, min_distance) {
+                            min_distance = distance;
+                        }
+                        if segment.color & CHANNEL_R != 0
+                            && distance_is_better(distance, selector_r.min_distance)
+                        {
+                            selector_r.min_distance = distance;
+                            selector_r.near_segment_index = Some(segment_index);
+                            selector_r.near_param = param;
+                        }
+                        if segment.color & CHANNEL_G != 0
+                            && distance_is_better(distance, selector_g.min_distance)
+                        {
+                            selector_g.min_distance = distance;
+                            selector_g.near_segment_index = Some(segment_index);
+                            selector_g.near_param = param;
+                        }
+                        if segment.color & CHANNEL_B != 0
+                            && distance_is_better(distance, selector_b.min_distance)
+                        {
+                            selector_b.min_distance = distance;
+                            selector_b.near_segment_index = Some(segment_index);
+                            selector_b.near_param = param;
+                        }
                     }
                 }
+
+                previous = Some([
+                    selector_r.min_distance.distance.abs(),
+                    selector_g.min_distance.distance.abs(),
+                    selector_b.min_distance.distance.abs(),
+                    min_distance.distance.abs(),
+                ]);
 
                 if !min_distance.distance.is_finite() {
                     output[Point::new(x, y)] = Bgra::new(0, 0, 0, 255);
@@ -340,14 +403,88 @@ fn flatten_shape(
     shape: &Shape,
     transform: Transform<f32>,
     inner_height: usize,
-) -> Vec<FlatSegment> {
+) -> (Vec<FlatSegment>, Vec<SegmentRun>) {
     let mut segments = Vec::new();
+    let mut runs = Vec::new();
     for contour in &shape.contours {
         for edge in &contour.edges {
+            let edge_start = segments.len();
             flatten_edge(*edge, transform, inner_height, &mut segments);
+            let mut start = edge_start;
+            while start < segments.len() {
+                let end = (start + SEGMENT_RUN_LEN).min(segments.len());
+                runs.push(SegmentRun::new(&segments, start..end, edge.color));
+                start = end;
+            }
         }
     }
-    segments
+    (segments, runs)
+}
+
+/// Consecutive flattened segments of one edge and the box that contains them.
+struct SegmentRun {
+    segments: std::ops::Range<usize>,
+    color: u8,
+    min: Point<f32>,
+    max: Point<f32>,
+    /// Whether a segment of the run has a finite distance, which its box's
+    /// farthest corner then bounds. A run of degenerate segments bounds nothing.
+    bounds_nearest: bool,
+}
+
+impl SegmentRun {
+    fn new(segments: &[FlatSegment], range: std::ops::Range<usize>, color: u8) -> Self {
+        let mut min = Point::new(f32::INFINITY, f32::INFINITY);
+        let mut max = Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for segment in &segments[range.clone()] {
+            for p in [segment.p0, segment.p1] {
+                min = Point::new(min.x.min(p.x), min.y.min(p.y));
+                max = Point::new(max.x.max(p.x), max.y.max(p.y));
+            }
+        }
+        let bounds_nearest = segments[range.clone()].iter().any(|segment| {
+            let v = Vec2::from_points(segment.p0, segment.p1);
+            v.dot(v) > DEGENERATE_SEGMENT_LEN_SQ
+        });
+        Self {
+            segments: range,
+            color,
+            min,
+            max,
+            bounds_nearest,
+        }
+    }
+
+    /// Squared distance from `point` to the box: no segment of the run is nearer.
+    fn near_distance_sq(&self, point: Point<f32>) -> f32 {
+        let x = (self.min.x - point.x).max(point.x - self.max.x).max(0.0);
+        let y = (self.min.y - point.y).max(point.y - self.max.y).max(0.0);
+        x * x + y * y
+    }
+
+    /// Squared distance from `point` to the box's farthest corner: the run's
+    /// nearest segment (if it has a distance) is no farther.
+    fn far_distance_sq(&self, point: Point<f32>) -> f32 {
+        let x = (point.x - self.min.x).abs().max((self.max.x - point.x).abs());
+        let y = (point.y - self.min.y).abs().max((self.max.y - point.y).abs());
+        x * x + y * y
+    }
+}
+
+/// Squared upper bounds on the nearest distance per channel (R, G, B) and
+/// overall: the closest farthest corner among the runs that can be nearest.
+fn far_corner_bounds_sq(runs: &[SegmentRun], point: Point<f32>) -> [f32; 4] {
+    let mut bound_sq = [f32::INFINITY; 4];
+    for run in runs.iter().filter(|run| run.bounds_nearest) {
+        let far_sq = run.far_distance_sq(point);
+        bound_sq[3] = bound_sq[3].min(far_sq);
+        for channel in 0..3 {
+            if run.color & CHANNELS[channel] != 0 {
+                bound_sq[channel] = bound_sq[channel].min(far_sq);
+            }
+        }
+    }
+    bound_sq
 }
 
 fn flatten_edge(
@@ -562,7 +699,7 @@ impl FlatSegment {
     fn signed_distance(self, point: Point<f32>) -> (SignedDistance, f32) {
         let segment = Vec2::from_points(self.p0, self.p1);
         let segment_len_sq = segment.dot(segment);
-        if segment_len_sq <= 0.000_000_1 {
+        if segment_len_sq <= DEGENERATE_SEGMENT_LEN_SQ {
             return (SignedDistance::inf(), 0.0);
         }
 
@@ -776,5 +913,81 @@ impl Vec2 {
 
     fn length(self) -> f32 {
         self.dot(self).sqrt()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::text::{
+            geom::Rect,
+            glyph_outline,
+            image::Image,
+        },
+        rustybuzz::ttf_parser,
+        std::time::{Duration, Instant},
+    };
+
+    fn outlines(font_file: &str, text: &str) -> Vec<(char, GlyphOutline)> {
+        let path = format!("{}/../widgets/resources/{font_file}", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+        let face = ttf_parser::Face::parse(&bytes, 0).unwrap();
+        let units_per_em = face.units_per_em() as f32;
+        text.chars()
+            .filter_map(|ch| {
+                let id = face.glyph_index(ch)?;
+                let mut builder = glyph_outline::Builder::new();
+                let bounds = face.outline_glyph(id, &mut builder)?;
+                let min = Point::new(bounds.x_min as f32, bounds.y_min as f32);
+                let max = Point::new(bounds.x_max as f32, bounds.y_max as f32);
+                Some((ch, builder.finish(Rect::new(min, max - min), units_per_em)))
+            })
+            .collect()
+    }
+
+    fn render(outline: &GlyphOutline, dpxs_per_em: f32, cull: bool) -> (Vec<Bgra>, Duration) {
+        // The layouter's MSDF settings, and the rasterizer's image size.
+        let settings = Settings { padding: 4, radius: 8.0, cutoff: 0.25, corner_angle_threshold: 3.0 };
+        let in_dpxs = outline.size_in_ems() * dpxs_per_em;
+        let size = Size::new(
+            in_dpxs.width.ceil() as usize + settings.padding * 2,
+            in_dpxs.height.ceil() as usize + settings.padding * 2,
+        );
+        let mut image = Image::<Bgra>::new(size);
+        let started = Instant::now();
+        Msdfer::new(settings).render(outline, dpxs_per_em, &mut image.subimage_mut(Rect::from(size)), cull);
+        (image.into_pixels(), started.elapsed())
+    }
+
+    /// Culling must not change one bit of any channel; it only skips segments
+    /// that cannot be nearest. Run with `--nocapture` in release for timings.
+    #[test]
+    fn culled_msdf_matches_full_scan() {
+        let glyphs = [
+            ("IBMPlexSans-Text.ttf", "AaBgQW@&%?8Rß"),
+            ("LXGWWenKaiRegular.ttf", "这样的周末真好下次一起测试输入是否流畅龍鬱齉體驚"),
+        ];
+        let (mut full_time, mut culled_time) = (Duration::ZERO, Duration::ZERO);
+        let mut images = 0;
+        for (font, text) in glyphs {
+            for (ch, outline) in outlines(font, text) {
+                for dpxs_per_em in [20.0, 32.0, 48.0, 64.0, 96.0, 128.0] {
+                    let (full, full_elapsed) = render(&outline, dpxs_per_em, false);
+                    let (culled, culled_elapsed) = render(&outline, dpxs_per_em, true);
+                    assert!(full == culled, "{ch:?} at {dpxs_per_em} dpx/em differs");
+                    full_time += full_elapsed;
+                    culled_time += culled_elapsed;
+                    images += 1;
+                }
+            }
+        }
+        assert!(images > 100);
+        println!(
+            "{images} glyph images: full scan {:.1} ms, culled {:.1} ms ({:.1}x)",
+            full_time.as_secs_f64() * 1e3,
+            culled_time.as_secs_f64() * 1e3,
+            full_time.as_secs_f64() / culled_time.as_secs_f64(),
+        );
     }
 }
