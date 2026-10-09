@@ -578,10 +578,9 @@ mod imp {
 
     /// True while a request is in flight, so the event loop knows to keep its
     /// paint clock at full rate instead of downshifting to the idle poll.
-    /// Only macOS downshifts, so this is unused on the other backends — they
-    /// poll the control channel at a fixed rate anyway.
-    #[allow(dead_code)]
-    #[allow(dead_code)]// only the macos paint clock asks
+    /// macOS and Wayland downshift; the other backends poll the control
+    /// channel at a fixed rate anyway.
+    #[allow(dead_code)] // only the downshifting loops ask
     pub(crate) fn needs_ticks() -> bool {
         if !ACTIVE.load(Ordering::Relaxed) {
             return false;
@@ -3258,7 +3257,7 @@ mod imp {
     pub fn is_active() -> bool {
         false
     }
-    #[allow(dead_code)] // only the macos paint clock asks
+    #[allow(dead_code)] // only the downshifting loops ask
     pub(crate) fn needs_ticks() -> bool {
         false
     }

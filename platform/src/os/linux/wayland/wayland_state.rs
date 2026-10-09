@@ -1745,6 +1745,12 @@ impl WaylandState {
         self.pending_paste_text_input.take()
     }
 
+    /// A paste's data is still arriving on a pipe the event loop does not
+    /// select on, so the loop must keep polling it (`pump_pending_clipboard_read`).
+    pub(crate) fn has_pending_clipboard_read(&self) -> bool {
+        self.pending_clipboard_read.is_some()
+    }
+
     pub(crate) fn pump_pending_clipboard_read(&mut self) {
         let mut pending = match self.pending_clipboard_read.take() {
             Some(pending) => pending,

@@ -178,6 +178,10 @@ pub struct CxOs {
     pub(crate) stdin_timers: PollTimers,
     pub(crate) start_time: Option<Instant>,
     pub opengl_cx: Option<OpenglCx>,
+    /// The event loop retires released GL storage on a beat that paints nothing
+    /// (`opengl_maintain_instance_retirements`). Without one, a frame that leaves
+    /// retirement debt repaints every pass to get the loop to come back for it.
+    pub(crate) gl_maintenance_beat: bool,
     #[cfg(use_vulkan)]
     pub(crate) vulkan: Option<super::vulkan::CxVulkan>,
     pub(crate) video_players: HashMap<LiveId, LinuxVideoPlayer>,
