@@ -57,6 +57,13 @@ use std::os::raw::c_void;
 use std::os::raw::c_char;
 use std::time::Instant;
 
+/// How long a window present waits for the previous frame's fence or a free
+/// swapchain image before handing the frame back to the event loop. With zero
+/// the present only polls, and a busy GPU or compositor turns the loop into a
+/// spin of paint attempts until one succeeds.
+#[cfg(target_os = "linux")]
+const PRESENT_WAIT_NS: u64 = 0;
+
 #[cfg(target_os = "android")]
 #[link(name = "nativewindow")]
 extern "C" {
@@ -502,9 +509,72 @@ pub struct CxVulkan {
     profile: vulkan_profile::VulkanProfile,
     #[cfg(target_os = "linux")]
     recycle_pass_resources: bool,
+    #[cfg(target_os = "linux")]
+    present_stats: PresentStats,
+}
+
+/// Window presents, the attempts that found the previous frame's fence or the
+/// swapchain busy, and the main-thread time they took. Summarised every two
+/// seconds under `MAKEPAD_TRACE=gpu.present`.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct PresentStats {
+    since: Option<Instant>,
+    presented: u32,
+    fence_busy: u32,
+    image_busy: u32,
+    encode_us: u64,
+    wait_us: u64,
+    /// Encoding, by phase: geometry pruning, texture preparation, command
+    /// recording, submission, publication of the draw receipts.
+    phase_us: [u64; 5],
+}
+
+#[cfg(target_os = "linux")]
+impl PresentStats {
+    fn report(&mut self) {
+        if !crate::makepad_error_log::trace_enabled("gpu.present") {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed < 2.0 {
+            return;
+        }
+        crate::trace!(
+            "gpu.present",
+            "{elapsed:.1}s: {} presented; {} attempts found the fence busy, {} no free image; main thread encode {:.2} ms (prune {:.2}, textures {:.2}, record {:.2}, submit {:.2}, publish {:.2}), wait {:.2} ms",
+            self.presented,
+            self.fence_busy,
+            self.image_busy,
+            self.encode_us as f64 / 1000.0,
+            self.phase_us[0] as f64 / 1000.0,
+            self.phase_us[1] as f64 / 1000.0,
+            self.phase_us[2] as f64 / 1000.0,
+            self.phase_us[3] as f64 / 1000.0,
+            self.phase_us[4] as f64 / 1000.0,
+            self.wait_us as f64 / 1000.0
+        );
+        *self = Self { since: Some(Instant::now()), ..Self::default() };
+    }
 }
 
 impl CxVulkan {
+    /// A present attempt that found the GPU or the compositor busy: the frame
+    /// stays dirty and the event loop comes back for it.
+    #[cfg(target_os = "linux")]
+    fn present_busy(&mut self, cx: &mut Cx, attempt_start: Instant, fence: bool) {
+        let us = attempt_start.elapsed().as_micros() as u64;
+        if fence {
+            self.present_stats.fence_busy += 1;
+        } else {
+            self.present_stats.image_busy += 1;
+        }
+        self.present_stats.wait_us += us;
+        self.present_stats.report();
+        cx.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAWABLE_WAIT, us);
+    }
+
     #[cfg(target_os = "android")]
     pub(crate) fn has_drawable_surface(&self) -> bool {
         !self.window.is_null()
@@ -2943,11 +3013,17 @@ impl CxVulkan {
             }
         };
 
+        #[cfg(target_os = "linux")]
+        let attempt_start = Instant::now();
         unsafe {
             #[cfg(target_os = "linux")]
-            if !self.device.get_fence_status(self.in_flight_fence)
-                .map_err(|e| format!("get_fence_status failed: {e:?}"))? {
-                return Ok(false);
+            match self.device.wait_for_fences(&[self.in_flight_fence], true, PRESENT_WAIT_NS) {
+                Ok(()) => {}
+                Err(vk::Result::TIMEOUT) => {
+                    self.present_busy(cx, attempt_start, true);
+                    return Ok(false);
+                }
+                Err(e) => return Err(format!("wait_for_fences failed: {e:?}")),
             }
             #[cfg(target_os = "android")]
             self.device
@@ -2965,16 +3041,24 @@ impl CxVulkan {
 
         self.destroy_frame_resources();
 
+        #[cfg(target_os = "linux")]
+        let acquire_timeout_ns = PRESENT_WAIT_NS;
+        #[cfg(not(target_os = "linux"))]
+        let acquire_timeout_ns = u64::MAX;
         let (image_index, acquire_suboptimal) = match unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
-                if cfg!(target_os = "linux") { 0 } else { u64::MAX },
+                acquire_timeout_ns,
                 self.image_available_semaphore,
                 vk::Fence::null(),
             )
         } {
             Ok(v) => v,
-            Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(false),
+            Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => {
+                #[cfg(target_os = "linux")]
+                self.present_busy(cx, attempt_start, false);
+                return Ok(false);
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain()?;
                 return Ok(false);
@@ -2988,6 +3072,12 @@ impl CxVulkan {
             }
         };
         self.acquired_image_pending = true;
+        // PerfMonitor "wait": fence and image acquisition before encoding, plus
+        // the present after it; "draw": encoding and submission, as GL reports.
+        #[cfg(target_os = "linux")]
+        let wait_before_encode_us = attempt_start.elapsed().as_micros() as u64;
+        #[cfg(target_os = "linux")]
+        let encode_start = Instant::now();
         if self.swapchain_images.get(image_index as usize).is_none() {
             return Err(format!("invalid swapchain image index {image_index}"));
         }
@@ -3019,11 +3109,46 @@ impl CxVulkan {
                 .begin_command_buffer(self.command_buffer, &begin_info)
                 .map_err(|e| format!("begin_command_buffer failed: {e:?}"))?;
         }
+        // `MAKEPAD_VULKAN_PROFILE=1` times the window pass on the GPU like an
+        // offscreen pass; the next frame's fence check collects the sample.
+        #[cfg(target_os = "linux")]
+        let mut profile_sample = self.profile.begin_sample(
+            cx,
+            draw_pass_id,
+            false,
+            self.swapchain_extent.width,
+            self.swapchain_extent.height,
+            wait_before_encode_us as f64 / 1000.0,
+        );
+        #[cfg(target_os = "linux")]
+        if let Some(sample) = profile_sample.as_mut() {
+            sample.wrote_timestamps = self.profile.begin_timestamps(
+                &self.device,
+                &self.instance,
+                self.physical_device,
+                self.queue_family_index,
+                self.command_buffer,
+            );
+        }
 
         self.texture_upload_count_this_frame = 0;
         self.texture_upload_bytes_this_frame = 0;
+        #[cfg(target_os = "linux")]
+        let mut phase_start = Instant::now();
+        #[cfg(target_os = "linux")]
+        let mut phase_us = [0u64; 5];
         self.prune_stale_geometry_resources(cx);
+        #[cfg(target_os = "linux")]
+        {
+            phase_us[0] = phase_start.elapsed().as_micros() as u64;
+            phase_start = Instant::now();
+        }
         self.prepare_draw_list_textures(cx, draw_list_id)?;
+        #[cfg(target_os = "linux")]
+        {
+            phase_us[1] = phase_start.elapsed().as_micros() as u64;
+            phase_start = Instant::now();
+        }
 
         let mut zbias = 0.0f32;
         let zbias_step = cx.passes[draw_pass_id].zbias_step;
@@ -3197,6 +3322,13 @@ impl CxVulkan {
             }
         }
 
+        #[cfg(target_os = "linux")]
+        if profile_sample
+            .as_ref()
+            .is_some_and(|sample| sample.wrote_timestamps)
+        {
+            self.profile.end_timestamps(&self.device, self.command_buffer);
+        }
         unsafe {
             self.device
                 .end_command_buffer(self.command_buffer)
@@ -3213,9 +3345,32 @@ impl CxVulkan {
             .command_buffers(&cmd_buffers)
             .signal_semaphores(&signal_semaphores);
 
+        #[cfg(target_os = "linux")]
+        let submit_start = Instant::now();
+        #[cfg(target_os = "linux")]
+        {
+            phase_us[2] = submit_start.duration_since(phase_start).as_micros() as u64;
+        }
         self.submit_frame(&submit_info)?;
+        #[cfg(target_os = "linux")]
+        {
+            phase_us[3] = submit_start.elapsed().as_micros() as u64;
+            phase_start = Instant::now();
+        }
         self.publish_draw_submission(cx, &draw_stats);
         self.acquired_image_pending = false;
+        #[cfg(target_os = "linux")]
+        let encode_us = encode_start.elapsed().as_micros() as u64;
+        #[cfg(target_os = "linux")]
+        {
+            phase_us[4] = phase_start.elapsed().as_micros() as u64;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(mut sample) = profile_sample.take() {
+            sample.encode_ms = submit_start.duration_since(encode_start).as_secs_f64() * 1000.0;
+            sample.submit_ms = submit_start.elapsed().as_secs_f64() * 1000.0;
+            self.profile.admit_pending(sample);
+        }
 
         let swapchains = [self.swapchain];
         let image_indices = [image_index];
@@ -3224,6 +3379,8 @@ impl CxVulkan {
             .swapchains(&swapchains)
             .image_indices(&image_indices);
 
+        #[cfg(target_os = "linux")]
+        let present_start = Instant::now();
         before_present();
         let present_suboptimal = match unsafe {
             self.swapchain_loader
@@ -3244,6 +3401,8 @@ impl CxVulkan {
                 return Err(format!("queue_present failed: {err:?}"));
             }
         };
+        #[cfg(target_os = "linux")]
+        let present_us = present_start.elapsed().as_micros() as u64;
 
         if capture_swapchain {
             let capture_result = (|| -> Result<(), String> {
@@ -3277,6 +3436,29 @@ impl CxVulkan {
             self.recreate_swapchain()?;
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            let wait_us = wait_before_encode_us + present_us;
+            self.present_stats.presented += 1;
+            self.present_stats.encode_us += encode_us;
+            self.present_stats.wait_us += wait_us;
+            for (total, us) in self.present_stats.phase_us.iter_mut().zip(phase_us) {
+                *total += us;
+            }
+            self.present_stats.report();
+            cx.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAW, encode_us);
+            cx.perf_monitor.add(crate::perf_monitor::PERF_CHANNEL_DRAWABLE_WAIT, wait_us);
+            crate::trace!(
+                "gpu.present",
+                "present time={:.6} encode={:.2}ms wait={:.2}ms (acquire {:.2}, present {:.2})",
+                crate::cx_api::CxOsApi::seconds_since_app_start(cx),
+                encode_us as f64 / 1000.0,
+                wait_us as f64 / 1000.0,
+                wait_before_encode_us as f64 / 1000.0,
+                (wait_us - wait_before_encode_us) as f64 / 1000.0
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
         crate::trace!("gpu.present", "present time={:.6}", crate::cx_api::CxOsApi::seconds_since_app_start(cx));
         cx.passes[draw_pass_id].paint_dirty = false;
         // The bake transaction's paint receipt, after all selected ranges.

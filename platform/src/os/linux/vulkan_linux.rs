@@ -323,6 +323,7 @@ impl DesktopInit {
             xr_depth_dummy: None,
             recycle_pass_resources,
             profile: vulkan_profile::VulkanProfile::from_env(recycle_pass_resources),
+            present_stats: PresentStats::default(),
         };
         // From this point CxVulkan::drop covers every partially constructed resource.
         renderer.command_pool = unsafe {
