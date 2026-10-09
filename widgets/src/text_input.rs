@@ -378,13 +378,13 @@ script_mod! {
             blink: {
                 default: @off
                 off: AnimatorState{
-                    from: {all: Forward {duration: 0.05}}
+                    from: {all: Snap}
                     apply: {
                         draw_cursor: {blink: 0.0}
                     }
                 }
                 on: AnimatorState{
-                    from: {all: Forward {duration: 0.05}}
+                    from: {all: Snap}
                     apply: {
                         draw_cursor: {blink: 1.0}
                     }

@@ -19,7 +19,10 @@ use std::{cell::Cell, collections::HashMap, rc::Rc};
 
 pub const PERF_MONITOR_HISTORY: usize = 240;
 pub const PERF_MONITOR_MAX_CHANNELS: usize = 12;
-pub const PERF_MONITOR_MAX_WORK: usize = 256;
+// A full application has more than 256 operation/type pairs even though
+// repeated row instances share entries. Keep captures bounded without losing
+// most of their attribution before the first conversation is opened.
+pub const PERF_MONITOR_MAX_WORK: usize = 1024;
 
 /// Aggregate by operation and static component type, never by user content or
 /// instance ID. Scrolling through new widgets cannot grow this table unbounded.
