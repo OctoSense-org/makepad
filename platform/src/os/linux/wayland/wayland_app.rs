@@ -8,7 +8,7 @@ use wayland_client::{Connection, EventQueue};
 
 use crate::{
     cx_native::EventFlow, wayland::wayland_state::WaylandState, x11::xlib_event::XlibEvent,
-    TimerEvent,
+    SignalToUI, TimerEvent,
 };
 
 pub(crate) struct WaylandApp {
@@ -42,13 +42,25 @@ impl WaylandApp {
                 EventFlow::Wait => {
                     let time = self.time_now();
                     self.state.timers.update_timers(&mut timer_ids);
+                    let mut timer_queued_work = false;
                     for timer_id in &timer_ids {
                         if !self.state.handle_key_repeat_timer(*timer_id) {
                             self.do_callback(XlibEvent::Timer(TimerEvent {
                                 timer_id: *timer_id,
                                 time: Some(time),
                             }));
+                            timer_queued_work |= matches!(self.state.event_flow, EventFlow::Poll);
                         }
+                    }
+                    if !self.state.event_loop_running {
+                        break;
+                    }
+                    // A timer that redrew or dispatched a signal with work paints
+                    // now. Timer 0 idles slowly, so sleeping first would hold that
+                    // paint until an unrelated wake.
+                    if timer_queued_work {
+                        self.state.event_flow = EventFlow::Poll;
+                        continue;
                     }
                     // Send any requests queued during event handling (cursor shapes,
                     // frame callback requests, etc.) before blocking, so the compositor
@@ -67,8 +79,18 @@ impl WaylandApp {
                             return;
                         }
                     }
-                    if let Some(guard) = self.event_queue.prepare_read() {
-                        self.state.timers.select(guard.connection_fd().as_raw_fd());
+                    let woken = match self.event_queue.prepare_read() {
+                        Some(guard) => self.state.timers.select(guard.connection_fd().as_raw_fd()),
+                        None => false,
+                    };
+                    // Another thread raised a signal or queued a `--remote` command.
+                    // Service it on this wake, as macOS does for its wake event,
+                    // instead of on the next timer-0 tick.
+                    if woken || SignalToUI::any_pending() {
+                        self.do_callback(XlibEvent::Timer(TimerEvent {
+                            timer_id: 0,
+                            time: Some(self.time_now()),
+                        }));
                     }
                     self.state.event_flow = EventFlow::Poll;
                 }

@@ -13,7 +13,7 @@ use crate::makepad_math::{dvec2, Rect, Vec2d};
 use crate::opengl_cx::OpenglCx;
 use crate::os::linux::gstreamer_sys::LibGStreamer;
 use crate::os::linux::linux_video_playback::{
-    poll_pending_gstreamer_teardowns, GStreamerVideoPlayer,
+    has_pending_gstreamer_teardowns, poll_pending_gstreamer_teardowns, GStreamerVideoPlayer,
 };
 use crate::os::linux::linux_video_player::{
     collect_linux_video_player_events, prepare_desktop_linux_video, LinuxPrepareResult,
@@ -54,6 +54,14 @@ pub fn wayland_event_loop(cx: Rc<RefCell<Cx>>) {
     WaylandCx::event_loop_impl(cx);
 }
 
+/// Timer 0 services what no fd wakes: video frames, GStreamer teardowns, GL
+/// retirement fences, in-flight `--remote` requests, live edit. Signals wake
+/// the loop and are serviced at once (`WaylandApp::event_loop`), and painting
+/// follows frame callbacks, so with none of that pending the beat drops to the
+/// idle rate instead of waking the process 125 times a second.
+const TIMER0_ACTIVE_SECS: f64 = 0.008;
+const TIMER0_IDLE_SECS: f64 = 0.2;
+
 pub(crate) struct WaylandCx {
     cx: Rc<RefCell<Cx>>,
     qhandle: Option<wayland_client::QueueHandle<WaylandState>>,
@@ -64,6 +72,8 @@ pub(crate) struct WaylandCx {
     /// callbacks the compositor withholds) from wedging the event loop. Disabled by
     /// `MAKEPAD_NO_VSYNC` for uncapped benchmarking.
     frame_pacing: bool,
+    /// Whether timer 0 runs at `TIMER0_ACTIVE_SECS` (else `TIMER0_IDLE_SECS`).
+    timer0_active: bool,
 }
 
 impl WaylandCx {
@@ -79,6 +89,7 @@ impl WaylandCx {
             cx: cx.clone(),
             qhandle: None,
             frame_pacing: std::env::var_os("MAKEPAD_NO_VSYNC").is_none(),
+            timer0_active: true,
         }));
         let conn = Connection::connect_to_env().unwrap();
         let display = conn.display();
@@ -92,6 +103,9 @@ impl WaylandCx {
                     display_ptr as NativeDisplayType,
                 )
             });
+            // Timer 0 retires released GL storage (see the `Timer` arm), so a
+            // frame that leaves retirement debt need not repaint to be woken.
+            cx.borrow_mut().os.gl_maintenance_beat = true;
         }
         #[cfg(use_vulkan)]
         {
@@ -142,7 +156,7 @@ impl WaylandCx {
         cx.borrow_mut().call_event_handler(&Event::Startup);
         cx.borrow_mut().redraw_all();
 
-        app.start_timer(0, 0.008, true);
+        app.start_timer(0, TIMER0_ACTIVE_SECS, true);
         app.event_loop();
         // WSI must release its surfaces while their wl_surface and display are alive.
         #[cfg(use_vulkan)]
@@ -312,6 +326,12 @@ impl WaylandCx {
                 // ok here we send out to all our childprocesses
 
                 self.handle_repaint(state);
+                // A frame that released GL storage leaves retirement debt that
+                // timer 0 serves; serve it at the active rate until it settles.
+                #[cfg(not(use_vulkan))]
+                if self.cx.borrow().opengl_retirement_pending() {
+                    self.pace_timer0(state, true);
+                }
 
                 {
                     let cx = self.cx.borrow();
@@ -456,6 +476,7 @@ impl WaylandCx {
                 cx.call_event_handler(&Event::TextCut(e))
             }
             XlibEvent::Timer(e) => {
+                let mut timer0_has_work = None;
                 let mut cx = self.cx.borrow_mut();
                 if e.timer_id == 0 {
                     let internal_signal = SignalToUI::check_and_clear_internal_signal();
@@ -518,6 +539,23 @@ impl WaylandCx {
                             cx.os.video_players = players;
                         }
                     }
+                    // Released GL storage waiting on its completion fence retires on
+                    // this beat instead of by repainting every live pass until the
+                    // fence passes (see `CxOs::gl_maintenance_beat`).
+                    #[cfg(not(use_vulkan))]
+                    let retirement_pending = cx.opengl_retirement_pending() && {
+                        cx.os.opengl_cx.as_ref().unwrap().make_current();
+                        cx.opengl_maintain_instance_retirements()
+                    };
+                    #[cfg(use_vulkan)]
+                    let retirement_pending = false;
+                    timer0_has_work = Some(
+                        retirement_pending
+                            || state.has_pending_clipboard_read()
+                            || crate::remote::needs_ticks()
+                            || !cx.os.video_players.is_empty()
+                            || has_pending_gstreamer_teardowns(),
+                    );
                 } else {
                     cx.handle_script_timer(&e);
                     cx.call_event_handler(&Event::Timer(e))
@@ -526,6 +564,9 @@ impl WaylandCx {
                 cx.run_live_edit_if_needed("linux-wayland");
                 let has_platform_ops = !cx.platform_ops.is_empty();
                 drop(cx);
+                if let Some(has_work) = timer0_has_work {
+                    self.pace_timer0(state, has_work);
+                }
                 if has_platform_ops {
                     if let EventFlow::Exit = self.handle_platform_ops(state) {
                         let mut cx = self.cx.borrow_mut();
@@ -534,7 +575,20 @@ impl WaylandCx {
                         return EventFlow::Exit;
                     }
                 }
-                return EventFlow::Wait;
+                // Paint what this timer queued (a redraw, a next frame, a serviced
+                // signal's results) now: timer 0 may be idling, and app timers such
+                // as a caret blink must not wait for its next beat either.
+                let cx = self.cx.borrow();
+                return if cx.any_passes_dirty()
+                    || cx.need_redrawing()
+                    || cx.new_next_frames.len() != 0
+                    || cx.screenshot_requests.len() > 0
+                    || cx.demo_time_repaint
+                {
+                    EventFlow::Poll
+                } else {
+                    EventFlow::Wait
+                };
             }
         }
         // Drain ops queued during this event (e.g. pause/resume from MouseDown).
@@ -567,6 +621,10 @@ impl WaylandCx {
     fn app_event_callback(&mut self, wayland_app: &mut WaylandApp, event: XlibEvent) -> EventFlow {
         let _phase = crate::thread::ui_phase(crate::thread::UiPhase::NativeEvent);
         let event_flow = self.state_event_callback(&mut wayland_app.state, event);
+        // A paste just started: poll its pipe at the active rate until it is read.
+        if wayland_app.state.has_pending_clipboard_read() {
+            self.pace_timer0(&mut wayland_app.state, true);
+        }
         if let EventFlow::Exit = event_flow {
             wayland_app.terminate_event_loop();
         }
@@ -1207,6 +1265,16 @@ impl WaylandCx {
             }
         }
         ret
+    }
+
+    /// Runs timer 0 at the active rate while it has work to poll (see
+    /// `TIMER0_ACTIVE_SECS`) and at the idle rate as soon as it has none.
+    fn pace_timer0(&mut self, state: &mut WaylandState, active: bool) {
+        if active != self.timer0_active {
+            self.timer0_active = active;
+            state.stop_timer(0);
+            state.start_timer(0, if active { TIMER0_ACTIVE_SECS } else { TIMER0_IDLE_SECS }, true);
+        }
     }
 
     pub(crate) fn handle_repaint(&self, state: &mut WaylandState) {

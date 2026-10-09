@@ -530,11 +530,18 @@ impl Cx {
         {
             // Retirement debt is maintenance, not ink. Android and OpenHarmony
             // service it on idle vsync beats (`opengl_maintain_instance_retirements`)
-            // without painting; the desktop GL loops only wake for a repaint, so
-            // they keep the repaint as their wake until the debt settles.
+            // without painting, and so does a desktop loop with a maintenance
+            // beat (Wayland's timer 0). Other desktop GL loops only wake for a
+            // repaint, so they keep the repaint as their wake until the debt settles.
             #[cfg(not(any(target_os = "android", target_env = "ohos")))]
             {
-                self.demo_time_repaint = true;
+                #[cfg(not(linux_direct))]
+                let beat = self.os.gl_maintenance_beat;
+                #[cfg(linux_direct)]
+                let beat = false;
+                if !beat {
+                    self.demo_time_repaint = true;
+                }
             }
         }
         self.render_view_inner(pass, list, zbias, step);
@@ -4483,7 +4490,6 @@ pub(crate) struct TextureFence {
     pending: Option<(u64, GlSync)>,
     /// Idle maintenance beats served (`opengl_maintain_instance_retirements`);
     /// their ledger frame keys count down from `u64::MAX`, apart from paints.
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
     maintenance_beats: u64,
     framebuffers: Vec<u32>,
 }
@@ -4645,14 +4651,12 @@ impl Cx {
     /// same beat (`maintain_instance_retirements`); a paint used to carry it.
     /// Released GPU storage still waiting on its completion fence or a
     /// worker: what keeps a mobile loop asking for beats without painting.
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) fn opengl_retirement_pending(&self) -> bool {
         self.textures.1.gl.pending.is_some()
             || !self.textures.1.retired.is_empty()
             || self.draw_lists.has_pending_instance_retirements()
     }
 
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) fn opengl_maintain_instance_retirements(&mut self) -> bool {
         let fence_pending = self.textures.1.gl.pending.is_some() || !self.textures.1.retired.is_empty();
         if !fence_pending && !self.draw_lists.has_pending_instance_retirements() {

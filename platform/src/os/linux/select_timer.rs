@@ -50,18 +50,21 @@ impl SelectTimers {
         }
     }
 
-    pub fn select(&mut self, fd: c_int) {
-        self.select_fds(std::iter::once(fd));
+    /// Sleeps until `fd` is readable, the next timer is due or another thread
+    /// wakes the UI loop. Returns whether such a wake arrived: a thread raised
+    /// `SignalToUI` (or a `--remote` command) and wants its queues serviced.
+    pub fn select(&mut self, fd: c_int) -> bool {
+        self.select_fds(std::iter::once(fd))
     }
 
-    pub fn select_fds(&mut self, input_fds: impl IntoIterator<Item = c_int>) {
-        self.select_fds_capped(input_fds, None);
+    pub fn select_fds(&mut self, input_fds: impl IntoIterator<Item = c_int>) -> bool {
+        self.select_fds_capped(input_fds, None)
     }
 
     /// Like `select_fds`, but never sleeps longer than `max_timeout` seconds.
     /// The direct renderer uses a sub-millisecond cap to retry a GPU that is
     /// still presenting, while input and the wake pipe interrupt it as usual.
-    pub fn select_fds_capped(&mut self, input_fds: impl IntoIterator<Item = c_int>, max_timeout: Option<f64>) {
+    pub fn select_fds_capped(&mut self, input_fds: impl IntoIterator<Item = c_int>, max_timeout: Option<f64>) -> bool {
         let mut max_fd = -1;
         let mut fds = mem::MaybeUninit::uninit();
         unsafe {
@@ -116,13 +119,17 @@ impl SelectTimers {
                     .unwrap_or(ptr::null_mut()),
             )
         };
+        let mut woken = false;
         let wake_fd = ui_wake_pipe()[0];
         if wake_fd >= 0 {
             let mut buffer = [0_u8; 64];
             unsafe {
-                while libc_sys::read(wake_fd, buffer.as_mut_ptr().cast(), buffer.len()) > 0 {}
+                while libc_sys::read(wake_fd, buffer.as_mut_ptr().cast(), buffer.len()) > 0 {
+                    woken = true;
+                }
             }
         }
+        woken
     }
 
     pub fn time_now(&self) -> f64 {
