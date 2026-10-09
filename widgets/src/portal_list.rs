@@ -1845,6 +1845,45 @@ impl PortalList {
         self.caught_fling = None;
     }
 
+    /// A child can take the finger (for example, a long-press text selection)
+    /// without this list receiving FingerUp. Retire that drag immediately so its
+    /// samples cannot classify the next press as a catch and suppress child moves.
+    fn cancel_drag_without_capture(&mut self, cx: &mut Cx) {
+        if !matches!(self.scroll_state, ScrollState::Drag { .. })
+            || cx.fingers.is_area_captured(self.area)
+        {
+            return;
+        }
+        self.was_scrolling = false;
+        self.suppress_child_events = false;
+        self.stretching = false;
+        self.caught_fling = None;
+        self.momentum = MomentumStream::Idle;
+        self.scroll_state = if self.bounce_at_start
+            && self.first_id == self.range_start && self.first_scroll > 0.0
+        {
+            ScrollState::Pulldown {
+                next_frame: cx.new_next_frame(),
+                x0: self.first_scroll,
+                v0: 0.0,
+                clock: FrameClock::default(),
+                at_start: true,
+                touch: true,
+            }
+        } else if self.bounce_at_end && self.bounce_overshoot > 0.0 {
+            ScrollState::Pulldown {
+                next_frame: cx.new_next_frame(),
+                x0: self.bounce_overshoot,
+                v0: 0.0,
+                clock: FrameClock::default(),
+                at_start: false,
+                touch: true,
+            }
+        } else {
+            ScrollState::Stopped
+        };
+    }
+
     /// Whether a press at `time` belongs to a touch that just stopped live motion.
     fn press_is_catch(&self, time: f64) -> bool {
         self.touch_caught_motion_at
@@ -2652,6 +2691,7 @@ impl WidgetNode for PortalList {
 impl Widget for PortalList {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         let uid = self.widget_uid();
+        self.cancel_drag_without_capture(cx);
 
         // Selection autoscroll is driven by next-frame ticks. If pointer-up happens outside
         // hit testing, selection can get "stuck" and keep scheduling frames. Clear it on
@@ -2866,6 +2906,8 @@ impl Widget for PortalList {
             }
             self.event_item_ids = item_ids;
         }
+        // Capture may have moved to a child during the dispatch above.
+        self.cancel_drag_without_capture(cx);
 
         // Handle auto-scroll during selection
         if let Some(mut scroll_state) = self.select_scroll_state.take() {
