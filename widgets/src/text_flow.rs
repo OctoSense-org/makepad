@@ -395,6 +395,38 @@ impl SelectionTracker {
         self.text.len()
     }
 
+    /// Caret geometry in the same draw coordinates as selection_rects.
+    /// Affinity resolves soft wraps and boundaries between formatted runs.
+    pub fn cursor_rect(&self, cursor: Cursor) -> Option<Rect> {
+        let mut candidate = None;
+        let mut distance = usize::MAX;
+        for segment in &self.segments {
+            let SelectionSegment::Text { laidout_text, origin, font_scale, text_start } = segment else {
+                continue;
+            };
+            if laidout_text.rows.is_empty() { continue; }
+            let end = text_start + laidout_text.text.len();
+            let index = cursor.index.clamp(*text_start, end);
+            let delta = cursor.index.abs_diff(index);
+            if delta > distance || (delta == distance && !cursor.prefer_next_row) { continue; }
+            let mut local_index = index - text_start;
+            while !laidout_text.text.is_char_boundary(local_index) { local_index -= 1; }
+            let position = laidout_text.cursor_to_position(Cursor {
+                index: local_index,
+                prefer_next_row: cursor.prefer_next_row,
+            });
+            let row = &laidout_text.rows[position.row_index];
+            let scale = *font_scale as f64;
+            candidate = Some(Rect {
+                pos: *origin + dvec2(position.x_in_lpxs as f64 * scale,
+                    (row.origin_in_lpxs.y - row.ascender_in_lpxs) as f64 * scale),
+                size: dvec2(2.0 * scale, (row.ascender_in_lpxs - row.descender_in_lpxs) as f64 * scale),
+            });
+            distance = delta;
+        }
+        candidate
+    }
+
     /// Find character index from screen point.
     /// `cx` is needed to query widget areas for WidgetText segments.
     pub fn point_to_index(&self, cx: &Cx, point: DVec2) -> Option<usize> {
@@ -1496,6 +1528,21 @@ impl TextFlow {
     /// Check if there is a selection
     pub fn has_selection(&self) -> bool {
         self.selectable && self.selection_anchor != self.selection_cursor
+    }
+
+    /// Current byte offsets, for an external selection controller.
+    pub fn selection(&self) -> (usize, usize) {
+        (self.selection_anchor, self.selection_cursor)
+    }
+
+    /// Unfiltered selection stream. Offsets match point hit testing, including gaps.
+    pub fn selection_text(&self) -> &str {
+        &self.selection_tracker.text
+    }
+
+    /// Query during drawing, after end(), before enclosing turtles are aligned.
+    pub fn selection_cursor_rect(&self, index: usize, prefer_next_row: bool) -> Option<Rect> {
+        self.selection_tracker.cursor_rect(Cursor { index, prefer_next_row })
     }
 
     /// Selection anchor rect for clipboard/action popups.
