@@ -2011,6 +2011,13 @@ impl PortalList {
         self.tail_range = tail_range;
     }
 
+    /// Controls whether the list may take pointer capture from a child.
+    /// This only changes input routing: it does not redraw, reapply templates,
+    /// or reset the current scroll position and auto-tail state.
+    pub fn set_capture_overload(&mut self, capture_overload: bool) {
+        self.capture_overload = capture_overload;
+    }
+
     /// Sets the flow direction, e.g. to switch a list between a vertical
     /// (`Flow::Down`) and horizontal (`Flow::right()`) layout at runtime.
     pub fn set_flow(&mut self, cx: &mut Cx, flow: Flow) {
@@ -3709,6 +3716,13 @@ impl PortalListRef {
     pub fn set_tail_range(&self, tail_range: bool) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.tail_range = tail_range;
+        }
+    }
+
+    /// See [`PortalList::set_capture_overload`].
+    pub fn set_capture_overload(&self, capture_overload: bool) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_capture_overload(capture_overload);
         }
     }
 
