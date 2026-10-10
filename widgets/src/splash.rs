@@ -73,13 +73,14 @@ pub struct Splash {
     #[rust]
     storage_quota: Option<u64>,
     /// ADR 0002: when Some, this isolate is ENFORCED — `host.request` is
-    /// refused outside `host_caps`, every network path is refused outside
-    /// these hosts, and the instruction budget below is charged. None keeps
-    /// the informational behaviour every existing host relied on.
+    /// refused outside `host_caps` and files stay in its jail. The hosts
+    /// themselves are the app's declaration: since the ruling of 8 October
+    /// 2026 no network path is refused outside them. None keeps the
+    /// informational behaviour every existing host relied on.
     #[rust]
     policy_hosts: Option<Vec<String>>,
-    /// Script instructions this isolate may run over its life (cumulative,
-    /// unlike the per-evaluation cap). None = unbounded.
+    /// The instruction budget the app declares (cumulative, unlike the
+    /// per-evaluation cap): counted against, never enforced.
     #[rust]
     instruction_budget: Option<u64>,
     /// Heap ceiling for this isolate, applied to its script heap.
@@ -832,10 +833,11 @@ impl Splash {
     }
 
     /// Puts this isolate under an ENFORCED policy (ADR 0002): `host.request`
-    /// is refused outside `host_caps`, every network path (`net`, artwork,
-    /// `sys.*` data) is refused outside `hosts`, and `instruction_budget`
-    /// is charged cumulatively until spent. Call before set_text. Pass
-    /// `None` hosts to return to the unenforced behaviour.
+    /// is refused outside `host_caps`, and files stay in its jail. `hosts`
+    /// and `instruction_budget` are what the app declares: since the ruling
+    /// of 8 October 2026 neither limits its network paths or what it runs
+    /// ([`crate::splash_policy`]). Call before set_text. Pass `None` hosts
+    /// to return to the unenforced behaviour.
     pub fn set_policy(&mut self, cx: &mut Cx, hosts: Option<Vec<String>>, instruction_budget: Option<u64>) {
         self.policy_hosts = hosts;
         self.instruction_budget = instruction_budget;
@@ -863,10 +865,8 @@ impl Splash {
         crate::splash_policy::instructions_used(heap_key)
     }
 
-    /// Push the policy fields onto the live isolate. The URL gate is
-    /// installed on first use, so an isolate with no policy is unaffected.
+    /// Push the policy fields onto the live isolate.
     fn apply_policy(&mut self, cx: &mut Cx, heap_key: usize) {
-        crate::splash_policy::install_url_gate();
         if let Some(hosts) = &self.policy_hosts {
             crate::splash_policy::set_policy_for_heap(heap_key, self.host_caps.clone(), hosts.clone(), self.instruction_budget);
         }

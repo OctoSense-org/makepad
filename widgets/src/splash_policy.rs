@@ -1,27 +1,37 @@
-//! What an isolate is allowed, enforced where the runtime acts.
+//! What an isolate is allowed, where the runtime acts.
 //!
-//! The `host` bridge reports a capability list and the storage jail enforces
-//! a quota, but until now nothing REFUSED a request on the strength of that
-//! list, and nothing bounded how much script an isolate could run over its
-//! life. This module holds the per-heap policy for both, and the rest of the
-//! splash runtime asks it:
+//! OctoSense's ruling of 8 October 2026 removed the per-app runtime gates on
+//! reach and compute: the OS is the outer protection and the host's API
+//! surface the boundary, as for a browser. An app's host list and its
+//! instruction budget are declarations, shown when it is installed, not
+//! limits while it runs:
 //!
-//! - [`service_allowed`] — before a `host.request` is queued (ADR 0002 §2);
-//! - [`url_allowed`] — from every network path, through the gate installed
-//!   in `makepad-script-std` (ADR 0002 §3): `net.http_request`,
-//!   `net.web_socket`, `sys.*` data fetches, artwork, map tiles, web cards
-//!   and a `Video`'s network source;
-//! - [`sockets_allowed`] — before `net.http_server` listens or
-//!   `net.socket_stream` connects. Neither names a URL a host list could
-//!   judge, and no capability covers them (`net` is requests to the listed
-//!   hosts), so a policed isolate gets neither;
-//! - [`charge`] — after every evaluation and callback, against a cumulative
-//!   instruction budget (ADR 0002 §4).
+//! - no URL, media or socket gate is installed in `makepad-script-std`, so
+//!   `net.http_request`, `net.web_socket`, `net.socket_stream`,
+//!   `net.http_server`, `sys.*` fetches, artwork, map tiles and a `Video`'s
+//!   network source reach whatever the device can. [`url_allowed`],
+//!   [`media_allowed`], [`page_allowed`] and [`sockets_allowed`] allow
+//!   everything, for the hosts that still ask;
+//! - [`charge`] counts what an isolate runs, for a host that shows it
+//!   ([`instructions_used`]), but never stops it. The per-evaluation cap
+//!   still ends a runaway evaluation.
+//!
+//! What a policy still decides, for a policed heap:
+//!
+//! - [`service_allowed`] — before a `host.request` is queued (ADR 0002 §2).
+//!   The ruling removes this check as well, once the host checks the family
+//!   grant itself; App Hub's dispatcher does not yet, so dropping it here
+//!   would open every host service to every app;
+//! - what the runtime reads for a script with no host in between: the
+//!   device's location ([`location_allowed`]), the person's saved lists
+//!   ([`profile_allowed`]), the camera preview and `agent.notify`;
+//! - files: a policed heap reads only inside its storage jail
+//!   ([`local_path_for_heap`]).
 //!
 //! Like the jail and the bridge, state is host-side and keyed by heap, where
 //! script can neither read nor raise it. An isolate with no policy set keeps
 //! the behaviour every existing host relied on: services pass through to the
-//! host, URLs are allowed, and only the per-evaluation cap applies.
+//! host.
 use crate::makepad_draw::makepad_platform::makepad_script_std;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -31,14 +41,13 @@ pub struct HeapPolicy {
     /// Granted capability names. A service `a.b.c` needs capability `a`, or
     /// the exact name `a.b.c`.
     pub capabilities: Vec<String>,
-    /// Hosts this heap may reach, lowercased, exact. Empty means none.
+    /// The hosts the app declares, lowercased: shown when it is installed,
+    /// not a limit on what it reaches.
     pub hosts: Vec<String>,
-    /// Script instructions this heap may run over its life. None = unbounded
-    /// (the per-evaluation cap still applies).
+    /// The instruction budget the app declares: counted against, never
+    /// enforced.
     pub instruction_budget: Option<u64>,
     pub instructions_used: u64,
-    /// Set once the budget is spent; nothing runs in this heap afterwards.
-    pub exhausted: bool,
 }
 
 thread_local! {
@@ -48,13 +57,9 @@ thread_local! {
 /// Set (or replace) the policy for a heap. Enforcement starts here: a heap
 /// that never had this called is not enforced.
 pub fn set_policy_for_heap(heap_key: usize, capabilities: Vec<String>, hosts: Vec<String>, instruction_budget: Option<u64>) {
-    // A policy nothing consults is not a policy: whoever sets one, the gates
-    // that read it are in place from here on.
-    install_url_gate();
     POLICIES.with(|p| {
         let mut p = p.borrow_mut();
         let used = p.get(&heap_key).map(|old| old.instructions_used).unwrap_or(0);
-        let exhausted = instruction_budget.map(|b| used >= b).unwrap_or(false);
         p.insert(
             heap_key,
             HeapPolicy {
@@ -62,7 +67,6 @@ pub fn set_policy_for_heap(heap_key: usize, capabilities: Vec<String>, hosts: Ve
                 hosts: hosts.into_iter().map(|h| h.to_ascii_lowercase()).collect(),
                 instruction_budget,
                 instructions_used: used,
-                exhausted,
             },
         );
     });
@@ -90,9 +94,6 @@ pub fn service_allowed(heap_key: usize, service: &str) -> Result<(), String> {
     POLICIES.with(|p| {
         let p = p.borrow();
         let Some(policy) = p.get(&heap_key) else { return Ok(()) };
-        if policy.exhausted {
-            return Err("this app's instruction budget is spent".into());
-        }
         let family = service.split('.').next().unwrap_or(service);
         if policy.capabilities.iter().any(|c| c == service || c == family) {
             Ok(())
@@ -102,29 +103,16 @@ pub fn service_allowed(heap_key: usize, service: &str) -> Result<(), String> {
     })
 }
 
-/// May this heap reach `url`? True when no policy is set. With a policy, the
-/// URL's host must be listed exactly; a URL with no host is refused.
-pub fn url_allowed(heap_key: usize, url: &str) -> bool {
-    POLICIES.with(|p| {
-        let p = p.borrow();
-        let Some(policy) = p.get(&heap_key) else { return true };
-        if policy.exhausted {
-            return false;
-        }
-        // A listed `host` matches any port; a listed `host:port` matches
-        // only that port, which is how a host lists its own asset origin.
-        let host = makepad_script_std::url_host(url);
-        let host_port = makepad_script_std::url_host_port(url);
-        policy.hosts.iter().any(|h| Some(h) == host.as_ref() || Some(h) == host_port.as_ref())
-    })
+/// May this heap reach `url`? Yes, policed or not: an app's host list is a
+/// declaration, not a gate (the ruling of 8 October 2026).
+pub fn url_allowed(_heap_key: usize, _url: &str) -> bool {
+    true
 }
 
-/// May this heap open a listening server or a raw socket? Only when it is
-/// not policed. A server answers whoever connects and a raw stream speaks any
-/// protocol to any port; a contained app's way out is a request to a listed
-/// host, and nothing wider.
-pub fn sockets_allowed(heap_key: usize) -> bool {
-    !is_enforced(heap_key)
+/// May this heap open a listening server or a raw socket? Yes, policed or
+/// not, as for [`url_allowed`].
+pub fn sockets_allowed(_heap_key: usize) -> bool {
+    true
 }
 
 /// May this heap know where the device is? Location is a service family
@@ -168,18 +156,12 @@ pub fn local_path_for_heap(heap_key: usize, path: &str) -> Option<String> {
     Some(real.to_string_lossy().into_owned())
 }
 
-/// The hosts a policed heap may reach, or `None` for an unpoliced heap. For
-/// a surface the gate cannot stand in front of — a system WebView fetches on
-/// its own — so it can be told the same list.
-pub fn hosts_for_heap(heap_key: usize) -> Option<Vec<String>> {
-    POLICIES.with(|p| p.borrow().get(&heap_key).map(|policy| policy.hosts.clone()))
-}
-
 /// The host of `url` when it is https and names a public host: not loopback,
 /// private, link-local, shared or unspecified, not a single-label or
 /// `.local`/`.internal`/`.localhost` name, and not an IP written in a form
-/// only some resolvers read as one (`0x7f.1`). What a grant to reach "any
-/// public page" may reach, and nothing on the device's own network.
+/// only some resolvers read as one (`0x7f.1`). A web card's `http.fetch`
+/// bridge, which runs a card's own JavaScript requests natively, reaches only
+/// such hosts.
 pub fn public_https_host(url: &str) -> Result<String, String> {
     if !url.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://")) {
         return Err("only https:// URLs are allowed".into());
@@ -229,67 +211,38 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// May this heap load `url` as media (an image, artwork)? Its host list
-/// answers first; the `images` grant adds any public https host, for an app
-/// that shows pictures from wherever its content links (a feed reader's
-/// thumbnails). A load is still a request, so the grant is its own consent.
-pub fn media_allowed(heap_key: usize, url: &str) -> bool {
-    url_allowed(heap_key, url)
-        || (is_enforced(heap_key)
-            && may_run(heap_key)
-            && service_allowed(heap_key, "images.any").is_ok()
-            && public_https_host(url).is_ok())
+/// May this heap load `url` as media (an image, artwork)? Yes, as for
+/// [`url_allowed`]: the `images` capability is a declaration.
+pub fn media_allowed(_heap_key: usize, _url: &str) -> bool {
+    true
 }
 
-/// May this heap open `url` as a page in the system WebView? Its host list
-/// answers first; the `web` grant adds any public https page, for a reader.
-/// Such a page gets no bridge into the app.
-pub fn page_allowed(heap_key: usize, url: &str) -> bool {
-    url_allowed(heap_key, url)
-        || (is_enforced(heap_key)
-            && may_run(heap_key)
-            && service_allowed(heap_key, "web.open").is_ok()
-            && public_https_host(url).is_ok())
+/// May this heap open `url` as a page in the system WebView? Yes, as for
+/// [`url_allowed`]: the `web` capability is a declaration. Such a page gets
+/// no bridge into the app.
+pub fn page_allowed(_heap_key: usize, _url: &str) -> bool {
+    true
 }
 
-/// Record `instructions` run by this heap. Returns false once the budget is
-/// spent, and stays false: the heap is exhausted from then on.
+/// Record `instructions` run by this heap. Always true: the budget an app
+/// declares is counted against, never enforced.
 pub fn charge(heap_key: usize, instructions: u64) -> bool {
     POLICIES.with(|p| {
-        let mut p = p.borrow_mut();
-        let Some(policy) = p.get_mut(&heap_key) else { return true };
-        policy.instructions_used = policy.instructions_used.saturating_add(instructions);
-        if let Some(budget) = policy.instruction_budget {
-            if policy.instructions_used >= budget {
-                policy.exhausted = true;
-            }
+        if let Some(policy) = p.borrow_mut().get_mut(&heap_key) {
+            policy.instructions_used = policy.instructions_used.saturating_add(instructions);
         }
-        !policy.exhausted
-    })
+    });
+    true
 }
 
-/// Whether this heap may still run anything.
-pub fn may_run(heap_key: usize) -> bool {
-    POLICIES.with(|p| p.borrow().get(&heap_key).map(|policy| !policy.exhausted).unwrap_or(true))
+/// Whether this heap may still run anything. Always: nothing exhausts a heap.
+pub fn may_run(_heap_key: usize) -> bool {
+    true
 }
 
 /// Instructions used so far, for a host that wants to show it.
 pub fn instructions_used(heap_key: usize) -> u64 {
     POLICIES.with(|p| p.borrow().get(&heap_key).map(|policy| policy.instructions_used).unwrap_or(0))
-}
-
-/// The gate installed into `makepad-script-std`, once per thread, so every
-/// request path consults the table above.
-pub(crate) fn install_url_gate() {
-    thread_local! { static INSTALLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-    INSTALLED.with(|installed| {
-        if !installed.get() {
-            makepad_script_std::set_script_url_gate(Some(url_allowed));
-            makepad_script_std::set_script_media_gate(Some(media_allowed));
-            makepad_script_std::set_script_socket_gate(Some(sockets_allowed));
-            installed.set(true);
-        }
-    });
 }
 
 #[cfg(test)]
@@ -316,58 +269,34 @@ mod tests {
         gc_policies(&[901]);
     }
 
+    /// The host list is a declaration (the ruling of 8 October 2026): a
+    /// policed heap reaches any URL, listed or not, with or without `net`.
     #[test]
-    fn a_url_must_name_a_listed_host_exactly() {
+    fn a_policed_heap_reaches_any_url() {
         set_policy_for_heap(902, vec!["net".into()], vec!["Api.Weather.Example".into()], None);
         assert!(url_allowed(902, "https://api.weather.example/v1"));
-        assert!(url_allowed(902, "HTTPS://API.WEATHER.EXAMPLE:443/"));
-        assert!(!url_allowed(902, "https://weather.example/"), "a parent domain is not the listed host");
-        assert!(!url_allowed(902, "https://evil.api.weather.example/"), "nor is a subdomain");
-        assert!(!url_allowed(902, "http://127.0.0.1:8170/ux-images/x.svg"), "the artwork server that leaked");
-        assert!(!url_allowed(902, "garbage"));
+        assert!(url_allowed(902, "https://weather.example/"), "a host it does not list");
+        assert!(url_allowed(902, "http://127.0.0.1:8170/ux-images/x.svg"), "plain http to this device");
+        set_policy_for_heap(902, vec![], vec![], None);
+        assert!(url_allowed(902, "https://api.weather.example/"), "nor does it need net or a host");
         gc_policies(&[902]);
     }
 
+    /// An app's instruction budget is counted, for a host that shows it, and
+    /// never stops the app; a re-push of its policy keeps the count.
     #[test]
-    fn a_listed_host_port_matches_only_that_port() {
-        set_policy_for_heap(907, vec![], vec!["127.0.0.1:5000".into()], None);
-        assert!(url_allowed(907, "http://127.0.0.1:5000/assets/a.svg"));
-        assert!(!url_allowed(907, "http://127.0.0.1:8170/ux-images/a.svg"), "another loopback service");
-        assert!(!url_allowed(907, "http://127.0.0.1/a.svg"), "nor the bare host");
-        gc_policies(&[907]);
-    }
-
-    #[test]
-    fn an_empty_host_list_reaches_nothing_even_with_the_capability() {
-        set_policy_for_heap(903, vec!["net".into()], vec![], None);
-        assert!(!url_allowed(903, "https://api.weather.example/"));
-        gc_policies(&[903]);
-    }
-
-    #[test]
-    fn the_budget_is_cumulative_and_exhaustion_is_permanent() {
+    fn the_budget_is_counted_and_stops_nothing() {
         set_policy_for_heap(904, vec!["location".into()], vec!["a.example".into()], Some(1000));
         assert!(charge(904, 400));
         assert!(charge(904, 400));
+        assert!(charge(904, 400), "crossing the budget stops nothing");
         assert!(may_run(904));
-        assert!(!charge(904, 400), "the third charge crosses the budget");
-        assert!(!may_run(904));
-        assert!(service_allowed(904, "location.get").is_err(), "an exhausted heap gets no services");
-        assert!(!url_allowed(904, "https://a.example/"), "nor network");
-        assert!(!charge(904, 1), "and stays exhausted");
-        assert_eq!(instructions_used(904), 1201);
+        assert!(service_allowed(904, "location.get").is_ok(), "its grants still answer");
+        assert_eq!(instructions_used(904), 1200);
+        set_policy_for_heap(904, vec![], vec![], Some(100));
+        assert_eq!(instructions_used(904), 1200, "a re-push of its policy is not a reset");
+        assert!(may_run(904), "nor does a lower budget stop it");
         gc_policies(&[904]);
-    }
-
-    #[test]
-    fn replacing_a_policy_keeps_what_was_already_spent() {
-        set_policy_for_heap(905, vec![], vec![], Some(100));
-        charge(905, 90);
-        set_policy_for_heap(905, vec![], vec![], Some(100));
-        assert_eq!(instructions_used(905), 90, "a re-push of the same policy is not a refill");
-        set_policy_for_heap(905, vec![], vec![], Some(50));
-        assert!(!may_run(905), "lowering the budget below what is spent exhausts the heap");
-        gc_policies(&[905]);
     }
 
     #[test]
@@ -431,40 +360,37 @@ mod tests {
         }
     }
 
+    /// Pictures and pages need neither `images` nor `web`: both are
+    /// declarations now.
     #[test]
-    fn images_and_web_grants_open_public_https_only() {
-        set_policy_for_heap(910, vec!["net".into()], vec!["hn.algolia.com".into()], None);
-        assert!(media_allowed(910, "https://hn.algolia.com/logo.png"), "its own hosts, as before");
-        assert!(!media_allowed(910, "https://cdn.example.org/a.jpg"));
-        assert!(!page_allowed(910, "https://example.org/story"));
-        set_policy_for_heap(910, vec!["net".into(), "images".into(), "web".into()], vec!["hn.algolia.com".into()], None);
+    fn media_and_pages_need_no_grant() {
+        set_policy_for_heap(910, vec![], vec![], None);
         assert!(media_allowed(910, "https://cdn.example.org/a.jpg"));
+        assert!(media_allowed(910, "http://192.168.1.1/a.jpg"));
         assert!(page_allowed(910, "https://example.org/story"));
-        assert!(!media_allowed(910, "https://192.168.1.1/a.jpg"), "never the device's network");
-        assert!(!page_allowed(910, "http://example.org/story"), "never plain http");
-        assert!(!url_allowed(910, "https://cdn.example.org/a.jpg"), "neither grant widens requests");
+        assert!(page_allowed(910, "http://example.org/story"));
         gc_policies(&[910]);
-        assert!(media_allowed(910, "https://anything.example/"), "an unpoliced heap, as before");
     }
 
+    /// Setting a policy installs no gate in `makepad-script-std`: a policed
+    /// heap opens sockets and servers, and reaches any URL, through it.
     #[test]
-    fn a_policed_heap_opens_no_server_and_no_raw_socket_whatever_it_holds() {
-        gc_policies(&[911]);
-        assert!(sockets_allowed(911), "an unpoliced heap, as before");
-        set_policy_for_heap(911, vec!["net".into(), "storage".into(), "web".into()], vec!["127.0.0.1".into()], None);
-        assert!(!sockets_allowed(911), "no grant and no listed host covers a socket");
-        assert!(!makepad_script_std::script_sockets_allowed(911), "setting a policy installs the gate");
-        assert!(makepad_script_std::script_url_allowed(911, "ws://127.0.0.1:9/"), "the url gate is in too");
-        gc_policies(&[911]);
+    fn a_policy_installs_no_gate() {
+        set_policy_for_heap(911, vec![], vec![], Some(1));
+        assert!(sockets_allowed(911));
         assert!(makepad_script_std::script_sockets_allowed(911));
+        assert!(makepad_script_std::script_url_allowed(911, "ws://127.0.0.1:9/"));
+        assert!(makepad_script_std::script_media_url_allowed(911, "http://10.0.0.8/a.jpg"));
+        gc_policies(&[911]);
     }
 
     #[test]
     fn gc_forgets_a_heap_entirely() {
         set_policy_for_heap(906, vec![], vec![], Some(1));
         charge(906, 5);
+        assert!(is_enforced(906));
         gc_policies(&[906]);
         assert!(!is_enforced(906));
-        assert!(may_run(906));
+        assert_eq!(instructions_used(906), 0);
     }
 }

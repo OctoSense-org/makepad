@@ -1891,12 +1891,12 @@ mod isolate_entry_tests {
         cx.free_splash_vm(granted);
     }
 
-    /// A probe found `net.web_socket`, `net.socket_stream` and
-    /// `net.http_server` skipping the host list that `net.http_request`
-    /// answers to. Each is tried from a host-owned isolate and from a
-    /// contained app holding `net` and a listed host.
+    /// `net.web_socket`, `net.socket_stream` and `net.http_server`, tried
+    /// from a host-owned isolate and from a contained app: since the ruling
+    /// of 8 October 2026 the app opens each as the host's own isolate does,
+    /// to any host, whatever its host list says.
     #[test]
-    fn a_contained_app_opens_sockets_and_servers_only_as_its_policy_allows() {
+    fn a_contained_app_opens_sockets_and_servers_as_a_host_owned_isolate_does() {
         let run = |cx: &mut Cx, vm_id, code: String| {
             cx.with_script_vm_id(vm_id, |vm| {
                 let script_mod = crate::makepad_script::ScriptMod {
@@ -1934,12 +1934,12 @@ mod isolate_entry_tests {
         assert!(run(&mut cx, host_own, server.clone()), "and listens");
 
         assert!(run(&mut cx, app, web_socket("127.0.0.1")), "an app reaches its listed host over a web socket");
-        assert!(!run(&mut cx, app, web_socket("elsewhere.example")), "and no other");
-        assert!(!run(&mut cx, app, raw_socket.clone()), "a raw socket is refused even to a listed host");
-        assert!(!run(&mut cx, app, server.clone()), "and so is a listening server");
+        assert!(run(&mut cx, app, web_socket("elsewhere.example")), "and a host it does not list");
+        assert!(run(&mut cx, app, raw_socket.clone()), "a raw socket");
+        assert!(run(&mut cx, app, server.clone()), "and a listening server");
 
-        crate::splash_policy::set_policy_for_heap(app_heap, vec!["net".into()], vec![], None);
-        assert!(!run(&mut cx, app, web_socket("127.0.0.1")), "an empty host list reaches nothing");
+        crate::splash_policy::set_policy_for_heap(app_heap, vec![], vec![], None);
+        assert!(run(&mut cx, app, web_socket("127.0.0.1")), "with neither net nor a host as well");
 
         crate::splash_policy::gc_policies(&[app_heap]);
         cx.free_splash_vm(host_own);
