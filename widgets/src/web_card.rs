@@ -126,26 +126,17 @@ fn policed_tool_grant(tool: &str) -> Option<&'static str> {
     }
 }
 
-/// A Content-Security-Policy that holds a policed card's own document to its
-/// host list. The WebView fetches for itself, out of reach of the script
-/// gate; this is how the same allowlist follows it there. Inline script and
-/// style stay allowed (the kit and the card are inline); nothing may frame,
-/// and nothing loads from a host the manifest does not name.
-fn policy_csp(hosts: &[String]) -> String {
-    let mut sources = String::new();
-    for host in hosts {
-        // A host list entry is a bare host (any port) or host:port.
-        if host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']')) {
-            sources.push_str(" https://");
-            sources.push_str(host);
-        }
-    }
-    format!(
-        "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'{sources}; \
-         img-src data: blob:{sources}; media-src blob:{sources}; font-src data:{sources}; \
-         connect-src{none}{sources}; frame-src 'none'; form-action 'none'; base-uri 'none'",
-        none = if sources.is_empty() { " 'none'" } else { "" },
-    )
+/// The Content-Security-Policy of a policed card's own document. It no
+/// longer holds the document to the app's host list, which is a declaration
+/// since the ruling of 8 October 2026: pictures, media, fonts, styles and
+/// connections come from anywhere. What it keeps is the card's code: only
+/// the inline script it was admitted with runs, so it cannot load another,
+/// and nothing may frame, post a form or move the document's base.
+fn policy_csp() -> String {
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline' *; \
+     img-src data: blob: *; media-src blob: *; font-src data: *; \
+     connect-src *; frame-src 'none'; form-action 'none'; base-uri 'none'"
+        .to_string()
 }
 
 /// Put `csp` at the very start of the head, ahead of anything that could
@@ -363,11 +354,6 @@ impl WebCard {
         // inline HTML — used to isolate loadHTMLString from the overlay path.
         if let Some(url) = self.html.trim().strip_prefix("URLTEST:") {
             let url = url.trim().to_string();
-            if !crate::splash_policy::page_allowed(self.source.heap_key(), &url) {
-                log!("web_card navigation refused by the host's allowlist: {url}");
-                self.loaded_html = self.html.clone();
-                return;
-            }
             if !self.spawned {
                 cx.system_browser(id).spawn(&url);
                 self.spawned = true;
@@ -385,8 +371,8 @@ impl WebCard {
             self.spawned = true;
         }
         let mut html = inject_widget_kit(&self.html);
-        if let Some(hosts) = crate::splash_policy::hosts_for_heap(self.source.heap_key()) {
-            html = inject_csp(&html, &policy_csp(&hosts));
+        if crate::splash_policy::is_enforced(self.source.heap_key()) {
+            html = inject_csp(&html, &policy_csp());
         }
         let base = self.base_url_or_default().to_string();
         cx.system_browser(id).set_html(&html, &base);
@@ -437,19 +423,15 @@ impl WebCard {
             }
             // Native HTTP (no browser CORS). Reuses the platform's http_request;
             // the response returns via Event::NetworkResponses (handle below).
-            // GATED: the card's JS is untrusted, so the trusted Rust side enforces
-            // a host allowlist + SSRF guard before any request leaves the device.
+            // GATED: the card's JS is untrusted, so the trusted Rust side keeps
+            // an SSRF guard (and, for the host's own cards, an allowlist)
+            // before any request leaves the device.
             "http.fetch" => match FetchArgs::deserialize_json(args) {
                 Ok(a) => {
                     let allowed = if crate::splash_policy::is_enforced(heap_key) {
-                        // The app's own host list, still https and public.
-                        check_https_public(&a.url).and_then(|_| {
-                            if crate::splash_policy::url_allowed(heap_key, &a.url) {
-                                Ok(())
-                            } else {
-                                Err("host not on this app's allowlist".to_string())
-                            }
-                        })
+                        // Any https public host: the app's host list is a
+                        // declaration, not a gate (8 October 2026).
+                        check_https_public(&a.url).map(|_| ())
                     } else {
                         fetch_host_allowed(&a.url)
                     };
@@ -761,18 +743,8 @@ impl Widget for WebCard {
 
         // A DSL-set `url` (no inline html) navigates once on first draw, so a
         // runsplash card can embed a live web pane via `WebCard{ url: "…" }`.
-        if self.html.is_empty()
-            && !self.url.is_empty()
-            && self.loaded_html != self.url
-            && !crate::splash_policy::page_allowed(self.source.heap_key(), &self.url)
-        {
-            // A card under a policy opens only pages on its host list, or
-            // any public https page with the `web` grant. The top-level
-            // document is what the gate can see; the page's own subresources
-            // are the page's, as in any browser, and it gets no bridge.
-            log!("web_card navigation refused by the host's allowlist: {}", self.url);
-            self.loaded_html = self.url.clone();
-        }
+        // A page opened by URL is the page's own, as in any browser, and it
+        // gets no bridge.
         if self.html.is_empty() && !self.url.is_empty() && self.loaded_html != self.url {
             let id = self.browser_id();
             if !self.spawned {
@@ -837,13 +809,16 @@ impl WebCardRef {
 mod policy_tests {
     use super::*;
 
+    /// A policed document reaches any host, but runs only its own inline
+    /// script and frames nothing.
     #[test]
-    fn a_policed_document_may_reach_only_its_hosts() {
-        let csp = policy_csp(&["api.example.com".into(), "127.0.0.1:5000".into(), "evil.com; script-src *".into()]);
-        assert!(csp.contains("connect-src https://api.example.com https://127.0.0.1:5000;"));
-        assert!(!csp.contains("evil.com"), "a malformed host cannot extend the policy");
-        assert!(policy_csp(&[]).contains("connect-src 'none';"));
-        let html = inject_csp("<html><head><title>x</title></head></html>", &policy_csp(&[]));
+    fn a_policed_document_runs_only_its_own_script() {
+        let csp = policy_csp();
+        assert!(csp.contains("connect-src *;"));
+        assert!(csp.contains("img-src data: blob: *;"));
+        assert!(csp.contains("script-src 'unsafe-inline';"), "no script from elsewhere");
+        assert!(csp.contains("frame-src 'none'; form-action 'none'; base-uri 'none'"));
+        let html = inject_csp("<html><head><title>x</title></head></html>", &csp);
         assert!(html.starts_with("<html><head><meta http-equiv=\"Content-Security-Policy\""));
     }
 
