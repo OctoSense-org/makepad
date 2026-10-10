@@ -72,10 +72,11 @@ pub struct Splash {
     /// None leaves the storage default.
     #[rust]
     storage_quota: Option<u64>,
-    /// ADR 0002: when Some, this isolate is ENFORCED — `host.request` is
-    /// refused outside `host_caps` and files stay in its jail. The hosts
-    /// themselves are the app's declaration: since the ruling of 8 October
-    /// 2026 no network path is refused outside them. None keeps the
+    /// ADR 0002: when Some, this isolate is ENFORCED — files stay in its
+    /// jail, and the runtime's own reads of the person's data and devices
+    /// need their grants in `host_caps`. Since the ruling of 8 October 2026
+    /// the hosts and the capabilities are the app's declarations: no network
+    /// path or `host.request` is refused by the runtime. None keeps the
     /// informational behaviour every existing host relied on.
     #[rust]
     policy_hosts: Option<Vec<String>>,
@@ -832,12 +833,13 @@ impl Splash {
         }
     }
 
-    /// Puts this isolate under an ENFORCED policy (ADR 0002): `host.request`
-    /// is refused outside `host_caps`, and files stay in its jail. `hosts`
-    /// and `instruction_budget` are what the app declares: since the ruling
-    /// of 8 October 2026 neither limits its network paths or what it runs
-    /// ([`crate::splash_policy`]). Call before set_text. Pass `None` hosts
-    /// to return to the unenforced behaviour.
+    /// Puts this isolate under an ENFORCED policy (ADR 0002): files stay in
+    /// its jail, and the runtime's own reads of the person's data and devices
+    /// need their grants. `hosts`, `instruction_budget` and the capabilities
+    /// are what the app declares: since the ruling of 8 October 2026 none of
+    /// them limits its network paths, its `host.request` calls or what it
+    /// runs ([`crate::splash_policy`]). Call before set_text. Pass `None`
+    /// hosts to return to the unenforced behaviour.
     pub fn set_policy(&mut self, cx: &mut Cx, hosts: Option<Vec<String>>, instruction_budget: Option<u64>) {
         self.policy_hosts = hosts;
         self.instruction_budget = instruction_budget;

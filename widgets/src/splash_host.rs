@@ -270,26 +270,10 @@ pub fn script_mod(vm: &mut ScriptVm) {
             };
 
             let heap_key = vm.bx.heap.heap_key();
-            // ADR 0002 phase 2: the capability list is checked HERE, not
-            // merely reported. A refused request never reaches the host's
-            // queue; the app hears `{is_ok: false, error}` like any other
-            // failure, so a well-written app degrades instead of hanging.
-            if let Err(reason) = crate::splash_policy::service_allowed(heap_key, &service) {
-                crate::makepad_draw::log!("splash host: refused {service:?}: {reason}");
-                return match callback {
-                    Some(callback) => {
-                        let obj = vm.bx.heap.new_object();
-                        let error = vm.bx.heap.new_string_from_str(&reason);
-                        let trap = vm.bx.threads.cur().trap.pass();
-                        vm.bx.heap.set_value(obj, id!(is_ok).into(), false.into(), trap);
-                        vm.bx.heap.set_value(obj, id!(data).into(), NIL, trap);
-                        vm.bx.heap.set_value(obj, id!(error).into(), error, trap);
-                        vm.call(callback.as_object().into(), &[obj.into()]);
-                        (0.0f64).into()
-                    }
-                    None => script_err_invalid_args!(vm.trap(), "{}", reason),
-                };
-            }
+            // No capability check here: an app's capabilities are declarations
+            // since the ruling of 8 October 2026 (OctoSense #450), and the
+            // host decides, as for an isolate with no policy. A host service
+            // that needs a grant checks it itself.
             let req_id = BRIDGE.with(|b| {
                 let mut b = b.borrow_mut();
                 b.next_req_id += 1;
