@@ -16,12 +16,13 @@
 //!   ([`instructions_used`]), but never stops it. The per-evaluation cap
 //!   still ends a runaway evaluation.
 //!
-//! What a policy still decides, for a policed heap:
+//! A `host.request` is not checked against the app's capabilities either:
+//! they are declarations too, and a host service that needs a grant checks it
+//! itself.
 //!
-//! - [`service_allowed`] — before a `host.request` is queued (ADR 0002 §2).
-//!   The ruling removes this check as well, once the host checks the family
-//!   grant itself; App Hub's dispatcher does not yet, so dropping it here
-//!   would open every host service to every app;
+//! What a policy still decides, for a policed heap, through
+//! [`service_allowed`]:
+//!
 //! - what the runtime reads for a script with no host in between: the
 //!   device's location ([`location_allowed`]), the person's saved lists
 //!   ([`profile_allowed`]), the camera preview and `agent.notify`;
@@ -87,9 +88,10 @@ pub fn is_enforced(heap_key: usize) -> bool {
     POLICIES.with(|p| p.borrow().contains_key(&heap_key))
 }
 
-/// May this heap ask the host for `service`? `Ok` when no policy is set (the
-/// host decides, as before) or when the policy grants it; `Err` names what is
-/// missing, in words meant for a log.
+/// Does this heap's policy grant `service`? `Ok` when no policy is set or
+/// when the policy grants it; `Err` names what is missing, in words meant for
+/// a log. A `host.request` no longer asks (the host decides); the runtime's
+/// own reads of the person's data and devices still do.
 pub fn service_allowed(heap_key: usize, service: &str) -> Result<(), String> {
     POLICIES.with(|p| {
         let p = p.borrow();
