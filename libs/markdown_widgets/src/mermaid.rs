@@ -44,10 +44,10 @@ fn render(sequence: Sequence) -> Result<String, String> {
     let size = mermaid_rs_renderer::measure_svg_dimensions(&layout, &config, None);
     if !size.width.is_finite()
         || !size.height.is_finite()
-        || size.width > 2048.
-        || size.height > 2048.
+        || size.width > 8192.
+        || size.height > 8192.
     {
-        return Err("Diagram exceeds 2048 pixels; split it into smaller diagrams".into());
+        return Err("Diagram exceeds 8192 pixels; split it into smaller diagrams".into());
     }
     let mut svg = mermaid_rs_renderer::render_svg(&layout, &theme, &config);
     if !heads.is_empty() {
@@ -62,7 +62,7 @@ fn render(sequence: Sequence) -> Result<String, String> {
             .width
             .max(title.chars().count().min(100) as f32 * 10. + 32.);
         let height = size.height + extra;
-        if height > 2048. {
+        if height > 8192. {
             return Err("Diagram title exceeds the image size limit".into());
         }
         let inner = svg.replacen(

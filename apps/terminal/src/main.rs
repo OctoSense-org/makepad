@@ -308,6 +308,7 @@ impl AppMain for App {
         crate::makepad_widgets::script_mod(vm);
         makepad_wm_theme::apply(vm);
         makepad_terminal::widget::script_mod(vm);
+        makepad_terminal::diagram_preview::script_mod(vm);
         makepad_terminal::tabs::script_mod(vm);
         self::script_mod(vm)
     }

@@ -36,6 +36,10 @@ pub fn prepare_image(bytes: &[u8]) -> Result<PreviewImage, String> {
     } else {
         prepare_svg(bytes)?
     };
+    preview_image(width, height, png)
+}
+
+fn preview_image(width: u32, height: u32, png: Vec<u8>) -> Result<PreviewImage, String> {
     if png.len() > 8 * 1024 * 1024 {
         return Err("Decoded image exceeds 8 MB".into());
     }
@@ -47,8 +51,21 @@ pub fn prepare_image(bytes: &[u8]) -> Result<PreviewImage, String> {
     })
 }
 
+/// Generated diagrams may be tall without using an unbounded backing texture.
+/// Ordinary externally supplied SVGs retain their smaller dimension limit.
+#[cfg(feature = "diagrams")]
+pub(crate) fn prepare_diagram_image(bytes: &[u8]) -> Result<PreviewImage, String> {
+    let (width, height, png) = prepare_svg_bounded(bytes, 8192)?;
+    preview_image(width, height, png)
+}
+
 #[cfg(feature = "svg")]
 fn prepare_svg(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    prepare_svg_bounded(bytes, 2048)
+}
+
+#[cfg(feature = "svg")]
+fn prepare_svg_bounded(bytes: &[u8], max_side: u32) -> Result<(u32, u32, Vec<u8>), String> {
     if bytes.len() > 256 * 1024 {
         return Err("SVG exceeds 256 KB".into());
     }
@@ -69,14 +86,25 @@ fn prepare_svg(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     };
     let tree = resvg::usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())?;
     let size = tree.size().to_int_size();
-    if size.width() > 2048 || size.height() > 2048 {
-        return Err("SVG exceeds 2048 pixels".into());
+    if size.width() > max_side || size.height() > max_side {
+        return Err(format!("SVG exceeds {max_side} pixels"));
     }
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width() * 2, size.height() * 2)
+    // At most 16 megapixels (64 MiB RGBA), and 8192 pixels on either axis.
+    // Small diagrams keep their 2x raster; large ones retain logical geometry
+    // and fit within the same allocation budget as the previous 2048x2048 path.
+    let width = size.width() as f64;
+    let height = size.height() as f64;
+    let scale = 2.0_f64
+        .min((16.0 * 1024.0 * 1024.0 / (width * height)).sqrt())
+        .min(8192.0 / width.max(height));
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(
+        (width * scale).floor().max(1.0) as u32,
+        (height * scale).floor().max(1.0) as u32,
+    )
         .ok_or("Invalid image size")?;
     resvg::render(
         &tree,
-        resvg::tiny_skia::Transform::from_scale(2.0, 2.0),
+        resvg::tiny_skia::Transform::from_scale(scale as f32, scale as f32),
         &mut pixmap.as_mut(),
     );
     Ok((

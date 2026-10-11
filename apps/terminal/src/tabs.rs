@@ -17,6 +17,11 @@
 //! | Alt+1..8 / Alt+9               | that tab / the last tab            |
 //! | Ctrl+,       | settings                                             |
 //!
+//! The Diagram button opens the selected Mermaid source, or the latest source
+//! block in this pane's scrollback. Ctrl+Shift+M (`preview_diagram` in settings)
+//! opens it even when a single tab's bar is hidden.
+//! Preview is a separate native view; Escape returns to the untouched PTY.
+//!
 //! Alt+digit is taken only while more than one tab is open (`performable:`),
 //! so a single shell keeps Meta+digit (readline's numeric argument).
 //!
@@ -42,6 +47,7 @@ use makepad_widgets::*;
 
 use crate::keybinds::{self, Keybinds};
 use crate::search;
+use crate::diagram_preview::TermDiagramPreview;
 use crate::settings::{self as term_settings, NewTabCwd, Settings, TabBar, TabTitle};
 use crate::panes::{self, Dir, Divider, Node};
 use crate::settings_panel::{self, Choice, Row, RowKind};
@@ -127,6 +133,7 @@ pub enum TabCommand {    New,
     /// 0-based; `usize::MAX` is the last tab.
     Select(usize),
     Settings,
+    Diagram,
     /// Split the focused pane: side by side, or stacked.
     SplitRight,
     SplitDown,
@@ -157,15 +164,16 @@ pub fn tab_command_of(action: &keybinds::Action) -> Option<TabCommand> {
         A::GotoSplit(dir) => TabCommand::Focus(*dir),
         A::ToggleSplitZoom => TabCommand::Zoom,
         A::OpenConfig => TabCommand::Settings,
+        A::PreviewDiagram => TabCommand::Diagram,
         A::PromptTabTitle => TabCommand::Rename,
         _ => return None,
     })
 }
 
-/// The keys the tab widget took before shortcuts were configurable; the
-/// default table must answer the same (`the_tab_keys_map_to_commands`).
+/// Independent reference for the default tab shortcuts. The configurable
+/// table must answer the same (`the_tab_keys_map_to_commands`).
 #[cfg(test)]
-fn legacy_tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
+fn reference_tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
     let m = &key.modifiers;
     if m.logo {
         return None;
@@ -179,6 +187,7 @@ fn legacy_tab_command(key: &KeyEvent, tabs: usize) -> Option<TabCommand> {
             KeyCode::PageDown if !m.shift => return Some(TabCommand::Next),
             KeyCode::PageUp if !m.shift => return Some(TabCommand::Previous),
             KeyCode::Comma if !m.shift => return Some(TabCommand::Settings),
+            KeyCode::KeyM if m.shift => return Some(TabCommand::Diagram),
             KeyCode::KeyD if m.shift => return Some(TabCommand::SplitRight),
             KeyCode::KeyE if m.shift => return Some(TabCommand::SplitDown),
             KeyCode::KeyZ if m.shift => return Some(TabCommand::Zoom),
@@ -440,6 +449,7 @@ enum BarHit {
     CloseTab(usize),
     NewTab,
     Settings,
+    Diagram,
     ConfirmClose,
     CancelClose,
 }
@@ -541,6 +551,10 @@ pub struct TermTabs {
     /// agent may call the read tools only (`run` stays with the host).
     #[rust]
     agent: Option<makepad_ai_services::peer::OctosPeer>,
+    #[rust]
+    diagram: WidgetRef,
+    #[rust]
+    diagram_open: bool,
     #[live(30.0)]
     bar_height: f64,
 
@@ -728,6 +742,9 @@ enum PanelHit {
 impl ScriptHook for TermTabs {
     fn on_after_new(&mut self, vm: &mut ScriptVm) {
         self.panel_list = Some(DrawList2d::script_new(vm));
+        let value = script_eval!(vm, { use mod.widgets.*; TermDiagramPreview{} });
+        self.diagram = WidgetRef::script_from_value(vm, value);
+        vm.cx_mut().widget_tree_insert_child_deep(self.uid, id!(diagram), self.diagram.clone());
     }
 
     fn on_after_apply(&mut self, vm: &mut ScriptVm, apply: &Apply, _scope: &mut Scope, value: ScriptValue) {
@@ -799,6 +816,15 @@ impl TermTabs {
         let jobs = self.running_jobs();
         let decision = close_all_decision(self.settings.confirm_close_running, self.close_confirmed, &jobs);
         if decision == CloseDecision::Veto {
+            if self.diagram_open {
+                self.diagram_open = false;
+                if let Some(mut preview) = self.diagram.borrow_mut::<TermDiagramPreview>() {
+                    preview.close(cx);
+                }
+                if let Some(tab) = self.tabs.get(self.active) {
+                    tab.with_term(|term| term.focus(cx));
+                }
+            }
             self.commit_rename(cx);
             self.pending_close = Some(PendingClose::All { jobs });
             // The bar may be hidden (one tab): the whole terminal relays
@@ -859,6 +885,7 @@ impl TermTabs {
                 self.select(cx, index.min(self.tabs.len() - 1))
             }
             TabCommand::Settings => self.toggle_panel(cx),
+            TabCommand::Diagram => self.open_diagram(cx),
             TabCommand::CloseTab => self.request_close(cx, self.active, None),
             TabCommand::Rename => self.begin_rename(cx, self.active),
             _ => {}
@@ -1286,6 +1313,17 @@ impl TermTabs {
                 .any(|p| p.with_term(|term| term.has_input_focus(cx)) == Some(true))
     }
 
+    fn open_diagram(&mut self, cx: &mut Cx) {
+        let source = self.tabs.get(self.active)
+            .and_then(|tab| tab.with_term(|term| term.diagram_source()).flatten());
+        self.panel = None;
+        self.diagram_open = true;
+        if let Some(mut preview) = self.diagram.borrow_mut::<TermDiagramPreview>() {
+            preview.open(cx, source);
+        }
+        self.refresh(cx);
+    }
+
     fn show_bar(&self) -> bool {
         self.tabs_enabled && (self.settings.tab_bar == TabBar::Always || self.tabs.len() > 1)
     }
@@ -1301,6 +1339,7 @@ impl TermTabs {
             BarHit::CloseTab(i) => self.request_close(cx, i, None),
             BarHit::NewTab => self.run_command(cx, TabCommand::New),
             BarHit::Settings => self.run_command(cx, TabCommand::Settings),
+            BarHit::Diagram => self.run_command(cx, TabCommand::Diagram),
             BarHit::ConfirmClose => self.confirm_pending(cx),
             BarHit::CancelClose => {
                 self.pending_close = None;
@@ -1523,6 +1562,22 @@ impl Widget for TermTabs {
                     self.begin_rename(cx, index);
                 }
             }
+        }
+
+        // A preview owns all input; PTY signals/timers still reach every pane.
+        let preview_was_open = self.diagram_open;
+        if self.diagram_open || !is_input(event) {
+            self.diagram.handle_event(cx, event, scope);
+        }
+        if self.diagram_open && self.diagram.borrow::<TermDiagramPreview>().is_some_and(|p| p.closed) {
+            self.diagram_open = false;
+            if let Some(tab) = self.tabs.get(self.active) {
+                tab.with_term(|term| term.focus(cx));
+            }
+            self.refresh(cx);
+        }
+        if preview_was_open && is_input(event) {
+            return;
         }
 
         if self.tabs_enabled && self.keyboard_is_ours(cx) {
@@ -1751,12 +1806,17 @@ impl Widget for TermTabs {
         }
         cx.begin_turtle(walk, self.layout);
         self.hits.clear();
-        if self.show_bar() || self.pending_close.is_some() {
+        if !self.diagram_open && (self.show_bar() || self.pending_close.is_some()) {
             self.draw_tab_bar(cx);
         }
         let body = cx.walk_turtle(Walk::fill());
         self.body = body;
-        self.draw_panes(cx, scope, body);
+        if self.diagram_open {
+            self.diagram.draw_walk_all(cx, scope,
+                Walk::new(Size::Fixed(body.size.x), Size::Fixed(body.size.y)).with_abs_pos(body.pos));
+        } else {
+            self.draw_panes(cx, scope, body);
+        }
         cx.end_turtle();
         if let Some(mut list) = self.panel_list.take() {
             list.begin_overlay_reuse(cx);
@@ -1765,7 +1825,7 @@ impl Widget for TermTabs {
             let pass = cx.current_pass_size();
             let size = dvec2(pass.x.max(body.pos.x + body.size.x), pass.y.max(body.pos.y + body.size.y));
             cx.begin_root_turtle(size, Layout::default());
-            if self.panel.is_some() {
+            if self.panel.is_some() && !self.diagram_open {
                 self.draw_settings_panel(cx, body);
             }
             cx.end_pass_sized_turtle();
@@ -1899,7 +1959,11 @@ impl TermTabs {
         let button = h - 6.0;
         let pad = 6.0;
         let gear = Rect { pos: dvec2(bar.pos.x + bar.size.x - pad - button, bar.pos.y + 3.0), size: dvec2(button, button) };
-        let tabs_room = (gear.pos.x - bar.pos.x - pad - button - 8.0).max(0.0);
+        let diagram_button = Rect { pos: dvec2(gear.pos.x - 80.0, gear.pos.y), size: dvec2(74.0, button) };
+        self.draw_label.color = if self.hover == Some(BarHit::Diagram) { fg } else { dim_fg };
+        self.draw_label.draw_abs(cx, diagram_button.pos + dvec2(8.0, (button - 12.0) * 0.5), "Diagram");
+        self.hits.push((diagram_button, BarHit::Diagram));
+        let tabs_room = (diagram_button.pos.x - bar.pos.x - pad - button - 8.0).max(0.0);
         let count = self.tabs.len().max(1) as f64;
         let tab_w = (tabs_room / count).clamp(48.0, 220.0);
         let mut x = bar.pos.x + pad;
@@ -2837,9 +2901,9 @@ mod tests {
     }
 
     #[test]
-    fn the_default_table_takes_exactly_the_old_tab_keys() {
+    fn the_default_table_matches_the_reference_tab_keys() {
         // Every key, every modifier combination, one to four tabs, both
-        // platforms: the table answers what the hard-coded match did.
+        // platforms: the table agrees with the independent reference.
         for mac in [false, true] {
             let keys = Keybinds::defaults(mac);
             for &code in keybinds::ALL_KEY_CODES {
@@ -2849,7 +2913,7 @@ mod tests {
                     for tabs in 1..=4 {
                         assert_eq!(
                             table_tab_command(&keys, &k, tabs, false),
-                            legacy_tab_command(&k, tabs),
+                            reference_tab_command(&k, tabs),
                             "mac {mac}, {tabs} tabs: {:?} {:?}",
                             k.key_code,
                             k.modifiers

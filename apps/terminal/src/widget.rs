@@ -1714,6 +1714,24 @@ impl MpTerm {
         Some(if a <= c { (a, c) } else { (c, a) })
     }
 
+    /// Source for the explicit diagram preview. Read only this pane; never
+    /// execute output, inspect other panes, or fetch linked resources.
+    pub(crate) fn diagram_source(&self) -> Option<String> {
+        if let Some(selected) = self.selected_text() {
+            return crate::diagram_preview::source_from_output(&selected).or(Some(selected));
+        }
+        let screen = self.session.as_ref()?.terminal.screen();
+        let end = screen.total_rows().saturating_sub(1);
+        let start = end.saturating_sub(511);
+        // Bound extraction even when a terminal is unusually wide.
+        if screen.cols.saturating_mul(end - start + 1) > 256 * 1024 { return None; }
+        let text = screen.selection_text(
+            (screen.absolute_of_virtual(start), 0),
+            (screen.absolute_of_virtual(end), screen.cols),
+        );
+        crate::diagram_preview::source_from_output(&text)
+    }
+
     fn selected_text(&self) -> Option<String> {
         let session = self.session.as_ref()?;
         let (start, end) = self.sel_ordered()?;
