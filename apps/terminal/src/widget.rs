@@ -49,6 +49,10 @@ mod search_bar;
 use crate::search::Search;
 use search_bar::SearchUi;
 
+#[path = "inline_diagrams.rs"]
+mod inline_diagrams;
+use inline_diagrams::{InlineClick, InlineDiagrams};
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -671,6 +675,8 @@ pub struct MpTerm {
     /// Lines scrolled back from the bottom (0 = live).
     #[rust]
     view_offset: usize,
+    #[rust]
+    inline_diagrams: InlineDiagrams,
     // Selection in absolute (eviction-stable) rows.
     #[rust]
     sel_anchor: Option<(u64, usize)>,
@@ -984,6 +990,7 @@ impl MpTerm {
     /// job — dropping the session kills the PTY child — and run a new one
     /// in place, same process, same window.
     pub fn restart_with(&mut self, cx: &mut Cx, cwd: Option<PathBuf>, command: Option<String>) {
+        self.inline_diagrams.clear(cx);
         self.session = None;
         self.cwd = cwd;
         self.command = command;
@@ -998,6 +1005,7 @@ impl MpTerm {
     /// Quick Look unload (`WmEvent::PreviewUnload`): drop the job and idle
     /// blank until the next retarget. Not a close — the process stays warm.
     pub fn unload(&mut self, cx: &mut Cx) {
+        self.inline_diagrams.clear(cx);
         self.session = None;
         self.dormant = true;
         self.view_offset = 0;
@@ -2343,6 +2351,8 @@ impl MpTerm {
         let top_virtual = screen.scrollback.len().saturating_sub(self.view_offset);
         let total = screen.total_rows();
 
+        self.inline_diagrams.prepare(cx, &session.terminal, top_virtual, output_changed, self.search_ui.open);
+
         // Collect draw data first (bg runs, glyphs, decorations), then issue
         // batched draws per layer.
         struct BgRun {
@@ -2416,6 +2426,7 @@ impl MpTerm {
                 break;
             }
             let abs = screen.absolute_of_virtual(virt);
+            if self.inline_diagrams.covers(abs) { continue; }
             let row = match screen.row_virtual(virt) {
                 Some(r) => r,
                 None => continue,
@@ -2837,6 +2848,9 @@ impl MpTerm {
             );
         }
 
+        self.inline_diagrams.draw(cx, &mut self.draw_cell_bg, &mut self.draw_text,
+            Rect {pos: dvec2(origin_x, origin_y), size: dvec2(cols as f64 * cell_w, rows as f64 * cell_h)},
+            screen.absolute_of_virtual(top_virtual), cell_h, selection);
         self.draw_search_bar(cx, session.terminal.screen(), default_fg, default_bg);
 
         // Exited banner.
@@ -2986,6 +3000,7 @@ impl Widget for MpTerm {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if self.inline_diagrams.handle_timer(cx, event) { self.draw_bg.redraw(cx); }
         self.search_next_frame(cx, event);
         if self.blink_timer.is_event(event).is_some() {
             self.blink_armed = false;
@@ -3124,6 +3139,23 @@ impl Widget for MpTerm {
         match hit {
             Hit::FingerDown(e) => {
                 cx.set_key_focus(self.area);
+                match self.inline_diagrams.click(e.abs) {
+                    InlineClick::None => {},
+                    action => {
+                        self.press = Press::Idle;
+                        self.selecting = false;
+                        self.sel_unit = None;
+                        self.sel_anchor = None;
+                        self.sel_cursor = None;
+                        if let InlineClick::Select {start, end} = action {
+                            let cols = self.session.as_ref().map(|s| s.terminal.screen().cols).unwrap_or(0);
+                            self.sel_anchor = Some((start, 0));
+                            self.sel_cursor = Some((end - 1, cols));
+                        }
+                        self.draw_bg.redraw(cx);
+                        return;
+                    }
+                }
                 if self.link_press_down(&e) {
                     return;
                 }
@@ -3251,13 +3283,15 @@ impl Widget for MpTerm {
                 let held = links::link_modifier(e.modifiers.logo, e.modifiers.control);
                 self.link_pointer = Some((e.abs, held));
                 self.update_link_hover(cx);
+                if self.inline_diagrams.control_at(e.abs) { cx.set_cursor(MouseCursor::Hand); }
             }
             Hit::FingerHoverOut(_) => {
                 self.link_pointer = None;
                 self.update_link_hover(cx);
             }
             Hit::FingerScroll(e) => {
-                self.handle_scroll(cx, &e);
+                if self.inline_diagrams.pan(&e) { self.draw_bg.redraw(cx); }
+                else { self.handle_scroll(cx, &e); }
             }
             Hit::KeyFocus(_) => {
                 term_settings::reload_if_changed();

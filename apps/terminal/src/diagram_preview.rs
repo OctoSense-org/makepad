@@ -57,7 +57,7 @@ pub fn source_from_output(text: &str) -> Option<String> {
     Some(source.trim().to_owned())
 }
 
-fn is_header(line: &str) -> bool {
+pub(crate) fn is_header(line: &str) -> bool {
     matches!(line.split_whitespace().next(), Some(
         "flowchart" | "graph" | "sequenceDiagram" | "classDiagram" |
         "stateDiagram" | "stateDiagram-v2" | "erDiagram" | "pie" |
@@ -65,7 +65,7 @@ fn is_header(line: &str) -> bool {
     ))
 }
 
-fn looks_like_statement(line: &str) -> bool {
+pub(crate) fn looks_like_statement(line: &str) -> bool {
     line.starts_with("%%") || line.contains("--") || line.contains("->") ||
     line.contains('[') || line.contains('{') || line.contains('(') || matches!(line.split_whitespace().next(), Some(
         "classDef" | "class" | "style" | "linkStyle" | "subgraph" | "end" |
