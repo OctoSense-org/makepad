@@ -195,6 +195,19 @@ pub(crate) fn resolve_studio_crate() -> Option<String> {
         })
 }
 
+/// Whether a build honours launch-time development input that Makepad itself
+/// acts on: the Studio connection and the `OCTOS_PROXY` app HTTP proxy, both
+/// carried in an Android Intent extra (or an OpenHarmony launch parameter).
+/// An activity that handles those is usually exported, so another installed
+/// app can start it with extras; a shipped app must not act on them. True for
+/// a debuggable build, or one that opts in through its manifest (on Android,
+/// the `dev.makepad.LAUNCH_STUDIO` meta-data). The Android glue
+/// (`os::linux::android::android_jni`) passes both signals in.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn launch_dev_input_allowed(debuggable: bool, manifest_opt_in: bool) -> bool {
+    debuggable || manifest_opt_in
+}
+
 fn build_studio_http(
     studio_host: &str,
     studio_build: Option<&str>,
@@ -238,6 +251,14 @@ pub fn resolve_studio_http() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_debuggable_or_opted_in_builds_honour_launch_dev_input() {
+        assert!(launch_dev_input_allowed(true, false), "a debuggable build");
+        assert!(launch_dev_input_allowed(false, true), "a manifest opt-in");
+        assert!(launch_dev_input_allowed(true, true));
+        assert!(!launch_dev_input_allowed(false, false), "a shipped build ignores launch dev input");
+    }
 
     #[test]
     fn extract_studio_build_id_handles_app_paths() {

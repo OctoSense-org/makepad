@@ -525,6 +525,136 @@ unsafe fn persist_string_pref(
     true
 }
 
+/// Remove a persisted preference. Used to drop a Studio host a development
+/// build saved, so it cannot survive into a shipped build.
+unsafe fn remove_persisted_pref(
+    env: *mut jni_sys::JNIEnv,
+    activity: jni_sys::jobject,
+    key: &str,
+) -> bool {
+    let prefs = match get_prefs_object(env, activity) {
+        Some(v) => v,
+        None => return false,
+    };
+    let editor = ndk_utils::call_object_method!(
+        env,
+        prefs,
+        "edit",
+        "()Landroid/content/SharedPreferences$Editor;"
+    );
+    if editor.is_null() {
+        return false;
+    }
+    let key = match new_jstring(env, key) {
+        Some(v) => v,
+        None => return false,
+    };
+    let editor = ndk_utils::call_object_method!(
+        env,
+        editor,
+        "remove",
+        "(Ljava/lang/String;)Landroid/content/SharedPreferences$Editor;",
+        key
+    );
+    if editor.is_null() {
+        return false;
+    }
+    ndk_utils::call_void_method!(env, editor, "apply", "()V");
+    true
+}
+
+/// Whether this build is debuggable (`android:debuggable="true"`): the
+/// ApplicationInfo `FLAG_DEBUGGABLE` bit.
+unsafe fn activity_is_debuggable(env: *mut jni_sys::JNIEnv, activity: jni_sys::jobject) -> bool {
+    let app_info = ndk_utils::call_object_method!(
+        env,
+        activity,
+        "getApplicationInfo",
+        "()Landroid/content/pm/ApplicationInfo;"
+    );
+    if app_info.is_null() {
+        return false;
+    }
+    let class = ((**env).GetObjectClass.unwrap())(env, app_info);
+    if class.is_null() {
+        return false;
+    }
+    let field = ((**env).GetFieldID.unwrap())(env, class, b"flags\0".as_ptr() as _, b"I\0".as_ptr() as _);
+    if field.is_null() {
+        return false;
+    }
+    const FLAG_DEBUGGABLE: i32 = 2; // ApplicationInfo.FLAG_DEBUGGABLE
+    ((**env).GetIntField.unwrap())(env, app_info, field) & FLAG_DEBUGGABLE != 0
+}
+
+/// A boolean `<meta-data>` on the application element, default false. Lets a
+/// specific signed build opt into launch-time development input without being
+/// debuggable.
+unsafe fn application_meta_bool(
+    env: *mut jni_sys::JNIEnv,
+    activity: jni_sys::jobject,
+    key: &str,
+) -> bool {
+    let pm = ndk_utils::call_object_method!(
+        env,
+        activity,
+        "getPackageManager",
+        "()Landroid/content/pm/PackageManager;"
+    );
+    if pm.is_null() {
+        return false;
+    }
+    let package = ndk_utils::call_object_method!(
+        env,
+        activity,
+        "getPackageName",
+        "()Ljava/lang/String;"
+    );
+    if package.is_null() {
+        return false;
+    }
+    const GET_META_DATA: i32 = 128; // PackageManager.GET_META_DATA
+    let app_info = ndk_utils::call_object_method!(
+        env,
+        pm,
+        "getApplicationInfo",
+        "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;",
+        package,
+        GET_META_DATA
+    );
+    // getApplicationInfo for our own package never throws, but clear any
+    // pending exception so the next JNI call is not poisoned.
+    if (**env).ExceptionCheck.map(|f| f(env)).unwrap_or(0) != 0 {
+        ((**env).ExceptionClear.unwrap())(env);
+        return false;
+    }
+    if app_info.is_null() {
+        return false;
+    }
+    let class = ((**env).GetObjectClass.unwrap())(env, app_info);
+    if class.is_null() {
+        return false;
+    }
+    let field = ((**env).GetFieldID.unwrap())(
+        env,
+        class,
+        b"metaData\0".as_ptr() as _,
+        b"Landroid/os/Bundle;\0".as_ptr() as _,
+    );
+    if field.is_null() {
+        return false;
+    }
+    let bundle = ((**env).GetObjectField.unwrap())(env, app_info, field);
+    if bundle.is_null() {
+        return false;
+    }
+    let key = match new_jstring(env, key) {
+        Some(v) => v,
+        None => return false,
+    };
+    ndk_utils::call_bool_method!(env, bundle, "getBoolean", "(Ljava/lang/String;Z)Z", key, 0i32) != 0
+}
+
 pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) {
     if activity.is_null() {
         return;
@@ -532,32 +662,55 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     let env = attach_jni_env();
     let activity = activity as jni_sys::jobject;
 
+    // A launch Intent's extras are untrusted: this activity is usually
+    // exported (an app's launcher entry, and OctoSense Home is a Home app and
+    // a share/deep-link target), so any installed app can start it with
+    // extras. The Studio connection and the OCTOS_PROXY JVM proxy below are
+    // things Makepad itself acts on, so they are honoured from launch input
+    // only when the build opts into launch-time development input:
+    // `android:debuggable="true"`, or the manifest meta-data
+    // `dev.makepad.LAUNCH_STUDIO` set true. A shipped (non-debuggable) app
+    // ignores them, and drops any Studio host it saved under an earlier
+    // development build. The other `MAKEPAD_*` passthroughs below are inert
+    // until an app reads them; the app decides whether to.
+    let allow_launch_dev = crate::app_main::launch_dev_input_allowed(
+        activity_is_debuggable(env, activity),
+        application_meta_bool(env, activity, "dev.makepad.LAUNCH_STUDIO"),
+    );
+
     std::env::remove_var("STUDIO");
     std::env::remove_var("STUDIO_BUILD");
     std::env::remove_var("STUDIO_HOST");
     std::env::remove_var("STUDIO_CRATE");
 
-    let intent_studio_host = get_intent_string_extra(env, activity, "makepad.STUDIO_HOST")
-        .filter(|v| !v.trim().is_empty());
-    let intent_studio_crate = get_intent_string_extra(env, activity, "makepad.STUDIO_CRATE")
-        .filter(|v| !v.trim().is_empty());
+    if allow_launch_dev {
+        let intent_studio_host = get_intent_string_extra(env, activity, "makepad.STUDIO_HOST")
+            .filter(|v| !v.trim().is_empty());
+        let intent_studio_crate = get_intent_string_extra(env, activity, "makepad.STUDIO_CRATE")
+            .filter(|v| !v.trim().is_empty());
 
-    if let Some(studio_host) = intent_studio_host {
-        let _ = persist_string_pref(env, activity, MAKEPAD_STUDIO_HOST_PREF_KEY, &studio_host);
-        std::env::set_var("STUDIO_HOST", &studio_host);
-    } else if let Some(studio_host) =
-        get_persisted_string_pref(env, activity, MAKEPAD_STUDIO_HOST_PREF_KEY)
-    {
-        std::env::set_var("STUDIO_HOST", &studio_host);
-    }
+        if let Some(studio_host) = intent_studio_host {
+            let _ = persist_string_pref(env, activity, MAKEPAD_STUDIO_HOST_PREF_KEY, &studio_host);
+            std::env::set_var("STUDIO_HOST", &studio_host);
+        } else if let Some(studio_host) =
+            get_persisted_string_pref(env, activity, MAKEPAD_STUDIO_HOST_PREF_KEY)
+        {
+            std::env::set_var("STUDIO_HOST", &studio_host);
+        }
 
-    if let Some(studio_crate) = intent_studio_crate {
-        let _ = persist_string_pref(env, activity, MAKEPAD_STUDIO_CRATE_PREF_KEY, &studio_crate);
-        std::env::set_var("STUDIO_CRATE", &studio_crate);
-    } else if let Some(studio_crate) =
-        get_persisted_string_pref(env, activity, MAKEPAD_STUDIO_CRATE_PREF_KEY)
-    {
-        std::env::set_var("STUDIO_CRATE", &studio_crate);
+        if let Some(studio_crate) = intent_studio_crate {
+            let _ = persist_string_pref(env, activity, MAKEPAD_STUDIO_CRATE_PREF_KEY, &studio_crate);
+            std::env::set_var("STUDIO_CRATE", &studio_crate);
+        } else if let Some(studio_crate) =
+            get_persisted_string_pref(env, activity, MAKEPAD_STUDIO_CRATE_PREF_KEY)
+        {
+            std::env::set_var("STUDIO_CRATE", &studio_crate);
+        }
+    } else {
+        // Never let a Studio host survive into a shipped build: an app built
+        // debuggable once, then released, must not keep dialing it.
+        let _ = remove_persisted_pref(env, activity, MAKEPAD_STUDIO_HOST_PREF_KEY);
+        let _ = remove_persisted_pref(env, activity, MAKEPAD_STUDIO_CRATE_PREF_KEY);
     }
 
     // Generic app-config passthrough: `--es makepad.APP_CONFIG <value>`
@@ -672,10 +825,18 @@ pub unsafe fn apply_studio_env_from_activity(activity: *const std::ffi::c_void) 
     // `direct` / `none` / `off` / empty (or no extra at all) => NO proxy: both the
     // octos LLM leg and the app-side sys.* fetches go straight out over the
     // device's own network (Wi-Fi). Any other value is a proxy URL to tunnel.
-    let proxy = get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY").filter(|v| {
-        let t = v.trim().to_ascii_lowercase();
-        !t.is_empty() && t != "direct" && t != "none" && t != "off"
-    });
+    // Makepad acts on this itself (the app-side JVM proxy below), so like the
+    // Studio connection it is honoured from launch input only when the build
+    // opts into launch-time development input; a shipped app always clears
+    // the proxy.
+    let proxy = allow_launch_dev
+        .then(|| {
+            get_intent_string_extra(env, activity, "makepad.OCTOS_PROXY").filter(|v| {
+                let t = v.trim().to_ascii_lowercase();
+                !t.is_empty() && t != "direct" && t != "none" && t != "off"
+            })
+        })
+        .flatten();
     if let Some(proxy) = proxy {
         std::env::set_var("MAKEPAD_OCTOS_PROXY", &proxy);
         // App-side leg: MakepadNetwork opens connections with a bare

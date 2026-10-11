@@ -1435,6 +1435,24 @@ public class MakepadActivity
         clearWarmResumeSurfaceSnapshot();
     }
 
+    // Whether this build acts on launch-time development input that Makepad
+    // itself handles (the OCTOS_PROXY app proxy here, the Studio connection
+    // on the native side): a debuggable build, or one that opts in with the
+    // `dev.makepad.LAUNCH_STUDIO` manifest meta-data. A shipped app does
+    // neither, so an Intent extra from another app cannot point it at a proxy.
+    private boolean launchDevInputAllowed() {
+        try {
+            ApplicationInfo info = getPackageManager().getApplicationInfo(
+                getPackageName(), PackageManager.GET_META_DATA);
+            boolean debuggable = (info.flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+            boolean optIn = info.metaData != null
+                && info.metaData.getBoolean("dev.makepad.LAUNCH_STUDIO", false);
+            return debuggable || optIn;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     @Override
     public void onCreate(Bundle savedInstanceState) {
         if (mWebSocketsThread == null || !mWebSocketsThread.isAlive()) {
@@ -1458,9 +1476,12 @@ public class MakepadActivity
         // is set — needed when the device has no direct internet route (e.g. an
         // adb-reverse tunnel to the dev host). HttpURLConnection honours these
         // JVM proxy system properties, so no per-request change is needed.
+        // This activity is usually exported, so the extra is untrusted: only a
+        // build that opts into launch-time development input acts on it (the
+        // native side keeps the same rule and clears the properties otherwise).
         try {
             Intent launchIntent = getIntent();
-            String proxy = launchIntent != null
+            String proxy = launchDevInputAllowed() && launchIntent != null
                 ? launchIntent.getStringExtra("makepad.OCTOS_PROXY") : null;
             if (proxy != null && proxy.length() > 0) {
                 String hp = proxy.replaceFirst("^https?://", "").replaceAll("/.*$", "");
