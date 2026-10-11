@@ -2351,7 +2351,7 @@ impl MpTerm {
         let top_virtual = screen.scrollback.len().saturating_sub(self.view_offset);
         let total = screen.total_rows();
 
-        self.inline_diagrams.prepare(cx, &session.terminal, top_virtual, output_changed, self.search_ui.open);
+        self.inline_diagrams.prepare(cx, session, top_virtual, output_changed, self.search_ui.open);
 
         // Collect draw data first (bg runs, glyphs, decorations), then issue
         // batched draws per layer.
@@ -3291,6 +3291,14 @@ impl Widget for MpTerm {
             }
             Hit::FingerScroll(e) => {
                 if self.inline_diagrams.pan(&e) { self.draw_bg.redraw(cx); }
+                else if e.modifiers.shift && self.inline_diagrams.routes_shift_scroll_to_app(e.abs) {
+                    // Shift bypasses image panning. In an agent's alternate
+                    // screen the app owns history, so send its normal wheel
+                    // reports rather than scrolling an empty local history.
+                    let mut forwarded = e.clone();
+                    forwarded.modifiers.shift = false;
+                    self.handle_scroll(cx, &forwarded);
+                }
                 else { self.handle_scroll(cx, &e); }
             }
             Hit::KeyFocus(_) => {

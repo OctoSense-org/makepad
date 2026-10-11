@@ -39,7 +39,8 @@ pub fn source_from_output(text: &str) -> Option<String> {
         let bare_id = !trimmed.is_empty()
             && trimmed.trim_end_matches(';').chars().all(|c| c.is_alphanumeric() || c == '_');
         if !fenced && !quoted && !source.is_empty() && !trimmed.is_empty()
-            && (flowchart || blank) && !looks_like_statement(trimmed) && !bare_id {
+            && (flowchart || blank)
+            && !(if flowchart { flowchart_statement(trimmed) } else { looks_like_statement(trimmed) }) && !bare_id {
             break;
         }
         if source.len() + line.len() + 1 > MAX_SOURCE {
@@ -65,7 +66,22 @@ pub(crate) fn is_header(line: &str) -> bool {
     ))
 }
 
-pub(crate) fn looks_like_statement(line: &str) -> bool {
+/// Recognize a statement at its beginning. Punctuation elsewhere in prose
+/// (especially Markdown links and parenthesized source citations) is not a
+/// node declaration and must not become part of an unfenced flowchart.
+pub(crate) fn flowchart_statement(line: &str) -> bool {
+    if line.starts_with("%%") || matches!(line.split_whitespace().next(), Some(
+        "classDef" | "class" | "style" | "linkStyle" | "subgraph" | "end" | "direction" | "click"
+    )) { return true; }
+    let id_end = line.char_indices().find(|(_, c)| !(c.is_alphanumeric() || matches!(c, '_' | '-' | '.')))
+        .map_or(line.len(), |(index, _)| index);
+    if id_end == 0 { return false; }
+    let rest = line[id_end..].trim_start();
+    rest.is_empty() || rest == ";" || rest.starts_with(":::") || rest.starts_with("@{")
+        || rest.starts_with(['[', '(', '{', '-', '=', '.', '<', '>', '&'])
+}
+
+fn looks_like_statement(line: &str) -> bool {
     line.starts_with("%%") || line.contains("--") || line.contains("->") ||
     line.contains('[') || line.contains('{') || line.contains('(') || matches!(line.split_whitespace().next(), Some(
         "classDef" | "class" | "style" | "linkStyle" | "subgraph" | "end" |

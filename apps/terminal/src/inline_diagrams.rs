@@ -1,8 +1,9 @@
 //! Mermaid is a presentation of transcript cells, never input to the PTY.
 //! Keep the original rows (including soft wraps) so cursor addressing, search,
 //! selection, copy and interactive CLI redraws retain their terminal semantics.
-use crate::diagram_preview::{is_header, looks_like_statement, MAX_SOURCE};
-use crate::term::{modes::Mode, screen::Screen, terminal::{ActiveScreen, Terminal}};
+use crate::diagram_preview::{is_header, flowchart_statement, MAX_SOURCE};
+use crate::session::Session;
+use crate::term::{modes::Mode, screen::Screen, terminal::ActiveScreen};
 use crate::widget::DrawTermBg;
 use makepad_markdown_widgets::{content::PreviewImage, diagram};
 use makepad_widgets::*;
@@ -14,6 +15,7 @@ const QUIET: Duration = Duration::from_millis(250);
 
 struct SourceBlock {
     start: u64,
+    source_start: u64,
     end: u64, // exclusive, physical rows
     source: String,
     cells: String,
@@ -32,6 +34,7 @@ struct Entry {
     header: Rect,
     canvas: Rect,
     visible: bool,
+    valid: bool,
 }
 
 impl Entry {
@@ -39,7 +42,7 @@ impl Entry {
         let fit = block.end - block.start < 10;
         Self { block, image: None, dimensions: dvec2(1.0, 1.0), failed: false,
             source_visible: false, zoom: 1.0, fit, pan: dvec2(0.0, 0.0),
-            rect: Rect::default(), header: Rect::default(), canvas: Rect::default(), visible: false }
+            rect: Rect::default(), header: Rect::default(), canvas: Rect::default(), visible: false, valid: true }
     }
 
     fn image_size(&self) -> Vec2d {
@@ -65,6 +68,7 @@ pub(crate) struct InlineDiagrams {
     changed: Option<Instant>,
     scanned: Option<(u64, usize)>,
     enabled: bool,
+    interactive: bool,
 }
 
 pub(crate) enum InlineClick {
@@ -85,12 +89,23 @@ impl InlineDiagrams {
 
     /// Run before collecting terminal glyphs: overlaying a quad alone cannot
     /// hide glyphs batched into the terminal's separate draw-call groups.
-    pub fn prepare(&mut self, cx: &mut Cx, terminal: &Terminal, top: usize, changed: bool, searching: bool) {
+    pub fn prepare(&mut self, cx: &mut Cx, session: &Session, top: usize, changed: bool, searching: bool) {
+        let terminal = &session.terminal;
         let modes = &terminal.modes;
         let was_enabled = self.enabled;
-        self.enabled = !searching && terminal.active == ActiveScreen::Primary
-            && ![Mode::MouseEventAny, Mode::MouseEventButton, Mode::MouseEventNormal, Mode::MouseEventX10]
+        let was_interactive = self.interactive;
+        self.interactive = terminal.active == ActiveScreen::Alternate
+            || [Mode::MouseEventAny, Mode::MouseEventButton, Mode::MouseEventNormal, Mode::MouseEventX10]
                 .into_iter().any(|m| modes.get(m));
+        // Coding agents use alternate-screen transcripts and mouse reporting,
+        // too. The foreground process, not a stale window title, distinguishes
+        // them from editors. Keep their PTY coordinates and input unchanged.
+        self.enabled = !searching && (!self.interactive || crate::agent::detect_agent(
+            session.foreground_name().as_deref(), &terminal.title).is_some());
+        if self.enabled != was_enabled || self.interactive != was_interactive {
+            log!("inline Mermaid: enabled={}, interactive={}, alternate={}",
+                self.enabled, self.interactive, terminal.active == ActiveScreen::Alternate);
+        }
         for entry in &mut self.entries { entry.visible = false; }
         if !self.enabled {
             self.changed = None;
@@ -99,22 +114,25 @@ impl InlineDiagrams {
         }
         let screen = terminal.screen();
         if changed || !was_enabled {
-            self.changed = Some(Instant::now());
+            // Bound the wait from the first change. An agent may continually
+            // repaint its status line while a completed diagram is stable.
+            self.changed.get_or_insert_with(Instant::now);
             self.scanned = None;
             // Never cover rewritten text with a stale result, even for one
             // debounce frame. Cursor-in-block also reveals editable source.
-            self.entries.retain(|entry| unchanged(screen, &entry.block));
+            for entry in &mut self.entries { entry.valid = unchanged(screen, &entry.block); }
             self.arm(cx);
         }
         let viewport = (screen.absolute_of_virtual(top), screen.cols);
         if self.scanned != Some(viewport) && self.changed.is_none_or(|t| t.elapsed() >= QUIET) {
             let mut old = std::mem::take(&mut self.entries);
-            self.entries = blocks(screen, top).into_iter().map(|block| {
+            self.entries = blocks(screen, top, self.interactive).into_iter().map(|block| {
                 let index = old.iter().position(|e| e.block.start == block.start && e.block.source == block.source)
                     .or_else(|| old.iter().position(|e| e.block.source == block.source));
                 if let Some(index) = index {
                     let mut entry = old.remove(index);
                     entry.block = block;
+                    entry.valid = true;
                     entry
                 } else { Entry::new(block) }
             }).collect();
@@ -122,7 +140,10 @@ impl InlineDiagrams {
             // survive leaving the viewport without retaining unbounded textures.
             for entry in old {
                 if self.entries.len() == MAX_BLOCKS { break; }
-                if unchanged(screen, &entry.block) { self.entries.push(entry); }
+                // Alternate-screen scrolling rewrites row coordinates. Keep
+                // invalid entries as a bounded cache, never as an overlay, so
+                // rediscovering the full source preserves its zoom and image.
+                self.entries.push(entry);
             }
             self.scanned = Some(viewport);
             self.changed = None;
@@ -131,7 +152,7 @@ impl InlineDiagrams {
     }
 
     pub fn covers(&self, row: u64) -> bool {
-        self.enabled && self.entries.iter().any(|e| e.image.is_some() && !e.source_visible
+        self.enabled && self.entries.iter().any(|e| e.valid && e.image.is_some() && !e.source_visible
             && row >= e.block.start && row < e.block.end)
     }
 
@@ -161,7 +182,7 @@ impl InlineDiagrams {
             }
         }
         if self.enabled && self.job.is_none() && self.changed.is_none() {
-            if let Some(entry) = self.entries.iter().find(|e| e.image.is_none() && !e.failed) {
+            if let Some(entry) = self.entries.iter().find(|e| e.valid && e.image.is_none() && !e.failed) {
                 let source = entry.block.source.clone();
                 let input = source.clone();
                 if let Ok(job) = cx.task_pool().try_submit(Lane::Heavy, move || diagram::render("mermaid", &input)) {
@@ -170,7 +191,7 @@ impl InlineDiagrams {
             }
         }
         if self.job.is_some() || self.changed.is_some()
-            || (self.enabled && self.entries.iter().any(|e| e.image.is_none() && !e.failed)) {
+            || (self.enabled && self.entries.iter().any(|e| e.valid && e.image.is_none() && !e.failed)) {
             self.arm(cx);
         } else {
             cx.stop_timer(self.timer);
@@ -183,7 +204,7 @@ impl InlineDiagrams {
         if !self.enabled { return; }
         cx.begin_turtle(Walk::fixed(viewport.size.x, viewport.size.y).with_abs_pos(viewport.pos), Layout::default());
         for entry in &mut self.entries {
-            if entry.image.is_none() { continue; }
+            if !entry.valid || entry.image.is_none() { continue; }
             let y = viewport.pos.y + (entry.block.start as f64 - top as f64) * cell_h;
             let height = (entry.block.end - entry.block.start) as f64 * cell_h;
             let rect = Rect {pos: dvec2(viewport.pos.x, y), size: dvec2(viewport.size.x, height)};
@@ -226,7 +247,7 @@ impl InlineDiagrams {
             let pos = entry.header.pos + dvec2(8.0, 5.0);
             if entry.source_visible { text.draw_abs(cx, pos, "Diagram"); }
             else {
-                let selected = selection.is_some_and(|(a, b)| a.0 <= entry.block.start && b.0 >= entry.block.end - 1);
+                let selected = selection.is_some_and(|(a, b)| a.0 <= entry.block.source_start && b.0 >= entry.block.end - 1);
                 let title = if selected && entry.header.size.x >= 540.0 {"Mermaid · selected · copy returns source"}
                     else if entry.header.size.x >= 670.0 {"Mermaid · scroll to pan · Shift+scroll transcript"} else {"Mermaid"};
                 text.draw_abs(cx, pos, title);
@@ -254,7 +275,7 @@ impl InlineDiagrams {
                 else if right <= 136.0 { entry.zoom = (entry.zoom / 1.25).max(0.125); }
                 return InlineClick::Control;
             }
-            if !entry.source_visible { return InlineClick::Select {start: entry.block.start, end: entry.block.end}; }
+            if !entry.source_visible { return InlineClick::Select {start: entry.block.source_start, end: entry.block.end}; }
         }
         InlineClick::None
     }
@@ -275,6 +296,10 @@ impl InlineDiagrams {
         self.enabled && self.entries.iter().any(|e| e.visible && e.header.contains(point)
             && (e.source_visible || point.x >= e.header.pos.x + e.header.size.x - 224.0))
     }
+
+    pub fn routes_shift_scroll_to_app(&self, point: Vec2d) -> bool {
+        self.enabled && self.interactive && self.entries.iter().any(|e| e.visible && e.rect.contains(point))
+    }
 }
 
 fn unchanged(screen: &Screen, block: &SourceBlock) -> bool {
@@ -286,7 +311,7 @@ fn unchanged(screen: &Screen, block: &SourceBlock) -> bool {
 
 /// Reconstruct logical lines, preserving spaces across soft wraps. Limit both
 /// rows and cells so pathological columns/history cannot monopolize a frame.
-fn blocks(screen: &Screen, top: usize) -> Vec<SourceBlock> {
+fn blocks(screen: &Screen, top: usize, interactive: bool) -> Vec<SourceBlock> {
     struct Line { text: String, start: usize, end: usize }
     let budget = (256 * 1024 / screen.cols.max(1)).min(MAX_ROWS * 2);
     let start = top.saturating_sub(MAX_ROWS.min(budget / 2));
@@ -324,8 +349,7 @@ fn blocks(screen: &Screen, top: usize) -> Vec<SourceBlock> {
             let trimmed = line.trim();
             if fence.is_some_and(|f| trimmed == f) { break; }
             if fence.is_none() && j > content && !quoted && !trimmed.is_empty() {
-                let bare_id = trimmed.trim_end_matches(';').chars().all(|c| c.is_alphanumeric() || c == '_');
-                if is_header(trimmed) || (!looks_like_statement(trimmed) && !bare_id) { break; }
+                if is_header(trimmed) || !flowchart_statement(trimmed) { break; }
             }
             if source.len() + line.len() + 1 > MAX_SOURCE { bounded = false; break; }
             source.push_str(line);
@@ -338,13 +362,35 @@ fn blocks(screen: &Screen, top: usize) -> Vec<SourceBlock> {
             if !trimmed.is_empty() { last = j + 1; }
             j += 1;
         }
-        let complete = fence.map_or(j < lines.len(), |f| lines.get(j).is_some_and(|l| l.text.trim() == f));
+        let complete = fence.map_or_else(|| lines.get(j).is_some_and(|line| {
+            // An agent's history viewport can cut a diagram in half. Its
+            // fixed footer is not the end of the source: retain text until
+            // the complete block can be seen, rather than draw a partial graph.
+            let tail = line.text.trim();
+            !interactive || !(tail.starts_with("↓ Back to bottom")
+                || tail.starts_with('›') || tail.starts_with('❯') || tail.starts_with("• Working"))
+        }), |f| lines.get(j).is_some_and(|l| l.text.trim() == f));
         let finish = if fence.is_some() { j + 1 } else { last };
         if complete && bounded && j - i < MAX_ROWS && finish > content && lines[finish - 1].end > top && lines[i].start < top + screen.rows {
-            let start_row = screen.absolute_of_virtual(lines[i].start);
+            let source_start = screen.absolute_of_virtual(lines[i].start);
+            // Codex prints this notice instead of a fence when its ASCII
+            // renderer declines a diagram. Hide that obsolete warning only
+            // when our native image is ready; copying still starts at source.
+            let mut display_start = i;
+            for count in 1..=3.min(i) {
+                let notice = lines[i - count..i].iter().map(|l| l.text.trim()).collect::<Vec<_>>().join(" ");
+                if matches!(notice.trim().trim_start_matches('•').trim_start(),
+                    "This Mermaid diagram uses features the terminal renderer doesn't support." |
+                    "This Mermaid diagram doesn't fit the current terminal width." |
+                    "This Mermaid diagram exceeds the terminal renderer's size limits.") {
+                    display_start = i - count;
+                    break;
+                }
+            }
+            let start_row = screen.absolute_of_virtual(lines[display_start].start);
             let end_row = screen.absolute_of_virtual(lines[finish - 1].end);
             let cells = screen.selection_text((start_row, 0), (end_row - 1, screen.cols));
-            let block = SourceBlock {start: start_row, end: end_row, source: source.trim().to_owned(), cells};
+            let block = SourceBlock {start: start_row, source_start, end: end_row, source: source.trim().to_owned(), cells};
             // A shorter source has too little vertical room for a readable
             // viewport and controls; leave it as text for the explicit preview.
             if end_row - start_row >= 4 && unchanged(screen, &block) { found.push(block); }
