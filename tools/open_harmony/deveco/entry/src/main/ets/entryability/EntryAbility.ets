@@ -8,12 +8,32 @@ import {ArkGlue} from '../makepad/makepad'
 export default class EntryAbility extends UIAbility {
   private studioReview: boolean = false;
 
+  // Whether this build acts on the launch parameters Makepad itself handles
+  // (the Studio connection and the OCTOS_PROXY app proxy): only a debuggable
+  // HAP. The ability is exported, so another app can start it with
+  // parameters; a shipped (release) HAP must not be pointed at a Studio host
+  // or a proxy that way.
+  private launchDevInputAllowed(): boolean {
+    try {
+      return this.context.applicationInfo.debug === true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     let x = ArkGlue.initInstance(this.context);
     const parameters: Record<string, string> = {};
+    const allowDevInput = this.launchDevInputAllowed();
     for (const key of Object.keys(want.parameters ?? {})) {
       const value = want.parameters?.[key];
       if (key.startsWith('makepad.') && typeof value === 'string') {
+        // Drop the Studio/proxy channel on a shipped HAP; other parameters
+        // (TRACE, KEEP_SCREEN_ON, …) stay inert until the app reads them.
+        if (!allowDevInput && (key === 'makepad.STUDIO_HOST' || key === 'makepad.STUDIO_BUILD'
+            || key === 'makepad.STUDIO_CRATE' || key === 'makepad.OCTOS_PROXY')) {
+          continue;
+        }
         parameters[key] = value;
       }
     }
