@@ -5,6 +5,7 @@ pub mod ai;
 pub mod cell_glyph;
 pub mod contrast;
 pub mod control;
+pub mod diagram_preview;
 pub mod fonts;
 pub mod gesture;
 pub mod keybinds;

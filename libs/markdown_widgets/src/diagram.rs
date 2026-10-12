@@ -1,6 +1,6 @@
 //! Static flowchart.js, Mermaid and Editor.md sequence diagrams. Source stays editable; preview output is
 //! generated SVG/pixels, with no scripts or external diagram resources.
-use crate::content::{PreviewImage, prepare_image};
+use crate::content::{PreviewImage, prepare_diagram_image};
 use makepad_markdown::escape;
 use std::{cell::RefCell, collections::BTreeMap, fmt::Write};
 
@@ -424,7 +424,7 @@ pub fn render(language: &str, source: &str) -> Result<PreviewImage, String> {
         return image;
     }
     let image = std::panic::catch_unwind(|| {
-        svg(language, source).and_then(|svg| prepare_image(svg.as_bytes()))
+        svg(language, source).and_then(|svg| prepare_diagram_image(svg.as_bytes()))
     })
     .unwrap_or_else(|_| Err("Diagram renderer could not process this source".into()));
     CACHE.with(|cache| {

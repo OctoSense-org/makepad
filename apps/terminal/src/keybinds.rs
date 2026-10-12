@@ -88,6 +88,8 @@ pub enum Action {
     ToggleSplitZoom,
     /// Open the settings panel (again: close it).
     OpenConfig,
+    /// Render Mermaid source from the selection or recent output.
+    PreviewDiagram,
     /// Type a name for the selected tab.
     PromptTabTitle,
     StartSearch,
@@ -148,6 +150,7 @@ impl Action {
             | Action::NewSplit(_)
             | Action::GotoSplit(_)
             | Action::ToggleSplitZoom
+            | Action::PreviewDiagram
             | Action::OpenConfig
             | Action::PromptTabTitle => Scope::Tabs,
             _ => Scope::Pane,
@@ -174,6 +177,7 @@ impl Action {
             Action::GotoSplit(d) => format!("goto_split:{}", dir(d)),
             Action::ToggleSplitZoom => "toggle_split_zoom".into(),
             Action::OpenConfig => "open_config".into(),
+            Action::PreviewDiagram => "preview_diagram".into(),
             Action::PromptTabTitle => "prompt_tab_title".into(),
             Action::StartSearch => "start_search".into(),
             Action::NavigateSearch { next: true } => "navigate_search:next".into(),
@@ -217,6 +221,7 @@ impl Action {
             Action::GotoSplit(d) => format!("Focus the split {}", dir(d)),
             Action::ToggleSplitZoom => "Zoom the split".into(),
             Action::OpenConfig => "Settings".into(),
+            Action::PreviewDiagram => "Preview Mermaid diagram".into(),
             Action::PromptTabTitle => "Rename tab".into(),
             Action::StartSearch => "Search".into(),
             Action::NavigateSearch { next: true } => "Search: next (older) match".into(),
@@ -330,6 +335,7 @@ const DEFAULTS: &[&str] = &[
     "performable:alt+8=goto_tab:8",
     "performable:alt+9=last_tab",
     "ctrl+comma=open_config",
+    "ctrl+shift+m=preview_diagram",
     "ctrl+shift+d=new_split:right",
     "ctrl+shift+e=new_split:down",
     "ctrl+shift+z=toggle_split_zoom",
@@ -476,6 +482,7 @@ pub fn available_actions() -> Vec<Action> {
         Action::GotoSplit(Dir::Down),
         Action::ToggleSplitZoom,
         Action::OpenConfig,
+        Action::PreviewDiagram,
         Action::PromptTabTitle,
         Action::StartSearch,
         Action::NavigateSearch { next: true },
@@ -857,6 +864,7 @@ pub fn parse_action(text: &str) -> Result<Action, String> {
         "goto_split" => Ok(Action::GotoSplit(parse_dir(param.unwrap_or(""), name)?)),
         "toggle_split_zoom" => no_param(Action::ToggleSplitZoom),
         "open_config" | "open_settings" => no_param(Action::OpenConfig),
+        "preview_diagram" => no_param(Action::PreviewDiagram),
         "prompt_tab_title" | "prompt_surface_title" | "rename_tab" => {
             no_param(Action::PromptTabTitle)
         }
@@ -1389,6 +1397,7 @@ mod tests {
             (cs(Tab), Action::PreviousTab, false),
             (c(PageUp), Action::PreviousTab, false),
             (c(Comma), Action::OpenConfig, false),
+            (cs(KeyM), Action::PreviewDiagram, false),
             (cs(KeyD), Action::NewSplit(Dir::Right), false),
             (cs(KeyE), Action::NewSplit(Dir::Down), false),
             (cs(KeyZ), Action::ToggleSplitZoom, false),
@@ -1429,7 +1438,7 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_exactly_the_keys_taken_before() {
+    fn the_defaults_match_the_reference_inventory() {
         for mac in [true, false] {
             let table = Keybinds::defaults(mac);
             assert!(table.errors.is_empty());

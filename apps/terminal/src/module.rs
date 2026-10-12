@@ -36,6 +36,7 @@ impl AppModule for TerminalModule {
 
     fn register(&self, vm: &mut ScriptVm) {
         crate::widget::script_mod(vm);
+        crate::diagram_preview::script_mod(vm);
         crate::tabs::script_mod(vm);
     }
 

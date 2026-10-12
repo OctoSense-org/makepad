@@ -30,6 +30,7 @@ path = "src/bin/terminal-ctl.rs"
 
 [dependencies]
 makepad-widgets = { path = "../../widgets" }
+makepad-markdown-widgets = { path = "../../libs/markdown_widgets", features = ["diagrams"] }
 makepad-ai-services = { path = "../../libs/ai/services" }
 makepad-app-module = { path = "../../libs/app_module" }
 makepad-strict-json = { path = "../../libs/strict_json" }
