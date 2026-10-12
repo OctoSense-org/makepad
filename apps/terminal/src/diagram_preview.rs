@@ -58,7 +58,7 @@ pub fn source_from_output(text: &str) -> Option<String> {
     Some(source.trim().to_owned())
 }
 
-pub(crate) fn is_header(line: &str) -> bool {
+fn is_header(line: &str) -> bool {
     matches!(line.split_whitespace().next(), Some(
         "flowchart" | "graph" | "sequenceDiagram" | "classDiagram" |
         "stateDiagram" | "stateDiagram-v2" | "erDiagram" | "pie" |
@@ -69,7 +69,7 @@ pub(crate) fn is_header(line: &str) -> bool {
 /// Recognize a statement at its beginning. Punctuation elsewhere in prose
 /// (especially Markdown links and parenthesized source citations) is not a
 /// node declaration and must not become part of an unfenced flowchart.
-pub(crate) fn flowchart_statement(line: &str) -> bool {
+fn flowchart_statement(line: &str) -> bool {
     if line.starts_with("%%") || matches!(line.split_whitespace().next(), Some(
         "classDef" | "class" | "style" | "linkStyle" | "subgraph" | "end" | "direction" | "click"
     )) { return true; }
@@ -231,7 +231,7 @@ impl TermDiagramPreview {
         if let Some((generation, result)) = self.job.as_mut().and_then(|(generation, job)| job.try_take().map(|r| (*generation, r))) {
             self.job = None;
             // A new source supersedes an in-flight result without piling up jobs.
-            if generation == self.generation && self.pending.is_none() && !self.closed {
+            if generation == self.generation && self.pending.is_none() {
                 match result.map_err(|e| format!("Diagram task failed: {e}")).and_then(|r| r) {
                     Ok(image) => {
                         match self.ui.image(cx, ids!(image)).load_png_from_data(cx, &image.png) {
@@ -266,6 +266,7 @@ impl TermDiagramPreview {
 
     pub fn close(&mut self, cx: &mut Cx) {
         self.closed = true;
+        self.generation = self.generation.wrapping_add(1);
         self.pending = None;
         self.redraw(cx);
     }
@@ -279,7 +280,10 @@ impl Widget for TermDiagramPreview {
         if self.closed { return; }
         let actions = cx.capture_actions(|cx| self.ui.handle_event(cx, event, scope));
         if self.ui.button(cx, ids!(back)).clicked(&actions) || matches!(event, Event::KeyDown(k) if k.key_code == KeyCode::Escape) {
-            self.close(cx);
+            // Returning to the terminal hides this tab; rendering and the
+            // source editor remain available when the user switches back.
+            self.closed = true;
+            self.redraw(cx);
         }
         if self.ui.button(cx, ids!(source_toggle)).clicked(&actions) {
             self.set_editing(cx, !self.editing);
