@@ -1387,6 +1387,25 @@ impl ScriptParser {
         }
     }
 
+    /// Close one branch of an `if`/`elif`/`else` (or a `match` arm) and hand
+    /// the join exactly one value: the statement-end `set_pop_to_me` that
+    /// follows lands its pop on the join (a standalone POP_TO_ME at the jump
+    /// target) or just past it, and that pop always consumes one value. An
+    /// arm whose tail leaves a value (assignment, call, bare value, nested
+    /// control flow) keeps it by cancelling the fused commit; an arm whose
+    /// tail hands nothing — `for`/`while` (FOR_END), `let`, `break`/
+    /// `continue`, an empty body, or a tail whose commit already ran inside
+    /// the arm (a `;` tail) — must stand in a NIL. Without it the join's pop
+    /// reads through the base of the stack and traps with `pop_stack_value
+    /// on empty stack` (the #492 family).
+    fn close_branch(&mut self, last_was_sep: bool) {
+        if !last_was_sep && self.has_pop_to_me() {
+            self.clear_pop_to_me();
+        } else {
+            self.push_code_none(NIL);
+        }
+    }
+
     fn set_opcode_args(&mut self, index: u32, args: OpcodeArgs) {
         self.opcodes[index as usize].set_opcode_args(args);
     }
@@ -1635,9 +1654,7 @@ impl ScriptParser {
             } => {
                 // Block body done, expect }
                 if tok.is_close_curly() {
-                    if !last_was_sep && self.has_pop_to_me() {
-                        self.clear_pop_to_me();
-                    }
+                    self.close_branch(last_was_sep);
                     self.state.push(State::MatchMaybeArm {
                         temp_id,
                         if_start,
@@ -1699,9 +1716,7 @@ impl ScriptParser {
             } => {
                 // Wildcard block body done, expect }
                 if tok.is_close_curly() {
-                    if !last_was_sep && self.has_pop_to_me() {
-                        self.clear_pop_to_me();
-                    }
+                    self.close_branch(last_was_sep);
                     self.state.push(State::MatchWildcardEnd {
                         prev_else_start,
                         index,
@@ -3583,6 +3598,13 @@ impl ScriptParser {
                 if tok.is_close_curly() {
                     if !last_was_sep && self.has_pop_to_me() {
                         self.clear_pop_to_me();
+                    } else if !self.has_pop_to_me() {
+                        // The protected tail hands no value (for/while/let/
+                        // empty body): stand in a NIL so the try join's pop
+                        // has its value (#492 family). A value-ful tail
+                        // terminated by `;` keeps its fused commit — the
+                        // canonical-catch path rewrites that marker below.
+                        self.push_code_none(NIL);
                     }
                     self.set_opcode_args(
                         try_start,
@@ -3675,6 +3697,11 @@ impl ScriptParser {
                     // the try value even when a separator terminated it.
                     if (canonical_catch || !last_was_sep) && self.has_pop_to_me() {
                         self.clear_pop_to_me();
+                    } else if !self.has_pop_to_me() {
+                        // A value-less catch tail (for/while/let/empty body)
+                        // must still hand one value to the join — same
+                        // contract as the protected block (#492 family).
+                        self.push_code_none(NIL);
                     }
                     self.last_jump_target = self.code_len();
                     self.set_opcode_args(
@@ -3795,9 +3822,7 @@ impl ScriptParser {
                 last_was_sep,
             } => {
                 if tok.is_close_curly() {
-                    if !last_was_sep && self.has_pop_to_me() {
-                        self.clear_pop_to_me();
-                    }
+                    self.close_branch(last_was_sep);
                     self.state.push(State::IfMaybeElse {
                         if_start,
                         was_block: true,
@@ -3881,9 +3906,7 @@ impl ScriptParser {
                 last_was_sep,
             } => {
                 if tok.is_close_curly() {
-                    if !last_was_sep && self.has_pop_to_me() {
-                        self.clear_pop_to_me();
-                    }
+                    self.close_branch(last_was_sep);
                     self.last_jump_target = self.code_len();
                     self.set_opcode_args(
                         else_start,
