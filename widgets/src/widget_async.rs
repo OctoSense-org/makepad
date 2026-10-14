@@ -415,6 +415,16 @@ fn with_isolate_installed<R>(cx: &mut Cx, vm_id: SplashVmId, f: impl FnOnce(&mut
     // app its VM and the table its isolate.
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(cx)));
 
+    // Drain promise/task resumptions `f` queued on the isolate while it is
+    // still the installed VM — see pump_installed_isolate_tasks. Without
+    // this, an `await` woken by a timer or network callback never resumes
+    // while the app is idle (OctoSense-App-Hub #213).
+    if out.is_ok() && cx.script_vm.is_some() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::makepad_draw::makepad_platform::makepad_script_std::pump(cx);
+        }));
+    }
+
     isolated.vm = cx.script_vm.take();
     cx.script_vm = outer_vm;
     isolated.std = std::mem::replace(&mut cx.script_data.std, outer_std);
@@ -1697,6 +1707,9 @@ impl<'a, 'b> IsolateCx for Cx2d<'a, 'b> {
 pub fn with_isolate<C: IsolateCx, R>(cx: &mut C, vm_id: SplashVmId, f: impl FnOnce(&mut C) -> R) -> R {
     let entry = enter_isolate(cx.isolate_cx(), vm_id);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(cx)));
+    if out.is_ok() {
+        pump_installed_isolate_tasks(cx.isolate_cx(), &entry);
+    }
     leave_isolate(cx.isolate_cx(), entry);
     match out {
         Ok(out) => out,
@@ -1728,6 +1741,27 @@ pub fn enter_isolate(cx: &mut Cx, vm_id: SplashVmId) -> IsolateEntry {
     let outer_vm = cx.script_vm.take();
     cx.script_vm = isolated.vm;
     IsolateEntry { vm_id, previous_vm_id, network_enabled: isolated.network_enabled, outer_std: Some(outer_std), outer_vm }
+}
+
+/// Drain the installed isolate's script task queue: promise resolutions and
+/// task send/recv resumptions queued while `f` ran (a timer callback firing
+/// `resolve`, a network response landing, a widget call answering) start the
+/// paused threads they woke. The main VM gets this drain after every event
+/// dispatch (`call_event_handler`); an isolate has no such beat of its own,
+/// so without it an `await` resumed by anything other than a user event
+/// would only run the next time something happened to enter the isolate —
+/// for an idle app, possibly never (OctoSense-App-Hub #213).
+///
+/// Only called on the success path: after a guest panic the thread list may
+/// be mid-teardown, and the host tears the isolate down anyway. A nested or
+/// main-VM entry skips it (the outermost entry drains).
+fn pump_installed_isolate_tasks(cx: &mut Cx, entry: &IsolateEntry) {
+    if entry.vm_id == MAIN_SPLASH_VM_ID || cx.script_vm.is_none() {
+        return;
+    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::makepad_draw::makepad_platform::makepad_script_std::pump(cx);
+    }));
 }
 
 /// Put the outer VM back. See [`enter_isolate`].
@@ -2007,6 +2041,45 @@ mod isolate_entry_tests {
         let entry = enter_isolate(&mut cx, MAIN_SPLASH_VM_ID);
         assert_eq!(cx.with_vm(|vm| vm.bx.heap.heap_key()), main_heap);
         leave_isolate(&mut cx, entry);
+        cx.free_splash_vm(vm_id);
+    }
+
+    /// Regression pin for OctoSense-App-Hub #213: a promise resolved while
+    /// host code is inside the isolate (a timer callback, a network event)
+    /// must resume its awaiting task on the way OUT — an isolate has no
+    /// event-dispatch beat of its own to drain the queue later. Fails when
+    /// the exit pump in `with_isolate_installed` is removed.
+    #[test]
+    fn a_resolution_queued_during_an_isolate_entry_resumes_on_exit() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let vm_id = cx.alloc_splash_vm();
+
+        // Entry 1: a task awaits a promise. The exit pump starts the task;
+        // it parks on the empty promise.
+        cx.with_script_vm_id(vm_id, |vm| {
+            let v = vm.eval(script! {
+                use mod.std
+                mod.state = {}
+                mod.state.p = std.promise()
+                std.task(|_t| {
+                    mod.state.resolved = mod.state.p.await()
+                })
+            });
+            assert!(!v.is_err(), "entry eval failed: {v:?}");
+        });
+
+        // Entry 2: resolve the promise (what a timer or network callback
+        // does). The exit pump must resume the parked task.
+        cx.with_script_vm_id(vm_id, |vm| {
+            vm.eval(script! { mod.state.p.resolve(42.5) });
+        });
+
+        let resolved = cx.with_script_vm_id(vm_id, |vm| {
+            vm.eval(script! { mod.state.resolved })
+        });
+        assert_eq!(resolved.as_f64(), Some(42.5), "the awaiting task resumed with the resolved value");
+
         cx.free_splash_vm(vm_id);
     }
 }
