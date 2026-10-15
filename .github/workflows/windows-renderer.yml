@@ -48,12 +48,11 @@ jobs:
         timeout-minutes: 5
         env:
           MAKEPAD_D3D11_WARP: '1'
-          MAKEPAD_HIDE_WINDOWS: '1'
         run: |
           $ErrorActionPreference='Stop'
           $sample=Join-Path $PWD 'local/agent_state/windows-warp-native'
           New-Item -ItemType Directory -Path $sample -Force | Out-Null
-          $owned=Start-Process -FilePath (Join-Path $PWD 'target/release/makepad-example-hello-world.exe') -ArgumentList '--remote=8680' -WorkingDirectory $PWD -WindowStyle Hidden -RedirectStandardOutput (Join-Path $sample 'stdout.log') -RedirectStandardError (Join-Path $sample 'stderr.log') -PassThru
+          $owned=Start-Process -FilePath (Join-Path $PWD 'target/release/makepad-example-hello-world.exe') -ArgumentList '--remote=8680' -WorkingDirectory $PWD -WindowStyle Normal -RedirectStandardOutput (Join-Path $sample 'stdout.log') -RedirectStandardError (Join-Path $sample 'stderr.log') -PassThru
           try {
             $ready=$false
             for($attempt=0;$attempt -lt 45;$attempt++){
@@ -68,16 +67,22 @@ jobs:
             $tree=Invoke-RestMethod 'http://127.0.0.1:8680/snap?all=1' -TimeoutSec 10
             if(!($tree.s | Where-Object {$_.t -eq 'Hello GIF'})){throw 'Existing example widget tree was not rendered'}
             $frame=Join-Path $sample 'native-warp.png'
-            Invoke-WebRequest 'http://127.0.0.1:8680/g?raw=1' -OutFile $frame -TimeoutSec 30
             Add-Type -AssemblyName System.Drawing
-            $image=[Drawing.Bitmap]::new($frame)
-            try {
-              if($image.Width -lt 200 -or $image.Height -lt 150){throw 'Native frame dimensions invalid'}
-              $colors=[Collections.Generic.HashSet[int]]::new()
-              for($y=0;$y -lt $image.Height;$y+=8){for($x=0;$x -lt $image.Width;$x+=8){[void]$colors.Add($image.GetPixel($x,$y).ToArgb())}}
-              if($colors.Count -lt 8){throw 'Native frame appears blank'}
-              Write-Output ('Native WARP frame: '+$image.Width+'x'+$image.Height+', sampled colors='+$colors.Count)
-            } finally {$image.Dispose()}
+            $drawn=$false
+            for($capture=0;$capture -lt 4;$capture++){
+              $candidate=Join-Path $sample ("native-warp-"+$capture+".png")
+              Invoke-WebRequest 'http://127.0.0.1:8680/g?raw=1' -OutFile $candidate -TimeoutSec 30
+              $image=[Drawing.Bitmap]::new($candidate)
+              try {
+                if($image.Width -lt 200 -or $image.Height -lt 150){throw 'Native frame dimensions invalid'}
+                $colors=[Collections.Generic.HashSet[int]]::new()
+                for($y=0;$y -lt $image.Height;$y+=8){for($x=0;$x -lt $image.Width;$x+=8){[void]$colors.Add($image.GetPixel($x,$y).ToArgb())}}
+                Write-Output ('Native WARP frame '+$capture+': '+$image.Width+'x'+$image.Height+', sampled colors='+$colors.Count)
+                if($colors.Count -ge 8){Copy-Item -LiteralPath $candidate -Destination $frame;$drawn=$true;break}
+              } finally {$image.Dispose()}
+              Start-Sleep -Seconds 1
+            }
+            if(!$drawn){throw 'Native frame stayed blank through bounded startup checks'}
             $observed=(Get-Content (Join-Path $sample 'stdout.log') -Raw)+(Get-Content (Join-Path $sample 'stderr.log') -Raw)
             if($observed -notmatch 'using Windows WARP software rendering'){throw 'Native WARP path was not observed'}
             Get-FileHash -LiteralPath $frame -Algorithm SHA256 | Format-List
@@ -85,6 +90,7 @@ jobs:
             if(!$owned.HasExited){try {Invoke-WebRequest 'http://127.0.0.1:8680/quit' -TimeoutSec 10 | Out-Null} catch {};if(!$owned.WaitForExit(20000)){Stop-Process -Id $owned.Id;throw 'Owned example did not exit gracefully'}}
           }
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: windows-warp-native-frame
           path: makepad/local/agent_state/windows-warp-native/
