@@ -33,7 +33,7 @@ use crate::{
             Graphics::{
                 Direct3D::{
                     Fxc::D3DCompile, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_SRV_DIMENSION,
+                    D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP, D3D_FEATURE_LEVEL_11_0, D3D_SRV_DIMENSION,
                     D3D_SRV_DIMENSION_TEXTURECUBE,
                 },
                 Direct3D11::{
@@ -90,7 +90,7 @@ use crate::{
                         DXGI_FORMAT_R8_UNORM,
                         DXGI_SAMPLE_DESC,
                     },
-                    CreateDXGIFactory2, IDXGIFactory2, IDXGIKeyedMutex, IDXGIResource1,
+                    CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGIResource1,
                     IDXGISwapChain, IDXGISwapChain1, IDXGISwapChain2, DXGI_CREATE_FACTORY_FLAGS,
                     DXGI_ERROR_WAS_STILL_DRAWING, DXGI_FRAME_STATISTICS, DXGI_PRESENT,
                     DXGI_PRESENT_DO_NOT_WAIT, DXGI_RGBA, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
@@ -2525,22 +2525,53 @@ impl D3d11Cx {
             // A DXGI factory snapshots its adapter enumeration when it is created, so one made
             // before a hybrid-GPU transition or a driver reinstall keeps handing back the
             // adapter that went away. Recovery always starts from a fresh factory.
-            let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
-            let adapter = factory.EnumAdapters(0)?;
+            let mut factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let force_software = std::env::var_os("MAKEPAD_D3D11_WARP")
+                .is_some_and(|value| value == "1")
+                || std::env::var_os("MAKEPAD_FORCE_SOFTWARE_GPU")
+                    .is_some_and(|value| value == "1");
             let mut device: Option<ID3D11Device> = None;
             let mut context: Option<ID3D11DeviceContext> = None;
             let mut query: Option<ID3D11Query> = None;
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE(std::ptr::null_mut()),
-                D3D11_CREATE_DEVICE_FLAG(0x800 | 0x20), // VIDEO_SUPPORT | BGRA_SUPPORT
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )?;
+            let hardware = if force_software {
+                None
+            } else {
+                Some(factory.EnumAdapters(0).and_then(|adapter| {
+                    D3D11CreateDevice(
+                        &adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        HMODULE(std::ptr::null_mut()),
+                        D3D11_CREATE_DEVICE_FLAG(0x800 | 0x20), // VIDEO_SUPPORT | BGRA_SUPPORT
+                        Some(&[D3D_FEATURE_LEVEL_11_0]),
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        None,
+                        Some(&mut context),
+                    )
+                }))
+            };
+            if hardware.as_ref().is_none_or(|result| result.is_err()) {
+                // A failed hardware attempt may have filled a partial COM
+                // handle. Release it before trying the system rasterizer.
+                device = None;
+                context = None;
+                D3D11CreateDevice(
+                    None::<&windows::Win32::Graphics::Dxgi::IDXGIAdapter>,
+                    D3D_DRIVER_TYPE_WARP,
+                    HMODULE(std::ptr::null_mut()),
+                    D3D11_CREATE_DEVICE_FLAG(0x20), // BGRA_SUPPORT; WARP needs no video interface
+                    Some(&[D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )?;
+                // Swap chains must use the factory that owns this actual
+                // adapter, rather than the failed hardware adapter's factory.
+                let dxgi: IDXGIDevice = device.as_ref().unwrap().cast()?;
+                factory = dxgi.GetAdapter()?.GetParent()?;
+                crate::log!("D3D11: using Windows WARP software rendering");
+            }
 
             let device = device.unwrap();
             let context = context.unwrap();

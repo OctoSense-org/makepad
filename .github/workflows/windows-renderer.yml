@@ -1,0 +1,33 @@
+name: Windows D3D11 renderer
+on:
+  push:
+    branches: [windows-warp-fallback]
+  pull_request:
+    paths:
+      - 'platform/src/os/windows/d3d11.rs'
+      - '.github/workflows/windows-renderer.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the native Windows platform
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.0
+        run: cargo check -p makepad-platform --all-targets
+      - name: Run existing native platform tests
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.0
+        run: cargo test -p makepad-platform --lib
+      - name: Build existing native example in release mode
+        env:
+          RUSTUP_TOOLCHAIN: 1.98.0
+        run: cargo build --release -p makepad-example-hello-world
