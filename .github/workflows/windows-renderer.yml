@@ -13,12 +13,24 @@ jobs:
   native-windows:
     runs-on: windows-2025
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: makepad
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          path: makepad
+      - uses: actions/checkout@v4
+        with:
+          repository: OctoSense-org/Octoscript-Makepad
+          ref: 6cf2d90aa33ff4ae603f49c7557f3ecf986207f0
+          path: octoscript-makepad
+          persist-credentials: false
       - run: rustup toolchain install 1.98.0 --profile minimal
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: makepad -> target
       - name: Check the native Windows platform
         env:
           RUSTUP_TOOLCHAIN: 1.98.0
