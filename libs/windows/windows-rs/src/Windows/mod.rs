@@ -107413,6 +107413,7 @@ pub const D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST: D3D_PRIMITIVE_TOPOLOGY = D3D_PR
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D3D_DRIVER_TYPE(pub i32);
 pub const D3D_DRIVER_TYPE_UNKNOWN: D3D_DRIVER_TYPE = D3D_DRIVER_TYPE(0i32);
+pub const D3D_DRIVER_TYPE_WARP: D3D_DRIVER_TYPE = D3D_DRIVER_TYPE(5i32);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct D3D_FEATURE_LEVEL(pub i32);
