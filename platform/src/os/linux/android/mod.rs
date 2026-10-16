@@ -7,6 +7,7 @@ pub mod android_camera;
 pub mod android_camera_player;
 pub mod android_file_dialog;
 pub mod android_jni;
+pub mod android_stuffing;
 pub mod android_keycodes;
 pub mod android_media;
 pub mod android_midi;

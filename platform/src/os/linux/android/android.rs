@@ -459,7 +459,16 @@ impl Cx {
                     // — which is what `destroy_surface` leaves us in — is
                     // undefined behavior and crashes Mali/Adreno drivers with
                     // a SIGSEGV inside `render_view`.
-                    if self.os.has_drawable_surface() {
+                    if self.os.has_drawable_surface()
+                        && super::android_stuffing::beat_begin(
+                            super::android_jni::BEAT_FRAME_TIME_NS.load(std::sync::atomic::Ordering::Relaxed),
+                            super::android_jni::BEAT_EXPECTED_PRESENT_NS.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                    {
+                        // Buffer-stuffing recovery leaves this beat unpainted
+                        // so the queue drains; what it would paint waits for
+                        // the next beat (android_stuffing.rs).
+                    } else if self.os.has_drawable_surface() {
                         // If we previously skipped frames because the surface
                         // wasn't ready, the redraw request may have been consumed
                         // by an earlier draw cycle that couldn't actually paint.
@@ -867,6 +876,9 @@ impl Cx {
                 self.call_event_handler(&e);
             }
             FromJavaMessage::Touch(mut touches) => {
+                super::android_stuffing::set_touch_active(
+                    touches.iter().any(|t| t.state != crate::event::finger::TouchState::Stop),
+                );
                 let time = touches[0].time;
                 let window = &self.windows[CxWindowPool::id_zero()];
                 for touch in &mut touches {
@@ -1811,10 +1823,14 @@ impl Cx {
             let perf_t0 = self.perf_monitor.enabled().then(std::time::Instant::now);
             if let Some(display) = &mut self.os.display {
                 if display.is_surface_alive() {
+                    super::android_stuffing::before_swap(&display.libegl, display.egl_display, display.surface);
                     let swapped = (display.libegl.eglSwapBuffers.unwrap())(
                         display.egl_display,
                         display.surface,
                     );
+                    if swapped != 0 {
+                        super::android_stuffing::swapped();
+                    }
                     // PerfMonitor "wait": eglSwapBuffers blocks on the buffer
                     // queue (and, on tilers, on the GPU finishing the frame).
                     if let Some(t0) = perf_t0 {
@@ -4088,6 +4104,7 @@ impl CxAndroidDisplay {
             (self.libegl.eglDestroySurface.unwrap())(self.egl_display, self.surface);
         }
         self.surface = std::ptr::null_mut();
+        super::android_stuffing::surface_reset();
     }
 
     #[cfg(not(use_vulkan))]
