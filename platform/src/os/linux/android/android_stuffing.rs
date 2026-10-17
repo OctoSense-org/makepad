@@ -19,6 +19,12 @@
 //! is down, where the lag shows; a stuffed queue during a fling's coast is
 //! invisible and is left alone.
 //!
+//! Any refresh without a new frame drains the queue the same way (an
+//! unpainted beat, or the beats an idle app stops asking for), so frames
+//! painted before one never count. Most motions end with the queue still
+//! stuffed, and their last frames' display times are read back only at the
+//! next gesture's first swap, where they would skip a beat for nothing.
+//!
 //! `setprop debug.makepad.stuffing off` turns it off (read once, at the first
 //! beat); the `android.stuffing` trace topic logs each detection and skip.
 use super::super::egl_sys::{EGLDisplay, EGLSurface, LibEgl};
@@ -45,7 +51,8 @@ struct StuffingRecovery {
     pending: VecDeque<(u64, i64, i64)>,
     latencies: VecDeque<i64>,
     /// Frames from beats at or before this were rendered before the last
-    /// skip and still carry the old queue; they never trigger another.
+    /// skip, or before the last refresh without a new frame, and still carry
+    /// the old queue; they never trigger a skip.
     armed_after: i64,
     skip_next_beat: bool,
     skips: u64,
@@ -197,12 +204,19 @@ pub(super) fn beat_begin(beat: i64, expected: i64) -> bool {
     RECOVERY.with(|r| {
         let mut r = r.borrow_mut();
         let painted_last_beat = std::mem::take(&mut r.swapped_this_beat);
+        let period = r.period();
         if r.last_beat > 0 && beat > r.last_beat && beat - r.last_beat < 100_000_000 {
             let interval = beat - r.last_beat;
             r.intervals.push_back(interval);
             if r.intervals.len() > 32 {
                 r.intervals.pop_front();
             }
+        }
+        // The last beat went unpainted, or beats stopped (an idle app asks for
+        // none): the screen took a refresh without a new frame, which drained
+        // the queue, so the frames painted before it no longer describe it.
+        if r.last_beat > 0 && (!painted_last_beat || beat - r.last_beat > period + period / 2) {
+            r.armed_after = r.armed_after.max(r.last_beat);
         }
         r.last_beat = beat;
         r.beat = beat;
