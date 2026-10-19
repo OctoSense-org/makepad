@@ -530,6 +530,60 @@ pub fn register_crate_resource_path(vm: &mut ScriptVm, logical_path: &str) -> Sc
     register_crate_resource_parts(vm, res_type, crate_part, file_path)
 }
 
+/// Register an absolute file path as `res.file_resource(path)` does, without
+/// a script call. FontPolicy uses this for the platform's own UI typeface,
+/// which is read from the system rather than packaged.
+pub fn register_file_resource_path(vm: &mut ScriptVm, abs_path: &str) -> ScriptValue {
+    let res_type = vm.handle_type(id_lut!(res));
+    register_file_resource_parts(vm, res_type, abs_path.to_string())
+}
+
+fn register_file_resource_parts(
+    vm: &mut ScriptVm,
+    res_type: ScriptHandleType,
+    abs_path: String,
+) -> ScriptValue {
+    let heap_key = vm.bx.heap.heap_key();
+    let cx = vm.host.cx_mut();
+    if let Some(existing) = cx
+        .script_data
+        .resources
+        .get_handle_by_abs_path(heap_key, &abs_path)
+    {
+        return existing.into();
+    }
+
+    let handle_gc = CxScriptResourceGc {
+        resources: cx.script_data.resources.resources.clone(),
+        handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
+        handle: ScriptHandle::ZERO,
+        heap_key,
+    };
+    let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
+
+    // Another heap may already track this path — attach our local
+    // handle to the shared entry instead of duplicating it.
+    if cx
+        .script_data
+        .resources
+        .attach_handle_for_path(heap_key, &abs_path, handle)
+    {
+        return handle.into();
+    }
+
+    cx.script_data.resources.insert_resource(
+        heap_key,
+        CxScriptResource {
+            abs_path,
+            dependency_path: None,
+            web_url: None,
+            data: CxScriptResourceData::NotLoaded,
+            handles: vec![(heap_key, handle)],
+        },
+    );
+    handle.into()
+}
+
 fn font_policy_declares_path(font_set: crate::FontSet, dependency_path: Option<&str>) -> bool {
     let Some(dependency_path) = dependency_path else {
         return false;
@@ -1248,46 +1302,7 @@ pub fn script_mod(vm: &mut ScriptVm) {
             }
 
             if let Some(abs_path) = vm.string_with(path, |_vm, s| s.to_string()) {
-                let heap_key = vm.bx.heap.heap_key();
-                let cx = vm.host.cx_mut();
-                if let Some(existing) = cx
-                    .script_data
-                    .resources
-                    .get_handle_by_abs_path(heap_key, &abs_path)
-                {
-                    return existing.into();
-                }
-
-                let handle_gc = CxScriptResourceGc {
-                    resources: cx.script_data.resources.resources.clone(),
-                    handles_by_abs_path: cx.script_data.resources.handles_by_abs_path.clone(),
-                    handle: ScriptHandle::ZERO,
-                    heap_key,
-                };
-                let handle = vm.bx.heap.new_handle(res_type, Box::new(handle_gc));
-
-                // Another heap may already track this path — attach our local
-                // handle to the shared entry instead of duplicating it.
-                if cx
-                    .script_data
-                    .resources
-                    .attach_handle_for_path(heap_key, &abs_path, handle)
-                {
-                    return handle.into();
-                }
-
-                cx.script_data.resources.insert_resource(
-                    heap_key,
-                    CxScriptResource {
-                        abs_path,
-                        dependency_path: None,
-                        web_url: None,
-                        data: CxScriptResourceData::NotLoaded,
-                        handles: vec![(heap_key, handle)],
-                    },
-                );
-
-                return handle.into();
+                return register_file_resource_parts(vm, res_type, abs_path);
             }
 
             script_err_type_mismatch!(vm.trap(), "invalid res arg type")

@@ -3575,6 +3575,10 @@ pub struct FontMember {
     /// real glyph miss; zero keeps the ordinary eager behavior.
     #[live(0.0)]
     pub lazy: f32,
+    /// The face's index in a font collection (`.ttc`); `0` for a
+    /// single-face file.
+    #[live(0.0)]
+    pub index: f32,
 }
 
 #[derive(Debug, Clone, Script, PartialEq)]
@@ -3598,6 +3602,7 @@ pub struct FontMemberDef {
     desc: f32,
     weight: f32,
     lazy: Option<LazyFontFamily>,
+    index: u32,
 }
 
 impl FontFamily {
@@ -3646,7 +3651,7 @@ impl FontFamily {
                         font_id,
                         FontDefinition {
                             data,
-                            index: 0,
+                            index: member.index,
                             ascender_fudge_in_ems: member.asc,
                             descender_fudge_in_ems: member.desc,
                             weight: font_member_weight(member),
@@ -3799,6 +3804,11 @@ fn font_member_font_id(member: &FontMemberDef) -> FontId {
     member.asc.to_bits().hash(&mut hasher);
     member.desc.to_bits().hash(&mut hasher);
     member.weight.to_bits().hash(&mut hasher);
+    // Faces of one collection differ only here; a single-face file keeps
+    // the id it always had.
+    if member.index != 0 {
+        member.index.hash(&mut hasher);
+    }
     FontId::from(hasher.finish())
 }
 
@@ -3891,6 +3901,7 @@ impl ScriptHook for FontFamily {
                         2 => Some(LazyFontFamily::Emoji),
                         _ => None,
                     },
+                    index: member.index.max(0.0) as u32,
                 });
             }
         }
