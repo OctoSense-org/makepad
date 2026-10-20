@@ -440,6 +440,77 @@ pub fn fallback_faces() -> &'static [Face] {
     })
 }
 
+/// The platform's own UI typeface, which leads every text role in place of
+/// the bundled faces so that every app reads alike, in Latin and in CJK:
+/// PingFang SC on macOS and iOS, read from the system (Apple does not license
+/// it for redistribution). `None` on other platforms, when system fonts are
+/// off (`MAKEPAD_SYSTEM_FONTS=0`), or when this machine lacks PingFang SC.
+#[derive(Clone, Debug)]
+pub struct UiFaces {
+    pub regular: UiFace,
+    pub semibold: UiFace,
+}
+
+/// One face of the UI typeface, with its own line metrics in ems (the
+/// descender negative), so a family can fit it to the line box it replaces.
+#[derive(Clone, Debug)]
+pub struct UiFace {
+    pub face: Face,
+    pub ascender_in_ems: f32,
+    pub descender_in_ems: f32,
+}
+
+pub fn ui_faces() -> Option<&'static UiFaces> {
+    static FACES: OnceLock<Option<UiFaces>> = OnceLock::new();
+    FACES
+        .get_or_init(|| {
+            if !fallback_enabled() || !cfg!(any(target_os = "macos", target_os = "ios")) {
+                return None;
+            }
+            let mut paths = pingfang_asset_paths();
+            paths.push(PathBuf::from("/System/Library/Fonts/PingFang.ttc"));
+            paths.into_iter().filter(|path| path.is_file()).find_map(|path| {
+                let faces = read_faces(&path)?;
+                let pick = |style: &str| {
+                    faces
+                        .iter()
+                        .find(|f| f.family.eq_ignore_ascii_case("PingFang SC") && f.style.eq_ignore_ascii_case(style))
+                        .and_then(ui_face)
+                };
+                Some(UiFaces { regular: pick("Regular")?, semibold: pick("Semibold")? })
+            })
+        })
+        .as_ref()
+}
+
+fn ui_face(face: &Face) -> Option<UiFace> {
+    use crate::text::font_face::FontFace;
+    use crate::makepad_platform::SharedBytes;
+    let data = SharedBytes::from_file_mmap_or_read(&face.path).ok()?;
+    let parsed = FontFace::from_data_and_index(data, face.index)?;
+    let (ascender_in_ems, descender_in_ems) = parsed.with_ttf_parser_face(|f| {
+        let units_per_em = f.units_per_em() as f32;
+        (f.ascender() as f32 / units_per_em, f.descender() as f32 / units_per_em)
+    });
+    Some(UiFace { face: face.clone(), ascender_in_ems, descender_in_ems })
+}
+
+/// macOS downloads PingFang on demand into its font asset store.
+fn pingfang_asset_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(stores) = std::fs::read_dir("/System/Library/AssetsV2") {
+        for store in stores.flatten() {
+            if !store.file_name().to_string_lossy().starts_with("com_apple_MobileAsset_Font") {
+                continue;
+            }
+            for asset in std::fs::read_dir(store.path()).into_iter().flatten().flatten() {
+                out.push(asset.path().join("AssetData/PingFang.ttc"));
+            }
+        }
+    }
+    out
+}
+
 /// Files to try, in order, with the family to pick from a collection.
 fn fallback_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
     const SC: &[&str] = &["PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei"];
@@ -451,16 +522,8 @@ fn fallback_candidates() -> Vec<(PathBuf, &'static [&'static str])> {
         }
     };
     if cfg!(any(target_os = "macos", target_os = "ios")) {
-        // PingFang is downloaded on demand into the asset store.
-        if let Ok(stores) = std::fs::read_dir("/System/Library/AssetsV2") {
-            for store in stores.flatten() {
-                if !store.file_name().to_string_lossy().starts_with("com_apple_MobileAsset_Font") {
-                    continue;
-                }
-                for asset in std::fs::read_dir(store.path()).into_iter().flatten().flatten() {
-                    push(asset.path().join("AssetData/PingFang.ttc"), SC);
-                }
-            }
+        for path in pingfang_asset_paths() {
+            push(path, SC);
         }
         for name in [
             "Hiragino Sans GB.ttc",

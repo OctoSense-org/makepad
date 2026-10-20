@@ -30,6 +30,9 @@ fn family_value(
         NoTrap,
     );
 
+    if let Some(ui) = ui_face_for(chain) {
+        push_ui_face(vm, family, member_proto, chain, ui);
+    }
     for asset in chain.members {
         let member = vm.bx.heap.new_with_proto(member_proto);
         let resource = crate::makepad_platform::script::res::register_crate_resource_path(
@@ -108,6 +111,61 @@ fn family_value(
             .vec_push(family, member_id.into(), member.into(), NoTrap);
     }
     family.into()
+}
+
+/// The platform's own UI typeface for a text role (PingFang SC on macOS and
+/// iOS: `system_fonts::ui_faces`), so the shell and every app read alike.
+/// Code and icon roles keep their bundled faces. PingFang has no italic:
+/// italic roles take the upright weight.
+fn ui_face_for(chain: FontChain) -> Option<&'static crate::text::system_fonts::UiFace> {
+    let faces = crate::text::system_fonts::ui_faces()?;
+    match chain.role {
+        FontRole::Regular | FontRole::Italic => Some(&faces.regular),
+        FontRole::Bold | FontRole::BoldItalic => Some(&faces.semibold),
+        FontRole::Monospace | FontRole::Icons => None,
+    }
+}
+
+/// The line box, in ems above and below the baseline, that the theme's text
+/// roles are laid out in: the bundled primary's, IBM Plex Sans (1.025 above,
+/// 0.275 below) with its asset's -0.1 ascender fudge. A UI face is fitted to
+/// it, so layouts keep their size whichever face draws them.
+const TEXT_LINE_BOX: (f32, f32) = (0.925, -0.275);
+
+/// Lead `family` with `ui`; the bundled chain stays behind it for anything
+/// it lacks.
+fn push_ui_face(
+    vm: &mut ScriptVm,
+    family: crate::makepad_platform::ScriptObject,
+    member_proto: ScriptValue,
+    chain: FontChain,
+    ui: &crate::text::system_fonts::UiFace,
+) {
+    let Some(path) = ui.face.path.to_str() else {
+        return;
+    };
+    let member = vm.bx.heap.new_with_proto(member_proto);
+    let resource = crate::makepad_platform::script::res::register_file_resource_path(vm, path);
+    vm.bx.heap.set_value(member, id!(res).into(), resource, NoTrap);
+    vm.bx.heap.set_value(
+        member,
+        id!(asc).into(),
+        ((TEXT_LINE_BOX.0 - ui.ascender_in_ems) as f64).into(),
+        NoTrap,
+    );
+    vm.bx.heap.set_value(
+        member,
+        id!(desc).into(),
+        ((TEXT_LINE_BOX.1 - ui.descender_in_ems) as f64).into(),
+        NoTrap,
+    );
+    vm.bx.heap.set_value(member, id!(index).into(), (ui.face.index as f64).into(), NoTrap);
+    let name = match chain.role {
+        FontRole::Bold | FontRole::BoldItalic => "system_ui_semibold",
+        _ => "system_ui_regular",
+    };
+    let member_id = LiveId::from_str_with_lut(name).unwrap_or_else(|_| LiveId::from_str(name));
+    vm.bx.heap.vec_push(family, member_id.into(), member.into(), NoTrap);
 }
 
 /// A style can choose its primary typeface without losing the platform's
@@ -319,21 +377,27 @@ mod tests {
             let bold_ids = bold.font_family.member_ids().collect::<Vec<_>>();
             let italic_ids = italic.font_family.member_ids().collect::<Vec<_>>();
             let bold_italic_ids = bold_italic.font_family.member_ids().collect::<Vec<_>>();
+            // Where the platform has a UI typeface (PingFang SC on macOS and
+            // iOS), it leads the text roles; the desktop chain follows in order.
+            let ui = crate::text::system_fonts::ui_faces().is_some();
+            let chain = |lead: &'static str, rest: [&'static str; 3]| {
+                ui.then_some(lead).into_iter().chain(rest).collect::<Vec<_>>()
+            };
             assert_eq!(
                 regular_ids,
-                ["ibm_plex_text", "lxgw_wenkai_regular", "noto_color_emoji"]
+                chain("system_ui_regular", ["ibm_plex_text", "lxgw_wenkai_regular", "noto_color_emoji"])
             );
             assert_eq!(
                 bold_ids,
-                ["ibm_plex_semibold", "lxgw_wenkai_bold", "noto_color_emoji"]
+                chain("system_ui_semibold", ["ibm_plex_semibold", "lxgw_wenkai_bold", "noto_color_emoji"])
             );
             assert_eq!(
                 italic_ids,
-                ["ibm_plex_italic", "lxgw_wenkai_regular", "noto_color_emoji"]
+                chain("system_ui_regular", ["ibm_plex_italic", "lxgw_wenkai_regular", "noto_color_emoji"])
             );
             assert_eq!(
                 bold_italic_ids,
-                ["ibm_plex_bold_italic", "lxgw_wenkai_bold", "noto_color_emoji"]
+                chain("system_ui_semibold", ["ibm_plex_bold_italic", "lxgw_wenkai_bold", "noto_color_emoji"])
             );
             assert_eq!(regular_i18n.font_family.member_ids().collect::<Vec<_>>(), regular_ids);
             assert_eq!(bold_i18n.font_family.member_ids().collect::<Vec<_>>(), bold_ids);
