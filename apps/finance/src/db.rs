@@ -397,8 +397,19 @@ impl Db {
         &mut self,
         body: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
+        self.transact_db(|db| body(&mut db.conn))
+    }
+
+    /// [`Db::transact`] for a body that writes through `Db`'s own methods.
+    /// The first-run seed writes thousands of rows; committed one by one,
+    /// each journaled and synced the file again, a freeze of seconds on the
+    /// UI thread.
+    pub(crate) fn transact_db<T>(
+        &mut self,
+        body: impl FnOnce(&mut Db) -> Result<T, String>,
+    ) -> Result<T, String> {
         self.conn.execute("BEGIN", &[]).map_err(|e| format!("begin: {e:?}"))?;
-        match body(&mut self.conn) {
+        match body(self) {
             Ok(value) => {
                 self.conn.execute("COMMIT", &[]).map_err(|e| format!("commit: {e:?}"))?;
                 Ok(value)
