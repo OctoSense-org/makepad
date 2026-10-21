@@ -34,7 +34,10 @@ impl Runtime for Backend {
         match db.is_empty() {
             Ok(true) => {
                 let ledger = crate::seed::generate(crate::seed::DEFAULT_YEARS, today);
-                match persist(&mut db, &ledger) {
+                // One transaction for the whole household: one journal and
+                // one sync instead of one per row, and a failure leaves the
+                // file empty rather than half seeded.
+                match db.transact_db(|db| persist(db, &ledger)) {
                     Ok(_) => {
                         let start = date::month_start(date::add_months(
                             today,
