@@ -1481,6 +1481,23 @@ extern "C" fn Java_dev_makepad_android_MakepadNative_surfaceOnSafeAreaInsets(
     });
 }
 
+/// The latest Choreographer beat's vsync time and its expected presentation
+/// time (CLOCK_MONOTONIC ns; 0 where Java does not provide it), set right
+/// before that beat's `RenderLoop` is sent (android_stuffing.rs).
+pub(crate) static BEAT_FRAME_TIME_NS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub(crate) static BEAT_EXPECTED_PRESENT_NS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+#[no_mangle]
+extern "C" fn Java_dev_makepad_android_MakepadNative_onFrameTime(
+    _: *mut jni_sys::JNIEnv,
+    _: jni_sys::jclass,
+    frame_time_nanos: jni_sys::jlong,
+    expected_present_nanos: jni_sys::jlong,
+) {
+    BEAT_FRAME_TIME_NS.store(frame_time_nanos, std::sync::atomic::Ordering::Relaxed);
+    BEAT_EXPECTED_PRESENT_NS.store(expected_present_nanos, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[no_mangle]
 extern "C" fn Java_dev_makepad_android_MakepadNative_onRenderLoop(
     _: *mut jni_sys::JNIEnv,

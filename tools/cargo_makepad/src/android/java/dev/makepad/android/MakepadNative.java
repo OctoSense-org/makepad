@@ -25,17 +25,39 @@ public class MakepadNative {
     private static final Choreographer.FrameCallback renderLoop = new Choreographer.FrameCallback() {
         @Override
         public void doFrame(long frameTimeNanos) {
+            onFrameTime(frameTimeNanos, 0);
             if (onRenderLoop()) {
                 Choreographer.getInstance().postFrameCallback(this);
             }
         }
     };
 
+    // API 33+: the same animation-phase beat, with the frame's expected
+    // presentation time, which buffer-stuffing recovery measures lateness
+    // against (android_stuffing.rs).
+    private static final Choreographer.VsyncCallback vsyncLoop = android.os.Build.VERSION.SDK_INT >= 33
+        ? new Choreographer.VsyncCallback() {
+            @Override
+            public void onVsync(Choreographer.FrameData data) {
+                onFrameTime(data.getFrameTimeNanos(),
+                    data.getPreferredFrameTimeline().getExpectedPresentationTimeNanos());
+                if (onRenderLoop()) {
+                    Choreographer.getInstance().postVsyncCallback(this);
+                }
+            }
+        }
+        : null;
+
     private static void startRenderLoop() {
-        Choreographer.getInstance().postFrameCallback(renderLoop);
+        if (vsyncLoop != null) {
+            Choreographer.getInstance().postVsyncCallback(vsyncLoop);
+        } else {
+            Choreographer.getInstance().postFrameCallback(renderLoop);
+        }
     }
 
     public native static boolean onRenderLoop();
+    public native static void onFrameTime(long frameTimeNanos, long expectedPresentNanos);
 
     public native static void onBackPressed();
     public native static void onHomeIntent();
