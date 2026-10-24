@@ -99,6 +99,7 @@ impl AndroidVariant {
                     android:configChanges="orientation|screenSize|keyboardHidden"
                     android:exported="true"
                     android:launchMode="singleTask"
+                    android:enableOnBackInvokedCallback="true"
                     android:windowSoftInputMode="adjustNothing|stateUnchanged"
                     android:theme="@style/MakepadLaunchTheme">
                     <intent-filter>
@@ -193,6 +194,7 @@ impl AndroidVariant {
                         android:excludeFromRecents="false"
                         android:exported="true"
                         android:launchMode="singleTask"
+                        android:enableOnBackInvokedCallback="true"
                         android:screenOrientation="landscape"
                         android:windowSoftInputMode="adjustNothing|stateUnchanged"
                         android:theme="@style/MakepadLaunchTheme"
@@ -209,6 +211,7 @@ impl AndroidVariant {
                         android:excludeFromRecents="false"
                         android:exported="true"
                         android:launchMode="singleTask"
+                        android:enableOnBackInvokedCallback="true"
                         android:screenOrientation="landscape"
                         android:windowSoftInputMode="adjustNothing|stateUnchanged"
                         android:theme="@style/MakepadLaunchTheme"
@@ -283,6 +286,7 @@ Self::Quest=>format!(r#"<?xml version="1.0" encoding="utf-8"?>
     android:name="{class_name}"
     android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
     android:launchMode="singleTask"
+    android:enableOnBackInvokedCallback="true"
     android:screenOrientation="landscape"
     android:excludeFromRecents="false"
     android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode"
@@ -301,6 +305,7 @@ Self::Quest=>format!(r#"<?xml version="1.0" encoding="utf-8"?>
     android:excludeFromRecents="false"
     android:exported="true"
     android:launchMode="singleTask"
+    android:enableOnBackInvokedCallback="true"
     android:screenOrientation="landscape"
     android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
     >
@@ -925,6 +930,22 @@ mod tests {
         assert!(xml.contains("android:theme=\"@style/MakepadAppTheme\""));
         assert!(xml.contains("android:theme=\"@style/MakepadLaunchTheme\""));
         assert!(xml.contains("android:launchMode=\"singleTask\""));
+    }
+
+    #[test]
+    fn every_activity_opts_into_back_invoked_callbacks() {
+        // MakepadActivity registers one OnBackInvokedCallback on API 33+;
+        // without the opt-in Android ignores it and finishes the activity
+        // on a system Back gesture instead.
+        for variant in [AndroidVariant::Default, AndroidVariant::Quest] {
+            let xml = variant.manifest_xml(&test_args("App", "dev.makepad.app"));
+            assert_eq!(
+                xml.matches("android:launchMode=\"singleTask\"").count(),
+                xml.matches("android:enableOnBackInvokedCallback=\"true\"").count(),
+                "every activity needs the Back opt-in: {xml}"
+            );
+            assert!(xml.contains("android:enableOnBackInvokedCallback=\"true\""));
+        }
     }
 
     #[test]
