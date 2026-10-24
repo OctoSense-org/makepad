@@ -451,14 +451,31 @@ pub fn contain_isolate_panic(what: &str, f: impl FnOnce()) -> bool {
     }
 }
 
+/// How long one entry into a Splash isolate may run: 64 ms, unless
+/// `MAKEPAD_SPLASH_BUDGET_MS` says otherwise. The budget is wall-clock time,
+/// so it also counts time the entry spends waiting for the CPU or a lock. A
+/// test binary running a thousand tests in one process is the case for the
+/// override: there the wall clock says little about the script.
+fn splash_entry_budget() -> std::time::Duration {
+    static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let ms = std::env::var("MAKEPAD_SPLASH_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .unwrap_or(64);
+        std::time::Duration::from_millis(ms)
+    })
+}
+
 /// A Splash isolate runs untrusted-ish user script on the UI thread; cap how long any
 /// single entry into it may run.
 fn with_splash_budget<R>(vm: &mut ScriptVm, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
-    let old_budget = vm.bx.run_budget.replace(ScriptRunBudget::from_durations(
-        std::time::Duration::from_millis(64),
-        std::time::Duration::from_millis(64),
-        512,
-    ));
+    let budget = splash_entry_budget();
+    let old_budget = vm
+        .bx
+        .run_budget
+        .replace(ScriptRunBudget::from_durations(budget, budget, 512));
     let out = f(vm);
     vm.bx.run_budget = old_budget;
     out
