@@ -1219,6 +1219,18 @@ impl Cx {
         if let crate::script::res::CxScriptResourceData::Loaded(data) = &res.data {
             return Some(SharedBytes::from_owned(data.clone()));
         }
+        // `path` is where the resource lived when it was registered: the build
+        // machine's directory. On any other machine the font is only in the
+        // package's resource tree, under the name `dependency_path` gives it
+        // inside its crate -- the same place `load_packaged_resource` searches
+        // for an unpackaged build's other assets.
+        if let Some(dep_path) = res.dependency_path.as_deref() {
+            if let Some(bytes) = crate::os::cx_native::read_file_cwd_or_exe_relative(format!(
+                "resources/{dep_path}"
+            )) {
+                return Some(SharedBytes::from_vec(bytes));
+            }
+        }
         res.dependency_path
             .as_deref()
             .and_then(|path| self.get_dependency(path).ok())
