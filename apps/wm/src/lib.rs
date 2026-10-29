@@ -717,6 +717,11 @@ pub struct App {
     /// The hosted apps' later windows, each a window of its own (`client_windows.rs`).
     #[rust]
     client_windows: ClientWindows,
+    /// Draws this WM has done. The home tiles' apps start only once its own first frame is
+    /// out: under `makepad run` they are domains of this process, and a warm phone start spent
+    /// 12 of its 16 s behind three domain starts queued on the owner before its first present.
+    #[rust]
+    draws: u32,
     #[rust]
     tick: Timer,
     /// Module instances whose root panicked, with when: their tiles show
@@ -6948,6 +6953,7 @@ impl AppMain for App {
         // The pane rect follows the desk: refreshed from the desk's last
         // drawn rect right before every draw, one borrow's worth.
         if let Event::Draw(_) = event {
+            self.draws = self.draws.saturating_add(1);
             if self.state.is_some() {
                 self.sync_ai_pane_geometry(cx);
                 self.sync_surface_targets(cx);
@@ -7119,6 +7125,10 @@ impl AppMain for App {
                     }
                 }
                 self.reap_exited(cx);
+                // the home tiles' apps, once the WM's own first frame is out (see `draws`)
+                if self.draws >= 2 {
+                    self.sync_home_tiles(cx);
+                }
                 self.history_poke(cx);
                 self.poll_backgrounds(cx);
                 self.drain_client_lines(cx);

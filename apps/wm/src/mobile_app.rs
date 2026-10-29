@@ -61,7 +61,8 @@ impl App {
                 .map(|(c, _)| *c).min();
             if let Some(client) = existing {
                 self.state_mut().phone.tiles.bind(app, client, false);
-            } else if home_visible && self.state_mut().phone.tiles.may_launch(app, now) {
+            // not before the WM's own first frame is out (`draws`): a domain start competes with it
+            } else if home_visible && self.draws >= 2 && self.state_mut().phone.tiles.may_launch(app, now) {
                 self.launch_tile_client(cx, app);
             }
         }
