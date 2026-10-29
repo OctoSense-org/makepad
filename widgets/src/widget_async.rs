@@ -322,6 +322,8 @@ struct WidgetToScriptCallRequest {
 
 struct IsolatedSplashVm {
     network_enabled: bool,
+    /// How long one entry into this isolate may run; see `with_splash_budget`.
+    time_budget: std::time::Duration,
     std: ScriptStd,
     vm: Option<Box<ScriptVmBase>>,
 }
@@ -451,17 +453,35 @@ pub fn contain_isolate_panic(what: &str, f: impl FnOnce()) -> bool {
     }
 }
 
+/// How long one entry into a Splash isolate may run before the VM stops it with
+/// `script time budget exceeded`, until its host sets another
+/// ([`CxSplashVmExt::set_splash_vm_time_budget`]).
+pub const DEFAULT_SPLASH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(64);
+
 /// A Splash isolate runs untrusted-ish user script on the UI thread; cap how long any
-/// single entry into it may run.
-fn with_splash_budget<R>(vm: &mut ScriptVm, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
-    let old_budget = vm.bx.run_budget.replace(ScriptRunBudget::from_durations(
-        std::time::Duration::from_millis(64),
-        std::time::Duration::from_millis(64),
-        512,
-    ));
+/// single entry into it may run. The cap is the isolate's own `budget`.
+fn with_splash_budget<R>(
+    vm: &mut ScriptVm,
+    budget: std::time::Duration,
+    f: impl FnOnce(&mut ScriptVm) -> R,
+) -> R {
+    let old_budget = vm
+        .bx
+        .run_budget
+        .replace(ScriptRunBudget::from_durations(budget, budget, 512));
     let out = f(vm);
     vm.bx.run_budget = old_budget;
     out
+}
+
+/// Isolate `vm_id`'s per-entry time budget. Read before the isolate is
+/// installed: installing takes it out of the table.
+fn splash_vm_time_budget(cx: &mut Cx, vm_id: SplashVmId) -> std::time::Duration {
+    cx.global::<CxWidgetAsync>()
+        .isolated_vms
+        .vms
+        .get(&vm_id)
+        .map_or(DEFAULT_SPLASH_TIME_BUDGET, |isolated| isolated.time_budget)
 }
 
 pub trait CxSplashVmExt {
@@ -489,6 +509,13 @@ pub trait CxSplashVmExt {
     /// for app script; a registration that takes longer than one budget
     /// slice would otherwise stop half way through.
     fn with_script_vm_id_trusted<R>(&mut self, vm_id: SplashVmId, f: impl FnOnce(&mut ScriptVm) -> R) -> R;
+    /// How long each entry into isolate `vm_id` may run before it is stopped
+    /// with `script time budget exceeded` ([`DEFAULT_SPLASH_TIME_BUDGET`]
+    /// until set). The default is sized for a small installed app on a fast
+    /// machine; a slow machine or an unoptimised build runs the same script
+    /// several times slower, so a host can give an app it ships itself more
+    /// room. Applies from the next entry.
+    fn set_splash_vm_time_budget(&mut self, vm_id: SplashVmId, budget: std::time::Duration);
     /// Tear an isolate down now: its script timers stop, its storage jail
     /// and host-bridge state go, its heap is freed. Every widget minted in
     /// it must be dropped by then (or about to be): a ref that outlives
@@ -596,6 +623,7 @@ impl CxSplashVmExt for Cx {
             id,
             IsolatedSplashVm {
                 network_enabled,
+                time_budget: DEFAULT_SPLASH_TIME_BUDGET,
                 std,
                 vm: Some(bx),
             },
@@ -627,7 +655,8 @@ impl CxSplashVmExt for Cx {
             return self.with_vm(f);
         }
 
-        with_isolate_installed(self, vm_id, |cx| cx.with_vm(|vm| with_splash_budget(vm, f)))
+        let budget = splash_vm_time_budget(self, vm_id);
+        with_isolate_installed(self, vm_id, |cx| cx.with_vm(|vm| with_splash_budget(vm, budget, f)))
     }
 
     fn with_script_vm_id_thread<R>(
@@ -649,8 +678,9 @@ impl CxSplashVmExt for Cx {
             return self.with_vm_thread(thread_id, f);
         }
 
+        let budget = splash_vm_time_budget(self, vm_id);
         with_isolate_installed(self, vm_id, |cx| {
-            cx.with_vm_thread(thread_id, |vm| with_splash_budget(vm, f))
+            cx.with_vm_thread(thread_id, |vm| with_splash_budget(vm, budget, f))
         })
     }
 
@@ -660,6 +690,12 @@ impl CxSplashVmExt for Cx {
             return self.with_vm(f);
         }
         with_isolate_installed(self, vm_id, |cx| cx.with_vm(f))
+    }
+
+    fn set_splash_vm_time_budget(&mut self, vm_id: SplashVmId, budget: std::time::Duration) {
+        if let Some(isolated) = self.global::<CxWidgetAsync>().isolated_vms.vms.get_mut(&vm_id) {
+            isolated.time_budget = budget;
+        }
     }
 
     fn free_splash_vm(&mut self, vm_id: SplashVmId) {
@@ -1649,6 +1685,7 @@ pub struct IsolateEntry {
     vm_id: SplashVmId,
     previous_vm_id: SplashVmId,
     network_enabled: bool,
+    time_budget: std::time::Duration,
     outer_std: Option<ScriptStd>,
     outer_vm: Option<Box<ScriptVmBase>>,
 }
@@ -1713,7 +1750,7 @@ pub fn with_isolate<C: IsolateCx, R>(cx: &mut C, vm_id: SplashVmId, f: impl FnOn
 pub fn enter_isolate(cx: &mut Cx, vm_id: SplashVmId) -> IsolateEntry {
     let previous_vm_id = cx.global::<CxWidgetAsync>().current_vm_id;
     if vm_id == MAIN_SPLASH_VM_ID || previous_vm_id == vm_id {
-        return IsolateEntry { vm_id: MAIN_SPLASH_VM_ID, previous_vm_id, network_enabled: false, outer_std: None, outer_vm: None };
+        return IsolateEntry { vm_id: MAIN_SPLASH_VM_ID, previous_vm_id, network_enabled: false, time_budget: DEFAULT_SPLASH_TIME_BUDGET, outer_std: None, outer_vm: None };
     }
     // Out of the table while installed, exactly as `with_isolate_installed`
     // keeps it: a nested entry by id takes the "already current" path.
@@ -1727,7 +1764,7 @@ pub fn enter_isolate(cx: &mut Cx, vm_id: SplashVmId) -> IsolateEntry {
     let outer_std = std::mem::replace(&mut cx.script_data.std, isolated.std);
     let outer_vm = cx.script_vm.take();
     cx.script_vm = isolated.vm;
-    IsolateEntry { vm_id, previous_vm_id, network_enabled: isolated.network_enabled, outer_std: Some(outer_std), outer_vm }
+    IsolateEntry { vm_id, previous_vm_id, network_enabled: isolated.network_enabled, time_budget: isolated.time_budget, outer_std: Some(outer_std), outer_vm }
 }
 
 /// Put the outer VM back. See [`enter_isolate`].
@@ -1735,7 +1772,7 @@ pub fn leave_isolate(cx: &mut Cx, entry: IsolateEntry) {
     if entry.vm_id == MAIN_SPLASH_VM_ID {
         return;
     }
-    let IsolateEntry { vm_id, previous_vm_id, network_enabled, outer_std, outer_vm } = entry;
+    let IsolateEntry { vm_id, previous_vm_id, network_enabled, time_budget, outer_std, outer_vm } = entry;
     let isolate_vm = cx.script_vm.take();
     cx.script_vm = outer_vm;
     let isolate_std = std::mem::replace(&mut cx.script_data.std, outer_std.expect("an entered isolate has an outer std"));
@@ -1743,7 +1780,7 @@ pub fn leave_isolate(cx: &mut Cx, entry: IsolateEntry) {
     cx.global::<CxWidgetAsync>()
         .isolated_vms
         .vms
-        .insert(vm_id, IsolatedSplashVm { network_enabled, std: isolate_std, vm: isolate_vm });
+        .insert(vm_id, IsolatedSplashVm { network_enabled, time_budget, std: isolate_std, vm: isolate_vm });
 }
 
 #[cfg(test)]
@@ -2007,6 +2044,39 @@ mod isolate_entry_tests {
         let entry = enter_isolate(&mut cx, MAIN_SPLASH_VM_ID);
         assert_eq!(cx.with_vm(|vm| vm.bx.heap.heap_key()), main_heap);
         leave_isolate(&mut cx, entry);
+        cx.free_splash_vm(vm_id);
+    }
+
+    /// Each entry into an isolate runs under that isolate's own time budget:
+    /// a runaway script is stopped at the default until its host sets
+    /// another, then at the host's budget and not sooner.
+    #[test]
+    fn an_isolate_entry_runs_until_its_own_time_budget() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let vm_id = cx.alloc_splash_vm();
+        let run_away = |cx: &mut Cx| {
+            let start = std::time::Instant::now();
+            let out = cx.with_script_vm_id(vm_id, |vm| {
+                vm.eval(crate::makepad_script::script! { loop {} })
+            });
+            assert!(out.is_err(), "a runaway entry is stopped");
+            start.elapsed()
+        };
+        let raised = std::time::Duration::from_millis(500);
+
+        let stopped_after = run_away(&mut cx);
+        assert!(stopped_after >= DEFAULT_SPLASH_TIME_BUDGET, "{stopped_after:?}");
+        assert!(stopped_after < raised, "{stopped_after:?}");
+
+        cx.set_splash_vm_time_budget(vm_id, raised);
+        let stopped_after = run_away(&mut cx);
+        assert!(stopped_after >= raised, "{stopped_after:?}");
+        assert!(cx.with_vm(|vm| vm.bx.run_budget.is_none()), "the app VM is not budgeted");
+        // A host's own entry and exit keep the isolate's budget.
+        let entry = enter_isolate(&mut cx, vm_id);
+        leave_isolate(&mut cx, entry);
+        assert_eq!(splash_vm_time_budget(&mut cx, vm_id), raised);
         cx.free_splash_vm(vm_id);
     }
 }

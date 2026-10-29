@@ -4,7 +4,8 @@ use crate::{
     view::View,
     widget::*,
     widget_async::{
-        CxSplashVmExt, SplashVmId, MAIN_SPLASH_VM_ID, WIDGET_SCRIPT_INSTRUCTION_LIMIT,
+        CxSplashVmExt, SplashVmId, DEFAULT_SPLASH_TIME_BUDGET, MAIN_SPLASH_VM_ID,
+        WIDGET_SCRIPT_INSTRUCTION_LIMIT,
     },
     widget_tree::CxWidgetExt,
 };
@@ -85,6 +86,10 @@ pub struct Splash {
     /// Heap ceiling for this isolate, applied to its script heap.
     #[rust]
     memory_bytes: Option<usize>,
+    /// How long one entry into this isolate's script may run. None = the
+    /// isolate default, `DEFAULT_SPLASH_TIME_BUDGET`.
+    #[rust]
+    time_budget: Option<std::time::Duration>,
     /// What to call this script in error messages. Set by the host to the
     /// mini-app's id; empty for previews and one-off evals.
     ///
@@ -218,6 +223,10 @@ impl Splash {
         if self.vm_id == MAIN_SPLASH_VM_ID {
             self.vm_id = cx.alloc_splash_vm_with_network(self.allow_net);
         }
+        cx.set_splash_vm_time_budget(
+            self.vm_id,
+            self.time_budget.unwrap_or(DEFAULT_SPLASH_TIME_BUDGET),
+        );
         // (Re)bind this isolate's storage jail and host-bridge identity.
         // Keyed by heap so the script can neither read nor retarget them.
         let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.heap_key());
@@ -854,6 +863,21 @@ impl Splash {
         }
     }
 
+    /// How long each entry into this app's script (its body's evaluation, a
+    /// handler, a render) may run before it is stopped with `script time
+    /// budget exceeded`. None = the default, `DEFAULT_SPLASH_TIME_BUDGET`,
+    /// sized for a small installed app; a host can give an app it ships
+    /// itself more, since a slow machine or an unoptimised build runs the
+    /// same script several times slower. Call before set_text so the body's
+    /// evaluation gets it; applies from the next entry when the isolate is
+    /// live.
+    pub fn set_time_budget(&mut self, cx: &mut Cx, budget: Option<std::time::Duration>) {
+        self.time_budget = budget;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            cx.set_splash_vm_time_budget(self.vm_id, budget.unwrap_or(DEFAULT_SPLASH_TIME_BUDGET));
+        }
+    }
+
     /// Instructions this isolate has run under its budget so far.
     pub fn instructions_used(&mut self, cx: &mut Cx) -> u64 {
         if self.vm_id == MAIN_SPLASH_VM_ID {
@@ -938,6 +962,13 @@ impl SplashRef {
     pub fn set_memory_bytes(&self, cx: &mut Cx, bytes: Option<usize>) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_memory_bytes(cx, bytes);
+        }
+    }
+
+    /// See [`Splash::set_time_budget`].
+    pub fn set_time_budget(&self, cx: &mut Cx, budget: Option<std::time::Duration>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_time_budget(cx, budget);
         }
     }
 
