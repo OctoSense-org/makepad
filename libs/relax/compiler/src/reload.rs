@@ -4349,6 +4349,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // installed patches whose landing is checked once LANDING has passed: (when, patch group, the edit)
     let mut landing: Vec<(Instant, u32, String)> = Vec::new();
     let mut tick: u32 = 0;
+    // the edits ledger as the last round saw it (`virtual_quiet`)
+    let mut ledger = crate::vfs::edits_ledger_stamp();
     let mut startup_scan = true;
     let mut restart_required = false;
     let mut revision = 0;
@@ -4491,12 +4493,20 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         let lost = events.is_some() && notifications.is_none();
         if lost { events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str())); }
         let all = lost || rewatched || (events.is_none() && tick % 20 == 0);
+        // A mounted store's file changes only through the edits folder, whose ledger is rewritten
+        // with every edit: while the ledger is as the last round saw it, the virtual files are as
+        // they were, and their stamps (an edits-folder lookup and a failing stat each; 2,700 files
+        // every 100 ms took a third of a core on a phone) are not read.
+        let now_ledger = crate::vfs::edits_ledger_stamp();
+        let virtual_quiet = now_ledger == ledger;
+        ledger = now_ledger;
         let t_round = std::time::Instant::now();
         let mut changed: Vec<usize> = Vec::new();
         let mut scanned = 0;
         if all {
             scanned = files.len();
             for (k, f) in files.iter_mut().enumerate() {
+                if virtual_quiet && crate::vfs::is_virtual(&f.0) { continue; }
                 if stamp(&f.0) != f.2 {
                     changed.push(k);
                 }
@@ -4509,6 +4519,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
         } else {
             scanned = hot.len();
             for &k in &hot {
+                if virtual_quiet && crate::vfs::is_virtual(&files[k].0) { continue; }
                 if stamp(&files[k].0) != files[k].2 {
                     changed.push(k);
                 }
