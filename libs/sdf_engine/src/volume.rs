@@ -29,9 +29,12 @@ use std::sync::Arc;
 pub const BS: i32 = 8;
 /// Bricks per block edge.
 pub const BLOCK: i32 = 4;
-/// Truth-atlas slots per row: a slot is 64 x 8 texels (8 z slices of 8 x 8).
-pub const ATLAS_SLOTS_X: usize = 64;
-pub const ATLAS_W: usize = ATLAS_SLOTS_X * 64;
+/// Storage uploads consumed by mod.sdf.Field and mod.sdf.Bake.
+pub struct FieldBuffers {
+    pub index: Vec<[f32; 4]>,
+    pub programs: Vec<[f32; 4]>,
+    pub bricks: Vec<[u32; 4]>,
+}
 
 /// What one brick of the volume is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -68,14 +71,12 @@ pub struct Volume {
     pub field_scale: f32,
     program_ids: HashMap<Vec<u32>, u32>,
     free_slots: Vec<u32>,
+    /// Slots still referenced by the published field. Only publish releases them.
+    deferred_slots: Vec<u32>,
     pub slot_count: u32,
     /// Bricks whose texels must be (re)baked.
     pub dirty: Vec<usize>,
-    /// Bricks the CPU twin baked (a program the GPU cannot run: a mesh, a kernel past the GPU
-    /// limits): their texels, which the baker uploads instead of baking.
-    pub cpu: HashMap<usize, Arc<CpuBrick>>,
-    /// Bricks a build classified again (baked or not): their neighbours'
-    /// render-copy aprons may have changed.
+    /// Bricks a build classified again (baked or not).
     pub touched: Vec<usize>,
 }
 
@@ -94,31 +95,9 @@ pub struct BuildStats {
     pub apply_ms: f64,
 }
 
-/// A brick's samples baked on the CPU twin: 64 x 8 slot texels (z slices along x), each a
-/// distance clamped to the band, and their material slots.
-pub struct CpuBrick {
-    pub d: Vec<f32>,
-    pub slots: Vec<u8>,
-}
-
 enum BrickResult {
     Empty { skip: f32 },
-    /// `cpu`: its samples, when the GPU cannot run its program.
-    Bake { program: Program, cpu: Option<CpuBrick> },
-}
-
-/// The samples of brick `b` (lattice coordinates) of `program`, as the GPU bake lays them out.
-fn bake_cpu(program: &[[f32; 4]], b: [i32; 3], cell: f32, band: f32, kernels: &[KernelSlot]) -> CpuBrick {
-    let mut qs = Vec::with_capacity(512);
-    for y in 0..8 {
-        for tx in 0..64 {
-            let (z, x) = (tx / 8, tx % 8);
-            let g = [b[0] * BS + x, b[1] * BS + y, b[2] * BS + z];
-            qs.push(g.map(|v| v as f32 * cell));
-        }
-    }
-    let vals = twin::eval_many(program, &qs, kernels);
-    CpuBrick { d: vals.iter().map(|(v, _)| v.max(-band).min(band) + 0.0).collect(), slots: vals.iter().map(|(_, s)| *s).collect() }
+    Bake { program: Program },
 }
 
 struct BlockResult {
@@ -201,9 +180,9 @@ impl Volume {
             field_scale: 1.0,
             program_ids: HashMap::new(),
             free_slots: Vec::new(),
+            deferred_slots: Vec::new(),
             slot_count: 0,
             dirty: Vec::new(),
-            cpu: HashMap::new(),
             touched: Vec::new(),
         }
     }
@@ -252,9 +231,8 @@ impl Volume {
 
     fn release(&mut self, i: usize) {
         if let Brick::Baked { slot, .. } = self.bricks[i] {
-            self.free_slots.push(slot);
+            self.deferred_slots.push(slot);
         }
-        self.cpu.remove(&i);
     }
 
     /// Classifies and programs every brick of the blocks overlapping `region`
@@ -266,7 +244,7 @@ impl Volume {
         let c = self.cell as f64;
         let min = self.min;
         let dim = self.dim;
-        crate::kernel::collect(root, &mut self.kernels);
+        crate::kernel::collect(root, &mut self.kernels)?;
         let mut region = region;
         let estimate = crate::kernel::has_estimate(root);
         if !self.kernels.is_empty() || estimate {
@@ -387,8 +365,7 @@ impl Volume {
                                                 if d.abs() > r + band {
                                                     BrickResult::Empty { skip: skip_of(d, r) as f32 }
                                                 } else {
-                                                    let cpu = (!p.fits_gpu()).then(|| bake_cpu(&p.texels, b, c as f32, band as f32, &kernels));
-                                                    BrickResult::Bake { program: p, cpu }
+                                                    BrickResult::Bake { program: p }
                                                 }
                                             }),
                                         };
@@ -417,13 +394,10 @@ impl Volume {
                 }
                 self.bricks[i] = match brick? {
                     BrickResult::Empty { skip } => Brick::Empty { skip },
-                    BrickResult::Bake { program: p, cpu } => {
+                    BrickResult::Bake { program: p } => {
                         let program = self.program_id(p);
                         let slot = self.alloc_slot();
                         st.bricks_baked += 1;
-                        if let Some(cpu) = cpu {
-                            self.cpu.insert(i, Arc::new(cpu));
-                        }
                         self.dirty.push(i);
                         Brick::Baked { slot, program }
                     }
@@ -466,16 +440,41 @@ impl Volume {
         }
     }
 
-    /// The index the GPU reads per brick (x + dim.x (y + dim.y z)): its slot
-    /// (-1 when empty) and, for an empty brick, its signed skip distance.
-    pub fn index_texels(&self) -> Vec<[f32; 4]> {
-        self.bricks
-            .iter()
-            .map(|b| match *b {
-                Brick::Baked { slot, .. } => [slot as f32, 0.0, 0.0, 0.0],
-                Brick::Empty { skip } => [-1.0, skip, 0.0, 0.0],
-            })
-            .collect()
+    /// Retire the previous field after the new index and atlas writes are
+    /// published together. The caller must have finished any earlier reads
+    /// before reusing these slots in another bake.
+    pub fn publish(&mut self) {
+        self.free_slots.append(&mut self.deferred_slots);
+    }
+
+    /// Immutable upload data for one field. Capture before draining dirty.
+    /// Index: (slot, signed skip, program base, 0).
+    /// Programs: concatenated vec4f streams, including each program's header.
+    /// Bricks: two vec4u per GPU entry: (signed xyz bits, slot), then
+    /// (program base, 0, 0, 0). first/count count entries, not vec4u records.
+    pub fn buffers(&self) -> FieldBuffers {
+        let mut programs = Vec::new();
+        let bases: Vec<u32> = self.programs.iter().map(|p| {
+            let base = u32::try_from(programs.len()).expect("program buffer exceeds u32 addressing");
+            programs.extend_from_slice(&p.texels);
+            base
+        }).collect();
+        let index = self.bricks.iter().map(|b| match *b {
+            Brick::Baked { slot, program } => [slot as f32, 0.0,
+                bases[program as usize] as f32, 0.0],
+            Brick::Empty { skip } => [-1.0, skip, -1.0, 0.0],
+        }).collect();
+        let mut dirty = self.dirty.clone();
+        dirty.sort_unstable();
+        dirty.dedup();
+        let mut bricks = Vec::new();
+        for i in dirty {
+            let Brick::Baked { slot, program } = self.bricks[i] else { continue };
+            let b = self.brick_of(i);
+            bricks.push([b[0] as u32, b[1] as u32, b[2] as u32, slot]);
+            bricks.push([bases[program as usize], 0, 0, 0]);
+        }
+        FieldBuffers { index, programs, bricks }
     }
 
     /// The 26 neighbours of brick `i` inside the volume, and itself.
@@ -492,8 +491,13 @@ impl Volume {
     /// slot texels, z slices along x), and its material slots.
     pub fn bake_brick_cpu(&self, i: usize) -> Option<(Vec<f32>, Vec<u8>)> {
         let Brick::Baked { program, .. } = self.bricks[i] else { return None };
-        let b = bake_cpu(&self.programs[program as usize].texels, self.brick_of(i), self.cell, self.band, &self.kernels);
-        Some((b.d, b.slots))
+        let b = self.brick_of(i);
+        let mut points = Vec::with_capacity(512);
+        for y in 0..8 { for z in 0..8 { for x in 0..8 {
+            points.push([b[0] * BS + x, b[1] * BS + y, b[2] * BS + z].map(|v| v as f32 * self.cell));
+        } } }
+        let values = twin::eval_many(&self.programs[program as usize].texels, &points, &self.kernels);
+        Some(values.into_iter().map(|(d, slot)| (d.max(-self.band).min(self.band) + 0.0, slot)).unzip())
     }
 
     /// The distance and material slot of `root` at `points`, all inside `region`: its program
@@ -598,4 +602,102 @@ mod tests {
         }
         assert!(misses.is_empty(), "{}", misses.join("\n"));
     }
+
+    #[test]
+    fn direct_aprons_match_truth_and_neighbours() {
+        for (name, root) in [
+            ("vase", vase(70.0, 21.0)),
+            ("sphere", SdfNode::Sphere { radius: 17.0 }),
+            ("box", SdfNode::Box { size: [25.0, 31.0, 19.0], radius: 1.5 }),
+            ("torus", SdfNode::Torus { radius: 18.0, tube: 4.0 }),
+        ] {
+            let root = SdfNode::Material { slot: 7, within: None, of: Box::new(root) };
+            let mut vol = Volume::new(Volume::bounds_of(&root).unwrap(), 1.25, 5.0);
+            vol.build(&root, None).unwrap();
+            let truth: HashMap<_, _> = (0..vol.bricks.len()).filter_map(|i| vol.bake_brick_cpu(i).map(|v| (i, v))).collect();
+            let (mut interior, mut apron, mut empty, mut material_changes) = (0, 0, 0, 0);
+            for (&i, own) in &truth {
+                let Brick::Baked { program, .. } = vol.bricks[i] else { unreachable!() };
+                let b = vol.brick_of(i);
+                let direct = twin::bake_brick(&vol.programs[program as usize].texels, b, vol.cell, vol.band, &vol.kernels);
+                for y in 0..9 {
+                    for z in 0..9 {
+                        for x in 0..9 {
+                            let j = (y * 81 + z * 9 + x) as usize;
+                            if x < 8 && y < 8 && z < 8 {
+                                let k = (y * 64 + z * 8 + x) as usize;
+                                assert_eq!(direct.d[j].to_bits(), twin::to_half(own.0[k]).to_bits(), "{name} interior {b:?} {x},{y},{z}");
+                                assert_eq!(direct.slots[j], own.1[k]);
+                                interior += 1;
+                                continue;
+                            }
+                            let nb = [b[0] + x / 8, b[1] + y / 8, b[2] + z / 8];
+                            let inside = (0..3).all(|a| nb[a] >= vol.min[a] && nb[a] < vol.min[a] + vol.dim[a]);
+                            let ni = inside.then(|| vol.index(nb));
+                            let (d, slot) = match ni.and_then(|i| truth.get(&i)) {
+                                Some((d, slots)) => {
+                                    apron += 1;
+                                    let k = ((y % 8) * 64 + (z % 8) * 8 + x % 8) as usize;
+                                    (d[k], slots[k])
+                                }
+                                None => {
+                                    empty += 1;
+                                    let negative = ni.is_some_and(|i| matches!(vol.bricks[i], Brick::Empty { skip } if skip < 0.0));
+                                    (if negative { -vol.band } else { vol.band }, 0)
+                                }
+                            };
+                            assert_eq!(direct.d[j].to_bits(), twin::to_half(d).to_bits(), "{name} apron {b:?} {x},{y},{z}");
+                            if direct.slots[j] != slot {
+                                // Empty neighbours previously supplied material zero. A
+                                // direct sample retains the field's material at the band.
+                                assert!(ni.is_none_or(|i| matches!(vol.bricks[i], Brick::Empty { .. })));
+                                material_changes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(interior > 0 && apron > 0 && empty > 0);
+            println!("{name}: {interior} interior, {apron} baked-neighbour apron, {empty} empty-neighbour apron distances bit-equal; {material_changes} band material changes");
+        }
+    }
+
+    #[test]
+    fn slots_retire_only_at_publish_and_buffers_follow_current_field() {
+        let root = SdfNode::Combine {
+            op: SdfOp::Union,
+            blend: 0.0,
+            of: vec![SdfNode::Sphere { radius: 9.0 }, at([25.0, 0.0, 0.0], SdfNode::Box { size: [10.0, 12.0, 14.0], radius: 1.0 })],
+        };
+        let mut vol = Volume::new(Volume::bounds_of(&root).unwrap(), 1.0, 4.0);
+        vol.build(&root, None).unwrap();
+        let slots = |v: &Volume| v.bricks.iter().filter_map(|b| match b { Brick::Baked { slot, .. } => Some(*slot), _ => None }).collect::<std::collections::BTreeSet<_>>();
+        let first = slots(&vol);
+        vol.publish();
+        vol.dirty.clear();
+        vol.build(&root, None).unwrap();
+        let second = slots(&vol);
+        assert!(first.is_disjoint(&second));
+        vol.build(&root, None).unwrap();
+        let third = slots(&vol);
+        assert!(first.is_disjoint(&third) && second.is_disjoint(&third));
+        let data = vol.buffers();
+        assert!(vol.programs.len() > 1, "exercise distinct concatenated program bases");
+        assert_eq!(data.bricks.len(), third.len() * 2, "repeated dirty entries deduplicated");
+        for pair in data.bricks.chunks_exact(2) {
+            let b = [pair[0][0] as i32, pair[0][1] as i32, pair[0][2] as i32];
+            let i = vol.index(b);
+            let Brick::Baked { slot, program } = vol.bricks[i] else { panic!("non-baked entry") };
+            assert_eq!(slot, pair[0][3]);
+            assert_eq!(data.index[i], [slot as f32, 0.0, pair[1][0] as f32, 0.0]);
+            let base = pair[1][0] as usize;
+            assert_eq!(&data.programs[base..base + vol.programs[program as usize].texels.len()], &vol.programs[program as usize].texels);
+        }
+        vol.publish();
+        vol.build(&root, None).unwrap();
+        let fourth = slots(&vol);
+        assert!(fourth.is_disjoint(&third));
+        assert!(fourth.iter().all(|s| first.contains(s) || second.contains(s)));
+    }
+
 }

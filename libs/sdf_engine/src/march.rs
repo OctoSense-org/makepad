@@ -34,7 +34,7 @@
 //! SHADER LAW: unary minus has the lowest precedence in the script shader
 //! parser; write `(0.0 - a) - b`, never `-a - b`.
 
-use crate::bake::{Baker, COPY_W, INDEX_W, PROG_W};
+use crate::bake::{Baker, ATLAS_W};
 use crate::volume::Volume;
 use makepad_draw::*;
 
@@ -45,12 +45,12 @@ script_mod! {
     use mod.draw
 
     // What both passes read: the brick index, the render copy, the field.
-    mod.draw.SdfField = {
+    mod.sdf.Field = {
+        ..mod.sdf.Eval,
         copy_tex: texture_2d(float)
         copy_slots: texture_2d(float)
-        index_tex: texture_2d(float)
+        index: buffer(vec4f)
         copy_inv: uniform(vec2(1.0, 1.0))
-        index_inv: uniform(vec2(1.0, 1.0))
         vol_min: uniform(vec3(0.0, 0.0, 0.0))
         vol_dim: uniform(vec3(1.0, 1.0, 1.0))
         cell: uniform(1.0)
@@ -93,8 +93,7 @@ script_mod! {
                 return vec4(0.0 - 1.0, self.band, 0.0, 0.0)
             }
             let i = (ib.z * self.vol_dim.y + ib.y) * self.vol_dim.x + ib.x
-            let row = floor(i * 0.0009765625)
-            return vec4(self.index_tex.sample_nearest((vec2(i - row * 1024.0, row) + vec2(0.5, 0.5)) * self.index_inv).xyz, 1.0)
+            return vec4(self.index[u32(i)].xyz, 1.0)
         }
 
         // the render copy's texel coordinates of local sample l (0..8) in slot s, slice z0
@@ -221,8 +220,8 @@ script_mod! {
 
     mod.draw.SdfMarch = mod.std.set_type_default() do #(DrawSdfMarch::script_shader(vm)){
         ..mod.draw.DrawQuad,
-        ..mod.draw.SdfInterp,
-        ..mod.draw.SdfField,
+        ..mod.sdf.Field,
+        precise_math: true
         depth_out: fragment_depth(@any)
         pix_angle: uniform(0.001)
         // the coarse pass's free distances (world units; 1e30 = no surface
@@ -415,8 +414,7 @@ script_mod! {
     // depth-tested so the nearest object's wins. The full march starts there.
     mod.draw.SdfCoarse = mod.std.set_type_default() do #(DrawSdfCoarse::script_shader(vm)){
         ..mod.draw.DrawQuad,
-        ..mod.draw.SdfInterp,
-        ..mod.draw.SdfField,
+        ..mod.sdf.Field,
         color_format: @Rgba32F
         alpha_blend: false
         depth_out: fragment_depth(@any)
@@ -471,8 +469,7 @@ script_mod! {
     // surface is left out: its shade has its soft shadow and AO.
     mod.draw.SdfCastShadow = mod.std.set_type_default() do #(DrawSdfCastShadow::script_shader(vm)){
         ..mod.draw.DrawQuad,
-        ..mod.draw.SdfInterp,
-        ..mod.draw.SdfField,
+        ..mod.sdf.Field,
         depth_out: fragment_depth(@any)
         gbuf_tex: texture_2d(float)
         gbuf_id: uniform(0.0)
@@ -563,8 +560,7 @@ script_mod! {
 
     mod.draw.SdfShade = mod.std.set_type_default() do #(DrawSdfShade::script_shader(vm)){
         ..mod.draw.DrawQuad,
-        ..mod.draw.SdfInterp,
-        ..mod.draw.SdfField,
+        ..mod.sdf.Field,
         depth_out: fragment_depth(@any)
         mat_tex: texture_2d(float)
         // per slot: (rgb, a = 1 replaces the albedo), e.g. the filament a slot prints in
@@ -948,6 +944,8 @@ script_mod! {
             }
         }
     }
+    mod.draw
+
 }
 
 #[derive(Script, ScriptHook)]
@@ -1117,28 +1115,26 @@ pub enum MarchOut {
 
 /// A baker's textures as a march binds them (handles: no borrow of the baker).
 struct FieldTex {
-    prog: Texture,
+    prog: GpuBuffer,
     copy: Texture,
     copy_slots: Texture,
-    index: Texture,
-    prog_rows: usize,
+    index: GpuBuffer,
     copy_rows: usize,
-    index_rows: usize,
+    meshes: std::rc::Rc<[(LiveId, std::rc::Rc<crate::mesh::MeshGpu>)]>,
 }
 
 impl FieldTex {
     fn of(b: &Baker) -> FieldTex {
-        FieldTex { prog: b.prog_texture().clone(), copy: b.copy.clone(), copy_slots: b.copy_slots.clone(), index: b.index_texture().clone(), prog_rows: b.prog_rows(), copy_rows: b.copy_rows, index_rows: b.index_rows() }
+        FieldTex { prog: b.program_buffer().clone(), copy: b.atlas().clone(), copy_slots: b.materials().clone(), index: b.index_buffer().clone(), copy_rows: b.rows(), meshes: b.mesh_buffers() }
     }
 
     fn set(&self, c: &Cx, dv: &mut DrawVars, view: &MarchView, vol: &Volume, exact: bool) {
-        dv.set_texture(0, &self.prog);
-        dv.set_texture(1, &self.copy);
-        dv.set_texture(2, &self.copy_slots);
-        dv.set_texture(3, &self.index);
-        dv.set_uniform(c, id!(prog_inv), &[1.0 / PROG_W as f32, 1.0 / self.prog_rows as f32]);
-        dv.set_uniform(c, id!(copy_inv), &[1.0 / COPY_W as f32, 1.0 / self.copy_rows as f32]);
-        dv.set_uniform(c, id!(index_inv), &[1.0 / INDEX_W as f32, 1.0 / self.index_rows as f32]);
+        dv.set_storage_buffer(id!(program), &self.prog);
+        dv.set_storage_buffer(id!(index), &self.index);
+        for (name, gpu) in self.meshes.iter() { dv.set_storage_buffer(*name, &gpu.buffer); }
+        dv.set_texture(0, &self.copy);
+        dv.set_texture(1, &self.copy_slots);
+        dv.set_uniform(c, id!(copy_inv), &[1.0 / ATLAS_W as f32, 1.0 / self.copy_rows as f32]);
         dv.set_uniform(c, id!(vol_min), &vol.min.map(|v| v as f32));
         dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
         dv.set_uniform(c, id!(cell), &[vol.cell]);
@@ -1150,20 +1146,7 @@ impl FieldTex {
 }
 
 fn set_field(c: &Cx, dv: &mut DrawVars, view: &MarchView, vol: &Volume, baker: &Baker, exact: bool) {
-    dv.set_texture(0, baker.prog_texture());
-    dv.set_texture(1, &baker.copy);
-    dv.set_texture(2, &baker.copy_slots);
-    dv.set_texture(3, baker.index_texture());
-    dv.set_uniform(c, id!(prog_inv), &[1.0 / PROG_W as f32, 1.0 / baker.prog_rows() as f32]);
-    dv.set_uniform(c, id!(copy_inv), &[1.0 / COPY_W as f32, 1.0 / baker.copy_rows as f32]);
-    dv.set_uniform(c, id!(index_inv), &[1.0 / INDEX_W as f32, 1.0 / baker.index_rows() as f32]);
-    dv.set_uniform(c, id!(vol_min), &vol.min.map(|v| v as f32));
-    dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
-    dv.set_uniform(c, id!(cell), &[vol.cell]);
-    dv.set_uniform(c, id!(band), &[vol.band]);
-    dv.set_uniform(c, id!(kernel_scale), &[vol.step_scale()]);
-    set_view(c, dv, view);
-    dv.set_uniform(c, id!(exact), &[if exact { 1.0 } else { 0.0 }]);
+    FieldTex::of(baker).set(c, dv, view, vol, exact);
 }
 
 fn set_view(c: &Cx, dv: &mut DrawVars, view: &MarchView) {
@@ -1195,14 +1178,14 @@ pub fn draw_object(cx: &mut Cx2d, draw: &mut DrawSdfMarch, rect: Rect, view: &Ma
     field.set(c, dv, view, vol, exact);
     match coarse {
         Some(t) => {
-            dv.set_texture(4, t);
+            dv.set_texture(2, t);
             dv.set_uniform(c, id!(coarse_in), &[1.0]);
             let (cw, ch) = (view.target.x.max(1.0) * view.coarse_scale, view.target.y.max(1.0) * view.coarse_scale);
             dv.set_uniform(c, id!(coarse_size_inv), &[1.0 / cw.ceil() as f32, 1.0 / ch.ceil() as f32]);
         }
         None => {
             // something bound: the slot is sampled only when on
-            dv.set_texture(4, &field.copy);
+            dv.set_texture(2, &field.copy);
             dv.set_uniform(c, id!(coarse_in), &[0.0]);
         }
     }
@@ -1330,9 +1313,9 @@ fn shade(cx: &mut Cx2d, draw: &mut DrawSdfShade, rect: Rect, view: &MarchView, e
     let c = &*cx.cx;
     let dv = &mut draw.draw_super.draw_vars;
     set_field(c, dv, view, vol, baker, true);
-    dv.set_texture(4, materials);
-    dv.set_texture(5, slot_override);
-    dv.set_texture(6, gbuffer);
+    dv.set_texture(2, materials);
+    dv.set_texture(3, slot_override);
+    dv.set_texture(4, gbuffer);
     dv.set_uniform(c, id!(gbuf_id), &[id]);
     dv.set_uniform(c, id!(depth_bias), &[depth_bias]);
     // an orthographic projection keeps w = 1 (no z term in its last row)
@@ -1384,7 +1367,7 @@ pub fn cast_shadow_object(cx: &mut Cx2d, draw: &mut DrawSdfCastShadow, rect: Rec
     let c = &*cx.cx;
     let dv = &mut draw.draw_super.draw_vars;
     set_field(c, dv, view, vol, baker, false);
-    dv.set_texture(4, gbuffer);
+    dv.set_texture(2, gbuffer);
     dv.set_uniform(c, id!(gbuf_id), &[id]);
     dv.set_uniform(c, id!(gbuf_size), &[view.target.x.max(1.0) as f32, view.target.y.max(1.0) as f32]);
     dv.set_uniform(c, id!(depth_bias), &[depth_bias]);

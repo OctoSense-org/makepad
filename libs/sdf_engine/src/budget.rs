@@ -2,7 +2,7 @@
 //! never passes, so no scene, kernel or GPU can hang or flood a machine.
 //!
 //! - **Only on change.** Nothing here asks for frames: a bake records its
-//!   batch once and an empty recording after the last one (`bake::Baker`),
+//!   bricks once, then stops recording (`bake::Baker`),
 //!   the march draws when its host repaints. An idle view costs nothing.
 //! - **Measured, steered.** [`GpuMeter`] reads the platform's frame timer
 //!   (`gpu_frame_timer`: per-pass GPU spans from timestamp queries on Metal,
@@ -27,15 +27,15 @@
 
 use std::collections::VecDeque;
 
-/// Texture bytes one baked brick takes: the truth atlas (64 x 8 R32F and R8)
-/// and the render copy (81 x 9 R16F and R8). Atlas rows grow in powers of
+/// Texture bytes one baked brick takes: 9^3 samples in R16F and R8.
+/// Atlas rows grow in powers of
 /// two, so a volume may hold up to twice this per brick.
-pub const BYTES_PER_BRICK: u64 = 64 * 8 * 4 + 64 * 8 + 81 * 9 * 2 + 81 * 9;
+pub const BYTES_PER_BRICK: u64 = 9 * 9 * 9 * 3;
 
 /// What the engine may spend.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budget {
-    /// GPU ms a frame's bake (truth and copy passes) may take.
+    /// GPU ms a frame's bake (compute pass) may take.
     pub bake_ms: f32,
     /// Whole-frame GPU ms (median of settled frames, the bake left out) the
     /// field look keeps inside by its [`Quality`] levels.
@@ -45,7 +45,7 @@ pub struct Budget {
     pub min_bricks_per_frame: usize,
     /// Bricks a frame bakes before anything is measured.
     pub start_bricks_per_frame: usize,
-    /// Worst-case kernel ops (AIR ops, 512 samples a brick) a frame's bake
+    /// Worst-case kernel ops (AIR ops, 729 samples a brick) a frame's bake
     /// may run: a slow kernel bakes fewer bricks a frame, never a long draw.
     pub bake_ops: u64,
     /// Texture memory all volumes may hold.
@@ -84,7 +84,7 @@ impl Budget {
         if kernel_cost == 0 {
             return self.max_bricks_per_frame;
         }
-        ((self.bake_ops / (512 * kernel_cost)) as usize).clamp(1, self.max_bricks_per_frame)
+        ((self.bake_ops / (729 * kernel_cost)) as usize).clamp(1, self.max_bricks_per_frame)
     }
 }
 
@@ -133,9 +133,9 @@ const WINDOW: usize = 60;
 pub struct FrameCost {
     /// The whole frame's GPU busy time, ms.
     pub busy_ms: f32,
-    /// The bake's passes (`sdf_bake`, `sdf_copy`), ms.
+    /// The bake's passes (`sdf bake`), ms.
     pub bake_ms: f32,
-    /// Every pass named `sdf`/`fab_sdf` (bake, copy, coarse), ms.
+    /// Every pass named `sdf`/`fab_sdf` (bake, coarse, march, shade), ms.
     pub sdf_ms: f32,
 }
 
@@ -181,7 +181,7 @@ impl GpuMeter {
             for (name, ms) in &f.passes {
                 folded |= name.starts_with("unpresented ");
                 let name = name.trim_start_matches("unpresented ");
-                if name == "sdf_bake" || name == "sdf_copy" {
+                if name == "sdf bake" {
                     c.bake_ms += ms;
                 }
                 if name.starts_with("sdf") || name.starts_with("fab_sdf") {
@@ -280,12 +280,12 @@ mod tests {
     #[test]
     fn caps_hold_without_measurements() {
         let b = Budget::desktop();
-        // a 20000-op kernel: 195 bricks a frame (2e9 ops), not 32768
-        assert_eq!(b.bricks_for_kernels(20_000), 195);
+        // a 20000-op kernel: 137 bricks a frame (2e9 ops), not 32768
+        assert_eq!(b.bricks_for_kernels(20_000), 137);
         assert_eq!(b.bricks_for_kernels(0), b.max_bricks_per_frame);
         assert_eq!(b.bricks_for_kernels(u64::MAX / 1024), 1);
         // the texture budget in bricks
-        assert!(b.max_bricks() > 50_000 && Budget::web().max_bricks() < 12_000);
+        assert!(b.max_bricks() > 100_000 && Budget::web().max_bricks() < 24_000);
         let mut m = GpuMeter::new(b);
         assert_eq!(m.bricks_per_frame(), b.start_bricks_per_frame);
         assert_eq!(m.judge(), None);

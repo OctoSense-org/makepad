@@ -20,7 +20,8 @@
 //!
 //! All parameters are converted to f32 here, once: what the GPU and the twin
 //! compute from is the same bits. A program starts with one header texel
-//! (texel count, value-stack depth, point-stack depth, 0).
+//! (op-stream end, value-stack depth, point-stack depth, 0). Payloads follow
+//! the op stream and count toward `texels.len()` and buffer uploads.
 
 use crate::kernel::KernelSlot;
 use makepad_csg_sdf::{SdfDeform, SdfNode, SdfOp, SdfPlace};
@@ -45,6 +46,10 @@ pub mod op {
     /// The top value times `y`: a kernel's distance brought to a 1-Lipschitz
     /// bound (the volume's estimate of its steepest gradient).
     pub const SCALE: f32 = 12.0;
+    /// Exact mesh query: y is the immutable asset binding in the field table.
+    pub const MESH: f32 = 14.0;
+    /// y/z: program-relative payload offset and texel count, stored as u32 bits.
+    pub const LINKS: f32 = 15.0;
 }
 
 /// Primitive kinds (a PRIM's header `y`). A PRIM is 3 texels: header
@@ -73,6 +78,7 @@ pub mod prim {
 pub enum LowerError {
     /// A kernel or mesh the volume's kernel table lacks.
     Unsupported(&'static str),
+    Kernel(String),
 }
 
 /// A lowered program.
@@ -83,13 +89,10 @@ pub struct Program {
     /// The deepest value stack and point stack it needs.
     pub value_depth: usize,
     pub point_depth: usize,
-    /// Every kernel it calls has a GPU route.
-    pub gpu_kernels: bool,
 }
 
 /// The value stack and point stack every interpreter (shader and twin)
-/// provides. A deeper program is not run on the GPU; its bricks bake on the
-/// CPU twin instead.
+/// provides. Lowering rejects a deeper program before allocating bricks.
 pub const MAX_VALUE_DEPTH: usize = 16;
 pub const MAX_POINT_DEPTH: usize = 8;
 
@@ -98,15 +101,20 @@ impl Program {
     /// the values its nodes combine are untouched).
     pub fn scaled(mut self, s: f32) -> Program {
         if s != 1.0 {
-            self.texels.push([op::SCALE, s, 0.0, 0.0]);
-            self.texels[0][0] = self.texels.len() as f32;
+            let end = self.texels[0][0] as usize;
+            let mut pc = 1;
+            while pc < end {
+                let h = self.texels[pc];
+                if h[0] == op::LINKS {
+                    self.texels[pc][1] = f32::from_bits(h[1].to_bits() + 1);
+                }
+                pc += if h[0] == op::PRIM { 3 } else if h[0] == op::XFORM_PUSH { 4 }
+                    else if h[0] == op::KERNEL { 1 + h[2] as usize } else { 1 };
+            }
+            self.texels.insert(end, [op::SCALE, s, 0.0, 0.0]);
+            self.texels[0][0] = (end + 1) as f32;
         }
         self
-    }
-
-    /// Whether the GPU interpreter can run it.
-    pub fn fits_gpu(&self) -> bool {
-        self.value_depth <= MAX_VALUE_DEPTH && self.point_depth <= MAX_POINT_DEPTH && self.gpu_kernels
     }
 }
 
@@ -114,8 +122,8 @@ struct Lower<'a> {
     kernels: &'a [KernelSlot],
     /// Multiplies every kernel's distance (1 / its Lipschitz bound).
     kernel_scale: f32,
-    gpu_kernels: bool,
     out: Vec<[f32; 4]>,
+    payloads: Vec<(usize, Vec<[f32; 4]>)>,
     vdepth: usize,
     vmax: usize,
     pdepth: usize,
@@ -248,8 +256,12 @@ impl Lower<'_> {
                 }
             }
             SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => self.node(of)?,
-            // thousands of tube loops (chains, chainmail): no program form; the part draws as its mesh
-            SdfNode::Links(_) => return Err(LowerError::Unsupported("links (a chain or chainmail)")),
+            SdfNode::Links(l) => {
+                let data = links_data(l);
+                self.payloads.push((self.out.len(), data));
+                self.out.push([op::LINKS, 0.0, 0.0, 0.0]);
+                self.push_value();
+            }
             // the capsules of its strokes (a brick's program holds only the ones near it)
             SdfNode::Sculpt { strokes, of } => {
                 let all = ([f64::NEG_INFINITY; 3], [f64::INFINITY; 3]);
@@ -284,19 +296,17 @@ impl Lower<'_> {
                     t[..c.len()].copy_from_slice(c);
                     self.out.push(t);
                 }
-                self.gpu_kernels &= self.kernels[slot].gpu.is_some();
                 self.push_value();
                 if self.kernel_scale != 1.0 {
                     self.out.push([op::SCALE, self.kernel_scale, 0.0, 0.0]);
                 }
             }
-            // A mesh is a kernel slot without parameters or a GPU route: it bakes on the CPU twin.
+            // A mesh leaf uses the same exact query in the bake and layer trace.
             SdfNode::Mesh(m) => {
-                let Some(slot) = self.kernels.iter().position(|s| s.gpu.is_none() && s.key == m.key() && s.is_mesh()) else {
+                let Some(slot) = self.kernels.iter().position(|s| s.key == m.key() && s.is_mesh()) else {
                     return Err(LowerError::Unsupported("a mesh missing from the volume's kernel table"));
                 };
-                self.out.push([op::KERNEL, slot as f32, 0.0, 0.0]);
-                self.gpu_kernels = false;
+                self.out.push([op::MESH, slot as f32, 0.0, 0.0]);
                 self.push_value();
                 if self.kernel_scale != 1.0 {
                     self.out.push([op::SCALE, self.kernel_scale, 0.0, 0.0]);
@@ -317,9 +327,44 @@ pub fn lower(n: &SdfNode) -> Result<Program, LowerError> {
 /// kernel's slot there is its index), each kernel's distance multiplied by
 /// `kernel_scale`.
 pub fn lower_with(n: &SdfNode, kernels: &[KernelSlot], kernel_scale: f32) -> Result<Program, LowerError> {
-    let mut l = Lower { kernels, kernel_scale, gpu_kernels: true, out: vec![[0.0; 4]], vdepth: 0, vmax: 0, pdepth: 0, pmax: 0 };
+    let mut l = Lower { kernels, kernel_scale, out: vec![[0.0; 4]], payloads: Vec::new(), vdepth: 0, vmax: 0, pdepth: 0, pmax: 0 };
     l.node(n)?;
+    if l.vmax > MAX_VALUE_DEPTH || l.pmax > MAX_POINT_DEPTH {
+        return Err(LowerError::Unsupported("program exceeds GPU interpreter stack depth"));
+    }
     let len = l.out.len();
     l.out[0] = [len as f32, l.vmax as f32, l.pmax as f32, 0.0];
-    Ok(Program { texels: l.out, value_depth: l.vmax, point_depth: l.pmax, gpu_kernels: l.gpu_kernels })
+    for (pc, data) in l.payloads {
+        l.out[pc][1] = f32::from_bits(u32::try_from(l.out.len()).expect("program offset exceeds u32"));
+        l.out[pc][2] = f32::from_bits(u32::try_from(data.len()).expect("links payload exceeds u32"));
+        l.out.extend(data);
+    }
+    Ok(Program { texels: l.out, value_depth: l.vmax, point_depth: l.pmax })
+}
+
+// LINKS payload (vec4s): radius/cell/clip-present/max cell count; clip plane;
+// min; max; origin; dims; starts/cell-segs/segments offsets (scalar words).
+// Arrays are packed four u32 bit patterns per texel. A segment is seven words:
+// a.xyz, b.xyz, loop material slot. All offsets are relative to this payload.
+fn links_data(l: &makepad_csg_sdf::Links) -> Vec<[f32; 4]> {
+    let (cell, origin, dims, starts, cell_segs, segs) = l.grid();
+    let bits = |n: usize| f32::from_bits(u32::try_from(n).expect("links index exceeds u32"));
+    let (normal, off) = l.clip.unwrap_or(([0.0; 3], 0.0));
+    let mut words = vec![
+        f(l.radius), f(cell), if l.clip.is_some() { 1.0 } else { 0.0 },
+        f32::from_bits(starts.windows(2).map(|s| s[1] - s[0]).max().unwrap_or(0)),
+        f(normal[0]), f(normal[1]), f(normal[2]), f(off),
+        f(l.min[0]), f(l.min[1]), f(l.min[2]), 0.0,
+        f(l.max[0]), f(l.max[1]), f(l.max[2]), 0.0,
+        f(origin[0]), f(origin[1]), f(origin[2]), 0.0,
+        bits(dims[0]), bits(dims[1]), bits(dims[2]), 0.0,
+        bits(28), bits(28 + starts.len()), bits(28 + starts.len() + cell_segs.len()), 0.0,
+    ];
+    words.extend(starts.iter().chain(cell_segs).map(|v| f32::from_bits(*v)));
+    for (a, b, li) in segs {
+        words.extend(a.iter().chain(b).map(|v| f(*v)));
+        words.push(f32::from_bits(l.loops[*li as usize].slot as u32));
+    }
+    words.resize(words.len().div_ceil(4) * 4, 0.0);
+    words.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
 }

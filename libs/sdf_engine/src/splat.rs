@@ -119,6 +119,7 @@ script_mod! {
             self.fb0 = vec4(self.v_col, 1.0)
         }
     }
+    mod.draw
 }
 
 #[derive(Script, ScriptHook)]

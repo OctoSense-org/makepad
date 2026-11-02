@@ -20,12 +20,12 @@
 pub use makepad_widgets;
 
 use makepad_csg_math::Vec3d;
-use makepad_sdf_engine::bake::{copy_rect, slot_rect, Baker, DrawSdfBake, DrawSdfCopy, COPY_W};
+use makepad_sdf_engine::bake::{Baker, ATLAS_W, ATLAS_SLOTS_X};
 use makepad_sdf_engine::makepad_csg_sdf::{distance_slot, part_id, quat_from_degrees, SdfDeform, SdfKernel, SdfNode, SdfOp, SdfPlace, SdfSplashExpr, SplashPoint};
 use makepad_sdf_engine::march::{coarse_object, draw_object, set_finish, Finish, material_texture, override_texture, shade_object, DrawSdfCoarse, DrawSdfMarch, DrawSdfShade, MarchLight, MarchOut, MarchView, COARSE_CLEAR};
 use makepad_sdf_engine::program::lower_with;
 use makepad_sdf_engine::twin;
-use makepad_sdf_engine::volume::{Brick, Volume, ATLAS_W, BS};
+use makepad_sdf_engine::volume::{Brick, Volume, BS};
 use makepad_widgets::makepad_platform::makepad_hal::gpu_prof;
 use makepad_widgets::*;
 use std::sync::{Arc, Mutex};
@@ -364,30 +364,6 @@ fn cpu_bake(vol: &Volume) -> std::collections::BTreeMap<[i32; 3], (Vec<f32>, Vec
     out
 }
 
-/// The GPU atlases' texels of every baked brick (by brick coordinate).
-fn gpu_bricks(vol: &Volume, rows: usize, atlas: &[u8], slots: &[u8]) -> std::collections::BTreeMap<[i32; 3], (Vec<f32>, Vec<u8>)> {
-    let mut out = std::collections::BTreeMap::new();
-    for i in 0..vol.bricks.len() {
-        let Brick::Baked { slot, .. } = vol.bricks[i] else { continue };
-        let r = slot_rect(slot);
-        let (x0, y0) = (r.pos.x as usize, r.pos.y as usize);
-        let mut d = vec![0.0f32; 512];
-        let mut s = vec![0u8; 512];
-        for y in 0..8 {
-            for x in 0..64 {
-                let t = (y0 + y) * ATLAS_W + x0 + x;
-                if t * 4 + 4 > atlas.len() || y0 + y >= rows {
-                    continue;
-                }
-                d[y * 64 + x] = f32::from_le_bytes([atlas[t * 4], atlas[t * 4 + 1], atlas[t * 4 + 2], atlas[t * 4 + 3]]);
-                s[y * 64 + x] = slots[t];
-            }
-        }
-        out.insert(vol.brick_of(i), (d, s));
-    }
-    out
-}
-
 /// Differing samples between two bakes, and bricks only one has.
 fn compare(a: &std::collections::BTreeMap<[i32; 3], (Vec<f32>, Vec<u8>)>, b: &std::collections::BTreeMap<[i32; 3], (Vec<f32>, Vec<u8>)>) -> (usize, usize, usize, String) {
     let (mut dd, mut ds, mut only) = (0, 0, 0);
@@ -517,49 +493,26 @@ fn f16_bits(v: f32) -> u16 {
     sign | h as u16
 }
 
-/// The render copy of every baked brick against the CPU bake: each 9^3
-/// sample (the apron from the neighbour, the band with the skip's sign for
-/// an empty one) as f16 bits, and the slots.
-fn check_copy(vol: &Volume, cpu: &std::collections::BTreeMap<[i32; 3], (Vec<f32>, Vec<u8>)>, copy: &[u8], copy_slots: &[u8]) -> (usize, usize, String) {
+/// Every storage atlas sample, including the apron, against the 9^3 twin.
+fn check_atlas(vol: &Volume, atlas: &[u8], materials: &[u8]) -> (usize, usize, String) {
     let (mut dd, mut ds) = (0, 0);
     let mut first = String::new();
     for (i, b) in vol.bricks.iter().enumerate() {
-        let Brick::Baked { slot, .. } = *b else { continue };
+        let Brick::Baked { slot, program } = *b else { continue };
         let bc = vol.brick_of(i);
-        let r = copy_rect(slot);
-        for z in 0..9i32 {
-            for y in 0..9i32 {
-                for x in 0..9i32 {
-                    let g = [bc[0] * BS + x, bc[1] * BS + y, bc[2] * BS + z];
-                    let nb = g.map(|v| v.div_euclid(BS));
-                    let l = [g[0] - nb[0] * BS, g[1] - nb[1] * BS, g[2] - nb[2] * BS];
-                    let inside = (0..3).all(|a| nb[a] >= vol.min[a] && nb[a] < vol.min[a] + vol.dim[a]);
-                    let (want, want_s) = if !inside {
-                        (BAND, 0u8)
-                    } else {
-                        match vol.bricks[vol.index(nb)] {
-                            Brick::Baked { .. } => {
-                                let (d, s) = &cpu[&nb];
-                                let k = (l[1] * 64 + l[2] * 8 + l[0]) as usize;
-                                (d[k], s[k])
-                            }
-                            Brick::Empty { skip } => (if skip < 0.0 { -BAND } else { BAND }, 0),
-                        }
-                    };
-                    let t = (r.pos.y as usize + y as usize) * COPY_W + r.pos.x as usize + (z * 9 + x) as usize;
-                    let got = u16::from_le_bytes([copy[t * 2], copy[t * 2 + 1]]);
-                    if got != f16_bits(want) {
-                        if dd == 0 {
-                            first = format!(" first brick {bc:?} ({x},{y},{z}): want {:04x} ({want}) got {got:04x}", f16_bits(want));
-                        }
-                        dd += 1;
-                    }
-                    if copy_slots[t] != want_s {
-                        ds += 1;
-                    }
-                }
+        let twin = twin::bake_brick(&vol.programs[program as usize].texels, bc, vol.cell, vol.band, &vol.kernels);
+        let (x0, y0) = (slot as usize % ATLAS_SLOTS_X * 81, slot as usize / ATLAS_SLOTS_X * 9);
+        for y in 0..9 { for z in 0..9 { for x in 0..9 {
+            let t = (y0 + y) * ATLAS_W + x0 + z * 9 + x;
+            let k = y * 81 + z * 9 + x;
+            let got = u16::from_le_bytes([atlas[t * 2], atlas[t * 2 + 1]]);
+            let want = f16_bits(twin.d[k]);
+            if got != want {
+                if dd == 0 { first = format!(" first brick {bc:?} ({x},{y},{z}): want {want:04x} got {got:04x}"); }
+                dd += 1;
             }
-        }
+            if materials[t] != twin.slots[k] { ds += 1; }
+        } } }
     }
     (dd, ds, first)
 }
@@ -778,10 +731,6 @@ pub struct SdfBakeView {
     #[rust]
     area: Area,
     #[live]
-    bake: DrawSdfBake,
-    #[live]
-    copy: DrawSdfCopy,
-    #[live]
     march: DrawSdfMarch,
     #[rust]
     march_pass: Option<(DrawPass, DrawList, Texture, Texture, (usize, usize))>,
@@ -854,14 +803,14 @@ impl SdfBakeView {
                 let mut vol = Volume::new(bounds, CELL, BAND);
                 let st = vol.build(&sc.before, None).expect("lowers");
                 println!(
-                    "SDFBAKE scene={} build {:.1} ms: {} blocks ({} skipped), {} bricks tested, {} baked, {} programs, cpu-baked {}, kernel scale {}",
-                    sc.name, st.ms, st.blocks, st.blocks_skipped, st.bricks_tested, st.bricks_baked, st.programs, vol.cpu.len(), vol.kernel_scale
+                    "SDFBAKE scene={} build {:.1} ms: {} blocks ({} skipped), {} bricks tested, {} baked, {} programs, kernel scale {}",
+                    sc.name, st.ms, st.blocks, st.blocks_skipped, st.bricks_tested, st.bricks_baked, st.programs, vol.kernel_scale
                 );
                 if !check_lowering(sc.name, &sc.before, &vol) {
                     self.fails.push(format!("{}-lowering", sc.name));
                 }
                 if self.baker.is_none() {
-                    self.baker = Some(Baker::new(cx.cx.cx));
+                    self.baker = Some(Baker::new(std::rc::Rc::new(cx.gpu_admission().register("SDF engine"))));
                 }
                 let baker = self.baker.as_mut().unwrap();
                 baker.reset();
@@ -955,8 +904,8 @@ impl SdfBakeView {
             }
             _ => {}
         }
-        if let (Some(baker), Some(vol)) = (self.baker.as_mut(), self.vol.as_ref()) {
-            baker.draw(cx, vol, &mut self.bake, &mut self.copy);
+        if let (Some(baker), Some(vol)) = (self.baker.as_mut(), self.vol.as_mut()) {
+            if baker.draw(cx, vol) { vol.publish(); }
         }
         if self.step == Step::Bake && self.baker.as_ref().is_some_and(|b| b.idle()) {
             // a few idle frames so the readback sees the finished atlas
@@ -971,7 +920,7 @@ impl SdfBakeView {
     fn request_readback(&mut self, cx: &mut Cx) {
         self.readbacks.lock().unwrap().clear();
         let baker = self.baker.as_ref().unwrap();
-        for (k, tex) in [(0u8, baker.atlas.clone()), (1u8, baker.slots.clone()), (2u8, baker.copy.clone()), (3u8, baker.copy_slots.clone())] {
+        for (k, tex) in [(0u8, baker.atlas().clone()), (1u8, baker.materials().clone())] {
             let out = self.readbacks.clone();
             if let Err(e) = cx.read_render_texture(&tex, move |res| out.lock().unwrap().push((k, res.map_err(|e| format!("{e:?}"))))) {
                 println!("SDFBAKE-FAIL readback request: {e:?}");
@@ -983,34 +932,25 @@ impl SdfBakeView {
     fn check_read(&mut self) {
         let got = {
             let r = self.readbacks.lock().unwrap();
-            if r.len() < 4 {
+            if r.len() < 2 {
                 return;
             }
             r.clone()
         };
         let sc = &self.scenes[self.scene];
         let vol = self.vol.as_ref().unwrap();
-        let rows = self.baker.as_ref().unwrap().rows;
         let find = |k: u8| got.iter().find(|(kk, _)| *kk == k).and_then(|(_, r)| r.as_ref().ok().cloned());
-        let (Some((_, _, atlas)), Some((_, _, slots)), Some((_, _, copy)), Some((_, _, copy_slots))) = (find(0), find(1), find(2), find(3)) else {
+        let (Some((_, _, atlas)), Some((_, _, slots))) = (find(0), find(1)) else {
             self.fails.push(format!("{}-readback", sc.name));
             self.next_scene();
             return;
         };
         let stage = if self.edited { "edit" } else { "full" };
-        let gpu = gpu_bricks(vol, rows, &atlas, &slots);
         let cpu = cpu_bake(vol);
-        let (dd, ds, only, first) = compare(&gpu, &cpu);
         let bricks = cpu.len();
-        println!("SDFBAKE scene={} {stage} gpu-vs-twin bricks={bricks} dist_differing={dd} slot_differing={ds} unmatched={only}{first}", sc.name);
-        if dd != 0 || ds != 0 || only != 0 {
-            self.fails.push(format!("{}-{stage}-gpu", sc.name));
-        }
-        let (cd, cs, cfirst) = check_copy(vol, &cpu, &copy, &copy_slots);
-        println!("SDFBAKE scene={} {stage} render-copy bricks={bricks} dist_differing={cd} slot_differing={cs}{cfirst}", sc.name);
-        if cd != 0 || cs != 0 {
-            self.fails.push(format!("{}-{stage}-copy", sc.name));
-        }
+        let (dd, ds, first) = check_atlas(vol, &atlas, &slots);
+        println!("SDFBAKE scene={} {stage} gpu-vs-twin bricks={bricks} samples={} dist_differing={dd} slot_differing={ds}{first}", sc.name, bricks * 729);
+        if dd != 0 || ds != 0 { self.fails.push(format!("{}-{stage}-gpu", sc.name)); }
         if !self.edited {
             self.step = Step::March;
             return;
@@ -1286,7 +1226,7 @@ impl SdfBakeView {
         if let Some(rec) = gpu_prof::recording_of(None) {
             for f in rec.frames.iter().filter(|f| f.id > self.prof_from && !f.split) {
                 for p in &f.passes {
-                    if rec.s(p.name) == "sdf_bake" && p.end > p.start {
+                    if rec.s(p.name) == "sdf bake" && p.end > p.start {
                         self.gpu_ms.push((p.end - p.start) as f64 / 1.0e6);
                     }
                     if rec.s(p.name) == "sdf_march" && p.end > p.start && matches!(self.step, Step::MarchBench(_)) {
@@ -1361,9 +1301,9 @@ impl Widget for SdfBakeView {
             self.step_frame(cx);
         }
         // the atlas, shown so its pass paints
-        if let Some(baker) = &self.baker {
+        if let Some(baker) = self.baker.as_ref().filter(|b| b.published() > 0) {
             let rect = cx.turtle().rect();
-            self.show.draw_super.draw_vars.set_texture(0, &baker.atlas);
+            self.show.draw_super.draw_vars.set_texture(0, baker.atlas());
             self.show.draw_super.draw_abs(cx, rect);
         }
         cx.end_turtle_with_area(&mut self.area);

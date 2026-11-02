@@ -1,11 +1,9 @@
-//! The render copy against the exact field, per frame, on the GPU's own texels.
+//! The storage atlas against the exact field, per frame, on the GPU's own texels.
 //!
-//! A host turns this on for one object while it debugs a picture or runs a regression test
-//! (nothing here runs otherwise). [`BakeAudit::frame`] records, after the frame's bake and
-//! before the frame's march, a pass that writes every texel of the render copy's used rows as
-//! the bits of its float into a BGRA8 target, and reads that back. A worker then takes each
-//! baked brick the frame's index points at and compares 27 of its 729 samples (the apron's
-//! among them) with the exact fields:
+//! A host enables this for an object while debugging or running a regression.
+//! The storage atlas is read after its pending compute writes, as native f16
+//! bytes. A platform worker compares 27 samples per brick (including aprons)
+//! with the twin and classifies stale values by generation:
 //!
 //! - `new`: the frame's own field, at the brick's place;
 //! - `old`: the field of an earlier generation (the volume this one replaced), at that place;
@@ -18,7 +16,7 @@
 //! The answer is one log line per frame (`sdf audit:`), and with a directory one file per
 //! frame that drew anything but `new`: per brick its class and its worst sample.
 
-use crate::bake::{Baker, COPY_SLOTS_X, COPY_W};
+use crate::bake::{Baker, ATLAS_SLOTS_X};
 use crate::kernel::KernelSlot;
 use crate::program::lower_with;
 use crate::twin;
@@ -27,35 +25,7 @@ use makepad_csg_math::thread_pool::parallel_map;
 use makepad_csg_sdf::SdfShape;
 use makepad_draw::*;
 use std::collections::{HashMap, VecDeque};
-use std::sync::{mpsc, Arc};
-
-script_mod! {
-    use mod.pod.*
-    use mod.math.*
-    use mod.shader.*
-    use mod.draw
-
-    // A texel of the render copy as its float's four bytes.
-    mod.draw.SdfAudit = mod.std.set_type_default() do #(DrawSdfAudit::script_shader(vm)){
-        ..mod.draw.DrawQuad
-        alpha_blend: false
-        copy_tex: texture_2d(float)
-        copy_inv: uniform(vec2(1.0, 1.0))
-
-        fragment: fn() {
-            let uv = (floor(self.world.xy) + vec2(0.5, 0.5)) * self.copy_inv
-            let b = asuint(self.copy_tex.sample_nearest(uv).x)
-            self.fb0 = vec4(f32(b & 255u), f32((b >> 8u) & 255u), f32((b >> 16u) & 255u), f32((b >> 24u) & 255u)) * 0.003921568627450980
-        }
-    }
-}
-
-#[derive(Script, ScriptHook)]
-#[repr(C)]
-pub struct DrawSdfAudit {
-    #[deref]
-    pub draw_super: DrawQuad,
-}
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 
 /// Generations an answer is looked for in, the frame's own and the ones before.
 const GENERATIONS: usize = 4;
@@ -245,113 +215,44 @@ fn answer(f: FrameData, dir: Option<&str>) {
 pub struct BakeAudit {
     object: String,
     dir: Option<String>,
-    pass: DrawPass,
-    list: DrawList,
-    draw: DrawSdfAudit,
-    target: Option<(Texture, usize)>,
     gens: VecDeque<Arc<Generation>>,
     published: u64,
     published_frame: u64,
     frame: u64,
     skipped: u64,
-    pending: Vec<(ReadbackTicket, u64, u64, (usize, usize, usize), Vec<Arc<Generation>>, Option<Arc<Generation>>)>,
+    pending: Arc<AtomicUsize>,
     /// The field being baked (by the volume's address), when it is not the one drawn.
     next: Option<(usize, Arc<Generation>)>,
-    to_worker: mpsc::Sender<FrameData>,
 }
 
 impl BakeAudit {
     /// The host names the object and where a frame's bricks go.
-    pub fn new(cx: &mut Cx, object: &str, dir: Option<String>) -> Option<BakeAudit> {
-        let draw = cx.with_vm(|vm| {
-            let draw_mod = vm.heap().module(id!(draw));
-            let base = vm.value(draw_mod, id!(SdfAudit)).as_object()?;
-            Some(DrawSdfAudit::script_from_value(vm, base.into()))
-        })?;
-        let (to_worker, from_ui) = mpsc::channel::<FrameData>();
-        let worker_dir = dir.clone();
-        std::thread::Builder::new()
-            .name("sdf-audit".into())
-            .spawn(move || {
-                while let Ok(f) = from_ui.recv() {
-                    answer(f, worker_dir.as_deref());
-                }
-            })
-            .ok()?;
+    pub fn new(_cx: &mut Cx, object: &str, dir: Option<String>) -> Option<BakeAudit> {
         Some(BakeAudit {
             object: object.to_string(),
             dir,
-            pass: DrawPass::new_with_name(cx, "sdf_audit"),
-            list: DrawList::new(cx),
-            draw,
-            target: None,
             gens: VecDeque::new(),
             published: u64::MAX,
             published_frame: 0,
             frame: 0,
             skipped: 0,
-            pending: Vec::new(),
+            pending: Arc::new(AtomicUsize::new(0)),
             next: None,
-            to_worker,
         })
-    }
-
-    /// The pass a baker hangs under while audited (it reads what the bake wrote).
-    pub fn pass_id(&self, cx: &mut Cx, parent: DrawPassId) -> DrawPassId {
-        self.pass.set_pass_parent(cx, parent);
-        self.pass.draw_pass_id()
     }
 
     /// Whether answers are still to come (the host keeps its frames coming).
     pub fn busy(&self) -> bool {
-        !self.pending.is_empty()
+        self.pending.load(Ordering::Acquire) != 0
     }
 
     pub fn directory(&self) -> Option<&str> {
         self.dir.as_deref()
     }
 
-    /// Takes the finished readbacks to the worker.
-    pub fn poll(&mut self, cx: &mut Cx) {
-        let tickets: Vec<ReadbackTicket> = self.pending.iter().map(|p| p.0).collect();
-        for r in cx.try_take_texture_readbacks_for(&tickets) {
-            let Some(at) = self.pending.iter().position(|p| p.0 == r.ticket) else { continue };
-            let (_, frame, age, pending, gens, next) = self.pending.remove(at);
-            let data = match r.data {
-                Ok(d) => d,
-                Err(e) => {
-                    self.skipped += 1;
-                    log!("sdf audit: {} frame {frame}: no readback: {e}", self.object);
-                    continue;
-                }
-            };
-            // the samples of each slot this frame's index points at (the payload goes now)
-            let row = r.width * 4;
-            let texel = |x: usize, y: usize| -> f32 {
-                let o = y * row + x * 4;
-                f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]])
-            };
-            let mut samples = HashMap::new();
-            for slot in gens[0].slots.keys() {
-                let s = *slot as usize;
-                let (cx0, cy0) = ((s % COPY_SLOTS_X) * 81, (s / COPY_SLOTS_X) * 9);
-                let mut v = Vec::with_capacity(SAMPLES.len().pow(3));
-                for z in SAMPLES {
-                    for y in SAMPLES {
-                        for x in SAMPLES {
-                            v.push(texel(cx0 + z * 9 + x, cy0 + y));
-                        }
-                    }
-                }
-                samples.insert(*slot, v);
-            }
-            let _ = self.to_worker.send(FrameData { object: self.object.clone(), frame, age, pending, gens, next, samples });
-        }
-    }
-
-    /// This frame's copy of `baker`, under `parent` (records one pass; call after the bake).
+    /// Read this frame's atlas after the bake's pending compute writes.
     /// `vol` and `shape`: what the frame's march draws; `next`: the volume being baked.
-    pub fn frame(&mut self, cx: &mut Cx2d, parent: DrawPassId, baker: &Baker, vol: &Volume, shape: &Arc<SdfShape>, next: Option<(&Volume, &Arc<SdfShape>)>) {
+    pub fn frame(&mut self, cx: &mut Cx2d, _parent: DrawPassId, baker: &Baker, vol: &Volume, shape: &Arc<SdfShape>, next: Option<(&Volume, &Arc<SdfShape>)>) {
         let next = next.filter(|(n, _)| !std::ptr::eq(*n, vol));
         match next {
             Some((n, s)) if self.next.as_ref().is_none_or(|(at, _)| *at != n as *const Volume as usize) => {
@@ -370,46 +271,48 @@ impl BakeAudit {
                 self.gens.truncate(GENERATIONS);
             }
         }
-        self.poll(cx.cx);
         if self.gens.is_empty() {
             return;
         }
-        let rows = (vol.slot_count as usize).div_ceil(COPY_SLOTS_X).max(1) * 9;
-        if self.target.as_ref().is_none_or(|(_, r)| *r < rows) {
-            let r = rows.next_power_of_two();
-            let t = Texture::new_with_format(cx.cx, TextureFormat::RenderBGRAu8 { size: TextureSize::Fixed { width: COPY_W, height: r }, initial: true });
-            self.target = Some((t, r));
-        }
-        let (target, r) = self.target.clone().unwrap();
-        let size = dvec2(COPY_W as f64, r as f64);
-        self.pass.set_size(cx, size);
-        self.pass.clear_color_textures(cx.cx);
-        self.pass.set_color_texture(cx, &target, DrawPassClearColor::InitWith(vec4(0.0, 0.0, 0.0, 0.0)));
-        self.pass.clear_depth_texture(cx.cx);
-        self.pass.set_pass_parent(cx.cx, parent);
-        cx.begin_pass(&self.pass, Some(1.0));
-        self.pass.set_size(cx, size);
-        self.pass.set_dpi_factor(cx, 1.0);
-        self.list.begin_always(cx);
-        cx.begin_root_turtle(size, Layout::flow_overlay());
-        {
-            let c = &*cx.cx;
-            let dv = &mut self.draw.draw_super.draw_vars;
-            dv.set_texture(0, &baker.copy);
-            dv.set_uniform(c, id!(copy_inv), &[1.0 / COPY_W as f32, 1.0 / baker.copy_rows as f32]);
-        }
-        self.draw.draw_super.draw_abs(cx, Rect { pos: dvec2(0.0, 0.0), size: dvec2(COPY_W as f64, rows as f64) });
-        cx.end_pass_sized_turtle();
-        self.list.end(cx);
-        cx.end_pass(&self.pass);
         let age = self.frame - self.published_frame;
         let gens: Vec<Arc<Generation>> = self.gens.iter().cloned().collect();
-        match target.read_back(cx.cx, ReadbackRequest { next_render: true }) {
-            Ok(t) => self.pending.push((t, self.frame, age, baker.queued(), gens, self.next.as_ref().map(|n| n.1.clone()))),
-            Err(e) => {
-                self.skipped += 1;
-                log!("sdf audit: {} frame {}: not read: {e}", self.object, self.frame);
+        let mut frame = FrameData { object: self.object.clone(), frame: self.frame, age,
+            pending: baker.queued(), gens, next: self.next.as_ref().map(|n| n.1.clone()), samples: HashMap::new() };
+        let pending = self.pending.clone();
+        let dir = self.dir.clone();
+        pending.fetch_add(1, Ordering::AcqRel);
+        // Native R16F bytes, after this frame's compute producer. The platform
+        // runs the callback on its worker pool, so decoding and the twin stay off UI.
+        if let Err(error) = cx.read_render_texture(baker.atlas(), move |result| {
+            match result {
+                Ok((width, height, data)) => {
+                    for slot in frame.gens[0].slots.keys() {
+                        let s = *slot as usize;
+                        let (x0, y0) = ((s % ATLAS_SLOTS_X) * 81, (s / ATLAS_SLOTS_X) * 9);
+                        if y0 + 8 >= height { continue; }
+                        let mut values = Vec::with_capacity(27);
+                        for z in SAMPLES { for y in SAMPLES { for x in SAMPLES {
+                            let at = ((y0 + y) * width + x0 + z * 9 + x) * 2;
+                            let bits = u16::from_le_bytes([data[at], data[at + 1]]);
+                            let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+                            let exponent = (bits >> 10) & 31;
+                            let fraction = (bits & 1023) as f32;
+                            let value = if exponent == 0 { fraction * 2.0f32.powi(-24) }
+                                else { (1.0 + fraction / 1024.0) * 2.0f32.powi(exponent as i32 - 15) };
+                            values.push(sign * value);
+                        } } }
+                        frame.samples.insert(*slot, values);
+                    }
+                    answer(frame, dir.as_deref());
+                }
+                Err(error) => log!("sdf audit: {} frame {}: {error}", frame.object, frame.frame),
             }
+            pending.fetch_sub(1, Ordering::AcqRel);
+            SignalToUI::set_ui_signal();
+        }) {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
+            self.skipped += 1;
+            log!("sdf audit: {} frame {}: {error}", self.object, self.frame);
         }
     }
 }

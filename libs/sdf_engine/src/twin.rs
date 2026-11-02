@@ -10,6 +10,48 @@
 
 use crate::program::{op, prim};
 
+/// One directly evaluated render slot, row-major 81 x 9 (x + 9*z + 81*y).
+/// Distances are f16 values represented exactly as f32 for comparison.
+pub struct RenderBrick {
+    pub d: Vec<f32>,
+    pub slots: Vec<u8>,
+}
+
+/// The compute bake rounding operation, including ties to even and
+/// subnormals. Call after clamping and adding +0.0, as the compute bake does.
+pub fn to_half(v: f32) -> f32 {
+    let a = v.abs();
+    if a < 0.00006103515625 {
+        let q = a * 16777216.0;
+        let mut r = q.floor();
+        let f = q - r;
+        if f > 0.5 || (f == 0.5 && r - (r * 0.5).floor() * 2.0 > 0.5) {
+            r += 1.0;
+        }
+        let h = r * 0.000000059604644775390625;
+        return if v < 0.0 { 0.0 - h } else { h };
+    }
+    let b = v.to_bits();
+    let odd = (b >> 13) & 1;
+    f32::from_bits(b.wrapping_add(4095 + odd) & 4294959104)
+}
+
+/// The compute kernel's 9^3 lattice, including the apron evaluated with
+/// this brick's culled program. Verification oracle only; the baker never calls it.
+pub fn bake_brick(program: &[[f32; 4]], b: [i32; 3], cell: f32, band: f32, kernels: &[crate::kernel::KernelSlot]) -> RenderBrick {
+    let points: Vec<_> = (0..729)
+        .map(|i| {
+            let l = [i % 9, i / 81, (i / 9) % 9];
+            std::array::from_fn(|a| (b[a] * 8 + l[a]) as f32 * cell)
+        })
+        .collect();
+    let values = eval_many(program, &points, kernels);
+    RenderBrick {
+        d: values.iter().map(|(d, _)| to_half(d.max(-band).min(band) + 0.0)).collect(),
+        slots: values.iter().map(|(_, slot)| *slot).collect(),
+    }
+}
+
 /// sin and cos of `x`: a quadrant reduction by pi/2 in two parts, then
 /// polynomials on [-pi/4, pi/4] (error about 1e-7). Only `floor`, `+` and
 /// `*`, so every backend computes the same bits.
@@ -109,6 +151,49 @@ fn prim(t: &[[f32; 4]], p: [f32; 3]) -> f32 {
     }
 }
 
+// Same scalar arithmetic and z/y/x/segment traversal as Eval.links_at.
+fn links_at(data: &[[f32; 4]], q: [f32; 3]) -> (f32, u8) {
+    let word = |i: u32| data[i as usize / 4][i as usize % 4];
+    let h = data[0];
+    let (r, reach) = (h[0], h[1]);
+    let dims = data[5].map(f32::to_bits);
+    let offsets = data[6].map(f32::to_bits);
+    let lo: [f32; 3] = std::array::from_fn(|k| (((q[k] - reach - r - data[4][k]) / reach).floor()).max(0.0));
+    let hi: [f32; 3] = std::array::from_fn(|k| (((q[k] + reach + r - data[4][k]) / reach).floor()).min((dims[k] - 1) as f32));
+    let mut best = f32::INFINITY;
+    let mut slot = 0;
+    for dz in 0..4 { for dy in 0..4 { for dx in 0..4 {
+        let x = lo[0] + dx as f32;
+        let y = lo[1] + dy as f32;
+        let z = lo[2] + dz as f32;
+        if x > hi[0] || y > hi[1] || z > hi[2] { continue; }
+        let c = (z as u32 * dims[1] + y as u32) * dims[0] + x as u32;
+        let start = word(offsets[0] + c).to_bits();
+        let end = word(offsets[0] + c + 1).to_bits();
+        for i in 0..h[3].to_bits() {
+            if start + i >= end { break; }
+            let at = offsets[2] + word(offsets[1] + start + i).to_bits() * 7;
+            let a = [word(at), word(at + 1), word(at + 2)];
+            let b = [word(at + 3), word(at + 4), word(at + 5)];
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ap = [q[0] - a[0], q[1] - a[1], q[2] - a[2]];
+            let l2 = (ab[0] * ab[0] + ab[1] * ab[1]) + ab[2] * ab[2];
+            let t = if l2 > 0.0 { clamp(((ap[0] * ab[0] + ap[1] * ab[1]) + ap[2] * ab[2]) / l2, 0.0, 1.0) } else { 0.0 };
+            let d = len3(ap[0] - ab[0] * t, ap[1] - ab[1] * t, ap[2] - ab[2] * t) - r;
+            if d < best { best = d; slot = word(at + 6).to_bits() as u8; }
+        }
+    } } }
+    let out: [f32; 3] = std::array::from_fn(|k| (data[2][k] - q[k]).max(q[k] - data[3][k]).max(0.0));
+    let d_box = len3(out[0], out[1], out[2]);
+    let mut d = best.min(reach);
+    if d_box > 0.0 { d = d_box.max(d); }
+    if h[2] != 0.0 {
+        let n = data[1];
+        d = d.max(n[3] - ((n[0] * q[0] + n[1] * q[1]) + n[2] * q[2]));
+    }
+    (d, slot)
+}
+
 /// The distance and material slot of `program` at `p` (the object frame).
 pub fn eval(program: &[[f32; 4]], p: [f32; 3]) -> (f32, u8) {
     eval_with(program, p, &[])
@@ -121,7 +206,10 @@ pub fn eval_with(program: &[[f32; 4]], p: [f32; 3], kernels: &[crate::kernel::Ke
     let mut pc = 1;
     while pc < len {
         let h = program[pc];
-        if h[0] == op::KERNEL {
+        if h[0] == op::MESH {
+            st.push(kernels[h[1] as usize].mesh_asset().expect("mesh binding").signed(st.q));
+            pc += 1;
+        } else if h[0] == op::KERNEL {
             let (params, n) = kernel_params(program, pc);
             let d = kernels.get(h[1] as usize).map_or(f32::MAX, |k| k.distance(&params[..n], st.q));
             st.push(d);
@@ -143,7 +231,11 @@ pub fn eval_many(program: &[[f32; 4]], ps: &[[f32; 3]], kernels: &[crate::kernel
     let mut qs = Vec::with_capacity(ps.len());
     while pc < len {
         let h = program[pc];
-        if h[0] == op::KERNEL {
+        if h[0] == op::MESH {
+            let asset = kernels[h[1] as usize].mesh_asset().expect("mesh binding");
+            for st in &mut sts { st.push(asset.signed(st.q)); }
+            pc += 1;
+        } else if h[0] == op::KERNEL {
             let (params, n) = kernel_params(program, pc);
             qs.clear();
             qs.extend(sts.iter().map(|s| s.q));
@@ -212,6 +304,13 @@ impl St {
             ss[*vn] = if *mn > 0 { ms[*mn - 1] } else { 0 };
             *vn += 1;
             pc + 3
+        } else if code == op::LINKS {
+            let start = h[1].to_bits() as usize;
+            let (d, slot) = links_at(&program[start..start + h[2].to_bits() as usize], *q);
+            vs[*vn] = d;
+            ss[*vn] = if slot != 0 { slot } else if *mn > 0 { ms[*mn - 1] } else { 0 };
+            *vn += 1;
+            pc + 1
         } else if code == op::XFORM_PUSH {
             ps[*pn] = *q;
             *pn += 1;
@@ -297,6 +396,21 @@ mod tests {
     use crate::program::lower;
     use makepad_csg_math::Vec3d;
     use makepad_csg_sdf::{distance_slot, SdfNode};
+
+    #[test]
+    fn render_half_rounds_ties_subnormals_and_signed_zero() {
+        for (input, expected) in [
+            (-0.0f32, 0.0f32),
+            (1.00048828125, 1.0),
+            (1.00146484375, 1.001953125),
+            (-1.00048828125, -1.0),
+            (2.0f32.powi(-25), 0.0),
+            (3.0 * 2.0f32.powi(-25), 2.0f32.powi(-23)),
+            (-3.0 * 2.0f32.powi(-25), -2.0f32.powi(-23)),
+        ] {
+            assert_eq!(super::to_half(input + 0.0).to_bits(), expected.to_bits());
+        }
+    }
 
     #[test]
     fn a_material_within_a_region_follows_csg_sdf() {

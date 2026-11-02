@@ -24,17 +24,16 @@
 //!   cap); one whose worst case exceeds [`MAX_KERNEL_COST`] ops per sample,
 //!   reads more than [`MAX_KERNEL_PARAMS`] parameters, uses f64, host calls,
 //!   tables or more than [`MAX_FRAME_WORDS`] words of local arrays has no GPU
-//!   route: its bricks bake on the CPU twin.
+//!   route and is rejected before baking.
 
 
-use crate::bake::DrawSdfBake;
 use crate::march::DrawSdfMarch;
-use makepad_csg_sdf::{Sdf3, SdfKernel, SdfNode, SdfSplashExpr};
+use makepad_csg_sdf::{SdfKernel, SdfNode, SdfSplashExpr};
 use makepad_draw::*;
 use makepad_script_compute::shader_route::{self, ShaderRoute};
 use std::sync::Arc;
 
-/// Worst-case AIR ops of one sample: past it a kernel bakes on the CPU (a
+/// Worst-case AIR ops of one sample accepted by the route (a
 /// bake quad samples 512 points, a march step one; GPU watchdogs kill
 /// draws of seconds).
 pub const MAX_KERNEL_COST: u64 = 20_000;
@@ -73,12 +72,13 @@ impl KernelAir {
 pub struct KernelSlot {
     /// The program's identity (or the field's key when it is no Splash program).
     pub key: u64,
-    field: Arc<dyn Sdf3 + Send + Sync>,
-    splash: Option<Arc<SdfSplashExpr>>,
-    /// A mesh's field (an import), queried in f32 a brick's samples at a time.
-    mesh: Option<Arc<makepad_csg_sdf::mesh_field::MeshField>>,
-    /// The GPU route; `None`: its bricks bake on the CPU twin.
-    pub gpu: Option<Arc<KernelAir>>,
+    route: FieldRoute,
+}
+
+#[derive(Clone)]
+enum FieldRoute {
+    Splash { field: Arc<SdfSplashExpr>, air: Arc<KernelAir> },
+    Mesh(Arc<crate::mesh::MeshAsset>),
 }
 
 fn structure_key(k: &SdfKernel) -> u64 {
@@ -86,59 +86,56 @@ fn structure_key(k: &SdfKernel) -> u64 {
 }
 
 impl KernelSlot {
-    pub fn new(k: &SdfKernel) -> KernelSlot {
-        let gpu = k.splash.as_ref().and_then(|s| match KernelAir::new(s) {
-            Ok(a) => Some(Arc::new(a)),
-            Err(e) => {
-                log!("sdf engine: kernel {:016x} bakes on the CPU: {e}", structure_key(k));
-                None
-            }
-        });
-        KernelSlot { key: structure_key(k), field: k.field.clone(), splash: k.splash.clone(), mesh: None, gpu }
+    pub fn new(k: &SdfKernel) -> Result<KernelSlot, crate::program::LowerError> {
+        let field = k.splash.clone().ok_or(crate::program::LowerError::Unsupported("SDF kernels require a Splash field"))?;
+        let air = Arc::new(KernelAir::new(&field).map_err(crate::program::LowerError::Kernel)?);
+        Ok(KernelSlot { key: structure_key(k), route: FieldRoute::Splash { field, air } })
     }
 
-    /// A mesh's distance field (an imported model): no GPU route, its bricks bake on the CPU twin.
     pub fn mesh(m: &Arc<makepad_csg_sdf::mesh_field::MeshField>) -> KernelSlot {
-        KernelSlot { key: m.key(), field: m.clone(), splash: None, mesh: Some(m.clone()), gpu: None }
+        KernelSlot { key: m.key(), route: FieldRoute::Mesh(Arc::new(crate::mesh::MeshAsset::new(m))) }
     }
 
-    /// A mesh's slot (no program).
-    pub fn is_mesh(&self) -> bool {
-        self.mesh.is_some()
+    pub fn mesh_asset(&self) -> Option<&Arc<crate::mesh::MeshAsset>> {
+        match &self.route { FieldRoute::Mesh(m) => Some(m), _ => None }
     }
+
+    pub fn air(&self) -> Option<&Arc<KernelAir>> {
+        match &self.route { FieldRoute::Splash { air, .. } => Some(air), _ => None }
+    }
+
+    pub fn is_mesh(&self) -> bool { self.mesh_asset().is_some() }
 
     /// Whether `k` runs this slot's program.
     pub fn matches(&self, k: &SdfKernel) -> bool {
-        self.key == structure_key(k)
+        !self.is_mesh() && self.key == structure_key(k)
     }
 
     /// [`KernelSlot::distance`] at many points (one kernel call).
     pub fn distance_many(&self, params: &[f32], ps: &[[f32; 3]]) -> Vec<f32> {
-        match &self.splash {
-            Some(s) => {
+        match &self.route {
+            FieldRoute::Splash { field, .. } => {
                 let xyz: Vec<f32> = ps.iter().flatten().copied().collect();
                 let mut out = vec![0.0f32; ps.len()];
-                s.distance_batch_with(params, &xyz, &mut out);
+                field.distance_batch_with(params, &xyz, &mut out);
                 out
             }
-            None => match &self.mesh {
-                Some(m) => m.signed_many(ps),
-                None => ps.iter().map(|p| self.distance(params, *p)).collect(),
-            },
+            FieldRoute::Mesh(m) => ps.iter().map(|p| m.signed(*p)).collect(),
         }
     }
 
     /// The distance at `p` with parameters `params` (by parameter index).
     pub fn distance(&self, params: &[f32], p: [f32; 3]) -> f32 {
-        match &self.splash {
-            Some(s) => {
+        match &self.route {
+            FieldRoute::Splash { field, .. } => {
                 let mut out = [0.0f32];
-                s.distance_batch_with(params, &p, &mut out);
+                field.distance_batch_with(params, &p, &mut out);
                 out[0]
             }
-            None => self.field.distance(makepad_csg_math::Vec3d::new(p[0] as f64, p[1] as f64, p[2] as f64)) as f32,
+            FieldRoute::Mesh(m) => m.signed(p),
         }
     }
+
 }
 
 /// Whether `n` calls any kernel.
@@ -166,28 +163,29 @@ pub fn has_estimate(n: &SdfNode) -> bool {
 
 /// Adds the kernels of `n` missing from `slots` (their order is stable:
 /// a slot keeps its index while its volume lives).
-pub fn collect(n: &SdfNode, slots: &mut Vec<KernelSlot>) {
+pub fn collect(n: &SdfNode, slots: &mut Vec<KernelSlot>) -> Result<(), crate::program::LowerError> {
     match n {
         SdfNode::Kernel(k) => {
             if !slots.iter().any(|s| s.matches(k)) {
-                slots.push(KernelSlot::new(k));
+                slots.push(KernelSlot::new(k)?);
             }
         }
         SdfNode::Mesh(m) => {
-            if !slots.iter().any(|s| s.splash.is_none() && s.key == m.key()) {
+            if !slots.iter().any(|s| s.is_mesh() && s.key == m.key()) {
                 slots.push(KernelSlot::mesh(m));
             }
         }
-        SdfNode::Combine { of, .. } => of.iter().for_each(|c| collect(c, slots)),
-        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => collect(of, slots),
+        SdfNode::Combine { of, .. } => for c in of { collect(c, slots)?; },
+        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => collect(of, slots)?,
         SdfNode::Material { within, of, .. } => {
             if let Some(w) = within {
-                collect(w, slots);
+                collect(w, slots)?;
             }
-            collect(of, slots);
+            collect(of, slots)?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// A volume's shaders with its kernels compiled in: the bake's, and the
@@ -195,14 +193,13 @@ pub fn collect(n: &SdfNode, slots: &mut Vec<KernelSlot>) {
 pub struct KernelBake {
     /// The kernels' program identities (slot order) it was made for.
     pub keys: Vec<u64>,
-    pub draw: DrawSdfBake,
+    pub compute: ComputeKernel,
+    source: ComputeBake,
     /// The march with the kernels (exact evaluation near the surface), and
     /// the shader it was made from.
     march: Option<(DrawShaderId, DrawSdfMarch)>,
     /// Every GPU kernel is cheap enough to evaluate in the march.
     pub march_ok: bool,
-    stub: ScriptObject,
-    refs: Vec<ScriptObjectRef>,
 }
 
 /// Worst-case ops per sample of a kernel the march evaluates exactly (a ray
@@ -219,29 +216,108 @@ fn variant(vm: &mut ScriptVm, base: ScriptObject, own: ScriptObject) -> Option<S
     Some(obj)
 }
 
-impl KernelBake {
-    /// The bake variant for `slots` (`None` when none has a GPU route).
-    pub fn new(cx: &mut Cx, slots: &[KernelSlot]) -> Option<KernelBake> {
-        if slots.iter().all(|s| s.gpu.is_none()) {
-            return None;
-        }
-        let keys: Vec<u64> = slots.iter().map(|s| s.key).collect();
-        let mut key = 0xcbf2_9ce4_8422_2325u64;
-        for (k, s) in keys.iter().zip(slots) {
-            key = (key ^ k ^ s.gpu.is_some() as u64).wrapping_mul(0x100_0000_01b3);
-        }
-        let march_ok = slots.iter().all(|s| s.gpu.as_ref().is_some_and(|g| g.cost <= MAX_MARCH_KERNEL_COST));
-        let routes: Vec<Option<&ShaderRoute>> = slots.iter().map(|s| s.gpu.as_ref().map(|g| &g.route)).collect();
-        cx.with_vm(|vm| {
-            let draw_mod = vm.heap().module(id!(draw));
-            let base = vm.value(draw_mod, id!(SdfBake)).as_object()?;
+/// A buffer-backed bake object with one dispatch splice per kernel set.
+/// Compile once for the selected device; this object never dispatches work.
+/// Keep it alive while compiling derived draw variants, then call release.
+pub struct ComputeBake {
+    pub object: ScriptObject,
+    pub keys: Vec<u64>,
+    dispatch: Option<ScriptObject>,
+    mesh: Option<ScriptObject>,
+    mesh_slots: Vec<usize>,
+    refs: Vec<ScriptObjectRef>,
+}
+
+impl ComputeBake {
+    pub fn new(vm: &mut ScriptVm, slots: &[KernelSlot]) -> Option<Self> {
+        let module = vm.heap().module(id!(sdf));
+        let base = vm.value(module, id!(Bake)).as_object()?;
+        let keys: Vec<_> = slots.iter().map(|s| s.key).collect();
+        let mut refs = Vec::new();
+        let dispatch = if slots.iter().any(|s| s.air().is_some()) {
+            let key = slots.iter().fold(0xcbf2_9ce4_8422_2325u64, |key, s| {
+                (key ^ s.key ^ s.air().is_some() as u64).wrapping_mul(0x100_0000_01b3)
+            });
             let stub = vm.value(base, id!(kernel_call)).as_object()?;
-            // a fn object of its own (the shader's identity and the hook's key) with the dispatch
+            let routes: Vec<_> = slots.iter().map(|s| s.air().map(|g| &g.route)).collect();
             let own = shader_route::dispatch_fn(vm, stub, key, &routes)?;
-            let obj = variant(vm, base, own)?;
-            let refs = vec![vm.new_object_ref(own), vm.new_object_ref(obj)];
-            let draw = DrawSdfBake::script_from_value(vm, obj.into());
-            Some(KernelBake { keys, draw, march: None, march_ok, stub: own, refs })
+            refs.push(vm.new_object_ref(own));
+            Some(own)
+        } else { None };
+        let object = match dispatch {
+            Some(own) => variant(vm, base, own)?,
+            None => vm.new_with_proto(base),
+        };
+        let mesh_slots: Vec<_> = slots.iter().enumerate().filter_map(|(i, s)| s.is_mesh().then_some(i)).collect();
+        let mesh = if mesh_slots.is_empty() { None } else {
+            // One binding per asset; choose the binding before each buffer read.
+            // Object instances share the uploaded buffers, including across bakers.
+            let mut code = String::from("use mod.pod.*\nuse mod.shader\n{\n");
+            for i in &mesh_slots { code += &format!("mesh_{i}: shader.buffer(vec4u)\n"); }
+            code += "mesh_read: fn(slot: u32, at: u32) -> vec4u {\n";
+            for i in &mesh_slots { code += &format!("if slot == {i}u {{ return self.mesh_{i}[at] }}\n"); }
+            code += "return vec4u(0u)\n}\n}";
+            let mesh = vm.eval(ScriptMod::new("", "", "sdf_mesh_bindings", 0, 0, &code, &[])).as_object()?;
+            refs.push(vm.new_object_ref(mesh));
+            Self::attach_mesh(vm, object, mesh, &mesh_slots);
+            Some(mesh)
+        };
+        refs.push(vm.new_object_ref(object));
+        Some(Self { object, keys, dispatch, mesh, mesh_slots, refs })
+    }
+
+    fn attach_mesh(vm: &mut ScriptVm, object: ScriptObject, mesh: ScriptObject, slots: &[usize]) {
+        for name in slots.iter().map(|i| crate::mesh::binding(*i)).chain([id!(mesh_read)]) {
+            let value = vm.value(mesh, name);
+            vm.set_value(object, name, value);
+        }
+    }
+
+    /// Compute uses IrFnCompiler::compile_shader_def, the same lowering as
+    /// draw. shader_lower_calls consults shader_ir_fns before compiling a
+    /// script body, so dispatch_fn's AIR splice also runs for compute.
+    pub fn compile(&self, vm: &mut ScriptVm, target: makepad_draw::makepad_script::shader_ir_compute::ComputeTarget)
+        -> Result<makepad_draw::makepad_script::shader_ir_compute::CompiledKernel, String>
+    {
+        makepad_draw::makepad_script::shader_ir_compute::compile_compute_kernel(vm, self.object, target)
+    }
+
+    /// Apply the same dispatch to mod.draw.SdfMarch (or a host's derived shader).
+    pub fn draw_variant(&mut self, vm: &mut ScriptVm, base: ScriptObject) -> Option<ScriptObject> {
+        let object = match self.dispatch {
+            Some(own) => variant(vm, base, own)?,
+            None => vm.new_with_proto(base),
+        };
+        if let Some(mesh) = self.mesh { Self::attach_mesh(vm, object, mesh, &self.mesh_slots); }
+        self.refs.push(vm.new_object_ref(object));
+        Some(object)
+    }
+
+    pub fn release(self, vm: &mut ScriptVm) {
+        if let Some(own) = self.dispatch { shader_route::release_dispatch(vm, own); }
+    }
+}
+
+impl KernelBake {
+    /// The bake variant for this kernel set, including the empty primitive set.
+    pub fn new(cx: &mut Cx, slots: &[KernelSlot]) -> Option<KernelBake> {
+        let march_ok = slots.iter().all(|s| s.is_mesh() || s.air().is_some_and(|g| g.cost <= MAX_MARCH_KERNEL_COST));
+        cx.with_vm(|vm| {
+            let mut source = ComputeBake::new(vm, slots)?;
+            if let Err(error) = crate::trace::lower_spliced(vm, &mut source) {
+                log!("sdf trace lowering: {error}");
+                source.release(vm);
+                return None;
+            }
+            let compute = match ComputeKernel::new(vm, source.object, "sdf bake") {
+                Ok(kernel) => kernel,
+                Err(error) => {
+                    log!("sdf compute: {error}");
+                    source.release(vm);
+                    return None;
+                }
+            };
+            Some(KernelBake { keys: source.keys.clone(), compute, source, march: None, march_ok })
         })
     }
 
@@ -254,16 +330,13 @@ impl KernelBake {
         let id = base.draw_super.draw_vars.draw_shader_id?;
         if self.march.as_ref().is_none_or(|(b, _)| *b != id) {
             let source = cx.draw_shaders.shaders.get(id.index)?.mapping.source.as_object();
-            let own = self.stub;
             let made = cx.with_vm(|vm| {
-                let obj = variant(vm, source, own)?;
-                let r = vm.new_object_ref(obj);
+                let obj = self.source.draw_variant(vm, source)?;
                 let mut draw = DrawSdfMarch::script_from_value(vm, obj.into());
                 draw.kernels = true;
-                Some((r, draw))
+                Some(draw)
             });
-            let (r, draw) = made?;
-            self.refs.push(r);
+            let draw = made?;
             self.march = Some((id, draw));
         }
         self.march.as_mut().map(|(_, d)| d)
@@ -275,8 +348,7 @@ impl KernelBake {
     }
 
     pub fn release(self, cx: &mut Cx) {
-        let stub = self.stub;
-        cx.with_vm(|vm| shader_route::release_dispatch(vm, stub));
+        cx.with_vm(|vm| self.source.release(vm));
     }
 }
 

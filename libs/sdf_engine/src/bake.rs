@@ -1,986 +1,284 @@
-//! The GPU brick bake: one quad per brick into the truth atlas (R32F) with the
-//! material slot atlas (R8) as a second attachment, each texel one lattice
-//! sample evaluated by the program interpreter below. The shader is the twin
-//! of [`crate::twin::eval`] written op for op; with `precise_math` the atlas
-//! equals the CPU bake bit for bit.
+//! Budgeted compute baking into a copy-on-write R16F/R8 brick atlas.
 //!
-//! The pass keeps its texels between frames. Each frame takes at most
-//! `budget` bricks from the queue and records them once; the next batch waits
-//! until the GPU painted that one whole (`DrawPass::painted_whole_since`), so
-//! a draw left out while a pipeline compiles is painted from the same
-//! recording and nothing is lost. A recording only writes its bricks from the
-//! program data, so running it again (every pipeline that becomes ready
-//! repaints all passes) writes the same texels.
-//!
-//! A frame's march reads one field whole. It reads the render copy, the index
-//! and the programs, never the truth atlas, so the truth may be baked over as
-//! many frames as it takes while the march goes on drawing what was published.
-//! The render copy is two textures: the march reads the front one, the copy
-//! pass writes the back one (the bricks this field changed and the ones the
-//! back one missed last time). Once the GPU has painted the last truth batch
-//! and those copies whole, the back one, the new index and the new programs
-//! become what the march binds ([`Baker::draw`] says so, the frame it happens),
-//! and the host draws the volume it published. A recording left unpainted, or
-//! painted with draws left out, is painted again before anything is shown.
-//!
-//! SHADER LAW: unary minus has the lowest precedence in the script shader
-//! parser; write `(0.0 - a) - b`, never `-a - b`.
+//! A version publishes in the recording of its final slice. The compute pass
+//! precedes its marching pass, including while native pipelines compile. An
+//! asynchronous completion readback gates reuse of the bake list and retired
+//! slots by the following version; the UI never waits for the device.
 
-use crate::volume::{Brick, Volume, ATLAS_SLOTS_X, ATLAS_W, BS};
-use std::collections::BTreeSet;
-
-/// Render-copy slots per row: a slot is 81 x 9 texels (9 z slices of 9 x 9).
-pub const COPY_SLOTS_X: usize = 50;
-pub const COPY_W: usize = COPY_SLOTS_X * 81;
-/// Index texture width (texels).
-pub const INDEX_W: usize = 1024;
+use crate::{kernel::KernelBake, volume::{Brick, Volume}};
 use makepad_draw::*;
+use makepad_draw::makepad_platform::gpu_admission::{GpuDocument, GpuReservation};
+use makepad_draw::makepad_script::shader_ir_compute::StorageTextureFormat;
+use std::{rc::Rc, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
-/// Program texture width (texels).
-pub const PROG_W: usize = 1024;
+pub const ATLAS_SLOTS_X: usize = 50;
+pub const ATLAS_W: usize = ATLAS_SLOTS_X * 81;
 
-script_mod! {
-    use mod.pod.*
-    use mod.math.*
-    use mod.shader.*
-    use mod.draw
+#[derive(Clone)]
+struct Buffer {
+    gpu: GpuBuffer,
+    data: Arc<[u8]>,
+    _reservation: Rc<GpuReservation>,
+}
 
-    // The program interpreter (`twin::eval` op for op), shared by the bake
-    // and the march: `eval_program(base, p)` = (distance, slot) of the
-    // program whose header texel is `base` at the object-frame point p.
-    mod.draw.SdfInterp = {
-        prog_tex: texture_2d(float)
-        prog_inv: uniform(vec2(1.0, 1.0))
-        fetch: fn(i: f32) -> vec4 {
-            let row = floor(i * 0.0009765625)
-            let col = i - row * 1024.0
-            return self.prog_tex.sample_nearest((vec2(col, row) + vec2(0.5, 0.5)) * self.prog_inv)
-        }
-        len2: fn(x: f32, y: f32) -> f32 {
-            return sqrt(x * x + y * y)
-        }
-        len3: fn(x: f32, y: f32, z: f32) -> f32 {
-            return sqrt((x * x + y * y) + z * z)
-        }
-        clamp01: fn(x: f32) -> f32 {
-            return min(max(x, 0.0), 1.0)
-        }
-        // sin and cos (twin::psin_pcos)
-        psc: fn(x: f32) -> vec2 {
-            let q = floor(x * 0.6366198 + 0.5)
-            let r = (x - q * 1.5707964) - q * (0.0 - 0.00000004371139)
-            let r2 = r * r
-            let s = r + r * r2 * ((0.0 - 0.16666667) + r2 * (0.008333331 + r2 * ((0.0 - 0.00019840874) + r2 * 0.0000027525562)))
-            let c = 1.0 + r2 * ((0.0 - 0.5) + r2 * (0.041666638 + r2 * ((0.0 - 0.0013888378) + r2 * 0.000024760495)))
-            let n = q - floor(q * 0.25) * 4.0
-            if n < 0.5 { return vec2(s, c) }
-            if n < 1.5 { return vec2(c, 0.0 - s) }
-            if n < 2.5 { return vec2(0.0 - s, 0.0 - c) }
-            return vec2(0.0 - c, s)
-        }
-        smin: fn(a: f32, b: f32, k: f32) -> f32 {
-            if k <= 0.0 { return min(a, b) }
-            let h = self.clamp01(0.5 + (0.5 * (b - a)) / k)
-            return (b + (a - b) * h) - (k * h) * (1.0 - h)
-        }
-        prim: fn(pc: f32, px: f32, py: f32, pz: f32) -> f32 {
-            let t0 = self.fetch(pc)
-            let t1 = self.fetch(pc + 1.0)
-            let t2 = self.fetch(pc + 2.0)
-            let kind = t0.y
-            let a = t0.z
-            let b = t0.w
-            let c = t1.x
-            let d = t1.y
-            if kind < 0.5 {
-                return self.len3(px, py, pz) - a
-            }
-            if kind < 1.5 {
-                let qx = abs(px) - a
-                let qy = abs(py) - b
-                let qz = abs(pz) - c
-                return self.len3(max(qx, 0.0), max(qy, 0.0), max(qz, 0.0)) + min(max(qx, max(qy, qz)), 0.0) - d
-            }
-            if kind < 2.5 {
-                let qx = self.len2(px, pz)
-                let dx = qx - a
-                let dy = abs(py) - b
-                let mx = max(dx, 0.0)
-                let my = max(dy, 0.0)
-                return sqrt(mx * mx + my * my) + min(max(dx, dy), 0.0)
-            }
-            if kind < 3.5 {
-                let qx = self.len2(px, pz)
-                let k2x = b - a
-                let k2y = c * 2.0
-                var rr = b
-                if py < 0.0 { rr = a }
-                let cax = qx - min(qx, rr)
-                let cay = abs(py) - c
-                let t = self.clamp01(((b - qx) * k2x + (c - py) * k2y) / (k2x * k2x + k2y * k2y))
-                let cbx = (qx - b) + k2x * t
-                let cby = (py - c) + k2y * t
-                var s = 1.0
-                if cbx < 0.0 && cay < 0.0 { s = 0.0 - 1.0 }
-                return s * sqrt(min(cax * cax + cay * cay, cbx * cbx + cby * cby))
-            }
-            if kind < 4.5 {
-                let q = self.len2(px, pz) - a
-                return self.len2(q, py) - b
-            }
-            if kind < 5.5 {
-                let pax = px - a
-                let pay = py - b
-                let paz = pz - c
-                let bx = d
-                let by = t1.z
-                let bz = t1.w
-                let h = self.clamp01(((pax * bx + pay * by) + paz * bz) / ((bx * bx + by * by) + bz * bz))
-                return self.len3(pax - bx * h, pay - by * h, paz - bz * h) - t2.x
-            }
-            if kind < 6.5 {
-                let k0 = self.len3(px / a, py / b, pz / c)
-                let k1 = self.len3(px / (a * a), py / (b * b), pz / (c * c))
-                return (k0 * (k0 - 1.0)) / max(k1, 0.000000000001)
-            }
-            let ex = self.psc(px * a)
-            let ey = self.psc(py * a)
-            let ez = self.psc(pz * a)
-            let gv = (ex.x * ey.y + ey.x * ez.y) + ez.x * ex.y
-            return abs(gv) / a - b
-        }
+impl Buffer {
+    fn reserve(doc: &GpuDocument, old: Option<&Self>, bytes: usize) -> Result<Option<Rc<GpuReservation>>, String> {
+        let size = bytes.max(16).next_power_of_two() as u64;
+        if old.is_some_and(|b| b.gpu.size() >= size) { return Ok(None); }
+        doc.admit(size).map(|r| Some(Rc::new(r))).map_err(|e| e.to_string())
+    }
 
-        // A KERNEL op at program texel `at` (kernel slot `slot`): the plain
-        // shaders have none (a volume with kernels bakes with a variant,
-        // `kernel::KernelBake`, whose kernel_at is kernel_at_fetch and whose
-        // kernel_call the host builds from the kernels' compiled programs).
-        kernel_at: fn(at: f32, slot: f32, x: f32, y: f32, z: f32) -> f32 {
-            return 1000000000.0
-        }
-        kernel_at_fetch: fn(at: f32, slot: f32, x: f32, y: f32, z: f32) -> f32 {
-            let a = self.fetch(at + 1.0)
-            let b = self.fetch(at + 2.0)
-            let c = self.fetch(at + 3.0)
-            let d = self.fetch(at + 4.0)
-            return self.kernel_call(slot, vec3(x, y, z), a, b, c, d)
-        }
-        kernel_call: fn(slot: f32, p: vec3, a: vec4, b: vec4, c: vec4, d: vec4) -> f32 {
-            return 1000000000.0
-        }
+    fn prepare(cx: &mut Cx, old: Option<&Self>, bytes: usize, reservation: Option<Rc<GpuReservation>>) -> Result<Self, String> {
+        let size = bytes.max(16).next_power_of_two() as u64;
+        if let Some(old) = old.filter(|b| b.gpu.size() >= size) { return Ok(old.clone()); }
+        let gpu = GpuBuffer::new(cx, size, GpuBufferFlags { readback: true, ..Default::default() })?;
+        Ok(Self { gpu, data: Arc::from([]), _reservation: reservation.expect("reserved buffer growth") })
+    }
 
-        eval_program: fn(base: f32, x: f32, y: f32, z: f32) -> vec2 {
-            var px = x
-            var py = y
-            var pz = z
-            var vs = array(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
-            var ss = array(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
-            var sx8 = array(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
-            var sy8 = array(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
-            var sz8 = array(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
-            var ms = array(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f)
-            var vn = 0i
-            var pn = 0i
-            var mn = 0i
-            let len = self.fetch(base).x
-            var pc = 1.0
-            loop {
-                if pc >= len { break }
-                let h = self.fetch(base + pc)
-                let code = h.x
-                if code < 0.5 {
-                    vs[vn] = self.prim(base + pc, px, py, pz)
-                    if mn > 0i { ss[vn] = ms[mn - 1i] } else { ss[vn] = 0.0 }
-                    vn = vn + 1i
-                    pc = pc + 3.0
-                } else if code < 1.5 {
-                    sx8[pn] = px
-                    sy8[pn] = py
-                    sz8[pn] = pz
-                    pn = pn + 1i
-                    let r0 = self.fetch(base + pc + 1.0)
-                    let r1 = self.fetch(base + pc + 2.0)
-                    let r2 = self.fetch(base + pc + 3.0)
-                    let nx = ((r0.x * px + r0.y * py) + r0.z * pz) + r0.w
-                    let ny = ((r1.x * px + r1.y * py) + r1.z * pz) + r1.w
-                    let nz = ((r2.x * px + r2.y * py) + r2.z * pz) + r2.w
-                    px = nx
-                    py = ny
-                    pz = nz
-                    pc = pc + 4.0
-                } else if code < 2.5 {
-                    pn = pn - 1i
-                    px = sx8[pn]
-                    py = sy8[pn]
-                    pz = sz8[pn]
-                    vs[vn - 1i] = vs[vn - 1i] * h.y
-                    pc = pc + 1.0
-                } else if code < 3.5 {
-                    sx8[pn] = px
-                    sy8[pn] = py
-                    sz8[pn] = pz
-                    pn = pn + 1i
-                    let x = px
-                    let y = py
-                    let z = pz
-                    if h.y < 0.5 {
-                        let e = self.psc(h.z * y)
-                        px = e.y * x + e.x * z
-                        pz = e.y * z - e.x * x
-                    } else if h.y < 1.5 {
-                        let e = self.psc(h.z * x)
-                        px = e.y * x + e.x * y
-                        py = e.y * y - e.x * x
-                    } else if h.y < 2.5 {
-                        let k = 1.0 / max(1.0 + h.z * y, 0.001)
-                        px = x * k
-                        pz = z * k
-                    } else if h.w < 0.5 {
-                        px = abs(x)
-                    } else if h.w < 1.5 {
-                        py = abs(y)
-                    } else {
-                        pz = abs(z)
-                    }
-                    pc = pc + 1.0
-                } else if code < 4.5 {
-                    pn = pn - 1i
-                    px = sx8[pn]
-                    py = sy8[pn]
-                    pz = sz8[pn]
-                    vs[vn - 1i] = vs[vn - 1i] / h.y
-                    pc = pc + 1.0
-                } else if code < 5.5 {
-                    let e = vs[vn - 1i]
-                    let se = ss[vn - 1i]
-                    let d = vs[vn - 2i]
-                    let sd = ss[vn - 2i]
-                    vn = vn - 1i
-                    var v = 0.0
-                    var s = sd
-                    if h.y < 0.5 {
-                        v = self.smin(d, e, h.z)
-                        if e < d { s = se }
-                    } else if h.y < 1.5 {
-                        v = 0.0 - self.smin(0.0 - d, e, h.z)
-                    } else {
-                        v = 0.0 - self.smin(0.0 - d, 0.0 - e, h.z)
-                        if e > d { s = se }
-                    }
-                    vs[vn - 1i] = v
-                    ss[vn - 1i] = s
-                    pc = pc + 1.0
-                } else if code < 6.5 {
-                    vs[vn - 1i] = abs(vs[vn - 1i]) - h.y
-                    pc = pc + 1.0
-                } else if code < 7.5 {
-                    vs[vn - 1i] = vs[vn - 1i] - h.y
-                    pc = pc + 1.0
-                } else if code < 8.5 {
-                    ms[mn] = h.y
-                    mn = mn + 1i
-                    pc = pc + 1.0
-                } else if code < 9.5 {
-                    mn = mn - 1i
-                    pc = pc + 1.0
-                } else if code < 10.5 {
-                    // MAT_WITHIN: the region's distance is on top
-                    vn = vn - 1i
-                    if vs[vn] > 0.0 {
-                        if mn > 0i { ms[mn] = ms[mn - 1i] } else { ms[mn] = 0.0 }
-                    } else {
-                        ms[mn] = h.y
-                    }
-                    mn = mn + 1i
-                    pc = pc + 1.0
-                } else if code < 11.5 {
-                    // KERNEL: slot h.y, h.z parameter texels
-                    vs[vn] = self.kernel_at(base + pc, h.y, px, py, pz)
-                    if mn > 0i { ss[vn] = ms[mn - 1i] } else { ss[vn] = 0.0 }
-                    vn = vn + 1i
-                    pc = pc + 1.0 + h.z
-                } else {
-                    // SCALE
-                    vs[vn - 1i] = vs[vn - 1i] * h.y
-                    pc = pc + 1.0
+    /// Coalesce changed vec4 ranges. Growing allocations upload their complete payload.
+    fn upload(&mut self, cx: &mut Cx, data: Vec<u8>) -> Result<(), String> {
+        if self.data.is_empty() {
+            if !data.is_empty() { self.gpu.update(cx, 0, &data)?; }
+        } else {
+            let mut start = None;
+            for offset in (0..data.len()).step_by(16) {
+                let end = (offset + 16).min(data.len());
+                let changed = self.data.get(offset..end) != Some(&data[offset..end]);
+                if changed { start.get_or_insert(offset); }
+                if !changed {
+                    if let Some(first) = start.take() { self.gpu.update(cx, first as u64, &data[first..offset])?; }
                 }
             }
-            // + 0.0: a zero leaves as +0 (min/max of signed zeros differ between GPUs)
-            return vec2(vs[0], ss[0])
+            if let Some(first) = start { self.gpu.update(cx, first as u64, &data[first..])?; }
         }
+        self.data = data.into();
+        Ok(())
     }
+}
 
-    mod.draw.SdfBake = mod.std.set_type_default() do #(DrawSdfBake::script_shader(vm)){
-        ..mod.draw.DrawQuad,
-        ..mod.draw.SdfInterp,
-        alpha_blend: false
-        precise_math: true
-        color_format: @Rf32
-        fb1: fragment_output(1, vec4f)
-        cell: uniform(1.0)
-        band: uniform(1.0)
+#[derive(Clone)]
+struct Atlas {
+    distance: Texture,
+    material: Texture,
+    rows: usize,
+    _reservation: Rc<GpuReservation>,
+}
 
-        fragment: fn() {
-            let pix = floor(self.world.xy)
-            let lx = pix.x - self.rect_pos.x
-            let ly = pix.y - self.rect_pos.y
-            let sz = floor(lx * 0.125)
-            let sx = lx - sz * 8.0
-            let e = self.eval_program(self.brick.w, (self.brick.x * 8.0 + sx) * self.cell, (self.brick.y * 8.0 + ly) * self.cell, (self.brick.z * 8.0 + sz) * self.cell)
-            // + 0.0: a zero leaves as +0 (min/max of signed zeros differ between GPUs)
-            let d = min(max(e.x, 0.0 - self.band), self.band) + 0.0
-            self.fb0 = vec4(d, 0.0, 0.0, 1.0)
-            self.fb1 = vec4(e.y / 255.0, 0.0, 0.0, 1.0)
-        }
-    }
-
-    // A brick the CPU twin baked: its texels from the upload texture (one row of 512 per
-    // brick, the distance and the slot), written where the bake would write them.
-    mod.draw.SdfUpload = mod.std.set_type_default() do #(DrawSdfUpload::script_shader(vm)){
-        ..mod.draw.DrawQuad,
-        alpha_blend: false
-        precise_math: true
-        color_format: @Rf32
-        fb1: fragment_output(1, vec4f)
-        vals: texture_2d(float)
-        vals_inv: uniform(vec2(1.0, 1.0))
-
-        fragment: fn() {
-            let pix = floor(self.world.xy)
-            let lx = pix.x - self.rect_pos.x
-            let ly = pix.y - self.rect_pos.y
-            let v = self.vals.sample_nearest((vec2(ly * 64.0 + lx, self.row) + vec2(0.5, 0.5)) * self.vals_inv)
-            self.fb0 = vec4(v.x, 0.0, 0.0, 1.0)
-            self.fb1 = vec4(v.y / 255.0, 0.0, 0.0, 1.0)
-        }
-    }
-
-    // The render copy: a brick's 9^3 samples (its own 8^3 and the first of
-    // the next brick on each axis, the apron) into the R16F copy atlas (9 z
-    // slices of 9 x 9), with the slots into the R8 copy; bilinear filtering
-    // then needs no neighbour lookups. A sample of an empty brick is the band
-    // with the brick's sign.
-    mod.draw.SdfCopy = mod.std.set_type_default() do #(DrawSdfCopy::script_shader(vm)){
-        ..mod.draw.DrawQuad
-        alpha_blend: false
-        color_format: @Rf16
-        fb1: fragment_output(1, vec4f)
-        truth: texture_2d(float)
-        truth_slots: texture_2d(float)
-        index_tex: texture_2d(float)
-        truth_inv: uniform(vec2(1.0, 1.0))
-        index_inv: uniform(vec2(1.0, 1.0))
-        vol_min: uniform(vec3(0.0, 0.0, 0.0))
-        vol_dim: uniform(vec3(1.0, 1.0, 1.0))
-        band: uniform(1.0)
-
-        // `v` rounded to the nearest f16 (ties to even), as an f32: the
-        // R16F write then stores it exactly. Render-target conversion modes
-        // differ between GPUs (a GPU-B truncates).
-        to_half: fn(v: f32) -> f32 {
-            let a = abs(v)
-            if a < 0.00006103515625 {
-                // the f16 subnormals: multiples of 2^-24
-                let q = a * 16777216.0
-                var r = floor(q)
-                let f = q - r
-                if f > 0.5 || (f == 0.5 && r - floor(r * 0.5) * 2.0 > 0.5) { r = r + 1.0 }
-                let h = r * 0.000000059604644775390625
-                if v < 0.0 { return 0.0 - h }
-                return h
-            }
-            let b = asuint(v)
-            let odd = (b >> 13u) & 1u
-            return asfloat((b + 4095u + odd) & 4294959104u)
-        }
-
-        fragment: fn() {
-            let pix = floor(self.world.xy)
-            let lx = pix.x - self.rect_pos.x
-            let ly = pix.y - self.rect_pos.y
-            let sz = floor((lx + 0.5) / 9.0)
-            let sx = lx - sz * 9.0
-            let g = self.brick.xyz * 8.0 + vec3(sx, ly, sz)
-            let nb = floor(g * 0.125)
-            let local = g - nb * 8.0
-            let ib = nb - self.vol_min
-            var v = self.band
-            var slot_v = 0.0
-            if ib.x >= 0.0 && ib.y >= 0.0 && ib.z >= 0.0 && ib.x < self.vol_dim.x && ib.y < self.vol_dim.y && ib.z < self.vol_dim.z {
-                let i = (ib.z * self.vol_dim.y + ib.y) * self.vol_dim.x + ib.x
-                let row = floor(i * 0.0009765625)
-                let e = self.index_tex.sample_nearest((vec2(i - row * 1024.0, row) + vec2(0.5, 0.5)) * self.index_inv)
-                if e.x >= 0.0 {
-                    let srow = floor(e.x * 0.015625)
-                    let scol = e.x - srow * 64.0
-                    let t = vec2(scol * 64.0 + local.z * 8.0 + local.x, srow * 8.0 + local.y) + vec2(0.5, 0.5)
-                    v = self.truth.sample_nearest(t * self.truth_inv).x
-                    slot_v = self.truth_slots.sample_nearest(t * self.truth_inv).x
-                } else if e.y < 0.0 {
-                    v = 0.0 - self.band
-                }
-            }
-            self.fb0 = vec4(self.to_half(v), 0.0, 0.0, 1.0)
-            self.fb1 = vec4(slot_v, 0.0, 0.0, 1.0)
+impl Atlas {
+    fn new(cx: &mut Cx, rows: usize, reservation: GpuReservation) -> Self {
+        let texture = |cx: &mut Cx, format| Texture::new_with_format(cx,
+            TextureFormat::Storage { format, width: ATLAS_W, height: rows });
+        Self {
+            distance: texture(cx, StorageTextureFormat::R16f),
+            material: texture(cx, StorageTextureFormat::R8unorm),
+            rows, _reservation: Rc::new(reservation),
         }
     }
 }
 
-#[derive(Script, ScriptHook)]
-#[repr(C)]
-pub struct DrawSdfCopy {
-    #[deref]
-    pub draw_super: DrawQuad,
-    /// The brick (x y z).
-    #[live]
-    pub brick: Vec4f,
+#[derive(Clone)]
+struct Field {
+    atlas: Atlas,
+    index: Buffer,
+    programs: Buffer,
+    kernel: usize,
+    meshes: Rc<[(LiveId, Rc<crate::mesh::MeshGpu>)]>,
 }
 
-#[derive(Script, ScriptHook)]
-#[repr(C)]
-pub struct DrawSdfUpload {
-    #[deref]
-    pub draw_super: DrawQuad,
-    /// The brick's row in the upload texture.
-    #[live]
-    pub row: f32,
+struct Pending {
+    field: Field,
+    index: Vec<u8>,
+    first: usize,
+    count: usize,
 }
 
-#[derive(Script, ScriptHook)]
-#[repr(C)]
-pub struct DrawSdfBake {
-    #[deref]
-    pub draw_super: DrawQuad,
-    /// The brick (x y z) and its program's first texel (w).
-    #[live]
-    pub brick: Vec4f,
-}
-
-/// The atlases one volume bakes into and the pass that writes them.
 pub struct Baker {
-    pass: DrawPass,
-    list: DrawList,
-    copy_pass: DrawPass,
-    copy_list: DrawList,
-    /// The published field (what a march binds). The render copy: R16F
-    /// distances and R8 slots with the apron, `COPY_W` wide, `copy_rows` high.
-    pub copy: Texture,
-    pub copy_slots: Texture,
-    pub copy_rows: usize,
-    index_tex: Texture,
-    index_rows: usize,
-    /// The field being baked, published when its truth and copies are painted.
-    next: Option<NextField>,
-    /// The other render copy (what `next` writes), once there is one.
-    back: Option<(Texture, Texture, usize)>,
-    /// Baked bricks whose render copy must be redone at the next publish.
-    copy_queue: BTreeSet<usize>,
-    /// The bricks the last publish copied into the front copy: the back one lacks them.
-    carry: BTreeSet<usize>,
-    /// The copies of `next` are recorded (their bricks, for `carry`): it is published once
-    /// they are painted whole.
-    copied: Option<BTreeSet<usize>>,
-    /// Truth (R32F) and slots (R8), `ATLAS_W` wide, `rows` high.
-    pub atlas: Texture,
-    pub slots: Texture,
-    pub rows: usize,
-    prog_tex: Texture,
-    prog_rows: usize,
-    /// The first texel of each program in `prog_tex`.
-    prog_at: Vec<u32>,
-    /// Bricks still to bake, and the batch in flight with the repaint it was
-    /// recorded at.
-    queue: Vec<usize>,
-    inflight: Option<(u64, Vec<usize>)>,
-    /// Bricks recorded per frame at most.
-    pub budget: usize,
-    /// Batches the GPU has finished (bricks), for the caller's progress.
-    pub baked: usize,
-    /// The passes' current recording draws nothing.
-    recorded_empty: bool,
-    /// The pass that samples the atlases (the march's): the bake runs under
-    /// it, so a frame's march reads that frame's bricks. `None`: under the
-    /// pass being drawn.
+    document: Rc<GpuDocument>,
+    field: Option<Field>,
+    next: Option<Pending>,
+    bricks: Option<Buffer>,
+    kernels: Vec<KernelBake>,
+    complete: Arc<AtomicBool>,
+    fresh: bool,
+    refused: bool,
     pub parent: Option<DrawPassId>,
-    /// The shaders with the published volume's kernels compiled in, and the ones of the
-    /// volume being baked when those differ (they take over when it is published).
-    kernels: Option<crate::kernel::KernelBake>,
-    next_kernels: Option<Option<crate::kernel::KernelBake>>,
-    /// The caps a frame's bake keeps (kernel work per frame).
+    pub budget: usize,
     pub limits: crate::budget::Budget,
-    /// The costliest GPU kernel's worst-case ops per sample (0: none).
+    pub baked: usize,
     kernel_cost: u64,
-    /// Bricks recorded since the host last took the count ([`Baker::take_recorded`]).
     recorded: usize,
-    /// Volumes published.
     published: u64,
-    /// The upload of CPU-baked bricks (made at the first such brick) and the texture its
-    /// recording reads (kept while that recording may be painted again).
-    upload: Option<DrawSdfUpload>,
-    upload_tex: Option<Texture>,
 }
 
-/// The textures a march binds of a field not published yet (each is the published one until
-/// the new volume needs its own).
-struct NextField {
-    copy: Texture,
-    copy_slots: Texture,
-    copy_rows: usize,
-    index: Texture,
-    index_rows: usize,
-    prog: Texture,
-    prog_rows: usize,
+fn floats(data: Vec<[f32; 4]>) -> Vec<u8> {
+    data.into_iter().flatten().flat_map(f32::to_le_bytes).collect()
 }
 
 impl Baker {
-    pub fn new(cx: &mut Cx) -> Baker {
-        let rows = 8;
-        Baker {
-            pass: DrawPass::new_with_name(cx, "sdf_bake"),
-            list: DrawList::new(cx),
-            copy_pass: DrawPass::new_with_name(cx, "sdf_copy"),
-            copy_list: DrawList::new(cx),
-            copy: Texture::new_with_format(cx, TextureFormat::RenderRf16 { size: TextureSize::Fixed { width: COPY_W, height: 9 }, initial: true }),
-            copy_slots: Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: COPY_W, height: 9 }, initial: true }),
-            copy_rows: 9,
-            index_tex: Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: INDEX_W, height: 1, data: Some(vec![0.0; INDEX_W * 4]), updated: TextureUpdated::Full }),
-            index_rows: 1,
-            next: None,
-            back: None,
-            copy_queue: BTreeSet::new(),
-            carry: BTreeSet::new(),
-            copied: None,
-            atlas: Texture::new_with_format(cx, TextureFormat::RenderRf32 { size: TextureSize::Fixed { width: ATLAS_W, height: rows }, initial: true }),
-            slots: Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: ATLAS_W, height: rows }, initial: true }),
-            rows,
-            prog_tex: Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: PROG_W, height: 1, data: Some(vec![0.0; PROG_W * 4]), updated: TextureUpdated::Full }),
-            prog_rows: 1,
-            prog_at: Vec::new(),
-            queue: Vec::new(),
-            inflight: None,
-            budget: crate::budget::Budget::for_platform().start_bricks_per_frame,
-            baked: 0,
-            recorded_empty: false,
-            parent: None,
-            kernels: None,
-            next_kernels: None,
-            limits: crate::budget::Budget::for_platform(),
-            kernel_cost: 0,
-            recorded: 0,
-            published: 0,
-            upload: None,
-            upload_tex: None,
+    /// All bakers belonging to an engine share its admission document.
+    pub fn new(document: Rc<GpuDocument>) -> Self {
+        let limits = crate::budget::Budget::for_platform();
+        Self { document, field: None, next: None, bricks: None, kernels: Vec::new(),
+            complete: Arc::new(AtomicBool::new(true)), fresh: true, refused: false,
+            parent: None, budget: limits.start_bricks_per_frame, limits, baked: 0,
+            kernel_cost: 0, recorded: 0, published: 0 }
+    }
+
+    /// False keeps the host's version waiting. A refused allocation never replaces
+    /// the published field, and is retried when the host next services the engine.
+    pub fn sync(&mut self, cx: &mut Cx, vol: &mut Volume) -> bool {
+        if self.publishing() { return false; }
+        match self.prepare(cx, vol) {
+            Ok(()) => { self.refused = false; true }
+            Err(error) => {
+                if !self.refused { log!("sdf bake paused: {error}; retaining the published field"); }
+                self.refused = true;
+                false
+            }
         }
     }
 
-    /// Uploads the volume's programs and queues its dirty bricks; grows the
-    /// atlases (and re-queues every baked brick) when its slots outgrow them.
-    pub fn sync(&mut self, cx: &mut Cx, vol: &mut Volume) {
-        // the volume's kernels: a variant of the bake shader that runs them
-        // (a new program compiles while the published field keeps drawing)
-        let served = match self.next_kernels.as_ref().map_or(self.kernels.as_ref(), |k| k.as_ref()) {
-            Some(k) => k.serves(&vol.kernels),
-            None => vol.kernels.is_empty(),
-        };
-        if !served {
-            if let Some(Some(k)) = self.next_kernels.take() {
-                k.release(cx);
-            }
-            self.next_kernels = Some(crate::kernel::KernelBake::new(cx, &vol.kernels));
+    fn prepare(&mut self, cx: &mut Cx, vol: &mut Volume) -> Result<(), String> {
+        let old = self.field.as_ref().filter(|_| !self.fresh);
+        let needed = (vol.slot_count as usize).div_ceil(ATLAS_SLOTS_X).max(1) * 9;
+        let grow = old.is_none_or(|f| f.atlas.rows < needed);
+        // Admit the entire growth before queuing any allocation. Check the
+        // atlas first so a refused growth does not rebuild CPU upload data.
+        let rows = needed.next_power_of_two();
+        let atlas_reservation = if grow { Some(self.document.admit((ATLAS_W * rows * 3) as u64).map_err(|e| e.to_string())?) } else { None };
+        // Reallocation has no carry/copy pass: every live slot is baked into the
+        // new allocation while the old allocation remains published.
+        if grow {
+            vol.dirty = (0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })).collect();
         }
-        self.kernel_cost = vol.kernels.iter().filter_map(|k| k.gpu.as_ref().map(|g| g.cost)).max().unwrap_or(0);
-        // the copies a new field writes: the back copy, made when there is none yet; the
-        // bricks the back copy lacks come along (a new texture lacks all of them)
-        let mut next = match self.next.take() {
-            Some(n) => n,
+        let data = vol.buffers();
+        let index_reservation = Buffer::reserve(&self.document, old.map(|f| &f.index), data.index.len() * 16)?;
+        let program_reservation = Buffer::reserve(&self.document, old.map(|f| &f.programs), data.programs.len() * 16)?;
+        let brick_reservation = Buffer::reserve(&self.document, self.bricks.as_ref(), data.bricks.len() * 16)?;
+        let meshes = vol.kernels.iter().enumerate().filter_map(|(i, slot)| slot.mesh_asset().map(|asset| (i, asset)))
+            .map(|(i, asset)| crate::mesh::upload(cx, &self.document, asset).map(|gpu| (crate::mesh::binding(i), gpu)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let atlas = if let Some(reservation) = atlas_reservation { Atlas::new(cx, rows, reservation) }
+            else { old.unwrap().atlas.clone() };
+        let index = Buffer::prepare(cx, old.map(|f| &f.index), data.index.len() * 16, index_reservation)?;
+        let mut programs = Buffer::prepare(cx, old.map(|f| &f.programs), data.programs.len() * 16, program_reservation)?;
+        let mut bricks = Buffer::prepare(cx, self.bricks.as_ref(), data.bricks.len() * 16, brick_reservation)?;
+        let kernel = match self.kernels.iter().position(|k| k.serves(&vol.kernels)) {
+            Some(i) => i,
             None => {
-                let (copy, copy_slots, copy_rows) = match self.back.take() {
-                    Some(b) => {
-                        let carry = std::mem::take(&mut self.carry);
-                        self.copy_queue.extend(carry.into_iter().filter(|i| *i < vol.bricks.len()));
-                        b
-                    }
-                    None => {
-                        self.carry.clear();
-                        self.copy_queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })));
-                        let rows = self.copy_rows;
-                        (
-                            Texture::new_with_format(cx, TextureFormat::RenderRf16 { size: TextureSize::Fixed { width: COPY_W, height: rows }, initial: true }),
-                            Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: COPY_W, height: rows }, initial: true }),
-                            rows,
-                        )
-                    }
-                };
-                NextField { copy, copy_slots, copy_rows, index: self.index_tex.clone(), index_rows: self.index_rows, prog: self.prog_tex.clone(), prog_rows: self.prog_rows }
+                let k = KernelBake::new(cx, &vol.kernels).ok_or("cannot compile compute bake")?;
+                self.kernels.push(k);
+                self.kernels.len() - 1
             }
         };
-        // programs: one texture, rebuilt when the volume has new ones
-        if self.prog_at.len() != vol.programs.len() {
-            let mut data: Vec<f32> = Vec::new();
-            self.prog_at.clear();
-            for p in &vol.programs {
-                self.prog_at.push((data.len() / 4) as u32);
-                data.extend(p.texels.iter().flatten());
-            }
-            let rows = (data.len() / 4).div_ceil(PROG_W).max(1);
-            data.resize(rows * PROG_W * 4, 0.0);
-            next.prog_rows = rows;
-            next.prog = Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: PROG_W, height: rows, data: Some(data), updated: TextureUpdated::Full });
-        }
-        let need_rows = (vol.slot_count as usize).div_ceil(ATLAS_SLOTS_X).max(1) * BS as usize;
-        if need_rows > self.rows {
-            let rows = need_rows.next_power_of_two();
-            self.rows = rows;
-            self.atlas = Texture::new_with_format(cx, TextureFormat::RenderRf32 { size: TextureSize::Fixed { width: ATLAS_W, height: rows }, initial: true });
-            self.slots = Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: ATLAS_W, height: rows }, initial: true });
-            self.queue.clear();
-            self.inflight = None;
-            self.recorded_empty = false;
-            self.queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })));
-            vol.dirty.clear();
-        }
-        // a brick edited again before it baked bakes once, from the newest program
-        self.queue.append(&mut vol.dirty);
-        self.queue.sort_unstable();
-        self.queue.dedup();
-        let need_copy = (vol.slot_count as usize).div_ceil(COPY_SLOTS_X).max(1) * 9;
-        if need_copy > next.copy_rows {
-            next.copy_rows = need_copy.next_power_of_two();
-            self.recorded_empty = false;
-            next.copy = Texture::new_with_format(cx, TextureFormat::RenderRf16 { size: TextureSize::Fixed { width: COPY_W, height: next.copy_rows }, initial: true });
-            next.copy_slots = Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: COPY_W, height: next.copy_rows }, initial: true });
-            self.copy_queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })));
-        }
-        // the neighbours of everything re-classified re-copy their aprons
-        for i in std::mem::take(&mut vol.touched) {
-            self.copy_queue.extend(vol.around(i));
-        }
-        // the index, whole (a texel per brick)
-        // (slot, skip, the brick's program's first texel, 0)
-        let mut texels = vol.index_texels();
-        // (-1: no program, the brick's texels are data: sculpted or uploaded)
-        for (t, b) in texels.iter_mut().zip(&vol.bricks) {
-            t[2] = match b {
-                Brick::Baked { program, .. } => self.prog_at.get(*program as usize).copied().unwrap_or(0) as f32,
-                _ => -1.0,
-            };
-        }
-        let mut data: Vec<f32> = texels.into_iter().flatten().collect();
-        let rows = (data.len() / 4).div_ceil(INDEX_W).max(1);
-        data.resize(rows * INDEX_W * 4, 0.0);
-        next.index_rows = rows;
-        next.index = Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: INDEX_W, height: rows, data: Some(data), updated: TextureUpdated::Full });
-        self.recorded_empty = false;
-        self.next = Some(next);
+        programs.upload(cx, floats(data.programs))?;
+        let count = data.bricks.len() / 2;
+        bricks.upload(cx, data.bricks.into_iter().flatten().flat_map(u32::to_le_bytes).collect())?;
+        self.kernel_cost = vol.kernels.iter().map(|k| k.air().map_or_else(|| k.mesh_asset().unwrap().cost(), |g| g.cost)).sum();
+        self.bricks = Some(bricks);
+        self.next = Some(Pending { field: Field { atlas, index, programs, kernel, meshes: meshes.into() },
+            index: floats(data.index), first: 0, count });
+        self.fresh = false;
+        vol.dirty.clear();
+        vol.touched.clear();
+        Ok(())
     }
 
-    /// Forgets the queue and the uploaded programs (a new volume into the same atlases). The
-    /// next [`Baker::sync`] copies all of its bricks. Not while [`Baker::publishing`].
-    pub fn reset(&mut self) {
-        debug_assert!(self.next.is_none(), "a reset while a field is being published");
-        self.queue.clear();
-        self.copy_queue.clear();
-        self.inflight = None;
-        self.recorded_empty = false;
-        self.prog_at.clear();
+    pub fn reset(&mut self) { debug_assert!(!self.publishing()); self.fresh = true; }
+    pub fn atlas(&self) -> &Texture { &self.field.as_ref().expect("published field").atlas.distance }
+    pub fn materials(&self) -> &Texture { &self.field.as_ref().expect("published field").atlas.material }
+    pub fn rows(&self) -> usize { self.field.as_ref().map_or(0, |f| f.atlas.rows) }
+    pub fn index_buffer(&self) -> &GpuBuffer { &self.field.as_ref().expect("published field").index.gpu }
+    pub fn program_buffer(&self) -> &GpuBuffer { &self.field.as_ref().expect("published field").programs.gpu }
+    pub fn mesh_buffers(&self) -> Rc<[(LiveId, Rc<crate::mesh::MeshGpu>)]> {
+        self.field.as_ref().expect("published field").meshes.clone()
     }
-
-    pub fn prog_texture(&self) -> &Texture {
-        &self.prog_tex
-    }
-    pub fn prog_rows(&self) -> usize {
-        self.prog_rows
-    }
-    pub fn index_texture(&self) -> &Texture {
-        &self.index_tex
-    }
-    pub fn index_rows(&self) -> usize {
-        self.index_rows
-    }
-
-    /// Volumes published so far.
-    pub fn published(&self) -> u64 {
-        self.published
-    }
-
-    /// Bricks still to bake, to copy, and in the batch in flight.
+    pub fn published(&self) -> u64 { self.published }
     pub fn queued(&self) -> (usize, usize, usize) {
-        (self.queue.len(), self.copy_queue.len(), self.inflight.as_ref().map_or(0, |(_, b)| b.len()))
+        (self.next.as_ref().map_or(0, |n| n.count - n.first), 0, usize::from(!self.complete.load(Ordering::Acquire)))
     }
+    pub fn publishing(&self) -> bool { self.next.is_some() || !self.complete.load(Ordering::Acquire) }
+    pub fn idle(&self) -> bool { !self.publishing() }
+    pub fn take_recorded(&mut self) -> usize { std::mem::take(&mut self.recorded) }
 
-    /// A field taken by [`Baker::sync`] is still being baked or its copies painted (the march
-    /// draws the one before); the host gives the baker no other volume meanwhile.
-    pub fn publishing(&self) -> bool {
-        self.next.is_some()
-    }
-
-    /// Whether everything queued has been baked and published.
-    pub fn idle(&self) -> bool {
-        self.queue.is_empty() && self.copy_queue.is_empty() && self.inflight.is_none() && self.next.is_none()
-    }
-
-    /// The passes for this frame: wait on the batch in flight, else record
-    /// the next one: its bricks into the truth atlases, then (a parent pass,
-    /// painted after) the render copies of those bricks and their neighbours.
-    /// The caller samples `copy` (or `atlas`), so the passes are painted.
-    fn attach(&self, cx: &mut Cx2d) {
-        match self.parent {
-            Some(p) => self.copy_pass.set_pass_parent(cx.cx, p),
-            None => cx.make_child_pass(&self.copy_pass),
+    /// Record one frame's slice. Publication and the final dispatch are in the
+    /// same frame; GPU submission order makes the new slots visible to its march.
+    pub fn draw(&mut self, cx: &mut Cx2d, vol: &Volume) -> bool {
+        match self.record(cx.cx, vol) {
+            Ok(published) => published,
+            Err(error) => { log!("sdf bake: {error}"); false }
         }
     }
 
-    /// This frame's bake of `vol`, the newest volume [`Baker::sync`] took. True: `vol` is
-    /// published, this frame's march is to draw it (with its textures, which this baker now
-    /// binds); until then it draws the volume published before.
-    pub fn draw(&mut self, cx: &mut Cx2d, vol: &Volume, bake: &mut DrawSdfBake, copy: &mut DrawSdfCopy) -> bool {
-        let pending = self.next_kernels.is_some();
-        let mut k = match pending {
-            true => self.next_kernels.take().flatten(),
-            false => self.kernels.take(),
-        };
-        let published = match k.as_mut() {
-            Some(k) => self.draw_with(cx, vol, &mut k.draw, copy),
-            None => self.draw_with(cx, vol, bake, copy),
-        };
-        match (pending, published) {
-            (false, _) => self.kernels = k,
-            (true, false) => self.next_kernels = Some(k),
-            (true, true) => {
-                if let Some(old) = std::mem::replace(&mut self.kernels, k) {
-                    old.release(cx.cx);
-                }
-            }
+    fn record(&mut self, cx: &mut Cx, vol: &Volume) -> Result<bool, String> {
+        let Some(next) = self.next.as_mut() else { return Ok(false) };
+        let budget = self.budget.min(self.limits.bricks_for_kernels(self.kernel_cost)).max(1);
+        let count = budget.min(next.count - next.first);
+        let kernel = &self.kernels[next.field.kernel].compute;
+        let mut pass = ComputePass::new("sdf bake", self.parent);
+        let buffers: Vec<_> = kernel.layout().buffers.iter().map(|b| {
+            if b.name == id!(program) { next.field.programs.gpu.clone() }
+            else if b.name == id!(bricks) { self.bricks.as_ref().unwrap().gpu.clone() }
+            else { next.field.meshes.iter().find(|(name, _)| *name == b.name).expect("mesh binding").1.buffer.clone() }
+        }).collect();
+        let textures: Vec<_> = kernel.layout().storage_textures.iter().map(|t| {
+            if t.name == id!(atlas) { next.field.atlas.distance.clone() }
+            else { next.field.atlas.material.clone() }
+        }).collect();
+        let mut first = next.first;
+        while first < next.first + count {
+            let n = (next.first + count - first).min(65535);
+            let mut params = kernel.params();
+            params.set_f32(id!(cell), vol.cell)?.set_f32(id!(band), vol.band)?
+                .set_u32(id!(first), first as u32)?.set_u32(id!(count), n as u32)?;
+            pass.dispatch(kernel, [n as u32, 1, 1], &params, &buffers, &textures)?;
+            first += n;
         }
-        published
+        if count != 0 { pass.submit(cx); }
+        next.first += count;
+        self.recorded += count;
+        self.baked += count;
+        if next.first != next.count { return Ok(false); }
+        next.field.index.upload(cx, std::mem::take(&mut next.index))?;
+        // The callback follows all pending compute commands, including ones held
+        // for compilation. Do not overwrite this bake list or write recycled slots
+        // in a subsequent version until those commands and earlier draws finish.
+        self.complete.store(false, Ordering::Release);
+        let complete = self.complete.clone();
+        cx.read_gpu_buffer(&self.bricks.as_ref().unwrap().gpu, 0, 4, move |result| {
+            if let Err(error) = result { log!("sdf bake completion: {error}; keeping subsequent versions queued"); return; }
+            complete.store(true, Ordering::Release);
+            SignalToUI::set_ui_signal();
+        }).map_err(|e| e.to_string())?;
+        self.field = Some(self.next.take().unwrap().field);
+        self.published += 1;
+        Ok(true)
     }
 
-    /// The march to draw this baker's volume with: `base`, or its variant
-    /// with the volume's kernels compiled in (exact near the surface).
     pub fn march<'a>(&'a mut self, cx: &mut Cx, base: &'a mut crate::march::DrawSdfMarch) -> &'a mut crate::march::DrawSdfMarch {
-        match self.kernels.as_mut() {
-            Some(k) => match k.march(cx, base) {
-                Some(m) => m,
-                None => base,
-            },
+        match self.field.as_ref().and_then(|f| self.kernels.get_mut(f.kernel)) {
+            Some(k) => k.march(cx, base).unwrap_or(base),
             None => base,
         }
     }
 
-    /// Bricks recorded since the last call (for a [`crate::budget::GpuMeter`]).
-    pub fn take_recorded(&mut self) -> usize {
-        std::mem::take(&mut self.recorded)
-    }
-
-    /// Texture bytes the baker holds now.
     pub fn vram_bytes(&self) -> u64 {
-        let atlas = ATLAS_W as u64 * self.rows as u64 * 5;
-        let copy = COPY_W as u64 * self.copy_rows as u64 * 3;
-        let index = INDEX_W as u64 * self.index_rows as u64 * 16;
-        let prog = PROG_W as u64 * self.prog_rows as u64 * 16;
-        // what a field not published yet holds on top of the published one's
-        let next = self.next.as_ref().map_or(0, |n| COPY_W as u64 * n.copy_rows as u64 * 3 + INDEX_W as u64 * n.index_rows as u64 * 16 + PROG_W as u64 * n.prog_rows as u64 * 16);
-        let back = self.back.as_ref().map_or(0, |b| COPY_W as u64 * b.2 as u64 * 3);
-        atlas + copy + index + prog + next + back
+        let bytes = |f: &Field| (ATLAS_W * f.atlas.rows * 3) as u64 + f.index.gpu.size() + f.programs.gpu.size()
+            + f.meshes.iter().map(|(_, m)| m.buffer.size()).sum::<u64>();
+        let mut total = self.field.as_ref().map_or(0, bytes);
+        if let Some(n) = &self.next {
+            let old = self.field.as_ref();
+            if old.is_none_or(|f| f.atlas.distance.texture_id() != n.field.atlas.distance.texture_id()) { total += (ATLAS_W * n.field.atlas.rows * 3) as u64; }
+            if old.is_none_or(|f| f.index.gpu != n.field.index.gpu) { total += n.field.index.gpu.size(); }
+            if old.is_none_or(|f| f.programs.gpu != n.field.programs.gpu) { total += n.field.programs.gpu.size(); }
+            for (_, mesh) in n.field.meshes.iter() {
+                if old.is_none_or(|f| !f.meshes.iter().any(|(_, m)| Rc::ptr_eq(m, mesh))) { total += mesh.buffer.size(); }
+            }
+        }
+        total + self.bricks.as_ref().map_or(0, |b| b.gpu.size())
     }
 
-    /// Releases the kernel variant's shader hook (the baker is going away).
     pub fn release(&mut self, cx: &mut Cx) {
-        if let Some(k) = self.kernels.take() {
-            k.release(cx);
-        }
-        if let Some(Some(k)) = self.next_kernels.take() {
-            k.release(cx);
-        }
+        for k in self.kernels.drain(..) { k.release(cx); }
     }
-
-    fn draw_with(&mut self, cx: &mut Cx2d, vol: &Volume, bake: &mut DrawSdfBake, copy: &mut DrawSdfCopy) -> bool {
-        let copy_id = self.copy_pass.draw_pass_id();
-        if let Some((serial, batch)) = &self.inflight {
-            self.attach(cx);
-            self.pass.set_pass_parent(cx.cx, copy_id);
-            if !(self.pass.painted_whole_since(cx.cx, *serial) && self.copy_pass.painted_whole_since(cx.cx, *serial)) {
-                return false;
-            }
-            self.baked += batch.len();
-            self.inflight = None;
-        }
-        // the field's copies are painted whole: it is what the march binds from this frame
-        if let Some(copied) = self.copied.take() {
-            self.publish(copied);
-            return true;
-        }
-        // the steered budget, within the kernel work a frame may run
-        let n = self.queue.len().min(self.budget).min(self.limits.bricks_for_kernels(self.kernel_cost));
-        let batch: Vec<usize> = self.queue.drain(..n).collect();
-        for &i in &batch {
-            self.copy_queue.extend(vol.around(i));
-        }
-        // The truth is complete with this batch: its copies go into the back copy with it.
-        let copying = self.queue.is_empty() && self.next.is_some();
-        let mut copies = if copying { std::mem::take(&mut self.copy_queue) } else { BTreeSet::new() };
-        copies.retain(|i| matches!(vol.bricks[*i], Brick::Baked { .. }));
-        // Nothing to do: the passes keep their last recording, which is empty
-        // (recorded once after the last batch), so repaints write nothing and
-        // whatever samples the atlases does not repaint every frame.
-        if batch.is_empty() && copies.is_empty() && self.recorded_empty {
-            self.attach(cx);
-            self.pass.set_pass_parent(cx.cx, copy_id);
-            if copying {
-                // nothing changed that the back copy lacks
-                self.publish(copies);
-                return true;
-            }
-            return false;
-        }
-        self.recorded_empty = batch.is_empty() && copies.is_empty();
-        // what this frame's passes read and write: the field being baked, into the back copy
-        let (prog, prog_rows, index, index_rows) = match &self.next {
-            Some(n) => (n.prog.clone(), n.prog_rows, n.index.clone(), n.index_rows),
-            None => (self.prog_tex.clone(), self.prog_rows, self.index_tex.clone(), self.index_rows),
-        };
-        let (copy_tex, copy_slots, copy_rows) = match &self.next {
-            Some(n) => (n.copy.clone(), n.copy_slots.clone(), n.copy_rows),
-            None => (self.copy.clone(), self.copy_slots.clone(), self.copy_rows),
-        };
-
-        // the bake
-        let size = dvec2(ATLAS_W as f64, self.rows as f64);
-        self.pass.set_size(cx, size);
-        self.pass.clear_color_textures(cx.cx);
-        self.pass.set_color_texture(cx, &self.atlas, DrawPassClearColor::InitWith(vec4(vol.band, 0.0, 0.0, 1.0)));
-        self.pass.add_color_texture(cx, &self.slots, DrawPassClearColor::InitWith(vec4(0.0, 0.0, 0.0, 0.0)));
-        self.pass.clear_depth_texture(cx.cx);
-        self.pass.set_pass_parent(cx.cx, copy_id);
-        cx.begin_pass(&self.pass, Some(1.0));
-        self.pass.set_size(cx, size);
-        self.pass.set_dpi_factor(cx, 1.0);
-        self.list.begin_always(cx);
-        cx.begin_root_turtle(size, Layout::flow_overlay());
-        {
-            let c = &*cx.cx;
-            let dv = &mut bake.draw_super.draw_vars;
-            dv.set_texture(0, &prog);
-            dv.set_uniform(c, id!(prog_inv), &[1.0 / PROG_W as f32, 1.0 / prog_rows as f32]);
-            dv.set_uniform(c, id!(cell), &[vol.cell]);
-            dv.set_uniform(c, id!(band), &[vol.band]);
-        }
-        let mut uploads = Vec::new();
-        for &i in &batch {
-            let Brick::Baked { slot, program } = vol.bricks[i] else { continue };
-            if let Some(c) = vol.cpu.get(&i) {
-                uploads.push((slot, c.clone()));
-                continue;
-            }
-            let b = vol.brick_of(i);
-            bake.brick = vec4(b[0] as f32, b[1] as f32, b[2] as f32, self.prog_at[program as usize] as f32);
-            bake.draw_super.draw_abs(cx, slot_rect(slot));
-        }
-        if !uploads.is_empty() {
-            self.draw_uploads(cx, &uploads);
-        }
-        cx.end_pass_sized_turtle();
-        self.list.end(cx);
-        cx.end_pass(&self.pass);
-
-        // the render copy (samples the truth atlases the bake just wrote)
-        let size = dvec2(COPY_W as f64, copy_rows as f64);
-        self.copy_pass.set_size(cx, size);
-        self.copy_pass.clear_color_textures(cx.cx);
-        self.copy_pass.set_color_texture(cx, &copy_tex, DrawPassClearColor::InitWith(vec4(vol.band, 0.0, 0.0, 1.0)));
-        self.copy_pass.add_color_texture(cx, &copy_slots, DrawPassClearColor::InitWith(vec4(0.0, 0.0, 0.0, 0.0)));
-        self.copy_pass.clear_depth_texture(cx.cx);
-        self.attach(cx);
-        cx.begin_pass(&self.copy_pass, Some(1.0));
-        self.copy_pass.set_size(cx, size);
-        self.copy_pass.set_dpi_factor(cx, 1.0);
-        self.copy_list.begin_always(cx);
-        cx.begin_root_turtle(size, Layout::flow_overlay());
-        {
-            let c = &*cx.cx;
-            let dv = &mut copy.draw_super.draw_vars;
-            dv.set_texture(0, &self.atlas);
-            dv.set_texture(1, &self.slots);
-            dv.set_texture(2, &index);
-            dv.set_uniform(c, id!(truth_inv), &[1.0 / ATLAS_W as f32, 1.0 / self.rows as f32]);
-            dv.set_uniform(c, id!(index_inv), &[1.0 / INDEX_W as f32, 1.0 / index_rows as f32]);
-            dv.set_uniform(c, id!(vol_min), &vol.min.map(|v| v as f32));
-            dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
-            dv.set_uniform(c, id!(band), &[vol.band]);
-        }
-        for &i in &copies {
-            let Brick::Baked { slot, .. } = vol.bricks[i] else { continue };
-            let b = vol.brick_of(i);
-            copy.brick = vec4(b[0] as f32, b[1] as f32, b[2] as f32, 0.0);
-            copy.draw_super.draw_abs(cx, copy_rect(slot));
-        }
-        cx.end_pass_sized_turtle();
-        self.copy_list.end(cx);
-        cx.end_pass(&self.copy_pass);
-        self.recorded += batch.len();
-        if !batch.is_empty() || !copies.is_empty() {
-            self.inflight = Some((cx.cx.repaint_id(), batch));
-        }
-        if copying {
-            self.copied = Some(copies);
-        }
-        false
-    }
-
-    /// Writes bricks the CPU twin baked into the truth atlases (inside the bake pass).
-    fn draw_uploads(&mut self, cx: &mut Cx2d, uploads: &[(u32, std::sync::Arc<crate::volume::CpuBrick>)]) {
-        if self.upload.is_none() {
-            self.upload = cx.cx.with_vm(|vm| {
-                let draw_mod = vm.heap().module(id!(draw));
-                let obj = vm.value(draw_mod, id!(SdfUpload)).as_object()?;
-                Some(DrawSdfUpload::script_from_value(vm, obj.into()))
-            });
-        }
-        let Some(upload) = self.upload.as_mut() else { return };
-        let mut data = Vec::with_capacity(uploads.len() * 512 * 4);
-        for (_, c) in uploads {
-            for (d, s) in c.d.iter().zip(&c.slots) {
-                data.extend([*d, *s as f32, 0.0, 0.0]);
-            }
-        }
-        let tex = Texture::new_with_format(cx.cx, TextureFormat::VecRGBAf32 { width: 512, height: uploads.len(), data: Some(data), updated: TextureUpdated::Full });
-        {
-            let c = &*cx.cx;
-            let dv = &mut upload.draw_super.draw_vars;
-            dv.set_texture(0, &tex);
-            dv.set_uniform(c, id!(vals_inv), &[1.0 / 512.0, 1.0 / uploads.len() as f32]);
-        }
-        for (row, (slot, _)) in uploads.iter().enumerate() {
-            upload.row = row as f32;
-            upload.draw_super.draw_abs(cx, slot_rect(*slot));
-        }
-        self.upload_tex = Some(tex);
-    }
-
-    /// The field being baked becomes the one a march binds; its front copy the back one.
-    fn publish(&mut self, copied: BTreeSet<usize>) {
-        let Some(n) = self.next.take() else { return };
-        let old_copy = std::mem::replace(&mut self.copy, n.copy);
-        let old_slots = std::mem::replace(&mut self.copy_slots, n.copy_slots);
-        let old_rows = std::mem::replace(&mut self.copy_rows, n.copy_rows);
-        // a back copy smaller than the front one is made anew (all bricks) when it is next used
-        self.back = (old_rows >= self.copy_rows).then_some((old_copy, old_slots, old_rows));
-        self.carry = copied;
-        self.index_tex = n.index;
-        self.index_rows = n.index_rows;
-        self.prog_tex = n.prog;
-        self.prog_rows = n.prog_rows;
-        self.published += 1;
-    }
-}
-
-/// A slot's texel rect in the render copy.
-pub fn copy_rect(slot: u32) -> Rect {
-    let s = slot as usize;
-    Rect { pos: dvec2(((s % COPY_SLOTS_X) * 81) as f64, ((s / COPY_SLOTS_X) * 9) as f64), size: dvec2(81.0, 9.0) }
-}
-
-/// A slot's texel rect in the atlas.
-pub fn slot_rect(slot: u32) -> Rect {
-    let s = slot as usize;
-    Rect { pos: dvec2(((s % ATLAS_SLOTS_X) * 64) as f64, ((s / ATLAS_SLOTS_X) * 8) as f64), size: dvec2(64.0, 8.0) }
 }

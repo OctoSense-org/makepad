@@ -7,12 +7,13 @@
 //! - [`kernel`]: Splash SDF kernels compiled into the bake shader;
 //! - [`audit`]: a frame's baked bricks read back and compared with the exact fields;
 //! - [`budget`]: GPU safety (measured frame costs, the bake's steering, caps);
-//! - [`bake`]: the GPU bake into persistent R32F/R8 atlases by draw passes;
+//! - [`bake`]: the GPU bake into persistent R16F/R8 storage atlases by compute;
 //! - [`march`]: the coarse pass, the march (depth + G-buffer) and the shade;
 //! - [`pick`]: one ray against the exact field, naming the feature hit;
 //! - [`splat`]: the splat look (surface splats from the bricks).
 //!
-//! No GPU compute: every GPU step is a draw pass into a render target.
+//! Buffer-backed compute shaders are available in [`compute`]; frame dispatch
+//! remains with the host integration.
 
 pub use makepad_csg_sdf;
 pub use makepad_draw;
@@ -20,19 +21,22 @@ pub use makepad_draw;
 pub mod audit;
 pub mod bake;
 pub mod budget;
+pub mod compute;
 pub mod kernel;
 pub mod march;
+pub mod mesh;
 pub mod pick;
 pub mod program;
 pub mod splat;
 pub mod twin;
+pub mod trace;
 pub mod volume;
 
 use makepad_draw::*;
 
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
-    crate::bake::script_mod(vm);
-    crate::audit::script_mod(vm);
+    crate::compute::script_mod(vm);
+    crate::trace::script_mod(vm);
     // the environment lookups the shade lights with, as the model lanes do
     makepad_render_material::builtin::register(vm);
     crate::march::script_mod(vm);
