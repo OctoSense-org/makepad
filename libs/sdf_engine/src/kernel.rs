@@ -75,6 +75,8 @@ pub struct KernelSlot {
     pub key: u64,
     field: Arc<dyn Sdf3 + Send + Sync>,
     splash: Option<Arc<SdfSplashExpr>>,
+    /// A mesh's field (an import), queried in f32 a brick's samples at a time.
+    mesh: Option<Arc<makepad_csg_sdf::mesh_field::MeshField>>,
     /// The GPU route; `None`: its bricks bake on the CPU twin.
     pub gpu: Option<Arc<KernelAir>>,
 }
@@ -92,7 +94,17 @@ impl KernelSlot {
                 None
             }
         });
-        KernelSlot { key: structure_key(k), field: k.field.clone(), splash: k.splash.clone(), gpu }
+        KernelSlot { key: structure_key(k), field: k.field.clone(), splash: k.splash.clone(), mesh: None, gpu }
+    }
+
+    /// A mesh's distance field (an imported model): no GPU route, its bricks bake on the CPU twin.
+    pub fn mesh(m: &Arc<makepad_csg_sdf::mesh_field::MeshField>) -> KernelSlot {
+        KernelSlot { key: m.key(), field: m.clone(), splash: None, mesh: Some(m.clone()), gpu: None }
+    }
+
+    /// A mesh's slot (no program).
+    pub fn is_mesh(&self) -> bool {
+        self.mesh.is_some()
     }
 
     /// Whether `k` runs this slot's program.
@@ -109,7 +121,10 @@ impl KernelSlot {
                 s.distance_batch_with(params, &xyz, &mut out);
                 out
             }
-            None => ps.iter().map(|p| self.distance(params, *p)).collect(),
+            None => match &self.mesh {
+                Some(m) => m.signed_many(ps),
+                None => ps.iter().map(|p| self.distance(params, *p)).collect(),
+            },
         }
     }
 
@@ -129,10 +144,22 @@ impl KernelSlot {
 /// Whether `n` calls any kernel.
 pub fn has_kernel(n: &SdfNode) -> bool {
     match n {
-        SdfNode::Kernel(_) => true,
+        SdfNode::Kernel(_) | SdfNode::Mesh(_) => true,
         SdfNode::Combine { of, .. } => of.iter().any(has_kernel),
-        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } => has_kernel(of),
+        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => has_kernel(of),
         SdfNode::Material { within, of, .. } => within.as_deref().is_some_and(has_kernel) || has_kernel(of),
+        _ => false,
+    }
+}
+
+/// Whether `n` holds a primitive whose field is no true distance (the ellipsoid's estimate,
+/// the gyroid's): steeper than 1 in places, so a volume measures it ([`crate::volume`]).
+pub fn has_estimate(n: &SdfNode) -> bool {
+    match n {
+        SdfNode::Ellipsoid { .. } | SdfNode::Gyroid { .. } => true,
+        SdfNode::Combine { of, .. } => of.iter().any(has_estimate),
+        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => has_estimate(of),
+        SdfNode::Material { within, of, .. } => within.as_deref().is_some_and(has_estimate) || has_estimate(of),
         _ => false,
     }
 }
@@ -146,8 +173,13 @@ pub fn collect(n: &SdfNode, slots: &mut Vec<KernelSlot>) {
                 slots.push(KernelSlot::new(k));
             }
         }
+        SdfNode::Mesh(m) => {
+            if !slots.iter().any(|s| s.splash.is_none() && s.key == m.key()) {
+                slots.push(KernelSlot::mesh(m));
+            }
+        }
         SdfNode::Combine { of, .. } => of.iter().for_each(|c| collect(c, slots)),
-        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } => collect(of, slots),
+        SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => collect(of, slots),
         SdfNode::Material { within, of, .. } => {
             if let Some(w) = within {
                 collect(w, slots);

@@ -71,8 +71,7 @@ pub mod prim {
 /// Why a shape could not be lowered.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LowerError {
-    /// A compiled Splash kernel or a mesh field: baked on the CPU (not yet in
-    /// the GPU program).
+    /// A kernel or mesh the volume's kernel table lacks.
     Unsupported(&'static str),
 }
 
@@ -95,6 +94,16 @@ pub const MAX_VALUE_DEPTH: usize = 16;
 pub const MAX_POINT_DEPTH: usize = 8;
 
 impl Program {
+    /// The program with its result multiplied by `s` (a field's Lipschitz scale, at the root:
+    /// the values its nodes combine are untouched).
+    pub fn scaled(mut self, s: f32) -> Program {
+        if s != 1.0 {
+            self.texels.push([op::SCALE, s, 0.0, 0.0]);
+            self.texels[0][0] = self.texels.len() as f32;
+        }
+        self
+    }
+
     /// Whether the GPU interpreter can run it.
     pub fn fits_gpu(&self) -> bool {
         self.value_depth <= MAX_VALUE_DEPTH && self.point_depth <= MAX_POINT_DEPTH && self.gpu_kernels
@@ -241,6 +250,14 @@ impl Lower<'_> {
             SdfNode::Bone { of, .. } | SdfNode::Id { of, .. } => self.node(of)?,
             // thousands of tube loops (chains, chainmail): no program form; the part draws as its mesh
             SdfNode::Links(_) => return Err(LowerError::Unsupported("links (a chain or chainmail)")),
+            // the capsules of its strokes (a brick's program holds only the ones near it)
+            SdfNode::Sculpt { strokes, of } => {
+                let all = ([f64::NEG_INFINITY; 3], [f64::INFINITY; 3]);
+                match makepad_csg_sdf::bounds::sculpt_in(strokes, of, &all) {
+                    Some(n) => self.node(&n)?,
+                    None => return Err(LowerError::Unsupported("a sculpt with nothing left of its solid")),
+                }
+            }
             SdfNode::Deform { deform, lipschitz, of } => {
                 let (kind, rate, axis) = match *deform {
                     SdfDeform::Twist { rate } => (0.0, rate, 0),
@@ -273,7 +290,18 @@ impl Lower<'_> {
                     self.out.push([op::SCALE, self.kernel_scale, 0.0, 0.0]);
                 }
             }
-            SdfNode::Mesh(_) => return Err(LowerError::Unsupported("a mesh field")),
+            // A mesh is a kernel slot without parameters or a GPU route: it bakes on the CPU twin.
+            SdfNode::Mesh(m) => {
+                let Some(slot) = self.kernels.iter().position(|s| s.gpu.is_none() && s.key == m.key() && s.is_mesh()) else {
+                    return Err(LowerError::Unsupported("a mesh missing from the volume's kernel table"));
+                };
+                self.out.push([op::KERNEL, slot as f32, 0.0, 0.0]);
+                self.gpu_kernels = false;
+                self.push_value();
+                if self.kernel_scale != 1.0 {
+                    self.out.push([op::SCALE, self.kernel_scale, 0.0, 0.0]);
+                }
+            }
         }
         Ok(())
     }

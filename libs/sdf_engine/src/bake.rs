@@ -12,6 +12,17 @@
 //! program data, so running it again (every pipeline that becomes ready
 //! repaints all passes) writes the same texels.
 //!
+//! A frame's march reads one field whole. It reads the render copy, the index
+//! and the programs, never the truth atlas, so the truth may be baked over as
+//! many frames as it takes while the march goes on drawing what was published.
+//! The render copy is two textures: the march reads the front one, the copy
+//! pass writes the back one (the bricks this field changed and the ones the
+//! back one missed last time). Once the GPU has painted the last truth batch
+//! and those copies whole, the back one, the new index and the new programs
+//! become what the march binds ([`Baker::draw`] says so, the frame it happens),
+//! and the host draws the volume it published. A recording left unpainted, or
+//! painted with draws left out, is painted again before anything is shown.
+//!
 //! SHADER LAW: unary minus has the lowest precedence in the script shader
 //! parser; write `(0.0 - a) - b`, never `-a - b`.
 
@@ -322,6 +333,27 @@ script_mod! {
         }
     }
 
+    // A brick the CPU twin baked: its texels from the upload texture (one row of 512 per
+    // brick, the distance and the slot), written where the bake would write them.
+    mod.draw.SdfUpload = mod.std.set_type_default() do #(DrawSdfUpload::script_shader(vm)){
+        ..mod.draw.DrawQuad,
+        alpha_blend: false
+        precise_math: true
+        color_format: @Rf32
+        fb1: fragment_output(1, vec4f)
+        vals: texture_2d(float)
+        vals_inv: uniform(vec2(1.0, 1.0))
+
+        fragment: fn() {
+            let pix = floor(self.world.xy)
+            let lx = pix.x - self.rect_pos.x
+            let ly = pix.y - self.rect_pos.y
+            let v = self.vals.sample_nearest((vec2(ly * 64.0 + lx, self.row) + vec2(0.5, 0.5)) * self.vals_inv)
+            self.fb0 = vec4(v.x, 0.0, 0.0, 1.0)
+            self.fb1 = vec4(v.y / 255.0, 0.0, 0.0, 1.0)
+        }
+    }
+
     // The render copy: a brick's 9^3 samples (its own 8^3 and the first of
     // the next brick on each axis, the apron) into the R16F copy atlas (9 z
     // slices of 9 x 9), with the slots into the R8 copy; bilinear filtering
@@ -405,6 +437,16 @@ pub struct DrawSdfCopy {
 
 #[derive(Script, ScriptHook)]
 #[repr(C)]
+pub struct DrawSdfUpload {
+    #[deref]
+    pub draw_super: DrawQuad,
+    /// The brick's row in the upload texture.
+    #[live]
+    pub row: f32,
+}
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
 pub struct DrawSdfBake {
     #[deref]
     pub draw_super: DrawQuad,
@@ -419,15 +461,24 @@ pub struct Baker {
     list: DrawList,
     copy_pass: DrawPass,
     copy_list: DrawList,
-    /// The render copy: R16F distances and R8 slots with the apron, `COPY_W`
-    /// wide, `copy_rows` high.
+    /// The published field (what a march binds). The render copy: R16F
+    /// distances and R8 slots with the apron, `COPY_W` wide, `copy_rows` high.
     pub copy: Texture,
     pub copy_slots: Texture,
     pub copy_rows: usize,
     index_tex: Texture,
     index_rows: usize,
-    /// Baked bricks whose render copy must be redone.
+    /// The field being baked, published when its truth and copies are painted.
+    next: Option<NextField>,
+    /// The other render copy (what `next` writes), once there is one.
+    back: Option<(Texture, Texture, usize)>,
+    /// Baked bricks whose render copy must be redone at the next publish.
     copy_queue: BTreeSet<usize>,
+    /// The bricks the last publish copied into the front copy: the back one lacks them.
+    carry: BTreeSet<usize>,
+    /// The copies of `next` are recorded (their bricks, for `carry`): it is published once
+    /// they are painted whole.
+    copied: Option<BTreeSet<usize>>,
     /// Truth (R32F) and slots (R8), `ATLAS_W` wide, `rows` high.
     pub atlas: Texture,
     pub slots: Texture,
@@ -450,14 +501,34 @@ pub struct Baker {
     /// it, so a frame's march reads that frame's bricks. `None`: under the
     /// pass being drawn.
     pub parent: Option<DrawPassId>,
-    /// The bake variant with the volume's kernels compiled in.
+    /// The shaders with the published volume's kernels compiled in, and the ones of the
+    /// volume being baked when those differ (they take over when it is published).
     kernels: Option<crate::kernel::KernelBake>,
+    next_kernels: Option<Option<crate::kernel::KernelBake>>,
     /// The caps a frame's bake keeps (kernel work per frame).
     pub limits: crate::budget::Budget,
     /// The costliest GPU kernel's worst-case ops per sample (0: none).
     kernel_cost: u64,
     /// Bricks recorded since the host last took the count ([`Baker::take_recorded`]).
     recorded: usize,
+    /// Volumes published.
+    published: u64,
+    /// The upload of CPU-baked bricks (made at the first such brick) and the texture its
+    /// recording reads (kept while that recording may be painted again).
+    upload: Option<DrawSdfUpload>,
+    upload_tex: Option<Texture>,
+}
+
+/// The textures a march binds of a field not published yet (each is the published one until
+/// the new volume needs its own).
+struct NextField {
+    copy: Texture,
+    copy_slots: Texture,
+    copy_rows: usize,
+    index: Texture,
+    index_rows: usize,
+    prog: Texture,
+    prog_rows: usize,
 }
 
 impl Baker {
@@ -473,7 +544,11 @@ impl Baker {
             copy_rows: 9,
             index_tex: Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: INDEX_W, height: 1, data: Some(vec![0.0; INDEX_W * 4]), updated: TextureUpdated::Full }),
             index_rows: 1,
+            next: None,
+            back: None,
             copy_queue: BTreeSet::new(),
+            carry: BTreeSet::new(),
+            copied: None,
             atlas: Texture::new_with_format(cx, TextureFormat::RenderRf32 { size: TextureSize::Fixed { width: ATLAS_W, height: rows }, initial: true }),
             slots: Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: ATLAS_W, height: rows }, initial: true }),
             rows,
@@ -487,9 +562,13 @@ impl Baker {
             recorded_empty: false,
             parent: None,
             kernels: None,
+            next_kernels: None,
             limits: crate::budget::Budget::for_platform(),
             kernel_cost: 0,
             recorded: 0,
+            published: 0,
+            upload: None,
+            upload_tex: None,
         }
     }
 
@@ -497,16 +576,43 @@ impl Baker {
     /// atlases (and re-queues every baked brick) when its slots outgrow them.
     pub fn sync(&mut self, cx: &mut Cx, vol: &mut Volume) {
         // the volume's kernels: a variant of the bake shader that runs them
-        // (a new program compiles while the bricks already baked keep drawing)
-        if self.kernels.as_ref().is_some_and(|k| !k.serves(&vol.kernels)) {
-            if let Some(k) = self.kernels.take() {
+        // (a new program compiles while the published field keeps drawing)
+        let served = match self.next_kernels.as_ref().map_or(self.kernels.as_ref(), |k| k.as_ref()) {
+            Some(k) => k.serves(&vol.kernels),
+            None => vol.kernels.is_empty(),
+        };
+        if !served {
+            if let Some(Some(k)) = self.next_kernels.take() {
                 k.release(cx);
             }
-        }
-        if self.kernels.is_none() && !vol.kernels.is_empty() {
-            self.kernels = crate::kernel::KernelBake::new(cx, &vol.kernels);
+            self.next_kernels = Some(crate::kernel::KernelBake::new(cx, &vol.kernels));
         }
         self.kernel_cost = vol.kernels.iter().filter_map(|k| k.gpu.as_ref().map(|g| g.cost)).max().unwrap_or(0);
+        // the copies a new field writes: the back copy, made when there is none yet; the
+        // bricks the back copy lacks come along (a new texture lacks all of them)
+        let mut next = match self.next.take() {
+            Some(n) => n,
+            None => {
+                let (copy, copy_slots, copy_rows) = match self.back.take() {
+                    Some(b) => {
+                        let carry = std::mem::take(&mut self.carry);
+                        self.copy_queue.extend(carry.into_iter().filter(|i| *i < vol.bricks.len()));
+                        b
+                    }
+                    None => {
+                        self.carry.clear();
+                        self.copy_queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })));
+                        let rows = self.copy_rows;
+                        (
+                            Texture::new_with_format(cx, TextureFormat::RenderRf16 { size: TextureSize::Fixed { width: COPY_W, height: rows }, initial: true }),
+                            Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: COPY_W, height: rows }, initial: true }),
+                            rows,
+                        )
+                    }
+                };
+                NextField { copy, copy_slots, copy_rows, index: self.index_tex.clone(), index_rows: self.index_rows, prog: self.prog_tex.clone(), prog_rows: self.prog_rows }
+            }
+        };
         // programs: one texture, rebuilt when the volume has new ones
         if self.prog_at.len() != vol.programs.len() {
             let mut data: Vec<f32> = Vec::new();
@@ -517,8 +623,8 @@ impl Baker {
             }
             let rows = (data.len() / 4).div_ceil(PROG_W).max(1);
             data.resize(rows * PROG_W * 4, 0.0);
-            self.prog_rows = rows;
-            self.prog_tex = Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: PROG_W, height: rows, data: Some(data), updated: TextureUpdated::Full });
+            next.prog_rows = rows;
+            next.prog = Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: PROG_W, height: rows, data: Some(data), updated: TextureUpdated::Full });
         }
         let need_rows = (vol.slot_count as usize).div_ceil(ATLAS_SLOTS_X).max(1) * BS as usize;
         if need_rows > self.rows {
@@ -529,16 +635,19 @@ impl Baker {
             self.queue.clear();
             self.inflight = None;
             self.recorded_empty = false;
-            self.queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. }) && !vol.cpu_only.contains(i)));
+            self.queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })));
             vol.dirty.clear();
         }
+        // a brick edited again before it baked bakes once, from the newest program
         self.queue.append(&mut vol.dirty);
+        self.queue.sort_unstable();
+        self.queue.dedup();
         let need_copy = (vol.slot_count as usize).div_ceil(COPY_SLOTS_X).max(1) * 9;
-        if need_copy > self.copy_rows {
-            self.copy_rows = need_copy.next_power_of_two();
+        if need_copy > next.copy_rows {
+            next.copy_rows = need_copy.next_power_of_two();
             self.recorded_empty = false;
-            self.copy = Texture::new_with_format(cx, TextureFormat::RenderRf16 { size: TextureSize::Fixed { width: COPY_W, height: self.copy_rows }, initial: true });
-            self.copy_slots = Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: COPY_W, height: self.copy_rows }, initial: true });
+            next.copy = Texture::new_with_format(cx, TextureFormat::RenderRf16 { size: TextureSize::Fixed { width: COPY_W, height: next.copy_rows }, initial: true });
+            next.copy_slots = Texture::new_with_format(cx, TextureFormat::RenderRu8 { size: TextureSize::Fixed { width: COPY_W, height: next.copy_rows }, initial: true });
             self.copy_queue.extend((0..vol.bricks.len()).filter(|i| matches!(vol.bricks[*i], Brick::Baked { .. })));
         }
         // the neighbours of everything re-classified re-copy their aprons
@@ -558,12 +667,16 @@ impl Baker {
         let mut data: Vec<f32> = texels.into_iter().flatten().collect();
         let rows = (data.len() / 4).div_ceil(INDEX_W).max(1);
         data.resize(rows * INDEX_W * 4, 0.0);
-        self.index_rows = rows;
-        self.index_tex = Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: INDEX_W, height: rows, data: Some(data), updated: TextureUpdated::Full });
+        next.index_rows = rows;
+        next.index = Texture::new_with_format(cx, TextureFormat::VecRGBAf32 { width: INDEX_W, height: rows, data: Some(data), updated: TextureUpdated::Full });
+        self.recorded_empty = false;
+        self.next = Some(next);
     }
 
-    /// Forgets the queue and the uploaded programs (a new volume into the same atlases).
+    /// Forgets the queue and the uploaded programs (a new volume into the same atlases). The
+    /// next [`Baker::sync`] copies all of its bricks. Not while [`Baker::publishing`].
     pub fn reset(&mut self) {
+        debug_assert!(self.next.is_none(), "a reset while a field is being published");
         self.queue.clear();
         self.copy_queue.clear();
         self.inflight = None;
@@ -584,9 +697,25 @@ impl Baker {
         self.index_rows
     }
 
-    /// Whether everything queued has been baked.
+    /// Volumes published so far.
+    pub fn published(&self) -> u64 {
+        self.published
+    }
+
+    /// Bricks still to bake, to copy, and in the batch in flight.
+    pub fn queued(&self) -> (usize, usize, usize) {
+        (self.queue.len(), self.copy_queue.len(), self.inflight.as_ref().map_or(0, |(_, b)| b.len()))
+    }
+
+    /// A field taken by [`Baker::sync`] is still being baked or its copies painted (the march
+    /// draws the one before); the host gives the baker no other volume meanwhile.
+    pub fn publishing(&self) -> bool {
+        self.next.is_some()
+    }
+
+    /// Whether everything queued has been baked and published.
     pub fn idle(&self) -> bool {
-        self.queue.is_empty() && self.copy_queue.is_empty() && self.inflight.is_none()
+        self.queue.is_empty() && self.copy_queue.is_empty() && self.inflight.is_none() && self.next.is_none()
     }
 
     /// The passes for this frame: wait on the batch in flight, else record
@@ -600,14 +729,29 @@ impl Baker {
         }
     }
 
-    pub fn draw(&mut self, cx: &mut Cx2d, vol: &Volume, bake: &mut DrawSdfBake, copy: &mut DrawSdfCopy) {
-        match self.kernels.take() {
-            Some(mut k) => {
-                self.draw_with(cx, vol, &mut k.draw, copy);
-                self.kernels = Some(k);
-            }
+    /// This frame's bake of `vol`, the newest volume [`Baker::sync`] took. True: `vol` is
+    /// published, this frame's march is to draw it (with its textures, which this baker now
+    /// binds); until then it draws the volume published before.
+    pub fn draw(&mut self, cx: &mut Cx2d, vol: &Volume, bake: &mut DrawSdfBake, copy: &mut DrawSdfCopy) -> bool {
+        let pending = self.next_kernels.is_some();
+        let mut k = match pending {
+            true => self.next_kernels.take().flatten(),
+            false => self.kernels.take(),
+        };
+        let published = match k.as_mut() {
+            Some(k) => self.draw_with(cx, vol, &mut k.draw, copy),
             None => self.draw_with(cx, vol, bake, copy),
+        };
+        match (pending, published) {
+            (false, _) => self.kernels = k,
+            (true, false) => self.next_kernels = Some(k),
+            (true, true) => {
+                if let Some(old) = std::mem::replace(&mut self.kernels, k) {
+                    old.release(cx.cx);
+                }
+            }
         }
+        published
     }
 
     /// The march to draw this baker's volume with: `base`, or its variant
@@ -633,7 +777,10 @@ impl Baker {
         let copy = COPY_W as u64 * self.copy_rows as u64 * 3;
         let index = INDEX_W as u64 * self.index_rows as u64 * 16;
         let prog = PROG_W as u64 * self.prog_rows as u64 * 16;
-        atlas + copy + index + prog
+        // what a field not published yet holds on top of the published one's
+        let next = self.next.as_ref().map_or(0, |n| COPY_W as u64 * n.copy_rows as u64 * 3 + INDEX_W as u64 * n.index_rows as u64 * 16 + PROG_W as u64 * n.prog_rows as u64 * 16);
+        let back = self.back.as_ref().map_or(0, |b| COPY_W as u64 * b.2 as u64 * 3);
+        atlas + copy + index + prog + next + back
     }
 
     /// Releases the kernel variant's shader hook (the baker is going away).
@@ -641,26 +788,36 @@ impl Baker {
         if let Some(k) = self.kernels.take() {
             k.release(cx);
         }
+        if let Some(Some(k)) = self.next_kernels.take() {
+            k.release(cx);
+        }
     }
 
-    fn draw_with(&mut self, cx: &mut Cx2d, vol: &Volume, bake: &mut DrawSdfBake, copy: &mut DrawSdfCopy) {
+    fn draw_with(&mut self, cx: &mut Cx2d, vol: &Volume, bake: &mut DrawSdfBake, copy: &mut DrawSdfCopy) -> bool {
         let copy_id = self.copy_pass.draw_pass_id();
         if let Some((serial, batch)) = &self.inflight {
             self.attach(cx);
             self.pass.set_pass_parent(cx.cx, copy_id);
             if !(self.pass.painted_whole_since(cx.cx, *serial) && self.copy_pass.painted_whole_since(cx.cx, *serial)) {
-                return;
+                return false;
             }
             self.baked += batch.len();
             self.inflight = None;
         }
+        // the field's copies are painted whole: it is what the march binds from this frame
+        if let Some(copied) = self.copied.take() {
+            self.publish(copied);
+            return true;
+        }
         // the steered budget, within the kernel work a frame may run
         let n = self.queue.len().min(self.budget).min(self.limits.bricks_for_kernels(self.kernel_cost));
         let batch: Vec<usize> = self.queue.drain(..n).collect();
-        let mut copies: BTreeSet<usize> = std::mem::take(&mut self.copy_queue);
         for &i in &batch {
-            copies.extend(vol.around(i));
+            self.copy_queue.extend(vol.around(i));
         }
+        // The truth is complete with this batch: its copies go into the back copy with it.
+        let copying = self.queue.is_empty() && self.next.is_some();
+        let mut copies = if copying { std::mem::take(&mut self.copy_queue) } else { BTreeSet::new() };
         copies.retain(|i| matches!(vol.bricks[*i], Brick::Baked { .. }));
         // Nothing to do: the passes keep their last recording, which is empty
         // (recorded once after the last batch), so repaints write nothing and
@@ -668,9 +825,23 @@ impl Baker {
         if batch.is_empty() && copies.is_empty() && self.recorded_empty {
             self.attach(cx);
             self.pass.set_pass_parent(cx.cx, copy_id);
-            return;
+            if copying {
+                // nothing changed that the back copy lacks
+                self.publish(copies);
+                return true;
+            }
+            return false;
         }
         self.recorded_empty = batch.is_empty() && copies.is_empty();
+        // what this frame's passes read and write: the field being baked, into the back copy
+        let (prog, prog_rows, index, index_rows) = match &self.next {
+            Some(n) => (n.prog.clone(), n.prog_rows, n.index.clone(), n.index_rows),
+            None => (self.prog_tex.clone(), self.prog_rows, self.index_tex.clone(), self.index_rows),
+        };
+        let (copy_tex, copy_slots, copy_rows) = match &self.next {
+            Some(n) => (n.copy.clone(), n.copy_slots.clone(), n.copy_rows),
+            None => (self.copy.clone(), self.copy_slots.clone(), self.copy_rows),
+        };
 
         // the bake
         let size = dvec2(ATLAS_W as f64, self.rows as f64);
@@ -688,27 +859,35 @@ impl Baker {
         {
             let c = &*cx.cx;
             let dv = &mut bake.draw_super.draw_vars;
-            dv.set_texture(0, &self.prog_tex);
-            dv.set_uniform(c, id!(prog_inv), &[1.0 / PROG_W as f32, 1.0 / self.prog_rows as f32]);
+            dv.set_texture(0, &prog);
+            dv.set_uniform(c, id!(prog_inv), &[1.0 / PROG_W as f32, 1.0 / prog_rows as f32]);
             dv.set_uniform(c, id!(cell), &[vol.cell]);
             dv.set_uniform(c, id!(band), &[vol.band]);
         }
+        let mut uploads = Vec::new();
         for &i in &batch {
             let Brick::Baked { slot, program } = vol.bricks[i] else { continue };
+            if let Some(c) = vol.cpu.get(&i) {
+                uploads.push((slot, c.clone()));
+                continue;
+            }
             let b = vol.brick_of(i);
             bake.brick = vec4(b[0] as f32, b[1] as f32, b[2] as f32, self.prog_at[program as usize] as f32);
             bake.draw_super.draw_abs(cx, slot_rect(slot));
+        }
+        if !uploads.is_empty() {
+            self.draw_uploads(cx, &uploads);
         }
         cx.end_pass_sized_turtle();
         self.list.end(cx);
         cx.end_pass(&self.pass);
 
         // the render copy (samples the truth atlases the bake just wrote)
-        let size = dvec2(COPY_W as f64, self.copy_rows as f64);
+        let size = dvec2(COPY_W as f64, copy_rows as f64);
         self.copy_pass.set_size(cx, size);
         self.copy_pass.clear_color_textures(cx.cx);
-        self.copy_pass.set_color_texture(cx, &self.copy, DrawPassClearColor::InitWith(vec4(vol.band, 0.0, 0.0, 1.0)));
-        self.copy_pass.add_color_texture(cx, &self.copy_slots, DrawPassClearColor::InitWith(vec4(0.0, 0.0, 0.0, 0.0)));
+        self.copy_pass.set_color_texture(cx, &copy_tex, DrawPassClearColor::InitWith(vec4(vol.band, 0.0, 0.0, 1.0)));
+        self.copy_pass.add_color_texture(cx, &copy_slots, DrawPassClearColor::InitWith(vec4(0.0, 0.0, 0.0, 0.0)));
         self.copy_pass.clear_depth_texture(cx.cx);
         self.attach(cx);
         cx.begin_pass(&self.copy_pass, Some(1.0));
@@ -721,9 +900,9 @@ impl Baker {
             let dv = &mut copy.draw_super.draw_vars;
             dv.set_texture(0, &self.atlas);
             dv.set_texture(1, &self.slots);
-            dv.set_texture(2, &self.index_tex);
+            dv.set_texture(2, &index);
             dv.set_uniform(c, id!(truth_inv), &[1.0 / ATLAS_W as f32, 1.0 / self.rows as f32]);
-            dv.set_uniform(c, id!(index_inv), &[1.0 / INDEX_W as f32, 1.0 / self.index_rows as f32]);
+            dv.set_uniform(c, id!(index_inv), &[1.0 / INDEX_W as f32, 1.0 / index_rows as f32]);
             dv.set_uniform(c, id!(vol_min), &vol.min.map(|v| v as f32));
             dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
             dv.set_uniform(c, id!(band), &[vol.band]);
@@ -741,6 +920,56 @@ impl Baker {
         if !batch.is_empty() || !copies.is_empty() {
             self.inflight = Some((cx.cx.repaint_id(), batch));
         }
+        if copying {
+            self.copied = Some(copies);
+        }
+        false
+    }
+
+    /// Writes bricks the CPU twin baked into the truth atlases (inside the bake pass).
+    fn draw_uploads(&mut self, cx: &mut Cx2d, uploads: &[(u32, std::sync::Arc<crate::volume::CpuBrick>)]) {
+        if self.upload.is_none() {
+            self.upload = cx.cx.with_vm(|vm| {
+                let draw_mod = vm.heap().module(id!(draw));
+                let obj = vm.value(draw_mod, id!(SdfUpload)).as_object()?;
+                Some(DrawSdfUpload::script_from_value(vm, obj.into()))
+            });
+        }
+        let Some(upload) = self.upload.as_mut() else { return };
+        let mut data = Vec::with_capacity(uploads.len() * 512 * 4);
+        for (_, c) in uploads {
+            for (d, s) in c.d.iter().zip(&c.slots) {
+                data.extend([*d, *s as f32, 0.0, 0.0]);
+            }
+        }
+        let tex = Texture::new_with_format(cx.cx, TextureFormat::VecRGBAf32 { width: 512, height: uploads.len(), data: Some(data), updated: TextureUpdated::Full });
+        {
+            let c = &*cx.cx;
+            let dv = &mut upload.draw_super.draw_vars;
+            dv.set_texture(0, &tex);
+            dv.set_uniform(c, id!(vals_inv), &[1.0 / 512.0, 1.0 / uploads.len() as f32]);
+        }
+        for (row, (slot, _)) in uploads.iter().enumerate() {
+            upload.row = row as f32;
+            upload.draw_super.draw_abs(cx, slot_rect(*slot));
+        }
+        self.upload_tex = Some(tex);
+    }
+
+    /// The field being baked becomes the one a march binds; its front copy the back one.
+    fn publish(&mut self, copied: BTreeSet<usize>) {
+        let Some(n) = self.next.take() else { return };
+        let old_copy = std::mem::replace(&mut self.copy, n.copy);
+        let old_slots = std::mem::replace(&mut self.copy_slots, n.copy_slots);
+        let old_rows = std::mem::replace(&mut self.copy_rows, n.copy_rows);
+        // a back copy smaller than the front one is made anew (all bricks) when it is next used
+        self.back = (old_rows >= self.copy_rows).then_some((old_copy, old_slots, old_rows));
+        self.carry = copied;
+        self.index_tex = n.index;
+        self.index_rows = n.index_rows;
+        self.prog_tex = n.prog;
+        self.prog_rows = n.prog_rows;
+        self.published += 1;
     }
 }
 

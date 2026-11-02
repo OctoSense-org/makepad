@@ -20,7 +20,7 @@
 use crate::kernel::KernelSlot;
 use crate::program::{lower_with, LowerError, Program};
 use crate::twin;
-use makepad_csg_math::thread_pool::parallel_map;
+use makepad_csg_math::thread_pool::{parallel_for, parallel_map, thread_count};
 use makepad_csg_sdf::{changed, cull, node_bounds, Bounds, SdfNode};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -60,15 +60,20 @@ pub struct Volume {
     /// Multiplies its kernels' distances: 1 / the steepest gradient the
     /// build measured near their surface (a kernel need not be a true
     /// distance; this keeps the field 1-Lipschitz for the brick tests and
-    /// the march). Only grows while the volume lives.
+    /// the march). Only shrinks while the volume lives.
     pub kernel_scale: f32,
+    /// Multiplies the whole field, at its root, when a primitive in it is an estimate (the
+    /// ellipsoid's): 1 / the steepest gradient measured near the surface. At the root, so a
+    /// shell or a blend over it keeps its exact offsets. Only shrinks while the volume lives.
+    pub field_scale: f32,
     program_ids: HashMap<Vec<u32>, u32>,
     free_slots: Vec<u32>,
     pub slot_count: u32,
     /// Bricks whose texels must be (re)baked.
     pub dirty: Vec<usize>,
-    /// Bricks a CPU bake must fill (a program the GPU cannot run).
-    pub cpu_only: Vec<usize>,
+    /// Bricks the CPU twin baked (a program the GPU cannot run: a mesh, a kernel past the GPU
+    /// limits): their texels, which the baker uploads instead of baking.
+    pub cpu: HashMap<usize, Arc<CpuBrick>>,
     /// Bricks a build classified again (baked or not): their neighbours'
     /// render-copy aprons may have changed.
     pub touched: Vec<usize>,
@@ -89,9 +94,31 @@ pub struct BuildStats {
     pub apply_ms: f64,
 }
 
+/// A brick's samples baked on the CPU twin: 64 x 8 slot texels (z slices along x), each a
+/// distance clamped to the band, and their material slots.
+pub struct CpuBrick {
+    pub d: Vec<f32>,
+    pub slots: Vec<u8>,
+}
+
 enum BrickResult {
     Empty { skip: f32 },
-    Bake { program: Program, gpu: bool },
+    /// `cpu`: its samples, when the GPU cannot run its program.
+    Bake { program: Program, cpu: Option<CpuBrick> },
+}
+
+/// The samples of brick `b` (lattice coordinates) of `program`, as the GPU bake lays them out.
+fn bake_cpu(program: &[[f32; 4]], b: [i32; 3], cell: f32, band: f32, kernels: &[KernelSlot]) -> CpuBrick {
+    let mut qs = Vec::with_capacity(512);
+    for y in 0..8 {
+        for tx in 0..64 {
+            let (z, x) = (tx / 8, tx % 8);
+            let g = [b[0] * BS + x, b[1] * BS + y, b[2] * BS + z];
+            qs.push(g.map(|v| v as f32 * cell));
+        }
+    }
+    let vals = twin::eval_many(program, &qs, kernels);
+    CpuBrick { d: vals.iter().map(|(v, _)| v.max(-band).min(band) + 0.0).collect(), slots: vals.iter().map(|(_, s)| *s).collect() }
 }
 
 struct BlockResult {
@@ -105,37 +132,47 @@ fn grow(b: Bounds, r: f64) -> Bounds {
 }
 
 /// The steepest gradient of `root`'s field near its surface inside `bounds`
-/// (a 16^3 grid, forward differences of a cell), with a tenth more for what
-/// the grid missed; within 1..8.
-fn lipschitz(root: &SdfNode, kernels: &[KernelSlot], bounds: Bounds, band: f64, cell: f64) -> f32 {
+/// (`n` samples per axis: a volume's bricks, the resolution its brick tests work
+/// at; forward differences of a cell), with a tenth more for what the samples
+/// missed; within 1..8.
+fn lipschitz(root: &SdfNode, kernels: &[KernelSlot], bounds: Bounds, band: f64, cell: f64, n: [i32; 3]) -> f32 {
     let Ok(p) = lower_with(root, kernels, 1.0) else { return 1.0 };
-    const N: usize = 16;
+    let n = n.map(|v| v.max(1) as usize);
     let h = cell as f32;
-    let mut pts = Vec::with_capacity(N * N * N * 4);
-    for z in 0..N {
-        for y in 0..N {
-            for x in 0..N {
-                let t = [x, y, z].map(|i| (i as f64 + 0.5) / N as f64);
-                let q: [f32; 3] = std::array::from_fn(|k| (bounds.0[k] + (bounds.1[k] - bounds.0[k]) * t[k]) as f32);
-                pts.push(q);
-                pts.push([q[0] + h, q[1], q[2]]);
-                pts.push([q[0], q[1] + h, q[2]]);
-                pts.push([q[0], q[1], q[2] + h]);
+    let texels = Arc::new(p.texels);
+    let kernels = Arc::new(kernels.to_vec());
+    let slices: Vec<_> = (0..n[2]).collect();
+    let l = parallel_map(&slices, move |chunk| {
+        let mut pts = Vec::with_capacity(n[0] * n[1] * chunk.len() * 4);
+        for &z in chunk {
+            for y in 0..n[1] {
+                for x in 0..n[0] {
+                    let i = [x, y, z];
+                    let t: [f64; 3] = std::array::from_fn(|k| (i[k] as f64 + 0.5) / n[k] as f64);
+                    let q: [f32; 3] = std::array::from_fn(|k| (bounds.0[k] + (bounds.1[k] - bounds.0[k]) * t[k]) as f32);
+                    pts.push(q);
+                    pts.push([q[0] + h, q[1], q[2]]);
+                    pts.push([q[0], q[1] + h, q[2]]);
+                    pts.push([q[0], q[1], q[2] + h]);
+                }
             }
         }
-    }
-    let d = twin::eval_many(&p.texels, &pts, kernels);
-    let mut l = 1.0f32;
-    for c in d.chunks(4) {
-        if (c[0].0.abs() as f64) > band * 4.0 + cell {
-            continue;
+        let d = twin::eval_many(&texels, &pts, &kernels);
+        let mut l = 1.0f32;
+        for c in d.chunks(4) {
+            if (c[0].0.abs() as f64) > band * 4.0 + cell {
+                continue;
+            }
+            let g = [c[1].0 - c[0].0, c[2].0 - c[0].0, c[3].0 - c[0].0].map(|v| v / h);
+            let m = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+            if m.is_finite() {
+                l = l.max(m);
+            }
         }
-        let g = [c[1].0 - c[0].0, c[2].0 - c[0].0, c[3].0 - c[0].0].map(|v| v / h);
-        let m = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
-        if m.is_finite() {
-            l = l.max(m);
-        }
-    }
+        vec![l]
+    })
+    .into_iter()
+    .fold(1.0f32, f32::max);
     // a true distance (gradient 1, within the differences' error) stays as it is
     if l <= 1.05 {
         return 1.0;
@@ -161,11 +198,12 @@ impl Volume {
             programs: Vec::new(),
             kernels: Vec::new(),
             kernel_scale: 1.0,
+            field_scale: 1.0,
             program_ids: HashMap::new(),
             free_slots: Vec::new(),
             slot_count: 0,
             dirty: Vec::new(),
-            cpu_only: Vec::new(),
+            cpu: HashMap::new(),
             touched: Vec::new(),
         }
     }
@@ -216,6 +254,7 @@ impl Volume {
         if let Brick::Baked { slot, .. } = self.bricks[i] {
             self.free_slots.push(slot);
         }
+        self.cpu.remove(&i);
     }
 
     /// Classifies and programs every brick of the blocks overlapping `region`
@@ -229,15 +268,18 @@ impl Volume {
         let dim = self.dim;
         crate::kernel::collect(root, &mut self.kernels);
         let mut region = region;
-        if !self.kernels.is_empty() {
+        let estimate = crate::kernel::has_estimate(root);
+        if !self.kernels.is_empty() || estimate {
             let lo: [f64; 3] = std::array::from_fn(|i| (self.min[i] * BS) as f64 * c);
             let hi: [f64; 3] = std::array::from_fn(|i| ((self.min[i] + self.dim[i]) * BS) as f64 * c);
             let t = std::time::Instant::now();
-            let scale = 1.0 / lipschitz(root, &self.kernels, (lo, hi), band, c);
+            let scale = 1.0 / lipschitz(root, &self.kernels, (lo, hi), band, c, self.dim);
             st.scale_ms = t.elapsed().as_secs_f64() * 1e3;
-            if scale < self.kernel_scale {
-                // steeper than before: every brick again, at one scale
-                self.kernel_scale = scale;
+            // steeper than before: every brick again, at one scale (an estimate's field
+            // scales at its root, kernels' at each kernel)
+            let held = if estimate { &mut self.field_scale } else { &mut self.kernel_scale };
+            if scale < *held {
+                *held = scale;
                 region = None;
             }
         }
@@ -266,89 +308,101 @@ impl Volume {
         }
         let t_blocks = std::time::Instant::now();
         let kernel_scale = self.kernel_scale;
+        let field_scale = self.field_scale;
         let kernels = Arc::new(self.kernels.clone());
         let root = Arc::new(root.clone());
-        let results = parallel_map(&blocks, move |chunk| {
-            chunk
-                .iter()
-                .map(|&b0| -> Result<BlockResult, LowerError> {
-                    let bb = (brick_region(b0).0, brick_region([b0[0] + BLOCK - 1, b0[1] + BLOCK - 1, b0[2] + BLOCK - 1]).1);
-                    // the block as a whole: one test at its centre
-                    let rb = half_diag(BLOCK as f64);
-                    let centre: [f64; 3] = std::array::from_fn(|i| 0.5 * (bb.0[i] + bb.1[i]));
-                    // A culled program is exact only up to the cull's margin (band + c)
-                    // around the region: what it dropped can be that near, so a skip
-                    // distance never goes past the margin.
-                    let margin = band + c;
-                    let skip_of = |d: f64, r: f64| if d < 0.0 { -(-d - r).min(margin) } else { (d - r).min(margin) };
-                    let mut block_prog = None;
-                    let block_skip = match cull(&root, &grow(bb, margin)) {
-                        None => Some(margin),
-                        Some(n) => {
-                            let p = lower_with(&n, &kernels, kernel_scale)?;
-                            let (d, _) = twin::eval_with(&p.texels, centre.map(|v| v as f32), &kernels);
-                            let d = d as f64;
-                            block_prog = Some(p);
-                            (d.abs() > rb + band).then(|| skip_of(d, rb))
-                        }
-                    };
-                    // A block whose program calls kernels: its bricks' centre
-                    // tests in one batch on the block's program (exact over the
-                    // block, so over each brick), one kernel call per op.
-                    let batched: Option<Vec<f32>> = match (&block_prog, block_skip) {
-                        (Some(p), None) if p.texels.iter().any(|t| t[0] == crate::program::op::KERNEL) => {
-                            let mut ctrs = Vec::with_capacity((BLOCK * BLOCK * BLOCK) as usize);
+        // Small tasks let workers take more blocks as they finish.
+        let chunk_size = (blocks.len() / (thread_count() * 4)).max(1);
+        let tasks: Vec<_> = blocks
+            .chunks(chunk_size)
+            .map(|chunk| {
+                let chunk = chunk.to_vec();
+                let kernels = kernels.clone();
+                let root = root.clone();
+                move || {
+                    chunk
+                        .iter()
+                        .map(|&b0| -> Result<BlockResult, LowerError> {
+                            let bb = (brick_region(b0).0, brick_region([b0[0] + BLOCK - 1, b0[1] + BLOCK - 1, b0[2] + BLOCK - 1]).1);
+                            // the block as a whole: one test at its centre
+                            let rb = half_diag(BLOCK as f64);
+                            let centre: [f64; 3] = std::array::from_fn(|i| 0.5 * (bb.0[i] + bb.1[i]));
+                            // A culled program is exact only up to the cull's margin (band + c)
+                            // around the region: what it dropped can be that near, so a skip
+                            // distance never goes past the margin.
+                            let margin = band + c;
+                            let skip_of = |d: f64, r: f64| if d < 0.0 { -(-d - r).min(margin) } else { (d - r).min(margin) };
+                            let mut block_prog = None;
+                            let block_skip = match cull(&root, &grow(bb, margin)) {
+                                None => Some(margin),
+                                Some(n) => {
+                                    let p = lower_with(&n, &kernels, kernel_scale)?.scaled(field_scale);
+                                    let (d, _) = twin::eval_with(&p.texels, centre.map(|v| v as f32), &kernels);
+                                    let d = d as f64;
+                                    block_prog = Some(p);
+                                    (d.abs() > rb + band).then(|| skip_of(d, rb))
+                                }
+                            };
+                            // A block whose program calls kernels: its bricks' centre
+                            // tests in one batch on the block's program (exact over the
+                            // block, so over each brick), one kernel call per op.
+                            let batched: Option<Vec<f32>> = match (&block_prog, block_skip) {
+                                (Some(p), None) if p.texels.iter().any(|t| t[0] == crate::program::op::KERNEL) => {
+                                    let mut ctrs = Vec::with_capacity((BLOCK * BLOCK * BLOCK) as usize);
+                                    for z in 0..BLOCK {
+                                        for y in 0..BLOCK {
+                                            for x in 0..BLOCK {
+                                                let bx = brick_region([b0[0] + x, b0[1] + y, b0[2] + z]);
+                                                ctrs.push(std::array::from_fn(|k| (0.5 * (bx.0[k] + bx.1[k])) as f32));
+                                            }
+                                        }
+                                    }
+                                    Some(twin::eval_many(&p.texels, &ctrs, &kernels).into_iter().map(|(d, _)| d).collect())
+                                }
+                                _ => None,
+                            };
+                            let mut bricks = Vec::with_capacity((BLOCK * BLOCK * BLOCK) as usize);
                             for z in 0..BLOCK {
                                 for y in 0..BLOCK {
                                     for x in 0..BLOCK {
-                                        let bx = brick_region([b0[0] + x, b0[1] + y, b0[2] + z]);
-                                        ctrs.push(std::array::from_fn(|k| (0.5 * (bx.0[k] + bx.1[k])) as f32));
+                                        let b = [b0[0] + x, b0[1] + y, b0[2] + z];
+                                        let l = [b[0] - min[0], b[1] - min[1], b[2] - min[2]];
+                                        let i = ((l[2] * dim[1] + l[1]) * dim[0] + l[0]) as usize;
+                                        if let Some(skip) = block_skip {
+                                            bricks.push((i, Ok(BrickResult::Empty { skip: skip as f32 })));
+                                            continue;
+                                        }
+                                        let bx = brick_region(b);
+                                        let r = half_diag(1.0);
+                                        let ctr: [f64; 3] = std::array::from_fn(|k| 0.5 * (bx.0[k] + bx.1[k]));
+                                        let k = ((z * BLOCK + y) * BLOCK + x) as usize;
+                                        let brick = match cull(&root, &grow(bx, band + c)) {
+                                            None => Ok(BrickResult::Empty { skip: margin as f32 }),
+                                            Some(n) => lower_with(&n, &kernels, kernel_scale).map(|p| p.scaled(field_scale)).map(|p| {
+                                                let d = match &batched {
+                                                    Some(ds) => ds[k],
+                                                    None => twin::eval_with(&p.texels, ctr.map(|v| v as f32), &kernels).0,
+                                                };
+                                                let d = d as f64;
+                                                if d.abs() > r + band {
+                                                    BrickResult::Empty { skip: skip_of(d, r) as f32 }
+                                                } else {
+                                                    let cpu = (!p.fits_gpu()).then(|| bake_cpu(&p.texels, b, c as f32, band as f32, &kernels));
+                                                    BrickResult::Bake { program: p, cpu }
+                                                }
+                                            }),
+                                        };
+                                        bricks.push((i, brick));
                                     }
                                 }
                             }
-                            Some(twin::eval_many(&p.texels, &ctrs, &kernels).into_iter().map(|(d, _)| d).collect())
-                        }
-                        _ => None,
-                    };
-                    let mut bricks = Vec::with_capacity((BLOCK * BLOCK * BLOCK) as usize);
-                    for z in 0..BLOCK {
-                        for y in 0..BLOCK {
-                            for x in 0..BLOCK {
-                                let b = [b0[0] + x, b0[1] + y, b0[2] + z];
-                                let l = [b[0] - min[0], b[1] - min[1], b[2] - min[2]];
-                                let i = ((l[2] * dim[1] + l[1]) * dim[0] + l[0]) as usize;
-                                if let Some(skip) = block_skip {
-                                    bricks.push((i, Ok(BrickResult::Empty { skip: skip as f32 })));
-                                    continue;
-                                }
-                                let bx = brick_region(b);
-                                let r = half_diag(1.0);
-                                let ctr: [f64; 3] = std::array::from_fn(|k| 0.5 * (bx.0[k] + bx.1[k]));
-                                let k = ((z * BLOCK + y) * BLOCK + x) as usize;
-                                let brick = match cull(&root, &grow(bx, band + c)) {
-                                    None => Ok(BrickResult::Empty { skip: margin as f32 }),
-                                    Some(n) => lower_with(&n, &kernels, kernel_scale).map(|p| {
-                                        let d = match &batched {
-                                            Some(ds) => ds[k],
-                                            None => twin::eval_with(&p.texels, ctr.map(|v| v as f32), &kernels).0,
-                                        };
-                                        let d = d as f64;
-                                        if d.abs() > r + band {
-                                            BrickResult::Empty { skip: skip_of(d, r) as f32 }
-                                        } else {
-                                            let gpu = p.fits_gpu();
-                                            BrickResult::Bake { program: p, gpu }
-                                        }
-                                    }),
-                                };
-                                bricks.push((i, brick));
-                            }
-                        }
-                    }
-                    Ok(BlockResult { block_skip, bricks })
-                })
-                .collect()
-        });
+                            Ok(BlockResult { block_skip, bricks })
+                        })
+                        .collect::<Vec<_>>()
+                }
+            })
+            .collect();
+        let results: Vec<_> = parallel_for(tasks).into_iter().flatten().collect();
         st.blocks_ms = t_blocks.elapsed().as_secs_f64() * 1e3;
         let t_apply = std::time::Instant::now();
         // Apply in lattice order: slot reuse and program ids depend on it.
@@ -363,15 +417,14 @@ impl Volume {
                 }
                 self.bricks[i] = match brick? {
                     BrickResult::Empty { skip } => Brick::Empty { skip },
-                    BrickResult::Bake { program: p, gpu } => {
+                    BrickResult::Bake { program: p, cpu } => {
                         let program = self.program_id(p);
                         let slot = self.alloc_slot();
                         st.bricks_baked += 1;
-                        if gpu {
-                            self.dirty.push(i);
-                        } else {
-                            self.cpu_only.push(i);
+                        if let Some(cpu) = cpu {
+                            self.cpu.insert(i, Arc::new(cpu));
                         }
+                        self.dirty.push(i);
                         Brick::Baked { slot, program }
                     }
                 };
@@ -384,6 +437,12 @@ impl Volume {
         st.apply_ms = t_apply.elapsed().as_secs_f64() * 1e3;
         st.ms = t0.elapsed().as_secs_f64() * 1e3;
         Ok(st)
+    }
+
+    /// The field's distances per true distance (its kernels' and its root's scales): a march's
+    /// footprint and a pick's step take it.
+    pub fn step_scale(&self) -> f32 {
+        self.kernel_scale * self.field_scale
     }
 
     /// Whether the volume's bricks cover `bounds` grown by the band.
@@ -433,24 +492,110 @@ impl Volume {
     /// slot texels, z slices along x), and its material slots.
     pub fn bake_brick_cpu(&self, i: usize) -> Option<(Vec<f32>, Vec<u8>)> {
         let Brick::Baked { program, .. } = self.bricks[i] else { return None };
-        let b = self.brick_of(i);
-        let p = &self.programs[program as usize].texels;
-        let mut qs = Vec::with_capacity(512);
-        for y in 0..8 {
-            for tx in 0..64 {
-                let (z, x) = (tx / 8, tx % 8);
-                let g = [b[0] * BS + x, b[1] * BS + y, b[2] * BS + z];
-                qs.push(g.map(|v| v as f32 * self.cell));
-            }
+        let b = bake_cpu(&self.programs[program as usize].texels, self.brick_of(i), self.cell, self.band, &self.kernels);
+        Some((b.d, b.slots))
+    }
+
+    /// The distance and material slot of `root` at `points`, all inside `region`: its program
+    /// culled to the region, as a brick's. `f32::MAX` everywhere when nothing of the solid is
+    /// near it, or it cannot be lowered. For a client that asks about far more space than one
+    /// brick, at its own resolution.
+    pub fn sample_region(root: &SdfNode, kernels: &[KernelSlot], kernel_scale: f32, region: Bounds, points: &[[f32; 3]], out: &mut Vec<(f32, u8)>) {
+        let program = cull(root, &region).and_then(|n| lower_with(&n, kernels, kernel_scale).ok());
+        match program {
+            Some(p) => out.extend(twin::eval_many(&p.texels, points, kernels)),
+            None => out.extend(points.iter().map(|_| (f32::MAX, 0))),
         }
-        let vals = twin::eval_many(p, &qs, &self.kernels);
-        let d = vals.iter().map(|(v, _)| v.max(-self.band).min(self.band) + 0.0).collect();
-        let s = vals.iter().map(|(_, slot)| *slot).collect();
-        Some((d, s))
     }
 
     /// The node's bounds (the volume a new object needs).
     pub fn bounds_of(root: &SdfNode) -> Option<Bounds> {
         node_bounds(root)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use makepad_csg_sdf::SdfOp;
+
+    fn at(p: [f64; 3], of: SdfNode) -> SdfNode {
+        SdfNode::Transform { at: p, rotate: [0.0; 3], scale: 1.0, of: Box::new(of) }
+    }
+
+    /// Fab's demo vase (`vase.cad.splash`) at a height and a belly radius (mm).
+    fn vase(height: f64, belly: f64) -> SdfNode {
+        let (neck, wall, blend) = (9.5, 1.6, 9.0);
+        let body = SdfNode::Combine {
+            op: SdfOp::Union,
+            blend,
+            of: vec![
+                at([0.0, height * 0.34, 0.0], SdfNode::Ellipsoid { radii: [belly, height * 0.36, belly] }),
+                at([0.0, height * 0.74, 0.0], SdfNode::Cylinder { radius: neck, top_radius: neck, height: height * 0.42 }),
+            ],
+        };
+        let footed = SdfNode::Combine { op: SdfOp::Difference, blend: 0.0, of: vec![body, at([0.0, -7.0, 0.0], SdfNode::Box { size: [4.0 * belly, 20.0, 4.0 * belly], radius: 0.0 })] };
+        let hollow = SdfNode::Shell { thickness: wall, of: Box::new(footed) };
+        let rimmed = SdfNode::Combine { op: SdfOp::Union, blend: 1.5, of: vec![hollow, at([0.0, height * 0.94, 0.0], SdfNode::Torus { radius: neck + 1.2, tube: 1.8 })] };
+        let (low, high) = (height * 0.87 - wall, height + 20.0);
+        let mouth = at([0.0, (low + high) / 2.0, 0.0], SdfNode::Cylinder { radius: neck - wall, top_radius: neck - wall, height: high - low });
+        SdfNode::Combine { op: SdfOp::Difference, blend: 0.0, of: vec![rimmed, mouth] }
+    }
+
+    /// The samples of empty brick `i` that lie inside the band (they should not exist).
+    fn inside_band(vol: &Volume, root: &SdfNode, i: usize) -> Vec<([f32; 3], f32)> {
+        let p = crate::program::lower_with(root, &[], 1.0).expect("lowers").scaled(vol.field_scale).texels;
+        let b = vol.brick_of(i);
+        let mut out = Vec::new();
+        for z in 0..BS {
+            for y in 0..BS {
+                for x in 0..BS {
+                    let q = [b[0] * BS + x, b[1] * BS + y, b[2] * BS + z].map(|v| v as f32 * vol.cell);
+                    let (d, _) = twin::eval(&p, q);
+                    if d.abs() < vol.band {
+                        out.push((q, d));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// An edited volume equals a volume built at the new value (at its scale), and no brick it
+    /// calls empty has a sample inside the band (the march would step through the surface
+    /// there): the vase's belly is an ellipsoid, whose field is an estimate.
+    #[test]
+    fn a_dragged_vase_keeps_every_surface_brick() {
+        let steps: Vec<(f64, f64)> = (0..=12).map(|k| (70.0, 21.0 + k as f64 * 2.5)).chain((0..=12).map(|k| (70.0 + k as f64 * 6.0, 51.0))).collect();
+        let first = vase(steps[0].0, steps[0].1);
+        let bounds = Volume::bounds_of(&first).unwrap();
+        let pad: [f64; 3] = std::array::from_fn(|i| (bounds.1[i] - bounds.0[i]) * 0.6);
+        let room = (std::array::from_fn(|i| bounds.0[i] - pad[i]), std::array::from_fn(|i| bounds.1[i] + pad[i] * 2.0));
+        let cell = 0.6f32;
+        let mut edited = Volume::new(room, cell, cell * 4.0);
+        edited.build(&first, None).unwrap();
+        let mut prev = first;
+        let mut misses = Vec::new();
+        for &(h, belly) in &steps[1..] {
+            let next = vase(h, belly);
+            if edited.edit(&prev, &next).unwrap().is_none() {
+                continue;
+            }
+            // at the scale the edited volume holds (a scale only shrinks while a volume lives)
+            let mut full = Volume::new(room, cell, cell * 4.0);
+            full.field_scale = edited.field_scale;
+            full.kernel_scale = edited.kernel_scale;
+            full.build(&next, None).unwrap();
+            let kind = |v: &Volume| v.bricks.iter().map(|b| matches!(b, Brick::Baked { .. })).collect::<Vec<_>>();
+            let (ke, kf) = (kind(&edited), kind(&full));
+            let differ = (0..ke.len()).filter(|i| ke[*i] != kf[*i]).count();
+            let holes: Vec<usize> = (0..full.bricks.len()).filter(|i| !kf[*i] && !inside_band(&full, &next, *i).is_empty()).collect();
+            if differ > 0 || !holes.is_empty() {
+                let example = holes.first().map(|i| (full.brick_of(*i), inside_band(&full, &next, *i)[0]));
+                misses.push(format!("height {h} belly {belly}: {differ} bricks differ from a full build, {} empty bricks hold surface (e.g. {example:?})", holes.len()));
+            }
+            prev = next;
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
     }
 }

@@ -854,8 +854,8 @@ impl SdfBakeView {
                 let mut vol = Volume::new(bounds, CELL, BAND);
                 let st = vol.build(&sc.before, None).expect("lowers");
                 println!(
-                    "SDFBAKE scene={} build {:.1} ms: {} blocks ({} skipped), {} bricks tested, {} baked, {} programs, gpu-unfit {}, kernel scale {}",
-                    sc.name, st.ms, st.blocks, st.blocks_skipped, st.bricks_tested, st.bricks_baked, st.programs, vol.cpu_only.len(), vol.kernel_scale
+                    "SDFBAKE scene={} build {:.1} ms: {} blocks ({} skipped), {} bricks tested, {} baked, {} programs, cpu-baked {}, kernel scale {}",
+                    sc.name, st.ms, st.blocks, st.blocks_skipped, st.bricks_tested, st.bricks_baked, st.programs, vol.cpu.len(), vol.kernel_scale
                 );
                 if !check_lowering(sc.name, &sc.before, &vol) {
                     self.fails.push(format!("{}-lowering", sc.name));

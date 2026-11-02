@@ -55,7 +55,7 @@ script_mod! {
         vol_dim: uniform(vec3(1.0, 1.0, 1.0))
         cell: uniform(1.0)
         band: uniform(1.0)
-        // the field's distances per true distance (a kernel volume's 1 / Lipschitz bound)
+        // the field's distances per true distance (its 1 / Lipschitz bound: kernels', an estimate's)
         kernel_scale: uniform(1.0)
         view_size: uniform(vec2(1.0, 1.0))
         // the view's origin in its target (pixels; a stereo eye's half) and
@@ -140,6 +140,21 @@ script_mod! {
                 return self.band
             }
             return self.copy_dist(p, b, e.x)
+        }
+
+        // ambient occlusion at object point p with object normal n
+        occlusion: fn(p: vec3, n: vec3, strength: f32) -> f32 {
+            var occ = 0.0
+            var w = 1.0
+            var h = self.cell * 0.75
+            for i in 0..5 {
+                let d = self.field_copy(p + n * h)
+                // A clamped distance gives no evidence of an occluder.
+                if d < self.band * 0.9 { occ = occ + (h - d) * w }
+                w = w * 0.6
+                h = h + self.cell * 1.5
+            }
+            return clamp(1.0 - strength * occ / (self.cell * 6.0), 0.0, 1.0)
         }
 
         // Sphere tracing from t to t1 along (ro, rd) (object frame; inv =
@@ -376,7 +391,16 @@ script_mod! {
             } else {
                 let vp = (self.view_m * hit_w).xyz
                 var vn = normalize((self.view_m * vec4(n, 0.0)).xyz)
-                if dot(vn, vp) > 0.0 { vn = 0.0 - vn }
+                // A ray that stops by the cone just past a silhouette stops where the surface
+                // turns away from the eye: its normal is turned to face across the view, still
+                // out of the solid (flipped, the shade's occlusion and shadow march inside it
+                // and the edge prints black). Only one that faces straight away is flipped.
+                let vd = normalize(vp)
+                let away = dot(vn, vd)
+                if away > 0.0 {
+                    let side = vn - vd * away
+                    if dot(side, side) > 0.0001 { vn = normalize(side) } else { vn = 0.0 - vn }
+                }
                 let e = self.oct_encode(vn)
                 var id = self.gbuf_id
                 if cap > 0.5 { id = 0.0 - id }
@@ -441,20 +465,27 @@ script_mod! {
         }
     }
 
-    // The shadow one field casts on a plane (a field has no mesh for a renderer's shadow maps):
-    // the pixel's ray onto the plane, from there toward the sun through the volume's box. Empty
-    // bricks read as the band, so the penumbra stays inside it.
-    mod.draw.SdfPlateShadow = mod.std.set_type_default() do #(DrawSdfPlateShadow::script_shader(vm)){
+    // The shadow one field casts on what the view sees (a field has no mesh for a renderer's
+    // shadow maps): each pixel's surface from the G-buffer, toward the sun through the volume's
+    // box. Empty bricks read as the band, so the penumbra stays inside it. The field's own
+    // surface is left out: its shade has its soft shadow and AO.
+    mod.draw.SdfCastShadow = mod.std.set_type_default() do #(DrawSdfCastShadow::script_shader(vm)){
         ..mod.draw.DrawQuad,
         ..mod.draw.SdfInterp,
         ..mod.draw.SdfField,
         depth_out: fragment_depth(@any)
+        gbuf_tex: texture_2d(float)
+        gbuf_id: uniform(0.0)
+        gbuf_size: uniform(vec2(1.0, 1.0))
         inv_proj: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         inv_view: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         sun_dir: uniform(vec3(0.35, 0.8, 0.45))
-        // world plane (n, d); x = how dark the full shadow is, y = penumbra sharpness
-        plane: uniform(vec4(0.0, 1.0, 0.0, 0.0))
-        shadow_ctl: uniform(vec2(0.55, 8.0))
+        sun_color: uniform(vec3(0.72, 0.72, 0.72))
+        sun_sky: uniform(vec3(0.28, 0.28, 0.28))
+        sun_ground: uniform(vec3(0.28, 0.28, 0.28))
+        world_up: uniform(vec3(0.0, 1.0, 0.0))
+        // x = penumbra sharpness (0 off), y = AO strength, zw unused
+        shadow_ctl: uniform(vec4(8.0, 1.0, 0.0, 0.0))
 
         vertex: fn() {
             self.pos = self.geom.pos
@@ -462,43 +493,71 @@ script_mod! {
             self.vertex_pos = vec4(ndc.x, ndc.y, 0.0, 1.0)
         }
 
+        oct_decode: fn(e: vec2f) -> vec3f {
+            let nz = 1.0 - abs(e.x) - abs(e.y)
+            let t = max(0.0 - nz, 0.0)
+            let sx = step(0.0, e.x) * 2.0 - 1.0
+            let sy = step(0.0, e.y) * 2.0 - 1.0
+            return normalize(vec3(e.x - t * sx, e.y - t * sy, nz))
+        }
+
         fragment: fn() {
             let pix = self.rect_pos + self.pos * self.rect_size
+            let gb = self.gbuf_tex.sample_nearest(pix / self.gbuf_size)
+            if gb.w == 0.0 || abs(abs(gb.w) - self.gbuf_id) < 0.5 { discard() }
+            let sun = normalize(self.sun_dir)
+            let n = normalize((self.inv_view * vec4(self.oct_decode(gb.yz), 0.0)).xyz)
+            let ndl = max(dot(n, sun), 0.0)
+            // the point at the G-buffer's view distance on the pixel's ray
             let ndc = self.to_ndc(pix)
             let a4 = self.inv_proj * vec4(ndc.x, ndc.y, 0.0, 1.0)
             let b4 = self.inv_proj * vec4(ndc.x, ndc.y, 1.0, 1.0)
-            let aw4 = self.inv_view * vec4(a4.xyz / a4.w, 1.0)
-            let bw4 = self.inv_view * vec4(b4.xyz / b4.w, 1.0)
-            let o = aw4.xyz / aw4.w
-            let d = bw4.xyz / bw4.w - o
-            let along = dot(self.plane.xyz, d)
-            if abs(along) < 0.000001 { discard() }
-            let s = (0.0 - self.plane.w - dot(self.plane.xyz, o)) / along
-            if s < 0.0 || s > 1.0 { discard() }
-            let hit_w = vec4(o + d * s, 1.0)
+            let av = a4.xyz / a4.w
+            let dv = b4.xyz / b4.w - av
+            let qa = dot(dv, dv)
+            let qb = 2.0 * dot(av, dv)
+            let qc = dot(av, av) - gb.x * gb.x
+            let s = ((0.0 - qb) + sqrt(max(qb * qb - 4.0 * qa * qc, 0.0))) / (2.0 * qa)
+            let hit_w4 = self.inv_view * vec4(av + dv * s, 1.0)
+            let hit_w = vec4(hit_w4.xyz / hit_w4.w, 1.0)
             let p = (self.obj_from_world * hit_w).xyz
-            let l = normalize((self.obj_from_world * vec4(normalize(self.sun_dir), 0.0)).xyz)
+            let no = normalize((self.obj_from_world * vec4(n, 0.0)).xyz)
             let bs = self.cell * 8.0
             let lo = self.vol_min * bs
             let hi = (self.vol_min + self.vol_dim) * bs
-            let inv = vec3(1.0, 1.0, 1.0) / l
-            let t0 = (mix(hi, lo, step(vec3(0.0, 0.0, 0.0), l)) - p) * inv
-            let t1 = (mix(lo, hi, step(vec3(0.0, 0.0, 0.0), l)) - p) * inv
-            var t = max(max(max(t0.x, t0.y), t0.z), self.cell * 2.0)
-            let t_out = min(min(t1.x, t1.y), t1.z)
-            if t_out <= t { discard() }
+            var occ = 1.0
+            let reach = self.cell * 7.5
+            if self.shadow_ctl.y > 0.0 && p.x >= lo.x - reach && p.y >= lo.y - reach && p.z >= lo.z - reach
+                && p.x <= hi.x + reach && p.y <= hi.y + reach && p.z <= hi.z + reach {
+                occ = self.occlusion(p, no, self.shadow_ctl.y)
+            }
             var lit = 1.0
-            for i in 0..96 {
-                if t > t_out { break }
-                let f = self.field_copy(p + l * t)
-                lit = min(lit, f / min(t / self.shadow_ctl.y, self.band * 0.9))
-                if lit < 0.01 { break }
-                t = t + max(f, self.cell * 0.5)
+            if ndl > 0.0 && self.shadow_ctl.x > 0.0 {
+                let l = normalize((self.obj_from_world * vec4(sun, 0.0)).xyz)
+                let inv = vec3(1.0, 1.0, 1.0) / l
+                let t0 = (mix(hi, lo, step(vec3(0.0, 0.0, 0.0), l)) - p) * inv
+                let t1 = (mix(lo, hi, step(vec3(0.0, 0.0, 0.0), l)) - p) * inv
+                var t = max(max(max(t0.x, t0.y), t0.z), self.cell * 2.0)
+                let t_out = min(min(t1.x, t1.y), t1.z)
+                if t_out > t {
+                    for i in 0..96 {
+                        if t > t_out { break }
+                        let f = self.field_copy(p + l * t)
+                        lit = min(lit, f / min(t / self.shadow_ctl.x, self.band * 0.9))
+                        if lit < 0.01 { break }
+                        t = t + max(f, self.cell * 0.5)
+                    }
+                }
             }
             lit = clamp(lit, 0.0, 1.0)
-            if lit > 0.99 { discard() }
+            if lit > 0.99 && occ > 0.99 { discard() }
+            let ambient = mix(self.sun_ground, self.sun_sky, dot(n, normalize(self.world_up)) * 0.5 + 0.5)
+            let luma = vec3(0.2126, 0.7152, 0.0722)
+            let key = dot(self.sun_color, luma) * ndl
+            let fill = dot(ambient, luma)
+            let f = (key * lit + fill * occ) / max(key + fill, 0.0001)
             self.depth_out = self.depth_of(hit_w) - self.depth_bias
-            self.fb0 = vec4(0.0, 0.0, 0.0, (1.0 - lit) * self.shadow_ctl.x)
+            self.fb0 = vec4(0.0, 0.0, 0.0, 1.0 - f)
         }
     }
 
@@ -512,6 +571,18 @@ script_mod! {
         override_tex: texture_2d(float)
         // the G-buffer the march wrote (view distance, oct normal, id)
         gbuf_tex: texture_2d(float)
+        // material paint (libs/paint_field's atlas, `DrawSdfShade::set_paint`): this object's
+        // volume header texel, -1 for none
+        paint_map: texture_2d(float)
+        paint_ctl: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        paint_hdr: uniform(0.0),
+        ..mod.draw.PaintLookup,
+
+        paint_texel: fn(i: f32) -> vec4 {
+            let w = max(self.paint_ctl.x, 1.0)
+            let h = max(self.paint_ctl.y, 1.0)
+            return self.paint_map.sample_nearest(vec2((modf(i, w) + 0.5) / w, (floor(i / w) + 0.5) / h))
+        }
         gbuf_id: uniform(0.0)
         // the G-buffer's size (pixels) and the right eye's offset in it
         gbuf_size: uniform(vec2(1.0, 1.0))
@@ -525,6 +596,20 @@ script_mod! {
         inv_proj_r: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         inv_view_r: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         ortho: uniform(0.0)
+        // The host's environment (bound by it, e.g. libs/render's `Renderer::bind_ibl`):
+        // render-material's IBL lookups, the ones the model lanes light with. detail_map holds
+        // the prepared map (the meta row, then the prefiltered atlas); ibl_ctl as the lanes
+        // read it: x = 1 while bound (0: the rig's hemisphere), y = the lane's scale on both
+        // lookups, z = 1 while the fill comes from the map.
+        detail_map: texture_2d(float)
+        ibl_ctl: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        mat_ibl_meta: mod.draw.mat_ibl_meta
+        mat_ibl_dir: mod.draw.mat_ibl_dir
+        mat_ibl_level: mod.draw.mat_ibl_level
+        mat_ibl_sky_env: mod.draw.mat_ibl_sky_env
+        mat_ibl_ambient: mod.draw.mat_ibl_ambient
+        mat_ibl_lane_sky_env: mod.draw.mat_ibl_lane_sky_env
+        mat_ibl_lane_ambient: mod.draw.mat_ibl_lane_ambient
         // the sun (world, toward the light), its colour, the hemisphere
         sun_dir: uniform(vec3(0.35, 0.8, 0.45))
         sun_color: uniform(vec3(0.72, 0.72, 0.72))
@@ -535,8 +620,10 @@ script_mod! {
         // sharpness k), z = exposure, w unused
         shade_ctl: uniform(vec4(1.0, 8.0, 1.0, 0.0))
         // x = 1: tone map + display gamma (a BGRA8 target next to a renderer
-        // that does the same)
-        display: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        // that does the same); y = the sun lobe's scale (MarchLight::sun_spec)
+        display: uniform(vec4(0.0, 1.0, 0.0, 0.0))
+        output_dither_ctl: uniform(vec3(1.0, 1.0, 0.0))
+        debug_term: uniform(0.0)
         // the predicted surface finish: (pattern 0 none..5, amplitude mm,
         // scale mm, layer height mm; 0 = off); the pattern frame (centre x,
         // centre y, repeats around); plate mm from and to the pass world
@@ -681,17 +768,15 @@ script_mod! {
             return pow(mapped, vec3(0.4545454, 0.4545454, 0.4545454))
         }
 
-        // ambient occlusion at object point p with object normal n
-        occlusion: fn(p: vec3, n: vec3) -> f32 {
-            var occ = 0.0
-            var w = 1.0
-            var h = self.cell * 0.75
-            for i in 0..5 {
-                occ = occ + (h - self.field_copy(p + n * h)) * w
-                w = w * 0.6
-                h = h + self.cell * 1.5
-            }
-            return clamp(1.0 - self.shade_ctl.x * occ / (self.cell * 6.0), 0.0, 1.0)
+        // Same display dither as the renderer, without a renderer dependency.
+        output_dither: fn(color: vec3, wp: vec3) -> vec3 {
+            if self.output_dither_ctl.z < 0.5 { return color }
+            let clip = self.draw_pass.camera_projection * (self.draw_pass.camera_view * vec4(wp, 1.0))
+            let p = floor(vec2(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5) * self.output_dither_ctl.xy)
+            let a = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))))
+            let b = fract(52.9829189 * fract(dot(p + vec2(47.0, 17.0), vec2(0.06711056, 0.00583715))))
+            let noise = (a + b - 1.0) / 255.0
+            return max(color + vec3(noise, noise, noise), vec3(0.0, 0.0, 0.0))
         }
 
         // soft shadow toward object-space direction l (unit) from p, within
@@ -705,7 +790,7 @@ script_mod! {
             for i in 0..64 {
                 if t > t_end { break }
                 let d = self.field_copy(p + l * t)
-                res = min(res, self.shade_ctl.y * d / t)
+                res = min(res, d / min(t / self.shade_ctl.y, self.band * 0.9))
                 if res < 0.01 { break }
                 t = t + clamp(d, self.cell * 0.5, self.cell * 16.0)
             }
@@ -718,6 +803,28 @@ script_mod! {
             return self.mat_tex.sample_nearest(vec2((slot + 0.5) / 256.0, (r + 0.5) / 5.0))
         }
 
+        // The ambient light on surface point wp (world) with normal n, given
+        // the hemisphere's: a host with its own ambient light (a GI field)
+        // replaces it. AO, the material and the rest of the lobe stay.
+        ambient_at: fn(wp: vec3, n: vec3, hemisphere: vec3) -> vec3 {
+            return hemisphere
+        }
+
+        // The fill on normal n before a host's own (`ambient_at`) and the reflection along r:
+        // the environment's lookups while one is bound (as the model lanes take them), else
+        // the rig's hemisphere.
+        env_fill: fn(n: vec3) -> vec3 {
+            let up = normalize(self.world_up)
+            let hemisphere = mix(self.sun_ground, self.sun_sky, clamp(dot(n, up) * 0.5 + 0.5, 0.0, 1.0))
+            if self.ibl_ctl.x > 0.5 { return self.mat_ibl_lane_ambient(n, hemisphere) }
+            return hemisphere
+        }
+        env_reflect: fn(r: vec3, rough: f32) -> vec3 {
+            if self.ibl_ctl.x > 0.5 { return self.mat_ibl_lane_sky_env(r, rough) }
+            let up = normalize(self.world_up)
+            return mix(self.sun_ground, self.sun_sky, clamp(dot(r, up) * 0.5 + 0.5, 0.0, 1.0))
+        }
+
         // The model lanes' shading (libs/render `shade_mr`), so an SDF part
         // sits in the same light as a mesh beside it: Lambert without 1/pi
         // under a rig that sums to one, a GGX sun lobe, the hemisphere along
@@ -725,11 +832,12 @@ script_mod! {
         // diffuse. The table's colours and the overrides are linear
         // reflectance (a material's base colour, as a mesh's): lit as they
         // are, the display transform encodes the result.
-        pbr: fn(n: vec3, v: vec3, slot: f32, ao: f32, shadow: f32) -> vec3 {
+        pbr: fn(wp: vec3, n: vec3, v: vec3, slot: f32, ao: f32, shadow: f32, pp: vec3, px: f32) -> vec3 {
             let m0 = self.mat_row(slot, 0.0)
             let m1 = self.mat_row(slot, 1.0)
             let ov = self.override_tex.sample_nearest(vec2((slot + 0.5) / 256.0, 0.5))
-            let albedo = mix(m0.xyz, ov.xyz, ov.w)
+            var albedo = mix(m0.xyz, ov.xyz, ov.w)
+            if self.paint_ctl.w > 0.5 { albedo = self.paint_albedo(self.paint_hdr, pp, px, albedo) }
             let emit = self.mat_row(slot, 2.0).xyz * m1.y
             if m1.z > 0.5 {
                 return albedo + emit
@@ -750,11 +858,11 @@ script_mod! {
             let k = (rough + 1.0) * (rough + 1.0) * 0.125
             let geo = (ndv / max(ndv * (1.0 - k) + k, 0.0001)) * (ndl / max(ndl * (1.0 - k) + k, 0.0001))
             let direct = self.sun_color * (max(dot(n, l), 0.0) * shadow)
-            let sun_spec = direct * (dist * geo / max(4.0 * ndv * ndl, 0.0001))
-            let up = normalize(self.world_up)
-            let ambient = mix(self.sun_ground, self.sun_sky, clamp(dot(n, up) * 0.5 + 0.5, 0.0, 1.0))
+            // display.y: the lobe's scale in the light's units (MarchLight::sun_spec)
+            let sun_spec = direct * (dist * geo / max(4.0 * ndv * ndl, 0.0001)) * self.display.y
+            let ambient = self.ambient_at(wp, n, self.env_fill(n))
             let r = n * (2.0 * ndv) - v
-            let env = mix(self.sun_ground, self.sun_sky, clamp(dot(r, up) * 0.5 + 0.5, 0.0, 1.0))
+            let env = self.env_reflect(r, rough)
             let g = 1.0 - rough
             let f_env = f0 + (max(vec3(g, g, g), f0) - f0) * pow(1.0 - ndv, 5.0)
             let lit = albedo * ((1.0 - metal) * (ambient * ao + direct)) + sun_spec * f + env * f_env * ao
@@ -804,10 +912,11 @@ script_mod! {
             }
             self.depth_out = self.depth_of(hit_w) - self.depth_bias
             let p = (self.obj_from_world * hit_w).xyz
+            let px = max(length(dFdx(p)), length(dFdy(p)))
             let no = normalize((self.obj_from_world * vec4(n, 0.0)).xyz)
             let slot = self.slot_at(p - no * (self.cell * 0.25))
             var ao = 1.0
-            if self.shade_ctl.x > 0.0 { ao = self.occlusion(p, no) }
+            if self.shade_ctl.x > 0.0 { ao = self.occlusion(p, no, self.shade_ctl.x) }
             var shadow = 1.0
             if self.shade_ctl.y > 0.0 {
                 let lo4 = normalize((self.obj_from_world * vec4(normalize(self.sun_dir), 0.0)).xyz)
@@ -820,7 +929,23 @@ script_mod! {
             if self.finish_ctl.w > 0.0 {
                 ns = self.finish_normal(hit_w, n)
             }
-            self.fb0 = vec4(self.to_display(self.pbr(ns, v, slot, ao, shadow)), 1.0)
+            if self.debug_term > 0.5 {
+                var term = vec3(0.0, 0.0, 0.0)
+                if self.debug_term < 1.5 {
+                    term = self.ambient_at(hit_w.xyz, ns, self.env_fill(ns))
+                } else if self.debug_term < 2.5 {
+                    term = vec3(ao, ao, ao)
+                } else if self.debug_term < 3.5 {
+                    term = vec3(shadow, shadow, shadow)
+                } else {
+                    term = self.sun_color * (max(dot(ns, normalize(self.sun_dir)), 0.0) * shadow)
+                }
+                self.fb0 = vec4(self.to_display(term), 1.0)
+            } else {
+                var color = self.to_display(self.pbr(hit_w.xyz, ns, v, slot, ao, shadow, p, px))
+                if self.display.x > 0.5 { color = self.output_dither(color, hit_w.xyz) }
+                self.fb0 = vec4(color, 1.0)
+            }
         }
     }
 }
@@ -850,9 +975,31 @@ pub struct DrawSdfShade {
     pub draw_super: DrawQuad,
 }
 
+impl DrawSdfShade {
+    /// The paint the next shaded object shows: the texture holding the atlas (libs/paint_field),
+    /// `paint_ctl` = (width, height, 0, on) and the object's volume header texel; `None`:
+    /// unpainted. The object frame is the volume's.
+    pub fn set_paint(&mut self, cx: &Cx, paint: Option<(&Texture, [f32; 4], f32)>) {
+        let dv = &mut self.draw_super.draw_vars;
+        match paint {
+            Some((map, ctl, hdr)) => {
+                if let Some(slot) = dv.draw_shader_id.and_then(|s| cx.draw_shaders[s.index].mapping.textures.iter().position(|t| t.id == id!(paint_map))) {
+                    dv.set_texture(slot, map);
+                }
+                dv.set_uniform(cx, id!(paint_ctl), &ctl);
+                dv.set_uniform(cx, id!(paint_hdr), &[hdr]);
+            }
+            None => {
+                dv.set_uniform(cx, id!(paint_ctl), &[0.0; 4]);
+                dv.set_uniform(cx, id!(paint_hdr), &[-1.0]);
+            }
+        }
+    }
+}
+
 #[derive(Script, ScriptHook)]
 #[repr(C)]
-pub struct DrawSdfPlateShadow {
+pub struct DrawSdfCastShadow {
     #[deref]
     pub draw_super: DrawQuad,
 }
@@ -902,6 +1049,34 @@ impl MarchView {
     /// This view's rect in its target.
     pub fn rect(&self) -> Rect {
         Rect { pos: self.origin, size: self.size }
+    }
+
+    /// Project the grown volume and optional world-space sweep, clipped to `rect`.
+    /// None keeps the full rect when a corner crosses the eye.
+    pub fn object_rect(&self, rect: Rect, world_from_obj: &Mat4f, vol: &Volume, grow: f32, sweep: Option<([f32; 3], f32)>) -> Option<Rect> {
+        let bs = vol.cell * crate::volume::BS as f32;
+        let lo: [f32; 3] = std::array::from_fn(|i| vol.min[i] as f32 * bs - grow);
+        let hi: [f32; 3] = std::array::from_fn(|i| (vol.min[i] + vol.dim[i]) as f32 * bs + grow);
+        let vp = Mat4f::mul(&self.proj, &self.view);
+        let (dir, reach) = sweep.unwrap_or(([0.0; 3], 0.0));
+        let ends = if sweep.is_some() { 2 } else { 1 };
+        let mut min = dvec2(f64::INFINITY, f64::INFINITY);
+        let mut max = dvec2(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for i in 0..8 {
+            let p: [f32; 3] = std::array::from_fn(|a| if i & (1 << a) == 0 { lo[a] } else { hi[a] });
+            let w = world_from_obj.transform_vec4(vec4(p[0], p[1], p[2], 1.0));
+            for end in 0..ends {
+                let offset = reach * end as f32;
+                let clip = vp.transform_vec4(vec4(w.x / w.w + dir[0] * offset, w.y / w.w + dir[1] * offset, w.z / w.w + dir[2] * offset, 1.0));
+                if !clip.w.is_finite() || clip.w <= 1e-6 { return None; }
+                let x = self.origin.x + (clip.x / clip.w * 0.5 + 0.5) as f64 * self.size.x;
+                let y = self.origin.y + (0.5 - clip.y / clip.w * 0.5) as f64 * self.size.y;
+                if !x.is_finite() || !y.is_finite() { return None; }
+                min.x = min.x.min(x); min.y = min.y.min(y);
+                max.x = max.x.max(x); max.y = max.y.max(y);
+            }
+        }
+        Some(Rect { pos: min - dvec2(2.0, 2.0), size: max - min + dvec2(4.0, 4.0) }.clip((rect.pos, rect.pos + rect.size)))
     }
 
     /// World units one pixel spans at world point `p` (orthographic: everywhere alike).
@@ -968,7 +1143,7 @@ impl FieldTex {
         dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
         dv.set_uniform(c, id!(cell), &[vol.cell]);
         dv.set_uniform(c, id!(band), &[vol.band]);
-        dv.set_uniform(c, id!(kernel_scale), &[vol.kernel_scale]);
+        dv.set_uniform(c, id!(kernel_scale), &[vol.step_scale()]);
         set_view(c, dv, view);
         dv.set_uniform(c, id!(exact), &[if exact { 1.0 } else { 0.0 }]);
     }
@@ -986,7 +1161,7 @@ fn set_field(c: &Cx, dv: &mut DrawVars, view: &MarchView, vol: &Volume, baker: &
     dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
     dv.set_uniform(c, id!(cell), &[vol.cell]);
     dv.set_uniform(c, id!(band), &[vol.band]);
-    dv.set_uniform(c, id!(kernel_scale), &[vol.kernel_scale]);
+    dv.set_uniform(c, id!(kernel_scale), &[vol.step_scale()]);
     set_view(c, dv, view);
     dv.set_uniform(c, id!(exact), &[if exact { 1.0 } else { 0.0 }]);
 }
@@ -1004,6 +1179,8 @@ fn set_view(c: &Cx, dv: &mut DrawVars, view: &MarchView) {
 /// world frame (keep `a x + b y + c z + d >= 0`, at most 6).
 #[allow(clippy::too_many_arguments)]
 pub fn draw_object(cx: &mut Cx2d, draw: &mut DrawSdfMarch, rect: Rect, view: &MarchView, world_from_obj: Mat4f, vol: &Volume, baker: &mut Baker, out: MarchOut, planes: &[[f32; 4]], coarse: Option<&Texture>, exact: bool) {
+    let rect = view.object_rect(rect, &world_from_obj, vol, vol.cell * 2.0, None).unwrap_or(rect);
+    if rect.size.x <= 0.0 || rect.size.y <= 0.0 { return; }
     // the march with the volume's kernels compiled in, when it has any
     let field = FieldTex::of(baker);
     let draw = baker.march(cx.cx, draw);
@@ -1148,6 +1325,8 @@ pub fn shade_object_stereo(cx: &mut Cx2d, draw: &mut DrawSdfShade, eyes: &[March
 
 #[allow(clippy::too_many_arguments)]
 fn shade(cx: &mut Cx2d, draw: &mut DrawSdfShade, rect: Rect, view: &MarchView, eyes: Option<&[MarchView; 2]>, world_from_obj: Mat4f, vol: &Volume, baker: &Baker, materials: &Texture, slot_override: &Texture, gbuffer: &Texture, id: f32, light: &MarchLight, depth_bias: f32) {
+    let rect = if eyes.is_none() { view.object_rect(rect, &world_from_obj, vol, vol.cell * 2.0, None).unwrap_or(rect) } else { rect };
+    if rect.size.x <= 0.0 || rect.size.y <= 0.0 { return; }
     let c = &*cx.cx;
     let dv = &mut draw.draw_super.draw_vars;
     set_field(c, dv, view, vol, baker, true);
@@ -1158,7 +1337,7 @@ fn shade(cx: &mut Cx2d, draw: &mut DrawSdfShade, rect: Rect, view: &MarchView, e
     dv.set_uniform(c, id!(depth_bias), &[depth_bias]);
     // an orthographic projection keeps w = 1 (no z term in its last row)
     dv.set_uniform(c, id!(ortho), &[if view.proj.v[11] == 0.0 { 1.0 } else { 0.0 }]);
-    dv.set_uniform(c, id!(display), &[if light.display { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0]);
+    dv.set_uniform(c, id!(display), &[if light.display { 1.0 } else { 0.0 }, light.sun_spec, 0.0, 0.0]);
     dv.set_uniform(c, id!(sun_dir), &light.dir);
     dv.set_uniform(c, id!(sun_color), &light.color);
     dv.set_uniform(c, id!(sun_sky), &light.sky);
@@ -1194,17 +1373,27 @@ fn shade(cx: &mut Cx2d, draw: &mut DrawSdfShade, rect: Rect, view: &MarchView, e
     draw.draw_super.draw_abs(cx, rect);
 }
 
-/// Draws the shadow one object casts on `plane` (world `n`, `d`), in a pass that has the plane
-/// and the objects in depth. `depth_bias` keeps it above the plane's own surface.
+/// Draws the shadow one object casts on the surfaces of `gbuffer` (the march's and the
+/// host's), the object `id` itself left out, in a pass that has them in depth. `depth_bias`
+/// keeps it above those surfaces; `reach` bounds the shadow's sweep in world units.
 #[allow(clippy::too_many_arguments)]
-pub fn plate_shadow_object(cx: &mut Cx2d, draw: &mut DrawSdfPlateShadow, rect: Rect, view: &MarchView, world_from_obj: Mat4f, vol: &Volume, baker: &Baker, light: &MarchLight, depth_bias: f32, plane: [f32; 4]) {
+pub fn cast_shadow_object(cx: &mut Cx2d, draw: &mut DrawSdfCastShadow, rect: Rect, view: &MarchView, world_from_obj: Mat4f, vol: &Volume, baker: &Baker, gbuffer: &Texture, id: f32, light: &MarchLight, depth_bias: f32, reach: f32) {
+    let sun = vec3(light.dir[0], light.dir[1], light.dir[2]).normalize();
+    let rect = view.object_rect(rect, &world_from_obj, vol, vol.cell * 7.5, Some(([-sun.x, -sun.y, -sun.z], reach))).unwrap_or(rect);
+    if rect.size.x <= 0.0 || rect.size.y <= 0.0 { return; }
     let c = &*cx.cx;
     let dv = &mut draw.draw_super.draw_vars;
     set_field(c, dv, view, vol, baker, false);
+    dv.set_texture(4, gbuffer);
+    dv.set_uniform(c, id!(gbuf_id), &[id]);
+    dv.set_uniform(c, id!(gbuf_size), &[view.target.x.max(1.0) as f32, view.target.y.max(1.0) as f32]);
     dv.set_uniform(c, id!(depth_bias), &[depth_bias]);
     dv.set_uniform(c, id!(sun_dir), &light.dir);
-    dv.set_uniform(c, id!(plane), &plane);
-    dv.set_uniform(c, id!(shadow_ctl), &[0.55, light.shadow_k]);
+    dv.set_uniform(c, id!(sun_color), &light.color);
+    dv.set_uniform(c, id!(sun_sky), &light.sky);
+    dv.set_uniform(c, id!(sun_ground), &light.ground);
+    dv.set_uniform(c, id!(world_up), &light.up);
+    dv.set_uniform(c, id!(shadow_ctl), &[light.shadow_k, light.ao, 0.0, 0.0]);
     dv.set_uniform(c, id!(inv_proj), &view.proj.invert().v);
     dv.set_uniform(c, id!(inv_view), &view.view.invert().v);
     dv.set_uniform(c, id!(obj_from_world), &world_from_obj.invert().v);
@@ -1268,10 +1457,15 @@ pub struct MarchLight {
     pub exposure: f32,
     /// Tone map + display gamma (a BGRA8 target).
     pub display: bool,
+    /// The sun's specular lobe scale: 1 where the light's units carry the
+    /// diffuse lobe's 1/π (a display-space rig), π for a radiometric rig
+    /// whose diffuse lobe drops it (the renderer's HDR lane, which lifts its
+    /// meshes' lobe the same way): an SDF part's highlight matches a mesh's.
+    pub sun_spec: f32,
 }
 
 impl Default for MarchLight {
     fn default() -> Self {
-        MarchLight { dir: [0.35, 0.8, 0.45], color: [0.72; 3], sky: [0.28; 3], ground: [0.28; 3], up: [0.0, 1.0, 0.0], ao: 1.0, shadow_k: 8.0, exposure: 1.0, display: false }
+        MarchLight { dir: [0.35, 0.8, 0.45], color: [0.72; 3], sky: [0.28; 3], ground: [0.28; 3], up: [0.0, 1.0, 0.0], ao: 1.0, shadow_k: 8.0, exposure: 1.0, display: false, sun_spec: 1.0 }
     }
 }

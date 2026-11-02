@@ -19,8 +19,8 @@ pub struct SdfHit {
 }
 
 /// Sphere traces `ro + t rd` (`rd` unit) over `[t0, t1]` to within `eps`,
-/// each step the distance times `step` (a kernel that is no distance: its
-/// volume's `kernel_scale`, the inverse of its Lipschitz bound; 1 otherwise).
+/// each step the distance times `step` (a field that is no distance, a kernel's or an
+/// estimate's: its volume's `step_scale`, the inverse of its Lipschitz bound; 1 otherwise).
 pub fn pick(root: &SdfNode, ro: [f64; 3], rd: [f64; 3], t0: f64, t1: f64, eps: f64, step: f64) -> Option<SdfHit> {
     let at = |t: f64| Vec3d::new(ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t);
     let mut t = t0.max(0.0);

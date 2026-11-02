@@ -5,6 +5,7 @@
 //! - [`volume`]: an object's sparse brick volume (lattice, allocation,
 //!   per-brick culled programs, dirty re-builds);
 //! - [`kernel`]: Splash SDF kernels compiled into the bake shader;
+//! - [`audit`]: a frame's baked bricks read back and compared with the exact fields;
 //! - [`budget`]: GPU safety (measured frame costs, the bake's steering, caps);
 //! - [`bake`]: the GPU bake into persistent R32F/R8 atlases by draw passes;
 //! - [`march`]: the coarse pass, the march (depth + G-buffer) and the shade;
@@ -16,6 +17,7 @@
 pub use makepad_csg_sdf;
 pub use makepad_draw;
 
+pub mod audit;
 pub mod bake;
 pub mod budget;
 pub mod kernel;
@@ -30,6 +32,9 @@ use makepad_draw::*;
 
 pub fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
     crate::bake::script_mod(vm);
+    crate::audit::script_mod(vm);
+    // the environment lookups the shade lights with, as the model lanes do
+    makepad_render_material::builtin::register(vm);
     crate::march::script_mod(vm);
     crate::splat::script_mod(vm)
 }

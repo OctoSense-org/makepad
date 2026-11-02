@@ -1,0 +1,10 @@
+[package]
+name = "makepad-paint-field"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Material paint as its own spatial program: regions in a part's frame, evaluated by position, baked to sparse bricks a shader samples once"
+
+[dependencies]
+makepad-csg-sdf = { path = "../csg/csg_sdf" }
+makepad-csg-math = { path = "../csg/csg_math" }
