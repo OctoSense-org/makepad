@@ -351,6 +351,8 @@ script_mod! {
             if n > 1.0 { b = self.fetch(at + 2.0) }
             if n > 2.0 { c = self.fetch(at + 3.0) }
             if n > 3.0 { d = self.fetch(at + 4.0) }
+            // a gridded kernel (program.rs GRIDDED): its grid's texel, from the op's offset
+            if self.fetch(at).w > 31.5 { a.x = a.x + at }
             return self.kernel_call(slot, vec3(x, y, z), a, b, c, d)
         }
         kernel_call: fn(slot: f32, p: vec3, a: vec4, b: vec4, c: vec4, d: vec4) -> f32 {
@@ -358,6 +360,18 @@ script_mod! {
         }
 
         eval_program: fn(base: f32, x: f32, y: f32, z: f32) -> vec2 {
+            return self.run_program(base, x, y, z, 0u, 0.0).xy
+        }
+
+        // The program at (x, y, z): (value, slot, known, ones). `masks` tells it textures'
+        // masks (bit i: texture i's are known, bit 16 + i: they are 1, else 0; program.rs's
+        // KNOWN_TEXTURES): it skips their gradients (and, masked off, their patterns) and takes
+        // those, the same value bits. `cell` > 0 (a bake's sample spacing) asks which masks hold
+        // all over a cell's reach of the point: `known` has the bit of each texture whose masks
+        // do, `ones` of those that are 1 there.
+        run_program: fn(base: f32, x: f32, y: f32, z: f32, masks: u32, cell: f32) -> vec4 {
+            var known = 0u
+            var ones = 0u
             var px = x
             var py = y
             var pz = z
@@ -496,17 +510,88 @@ script_mod! {
                     if mn > 0i { ss[vn] = ms[mn - 1i] } else { ss[vn] = 0.0 }
                     vn = vn + 1i
                     pc = pc + 1.0
-                } else {
+                } else if code < 15.5 {
                     let e = self.links_at(u32(base) + asuint(h.y), vec3(px, py, pz))
                     vs[vn] = e.x
                     if e.y != 0.0 { ss[vn] = e.y }
                     else if mn > 0i { ss[vn] = ms[mn - 1i] } else { ss[vn] = 0.0 }
                     vn = vn + 1i
                     pc = pc + 1.0
+                } else if code < 16.5 {
+                    // TEX: the pattern's values on top (3 for triplanar, else 1), the source's
+                    // value below them and, with the gradient, its four corners below that.
+                    // Known masks: the mask is exactly the 1 or 0 the ramps give there, and no
+                    // corners are on the stack (GRAD skipped them) nor, masked off, a pattern
+                    // (PAT skipped it).
+                    let a = self.fetch(base + pc + 1.0)
+                    let m = self.fetch(base + pc + 2.0)
+                    var np = 1i
+                    if h.y > 0.5 { np = 3i }
+                    // the source's value, and where the result goes
+                    var si = vn - np - 1i
+                    var at = si
+                    let o = u32(a.z)
+                    var mm = 0.0
+                    var t = 0.0
+                    if o < 16u && ((masks >> o) & 1u) != 0u {
+                        mm = f32((masks >> (o + 16u)) & 1u)
+                        if mm > 0.5 { t = vs[vn - 1i] } else { si = vn - 1i }
+                        at = si
+                    } else {
+                        var gx = 0.0
+                        var gy = 0.0
+                        var gz = 0.0
+                        if h.z > 0.5 {
+                            let g0 = vs[si - 4i]
+                            let g1 = vs[si - 3i]
+                            let g2 = vs[si - 2i]
+                            let g3 = vs[si - 1i]
+                            gx = (((g0 - g1) - g2) + g3) * a.y
+                            gy = (((0.0 - g0) - g1) + g2 + g3) * a.y
+                            gz = (((0.0 - g0) + g1) - g2 + g3) * a.y
+                            at = si - 4i
+                        }
+                        let mt0 = self.clamp01((m.y - gy) / (m.y - m.x))
+                        let mb0 = self.clamp01((m.w + gy) / (m.w - m.z))
+                        let mt = (mt0 * mt0) * (3.0 - 2.0 * mt0)
+                        let mb = (mb0 * mb0) * (3.0 - 2.0 * mb0)
+                        mm = mt * mb
+                        if cell > 0.0 && o < 16u && np == 1i && h.z > 0.5 {
+                            // The gradient's Y changes at most 4 a.y per unit (a 1-Lipschitz
+                            // source; a quarter more for estimates): within half a cell's
+                            // diagonal of here it stays this far from the ramps' ends.
+                            let reach = (4.33 * cell) * a.y + 0.0001
+                            let one = gy >= reach - m.z && gy <= m.x - reach
+                            if one || gy >= m.y + reach || gy <= (0.0 - m.w) - reach {
+                                known = known | (1u << o)
+                                if one { ones = ones | (1u << o) }
+                            }
+                        }
+                        t = vs[vn - 1i]
+                        if np == 3i {
+                            let n = max((gx * gx + gy * gy) + gz * gz, 1.0)
+                            t = (((gx * gx) / n) * vs[vn - 3i] + ((gy * gy) / n) * vs[vn - 2i]) + ((gz * gz) / n) * vs[vn - 1i]
+                        }
+                    }
+                    let sd = ss[si]
+                    vs[at] = (vs[si] + h.w * (mm * t)) * a.x
+                    ss[at] = sd
+                    vn = at + 1i
+                    pc = pc + 3.0
+                } else {
+                    // GRAD (corners) or PAT (pattern, where the masks are 0): h.y texels follow
+                    // that a texture with known masks skips (its TEX knows they are not there)
+                    let o = u32(h.z)
+                    var skip = false
+                    if o < 16u && ((masks >> o) & 1u) != 0u {
+                        skip = code < 17.5 || ((masks >> (o + 16u)) & 1u) == 0u
+                    }
+                    pc = pc + 1.0
+                    if skip { pc = pc + h.y }
                 }
             }
             // + 0.0: a zero leaves as +0 (min/max of signed zeros differ between GPUs)
-            return vec2(vs[0], ss[0])
+            return vec4(vs[0], ss[0], f32(known), f32(ones))
         }
     }
 
@@ -518,6 +603,16 @@ script_mod! {
         bricks: shader.buffer(vec4u)
         atlas: shader.texture_2d_rw(@r16f)
         materials: shader.texture_2d_rw(@r8unorm)
+        // Per slot: x, how fast the slot's copy changes, at most (field units per object
+        // unit: the march's step and footprint scale in that brick); y, the textures whose
+        // masks are constant all over the brick (run_program's `known`); z, those that are 1
+        slopes: shader.buffer_rw(vec4f)
+        // the brick's 9^3 stored samples, then per thread its most and its masks
+        near: shader.workgroup(f32, 729)
+        most: shader.workgroup(f32, 64)
+        all_known: shader.workgroup(u32, 64)
+        all_ones: shader.workgroup(u32, 64)
+        any_ones: shader.workgroup(u32, 64)
         cell: shader.uniform(f32)
         band: shader.uniform(f32)
         first: shader.uniform(u32)
@@ -554,21 +649,86 @@ script_mod! {
             let bz = i32(brick.z)
             let col = brick.w % 50u
             let row = brick.w / 50u
+            let li = local_index()
+            // the textures whose masks hold over every sample's cell reach, and their values
+            var known = 65535u
+            var all1 = 65535u
+            var any1 = 0u
             for k in 0..12u {
-                let sample = local_index() + k * 64u
+                let sample = li + k * 64u
                 if sample < 729u {
                     let x = sample % 9u
                     let z = (sample / 9u) % 9u
                     let y = sample / 81u
-                    let e = self.eval_program(base,
+                    let e = self.run_program(base,
                         f32(bx * 8i + i32(x)) * self.cell,
                         f32(by * 8i + i32(y)) * self.cell,
-                        f32(bz * 8i + i32(z)) * self.cell)
-                    let d = min(max(e.x, 0.0 - self.band), self.band) + 0.0
+                        f32(bz * 8i + i32(z)) * self.cell, 0u, self.cell)
+                    let d = self.to_half(min(max(e.x, 0.0 - self.band), self.band) + 0.0)
                     let texel = vec2u(col * 81u + z * 9u + x, row * 9u + y)
-                    self.atlas.write(texel, self.to_half(d))
+                    self.atlas.write(texel, d)
                     self.materials.write(texel, e.y / 255.0)
+                    self.near[y * 81u + z * 9u + x] = d
+                    known = known & u32(e.z)
+                    all1 = all1 & u32(e.w)
+                    any1 = any1 | u32(e.w)
                 }
+            }
+            barrier()
+            // The copy's slope bound. Inside a cell the trilinear copy's derivative along an
+            // axis is linear in each other coordinate (a blend of the cell's four edge
+            // differences on that axis), so the squared slope is convex along every axis and
+            // peaks at a corner, where it is the corner's three edges'. The brick's bound is
+            // the most of its cells' corners.
+            var g = 0.0
+            for k in 0..8u {
+                let c = li + k * 64u
+                let i = (c / 64u) * 81u + ((c / 8u) % 8u) * 9u + c % 8u
+                let v0 = self.near[i]
+                let v1 = self.near[i + 1u]
+                let v2 = self.near[i + 81u]
+                let v3 = self.near[i + 82u]
+                let v4 = self.near[i + 9u]
+                let v5 = self.near[i + 10u]
+                let v6 = self.near[i + 90u]
+                let v7 = self.near[i + 91u]
+                // x edges at (y, z) 00 10 01 11; y edges at (x, z); z edges at (x, y)
+                let a0 = (v1 - v0) * (v1 - v0)
+                let a1 = (v3 - v2) * (v3 - v2)
+                let a2 = (v5 - v4) * (v5 - v4)
+                let a3 = (v7 - v6) * (v7 - v6)
+                let b0 = (v2 - v0) * (v2 - v0)
+                let b1 = (v3 - v1) * (v3 - v1)
+                let b2 = (v6 - v4) * (v6 - v4)
+                let b3 = (v7 - v5) * (v7 - v5)
+                let c0 = (v4 - v0) * (v4 - v0)
+                let c1 = (v5 - v1) * (v5 - v1)
+                let c2 = (v6 - v2) * (v6 - v2)
+                let c3 = (v7 - v3) * (v7 - v3)
+                // corner (x, y, z): x edge at (y, z), y edge at (x, z), z edge at (x, y)
+                let m0 = max(max((a0 + b0) + c0, (a0 + b1) + c1), max((a1 + b0) + c2, (a1 + b1) + c3))
+                let m1 = max(max((a2 + b2) + c0, (a2 + b3) + c1), max((a3 + b2) + c2, (a3 + b3) + c3))
+                g = max(g, max(m0, m1))
+            }
+            self.most[li] = g
+            self.all_known[li] = known
+            self.all_ones[li] = all1
+            self.any_ones[li] = any1
+            barrier()
+            for k in 0..6u {
+                let s = 32u >> k
+                if li < s {
+                    self.most[li] = max(self.most[li], self.most[li + s])
+                    self.all_known[li] = self.all_known[li] & self.all_known[li + s]
+                    self.all_ones[li] = self.all_ones[li] & self.all_ones[li + s]
+                    self.any_ones[li] = self.any_ones[li] | self.any_ones[li + s]
+                }
+                barrier()
+            }
+            if li == 0u {
+                // known: the same value at every sample (masks that change sign stay unknown)
+                let held = self.all_known[0] & (65535u ^ (self.all_ones[0] ^ self.any_ones[0]))
+                self.slopes[brick.w] = vec4(sqrt(self.most[0]) / self.cell, f32(held), f32(held & self.all_ones[0]), 0.0)
             }
         }
     }

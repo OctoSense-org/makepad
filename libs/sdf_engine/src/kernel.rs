@@ -112,24 +112,25 @@ impl KernelSlot {
     }
 
     /// [`KernelSlot::distance`] at many points (one kernel call).
-    pub fn distance_many(&self, params: &[f32], ps: &[[f32; 3]]) -> Vec<f32> {
+    pub fn distance_many(&self, params: &[f32], grid: Option<&[f32]>, ps: &[[f32; 3]]) -> Vec<f32> {
         match &self.route {
             FieldRoute::Splash { field, .. } => {
                 let xyz: Vec<f32> = ps.iter().flatten().copied().collect();
                 let mut out = vec![0.0f32; ps.len()];
-                field.distance_batch_with(params, &xyz, &mut out);
+                field.distance_batch_words(params, grid, &xyz, &mut out);
                 out
             }
             FieldRoute::Mesh(m) => ps.iter().map(|p| m.signed(*p)).collect(),
         }
     }
 
-    /// The distance at `p` with parameters `params` (by parameter index).
-    pub fn distance(&self, params: &[f32], p: [f32; 3]) -> f32 {
+    /// The distance at `p` with parameters `params` (by parameter index), a gridded kernel's
+    /// reading `grid` (its words, as its program's payload holds them).
+    pub fn distance(&self, params: &[f32], grid: Option<&[f32]>, p: [f32; 3]) -> f32 {
         match &self.route {
             FieldRoute::Splash { field, .. } => {
                 let mut out = [0.0f32];
-                field.distance_batch_with(params, &p, &mut out);
+                field.distance_batch_words(params, grid, &p, &mut out);
                 out[0]
             }
             FieldRoute::Mesh(m) => m.signed(p),
@@ -138,10 +139,12 @@ impl KernelSlot {
 
 }
 
-/// Whether `n` calls any kernel.
+/// Whether `n` calls any distance kernel (a texture's pattern kernel is none: the texture
+/// keeps its own bound).
 pub fn has_kernel(n: &SdfNode) -> bool {
     match n {
         SdfNode::Kernel(_) | SdfNode::Mesh(_) => true,
+        SdfNode::Texture { of, .. } => has_kernel(of),
         SdfNode::Combine { of, .. } => of.iter().any(has_kernel),
         SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => has_kernel(of),
         SdfNode::Material { within, of, .. } => within.as_deref().is_some_and(has_kernel) || has_kernel(of),
@@ -154,6 +157,7 @@ pub fn has_kernel(n: &SdfNode) -> bool {
 pub fn has_estimate(n: &SdfNode) -> bool {
     match n {
         SdfNode::Ellipsoid { .. } | SdfNode::Gyroid { .. } => true,
+        SdfNode::Texture { of, .. } => has_estimate(of),
         SdfNode::Combine { of, .. } => of.iter().any(has_estimate),
         SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => has_estimate(of),
         SdfNode::Material { within, of, .. } => within.as_deref().is_some_and(has_estimate) || has_estimate(of),
@@ -174,6 +178,12 @@ pub fn collect(n: &SdfNode, slots: &mut Vec<KernelSlot>) -> Result<(), crate::pr
             if !slots.iter().any(|s| s.is_mesh() && s.key == m.key()) {
                 slots.push(KernelSlot::mesh(m));
             }
+        }
+        SdfNode::Texture { tex, of } => {
+            if !slots.iter().any(|s| s.matches(&tex.kernel)) {
+                slots.push(KernelSlot::new(&tex.kernel)?);
+            }
+            collect(of, slots)?;
         }
         SdfNode::Combine { of, .. } => for c in of { collect(c, slots)?; },
         SdfNode::Shell { of, .. } | SdfNode::Round { of, .. } | SdfNode::Transform { of, .. } | SdfNode::Instance { of, .. } | SdfNode::Bone { of, .. } | SdfNode::Deform { of, .. } | SdfNode::Id { of, .. } | SdfNode::Sculpt { of, .. } => collect(of, slots)?,

@@ -132,7 +132,7 @@ fn gpu_mesh_brick_matches_twin() {
         let out = bake.compile(vm, target).unwrap(); bake.release(vm); out
     });
     let l = &compiled.layout;
-    let program = Id::new(1, 1); let bricks = Id::new(2, 1); let asset = Id::new(3, 1);
+    let program = Id::new(1, 1); let bricks = Id::new(2, 1); let asset = Id::new(3, 1); let slopes = Id::new(4, 1);
     let atlas = Id::new(1, 1); let materials = Id::new(2, 1); let pipeline = Id::new(1, 1);
     let mut w = CmdWriter::new(info.session);
     // HAL upload commands borrow these bytes until submit; retain every input.
@@ -140,6 +140,8 @@ fn gpu_mesh_brick_matches_twin() {
         (program, prog.texels.iter().flatten().flat_map(|f| f.to_le_bytes()).collect::<Vec<_>>()),
         (bricks, [0u32; 8].into_iter().flat_map(u32::to_le_bytes).collect()),
         (asset, slots[0].mesh_asset().unwrap().words.iter().flatten().flat_map(|w| w.to_le_bytes()).collect()),
+        // the one slot's slope bound and known masks, which the bake writes
+        (slopes, vec![0u8; 16]),
     ];
     for (id, bytes) in &inputs {
         w.buffer_create(*id, buffer_kind::STORAGE, bytes.len() as u64, Attr::default()); w.buffer_update(*id, 0, bytes);
@@ -162,14 +164,14 @@ fn gpu_mesh_brick_matches_twin() {
         let value = match slot.name { n if n == id!(cell) => 0.25f32.to_bits(), n if n == id!(band) => 4.0f32.to_bits(), n if n == id!(count) => 1, _ => 0u32 };
         params[slot.offset as usize..slot.offset as usize + 4].copy_from_slice(&value.to_le_bytes());
     }
-    let bound: Vec<_> = l.buffers.iter().map(|b| match b.name { n if n == id!(program) => program, n if n == id!(bricks) => bricks, _ => asset }).collect();
+    let bound: Vec<_> = l.buffers.iter().map(|b| match b.name { n if n == id!(program) => program, n if n == id!(bricks) => bricks, n if n == id!(slopes) => slopes, _ => asset }).collect();
     let textures: Vec<_> = l.storage_textures.iter().map(|t| if t.name == id!(atlas) { atlas } else { materials }).collect();
     assert_eq!(gpu.with_world(|w| w.session(info.session).unwrap().stats.bad_args), 0, "bake setup");
     let points: Vec<_> = (0..729).map(|i| [(i % 9) as f32 * 0.25, (i / 81) as f32 * 0.25, ((i / 9) % 9) as f32 * 0.25]).collect();
     for run in 0..3 {
         w.clear(); w.frame_begin(run + 1, FrameMeta::default());
         let b = w.put_ids(&bound); let t = w.put_ids(&textures);
-        let dispatch = Dispatch { pipeline, groups: [1, 1, 1], indirect_buffer: Id::NONE, indirect_offset: 0, params: w.put_bytes(&params),
+        let dispatch = Dispatch { pipeline, timer: 0, groups: [1, 1, 1], indirect_buffer: Id::NONE, indirect_offset: 0, params: w.put_bytes(&params),
             buffers: Range { off: b.off * 8, len: b.len * 8 }, textures: Range { off: t.off * 8, len: t.len * 8 } };
         w.compute_pass(0, 0, &[dispatch]); w.frame_end(Id::NONE, target::COMPUTE);
         let start = Instant::now(); gpu.submit(&w.buf());

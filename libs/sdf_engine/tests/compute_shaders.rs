@@ -1,7 +1,7 @@
 //! Compile the production objects, including the AIR splice, with native validators.
 use makepad_draw::*;
 use makepad_draw::makepad_script::{shader_backend::ShaderBackend, shader_ir_compute::*, shader_ir_draw, shader_ir_hlsl, shader_ir_metal};
-use makepad_sdf_engine::{kernel::{ComputeBake, KernelSlot}, makepad_csg_sdf::{SdfKernel, SdfSplashExpr, SplashPoint}};
+use makepad_sdf_engine::{kernel::{ComputeBake, KernelSlot}, makepad_csg_sdf::{SdfGrid, SdfKernel, SdfSplashExpr, SplashPoint}};
 
 #[cfg(target_os = "macos")]
 #[path = "../../../platform/script/tests/support/native_shader.rs"]
@@ -64,9 +64,10 @@ fn spirv(words: &[u32]) {
 fn validate_compute(k: &CompiledKernel, routed: bool, meshes: usize) {
     assert!(k.layout.precise_math);
     assert_eq!(k.layout.workgroup, [64, 1, 1]);
-    assert_eq!(k.layout.buffers.len(), 2 + meshes);
+    // the bricks and the programs it reads, the slopes it writes, a buffer per mesh
+    assert_eq!(k.layout.buffers.len(), 3 + meshes);
     assert_eq!(k.layout.storage_textures.len(), 2);
-    assert!(k.layout.buffers.iter().all(|b| !b.writable && b.stride == 16));
+    assert!(k.layout.buffers.iter().all(|b| b.writable == (b.name == id!(slopes)) && b.stride == 16));
     for name in [id!(cell), id!(band), id!(first), id!(count)] {
         assert!(k.layout.slots.iter().any(|s| s.name == name));
     }
@@ -91,7 +92,8 @@ fn validate_draw(vm: &mut ScriptVm, object: ScriptObject, name: &str, backend: S
     assert!(!out.has_errors, "{name}: {:?}", out.errors);
     assert!(vm.take_errors().is_empty(), "{name}: VM errors");
     assert!(out.io.iter().all(|io| io.name != id!(prog_tex) && io.name != id!(index_tex)), "{name}: obsolete texture binding");
-    if name == "March" { assert_eq!(out.storage_buffers.len(), 2 + meshes); }
+    // the index, the programs, the slopes, a buffer per mesh
+    if name == "March" { assert_eq!(out.storage_buffers.len(), 3 + meshes); }
     else if name != "Splat" { assert!(out.storage_buffers.iter().any(|b| b.name == id!(index))); }
     if vulkan {
         for module in shader_ir_draw::draw_spirv(&out, vm).unwrap() {
@@ -135,11 +137,17 @@ fn bake_and_draw_native_compilers() {
         let field = SdfSplashExpr::compile(vm, field, SplashPoint::Vec3, &[]).unwrap();
         let slot = KernelSlot::new(&SdfKernel::splash(field, None)).unwrap();
         assert!(slot.air().is_some(), "fixture must have a GPU route");
+        // a field reading a grid: its words come from the program buffer
+        let grid_fn = vm.eval(ScriptMod::new("", "", "grid_field", 0, 0, "use mod.math.*\nlet field = fn(p) { return sdf_grid3(p) - 0.5 }\n(field)", &[])).as_object().unwrap();
+        let _keep_grid = vm.new_object_ref(grid_fn);
+        let grid = SdfGrid::new([0.0; 3], 1.0, [2, 2, 2], 0.0, vec![0.0f32; 8].into());
+        let gridded = KernelSlot::new(&SdfKernel::splash(SdfSplashExpr::compile_gridded(vm, grid_fn, SplashPoint::Vec3, &[], grid).unwrap(), None)).unwrap();
+        assert!(gridded.air().is_some(), "a gridded field has a GPU route");
         let module = vm.heap().module(id!(draw));
         let corpus = meshes::corpus();
         let mesh = KernelSlot::mesh(&std::sync::Arc::new(corpus[0].1.clone()));
         let cup = KernelSlot::mesh(&std::sync::Arc::new(corpus[1].1.clone()));
-        for slots in [Vec::new(), vec![slot.clone()], vec![mesh.clone()], vec![slot, mesh, cup]] {
+        for slots in [Vec::new(), vec![slot.clone()], vec![mesh.clone()], vec![gridded], vec![slot, mesh, cup]] {
             let routed = slots.iter().any(|s| s.air().is_some());
             let meshes = slots.iter().filter(|s| s.is_mesh()).count();
             let mut bake = ComputeBake::new(vm, &slots).unwrap();

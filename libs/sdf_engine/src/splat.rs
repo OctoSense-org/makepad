@@ -218,5 +218,5 @@ pub fn draw_splats(cx: &mut Cx2d, draw: &mut DrawSdfSplat, splats: &RetainedInst
     dv.set_uniform(c, id!(sun_sky), &light.sky);
     dv.set_uniform(c, id!(sun_ground), &light.ground);
     dv.set_uniform(c, id!(world_up), &light.up);
-    cx.add_retained_instances(&draw.draw_vars, splats);
+    cx.add_retained_instances(&mut draw.draw_vars, splats);
 }

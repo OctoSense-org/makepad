@@ -211,7 +211,8 @@ pub fn eval_with(program: &[[f32; 4]], p: [f32; 3], kernels: &[crate::kernel::Ke
             pc += 1;
         } else if h[0] == op::KERNEL {
             let (params, n) = kernel_params(program, pc);
-            let d = kernels.get(h[1] as usize).map_or(f32::MAX, |k| k.distance(&params[..n], st.q));
+            let grid = kernel_grid(program, pc, &params);
+            let d = kernels.get(h[1] as usize).map_or(f32::MAX, |k| k.distance(&params[..n], grid, st.q));
             st.push(d);
             pc += 1 + h[2] as usize;
         } else {
@@ -237,11 +238,12 @@ pub fn eval_many(program: &[[f32; 4]], ps: &[[f32; 3]], kernels: &[crate::kernel
             pc += 1;
         } else if h[0] == op::KERNEL {
             let (params, n) = kernel_params(program, pc);
+            let grid = kernel_grid(program, pc, &params);
             qs.clear();
             qs.extend(sts.iter().map(|s| s.q));
             match kernels.get(h[1] as usize) {
                 Some(k) => {
-                    let d = k.distance_many(&params[..n], &qs);
+                    let d = k.distance_many(&params[..n], grid, &qs);
                     for (s, d) in sts.iter_mut().zip(d) {
                         s.push(d);
                     }
@@ -260,14 +262,26 @@ pub fn eval_many(program: &[[f32; 4]], ps: &[[f32; 3]], kernels: &[crate::kernel
     sts.iter().map(|s| (s.vs[0], s.ss[0])).collect()
 }
 
-/// A KERNEL op's parameters (at most 16) and their count.
+/// A KERNEL op's parameters (at most 16) and their count (a gridded op's count is 32 more:
+/// [`crate::program::GRIDDED`]).
 fn kernel_params(program: &[[f32; 4]], pc: usize) -> ([f32; 16], usize) {
-    let n = (program[pc][3] as usize).min(16);
+    let n = ((program[pc][3] as usize) % crate::program::GRIDDED).min(16);
     let mut params = [0.0f32; 16];
     for k in 0..n {
         params[k] = program[pc + 1 + k / 4][k % 4];
     }
     (params, n)
+}
+
+/// A gridded KERNEL op's grid: the words of its payload (param 0 is the payload's texel
+/// offset from the op; its header's word 13, the word count), as the shader reads them.
+fn kernel_grid<'a>(program: &'a [[f32; 4]], pc: usize, params: &[f32; 16]) -> Option<&'a [f32]> {
+    if (program[pc][3] as usize) < crate::program::GRIDDED {
+        return None;
+    }
+    let at = pc + params[0] as usize;
+    let words = program[at + 3][1] as usize;
+    program[at..at + words.div_ceil(4)].as_flattened().get(..words)
 }
 
 /// One point's interpreter state.
@@ -380,6 +394,36 @@ impl St {
             pc + 1
         } else if code == op::SCALE {
             vs[*vn - 1] *= h[1];
+            pc + 1
+        } else if code == op::TEX {
+            // Eval.eval_program's TEX, op for op
+            let (a, m) = (program[pc + 1], program[pc + 2]);
+            let np = if h[1] > 0.5 { 3 } else { 1 };
+            let di = *vn - np - 1;
+            let (d, sd) = (vs[di], ss[di]);
+            let (mut gx, mut gy, mut gz) = (0.0f32, 0.0f32, 0.0f32);
+            let mut at = di;
+            if h[2] > 0.5 {
+                let (g0, g1, g2, g3) = (vs[di - 4], vs[di - 3], vs[di - 2], vs[di - 1]);
+                gx = (((g0 - g1) - g2) + g3) * a[1];
+                gy = (((0.0 - g0) - g1) + g2 + g3) * a[1];
+                gz = (((0.0 - g0) + g1) - g2 + g3) * a[1];
+                at = di - 4;
+            }
+            let mt = clamp((m[1] - gy) / (m[1] - m[0]), 0.0, 1.0);
+            let mb = clamp((m[3] + gy) / (m[3] - m[2]), 0.0, 1.0);
+            let (mt, mb) = ((mt * mt) * (3.0 - 2.0 * mt), (mb * mb) * (3.0 - 2.0 * mb));
+            let mut t = vs[*vn - 1];
+            if np == 3 {
+                let n = ((gx * gx + gy * gy) + gz * gz).max(1.0);
+                t = (((gx * gx) / n) * vs[*vn - 3] + ((gy * gy) / n) * vs[*vn - 2]) + ((gz * gz) / n) * vs[*vn - 1];
+            }
+            vs[at] = (d + h[3] * ((mt * mb) * t)) * a[0];
+            ss[at] = sd;
+            *vn = at + 1;
+            pc + 3
+        } else if code == op::GRAD || code == op::PAT {
+            // the twin knows no masks: it evaluates what they would skip
             pc + 1
         } else {
             // MAT_WITHIN: the region's distance is on top

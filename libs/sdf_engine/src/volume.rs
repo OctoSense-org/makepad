@@ -21,8 +21,9 @@ use crate::kernel::KernelSlot;
 use crate::program::{lower_with, LowerError, Program};
 use crate::twin;
 use makepad_csg_math::thread_pool::{parallel_for, parallel_map, thread_count};
-use makepad_csg_sdf::{changed, cull, node_bounds, Bounds, SdfNode};
+use makepad_csg_sdf::{changed, cull, culls_alike, node_bounds, Bounds, SdfNode};
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::sync::Arc;
 
 /// Samples per brick edge.
@@ -69,7 +70,8 @@ pub struct Volume {
     /// ellipsoid's): 1 / the steepest gradient measured near the surface. At the root, so a
     /// shell or a blend over it keeps its exact offsets. Only shrinks while the volume lives.
     pub field_scale: f32,
-    program_ids: HashMap<Vec<u32>, u32>,
+    /// The ids of `programs` by a hash of their texels.
+    program_ids: HashMap<u64, Vec<u32>>,
     free_slots: Vec<u32>,
     /// Slots still referenced by the published field. Only publish releases them.
     deferred_slots: Vec<u32>,
@@ -97,13 +99,17 @@ pub struct BuildStats {
 
 enum BrickResult {
     Empty { skip: f32 },
-    Bake { program: Program },
+    /// Bakes its block's program `program`.
+    Bake { program: usize },
 }
 
 struct BlockResult {
     block_skip: Option<f64>,
     // Keep brick errors in order so release and touched still precede them.
     bricks: Vec<(usize, Result<BrickResult, LowerError>)>,
+    /// The block's distinct programs, each with the region it was culled to (the block's own
+    /// first, when it has one); taken as their first brick is applied.
+    programs: Vec<(Bounds, Option<Program>)>,
 }
 
 fn grow(b: Bounds, r: f64) -> Bounds {
@@ -212,13 +218,20 @@ impl Volume {
     }
 
     fn program_id(&mut self, p: Program) -> u32 {
-        let key: Vec<u32> = p.texels.iter().flat_map(|t| t.map(f32::to_bits)).collect();
-        if let Some(id) = self.program_ids.get(&key) {
-            return *id;
+        fn bits(q: &Program) -> impl Iterator<Item = u32> + '_ {
+            q.texels.iter().flat_map(|t| t.map(f32::to_bits))
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for v in bits(&p) {
+            h.write_u32(v);
+        }
+        let ids = self.program_ids.entry(h.finish()).or_default();
+        if let Some(&id) = ids.iter().find(|&&id| bits(&self.programs[id as usize]).eq(bits(&p))) {
+            return id;
         }
         let id = self.programs.len() as u32;
+        ids.push(id);
         self.programs.push(p);
-        self.program_ids.insert(key, id);
         id
     }
 
@@ -247,7 +260,8 @@ impl Volume {
         crate::kernel::collect(root, &mut self.kernels)?;
         let mut region = region;
         let estimate = crate::kernel::has_estimate(root);
-        if !self.kernels.is_empty() || estimate {
+        // A texture's pattern kernel needs no measuring: the texture keeps its own bound.
+        if crate::kernel::has_kernel(root) || estimate {
             let lo: [f64; 3] = std::array::from_fn(|i| (self.min[i] * BS) as f64 * c);
             let hi: [f64; 3] = std::array::from_fn(|i| ((self.min[i] + self.dim[i]) * BS) as f64 * c);
             let t = std::time::Instant::now();
@@ -311,7 +325,8 @@ impl Volume {
                             let margin = band + c;
                             let skip_of = |d: f64, r: f64| if d < 0.0 { -(-d - r).min(margin) } else { (d - r).min(margin) };
                             let mut block_prog = None;
-                            let block_skip = match cull(&root, &grow(bb, margin)) {
+                            let block_region = grow(bb, margin);
+                            let block_skip = match cull(&root, &block_region) {
                                 None => Some(margin),
                                 Some(n) => {
                                     let p = lower_with(&n, &kernels, kernel_scale)?.scaled(field_scale);
@@ -339,6 +354,10 @@ impl Volume {
                                 }
                                 _ => None,
                             };
+                            let mut programs: Vec<(Bounds, Option<Program>)> = match (block_skip, block_prog) {
+                                (None, Some(p)) => vec![(block_region, Some(p))],
+                                _ => Vec::new(),
+                            };
                             let mut bricks = Vec::with_capacity((BLOCK * BLOCK * BLOCK) as usize);
                             for z in 0..BLOCK {
                                 for y in 0..BLOCK {
@@ -354,9 +373,20 @@ impl Volume {
                                         let r = half_diag(1.0);
                                         let ctr: [f64; 3] = std::array::from_fn(|k| 0.5 * (bx.0[k] + bx.1[k]));
                                         let k = ((z * BLOCK + y) * BLOCK + x) as usize;
-                                        let brick = match cull(&root, &grow(bx, band + c)) {
+                                        // A brick whose cull keeps what the block's or an earlier brick's
+                                        // kept has that program: neither culled, lowered nor keyed again.
+                                        let region = grow(bx, band + c);
+                                        let program = match programs.iter().position(|(kept, _)| culls_alike(&root, &region, kept)) {
+                                            Some(at) => Some(Ok(at)),
+                                            None => cull(&root, &region).map(|n| lower_with(&n, &kernels, kernel_scale).map(|p| {
+                                                programs.push((region, Some(p.scaled(field_scale))));
+                                                programs.len() - 1
+                                            })),
+                                        };
+                                        let brick = match program {
                                             None => Ok(BrickResult::Empty { skip: margin as f32 }),
-                                            Some(n) => lower_with(&n, &kernels, kernel_scale).map(|p| p.scaled(field_scale)).map(|p| {
+                                            Some(program) => program.map(|at| {
+                                                let p = programs[at].1.as_ref().expect("a block program");
                                                 let d = match &batched {
                                                     Some(ds) => ds[k],
                                                     None => twin::eval_with(&p.texels, ctr.map(|v| v as f32), &kernels).0,
@@ -365,7 +395,7 @@ impl Volume {
                                                 if d.abs() > r + band {
                                                     BrickResult::Empty { skip: skip_of(d, r) as f32 }
                                                 } else {
-                                                    BrickResult::Bake { program: p }
+                                                    BrickResult::Bake { program: at }
                                                 }
                                             }),
                                         };
@@ -373,7 +403,7 @@ impl Volume {
                                     }
                                 }
                             }
-                            Ok(BlockResult { block_skip, bricks })
+                            Ok(BlockResult { block_skip, bricks, programs })
                         })
                         .collect::<Vec<_>>()
                 }
@@ -383,19 +413,29 @@ impl Volume {
         st.blocks_ms = t_blocks.elapsed().as_secs_f64() * 1e3;
         let t_apply = std::time::Instant::now();
         // Apply in lattice order: slot reuse and program ids depend on it.
+        let mut ids: Vec<Option<u32>> = Vec::new();
         for result in results {
             st.blocks += 1;
-            let block = result?;
-            for (i, brick) in block.bricks {
+            let BlockResult { block_skip, bricks, mut programs } = result?;
+            ids.clear();
+            ids.resize(programs.len(), None);
+            for (i, brick) in bricks {
                 self.release(i);
                 self.touched.push(i);
-                if block.block_skip.is_none() {
+                if block_skip.is_none() {
                     st.bricks_tested += 1;
                 }
                 self.bricks[i] = match brick? {
                     BrickResult::Empty { skip } => Brick::Empty { skip },
-                    BrickResult::Bake { program: p } => {
-                        let program = self.program_id(p);
+                    BrickResult::Bake { program: at } => {
+                        let program = match ids[at] {
+                            Some(id) => id,
+                            None => {
+                                let id = self.program_id(programs[at].1.take().expect("a block program, taken once"));
+                                ids[at] = Some(id);
+                                id
+                            }
+                        };
                         let slot = self.alloc_slot();
                         st.bricks_baked += 1;
                         self.dirty.push(i);
@@ -403,7 +443,7 @@ impl Volume {
                     }
                 };
             }
-            if block.block_skip.is_some() {
+            if block_skip.is_some() {
                 st.blocks_skipped += 1;
             }
         }
@@ -546,45 +586,68 @@ mod tests {
         SdfNode::Combine { op: SdfOp::Difference, blend: 0.0, of: vec![rimmed, mouth] }
     }
 
-    /// The samples of empty brick `i` that lie inside the band (they should not exist).
-    fn inside_band(vol: &Volume, root: &SdfNode, i: usize) -> Vec<([f32; 3], f32)> {
-        let p = crate::program::lower_with(root, &[], 1.0).expect("lowers").scaled(vol.field_scale).texels;
-        let b = vol.brick_of(i);
-        let mut out = Vec::new();
-        for z in 0..BS {
-            for y in 0..BS {
-                for x in 0..BS {
-                    let q = [b[0] * BS + x, b[1] * BS + y, b[2] * BS + z].map(|v| v as f32 * vol.cell);
-                    let (d, _) = twin::eval(&p, q);
-                    if d.abs() < vol.band {
-                        out.push((q, d));
+    /// The empty bricks of `vol` with a sample inside the band (there should be none), each with
+    /// its first such sample and its distance. A brick is sampled whole only when its centre is
+    /// within the band and two half-diagonals of the surface: a farther one holds a sample in the
+    /// band only where the field (at the volume's scale) is steeper than 2, twice the 1 its scale
+    /// keeps it to. The unscaled field of the drag's flattest belly is about 1.4 steep, so a
+    /// field left unscaled still shows its holes.
+    fn holes(vol: &Volume, root: &SdfNode) -> Vec<([i32; 3], [f32; 3], f32)> {
+        let p = Arc::new(crate::program::lower_with(root, &[], 1.0).expect("lowers").scaled(vol.field_scale).texels);
+        let (cell, band) = (vol.cell, vol.band);
+        let r = 0.5 * (BS as f32) * cell * 3f32.sqrt();
+        let empty: Vec<[i32; 3]> = (0..vol.bricks.len()).filter(|&i| !matches!(vol.bricks[i], Brick::Baked { .. })).map(|i| vol.brick_of(i)).collect();
+        parallel_map(&empty, move |bricks| {
+            let centres: Vec<[f32; 3]> = bricks.iter().map(|b| b.map(|v| (v * BS) as f32 * cell + 0.5 * (BS - 1) as f32 * cell)).collect();
+            let near = twin::eval_many(&p, &centres, &[]);
+            let mut out = Vec::new();
+            let mut samples = Vec::with_capacity((BS * BS * BS) as usize);
+            for (b, (d, _)) in bricks.iter().zip(near) {
+                if d.abs() >= band + 2.0 * r {
+                    continue;
+                }
+                samples.clear();
+                for z in 0..BS {
+                    for y in 0..BS {
+                        for x in 0..BS {
+                            samples.push([b[0] * BS + x, b[1] * BS + y, b[2] * BS + z].map(|v| v as f32 * cell));
+                        }
                     }
                 }
+                let ds = twin::eval_many(&p, &samples, &[]);
+                if let Some(k) = ds.iter().position(|(d, _)| d.abs() < band) {
+                    out.push((*b, samples[k], ds[k].0));
+                }
             }
-        }
-        out
+            out
+        })
     }
 
     /// An edited volume equals a volume built at the new value (at its scale), and no brick it
     /// calls empty has a sample inside the band (the march would step through the surface
-    /// there): the vase's belly is an ellipsoid, whose field is an estimate.
+    /// there): the vase's belly is an ellipsoid, whose field is an estimate. The drag's states:
+    /// the belly grows (the ellipsoid flattens and its estimate steepens: the scale shrinks and
+    /// every brick is built again), then the height (a region edit at the scale held, and ones
+    /// that shrink it again).
     #[test]
     fn a_dragged_vase_keeps_every_surface_brick() {
-        let steps: Vec<(f64, f64)> = (0..=12).map(|k| (70.0, 21.0 + k as f64 * 2.5)).chain((0..=12).map(|k| (70.0 + k as f64 * 6.0, 51.0))).collect();
-        let first = vase(steps[0].0, steps[0].1);
-        let bounds = Volume::bounds_of(&first).unwrap();
-        let pad: [f64; 3] = std::array::from_fn(|i| (bounds.1[i] - bounds.0[i]) * 0.6);
-        let room = (std::array::from_fn(|i| bounds.0[i] - pad[i]), std::array::from_fn(|i| bounds.1[i] + pad[i] * 2.0));
+        let steps = [(70.0, 21.0), (70.0, 36.0), (70.0, 51.0), (82.0, 51.0), (106.0, 51.0), (142.0, 51.0)];
         let cell = 0.6f32;
+        // room for every state, with the band and a cell around it (`Volume::covers`)
+        let room = steps
+            .iter()
+            .map(|&(h, belly)| Volume::bounds_of(&vase(h, belly)).unwrap())
+            .reduce(|a, b| (std::array::from_fn(|i| a.0[i].min(b.0[i])), std::array::from_fn(|i| a.1[i].max(b.1[i]))))
+            .map(|r| grow(r, (cell * 5.0) as f64))
+            .unwrap();
+        let first = vase(steps[0].0, steps[0].1);
         let mut edited = Volume::new(room, cell, cell * 4.0);
         edited.build(&first, None).unwrap();
         let mut prev = first;
         let mut misses = Vec::new();
         for &(h, belly) in &steps[1..] {
             let next = vase(h, belly);
-            if edited.edit(&prev, &next).unwrap().is_none() {
-                continue;
-            }
+            assert!(edited.edit(&prev, &next).unwrap().is_some(), "height {h} belly {belly} left the volume");
             // at the scale the edited volume holds (a scale only shrinks while a volume lives)
             let mut full = Volume::new(room, cell, cell * 4.0);
             full.field_scale = edited.field_scale;
@@ -593,14 +656,40 @@ mod tests {
             let kind = |v: &Volume| v.bricks.iter().map(|b| matches!(b, Brick::Baked { .. })).collect::<Vec<_>>();
             let (ke, kf) = (kind(&edited), kind(&full));
             let differ = (0..ke.len()).filter(|i| ke[*i] != kf[*i]).count();
-            let holes: Vec<usize> = (0..full.bricks.len()).filter(|i| !kf[*i] && !inside_band(&full, &next, *i).is_empty()).collect();
+            let holes = holes(&full, &next);
             if differ > 0 || !holes.is_empty() {
-                let example = holes.first().map(|i| (full.brick_of(*i), inside_band(&full, &next, *i)[0]));
-                misses.push(format!("height {h} belly {belly}: {differ} bricks differ from a full build, {} empty bricks hold surface (e.g. {example:?})", holes.len()));
+                misses.push(format!("height {h} belly {belly}: {differ} bricks differ from a full build, {} empty bricks hold surface (e.g. {:?})", holes.len(), holes.first()));
             }
             prev = next;
         }
         assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    /// Every baked brick's program is its own region's cull, lowered: a brick that takes its
+    /// block's or a neighbour's program bakes the field it would have culled itself.
+    #[test]
+    fn shared_brick_programs_are_each_bricks_own() {
+        for (h, belly) in [(70.0, 21.0), (82.0, 26.0)] {
+            let root = vase(h, belly);
+            let bounds = Volume::bounds_of(&root).unwrap();
+            let pad: [f64; 3] = std::array::from_fn(|i| (bounds.1[i] - bounds.0[i]) * 0.3);
+            let room = (std::array::from_fn(|i| bounds.0[i] - pad[i]), std::array::from_fn(|i| bounds.1[i] + pad[i]));
+            let mut vol = Volume::new(room, 0.6, 2.4);
+            vol.build(&root, None).unwrap();
+            let (c, margin) = (vol.cell as f64, (vol.band + vol.cell) as f64);
+            let bits = |p: &Program| p.texels.iter().map(|t| t.map(f32::to_bits)).collect::<Vec<_>>();
+            let mut used = std::collections::HashSet::new();
+            for (i, brick) in vol.bricks.iter().enumerate() {
+                let Brick::Baked { program, .. } = brick else { continue };
+                used.insert(*program);
+                let b = vol.brick_of(i);
+                let region = grow((b.map(|v| (v * BS) as f64 * c), b.map(|v| (v * BS + BS) as f64 * c)), margin);
+                let own = lower_with(&cull(&root, &region).expect("a baked brick's solid"), &vol.kernels, vol.kernel_scale).unwrap().scaled(vol.field_scale);
+                assert_eq!(bits(&vol.programs[*program as usize]), bits(&own), "vase {h} {belly}: brick {b:?}");
+            }
+            let baked = vol.bricks.iter().filter(|b| matches!(b, Brick::Baked { .. })).count();
+            assert!(used.len() < baked, "vase {h} {belly}: {} programs for {baked} baked bricks", used.len());
+        }
     }
 
     #[test]

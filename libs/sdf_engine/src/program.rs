@@ -16,7 +16,15 @@
 //!   region runs the region's program first and MAT_WITHIN pops its value:
 //!   the slot applies where it is <= 0, elsewhere the inherited one stays;
 //! - Instance becomes a sharp union of its copies (each one an XFORM bracket
-//!   around the same subprogram); Bone and Id leave the field as it is.
+//!   around the same subprogram); Bone and Id leave the field as it is;
+//! - a Texture pushes its source's values at the four corners of its gradient's
+//!   tetrahedron (XFORM brackets of a translation; only for its masks or the
+//!   triplanar blend), the source's value, then its pattern kernel's value per
+//!   projection (KERNEL ops in XFORM brackets that turn the point into the
+//!   kernel's frame and units, no SCALE: a pattern is no distance); TEX
+//!   combines them into the textured value. A single-projection texture's
+//!   corners follow a GRAD op and its pattern a PAT op, which a march skips in a
+//!   brick where the bake found the texture's masks constant ([`KNOWN_TEXTURES`]).
 //!
 //! All parameters are converted to f32 here, once: what the GPU and the twin
 //! compute from is the same bits. A program starts with one header texel
@@ -24,7 +32,7 @@
 //! the op stream and count toward `texels.len()` and buffer uploads.
 
 use crate::kernel::KernelSlot;
-use makepad_csg_sdf::{SdfDeform, SdfNode, SdfOp, SdfPlace};
+use makepad_csg_sdf::{SdfDeform, SdfNode, SdfOp, SdfPlace, TexProject};
 
 /// Op codes (the header texel's `x`).
 pub mod op {
@@ -41,7 +49,10 @@ pub mod op {
     pub const MAT_WITHIN: f32 = 10.0;
     /// A compiled Splash kernel: (op, slot in the volume's kernel table,
     /// parameter texels, parameter count), then its parameters, four per
-    /// texel. It pushes its distance like a primitive.
+    /// texel. It pushes its distance like a primitive. A gridded kernel's
+    /// count is [`super::GRIDDED`] more, and its parameter 0 is the texel
+    /// offset from this op of its grid's words (a payload; the shader's
+    /// `kernel_at_fetch` adds the op's own texel).
     pub const KERNEL: f32 = 11.0;
     /// The top value times `y`: a kernel's distance brought to a 1-Lipschitz
     /// bound (the volume's estimate of its steepest gradient).
@@ -50,6 +61,39 @@ pub mod op {
     pub const MESH: f32 = 14.0;
     /// y/z: program-relative payload offset and texel count, stored as u32 bits.
     pub const LINKS: f32 = 15.0;
+    /// A texture (`csg_sdf::SdfTexture::combine`): 3 texels, (op, triplanar, gradient,
+    /// depth), (1 / lipschitz, 1 / (4 step), its ordinal, 0), (top ramp lo hi, bottom ramp lo
+    /// hi; an absent mask is the ramp 2..3, 1 everywhere). It pops the pattern's values (3 for
+    /// triplanar, else 1), the source's value and, with the gradient, the source's values at
+    /// the tetrahedron's corners below it, and pushes the textured value with the source's slot.
+    pub const TEX: f32 = 16.0;
+    /// (op, texels of the gradient's four corner brackets after it, the texture's ordinal, 0):
+    /// where the evaluation knows the texture's masks, it skips the brackets and pushes four
+    /// zeros in their place (the TEX takes the known masks instead of the gradient's).
+    pub const GRAD: f32 = 17.0;
+    /// (op, texels of the pattern's brackets after it, the texture's ordinal, its values):
+    /// where the texture's masks are known 0, it skips them and pushes zeros in their place.
+    pub const PAT: f32 = 18.0;
+}
+
+/// Added to a KERNEL op's parameter count when the kernel reads a grid.
+pub const GRIDDED: usize = 32;
+
+/// The textures (in lowering order) whose masks an evaluation can be told: the ordinal's bit
+/// of a known-masks word (`compute.rs`'s `run_program`), its value 16 bits up.
+pub const KNOWN_TEXTURES: usize = 16;
+
+/// The texels of the op whose header is `h` (its parameters included).
+pub fn op_len(h: [f32; 4]) -> usize {
+    if h[0] == op::PRIM || h[0] == op::TEX {
+        3
+    } else if h[0] == op::XFORM_PUSH {
+        4
+    } else if h[0] == op::KERNEL {
+        1 + h[2] as usize
+    } else {
+        1
+    }
 }
 
 /// Primitive kinds (a PRIM's header `y`). A PRIM is 3 texels: header
@@ -108,8 +152,10 @@ impl Program {
                 if h[0] == op::LINKS {
                     self.texels[pc][1] = f32::from_bits(h[1].to_bits() + 1);
                 }
-                pc += if h[0] == op::PRIM { 3 } else if h[0] == op::XFORM_PUSH { 4 }
-                    else if h[0] == op::KERNEL { 1 + h[2] as usize } else { 1 };
+                if h[0] == op::KERNEL && h[3] as usize >= GRIDDED {
+                    self.texels[pc + 1][0] += 1.0;
+                }
+                pc += op_len(h);
             }
             self.texels.insert(end, [op::SCALE, s, 0.0, 0.0]);
             self.texels[0][0] = (end + 1) as f32;
@@ -124,10 +170,14 @@ struct Lower<'a> {
     kernel_scale: f32,
     out: Vec<[f32; 4]>,
     payloads: Vec<(usize, Vec<[f32; 4]>)>,
+    /// Gridded KERNEL ops and their grids' words.
+    grids: Vec<(usize, Vec<[f32; 4]>)>,
     vdepth: usize,
     vmax: usize,
     pdepth: usize,
     pmax: usize,
+    /// Textures lowered so far (the next one's ordinal).
+    textures: usize,
 }
 
 fn f(v: f64) -> f32 {
@@ -176,6 +226,18 @@ impl Lower<'_> {
         self.out.push([op::PRIM, kind, p[0], p[1]]);
         self.out.push([p[2], p[3], p[4], p[5]]);
         self.out.push([p[6], p[7], p[8], p[9]]);
+        self.push_value();
+    }
+
+    /// A KERNEL op: the kernel in `slot` at the current point, its parameters inline.
+    fn kernel_op(&mut self, slot: usize, params: &[f32]) {
+        let texels = params.len().div_ceil(4);
+        self.out.push([op::KERNEL, slot as f32, texels as f32, params.len() as f32]);
+        for c in params.chunks(4) {
+            let mut t = [0.0f32; 4];
+            t[..c.len()].copy_from_slice(c);
+            self.out.push(t);
+        }
         self.push_value();
     }
 
@@ -270,6 +332,56 @@ impl Lower<'_> {
                     None => return Err(LowerError::Unsupported("a sculpt with nothing left of its solid")),
                 }
             }
+            SdfNode::Texture { tex, of } => {
+                let Some(slot) = self.kernels.iter().position(|s| s.matches(&tex.kernel)) else {
+                    return Err(LowerError::Unsupported("a texture's kernel missing from the volume's kernel table"));
+                };
+                let grad = tex.needs_gradient();
+                let triplanar = tex.project == TexProject::Triplanar;
+                let ordinal = self.textures;
+                self.textures += 1;
+                // A single projection's masks read the gradient's Y alone: where they are
+                // constant over a brick, a march is told and skips the corners (and, masked
+                // off, the pattern). The triplanar blend needs the whole gradient.
+                let skips = !triplanar && ordinal < KNOWN_TEXTURES;
+                if grad {
+                    let at = self.out.len();
+                    if skips { self.out.push([op::GRAD, 0.0, ordinal as f32, 0.0]); }
+                    for k in makepad_csg_sdf::texture::TETRA {
+                        let t = k.map(|c| f(c * tex.step));
+                        self.xform([[1.0, 0.0, 0.0, t[0]], [0.0, 1.0, 0.0, t[1]], [0.0, 0.0, 1.0, t[2]]], 1.0, |s| s.node(of))?;
+                    }
+                    if skips { self.out[at][1] = (self.out.len() - at - 1) as f32; }
+                }
+                self.node(of)?;
+                let axes: &[u8] = match tex.project {
+                    TexProject::Axis(a) => &[0, 1, 2][a.min(2) as usize..a.min(2) as usize + 1],
+                    TexProject::Triplanar => &[0, 1, 2],
+                };
+                let params = tex.kernel.splash.as_ref().map(|s| s.params()).unwrap_or_default();
+                let k = f(tex.kscale);
+                let pat = self.out.len();
+                if skips && grad { self.out.push([op::PAT, 0.0, ordinal as f32, axes.len() as f32]); }
+                for &a in axes {
+                    // the kernel's point: the swizzle that makes axis `a` its Y, in its units
+                    let rows = match a {
+                        0 => [[0.0, 0.0, k, 0.0], [k, 0.0, 0.0, 0.0], [0.0, k, 0.0, 0.0]],
+                        2 => [[k, 0.0, 0.0, 0.0], [0.0, 0.0, k, 0.0], [0.0, k, 0.0, 0.0]],
+                        _ => [[k, 0.0, 0.0, 0.0], [0.0, k, 0.0, 0.0], [0.0, 0.0, k, 0.0]],
+                    };
+                    self.xform(rows, 1.0, |s| {
+                        s.kernel_op(slot, &params);
+                        Ok(())
+                    })?;
+                }
+                if skips && grad { self.out[pat][1] = (self.out.len() - pat - 1) as f32; }
+                let none = (2.0, 3.0);
+                let (top, bottom) = (tex.top.unwrap_or(none), tex.bottom.unwrap_or(none));
+                self.out.push([op::TEX, if triplanar { 1.0 } else { 0.0 }, if grad { 1.0 } else { 0.0 }, f(tex.depth)]);
+                self.out.push([f(1.0 / tex.lipschitz), f(0.25 / tex.step), ordinal as f32, 0.0]);
+                self.out.push([f(top.0), f(top.1), f(bottom.0), f(bottom.1)]);
+                self.vdepth -= axes.len() + if grad { 4 } else { 0 };
+            }
             SdfNode::Deform { deform, lipschitz, of } => {
                 let (kind, rate, axis) = match *deform {
                     SdfDeform::Twist { rate } => (0.0, rate, 0),
@@ -289,14 +401,14 @@ impl Lower<'_> {
                     return Err(LowerError::Unsupported("a kernel missing from the volume's kernel table"));
                 };
                 let params = k.splash.as_ref().map(|s| s.params()).unwrap_or_default();
-                let texels = params.len().div_ceil(4);
-                self.out.push([op::KERNEL, slot as f32, texels as f32, params.len() as f32]);
-                for c in params.chunks(4) {
-                    let mut t = [0.0f32; 4];
-                    t[..c.len()].copy_from_slice(c);
-                    self.out.push(t);
+                let at = self.out.len();
+                self.kernel_op(slot, &params);
+                if let Some(g) = k.splash.as_ref().and_then(|s| s.grid()) {
+                    self.out[at][3] += GRIDDED as f32;
+                    let mut words = g.words();
+                    words.resize(words.len().div_ceil(4) * 4, 0.0);
+                    self.grids.push((at, words.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()));
                 }
-                self.push_value();
                 if self.kernel_scale != 1.0 {
                     self.out.push([op::SCALE, self.kernel_scale, 0.0, 0.0]);
                 }
@@ -327,7 +439,7 @@ pub fn lower(n: &SdfNode) -> Result<Program, LowerError> {
 /// kernel's slot there is its index), each kernel's distance multiplied by
 /// `kernel_scale`.
 pub fn lower_with(n: &SdfNode, kernels: &[KernelSlot], kernel_scale: f32) -> Result<Program, LowerError> {
-    let mut l = Lower { kernels, kernel_scale, out: vec![[0.0; 4]], payloads: Vec::new(), vdepth: 0, vmax: 0, pdepth: 0, pmax: 0 };
+    let mut l = Lower { kernels, kernel_scale, out: vec![[0.0; 4]], payloads: Vec::new(), grids: Vec::new(), vdepth: 0, vmax: 0, pdepth: 0, pmax: 0, textures: 0 };
     l.node(n)?;
     if l.vmax > MAX_VALUE_DEPTH || l.pmax > MAX_POINT_DEPTH {
         return Err(LowerError::Unsupported("program exceeds GPU interpreter stack depth"));
@@ -337,6 +449,10 @@ pub fn lower_with(n: &SdfNode, kernels: &[KernelSlot], kernel_scale: f32) -> Res
     for (pc, data) in l.payloads {
         l.out[pc][1] = f32::from_bits(u32::try_from(l.out.len()).expect("program offset exceeds u32"));
         l.out[pc][2] = f32::from_bits(u32::try_from(data.len()).expect("links payload exceeds u32"));
+        l.out.extend(data);
+    }
+    for (pc, data) in l.grids {
+        l.out[pc + 1][0] = (l.out.len() - pc) as f32;
         l.out.extend(data);
     }
     Ok(Program { texels: l.out, value_depth: l.vmax, point_depth: l.pmax })

@@ -14,10 +14,14 @@ use std::{rc::Rc, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 pub const ATLAS_SLOTS_X: usize = 50;
 pub const ATLAS_W: usize = ATLAS_SLOTS_X * 81;
 
+/// A vec4 of the device's buffers: four 4-byte lanes (f32 as its bits).
+type Word = [u32; 4];
+
 #[derive(Clone)]
 struct Buffer {
     gpu: GpuBuffer,
-    data: Arc<[u8]>,
+    /// what the device holds: the changed words of the next upload go up alone
+    data: Arc<[Word]>,
     _reservation: Rc<GpuReservation>,
 }
 
@@ -36,20 +40,19 @@ impl Buffer {
     }
 
     /// Coalesce changed vec4 ranges. Growing allocations upload their complete payload.
-    fn upload(&mut self, cx: &mut Cx, data: Vec<u8>) -> Result<(), String> {
+    fn upload(&mut self, cx: &mut Cx, data: Vec<Word>) -> Result<(), String> {
         if self.data.is_empty() {
-            if !data.is_empty() { self.gpu.update(cx, 0, &data)?; }
+            if !data.is_empty() { self.gpu.update(cx, 0, bytes(&data))?; }
         } else {
             let mut start = None;
-            for offset in (0..data.len()).step_by(16) {
-                let end = (offset + 16).min(data.len());
-                let changed = self.data.get(offset..end) != Some(&data[offset..end]);
-                if changed { start.get_or_insert(offset); }
+            for (i, word) in data.iter().enumerate() {
+                let changed = self.data.get(i) != Some(word);
+                if changed { start.get_or_insert(i); }
                 if !changed {
-                    if let Some(first) = start.take() { self.gpu.update(cx, first as u64, &data[first..offset])?; }
+                    if let Some(first) = start.take() { self.gpu.update(cx, first as u64 * 16, bytes(&data[first..i]))?; }
                 }
             }
-            if let Some(first) = start { self.gpu.update(cx, first as u64, &data[first..])?; }
+            if let Some(first) = start { self.gpu.update(cx, first as u64 * 16, bytes(&data[first..]))?; }
         }
         self.data = data.into();
         Ok(())
@@ -60,19 +63,25 @@ impl Buffer {
 struct Atlas {
     distance: Texture,
     material: Texture,
+    /// Per slot a vec4, x: the slot copy's slope bound (the bake writes it with the slot).
+    slopes: GpuBuffer,
     rows: usize,
     _reservation: Rc<GpuReservation>,
 }
 
 impl Atlas {
-    fn new(cx: &mut Cx, rows: usize, reservation: GpuReservation) -> Self {
+    /// The device bytes of an atlas of `rows` texel rows: two texels per sample, a vec4 per slot.
+    fn bytes(rows: usize) -> usize { ATLAS_W * rows * 3 + rows / 9 * ATLAS_SLOTS_X * 16 }
+
+    fn new(cx: &mut Cx, rows: usize, reservation: GpuReservation) -> Result<Self, String> {
         let texture = |cx: &mut Cx, format| Texture::new_with_format(cx,
             TextureFormat::Storage { format, width: ATLAS_W, height: rows });
-        Self {
+        Ok(Self {
             distance: texture(cx, StorageTextureFormat::R16f),
             material: texture(cx, StorageTextureFormat::R8unorm),
+            slopes: GpuBuffer::new(cx, (rows / 9 * ATLAS_SLOTS_X * 16) as u64, GpuBufferFlags::default())?,
             rows, _reservation: Rc::new(reservation),
-        }
+        })
     }
 }
 
@@ -87,7 +96,7 @@ struct Field {
 
 struct Pending {
     field: Field,
-    index: Vec<u8>,
+    index: Vec<Word>,
     first: usize,
     count: usize,
 }
@@ -110,8 +119,17 @@ pub struct Baker {
     published: u64,
 }
 
-fn floats(data: Vec<[f32; 4]>) -> Vec<u8> {
-    data.into_iter().flatten().flat_map(f32::to_le_bytes).collect()
+fn floats(data: Vec<[f32; 4]>) -> Vec<Word> {
+    data.into_iter().map(|v| v.map(f32::to_bits)).collect()
+}
+
+// The device reads little-endian lanes: the words' own memory on every target.
+const _: () = assert!(cfg!(target_endian = "little"));
+
+/// The words as the device reads them, in place (the upload copies them once itself).
+fn bytes(words: &[Word]) -> &[u8] {
+    // [u32; 4]: plain data without padding
+    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
 }
 
 impl Baker {
@@ -145,7 +163,7 @@ impl Baker {
         // Admit the entire growth before queuing any allocation. Check the
         // atlas first so a refused growth does not rebuild CPU upload data.
         let rows = needed.next_power_of_two();
-        let atlas_reservation = if grow { Some(self.document.admit((ATLAS_W * rows * 3) as u64).map_err(|e| e.to_string())?) } else { None };
+        let atlas_reservation = if grow { Some(self.document.admit(Atlas::bytes(rows) as u64).map_err(|e| e.to_string())?) } else { None };
         // Reallocation has no carry/copy pass: every live slot is baked into the
         // new allocation while the old allocation remains published.
         if grow {
@@ -158,7 +176,7 @@ impl Baker {
         let meshes = vol.kernels.iter().enumerate().filter_map(|(i, slot)| slot.mesh_asset().map(|asset| (i, asset)))
             .map(|(i, asset)| crate::mesh::upload(cx, &self.document, asset).map(|gpu| (crate::mesh::binding(i), gpu)))
             .collect::<Result<Vec<_>, _>>()?;
-        let atlas = if let Some(reservation) = atlas_reservation { Atlas::new(cx, rows, reservation) }
+        let atlas = if let Some(reservation) = atlas_reservation { Atlas::new(cx, rows, reservation)? }
             else { old.unwrap().atlas.clone() };
         let index = Buffer::prepare(cx, old.map(|f| &f.index), data.index.len() * 16, index_reservation)?;
         let mut programs = Buffer::prepare(cx, old.map(|f| &f.programs), data.programs.len() * 16, program_reservation)?;
@@ -173,7 +191,7 @@ impl Baker {
         };
         programs.upload(cx, floats(data.programs))?;
         let count = data.bricks.len() / 2;
-        bricks.upload(cx, data.bricks.into_iter().flatten().flat_map(u32::to_le_bytes).collect())?;
+        bricks.upload(cx, data.bricks)?;
         self.kernel_cost = vol.kernels.iter().map(|k| k.air().map_or_else(|| k.mesh_asset().unwrap().cost(), |g| g.cost)).sum();
         self.bricks = Some(bricks);
         self.next = Some(Pending { field: Field { atlas, index, programs, kernel, meshes: meshes.into() },
@@ -187,6 +205,7 @@ impl Baker {
     pub fn reset(&mut self) { debug_assert!(!self.publishing()); self.fresh = true; }
     pub fn atlas(&self) -> &Texture { &self.field.as_ref().expect("published field").atlas.distance }
     pub fn materials(&self) -> &Texture { &self.field.as_ref().expect("published field").atlas.material }
+    pub fn slopes(&self) -> &GpuBuffer { &self.field.as_ref().expect("published field").atlas.slopes }
     pub fn rows(&self) -> usize { self.field.as_ref().map_or(0, |f| f.atlas.rows) }
     pub fn index_buffer(&self) -> &GpuBuffer { &self.field.as_ref().expect("published field").index.gpu }
     pub fn program_buffer(&self) -> &GpuBuffer { &self.field.as_ref().expect("published field").programs.gpu }
@@ -219,6 +238,7 @@ impl Baker {
         let buffers: Vec<_> = kernel.layout().buffers.iter().map(|b| {
             if b.name == id!(program) { next.field.programs.gpu.clone() }
             else if b.name == id!(bricks) { self.bricks.as_ref().unwrap().gpu.clone() }
+            else if b.name == id!(slopes) { next.field.atlas.slopes.clone() }
             else { next.field.meshes.iter().find(|(name, _)| *name == b.name).expect("mesh binding").1.buffer.clone() }
         }).collect();
         let textures: Vec<_> = kernel.layout().storage_textures.iter().map(|t| {
@@ -263,12 +283,12 @@ impl Baker {
     }
 
     pub fn vram_bytes(&self) -> u64 {
-        let bytes = |f: &Field| (ATLAS_W * f.atlas.rows * 3) as u64 + f.index.gpu.size() + f.programs.gpu.size()
+        let bytes = |f: &Field| Atlas::bytes(f.atlas.rows) as u64 + f.index.gpu.size() + f.programs.gpu.size()
             + f.meshes.iter().map(|(_, m)| m.buffer.size()).sum::<u64>();
         let mut total = self.field.as_ref().map_or(0, bytes);
         if let Some(n) = &self.next {
             let old = self.field.as_ref();
-            if old.is_none_or(|f| f.atlas.distance.texture_id() != n.field.atlas.distance.texture_id()) { total += (ATLAS_W * n.field.atlas.rows * 3) as u64; }
+            if old.is_none_or(|f| f.atlas.distance.texture_id() != n.field.atlas.distance.texture_id()) { total += Atlas::bytes(n.field.atlas.rows) as u64; }
             if old.is_none_or(|f| f.index.gpu != n.field.index.gpu) { total += n.field.index.gpu.size(); }
             if old.is_none_or(|f| f.programs.gpu != n.field.programs.gpu) { total += n.field.programs.gpu.size(); }
             for (_, mesh) in n.field.meshes.iter() {
@@ -280,5 +300,20 @@ impl Baker {
 
     pub fn release(&mut self, cx: &mut Cx) {
         for k in self.kernels.drain(..) { k.release(cx); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn words_reach_the_device_as_little_endian_lanes() {
+        let words = floats(vec![[1.0, -2.5, 0.0, f32::MAX]]);
+        let want: Vec<u8> = [1.0f32, -2.5, 0.0, f32::MAX].iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(bytes(&words), want);
+        let bricks: Vec<Word> = vec![[1, 2, 0xdead_beef, u32::MAX]];
+        let want: Vec<u8> = [1u32, 2, 0xdead_beef, u32::MAX].iter().flat_map(|u| u.to_le_bytes()).collect();
+        assert_eq!(bytes(&bricks), want);
     }
 }

@@ -98,23 +98,32 @@ impl MeshAsset {
 
 pub struct MeshGpu {
     pub buffer: GpuBuffer,
+    /// The device generation it was uploaded on (`Cx::gpu_device_generation`): after a
+    /// device reset its contents are gone, and a holder uploads again.
+    pub generation: u64,
     _reservation: GpuReservation,
 }
+impl MeshGpu {
+    pub fn is_current(&self, cx: &Cx) -> bool { self.generation == cx.gpu_device_generation() }
+}
 
+/// Keyed by device generation and geometry: an upload made before a device reset is never
+/// handed out after it, whoever saw the reset.
 #[derive(Default)]
-struct MeshCache(HashMap<u64, Weak<MeshGpu>>);
+struct MeshCache(HashMap<(u64, u64), Weak<MeshGpu>>);
 
 pub fn binding(slot: usize) -> LiveId { LiveId::from_str(&format!("mesh_{slot}")) }
 
 pub fn upload(cx: &mut Cx, document: &GpuDocument, asset: &MeshAsset) -> Result<Rc<MeshGpu>, String> {
-    if let Some(gpu) = cx.global::<MeshCache>().0.get(&asset.key).and_then(Weak::upgrade) { return Ok(gpu); }
-    cx.global::<MeshCache>().0.retain(|_, gpu| gpu.strong_count() != 0);
+    let generation = cx.gpu_device_generation();
+    if let Some(gpu) = cx.global::<MeshCache>().0.get(&(generation, asset.key)).and_then(Weak::upgrade) { return Ok(gpu); }
+    cx.global::<MeshCache>().0.retain(|&(g, _), gpu| g == generation && gpu.strong_count() != 0);
     let size = (asset.words.len() * 16) as u64;
     let reservation = document.admit(size).map_err(|e| e.to_string())?;
     let buffer = GpuBuffer::new(cx, size, GpuBufferFlags::default())?;
     let bytes: Vec<_> = asset.words.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
     buffer.update(cx, 0, &bytes)?;
-    let gpu = Rc::new(MeshGpu { buffer, _reservation: reservation });
-    cx.global::<MeshCache>().0.insert(asset.key, Rc::downgrade(&gpu));
+    let gpu = Rc::new(MeshGpu { buffer, generation, _reservation: reservation });
+    cx.global::<MeshCache>().0.insert((generation, asset.key), Rc::downgrade(&gpu));
     Ok(gpu)
 }

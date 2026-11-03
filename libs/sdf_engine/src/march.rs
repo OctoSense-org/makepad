@@ -50,13 +50,14 @@ script_mod! {
         copy_tex: texture_2d(float)
         copy_slots: texture_2d(float)
         index: buffer(vec4f)
+        // per slot (the bake's): x, its copy's slope bound (field units per object unit);
+        // y and z, the textures whose masks are constant over the brick and those that are 1
+        slopes: buffer(vec4f)
         copy_inv: uniform(vec2(1.0, 1.0))
         vol_min: uniform(vec3(0.0, 0.0, 0.0))
         vol_dim: uniform(vec3(1.0, 1.0, 1.0))
         cell: uniform(1.0)
         band: uniform(1.0)
-        // the field's distances per true distance (its 1 / Lipschitz bound: kernels', an estimate's)
-        kernel_scale: uniform(1.0)
         view_size: uniform(vec2(1.0, 1.0))
         // the view's origin in its target (pixels; a stereo eye's half) and
         // the target's size: the quad's clip space
@@ -113,24 +114,9 @@ script_mod! {
             return mix(d0, d1, f)
         }
 
-        // the field at object point p: the band (with sign) outside baked bricks
-        field: fn(p: vec3) -> f32 {
-            let b = floor(p / (self.cell * 8.0))
-            let e = self.brick_entry(b)
-            if e.x < 0.0 {
-                if e.y < 0.0 { return 0.0 - self.band }
-                return self.band
-            }
-            let d = self.copy_dist(p, b, e.x)
-            if self.exact > 0.5 && e.z >= 0.0 && abs(d) < self.band * 0.9 {
-                return self.eval_program(e.z, p.x, p.y, p.z).x
-            }
-            return d
-        }
-
         // the field from the render copy only (no exact evaluation): what AO,
         // shadows and the section test read, so the program interpreter is
-        // emitted at two call sites only (the march and the normal)
+        // emitted at one call site only (the march's loop)
         field_copy: fn(p: vec3) -> f32 {
             let b = floor(p / (self.cell * 8.0))
             let e = self.brick_entry(b)
@@ -156,18 +142,37 @@ script_mod! {
             return clamp(1.0 - strength * occ / (self.cell * 6.0), 0.0, 1.0)
         }
 
-        // Sphere tracing from t to t1 along (ro, rd) (object frame; inv =
-        // 1 / rd): (t, slot, hit, the last t whose step was free). A hit is
-        // a distance under `cone` x t (the pixel's footprint; a coarse pass
-        // passes its own, bigger pixel) or a hundredth of a cell. `use_exact`
-        // is a constant at each call site: the coarse pass compiles no
-        // program interpreter.
-        trace: fn(ro: vec3, rd: vec3, inv: vec3, t_from: f32, t1: f32, cone: f32, use_exact: f32) -> vec4 {
+        // where the ray (ro, rd; inv = 1 / rd) leaves brick b
+        brick_exit: fn(ro: vec3, rd: vec3, inv: vec3, b: vec3) -> f32 {
+            let bs = self.cell * 8.0
+            let bmin = b * bs
+            let te = (mix(bmin, bmin + vec3(bs, bs, bs), step(vec3(0.0, 0.0, 0.0), rd)) - ro) * inv
+            return min(min(te.x, te.y), te.z)
+        }
+
+        // the slope bound of baked slot s's copy (the bake's; at most 1, the field's own)
+        slope: fn(s: f32) -> f32 {
+            return clamp(self.slopes[u32(s)].x, 0.004, 1.0)
+        }
+
+        // A sphere-tracing step from t with field value d in a baked brick whose copy
+        // changes at most g per unit, leaving it at t_exit: as far as no surface on the
+        // ray can be, d / g inside the brick (a texture's field is the shape's compressed
+        // by its worst slope; where it is gentler the bound says so), slope 1 past it.
+        safe_step: fn(d: f32, g: f32, t: f32, t_exit: f32) -> f32 {
+            return max(min(d / g, d + max(t_exit - t, 0.0) * (1.0 - g)), self.cell * 0.05)
+        }
+
+        // Sphere tracing the render copy from t to t1 along (ro, rd) (object frame;
+        // inv = 1 / rd): (t, steps, hit, the last t whose step was free). A hit is the
+        // ray within `cone` x t of the surface (a coarse pixel's footprint) or a fiftieth
+        // of a cell; `free` 1 asks for the whole cone known free instead: the field's own
+        // distance, whose slope 1 holds across bricks (the coarse pass's free distance).
+        trace: fn(ro: vec3, rd: vec3, inv: vec3, t_from: f32, t1: f32, cone: f32, free: f32) -> vec4 {
             let bs = self.cell * 8.0
             var t = t_from
             var t_free = t_from
             var hit = 0.0
-            var slot = 0.0
             var steps = 0.0
             for i in 0..256 {
                 if t > t1 || steps >= self.max_steps { break }
@@ -175,36 +180,25 @@ script_mod! {
                 let p = ro + rd * t
                 let b = floor(p / bs)
                 let e = self.brick_entry(b)
+                let t_exit = self.brick_exit(ro, rd, inv, b)
+                t_free = t
                 if e.x < 0.0 {
                     // an empty brick: no surface in it, leave it
-                    let bmin = b * bs
-                    let bmax = bmin + vec3(bs, bs, bs)
-                    let te = (mix(bmin, bmax, step(vec3(0.0, 0.0, 0.0), rd)) - ro) * inv
-                    let t_exit = min(min(te.x, te.y), te.z)
-                    t_free = t
                     t = max(t_exit, t + abs(e.y)) + self.cell * 0.01
                 } else {
+                    let g = self.slope(e.x)
                     // trilinear can overestimate near edges and corners: 0.9 of it
-                    var d = self.copy_dist(p, b, e.x) * 0.9
-                    if use_exact > 0.5 && self.exact > 0.5 && e.z >= 0.0 && abs(d) < self.cell * 1.5 {
-                        let ev = self.eval_program(e.z, p.x, p.y, p.z)
-                        d = ev.x
-                        slot = ev.y
-                    } else if use_exact > 0.5 {
-                        let l = floor(p / self.cell - b * 8.0 + vec3(0.5, 0.5, 0.5))
-                        slot = floor(self.copy_slots.sample_nearest(self.copy_uv(e.x, l.xy, min(l.z, 8.0))).x * 255.0 + 0.5)
-                    }
-                    // the footprint is a true distance, d the field's
-                    let eps = max(self.cell * 0.02, t * cone) * self.kernel_scale
+                    let d = self.copy_dist(p, b, e.x) * 0.9
+                    var eps = max(self.cell * 0.02, t * cone)
+                    if free < 0.5 { eps = eps * g }
                     if d < eps {
                         hit = 1.0
                         break
                     }
-                    t_free = t
-                    t = t + max(d, self.cell * 0.05)
+                    t = t + self.safe_step(d, g, t, t_exit)
                 }
             }
-            return vec4(t, slot, hit, t_free)
+            return vec4(t, steps, hit, t_free)
         }
 
         // the material slot at object point p (a baked brick's; 0 elsewhere)
@@ -232,7 +226,11 @@ script_mod! {
         coarse_size_inv: uniform(vec2(1.0, 1.0))
         // world units per object unit (a uniform scale)
         obj_scale: uniform(1.0)
-        // 1: fb0 = (t, slot, normal x, normal y) into an RGBA32F target (checks)
+        // 1: the copy's march runs to the copy's hit before the exact evaluations (an
+        // evaluation that costs many copy steps: a volume with kernels)
+        copy_first: uniform(0.0)
+        // 1: fb0 = (t, slot, normal x, normal y) into an RGBA32F target (checks);
+        // 2: the work map, (view distance (0: a miss), steps, program evaluations, id)
         debug_out: uniform(0.0)
         gbuf_id: uniform(0.0)
         // section planes in the OBJECT frame: keep a x + b y + c z + d >= 0;
@@ -338,43 +336,129 @@ script_mod! {
                     t1 = t0 - 1.0
                 }
             }
-            if hit < 0.5 {
+            if hit < 0.5 && self.coarse_in > 0.5 {
                 // the coarse pass's free distance (world, the nearest object's)
-                if self.coarse_in > 0.5 {
-                    let cuv = pix / self.target_size
-                    let c = self.coarse_tex.sample_nearest(cuv)
-                    if c.x > 1000000000.0 { discard() }
-                    t = max(t, c.x / self.obj_scale)
-                    // the four coarse hits around this pixel: where they all
-                    // hit and agree within two cells, start a cell before the
-                    // nearest (a smooth surface between them), not at the
-                    // conservative free distance
-                    let ct = self.coarse_size_inv * 0.5
-                    let h0 = self.coarse_tex.sample_nearest(cuv + vec2(0.0 - ct.x, 0.0 - ct.y)).y
-                    let h1 = self.coarse_tex.sample_nearest(cuv + vec2(ct.x, 0.0 - ct.y)).y
-                    let h2 = self.coarse_tex.sample_nearest(cuv + vec2(0.0 - ct.x, ct.y)).y
-                    let h3 = self.coarse_tex.sample_nearest(cuv + vec2(ct.x, ct.y)).y
-                    let hmin = min(min(h0, h1), min(h2, h3))
-                    let hmax = max(max(h0, h1), max(h2, h3))
-                    if hmax < 1000000000.0 && (hmax - hmin) < self.cell * 2.0 * self.obj_scale {
-                        t = max(t, hmin / self.obj_scale - self.cell)
-                    }
+                let cuv = pix / self.target_size
+                let c = self.coarse_tex.sample_nearest(cuv)
+                if c.x > 1000000000.0 { discard() }
+                t = max(t, c.x / self.obj_scale)
+                // the four coarse hits around this pixel: where they all
+                // hit and agree within two cells, start a cell before the
+                // nearest (a smooth surface between them), not at the
+                // conservative free distance
+                let ct = self.coarse_size_inv * 0.5
+                let h0 = self.coarse_tex.sample_nearest(cuv + vec2(0.0 - ct.x, 0.0 - ct.y)).y
+                let h1 = self.coarse_tex.sample_nearest(cuv + vec2(ct.x, 0.0 - ct.y)).y
+                let h2 = self.coarse_tex.sample_nearest(cuv + vec2(0.0 - ct.x, ct.y)).y
+                let h3 = self.coarse_tex.sample_nearest(cuv + vec2(ct.x, ct.y)).y
+                let hmin = min(min(h0, h1), min(h2, h3))
+                let hmax = max(max(h0, h1), max(h2, h3))
+                if hmax < 1000000000.0 && (hmax - hmin) < self.cell * 2.0 * self.obj_scale {
+                    t = max(t, hmin / self.obj_scale - self.cell)
                 }
-                // the cone's radius: half a pixel, so a pixel's stop grows the shape by half a pixel at most
-                let tr = self.trace(ro, rd, inv, t, t1, self.pix_angle * 0.5, 1.0)
+            }
+            // The march, then the normal (the field's forward differences from the hit along
+            // the three axes, the hit's own value the fourth), in one loop around one copy of
+            // the program interpreter: a copy costs the shader its size. `corner` -1 marches;
+            // 0..2 read the axes' points; 3 is done (a cap's normal is its plane's).
+            let bs = self.cell * 8.0
+            // the cone's radius: half a pixel, so a pixel's stop grows the shape by half a pixel at most
+            let cone = self.pix_angle * 0.5
+            let hn = self.cell * 0.5
+            var g = vec3(0.0, 0.0, 0.0)
+            // the field at the hit, which the differences start from
+            var d0 = 0.0
+            var corner = 0 - 1
+            if hit > 0.5 { corner = 3 }
+            var steps = 0.0
+            var evals = 0.0
+            var exact_hit = 0.0
+            if hit < 0.5 && self.copy_first > 0.5 {
+                // The copy's march first, to where the copy calls a hit: every ray of a warp
+                // comes out of it together, so their evaluations (that hit's, then the
+                // differences') run side by side, not each on its own iteration of the loop
+                // below while the others step. The loop takes the hit's step again: a step
+                // more a ray, which an evaluation as cheap as a step does not pay back.
+                let tr = self.trace(ro, rd, inv, t, t1, cone, 0.0)
                 t = tr.x
-                slot = tr.y
-                hit = tr.z
+                steps = tr.y - tr.z
+            }
+            for i in 0..260 {
+                if corner > 2 { break }
+                var q = ro + rd * t
+                var k = vec3(1.0, 0.0, 0.0)
+                if corner < 0 {
+                    if t > t1 || steps >= self.max_steps { break }
+                    steps = steps + 1.0
+                } else {
+                    if corner == 1 { k = vec3(0.0, 1.0, 0.0) }
+                    else if corner == 2 { k = vec3(0.0, 0.0, 1.0) }
+                    q = q + k * hn
+                }
+                let b = floor(q / bs)
+                let e = self.brick_entry(b)
+                // the field at q: outside baked bricks the band (with sign), else the copy,
+                // exact where it asks for it: a march step the copy calls a hit, a difference's
+                // point inside the band when the hit was exact (the differences take one field)
+                var d = self.band
+                if e.y < 0.0 { d = 0.0 - self.band }
+                var dc = d
+                var gb = 1.0
+                var eps = 0.0
+                var want = 0.0
+                // the textures whose masks the bake found constant over this brick
+                var masks = 0u
+                if e.x >= 0.0 {
+                    let sl = self.slopes[u32(e.x)]
+                    masks = u32(sl.y) | (u32(sl.z) << 16u)
+                    dc = self.copy_dist(q, b, e.x)
+                    d = dc
+                    if corner < 0 {
+                        gb = clamp(sl.x, 0.004, 1.0)
+                        // trilinear can overestimate near edges and corners: 0.9 of it
+                        d = d * 0.9
+                        // the footprint in the field's units
+                        eps = max(self.cell * 0.02, t * cone) * gb
+                        if d < eps { want = 1.0 }
+                    } else if abs(d) < self.band * 0.9 && exact_hit > 0.5 {
+                        want = 1.0
+                    }
+                    if self.exact < 0.5 || e.z < 0.0 { want = 0.0 }
+                }
+                if want > 0.5 {
+                    let ev = self.run_program(e.z, q.x, q.y, q.z, masks, 0.0)
+                    d = ev.x
+                    evals = evals + 1.0
+                    if corner < 0 { slot = ev.y }
+                }
+                if corner >= 0 {
+                    g = g + k * (d - d0)
+                    corner = corner + 1
+                } else if e.x < 0.0 {
+                    // an empty brick: no surface in it, leave it
+                    t = max(self.brick_exit(ro, rd, inv, b), t + abs(e.y)) + self.cell * 0.01
+                } else if d < eps {
+                    hit = 1.0
+                    exact_hit = want
+                    d0 = dc
+                    if want > 0.5 { d0 = d }
+                    corner = 0
+                } else {
+                    t = t + self.safe_step(d, gb, t, self.brick_exit(ro, rd, inv, b))
+                }
+            }
+            // the steps + the program evaluations / 512 (`MarchOut::Steps` reads both)
+            let work = steps + evals / 512.0
+            // the work map (`MarchOut::Steps`): a miss shows its steps too, at the far plane
+            if hit < 0.5 && self.debug_out > 1.5 && work > 0.5 {
+                self.depth_out = 1.0
+                self.fb0 = vec4(0.0, floor(work), fract(work) * 512.0, self.gbuf_id)
+                return
             }
             if hit < 0.5 { discard() }
             let p = ro + rd * t
-            // the normal: a tetrahedral gradient of the field
-            let h = self.cell * 0.5
-            let k0 = vec3(1.0, 0.0 - 1.0, 0.0 - 1.0)
-            let k1 = vec3(0.0 - 1.0, 0.0 - 1.0, 1.0)
-            let k2 = vec3(0.0 - 1.0, 1.0, 0.0 - 1.0)
-            let k3 = vec3(1.0, 1.0, 1.0)
-            var g = k0 * self.field(p + k0 * h) + k1 * self.field(p + k1 * h) + k2 * self.field(p + k2 * h) + k3 * self.field(p + k3 * h)
+            // a hit the copy decided takes the copy's slot
+            if cap < 0.5 && exact_hit < 0.5 { slot = self.slot_at(p) }
             if cap > 0.5 {
                 // the cut face looks back along the ray
                 g = 0.0 - self.clip_plane(cap).xyz
@@ -385,7 +469,10 @@ script_mod! {
             // the view's own camera (a stereo eye's, not the pass's)
             let clip = self.proj_m * (self.view_m * hit_w)
             self.depth_out = clip.z / clip.w - self.depth_bias
-            if self.debug_out > 0.5 {
+            if self.debug_out > 1.5 {
+                // the work map: the normal's program evaluations are in `work`
+                self.fb0 = vec4(length((self.view_m * hit_w).xyz), floor(work), fract(work) * 512.0, self.gbuf_id)
+            } else if self.debug_out > 0.5 {
                 self.fb0 = vec4(t, slot, n.x, n.y)
             } else {
                 let vp = (self.view_m * hit_w).xyz
@@ -449,7 +536,7 @@ script_mod! {
             let t1 = min(min(tf.x, tf.y), tf.z)
             if t1 <= t0 { discard() }
             // the cone covers every full-resolution pixel of this coarse one
-            let tr = self.trace(ro, rd, inv, t0 + self.cell * 0.01, t1, self.pix_angle * 1.5, 0.0)
+            let tr = self.trace(ro, rd, inv, t0 + self.cell * 0.01, t1, self.pix_angle * 1.5, 1.0)
             if tr.z < 0.5 { discard() }
             // then this coarse ray's own hit (its pixel's cone): the full
             // march interpolates where four coarse hits agree
@@ -558,6 +645,41 @@ script_mod! {
         }
     }
 
+    // The host's environment as a field part's shade takes it, for the shade and for a host's
+    // pass that must light alike (a GI screen cache filled under the shade's own fill).
+    // detail_map and ibl_ctl are bound by the host (e.g. libs/render's `Renderer::bind_ibl`):
+    // render-material's IBL lookups, the ones the model lanes light with. detail_map holds the
+    // prepared map (the meta row, then the prefiltered atlas); ibl_ctl as the lanes read it:
+    // x = 1 while bound (0: the rig's hemisphere), y = the lane's scale on both lookups, z = 1
+    // while the fill comes from the map. The hemisphere: sky and ground along world_up.
+    mod.draw.SdfEnv = {
+        detail_map: texture_2d(float)
+        ibl_ctl: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        mat_ibl_meta: mod.draw.mat_ibl_meta
+        mat_ibl_dir: mod.draw.mat_ibl_dir
+        mat_ibl_level: mod.draw.mat_ibl_level
+        mat_ibl_sky_env: mod.draw.mat_ibl_sky_env
+        mat_ibl_ambient: mod.draw.mat_ibl_ambient
+        mat_ibl_lane_sky_env: mod.draw.mat_ibl_lane_sky_env
+        mat_ibl_lane_ambient: mod.draw.mat_ibl_lane_ambient
+        sun_sky: uniform(vec3(0.28, 0.28, 0.28))
+        sun_ground: uniform(vec3(0.28, 0.28, 0.28))
+        world_up: uniform(vec3(0.0, 1.0, 0.0))
+        // The fill on normal n and the reflection along r: the environment's lookups while one
+        // is bound (as the model lanes take them), else the rig's hemisphere.
+        env_fill: fn(n: vec3) -> vec3 {
+            let up = normalize(self.world_up)
+            let hemisphere = mix(self.sun_ground, self.sun_sky, clamp(dot(n, up) * 0.5 + 0.5, 0.0, 1.0))
+            if self.ibl_ctl.x > 0.5 { return self.mat_ibl_lane_ambient(n, hemisphere) }
+            return hemisphere
+        }
+        env_reflect: fn(r: vec3, rough: f32) -> vec3 {
+            if self.ibl_ctl.x > 0.5 { return self.mat_ibl_lane_sky_env(r, rough) }
+            let up = normalize(self.world_up)
+            return mix(self.sun_ground, self.sun_sky, clamp(dot(r, up) * 0.5 + 0.5, 0.0, 1.0))
+        }
+    }
+
     mod.draw.SdfShade = mod.std.set_type_default() do #(DrawSdfShade::script_shader(vm)){
         ..mod.draw.DrawQuad,
         ..mod.sdf.Field,
@@ -591,27 +713,12 @@ script_mod! {
         inv_view: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         inv_proj_r: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         inv_view_r: uniform(mat4x4f(1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0))
-        ortho: uniform(0.0)
-        // The host's environment (bound by it, e.g. libs/render's `Renderer::bind_ibl`):
-        // render-material's IBL lookups, the ones the model lanes light with. detail_map holds
-        // the prepared map (the meta row, then the prefiltered atlas); ibl_ctl as the lanes
-        // read it: x = 1 while bound (0: the rig's hemisphere), y = the lane's scale on both
-        // lookups, z = 1 while the fill comes from the map.
-        detail_map: texture_2d(float)
-        ibl_ctl: uniform(vec4(0.0, 0.0, 0.0, 0.0))
-        mat_ibl_meta: mod.draw.mat_ibl_meta
-        mat_ibl_dir: mod.draw.mat_ibl_dir
-        mat_ibl_level: mod.draw.mat_ibl_level
-        mat_ibl_sky_env: mod.draw.mat_ibl_sky_env
-        mat_ibl_ambient: mod.draw.mat_ibl_ambient
-        mat_ibl_lane_sky_env: mod.draw.mat_ibl_lane_sky_env
-        mat_ibl_lane_ambient: mod.draw.mat_ibl_lane_ambient
-        // the sun (world, toward the light), its colour, the hemisphere
+        ortho: uniform(0.0),
+        // the host's environment: the fill and the reflection (`SdfEnv`)
+        ..mod.draw.SdfEnv,
+        // the sun (world, toward the light), its colour
         sun_dir: uniform(vec3(0.35, 0.8, 0.45))
         sun_color: uniform(vec3(0.72, 0.72, 0.72))
-        sun_sky: uniform(vec3(0.28, 0.28, 0.28))
-        sun_ground: uniform(vec3(0.28, 0.28, 0.28))
-        world_up: uniform(vec3(0.0, 1.0, 0.0))
         // x = AO strength (0 off), y = soft shadows (0 off, else the penumbra
         // sharpness k), z = exposure, w unused
         shade_ctl: uniform(vec4(1.0, 8.0, 1.0, 0.0))
@@ -619,6 +726,8 @@ script_mod! {
         // that does the same); y = the sun lobe's scale (MarchLight::sun_spec)
         display: uniform(vec4(0.0, 1.0, 0.0, 0.0))
         output_dither_ctl: uniform(vec3(1.0, 1.0, 0.0))
+        // 1..4: a light term alone (ambient, AO, shadow, sun); 5: the work map of a
+        // `MarchOut::Steps` G-buffer
         debug_term: uniform(0.0)
         // the predicted surface finish: (pattern 0 none..5, amplitude mm,
         // scale mm, layer height mm; 0 = off); the pattern frame (centre x,
@@ -800,25 +909,11 @@ script_mod! {
         }
 
         // The ambient light on surface point wp (world) with normal n, given
-        // the hemisphere's: a host with its own ambient light (a GI field)
-        // replaces it. AO, the material and the rest of the lobe stay.
+        // the environment's fill there (`env_fill`): a host with its own
+        // ambient light (a GI field) composes it over that fill. AO, the
+        // material and the rest of the lobe stay.
         ambient_at: fn(wp: vec3, n: vec3, hemisphere: vec3) -> vec3 {
             return hemisphere
-        }
-
-        // The fill on normal n before a host's own (`ambient_at`) and the reflection along r:
-        // the environment's lookups while one is bound (as the model lanes take them), else
-        // the rig's hemisphere.
-        env_fill: fn(n: vec3) -> vec3 {
-            let up = normalize(self.world_up)
-            let hemisphere = mix(self.sun_ground, self.sun_sky, clamp(dot(n, up) * 0.5 + 0.5, 0.0, 1.0))
-            if self.ibl_ctl.x > 0.5 { return self.mat_ibl_lane_ambient(n, hemisphere) }
-            return hemisphere
-        }
-        env_reflect: fn(r: vec3, rough: f32) -> vec3 {
-            if self.ibl_ctl.x > 0.5 { return self.mat_ibl_lane_sky_env(r, rough) }
-            let up = normalize(self.world_up)
-            return mix(self.sun_ground, self.sun_sky, clamp(dot(r, up) * 0.5 + 0.5, 0.0, 1.0))
         }
 
         // The model lanes' shading (libs/render `shade_mr`), so an SDF part
@@ -883,6 +978,17 @@ script_mod! {
             }
             let gb = self.gbuf_tex.sample_nearest((pix + goff) / self.gbuf_size)
             if abs(abs(gb.w) - self.gbuf_id) > 0.5 { discard() }
+            if self.debug_term > 4.5 {
+                // the work map of a `MarchOut::Steps` G-buffer: steps over the step budget,
+                // dark blue (few) to red (the budget); a ray with program evaluations
+                // brightens by their share of its steps. Over everything: it is a diagnostic.
+                let s = clamp(gb.y / self.max_steps, 0.0, 1.0)
+                let ev = clamp(gb.z / max(gb.y + 4.0, 1.0), 0.0, 1.0)
+                let heat = clamp(vec3(1.5 - abs(4.0 * s - 3.0), 1.5 - abs(4.0 * s - 2.0), 1.5 - abs(4.0 * s - 1.0)), vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0))
+                self.depth_out = 0.0
+                self.fb0 = vec4(self.to_display(heat * (0.55 + 0.45 * ev)), 1.0)
+                return
+            }
             // the view-space ray through the pixel, then the point at the
             // G-buffer's view distance on it (perspective or orthographic)
             let ndc = self.to_ndc(pix)
@@ -1111,6 +1217,69 @@ pub enum MarchOut {
     Debug,
     /// (view distance, octahedral view normal, `id`; cut faces `-id`).
     GBuffer { id: f32 },
+    /// The work map, in the G-buffer's place: (view distance (0: a ray that missed, at the
+    /// far plane), steps, program evaluations (the normal's included), `id`). A shade with
+    /// `debug_term` 5 draws it as a heat map; [`WorkStats::of`] sums a readback of it.
+    Steps { id: f32 },
+}
+
+/// What a view's rays cost one object: [`MarchOut::Steps`] read back and summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WorkStats {
+    /// Pixels whose ray hit, and those that marched without a hit.
+    pub hits: usize,
+    pub misses: usize,
+    /// Steps per ray (hits and misses alike): mean, 90th percentile, most.
+    pub steps_mean: f32,
+    pub steps_p90: u32,
+    pub steps_max: u32,
+    /// Program (exact) evaluations per ray: mean and most.
+    pub evals_mean: f32,
+    pub evals_max: u32,
+}
+
+impl WorkStats {
+    /// The stats of object `id` in an RGBA32F readback (`w` x `h`, rows packed) of a
+    /// [`MarchOut::Steps`] target.
+    pub fn of(px: &[u8], w: usize, h: usize, id: f32) -> WorkStats {
+        let at = |i: usize, c: usize| {
+            let o = i * 16 + c * 4;
+            f32::from_le_bytes([px[o], px[o + 1], px[o + 2], px[o + 3]])
+        };
+        let mut steps = Vec::new();
+        let (mut st, mut evals, mut evals_max) = (WorkStats::default(), 0.0f64, 0u32);
+        for i in 0..(w * h).min(px.len() / 16) {
+            if (at(i, 3).abs() - id).abs() > 0.5 || at(i, 1) <= 0.0 {
+                continue;
+            }
+            if at(i, 0) > 0.0 { st.hits += 1 } else { st.misses += 1 }
+            steps.push(at(i, 1) as u32);
+            let e = at(i, 2).round() as u32;
+            evals += e as f64;
+            evals_max = evals_max.max(e);
+        }
+        let n = steps.len();
+        if n == 0 {
+            return st;
+        }
+        steps.sort_unstable();
+        st.steps_mean = (steps.iter().map(|s| *s as f64).sum::<f64>() / n as f64) as f32;
+        st.steps_p90 = steps[(n * 9 / 10).min(n - 1)];
+        st.steps_max = steps[n - 1];
+        st.evals_mean = (evals / n as f64) as f32;
+        st.evals_max = evals_max;
+        st
+    }
+}
+
+impl std::fmt::Display for WorkStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} rays ({} missed): steps mean {:.1} p90 {} max {}, program evaluations mean {:.1} max {}",
+            self.hits + self.misses, self.misses, self.steps_mean, self.steps_p90, self.steps_max, self.evals_mean, self.evals_max
+        )
+    }
 }
 
 /// A baker's textures as a march binds them (handles: no borrow of the baker).
@@ -1119,18 +1288,20 @@ struct FieldTex {
     copy: Texture,
     copy_slots: Texture,
     index: GpuBuffer,
+    slopes: GpuBuffer,
     copy_rows: usize,
     meshes: std::rc::Rc<[(LiveId, std::rc::Rc<crate::mesh::MeshGpu>)]>,
 }
 
 impl FieldTex {
     fn of(b: &Baker) -> FieldTex {
-        FieldTex { prog: b.program_buffer().clone(), copy: b.atlas().clone(), copy_slots: b.materials().clone(), index: b.index_buffer().clone(), copy_rows: b.rows(), meshes: b.mesh_buffers() }
+        FieldTex { prog: b.program_buffer().clone(), copy: b.atlas().clone(), copy_slots: b.materials().clone(), index: b.index_buffer().clone(), slopes: b.slopes().clone(), copy_rows: b.rows(), meshes: b.mesh_buffers() }
     }
 
     fn set(&self, c: &Cx, dv: &mut DrawVars, view: &MarchView, vol: &Volume, exact: bool) {
         dv.set_storage_buffer(id!(program), &self.prog);
         dv.set_storage_buffer(id!(index), &self.index);
+        dv.set_storage_buffer(id!(slopes), &self.slopes);
         for (name, gpu) in self.meshes.iter() { dv.set_storage_buffer(*name, &gpu.buffer); }
         dv.set_texture(0, &self.copy);
         dv.set_texture(1, &self.copy_slots);
@@ -1139,7 +1310,6 @@ impl FieldTex {
         dv.set_uniform(c, id!(vol_dim), &vol.dim.map(|v| v as f32));
         dv.set_uniform(c, id!(cell), &[vol.cell]);
         dv.set_uniform(c, id!(band), &[vol.band]);
-        dv.set_uniform(c, id!(kernel_scale), &[vol.step_scale()]);
         set_view(c, dv, view);
         dv.set_uniform(c, id!(exact), &[if exact { 1.0 } else { 0.0 }]);
     }
@@ -1176,6 +1346,7 @@ pub fn draw_object(cx: &mut Cx2d, draw: &mut DrawSdfMarch, rect: Rect, view: &Ma
     // and the exact evaluation is skipped (a far part costs a copy lookup a step).
     let exact = exact && (vol.kernels.is_empty() || draw.kernels) && view.volume_pixel(&world_from_obj, vol) < view.exact_cells * vol.cell;
     field.set(c, dv, view, vol, exact);
+    dv.set_uniform(c, id!(copy_first), &[if exact && !vol.kernels.is_empty() { 1.0 } else { 0.0 }]);
     match coarse {
         Some(t) => {
             dv.set_texture(2, t);
@@ -1195,6 +1366,10 @@ pub fn draw_object(cx: &mut Cx2d, draw: &mut DrawSdfMarch, rect: Rect, view: &Ma
         MarchOut::Debug => dv.set_uniform(c, id!(debug_out), &[1.0]),
         MarchOut::GBuffer { id } => {
             dv.set_uniform(c, id!(debug_out), &[0.0]);
+            dv.set_uniform(c, id!(gbuf_id), &[id]);
+        }
+        MarchOut::Steps { id } => {
+            dv.set_uniform(c, id!(debug_out), &[2.0]);
             dv.set_uniform(c, id!(gbuf_id), &[id]);
         }
     }
