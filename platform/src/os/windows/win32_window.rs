@@ -795,7 +795,14 @@ impl Win32Window {
         let window = &mut (*(user_data as *mut Win32Window));
         match msg {
             WM_ACTIVATE => {
-                if wparam.0 & 0xffff == WA_ACTIVE as usize {
+                // The low word is WA_INACTIVE (0), WA_ACTIVE (1) or WA_CLICKACTIVE (2).
+                // Activating a window by clicking it arrives as WA_CLICKACTIVE, so
+                // anything but WA_INACTIVE means the window gained focus. Matching
+                // WA_ACTIVE alone reported a click-activated window as having lost
+                // focus, which left a second window's buttons unresponsive.
+                const WA_INACTIVE: usize = 0;
+                debug_assert_eq!(WA_ACTIVE, 1);
+                if wparam.0 & 0xffff != WA_INACTIVE {
                     window.do_callback(Win32Event::WindowGotFocus(window.window_id));
                 } else {
                     if window.is_popup {

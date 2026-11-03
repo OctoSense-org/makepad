@@ -802,9 +802,20 @@ impl Cx {
                     // may never come (an occluded window's presents are not
                     // retired), and holding the pass back while another window
                     // keeps flipping would leave the grab unanswered forever.
+                    // ...and unless that window's own clock is already ready: the
+                    // beat wait returns the lowest signaled handle, so a secondary
+                    // window never wins it while the primary keeps presenting, and
+                    // holding its pass back would leave it unpainted until the
+                    // primary stops (seen as a second window whose button clicks
+                    // took effect but never showed). `beat_ready` takes the credit;
+                    // the present below spends it.
                     if window_id != scope
                         && paced.contains(&window_id)
                         && !self.has_pending_window_screenshot(window_id)
+                        && !d3d11_windows
+                            .iter()
+                            .find(|w| w.window_id == window_id)
+                            .is_some_and(|w| w.beat_ready())
                     {
                         self.repaint_pass(*draw_pass_id);
                         continue;
