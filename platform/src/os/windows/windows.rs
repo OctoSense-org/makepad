@@ -392,6 +392,14 @@ impl Cx {
                     self.handle_action_receiver();
                 }
                 self.poll_control_channel();
+                // Shader compilation runs on workers. A static first frame has
+                // no further UI redraw to adopt their results, so waiting until
+                // `need_redrawing()` would leave the window blank until input.
+                // Poll on the existing signal heartbeat; adoption dirties the
+                // UI, while unfinished compilation does not force GPU paints.
+                if !d3d11_cx.device_lost.get() && self.hlsl_shaders_pending() {
+                    self.hlsl_compile_shaders(d3d11_cx);
+                }
                 // A `--remote` grab arrives here (the control channel is polled on
                 // this tick) and can only be answered by a pass that renders. Dirty
                 // the window passes so the next tick paints one — the same thing the
@@ -581,7 +589,9 @@ impl Cx {
         }
         if self.need_redrawing() {
             self.call_draw_event(time_now);
-            self.hlsl_compile_shaders(&d3d11_cx);
+        }
+        if self.hlsl_shaders_pending() {
+            self.hlsl_compile_shaders(d3d11_cx);
         }
         // ok here we send out to all our childprocesses
 

@@ -1009,6 +1009,10 @@ impl Cx {
         }
     }
 
+    pub(crate) fn hlsl_shaders_pending(&self) -> bool {
+        !self.os.async_hlsl_compile.pending.is_empty() || !self.draw_shaders.compile_set.is_empty()
+    }
+
     pub(crate) fn hlsl_compile_shaders(&mut self, d3d11_cx: &D3d11Cx) {
         let pending = &mut self.os.async_hlsl_compile.pending;
         let mut adopted = false;
@@ -1079,11 +1083,9 @@ impl Cx {
                 .pending
                 .insert(id, (device, task));
         }
-        if !self.os.async_hlsl_compile.pending.is_empty()
-            || !self.draw_shaders.compile_set.is_empty()
-        {
-            self.demo_time_repaint = true;
-        }
+        // Completion is polled by the signal heartbeat even when no UI redraw
+        // is pending. Adopting a shader above schedules the redraw it needs;
+        // compilation alone must not keep presenting empty frames.
     }
 
     pub fn share_texture_for_presentable_image(&mut self, texture: &Texture) -> u64 {
