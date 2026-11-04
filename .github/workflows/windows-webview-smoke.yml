@@ -56,7 +56,7 @@ jobs:
   desktop:
     if: "contains(github.event.head_commit.message, 'Check Windows desktop')"
     runs-on: windows-2022
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Check the pinned Hagency Desktop source
         shell: pwsh
@@ -64,10 +64,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           git clone --depth 1 --branch codex/windows-system-browser-20261104 https://github.com/hagency-org/hagency-desktop.git desktop
           if ($LASTEXITCODE -ne 0) { throw 'Desktop source clone failed' }
+          if ((git -C desktop rev-parse HEAD) -ne '8b7dda56ec172c0b98e84e802e4b33ac88fc2fbd') { throw 'Unexpected Desktop revision' }
           rustup toolchain list
           rustup run stable rustc --version
           if ($LASTEXITCODE -ne 0) { throw 'No preinstalled stable Rust toolchain' }
           $env:CARGO_BUILD_JOBS = '4'
           $env:CARGO_INCREMENTAL = '0'
-          rustup run stable cargo check --locked --lib --manifest-path desktop/Cargo.toml
-          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop check failed' }
+          rustup run stable cargo build --locked --release --bin rinx --manifest-path desktop/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { throw 'Windows desktop release build failed' }
