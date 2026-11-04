@@ -36,7 +36,7 @@ jobs:
           $stderr = Join-Path $pwd 'webview-probe.stderr'
           $env:MAKEPAD_HIDE_WINDOWS = '1'
           $process = Start-Process -FilePath $exe -ArgumentList '--remote' -WorkingDirectory (Join-Path $pwd 'makepad') -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
-          $end = [DateTime]::UtcNow.AddSeconds(90)
+          $end = [DateTime]::UtcNow.AddSeconds(105)
           $content = ''
           $errors = ''
           while ([DateTime]::UtcNow -lt $end -and -not $process.HasExited) {
