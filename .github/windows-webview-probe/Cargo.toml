@@ -1,0 +1,15 @@
+[package]
+name = "makepad-webview2-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+makepad-widgets = { path = "../../widgets" }
+
+[patch."https://github.com/OctoSense-org/Octoscript-Makepad.git"]
+octoscript-node = { path = "../../../octoscript-makepad/crates/octoscript-node" }
+
+[profile.release]
+opt-level = 1
