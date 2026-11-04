@@ -392,17 +392,32 @@ impl Widget for Modal {
     /// that root — never from the slot a parent thought it was handing over.
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, _walk: Walk) -> DrawStep {
         let bounds = cx.global::<ModalBounds>().0;
+        // Bounded to part of the pass, the overlay also takes the view transform
+        // of the list it opens from: a host may draw the app shifted or scaled
+        // (a phone shell's app layer), and the bounds are in the app's coordinates.
+        let parent_transform = bounds.and_then(|_| {
+            cx.draw_list_stack.last().map(|id| cx.draw_lists[*id].draw_list_uniforms.view_transform)
+        });
         let draw_list = self.draw_list.as_mut().unwrap();
         // Tab stays inside an open modal.
         CxDraw::set_nav_trap(cx, draw_list.id(), self.is_open);
         draw_list.begin_popup_overlay(cx);
-        match bounds {
-            None => cx.begin_root_turtle_for_pass(self.view.layout),
-            Some(bounds) => {
-                cx.begin_root_turtle_for_pass(Layout::default());
-                cx.begin_turtle(Walk::abs_rect(bounds), self.view.layout);
+        // Bounded, the overlay is sized explicitly: a `Fill` walk placed at an
+        // absolute position loses that position's offset from its size.
+        // Its root turtle clips, so it must also reach the bounds, which a host
+        // may place past the pass's own size (an app layer drawn shifted).
+        let walk = match bounds {
+            None => {
+                cx.begin_root_turtle_for_pass(self.view.layout);
+                Walk::fill()
             }
-        }
+            Some(bounds) => {
+                let pass = cx.current_pass_size();
+                let size = dvec2(pass.x.max(bounds.pos.x + bounds.size.x), pass.y.max(bounds.pos.y + bounds.size.y));
+                cx.begin_root_turtle(size, Layout::default());
+                Walk::abs_rect(bounds)
+            }
+        };
 
         // Even an invisible `draw_bg` costs the GPU a full-window pass every frame,
         // so a closed modal leaves its overlay empty.
@@ -410,7 +425,7 @@ impl Widget for Modal {
             // Our overlay doesn't move with the window body when it pans up to keep a focused
             // text input above the soft keyboard, so we pan our content up by the same amount.
             let layout = self.view.layout.with_scroll(dvec2(0.0, cx.keyboard_shift));
-            self.draw_bg.begin(cx, Walk::fill(), layout);
+            self.draw_bg.begin(cx, walk, layout);
             let bg_view = self.view.widget(cx, ids!(bg_view));
             // the fade: a scrim's alpha, or a glass backdrop's opacity
             let fade = self.fade;
@@ -418,8 +433,11 @@ impl Widget for Modal {
                 v.draw_bg.draw_vars.set_dyn_instance(cx, live_id!(fade), &[fade]);
                 v.draw_bg.draw_vars.set_dyn_instance(cx, live_id!(layer_opacity), &[fade]);
             }
-            let origin = bounds.map_or(Vec2d { x: 0., y: 0. }, |b| b.pos);
-            let _ = bg_view.draw_walk(cx, scope, Walk::fill().with_abs_pos(origin));
+            let bg_walk = match bounds {
+                None => Walk::fill().with_abs_pos(Vec2d { x: 0., y: 0. }),
+                Some(bounds) => Walk::abs_rect(bounds),
+            };
+            let _ = bg_view.draw_walk(cx, scope, bg_walk);
 
             // We aren't laid out inside any KeyboardView around us, so our text inputs go to the outermost one,
             // which is the one we pan along with.
@@ -430,11 +448,11 @@ impl Widget for Modal {
             self.draw_bg.end(cx);
         }
 
-        if bounds.is_some() {
-            cx.end_turtle();
-        }
         cx.end_pass_sized_turtle();
         self.draw_list.as_mut().unwrap().end(cx);
+        if let Some(transform) = parent_transform {
+            self.draw_list.as_ref().unwrap().set_view_transform(cx, &transform);
+        }
 
         // We must re-set the blocked scrolling area, as it might've changed after each draw.
         if self.is_open {
