@@ -173,6 +173,19 @@ impl<'a> CxSystemBrowser<'a> {
         });
     }
 
+    /// Load inline HTML at a fresh, isolated origin on Windows. `base_url`
+    /// supplies relative URL resolution; the document does not inherit that
+    /// site's cookies or security origin. Only this document can use the
+    /// `octos_native` message bridge, and its capability is revoked on navigation.
+    #[cfg(target_os = "windows")]
+    pub fn set_isolated_html(&mut self, html: &str, base_url: &str) {
+        self.cx.platform_ops.push_back(CxOsOp::SetSystemBrowserIsolatedHtml {
+            browser_id: self.id.0,
+            html: html.to_string(),
+            base_url: base_url.to_string(),
+        });
+    }
+
     /// Evaluate JS inside the browser document.
     pub fn eval_js(&mut self, js: &str) {
         self.cx.platform_ops.push_back(CxOsOp::EvalSystemBrowserJs {
@@ -534,6 +547,12 @@ pub enum CxOsOp {
         html: String,
         base_url: String,
     },
+    #[cfg(target_os = "windows")]
+    SetSystemBrowserIsolatedHtml {
+        browser_id: LiveId,
+        html: String,
+        base_url: String,
+    },
     /// Evaluate JS inside the browser document (native to card).
     EvalSystemBrowserJs {
         browser_id: LiveId,
@@ -682,6 +701,8 @@ impl std::fmt::Debug for CxOsOp {
             #[cfg(target_os = "macos")]
             Self::InspectSystemBrowser { .. } => write!(f, "InspectSystemBrowser"),
             Self::SetSystemBrowserHtml { .. } => write!(f, "SetSystemBrowserHtml"),
+            #[cfg(target_os = "windows")]
+            Self::SetSystemBrowserIsolatedHtml { .. } => write!(f, "SetSystemBrowserIsolatedHtml"),
             Self::EvalSystemBrowserJs { .. } => write!(f, "EvalSystemBrowserJs"),
             Self::ShareText(..) => write!(f, "ShareText"),
             Self::ShowNotification { .. } => write!(f, "ShowNotification"),

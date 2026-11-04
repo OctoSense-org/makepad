@@ -4,30 +4,38 @@
 //! rather than running a nested message pump while Cx is borrowed. A hidden
 //! parking window keeps the native child alive when a tab moves between windows.
 use crate::{
-    event::NativeSystemBrowserNavigation, makepad_live_id::LiveId, makepad_math::Rect,
-    thread::SignalToUI, window::WindowId,
+    event::{NativeSystemBrowserInvoke, NativeSystemBrowserNavigation},
+    makepad_live_id::LiveId,
+    makepad_math::Rect,
+    thread::SignalToUI,
+    window::WindowId,
 };
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     os::windows::ffi::OsStrExt,
     path::PathBuf,
     rc::{Rc, Weak},
+    time::{Duration, Instant},
 };
 use webview2_com::{
     take_pwstr, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler,
+    NavigationStartingEventHandler, WebMessageReceivedEventHandler,
+    WebResourceRequestedEventHandler,
 };
 use webview_windows::{
     core::{w, BOOL, PCWSTR, PWSTR},
     Win32::{
         Foundation::{HWND, RECT},
-        UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, SetParent, SetWindowPos, ShowWindow, SWP_NOACTIVATE,
-            SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_CHILD, WS_CLIPCHILDREN,
-            WS_CLIPSIBLINGS, WS_POPUP,
+        UI::{
+            Shell::SHCreateMemStream,
+            WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, SetParent, SetWindowPos, ShowWindow,
+                SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+                WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_POPUP,
+            },
         },
     },
 };
@@ -39,7 +47,23 @@ enum BrowserEvent {
     Environment(LiveId, u64, Result<ICoreWebView2Environment, String>),
     Controller(LiveId, u64, Result<ICoreWebView2Controller, String>),
     Navigation(LiveId, u64, NativeSystemBrowserNavigation),
+    Invoke(LiveId, u64, String, NativeSystemBrowserInvoke),
 }
+
+pub(crate) enum BrowserAction {
+    Navigation(NativeSystemBrowserNavigation),
+    Invoke(NativeSystemBrowserInvoke),
+}
+
+struct InlineDocument {
+    origin: String,
+    url: String,
+    token: String,
+    html: Rc<str>,
+}
+
+type InlineState = Rc<RefCell<Option<InlineDocument>>>;
+type AllowedNavigation = Rc<RefCell<Option<String>>>;
 
 fn send(queue: &WeakQueue, event: BrowserEvent) {
     if let Some(queue) = queue.upgrade() {
@@ -50,6 +74,63 @@ fn send(queue: &WeakQueue, event: BrowserEvent) {
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn normalized_url(value: &str) -> String {
+    url::Url::parse(value)
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn isolated_document(html: String, base_url: String) -> InlineDocument {
+    let origin = format!(
+        "https://{}.makepad-card.invalid",
+        uuid::Uuid::new_v4().simple()
+    );
+    let url = format!("{origin}/index.html");
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let bridge = format!(
+        "<script>(()=>{{const token=\"{token}\";const post=window.chrome.webview.postMessage.bind(window.chrome.webview);Object.defineProperty(window,'octos_native',{{value:Object.freeze({{invoke:(id,tool,args)=>post({{token,id,tool,args}})}}),writable:false,configurable:false}});document.currentScript.remove();}})();</script>"
+    );
+    let escaped_base = base_url
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let base = if escaped_base.is_empty() {
+        String::new()
+    } else {
+        format!("<base href=\"{escaped_base}\">")
+    };
+    // Keep a card's CSP ahead of its base element. The host bridge itself is
+    // inserted first and removes its script node before any card code runs.
+    let mut result = html;
+    if let Some(head) = result.to_ascii_lowercase().find("<head>") {
+        let at = head + "<head>".len();
+        let lower = result.to_ascii_lowercase();
+        let end_head = lower[at..]
+            .find("</head>")
+            .map(|offset| at + offset)
+            .unwrap_or(result.len());
+        let csp = lower[at..end_head].find("<meta http-equiv=\"content-security-policy\"");
+        let base_at = csp
+            .and_then(|offset| {
+                result[at + offset..]
+                    .find('>')
+                    .map(|end| at + offset + end + 1)
+            })
+            .unwrap_or(at);
+        result.insert_str(base_at, &base);
+        result.insert_str(at, &bridge);
+    } else {
+        result = format!("<head>{bridge}{base}</head>{result}");
+    }
+    InlineDocument {
+        origin,
+        url,
+        token,
+        html: result.into(),
+    }
 }
 
 fn profile_directory() -> PathBuf {
@@ -78,16 +159,20 @@ enum Pending {
     History(i32),
     Eval(String),
     HtmlUnsupported,
+    IsolatedHtml(String, String),
 }
 
 struct Browser {
     generation: u64,
+    started: Instant,
     host: HWND,
     parent: HWND,
     layout: Option<Layout>,
     controller: Option<ICoreWebView2Controller>,
     webview: Option<ICoreWebView2>,
-    allowed_navigation: Rc<Cell<bool>>,
+    environment: Option<ICoreWebView2Environment>,
+    allowed_navigation: AllowedNavigation,
+    inline: InlineState,
     navigable: bool,
     pending: VecDeque<Pending>,
     url: String,
@@ -245,12 +330,15 @@ impl WindowsSystemBrowsers {
             id,
             Browser {
                 generation,
+                started: Instant::now(),
                 host,
                 parent: parking,
                 layout: None,
                 controller: None,
                 webview: None,
-                allowed_navigation: Rc::new(Cell::new(false)),
+                environment: None,
+                allowed_navigation: Rc::new(RefCell::new(None)),
+                inline: Rc::new(RefCell::new(None)),
                 navigable,
                 pending: VecDeque::from([Pending::Url(url.clone(), false)]),
                 url: url.clone(),
@@ -394,6 +482,9 @@ impl WindowsSystemBrowsers {
     pub fn set_html(&mut self, id: LiveId) {
         self.enqueue(id, Pending::HtmlUnsupported);
     }
+    pub fn set_isolated_html(&mut self, id: LiveId, html: String, base_url: String) {
+        self.enqueue(id, Pending::IsolatedHtml(html, base_url));
+    }
 
     fn enqueue(&mut self, id: LiveId, command: Pending) {
         if let Some(browser) = self.browsers.get_mut(&id) {
@@ -413,7 +504,8 @@ impl WindowsSystemBrowsers {
                     match command {
                         Pending::Url(url, replace) => {
                             browser.url = url.clone();
-                            browser.allowed_navigation.set(true);
+                            *browser.inline.borrow_mut() = None;
+                            *browser.allowed_navigation.borrow_mut() = Some(normalized_url(&url));
                             if replace {
                                 let script = format!(
                                     "location.replace({})",
@@ -444,6 +536,15 @@ impl WindowsSystemBrowsers {
                             failure = Some((browser.generation, "Inline HTML with a custom origin is not supported by the Windows browser".to_string()));
                             break;
                         }
+                        Pending::IsolatedHtml(html, base_url) => {
+                            let document = isolated_document(html, base_url);
+                            let url = document.url.clone();
+                            browser.url = url.clone();
+                            *browser.inline.borrow_mut() = Some(document);
+                            *browser.allowed_navigation.borrow_mut() = Some(normalized_url(&url));
+                            let url = wide(&url);
+                            webview.Navigate(PCWSTR(url.as_ptr()))
+                        }
                     }
                 };
                 if let Err(error) = result {
@@ -457,7 +558,27 @@ impl WindowsSystemBrowsers {
         }
     }
 
-    pub fn drain(&mut self) -> Vec<NativeSystemBrowserNavigation> {
+    pub fn drain(&mut self) -> Vec<BrowserAction> {
+        // WebView2 can leave a creation request pending indefinitely (for
+        // example if the user-data directory cannot be used). Keep the rest of
+        // the UI responsive and provide an actionable fallback in that case.
+        let expired: Vec<_> = self
+            .browsers
+            .iter()
+            .filter(|(_, browser)| {
+                !browser.failed
+                    && browser.webview.is_none()
+                    && browser.started.elapsed() >= Duration::from_secs(30)
+            })
+            .map(|(&id, browser)| (id, browser.generation))
+            .collect();
+        for (id, generation) in expired {
+            self.fail(
+                id,
+                generation,
+                "WebView2 initialization timed out".to_string(),
+            );
+        }
         let mut actions = Vec::new();
         loop {
             let event = self.queue.borrow_mut().pop_front();
@@ -466,7 +587,7 @@ impl WindowsSystemBrowsers {
                 BrowserEvent::Environment(id, generation, result) => {
                     let Some(browser) = self
                         .browsers
-                        .get(&id)
+                        .get_mut(&id)
                         .filter(|b| b.generation == generation && !b.failed)
                     else {
                         continue;
@@ -474,6 +595,7 @@ impl WindowsSystemBrowsers {
                     match result {
                         Ok(environment) => {
                             let host = browser.host;
+                            browser.environment = Some(environment.clone());
                             let queue = Rc::downgrade(&self.queue);
                             let handler = CreateCoreWebView2ControllerCompletedHandler::create(
                                 Box::new(move |result, controller| {
@@ -526,10 +648,16 @@ impl WindowsSystemBrowsers {
                                 let browser = self.browsers.get_mut(&id).unwrap();
                                 if let Err(error) = register_events(
                                     &webview,
+                                    browser
+                                        .environment
+                                        .as_ref()
+                                        .expect("environment precedes controller")
+                                        .clone(),
                                     id,
                                     generation,
                                     browser.navigable,
                                     browser.allowed_navigation.clone(),
+                                    browser.inline.clone(),
                                     Rc::downgrade(&self.queue),
                                 ) {
                                     unsafe {
@@ -561,7 +689,19 @@ impl WindowsSystemBrowsers {
                         .is_some_and(|b| b.generation == generation)
                         || self.failed_spawns.get(&id) == Some(&generation)
                     {
-                        actions.push(action);
+                        actions.push(BrowserAction::Navigation(action));
+                    }
+                }
+                BrowserEvent::Invoke(id, generation, token, action) => {
+                    if self.browsers.get(&id).is_some_and(|browser| {
+                        browser.generation == generation
+                            && browser
+                                .inline
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|doc| doc.token == token)
+                    }) {
+                        actions.push(BrowserAction::Invoke(action));
                     }
                 }
             }
@@ -608,23 +748,45 @@ fn navigation(
 
 fn register_events(
     webview: &ICoreWebView2,
+    environment: ICoreWebView2Environment,
     id: LiveId,
     generation: u64,
     navigable: bool,
-    allowed: Rc<Cell<bool>>,
+    allowed: AllowedNavigation,
+    inline: InlineState,
     queue: WeakQueue,
 ) -> webview_windows::core::Result<()> {
     unsafe {
         let mut token = 0;
         let start_queue = queue.clone();
+        let start_inline = inline.clone();
         webview.add_NavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(move |sender, args| {
-                if !navigable && !allowed.replace(false) {
-                    if let Some(args) = args {
-                        args.SetCancel(true)?;
-                    }
+                let Some(args) = args else { return Ok(()) };
+                let mut raw_url = PWSTR::null();
+                if args.Uri(&mut raw_url).is_err() {
+                    args.SetCancel(true)?;
                     return Ok(());
                 }
+                let target = normalized_url(&take_pwstr(raw_url));
+                if !navigable {
+                    if allowed.borrow().as_deref() != Some(target.as_str()) {
+                        args.SetCancel(true)?;
+                        return Ok(());
+                    }
+                    allowed.borrow_mut().take();
+                }
+                let mut doc = start_inline.borrow_mut();
+                if doc.as_ref().is_some_and(|doc| {
+                    let mut target_url = url::Url::parse(&target).ok();
+                    if let Some(target_url) = target_url.as_mut() {
+                        target_url.set_fragment(None);
+                    }
+                    target_url.map(|url| url.to_string()) != Some(doc.url.clone())
+                }) {
+                    *doc = None;
+                }
+                drop(doc);
                 send(
                     &start_queue,
                     BrowserEvent::Navigation(id, generation, navigation(sender, id, true, None)),
@@ -662,11 +824,104 @@ fn register_events(
             })),
             &mut token,
         )?;
+        let title_queue = queue.clone();
         webview.add_DocumentTitleChanged(
             &DocumentTitleChangedEventHandler::create(Box::new(move |sender, _| {
                 send(
-                    &queue,
+                    &title_queue,
                     BrowserEvent::Navigation(id, generation, navigation(sender, id, false, None)),
+                );
+                Ok(())
+            })),
+            &mut token,
+        )?;
+        let filter = wide("https://*.makepad-card.invalid/*");
+        webview.AddWebResourceRequestedFilter(
+            PCWSTR(filter.as_ptr()),
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        )?;
+        let resource_inline = inline.clone();
+        webview.add_WebResourceRequested(
+            &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let request = args.Request()?;
+                let mut raw_url = PWSTR::null();
+                request.Uri(&mut raw_url)?;
+                let request_url = normalized_url(&take_pwstr(raw_url));
+                let html = resource_inline.borrow().as_ref()
+                    .filter(|doc| request_url == doc.url)
+                    .map(|doc| doc.html.clone());
+                let (body, code, reason, headers) = if let Some(html) = html {
+                    (html, 200, w!("OK"), w!("Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff"))
+                } else {
+                    (Rc::<str>::from(""), 404, w!("Not Found"), w!("Content-Type: text/plain\r\nCache-Control: no-store"))
+                };
+                let stream = SHCreateMemStream(Some(body.as_bytes()));
+                let response = environment.CreateWebResourceResponse(stream.as_ref(), code, reason, headers)?;
+                args.SetResponse(&response)?;
+                Ok(())
+            })),
+            &mut token,
+        )?;
+        webview.add_WebMessageReceived(
+            &WebMessageReceivedEventHandler::create(Box::new(move |sender, args| {
+                let (Some(sender), Some(args)) = (sender, args) else {
+                    return Ok(());
+                };
+                let mut raw_source = PWSTR::null();
+                let mut raw_current = PWSTR::null();
+                args.Source(&mut raw_source)?;
+                sender.Source(&mut raw_current)?;
+                let source = take_pwstr(raw_source);
+                let current = take_pwstr(raw_current);
+                let same_origin = |value: &str, origin: &str| {
+                    url::Url::parse(value)
+                        .is_ok_and(|url| url.origin().ascii_serialization() == origin)
+                };
+                let (origin, secret) = match inline.borrow().as_ref() {
+                    Some(doc) => (doc.origin.clone(), doc.token.clone()),
+                    None => return Ok(()),
+                };
+                if !same_origin(&source, &origin) || !same_origin(&current, &origin) {
+                    return Ok(());
+                }
+                let mut raw_json = PWSTR::null();
+                args.WebMessageAsJson(&mut raw_json)?;
+                let json = take_pwstr(raw_json);
+                if json.len() > 1_048_576 {
+                    return Ok(());
+                }
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(&json) else {
+                    return Ok(());
+                };
+                let (Some(message_token), Some(call_id), Some(tool), Some(args_json)) = (
+                    message.get("token").and_then(|v| v.as_str()),
+                    message.get("id").and_then(|v| v.as_i64()),
+                    message.get("tool").and_then(|v| v.as_str()),
+                    message.get("args").and_then(|v| v.as_str()),
+                ) else {
+                    return Ok(());
+                };
+                if message_token != secret
+                    || call_id < 0
+                    || tool.len() > 128
+                    || serde_json::from_str::<serde_json::Value>(args_json).is_err()
+                {
+                    return Ok(());
+                }
+                send(
+                    &queue,
+                    BrowserEvent::Invoke(
+                        id,
+                        generation,
+                        secret,
+                        NativeSystemBrowserInvoke {
+                            browser_id: id.0,
+                            call_id,
+                            tool: tool.to_string(),
+                            args: args_json.to_string(),
+                        },
+                    ),
                 );
                 Ok(())
             })),

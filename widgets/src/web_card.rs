@@ -384,6 +384,9 @@ impl WebCard {
             html = inject_csp(&html, &policy_csp());
         }
         let base = self.base_url_or_default().to_string();
+        #[cfg(target_os = "windows")]
+        cx.system_browser(id).set_isolated_html(&html, &base);
+        #[cfg(not(target_os = "windows"))]
         cx.system_browser(id).set_html(&html, &base);
         self.loaded_html = self.html.clone();
         self.bridge_allowed = true; // our own inline document — arm the bridge
