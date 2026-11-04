@@ -293,7 +293,12 @@ struct DownloadArgs {
 /// A card can NEVER reach outside it (absolute paths and `..` are rejected in
 /// `fs_resolve`), so it can't read the octos profile, other apps, or the system.
 fn fs_sandbox_root() -> Result<std::path::PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "no app storage available".to_string())?;
+    let home = std::env::var_os("HOME").or_else(|| {
+        #[cfg(target_os = "windows")]
+        { std::env::var_os("USERPROFILE") }
+        #[cfg(not(target_os = "windows"))]
+        { None }
+    }).ok_or_else(|| "no app storage available".to_string())?;
     let root = std::path::PathBuf::from(home).join("card-fs");
     // Create on first use so `fs.list('.')` on a fresh install returns an
     // empty listing instead of ENOENT (fs.write created it lazily before).

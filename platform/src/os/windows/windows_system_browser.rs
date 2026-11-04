@@ -22,7 +22,7 @@ use webview2_com::{
     take_pwstr, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler,
     Microsoft::Web::WebView2::Win32::*, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, WebMessageReceivedEventHandler,
+    NavigationStartingEventHandler, NewWindowRequestedEventHandler, WebMessageReceivedEventHandler,
     WebResourceRequestedEventHandler,
 };
 use webview_windows::{
@@ -90,7 +90,7 @@ fn isolated_document(html: String, base_url: String) -> InlineDocument {
     let url = format!("{origin}/index.html");
     let token = uuid::Uuid::new_v4().simple().to_string();
     let bridge = format!(
-        "<script>(()=>{{const token=\"{token}\";const post=window.chrome.webview.postMessage.bind(window.chrome.webview);Object.defineProperty(window,'octos_native',{{value:Object.freeze({{invoke:(id,tool,args)=>post({{token,id,tool,args}})}}),writable:false,configurable:false}});document.currentScript.remove();}})();</script>"
+        "<script>(()=>{{const token=\"{token}\";const post=window.chrome.webview.postMessage.bind(window.chrome.webview);const invoke=(id,tool,args)=>{{const message={{token,id,tool,args}};const bytes=new TextEncoder();if(!Number.isSafeInteger(id)||id<0||typeof tool!=='string'||bytes.encode(tool).length>128||typeof args!=='string'||bytes.encode(JSON.stringify(message)).length>1048576)throw Error('invalid or oversized native request');post(message);}};Object.defineProperty(window,'octos_native',{{value:Object.freeze({{invoke}}),writable:false,configurable:false}});document.currentScript.remove();}})();</script>"
     );
     let escaped_base = base_url
         .replace('&', "&amp;")
@@ -758,6 +758,17 @@ fn register_events(
 ) -> webview_windows::core::Result<()> {
     unsafe {
         let mut token = 0;
+        webview.add_NewWindowRequested(
+            &NewWindowRequestedEventHandler::create(Box::new(move |_, args| {
+                if !navigable {
+                    if let Some(args) = args {
+                        args.SetHandled(true)?;
+                    }
+                }
+                Ok(())
+            })),
+            &mut token,
+        )?;
         let start_queue = queue.clone();
         let start_inline = inline.clone();
         webview.add_NavigationStarting(
