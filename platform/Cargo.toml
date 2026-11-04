@@ -108,6 +108,17 @@ ohos-sys = { version = "0.2.1", features = ["xcomponent"] }
 path = "../libs/futures_legacy"
 version = "1.0.0"
 
+[target.'cfg(windows)'.dependencies.webview2-com]
+version = "0.39.1"
+
+[target.'cfg(windows)'.dependencies.serde_json]
+version = "1"
+
+[target.'cfg(windows)'.dependencies.webview-windows]
+package = "windows"
+version = "0.62.2"
+features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_WindowsAndMessaging"]
+
 [target.'cfg(windows)'.dependencies.windows-core]
 path = "../libs/windows/windows-core"
 version = "0.62.2"

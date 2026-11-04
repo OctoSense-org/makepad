@@ -27,6 +27,7 @@ pub mod d3d11;
 pub mod d3d11_texture;
 pub mod windows;
 pub mod windows_game_input;
+pub mod windows_system_browser;
 pub mod windows_stdin;
 
 pub(crate) use crate::os::windows::d3d11::*;

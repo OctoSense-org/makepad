@@ -121,13 +121,22 @@ impl<'a> CxSystemBrowser<'a> {
     /// Open `url` in a browser that may navigate: links, scripts and
     /// redirects are followed. A reader showing pages off the open web needs
     /// this — a redirector like a Google News RSS link never reaches its
-    /// article otherwise. Only Android enforces the distinction today; the
+    /// article otherwise. Android and Windows enforce the distinction; the
     /// Apple backends have no navigation policy and always navigate.
     pub fn spawn_navigable(&mut self, url: &str) {
         self.cx.platform_ops.push_back(CxOsOp::SpawnSystemBrowser {
             browser_id: self.id.0,
             url: url.to_string(),
             navigable: true,
+        });
+    }
+
+    /// Select a WebView2 profile directory before spawning on Windows.
+    #[cfg(target_os = "windows")]
+    pub fn set_data_directory(&mut self, path: std::path::PathBuf) {
+        self.cx.platform_ops.push_back(CxOsOp::SetSystemBrowserDataDirectory {
+            browser_id: self.id.0,
+            path,
         });
     }
 
@@ -153,7 +162,9 @@ impl<'a> CxSystemBrowser<'a> {
         });
     }
 
-    /// Load an inline HTML document into the browser.
+    /// Load an inline HTML document into the browser. The Windows WebView2
+    /// backend reports an error until it can provide this API's origin and
+    /// native-bridge guarantees for inline documents.
     pub fn set_html(&mut self, html: &str, base_url: &str) {
         self.cx.platform_ops.push_back(CxOsOp::SetSystemBrowserHtml {
             browser_id: self.id.0,
@@ -483,6 +494,11 @@ pub enum CxOsOp {
         /// Whether the browser may leave the document it was opened with.
         navigable: bool,
     },
+    #[cfg(target_os = "windows")]
+    SetSystemBrowserDataDirectory {
+        browser_id: LiveId,
+        path: std::path::PathBuf,
+    },
     UpdateSystemBrowser {
         browser_id: LiveId,
         area: Area,
@@ -656,6 +672,8 @@ impl std::fmt::Debug for CxOsOp {
             Self::UpdateCameraNativePreview { .. } => write!(f, "UpdateCameraNativePreview"),
             Self::DetachCameraNativePreview { .. } => write!(f, "DetachCameraNativePreview"),
             Self::SpawnSystemBrowser { .. } => write!(f, "SpawnSystemBrowser"),
+            #[cfg(target_os = "windows")]
+            Self::SetSystemBrowserDataDirectory { .. } => write!(f, "SetSystemBrowserDataDirectory"),
             Self::UpdateSystemBrowser { .. } => write!(f, "UpdateSystemBrowser"),
             Self::DetachSystemBrowser { .. } => write!(f, "DetachSystemBrowser"),
             Self::SetSystemBrowserUrl { .. } => write!(f, "SetSystemBrowserUrl"),

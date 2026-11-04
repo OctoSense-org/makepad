@@ -163,6 +163,10 @@ script_mod! {
         draw_bg +: {
             color: #x101418
         }
+        draw_text +: {
+            color: #fff
+            text_style: theme.font_regular {font_size: 12}
+        }
     }
 }
 
@@ -186,6 +190,8 @@ pub struct WebCard {
     #[redraw]
     #[live]
     draw_bg: DrawColor,
+    #[live]
+    draw_text: DrawText,
     /// Document origin for the inline HTML (relative fetches + embed referers
     /// resolve against this instead of about:blank).
     #[live]
@@ -228,6 +234,8 @@ pub struct WebCard {
     /// native navigation/frame callbacks to close.)
     #[rust]
     bridge_allowed: bool,
+    #[rust]
+    load_error: bool,
 }
 
 /// Args for the `http.fetch` bridge tool. The card sends headers as `[[k,v],…]`
@@ -349,6 +357,7 @@ impl WebCard {
         if self.html.is_empty() || self.html == self.loaded_html {
             return;
         }
+        self.load_error = false;
         let id = self.browser_id();
         // DEBUG probe: a body of `URLTEST:<url>` navigates instead of loading
         // inline HTML — used to isolate loadHTMLString from the overlay path.
@@ -658,6 +667,18 @@ impl Widget for WebCard {
         // `url:`-navigated remote page or iframe cannot reach fs/dialog/download.
         if let Event::Actions(actions) = event {
             for action in actions {
+                if let Some(nav) = action
+                    .downcast_ref::<crate::makepad_platform::event::NativeSystemBrowserNavigation>()
+                {
+                    if nav.browser_id == self.browser_id().0.get_value()
+                        && nav.error.is_some()
+                        && OVERLAY_OWNER.load(Ordering::SeqCst) == self.uid.0
+                    {
+                        self.load_error = true;
+                        self.bridge_allowed = false;
+                        self.redraw(cx);
+                    }
+                }
                 if let Some(inv) = action
                     .downcast_ref::<crate::makepad_platform::event::NativeSystemBrowserInvoke>()
                 {
@@ -740,12 +761,16 @@ impl Widget for WebCard {
         }
         let rect = cx.walk_turtle(walk);
         self.draw_bg.draw_abs(cx, rect);
+        if self.load_error {
+            self.draw_text.draw_abs(cx, rect.pos + dvec2(12.0, 12.0), "Unable to load embedded web content.");
+        }
 
         // A DSL-set `url` (no inline html) navigates once on first draw, so a
         // runsplash card can embed a live web pane via `WebCard{ url: "…" }`.
         // A page opened by URL is the page's own, as in any browser, and it
         // gets no bridge.
         if self.html.is_empty() && !self.url.is_empty() && self.loaded_html != self.url {
+            self.load_error = false;
             let id = self.browser_id();
             if !self.spawned {
                 cx.system_browser(id).spawn(&self.url);
@@ -762,7 +787,7 @@ impl Widget for WebCard {
         let area = self.draw_bg.area();
         let has_doc = !self.loaded_html.is_empty();
         if self.spawned || has_doc {
-            cx.system_browser(self.browser_id()).update(area, has_doc);
+            cx.system_browser(self.browser_id()).update(area, has_doc && !self.load_error);
         }
         DrawStep::done()
     }
@@ -791,6 +816,7 @@ impl WebCardRef {
             cx.stop_timer(inner.settle_timer);
             inner.html.clear();
             inner.loaded_html.clear();
+            inner.load_error = false;
             inner.url = url.to_owned();
             inner.bridge_allowed = false;
             OVERLAY_OWNER.store(inner.uid.0, Ordering::SeqCst);

@@ -24,6 +24,7 @@ use {
                 win32_window::Win32Window,
                 windows_game_input::WindowsGameInput,
                 windows_media::CxWindowsMedia,
+                windows_system_browser::WindowsSystemBrowsers,
                 windows_video_player::WindowsUnifiedVideoPlayer,
             },
         },
@@ -83,6 +84,11 @@ impl Cx {
         d3d11_windows: &mut Vec<D3d11Window>,
     ) -> EventFlow {
         let _phase = crate::thread::ui_phase(crate::thread::UiPhase::NativeEvent);
+        let browser_actions = self.os.system_browsers.drain();
+        if !browser_actions.is_empty() {
+            for action in browser_actions { self.action(action); }
+            self.handle_actions();
+        }
         // Before anything touches the GPU. This is the one place holding both `&mut D3d11Cx`
         // and `&mut Vec<D3d11Window>` exclusively while nothing is mid-render — the wndproc
         // queues re-entrant events, `handle_platform_ops` only borrows the Cx immutably, and
@@ -133,6 +139,7 @@ impl Cx {
                 }
             }
             Win32Event::WindowGeomChange(mut re) => {
+                self.os.system_browsers.window_moved(re.window_id);
                 // do this here because mac
 
                 if let Some(window) = d3d11_windows
@@ -181,6 +188,7 @@ impl Cx {
                     ));
                     if let Some(index) = d3d11_windows.iter().position(|w| w.window_id == popup_id)
                     {
+                        self.os.system_browsers.detach_window(popup_id);
                         self.windows[popup_id].is_created = false;
                         d3d11_windows[index].win32_window.close_window();
                         d3d11_windows.remove(index);
@@ -337,6 +345,7 @@ impl Cx {
                 let accept_close = e.accept_close.clone();
                 self.call_event_handler(&Event::WindowCloseRequested(e));
                 if accept_close.get() {
+                    self.os.system_browsers.detach_window(window_id);
                     crate::remote::note_window_close_requested(window_id.id());
                 }
             }
@@ -1016,6 +1025,7 @@ impl Cx {
                     // Remove the D3d11Window now so later ops cannot touch the destroyed hwnd.
                     if let Some(index) = d3d11_windows.iter().position(|w| w.window_id == window_id)
                     {
+                        self.os.system_browsers.detach_window(window_id);
                         self.windows[window_id].is_created = false;
                         d3d11_windows[index].win32_window.close_window();
                         d3d11_windows.remove(index);
@@ -1073,6 +1083,28 @@ impl Cx {
                     }
                 }
                 CxOsOp::Quit => ret = EventFlow::Exit,
+                CxOsOp::SetSystemBrowserDataDirectory { browser_id, path } => {
+                    self.os.system_browsers.set_data_directory(browser_id, path);
+                }
+                CxOsOp::SpawnSystemBrowser { browser_id, url, navigable } => {
+                    self.os.system_browsers.spawn(browser_id, url, navigable);
+                }
+                CxOsOp::UpdateSystemBrowser { browser_id, area, visible } => {
+                    let Some(draw_list_id) = area.draw_list_id() else { continue };
+                    let Some(pass_id) = self.draw_lists[draw_list_id].draw_pass_id else { continue };
+                    let Some(window_id) = self.get_pass_window_id(pass_id) else { continue };
+                    let Some(window) = d3d11_windows.iter().find(|w| w.window_id == window_id) else { continue };
+                    let rect = area.rect(self);
+                    let clip = area.clipped_rect(self);
+                    let dpi = self.windows[window_id].effective_dpi_factor();
+                    self.os.system_browsers.update(browser_id, window_id, window.win32_window.hwnd.0, rect, clip, dpi, visible);
+                }
+                CxOsOp::DetachSystemBrowser { browser_id } => self.os.system_browsers.detach(browser_id),
+                CxOsOp::CloseSystemBrowser { browser_id } => self.os.system_browsers.close(browser_id),
+                CxOsOp::SetSystemBrowserUrl { browser_id, url, replace } => self.os.system_browsers.set_url(browser_id, url, replace),
+                CxOsOp::SystemBrowserHistoryGo { browser_id, delta } => self.os.system_browsers.history(browser_id, delta),
+                CxOsOp::EvalSystemBrowserJs { browser_id, js } => self.os.system_browsers.eval(browser_id, js),
+                CxOsOp::SetSystemBrowserHtml { browser_id, .. } => self.os.system_browsers.set_html(browser_id),
                 CxOsOp::SetTopmost(window_id, is_topmost) => {
                     if d3d11_windows.len() == 0 {
                         if self.defer_platform_op(CxOsOp::SetTopmost(window_id, is_topmost)) {
@@ -1444,6 +1476,7 @@ pub struct CxOs {
     pub(crate) d3d11_device: Option<ID3D11Device>,
     pub(crate) game_input_events: GameInputEventChannel,
     pub(crate) windows_game_input: Option<WindowsGameInput>,
+    pub(crate) system_browsers: WindowsSystemBrowsers,
     pub(crate) video_players: HashMap<LiveId, WindowsUnifiedVideoPlayer>,
     pub(crate) async_hlsl_compile: crate::os::windows::d3d11::AsyncHlslCompile,
     pub(crate) stdin_timers: crate::os::shared_framebuf::PollTimers,
