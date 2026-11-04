@@ -35,18 +35,30 @@ fn redirect_server() -> std::io::Result<String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}/redirect", listener.local_addr()?);
     std::thread::spawn(move || {
-        for stream in listener.incoming().take(2) {
+        let mut redirected = false;
+        for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-            let mut request = [0u8; 4096];
-            let Ok(count) = stream.read(&mut request) else { break };
-            let response = if request[..count].starts_with(b"GET /redirect ") {
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let Ok(count) = stream.read(&mut chunk) else { break };
+                if count == 0 { break; }
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") || request.len() > 8192 { break; }
+            }
+            let destination = request.starts_with(b"GET /destination ") && redirected;
+            let response = if request.starts_with(b"GET /redirect ") {
+                redirected = true;
                 "HTTP/1.1 302 Found\r\nLocation: /destination\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
-            } else {
+            } else if destination {
                 let body = "<html><head><title>wv2-redirect-ok</title></head><body>Redirected</body></html>";
                 format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
             };
             let _ = stream.write_all(response.as_bytes());
+            if destination { break; }
         }
     });
     Ok(url)
