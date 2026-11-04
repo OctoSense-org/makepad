@@ -33,7 +33,7 @@ use crate::{
             Graphics::{
                 Direct3D::{
                     Fxc::D3DCompile, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-                    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_SRV_DIMENSION,
+                    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL_11_0, D3D_SRV_DIMENSION,
                     D3D_SRV_DIMENSION_TEXTURECUBE,
                 },
                 Direct3D11::{
@@ -90,7 +90,7 @@ use crate::{
                         DXGI_FORMAT_R8_UNORM,
                         DXGI_SAMPLE_DESC,
                     },
-                    CreateDXGIFactory2, IDXGIFactory2, IDXGIKeyedMutex, IDXGIResource1,
+                    CreateDXGIFactory2, IDXGIAdapter, IDXGIFactory2, IDXGIKeyedMutex, IDXGIResource1,
                     IDXGISwapChain, IDXGISwapChain1, IDXGISwapChain2, DXGI_CREATE_FACTORY_FLAGS,
                     DXGI_ERROR_WAS_STILL_DRAWING, DXGI_FRAME_STATISTICS, DXGI_PRESENT,
                     DXGI_PRESENT_DO_NOT_WAIT, DXGI_RGBA, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
@@ -2551,23 +2551,53 @@ impl D3d11Cx {
             // adapter that went away. Recovery always starts from a fresh factory.
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
             let adapter = factory.EnumAdapters(0)?;
-            let mut device: Option<ID3D11Device> = None;
-            let mut context: Option<ID3D11DeviceContext> = None;
-            let mut query: Option<ID3D11Query> = None;
-            D3D11CreateDevice(
-                &adapter,
-                D3D_DRIVER_TYPE_UNKNOWN,
-                HMODULE(std::ptr::null_mut()),
-                D3D11_CREATE_DEVICE_FLAG(0x800 | 0x20), // VIDEO_SUPPORT | BGRA_SUPPORT
-                Some(&[D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut context),
-            )?;
+            let create = |adapter: Option<&IDXGIAdapter>, driver, flags| {
+                let mut device: Option<ID3D11Device> = None;
+                let mut context: Option<ID3D11DeviceContext> = None;
+                D3D11CreateDevice(
+                    adapter,
+                    driver,
+                    HMODULE(std::ptr::null_mut()),
+                    flags,
+                    Some(&[D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut context),
+                )?;
+                Ok::<_, windows_core::Error>((device.unwrap(), context.unwrap()))
+            };
+            // These constants are absent from the trimmed Windows bindings.
+            const UNSUPPORTED: windows_core::HRESULT =
+                windows_core::HRESULT(0x887A0004u32 as i32);
+            const BGRA: D3D11_CREATE_DEVICE_FLAG = D3D11_CREATE_DEVICE_FLAG(0x20);
+            const VIDEO_BGRA: D3D11_CREATE_DEVICE_FLAG = D3D11_CREATE_DEVICE_FLAG(0x820);
+            const WARP: D3D_DRIVER_TYPE = D3D_DRIVER_TYPE(5);
 
-            let device = device.unwrap();
-            let context = context.unwrap();
+            let (device, context) = match create(
+                Some(&adapter), D3D_DRIVER_TYPE_UNKNOWN, VIDEO_BGRA,
+            ) {
+                Ok(device) => device,
+                Err(error) if error.code() == UNSUPPORTED => {
+                    // Video acceleration is optional. Basic/remote adapters may
+                    // support the renderer's feature level but reject VIDEO_SUPPORT.
+                    // Keep their graphics acceleration when possible; otherwise use
+                    // WARP without the video flag that software devices can reject.
+                    crate::log!("D3D11: video device unavailable; trying graphics-only device");
+                    match create(Some(&adapter), D3D_DRIVER_TYPE_UNKNOWN, BGRA) {
+                        Ok(device) => device,
+                        Err(error) if error.code() == UNSUPPORTED => {
+                            crate::log!("D3D11: hardware graphics unavailable; using WARP");
+                            create(None, WARP, BGRA)?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                // Device-removed/reset failures still belong to the existing
+                // recovery loop, rather than silently changing renderers.
+                Err(error) => return Err(error),
+            };
+            let mut query: Option<ID3D11Query> = None;
 
             // NOTE: DXGI frame latency is now controlled per-swap-chain via
             // IDXGISwapChain2::SetMaximumFrameLatency(1) in D3d11Window::new,
@@ -4604,6 +4634,19 @@ mod shader_cache_tests {
         assert!(!is_complete_dxbc(b"DXBC"));
         assert!(!is_complete_dxbc(&[0u8; 64]));
         assert!(!is_complete_dxbc(&dxbc(48, 16)[..31]));
+    }
+}
+
+#[cfg(test)]
+mod device_startup_tests {
+    #[test]
+    fn device_tier_starts_on_software_adapter() {
+        // Hosted Windows runners have a graphics-capable software adapter that
+        // rejects VIDEO_SUPPORT. Exercise the production startup/recovery path,
+        // not a model of the fallback or a replacement graphics implementation.
+        for _ in 0..2 {
+            super::D3d11Cx::create_device_tier().expect("create the renderer device tier");
+        }
     }
 }
 
