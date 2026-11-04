@@ -1,6 +1,7 @@
 pub use makepad_widgets;
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::event::{NativeSystemBrowserInvoke, NativeSystemBrowserNavigation};
+use std::io::{Read, Write};
 
 app_main!(App);
 const BROWSER: LiveId = live_id!(windows_webview_smoke);
@@ -8,6 +9,7 @@ const LOCKED: LiveId = live_id!(windows_webview_locked_smoke);
 const FAILED: LiveId = live_id!(windows_webview_failure_smoke);
 const CARD: LiveId = live_id!(windows_webview_card_smoke);
 const CSP: LiveId = live_id!(windows_webview_csp_smoke);
+const REDIRECT: LiveId = live_id!(windows_webview_redirect_smoke);
 const FIRST: &str = "data:text/html,%3Ctitle%3Ewv2-start%3C/title%3E%3Cp%3EFirst%3C/p%3E";
 const SECOND: &str = "data:text/html,%3Ctitle%3Ewv2-second%3C/title%3E%3Cp%3ESecond%3C/p%3E";
 const LOCKED_PAGE: &str = "data:text/html,%3Ctitle%3Ewv2-locked%3C/title%3E%3Cp%3ELocked%3C/p%3E";
@@ -27,6 +29,27 @@ document.title='wv2-remote';
 fn data_url(html: &str) -> String {
     let encoded: String = html.bytes().map(|byte| format!("%{byte:02X}")).collect();
     format!("data:text/html,{encoded}")
+}
+
+fn redirect_server() -> std::io::Result<String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}/redirect", listener.local_addr()?);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let Ok(mut stream) = stream else { break };
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+            let mut request = [0u8; 4096];
+            let Ok(count) = stream.read(&mut request) else { break };
+            let response = if request[..count].starts_with(b"GET /redirect ") {
+                "HTTP/1.1 302 Found\r\nLocation: /destination\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+            } else {
+                let body = "<html><head><title>wv2-redirect-ok</title></head><body>Redirected</body></html>";
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    Ok(url)
 }
 
 script_mod! {
@@ -60,6 +83,7 @@ pub struct App {
     #[rust] card_remote_started: bool,
     #[rust] card_ok: bool,
     #[rust] csp_ok: bool,
+    #[rust] redirect_ok: bool,
     #[rust] finished: bool,
     #[rust] invalid_profile_file: Option<std::path::PathBuf>,
 }
@@ -78,14 +102,15 @@ impl App {
         }
     }
     fn maybe_pass(&mut self, cx: &mut Cx) {
-        if !self.finished && self.phase == 8 && self.locked_ok && self.error_ok && self.card_ok && self.csp_ok {
+        if !self.finished && self.phase == 8 && self.locked_ok && self.error_ok && self.card_ok && self.csp_ok && self.redirect_ok {
             self.finished = true;
-            println!("WV2_PASS reparenting, history, navigation policy, failure fallback, isolated card, CSP, and bridge isolation");
+            println!("WV2_PASS reparenting, history, redirects, navigation policy, failure fallback, isolated card, CSP, and bridge isolation");
             cx.system_browser(BROWSER).close();
             cx.system_browser(LOCKED).close();
             cx.system_browser(FAILED).close();
             cx.system_browser(CARD).close();
             cx.system_browser(CSP).close();
+            cx.system_browser(REDIRECT).close();
             if let Some(path) = self.invalid_profile_file.take() { let _ = std::fs::remove_file(path); }
         }
     }
@@ -101,6 +126,10 @@ impl MatchEvent for App {
         cx.system_browser(CARD).set_isolated_html(CARD_HTML, "https://example.org/root/");
         cx.system_browser(CSP).spawn("about:blank");
         cx.system_browser(CSP).set_isolated_html(CSP_HTML, "https://example.org/root/");
+        match redirect_server() {
+            Ok(url) => cx.system_browser(REDIRECT).spawn_navigable(&url),
+            Err(error) => self.fail(&format!("cannot start redirect server: {error}")),
+        }
         let file = std::env::temp_dir().join(format!("makepad-webview2-smoke-{}", std::process::id()));
         if let Err(error) = std::fs::write(&file, b"not a directory") {
             self.fail(&format!("cannot prepare invalid profile: {error}"));
@@ -137,6 +166,9 @@ impl MatchEvent for App {
                 if let Some(error) = &nav.error { self.fail(&format!("CSP card: {error}")); }
                 else if nav.title == "wv2-csp-ok" { self.csp_ok = true; }
                 else if nav.title == "wv2-csp-bad" { self.fail("CSP base-uri was bypassed"); }
+            } else if nav.browser_id == REDIRECT.0 {
+                if let Some(error) = &nav.error { self.fail(&format!("redirect: {error}")); }
+                else if nav.title == "wv2-redirect-ok" { self.redirect_ok = true; }
             } else if nav.browser_id == LOCKED.0 {
                 if let Some(error) = &nav.error {
                     self.fail(&format!("locked browser: {error}"));
@@ -186,7 +218,7 @@ impl AppMain for App {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         if self.timeout.is_event(event).is_some() && !self.finished {
-            self.fail(&format!("timeout at phase {}, policy={}, error={}, card={}, csp={}", self.phase, self.locked_ok, self.error_ok, self.card_ok, self.csp_ok));
+            self.fail(&format!("timeout at phase {}, policy={}, error={}, card={}, csp={}, redirect={}", self.phase, self.locked_ok, self.error_ok, self.card_ok, self.csp_ok, self.redirect_ok));
         }
         if self.remote_timer.is_event(event).is_some() && self.card_remote_started && !self.finished {
             self.card_ok = true;
