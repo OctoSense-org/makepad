@@ -229,6 +229,8 @@ pub struct Splitter {
     draw_bg: DrawSplitter,
     #[live]
     size: f64,
+    #[live(3.0)]
+    hit_margin: f64,
 
     // framecomponent mode
     #[rust]
@@ -271,20 +273,19 @@ impl Widget for Splitter {
                 .with_touch_margin(self.touch_margin()),
         ) {
             Hit::FingerHoverIn(_) => {
-                match self.axis {
-                    SplitterAxis::Horizontal => cx.set_cursor(MouseCursor::ColResize),
-                    SplitterAxis::Vertical => cx.set_cursor(MouseCursor::RowResize),
-                }
+                cx.set_cursor(self.resize_cursor());
                 self.animator_play(cx, ids!(hover.on));
+            }
+            Hit::FingerHoverOver(_) => {
+                // Native Windows hit testing can restore the default cursor
+                // before every mouse move, even while the hover area is unchanged.
+                cx.set_cursor(self.resize_cursor());
             }
             Hit::FingerHoverOut(_) => {
                 self.animator_play(cx, ids!(hover.off));
             }
             Hit::FingerDown(fe) if self.drag_start_align.is_none() && fe.is_primary_hit() => {
-                match self.axis {
-                    SplitterAxis::Horizontal => cx.set_cursor(MouseCursor::ColResize),
-                    SplitterAxis::Vertical => cx.set_cursor(MouseCursor::RowResize),
-                }
+                cx.set_cursor(self.resize_cursor());
                 self.animator_play(cx, ids!(hover.drag));
                 self.drag_start_align = Some(self.align);
             }
@@ -298,6 +299,7 @@ impl Widget for Splitter {
             }
             Hit::FingerMove(f) => {
                 if let Some(drag_start_align) = self.drag_start_align {
+                    cx.set_cursor(self.resize_cursor());
                     let delta = match self.axis {
                         SplitterAxis::Horizontal => f.abs.x - f.abs_start.x,
                         SplitterAxis::Vertical => f.abs.y - f.abs_start.y,
@@ -452,7 +454,14 @@ impl Splitter {
     }
 
     fn margin(&self) -> Inset {
-        self.axis_inset(3.0)
+        self.axis_inset(self.hit_margin.max(0.0))
+    }
+
+    fn resize_cursor(&self) -> MouseCursor {
+        match self.axis {
+            SplitterAxis::Horizontal => MouseCursor::ColResize,
+            SplitterAxis::Vertical => MouseCursor::RowResize,
+        }
     }
 
     /// Wider hit margin used only when the event came from a touch device.
