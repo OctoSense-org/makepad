@@ -24,7 +24,7 @@ use {
                 win32_window::Win32Window,
                 windows_game_input::WindowsGameInput,
                 windows_media::CxWindowsMedia,
-                windows_system_browser::WindowsSystemBrowsers,
+                windows_system_browser::{BrowserAction, WindowsSystemBrowsers},
                 windows_video_player::WindowsUnifiedVideoPlayer,
             },
         },
@@ -86,7 +86,12 @@ impl Cx {
         let _phase = crate::thread::ui_phase(crate::thread::UiPhase::NativeEvent);
         let browser_actions = self.os.system_browsers.drain();
         if !browser_actions.is_empty() {
-            for action in browser_actions { self.action(action); }
+            for action in browser_actions {
+                match action {
+                    BrowserAction::Navigation(action) => self.action(action),
+                    BrowserAction::Invoke(action) => self.action(action),
+                }
+            }
             self.handle_actions();
         }
         // Before anything touches the GPU. This is the one place holding both `&mut D3d11Cx`
@@ -1105,6 +1110,7 @@ impl Cx {
                 CxOsOp::SystemBrowserHistoryGo { browser_id, delta } => self.os.system_browsers.history(browser_id, delta),
                 CxOsOp::EvalSystemBrowserJs { browser_id, js } => self.os.system_browsers.eval(browser_id, js),
                 CxOsOp::SetSystemBrowserHtml { browser_id, .. } => self.os.system_browsers.set_html(browser_id),
+                CxOsOp::SetSystemBrowserIsolatedHtml { browser_id, html, base_url } => self.os.system_browsers.set_isolated_html(browser_id, html, base_url),
                 CxOsOp::SetTopmost(window_id, is_topmost) => {
                     if d3d11_windows.len() == 0 {
                         if self.defer_platform_op(CxOsOp::SetTopmost(window_id, is_topmost)) {
