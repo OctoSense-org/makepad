@@ -361,6 +361,12 @@ impl Cx {
         STUDIO_WEB_SOCKET_CONNECTED.store(false, Ordering::SeqCst);
         let mut request = HttpRequest::new(studio_http.to_string(), HttpMethod::GET);
         request.set_websocket_transport(WebSocketTransport::PlainTcp);
+        // A host that handed this launch a connect token gets it back in the
+        // handshake; a hub that issues per-launch secrets refuses the socket
+        // without it.
+        if let Some(token) = crate::app_main::studio_launch_token() {
+            request.set_header(crate::app_main::STUDIO_TOKEN_HEADER.to_string(), token);
+        }
         let network = self.net.clone();
         *STUDIO_NET_RUNTIME.lock().unwrap() = Some(network.clone());
         match network.ws_open(LiveId(STUDIO_SOCKET_ID), request) {

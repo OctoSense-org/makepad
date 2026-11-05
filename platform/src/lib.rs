@@ -207,7 +207,8 @@ pub fn host_dark() -> Option<bool> {
 pub use crate::app_main::android_on_load;
 pub use crate::app_main::{
     admitted_by_window_manager, attach_parent_console, discover_window_manager, hosted_by_window_manager, is_window_manager, launched_by_host, set_menu_bar_app, set_outlives_window_manager,
-    new_cx_with_font_set, resolve_studio_http, run_app, set_window_manager, should_run_stdin_loop_from_env, WmAdmission,
+    new_cx_with_font_set, resolve_studio_http, run_app, set_window_manager, should_run_stdin_loop_from_env, studio_launch_token, WmAdmission,
+    STUDIO_HANDSHAKE_STDIN_ENV, STUDIO_TOKEN_HEADER,
 };
 // Working-tree startup instrumentation (`MAKEPAD_TRACE=startup`).
 pub use crate::cx::{
