@@ -291,6 +291,8 @@ pub struct Win32App {
     pub event_flow: EventFlow,
     pub dpi_functions: DpiFunctions,
     pub current_cursor: Option<MouseCursor>,
+    // ShowCursor is a counter, so pair only the hide/show calls owned by us.
+    cursor_hidden_by_app: bool,
     pub currently_clicked_window_id: Option<WindowId>,
     pub start_dragging_items: Option<Vec<DragItem>>,
     pub is_dragging_internal: Cell<bool>,
@@ -429,6 +431,7 @@ impl Win32App {
             timers: Vec::new(),
             dpi_functions: DpiFunctions::new(),
             current_cursor: None,
+            cursor_hidden_by_app: false,
             currently_clicked_window_id: None,
             is_dragging_internal: Cell::new(false),
             beat_handles: Vec::new(),
@@ -1015,10 +1018,16 @@ impl Win32App {
             self.current_cursor = Some(cursor);
             unsafe {
                 if win32_cursor == PCWSTR::null() {
-                    ShowCursor(false);
+                    if !self.cursor_hidden_by_app {
+                        ShowCursor(false);
+                        self.cursor_hidden_by_app = true;
+                    }
                 } else {
                     SetCursor(Some(LoadCursorW(None, win32_cursor).unwrap()));
-                    ShowCursor(true);
+                    if self.cursor_hidden_by_app {
+                        ShowCursor(true);
+                        self.cursor_hidden_by_app = false;
+                    }
                 }
             }
             //TODO

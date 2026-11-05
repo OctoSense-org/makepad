@@ -870,7 +870,8 @@ impl Win32Window {
                 }
                 window.track_mouse_event = false;
                 window.send_mouse_leave(window.last_mouse_pos, Self::get_key_modifiers());
-                with_win32_app(|app| app.current_cursor = Some(MouseCursor::Hidden));
+                // Invalidate the cached shape without claiming that we hid it.
+                with_win32_app(|app| app.current_cursor = None);
             }
             WM_MOUSEWHEEL => {
                 let delta = (wparam.0 >> 16) as u16 as i16 as f64;
