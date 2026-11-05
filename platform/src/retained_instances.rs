@@ -822,7 +822,7 @@ mod upload_tests {
             .reserve(0)
             .expect("an empty retained link does not contend for capacity");
         drop(empty);
-        assert_eq!(cpu.refusals(), cpu.refusal_reasons().iter().sum());
+        assert_eq!(cpu.refusals(), cpu.refusal_reasons().iter().sum::<usize>());
         recording.clear();
         assert_eq!(
             cpu.bytes(),
