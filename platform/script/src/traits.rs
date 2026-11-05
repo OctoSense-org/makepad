@@ -377,7 +377,10 @@ pub struct ScriptTypeCheck {
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
 pub struct ScriptTypeIndex(pub(crate) u32);
 
-// Non-generic helper to reduce monomorphization in script_proto
+// Non-generic helper to reduce monomorphization in script_proto. A bound op when makepad-script
+// is a provided crate: it builds a `ScriptTypeObject`, which JIT-compiled code may not (the
+// generic `register_type` above runs in the JIT for every app type).
+#[relax_api]
 #[inline(never)]
 pub fn register_type_inner(
     vm: &mut ScriptVm,
