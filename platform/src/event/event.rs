@@ -275,6 +275,10 @@ pub enum Event {
     /// Respond with `Cx::send_studio_message(AppToStudio::Custom(..))`.
     Custom(String),
 
+    /// A message from the application's Android extension (the Java side of
+    /// `Cx::android_integration`): which `channel` answered, and its payload.
+    AndroidIntegration { channel: String, payload: String },
+
     Actions(ActionsBuf),
     AudioDevices(AudioDevicesEvent),
     MidiPorts(MidiPortsEvent),
@@ -472,6 +476,7 @@ impl Event {
             91 => "TrayMenu",
             92 => "TrayClick",
             93 => "NativeLayer",
+            96 => "AndroidIntegration",
             _ => panic!(),
         }
     }
@@ -578,6 +583,7 @@ impl Event {
             Self::TrayMenu(_) => 91,
             Self::TrayClick(_) => 92,
             Self::NativeLayer(_) => 93,
+            Self::AndroidIntegration { .. } => 96,
 
             #[cfg(target_arch = "wasm32")]
             Self::ToWasmMsg(_) => 55,
@@ -1392,4 +1398,21 @@ mod event_id_tests {
         }
         assert!(seen.len() > 90, "parsed only {} to_u32 arms", seen.len());
     }
+}
+
+/// The native QR scanner (`Cx::show_qr_scanner`) decoded a code. A bare
+/// action.
+#[derive(Clone, Debug, Default)]
+pub struct NativeQrScanned {
+    /// The complete decoded text of the QR code, untruncated, whatever it is
+    /// (e.g. an `OCTOS1E:` provisioning string). Named `json` for
+    /// compatibility with its first user, which scanned a JSON config.
+    pub json: String,
+}
+
+/// The native QR scanner closed without a result. A bare action; see
+/// `Cx::show_qr_scanner` for the `reason` values.
+#[derive(Clone, Debug, Default)]
+pub struct NativeQrCancelled {
+    pub reason: String,
 }

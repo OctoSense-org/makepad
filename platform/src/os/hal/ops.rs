@@ -689,6 +689,8 @@ impl Cx {
                 CxOsOp::NativeLayerDestroy { id } => self.hal.frames.w.native_layer_destroy(id.hal()),
                 CxOsOp::XrStartPresenting => self.hal_xr_start(),
                 CxOsOp::XrStopPresenting => self.hal_xr_stop(),
+                // Android-only requests; this backend has no extension to carry them.
+                CxOsOp::ShowQrScanner | CxOsOp::AndroidIntegration { .. } => {}
                 CxOsOp::XrSetRenderScale(_)
                 | CxOsOp::XrSetLocalAnchor(_)
                 | CxOsOp::XrSetLocalFloor(_)
