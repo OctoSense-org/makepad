@@ -97,6 +97,11 @@ pub(crate) fn set_tag_for_heap(heap_key: usize, tag: Option<String>) {
     });
 }
 
+/// Host-assigned identity for runtime permission checks; never script supplied.
+pub(crate) fn app_tag_for_heap(heap_key: usize) -> Option<String> {
+    BRIDGE.with(|b| b.borrow().tags.get(&heap_key).cloned())
+}
+
 /// Replaces the granted-capability list `host.capabilities()` reports.
 pub(crate) fn set_caps_for_heap(heap_key: usize, caps: Vec<String>) {
     BRIDGE.with(|b| {
@@ -120,6 +125,12 @@ pub(crate) fn set_prompts_for_heap(heap_key: usize, may_prompt: bool) {
 /// so their answers go nowhere, as a dead isolate's do.
 pub(crate) fn forget_callbacks(heap_key: usize) {
     BRIDGE.with(|b| b.borrow_mut().callbacks.retain(|(heap, _), _| *heap != heap_key));
+}
+
+/// Whether this isolate may raise a host prompt (set_prompts_for_heap): a card
+/// whose host turned prompts off cannot start an OS permission request either.
+pub(crate) fn prompts_allowed_for_heap(heap_key: usize) -> bool {
+    BRIDGE.with(|b| !b.borrow().no_prompt.contains(&heap_key))
 }
 
 /// Drops all bridge state for reclaimed isolates (called from the isolate GC).
