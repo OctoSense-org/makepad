@@ -35,7 +35,8 @@
 //! host.
 use crate::makepad_draw::makepad_platform::makepad_script_std;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 #[derive(Clone, Debug, Default)]
 pub struct HeapPolicy {
@@ -53,6 +54,45 @@ pub struct HeapPolicy {
 
 thread_local! {
     static POLICIES: RefCell<HashMap<usize, HeapPolicy>> = RefCell::new(HashMap::new());
+    static DEVICE_CONSENT: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+}
+
+/// The embedding host's cached device consent lookup. No OS operations or UI
+/// belong here: widgets may ask every frame. Identity comes from the host bridge.
+static DEVICE_GATE: Mutex<Option<fn(&str, &str) -> bool>> = Mutex::new(None);
+
+pub fn set_device_permission_gate(gate: fn(&str, &str) -> bool) {
+    *DEVICE_GATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+}
+
+/// Opt a contained heap into host-managed device consent. The host sets this
+/// before evaluating app code; the script cannot change it. Default preserves
+/// older containers. Once opted in, a missing hook or identity fails closed.
+pub fn set_device_consent_for_heap(heap_key: usize, required: bool) {
+    DEVICE_CONSENT.with(|heaps| {
+        if required { heaps.borrow_mut().insert(heap_key); }
+        else { heaps.borrow_mut().remove(&heap_key); }
+    });
+}
+
+pub(crate) fn device_consent_required(heap_key: usize) -> bool {
+    DEVICE_CONSENT.with(|heaps| heaps.borrow().contains(&heap_key))
+}
+
+/// Legacy widgets may use an existing OS grant in a background card, but an
+/// opted-in app must never cause a native permission prompt from that surface.
+pub(crate) fn device_prompt_allowed(heap_key: usize) -> bool {
+    !device_consent_required(heap_key) || crate::splash_host::prompts_allowed_for_heap(heap_key)
+}
+
+fn device_allowed(heap_key: usize, service: &str) -> bool {
+    let family = service.split('.').next().unwrap_or(service);
+    if !matches!(family, "camera" | "microphone" | "location")
+        || service.starts_with(&format!("{family}.permission."))
+        || !DEVICE_CONSENT.with(|heaps| heaps.borrow().contains(&heap_key)) { return true; }
+    let Some(app) = crate::splash_host::app_tag_for_heap(heap_key) else { return false; };
+    let gate = *DEVICE_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    gate.is_some_and(|gate| gate(&app, family))
 }
 
 /// Set (or replace) the policy for a heap. Enforcement starts here: a heap
@@ -75,6 +115,7 @@ pub fn set_policy_for_heap(heap_key: usize, capabilities: Vec<String>, hosts: Ve
 
 /// Drop policies for reclaimed isolates (from the isolate GC).
 pub(crate) fn gc_policies(dead_heaps: &[usize]) {
+    DEVICE_CONSENT.with(|heaps| heaps.borrow_mut().retain(|heap| !dead_heaps.contains(heap)));
     POLICIES.with(|p| {
         let mut p = p.borrow_mut();
         for heap in dead_heaps {
@@ -98,7 +139,8 @@ pub fn service_allowed(heap_key: usize, service: &str) -> Result<(), String> {
         let Some(policy) = p.get(&heap_key) else { return Ok(()) };
         let family = service.split('.').next().unwrap_or(service);
         if policy.capabilities.iter().any(|c| c == service || c == family) {
-            Ok(())
+            if device_allowed(heap_key, service) { Ok(()) }
+            else { Err(format!("authorization_required: request {family}.permission.request from the foreground app")) }
         } else {
             Err(format!("this app was not granted {family:?}, which {service:?} needs"))
         }
@@ -384,6 +426,40 @@ mod tests {
         assert!(makepad_script_std::script_url_allowed(911, "ws://127.0.0.1:9/"));
         assert!(makepad_script_std::script_media_url_allowed(911, "http://10.0.0.8/a.jpg"));
         gc_policies(&[911]);
+    }
+
+    #[test]
+    fn device_consent_uses_host_identity_preserves_permission_ui_and_revokes_cached_gps() {
+        static ALLOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn gate(app: &str, family: &str) -> bool {
+            app == "org.example.device-test" && family == "location" && ALLOW.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        let heap = 992031;
+        set_policy_for_heap(heap, vec!["location".into()], vec![], None);
+        assert!(service_allowed(heap, "location.get").is_ok(), "legacy app retains declared grant");
+        set_device_consent_for_heap(heap, true);
+        assert!(service_allowed(heap, "location.get").is_err(), "missing host gate fails closed");
+        assert!(service_allowed(heap, "location.permission.request").is_ok(), "request UI remains reachable");
+        set_device_permission_gate(gate);
+        ALLOW.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(service_allowed(heap, "location.get").is_err(), "no host identity fails closed");
+        crate::splash_host::set_tag_for_heap(heap, Some("org.example.device-test".into()));
+        assert!(service_allowed(heap, "location.get").is_ok());
+        crate::splash_host::set_prompts_for_heap(heap, false);
+        assert!(!device_prompt_allowed(heap), "an agent may not request an OS permission");
+        assert!(service_allowed(heap, "location.get").is_ok(), "existing consent still permits passive reads");
+        crate::makepad_platform::gps::set_gps_fix(37.7, -122.4, 10.0);
+        assert!(gps_fix_for_heap(heap).is_some());
+        ALLOW.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(gps_fix_for_heap(heap).is_none(), "revocation hides an already cached fix");
+        assert!(service_allowed(heap, "camera.permission.request").is_err(), "consent cannot expand the manifest ceiling");
+        gc_policies(&[heap]);
+        crate::splash_host::set_tag_for_heap(heap, None);
+        set_policy_for_heap(heap, vec!["location".into()], vec![], None);
+        assert!(service_allowed(heap, "location.get").is_ok(), "GC removed the device opt-in marker");
+        assert!(device_prompt_allowed(heap), "older apps retain their existing prompt behavior");
+        crate::splash_host::gc_bridge(&[heap]);
+        gc_policies(&[heap]);
     }
 
     #[test]

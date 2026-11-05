@@ -71,6 +71,9 @@ pub struct Splash {
     /// widget tiles). Rides on every host.request as `may_prompt`.
     #[rust(true)]
     host_prompts: bool,
+    /// Host API v1 device consent; never exposed as a script field.
+    #[rust]
+    device_consent: bool,
     /// Whole-jail byte cap when the host has granted this app extra room.
     /// None leaves the storage default.
     #[rust]
@@ -302,6 +305,7 @@ impl Splash {
         crate::splash_host::set_prompts_for_heap(heap_key, self.host_prompts);
         crate::splash_storage::set_quota_for_heap(heap_key, self.storage_quota);
         self.apply_policy(cx, heap_key);
+        crate::splash_policy::set_device_consent_for_heap(heap_key, self.device_consent);
         if !crate::splash_policy::may_run(heap_key) {
             log!("splash: {} is stopped: its instruction budget is spent", self.source_label());
             return;
@@ -894,6 +898,16 @@ impl Splash {
         }
     }
 
+    /// Require the host's per-app device consent before legacy camera/location
+    /// widgets or host methods act. Call before set_text, like set_policy.
+    pub fn set_device_consent(&mut self, cx: &mut Cx, required: bool) {
+        self.device_consent = required;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.heap_key());
+            crate::splash_policy::set_device_consent_for_heap(heap_key, required);
+        }
+    }
+
     /// Puts this isolate under an ENFORCED policy (ADR 0002): files stay in
     /// its jail, and the runtime's own reads of the person's data and devices
     /// need their grants. `hosts`, `instruction_budget` and the capabilities
@@ -1053,6 +1067,11 @@ impl SplashRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_host_prompts(cx, may_prompt);
         }
+    }
+
+    /// See [`Splash::set_device_consent`].
+    pub fn set_device_consent(&self, cx: &mut Cx, required: bool) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_device_consent(cx, required); }
     }
 
     /// See [`Splash::isolate_heap_key`].
