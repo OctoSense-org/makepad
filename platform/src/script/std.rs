@@ -89,7 +89,9 @@ impl Cx {
         makepad_script_std::set_script_task_trace(self.script_std_mut(), enabled);
     }
 
-    pub(crate) fn handle_script_tasks(&mut self) {
+    /// Work the queued script tasks (`ui.*` calls) now, as the event loop does
+    /// after a host callback; a host's test pumps them with this.
+    pub fn handle_script_tasks(&mut self) {
         makepad_script_std::handle_script_tasks(&mut self.host_context());
     }
 
