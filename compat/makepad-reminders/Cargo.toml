@@ -1,0 +1,14 @@
+[package]
+name = "makepad-reminders"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+makepad-app-reminders = { path = "../../apps/reminders" }
+
+[features]
+default = []
+standalone = ["makepad-app-reminders/standalone"]

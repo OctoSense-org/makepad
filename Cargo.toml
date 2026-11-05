@@ -31,6 +31,9 @@ workspace.members = [
     "apps/calendar",
     "apps/reminders",
     "apps/calculator",
+    # OctoSense jit line: the fork's crate names over upstream's renamed apps, and its WM theme
+    "compat/*",
+    "libs/wm_theme",
     "apps/synth",
     "libs/wayland_server",
     "libs/xkb_keymap",
