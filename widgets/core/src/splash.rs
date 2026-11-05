@@ -63,10 +63,28 @@ pub struct Splash {
     /// widget tiles). Rides on every host.request as `may_prompt`.
     #[rust(true)]
     host_prompts: bool,
+    /// Host API v1 device consent; never exposed as a script field.
+    #[rust]
+    device_consent: bool,
     /// Whole-jail byte cap when the host has granted this app extra room.
     /// None leaves the storage default.
     #[rust]
     storage_quota: Option<u64>,
+    /// ADR 0002: when Some, this isolate is ENFORCED — files stay in its
+    /// jail, and the runtime's own reads of the person's data and devices
+    /// need their grants in `host_caps`. Since the ruling of 8 October 2026
+    /// the hosts and the capabilities are the app's declarations: no network
+    /// path or `host.request` is refused by the runtime. None keeps the
+    /// informational behaviour every existing host relied on.
+    #[rust]
+    policy_hosts: Option<Vec<String>>,
+    /// The instruction budget the app declares (cumulative, unlike the
+    /// per-evaluation cap): counted against, never enforced.
+    #[rust]
+    instruction_budget: Option<u64>,
+    /// Heap ceiling for this isolate, applied to its script heap.
+    #[rust]
+    memory_bytes: Option<usize>,
     /// What to call this script in error messages. Set by the host to the
     /// mini-app's id; empty for previews and one-off evals.
     ///
@@ -256,8 +274,7 @@ impl Splash {
     fn eval_body(&mut self, cx: &mut Cx) {self.eval_styled_body(cx,false);}
 
     fn eval_styled_body(&mut self,cx:&mut Cx,preserve:bool) {
-        let body = self.body.as_ref();
-        if body.is_empty() {
+        if self.body.as_ref().is_empty() {
             return;
         }
 
@@ -274,8 +291,15 @@ impl Splash {
         crate::splash_host::set_caps_for_heap(heap_key, self.host_caps.clone());
         crate::splash_host::set_prompts_for_heap(heap_key, self.host_prompts);
         crate::splash_storage::set_quota_for_heap(heap_key, self.storage_quota);
+        self.apply_policy(cx, heap_key);
+        crate::splash_policy::set_device_consent_for_heap(heap_key, self.device_consent);
+        if !crate::splash_policy::may_run(heap_key) {
+            log!("splash: {} is stopped: its instruction budget is spent", self.source_label());
+            return;
+        }
 
         let body_key = self.body_key();
+        let body = self.body.as_ref();
         // Full code string: prefix + body (no closing - parser auto-closes)
         let prefix = splash_prefix(self.allow_net);
         let code = format!("{}{}", prefix, body);
@@ -325,6 +349,9 @@ impl Splash {
                 });
             }
             let (view, body_modules, errors) = cx.with_script_vm_id(vm_id, |vm| {
+                // Vocabulary this app's grants entitle it to, now that its policy is seated
+                // (see `register_splash_isolate_mod_for`).
+                crate::widget_async::apply_granted_isolate_mods(vm);
                 // Everything on `mod` that is not the body's own; whatever the run
                 // adds beyond this is the body's.
                 let mut known = module_keys(vm);
@@ -340,6 +367,9 @@ impl Splash {
                 });
                 if preserve {
                     restore_modules(vm, saved);
+                }
+                if !crate::splash_policy::charge(heap_key, vm.last_limit_consumed() as u64) {
+                    log!("splash: an app spent its instruction budget evaluating its body and is stopped");
                 }
                 let body_modules: Vec<LiveId> = module_keys(vm)
                     .into_iter()
@@ -735,6 +765,10 @@ impl Splash {
         let mut called = false;
         crate::widget_async::contain_isolate_panic("script hook call", || {
         called = cx.with_script_vm_id(self.vm_id, |vm| {
+            let heap_key = vm.bx.heap.heap_key();
+            if !crate::splash_policy::may_run(heap_key) {
+                return false;
+            }
             // NoTrap: this is an existence probe for an OPTIONAL hook. A
             // trapping lookup queues a NotFound into the error log even though
             // the miss is handled right here — every host broadcast (e.g.
@@ -747,6 +781,7 @@ impl Splash {
             vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT, |vm| {
                 vm.call(fnval, args);
             });
+            crate::splash_policy::charge(heap_key, vm.last_limit_consumed() as u64);
             true
         });
         });
@@ -764,6 +799,9 @@ impl Splash {
         let mut called = false;
         crate::widget_async::contain_isolate_panic("script hook call", || {
         called = cx.with_script_vm_id(self.vm_id, |vm| {
+            if !crate::splash_policy::may_run(vm.heap_key()) {
+                return false;
+            }
             let fnval = vm.heap().scope_value(scope, name, NoTrap);
             if fnval.is_nil() || fnval.is_err() {
                 return false;
@@ -775,6 +813,7 @@ impl Splash {
             vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT, |vm| {
                 vm.call(fnval, &vals);
             });
+            crate::splash_policy::charge(vm.heap_key(), vm.last_limit_consumed() as u64);
             true
         });
         });
@@ -855,6 +894,60 @@ impl Splash {
         }
     }
 
+    /// Require the host's per-app device consent before legacy camera/location
+    /// widgets or host methods act. Call before set_text, like set_policy.
+    pub fn set_device_consent(&mut self, cx: &mut Cx, required: bool) {
+        self.device_consent = required;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.heap_key());
+            crate::splash_policy::set_device_consent_for_heap(heap_key, required);
+        }
+    }
+
+    /// Puts this isolate under an ENFORCED policy (ADR 0002): files stay in
+    /// its jail, and the runtime's own reads of the person's data and devices
+    /// need their grants. `hosts`, `instruction_budget` and the capabilities
+    /// are what the app declares: since the ruling of 8 October 2026 none of
+    /// them limits its network paths, its `host.request` calls or what it
+    /// runs ([`crate::splash_policy`]). Call before set_text. Pass `None`
+    /// hosts to return to the unenforced behaviour.
+    pub fn set_policy(&mut self, cx: &mut Cx, hosts: Option<Vec<String>>, instruction_budget: Option<u64>) {
+        self.policy_hosts = hosts;
+        self.instruction_budget = instruction_budget;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.heap_key());
+            self.apply_policy(cx, heap_key);
+        }
+    }
+
+    /// Caps this isolate's script heap. Applied when the isolate exists, and
+    /// on the next eval otherwise. None removes the cap.
+    pub fn set_memory_bytes(&mut self, cx: &mut Cx, bytes: Option<usize>) {
+        self.memory_bytes = bytes;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.set_max_heap_bytes(bytes));
+        }
+    }
+
+    /// Instructions this isolate has run under its budget so far.
+    pub fn instructions_used(&mut self, cx: &mut Cx) -> u64 {
+        if self.vm_id == MAIN_SPLASH_VM_ID {
+            return 0;
+        }
+        let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.heap_key());
+        crate::splash_policy::instructions_used(heap_key)
+    }
+
+    /// Push the policy fields onto the live isolate.
+    fn apply_policy(&mut self, cx: &mut Cx, heap_key: usize) {
+        if let Some(hosts) = &self.policy_hosts {
+            crate::splash_policy::set_policy_for_heap(heap_key, self.host_caps.clone(), hosts.clone(), self.instruction_budget);
+        }
+        if let Some(bytes) = self.memory_bytes {
+            cx.with_script_vm_id(self.vm_id, |vm| vm.heap_mut().set_max_heap_bytes(Some(bytes)));
+        }
+    }
+
     /// This Splash's live isolate heap identity (None while stopped) — the
     /// same key `SplashHostRequest::heap_key` carries, so hosts can relate a
     /// request to a specific widget (e.g. to skip an IPC sender's own isolate
@@ -900,6 +993,25 @@ impl Splash {
 }
 
 impl SplashRef {
+    /// See [`Splash::set_policy`].
+    pub fn set_policy(&self, cx: &mut Cx, hosts: Option<Vec<String>>, instruction_budget: Option<u64>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_policy(cx, hosts, instruction_budget);
+        }
+    }
+
+    /// See [`Splash::set_memory_bytes`].
+    pub fn set_memory_bytes(&self, cx: &mut Cx, bytes: Option<usize>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_memory_bytes(cx, bytes);
+        }
+    }
+
+    /// See [`Splash::instructions_used`].
+    pub fn instructions_used(&self, cx: &mut Cx) -> u64 {
+        self.borrow_mut().map(|mut inner| inner.instructions_used(cx)).unwrap_or(0)
+    }
+
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
@@ -951,6 +1063,11 @@ impl SplashRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_host_prompts(cx, may_prompt);
         }
+    }
+
+    /// See [`Splash::set_device_consent`].
+    pub fn set_device_consent(&self, cx: &mut Cx, required: bool) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_device_consent(cx, required); }
     }
 
     /// See [`Splash::isolate_heap_key`].
@@ -1181,6 +1298,36 @@ mod prefix_tests {
         assert_eq!(super::splash_prefix(false).matches('\n').count() as u32, super::SPLASH_PREFIX_LINES);
         assert_eq!(super::splash_prefix(true).matches('\n').count() as u32, super::SPLASH_NET_PREFIX_LINES);
     }
+}
+
+/// What a Splash body posts to its host.
+#[derive(Clone, Debug)]
+pub enum SplashAction {
+    /// `agent.notify(event, payload)` from an isolate granted `agent`: the host acts on
+    /// it as if its own card sent it (the payload is the JSON of the second argument).
+    Notify { event_id: String, payload: String },
+}
+
+/// `agent.notify` for isolates. A notify carries no sender, so the host acts on it as if
+/// its own card sent it; an app under a policy may only post one when it was granted
+/// `agent` (installed through `register_splash_isolate_mod_for("agent", ..)` or the host's
+/// own registration), anything else would let an installed app drive the host's agent.
+pub fn register_agent_module(vm: &mut ScriptVm) {
+    let agent = vm.new_module(id!(agent));
+    vm.add_method(agent, id_lut!(notify), script_args_def!(event = NIL, payload = NIL), |vm, args| {
+        let event_value = script_value!(vm, args.event);
+        let payload_value = script_value!(vm, args.payload);
+        let event_id = vm.cast_to_string(event_value);
+        let mut payload = String::new();
+        vm.heap().to_json_inner(payload_value, &mut payload);
+        if let Err(reason) = crate::splash_policy::service_allowed(vm.heap_key(), "agent.notify") {
+            log!("splash: refused agent.notify {event_id:?}: {reason}");
+            return NIL;
+        }
+        Cx::post_action(SplashAction::Notify { event_id, payload });
+        NIL
+    });
+    vm.set_injected_global(id!(agent), agent.into());
 }
 
 #[cfg(test)]

@@ -97,6 +97,11 @@ pub(crate) fn set_tag_for_heap(heap_key: usize, tag: Option<String>) {
     });
 }
 
+/// Host-assigned identity for runtime permission checks; never script supplied.
+pub(crate) fn app_tag_for_heap(heap_key: usize) -> Option<String> {
+    BRIDGE.with(|b| b.borrow().tags.get(&heap_key).cloned())
+}
+
 /// Replaces the granted-capability list `host.capabilities()` reports.
 pub(crate) fn set_caps_for_heap(heap_key: usize, caps: Vec<String>) {
     BRIDGE.with(|b| {
@@ -120,6 +125,12 @@ pub(crate) fn set_prompts_for_heap(heap_key: usize, may_prompt: bool) {
 /// so their answers go nowhere, as a dead isolate's do.
 pub(crate) fn forget_callbacks(heap_key: usize) {
     BRIDGE.with(|b| b.borrow_mut().callbacks.retain(|(heap, _), _| *heap != heap_key));
+}
+
+/// Whether this isolate may raise a host prompt (set_prompts_for_heap): a card
+/// whose host turned prompts off cannot start an OS permission request either.
+pub(crate) fn prompts_allowed_for_heap(heap_key: usize) -> bool {
+    BRIDGE.with(|b| !b.borrow().no_prompt.contains(&heap_key))
 }
 
 /// Drops all bridge state for reclaimed isolates (called from the isolate GC).
@@ -196,9 +207,16 @@ pub fn splash_host_respond(
         vm.set_value_trap(obj, id!(is_ok), ok);
         vm.set_value_trap(obj, id!(data), data);
         vm.set_value_trap(obj, id!(error), error);
+        if !crate::splash_policy::may_run(heap_key) {
+            delivered = false;
+            return;
+        }
         vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT, |vm| {
             vm.call(callback.as_object().into(), &[obj.into()]);
         });
+        if !crate::splash_policy::charge(heap_key, vm.last_limit_consumed() as u64) {
+            crate::makepad_draw::log!("splash host: an app spent its instruction budget in a callback and is stopped");
+        }
         // A callback that errors (or pauses and errors later on its own
         // thread) leaves its errors queued on the trap; nothing else drains
         // this entry path, so they used to vanish and a broken callback
@@ -268,6 +286,10 @@ pub fn script_mod(vm: &mut ScriptVm) {
             };
 
             let heap_key = vm.heap_key();
+            // No capability check here: an app's capabilities are declarations
+            // since the ruling of 8 October 2026 (OctoSense #450), and the
+            // host decides, as for an isolate with no policy. A host service
+            // that needs a grant checks it itself.
             let req_id = BRIDGE.with(|b| {
                 let mut b = b.borrow_mut();
                 b.next_req_id += 1;

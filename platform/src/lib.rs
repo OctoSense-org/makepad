@@ -2,6 +2,7 @@
 pub mod gl_render_bridge;
 pub mod home;
 pub mod accessibility;
+pub mod gps;
 mod input_provenance;
 pub use input_provenance::{trusted_user_input, with_untrusted_input};
 /// Allocator swaps (before/after loading something that replaces the process allocator).
@@ -234,6 +235,7 @@ pub use makepad_hal::window_controls;
 pub mod window_controls;
 
 pub use makepad_futures;
+pub use makepad_script_std;
 pub use makepad_script_std::makepad_network;
 pub use makepad_script_std::makepad_script;
 pub use makepad_script_census;

@@ -3,6 +3,7 @@ pub use makepad_network;
 pub use makepad_script;
 
 pub mod data;
+pub mod gate;
 pub mod fs;
 pub mod net;
 pub mod net_types;
@@ -13,6 +14,7 @@ pub mod task;
 pub mod vm;
 
 pub use data::*;
+pub use gate::*;
 pub use net::*;
 pub use run::*;
 pub use task::*;
