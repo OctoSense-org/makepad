@@ -73,6 +73,7 @@ pub struct Cx {
     pub(crate) remote_activity: crate::remote::RemoteActivity,
     pub(crate) font_set: crate::font_policy::FontSet,
     pub(crate) font_set_frozen: bool,
+    accessibility_preferences: crate::accessibility::AccessibilityPreferences,
 
     pub debug_trace_active: bool,
 
@@ -910,6 +911,23 @@ impl Cx {
         true
     }
 
+    /// The accessibility preferences the platform observed (high-contrast
+    /// text, font weight adjustment, animation scale). Defaults until a host
+    /// reports them.
+    pub fn accessibility_preferences(&self) -> crate::accessibility::AccessibilityPreferences {
+        self.accessibility_preferences
+    }
+    /// A platform host records what it observed; true when they changed
+    /// (everything is redrawn).
+    pub fn set_accessibility_preferences(&mut self, value: crate::accessibility::AccessibilityPreferences) -> bool {
+        if self.accessibility_preferences == value {
+            return false;
+        }
+        self.accessibility_preferences = value;
+        self.redraw_all();
+        true
+    }
+
     pub fn font_set(&self) -> crate::font_policy::FontSet {
         self.font_set
     }
@@ -1041,6 +1059,7 @@ impl Cx {
             remote_activity: Default::default(),
             font_set: crate::font_policy::FontSet::target_default(),
             font_set_frozen: false,
+            accessibility_preferences: Default::default(),
             demo_time_repaint: false,
             pass_time_origin: 0.0,
             pass_time_rebase: true,

@@ -249,6 +249,8 @@ pub enum Event {
     KeyDown(KeyEvent),
     KeyUp(KeyEvent),
     PhysicalKeyboard(PhysicalKeyboardEvent),
+    /// Internal native-editor observation; only the focused editable widget responds.
+    TextInputStateQuery(std::rc::Rc<std::cell::RefCell<Option<(u64, FullTextState)>>>),
     TextInput(TextInputEvent),
     /// A reply to `Cx::read_clipboard`, routed by its request id.
     Clipboard(crate::clipboard_read::ClipboardEvent),
@@ -277,6 +279,10 @@ pub enum Event {
     /// A message from the application's Android extension (the Java side of
     /// `Cx::android_integration`): which `channel` answered, and its payload.
     AndroidIntegration { channel: String, payload: String },
+    /// Android: the running activity received a HOME intent (the Home button
+    /// or gesture while this app is the device's Home app). A shell shows
+    /// its home screen; other apps can ignore it.
+    HomeIntent,
 
     Actions(ActionsBuf),
     AudioDevices(AudioDevicesEvent),
@@ -476,6 +482,8 @@ impl Event {
             92 => "TrayClick",
             93 => "NativeLayer",
             96 => "AndroidIntegration",
+            97 => "HomeIntent",
+            98 => "TextInputStateQuery",
             _ => panic!(),
         }
     }
@@ -583,6 +591,8 @@ impl Event {
             Self::TrayClick(_) => 92,
             Self::NativeLayer(_) => 93,
             Self::AndroidIntegration { .. } => 96,
+            Self::HomeIntent => 97,
+            Self::TextInputStateQuery(_) => 98,
 
             #[cfg(target_arch = "wasm32")]
             Self::ToWasmMsg(_) => 55,

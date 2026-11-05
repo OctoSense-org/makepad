@@ -1759,6 +1759,9 @@ impl Cx {
     }
 
     pub(crate) fn call_event_handler(&mut self, event: &Event) {
+        // No HAL backend establishes input provenance yet: every dispatch runs
+        // untrusted (see input_provenance.rs).
+        let _untrusted = crate::input_provenance::InputTrustGuard::enter(false);
         #[cfg(not(target_arch = "wasm32"))]
         self.first_draw.note_event(event);
         #[cfg(not(target_arch = "wasm32"))]

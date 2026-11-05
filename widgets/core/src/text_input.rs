@@ -4,7 +4,7 @@ use {
         makepad_derive_widget::*,
         makepad_draw::{
             event::finger::{DigitId, ScrollDirection, TouchState},
-            event::keyboard::CharOffset,
+            event::keyboard::{CharOffset, FullTextState},
             ime::{
                 AutoCapitalize, AutoCorrect, InputMode, ReturnKeyType, SoftKeyboardConfig,
                 TextInputConfig, TextInputContentType,
@@ -3125,6 +3125,21 @@ impl Widget for TextInput {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
+        if let Event::TextInputStateQuery(response) = event {
+            let area = self.draw_bg.area();
+            if !area.is_empty() && cx.has_key_focus(area) && !self.is_read_only {
+                let offset = |at: usize| CharOffset(self.text[..floor_grapheme_boundary(&self.text, at)].chars().count());
+                *response.borrow_mut() = Some((
+                    self.widget_uid().0,
+                    FullTextState {
+                        text: self.text.clone(),
+                        selection: offset(self.selection.start().index)..offset(self.selection.end().index),
+                        composition: self.has_composition().then(|| offset(self.composition_start)..offset(self.composition_end)),
+                    },
+                ));
+            }
+            return;
+        }
         if self.animator_handle_event(cx, event).must_redraw() {
             self.draw_bg.redraw(cx);
             self.draw_cursor.redraw(cx);

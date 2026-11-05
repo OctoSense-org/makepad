@@ -748,6 +748,11 @@ impl ViewRef {
         }
     }
 
+    /// Current scroll offset, including native scrollbar drag and fling.
+    pub fn scroll_pos(&self) -> Vec2d {
+        self.borrow().map(|inner| inner.scroll_pos()).unwrap_or_default()
+    }
+
     pub fn set_scroll_pos(&self, cx: &mut Cx, v: Vec2d) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_scroll_pos(cx, v)
@@ -2230,6 +2235,11 @@ impl View {
         } else {
             None
         }
+    }
+
+    /// Read the same authoritative position used by this view when drawing.
+    pub fn scroll_pos(&self) -> Vec2d {
+        self.scroll_bars_obj.as_ref().map(|bars| bars.get_scroll_pos()).unwrap_or(self.layout.scroll)
     }
 
     pub fn set_scroll_pos(&mut self, cx: &mut Cx, v: Vec2d) {
