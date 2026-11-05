@@ -361,7 +361,9 @@ mod imp {
 
     /// A native bundle must resolve every import before any program code starts. Its handle.
     pub fn load_path(path: &str) -> Result<usize, String> {
-        super::unix::load_path(path, 2 | 0x100)
+        let handle = super::unix::load_path(path, 2 | 0x100)?;
+        crate::os::hidden::note_native_lib(path);
+        Ok(handle)
     }
     pub use super::unix::symbol_in;
 
@@ -525,7 +527,9 @@ mod imp {
 
     /// A shared library by absolute path (--allow-c's native library), its symbols global. Its handle.
     pub fn load_path(path: &str) -> Result<usize, String> {
-        super::unix::load_path(path, 2 | 0x100)
+        let handle = super::unix::load_path(path, 2 | 0x100)?;
+        crate::os::hidden::note_native_lib(path);
+        Ok(handle)
     }
     pub use super::unix::symbol_in;
 
@@ -594,7 +598,9 @@ mod imp {
 
     /// A shared library by absolute path (--allow-c's native library), its symbols global. Its handle.
     pub fn load_path(path: &str) -> Result<usize, String> {
-        super::unix::load_path(path, 2 | 8)
+        let handle = super::unix::load_path(path, 2 | 8)?;
+        crate::os::hidden::note_native_lib(path);
+        Ok(handle)
     }
     pub use super::unix::symbol_in;
 

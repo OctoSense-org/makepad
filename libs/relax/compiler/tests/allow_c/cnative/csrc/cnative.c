@@ -12,3 +12,7 @@ int32_t cn_apply(cn_cb f, int32_t x) { return f(x) * 2; }
 // code calls blake3_compress_in_place_portable.
 extern int32_t cn_rust_square(int32_t x);
 int32_t cn_square_plus(int32_t x) { return cn_rust_square(x) + 1; }
+
+/* Kept out of the dynamic symbol table, as `-fvisibility=hidden` builds (ring's whole C core) and
+ * `.private_extern` assembly are: the JIT must still reach it through the library's symbol table. */
+__attribute__((visibility("hidden"))) int cn_hidden_mul(int a, int b) { return a * b; }

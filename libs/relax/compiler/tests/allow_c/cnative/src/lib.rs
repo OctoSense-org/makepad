@@ -13,3 +13,8 @@ pub fn square_plus(x: i32) -> i32 { unsafe { cn_square_plus(x) } }
 /// Only C calls it.
 #[no_mangle]
 pub extern "C" fn cn_rust_square(x: i32) -> i32 { x * x }
+extern "C" {
+    fn cn_hidden_mul(a: i32, b: i32) -> i32;
+}
+/// A function the library does not export (hidden visibility).
+pub fn hidden_mul(a: i32, b: i32) -> i32 { unsafe { cn_hidden_mul(a, b) } }
