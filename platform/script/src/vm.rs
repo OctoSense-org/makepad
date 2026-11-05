@@ -2866,6 +2866,26 @@ impl<'a> ScriptVm<'a> {
         self.bx.vm_register(&req);
     }
 
+    /// A native fn as a script value (not a module's method): what a host hands an isolate as
+    /// an injected global or a callback. The way JIT-compiled code makes one when makepad-script
+    /// is a provided crate (the native table is the crate's own).
+    pub fn new_fn<F>(&mut self, args: &[(LiveId, ScriptValue)], f: F) -> ScriptValue
+    where
+        F: Fn(&mut ScriptVm, ScriptObject) -> ScriptValue + 'static,
+    {
+        self.new_fn_native(args, NativeFn::new(f))
+    }
+
+    /// [`Self::new_fn`] with the closure already a [`NativeFn`].
+    #[inline(always)]
+    pub fn new_fn_native(&mut self, args: &[(LiveId, ScriptValue)], f: NativeFn) -> ScriptValue {
+        let mut req = ScriptRegReq::new(REG_FN);
+        req.args = args;
+        req.native = f.into_raw();
+        let packed = self.bx.vm_register(&req);
+        ScriptObject::new(packed as u32, (packed >> 32) as Generation).into()
+    }
+
     #[inline(always)]
     pub fn set_injected_global(&mut self, key: LiveId, value: ScriptValue) {
         let mut req = ScriptRegReq::new(REG_INJECTED_GLOBAL);

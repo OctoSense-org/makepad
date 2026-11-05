@@ -273,6 +273,9 @@ pub const REG_OBJECT_OP_HOOK: u32 = 10;
 pub const REG_CRATE_MANIFEST: u32 = 11;
 /// `module` (the shader fn), `renames`, `input`: its namespace.
 pub const REG_SHADER_FN_NAMESPACE: u32 = 12;
+/// `args`, `native`: a native fn as a value (not a module's method); the answer: its object,
+/// index in the low word and generation in the high.
+pub const REG_FN: u32 = 13;
 
 /// A native as `{data, call, drop}`: what the four native kinds share. Made by
 /// `into_raw`, which gives up the native's ownership; the op rebuilds the kind it registers.
@@ -718,6 +721,11 @@ impl ScriptVmBase {
             REG_HANDLE_TYPE => {
                 let ht = self.code.native.borrow_mut().new_handle_type(&mut self.heap, req.id);
                 ht.0 as u64
+            }
+            REG_FN => {
+                let f = unsafe { NativeFn::from_raw(req.native) };
+                let obj = self.code.native.borrow_mut().add_fn_boxed(&mut self.heap, req.args, f);
+                (obj.index() as u64) | ((obj.generation() as u64) << 32)
             }
             REG_INJECTED_GLOBAL => {
                 self.injected_globals.insert(req.id, req.value);
