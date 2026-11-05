@@ -1,6 +1,9 @@
 #[cfg(not(target_os = "android"))]
 pub mod gl_render_bridge;
 pub mod home;
+pub mod accessibility;
+mod input_provenance;
+pub use input_provenance::{trusted_user_input, with_untrusted_input};
 /// Allocator swaps (before/after loading something that replaces the process allocator).
 pub use makepad_alloc_epoch as alloc_epoch;
 pub mod archive_cache;

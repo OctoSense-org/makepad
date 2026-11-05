@@ -1661,6 +1661,9 @@ impl Cx {
     }
 
     pub(crate) fn call_event_handler(&mut self, event: &Event) {
+        // No HAL backend establishes input provenance yet: every dispatch runs
+        // untrusted (see input_provenance.rs).
+        let _untrusted = crate::input_provenance::InputTrustGuard::enter(false);
         // One dispatch for every backend, including remote input. Hover and plain
         // pointer motion leave startup warm-up alone; an actual gesture ends it.
         if crate::thread::ends_warmup(event) {

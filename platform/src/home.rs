@@ -1,4 +1,20 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static PLATFORM_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// A mobile backend records the platform's writable per-app directory before
+/// `Event::Startup`; later calls are ignored.
+pub fn set_platform_data_dir(dir: PathBuf) {
+    let _ = PLATFORM_DATA_DIR.set(dir);
+}
+
+/// The platform's writable per-app directory, once the platform reported
+/// it (Android, before `Event::Startup`). A host that keeps its own state
+/// beside Makepad's uses it in place of the user's home directory.
+pub fn platform_data_dir() -> Option<PathBuf> {
+    PLATFORM_DATA_DIR.get().cloned()
+}
 
 /// Returns Makepad's shared per-user state directory.
 ///
