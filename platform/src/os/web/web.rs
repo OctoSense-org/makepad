@@ -1213,6 +1213,7 @@ impl Cx {
                     self.os.from_wasm(FromWasmXrStartPresenting {});
                 }
                 CxOsOp::XrSetRenderScale(_) => {}
+                CxOsOp::ShowQrScanner | CxOsOp::AndroidIntegration { .. } => {}
                 CxOsOp::XrStopPresenting => {
                     self.os.from_wasm(FromWasmXrStopPresenting {});
                 }
