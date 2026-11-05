@@ -628,7 +628,9 @@ impl ShaderFnNamespace {
     }
 }
 
+#[relax_api]
 impl ScriptLoc {
+    #[relax_api]
     #[inline(always)]
     pub fn new(file: &str, line: u32, col: u32) -> Self { Self { file: file.to_owned(), line, col } }
     #[inline(always)]
