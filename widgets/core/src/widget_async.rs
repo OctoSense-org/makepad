@@ -3105,3 +3105,46 @@ mod lazy_isolate_type_tests {
         cx.free_splash_vm(second);
     }
 }
+
+// ---- live data -----------------------------------------------------------------------------
+//
+// A host module installed into isolates (`register_splash_isolate_mod`) may answer a card's
+// calls from data it fetches on the card's behalf: the first evaluation reads a placeholder,
+// and the body must run again once the datum lands. The module bumps this epoch when it does;
+// a Splash whose body binds live data (the module says which bodies do, through a predicate)
+// re-evaluates once per change. The epoch is process-wide: a datum may serve several cards.
+
+static LIVE_DATA_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A datum a host module fetched for cards landed (or failed for good): bodies that bind live
+/// data re-evaluate once.
+pub fn bump_live_data_epoch() {
+    LIVE_DATA_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The live-data epoch as it stands; a Splash records it at every evaluation.
+pub fn live_data_epoch() -> u64 {
+    LIVE_DATA_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+thread_local! {
+    static LIVE_DATA_PREDICATES: RefCell<Vec<fn(&str) -> bool>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A host module declares which bodies read its live data (its own vocabulary, such as
+/// `sys.weather`): those re-evaluate when the epoch changes, the others never do.
+pub fn register_live_data_predicate(f: fn(&str) -> bool) {
+    LIVE_DATA_PREDICATES.with(|p| p.borrow_mut().push(f));
+}
+
+/// Whether any registered module says this body binds live data.
+pub fn body_binds_live_data(body: &str) -> bool {
+    LIVE_DATA_PREDICATES.with(|p| p.borrow().iter().any(|f| f(body)))
+}
+
+/// Monotonic seconds since first use: the clock a body animates from when it names
+/// `sys.simsecs` (a host module's vocabulary) -- one second of it re-evaluates such a body once.
+pub fn sim_clock_secs() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}

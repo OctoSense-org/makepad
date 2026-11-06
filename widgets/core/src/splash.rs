@@ -121,6 +121,22 @@ pub struct Splash {
     /// `!vm.is_reload()`-guarded application state survives a style reload.
     #[rust]
     body_modules: Vec<LiveId>,
+    /// Per-frame pump for a body that binds live data (`widget_async::body_binds_live_data`),
+    /// animates (`draw_pass.time`) or reads the sim clock (`sys.simsecs`): armed only then.
+    #[rust]
+    anim_next_frame: NextFrame,
+    #[rust]
+    animating: bool,
+    /// The live-data epoch at this body's last evaluation: the pump re-evaluates once a later
+    /// datum lands (`widget_async::bump_live_data_epoch`), and never loops, since an evaluation
+    /// only reads data and fires fetches.
+    #[rust]
+    last_data_epoch: u64,
+    #[rust]
+    last_sim_tick: u64,
+    /// 1 Hz for a body with a top-level `fn tick()`: the script updates its widgets in place.
+    #[rust]
+    tick_timer: Timer,
     /// The stock theme this isolate is pinned to; None follows the host's.
     #[rust]
     theme: Option<SplashTheme>,
@@ -421,6 +437,29 @@ impl Splash {
         });
         self.last_errors = errors_out;
         self.body_modules = body_modules_out;
+        // What keeps this body moving once it is up: a `fn tick()` gets the 1 Hz timer; a
+        // time-based shader, a sim-clock reader or a live-data binding gets the per-frame pump.
+        // A tick body that also binds live data is left to its tick: a full re-evaluation would
+        // rebuild its widgets under the script's in-place updates.
+        let (has_tick, animating) = {
+            let b = self.body.as_ref();
+            let is_tick = b.contains("fn tick(") || b.contains("fn tick (");
+            (
+                is_tick,
+                b.contains("draw_pass.time")
+                    || b.contains("sys.simsecs")
+                    || (crate::widget_async::body_binds_live_data(b) && !is_tick),
+            )
+        };
+        if !preserve {
+            cx.stop_timer(self.tick_timer);
+            if has_tick {
+                self.tick_timer = cx.start_interval(1.0);
+            }
+        }
+        self.animating = animating;
+        self.anim_next_frame = if animating { cx.new_next_frame() } else { NextFrame::default() };
+        self.last_data_epoch = crate::widget_async::live_data_epoch();
         self.startup_timers = isolate_timer_ids(cx, heap_key)
             .into_iter()
             .filter(|id| !timers_before.contains(id))
@@ -698,6 +737,39 @@ impl Widget for Splash {
             if let Event::NetworkResponses(responses) = event {
                 crate::widget_async::handle_splash_network_responses(cx, self.vm_id, responses);
             }
+        }
+        // 1 Hz tick for `fn tick()` bodies: the script updates its widgets in place
+        // (ui.<id>.set_*), which schedules no paint of its own.
+        if self.tick_timer.is_event(event).is_some() {
+            self.call_script_fn(cx, id!(tick), &[]);
+            self.view.redraw(cx);
+        }
+        // The per-frame pump (see `anim_next_frame`): re-evaluate the body once per live-data
+        // epoch change (live values replace the placeholders a module answered while it
+        // fetched), once per whole sim-clock second for `sys.simsecs` bodies, and repaint per
+        // frame only for a genuinely time-based shader.
+        if self.animating && self.anim_next_frame.is_event(event).is_some() {
+            let epoch = crate::widget_async::live_data_epoch();
+            let sim_tick = crate::widget_async::sim_clock_secs() as u64;
+            let (sim_due, is_tick_card, needs_frame_anim, binds_live) = {
+                let b = self.body.as_ref();
+                (
+                    sim_tick != self.last_sim_tick && b.contains("sys.simsecs"),
+                    b.contains("fn tick(") || b.contains("fn tick ("),
+                    b.contains("draw_pass.time"),
+                    crate::widget_async::body_binds_live_data(b),
+                )
+            };
+            if (epoch != self.last_data_epoch && binds_live && !is_tick_card) || sim_due {
+                self.last_sim_tick = sim_tick;
+                // A full evaluation into a fresh view: the body's live calls now read what the
+                // module fetched instead of its placeholders.
+                self.eval_styled_body(cx, false);
+                cx.redraw_all();
+            } else if needs_frame_anim {
+                self.view.redraw(cx);
+            }
+            self.anim_next_frame = cx.new_next_frame();
         }
         if self.host_io_only && matches!(event, Event::TextCopy(_) | Event::TextCut(_)) {
             return;

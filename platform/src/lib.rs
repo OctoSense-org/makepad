@@ -3,6 +3,8 @@ pub mod gl_render_bridge;
 pub mod home;
 pub mod accessibility;
 pub mod gps;
+/// The device region's units (`sys.locale("distance_unit")` for a card).
+pub mod locale;
 mod input_provenance;
 pub use input_provenance::{trusted_user_input, with_untrusted_input};
 /// Allocator swaps (before/after loading something that replaces the process allocator).
