@@ -30,6 +30,9 @@ pub(crate) struct PendingLiveChange {
 
 pub struct CxLiveReloadState {
     pub(crate) pending_files: Vec<PendingLiveChange>,
+    /// `Cx::lock_script_sources`: this process keeps its compiled script sources; files and
+    /// Studio cannot replace approved code.
+    pub(crate) source_locked: bool,
     pub script_mod_overrides: crate::makepad_script::ScriptModOverrides,
     /// Set when overrides were dropped outside the file path (a revert, or a
     /// compiler patch of a design's code under `makepad run`), so the next
@@ -124,6 +127,7 @@ impl Default for CxLiveReloadState {
     fn default() -> Self {
         Self {
             pending_files: Vec::new(),
+            source_locked: false,
             script_mod_overrides: Default::default(),
             overrides_changed: false,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -134,6 +138,7 @@ impl Default for CxLiveReloadState {
 
 impl CxLiveReloadState {
     pub fn queue_file_change(&mut self, file_name: String, content: String) {
+        if self.source_locked { return; }
         self.pending_files
             .push(PendingLiveChange { file_name, content });
     }
@@ -203,7 +208,22 @@ impl Cx {
         self.script_data.live_reload.script_mod_overrides.len()
     }
 
+    /// Keep this process on its compiled script sources. Hosts that pin runtime approvals
+    /// call this before registering widgets; manual layout refreshes remain available, but
+    /// files and Studio cannot replace approved code.
+    pub fn lock_script_sources(&mut self) {
+        let state = &mut self.script_data.live_reload;
+        state.source_locked = true;
+        state.pending_files.clear();
+        state.script_mod_overrides.replace(Default::default());
+        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        {
+            state.file_observer = None;
+        }
+    }
+
     pub fn start_hot_reload_file_observer_if_requested(&mut self) {
+        if self.script_data.live_reload.source_locked { return; }
         #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
         self.start_desktop_hot_reload_file_observer_if_requested();
     }
@@ -397,6 +417,7 @@ impl Cx {
 }
 
 fn handle_cx_live_edit_files(cx: &mut Cx) -> bool {
+    if cx.script_data.live_reload.source_locked { return false; }
     let pending = std::mem::take(&mut cx.script_data.live_reload.pending_files);
     if pending.is_empty() {
         return false;
