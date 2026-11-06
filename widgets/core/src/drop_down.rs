@@ -19,6 +19,9 @@ script_mod! {
 
     mod.widgets.DrawLabelTextBase = #(DrawLabelText::script_component(vm))
     mod.widgets.DropDownBase = #(DropDown::register_widget(vm))
+    // The position enum by name in the DSL (`popup_menu_position: PopupMenuPosition.BelowInput`).
+    mod.widgets.PopupMenuPosition = set_type_default() do #(PopupMenuPosition::script_api(vm))
+    mod.widgets.splat(mod.widgets.PopupMenuPosition)
     set_type_default() do #(DrawLabelText::script_shader(vm)){
         ..mod.draw.DrawText // splat in draw quad
     }
