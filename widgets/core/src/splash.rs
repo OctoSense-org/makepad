@@ -762,6 +762,7 @@ impl Widget for Splash {
             };
             if (epoch != self.last_data_epoch && binds_live && !is_tick_card) || sim_due {
                 self.last_sim_tick = sim_tick;
+                log!("splash: live re-eval: epoch {} -> {} sim_due={} ({} bytes)", self.last_data_epoch, epoch, sim_due, self.body.as_ref().len());
                 // A full evaluation into a fresh view: the body's live calls now read what the
                 // module fetched instead of its placeholders.
                 self.eval_styled_body(cx, false);
