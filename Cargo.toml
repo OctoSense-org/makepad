@@ -34,6 +34,7 @@ workspace.members = [
     "apps/calculator",
     # OctoSense jit line: the fork's crate names over upstream's renamed apps, and its WM theme
     "compat/*",
+    "libs/makepad_ai",
     "libs/wm_theme",
     "apps/synth",
     "libs/wayland_server",
