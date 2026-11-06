@@ -40,9 +40,9 @@ use {
 ///
 /// On 64-bit Windows platforms, the "C" ABI corresponds to the "win64" ABI. This ABI allows only
 /// the first 4 arguments to be passed in hardware registers, regardless of their type. This is
-/// insufficient for our needs, so on Windows platforms, we use the "sysv64" ABI instead.
+/// insufficient for our needs, so on x86-64 Windows, we use the "sysv64" ABI instead.
 
-#[cfg(not(windows))]
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 pub(crate) type ThreadedInstr = unsafe extern "C" fn(
     ip: Ip,
     sp: Sp,
@@ -54,7 +54,7 @@ pub(crate) type ThreadedInstr = unsafe extern "C" fn(
     cx: Cx,
 ) -> ControlFlowBits;
 
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) type ThreadedInstr = unsafe extern "sysv64" fn(
     ip: Ip,
     sp: Sp,
@@ -289,7 +289,7 @@ pub(crate) fn exec(
 // Helper macros
 
 /// A helper macro for defining a `ThreadedInstr` with the correct ABI.
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 macro_rules! threaded_instr {
     ($name:ident(
         $ip:ident: Ip,
@@ -313,7 +313,7 @@ macro_rules! threaded_instr {
         ) -> ControlFlowBits $body
     };
 }
-#[cfg(not(windows))]
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 macro_rules! threaded_instr {
     ($name:ident(
         $ip:ident: Ip,
