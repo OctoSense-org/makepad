@@ -81,7 +81,7 @@ pub(crate) fn device_consent_required(heap_key: usize) -> bool {
 
 /// Legacy widgets may use an existing OS grant in a background card, but an
 /// opted-in app must never cause a native permission prompt from that surface.
-pub(crate) fn device_prompt_allowed(heap_key: usize) -> bool {
+pub fn device_prompt_allowed(heap_key: usize) -> bool {
     !device_consent_required(heap_key) || crate::splash_host::prompts_allowed_for_heap(heap_key)
 }
 
