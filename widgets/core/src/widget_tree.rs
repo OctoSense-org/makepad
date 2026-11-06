@@ -2496,6 +2496,111 @@ impl WidgetTree {
     /// across repeated lookups is the property that keeps a per-frame UI
     /// sync cheap: a warm cache answers with a hash probe, a cold one walks
     /// every node under the entrypoint.
+    /// Every drawn widget of the tree as JSON (`{"widgets":[{i, parent, id, kind, x, y, w, h,
+    /// cx, cy, cw, ch, text?, glyphs?, fg?, bg?, tappable?, scroller?}...]}`): what an app's
+    /// layout review reads to judge a card without guessing at pixels. The rect is the union of
+    /// the widget's instances (a Label is one per glyph); `glyphs` counts the quads a text run
+    /// emitted, the renderer's only word on whether the text fit; `fg`/`bg` are a Label's and a
+    /// View's colours, argb hex as the L0 palettes write them.
+    pub fn geometry_json(&self, cx: &Cx) -> String {
+        use std::fmt::Write;
+        self.sync_dirty();
+        let inner = self.inner.borrow();
+        let type_names = widget_type_names(cx);
+        fn esc(s: &str) -> String {
+            let mut o = String::with_capacity(s.len() + 2);
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    '\r' => o.push_str("\\r"),
+                    '\t' => o.push_str("\\t"),
+                    c if (c as u32) < 0x20 => o.push(' '),
+                    c => o.push(c),
+                }
+            }
+            o
+        }
+        fn argb(v: &[f32; 4]) -> String {
+            let b = |f: f32| (f.clamp(0.0, 1.0) * 255.0).round() as u32;
+            format!("#{:02x}{:02x}{:02x}{:02x}", b(v[3]), b(v[0]), b(v[1]), b(v[2]))
+        }
+        let mut out = String::from("{\"widgets\":[");
+        let mut first = true;
+        for (index, node) in inner.nodes.iter().enumerate() {
+            let Some(widget) = node.widget.upgrade() else { continue };
+            let area = widget.area();
+            if !area.is_valid(cx) {
+                continue;
+            }
+            let r = area.rect_union(cx);
+            if r.size.x <= 0.0 || r.size.y <= 0.0 {
+                continue;
+            }
+            let kind = widget
+                .widget_type_id()
+                .and_then(|t| type_names.get(&t).copied())
+                .map(live_id_token)
+                .unwrap_or_else(|| "-".to_string());
+            let mut buf = [0f32; 4];
+            let fg = widget
+                .borrow::<crate::label::Label>()
+                .and_then(|l| l.draw_text.get_instance_on_area(cx, live_id!(color), &mut buf).then(|| argb(&buf)));
+            let mut buf2 = [0f32; 4];
+            let bg = widget
+                .borrow::<crate::view::View>()
+                .and_then(|v| v.draw_bg.get_instance_on_area(cx, live_id!(color), &mut buf2).then(|| argb(&buf2)));
+            let text = widget.text();
+            let text = text.trim();
+            let glyphs = match area {
+                Area::Instance(inst) => Some(inst.instance_count),
+                _ => None,
+            };
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            let _ = write!(
+                out,
+                "{{\"i\":{},\"parent\":{},\"id\":\"{}\",\"kind\":\"{}\",\"x\":{},\"y\":{},\"w\":{},\"h\":{},\"cx\":{},\"cy\":{},\"cw\":{},\"ch\":{}",
+                index,
+                if node.parent == NONE { -1 } else { node.parent as i64 },
+                esc(&live_id_token(inner.names[index])),
+                esc(&kind),
+                r.pos.x.round() as i64,
+                r.pos.y.round() as i64,
+                r.size.x.round() as i64,
+                r.size.y.round() as i64,
+                r.pos.x.round() as i64,
+                r.pos.y.round() as i64,
+                r.size.x.round() as i64,
+                r.size.y.round() as i64,
+            );
+            if !text.is_empty() {
+                let _ = write!(out, ",\"text\":\"{}\"", esc(text));
+                if let Some(g) = glyphs {
+                    let _ = write!(out, ",\"glyphs\":{g}");
+                }
+            }
+            if let Some(fg) = fg {
+                let _ = write!(out, ",\"fg\":\"{fg}\"");
+            }
+            if let Some(bg) = bg {
+                let _ = write!(out, ",\"bg\":\"{bg}\"");
+            }
+            if kind == "Button" {
+                out.push_str(",\"tappable\":true");
+            }
+            if kind.contains("Scroll") || kind == "PortalList" {
+                out.push_str(",\"scroller\":true");
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+
     pub fn stats(&self) -> WidgetTreeStats {
         self.inner.borrow().stats
     }

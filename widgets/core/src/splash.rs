@@ -1373,11 +1373,14 @@ mod prefix_tests {
 }
 
 /// What a Splash body posts to its host.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum SplashAction {
     /// `agent.notify(event, payload)` from an isolate granted `agent`: the host acts on
     /// it as if its own card sent it (the payload is the JSON of the second argument).
     Notify { event_id: String, payload: String },
+    /// Not a Splash action (what `action.cast()` answers for anything else).
+    #[default]
+    None,
 }
 
 /// `agent.notify` for isolates. A notify carries no sender, so the host acts on it as if
