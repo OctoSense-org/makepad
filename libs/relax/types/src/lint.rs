@@ -663,6 +663,7 @@ pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<
     if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
     let pf = &prog.files[od.file as usize];
     let ast = &pf.ast;
+    if !ast.has_item(od.item) { return Vec::new(); }
     let mut f = Find { ast, pf, call: pf.diagnostic_pos(call), stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
         ItemKind::Fn(..) => {
@@ -727,6 +728,8 @@ pub fn attrs_at(prog: &Program, def: DefId, file: u32, lo: u32, hi: u32) -> Vec<
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
     let ast = &prog.files[od.file as usize].ast;
+    // (an owner whose item sits in a body part nothing has parsed yet has no attributes to read)
+    if !ast.has_item(od.item) { return Vec::new(); }
     let item = ast.item(od.item);
     // (a span outside the item is none of its body's nodes)
     if lo < item.lo || lo >= item.hi { return Vec::new(); }
