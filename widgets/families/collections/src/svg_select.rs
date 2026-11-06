@@ -490,6 +490,7 @@ fn node_id(node: &SvgNode) -> Option<&str> {
         SvgNode::Polyline(n) => n.id.as_deref(),
         SvgNode::Polygon(n) => n.id.as_deref(),
         SvgNode::Use(n) => n.id.as_deref(),
+        SvgNode::Text(n) => n.id.as_deref(),
     }
 }
 
@@ -504,6 +505,7 @@ fn node_transform(node: &SvgNode) -> &Transform2d {
         SvgNode::Polyline(n) => &n.transform,
         SvgNode::Polygon(n) => &n.transform,
         SvgNode::Use(n) => &n.transform,
+        SvgNode::Text(n) => &n.transform,
     }
 }
 
@@ -518,6 +520,7 @@ fn node_style(node: &SvgNode) -> &SvgStyle {
         SvgNode::Polyline(n) => &n.style,
         SvgNode::Polygon(n) => &n.style,
         SvgNode::Use(n) => &n.style,
+        SvgNode::Text(n) => &n.style,
     }
 }
 
@@ -532,6 +535,7 @@ fn node_style_mut(node: &mut SvgNode) -> &mut SvgStyle {
         SvgNode::Polyline(n) => &mut n.style,
         SvgNode::Polygon(n) => &mut n.style,
         SvgNode::Use(n) => &mut n.style,
+        SvgNode::Text(n) => &mut n.style,
     }
 }
 
@@ -562,7 +566,8 @@ fn rings_of_node(node: &SvgNode, xf: &Transform2d, unit: f64) -> Vec<Ring> {
         // A line encloses nothing, and a use stands for geometry that lives
         // in a symbol rather than in the node. A group holds no geometry of
         // its own — the walk reaches its children separately.
-        SvgNode::Line(_) | SvgNode::Use(_) | SvgNode::Group(_) => Vec::new(),
+        // Text is laid out by the host, not a region to pick.
+        SvgNode::Line(_) | SvgNode::Use(_) | SvgNode::Group(_) | SvgNode::Text(_) => Vec::new(),
     }
 }
 
