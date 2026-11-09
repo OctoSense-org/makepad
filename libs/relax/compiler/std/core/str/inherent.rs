@@ -10,6 +10,10 @@ impl str {
     pub const fn from_utf8(v: &[u8]) -> Result<&str, crate::str::Utf8Error> {
         crate::str::from_utf8(v)
     }
+    /// `core::str::from_utf8_mut` as an associated function.
+    pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, crate::str::Utf8Error> {
+        crate::str::from_utf8_mut(v)
+    }
     /// `core::str::from_utf8_unchecked` as an associated function.
     pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
         crate::str::from_utf8_unchecked(v)
