@@ -6,6 +6,20 @@ use super::*;
 use crate::string::String;
 
 impl str {
+    // The associated conversions (Rust 1.87): `str::from_utf8(..)` names them through the
+    // primitive type, without the `core::str` module in scope (yoke-derive 0.8 does).
+    pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
+        from_utf8(v)
+    }
+    pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
+        from_utf8_mut(v)
+    }
+    pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
+        unsafe { from_utf8_unchecked(v) }
+    }
+    pub const unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
+        unsafe { from_utf8_unchecked_mut(v) }
+    }
     pub fn into_string(self: crate::boxed::Box<str>) -> crate::string::String {
         let len = (*self).len();
         let p = crate::boxed::Box::into_raw(self) as *mut u8;
