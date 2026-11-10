@@ -58,7 +58,9 @@ pub struct HtmlError {
 /// element, or (for `closes`) opens one that has no close tag of its own.
 const NO_CLOSE: usize = usize::MAX;
 
-#[derive(Default, PartialEq)]
+// FORK PORT (hagency JIT parity): Clone, so a host can copy-on-write the
+// document an `Html` widget shares (`Rc::make_mut`) to rewrite nodes in place.
+#[derive(Clone, Default, PartialEq)]
 pub struct HtmlDoc {
     pub decoded: String,
     pub nodes: Vec<HtmlNode>,
@@ -74,7 +76,7 @@ pub struct HtmlDoc {
     ends: Vec<usize>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HtmlNode {
     OpenTag {
         lc: LiveId,

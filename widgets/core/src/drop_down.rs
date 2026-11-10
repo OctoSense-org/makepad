@@ -18,6 +18,8 @@ script_mod! {
     use mod.widgets.*
 
     mod.widgets.DrawLabelTextBase = #(DrawLabelText::script_component(vm))
+    // Scripts name the menu's placement (`popup_menu_position: PopupMenuPosition.BelowInput`).
+    mod.widgets.PopupMenuPosition = set_type_default() do #(PopupMenuPosition::script_api(vm))
     mod.widgets.DropDownBase = #(DropDown::register_widget(vm))
     set_type_default() do #(DrawLabelText::script_shader(vm)){
         ..mod.draw.DrawText // splat in draw quad

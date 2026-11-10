@@ -256,6 +256,9 @@ pub struct Tcx {
     /// async blocks / async fn bodies (file, expr; an async fn body is ASYNC_FN_BODY | block):
     /// closure types that are coroutines -- they implement Future<Output = sig's return>; their
     /// storage record holds the state word and is extended by saved locals (coro_frames).
+    /// Whoever makes such a type marks it here first: the type check of the body that holds the
+    /// block, and the code cache for a type it decodes (cache.rs dec_ty), whose body this run may
+    /// never check.
     pub coroutines: crate::conc::MemoMap<(u32, u32), ()>,
     /// `mir_coroutine_witnesses` reduced to what dropck asks (whether any local live across a suspension
     /// point needs drop), per coroutine (file, expr), set when borrowck has built the coroutine's MIR.
@@ -1301,6 +1304,7 @@ impl Tcx {
                 // in generic args, tuples, slices, arrays (`&mut Image2d<u8, impl AsMut<[u8]>>`;
                 // rustc: synthetic params in order of appearance)
                 let mut found = Vec::new();
+                collect_generics_impl_traits(ast, &sig.generics, &mut found);
                 for p in ast.list(sig.params) {
                     collect_argument_impl_traits(ast, p.ty, &mut found);
                 }
@@ -2840,7 +2844,7 @@ impl Tcx {
                         let tr = if prog.def(ad).parent == td { tr } else { RegionArgsId::EMPTY };
                         let mut own_regions = self.written_lifetimes(cx.infcx, prog, file, env, p);
                         let mut own_args = self.lower_generic_args_of_item(cx, prog, file, module, env, p, Some(ad));
-                        self.fit_assoc_own_args(prog, ad, &mut own_args, &mut own_regions);
+                        self.fit_assoc_own_args(prog, ad, &mut own_args, &mut own_regions, cx.infcx.filter(|_| source_ty.is_none()));
                         args.extend(own_args);
                         let mut rs = self.tys.region_args(tr).to_vec();
                         rs.extend(own_regions);
@@ -3239,21 +3243,29 @@ impl Tcx {
     /// An associated type path's own arguments are exactly the declared parameters of the
     /// associated type (hir_ty_lowering/generics.rs: missing ones are error terms, extra ones
     /// are dropped; E0107 reports either).
-    pub(crate) fn fit_assoc_own_args(&self, prog: &Program, ad: DefId, args: &mut Vec<TyId>, regions: &mut Vec<RegionId>) {
+    /// The associated type's own arguments, one per parameter: missing ones are errors, or with
+    /// `infer` (an expression path's segment, rustc `seg.infer_args`) inference variables, so
+    /// `Self::RwLock::new(value)` for `type RwLock<T>` infers T like `RwLock::new(value)`.
+    pub(crate) fn fit_assoc_own_args(&self, prog: &Program, ad: DefId, args: &mut Vec<TyId>, regions: &mut Vec<RegionId>, infer: Option<&crate::infer::InferCtxt<'_>>) {
         let def = prog.def(ad);
         let ast = &prog.files[def.file as usize].ast;
         let Some(generics) = ast.kind_generics(&ast.item(def.item).kind) else { return; };
         let params = ast.list(generics.params);
         let lifetimes = params.iter().filter(|p| matches!(p.kind, GenericParamKind::Lifetime(_))).count();
-        regions.resize(lifetimes, self.tys.intern_region(RegionKind::ReError));
+        regions.truncate(lifetimes);
+        while regions.len() < lifetimes {
+            regions.push(infer.map_or_else(|| self.tys.intern_region(RegionKind::ReError), |infcx| infcx.next_region_var()));
+        }
         let mut own = params.iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_)));
         let mut fitted = Vec::new();
         for _ in 0..params.len() - lifetimes {
             let param = own.next().unwrap();
-            fitted.push(match args.get(fitted.len()) {
-                Some(&t) => t,
-                None if matches!(param.kind, GenericParamKind::Const(..)) => self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))),
-                None => self.tys.error,
+            fitted.push(match (args.get(fitted.len()), infer) {
+                (Some(&t), _) => t,
+                (None, Some(infcx)) if matches!(param.kind, GenericParamKind::Const(..)) => self.tys.intern(TyKind::Const(infcx.next_const_var())),
+                (None, Some(infcx)) => infcx.next_ty_var(),
+                (None, None) if matches!(param.kind, GenericParamKind::Const(..)) => self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))),
+                (None, None) => self.tys.error,
             });
         }
         *args = fitted;
@@ -3845,7 +3857,7 @@ impl Tcx {
         let mut args = self.tys.list(alias.args).to_vec();
         let mut own_regions = self.written_lifetimes(cx.infcx, prog, file, env, path);
         let mut own_args = self.lower_generic_args_of_item(cx, prog, file, module, env, path, Some(alias.kind.def_id()));
-        self.fit_assoc_own_args(prog, alias.kind.def_id(), &mut own_args, &mut own_regions);
+        self.fit_assoc_own_args(prog, alias.kind.def_id(), &mut own_args, &mut own_regions, cx.infcx.filter(|_| source_ty.is_none()));
         args.extend(own_args);
         let mut regions = self.tys.region_args(alias.regions).to_vec();
         regions.extend(own_regions);
@@ -4320,6 +4332,28 @@ impl Drop for Tcx {
         if !std::thread::panicking() {
             if !self.errors.is_empty() || !self.err_sink.get_mut().unwrap().is_empty() { self.dcx.note_reported_error(); }
             self.dcx.flush_delayed();
+        }
+    }
+}
+
+/// The `impl Trait`s written in the bounds of a fn's own generic parameters (`I: Iterator<Item =
+/// impl AsRef<[u8]>>`): anonymous parameters like the ones in parameter types, and before them
+/// (rustc_ast_lowering lower_generics lowers the bounds with ImplTraitContext::Universal, then the
+/// declaration). Not the where clause: rustc rejects `impl Trait` there (E0562).
+pub(crate) fn collect_generics_impl_traits(ast: &ast::Ast, g: &ast::Generics, out: &mut Vec<ast::TyId>) {
+    for p in ast.list(g.params) {
+        let GenericParamKind::Type(bounds, _) = &p.kind else { continue };
+        for b in ast.list(*bounds) {
+            let ast::Bound::Trait { path, .. } = b else { continue };
+            for seg in ast.segs(path.segs) {
+                if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
+                    for g in ast.list(*v) {
+                        if let GenericArg::Type(x) | GenericArg::Binding(_, _, x) = g {
+                            collect_argument_impl_traits(ast, *x, out);
+                        }
+                    }
+                }
+            }
         }
     }
 }

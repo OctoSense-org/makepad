@@ -163,6 +163,12 @@ impl<T> [T] {
         let end = unsafe { im::ptr_add(start, self.len()) };
         start..end
     }
+    // core/src/slice/mod.rs (stable 1.48; zerovec's VarZeroVecOwned)
+    pub const fn as_mut_ptr_range(&mut self) -> crate::ops::Range<*mut T> {
+        let start = self.as_mut_ptr();
+        let end = unsafe { im::ptr_add_mut(start, self.len()) };
+        start..end
+    }
     #[track_caller]
     pub fn swap(&mut self, a: usize, b: usize) {
         super::swap(self, a, b)
@@ -250,6 +256,18 @@ impl<T> [T] {
         } else {
             Some((&self[..mid], &self[mid..]))
         }
+    }
+    // core/src/slice/mod.rs (stable 1.79; cmov 0.5's slice_as_chunks, under every constant-time
+    // comparison of ctutils: the AEAD tag check of chacha20poly1305)
+    pub const unsafe fn split_at_unchecked(&self, mid: usize) -> (&[T], &[T]) {
+        let len = self.len();
+        let ptr = self.as_ptr();
+        unsafe { (crate::slice::from_raw_parts(ptr, mid), crate::slice::from_raw_parts(ptr.add(mid), len - mid)) }
+    }
+    pub const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
+        let len = self.len();
+        let ptr = self.as_mut_ptr();
+        unsafe { (crate::slice::from_raw_parts_mut(ptr, mid), crate::slice::from_raw_parts_mut(ptr.add(mid), len - mid)) }
     }
     // core/src/slice/mod.rs (stable 1.80; getrandom 0.4's sys_fill_exact)
     pub const fn split_at_mut_checked(&mut self, mid: usize) -> Option<(&mut [T], &mut [T])> {

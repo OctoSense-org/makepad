@@ -221,8 +221,9 @@ const LEDGER_KEY: u128 = 0;
 // offsets of one block link to one block. 29: image symbol and closure-parent key spans (image.rs
 // skip_*) follow the encoding again; images written before cut keys short. 30: a code entry ended
 // with the trait-object types its code calls through; 31: it no longer does (jit.rs realtime reach
-// follows the trait objects its roots are passed, not every one its code calls through).
-const ENTRY_VERSION: u32 = 31;
+// follows the trait objects its roots are passed, not every one its code calls through). 32: a
+// coroutine's closure type has a tag of its own (enc_ty 28).
+const ENTRY_VERSION: u32 = 32;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -1743,7 +1744,11 @@ impl Cache {
                 return self.enc_tys(u, u.tcx.tys.list(args), e, crates, depth);
             }
             TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
-                e.u8(17);
+                // 28: a coroutine's (an async block's, an async fn body's). The type itself does not
+                // say so: Tcx::coroutines does, filled by the type check of the body that holds the
+                // block. A run that takes that body's code from here never checks it, so the key
+                // carries the fact to the run that decodes it (dec_ty).
+                e.u8(if u.tcx.coroutines.contains(&(file, expr)) { 28 } else { 17 });
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                 self.enc_file(u, file, e)?;
                 e.u32(expr);
@@ -1961,7 +1966,7 @@ impl Cache {
                 let regions = self.dec_regions(u, d)?;
                 TyKind::FnDef(def, u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?), regions)
             }
-            17 => {
+            tag @ (17 | 28) => {
                 let file = self.dec_file(u, d)?;
                 let expr = d.u32()?;
                 if !self.closure_fp_agrees(u, file, expr, d.u64()?) { return None; }
@@ -1969,6 +1974,12 @@ impl Cache {
                 let sig = self.dec_ty(u, d, depth + 1)?;
                 let state = self.dec_ty(u, d, depth + 1)?;
                 let owner = self.dec_ty(u, d, depth + 1)?;
+                // A coroutine is known as one before its type exists here: the body that defines it
+                // may never be type-checked in this run (its code is cached), and without the mark
+                // the type is a plain closure to the solver, with no `Future` impl: an instance whose
+                // body names `<F as Future>::Output` over it fails to normalize.
+                // (Looked up first: an insert adds a node each time, and many keys name one coroutine.)
+                if tag == 28 && !u.tcx.coroutines.contains(&(file, expr)) { u.tcx.coroutines.insert((file, expr), ()); }
                 TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state })
             }
             18 => {
@@ -7143,6 +7154,75 @@ mod data_tests {
             for end in 0..bytes.len() {
                 assert!(unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut D { b: &bytes[..end], p: 0 }, 0) }.is_none());
             }
+        }
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A warm start: a key names a coroutine's type, and the body that defines the coroutine is
+    /// never type-checked (its code is cached). The decoded type is a coroutine all the same: the
+    /// key says so (enc_ty 28), where Tcx::coroutines was filled by that type check alone and an
+    /// instance over the type failed to normalize (`<F as Future>::Output`: no solution).
+    #[test]
+    fn coroutine_type_key_marks_its_coroutine() {
+        isolated_test!(coroutine_type_key_marks_its_coroutine);
+        use crate::types::{ClosureArgs, FnHeader, List, RegionArgsId};
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let root = std::env::temp_dir().join(format!("relax-coroutine-key-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "#![no_std] fn method<T>() {} fn owner() { let _ = || 1u32; let _ = async { 2u32 }; }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("coroutine_key", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let named = |name| u.prog.defs.iter().enumerate().find_map(|(i, _)| (u.prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+        let (method, owner) = (named("method"), named("owner"));
+        let file = u.prog.def(owner).file;
+        let exprs = crate::program::closure_exprs(&u.prog, owner);
+        assert_eq!(exprs.len(), 2, "the closure, then the async block");
+        // the two types as the type check of `owner` makes them, the async block's marked a coroutine
+        let closure_ty = |tcx: &crate::tcx::Tcx, expr: u32| {
+            let tys = &tcx.tys;
+            let sig = tys.intern(TyKind::FnPtr(List::EMPTY, tys.u32_, FnHeader::RUST, 0));
+            let parent = tys.intern(TyKind::FnDef(owner, List::EMPTY, RegionArgsId::EMPTY));
+            tys.intern(TyKind::Closure(file, expr, ClosureArgs {
+                parent_args: parent, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tys.unit,
+            }))
+        };
+        u.tcx.coroutines.insert((file, exprs[1]), ());
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        let mut keys = Vec::new();
+        for expr in &exprs {
+            let ty = closure_ty(&u.tcx, *expr);
+            let mut e = E::default();
+            assert!(cache.enc_fnkey(&u, &FnKey::Inst(method, vec![ty]), &mut e, &mut vec![], 0).is_some());
+            keys.push(e.0);
+        }
+        assert_ne!(keys[0][..], keys[1][..]);
+        // the next run: declarations collected, no body checked
+        let mut fresh = crate::tcx::Tcx::new(); fresh.collect(&u.prog);
+        u.tcx = fresh;
+        assert!(!u.tcx.coroutines.contains(&(file, exprs[1])));
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+        for (bytes, coroutine) in keys.iter().zip([false, true]) {
+            let mut d = D { b: bytes, p: 0 };
+            let key = unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut d, 0) }.unwrap();
+            assert_eq!(d.p, bytes.len());
+            let FnKey::Inst(_, args) = &key else { panic!("an instance key") };
+            assert_eq!(args[..], [closure_ty(&u.tcx, exprs[coroutine as usize])]);
+            assert_eq!(u.tcx.is_coroutine(args[0]), coroutine, "a decoded {} type", if coroutine { "coroutine's" } else { "closure's" });
+            // a query that asks (Tcx::needs_drop: a coroutine always has its state to drop)
+            assert_eq!(u.tcx.needs_drop(&u.prog, env, args[0]), coroutine);
+            // the image's skip walks the bytes the encoder wrote, and this run writes the same key
+            let mut skipped = D { b: bytes, p: 0 };
+            assert!(image::skip_fnkey(&mut skipped, 0, &mut image::no_atoms).is_some() && skipped.p == bytes.len(), "skip_fnkey stopped at {} of {}", skipped.p, bytes.len());
+            let mut again = E::default();
+            assert!(cache.enc_fnkey(&u, &key, &mut again, &mut vec![], 0).is_some());
+            assert_eq!(*bytes, again.0);
         }
         drop(cache);
         std::fs::remove_dir_all(root).unwrap();

@@ -109,7 +109,7 @@ pub(crate) fn publish_macros(table: &mut MacroTable, name: &str, defs: &[MacroRe
             }
         }
     }
-    let mods = Arc::new(crate::macros::CrateMods { root: mods.root.clone(), src: mods.src.clone(), mods: mods.mods.clone(), items: mods.items.clone(), uses: mods.uses.clone(), externs, renames: mods.renames.clone(), recursion_limit: mods.recursion_limit, ..Default::default() });
+    let mods = Arc::new(crate::macros::CrateMods { root: mods.root.clone(), src: mods.src.clone(), mods: mods.mods.clone(), items: mods.items.clone(), inner_macro_use: mods.inner_macro_use.clone(), uses: mods.uses.clone(), externs, renames: mods.renames.clone(), recursion_limit: mods.recursion_limit, ..Default::default() });
     table.add_crate(name.to_string(), mods);
     if !macro_use.is_empty() {
         let v = table.macro_use.entry(name.to_string()).or_default();
@@ -251,6 +251,10 @@ impl Pool {
     /// The demand plan's outline macro definitions of crate `ci` (PendingPlan::outline_macros).
     pub(crate) fn outline_macros(&self, ci: u32) -> Option<Vec<MacroRef>> {
         self.demand_plan.as_ref()?.outline_macros(ci as usize + self.plan_offset)
+    }
+    /// The demand plan's outline of crate `ci`: its expansion-made imports (PendingPlan::outline_expansions).
+    pub(crate) fn outline_expansions(&self, ci: u32) -> Option<Arc<crate::fxhash::HashMap<(String, String), Vec<String>>>> {
+        self.demand_plan.as_ref()?.outline_expansions(ci as usize + self.plan_offset)
     }
     /// Set queued jobs' scope; entering the crate replaces an early snapshot with the loader's.
     pub fn start_parsing(&self, ci: u32, table: Arc<MacroTable>) {
@@ -581,6 +585,9 @@ impl Pool {
                 cmods.mods.insert(m);
             }
             cmods.items.extend(s.mod_items);
+            if s.inner_macro_use {
+                cmods.inner_macro_use.insert(seen[&path].clone());
+            }
             for u in s.uses {
                 if let Some(b) = &u.bind {
                     if u.path.last() != Some(b) {
@@ -886,6 +893,9 @@ struct Scanned {
     mod_items: Vec<(String, crate::macros::ModItem)>,
     /// `#![recursion_limit = ".."]` in the file's leading inner attributes
     pub(crate) recursion_limit: Option<u32>,
+    /// `#![macro_use]` in the file's leading inner attributes: its module's `macro_rules!` leave
+    /// it as with `#[macro_use]` on its `mod` item (CrateMods::inner_macro_use)
+    inner_macro_use: bool,
 }
 
 /// The bindings of a `use` tree in tokens `lo..hi` (after `use`, before `;`) under `prefix`.
@@ -1017,8 +1027,9 @@ fn decl_attrs(src: &[u8], toks: &[Tok], i: usize, cfg: &CfgSet) -> DeclAttrs {
     out
 }
 
-/// The file's leading inner attributes (`#![..]`) hold their #[cfg]s.
-pub fn file_cfg_active(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
+/// The leading inner attributes (`#![..]`) of a file, or of an inline module's body when `toks`
+/// starts after its `{`, as written (cfg_attr not expanded).
+fn leading_inner_attrs(toks: &[Tok]) -> Vec<Attr> {
     let mut attrs = Vec::new();
     let mut i = 0;
     while i + 2 < toks.len() && toks[i].kind == T::Pound && toks[i + 1].kind == T::Not && toks[i + 2].kind == T::OpenBracket {
@@ -1040,7 +1051,23 @@ pub fn file_cfg_active(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
         attrs.push(Attr { inner: true, toks: TokRange { lo: (i + 3) as u32, hi: j as u32 } });
         i = j + 1;
     }
+    attrs
+}
+
+/// The file's leading inner attributes (`#![..]`) hold their #[cfg]s.
+pub fn file_cfg_active(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
+    let attrs = leading_inner_attrs(toks);
     attrs.is_empty() || crate::cfg::active(Src { src, plain: toks, ext: &[], parts: None }, &attrs, cfg)
+}
+
+/// Do the leading inner attributes (configured) of a file, or of an inline module's body when
+/// `toks` starts after its `{`, hold `#![macro_use]`? rustc appends a module's inner attributes to
+/// its `mod` item's (rustc_expand module.rs parse_external_mod, rustc_parse parse_item_mod), so
+/// this is `#[macro_use]` on the item: the module's `macro_rules!` stay in scope after it.
+fn inner_macro_use(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
+    let p = Src { src, plain: toks, ext: &[], parts: None };
+    let attrs = crate::cfg::expand_cfg_attr_list(p, &leading_inner_attrs(toks), cfg);
+    attrs.iter().any(|a| a.toks.hi > a.toks.lo && crate::cfg::tok_str(p, a.toks.lo as usize) == b"macro_use")
 }
 
 fn scan_file(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, context: &crate::source_context::Context) -> Option<Scanned> {
@@ -1099,7 +1126,8 @@ fn file_imports(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, c
     let mut toks = Vec::with_capacity(src.len() / 4);
     crate::lexer::lex(src, edition, &mut toks).ok()?;
     let scan = scan_tokens(path, dir, mpath, krate, edition, cfg, src.len(), src.to_vec().into(), toks, context, ScanSurface::Imports)?;
-    Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items })
+    let inner_macro_use = scan.inner_macro_use.then(|| mpath.to_string());
+    Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items, inner_macro_use })
 }
 
 /// What a scan reads besides the file's modules.
@@ -1124,8 +1152,9 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
     let mut mod_items: Vec<(String, crate::macros::ModItem)> = Vec::new();
     if !file_cfg_active(&src, &toks, cfg) {
         // `#![cfg(false)]` file: removed with its module; nothing in it counts
-        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new(), mod_items: Vec::new(), recursion_limit: None });
+        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new(), mod_items: Vec::new(), recursion_limit: None, inner_macro_use: false });
     }
+    let file_macro_use = inner_macro_use(&src, &toks, cfg);
     let mut recursion_limit = None;
     {
         let mut i = 0;
@@ -1265,7 +1294,9 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     let pa = attrs.path;
                     if cur_active && active {
                         let is_pub = i >= 1 && toks[i - 1].kind == T::KwPub;
-                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use: attrs.macro_use, is_pub }));
+                        // an inline module's own `#![macro_use]` is its item's (inner_macro_use)
+                        let macro_use = attrs.macro_use || toks[i + 2].kind == T::OpenBrace && inner_macro_use(&src, &toks[i + 3..], cfg);
+                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use, is_pub }));
                     }
                     if toks[i + 2].kind == T::Semi {
                         if cur_active && active {
@@ -1367,7 +1398,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
             i += 1;
         }
     }
-    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods, mod_items, recursion_limit })
+    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods, mod_items, recursion_limit, inner_macro_use: file_macro_use })
 }
 
 /// Starts the pipeline for `crates` (load order): scans (all crates at once, earliest crate
@@ -1568,7 +1599,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
                 .or_else(|| crate::vfs::read(&path).ok());
             if let Some(scan) = text.and_then(|t| scan_text(&path, &dir, &module, &name, c.edition, &c.cfg, t.into(), &c.context)) {
                 todo.extend(scan.children.iter().rev().cloned());
-                scans.push(scan);
+                scans.push((module, scan));
             }
         }
         contexts.push((k as u32, reachable, mods, scans));
@@ -1579,7 +1610,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
     table.crates.remove(&name); table.crates.remove(&format!("{}\u{1}lib", name));
     let mut reached = Vec::new();
     for (k, reachable, mut mods, scans) in contexts {
-        for scan in scans {
+        for (module, scan) in scans {
             if scan.recursion_limit.is_some() && mods.recursion_limit.is_none() {
                 mods.recursion_limit = scan.recursion_limit;
             }
@@ -1588,6 +1619,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
             table.macro_use.entry(name.clone()).or_default().extend(scan.macro_use);
             mods.mods.extend(scan.mods);
             mods.items.extend(scan.mod_items);
+            if scan.inner_macro_use { mods.inner_macro_use.insert(module); }
             for u in scan.uses { mods.add_use(u); }
         }
         table.add_crate(name.clone(), std::sync::Arc::new(mods));
@@ -1892,6 +1924,96 @@ mod lowered_scope_tests {
     }
 
 
+}
+
+#[cfg(test)]
+mod inner_macro_use_tests {
+    use super::*;
+
+    /// `#![macro_use]` opening a module (its file, or an inline module's body) is `#[macro_use]` on
+    /// its `mod` item: rustc appends a module's inner attributes to the item's.
+    #[test]
+    fn a_modules_inner_macro_use_is_its_items() {
+        let sess = Arc::new(crate::Session::default());
+        let path = "inner_macro_use.rs";
+        let context = crate::source_context::Context::new(path, Default::default(), &sess);
+        let source = br#"#![macro_use]
+            //! a doc comment after the attribute (xml-rs 1.4 macros.rs)
+            mod plain { macro_rules! a { () => {} } }
+            mod inline { #![macro_use] macro_rules! b { () => {} } }
+            mod configured { #![cfg_attr(feature = "selected", macro_use)] macro_rules! c { () => {} } }
+            #[macro_use] mod outer { macro_rules! d { () => {} } }
+        "#;
+        for features in [vec![], vec!["selected".to_string()]] {
+            let cfg = CfgSet::host(&sess, &features);
+            let scan = scan_text(path, ".", "t::m", "t", 2021, &cfg, source.to_vec().into(), &context).unwrap();
+            assert!(scan.inner_macro_use);
+            let macro_use = |m: &str| scan.mod_items.iter().find(|(p, _)| p == m).unwrap().1.macro_use;
+            assert!(!macro_use("t::m::plain") && macro_use("t::m::inline") && macro_use("t::m::outer"));
+            assert_eq!(macro_use("t::m::configured"), !features.is_empty());
+        }
+        let cfg = CfgSet::host(&sess, &[]);
+        let plain = scan_text(path, ".", "t::m", "t", 2021, &cfg, b"#![allow(unused)] mod x {}".to_vec().into(), &context).unwrap();
+        assert!(!plain.inner_macro_use);
+        let configured_out = scan_text(path, ".", "t::m", "t", 2021, &cfg, b"#![cfg_attr(any(), macro_use)] mod x {}".to_vec().into(), &context).unwrap();
+        assert!(!configured_out.inner_macro_use);
+    }
+
+    /// xml-rs 1.4: `pub mod macros;` whose file opens with `#![macro_use]`, its `gen_setters!` called
+    /// in a module declared after it in another file and expanding to calls of `gen_setter!`; an
+    /// inline module's `#![macro_use]` exports its macro too. Before, the crate's modules reported
+    /// "cannot find macro" and the setters did not exist.
+    #[test]
+    fn a_module_files_inner_macro_use_reaches_the_modules_after_it() {
+        let dir = std::env::temp_dir().join(format!("relax-inner-macro-use-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("lib.rs"), r#"
+            pub mod macros;
+            pub mod sub;
+            pub mod inline {
+                #![macro_use]
+                macro_rules! twice { ($e:expr) => { $e * 2 } }
+            }
+            pub fn four() -> u32 { twice!(2) }
+        "#).unwrap();
+        std::fs::write(dir.join("macros.rs"), r#"#![macro_use]
+            //! the crate's macros
+            macro_rules! gen_setter {
+                ($field:ident : $t:ty) => { pub fn $field(mut self, value: $t) -> Self { self.$field = value; self } };
+            }
+            macro_rules! gen_setters {
+                ($target:ident, $($field:ident : $t:ty),+) => { impl $target { $(gen_setter! { $field : $t })+ } };
+            }
+        "#).unwrap();
+        std::fs::write(dir.join("sub/mod.rs"), r#"
+            pub struct Config { pub trim: bool, pub depth: u32 }
+            gen_setters! { Config, trim: bool, depth: u32 }
+        "#).unwrap();
+        let root = dir.join("lib.rs").to_string_lossy().into_owned();
+        // eager, then lazy with the files nothing demands loaded afterwards in either order (the
+        // post-boot loader's)
+        for (lazy, reverse) in [(false, false), (true, false), (true, true)] {
+            let mut session = crate::Session::default();
+            session.options.rs_lazy = lazy;
+            let session = Arc::new(session);
+            let cfg = CfgSet::host(&session, &[]);
+            let mut p = crate::program::Program::new(&session);
+            if lazy {
+                p.preload(vec![PreCrate { name: "inner_mu".into(), root: root.clone(), edition: 2021, cfg: cfg.clone(), deps: Vec::new(),
+                    proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() }]);
+            }
+            p.load_crate("inner_mu", &root, 2021, cfg, Vec::new()).unwrap();
+            p.resolve_imports();
+            let mut skipped: Vec<u32> = p.skipped_files.keys().copied().collect();
+            skipped.sort_unstable();
+            if reverse { skipped.reverse(); }
+            for m in skipped { p.load_deferred_module(m).unwrap(); }
+            assert!(p.errors.is_empty(), "lazy {lazy}: {:?}", p.errors);
+            let methods: Vec<&str> = p.defs.iter().filter(|d| d.kind == crate::program::DefKind::AssocFn).map(|d| p.syms.str(d.name)).collect();
+            assert!(methods.contains(&"trim") && methods.contains(&"depth"), "lazy {lazy}: {methods:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.

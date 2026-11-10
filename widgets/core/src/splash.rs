@@ -10,6 +10,11 @@ use crate::{
     widget_tree::CxWidgetExt,
 };
 
+// FORK PORT: the isolate `agent`/`sys` modules live in splash_agent.rs.
+pub use crate::splash_agent::{
+    collection_len, register_agent_module, set_collections, set_link, set_locale, set_prefs, SplashAction,
+};
+
 script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
@@ -67,6 +72,35 @@ pub struct Splash {
     /// None leaves the storage default.
     #[rust]
     storage_quota: Option<u64>,
+    /// Cap on this isolate's retained script heap. None = no cap.
+    #[rust]
+    memory_bytes: Option<usize>,
+    /// FORK PORT: the hosts the app's policy declares. `Some` puts the
+    /// isolate under an enforced policy ([`crate::splash_policy`]).
+    #[rust]
+    policy_hosts: Option<Vec<String>>,
+    /// FORK PORT: the instruction budget the policy declares (counted only).
+    #[rust]
+    instruction_budget: Option<u64>,
+    /// FORK PORT: how long each entry into the isolate may run. None leaves
+    /// Makepad's default, which upstream is no clock at all.
+    #[rust]
+    time_budget: Option<std::time::Duration>,
+    /// FORK PORT: the live-data pump. A body that binds `sys.*` data, reads
+    /// `sys.simsecs` or animates a time-reading shader re-evaluates (or
+    /// repaints) from a per-frame tick while this is armed.
+    #[rust]
+    anim_next_frame: NextFrame,
+    #[rust]
+    animating: bool,
+    /// The data-fetch epoch the body last evaluated against.
+    #[rust]
+    last_data_epoch: u64,
+    #[rust]
+    last_sim_tick: u64,
+    /// FORK PORT: 1 Hz timer for `fn tick()` bodies.
+    #[rust]
+    tick_timer: Timer,
     /// What to call this script in error messages. Set by the host to the
     /// mini-app's id; empty for previews and one-off evals.
     ///
@@ -279,6 +313,11 @@ impl Splash {
         crate::splash_host::set_caps_for_heap(heap_key, self.host_caps.clone());
         crate::splash_host::set_prompts_for_heap(heap_key, self.host_prompts);
         crate::splash_storage::set_quota_for_heap(heap_key, self.storage_quota);
+        if let Some(bytes) = self.memory_bytes {
+            cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.set_max_heap_bytes(Some(bytes)));
+        }
+        cx.set_splash_vm_time_budget(self.vm_id, self.time_budget);
+        self.apply_policy(heap_key);
 
         let body_key = self.body_key();
         // Full code string: prefix + body (no closing - parser auto-closes)
@@ -343,6 +382,7 @@ impl Splash {
                         vm.eval_with_append_source(script_mod, &code, NIL.into())
                     }
                 });
+                crate::splash_policy::charge(heap_key, vm.last_limit_consumed());
                 if preserve {
                     restore_modules(vm, saved);
                 }
@@ -414,6 +454,73 @@ impl Splash {
             crate::widget_async::inject_splash_ui_handle(cx, self.vm_id, self.uid);
             cx.widget_tree_mark_dirty(self.uid);
         }
+        self.arm_live_pumps(cx, preserve);
+    }
+
+    /// FORK PORT: the live-data / animation bookkeeping after an evaluation.
+    /// A body that binds async live data (`sys.weather`, ...) evaluates
+    /// against "—" placeholders while its fetches are in flight; arm the
+    /// per-frame pump so `handle_event` can re-evaluate it once they land.
+    /// `fn tick()` bodies update themselves in place at 1 Hz and must never
+    /// be rebuilt underneath, so they get the timer instead of the pump.
+    fn arm_live_pumps(&mut self, cx: &mut Cx, preserve: bool) {
+        let (has_tick, animating) = {
+            let b = self.body.as_ref();
+            let is_tick = b.contains("fn tick(") || b.contains("fn tick (");
+            (
+                is_tick,
+                b.contains("draw_pass.time")
+                    || b.contains("WeatherIcon")
+                    || b.contains("sys.simsecs")
+                    || (crate::splash_agent::body_binds_live_data(b) && !is_tick),
+            )
+        };
+        if !preserve {
+            cx.stop_timer(self.tick_timer);
+            self.tick_timer = Timer::default();
+            if has_tick {
+                self.tick_timer = cx.start_interval(1.0);
+            }
+        }
+        self.animating = animating;
+        self.anim_next_frame = if animating { cx.new_next_frame() } else { NextFrame::default() };
+        // The epoch AT this eval, so the pump only re-evaluates when a LATER
+        // fetch completes: an eval only reads cached data or fires pending
+        // fetches, it never bumps the epoch, so this settles and cannot loop.
+        self.last_data_epoch = cx.script_data_fetch_epoch();
+    }
+
+    /// FORK PORT: the `fn tick()` timer and the per-frame live-data pump.
+    fn handle_live_pumps(&mut self, cx: &mut Cx, event: &Event) {
+        if self.tick_timer.is_event(event).is_some() {
+            self.call_script_fn(cx, id!(tick), &[]);
+            self.view.redraw(cx);
+        }
+        if self.animating && self.anim_next_frame.is_event(event).is_some() {
+            let epoch = cx.script_data_fetch_epoch();
+            let sim_tick = crate::splash_agent::sim_clock_secs() as u64;
+            let (sim_due, is_tick_card, needs_frame_anim, binds_live) = {
+                let b = self.body.as_ref();
+                (
+                    sim_tick != self.last_sim_tick && b.contains("sys.simsecs"),
+                    b.contains("fn tick(") || b.contains("fn tick ("),
+                    b.contains("draw_pass.time") || b.contains("WeatherIcon"),
+                    crate::splash_agent::body_binds_live_data(b),
+                )
+            };
+            if (epoch != self.last_data_epoch && binds_live && !is_tick_card) || sim_due {
+                self.last_sim_tick = sim_tick;
+                // Full re-evaluation into a fresh view: the body's `sys.*`
+                // calls now read the fetch cache instead of placeholders.
+                self.eval_styled_body(cx, false);
+                cx.redraw_all();
+            } else if needs_frame_anim {
+                self.view.redraw(cx);
+            }
+            if self.animating {
+                self.anim_next_frame = cx.new_next_frame();
+            }
+        }
     }
 
     /// Tears down this Splash's isolate (if any), returning it to the empty
@@ -433,6 +540,10 @@ impl Splash {
         self.view = cx.with_vm(|vm| View::script_from_value(vm, NIL.into()));
         self.view.walk = walk;
         self.body_id = None;
+        cx.stop_timer(self.tick_timer);
+        self.tick_timer = Timer::default();
+        self.animating = false;
+        self.anim_next_frame = NextFrame::default();
         self.startup_timers.clear();
         self.body_modules.clear();
         crate::widget_async::mark_splash_isolate_dead(self.vm_id);
@@ -675,6 +786,9 @@ impl Widget for Splash {
                 crate::widget_async::handle_splash_network_responses(cx, self.vm_id, responses);
             }
         }
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            self.handle_live_pumps(cx, event);
+        }
         if self.host_io_only && matches!(event, Event::TextCopy(_) | Event::TextCut(_)) {
             return;
         }
@@ -757,6 +871,7 @@ impl Splash {
             vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT as u64, |vm| {
                 vm.call(fnval, args);
             });
+            crate::splash_policy::charge(vm.heap_key(), vm.last_limit_consumed());
             true
         });
         });
@@ -785,6 +900,7 @@ impl Splash {
             vm.with_instruction_limit(WIDGET_SCRIPT_INSTRUCTION_LIMIT as u64, |vm| {
                 vm.call(fnval, &vals);
             });
+            crate::splash_policy::charge(vm.heap_key(), vm.last_limit_consumed());
             true
         });
         });
@@ -855,6 +971,62 @@ impl Splash {
         }
     }
 
+    /// Caps this isolate's retained script heap. Applied now when the isolate
+    /// exists, and on every evaluation. None removes the cap.
+    pub fn set_memory_bytes(&mut self, cx: &mut Cx, bytes: Option<usize>) {
+        self.memory_bytes = bytes;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.set_max_heap_bytes(bytes));
+        }
+    }
+
+    /// FORK PORT. Puts this isolate under an ENFORCED policy (ADR 0002):
+    /// files stay in its jail, and the runtime's own reads of the person's
+    /// data and devices (location, saved lists, the camera, `agent.notify`)
+    /// need their grants. `hosts`, `instruction_budget` and the capabilities
+    /// are what the app declares: since the ruling of 8 October 2026 none of
+    /// them limits its network paths, its `host.request` calls or what it
+    /// runs ([`crate::splash_policy`]). Call before set_text. Pass `None`
+    /// hosts to return to the unenforced behaviour.
+    pub fn set_policy(&mut self, cx: &mut Cx, hosts: Option<Vec<String>>, instruction_budget: Option<u64>) {
+        self.policy_hosts = hosts;
+        self.instruction_budget = instruction_budget;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.heap_key());
+            self.apply_policy(heap_key);
+        }
+    }
+
+    /// FORK PORT. How long each entry into this app's script (its body's
+    /// evaluation, a handler, a render) may run before it is stopped with
+    /// `script time budget exceeded`. None = Makepad's default, which on this
+    /// line is no clock (upstream runs isolates without an implicit budget;
+    /// the per-evaluation instruction cap still ends a runaway). Call before
+    /// set_text so the body's evaluation gets it; applies from the next entry
+    /// when the isolate is live.
+    pub fn set_time_budget(&mut self, cx: &mut Cx, budget: Option<std::time::Duration>) {
+        self.time_budget = budget;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            cx.set_splash_vm_time_budget(self.vm_id, budget);
+        }
+    }
+
+    /// FORK PORT. Instructions this isolate has run under its budget so far.
+    pub fn instructions_used(&mut self, cx: &mut Cx) -> u64 {
+        if self.vm_id == MAIN_SPLASH_VM_ID {
+            return 0;
+        }
+        let heap_key = cx.with_script_vm_id(self.vm_id, |vm| vm.heap_key());
+        crate::splash_policy::instructions_used(heap_key)
+    }
+
+    /// Push the policy fields onto the live isolate.
+    fn apply_policy(&self, heap_key: usize) {
+        if let Some(hosts) = &self.policy_hosts {
+            crate::splash_policy::set_policy_for_heap(heap_key, self.host_caps.clone(), hosts.clone(), self.instruction_budget);
+        }
+    }
+
     /// Marks whether this isolate's surface may raise user prompts; see
     /// `SplashHostRequest::may_prompt`. Defaults true.
     pub fn set_host_prompts(&mut self, cx: &mut Cx, may_prompt: bool) {
@@ -914,6 +1086,47 @@ impl SplashRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
         }
+    }
+
+    /// Re-evaluate a host-generated body in its live isolate, keeping the
+    /// body's state the way a style reapply does. An empty body, or a Splash
+    /// with no isolate yet, goes through `set_text`.
+    pub fn reapply_text(&self, cx: &mut Cx, body: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.vm_id == MAIN_SPLASH_VM_ID || body.is_empty() {
+                inner.set_text(cx, body);
+            } else if inner.body.as_ref() != body {
+                inner.body.set(body);
+                inner.eval_styled_body(cx, true);
+                inner.redraw(cx);
+            }
+        }
+    }
+
+    /// See [`Splash::set_memory_bytes`].
+    pub fn set_memory_bytes(&self, cx: &mut Cx, bytes: Option<usize>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_memory_bytes(cx, bytes);
+        }
+    }
+
+    /// See [`Splash::set_policy`].
+    pub fn set_policy(&self, cx: &mut Cx, hosts: Option<Vec<String>>, instruction_budget: Option<u64>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_policy(cx, hosts, instruction_budget);
+        }
+    }
+
+    /// See [`Splash::set_time_budget`].
+    pub fn set_time_budget(&self, cx: &mut Cx, budget: Option<std::time::Duration>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_time_budget(cx, budget);
+        }
+    }
+
+    /// See [`Splash::instructions_used`].
+    pub fn instructions_used(&self, cx: &mut Cx) -> u64 {
+        self.borrow_mut().map(|mut inner| inner.instructions_used(cx)).unwrap_or(0)
     }
 
     /// What the last evaluation of the body reported (empty: it evaluated to a view).

@@ -156,6 +156,18 @@ macro_rules! b {
         bin(concat!(stringify!($name), "::<", $k, ">"), |a: $a, b: $b| unsafe { $name::<$k>(a, b) }, |a: $a, b: $b| unsafe { $name::<$k>(a, b) })
     };
 }
+/// rustc's legacy const-generic call form (`vshrq_n_u8(a, 4)`): the constant passed as the last
+/// argument of an intrinsic marked `#[rustc_legacy_const_generics]`
+macro_rules! ul {
+    ($name:ident ($k:literal), $a:ty) => {
+        un(concat!(stringify!($name), "::legacy::", $k), |a: $a| unsafe { $name(a, $k) }, |a: $a| unsafe { $name(a, $k) })
+    };
+}
+macro_rules! bl {
+    ($name:ident ($k:literal), $a:ty, $b:ty) => {
+        bin(concat!(stringify!($name), "::legacy::", $k), |a: $a, b: $b| unsafe { $name(a, b, $k) }, |a: $a, b: $b| unsafe { $name(a, b, $k) })
+    };
+}
 macro_rules! t {
     ($name:ident, $a:ty, $b:ty, $c:ty) => {
         tri(stringify!($name), |a: $a, b: $b, c: $c| unsafe { $name(a, b, c) }, |a: $a, b: $b, c: $c| unsafe { $name(a, b, c) })
@@ -190,6 +202,140 @@ fn chain_adler(a: [u8; 64], b: [u8; 64]) -> [u32; 4] {
         }
 }
 
+/// bytecount 0.6's NEON count: four registers loaded at once and destructured, lanes compared
+/// with a needle and summed across with UADDLV.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn chain_count(a: [u8; 64], b: [u8; 64]) -> [u16; 4] {
+    unsafe {
+        let mask = vdupq_n_u8(0x81);
+        let needles = vdupq_n_u8(b[0] & 0x81);
+        let uint8x16x4_t(h1, h2, h3, h4) = vld1q_u8_x4(a.as_ptr());
+        let mut count = vdupq_n_u8(0);
+        for h in [h1, h2, h3, h4] {
+            count = vsubq_u8(count, vceqq_u8(vandq_u8(h, mask), needles));
+        }
+        [vaddlvq_u8(count), vaddlvq_u8(h1), vaddlvq_u8(vaddq_u8(h2, h3)), vaddlvq_u8(h4)]
+    }
+}
+
+/// aho-corasick 1.1's NEON Teddy step: intrinsics called in the legacy const-generic form, one
+/// forwarding the caller's own const parameter (`vshrq_n_u8(self, BITS)`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn shift_8bit_lane_right<const BITS: i32>(v: uint8x16_t) -> uint8x16_t {
+    vshrq_n_u8(v, BITS)
+}
+
+/// One Teddy chunk: nibble lookups, then EXT shifting the previous chunk's last bytes in
+/// (`vextq_u8(prev, res, 15/14/13)`) and the is_zero test over 64-bit lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn chain_teddy(a: [u8; 32], b: [u8; 32]) -> [u8; 72] {
+    unsafe {
+        let prev = vld1q_u8(a.as_ptr());
+        let cur = vld1q_u8(a.as_ptr().add(16));
+        let lo = vqtbl1q_u8(vld1q_u8(b.as_ptr()), vandq_u8(cur, vdupq_n_u8(0xf)));
+        let hi = vqtbl1q_u8(vld1q_u8(b.as_ptr().add(16)), shift_8bit_lane_right::<4>(cur));
+        let res = vandq_u8(lo, hi);
+        let mut out = [0u8; 72];
+        for (k, v) in [res, vextq_u8(prev, res, 15), vextq_u8(prev, res, 14), vextq_u8(prev, res, 13)].into_iter().enumerate() {
+            vst1q_u8(out.as_mut_ptr().add(16 * k), v);
+        }
+        for (k, v) in [res, vandq_u8(res, vdupq_n_u8(0)), vceqq_u8(prev, prev), vorrq_u8(lo, vshlq_n_u8(hi, 7))].into_iter().enumerate() {
+            let maxes = vreinterpretq_u64_u8(vpmaxq_u8(v, v));
+            out[64 + 2 * k] = (vgetq_lane_u64(maxes, 0) == 0) as u8;
+            out[65 + 2 * k] = (vgetq_lane_u64(maxes, 1) == vgetq_lane_u64::<0>(maxes)) as u8;
+        }
+        out
+    }
+}
+
+/// polyval's multiply and the first step of its reduction: pmull, pmull2 and the fold by the
+/// field polynomial
+#[cfg(target_arch = "aarch64")]
+unsafe fn pmull_fold(x: uint8x16_t, y: uint8x16_t) -> [uint8x16_t; 2] {
+    let (x64, y64) = (vreinterpretq_u64_u8(x), vreinterpretq_u64_u8(y));
+    let lo: uint8x16_t = core::mem::transmute(vmull_p64(vgetq_lane_u64(x64, 0), vgetq_lane_u64(y64, 0)));
+    let hi: uint8x16_t = core::mem::transmute(vmull_p64(vgetq_lane_u64(x64, 1), vgetq_lane_u64(y64, 1)));
+    let poly = vreinterpretq_u8_p128(1 << 127 | 1 << 126 | 1 << 121 | 1 << 63 | 1 << 62 | 1 << 57);
+    let fold = vmull_p64(vgetq_lane_u64(vreinterpretq_u64_u8(lo), 1), vgetq_lane_u64(vreinterpretq_u64_u8(poly), 0));
+    [veorq_u8(lo, vextq_u8(hi, hi, 8)), vreinterpretq_u8_p128(fold)]
+}
+
+/// f32 lanes for the reciprocal estimates: subnormals and the smallest normals
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_tiny(a: uint32x4_t) -> float32x4_t {
+    vreinterpretq_f32_u32(vandq_u32(a, vdupq_n_u32(0x80ff_ffff)))
+}
+
+/// 2^125 and above, infinities and NaNs included
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_huge(a: uint32x4_t) -> float32x4_t {
+    vreinterpretq_f32_u32(vorrq_u32(a, vdupq_n_u32(0x7e00_0000)))
+}
+
+/// 2^-8 to 2^8 with a random mantissa and sign
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_moderate(a: uint32x4_t) -> float32x4_t {
+    vreinterpretq_f32_u32(vorrq_u32(vandq_u32(a, vdupq_n_u32(0x87ff_ffff)), vdupq_n_u32(0x3b80_0000)))
+}
+
+/// each lane one of sixteen special values, picked by its low four bits
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_special(a: uint32x4_t) -> float32x4_t {
+    const S: [u32; 16] = [
+        0x0000_0000, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x3f80_0000, 0xbf80_0000, 0x4000_0000, 0x3fc0_0000,
+        0x4040_0000, 0x0000_0001, 0x8020_0000, 0x7f7f_ffff, 0x7fc0_1234, 0xffc0_0001, 0x7f80_0055, 0xffa0_0000,
+    ];
+    let mut l = [0u32; 4];
+    vst1q_u32(l.as_mut_ptr(), a);
+    for x in l.iter_mut() {
+        *x = S[(*x & 15) as usize];
+    }
+    vreinterpretq_f32_u32(vld1q_u32(l.as_ptr()))
+}
+
+/// FRSQRTE over all 512 operand classes (9 mantissa bits) of an even and an odd exponent, and of
+/// the subnormals: every entry of Arm's estimate table
+#[cfg(target_arch = "aarch64")]
+unsafe fn rsqrte_sweep(seed: u32) -> [u32; 4] {
+    let mut h = [seed; 4];
+    for m in 0..512u32 {
+        let frac = m << 14 | (seed & 0x3fff);
+        let lanes = [0x3f00_0000 | frac, 0x3f80_0000 | frac, frac >> (seed % 20), 0x0080_0000 | frac];
+        let mut out = [0u32; 4];
+        vst1q_u32(out.as_mut_ptr(), vreinterpretq_u32_f32(vrsqrteq_f32(vreinterpretq_f32_u32(vld1q_u32(lanes.as_ptr())))));
+        for k in 0..4 {
+            h[k] = (h[k] ^ out[k]).wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
+/// tiny-skia's f32x4 recip_fast and recip_sqrt: one Newton step on each estimate. A NaN lane of
+/// x reads as zero: its step and its estimate are NaNs of opposite sign, and which of the two the
+/// final multiply returns follows the operand order the compiler emits (LLVM commutes fmul).
+#[cfg(target_arch = "aarch64")]
+unsafe fn recip_newton(x: float32x4_t) -> [[u32; 4]; 2] {
+    let a = vrecpeq_f32(x);
+    let recip = vmulq_f32(vrecpsq_f32(x, a), a);
+    let a = vrsqrteq_f32(x);
+    let rsqrt = vmulq_f32(vrsqrtsq_f32(x, vmulq_f32(a, a)), a);
+    let mut out = [[0u32; 4]; 2];
+    let mut xs = [0u32; 4];
+    vst1q_u32(xs.as_mut_ptr(), vreinterpretq_u32_f32(x));
+    vst1q_u32(out[0].as_mut_ptr(), vreinterpretq_u32_f32(recip));
+    vst1q_u32(out[1].as_mut_ptr(), vreinterpretq_u32_f32(rsqrt));
+    for l in 0..4 {
+        if xs[l] & 0x7fff_ffff > 0x7f80_0000 {
+            out[0][l] = 0;
+            out[1][l] = 0;
+        }
+    }
+    out
+}
+
 #[cfg(target_arch = "aarch64")]
 fn arch() {
     tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
@@ -220,6 +366,7 @@ fn arch() {
     b!(vsetq_lane_u32::<0>, u32, uint32x4_t);
     b!(vsetq_lane_u32::<2>, u32, uint32x4_t);
     u!(vaddvq_u32, uint32x4_t);
+    u!(vaddlvq_u8, uint8x16_t);
     u!(vmaxvq_u32, uint32x4_t);
     b!(vaddw_u8, uint16x8_t, uint8x8_t);
     t!(vmlal_u16, uint32x4_t, uint16x4_t, uint16x4_t);
@@ -237,6 +384,173 @@ fn arch() {
     u!(vshrq_n_s16::<16>, int16x8_t);
     u!(vshrq_n_s32::<7>, int32x4_t);
     u!(vshrq_n_s32::<32>, int32x4_t);
+    // every immediate shift in the legacy form rustc accepts (stdarch's legacy position 1)
+    ul!(vshlq_n_s8(0), int8x16_t);
+    ul!(vshlq_n_s8(7), int8x16_t);
+    ul!(vshrq_n_s8(1), int8x16_t);
+    ul!(vshrq_n_s8(8), int8x16_t);
+    ul!(vshlq_n_s16(15), int16x8_t);
+    ul!(vshrq_n_s16(3), int16x8_t);
+    ul!(vshlq_n_s32(9), int32x4_t);
+    ul!(vshrq_n_s32(32), int32x4_t);
+    ul!(vshlq_n_s64(63), int64x2_t);
+    ul!(vshrq_n_s64(64), int64x2_t);
+    ul!(vshlq_n_u8(3), uint8x16_t);
+    ul!(vshrq_n_u8(4), uint8x16_t);
+    ul!(vshrq_n_u8(8), uint8x16_t);
+    ul!(vshlq_n_u16(1), uint16x8_t);
+    ul!(vshrq_n_u16(16), uint16x8_t);
+    ul!(vshlq_n_u32(31), uint32x4_t);
+    ul!(vshrq_n_u32(5), uint32x4_t);
+    ul!(vshlq_n_u64(32), uint64x2_t);
+    ul!(vshrq_n_u64(1), uint64x2_t);
+    ul!(vgetq_lane_u64(1), uint64x2_t);
+    ul!(vgetq_lane_u8(0), uint8x16_t);
+    ul!(vgetq_lane_u8(15), uint8x16_t);
+    u!(vmvnq_u8, uint8x16_t);
+    // vreinterpret: zmij's and chacha20's, then one per element type and width (p128 = u128)
+    u!(vreinterpret_s32_u64, uint64x1_t);
+    u!(vreinterpret_u32_s32, int32x2_t);
+    u!(vreinterpret_u16_s32, int32x2_t);
+    u!(vreinterpretq_u64_u32, uint32x4_t);
+    u!(vreinterpretq_u32_u64, uint64x2_t);
+    u!(vreinterpret_f64_s8, int8x8_t);
+    u!(vreinterpret_p16_f32, float32x2_t);
+    u!(vreinterpret_p64_u16, uint16x4_t);
+    u!(vreinterpret_s64_p8, poly8x8_t);
+    u!(vreinterpretq_s8_f64, float64x2_t);
+    u!(vreinterpretq_p8_s16, int16x8_t);
+    u!(vreinterpretq_p64_s32, int32x4_t);
+    u!(vreinterpretq_f32_p16, poly16x8_t);
+    u!(vreinterpretq_p128_u8, uint8x16_t);
+    u!(vreinterpretq_u16_p128, u128);
+    // zmij's digit split and chacha20's rotate
+    t!(vmla_n_s32, int32x2_t, int32x2_t, i32);
+    t!(vmlaq_n_s16, int16x8_t, int16x8_t, i16);
+    t!(vmlaq_n_s32, int32x4_t, int32x4_t, i32);
+    b!(vqdmulh_n_s32, int32x2_t, i32);
+    b!(vqdmulhq_n_s16, int16x8_t, i16);
+    b!(vqdmulhq_n_s32, int32x4_t, i32);
+    u!(vrev64q_u8, uint8x16_t);
+    u!(vrev32q_u16, uint16x8_t);
+    ul!(vshll_n_u16(0), uint16x4_t);
+    ul!(vshll_n_u16(9), uint16x4_t);
+    ul!(vshll_n_u16(16), uint16x4_t);
+    ul!(vshr_n_u32(1), uint32x2_t);
+    ul!(vshr_n_u32(9), uint32x2_t);
+    ul!(vshr_n_u32(32), uint32x2_t);
+    // memchr 2.8, simdutf8 0.1.5, zmij 1.0.19+
+    u!(vrev16q_u8, uint8x16_t);
+    u!(vmovq_n_u8, u8);
+    u!(vcgtzq_s8, int8x16_t);
+    b!(vcombine_s32, int32x2_t, int32x2_t);
+    u!(vcreate_u64, u64);
+    u!(vdup_n_s32, i32);
+    // sha2's SHA-512 backend
+    b!(vextq_u64::<0>, uint64x2_t, uint64x2_t);
+    bl!(vextq_u64(1), uint64x2_t, uint64x2_t);
+    t!(vsha512hq_u64, uint64x2_t, uint64x2_t, uint64x2_t);
+    t!(vsha512h2q_u64, uint64x2_t, uint64x2_t, uint64x2_t);
+    b!(vsha512su0q_u64, uint64x2_t, uint64x2_t);
+    t!(vsha512su1q_u64, uint64x2_t, uint64x2_t, uint64x2_t);
+    // the aes crate's aarch64 backend
+    b!(vaeseq_u8, uint8x16_t, uint8x16_t);
+    b!(vaesdq_u8, uint8x16_t, uint8x16_t);
+    u!(vaesmcq_u8, uint8x16_t);
+    u!(vaesimcq_u8, uint8x16_t);
+    // one full round each way, as aes chains them
+    bin("chain_aes", |a: uint8x16_t, k: uint8x16_t| unsafe { [vaesmcq_u8(vaeseq_u8(a, k)), vaesimcq_u8(vaesdq_u8(a, k))] }, |a: uint8x16_t, k: uint8x16_t| unsafe {
+        [vaesmcq_u8(vaeseq_u8(a, k)), vaesimcq_u8(vaesdq_u8(a, k))]
+    });
+    // polyval's and ghash's carry-less multiply (the result is a p128 = u128)
+    b!(vmull_p64, u64, u64);
+    bin("chain_pmull", |a: uint8x16_t, b: uint8x16_t| unsafe { pmull_fold(a, b) }, |a: uint8x16_t, b: uint8x16_t| unsafe { pmull_fold(a, b) });
+    // constant_time_eq's two-register load, and the three-register one beside it
+    un(
+        "vld1q_u8_x2",
+        |p: [u8; 32]| {
+            let mut b = [0u8; 33];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x2(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 32]| {
+            let mut b = [0u8; 33];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x2(b.as_ptr().add(1)) }
+        },
+    );
+    un(
+        "vld1q_u8_x3",
+        |p: [u8; 48]| {
+            let mut b = [0u8; 49];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x3(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 48]| {
+            let mut b = [0u8; 49];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x3(b.as_ptr().add(1)) }
+        },
+    );
+    // xxh3's accumulate and scramble (xxhash-rust, redb)
+    u!(vdup_n_u32, u32);
+    t!(vmlal_u32, uint64x2_t, uint32x2_t, uint32x2_t);
+    t!(vmlal_high_u32, uint64x2_t, uint32x4_t, uint32x4_t);
+    u!(vmovn_u64, uint64x2_t);
+    b!(vuzpq_u32, uint32x4_t, uint32x4_t);
+    // zlib-rs: crc32's tail, adler32, compare256
+    bin("__crc32h", |c: u32, d: u16| unsafe { __crc32h(c, d) }, |c: u32, d: u16| unsafe { __crc32h(c, d) });
+    bin("__crc32w", |c: u32, d: u32| unsafe { __crc32w(c, d) }, |c: u32, d: u32| unsafe { __crc32w(c, d) });
+    b!(vaddw_high_u8, uint16x8_t, uint8x16_t);
+    un(
+        "vld4q_u8",
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld4q_u8(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld4q_u8(b.as_ptr().add(1)) }
+        },
+    );
+    b!(vsriq_n_u8::<1>, uint8x16_t, uint8x16_t);
+    b!(vsriq_n_u8::<2>, uint8x16_t, uint8x16_t);
+    b!(vsriq_n_u8::<4>, uint8x16_t, uint8x16_t);
+    bl!(vsriq_n_u8(7), uint8x16_t, uint8x16_t);
+    bl!(vsriq_n_u8(8), uint8x16_t, uint8x16_t);
+    // tiny-skia's recip_fast and recip_sqrt: the estimates and their Newton steps. Random bits
+    // give every exponent; the masked forms keep to the subnormal, huge and special operands.
+    u!(vrecpeq_f32, float32x4_t);
+    u!(vrsqrteq_f32, float32x4_t);
+    b!(vrecpsq_f32, float32x4_t, float32x4_t);
+    b!(vrsqrtsq_f32, float32x4_t, float32x4_t);
+    un("vrecpeq_f32::tiny", |a: uint32x4_t| unsafe { vrecpeq_f32(f32_tiny(a)) }, |a: uint32x4_t| unsafe { vrecpeq_f32(f32_tiny(a)) });
+    un("vrecpeq_f32::huge", |a: uint32x4_t| unsafe { vrecpeq_f32(f32_huge(a)) }, |a: uint32x4_t| unsafe { vrecpeq_f32(f32_huge(a)) });
+    un("vrecpeq_f32::special", |a: uint32x4_t| unsafe { vrecpeq_f32(f32_special(a)) }, |a: uint32x4_t| unsafe { vrecpeq_f32(f32_special(a)) });
+    un("vrsqrteq_f32::tiny", |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_tiny(a)) }, |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_tiny(a)) });
+    un("vrsqrteq_f32::huge", |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_huge(a)) }, |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_huge(a)) });
+    un("vrsqrteq_f32::special", |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_special(a)) }, |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_special(a)) });
+    un("vrsqrteq_f32::every_mantissa", |a: u32| unsafe { rsqrte_sweep(a) }, |a: u32| unsafe { rsqrte_sweep(a) });
+    bin("vrecpsq_f32::special", |a: uint32x4_t, b: uint32x4_t| unsafe { vrecpsq_f32(f32_special(a), f32_special(b)) }, |a: uint32x4_t, b: uint32x4_t| unsafe {
+        vrecpsq_f32(f32_special(a), f32_special(b))
+    });
+    bin("vrsqrtsq_f32::special", |a: uint32x4_t, b: uint32x4_t| unsafe { vrsqrtsq_f32(f32_special(a), f32_special(b)) }, |a: uint32x4_t, b: uint32x4_t| unsafe {
+        vrsqrtsq_f32(f32_special(a), f32_special(b))
+    });
+    bin("vrecpsq_f32::tiny", |a: uint32x4_t, b: float32x4_t| unsafe { vrecpsq_f32(f32_tiny(a), b) }, |a: uint32x4_t, b: float32x4_t| unsafe { vrecpsq_f32(f32_tiny(a), b) });
+    bin("vrsqrtsq_f32::tiny", |a: float32x4_t, b: uint32x4_t| unsafe { vrsqrtsq_f32(a, f32_tiny(b)) }, |a: float32x4_t, b: uint32x4_t| unsafe { vrsqrtsq_f32(a, f32_tiny(b)) });
+    // the products near 2 and 3 that the Newton steps cancel, as tiny-skia chains them
+    un("chain_recip", |a: float32x4_t| unsafe { recip_newton(a) }, |a: float32x4_t| unsafe { recip_newton(a) });
+    un("chain_recip::moderate", |a: uint32x4_t| unsafe { recip_newton(f32_moderate(a)) }, |a: uint32x4_t| unsafe { recip_newton(f32_moderate(a)) });
+    u!(vshrq_n_u8::<1>, uint8x16_t);
+    u!(vshlq_n_u8::<7>, uint8x16_t);
+    b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
+    b!(vextq_u8::<1>, uint8x16_t, uint8x16_t);
+    bl!(vextq_u8(13), uint8x16_t, uint8x16_t);
+    bl!(vextq_u8(15), uint8x16_t, uint8x16_t);
+    bl!(vextq_u32(3), uint32x4_t, uint32x4_t);
     u!(vget_low_u8, uint8x16_t);
     u!(vget_low_u16, uint16x8_t);
     u!(vget_low_u32, uint32x4_t);
@@ -254,6 +568,19 @@ fn arch() {
     b!(vcombine_u16, uint16x4_t, uint16x4_t);
     b!(vcombine_s16, int16x4_t, int16x4_t);
     un("vld1q_u8", |p: [u8; 17]| unsafe { vld1q_u8(p.as_ptr().add(1)) }, |p: [u8; 17]| unsafe { vld1q_u8(p.as_ptr().add(1)) });
+    un(
+        "vld1q_u8_x4",
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x4(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x4(b.as_ptr().add(1)) }
+        },
+    );
     un("vld1q_u16", |p: [u16; 8]| unsafe { vld1q_u16(p.as_ptr()) }, |p: [u16; 8]| unsafe { vld1q_u16(p.as_ptr()) });
     un("vld1_u16", |p: [u16; 4]| unsafe { vld1_u16(p.as_ptr()) }, |p: [u16; 4]| unsafe { vld1_u16(p.as_ptr()) });
     un("vld1q_u32", |p: [u32; 4]| unsafe { vld1q_u32(p.as_ptr()) }, |p: [u32; 4]| unsafe { vld1q_u32(p.as_ptr()) });
@@ -294,6 +621,35 @@ fn arch() {
                 h = h.wrapping_mul(31).wrapping_add(a[i] as u32 ^ b[i] as u32);
             }
             [h, 0, 0, 0]
+        },
+    );
+    bin("chain_teddy", |a: [u8; 32], b: [u8; 32]| chain_teddy(a, b), |a: [u8; 32], b: [u8; 32]| {
+        let res: [u8; 16] = core::array::from_fn(|i| b[(a[16 + i] & 0xf) as usize] & b[16 + (a[16 + i] >> 4) as usize]);
+        let ext = |k: usize| -> [u8; 16] { core::array::from_fn(|i| if i + k < 16 { a[i + k] } else { res[i + k - 16] }) };
+        let mut out = [0u8; 72];
+        for (k, v) in [res, ext(15), ext(14), ext(13)].into_iter().enumerate() {
+            out[16 * k..16 * k + 16].copy_from_slice(&v);
+        }
+        let lo: [u8; 16] = core::array::from_fn(|i| b[(a[16 + i] & 0xf) as usize]);
+        let hi: [u8; 16] = core::array::from_fn(|i| b[16 + (a[16 + i] >> 4) as usize]);
+        let tests = [res, [0; 16], [0xff; 16], core::array::from_fn(|i| lo[i] | hi[i] << 7)];
+        for (k, v) in tests.into_iter().enumerate() {
+            // vpmaxq_u8(v, v): the pairwise maxima of v, twice; both 64-bit lanes hold the same bytes
+            let zero = (0..8).all(|j| v[2 * j].max(v[2 * j + 1]) == 0);
+            out[64 + 2 * k] = zero as u8;
+            out[65 + 2 * k] = 1;
+        }
+        out
+    });
+    // the same in scalar code on the pointer side: PTR-DIFFERS when the NEON chain is wrong
+    bin(
+        "chain_count",
+        |a: [u8; 64], b: [u8; 64]| chain_count(a, b),
+        |a: [u8; 64], b: [u8; 64]| {
+            let sum = |s: &[u8]| s.iter().map(|&x| x as u16).sum::<u16>();
+            let count = a.iter().filter(|&&x| x & 0x81 == b[0] & 0x81).count() as u16;
+            let middle = (0..16).map(|i| a[16 + i].wrapping_add(a[32 + i]) as u16).sum::<u16>();
+            [count, sum(&a[..16]), middle, sum(&a[48..])]
         },
     );
 }

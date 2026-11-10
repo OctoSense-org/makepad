@@ -1079,6 +1079,14 @@ impl AsRef<OsStr> for PathBuf {
     }
 }
 
+// `"dir".parse::<PathBuf>()` (std: infallible); comrak's build script parses OUT_DIR this way.
+impl core::str::FromStr for PathBuf {
+    type Err = core::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(PathBuf::from(s))
+    }
+}
+
 impl From<String> for PathBuf {
     fn from(s: String) -> PathBuf {
         PathBuf { inner: OsString::from(s) }

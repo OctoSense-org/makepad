@@ -60,6 +60,21 @@ thread_local! {
     static SPLASH_THEME_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Whether this thread's new Splash isolates end an evaluation at an uncaught script error.
+    static SPLASH_BAIL_ON_UNCAUGHT_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the Splash isolates this thread allocates from now on end an evaluation at an uncaught
+/// script error (`ScriptVmBase::bail_on_uncaught_error`) instead of reporting it and running on.
+/// For a host whose Splashes run script it did not write: the instruction after a failed one must
+/// not reach another host effect, and a render callback that failed is discarded whole rather than
+/// applied half built. An isolate's own UI registration (theme, widgets, prelude, the host's
+/// isolate mods) is the host's code and keeps evaluating past a bad statement.
+pub fn set_splash_bail_on_uncaught_error(on: bool) {
+    SPLASH_BAIL_ON_UNCAUGHT_ERROR.with(|current| current.set(on));
+}
+
 /// Sets the theme this thread's Splash isolates use. Running ones restyle to it
 /// on their next draw, unless pinned to a theme of their own (`Splash::set_theme`).
 pub fn set_splash_theme(theme: SplashTheme) {
@@ -151,6 +166,7 @@ pub(crate) fn restyle_isolate(
     // The registration is the host's own code (the library's fonts load through the loader the
     // isolate was stripped of), and the restriction is back before any guest code runs again.
     let restricted = vm.cx_mut().script_data.std.set_host_io_only_for_host_code(false);
+    let bail = std::mem::replace(&mut vm.bx.bail_on_uncaught_error, false);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.with_reload(|vm| {
             with_loader(vm, loader, |vm| {
@@ -164,6 +180,7 @@ pub(crate) fn restyle_isolate(
         })
     }));
     vm.cx_mut().script_data.std.set_host_io_only_for_host_code(restricted);
+    vm.bx.bail_on_uncaught_error = bail;
     if let Err(payload) = out {
         std::panic::resume_unwind(payload);
     }
@@ -270,6 +287,7 @@ pub fn gc_dead_splash_isolates(cx: &mut Cx) {
     // Sandbox roots and host-bridge state die with their isolates.
     crate::splash_storage::gc_roots(&dead_heaps);
     crate::splash_host::gc_bridge(&dead_heaps);
+    crate::splash_policy::gc_policies(&dead_heaps);
     // Script tweens: the isolate's host (its rooted apply objects), its
     // callback closures and its handle type go with it.
     crate::tween_script::gc_vms(cx, &dead);
@@ -475,8 +493,10 @@ fn expand_isolate_ui(vm: &mut ScriptVm) {
     // The registration is the host's own code: it loads the library's fonts like before the
     // isolate was restricted, and the restriction is back before any guest code runs again.
     let restricted = vm.cx_mut().script_data.std.set_host_io_only_for_host_code(false);
+    let bail = std::mem::replace(&mut vm.bx.bail_on_uncaught_error, false);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expand_isolate_ui_modules(vm, sheet, host_io_only, theme, script, loader, host_mods, custom, apply_sheet_widgets)));
     vm.cx_mut().script_data.std.set_host_io_only_for_host_code(restricted);
+    vm.bx.bail_on_uncaught_error = bail;
     if let Err(payload) = out {
         std::panic::resume_unwind(payload);
     }
@@ -502,10 +522,16 @@ fn expand_isolate_ui_modules(
             return;
         }
         // The allocating VM's sheet, or its plain theme: never the
-        // environment's sheet over a VM that took it off.
-        match sheet {
-            Some(sheet) => crate::desktop_style::install(vm, sheet),
-            None => crate::desktop_style::uninstall(vm),
+        // environment's sheet over a VM that took it off. A host that picked
+        // for this isolate itself since allocating it (`desktop_style::install`
+        // on a disposable isolate, then the library) keeps its pick: this
+        // expansion may run on the library's first step, after that pick.
+        let heap_key = vm.heap_key();
+        if !crate::desktop_style::has_pick(vm.cx_mut(), heap_key) {
+            match sheet {
+                Some(sheet) => crate::desktop_style::install(vm, sheet),
+                None => crate::desktop_style::uninstall(vm),
+            }
         }
         crate::theme_mod(vm);
         style_isolate(vm, theme, script.as_deref(), host_io_only);
@@ -534,6 +560,7 @@ fn reload_isolate(vm: &mut ScriptVm) {
     let lazy = vm.has_lazy_modules();
     let ui = vm.cx_mut().global::<CxWidgetAsync>().isolate_ui.get(&heap_key).map(|ui| (ui.host_io_only, ui.theme, ui.script.clone(), ui.loader.clone(), ui.host_mods.clone(), ui.custom.clone()));
     let restricted = vm.cx_mut().script_data.std.set_host_io_only_for_host_code(false);
+    let bail = std::mem::replace(&mut vm.bx.bail_on_uncaught_error, false);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.with_reload(|vm| {
             if let Some((host_io_only, theme, script, loader, host_mods, custom)) = ui.filter(|_| !lazy) {
@@ -555,6 +582,7 @@ fn reload_isolate(vm: &mut ScriptVm) {
         })
     }));
     vm.cx_mut().script_data.std.set_host_io_only_for_host_code(restricted);
+    vm.bx.bail_on_uncaught_error = bail;
     if let Err(payload) = out {
         std::panic::resume_unwind(payload);
     }
@@ -568,6 +596,18 @@ struct IsolatedSplashVm {
     reloaded_at: u64,
     /// Its host follows live edits itself ([`isolate_reloads_with_host`]).
     host_reloads: bool,
+    /// FORK PORT: how long one entry into it may run before the VM stops it
+    /// with `script time budget exceeded` ([`CxSplashVmExt::set_splash_vm_time_budget`]).
+    /// None (upstream's default) leaves its entries unbounded by a clock.
+    time_budget: Option<std::time::Duration>,
+}
+
+/// FORK PORT: start isolate entry's wall-clock budget on the VM just installed
+/// on `cx`, returning the budget it replaced (the fork's `with_splash_budget`).
+fn begin_isolate_time_budget(cx: &mut Cx, budget: Option<std::time::Duration>) -> Option<Option<crate::makepad_script::ScriptRunBudget>> {
+    let budget = budget?;
+    let bx = cx.script_vm.as_mut()?;
+    Some(bx.run_budget.replace(crate::makepad_script::ScriptRunBudget::from_durations(budget, budget, 512)))
 }
 
 /// The host of isolate `vm_id` follows live edits itself: it registers the isolate's UI again
@@ -672,6 +712,7 @@ fn with_isolate_installed<R>(cx: &mut Cx, vm_id: SplashVmId, f: impl FnOnce(&mut
     let outer_std = std::mem::replace(&mut cx.script_data.std, isolated.std);
     let outer_vm = cx.script_vm.take();
     cx.script_vm = isolated.vm.take();
+    let replaced_budget = begin_isolate_time_budget(cx, isolated.time_budget);
 
     // Whether `f` returns or unwinds, the isolate goes back into the table
     // and the outer VM back onto `Cx`: a panic caught above this frame (a
@@ -686,6 +727,9 @@ fn with_isolate_installed<R>(cx: &mut Cx, vm_id: SplashVmId, f: impl FnOnce(&mut
     }));
 
     isolated.vm = cx.script_vm.take();
+    if let (Some(previous), Some(bx)) = (replaced_budget, isolated.vm.as_mut()) {
+        bx.run_budget = previous;
+    }
     cx.script_vm = outer_vm;
     isolated.std = std::mem::replace(&mut cx.script_data.std, outer_std);
 
@@ -707,16 +751,21 @@ pub(crate) fn isolate_loader(cx: &mut Cx, vm_id: SplashVmId) -> Option<ScriptObj
 }
 
 /// Runs `f`, the host's own work in an isolate, with the isolate's resource
-/// loader back on `mod.res`, and strips it again after, a panic included, so
-/// no body code runs while it is there.
+/// loader back on `mod.res`, and takes it off again after, a panic included, so
+/// no body code runs while it is there. What `mod.res` held before goes back:
+/// nil in a stripped isolate, and the module itself where host code registered
+/// the platform's script modules in the isolate again (a host that evaluates
+/// its own trusted theme in a disposable isolate, then `theme_mod`, whose lazy
+/// expansion comes through here).
 pub(crate) fn with_loader<R>(vm: &mut ScriptVm, loader: Option<&ScriptObjectRef>, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
     let Some(loader) = loader else {
         return f(vm);
     };
     let modules = vm.modules();
+    let before = vm.heap().value(modules, id!(res).into(), NoTrap);
     vm.set_value_def(modules, id!(res), loader.as_object());
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(vm)));
-    vm.set_value_def(modules, id!(res), NIL);
+    vm.set_value_def(modules, id!(res), if before.as_object().is_some() { before } else { NIL });
     match out {
         Ok(out) => out,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -786,6 +835,10 @@ pub trait CxSplashVmExt {
     /// it must be dropped by then (or about to be): a ref that outlives
     /// the heap is dropped, never redirected — see `script_ref_vm_id`.
     fn free_splash_vm(&mut self, vm_id: SplashVmId);
+    /// FORK PORT: cap how long each entry into isolate `vm_id` (its body's
+    /// evaluation, a handler, a render) may run before the VM stops it with
+    /// `script time budget exceeded`. None, upstream's default, sets no cap.
+    fn set_splash_vm_time_budget(&mut self, vm_id: SplashVmId, budget: Option<std::time::Duration>);
 }
 
 // The bodies of `CxSplashVmExt::with_script_vm_id*`, compiled once: the trait
@@ -838,6 +891,9 @@ fn alloc_splash_vm_impl(cx: &mut Cx, network_enabled: bool, host_io_only: bool, 
         // lazy: declared now, registered on the first read of any of them, once, in this heap.
         // The first isolate of the process registers them eagerly to learn their `mod` keys.
         let heap_key = vm.heap_key();
+        // A heap key is an allocation address: no pick of a dead isolate that
+        // owned this one may pass for this isolate's own (see the expansion).
+        crate::desktop_style::gc_heaps(vm.cx_mut(), &[heap_key]);
         let script = if pin.is_none() { splash_theme_script() } else { None };
         vm.cx_mut().global::<CxWidgetAsync>().isolate_ui.insert(heap_key, IsolateUi { sheet: inherited, host_io_only, theme: pin.unwrap_or_else(splash_theme), script: script.clone(), loader: None, host_mods: HOST_ISOLATE_MODS.with(|g| g.borrow().clone()), custom: None, apply_sheet_widgets: false });
         let shape: Vec<usize> = {
@@ -899,6 +955,8 @@ fn alloc_splash_vm_impl(cx: &mut Cx, network_enabled: bool, host_io_only: bool, 
         // clipboard, IPC, ...); requests queue for the embedding host to
         // answer, and no host = nothing resolves. See splash_host.rs.
         crate::splash_host::script_mod(&mut vm);
+        // From here on the isolate runs guest script: see `set_splash_bail_on_uncaught_error`.
+        vm.bx.bail_on_uncaught_error = SPLASH_BAIL_ON_UNCAUGHT_ERROR.with(|on| on.get());
         (vm.bx, loader)
     };
     let mut std = std::mem::replace(&mut cx.script_data.std, outer_std);
@@ -931,6 +989,7 @@ fn alloc_splash_vm_impl(cx: &mut Cx, network_enabled: bool, host_io_only: bool, 
             vm: Some(bx),
             reloaded_at,
             host_reloads: false,
+            time_budget: None,
         },
     );
     if crate::makepad_script::makepad_error_log::trace_enabled("script.heaps") {
@@ -1047,6 +1106,12 @@ impl CxSplashVmExt for Cx {
     fn free_splash_vm(&mut self, vm_id: SplashVmId) {
         mark_splash_isolate_dead(vm_id);
         gc_dead_splash_isolates(self);
+    }
+
+    fn set_splash_vm_time_budget(&mut self, vm_id: SplashVmId, budget: Option<std::time::Duration>) {
+        if let Some(isolated) = self.global::<CxWidgetAsync>().isolated_vms.vms.get_mut(&vm_id) {
+            isolated.time_budget = budget;
+        }
     }
 
     fn script_ref_vm_id(&mut self, script_ref: &ScriptObjectRef) -> Option<SplashVmId> {
@@ -2058,6 +2123,8 @@ pub struct IsolateEntry {
     host_reloads: bool,
     outer_std: Option<ScriptStd>,
     outer_vm: Option<Box<ScriptVmBase>>,
+    time_budget: Option<std::time::Duration>,
+    replaced_budget: Option<Option<crate::makepad_script::ScriptRunBudget>>,
 }
 
 /// The isolate installed on `Cx` right now — [`MAIN_SPLASH_VM_ID`] when
@@ -2120,7 +2187,7 @@ pub fn with_isolate<C: IsolateCx, R>(cx: &mut C, vm_id: SplashVmId, f: impl FnOn
 pub fn enter_isolate(cx: &mut Cx, vm_id: SplashVmId) -> IsolateEntry {
     let previous_vm_id = cx.global::<CxWidgetAsync>().current_vm_id;
     if vm_id == MAIN_SPLASH_VM_ID || previous_vm_id == vm_id {
-        return IsolateEntry { vm_id: MAIN_SPLASH_VM_ID, previous_vm_id, network_enabled: false, reloaded_at: 0, host_reloads: false, outer_std: None, outer_vm: None };
+        return IsolateEntry { vm_id: MAIN_SPLASH_VM_ID, previous_vm_id, network_enabled: false, reloaded_at: 0, host_reloads: false, outer_std: None, outer_vm: None, time_budget: None, replaced_budget: None };
     }
     // Out of the table while installed, exactly as `with_isolate_installed`
     // keeps it: a nested entry by id takes the "already current" path.
@@ -2134,12 +2201,13 @@ pub fn enter_isolate(cx: &mut Cx, vm_id: SplashVmId) -> IsolateEntry {
     let outer_std = std::mem::replace(&mut cx.script_data.std, isolated.std);
     let outer_vm = cx.script_vm.take();
     cx.script_vm = isolated.vm;
+    let replaced_budget = begin_isolate_time_budget(cx, isolated.time_budget);
     // The first entry after a live edit, as in `with_isolate_installed`.
     let reloaded_at = cx.reload_generation;
     if isolated.reloaded_at != reloaded_at && !isolated.host_reloads {
         contain_isolate_panic("live edit reload", || cx.with_vm(reload_isolate));
     }
-    IsolateEntry { vm_id, previous_vm_id, network_enabled: isolated.network_enabled, reloaded_at, host_reloads: isolated.host_reloads, outer_std: Some(outer_std), outer_vm }
+    IsolateEntry { vm_id, previous_vm_id, network_enabled: isolated.network_enabled, reloaded_at, host_reloads: isolated.host_reloads, outer_std: Some(outer_std), outer_vm, time_budget: isolated.time_budget, replaced_budget }
 }
 
 /// Put the outer VM back. See [`enter_isolate`].
@@ -2147,15 +2215,18 @@ pub fn leave_isolate(cx: &mut Cx, entry: IsolateEntry) {
     if entry.vm_id == MAIN_SPLASH_VM_ID {
         return;
     }
-    let IsolateEntry { vm_id, previous_vm_id, network_enabled, reloaded_at, host_reloads, outer_std, outer_vm } = entry;
-    let isolate_vm = cx.script_vm.take();
+    let IsolateEntry { vm_id, previous_vm_id, network_enabled, reloaded_at, host_reloads, outer_std, outer_vm, time_budget, replaced_budget } = entry;
+    let mut isolate_vm = cx.script_vm.take();
+    if let (Some(previous), Some(bx)) = (replaced_budget, isolate_vm.as_mut()) {
+        bx.run_budget = previous;
+    }
     cx.script_vm = outer_vm;
     let isolate_std = std::mem::replace(&mut cx.script_data.std, outer_std.expect("an entered isolate has an outer std"));
     cx.global::<CxWidgetAsync>().current_vm_id = previous_vm_id;
     cx.global::<CxWidgetAsync>()
         .isolated_vms
         .vms
-        .insert(vm_id, IsolatedSplashVm { network_enabled, std: isolate_std, vm: isolate_vm, reloaded_at, host_reloads });
+        .insert(vm_id, IsolatedSplashVm { network_enabled, std: isolate_std, vm: isolate_vm, reloaded_at, host_reloads, time_budget });
 }
 
 #[cfg(test)]
@@ -2944,5 +3015,150 @@ mod lazy_isolate_type_tests {
         }
         cx.free_splash_vm(first);
         cx.free_splash_vm(second);
+    }
+}
+
+/// FORK PORT: per-isolate time budgets (`set_splash_vm_time_budget`).
+#[cfg(test)]
+mod time_budget_tests {
+    use super::*;
+
+    /// Upstream's default stays: no clock on an isolate nobody budgeted. A
+    /// host's budget stops a runaway entry at that budget and not sooner,
+    /// survives a host's own enter/leave, and never lands on the app VM.
+    #[test]
+    fn an_isolate_entry_runs_until_its_own_time_budget() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let vm_id = cx.alloc_splash_vm();
+        let budgeted = |cx: &mut Cx| cx.with_script_vm_id(vm_id, |vm| vm.run_budget().is_some());
+        assert!(!budgeted(&mut cx), "no implicit budget");
+
+        let budget = std::time::Duration::from_millis(60);
+        cx.set_splash_vm_time_budget(vm_id, Some(budget));
+        let run_away = |cx: &mut Cx| {
+            let start = std::time::Instant::now();
+            let out = cx.with_script_vm_id(vm_id, |vm| vm.eval(crate::makepad_script::script! { loop {} }));
+            assert!(out.is_err(), "a runaway entry is stopped");
+            start.elapsed()
+        };
+        let stopped_after = run_away(&mut cx);
+        assert!(stopped_after >= budget, "{stopped_after:?}");
+        assert!(stopped_after < std::time::Duration::from_secs(5), "{stopped_after:?}");
+        assert!(cx.with_vm(|vm| vm.run_budget().is_none()), "the app VM is not budgeted");
+
+        let entry = enter_isolate(&mut cx, vm_id);
+        assert!(cx.with_vm(|vm| vm.run_budget().is_some()), "an entered isolate runs under its budget");
+        leave_isolate(&mut cx, entry);
+        assert!(run_away(&mut cx) >= budget, "enter/leave keep the budget");
+
+        cx.set_splash_vm_time_budget(vm_id, None);
+        assert!(!budgeted(&mut cx), "None restores the unbudgeted default");
+        cx.free_splash_vm(vm_id);
+    }
+}
+
+#[cfg(test)]
+mod host_registration_tests {
+    use super::*;
+
+    /// A host may register the platform's script modules and the library again in a disposable
+    /// isolate, to evaluate a trusted theme of its own (Rinx resolves theme packages this way).
+    /// In an isolate whose UI is still lazy, the library's first step expands that UI through
+    /// `with_loader`; the resource module the host registered must still be there after it, or
+    /// the theme's fonts no longer resolve (`crate_resource` not in scope) and it stays unbuilt.
+    /// The sheet the host installed on the isolate must also still be worn, not the one the
+    /// expansion would install from the allocation's record.
+    #[test]
+    fn a_hosts_own_registration_survives_the_lazy_ui_expansion() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let has_loader = |vm: &mut ScriptVm| {
+            let modules = vm.modules();
+            let res = vm.heap().value(modules, id!(res).into(), NoTrap);
+            res.as_object().is_some_and(|res| !vm.heap().value(res, id!(crate_resource).into(), NoTrap).is_nil())
+        };
+        let mut lazy_seen = false;
+        // The first isolate of a shape registers its UI eagerly; later ones are lazy.
+        for _ in 0..4 {
+            let isolate = cx.alloc_splash_vm();
+            cx.with_script_vm_id(isolate, |vm| {
+                assert!(!has_loader(vm), "an isolate is allocated without the resource loader");
+                lazy_seen |= vm.has_lazy_modules();
+                crate::makepad_draw::makepad_platform::script::script_mod(vm);
+                let mut sheet = crate::desktop_style::StyleSheet::named("macos").unwrap();
+                sheet.theme.push_str("\nmod.theme.color_bg_app = #x123456\ntrue\n");
+                crate::desktop_style::install(vm, sheet);
+                vm.bx.captured_errors = Some(Vec::new());
+                crate::script_mod(vm);
+                let errors = vm.take_errors();
+                assert!(errors.is_empty(), "{:?}", errors.iter().take(3).collect::<Vec<_>>());
+                assert!(has_loader(vm), "the host's resource module is still registered");
+                let theme = vm.module(id!(theme));
+                let page = vm.heap().value(theme, id!(color_bg_app).into(), NoTrap);
+                assert_eq!(page.as_color(), Some(0x123456ff), "the isolate wears the host's sheet");
+            });
+            cx.free_splash_vm(isolate);
+        }
+        assert!(lazy_seen, "the test never reached a lazy isolate");
+        // An isolate the host leaves alone stays stripped after its UI expands.
+        let isolate = cx.alloc_splash_vm();
+        cx.with_script_vm_id(isolate, |vm| {
+            vm.expand_all_lazy();
+            assert!(!has_loader(vm), "a guest never sees the resource loader");
+        });
+        cx.free_splash_vm(isolate);
+    }
+
+    /// A host whose Splashes run script it did not write asks for a guest evaluation to end at
+    /// its first uncaught error (`set_splash_bail_on_uncaught_error`): the statement after the
+    /// failed one has not run. Without the setting the error is reported and the evaluation
+    /// runs on. The error here is a property the widget's type does not define.
+    #[test]
+    fn a_guest_evaluation_ends_at_an_uncaught_error_when_the_host_asks() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        // -> (the isolate's UI was still lazy, the statement after the error ran, the errors)
+        let run = |cx: &mut Cx, expect_bail: bool| -> (bool, bool, Vec<String>) {
+            let isolate = cx.alloc_splash_vm();
+            let out = cx.with_script_vm_id(isolate, |vm| {
+                assert_eq!(vm.bx.bail_on_uncaught_error, expect_bail);
+                let lazy = vm.has_lazy_modules();
+                vm.bx.captured_errors = Some(Vec::new());
+                vm.eval(crate::makepad_script::script! {
+                    use mod.prelude.widgets.*
+                    mod.guest_ran_on = false
+                    let field = TextInput{no_such_property: 1}
+                    mod.guest_ran_on = true
+                });
+                let errors = vm.take_errors();
+                let modules = vm.modules();
+                let ran_on = vm.heap().value(modules, id!(guest_ran_on).into(), NoTrap).as_bool() == Some(true);
+                // The UI registration the guest's first `use` expanded ran as host code and
+                // handed the isolate's setting back.
+                assert_eq!(vm.bx.bail_on_uncaught_error, expect_bail);
+                (lazy, ran_on, errors)
+            });
+            cx.free_splash_vm(isolate);
+            out
+        };
+        let undefined = |errors: &[String]| errors.iter().any(|e| e.contains("no_such_property"));
+        // The first isolate of a shape registers its UI eagerly; later ones are lazy.
+        for _ in 0..2 {
+            let (_, ran_on, errors) = run(&mut cx, false);
+            assert!(undefined(&errors), "{errors:?}");
+            assert!(ran_on, "by default an uncaught error is reported and the evaluation runs on");
+        }
+        set_splash_bail_on_uncaught_error(true);
+        let mut lazy_seen = false;
+        for _ in 0..2 {
+            let (lazy, ran_on, errors) = run(&mut cx, true);
+            lazy_seen |= lazy;
+            assert!(undefined(&errors), "{errors:?}");
+            assert!(!ran_on, "the evaluation ended at the error");
+        }
+        assert!(lazy_seen, "the test never reached a lazy isolate");
+        set_splash_bail_on_uncaught_error(false);
+        assert!(run(&mut cx, false).1, "the setting is the host's to take back");
     }
 }

@@ -84,7 +84,11 @@ fn host() -> &'static Host {
 /// The runner's host, once, before `main`/`init_embedded`/`run_checkout`.
 pub fn set_host(host: &'static Host) {
     if HOST.set(host).is_ok() {
-        relax_compiler::pmhost::set_policy(host.proc_macros);
+        // MAKEPAD_RUN_TRUST_PROC_MACROS=1: run third-party proc macros unsandboxed, as cargo and
+        // bare `relax` do. For an app whose dependencies already run that way in its cargo build
+        // (zerocopy-derive's `unsafe`): the sandbox otherwise refuses them before anything compiles.
+        let trust = std::env::var("MAKEPAD_RUN_TRUST_PROC_MACROS").is_ok_and(|v| !v.is_empty() && v != "0");
+        relax_compiler::pmhost::set_policy(if trust { relax_compiler::pmhost::Policy::Open } else { host.proc_macros });
         relax_compiler::reload::set_loader_package(host.package, host.manifest);
         // the entry point's ahead level, unless the environment names one; MAKEPAD_RUN_AHEAD
         // carries it to the session (options.rs) and to every process this one starts

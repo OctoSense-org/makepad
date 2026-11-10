@@ -42,6 +42,8 @@ pub mod audio;
 pub mod midi;
 pub mod midi_inject;
 pub mod script;
+/// Last-known device GPS fix (fork port; read by Splash `sys.gps`).
+pub mod gps;
 pub mod thread;
 pub mod storage;
 pub mod video;

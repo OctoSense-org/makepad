@@ -9,6 +9,8 @@ homepage = "https://github.com/makepad/makepad/"
 repository = "https://github.com/makepad/makepad/"
 
 [dependencies]
+# FORK PORT: the Splash `sys.*` helpers read JSON feeds through serde_json.
+serde_json = "1.0"
 makepad-draw = { path = "../../draw", version = "2.0.0" }
 
 makepad-derive-widget = {path = "../derive_widget", version="2.0.0"}

@@ -89,7 +89,10 @@ impl Cx {
         makepad_script_std::set_script_task_trace(self.script_std_mut(), enabled);
     }
 
-    pub(crate) fn handle_script_tasks(&mut self) {
+    /// Run the script tasks the installed VM has queued (render work a
+    /// widget callback scheduled, finished host requests). Public so a host's
+    /// tests can drain it as the event loop does (fork parity).
+    pub fn handle_script_tasks(&mut self) {
         makepad_script_std::handle_script_tasks(&mut self.host_context());
     }
 
@@ -182,6 +185,59 @@ impl Cx {
                     }
                     _ => {}
                 }
+            } else if self.script_data.resources.is_data_fetch(request_id) {
+                // Script data-binding fetch (sys.weather etc): store the loaded
+                // JSON/text bytes (or mark errored) and redraw so the helper
+                // re-runs and returns the live value.
+                match response {
+                    NetworkResponse::HttpResponse { response: res, .. } => {
+                        // Classify by STATUS first (independent of whether a body
+                        // is present — a bodyless 404 must not be retried as if
+                        // transient). A 2xx is only a real success if it carries
+                        // a NON-EMPTY body; an empty/absent 2xx body would
+                        // otherwise be cached as Loaded forever and poison the
+                        // binding (permanent "—", no retry).
+                        let status = res.status_code;
+                        let body = res.get_body().filter(|b| !b.is_empty());
+                        if (200..300).contains(&status) {
+                            if let Some(body) = body {
+                                crate::log!(
+                                    "Script data fetch: loaded {} bytes (status {status})",
+                                    body.len()
+                                );
+                                self.script_data
+                                    .resources
+                                    .handle_data_fetch_response(request_id, body.to_vec());
+                            } else {
+                                let url = self.script_data.resources.data_fetch_url(request_id).unwrap_or_default();
+                                crate::log!("Script data fetch: {status} with empty body; retrying url={url}");
+                                self.retry_data_fetch_or_fail(request_id);
+                            }
+                        } else {
+                            let url = self.script_data.resources.data_fetch_url(request_id).unwrap_or_default();
+                            crate::log!("Script data fetch failed: status={status} url={url}");
+                            // Transient statuses are worth retrying; a permanent
+                            // 4xx (404/403) fails identically every time -> make
+                            // it terminal at once.
+                            let transient = matches!(status, 408 | 429) || status >= 500;
+                            if transient {
+                                self.retry_data_fetch_or_fail(request_id);
+                            } else {
+                                self.script_data
+                                    .resources
+                                    .fail_data_fetch_terminally(request_id);
+                                crate::script::res::bump_data_fetch_epoch();
+                            }
+                        }
+                        self.redraw_all();
+                    }
+                    NetworkResponse::HttpError { error: err, .. } => {
+                        crate::log!("Script data fetch request error: {}", err.message);
+                        self.retry_data_fetch_or_fail(request_id);
+                        self.redraw_all();
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -190,6 +246,22 @@ impl Cx {
                 &mut self.host_context(),
                 response,
             );
+        }
+    }
+
+    /// A data fetch failed (transport error / transient status): mark the
+    /// attempt failed so the next evaluation re-issues the request while retry
+    /// budget remains (lazy retry — see script_data_fetch), so attempts are
+    /// paced by the failing round-trips instead of bursting into a
+    /// rate-limited API. Once the budget is spent the fetch is terminal and the
+    /// epoch bumps so bound cards re-evaluate onto their "n/a" placeholder.
+    fn retry_data_fetch_or_fail(&mut self, request_id: LiveId) {
+        if self
+            .script_data
+            .resources
+            .handle_data_fetch_error(request_id)
+        {
+            crate::script::res::bump_data_fetch_epoch();
         }
     }
 

@@ -177,6 +177,10 @@ pub struct CrateMods {
     pub mods: crate::fxhash::HashSet<String>,
     /// the `mod` item of each module (not the root)
     pub items: HashMap<String, ModItem>,
+    /// the modules whose file opens with `#![macro_use]`: rustc appends a module file's inner
+    /// attributes to its `mod` item's, so this is `#[macro_use]` on that item (kept apart from
+    /// `items`, which the parent's file gives: an edit of either file replaces only its own)
+    pub inner_macro_use: crate::fxhash::HashSet<String>,
     /// `use` / `extern crate` bindings per module
     pub uses: HashMap<String, Vec<UseItem>>,
     /// extern prelude: names the crate refers to other crates by -> their crate names
@@ -198,6 +202,8 @@ pub struct FileImports {
     pub macro_use: Vec<String>,
     pub mods: Vec<String>,
     pub mod_items: Vec<(String, ModItem)>,
+    /// the file's module when the file opens with `#![macro_use]` (CrateMods::inner_macro_use)
+    pub inner_macro_use: Option<String>,
 }
 
 impl FileImports {
@@ -205,6 +211,7 @@ impl FileImports {
     pub fn same_as(&self, other: &FileImports) -> bool {
         let items = |f: &'_ FileImports| f.mod_items.iter().map(|(m, i)| (m.clone(), i.macro_use, i.is_pub)).collect::<Vec<_>>();
         self.uses == other.uses && self.aliases == other.aliases && self.macro_use == other.macro_use && self.mods == other.mods && items(self) == items(other)
+            && self.inner_macro_use == other.inner_macro_use
     }
 }
 
@@ -244,8 +251,8 @@ impl CrateMods {
 
     /// A copy whose scopes are computed afresh on next use.
     fn unresolved(&self) -> CrateMods {
-        CrateMods { root: self.root.clone(), src: self.src.clone(), mods: self.mods.clone(), items: self.items.clone(), uses: self.uses.clone(),
-            externs: self.externs.clone(), renames: self.renames.clone(), recursion_limit: self.recursion_limit, scope: Default::default() }
+        CrateMods { root: self.root.clone(), src: self.src.clone(), mods: self.mods.clone(), items: self.items.clone(), inner_macro_use: self.inner_macro_use.clone(),
+            uses: self.uses.clone(), externs: self.externs.clone(), renames: self.renames.clone(), recursion_limit: self.recursion_limit, scope: Default::default() }
     }
 
     fn replace_imports(&mut self, e: &ImportEdit) {
@@ -268,12 +275,15 @@ impl CrateMods {
             if !e.now.mod_items.iter().any(|(n, _)| n == m) { self.items.remove(m); }
         }
         self.items.extend(e.now.mod_items.iter().cloned());
+        if let Some(m) = &e.was.inner_macro_use { self.inner_macro_use.remove(m); }
+        if let Some(m) = &e.now.inner_macro_use { self.inner_macro_use.insert(m.clone()); }
     }
 
     /// Is the `macro_rules!` `d` of this crate in rustc's legacy (textual) scope in module `from`
     /// at source position `at` (None: at any position of it)? A definition is in scope after it
     /// in its module and in the modules declared after it inside that module; it leaves its module
-    /// only through `#[macro_use]` on the `mod` item, and then is in scope after that item in the
+    /// only through `#[macro_use]` on the `mod` item (or `#![macro_use]` inside the module, which
+    /// rustc appends to the item's attributes), and then is in scope after that item in the
     /// parent (rustc_resolve build_reduced_graph.rs: `MacroRulesScope::Binding` chained through
     /// `define_macro`, `#[macro_use]` modules `restore_macro_rules_scope` to the parent; ident.rs
     /// `visit_scopes`). What the scan has no `mod` item for (a module an expansion made) is not
@@ -294,7 +304,7 @@ impl CrateMods {
             // `from` is outside `m`: only a `#[macro_use]` module hands its macros to its parent
             let Some(it) = self.items.get(m) else { return true };
             let Some((parent, _)) = m.rsplit_once("::") else { return false };
-            if !it.macro_use { return false; }
+            if !it.macro_use && !self.inner_macro_use.contains(m) { return false; }
             e = it.end;
             m = parent;
         }
@@ -866,7 +876,7 @@ impl MacroTable {
         if !added {
             return;
         }
-        let cm = CrateMods { root: old.root.clone(), src: old.src.clone(), mods, items: old.items.clone(), uses, externs, renames, recursion_limit: old.recursion_limit, scope: Default::default() };
+        let cm = CrateMods { root: old.root.clone(), src: old.src.clone(), mods, items: old.items.clone(), inner_macro_use: old.inner_macro_use.clone(), uses, externs, renames, recursion_limit: old.recursion_limit, scope: Default::default() };
         self.add_crate(k.to_string(), std::sync::Arc::new(cm));
         // a crate not loaded yet whose scope a parse ahead of its load computed (preloaded files'
         // lookups) copied this crate's names as they were: computed afresh on next use
@@ -1292,17 +1302,25 @@ impl CrateScope {
                                 continue;
                             }
                             // where the path's prefix leads: another crate's module is final
-                            let prefix_crate = match u.path.split_last() {
+                            let prefix_mod = match u.path.split_last() {
                                 Some((_, prefix)) if !prefix.is_empty() && !(prefix.len() == 1 && prefix[0].is_empty()) => {
-                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|x| x.0)
+                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n))
                                 }
                                 _ => None,
                             };
-                            if prefix_crate.map_or(false, |c| c != k) {
+                            if prefix_mod.map_or(false, |(c, _)| c != k) {
                                 settled.insert((m.clone(), ui));
                             }
+                            // rustc binds an import in each namespace where the name is found and
+                            // visible. Another crate's private `mod name` beside its exported
+                            // `macro_rules! name` (zerovec's `mod zerovec;` and `zerovec!`,
+                            // imported as `use zerovec::zerovec;`) binds the macro only: the
+                            // importer's `name::..` paths still mean the crate.
+                            let hidden = prefix_mod.is_some_and(|(pk, pm)| {
+                                pk != k && r.scope(pk).is_some_and(|s| s.tpriv.get(pm).is_some_and(|p| p.contains(last)))
+                            });
                             // a module / crate under that name
-                            if may_type && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
+                            if may_type && !hidden && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
                                 let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
                                 if let Some(t) = t {
                                     sc.tnon.entry(m.clone()).or_default().insert(b.clone(), t);
@@ -3615,6 +3633,12 @@ mod replay_tests {
         assert!(cm.in_textual_scope(&d1, "c", Some(61)) && cm.in_textual_scope(&d1, "c::m::sib", None));
         let s1 = def("c::m::sib", 32);
         assert!(!cm.in_textual_scope(&s1, "c::m", None) && !cm.in_textual_scope(&s1, "c", None));
+        // `mod x;` whose file opens with `#![macro_use]`: the same as `#[macro_use]` on the item
+        let x1 = def("c::x", 5);
+        assert!(!cm.in_textual_scope(&x1, "c", Some(72)));
+        cm.inner_macro_use.insert("c::x".into());
+        assert!(cm.in_textual_scope(&x1, "c", Some(72)) && !cm.in_textual_scope(&x1, "c", Some(69)));
+        assert!(!cm.in_textual_scope(&x1, "c::b", None));
     }
 }
 

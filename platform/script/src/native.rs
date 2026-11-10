@@ -240,7 +240,7 @@ impl ScriptNative {
 
     /// Non-generic helper that does the actual work - reduces monomorphization
     #[inline(never)]
-    fn add_fn_boxed(
+    pub(crate) fn add_fn_boxed(
         &mut self,
         heap: &mut ScriptHeap,
         args: &[(LiveId, ScriptValue)],

@@ -645,7 +645,7 @@ impl Resolver {
     fn inherits_from(&mut self, dir: &str, source: &Source) -> Result<std::rc::Rc<Workspace>, String> {
         if let Source::Git(_) = source {
             let ceiling = self.git.borrow().mounts.iter().find(|m| dir == m.1 || dir.starts_with(&format!("{}/", m.1))).map(|m| m.1.clone());
-            let root = find_root_in(dir, ceiling.as_deref())?;
+            let root = find_inherit_root(dir, ceiling.as_deref())?;
             if let Some(w) = self.owners.get(&root) {
                 return Ok(w.clone());
             }
@@ -653,12 +653,13 @@ impl Resolver {
             self.owners.insert(root, w.clone());
             return Ok(w);
         }
-        if *source == Source::Registry || (dir == self.ws.root || dir.starts_with(&format!("{}/", self.ws.root))) && !self.ws.excluded(dir) {
+        if *source == Source::Registry {
             return Ok(self.ws.clone());
         }
-        // a workspace already found that holds `dir` (cargo's ws_roots shortcut)
-        if let Some(w) = self.owners.values().find(|w| dir.starts_with(&format!("{}/", w.root)) && !w.excluded(dir)) { return Ok(w.clone()); }
-        let root = find_root(dir)?;
+        // cargo walks up from the package itself: a nearer `[workspace]` wins over the graph's
+        // own, even inside the graph's folder (a checkout of another repository placed or
+        // symlinked under it, as `.sources/makepad`)
+        let root = find_inherit_root(dir, None)?;
         if root == self.ws.root { return Ok(self.ws.clone()); }
         if let Some(w) = self.owners.get(&root) { return Ok(w.clone()); }
         let w = std::rc::Rc::new(Workspace::load(&root)?);
@@ -1322,7 +1323,7 @@ pub fn target_dir(dir: &str) -> Result<String, String> {
 }
 
 pub fn find_root(dir: &str) -> Result<String, String> {
-    find_root_in(dir, None)
+    find_root_in(dir, None, true)
 }
 
 /// The cargo config files for a start folder, in cargo's order (GlobalContext::walk_tree): the
@@ -1441,8 +1442,18 @@ impl FileRoot {
     }
 }
 
-/// `find_root` looking no higher than `ceiling` (a mounted repository's root).
-fn find_root_in(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
+/// The workspace a dependency at `dir` inherits `workspace = true` fields from, as cargo's
+/// find_workspace_root has it: the nearest `[workspace]` at or above its manifest that does not
+/// exclude it, listed in `members` or not (makepad's libs/micro_proc_macro is no member of the
+/// makepad workspace, yet takes `relax-lex` from its `[workspace.dependencies]`). `find_root`
+/// keeps a start folder outside every workspace's members standalone instead.
+fn find_inherit_root(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
+    find_root_in(dir, ceiling, false)
+}
+
+/// `find_root` looking no higher than `ceiling` (a mounted repository's root); `members_only`:
+/// a workspace that does not list the package is passed over (see `find_inherit_root`).
+fn find_root_in(dir: &str, ceiling: Option<&str>, members_only: bool) -> Result<String, String> {
     let up = |d: &str| if ceiling == Some(d) { None } else { parent(d) };
     let start = normalize(dir);
     let mut cur = Some(start.clone());
@@ -1465,7 +1476,7 @@ fn find_root_in(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
                         return Ok(d);
                     }
                     if let Ok(ws) = Workspace::load(&d) {
-                        if !ws.excluded(&current) && ws.has_member(&current) {
+                        if !ws.excluded(&current) && (!members_only || ws.has_member(&current)) {
                             return Ok(d);
                         }
                     }
@@ -2021,7 +2032,7 @@ pub fn package_meta_env(dir: &str) -> Vec<(String, String)> {
         if let Some(Toml::Table(x)) = &v {
             if b(x, "workspace") == Some(true) {
                 let w = ws.get_or_insert_with(|| {
-                    find_root(dir).ok().and_then(|r| read_toml(&format!("{}/Cargo.toml", r)).ok()).and_then(|t| table(&t, "workspace").and_then(|w| table(w, "package")).cloned()).unwrap_or_default()
+                    find_inherit_root(dir, None).ok().and_then(|r| read_toml(&format!("{}/Cargo.toml", r)).ok()).and_then(|t| table(&t, "workspace").and_then(|w| table(w, "package")).cloned()).unwrap_or_default()
                 });
                 v = w.get(key).cloned();
             }
@@ -2832,6 +2843,9 @@ required-features = ["b", "manual"]
         assert!(b.iter().any(|n| n == "bench") && b.iter().any(|n| n == "lib"));
         // a package without a workspace table that no workspace above holds
         assert_eq!(find_root(&format!("{root}/solo")).unwrap(), normalize(&format!("{root}/solo")));
+        // ...is still that workspace's for what it inherits, as cargo has it; an excluded one is not
+        assert_eq!(find_inherit_root(&format!("{root}/solo"), None).unwrap(), normalize(&root));
+        assert_eq!(find_inherit_root(&format!("{root}/bench"), None).unwrap(), normalize(&format!("{root}/bench")));
         assert!(units(sess, &format!("{root}/solo"), "solo").iter().any(|n| n == "solo"));
         let _ = std::fs::remove_dir_all(&root);
     }
