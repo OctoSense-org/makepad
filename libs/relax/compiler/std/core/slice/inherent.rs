@@ -163,6 +163,12 @@ impl<T> [T] {
         let end = unsafe { im::ptr_add(start, self.len()) };
         start..end
     }
+    // core/src/slice/mod.rs (stable 1.48; zerovec's VarZeroVecOwned)
+    pub const fn as_mut_ptr_range(&mut self) -> crate::ops::Range<*mut T> {
+        let start = self.as_mut_ptr();
+        let end = unsafe { im::ptr_add_mut(start, self.len()) };
+        start..end
+    }
     #[track_caller]
     pub fn swap(&mut self, a: usize, b: usize) {
         super::swap(self, a, b)
