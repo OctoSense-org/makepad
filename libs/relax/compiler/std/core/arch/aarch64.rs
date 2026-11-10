@@ -4279,6 +4279,20 @@ pub unsafe fn vaesimcq_u8(data: uint8x16_t) -> uint8x16_t {
     vaesmcq_u8(uint8x16_t(a))
 }
 
+// ---- PMULL (FEAT_PMULL, under `aes` in rustc's feature names): polyval's and ghash's
+// carry-less multiply.
+
+/// stdarch's polynomial element types (`vmull_p64`'s operands; p128 is its result)
+pub type p8 = u8;
+pub type p16 = u16;
+pub type p64 = u64;
+
+/// PMULL .1q: the 128-bit carry-less product of two 64-bit polynomials
+pub unsafe fn vmull_p64(a: p64, b: p64) -> p128 {
+    let r: uint64x2_t = vx::vx_binary(uint64x2_t([a, 0]), uint64x2_t([b, 0]), 90, 64);
+    (r.0[0] as u128) | (r.0[1] as u128) << 64
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 

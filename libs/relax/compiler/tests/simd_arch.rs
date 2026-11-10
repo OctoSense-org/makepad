@@ -251,6 +251,18 @@ fn chain_teddy(a: [u8; 32], b: [u8; 32]) -> [u8; 72] {
     }
 }
 
+/// polyval's multiply and the first step of its reduction: pmull, pmull2 and the fold by the
+/// field polynomial
+#[cfg(target_arch = "aarch64")]
+unsafe fn pmull_fold(x: uint8x16_t, y: uint8x16_t) -> [uint8x16_t; 2] {
+    let (x64, y64) = (vreinterpretq_u64_u8(x), vreinterpretq_u64_u8(y));
+    let lo: uint8x16_t = core::mem::transmute(vmull_p64(vgetq_lane_u64(x64, 0), vgetq_lane_u64(y64, 0)));
+    let hi: uint8x16_t = core::mem::transmute(vmull_p64(vgetq_lane_u64(x64, 1), vgetq_lane_u64(y64, 1)));
+    let poly = vreinterpretq_u8_p128(1 << 127 | 1 << 126 | 1 << 121 | 1 << 63 | 1 << 62 | 1 << 57);
+    let fold = vmull_p64(vgetq_lane_u64(vreinterpretq_u64_u8(lo), 1), vgetq_lane_u64(vreinterpretq_u64_u8(poly), 0));
+    [veorq_u8(lo, vextq_u8(hi, hi, 8)), vreinterpretq_u8_p128(fold)]
+}
+
 #[cfg(target_arch = "aarch64")]
 fn arch() {
     tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
@@ -377,6 +389,9 @@ fn arch() {
     bin("chain_aes", |a: uint8x16_t, k: uint8x16_t| unsafe { [vaesmcq_u8(vaeseq_u8(a, k)), vaesimcq_u8(vaesdq_u8(a, k))] }, |a: uint8x16_t, k: uint8x16_t| unsafe {
         [vaesmcq_u8(vaeseq_u8(a, k)), vaesimcq_u8(vaesdq_u8(a, k))]
     });
+    // polyval's and ghash's carry-less multiply (the result is a p128 = u128)
+    b!(vmull_p64, u64, u64);
+    bin("chain_pmull", |a: uint8x16_t, b: uint8x16_t| unsafe { pmull_fold(a, b) }, |a: uint8x16_t, b: uint8x16_t| unsafe { pmull_fold(a, b) });
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
