@@ -281,3 +281,9 @@ impl From<CString> for Box<CStr> {
         s.into_boxed_c_str()
     }
 }
+
+impl Clone for Box<CStr> {
+    fn clone(&self) -> Box<CStr> {
+        CString::from(&**self).into_boxed_c_str()
+    }
+}

@@ -1354,6 +1354,12 @@ impl From<PathBuf> for Box<Path> {
     }
 }
 
+impl Clone for Box<Path> {
+    fn clone(&self) -> Box<Path> {
+        self.to_path_buf().into_boxed_path()
+    }
+}
+
 impl From<&Path> for alloc::sync::Arc<Path> {
     fn from(p: &Path) -> alloc::sync::Arc<Path> {
         let s: alloc::sync::Arc<OsStr> = alloc::sync::Arc::from(p.as_os_str());
