@@ -131,6 +131,17 @@ unsafe fn crc32<const BYTES: u32>(crc: u32, data: u64) -> u32 {
     }
 }
 
+/// UADDLV: the 16 lanes summed into a u16 (at most 16 * 255: it never wraps).
+pub unsafe fn vaddlvq_u8(a: uint8x16_t) -> u16 {
+    let mut r = 0u16;
+    let mut i = 0;
+    while i < 16 {
+        r += a.0[i] as u16;
+        i += 1;
+    }
+    r
+}
+
 #[inline(always)]
 pub unsafe fn vaddq_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
     vx::vx_binary(a, b, 0, 16)
@@ -412,6 +423,12 @@ pub unsafe fn vld1q_u32(a: *const u32) -> uint32x4_t {
 #[inline(always)]
 pub unsafe fn vld1q_u8(a: *const u8) -> uint8x16_t {
     vx::vx_load(a as *const u8)
+}
+
+/// LD1 of four registers: 64 consecutive bytes, the first 16 in `.0`.
+#[inline(always)]
+pub unsafe fn vld1q_u8_x4(a: *const u8) -> uint8x16x4_t {
+    uint8x16x4_t(vld1q_u8(a), vld1q_u8(a.add(16)), vld1q_u8(a.add(32)), vld1q_u8(a.add(48)))
 }
 
 #[inline(always)]
