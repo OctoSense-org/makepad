@@ -1205,3 +1205,49 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Range<'_, K, V> {
         l.finish()
     }
 }
+
+// The iterators that yield `&mut V` or owned items print the entries they have not yielded yet,
+// read through a borrowing iterator over the same span (serde_json's `Map` iterators are
+// `#[derive(Debug)]` wrappers around these).
+impl<'a, K, V> IterMut<'a, K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        Iter { map: unsafe { &*self.map }, front: self.front, back: self.back, remaining: self.remaining }
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.iter(), f)
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.map.iter(), f)
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for RangeMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let range = Range { map: unsafe { &*self.map }, front: self.front, back: self.back, done: self.done };
+        fmt::Debug::fmt(&range, f)
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(Values { inner: self.inner.iter() }).finish()
+    }
+}
+
+impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(Keys { inner: self.inner.map.iter() }).finish()
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(Values { inner: self.inner.map.iter() }).finish()
+    }
+}
