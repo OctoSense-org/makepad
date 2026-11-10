@@ -263,6 +263,79 @@ unsafe fn pmull_fold(x: uint8x16_t, y: uint8x16_t) -> [uint8x16_t; 2] {
     [veorq_u8(lo, vextq_u8(hi, hi, 8)), vreinterpretq_u8_p128(fold)]
 }
 
+/// f32 lanes for the reciprocal estimates: subnormals and the smallest normals
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_tiny(a: uint32x4_t) -> float32x4_t {
+    vreinterpretq_f32_u32(vandq_u32(a, vdupq_n_u32(0x80ff_ffff)))
+}
+
+/// 2^125 and above, infinities and NaNs included
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_huge(a: uint32x4_t) -> float32x4_t {
+    vreinterpretq_f32_u32(vorrq_u32(a, vdupq_n_u32(0x7e00_0000)))
+}
+
+/// 2^-8 to 2^8 with a random mantissa and sign
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_moderate(a: uint32x4_t) -> float32x4_t {
+    vreinterpretq_f32_u32(vorrq_u32(vandq_u32(a, vdupq_n_u32(0x87ff_ffff)), vdupq_n_u32(0x3b80_0000)))
+}
+
+/// each lane one of sixteen special values, picked by its low four bits
+#[cfg(target_arch = "aarch64")]
+unsafe fn f32_special(a: uint32x4_t) -> float32x4_t {
+    const S: [u32; 16] = [
+        0x0000_0000, 0x8000_0000, 0x7f80_0000, 0xff80_0000, 0x3f80_0000, 0xbf80_0000, 0x4000_0000, 0x3fc0_0000,
+        0x4040_0000, 0x0000_0001, 0x8020_0000, 0x7f7f_ffff, 0x7fc0_1234, 0xffc0_0001, 0x7f80_0055, 0xffa0_0000,
+    ];
+    let mut l = [0u32; 4];
+    vst1q_u32(l.as_mut_ptr(), a);
+    for x in l.iter_mut() {
+        *x = S[(*x & 15) as usize];
+    }
+    vreinterpretq_f32_u32(vld1q_u32(l.as_ptr()))
+}
+
+/// FRSQRTE over all 512 operand classes (9 mantissa bits) of an even and an odd exponent, and of
+/// the subnormals: every entry of Arm's estimate table
+#[cfg(target_arch = "aarch64")]
+unsafe fn rsqrte_sweep(seed: u32) -> [u32; 4] {
+    let mut h = [seed; 4];
+    for m in 0..512u32 {
+        let frac = m << 14 | (seed & 0x3fff);
+        let lanes = [0x3f00_0000 | frac, 0x3f80_0000 | frac, frac >> (seed % 20), 0x0080_0000 | frac];
+        let mut out = [0u32; 4];
+        vst1q_u32(out.as_mut_ptr(), vreinterpretq_u32_f32(vrsqrteq_f32(vreinterpretq_f32_u32(vld1q_u32(lanes.as_ptr())))));
+        for k in 0..4 {
+            h[k] = (h[k] ^ out[k]).wrapping_mul(0x0100_0193);
+        }
+    }
+    h
+}
+
+/// tiny-skia's f32x4 recip_fast and recip_sqrt: one Newton step on each estimate. A NaN lane of
+/// x reads as zero: its step and its estimate are NaNs of opposite sign, and which of the two the
+/// final multiply returns follows the operand order the compiler emits (LLVM commutes fmul).
+#[cfg(target_arch = "aarch64")]
+unsafe fn recip_newton(x: float32x4_t) -> [[u32; 4]; 2] {
+    let a = vrecpeq_f32(x);
+    let recip = vmulq_f32(vrecpsq_f32(x, a), a);
+    let a = vrsqrteq_f32(x);
+    let rsqrt = vmulq_f32(vrsqrtsq_f32(x, vmulq_f32(a, a)), a);
+    let mut out = [[0u32; 4]; 2];
+    let mut xs = [0u32; 4];
+    vst1q_u32(xs.as_mut_ptr(), vreinterpretq_u32_f32(x));
+    vst1q_u32(out[0].as_mut_ptr(), vreinterpretq_u32_f32(recip));
+    vst1q_u32(out[1].as_mut_ptr(), vreinterpretq_u32_f32(rsqrt));
+    for l in 0..4 {
+        if xs[l] & 0x7fff_ffff > 0x7f80_0000 {
+            out[0][l] = 0;
+            out[1][l] = 0;
+        }
+    }
+    out
+}
+
 #[cfg(target_arch = "aarch64")]
 fn arch() {
     tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
@@ -447,6 +520,30 @@ fn arch() {
     b!(vsriq_n_u8::<4>, uint8x16_t, uint8x16_t);
     bl!(vsriq_n_u8(7), uint8x16_t, uint8x16_t);
     bl!(vsriq_n_u8(8), uint8x16_t, uint8x16_t);
+    // tiny-skia's recip_fast and recip_sqrt: the estimates and their Newton steps. Random bits
+    // give every exponent; the masked forms keep to the subnormal, huge and special operands.
+    u!(vrecpeq_f32, float32x4_t);
+    u!(vrsqrteq_f32, float32x4_t);
+    b!(vrecpsq_f32, float32x4_t, float32x4_t);
+    b!(vrsqrtsq_f32, float32x4_t, float32x4_t);
+    un("vrecpeq_f32::tiny", |a: uint32x4_t| unsafe { vrecpeq_f32(f32_tiny(a)) }, |a: uint32x4_t| unsafe { vrecpeq_f32(f32_tiny(a)) });
+    un("vrecpeq_f32::huge", |a: uint32x4_t| unsafe { vrecpeq_f32(f32_huge(a)) }, |a: uint32x4_t| unsafe { vrecpeq_f32(f32_huge(a)) });
+    un("vrecpeq_f32::special", |a: uint32x4_t| unsafe { vrecpeq_f32(f32_special(a)) }, |a: uint32x4_t| unsafe { vrecpeq_f32(f32_special(a)) });
+    un("vrsqrteq_f32::tiny", |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_tiny(a)) }, |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_tiny(a)) });
+    un("vrsqrteq_f32::huge", |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_huge(a)) }, |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_huge(a)) });
+    un("vrsqrteq_f32::special", |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_special(a)) }, |a: uint32x4_t| unsafe { vrsqrteq_f32(f32_special(a)) });
+    un("vrsqrteq_f32::every_mantissa", |a: u32| unsafe { rsqrte_sweep(a) }, |a: u32| unsafe { rsqrte_sweep(a) });
+    bin("vrecpsq_f32::special", |a: uint32x4_t, b: uint32x4_t| unsafe { vrecpsq_f32(f32_special(a), f32_special(b)) }, |a: uint32x4_t, b: uint32x4_t| unsafe {
+        vrecpsq_f32(f32_special(a), f32_special(b))
+    });
+    bin("vrsqrtsq_f32::special", |a: uint32x4_t, b: uint32x4_t| unsafe { vrsqrtsq_f32(f32_special(a), f32_special(b)) }, |a: uint32x4_t, b: uint32x4_t| unsafe {
+        vrsqrtsq_f32(f32_special(a), f32_special(b))
+    });
+    bin("vrecpsq_f32::tiny", |a: uint32x4_t, b: float32x4_t| unsafe { vrecpsq_f32(f32_tiny(a), b) }, |a: uint32x4_t, b: float32x4_t| unsafe { vrecpsq_f32(f32_tiny(a), b) });
+    bin("vrsqrtsq_f32::tiny", |a: float32x4_t, b: uint32x4_t| unsafe { vrsqrtsq_f32(a, f32_tiny(b)) }, |a: float32x4_t, b: uint32x4_t| unsafe { vrsqrtsq_f32(a, f32_tiny(b)) });
+    // the products near 2 and 3 that the Newton steps cancel, as tiny-skia chains them
+    un("chain_recip", |a: float32x4_t| unsafe { recip_newton(a) }, |a: float32x4_t| unsafe { recip_newton(a) });
+    un("chain_recip::moderate", |a: uint32x4_t| unsafe { recip_newton(f32_moderate(a)) }, |a: uint32x4_t| unsafe { recip_newton(f32_moderate(a)) });
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
