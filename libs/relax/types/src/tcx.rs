@@ -1301,6 +1301,7 @@ impl Tcx {
                 // in generic args, tuples, slices, arrays (`&mut Image2d<u8, impl AsMut<[u8]>>`;
                 // rustc: synthetic params in order of appearance)
                 let mut found = Vec::new();
+                collect_generics_impl_traits(ast, &sig.generics, &mut found);
                 for p in ast.list(sig.params) {
                     collect_argument_impl_traits(ast, p.ty, &mut found);
                 }
@@ -4328,6 +4329,28 @@ impl Drop for Tcx {
         if !std::thread::panicking() {
             if !self.errors.is_empty() || !self.err_sink.get_mut().unwrap().is_empty() { self.dcx.note_reported_error(); }
             self.dcx.flush_delayed();
+        }
+    }
+}
+
+/// The `impl Trait`s written in the bounds of a fn's own generic parameters (`I: Iterator<Item =
+/// impl AsRef<[u8]>>`): anonymous parameters like the ones in parameter types, and before them
+/// (rustc_ast_lowering lower_generics lowers the bounds with ImplTraitContext::Universal, then the
+/// declaration). Not the where clause: rustc rejects `impl Trait` there (E0562).
+pub(crate) fn collect_generics_impl_traits(ast: &ast::Ast, g: &ast::Generics, out: &mut Vec<ast::TyId>) {
+    for p in ast.list(g.params) {
+        let GenericParamKind::Type(bounds, _) = &p.kind else { continue };
+        for b in ast.list(*bounds) {
+            let ast::Bound::Trait { path, .. } = b else { continue };
+            for seg in ast.segs(path.segs) {
+                if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
+                    for g in ast.list(*v) {
+                        if let GenericArg::Type(x) | GenericArg::Binding(_, _, x) = g {
+                            collect_argument_impl_traits(ast, *x, out);
+                        }
+                    }
+                }
+            }
         }
     }
 }
