@@ -425,6 +425,28 @@ fn arch() {
     t!(vmlal_high_u32, uint64x2_t, uint32x4_t, uint32x4_t);
     u!(vmovn_u64, uint64x2_t);
     b!(vuzpq_u32, uint32x4_t, uint32x4_t);
+    // zlib-rs: crc32's tail, adler32, compare256
+    bin("__crc32h", |c: u32, d: u16| unsafe { __crc32h(c, d) }, |c: u32, d: u16| unsafe { __crc32h(c, d) });
+    bin("__crc32w", |c: u32, d: u32| unsafe { __crc32w(c, d) }, |c: u32, d: u32| unsafe { __crc32w(c, d) });
+    b!(vaddw_high_u8, uint16x8_t, uint8x16_t);
+    un(
+        "vld4q_u8",
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld4q_u8(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld4q_u8(b.as_ptr().add(1)) }
+        },
+    );
+    b!(vsriq_n_u8::<1>, uint8x16_t, uint8x16_t);
+    b!(vsriq_n_u8::<2>, uint8x16_t, uint8x16_t);
+    b!(vsriq_n_u8::<4>, uint8x16_t, uint8x16_t);
+    bl!(vsriq_n_u8(7), uint8x16_t, uint8x16_t);
+    bl!(vsriq_n_u8(8), uint8x16_t, uint8x16_t);
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
