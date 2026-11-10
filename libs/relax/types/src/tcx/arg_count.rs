@@ -38,6 +38,7 @@ impl Tcx {
         if let ItemKind::Fn(sig, _, _) = &item.kind {
             let sig = ast.fn_sig(*sig);
             let mut found = Vec::new();
+            super::collect_generics_impl_traits(ast, &sig.generics, &mut found);
             for p in ast.list(sig.params) { super::collect_argument_impl_traits(ast, p.ty, &mut found); }
             c.synth = found.len();
         }

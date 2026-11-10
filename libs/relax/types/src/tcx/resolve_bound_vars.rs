@@ -576,6 +576,7 @@ pub(crate) fn resolve_bound_vars(tcx: &Tcx, prog: &Program, owner: DefId, parent
     let mut late = Vec::new();
     let mut apits = Vec::new();
     if let Some(sig) = function {
+        super::collect_generics_impl_traits(ast, &sig.generics, &mut apits);
         for param in ast.list(sig.params) { super::collect_argument_impl_traits(ast, param.ty, &mut apits); }
     }
     if let Some(sig) = function {
