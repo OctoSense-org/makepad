@@ -4113,6 +4113,48 @@ pub unsafe fn vld1q_u8_x3(a: *const u8) -> uint8x16x3_t {
     uint8x16x3_t(vld1q_u8(a), vld1q_u8(a.add(16)), vld1q_u8(a.add(32)))
 }
 
+// ---- xxh3's accumulate and scramble (xxhash-rust, redb): 32 x 32 -> 64 multiply-accumulate
+// over the even and odd halves of the lanes.
+
+pub unsafe fn vdup_n_u32(value: u32) -> uint32x2_t {
+    uint32x2_t([value; 2])
+}
+
+/// UMLAL: a + b * c, each 32-bit lane widened to 64
+pub unsafe fn vmlal_u32(a: uint64x2_t, b: uint32x2_t, c: uint32x2_t) -> uint64x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[i].wrapping_add((b.0[i] as u64) * (c.0[i] as u64));
+        i += 1;
+    }
+    uint64x2_t(r)
+}
+
+/// UMLAL2: the same over the high halves of b and c
+pub unsafe fn vmlal_high_u32(a: uint64x2_t, b: uint32x4_t, c: uint32x4_t) -> uint64x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[i].wrapping_add((b.0[i + 2] as u64) * (c.0[i + 2] as u64));
+        i += 1;
+    }
+    uint64x2_t(r)
+}
+
+/// XTN: the low half of each 64-bit lane
+pub unsafe fn vmovn_u64(a: uint64x2_t) -> uint32x2_t {
+    uint32x2_t([a.0[0] as u32, a.0[1] as u32])
+}
+
+/// UZP1 and UZP2: the even lanes of a then b in `.0`, the odd lanes in `.1`
+pub unsafe fn vuzpq_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4x2_t {
+    uint32x4x2_t(
+        uint32x4_t([a.0[0], a.0[2], b.0[0], b.0[2]]),
+        uint32x4_t([a.0[1], a.0[3], b.0[1], b.0[3]]),
+    )
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
