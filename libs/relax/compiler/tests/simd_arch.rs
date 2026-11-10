@@ -190,6 +190,23 @@ fn chain_adler(a: [u8; 64], b: [u8; 64]) -> [u32; 4] {
         }
 }
 
+/// bytecount 0.6's NEON count: four registers loaded at once and destructured, lanes compared
+/// with a needle and summed across with UADDLV.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn chain_count(a: [u8; 64], b: [u8; 64]) -> [u16; 4] {
+    unsafe {
+        let mask = vdupq_n_u8(0x81);
+        let needles = vdupq_n_u8(b[0] & 0x81);
+        let uint8x16x4_t(h1, h2, h3, h4) = vld1q_u8_x4(a.as_ptr());
+        let mut count = vdupq_n_u8(0);
+        for h in [h1, h2, h3, h4] {
+            count = vsubq_u8(count, vceqq_u8(vandq_u8(h, mask), needles));
+        }
+        [vaddlvq_u8(count), vaddlvq_u8(h1), vaddlvq_u8(vaddq_u8(h2, h3)), vaddlvq_u8(h4)]
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn arch() {
     tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
@@ -220,6 +237,7 @@ fn arch() {
     b!(vsetq_lane_u32::<0>, u32, uint32x4_t);
     b!(vsetq_lane_u32::<2>, u32, uint32x4_t);
     u!(vaddvq_u32, uint32x4_t);
+    u!(vaddlvq_u8, uint8x16_t);
     u!(vmaxvq_u32, uint32x4_t);
     b!(vaddw_u8, uint16x8_t, uint8x8_t);
     t!(vmlal_u16, uint32x4_t, uint16x4_t, uint16x4_t);
@@ -254,6 +272,19 @@ fn arch() {
     b!(vcombine_u16, uint16x4_t, uint16x4_t);
     b!(vcombine_s16, int16x4_t, int16x4_t);
     un("vld1q_u8", |p: [u8; 17]| unsafe { vld1q_u8(p.as_ptr().add(1)) }, |p: [u8; 17]| unsafe { vld1q_u8(p.as_ptr().add(1)) });
+    un(
+        "vld1q_u8_x4",
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x4(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 64]| {
+            let mut b = [0u8; 65];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x4(b.as_ptr().add(1)) }
+        },
+    );
     un("vld1q_u16", |p: [u16; 8]| unsafe { vld1q_u16(p.as_ptr()) }, |p: [u16; 8]| unsafe { vld1q_u16(p.as_ptr()) });
     un("vld1_u16", |p: [u16; 4]| unsafe { vld1_u16(p.as_ptr()) }, |p: [u16; 4]| unsafe { vld1_u16(p.as_ptr()) });
     un("vld1q_u32", |p: [u32; 4]| unsafe { vld1q_u32(p.as_ptr()) }, |p: [u32; 4]| unsafe { vld1q_u32(p.as_ptr()) });
@@ -294,6 +325,17 @@ fn arch() {
                 h = h.wrapping_mul(31).wrapping_add(a[i] as u32 ^ b[i] as u32);
             }
             [h, 0, 0, 0]
+        },
+    );
+    // the same in scalar code on the pointer side: PTR-DIFFERS when the NEON chain is wrong
+    bin(
+        "chain_count",
+        |a: [u8; 64], b: [u8; 64]| chain_count(a, b),
+        |a: [u8; 64], b: [u8; 64]| {
+            let sum = |s: &[u8]| s.iter().map(|&x| x as u16).sum::<u16>();
+            let count = a.iter().filter(|&&x| x & 0x81 == b[0] & 0x81).count() as u16;
+            let middle = (0..16).map(|i| a[16 + i].wrapping_add(a[32 + i]) as u16).sum::<u16>();
+            [count, sum(&a[..16]), middle, sum(&a[48..])]
         },
     );
 }
