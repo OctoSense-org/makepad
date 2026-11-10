@@ -5,7 +5,7 @@ use makepad_markdown::math::Formula;
 use std::{cell::RefCell, collections::VecDeque, sync::Arc};
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Transform};
 
-const FONT: &[u8] = include_bytes!("../../latex_math/fonts/NewCMMath-Regular.otf");
+const FONT: &[u8] = include_bytes!("../../../libs/latex_math/fonts/NewCMMath-Regular.otf");
 pub struct MathImage {
     pub png: Vec<u8>,
     pub width: f32,
