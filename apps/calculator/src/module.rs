@@ -110,6 +110,7 @@ mod tests {
                 size: dvec2(320.0, 200.0),
             },
             replies,
+            windows: Default::default(),
         };
         let open = CALCULATOR_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts {
@@ -144,6 +145,7 @@ mod tests {
                 size: dvec2(320.0, 200.0),
             },
             replies: replies2,
+            windows: Default::default(),
         };
         let open2 = CALCULATOR_MODULE.open_schema().empty_open().unwrap();
         let InstanceParts {
