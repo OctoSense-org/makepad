@@ -3978,6 +3978,48 @@ pub unsafe fn vdup_n_s32(value: i32) -> int32x2_t {
     int32x2_t([value; 2])
 }
 
+// ---- SHA-512 (FEAT_SHA512, part of `sha3` in rustc's feature names): sha2's
+// sha512/aarch64 backends. Lane 0 is bits 63:0 of the register, lane 1 bits 127:64.
+
+/// EXT .2d: lane N.. of a, then the first N lanes of b (N in 0..=1)
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn vextq_u64<const N: i32>(a: uint64x2_t, b: uint64x2_t) -> uint64x2_t {
+    if N & 1 == 0 { a } else { uint64x2_t([a.0[1], b.0[0]]) }
+}
+
+/// SHA512H Qd, Qn, Vm.2D with d = hash_ed, n = hash_gf, m = kwh_kwh2
+pub unsafe fn vsha512hq_u64(hash_ed: uint64x2_t, hash_gf: uint64x2_t, kwh_kwh2: uint64x2_t) -> uint64x2_t {
+    let (w, x, y) = (hash_ed.0, hash_gf.0, kwh_kwh2.0);
+    let sigma1 = |v: u64| v.rotate_right(14) ^ v.rotate_right(18) ^ v.rotate_right(41);
+    let hi = ((y[1] & x[0]) ^ (!y[1] & x[1])).wrapping_add(sigma1(y[1])).wrapping_add(w[1]);
+    let tmp = hi.wrapping_add(y[0]);
+    let lo = ((tmp & y[1]) ^ (!tmp & x[0])).wrapping_add(sigma1(tmp)).wrapping_add(w[0]);
+    uint64x2_t([lo, hi])
+}
+
+/// SHA512H2 Qd, Qn, Vm.2D with d = sum_ab, n = hash_c_, m = hash_ab
+pub unsafe fn vsha512h2q_u64(sum_ab: uint64x2_t, hash_c_: uint64x2_t, hash_ab: uint64x2_t) -> uint64x2_t {
+    let (w, x, y) = (sum_ab.0, hash_c_.0, hash_ab.0);
+    let sigma0 = |v: u64| v.rotate_right(28) ^ v.rotate_right(34) ^ v.rotate_right(39);
+    let hi = ((x[0] & y[1]) ^ (x[0] & y[0]) ^ (y[1] & y[0])).wrapping_add(sigma0(y[0])).wrapping_add(w[1]);
+    let lo = ((hi & y[0]) ^ (hi & y[1]) ^ (y[1] & y[0])).wrapping_add(sigma0(hi)).wrapping_add(w[0]);
+    uint64x2_t([lo, hi])
+}
+
+/// SHA512SU0 Vd.2D, Vn.2D: the message schedule's sigma0 half
+pub unsafe fn vsha512su0q_u64(w0_1: uint64x2_t, w2_: uint64x2_t) -> uint64x2_t {
+    let (w, x) = (w0_1.0, w2_.0);
+    let sig0 = |v: u64| v.rotate_right(1) ^ v.rotate_right(8) ^ (v >> 7);
+    uint64x2_t([w[0].wrapping_add(sig0(w[1])), w[1].wrapping_add(sig0(x[0]))])
+}
+
+/// SHA512SU1 Vd.2D, Vn.2D, Vm.2D: the message schedule's sigma1 half
+pub unsafe fn vsha512su1q_u64(s01_s02: uint64x2_t, w14_15: uint64x2_t, w9_10: uint64x2_t) -> uint64x2_t {
+    let (w, x, y) = (s01_s02.0, w14_15.0, w9_10.0);
+    let sig1 = |v: u64| v.rotate_right(19) ^ v.rotate_right(61) ^ (v >> 6);
+    uint64x2_t([w[0].wrapping_add(sig1(x[0])).wrapping_add(y[0]), w[1].wrapping_add(sig1(x[1])).wrapping_add(y[1])])
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 

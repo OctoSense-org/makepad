@@ -361,6 +361,13 @@ fn arch() {
     b!(vcombine_s32, int32x2_t, int32x2_t);
     u!(vcreate_u64, u64);
     u!(vdup_n_s32, i32);
+    // sha2's SHA-512 backend
+    b!(vextq_u64::<0>, uint64x2_t, uint64x2_t);
+    bl!(vextq_u64(1), uint64x2_t, uint64x2_t);
+    t!(vsha512hq_u64, uint64x2_t, uint64x2_t, uint64x2_t);
+    t!(vsha512h2q_u64, uint64x2_t, uint64x2_t, uint64x2_t);
+    b!(vsha512su0q_u64, uint64x2_t, uint64x2_t);
+    t!(vsha512su1q_u64, uint64x2_t, uint64x2_t, uint64x2_t);
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
