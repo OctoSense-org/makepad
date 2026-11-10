@@ -1815,6 +1815,15 @@ impl MacroScope {
         if matches!(k, "core" | "std" | "alloc") && m == k && (crate::program::BUILTIN_MACROS.contains(&name.as_str()) || (k == "std" && name == "dbg")) {
             return Some(name.clone());
         }
+        // The provided smallvec (std/substitutes.txt) has no `macro_rules! smallvec`: its
+        // `smallvec!` is a built-in like std's `vec!`, by its path too (stylo's stylist.rs:
+        // `smallvec::smallvec![CascadeLayer::root()]`). A crate of the name that defines the
+        // macro itself keeps its own. The crate is known by its original name: a graph with
+        // two smallvec units (a path copy next to the registry's) renames one of them.
+        if crate::crates::base_crate_name(k) == "smallvec" && m == k && name == "smallvec"
+            && !self.table.defs.get(name.as_str()).into_iter().flatten().any(|d| d.builtin == 0 && d.krate == k) {
+            return Some(name.clone());
+        }
         let uses = self.table.crates.get(k)?.uses.get(m)?;
         for u in uses.iter().filter(|u| (k == cur || u.is_pub) && u.bind.as_deref() == Some(name)) {
             if let Some(name) = self.builtin_macro_path(k, m, &u.path, seen) { return Some(name); }
