@@ -1302,17 +1302,25 @@ impl CrateScope {
                                 continue;
                             }
                             // where the path's prefix leads: another crate's module is final
-                            let prefix_crate = match u.path.split_last() {
+                            let prefix_mod = match u.path.split_last() {
                                 Some((_, prefix)) if !prefix.is_empty() && !(prefix.len() == 1 && prefix[0].is_empty()) => {
-                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|x| x.0)
+                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n))
                                 }
                                 _ => None,
                             };
-                            if prefix_crate.map_or(false, |c| c != k) {
+                            if prefix_mod.map_or(false, |(c, _)| c != k) {
                                 settled.insert((m.clone(), ui));
                             }
+                            // rustc binds an import in each namespace where the name is found and
+                            // visible. Another crate's private `mod name` beside its exported
+                            // `macro_rules! name` (zerovec's `mod zerovec;` and `zerovec!`,
+                            // imported as `use zerovec::zerovec;`) binds the macro only: the
+                            // importer's `name::..` paths still mean the crate.
+                            let hidden = prefix_mod.is_some_and(|(pk, pm)| {
+                                pk != k && r.scope(pk).is_some_and(|s| s.tpriv.get(pm).is_some_and(|p| p.contains(last)))
+                            });
                             // a module / crate under that name
-                            if may_type && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
+                            if may_type && !hidden && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
                                 let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
                                 if let Some(t) = t {
                                     sc.tnon.entry(m.clone()).or_default().insert(b.clone(), t);
