@@ -4197,6 +4197,144 @@ pub unsafe fn vsriq_n_u8<const N: i32>(a: uint8x16_t, b: uint8x16_t) -> uint8x16
     vorrq_u8(vandq_u8(a, vdupq_n_u8(keep)), vshrq_n_u8::<N>(b))
 }
 
+// ---- Reciprocal and reciprocal square root estimates and their Newton steps (tiny-skia's
+// f32x4 recip_fast / recip_sqrt): Arm's FPRecipEstimate, FPRSqrtEstimate, FPRecipStepFused and
+// FPRSqrtStepFused under the default FPCR (round to nearest, no flush to zero, NaNs propagate).
+
+/// FRECPE's lane: an 8-bit estimate of 1 / a
+fn neon_recpe_f32(a: f32) -> f32 {
+    let bits = a.to_bits();
+    let sign = bits & 0x8000_0000;
+    let mut exp = ((bits >> 23) & 0xff) as i32;
+    let mut frac = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return if frac != 0 { neon_quiet_f32(a) } else { f32::from_bits(sign) };
+    }
+    if exp == 0 {
+        // zero, and anything below 2^-128 (its reciprocal overflows): infinity
+        if frac < 0x0020_0000 {
+            return f32::from_bits(sign | 0x7f80_0000);
+        }
+        // a subnormal of 2^-128 or more: normalize it by one or two places
+        if frac & 0x0040_0000 == 0 {
+            exp = -1;
+            frac = (frac << 2) & 0x007f_ffff;
+        } else {
+            frac = (frac << 1) & 0x007f_ffff;
+        }
+    }
+    // the operand scaled to [0.5, 1) in 1/512ths, its estimate in [1, 2) in 1/256ths
+    let scaled = 256 | (frac >> 15);
+    let estimate = ((1 << 19) / (scaled * 2 + 1) + 1) / 2;
+    let mut result_exp = 253 - exp;
+    let mut result = (estimate & 0xff) << 15;
+    // 2^126 and above: the estimate is subnormal
+    if result_exp == 0 {
+        result = 0x0040_0000 | result >> 1;
+    } else if result_exp == -1 {
+        result = 0x0020_0000 | result >> 2;
+        result_exp = 0;
+    }
+    f32::from_bits(sign | (result_exp as u32) << 23 | result)
+}
+
+/// Arm's RecipSqrtEstimate for each 9-bit operand 128..=511 (0.25 to 1 in 1/512ths): the low
+/// eight bits of the estimate in 256..=511 (1 to 2 in 1/256ths)
+const fn neon_rsqrt_estimates() -> [u8; 384] {
+    let mut table = [0u8; 384];
+    let mut i = 0;
+    while i < 384 {
+        let a = i as u32 + 128;
+        let a = if a < 256 { a * 2 + 1 } else { ((a >> 1 << 1) + 1) * 2 };
+        let mut b = 512;
+        while a * (b + 1) * (b + 1) < 1 << 28 {
+            b += 1;
+        }
+        table[i] = ((b + 1) / 2) as u8;
+        i += 1;
+    }
+    table
+}
+
+const NEON_RSQRT_ESTIMATES: [u8; 384] = neon_rsqrt_estimates();
+
+/// FRSQRTE's lane: an 8-bit estimate of 1 / sqrt(a)
+fn neon_rsqrte_f32(a: f32) -> f32 {
+    let bits = a.to_bits();
+    let mut exp = ((bits >> 23) & 0xff) as i32;
+    let mut frac = bits & 0x007f_ffff;
+    if exp == 0xff && frac != 0 {
+        return neon_quiet_f32(a);
+    }
+    if exp == 0 && frac == 0 {
+        return f32::from_bits((bits & 0x8000_0000) | 0x7f80_0000);
+    }
+    if bits >> 31 != 0 {
+        return f32::from_bits(0x7fc0_0000);
+    }
+    if exp == 0xff {
+        return 0.0;
+    }
+    if exp == 0 {
+        while frac & 0x0040_0000 == 0 {
+            frac <<= 1;
+            exp -= 1;
+        }
+        frac = (frac << 1) & 0x007f_ffff;
+    }
+    // the operand scaled to [0.25, 1) with its exponent's parity kept
+    let scaled = if exp & 1 == 0 { 256 | (frac >> 15) } else { 128 | (frac >> 16) };
+    let estimate = NEON_RSQRT_ESTIMATES[(scaled - 128) as usize] as u32;
+    f32::from_bits((((380 - exp) / 2) as u32) << 23 | estimate << 15)
+}
+
+/// FRECPS's and FRSQRTS's lane: 2 - a * b, or (3 - a * b) / 2, fused. a is negated before the
+/// NaN rules (a NaN taken from a has its sign flipped); infinity times zero gives 2, or 1.5.
+fn neon_step_f32(a: f32, b: f32, rsqrt: bool) -> f32 {
+    let a = f32::from_bits(a.to_bits() ^ 0x8000_0000);
+    if a.is_nan() || b.is_nan() {
+        return neon_result_f32(a, b, 0.0);
+    }
+    if (a.is_infinite() && b == 0.0) || (a == 0.0 && b.is_infinite()) {
+        return if rsqrt { 1.5 } else { 2.0 };
+    }
+    if !rsqrt {
+        return a.mul_add(b, 2.0);
+    }
+    // 1.5 + (a / 2) * b in one rounding. Halving the larger operand is exact unless it is
+    // below 2^-125, where the product is far below 1.5's last place whichever way it rounds.
+    let (a, b) = if a.abs() >= b.abs() { (a * 0.5, b) } else { (a, b * 0.5) };
+    a.mul_add(b, 1.5)
+}
+
+pub unsafe fn vrecpeq_f32(a: float32x4_t) -> float32x4_t {
+    float32x4_t([neon_recpe_f32(a.0[0]), neon_recpe_f32(a.0[1]), neon_recpe_f32(a.0[2]), neon_recpe_f32(a.0[3])])
+}
+
+pub unsafe fn vrecpsq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+    let mut r = [0.0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = neon_step_f32(a.0[i], b.0[i], false);
+        i += 1;
+    }
+    float32x4_t(r)
+}
+
+pub unsafe fn vrsqrteq_f32(a: float32x4_t) -> float32x4_t {
+    float32x4_t([neon_rsqrte_f32(a.0[0]), neon_rsqrte_f32(a.0[1]), neon_rsqrte_f32(a.0[2]), neon_rsqrte_f32(a.0[3])])
+}
+
+pub unsafe fn vrsqrtsq_f32(a: float32x4_t, b: float32x4_t) -> float32x4_t {
+    let mut r = [0.0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = neon_step_f32(a.0[i], b.0[i], true);
+        i += 1;
+    }
+    float32x4_t(r)
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
