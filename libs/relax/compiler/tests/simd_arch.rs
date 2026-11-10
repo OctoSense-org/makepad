@@ -339,6 +339,21 @@ fn arch() {
     u!(vreinterpretq_f32_p16, poly16x8_t);
     u!(vreinterpretq_p128_u8, uint8x16_t);
     u!(vreinterpretq_u16_p128, u128);
+    // zmij's digit split and chacha20's rotate
+    t!(vmla_n_s32, int32x2_t, int32x2_t, i32);
+    t!(vmlaq_n_s16, int16x8_t, int16x8_t, i16);
+    t!(vmlaq_n_s32, int32x4_t, int32x4_t, i32);
+    b!(vqdmulh_n_s32, int32x2_t, i32);
+    b!(vqdmulhq_n_s16, int16x8_t, i16);
+    b!(vqdmulhq_n_s32, int32x4_t, i32);
+    u!(vrev64q_u8, uint8x16_t);
+    u!(vrev32q_u16, uint16x8_t);
+    ul!(vshll_n_u16(0), uint16x4_t);
+    ul!(vshll_n_u16(9), uint16x4_t);
+    ul!(vshll_n_u16(16), uint16x4_t);
+    ul!(vshr_n_u32(1), uint32x2_t);
+    ul!(vshr_n_u32(9), uint32x2_t);
+    ul!(vshr_n_u32(32), uint32x2_t);
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);

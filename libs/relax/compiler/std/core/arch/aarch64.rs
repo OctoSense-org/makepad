@@ -3826,6 +3826,117 @@ pub unsafe fn vmaxq_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vx::vx_binary(a, b, 14, 32)
 }
 
+// ---- zmij 1.0 (serde_json's float formatter) and chacha20 0.10's NEON paths
+
+/// MLA by scalar: a + b * c per lane (wrapping)
+pub unsafe fn vmla_n_s32(a: int32x2_t, b: int32x2_t, c: i32) -> int32x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
+        i += 1;
+    }
+    int32x2_t(r)
+}
+
+pub unsafe fn vmlaq_n_s16(a: int16x8_t, b: int16x8_t, c: i16) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+pub unsafe fn vmlaq_n_s32(a: int32x4_t, b: int32x4_t, c: i32) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// SQDMULH by scalar: the high half of 2 * a * b (a * b >> 31), saturated (only MIN * MIN
+/// overflows)
+pub unsafe fn vqdmulh_n_s32(a: int32x2_t, b: i32) -> int32x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = ((a.0[i] as i64 * b as i64) >> 31).min(i32::MAX as i64) as i32;
+        i += 1;
+    }
+    int32x2_t(r)
+}
+
+pub unsafe fn vqdmulhq_n_s32(a: int32x4_t, b: i32) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = ((a.0[i] as i64 * b as i64) >> 31).min(i32::MAX as i64) as i32;
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+pub unsafe fn vqdmulhq_n_s16(a: int16x8_t, b: i16) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = ((a.0[i] as i32 * b as i32) >> 15).min(i16::MAX as i32) as i16;
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// REV64 .16b: the bytes of each 64-bit half reversed
+pub unsafe fn vrev64q_u8(a: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[(i & !7) + 7 - (i & 7)];
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// REV32 .8h: the two halfwords of each 32-bit word swapped
+pub unsafe fn vrev32q_u16(a: uint16x8_t) -> uint16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i ^ 1];
+        i += 1;
+    }
+    uint16x8_t(r)
+}
+
+/// USHLL: each u16 lane widened to u32, then shifted left N (0..=16)
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn vshll_n_u16<const N: i32>(a: uint16x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = (a.0[i] as u32) << N;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+/// USHR .2s by N in 1..=32 (32 gives zero)
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn vshr_n_u32<const N: i32>(a: uint32x2_t) -> uint32x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = if N >= 32 { 0 } else { a.0[i] >> N };
+        i += 1;
+    }
+    uint32x2_t(r)
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
