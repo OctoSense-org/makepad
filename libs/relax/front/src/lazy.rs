@@ -1185,13 +1185,14 @@ impl Drop for OutlineFinish<'_> {
 fn crate_modules(c: &PreCrate, scans: &[part::Scan]) -> crate::macros::CrateMods {
     let mut modules = crate::macros::CrateMods { root: c.name.clone(), src: c.root.clone(), ..Default::default() };
     modules.externs.extend(c.deps.iter().cloned());
-    for (path, _, _, scan, _, _) in scans {
+    for (path, module, _, scan, _, _) in scans {
         let Some(scan) = scan else { continue; };
         if path == &c.root && scan.recursion_limit.is_some() {
             modules.recursion_limit = scan.recursion_limit;
         }
         modules.mods.extend(scan.mods.iter().cloned());
         modules.items.extend(scan.mod_items.iter().cloned());
+        if scan.inner_macro_use { modules.inner_macro_use.insert(module.clone()); }
         for u in &scan.uses { modules.add_use(u.clone()); }
     }
     modules

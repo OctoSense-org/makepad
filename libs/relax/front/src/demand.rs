@@ -26,6 +26,18 @@ fn word(src: &[u8], t: &Tok) -> String {
     String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).trim_start_matches("r#").into()
 }
 
+/// Does one of the leading inner attributes (`#![..]`) of `toks` (a file, or an inline module's
+/// body) say `name`?
+fn leading_inner_attr(src: &[u8], toks: &[Tok], name: &str) -> bool {
+    let mut i = 0;
+    while i + 2 < toks.len() && toks[i].kind == T::Pound && toks[i + 1].kind == T::Not && toks[i + 2].kind == T::OpenBracket {
+        let end = close(toks, i + 2);
+        if toks.get(i + 3..end).is_some_and(|attr| attr.iter().any(|t| is_word(src, t, name))) { return true; }
+        i = end + 1;
+    }
+    false
+}
+
 fn is_word(src: &[u8], token: &Tok, expected: &str) -> bool {
     // the spelling is the word or `r#` and the word: any other length cannot match
     let len = (token.hi - token.lo) as usize;
@@ -224,6 +236,11 @@ impl Names {
         }
     }
     fn scan(&mut self, ci: usize, module: &str, src: &[u8], toks: &[Tok]) {
+        // `#![macro_use]` opening the module (its file, or an inline module's body) is
+        // `#[macro_use]` on its `mod` item: rustc appends the inner attributes to the item's
+        if let Some((parent, _)) = module.rsplit_once("::") {
+            if leading_inner_attr(src, toks, "macro_use") { self.macro_uses.push((parent.into(), module.into(), false)); }
+        }
         let mut i = 0;
         let mut exported = false;
         let mut macro_use = false;
@@ -1772,6 +1789,32 @@ mod image_tests {
         let mut truncated = bytes.clone();
         truncated.pop();
         assert!(strings::decode::<BindingImage>(&truncated).is_none());
+    }
+}
+
+#[cfg(test)]
+mod macro_use_tests {
+    use super::*;
+    /// `#![macro_use]` opening a module's file or an inline module's body hands its macros to the
+    /// parent, as `#[macro_use]` on the `mod` item does (xml-rs 1.4's macros.rs).
+    #[test]
+    fn inner_macro_use_hands_the_modules_macros_to_its_parent() {
+        let sess = std::sync::Arc::new(crate::Session::default());
+        let cfg = CfgSet::host(&sess, &[]);
+        let krate = PreCrate { name: "c".into(), root: "lib.rs".into(), edition: 2021, cfg, deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() };
+        let mut names = Names::new(&[krate]);
+        let scan = |names: &mut Names, module: &str, text: &str| {
+            let mut toks = Vec::new();
+            let _ = crate::lexer::lex(text.as_bytes(), 2021, &mut toks);
+            names.add(0, module, text.as_bytes(), &toks, &[], &[]);
+        };
+        scan(&mut names, "c::macros", "#![macro_use]\nmacro_rules! gen { () => {} }");
+        scan(&mut names, "c::plain", "#![allow(unused)]\nmacro_rules! hidden { () => {} }");
+        scan(&mut names, "c", "#![macro_use] pub mod macros; mod inline { #![macro_use] macro_rules! twice { () => {} } } mod other { macro_rules! kept { () => {} } } #[macro_use] mod outer;");
+        let mut uses = names.macro_uses.clone();
+        uses.sort();
+        let expected = [("c", "c::inline"), ("c", "c::macros"), ("c", "c::outer")].map(|(scope, target)| (scope.to_string(), target.to_string(), false));
+        assert_eq!(uses, expected);
     }
 }
 
