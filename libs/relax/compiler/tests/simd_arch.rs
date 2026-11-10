@@ -156,6 +156,18 @@ macro_rules! b {
         bin(concat!(stringify!($name), "::<", $k, ">"), |a: $a, b: $b| unsafe { $name::<$k>(a, b) }, |a: $a, b: $b| unsafe { $name::<$k>(a, b) })
     };
 }
+/// rustc's legacy const-generic call form (`vshrq_n_u8(a, 4)`): the constant passed as the last
+/// argument of an intrinsic marked `#[rustc_legacy_const_generics]`
+macro_rules! ul {
+    ($name:ident ($k:literal), $a:ty) => {
+        un(concat!(stringify!($name), "::legacy::", $k), |a: $a| unsafe { $name(a, $k) }, |a: $a| unsafe { $name(a, $k) })
+    };
+}
+macro_rules! bl {
+    ($name:ident ($k:literal), $a:ty, $b:ty) => {
+        bin(concat!(stringify!($name), "::legacy::", $k), |a: $a, b: $b| unsafe { $name(a, b, $k) }, |a: $a, b: $b| unsafe { $name(a, b, $k) })
+    };
+}
 macro_rules! t {
     ($name:ident, $a:ty, $b:ty, $c:ty) => {
         tri(stringify!($name), |a: $a, b: $b, c: $c| unsafe { $name(a, b, c) }, |a: $a, b: $b, c: $c| unsafe { $name(a, b, c) })
@@ -207,6 +219,38 @@ fn chain_count(a: [u8; 64], b: [u8; 64]) -> [u16; 4] {
     }
 }
 
+/// aho-corasick 1.1's NEON Teddy step: intrinsics called in the legacy const-generic form, one
+/// forwarding the caller's own const parameter (`vshrq_n_u8(self, BITS)`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn shift_8bit_lane_right<const BITS: i32>(v: uint8x16_t) -> uint8x16_t {
+    vshrq_n_u8(v, BITS)
+}
+
+/// One Teddy chunk: nibble lookups, then EXT shifting the previous chunk's last bytes in
+/// (`vextq_u8(prev, res, 15/14/13)`) and the is_zero test over 64-bit lanes.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn chain_teddy(a: [u8; 32], b: [u8; 32]) -> [u8; 72] {
+    unsafe {
+        let prev = vld1q_u8(a.as_ptr());
+        let cur = vld1q_u8(a.as_ptr().add(16));
+        let lo = vqtbl1q_u8(vld1q_u8(b.as_ptr()), vandq_u8(cur, vdupq_n_u8(0xf)));
+        let hi = vqtbl1q_u8(vld1q_u8(b.as_ptr().add(16)), shift_8bit_lane_right::<4>(cur));
+        let res = vandq_u8(lo, hi);
+        let mut out = [0u8; 72];
+        for (k, v) in [res, vextq_u8(prev, res, 15), vextq_u8(prev, res, 14), vextq_u8(prev, res, 13)].into_iter().enumerate() {
+            vst1q_u8(out.as_mut_ptr().add(16 * k), v);
+        }
+        for (k, v) in [res, vandq_u8(res, vdupq_n_u8(0)), vceqq_u8(prev, prev), vorrq_u8(lo, vshlq_n_u8(hi, 7))].into_iter().enumerate() {
+            let maxes = vreinterpretq_u64_u8(vpmaxq_u8(v, v));
+            out[64 + 2 * k] = (vgetq_lane_u64(maxes, 0) == 0) as u8;
+            out[65 + 2 * k] = (vgetq_lane_u64(maxes, 1) == vgetq_lane_u64::<0>(maxes)) as u8;
+        }
+        out
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 fn arch() {
     tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
@@ -255,6 +299,37 @@ fn arch() {
     u!(vshrq_n_s16::<16>, int16x8_t);
     u!(vshrq_n_s32::<7>, int32x4_t);
     u!(vshrq_n_s32::<32>, int32x4_t);
+    // every immediate shift in the legacy form rustc accepts (stdarch's legacy position 1)
+    ul!(vshlq_n_s8(0), int8x16_t);
+    ul!(vshlq_n_s8(7), int8x16_t);
+    ul!(vshrq_n_s8(1), int8x16_t);
+    ul!(vshrq_n_s8(8), int8x16_t);
+    ul!(vshlq_n_s16(15), int16x8_t);
+    ul!(vshrq_n_s16(3), int16x8_t);
+    ul!(vshlq_n_s32(9), int32x4_t);
+    ul!(vshrq_n_s32(32), int32x4_t);
+    ul!(vshlq_n_s64(63), int64x2_t);
+    ul!(vshrq_n_s64(64), int64x2_t);
+    ul!(vshlq_n_u8(3), uint8x16_t);
+    ul!(vshrq_n_u8(4), uint8x16_t);
+    ul!(vshrq_n_u8(8), uint8x16_t);
+    ul!(vshlq_n_u16(1), uint16x8_t);
+    ul!(vshrq_n_u16(16), uint16x8_t);
+    ul!(vshlq_n_u32(31), uint32x4_t);
+    ul!(vshrq_n_u32(5), uint32x4_t);
+    ul!(vshlq_n_u64(32), uint64x2_t);
+    ul!(vshrq_n_u64(1), uint64x2_t);
+    ul!(vgetq_lane_u64(1), uint64x2_t);
+    ul!(vgetq_lane_u8(0), uint8x16_t);
+    ul!(vgetq_lane_u8(15), uint8x16_t);
+    u!(vmvnq_u8, uint8x16_t);
+    u!(vshrq_n_u8::<1>, uint8x16_t);
+    u!(vshlq_n_u8::<7>, uint8x16_t);
+    b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
+    b!(vextq_u8::<1>, uint8x16_t, uint8x16_t);
+    bl!(vextq_u8(13), uint8x16_t, uint8x16_t);
+    bl!(vextq_u8(15), uint8x16_t, uint8x16_t);
+    bl!(vextq_u32(3), uint32x4_t, uint32x4_t);
     u!(vget_low_u8, uint8x16_t);
     u!(vget_low_u16, uint16x8_t);
     u!(vget_low_u32, uint32x4_t);
@@ -327,6 +402,24 @@ fn arch() {
             [h, 0, 0, 0]
         },
     );
+    bin("chain_teddy", |a: [u8; 32], b: [u8; 32]| chain_teddy(a, b), |a: [u8; 32], b: [u8; 32]| {
+        let res: [u8; 16] = core::array::from_fn(|i| b[(a[16 + i] & 0xf) as usize] & b[16 + (a[16 + i] >> 4) as usize]);
+        let ext = |k: usize| -> [u8; 16] { core::array::from_fn(|i| if i + k < 16 { a[i + k] } else { res[i + k - 16] }) };
+        let mut out = [0u8; 72];
+        for (k, v) in [res, ext(15), ext(14), ext(13)].into_iter().enumerate() {
+            out[16 * k..16 * k + 16].copy_from_slice(&v);
+        }
+        let lo: [u8; 16] = core::array::from_fn(|i| b[(a[16 + i] & 0xf) as usize]);
+        let hi: [u8; 16] = core::array::from_fn(|i| b[16 + (a[16 + i] >> 4) as usize]);
+        let tests = [res, [0; 16], [0xff; 16], core::array::from_fn(|i| lo[i] | hi[i] << 7)];
+        for (k, v) in tests.into_iter().enumerate() {
+            // vpmaxq_u8(v, v): the pairwise maxima of v, twice; both 64-bit lanes hold the same bytes
+            let zero = (0..8).all(|j| v[2 * j].max(v[2 * j + 1]) == 0);
+            out[64 + 2 * k] = zero as u8;
+            out[65 + 2 * k] = 1;
+        }
+        out
+    });
     // the same in scalar code on the pointer side: PTR-DIFFERS when the NEON chain is wrong
     bin(
         "chain_count",
