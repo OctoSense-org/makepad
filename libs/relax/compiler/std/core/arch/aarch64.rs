@@ -4155,6 +4155,48 @@ pub unsafe fn vuzpq_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4x2_t {
     )
 }
 
+// ---- zlib-rs: the CRC-32 half-word and word forms, adler32's widening add of the high half,
+// compare256's deinterleaving load and shift-right-insert.
+
+#[inline(always)]
+pub unsafe fn __crc32h(crc: u32, data: u16) -> u32 {
+    crc32::<2>(crc, data as u64)
+}
+
+#[inline(always)]
+pub unsafe fn __crc32w(crc: u32, data: u32) -> u32 {
+    crc32::<4>(crc, data as u64)
+}
+
+/// UADDW2: a plus the high eight bytes of b, widened
+pub unsafe fn vaddw_high_u8(a: uint16x8_t, b: uint8x16_t) -> uint16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i].wrapping_add(b.0[i + 8] as u16);
+        i += 1;
+    }
+    uint16x8_t(r)
+}
+
+/// LD4: 64 bytes deinterleaved, byte 4 * i + k in lane i of register k
+pub unsafe fn vld4q_u8(a: *const u8) -> uint8x16x4_t {
+    let mut r = [[0u8; 16]; 4];
+    let mut i = 0;
+    while i < 64 {
+        r[i % 4][i / 4] = *a.add(i);
+        i += 1;
+    }
+    uint8x16x4_t(uint8x16_t(r[0]), uint8x16_t(r[1]), uint8x16_t(r[2]), uint8x16_t(r[3]))
+}
+
+/// SRI: b shifted right by N (1..=8) into a, whose top N bits of each lane stay
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+pub unsafe fn vsriq_n_u8<const N: i32>(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    let keep = !(0xffu32 >> N) as u8;
+    vorrq_u8(vandq_u8(a, vdupq_n_u8(keep)), vshrq_n_u8::<N>(b))
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
