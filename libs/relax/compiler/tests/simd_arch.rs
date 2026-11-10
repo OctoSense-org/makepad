@@ -323,6 +323,22 @@ fn arch() {
     ul!(vgetq_lane_u8(0), uint8x16_t);
     ul!(vgetq_lane_u8(15), uint8x16_t);
     u!(vmvnq_u8, uint8x16_t);
+    // vreinterpret: zmij's and chacha20's, then one per element type and width (p128 = u128)
+    u!(vreinterpret_s32_u64, uint64x1_t);
+    u!(vreinterpret_u32_s32, int32x2_t);
+    u!(vreinterpret_u16_s32, int32x2_t);
+    u!(vreinterpretq_u64_u32, uint32x4_t);
+    u!(vreinterpretq_u32_u64, uint64x2_t);
+    u!(vreinterpret_f64_s8, int8x8_t);
+    u!(vreinterpret_p16_f32, float32x2_t);
+    u!(vreinterpret_p64_u16, uint16x4_t);
+    u!(vreinterpret_s64_p8, poly8x8_t);
+    u!(vreinterpretq_s8_f64, float64x2_t);
+    u!(vreinterpretq_p8_s16, int16x8_t);
+    u!(vreinterpretq_p64_s32, int32x4_t);
+    u!(vreinterpretq_f32_p16, poly16x8_t);
+    u!(vreinterpretq_p128_u8, uint8x16_t);
+    u!(vreinterpretq_u16_p128, u128);
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
