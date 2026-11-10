@@ -181,6 +181,16 @@ impl<T: Copy> Clone for MaybeUninit<T> {
     }
 }
 impl<T: Copy> Copy for MaybeUninit<T> {}
+// The value may be uninitialised: the type's name from `MaybeUninit` on stands for it.
+impl<T> crate::fmt::Debug for MaybeUninit<T> {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        let name = crate::any::type_name::<MaybeUninit<T>>();
+        match name.find("MaybeUninit") {
+            Some(at) => f.pad(&name[at..]),
+            None => f.pad(name),
+        }
+    }
+}
 
 impl<T> crate::fmt::Debug for MaybeUninit<T> {
     fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
