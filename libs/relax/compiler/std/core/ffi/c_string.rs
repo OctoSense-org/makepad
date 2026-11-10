@@ -183,6 +183,32 @@ impl From<&CStr> for CString {
     }
 }
 
+// alloc/src/ffi/c_str.rs: the conversions with `Cow<CStr>` (objc2 names a class's ivars with
+// `Cow<'static, CStr>` values built by `CString::new(..).unwrap().into()`).
+impl<'a> From<CString> for crate::borrow::Cow<'a, CStr> {
+    fn from(s: CString) -> crate::borrow::Cow<'a, CStr> {
+        crate::borrow::Cow::Owned(s)
+    }
+}
+
+impl<'a> From<&'a CStr> for crate::borrow::Cow<'a, CStr> {
+    fn from(s: &'a CStr) -> crate::borrow::Cow<'a, CStr> {
+        crate::borrow::Cow::Borrowed(s)
+    }
+}
+
+impl<'a> From<&'a CString> for crate::borrow::Cow<'a, CStr> {
+    fn from(s: &'a CString) -> crate::borrow::Cow<'a, CStr> {
+        crate::borrow::Cow::Borrowed(s.as_c_str())
+    }
+}
+
+impl<'a> From<crate::borrow::Cow<'a, CStr>> for CString {
+    fn from(s: crate::borrow::Cow<'a, CStr>) -> CString {
+        s.into_owned()
+    }
+}
+
 impl crate::borrow::ToOwned for CStr {
     type Owned = CString;
     fn to_owned(&self) -> CString {
