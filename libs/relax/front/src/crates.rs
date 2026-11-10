@@ -27,6 +27,9 @@ pub struct CrateUnit {
     /// the package comes from a registry or git source (its cargo pkg_id is not `path+`): a
     /// third-party crate, wherever its sources are stored
     pub registry: bool,
+    /// the graph has this source on the host side only (a build-dependency, a proc-macro crate
+    /// or one of their dependencies): the app has it only if one of its crates depends on it
+    pub host_only: bool,
 }
 
 pub struct HostUnit {
@@ -179,6 +182,7 @@ fn a_provided_crate_at_another_version_compiles_its_own_source_and_says_so() {
         build_script: false,
         version: version.to_string(),
         registry: true,
+        host_only: false,
     };
     let mut units = vec![unit("1.13.2"), unit("0.6.14")];
     let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs\n");
@@ -205,6 +209,7 @@ fn a_provided_crate_keeps_the_features_its_root_implements_and_their_dependency(
         build_script: false,
         version: "0.7.8".to_string(),
         registry: true,
+        host_only: false,
     };
     let mut units = vec![unit(&["default", "serde", "std", "zeroize"]), unit(&["default", "std"])];
     let said = apply_substitute_table(&mut units, "/std", "arrayvec 0.7 arrayvec/lib.rs serde=serde\n");
@@ -361,7 +366,7 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
             None => String::new(),
         };
         map.push(out.len());
-        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, harness, build_script, version, registry: !pkg.starts_with("path+") });
+        out.push(CrateUnit { name, src_path, edition, features, deps, host: None, proc_macro: kind_pm, bin: false, harness, build_script, version, registry: !pkg.starts_with("path+"), host_only: false });
     }
     // remap dependency indices to deduplicated crate indices; drop build-script deps
     for c in out.iter_mut() {
