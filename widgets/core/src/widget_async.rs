@@ -60,6 +60,21 @@ thread_local! {
     static SPLASH_THEME_GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    /// Whether this thread's new Splash isolates end an evaluation at an uncaught script error.
+    static SPLASH_BAIL_ON_UNCAUGHT_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes the Splash isolates this thread allocates from now on end an evaluation at an uncaught
+/// script error (`ScriptVmBase::bail_on_uncaught_error`) instead of reporting it and running on.
+/// For a host whose Splashes run script it did not write: the instruction after a failed one must
+/// not reach another host effect, and a render callback that failed is discarded whole rather than
+/// applied half built. An isolate's own UI registration (theme, widgets, prelude, the host's
+/// isolate mods) is the host's code and keeps evaluating past a bad statement.
+pub fn set_splash_bail_on_uncaught_error(on: bool) {
+    SPLASH_BAIL_ON_UNCAUGHT_ERROR.with(|current| current.set(on));
+}
+
 /// Sets the theme this thread's Splash isolates use. Running ones restyle to it
 /// on their next draw, unless pinned to a theme of their own (`Splash::set_theme`).
 pub fn set_splash_theme(theme: SplashTheme) {
@@ -151,6 +166,7 @@ pub(crate) fn restyle_isolate(
     // The registration is the host's own code (the library's fonts load through the loader the
     // isolate was stripped of), and the restriction is back before any guest code runs again.
     let restricted = vm.cx_mut().script_data.std.set_host_io_only_for_host_code(false);
+    let bail = std::mem::replace(&mut vm.bx.bail_on_uncaught_error, false);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.with_reload(|vm| {
             with_loader(vm, loader, |vm| {
@@ -164,6 +180,7 @@ pub(crate) fn restyle_isolate(
         })
     }));
     vm.cx_mut().script_data.std.set_host_io_only_for_host_code(restricted);
+    vm.bx.bail_on_uncaught_error = bail;
     if let Err(payload) = out {
         std::panic::resume_unwind(payload);
     }
@@ -476,8 +493,10 @@ fn expand_isolate_ui(vm: &mut ScriptVm) {
     // The registration is the host's own code: it loads the library's fonts like before the
     // isolate was restricted, and the restriction is back before any guest code runs again.
     let restricted = vm.cx_mut().script_data.std.set_host_io_only_for_host_code(false);
+    let bail = std::mem::replace(&mut vm.bx.bail_on_uncaught_error, false);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| expand_isolate_ui_modules(vm, sheet, host_io_only, theme, script, loader, host_mods, custom, apply_sheet_widgets)));
     vm.cx_mut().script_data.std.set_host_io_only_for_host_code(restricted);
+    vm.bx.bail_on_uncaught_error = bail;
     if let Err(payload) = out {
         std::panic::resume_unwind(payload);
     }
@@ -541,6 +560,7 @@ fn reload_isolate(vm: &mut ScriptVm) {
     let lazy = vm.has_lazy_modules();
     let ui = vm.cx_mut().global::<CxWidgetAsync>().isolate_ui.get(&heap_key).map(|ui| (ui.host_io_only, ui.theme, ui.script.clone(), ui.loader.clone(), ui.host_mods.clone(), ui.custom.clone()));
     let restricted = vm.cx_mut().script_data.std.set_host_io_only_for_host_code(false);
+    let bail = std::mem::replace(&mut vm.bx.bail_on_uncaught_error, false);
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         vm.with_reload(|vm| {
             if let Some((host_io_only, theme, script, loader, host_mods, custom)) = ui.filter(|_| !lazy) {
@@ -562,6 +582,7 @@ fn reload_isolate(vm: &mut ScriptVm) {
         })
     }));
     vm.cx_mut().script_data.std.set_host_io_only_for_host_code(restricted);
+    vm.bx.bail_on_uncaught_error = bail;
     if let Err(payload) = out {
         std::panic::resume_unwind(payload);
     }
@@ -934,6 +955,8 @@ fn alloc_splash_vm_impl(cx: &mut Cx, network_enabled: bool, host_io_only: bool, 
         // clipboard, IPC, ...); requests queue for the embedding host to
         // answer, and no host = nothing resolves. See splash_host.rs.
         crate::splash_host::script_mod(&mut vm);
+        // From here on the isolate runs guest script: see `set_splash_bail_on_uncaught_error`.
+        vm.bx.bail_on_uncaught_error = SPLASH_BAIL_ON_UNCAUGHT_ERROR.with(|on| on.get());
         (vm.bx, loader)
     };
     let mut std = std::mem::replace(&mut cx.script_data.std, outer_std);
@@ -3085,5 +3108,57 @@ mod host_registration_tests {
             assert!(!has_loader(vm), "a guest never sees the resource loader");
         });
         cx.free_splash_vm(isolate);
+    }
+
+    /// A host whose Splashes run script it did not write asks for a guest evaluation to end at
+    /// its first uncaught error (`set_splash_bail_on_uncaught_error`): the statement after the
+    /// failed one has not run. Without the setting the error is reported and the evaluation
+    /// runs on. The error here is a property the widget's type does not define.
+    #[test]
+    fn a_guest_evaluation_ends_at_an_uncaught_error_when_the_host_asks() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        // -> (the isolate's UI was still lazy, the statement after the error ran, the errors)
+        let run = |cx: &mut Cx, expect_bail: bool| -> (bool, bool, Vec<String>) {
+            let isolate = cx.alloc_splash_vm();
+            let out = cx.with_script_vm_id(isolate, |vm| {
+                assert_eq!(vm.bx.bail_on_uncaught_error, expect_bail);
+                let lazy = vm.has_lazy_modules();
+                vm.bx.captured_errors = Some(Vec::new());
+                vm.eval(crate::makepad_script::script! {
+                    use mod.prelude.widgets.*
+                    mod.guest_ran_on = false
+                    let field = TextInput{no_such_property: 1}
+                    mod.guest_ran_on = true
+                });
+                let errors = vm.take_errors();
+                let modules = vm.modules();
+                let ran_on = vm.heap().value(modules, id!(guest_ran_on).into(), NoTrap).as_bool() == Some(true);
+                // The UI registration the guest's first `use` expanded ran as host code and
+                // handed the isolate's setting back.
+                assert_eq!(vm.bx.bail_on_uncaught_error, expect_bail);
+                (lazy, ran_on, errors)
+            });
+            cx.free_splash_vm(isolate);
+            out
+        };
+        let undefined = |errors: &[String]| errors.iter().any(|e| e.contains("no_such_property"));
+        // The first isolate of a shape registers its UI eagerly; later ones are lazy.
+        for _ in 0..2 {
+            let (_, ran_on, errors) = run(&mut cx, false);
+            assert!(undefined(&errors), "{errors:?}");
+            assert!(ran_on, "by default an uncaught error is reported and the evaluation runs on");
+        }
+        set_splash_bail_on_uncaught_error(true);
+        let mut lazy_seen = false;
+        for _ in 0..2 {
+            let (lazy, ran_on, errors) = run(&mut cx, true);
+            lazy_seen |= lazy;
+            assert!(undefined(&errors), "{errors:?}");
+            assert!(!ran_on, "the evaluation ended at the error");
+        }
+        assert!(lazy_seen, "the test never reached a lazy isolate");
+        set_splash_bail_on_uncaught_error(false);
+        assert!(run(&mut cx, false).1, "the setting is the host's to take back");
     }
 }

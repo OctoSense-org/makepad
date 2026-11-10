@@ -276,7 +276,8 @@ pub use crate::{
         WidgetSet, WidgetSetIterator, WidgetUid,
     },
     widget_async::{
-        enter_isolate, leave_isolate, set_splash_theme, set_splash_theme_script,
+        enter_isolate, leave_isolate, set_splash_bail_on_uncaught_error, set_splash_theme,
+        set_splash_theme_script,
         set_widget_async_trace, CxSplashVmExt, CxWidgetToScriptCallExt, IsolateEntry,
         ScriptAsyncCalls, ScriptAsyncId, ScriptAsyncResult, SplashTheme, SplashThemeScript,
         SplashVmId, MAIN_SPLASH_VM_ID,
