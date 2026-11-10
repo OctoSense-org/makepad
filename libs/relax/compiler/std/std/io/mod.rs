@@ -498,9 +498,36 @@ impl<B: BufRead + ?Sized> BufRead for alloc::boxed::Box<B> {
     }
 }
 
+// library/std/src/io/impls.rs: a reference or a box seeks as its target does, every method
+// forwarded so the target's own rewind / stream_position / seek_relative are the ones that run
+// (image's GenericReader seeks a `BufReader<Box<dyn ReadSeek>>`)
 impl<S: Seek + ?Sized> Seek for &mut S {
     fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
         (**self).seek(pos)
+    }
+    fn rewind(&mut self) -> Result<()> {
+        (**self).rewind()
+    }
+    fn stream_position(&mut self) -> Result<u64> {
+        (**self).stream_position()
+    }
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        (**self).seek_relative(offset)
+    }
+}
+
+impl<S: Seek + ?Sized> Seek for alloc::boxed::Box<S> {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        (**self).seek(pos)
+    }
+    fn rewind(&mut self) -> Result<()> {
+        (**self).rewind()
+    }
+    fn stream_position(&mut self) -> Result<u64> {
+        (**self).stream_position()
+    }
+    fn seek_relative(&mut self, offset: i64) -> Result<()> {
+        (**self).seek_relative(offset)
     }
 }
 
