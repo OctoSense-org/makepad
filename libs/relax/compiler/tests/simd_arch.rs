@@ -392,6 +392,33 @@ fn arch() {
     // polyval's and ghash's carry-less multiply (the result is a p128 = u128)
     b!(vmull_p64, u64, u64);
     bin("chain_pmull", |a: uint8x16_t, b: uint8x16_t| unsafe { pmull_fold(a, b) }, |a: uint8x16_t, b: uint8x16_t| unsafe { pmull_fold(a, b) });
+    // constant_time_eq's two-register load, and the three-register one beside it
+    un(
+        "vld1q_u8_x2",
+        |p: [u8; 32]| {
+            let mut b = [0u8; 33];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x2(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 32]| {
+            let mut b = [0u8; 33];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x2(b.as_ptr().add(1)) }
+        },
+    );
+    un(
+        "vld1q_u8_x3",
+        |p: [u8; 48]| {
+            let mut b = [0u8; 49];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x3(b.as_ptr().add(1)) }
+        },
+        |p: [u8; 48]| {
+            let mut b = [0u8; 49];
+            b[1..].copy_from_slice(&p);
+            unsafe { vld1q_u8_x3(b.as_ptr().add(1)) }
+        },
+    );
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
