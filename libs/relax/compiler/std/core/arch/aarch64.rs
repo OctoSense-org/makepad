@@ -6548,3 +6548,239 @@ pub unsafe fn vst4q_u32(a: *mut u32, b: uint32x4x4_t) {
         i += 1;
     }
 }
+
+// What moxcms's NEON paths call beyond the above (the colour management under the image
+// decoders): 16-bit half-vector arithmetic, loads and lane reads, the rounding doubling
+// multiplies with their accumulating forms, and FCVTAU. Plain lane loops; each one is compared
+// with the real instruction in check_arch.
+
+/// ADD: lane sum, wrapping
+pub unsafe fn vadd_s16(a: int16x4_t, b: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i].wrapping_add(b.0[i]);
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// FCVTAU: to nearest with ties away from zero, saturating, negative and NaN give zero
+pub unsafe fn vcvtaq_u32_f32(a: float32x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i].round() as u32;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+/// DUP: the value in every lane
+pub unsafe fn vdup_n_s16(value: i16) -> int16x4_t {
+    int16x4_t([value; 4])
+}
+
+/// DUP: the value in every lane
+pub unsafe fn vdup_n_u16(value: u16) -> uint16x4_t {
+    uint16x4_t([value; 4])
+}
+
+/// UMOV / SMOV: one lane
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn vget_lane_s16<const LANE: i32>(v: int16x4_t) -> i16 {
+    v.0[LANE as usize]
+}
+
+/// UMOV / SMOV: one lane
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn vget_lane_u16<const LANE: i32>(v: uint16x4_t) -> u16 {
+    v.0[LANE as usize]
+}
+
+/// LD1R: one 16-bit value, no alignment needed, in every lane
+pub unsafe fn vld1_dup_s16(ptr: *const i16) -> int16x4_t {
+    int16x4_t([crate::ptr::read_unaligned(ptr); 4])
+}
+
+/// LD1: four 16-bit values, no alignment needed
+pub unsafe fn vld1_s16(ptr: *const i16) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = crate::ptr::read_unaligned(ptr.add(i));
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// LD1R: one 32-bit value, no alignment needed, in every lane
+pub unsafe fn vld1q_dup_s32(ptr: *const i32) -> int32x4_t {
+    int32x4_t([crate::ptr::read_unaligned(ptr); 4])
+}
+
+/// SMAX: the larger lane, signed
+pub unsafe fn vmax_s16(a: int16x4_t, b: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if a.0[i] > b.0[i] { a.0[i] } else { b.0[i] };
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// SMIN: the smaller lane, signed
+pub unsafe fn vmin_s16(a: int16x4_t, b: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if a.0[i] < b.0[i] { a.0[i] } else { b.0[i] };
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// UMIN: the smaller lane, unsigned
+pub unsafe fn vmin_u16(a: uint16x4_t, b: uint16x4_t) -> uint16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if a.0[i] < b.0[i] { a.0[i] } else { b.0[i] };
+        i += 1;
+    }
+    uint16x4_t(r)
+}
+
+/// SMLAL: a + b * c with the 16-bit lanes widened to 32 bits first, the sum wrapping
+pub unsafe fn vmlal_s16(a: int32x4_t, b: int16x4_t, c: int16x4_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i].wrapping_add((b.0[i] as i32) * (c.0[i] as i32));
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// SQXTUN: each signed 32-bit lane saturated to an unsigned 16-bit one
+pub unsafe fn vqmovun_s32(a: int32x4_t) -> uint16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if a.0[i] < 0 { 0 } else if a.0[i] > 0xffff { 0xffff } else { a.0[i] as u16 };
+        i += 1;
+    }
+    uint16x4_t(r)
+}
+
+/// SQRDMLAH (FEAT_RDM): ((a << 16) + 2 * b * c + 0x8000) >> 16, saturated once at the end
+pub unsafe fn vqrdmlah_s16(a: int16x4_t, b: int16x4_t, c: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = {
+            let v = (((a.0[i] as i64) << 16) + (b.0[i] as i64) * (c.0[i] as i64) * 2 + (1 << 15)) >> 16;
+            if v > i16::MAX as i64 { i16::MAX } else if v < i16::MIN as i64 { i16::MIN } else { v as i16 }
+        };
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// SQRDMLAH (FEAT_RDM): ((a << 16) + 2 * b * c + 0x8000) >> 16, saturated once at the end
+pub unsafe fn vqrdmlahq_s16(a: int16x8_t, b: int16x8_t, c: int16x8_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = {
+            let v = (((a.0[i] as i64) << 16) + (b.0[i] as i64) * (c.0[i] as i64) * 2 + (1 << 15)) >> 16;
+            if v > i16::MAX as i64 { i16::MAX } else if v < i16::MIN as i64 { i16::MIN } else { v as i16 }
+        };
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// SQRDMLAH (FEAT_RDM): ((a << 32) + 2 * b * c + 0x8000_0000) >> 32, saturated once at the end
+pub unsafe fn vqrdmlahq_s32(a: int32x4_t, b: int32x4_t, c: int32x4_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = {
+            // half of the accumulator, which is even, so that it stays inside an i64
+            let v = (((a.0[i] as i64) << 31) + (b.0[i] as i64) * (c.0[i] as i64) + (1 << 30)) >> 31;
+            if v > i32::MAX as i64 { i32::MAX } else if v < i32::MIN as i64 { i32::MIN } else { v as i32 }
+        };
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// SQRDMLSH (FEAT_RDM): ((a << 16) - 2 * b * c + 0x8000) >> 16, saturated once at the end
+pub unsafe fn vqrdmlsh_s16(a: int16x4_t, b: int16x4_t, c: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = {
+            let v = (((a.0[i] as i64) << 16) - (b.0[i] as i64) * (c.0[i] as i64) * 2 + (1 << 15)) >> 16;
+            if v > i16::MAX as i64 { i16::MAX } else if v < i16::MIN as i64 { i16::MIN } else { v as i16 }
+        };
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// SQRDMLSH (FEAT_RDM): ((a << 16) - 2 * b * c + 0x8000) >> 16, saturated once at the end
+pub unsafe fn vqrdmlshq_s16(a: int16x8_t, b: int16x8_t, c: int16x8_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = {
+            let v = (((a.0[i] as i64) << 16) - (b.0[i] as i64) * (c.0[i] as i64) * 2 + (1 << 15)) >> 16;
+            if v > i16::MAX as i64 { i16::MAX } else if v < i16::MIN as i64 { i16::MIN } else { v as i16 }
+        };
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// SQRDMULH: (2 * a * b + 0x8000) >> 16, saturating (only MIN * MIN overflows)
+pub unsafe fn vqrdmulh_s16(a: int16x4_t, b: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = {
+            let v = ((a.0[i] as i64) * (b.0[i] as i64) * 2 + (1 << 15)) >> 16;
+            if v > i16::MAX as i64 { i16::MAX } else { v as i16 }
+        };
+        i += 1;
+    }
+    int16x4_t(r)
+}
+
+/// SQRDMULH: (2 * a * b + 0x8000_0000) >> 32, saturating (only MIN * MIN overflows)
+pub unsafe fn vqrdmulhq_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = {
+            // (a * b + 0x4000_0000) >> 31 is the same value and stays inside an i64
+            let v = ((a.0[i] as i64) * (b.0[i] as i64) + (1 << 30)) >> 31;
+            if v > i32::MAX as i64 { i32::MAX } else { v as i32 }
+        };
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// SUB: lane difference, wrapping
+pub unsafe fn vsub_s16(a: int16x4_t, b: int16x4_t) -> int16x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i].wrapping_sub(b.0[i]);
+        i += 1;
+    }
+    int16x4_t(r)
+}
