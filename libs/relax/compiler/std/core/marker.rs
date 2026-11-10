@@ -71,8 +71,7 @@ impl<T: PointeeSized> crate::hash::Hash for PhantomData<T> {
 }
 
 pub struct PhantomPinned;
-// core's #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)] (the ones bytemuck's
-// `unsafe impl Pod for PhantomPinned` needs: Pod: Copy)
+// core's #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 impl crate::clone::Clone for PhantomPinned {
     fn clone(&self) -> PhantomPinned {
         PhantomPinned
@@ -83,6 +82,31 @@ impl crate::default::Default for PhantomPinned {
     fn default() -> PhantomPinned {
         PhantomPinned
     }
+}
+// the derive's output for a unit struct: the bare name, no padding
+impl crate::fmt::Debug for PhantomPinned {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        f.write_str("PhantomPinned")
+    }
+}
+impl crate::cmp::PartialEq for PhantomPinned {
+    fn eq(&self, _o: &PhantomPinned) -> bool {
+        true
+    }
+}
+impl crate::cmp::Eq for PhantomPinned {}
+impl crate::cmp::PartialOrd for PhantomPinned {
+    fn partial_cmp(&self, _o: &PhantomPinned) -> Option<crate::cmp::Ordering> {
+        Some(crate::cmp::Ordering::Equal)
+    }
+}
+impl crate::cmp::Ord for PhantomPinned {
+    fn cmp(&self, _o: &PhantomPinned) -> crate::cmp::Ordering {
+        crate::cmp::Ordering::Equal
+    }
+}
+impl crate::hash::Hash for PhantomPinned {
+    fn hash<H: crate::hash::Hasher>(&self, _state: &mut H) {}
 }
 
 #[cfg_attr(not(relax_check), lang = "tuple_trait")]
@@ -142,6 +166,7 @@ impl<T, const N: usize> StructuralPartialEq for [T; N] {}
 impl<T> StructuralPartialEq for [T] {}
 impl<T: PointeeSized> StructuralPartialEq for &T {}
 impl<T: PointeeSized> StructuralPartialEq for PhantomData<T> {}
+impl StructuralPartialEq for PhantomPinned {}
 
 // library/core/src/marker.rs:880-887,904-906,1059-1063.
 #[cfg_attr(not(relax_check), lang = "discriminant_kind")]
