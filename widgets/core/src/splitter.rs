@@ -555,6 +555,10 @@ pub struct Splitter {
     draw_bg: DrawSplitter,
     #[live]
     size: f64,
+    /// How far past the painted bar, on each side across the axis, a mouse
+    /// still grabs it. A finger gets `touch_margin`, never less than this.
+    #[live(3.0)]
+    hit_margin: f64,
 
     // framecomponent mode
     #[rust]
@@ -1092,14 +1096,14 @@ impl Splitter {
     }
 
     fn margin(&self) -> Inset {
-        self.axis_inset(3.0)
+        self.axis_inset(self.hit_margin.max(0.0))
     }
 
     /// Wider hit margin used only when the event came from a touch device.
     /// Fingers are blunter than mouse cursors, so the bar needs more slop to
     /// be grabbable on touchscreens.
     fn touch_margin(&self) -> Inset {
-        self.axis_inset(8.0)
+        self.axis_inset(self.hit_margin.max(8.0))
     }
 
     fn axis_inset(&self, side: f64) -> Inset {
@@ -1544,6 +1548,24 @@ mod preset_tests {
             assert_eq!(splitter.size, 6.0);
             assert_eq!(splitter.axis_min_max(), (50.0, 50.0));
             assert!(matches!(splitter.align(), SplitterAlign::Weighted(w) if w == 0.5));
+        });
+    }
+
+    /// The mouse grabs the bar as far out as `hit_margin` says: three points
+    /// unless a host widens it, and a finger never gets less than the mouse.
+    #[test]
+    fn the_grab_reaches_as_far_as_hit_margin_says() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let plain = built(vm, "Splitter");
+            assert_eq!(plain.margin().left, 3.0);
+            assert_eq!(plain.touch_margin().left, 8.0);
+            let value = crate::script_eval!(vm, {use mod.widgets.* Splitter{hit_margin: 12.0}});
+            let wide = Splitter::script_from_value(vm, value);
+            assert_eq!(wide.margin().left, 12.0);
+            assert_eq!(wide.margin().top, 0.0);
+            assert_eq!(wide.touch_margin().left, 12.0);
         });
     }
 
