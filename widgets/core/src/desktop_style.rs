@@ -413,6 +413,11 @@ pub(crate) fn gc_heaps(cx: &mut Cx, heaps: &[usize]) {
         .heaps
         .retain(|key, _| !heaps.contains(key));
 }
+/// Whether the heap `key` wears a pick (`install`, `uninstall`) rather than
+/// nothing yet or the window system's sheet.
+pub(crate) fn has_pick(cx: &mut Cx, key: usize) -> bool {
+    matches!(worn(cx, key), Some(Worn::Picked(_)))
+}
 /// Wear `sheet` from now on: the app's (or its user's) pick, which the
 /// window system's sheet does not override.
 pub fn install(vm: &mut ScriptVm, sheet: StyleSheet) {

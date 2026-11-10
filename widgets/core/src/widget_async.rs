@@ -503,10 +503,16 @@ fn expand_isolate_ui_modules(
             return;
         }
         // The allocating VM's sheet, or its plain theme: never the
-        // environment's sheet over a VM that took it off.
-        match sheet {
-            Some(sheet) => crate::desktop_style::install(vm, sheet),
-            None => crate::desktop_style::uninstall(vm),
+        // environment's sheet over a VM that took it off. A host that picked
+        // for this isolate itself since allocating it (`desktop_style::install`
+        // on a disposable isolate, then the library) keeps its pick: this
+        // expansion may run on the library's first step, after that pick.
+        let heap_key = vm.heap_key();
+        if !crate::desktop_style::has_pick(vm.cx_mut(), heap_key) {
+            match sheet {
+                Some(sheet) => crate::desktop_style::install(vm, sheet),
+                None => crate::desktop_style::uninstall(vm),
+            }
         }
         crate::theme_mod(vm);
         style_isolate(vm, theme, script.as_deref(), host_io_only);
@@ -864,6 +870,9 @@ fn alloc_splash_vm_impl(cx: &mut Cx, network_enabled: bool, host_io_only: bool, 
         // lazy: declared now, registered on the first read of any of them, once, in this heap.
         // The first isolate of the process registers them eagerly to learn their `mod` keys.
         let heap_key = vm.heap_key();
+        // A heap key is an allocation address: no pick of a dead isolate that
+        // owned this one may pass for this isolate's own (see the expansion).
+        crate::desktop_style::gc_heaps(vm.cx_mut(), &[heap_key]);
         let script = if pin.is_none() { splash_theme_script() } else { None };
         vm.cx_mut().global::<CxWidgetAsync>().isolate_ui.insert(heap_key, IsolateUi { sheet: inherited, host_io_only, theme: pin.unwrap_or_else(splash_theme), script: script.clone(), loader: None, host_mods: HOST_ISOLATE_MODS.with(|g| g.borrow().clone()), custom: None, apply_sheet_widgets: false });
         let shape: Vec<usize> = {
@@ -3035,6 +3044,8 @@ mod host_registration_tests {
     /// In an isolate whose UI is still lazy, the library's first step expands that UI through
     /// `with_loader`; the resource module the host registered must still be there after it, or
     /// the theme's fonts no longer resolve (`crate_resource` not in scope) and it stays unbuilt.
+    /// The sheet the host installed on the isolate must also still be worn, not the one the
+    /// expansion would install from the allocation's record.
     #[test]
     fn a_hosts_own_registration_survives_the_lazy_ui_expansion() {
         let mut cx = Cx::new(Box::new(|_, _| {}));
@@ -3052,6 +3063,9 @@ mod host_registration_tests {
                 assert!(!has_loader(vm), "an isolate is allocated without the resource loader");
                 lazy_seen |= vm.has_lazy_modules();
                 crate::makepad_draw::makepad_platform::script::script_mod(vm);
+                let mut sheet = crate::desktop_style::StyleSheet::named("macos").unwrap();
+                sheet.theme.push_str("\nmod.theme.color_bg_app = #x123456\ntrue\n");
+                crate::desktop_style::install(vm, sheet);
                 vm.bx.captured_errors = Some(Vec::new());
                 crate::script_mod(vm);
                 let errors = vm.take_errors();
@@ -3059,7 +3073,7 @@ mod host_registration_tests {
                 assert!(has_loader(vm), "the host's resource module is still registered");
                 let theme = vm.module(id!(theme));
                 let page = vm.heap().value(theme, id!(color_bg_app).into(), NoTrap);
-                assert!(page.as_color().is_some(), "the theme was built");
+                assert_eq!(page.as_color(), Some(0x123456ff), "the isolate wears the host's sheet");
             });
             cx.free_splash_vm(isolate);
         }
