@@ -1059,6 +1059,50 @@ mod tests {
         }
     }
 
+    /// Faces an app lays over the base themes (`set_app_theme_fonts`) survive
+    /// `widgets_mod` building the base themes again under a sheet: the theme and
+    /// the library's templates both draw with them.
+    #[test]
+    fn app_theme_fonts_survive_the_rebuild_under_a_sheet() {
+        fn code_face_everywhere(vm: &mut ScriptVm) {
+            script_eval!(vm, {
+                mod.themes.light = mod.themes.light{font_regular: mod.themes.light.font_code{}}
+                mod.themes.dark = mod.themes.dark{font_regular: mod.themes.dark.font_code{}}
+            });
+        }
+        fn members(vm: &mut ScriptVm, value: ScriptValue) -> Vec<String> {
+            let text = TextStyle::script_from_value(vm, value);
+            text.font_family.member_ids().map(str::to_owned).collect()
+        }
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.init_cx_os();
+        cx.with_vm(|vm| {
+            crate::theme_mod(vm);
+            script_eval!(vm, { mod.theme = mod.themes.light });
+            let code = script_eval!(vm, { mod.theme.font_code });
+            let code = members(vm, code);
+            let regular = script_eval!(vm, { mod.theme.font_regular });
+            assert_ne!(members(vm, regular), code);
+            install(vm, StyleSheet::named("macos").unwrap());
+            crate::set_app_theme_fonts(vm, Some(code_face_everywhere));
+            code_face_everywhere(vm);
+            crate::widgets_mod(vm);
+            apply_widgets(vm);
+            let regular = script_eval!(vm, { mod.theme.font_regular });
+            assert_eq!(members(vm, regular), code);
+            let label = script_eval!(vm, { mod.widgets.Label.draw_text.text_style });
+            assert_eq!(members(vm, label), code);
+            crate::set_app_theme_fonts(vm, None);
+            vm.with_reload(|vm| {
+                crate::theme_mod(vm);
+                crate::widgets_mod(vm);
+            });
+            let label = script_eval!(vm, { mod.widgets.Label.draw_text.text_style });
+            assert_ne!(members(vm, label), code, "taken off, the policy's faces come back");
+            assert!(vm.take_errors().is_empty());
+        });
+    }
+
     #[test]
     fn mobile_typefaces_keep_symbol_fallbacks_across_appearances() {
         let mut cx=Cx::new(Box::new(|_,_|{}));

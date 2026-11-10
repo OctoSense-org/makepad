@@ -395,6 +395,30 @@ pub fn set_app_theme_tokens(cx: &mut Cx, code: Option<String>) {
     cx.global::<AppThemeTokens>().0 = code;
 }
 
+/// The app's own typefaces per script heap (`set_app_theme_fonts`).
+#[derive(Default)]
+struct AppThemeFonts(std::collections::HashMap<usize, fn(&mut ScriptVm)>);
+
+/// The app's own typefaces: a function that rewrites `theme.font_*` in the base
+/// themes of `vm`'s heap (Rinx puts the macOS system face ahead of the bundled
+/// ones). Every base-theme build of that heap runs it right after the font policy
+/// installs the theme's fonts, the rebuild `widgets_mod` makes under a style sheet
+/// included, so every template, stock or sheet, bakes the app's faces. FORK PORT:
+/// the fork built the base themes once per module run, so an app could rewrite
+/// them between `theme_mod` and `widgets_mod`. `None` takes it off.
+pub fn set_app_theme_fonts(vm: &mut ScriptVm, install: Option<fn(&mut ScriptVm)>) {
+    let key = vm.heap_key();
+    let fonts = &mut vm.cx_mut().global::<AppThemeFonts>().0;
+    match install {
+        Some(install) => {
+            fonts.insert(key, install);
+        }
+        None => {
+            fonts.remove(&key);
+        }
+    }
+}
+
 /// The blend in force, if any: the script `theme_mod` re-emits on every run.
 pub fn theme_mix(cx: &mut Cx) -> Option<String> {
     cx.global::<ThemeMixChoice>().0.clone()
@@ -523,6 +547,11 @@ fn build_base_themes(vm: &mut ScriptVm) {
     }
     crate::theme_tokens::derive_base_property_inks(vm);
     crate::font_policy::install_theme_fonts(vm);
+    // The app's own typefaces over the policy's, on this build like every other.
+    let key = vm.heap_key();
+    if let Some(install) = vm.cx_mut().global::<AppThemeFonts>().0.get(&key).copied() {
+        install(vm);
+    }
 }
 
 pub fn theme_mod(vm: &mut ScriptVm) {
