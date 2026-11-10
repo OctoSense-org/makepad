@@ -901,7 +901,7 @@ fn skip_ty(d: &mut D, depth: u32, v: &mut dyn FnMut(Atom)) -> Option<()> {
             d.u8()?;
             d.u32()?;
         }
-        17 => {
+        17 | 28 => {
             skip_file(d, v)?;
             d.u32()?;
             d.u64()?;
