@@ -1195,6 +1195,20 @@ impl<'a> Lcx<'a> {
     fn is_wide(&self, t: TyId) -> bool {
         matches!(self.u.tcx.tys.kind(t), TyKind::Int(Prim::I128) | TyKind::Int(Prim::U128))
     }
+    fn is_prim_int(&self, t: TyId) -> bool {
+        matches!(self.u.tcx.tys.kind(t), TyKind::Int(_))
+    }
+    /// `&..&prim` as `prim`, the type prim_leaves loads such an operand as.
+    fn peel_prim_refs(&self, t: TyId) -> TyId {
+        let mut t = t;
+        while let TyKind::Ref(_, inner, _) = self.kind(t) {
+            if !matches!(self.kind_ref(inner), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ref(..) | TyKind::FnPtr(..)) {
+                break;
+            }
+            t = inner;
+        }
+        t
+    }
     /// A placeholder value of type `t` after an error (keeps lowering going without panics).
     fn dummy_val(&mut self, t: TyId) -> Val {
         let l = self.layout(t);
@@ -6931,10 +6945,23 @@ impl<'a> Lcx<'a> {
         let ex = ast.expr(e);
         // Two-word integer operations need both halves of every operand.
         let wide = match &ex.kind {
-            ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.body_ty(*a)) || self.is_wide(self.body_ty(*b)),
+            // an operand may be a reference to the integer (`&a + &b`, `&a >> 3`, `&a != &b`:
+            // the built-in operation, read through the references by wide_parts)
+            ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.peel_prim_refs(self.body_ty(*a))) || self.is_wide(self.peel_prim_refs(self.body_ty(*b))),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.body_ty(*x)) || self.is_wide(t),
             _ => false,
         };
+        // An operator the checker resolved to its trait's method is the built-in operation only
+        // between integers (`T + T` at u128). With a struct or a reference for an operand
+        // (`W(a) + b`, `a + &b`, `-small` giving an i128) it is the call below, not the two-word
+        // arithmetic, which read the other operand's words as an integer's halves.
+        let wide = wide
+            && !(self.b.binops.contains_key(&e.0)
+                && match &ex.kind {
+                    ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => !(self.is_prim_int(self.body_ty(*a)) && self.is_prim_int(self.body_ty(*b))),
+                    ExprKind::Unary(_, x) => !self.is_prim_int(self.body_ty(*x)),
+                    _ => false,
+                });
         if wide {
             return self.lower_wide(e, t);
         }
@@ -7501,15 +7528,16 @@ impl<'a> Lcx<'a> {
             ExprKind::MethodCall(recv, row) => self.lower_method(e, *recv, ast.list(ast.row(*row).args), t),
             ExprKind::Struct(row) => { let crate::ast::StructRow { fields, base, rest, .. } = ast.row(*row); self.lower_struct_lit(e, ast.list(*fields), base.get(), *rest, t) }
             ExprKind::Range(a, b, _) => {
-                // Range { start, end } as a plain struct value
+                // Range { start, end } as a plain struct value; each bound is a coercion site
+                // (`&a..&b` for a `Range<&[u8]>`)
                 let mut vals = Vec::new();
                 let tys = self.range_field_tys(t);
                 if let Some(a) = &a.get() {
-                    vals.push((self.lower_expr(*a), tys[0]));
+                    vals.push((self.lower_expr_coerced(*a, tys[0]), tys[0]));
                 }
                 if let Some(b) = &b.get() {
                     let ft = if tys.len() > 1 { tys[1] } else { tys[0] };
-                    vals.push((self.lower_expr(*b), ft));
+                    vals.push((self.lower_expr_coerced(*b, ft), ft));
                 }
                 // RangeInclusive has an extra `exhausted: bool` field
                 if let TyKind::Adt(d, _, _) = self.kind(t) {
@@ -8994,7 +9022,8 @@ impl<'a> Lcx<'a> {
         match &ex.kind {
             ExprKind::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
                 let at = self.body_ty(*a);
-                let signed = self.wide_signed(at) || (!self.is_wide(at) && self.int_ty(at).signed);
+                let pa = self.peel_prim_refs(at);
+                let signed = self.wide_signed(pa) || (!self.is_wide(pa) && self.int_ty(pa).signed);
                 let av = self.lower_expr(*a);
                 let x = self.wide_parts(av, at);
                 let bt = self.body_ty(*b);
@@ -13194,6 +13223,25 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
             };
             let inr = f.vreg(Cls::I);
             push_at(f, b, pos, Inst::ICmpI(Cond::Le, false, inr, rel, (hi - lo) as i64));
+            // a 128-bit tag (Option<NonZero<u128>>) is two words: the relative value is in range
+            // when its high word, `tag.hi - start.hi - borrow`, is zero as well
+            let inr = if raw.len() == 2 {
+                let borrow = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::ICmp(Cond::Lt, false, borrow, raw[0], ks));
+                let kh = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(kh, (start >> 64) as u64 as i64));
+                let rh = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBin(IOp::Sub, U64, rh, raw[1], kh));
+                let rel_hi = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBin(IOp::Sub, U64, rel_hi, rh, borrow));
+                let hi_zero = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::ICmpI(Cond::Eq, false, hi_zero, rel_hi, 0));
+                let both = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBin(IOp::And, U64, both, inr, hi_zero));
+                both
+            } else {
+                inr
+            };
             // one niche variant: in range means exactly that variant
             let vidx = f.vreg(Cls::I);
             if hi == lo {

@@ -223,6 +223,9 @@ fn teardown_fixture_cycles_and_retiring_thread() {
     assert!(freed_by_teardown() > freed);
     next_flags[1].store(1, Ordering::SeqCst);
     stop(replacement, Stop::Quit).unwrap();
+    // `stop` returns once the replacement's main is done: its worker may still be in its TLS
+    // destructor, which is JIT code reading the domain's statics. The unit goes only after it.
+    wait_thread_done(replacement);
     domains().retain(|d| d.info.id != domain && d.info.id != replacement);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
