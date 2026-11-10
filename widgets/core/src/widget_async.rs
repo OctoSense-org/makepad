@@ -724,16 +724,21 @@ pub(crate) fn isolate_loader(cx: &mut Cx, vm_id: SplashVmId) -> Option<ScriptObj
 }
 
 /// Runs `f`, the host's own work in an isolate, with the isolate's resource
-/// loader back on `mod.res`, and strips it again after, a panic included, so
-/// no body code runs while it is there.
+/// loader back on `mod.res`, and takes it off again after, a panic included, so
+/// no body code runs while it is there. What `mod.res` held before goes back:
+/// nil in a stripped isolate, and the module itself where host code registered
+/// the platform's script modules in the isolate again (a host that evaluates
+/// its own trusted theme in a disposable isolate, then `theme_mod`, whose lazy
+/// expansion comes through here).
 pub(crate) fn with_loader<R>(vm: &mut ScriptVm, loader: Option<&ScriptObjectRef>, f: impl FnOnce(&mut ScriptVm) -> R) -> R {
     let Some(loader) = loader else {
         return f(vm);
     };
     let modules = vm.modules();
+    let before = vm.heap().value(modules, id!(res).into(), NoTrap);
     vm.set_value_def(modules, id!(res), loader.as_object());
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(vm)));
-    vm.set_value_def(modules, id!(res), NIL);
+    vm.set_value_def(modules, id!(res), if before.as_object().is_some() { before } else { NIL });
     match out {
         Ok(out) => out,
         Err(payload) => std::panic::resume_unwind(payload),
@@ -3018,5 +3023,53 @@ mod time_budget_tests {
         cx.set_splash_vm_time_budget(vm_id, None);
         assert!(!budgeted(&mut cx), "None restores the unbudgeted default");
         cx.free_splash_vm(vm_id);
+    }
+}
+
+#[cfg(test)]
+mod host_registration_tests {
+    use super::*;
+
+    /// A host may register the platform's script modules and the library again in a disposable
+    /// isolate, to evaluate a trusted theme of its own (Rinx resolves theme packages this way).
+    /// In an isolate whose UI is still lazy, the library's first step expands that UI through
+    /// `with_loader`; the resource module the host registered must still be there after it, or
+    /// the theme's fonts no longer resolve (`crate_resource` not in scope) and it stays unbuilt.
+    #[test]
+    fn a_hosts_own_registration_survives_the_lazy_ui_expansion() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let has_loader = |vm: &mut ScriptVm| {
+            let modules = vm.modules();
+            let res = vm.heap().value(modules, id!(res).into(), NoTrap);
+            res.as_object().is_some_and(|res| !vm.heap().value(res, id!(crate_resource).into(), NoTrap).is_nil())
+        };
+        let mut lazy_seen = false;
+        // The first isolate of a shape registers its UI eagerly; later ones are lazy.
+        for _ in 0..4 {
+            let isolate = cx.alloc_splash_vm();
+            cx.with_script_vm_id(isolate, |vm| {
+                assert!(!has_loader(vm), "an isolate is allocated without the resource loader");
+                lazy_seen |= vm.has_lazy_modules();
+                crate::makepad_draw::makepad_platform::script::script_mod(vm);
+                vm.bx.captured_errors = Some(Vec::new());
+                crate::script_mod(vm);
+                let errors = vm.take_errors();
+                assert!(errors.is_empty(), "{:?}", errors.iter().take(3).collect::<Vec<_>>());
+                assert!(has_loader(vm), "the host's resource module is still registered");
+                let theme = vm.module(id!(theme));
+                let page = vm.heap().value(theme, id!(color_bg_app).into(), NoTrap);
+                assert!(page.as_color().is_some(), "the theme was built");
+            });
+            cx.free_splash_vm(isolate);
+        }
+        assert!(lazy_seen, "the test never reached a lazy isolate");
+        // An isolate the host leaves alone stays stripped after its UI expands.
+        let isolate = cx.alloc_splash_vm();
+        cx.with_script_vm_id(isolate, |vm| {
+            vm.expand_all_lazy();
+            assert!(!has_loader(vm), "a guest never sees the resource loader");
+        });
+        cx.free_splash_vm(isolate);
     }
 }
