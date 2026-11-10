@@ -100,7 +100,37 @@ pub fn native_reason(g: &Graph, bs: &BuildScript) -> Option<String> {
     if src.contains("DEP_") {
         return Some(format!("{}: reads DEP_ metadata", name));
     }
+    // A script that builds its own archive with another toolchain (robius-speech runs swiftc)
+    // and links it statically: the run cannot load an archive, so cargo builds it like a `cc`
+    // package and the archive joins the native library. The reason names a build-dependency,
+    // the toolchain, so the run gates it on `--allow-c` exactly as it gates a `cc` package.
+    if links_static_archive(&src) {
+        return Some(format!("{}: build-dependency on a native toolchain (links a static archive it builds)", name));
+    }
     None
+}
+
+/// Whether a build script's source prints a plain `rustc-link-lib=static=` (or `static:+mods=`)
+/// directive. A `-bundle` static link names a library the toolchain already has, not one the
+/// script built.
+fn links_static_archive(src: &str) -> bool {
+    src.match_indices("rustc-link-lib=static").any(|(i, m)| {
+        let rest = &src[i + m.len()..];
+        rest.starts_with('=') || (rest.starts_with(':') && !rest[1..].starts_with("-bundle"))
+    })
+}
+
+#[cfg(test)]
+mod static_archive_tests {
+    use super::links_static_archive;
+
+    #[test]
+    fn a_script_built_archive_is_native_and_a_toolchain_runtime_is_not() {
+        assert!(links_static_archive(r#"println!("cargo:rustc-link-lib=static=robius_speech");"#));
+        assert!(links_static_archive(r#"println!("cargo::rustc-link-lib=static:+whole-archive=foo");"#));
+        assert!(!links_static_archive(r#"println!("cargo:rustc-link-lib=static:-bundle={rt}");"#));
+        assert!(!links_static_archive(r#"println!("cargo:rustc-link-lib=framework=Speech");"#));
+    }
 }
 
 fn fnv(data: &[u8], mut h: u64) -> u64 {

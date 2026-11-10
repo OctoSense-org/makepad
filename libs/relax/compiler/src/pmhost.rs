@@ -391,6 +391,9 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     let _mem = crate::memstat::tag(crate::memstat::Tag::PmHost);
     let reg = REG.with(|r| r.borrow().as_ref().map(|r| (r.units.clone(), r.std_dir.clone())));
     let (units, std_dir) = reg.ok_or("no crate graph registered")?;
+    if std::env::var_os("MAKEPAD_RUN_PM_TRACE").is_some() {
+        eprintln!("makepad-run pmhost: building the world under {:?} (pid {})", policy(), std::process::id());
+    }
     // Only third-party proc-macro roots and their dependencies need a JIT world.
     let mut need = vec![false; units.len()];
     let mut stack: Vec<usize> = (0..units.len()).filter(|&i| units[i].proc_macro && !crate::native_macros::required(&units[i].name)).collect();
