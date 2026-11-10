@@ -419,6 +419,12 @@ fn arch() {
             unsafe { vld1q_u8_x3(b.as_ptr().add(1)) }
         },
     );
+    // xxh3's accumulate and scramble (xxhash-rust, redb)
+    u!(vdup_n_u32, u32);
+    t!(vmlal_u32, uint64x2_t, uint32x2_t, uint32x2_t);
+    t!(vmlal_high_u32, uint64x2_t, uint32x4_t, uint32x4_t);
+    u!(vmovn_u64, uint64x2_t);
+    b!(vuzpq_u32, uint32x4_t, uint32x4_t);
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
