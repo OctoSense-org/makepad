@@ -2158,6 +2158,30 @@ mod tests {
             .any(|diagnostic| diagnostic.contains("script string allocation limit exceeded")));
     }
 
+    /// A native fn made as a value (`ScriptVm::new_fn`) is callable from script once it is
+    /// handed over as an injected global, with its declared argument and its default.
+    #[test]
+    fn a_native_fn_value_is_callable_as_an_injected_global() {
+        let mut host = ScriptVmHost::new((), ());
+        let mut vm = ScriptVm {
+            host: host.host_context(),
+            bx: Box::new(ScriptVmBase::new()),
+        };
+        vm.bx.captured_errors = Some(Vec::new());
+        let twice = vm.new_fn(&[(id!(n), ScriptValue::from_f64(5.0))], |vm, args| {
+            let n = vm.bx.heap.value(args, id!(n).into(), NoTrap);
+            // An integer literal is not an f64 value: cast, as the math natives do.
+            let n = vm.bx.heap.cast_to_f64(n, ScriptIp::default());
+            ScriptValue::from_f64(n * 2.0)
+        });
+        assert!(twice.as_object().is_some());
+        vm.set_injected_global(id!(twice), twice);
+
+        let result = eval(&mut vm, "native-fn-value.octoscript", "twice(21) + twice()");
+        assert_eq!(result.as_f64(), Some(52.0));
+        assert!(vm.take_errors().is_empty());
+    }
+
     #[test]
     fn byte_array_json_input_parses_within_the_string_limit() {
         let mut host = ScriptVmHost::new((), ());
