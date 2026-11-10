@@ -793,3 +793,66 @@ impl<K: Eq + Hash, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, Random
         map
     }
 }
+
+// The iterators that yield `&mut V` or owned items print the entries they have not yielded yet,
+// read through a borrowing iterator from the same position (slotmap's SparseSecondaryMap
+// iterators are `#[derive(Debug)]` wrappers around Drain, IntoIter and IterMut).
+impl<'a, K, V> IterMut<'a, K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        Iter { table: unsafe { &*self.table }, pos: self.pos, remaining: self.remaining }
+    }
+}
+
+impl<K, V> IntoIter<K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        Iter { table: &self.table, pos: self.pos, remaining: self.table.len() }
+    }
+}
+
+impl<'a, K, V> Drain<'a, K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        Iter { table: &*self.table, pos: self.pos, remaining: self.remaining }
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.iter(), f)
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.iter(), f)
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Drain<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.iter(), f)
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(Values { inner: self.inner.iter() }).finish()
+    }
+}
+
+impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(Keys { inner: self.inner.iter() }).finish()
+    }
+}
+
+impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(Values { inner: self.inner.iter() }).finish()
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug, F> fmt::Debug for ExtractIf<'_, K, V, F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
+    }
+}
