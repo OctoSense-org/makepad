@@ -354,6 +354,13 @@ fn arch() {
     ul!(vshr_n_u32(1), uint32x2_t);
     ul!(vshr_n_u32(9), uint32x2_t);
     ul!(vshr_n_u32(32), uint32x2_t);
+    // memchr 2.8, simdutf8 0.1.5, zmij 1.0.19+
+    u!(vrev16q_u8, uint8x16_t);
+    u!(vmovq_n_u8, u8);
+    u!(vcgtzq_s8, int8x16_t);
+    b!(vcombine_s32, int32x2_t, int32x2_t);
+    u!(vcreate_u64, u64);
+    u!(vdup_n_s32, i32);
     u!(vshrq_n_u8::<1>, uint8x16_t);
     u!(vshlq_n_u8::<7>, uint8x16_t);
     b!(vextq_u8::<0>, uint8x16_t, uint8x16_t);
