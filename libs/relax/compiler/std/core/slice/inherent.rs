@@ -259,6 +259,18 @@ impl<T> [T] {
             Some((&self[..mid], &self[mid..]))
         }
     }
+    // core/src/slice/mod.rs (stable 1.79; cmov 0.5's slice_as_chunks, under every constant-time
+    // comparison of ctutils: the AEAD tag check of chacha20poly1305)
+    pub const unsafe fn split_at_unchecked(&self, mid: usize) -> (&[T], &[T]) {
+        let len = self.len();
+        let ptr = self.as_ptr();
+        unsafe { (crate::slice::from_raw_parts(ptr, mid), crate::slice::from_raw_parts(ptr.add(mid), len - mid)) }
+    }
+    pub const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
+        let len = self.len();
+        let ptr = self.as_mut_ptr();
+        unsafe { (crate::slice::from_raw_parts_mut(ptr, mid), crate::slice::from_raw_parts_mut(ptr.add(mid), len - mid)) }
+    }
     // core/src/slice/mod.rs (stable 1.80; getrandom 0.4's sys_fill_exact)
     pub const fn split_at_mut_checked(&mut self, mid: usize) -> Option<(&mut [T], &mut [T])> {
         if mid > self.len() {
