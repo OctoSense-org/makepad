@@ -688,7 +688,12 @@ fn gen_int_traits(o: &mut String, t: &Int) {
     for r in rhs_types {
         for (tr, m, sym) in [("Shl", "shl", "<<"), ("Shr", "shr", ">>")] {
             let _ = writeln!(o, "impl {tr}<{r}> for {n} {{ type Output = {n}; fn {m}(self, rhs: {r}) -> {n} {{ self {sym} rhs }} }}");
+            // core's forward_ref_binop! / forward_ref_op_assign!: either side by reference
+            let _ = writeln!(o, "impl<'a> {tr}<&'a {r}> for {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {r}) -> {n} {{ self {sym} *rhs }} }}");
+            let _ = writeln!(o, "impl<'a> {tr}<{r}> for &'a {n} {{ type Output = {n}; fn {m}(self, rhs: {r}) -> {n} {{ *self {sym} rhs }} }}");
+            let _ = writeln!(o, "impl<'a, 'b> {tr}<&'a {r}> for &'b {n} {{ type Output = {n}; fn {m}(self, rhs: &'a {r}) -> {n} {{ *self {sym} *rhs }} }}");
             let _ = writeln!(o, "impl {tr}Assign<{r}> for {n} {{ fn {m}_assign(&mut self, rhs: {r}) {{ *self = *self {sym} rhs; }} }}");
+            let _ = writeln!(o, "impl<'a> {tr}Assign<&'a {r}> for {n} {{ fn {m}_assign(&mut self, rhs: &'a {r}) {{ *self = *self {sym} *rhs; }} }}");
         }
     }
     let _ = writeln!(o, "impl Not for {n} {{ type Output = {n}; fn not(self) -> {n} {{ !self }} }}");
