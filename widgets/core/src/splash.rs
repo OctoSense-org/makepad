@@ -67,6 +67,9 @@ pub struct Splash {
     /// None leaves the storage default.
     #[rust]
     storage_quota: Option<u64>,
+    /// Cap on this isolate's retained script heap. None = no cap.
+    #[rust]
+    memory_bytes: Option<usize>,
     /// What to call this script in error messages. Set by the host to the
     /// mini-app's id; empty for previews and one-off evals.
     ///
@@ -279,6 +282,9 @@ impl Splash {
         crate::splash_host::set_caps_for_heap(heap_key, self.host_caps.clone());
         crate::splash_host::set_prompts_for_heap(heap_key, self.host_prompts);
         crate::splash_storage::set_quota_for_heap(heap_key, self.storage_quota);
+        if let Some(bytes) = self.memory_bytes {
+            cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.set_max_heap_bytes(Some(bytes)));
+        }
 
         let body_key = self.body_key();
         // Full code string: prefix + body (no closing - parser auto-closes)
@@ -855,6 +861,15 @@ impl Splash {
         }
     }
 
+    /// Caps this isolate's retained script heap. Applied now when the isolate
+    /// exists, and on every evaluation. None removes the cap.
+    pub fn set_memory_bytes(&mut self, cx: &mut Cx, bytes: Option<usize>) {
+        self.memory_bytes = bytes;
+        if self.vm_id != MAIN_SPLASH_VM_ID {
+            cx.with_script_vm_id(self.vm_id, |vm| vm.bx.heap.set_max_heap_bytes(bytes));
+        }
+    }
+
     /// Marks whether this isolate's surface may raise user prompts; see
     /// `SplashHostRequest::may_prompt`. Defaults true.
     pub fn set_host_prompts(&mut self, cx: &mut Cx, may_prompt: bool) {
@@ -913,6 +928,28 @@ impl SplashRef {
     pub fn set_text(&self, cx: &mut Cx, v: &str) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_text(cx, v);
+        }
+    }
+
+    /// Re-evaluate a host-generated body in its live isolate, keeping the
+    /// body's state the way a style reapply does. An empty body, or a Splash
+    /// with no isolate yet, goes through `set_text`.
+    pub fn reapply_text(&self, cx: &mut Cx, body: &str) {
+        if let Some(mut inner) = self.borrow_mut() {
+            if inner.vm_id == MAIN_SPLASH_VM_ID || body.is_empty() {
+                inner.set_text(cx, body);
+            } else if inner.body.as_ref() != body {
+                inner.body.set(body);
+                inner.eval_styled_body(cx, true);
+                inner.redraw(cx);
+            }
+        }
+    }
+
+    /// See [`Splash::set_memory_bytes`].
+    pub fn set_memory_bytes(&self, cx: &mut Cx, bytes: Option<usize>) {
+        if let Some(mut inner) = self.borrow_mut() {
+            inner.set_memory_bytes(cx, bytes);
         }
     }
 

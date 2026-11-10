@@ -142,6 +142,19 @@ pub fn take_splash_host_requests() -> Vec<SplashHostRequest> {
     BRIDGE.with(|b| std::mem::take(&mut b.borrow_mut().queue))
 }
 
+/// Drains only the requests from these isolates, leaving every other host's
+/// queued: a host that runs some isolates (an app runner) must not swallow
+/// the requests of isolates another host answers.
+pub fn take_splash_host_requests_for(heap_keys: &[usize]) -> Vec<SplashHostRequest> {
+    BRIDGE.with(|b| {
+        let mut b = b.borrow_mut();
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut b.queue).into_iter().partition(|r| heap_keys.contains(&r.heap_key));
+        b.queue = rest;
+        mine
+    })
+}
+
 /// Answers one request: `Ok(json)` becomes `{ok: true, data: <parsed>}`,
 /// `Err(msg)` becomes `{ok: false, error: msg}`. Returns what happened, so a
 /// host can log undeliverable answers instead of wondering why an app hangs.
