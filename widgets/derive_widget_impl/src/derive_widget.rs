@@ -299,7 +299,19 @@ fn widget_node_impl(
                     .add(".set_scroll_pos(cx, v)}");
             }
             if !find_fields.is_empty() {
+                // A widget that is a view (`#[deref]`) and also names widgets
+                // of its own (`#[find]`) has both sets of children. Listing
+                // only the find fields made a lookup from the widget itself
+                // (`self.view(cx, ids!(..))`) replace the view's children in
+                // the widget tree with the find fields' and miss everything
+                // in the view, while the same lookup through the deref field
+                // put them back.
                 tb.add("    fn children(&self, visit:&mut dyn FnMut(LiveId, WidgetRef)){");
+                if let Some(deref_field) = &deref_field {
+                    tb.add("    self.")
+                        .ident(deref_field)
+                        .add(".children(visit);");
+                }
                 for find_field in &find_fields {
                     tb.add("    self.")
                         .ident(find_field)
@@ -308,6 +320,11 @@ fn widget_node_impl(
                 tb.add("    }");
                 tb.add("    fn cancel_children_impl(&self, visit:&mut dyn FnMut(LiveId, WidgetRef))->bool{");
                 tb.add("    if !self.visible() { return false; }");
+                if let Some(deref_field) = &deref_field {
+                    tb.add("    self.")
+                        .ident(deref_field)
+                        .add(".visit_cancel(visit);");
+                }
                 for find_field in &find_fields {
                     tb.add("    self.")
                         .ident(find_field)
@@ -315,6 +332,11 @@ fn widget_node_impl(
                 }
                 tb.add("    true }");
                 tb.add("    fn find_widgets_from_point(&self, cx:&Cx, point:DVec2, found:&mut dyn FnMut(&WidgetRef)){");
+                if let Some(deref_field) = &deref_field {
+                    tb.add("    self.")
+                        .ident(deref_field)
+                        .add(".find_widgets_from_point(cx, point, found);");
+                }
                 for find_field in &find_fields {
                     tb.add("    self.")
                         .ident(find_field)
