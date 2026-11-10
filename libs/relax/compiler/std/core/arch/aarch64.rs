@@ -4212,6 +4212,73 @@ pub unsafe fn vsha512su1q_u64(s01_s02: uint64x2_t, w14_15: uint64x2_t, w9_10: ui
     uint64x2_t([w[0].wrapping_add(sig1(x[0])).wrapping_add(y[0]), w[1].wrapping_add(sig1(x[1])).wrapping_add(y[1])])
 }
 
+// ---- AES (FEAT_AES, `aes`): the aes crate's aarch64 backend. A state is FIPS-197's in
+// column-major memory order: byte i is row i % 4 of column i / 4.
+
+/// AESE: SubBytes(ShiftRows(data ^ key)); the round's MixColumns is a separate AESMC
+pub unsafe fn vaeseq_u8(data: uint8x16_t, key: uint8x16_t) -> uint8x16_t {
+    let mut r = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        let row = i % 4;
+        let j = ((i / 4 + row) % 4) * 4 + row;
+        r[i] = super::x86_64::AES_SBOXES[0][(data.0[j] ^ key.0[j]) as usize];
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// AESD: InvSubBytes(InvShiftRows(data ^ key))
+pub unsafe fn vaesdq_u8(data: uint8x16_t, key: uint8x16_t) -> uint8x16_t {
+    let mut r = [0u8; 16];
+    let mut i = 0;
+    while i < 16 {
+        let row = i % 4;
+        let j = ((i / 4 + 4 - row) % 4) * 4 + row;
+        r[i] = super::x86_64::AES_SBOXES[1][(data.0[j] ^ key.0[j]) as usize];
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// times x modulo x^8 + x^4 + x^3 + x + 1
+#[inline(always)]
+fn aes_xtime(a: u8) -> u8 {
+    (a << 1) ^ ((a >> 7) * 0x1b)
+}
+
+/// AESMC: MixColumns, each column times {03}x^3 + {01}x^2 + {01}x + {02}
+pub unsafe fn vaesmcq_u8(data: uint8x16_t) -> uint8x16_t {
+    let a = data.0;
+    let mut r = [0u8; 16];
+    let mut c = 0;
+    while c < 16 {
+        let t = a[c] ^ a[c + 1] ^ a[c + 2] ^ a[c + 3];
+        r[c] = a[c] ^ t ^ aes_xtime(a[c] ^ a[c + 1]);
+        r[c + 1] = a[c + 1] ^ t ^ aes_xtime(a[c + 1] ^ a[c + 2]);
+        r[c + 2] = a[c + 2] ^ t ^ aes_xtime(a[c + 2] ^ a[c + 3]);
+        r[c + 3] = a[c + 3] ^ t ^ aes_xtime(a[c + 3] ^ a[c]);
+        c += 4;
+    }
+    uint8x16_t(r)
+}
+
+/// AESIMC: InvMixColumns, as MixColumns of the column times {04}x^2 + {05}
+pub unsafe fn vaesimcq_u8(data: uint8x16_t) -> uint8x16_t {
+    let mut a = data.0;
+    let mut c = 0;
+    while c < 16 {
+        let u = aes_xtime(aes_xtime(a[c] ^ a[c + 2]));
+        let v = aes_xtime(aes_xtime(a[c + 1] ^ a[c + 3]));
+        a[c] ^= u;
+        a[c + 1] ^= v;
+        a[c + 2] ^= u;
+        a[c + 3] ^= v;
+        c += 4;
+    }
+    vaesmcq_u8(uint8x16_t(a))
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
