@@ -6067,3 +6067,484 @@ pub unsafe fn vreinterpretq_p128_p16(a: poly16x8_t) -> p128 {
 pub unsafe fn vreinterpretq_p128_p64(a: poly64x2_t) -> p128 {
     crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
 }
+
+// The rest of what fearless_simd's NEON level calls (the HTML preview's renderer, vello_cpu,
+// sits on it). Plain lane loops; each one is compared with the real instruction in check_arch.
+
+/// BSL: the bits of `b` where the mask is set, the bits of `c` elsewhere
+pub unsafe fn vbslq_f64(a: uint64x2_t, b: float64x2_t, c: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = f64::from_bits((b.0[i].to_bits() & a.0[i]) | (c.0[i].to_bits() & !a.0[i]));
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// UCVTF: unsigned integer to float, round to nearest even
+pub unsafe fn vcvtq_f32_u32(a: uint32x4_t) -> float32x4_t {
+    let mut r = [0.0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i] as f32;
+        i += 1;
+    }
+    float32x4_t(r)
+}
+
+/// FCVTZS: toward zero, saturating, NaN gives zero
+pub unsafe fn vcvtq_s64_f64(a: float64x2_t) -> int64x2_t {
+    let mut r = [0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = a.0[i] as i64;
+        i += 1;
+    }
+    int64x2_t(r)
+}
+
+/// FCVTZU: toward zero, saturating, negative and NaN give zero
+pub unsafe fn vcvtq_u32_f32(a: float32x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = a.0[i] as u32;
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+/// a - b * c, fused. NaNs follow stdarch's unoptimised form: `b` is negated, then FMLA picks
+/// `a`'s, `c`'s, then `-b`'s. An optimised native build folds the negation into FMLS, which
+/// can return the other factor's NaN sign.
+pub unsafe fn vfmsq_f64(a: float64x2_t, b: float64x2_t, c: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = neon_fma_f64(a.0[i], c.0[i], -b.0[i]);
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// XTN: the low half of each 16-bit lane
+pub unsafe fn vmovn_u16(a: uint16x8_t) -> uint8x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i] as u8;
+        i += 1;
+    }
+    uint8x8_t(r)
+}
+
+/// MUL: lane product, wrapping
+pub unsafe fn vmulq_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[i].wrapping_mul(b.0[i]);
+        i += 1;
+    }
+    int8x16_t(r)
+}
+
+/// MUL: lane product, wrapping
+pub unsafe fn vmulq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[i].wrapping_mul(b.0[i]);
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// MVN: bitwise not
+pub unsafe fn vmvnq_s8(a: int8x16_t) -> int8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = !a.0[i];
+        i += 1;
+    }
+    int8x16_t(r)
+}
+
+/// MVN: bitwise not
+pub unsafe fn vmvnq_s16(a: int16x8_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = !a.0[i];
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// MVN: bitwise not
+pub unsafe fn vmvnq_s32(a: int32x4_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = !a.0[i];
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// MVN: bitwise not
+pub unsafe fn vmvnq_u16(a: uint16x8_t) -> uint16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = !a.0[i];
+        i += 1;
+    }
+    uint16x8_t(r)
+}
+
+/// FNEG: flips the sign bit, of a NaN too
+pub unsafe fn vnegq_f64(a: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = -a.0[i];
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// NEG: wrapping, so the minimum stays the minimum
+pub unsafe fn vnegq_s8(a: int8x16_t) -> int8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[i].wrapping_neg();
+        i += 1;
+    }
+    int8x16_t(r)
+}
+
+/// NEG: wrapping, so the minimum stays the minimum
+pub unsafe fn vnegq_s16(a: int16x8_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = a.0[i].wrapping_neg();
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// FRINTN: to nearest, ties to even
+pub unsafe fn vrndnq_f64(a: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = neon_result_f64(a.0[i], a.0[i], a.0[i].round_ties_even());
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// FRINTZ: toward zero
+pub unsafe fn vrndq_f64(a: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = neon_result_f64(a.0[i], a.0[i], a.0[i].trunc());
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// SSHL: left by the signed low byte of each `b` lane, arithmetic right when it is negative
+pub unsafe fn vshlq_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = {
+            let shift = b.0[i] as i32;
+            if shift >= 8 {
+                0
+            } else if shift >= 0 {
+                a.0[i] << shift
+            } else if shift <= -8 {
+                a.0[i] >> 7
+            } else {
+                a.0[i] >> -shift
+            }
+        };
+        i += 1;
+    }
+    int8x16_t(r)
+}
+
+/// USHL: left by the signed low byte of each `b` lane, logical right when it is negative
+pub unsafe fn vshlq_u8(a: uint8x16_t, b: int8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = {
+            let shift = b.0[i] as i32;
+            if shift >= 8 {
+                0
+            } else if shift >= 0 {
+                a.0[i] << shift
+            } else if shift <= -8 {
+                0
+            } else {
+                a.0[i] >> -shift
+            }
+        };
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_f64(a: float64x2_t, b: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = if i < 1 { a.0[i * 2 + 0] } else { b.0[(i - 1) * 2 + 0] };
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if i < 8 { a.0[i * 2 + 0] } else { b.0[(i - 8) * 2 + 0] };
+        i += 1;
+    }
+    int8x16_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = if i < 4 { a.0[i * 2 + 0] } else { b.0[(i - 4) * 2 + 0] };
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if i < 2 { a.0[i * 2 + 0] } else { b.0[(i - 2) * 2 + 0] };
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if i < 8 { a.0[i * 2 + 0] } else { b.0[(i - 8) * 2 + 0] };
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = if i < 4 { a.0[i * 2 + 0] } else { b.0[(i - 4) * 2 + 0] };
+        i += 1;
+    }
+    uint16x8_t(r)
+}
+
+/// UZP1: the even lanes of `a`, then the even lanes of `b`
+pub unsafe fn vuzp1q_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if i < 2 { a.0[i * 2 + 0] } else { b.0[(i - 2) * 2 + 0] };
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_f64(a: float64x2_t, b: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = if i < 1 { a.0[i * 2 + 1] } else { b.0[(i - 1) * 2 + 1] };
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_s8(a: int8x16_t, b: int8x16_t) -> int8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if i < 8 { a.0[i * 2 + 1] } else { b.0[(i - 8) * 2 + 1] };
+        i += 1;
+    }
+    int8x16_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = if i < 4 { a.0[i * 2 + 1] } else { b.0[(i - 4) * 2 + 1] };
+        i += 1;
+    }
+    int16x8_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if i < 2 { a.0[i * 2 + 1] } else { b.0[(i - 2) * 2 + 1] };
+        i += 1;
+    }
+    int32x4_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if i < 8 { a.0[i * 2 + 1] } else { b.0[(i - 8) * 2 + 1] };
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
+    let mut r = [0; 8];
+    let mut i = 0;
+    while i < 8 {
+        r[i] = if i < 4 { a.0[i * 2 + 1] } else { b.0[(i - 4) * 2 + 1] };
+        i += 1;
+    }
+    uint16x8_t(r)
+}
+
+/// UZP2: the odd lanes of `a`, then the odd lanes of `b`
+pub unsafe fn vuzp2q_u32(a: uint32x4_t, b: uint32x4_t) -> uint32x4_t {
+    let mut r = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        r[i] = if i < 2 { a.0[i * 2 + 1] } else { b.0[(i - 2) * 2 + 1] };
+        i += 1;
+    }
+    uint32x4_t(r)
+}
+
+/// ZIP1: the low lanes of `a` and `b`, interleaved
+pub unsafe fn vzip1q_f64(a: float64x2_t, b: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = if i == 0 { a.0[0] } else { b.0[0] };
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// ZIP2: the high lanes of `a` and `b`, interleaved
+pub unsafe fn vzip2q_f64(a: float64x2_t, b: float64x2_t) -> float64x2_t {
+    let mut r = [0.0; 2];
+    let mut i = 0;
+    while i < 2 {
+        r[i] = if i == 0 { a.0[1] } else { b.0[1] };
+        i += 1;
+    }
+    float64x2_t(r)
+}
+
+/// LD4: 16 values deinterleaved, value 4 * i + k in lane i of register k
+pub unsafe fn vld4q_f32(a: *const f32) -> float32x4x4_t {
+    let mut r = [[0.0f32; 4]; 4];
+    let mut i = 0;
+    while i < 16 {
+        r[i % 4][i / 4] = crate::ptr::read_unaligned(a.add(i));
+        i += 1;
+    }
+    float32x4x4_t(float32x4_t(r[0]), float32x4_t(r[1]), float32x4_t(r[2]), float32x4_t(r[3]))
+}
+
+/// ST4: 16 values interleaved, lane i of register k at index 4 * i + k
+pub unsafe fn vst4q_f32(a: *mut f32, b: float32x4x4_t) {
+    let mut i = 0;
+    while i < 4 {
+        crate::ptr::write_unaligned(a.add(i * 4 + 0), b.0 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 1), b.1 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 2), b.2 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 3), b.3 .0[i]);
+        i += 1;
+    }
+}
+
+/// LD4: 32 values deinterleaved, value 4 * i + k in lane i of register k
+pub unsafe fn vld4q_u16(a: *const u16) -> uint16x8x4_t {
+    let mut r = [[0u16; 8]; 4];
+    let mut i = 0;
+    while i < 32 {
+        r[i % 4][i / 4] = crate::ptr::read_unaligned(a.add(i));
+        i += 1;
+    }
+    uint16x8x4_t(uint16x8_t(r[0]), uint16x8_t(r[1]), uint16x8_t(r[2]), uint16x8_t(r[3]))
+}
+
+/// ST4: 32 values interleaved, lane i of register k at index 4 * i + k
+pub unsafe fn vst4q_u16(a: *mut u16, b: uint16x8x4_t) {
+    let mut i = 0;
+    while i < 8 {
+        crate::ptr::write_unaligned(a.add(i * 4 + 0), b.0 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 1), b.1 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 2), b.2 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 3), b.3 .0[i]);
+        i += 1;
+    }
+}
+
+/// LD4: 16 values deinterleaved, value 4 * i + k in lane i of register k
+pub unsafe fn vld4q_u32(a: *const u32) -> uint32x4x4_t {
+    let mut r = [[0u32; 4]; 4];
+    let mut i = 0;
+    while i < 16 {
+        r[i % 4][i / 4] = crate::ptr::read_unaligned(a.add(i));
+        i += 1;
+    }
+    uint32x4x4_t(uint32x4_t(r[0]), uint32x4_t(r[1]), uint32x4_t(r[2]), uint32x4_t(r[3]))
+}
+
+/// ST4: 16 values interleaved, lane i of register k at index 4 * i + k
+pub unsafe fn vst4q_u32(a: *mut u32, b: uint32x4x4_t) {
+    let mut i = 0;
+    while i < 4 {
+        crate::ptr::write_unaligned(a.add(i * 4 + 0), b.0 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 1), b.1 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 2), b.2 .0[i]);
+        crate::ptr::write_unaligned(a.add(i * 4 + 3), b.3 .0[i]);
+        i += 1;
+    }
+}
