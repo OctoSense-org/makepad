@@ -4101,6 +4101,18 @@ pub unsafe fn vmull_p64(a: p64, b: p64) -> p128 {
     (r.0[0] as u128) | (r.0[1] as u128) << 64
 }
 
+/// LD1 of two registers: 32 consecutive bytes, the first 16 in `.0` (constant_time_eq).
+#[inline(always)]
+pub unsafe fn vld1q_u8_x2(a: *const u8) -> uint8x16x2_t {
+    uint8x16x2_t(vld1q_u8(a), vld1q_u8(a.add(16)))
+}
+
+/// LD1 of three registers: 48 consecutive bytes.
+#[inline(always)]
+pub unsafe fn vld1q_u8_x3(a: *const u8) -> uint8x16x3_t {
+    uint8x16x3_t(vld1q_u8(a), vld1q_u8(a.add(16)), vld1q_u8(a.add(32)))
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
