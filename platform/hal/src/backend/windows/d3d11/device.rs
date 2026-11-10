@@ -221,18 +221,27 @@ impl Device {
                 .unwrap_or_default();
             let mut device: Option<ID3D11Device> = None;
             let mut ctx: Option<ID3D11DeviceContext> = None;
-            D3D11CreateDevice(
-                Some(&adapter),
-                D3D_DRIVER_TYPE_UNKNOWN,
-                None,
-                D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 | D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0),
-                Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
-                D3D11_SDK_VERSION,
-                Some(&mut device),
-                None,
-                Some(&mut ctx),
-            )
-            .map_err(|e| hr("D3D11CreateDevice (feature level 11)", e))?;
+            let mut create = |flags: u32| {
+                D3D11CreateDevice(
+                    Some(&adapter),
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    None,
+                    D3D11_CREATE_DEVICE_FLAG(flags),
+                    Some(&[D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0]),
+                    D3D11_SDK_VERSION,
+                    Some(&mut device),
+                    None,
+                    Some(&mut ctx),
+                )
+            };
+            // A machine whose only adapter is the software one (a VM, a CI runner, a session
+            // without a GPU: Microsoft Basic Render Driver) has no video support, and the device
+            // is refused with the flag (DXGI_ERROR_UNSUPPORTED, 887a0004). It renders without
+            // it; what needs the video processor asks the device for it and is told no.
+            if create(D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 | D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0).is_err() {
+                create(D3D11_CREATE_DEVICE_BGRA_SUPPORT.0).map_err(|e| hr("D3D11CreateDevice (feature level 11)", e))?;
+                eprintln!("[hal-d3d11] {adapter_name}: no video support; the device is open without it");
+            }
             let device = device.ok_or("D3D11CreateDevice returned no device")?;
             let ctx = ctx.ok_or("D3D11CreateDevice returned no context")?;
             let ctx1 = ID3D11DeviceContext1::query(ctx.as_raw()).map_err(|e| hr("ID3D11DeviceContext1 (D3D11.1 runtime)", e))?;

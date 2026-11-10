@@ -35,6 +35,21 @@ mod tests {
         assert!(!zst.spilled());
     }
 
+    // `smallvec!` named by its path, with no `use` of the macro (stylo's stylist.rs:
+    // `smallvec::smallvec![CascadeLayer::root()]`). The provided smallvec declares no such
+    // macro_rules: it is a built-in, and has to be one by this spelling too.
+    #[test]
+    fn smallvec_macro_by_its_path() {
+        let list: SmallVec<[u32; 2]> = smallvec::smallvec![1, 2, 3];
+        assert_eq!(&list[..], &[1, 2, 3]);
+        assert!(list.spilled());
+        let repeat: SmallVec<[u8; 4]> = smallvec::smallvec![9; 2];
+        assert_eq!(&repeat[..], &[9, 9]);
+        assert!(!repeat.spilled());
+        let empty: SmallVec<[String; 1]> = smallvec::smallvec![];
+        assert!(empty.is_empty());
+    }
+
     #[test]
     fn array_string_utf8_and_capacity() {
         const EMPTY: ArrayString<10> = ArrayString::new_const();
