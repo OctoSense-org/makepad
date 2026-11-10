@@ -3937,6 +3937,47 @@ pub unsafe fn vshr_n_u32<const N: i32>(a: uint32x2_t) -> uint32x2_t {
     uint32x2_t(r)
 }
 
+// ---- memchr 2.8 (vrev16q_u8), simdutf8 0.1.5 (vmovq_n_u8), zmij 1.0.19+
+
+/// REV16 .16b: the two bytes of each 16-bit lane swapped
+pub unsafe fn vrev16q_u8(a: uint8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = a.0[i ^ 1];
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+#[inline(always)]
+pub unsafe fn vmovq_n_u8(value: u8) -> uint8x16_t {
+    vdupq_n_u8(value)
+}
+
+/// CMGT #0: all ones where a lane is greater than zero
+pub unsafe fn vcgtzq_s8(a: int8x16_t) -> uint8x16_t {
+    let mut r = [0; 16];
+    let mut i = 0;
+    while i < 16 {
+        r[i] = if a.0[i] > 0 { 0xff } else { 0 };
+        i += 1;
+    }
+    uint8x16_t(r)
+}
+
+pub unsafe fn vcombine_s32(low: int32x2_t, high: int32x2_t) -> int32x4_t {
+    int32x4_t([low.0[0], low.0[1], high.0[0], high.0[1]])
+}
+
+pub unsafe fn vcreate_u64(a: u64) -> uint64x1_t {
+    uint64x1_t([a])
+}
+
+pub unsafe fn vdup_n_s32(value: i32) -> int32x2_t {
+    int32x2_t([value; 2])
+}
+
 // ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
 // generates the same set); the bits are unchanged.
 
