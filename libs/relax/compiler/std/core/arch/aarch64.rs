@@ -3825,3 +3825,1544 @@ pub unsafe fn vst1q_u64(a: *mut u64, b: uint64x2_t) {
 pub unsafe fn vmaxq_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
     vx::vx_binary(a, b, 14, 32)
 }
+
+// ---- vreinterpret{,q}_<to>_<from>: every pair of core::arch's element types (stdarch
+// generates the same set); the bits are unchanged.
+
+/// stdarch's 128-bit polynomial (`vreinterpretq_p128_*`, `vmull_p64`'s result)
+pub type p128 = u128;
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_s16(a: int16x4_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_s32(a: int32x2_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_s64(a: int64x1_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_u16(a: uint16x4_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_u32(a: uint32x2_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_u64(a: uint64x1_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_f32(a: float32x2_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_f64(a: float64x1_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_p8(a: poly8x8_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_p16(a: poly16x4_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s8_p64(a: poly64x1_t) -> int8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_s8(a: int8x8_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_s32(a: int32x2_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_s64(a: int64x1_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_u8(a: uint8x8_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_u16(a: uint16x4_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_u32(a: uint32x2_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_u64(a: uint64x1_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_f32(a: float32x2_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_f64(a: float64x1_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_p8(a: poly8x8_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_p16(a: poly16x4_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s16_p64(a: poly64x1_t) -> int16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_s8(a: int8x8_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_s16(a: int16x4_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_s64(a: int64x1_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_u8(a: uint8x8_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_u16(a: uint16x4_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_u32(a: uint32x2_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_u64(a: uint64x1_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_f32(a: float32x2_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_f64(a: float64x1_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_p8(a: poly8x8_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_p16(a: poly16x4_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s32_p64(a: poly64x1_t) -> int32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_s8(a: int8x8_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_s16(a: int16x4_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_s32(a: int32x2_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_u8(a: uint8x8_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_u16(a: uint16x4_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_u32(a: uint32x2_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_u64(a: uint64x1_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_f32(a: float32x2_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_f64(a: float64x1_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_p8(a: poly8x8_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_p16(a: poly16x4_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_s64_p64(a: poly64x1_t) -> int64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_s8(a: int8x8_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_s16(a: int16x4_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_s32(a: int32x2_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_s64(a: int64x1_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_u16(a: uint16x4_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_u32(a: uint32x2_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_u64(a: uint64x1_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_f32(a: float32x2_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_f64(a: float64x1_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_p8(a: poly8x8_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_p16(a: poly16x4_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u8_p64(a: poly64x1_t) -> uint8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_s8(a: int8x8_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_s16(a: int16x4_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_s32(a: int32x2_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_s64(a: int64x1_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_u8(a: uint8x8_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_u32(a: uint32x2_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_u64(a: uint64x1_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_f32(a: float32x2_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_f64(a: float64x1_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_p8(a: poly8x8_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_p16(a: poly16x4_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u16_p64(a: poly64x1_t) -> uint16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_s8(a: int8x8_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_s16(a: int16x4_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_s32(a: int32x2_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_s64(a: int64x1_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_u8(a: uint8x8_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_u16(a: uint16x4_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_u64(a: uint64x1_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_f32(a: float32x2_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_f64(a: float64x1_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_p8(a: poly8x8_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_p16(a: poly16x4_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u32_p64(a: poly64x1_t) -> uint32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_s8(a: int8x8_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_s16(a: int16x4_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_s32(a: int32x2_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_s64(a: int64x1_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_u16(a: uint16x4_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_u32(a: uint32x2_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_f32(a: float32x2_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_f64(a: float64x1_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_p8(a: poly8x8_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_p16(a: poly16x4_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_u64_p64(a: poly64x1_t) -> uint64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_s8(a: int8x8_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_s16(a: int16x4_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_s32(a: int32x2_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_s64(a: int64x1_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_u8(a: uint8x8_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_u16(a: uint16x4_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_u32(a: uint32x2_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_u64(a: uint64x1_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_f64(a: float64x1_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_p8(a: poly8x8_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_p16(a: poly16x4_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f32_p64(a: poly64x1_t) -> float32x2_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_s8(a: int8x8_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_s16(a: int16x4_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_s32(a: int32x2_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_s64(a: int64x1_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_u8(a: uint8x8_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_u16(a: uint16x4_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_u32(a: uint32x2_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_u64(a: uint64x1_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_f32(a: float32x2_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_p8(a: poly8x8_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_p16(a: poly16x4_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_f64_p64(a: poly64x1_t) -> float64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_s8(a: int8x8_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_s16(a: int16x4_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_s32(a: int32x2_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_s64(a: int64x1_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_u8(a: uint8x8_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_u16(a: uint16x4_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_u32(a: uint32x2_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_u64(a: uint64x1_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_f32(a: float32x2_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_f64(a: float64x1_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_p16(a: poly16x4_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p8_p64(a: poly64x1_t) -> poly8x8_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_s8(a: int8x8_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_s16(a: int16x4_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_s32(a: int32x2_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_s64(a: int64x1_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_u8(a: uint8x8_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_u16(a: uint16x4_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_u32(a: uint32x2_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_u64(a: uint64x1_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_f32(a: float32x2_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_f64(a: float64x1_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_p8(a: poly8x8_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p16_p64(a: poly64x1_t) -> poly16x4_t {
+    crate::ptr::read_unaligned((&a as *const poly64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_s8(a: int8x8_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const int8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_s16(a: int16x4_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_s32(a: int32x2_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_s64(a: int64x1_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_u8(a: uint8x8_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_u16(a: uint16x4_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_u32(a: uint32x2_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_u64(a: uint64x1_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_f32(a: float32x2_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_f64(a: float64x1_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const float64x1_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_p8(a: poly8x8_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly8x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpret_p64_p16(a: poly16x4_t) -> poly64x1_t {
+    crate::ptr::read_unaligned((&a as *const poly16x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_s16(a: int16x8_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_s32(a: int32x4_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_s64(a: int64x2_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_u16(a: uint16x8_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_u32(a: uint32x4_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_u64(a: uint64x2_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_f32(a: float32x4_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_f64(a: float64x2_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_p8(a: poly8x16_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_p16(a: poly16x8_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_p64(a: poly64x2_t) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s8_p128(a: p128) -> int8x16_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_s8(a: int8x16_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_s64(a: int64x2_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_u8(a: uint8x16_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_u32(a: uint32x4_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_u64(a: uint64x2_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_f32(a: float32x4_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_f64(a: float64x2_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_p8(a: poly8x16_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_p16(a: poly16x8_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_p64(a: poly64x2_t) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s16_p128(a: p128) -> int16x8_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_s8(a: int8x16_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_u8(a: uint8x16_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_u16(a: uint16x8_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_u64(a: uint64x2_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_f64(a: float64x2_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_p8(a: poly8x16_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_p16(a: poly16x8_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_p64(a: poly64x2_t) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s32_p128(a: p128) -> int32x4_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_s8(a: int8x16_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_s16(a: int16x8_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_u8(a: uint8x16_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_u16(a: uint16x8_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_u32(a: uint32x4_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_f32(a: float32x4_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_f64(a: float64x2_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_p8(a: poly8x16_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_p16(a: poly16x8_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_p64(a: poly64x2_t) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_s64_p128(a: p128) -> int64x2_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_s16(a: int16x8_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_s64(a: int64x2_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_u16(a: uint16x8_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_u32(a: uint32x4_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_u64(a: uint64x2_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_f32(a: float32x4_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_f64(a: float64x2_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_p8(a: poly8x16_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_p16(a: poly16x8_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_p64(a: poly64x2_t) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u8_p128(a: p128) -> uint8x16_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_s8(a: int8x16_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_s64(a: int64x2_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_u64(a: uint64x2_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_f32(a: float32x4_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_f64(a: float64x2_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_p8(a: poly8x16_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_p16(a: poly16x8_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_p64(a: poly64x2_t) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u16_p128(a: p128) -> uint16x8_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_s8(a: int8x16_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_s16(a: int16x8_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_s64(a: int64x2_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_u16(a: uint16x8_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_u64(a: uint64x2_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_p8(a: poly8x16_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_p16(a: poly16x8_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_p64(a: poly64x2_t) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u32_p128(a: p128) -> uint32x4_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_s8(a: int8x16_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_s16(a: int16x8_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_s32(a: int32x4_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_u16(a: uint16x8_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_u32(a: uint32x4_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_p8(a: poly8x16_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_p16(a: poly16x8_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_p64(a: poly64x2_t) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_u64_p128(a: p128) -> uint64x2_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_s8(a: int8x16_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_s16(a: int16x8_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_s64(a: int64x2_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_u16(a: uint16x8_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_f64(a: float64x2_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_p8(a: poly8x16_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_p16(a: poly16x8_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_p64(a: poly64x2_t) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f32_p128(a: p128) -> float32x4_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_s8(a: int8x16_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_s16(a: int16x8_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_s32(a: int32x4_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_s64(a: int64x2_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_u8(a: uint8x16_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_u16(a: uint16x8_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_f32(a: float32x4_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_p8(a: poly8x16_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_p16(a: poly16x8_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_p64(a: poly64x2_t) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_f64_p128(a: p128) -> float64x2_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_s8(a: int8x16_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_s16(a: int16x8_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_s32(a: int32x4_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_s64(a: int64x2_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_u8(a: uint8x16_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_u16(a: uint16x8_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_u32(a: uint32x4_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_u64(a: uint64x2_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_f32(a: float32x4_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_f64(a: float64x2_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_p16(a: poly16x8_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_p64(a: poly64x2_t) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p8_p128(a: p128) -> poly8x16_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_s8(a: int8x16_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_s16(a: int16x8_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_s32(a: int32x4_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_s64(a: int64x2_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_u8(a: uint8x16_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_u16(a: uint16x8_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_u32(a: uint32x4_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_u64(a: uint64x2_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_f32(a: float32x4_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_f64(a: float64x2_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_p8(a: poly8x16_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_p64(a: poly64x2_t) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p16_p128(a: p128) -> poly16x8_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_s8(a: int8x16_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_s16(a: int16x8_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_s32(a: int32x4_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_s64(a: int64x2_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_u8(a: uint8x16_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_u16(a: uint16x8_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_u32(a: uint32x4_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_u64(a: uint64x2_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_f32(a: float32x4_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_f64(a: float64x2_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_p8(a: poly8x16_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_p16(a: poly16x8_t) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p64_p128(a: p128) -> poly64x2_t {
+    crate::ptr::read_unaligned((&a as *const p128).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_s8(a: int8x16_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_s16(a: int16x8_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_s32(a: int32x4_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const int32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_s64(a: int64x2_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_u8(a: uint8x16_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const uint8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_u16(a: uint16x8_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const uint16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_u32(a: uint32x4_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_u64(a: uint64x2_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_f32(a: float32x4_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const float32x4_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_f64(a: float64x2_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const float64x2_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_p8(a: poly8x16_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const poly8x16_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_p16(a: poly16x8_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const poly16x8_t).cast())
+}
+
+#[inline(always)]
+pub unsafe fn vreinterpretq_p128_p64(a: poly64x2_t) -> p128 {
+    crate::ptr::read_unaligned((&a as *const poly64x2_t).cast())
+}
