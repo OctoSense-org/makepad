@@ -155,6 +155,72 @@ pub struct InstanceHandles {
     pub storage: StorageHandle,
     pub viewport: Viewport,
     pub replies: ReplySink,
+    /// Extra windows the instance asks the host for (see [`ModuleWindows`]).
+    pub windows: ModuleWindows,
+}
+
+/// A request from an instance for one of its extra host windows.
+pub enum WindowRequest {
+    /// Show `root` (a widget of the instance, in its isolate) in a new host
+    /// window titled `title`, keyed `key` within the instance. `size` is a hint.
+    Open { key: LiveId, title: String, root: WidgetRef, size: Option<DVec2> },
+    /// Close the instance's window `key`, if it is open.
+    Close { key: LiveId },
+}
+
+#[derive(Default)]
+struct ModuleWindowsInner {
+    supported: bool,
+    requests: Vec<WindowRequest>,
+    closed: Vec<LiveId>,
+}
+
+/// Extra windows for an instance: a chat app's separate article or photo
+/// window on a desktop host, beside the instance's own window.
+///
+/// The instance queues requests; the host takes them on the UI thread, shows
+/// each root as a window of its own (drawn and fed events in the instance's
+/// isolate), and reports windows the person closed. A host that has no
+/// windows (a phone) never takes requests, so an instance should only use
+/// this where [`ModuleWindows::is_supported`] says so and fall back to its
+/// own full-screen views otherwise. Not `Send`: UI-thread only.
+#[derive(Clone, Default)]
+pub struct ModuleWindows(std::rc::Rc<std::cell::RefCell<ModuleWindowsInner>>);
+
+impl ModuleWindows {
+    /// Handles for a host that does (`true`) or does not show extra windows.
+    pub fn new(supported: bool) -> Self {
+        let windows = Self::default();
+        windows.set_supported(supported);
+        windows
+    }
+    /// Whether this host shows extra windows now. It can change while the
+    /// instance runs (a desktop host switching to its phone shell).
+    pub fn is_supported(&self) -> bool {
+        self.0.borrow().supported
+    }
+    /// The host starts or stops showing extra windows (host side).
+    pub fn set_supported(&self, supported: bool) {
+        self.0.borrow_mut().supported = supported;
+    }
+    pub fn open(&self, key: LiveId, title: &str, root: WidgetRef, size: Option<DVec2>) {
+        self.0.borrow_mut().requests.push(WindowRequest::Open { key, title: title.into(), root, size });
+    }
+    pub fn close(&self, key: LiveId) {
+        self.0.borrow_mut().requests.push(WindowRequest::Close { key });
+    }
+    /// Windows the person closed since the last call (instance side).
+    pub fn take_closed(&self) -> Vec<LiveId> {
+        std::mem::take(&mut self.0.borrow_mut().closed)
+    }
+    /// Pending requests (host side).
+    pub fn take_requests(&self) -> Vec<WindowRequest> {
+        std::mem::take(&mut self.0.borrow_mut().requests)
+    }
+    /// The person closed window `key` (host side).
+    pub fn notify_closed(&self, key: LiveId) {
+        self.0.borrow_mut().closed.push(key);
+    }
 }
 
 /// How a call ended, from the executor's side.
@@ -171,6 +237,14 @@ pub enum ExecOutcome {
 /// widget reference cannot lend out.
 pub trait ServiceExecutor {
     /// The manifest the host registers on the AI bus for this instance.
+    ///
+    /// A module is trusted code, so a destructive tool it marks
+    /// [`confirmed_by_app`](makepad_ai_services::wire::ToolDef::confirmed_by_app)
+    /// keeps that mark: the module's own sheet, showing the person the exact
+    /// effect, is then the only confirmation, and the chat pane does not ask
+    /// again. Such a tool answers `Pending` while its sheet is up, sends its
+    /// result through the [`ReplySink`], answers `Denied` on a no or a
+    /// timeout, and closes the sheet on [`cancel`](Self::cancel).
     fn manifest(&self) -> ServiceManifest;
     /// Run one call. `cx` is the host's; the executor may borrow its own
     /// widgets through it but must not run isolate script outside the
@@ -384,6 +458,35 @@ mod tests {
         let strict = OpenSchema::new(2).arg("file", OpenArgKind::FileHandle, true);
         assert!(strict.empty_open().unwrap_err().contains("required"));
         assert!(s.empty_open().is_ok());
+    }
+
+    #[test]
+    fn a_module_manifest_can_mark_a_destructive_tool_as_confirmed_by_the_app() {
+        use makepad_ai_services::wire::{Risk, ToolDef};
+        let manifest = ServiceManifest::new("chat", "Chat", "Messages.")
+            .with_tool(ToolDef::new("send", "Send a message.", r#"{"type":"object","properties":{}}"#, Risk::Destructive).confirmed_by_app())
+            .with_tool(ToolDef::new("delete", "Delete a message.", r#"{"type":"object","properties":{}}"#, Risk::Destructive));
+        manifest.validate().expect("valid");
+        assert!(manifest.tool("send").unwrap().confirms_itself());
+        assert!(!manifest.tool("delete").unwrap().confirms_itself(), "the default is the pane's confirm");
+    }
+
+    #[test]
+    fn extra_windows_queue_requests_for_the_host_and_closes_for_the_instance() {
+        let windows = ModuleWindows::default();
+        assert!(!windows.is_supported(), "a host that says nothing shows no extra windows");
+        let host_side = windows.clone();
+        host_side.set_supported(true);
+        assert!(windows.is_supported());
+        windows.open(live_id!(article), "Article", WidgetRef::empty(), Some(dvec2(640.0, 480.0)));
+        windows.close(live_id!(photo));
+        let requests = host_side.take_requests();
+        assert!(matches!(&requests[0], WindowRequest::Open { key, title, .. } if *key == live_id!(article) && title == "Article"));
+        assert!(matches!(&requests[1], WindowRequest::Close { key } if *key == live_id!(photo)));
+        assert!(host_side.take_requests().is_empty());
+        host_side.notify_closed(live_id!(article));
+        assert_eq!(windows.take_closed(), vec![live_id!(article)]);
+        assert!(windows.take_closed().is_empty());
     }
 
     #[test]
