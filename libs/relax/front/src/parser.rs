@@ -172,6 +172,9 @@ pub struct Parser<'a> {
     /// the statement macro whose expansion is being parsed was called with a `;` after it: its
     /// last statement gets that `;` (rustc add_trailing_semicolon), so it is not a trailing macro
     expansion_semi: bool,
+    /// the call at the cursor is the whole expansion of a block's trailing macro call: a
+    /// trailing call itself (taken by `try_expand_rules`)
+    tail_mac: bool,
     /// attributes whose shape is checked once their item is known to be configured in (check only)
     pending_shape: Vec<(TokRange, Option<PErr>)>,
 }
@@ -244,6 +247,7 @@ impl<'a> Parser<'a> {
             foreign_abi: None,
             cfg_out: 0,
             expansion_semi: false,
+            tail_mac: false,
             pending_shape: Vec::new(),
         }
     }
@@ -2031,6 +2035,7 @@ impl<'a> Parser<'a> {
     /// the item or statement) expanded and parsed with `f`.
     fn try_expand_rules<X>(&mut self, f: impl FnOnce(&mut Self, bool, bool) -> PResult<X>) -> PResult<Option<X>> {
         let as_expr = std::mem::take(&mut self.stmt_ctx);
+        let tail_mac = std::mem::take(&mut self.tail_mac);
         if self.macros.is_none() || !self.mac_ahead() {
             return Ok(None);
         }
@@ -2053,11 +2058,16 @@ impl<'a> Parser<'a> {
             self.pos = save;
             return Ok(None);
         }
+        // (asked for as a trailing call only: anything else is left to the expression parse)
+        if tail_mac && (def.builtin != 0 || self.kind() != T::Eof) {
+            self.pos = save;
+            return Ok(None);
+        }
         let trailing = delim != b'{' && (self.kind() == T::CloseBrace || (self.kind() == T::Eof && !self.expansion_semi));
         // rustc_parse `parse_stmt_mac`: a call ending its block without `;` is an expression statement,
         // expanded as one expression (an `Eof` after it is the end of an enclosing expansion: a statement),
         // in a run as in a check: the block's value is the expression's
-        let tail_expr = delim != b'{' && self.kind() == T::CloseBrace && def.builtin == 0 && (lo as usize) < self.src.len();
+        let tail_expr = delim != b'{' && def.builtin == 0 && (self.kind() == T::CloseBrace && (lo as usize) < self.src.len() || tail_mac && self.kind() == T::Eof);
         let had_semi = self.eat(T::Semi);
         self.include_as_expr = as_expr;
         self.cfg_select_rest.borrow_mut().clear();
@@ -2192,13 +2202,36 @@ impl<'a> Parser<'a> {
                 if p.kind() == T::Eof {
                     return Err(PErr { pos: p.lo(), msg: "macro expansion ends with an incomplete expression: expected expression".to_string() });
                 }
-                let e = p.expr()?;
+                // The expression is the block's trailing statement (rustc_expand `flat_map_stmt`
+                // expands it as AstFragmentKind::OptExpr): a `#[cfg]` on it that is false removes
+                // it, leaving the block without a value (hyper's `trace!` is
+                // `#[cfg(feature = "tracing")] { .. }`), and a macro call that is the whole
+                // expansion is a trailing call again.
+                if p.whole_expansion_is_call() {
+                    let save = p.pos;
+                    p.tail_mac = true;
+                    if p.stmt_macro(&mut v)? {
+                        return Ok(v);
+                    }
+                    p.pos = save;
+                }
+                let pend0 = p.pending_shape.len();
+                let attrs = p.outer_attrs()?;
+                let active = attrs.is_empty() || p.cfg_active(&attrs);
+                if active && !p.pending_shape.is_empty() { p.check_pending_attrs()?; }
+                let e = p.with_cfg_active(active, pend0, |p| p.expr())?;
                 p.eat(T::Semi);
                 if p.kind() != T::Eof {
                     let t = String::from_utf8_lossy(p.tok_text(p.tok())).into_owned();
                     return Err(PErr { pos: p.lo(), msg: format!("macro expansion ignores `{t}` and any tokens following") });
                 }
-                return Ok(vec![Stmt::Expr(e, false)]);
+                if attrs.is_empty() {
+                    return Ok(vec![Stmt::Expr(e, false)]);
+                }
+                // kept for cfg stripping at load, like a written statement's attributes
+                let attrs = p.ast.push_list(attrs);
+                let r = p.ast.push_row(AttrsStmt { attrs, expr: e, semi: false });
+                return Ok(vec![Stmt::Attrs(r)]);
             }
             // `include!` in statement position is an expression: its first one, the rest of the
             // file is ignored (rustc_expand base.rs `ExpandInclude::make_expr`, lint incomplete_include)
@@ -2230,6 +2263,37 @@ impl<'a> Parser<'a> {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+
+    /// Are the tokens from the cursor to the end of the expansion one macro call in `(..)` or
+    /// `[..]` (`a::b!(..)`), with nothing after it?
+    fn whole_expansion_is_call(&self) -> bool {
+        if self.macros.is_none() || !self.mac_ahead() {
+            return false;
+        }
+        let mut i = self.pos;
+        while self.toks.kind_at(i) != T::Not {
+            i += 1;
+        }
+        i += 1;
+        if self.toks.kind_at(i) == T::OpenBrace {
+            return false;
+        }
+        let mut depth = 0u32;
+        loop {
+            match self.toks.kind_at(i) {
+                T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return self.toks.kind_at(i + 1) == T::Eof;
+                    }
+                }
+                T::Eof => return false,
+                _ => {}
+            }
+            i += 1;
         }
     }
 
