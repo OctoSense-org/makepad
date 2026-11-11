@@ -443,6 +443,16 @@ impl Literal {
         s.push('"');
         Literal::from_text(s)
     }
+    /// library/proc_macro/src/lib.rs (1.79): a C string literal, its bytes written as
+    /// `escape_ascii` writes them.
+    pub fn c_string(string: &std::ffi::CStr) -> Literal {
+        let mut s = String::from("c\"");
+        for c in string.to_bytes().escape_ascii() {
+            s.push(c as char);
+        }
+        s.push('"');
+        Literal::from_text(s)
+    }
     pub fn span(&self) -> Span {
         self.span
     }
