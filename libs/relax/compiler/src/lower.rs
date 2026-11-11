@@ -153,6 +153,14 @@ struct Coro {
     /// a by-value aggregate -- the callee cannot keep their address
     call_private: crate::fxhash::HashSet<VReg>,
     call_sret: crate::fxhash::HashSet<VReg>,
+    /// the places of call results that have no drop glue (place -> its slot and type): one
+    /// whose address goes to a later call is kept to the end of its storage
+    /// (keep_borrowed_result)
+    result_places: crate::fxhash::HashMap<VReg, (u32, TyId)>,
+    /// the scope depth of the local that took such a place over (bind_pat)
+    result_owner: crate::fxhash::HashMap<VReg, usize>,
+    /// the ones kept: their temporary's drop is a read of the slot
+    result_kept: crate::fxhash::HashSet<VReg>,
     /// Poll<Output> (the poll function's return type)
     poll_ret: TyId,
     /// suspension points: (block ending in the Pending return, block to resume at, block
@@ -862,7 +870,9 @@ impl<'a> Lcx<'a> {
         if !self.unwind_on() {
             return false;
         }
-        !self.stmt_temps.is_empty() || self.scopes.iter().any(|s| !s.is_empty()) || self.scope_temps.iter().any(|s| !s.is_empty())
+        // (a kept call result has no drop: keep_touch)
+        let real = |x: &(VReg, TyId, Option<VReg>)| self.kept_result(x.0, x.1).is_none();
+        self.stmt_temps.iter().any(real) || self.scopes.iter().any(|s| !s.is_empty()) || self.scope_temps.iter().any(|s| s.iter().any(real))
     }
 
     /// The cleanup pad for the current drop state: the drops an early return would run
@@ -951,6 +961,9 @@ impl<'a> Lcx<'a> {
             }
         };
         for a in acts.iter().rev() {
+            if self.is_keep_act(a) {
+                continue;
+            }
             let mut key = self.drop_act_key(a);
             key.push(0x7000_0000_0000_0000 | next as u64);
             next = match self.pad_cache.get(&key) {
@@ -987,10 +1000,10 @@ impl<'a> Lcx<'a> {
             }
             return;
         }
-        let outer: Vec<DropAct> = self.exit_actions(0, 0).into_iter().filter(|a| !seq.contains(a)).collect();
+        let outer: Vec<DropAct> = self.exit_actions(0, 0).into_iter().filter(|a| !seq.contains(a) && !self.is_keep_act(a)).collect();
         let saved = self.pad_fixed.take();
         for k in 0..seq.len() {
-            let mut rest: Vec<DropAct> = seq[k + 1..].to_vec();
+            let mut rest: Vec<DropAct> = seq[k + 1..].iter().filter(|a| !self.is_keep_act(a)).cloned().collect();
             rest.extend(outer.iter().cloned());
             let pad = if rest.is_empty() { None } else { Some(self.pad_for(&rest)) };
             self.pad_fixed = Some(pad);
@@ -2446,7 +2459,7 @@ impl<'a> Lcx<'a> {
                 self.own_capture(ce, i, *li);
             }
         }
-        self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), await_tys: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
+        self.coro = Some(Coro { ct, env, cx, frame_off, tag, up_size: ul.size, await_slots: Vec::new(), await_tys: Vec::new(), poll_scratch: Vec::new(), call_private: Default::default(), call_sret: Default::default(), result_places: Default::default(), result_owner: Default::default(), result_kept: Default::default(), poll_ret, suspends: Vec::new(), cancel_end: Some(cancel_end), pending_ret, after_done, after_panic });
         if ce & crate::tcx::ASYNC_FN_BODY != 0 {
             // a pattern parameter's bindings are declared right after its whole argument
             // (rustc_ast_lowering: `let __argN = __argN; let <pat> = __argN;` parameter by
@@ -2662,8 +2675,8 @@ impl<'a> Lcx<'a> {
         let saved_nounwind = std::mem::replace(&mut self.nounwind, 0);
         let mut next = end;
         for (k, a) in acts.iter().enumerate().rev() {
-            let rest = &acts[k + 1..];
-            let pad = if rest.is_empty() { None } else { Some(self.pad_for(rest)) };
+            let rest: Vec<DropAct> = acts[k + 1..].iter().filter(|a| !self.is_keep_act(a)).cloned().collect();
+            let pad = if rest.is_empty() { None } else { Some(self.pad_for(&rest)) };
             let b = self.f.block();
             self.switch(b);
             self.pad_fixed = Some(pad);
@@ -4286,7 +4299,7 @@ impl<'a> Lcx<'a> {
     fn emit_drop_act(&mut self, a: &DropAct) {
         match *a {
             DropAct::Local(li) => self.drop_local_if_live(li),
-            DropAct::Temp(p, t, None) => self.drop_at(p, t),
+            DropAct::Temp(p, t, None) => self.drop_temp_at(p, t),
             DropAct::Temp(p, t, Some(f)) => self.drop_flagged_temp(p, t, f),
         }
     }
@@ -4506,6 +4519,14 @@ impl<'a> Lcx<'a> {
                         if l.leaves.is_none() {
                             let a = self.addr_add(*base, *off);
                             self.locals[li as usize] = Some(LocalSt::Slot(a));
+                            // (a call result kept for a borrow now lives as long as the local)
+                            let top = self.scopes.len() - 1;
+                            let at = self.decl_depth[li as usize].filter(|d| *d <= top).unwrap_or(top);
+                            if let Some(c) = self.coro.as_mut() {
+                                if c.result_places.contains_key(&a) {
+                                    c.result_owner.insert(a, at);
+                                }
+                            }
                             self.own_local(li);
                             return;
                         }
@@ -7405,7 +7426,12 @@ impl<'a> Lcx<'a> {
                     match self.field_move_path(e) {
                         Some((li, path)) => self.moved_field(li, &path),
                         // out of a temporary (`make().field`): it is not dropped again
-                        None => self.stmt_temps.truncate(mark),
+                        // (a kept call result has no drop: it stays)
+                        None => {
+                            let kept: Vec<(VReg, TyId, Option<VReg>)> = self.stmt_temps.get(mark..).unwrap_or(&[]).iter().filter(|x| self.kept_result(x.0, x.1).is_some()).copied().collect();
+                            self.stmt_temps.truncate(mark);
+                            self.stmt_temps.extend(kept);
+                        }
                     }
                 }
                 v
@@ -9961,7 +9987,7 @@ impl<'a> Lcx<'a> {
                     self.emit(Inst::Iconst(*m, 0));
                 }
             }
-            None => self.drop_at(a, t),
+            None => self.drop_temp_at(a, t),
         }
         self.goto(join);
         self.switch(join);
@@ -10456,6 +10482,11 @@ impl<'a> Lcx<'a> {
             match l.leaves {
                 Some(_) if !c_agg => {
                     let r = self.to_leaves(v, t);
+                    if self.coro.as_ref().is_some_and(|c| !c.result_places.is_empty()) {
+                        for x in &r {
+                            self.keep_borrowed_result(*x);
+                        }
+                    }
                     abi_args.extend(r);
                 }
                 _ => {
@@ -10554,9 +10585,95 @@ impl<'a> Lcx<'a> {
         if self.coro.is_some() {
             let arg = self.f.vreg(Cls::I);
             self.emit(Inst::SlotAddr(arg, s));
+            if self.f.slots[s as usize].size > 0 && !self.needs_drop_glue(ret) {
+                if let Some(c) = self.coro.as_mut() {
+                    c.result_places.insert(a, (s, ret));
+                }
+            }
             (a, arg)
         } else {
             (a, a)
+        }
+    }
+
+    /// The address of a call result that has no drop glue goes to a later call
+    /// (`f(&make()).await`, `make().iter()`, `let t = make(); f(&t)`). That call may keep the
+    /// address in what it returns, which the suspension analysis does not follow: the place
+    /// counts as the first call's own memory (call_private), so only what it holds flows on.
+    /// A result with drop glue is read again by its drop where its storage ends, and is saved
+    /// across the suspension points before that; one without was saved only while something
+    /// read it by name, not while its borrower lived (tests/coro_borrowed_call_result.rs).
+    /// It is kept as rustc keeps a borrowed local, to the end of its storage: registered as a
+    /// temporary of the current statement, or of the scope of the local that took it over,
+    /// whose drop is a read of the slot (keep_touch).
+    fn keep_borrowed_result(&mut self, a: VReg) {
+        let (t, owner) = match &self.coro {
+            Some(c) => match c.result_places.get(&a) {
+                Some(&(_, t)) => (t, c.result_owner.get(&a).copied()),
+                None => return,
+            },
+            None => return,
+        };
+        if self.building_pad {
+            return;
+        }
+        // (a temporary already registered for the place, as a `for` loop's iterator is: its
+        // drop becomes the read)
+        let held = |v: &Vec<(VReg, TyId, Option<VReg>)>| v.iter().any(|x| x.0 == a && x.1 == t);
+        if let Some(c) = self.coro.as_mut() {
+            c.result_kept.insert(a);
+        }
+        let top = self.scopes.len() - 1;
+        // a local this pass did not see take the place over: its `let`'s scope, else the body's
+        let owner = owner.or_else(|| {
+            let li = self.locals.iter().position(|l| matches!(l, Some(LocalSt::Slot(x)) if *x == a))?;
+            Some(self.decl_depth[li].unwrap_or(0))
+        });
+        match owner {
+            Some(d) => {
+                let d = d.min(top).min(self.scope_temps.len() - 1);
+                if !self.scope_temps[..=d].iter().any(held) {
+                    self.push_scope_temp(d, (a, t, None));
+                }
+            }
+            None => {
+                if !held(&self.stmt_temps) && !self.scope_temps.iter().any(held) {
+                    self.stmt_temps.push((a, t, None));
+                }
+            }
+        }
+    }
+
+    /// The slot of a kept call result (keep_borrowed_result) registered as the temporary `p: t`.
+    fn kept_result(&self, p: VReg, t: TyId) -> Option<u32> {
+        let c = self.coro.as_ref()?;
+        match c.result_places.get(&p) {
+            Some(&(s, rt)) if rt == t && c.result_kept.contains(&p) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn is_keep_act(&self, a: &DropAct) -> bool {
+        matches!(a, DropAct::Temp(p, t, _) if self.kept_result(*p, *t).is_some())
+    }
+
+    /// Where a kept call result's storage ends: a read of its slot, so that the suspension
+    /// points before it save the slot. Unwinding never suspends again: a pad has none.
+    fn keep_touch(&mut self, s: u32) {
+        if self.building_pad || self.dead_blk == Some(self.cur) {
+            return;
+        }
+        let q = self.f.vreg(Cls::I);
+        self.emit(Inst::SlotAddr(q, s));
+        let d = self.f.vreg(Cls::I);
+        self.emit(Inst::Load(Mem::Int(1, false), d, q, 0));
+    }
+
+    /// The drop of the temporary `p: t`.
+    fn drop_temp_at(&mut self, p: VReg, t: TyId) {
+        match self.kept_result(p, t) {
+            Some(s) => self.keep_touch(s),
+            None => self.drop_at(p, t),
         }
     }
 
