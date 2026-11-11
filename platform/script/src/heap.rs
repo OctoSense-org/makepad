@@ -423,6 +423,16 @@ impl ScriptHeap {
         self.allocation_budget.is_some() || self.heap_cap.is_some()
     }
 
+    /// Whether a string native code builds without an allocation preflight is
+    /// charged its real length when it is stored, instead of being refused up
+    /// front. A scoped run budget refuses it unless its caller opted in; the
+    /// retained heap cap alone always charges it on storage, so an isolate under
+    /// a cap keeps working and the cap still holds.
+    #[inline]
+    pub(crate) fn charges_native_strings_after(&self) -> bool {
+        self.charge_native_strings_after || self.allocation_budget.is_none()
+    }
+
     pub(crate) fn allocation_remaining(&self) -> usize {
         let scoped = self
             .allocation_budget
@@ -2010,6 +2020,23 @@ mod tests {
         // The scoped refusal is not a retained-cap refusal.
         assert!(!vm.bx.heap.take_heap_limit_exceeded());
         assert_eq!(vm.bx.heap.accounted_heap_bytes(), before);
+    }
+
+    #[test]
+    fn retained_cap_charges_native_strings_when_stored() {
+        let mut heap = ScriptHeap::empty();
+        heap.set_max_heap_bytes(Some(usize::MAX));
+        let before = heap.accounted_heap_bytes();
+        // Under the retained cap alone, a string native code builds without a
+        // preflight is stored and charged; refusing it would poison the heap.
+        let value = heap.new_string_with(|_, out| out.push_str("a native string long enough to live on the heap"));
+        assert!(value.as_string().is_some());
+        assert!(heap.accounted_heap_bytes() > before);
+        assert!(!heap.take_heap_limit_exceeded());
+        // A scoped run budget still refuses it unless its caller opted in.
+        let previous = heap.begin_allocation_budget(usize::MAX / 2);
+        assert!(heap.new_string_with(|_, out| out.push_str("refused under a scoped budget")).is_nil());
+        assert!(heap.end_allocation_budget(previous).exceeded);
     }
 
     #[test]
