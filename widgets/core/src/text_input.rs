@@ -1207,6 +1207,11 @@ impl TextInput {
     }
 
     pub fn set_is_password(&mut self, cx: &mut Cx, is_password: bool) {
+        // A setter that changes nothing asks for no redraw: apps call these from their draw,
+        // and a redraw asked for while drawing is drawn in the next frame, every frame.
+        if self.is_password == is_password {
+            return;
+        }
         self.is_password = is_password;
         self.laidout_text = None;
         self.draw_bg.redraw(cx);
@@ -1221,6 +1226,9 @@ impl TextInput {
     }
 
     pub fn set_is_read_only(&mut self, cx: &mut Cx, is_read_only: bool) {
+        if self.is_read_only == is_read_only {
+            return;
+        }
         self.is_read_only = is_read_only;
         // Flipped to read-only while focused: drop the keyboard now, since the draw
         // path no longer re-shows it (gated on !is_read_only). Guard against Area::Empty
@@ -1242,6 +1250,9 @@ impl TextInput {
     }
 
     pub fn set_is_numeric_only(&mut self, cx: &mut Cx, is_numeric_only: bool) {
+        if self.is_numeric_only == is_numeric_only {
+            return;
+        }
         self.is_numeric_only = is_numeric_only;
         self.laidout_text = None;
         self.draw_bg.redraw(cx);
@@ -1256,6 +1267,9 @@ impl TextInput {
     }
 
     pub fn set_empty_text(&mut self, cx: &mut Cx, empty_text: String) {
+        if self.empty_text == empty_text {
+            return;
+        }
         self.empty_text = empty_text;
         if self.text.is_empty() {
             self.draw_bg.redraw(cx);
