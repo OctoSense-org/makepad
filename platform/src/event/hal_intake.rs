@@ -513,7 +513,13 @@ impl Cx {
                     }
                     _ => {
                         self.hal.composing = false;
-                        (input, end != start)
+                        // Committed text ends the composition. A text field replaces its own
+                        // preview with it, and takes `replace_last` to mean "still composing":
+                        // passed on as a replacement, the committed word stayed an open preview
+                        // and the next word typed overwrote it. Only a text-less commit (a
+                        // deleted range) is still a replacement.
+                        let replace = input.is_empty() && end != start;
+                        (input, replace)
                     }
                 };
                 self.call_event_handler(&Event::TextInput(TextInputEvent { input, replace_last, was_paste: false, ..Default::default() }));
