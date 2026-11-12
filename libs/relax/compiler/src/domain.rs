@@ -275,6 +275,11 @@ impl ForeignSaved {
     pub fn from_words(w: [u64; 3]) -> ForeignSaved {
         ForeignSaved { base: w[0], heap: w[1] as *const (), entered: w[2] != 0 }
     }
+    /// Whether the thread was put in the scope's domain (not for no scope, nor for one whose
+    /// domain ended).
+    pub fn entered(&self) -> bool {
+        self.entered
+    }
 }
 
 /// Puts the calling thread (any: a realtime audio thread, a driver's worker) in the domain of

@@ -1314,6 +1314,117 @@ fn a_run_ends_with_what_it_held_given_back() {
     assert_eq!(&counts[1..], &[0, 0], "left open: {counts:?}");
 }
 
+// Sets one handler with `signal`, a second over it with `sigaction` that calls the one before it
+// (what signal-hook does with the action it found), then waits for the signal.
+#[cfg(unix)]
+const SIGNALS: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+static SEEN: AtomicU64 = AtomicU64::new(0);
+static BEFORE: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct SigAction { handler: usize, mask: [u64; 16], flags: i32, restorer: usize }
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct SigAction { flags: i32, handler: usize, mask: u64, restorer: usize }
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct SigAction { handler: usize, mask: u32, flags: i32 }
+extern "C" {
+    fn signal(sig: i32, handler: usize) -> usize;
+    fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+}
+#[cfg(target_os = "linux")]
+const SIGUSR2: i32 = 12;
+#[cfg(not(target_os = "linux"))]
+const SIGUSR2: i32 = 31;
+extern "C" fn first(_sig: i32) {
+    SEEN.fetch_add(1, Ordering::SeqCst);
+}
+extern "C" fn second(sig: i32) {
+    SEEN.fetch_add(16, Ordering::SeqCst);
+    let before: extern "C" fn(i32) = unsafe { std::mem::transmute(BEFORE.load(Ordering::SeqCst) as usize) };
+    before(sig);
+}
+fn signals(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    unsafe {
+        signal(SIGUSR2, first as usize);
+        let mut act: SigAction = std::mem::zeroed();
+        act.handler = second as usize;
+        let mut old: SigAction = std::mem::zeroed();
+        sigaction(SIGUSR2, &act, &mut old);
+        BEFORE.store(old.handler as u64, Ordering::SeqCst);
+        a[1].store((old.handler == first as usize) as u64, Ordering::SeqCst);
+        // read alone, the action is the program's own too
+        let mut now: SigAction = std::mem::zeroed();
+        sigaction(SIGUSR2, std::ptr::null(), &mut now);
+        a[3].store((now.handler == second as usize) as u64, Ordering::SeqCst);
+    }
+    a[0].store(1, Ordering::SeqCst);
+    loop {
+        a[2].store(SEEN.load(Ordering::SeqCst), Ordering::SeqCst);
+        std::thread::yield_now();
+    }
+}
+"#;
+
+// A signal comes to whatever thread takes it: a child's exit (SIGCHLD) to the main thread, which
+// sits in the HAL's event loop in no domain. The program's handler ran there in the default
+// domain, on a copy of the program's statics nothing set up (signal-hook's registry was not
+// there: a panic with no recovery point, the process's abort). It runs in the domain that set it.
+#[cfg(unix)]
+#[test]
+fn a_signal_on_a_thread_in_no_domain_runs_the_handler_in_the_domain_that_set_it() {
+    isolated_test!(a_signal_on_a_thread_in_no_domain_runs_the_handler_in_the_domain_that_set_it);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(target_os = "linux")]
+    const SIGUSR2: i32 = 12;
+    #[cfg(not(target_os = "linux"))]
+    const SIGUSR2: i32 = 31;
+    extern "C" {
+        fn signal(sig: i32, handler: usize) -> usize;
+        fn pthread_self() -> usize;
+        fn pthread_kill(thread: usize, sig: i32) -> i32;
+    }
+    let (mut u, entry, root) = fixture_of(SIGNALS, "signals");
+    u.tier1 = None;
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| {
+        if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
+        flags[0].load(Ordering::SeqCst) == 1
+    });
+    // (the runner's entry there would call the second handler again from inside it, for ever)
+    assert_eq!(flags[1].load(Ordering::SeqCst), 1, "the action before is the program's first handler");
+    assert_eq!(flags[3].load(Ordering::SeqCst), 1, "the action now is the program's second handler");
+    // a thread the program never started, in no domain
+    std::thread::spawn(move || {
+        assert_ne!(current(), base);
+        assert_eq!(unsafe { pthread_kill(pthread_self(), SIGUSR2) }, 0);
+        assert_ne!(current(), base, "the thread is back where the signal found it");
+        assert!(crate::zone_alloc::domain::current().is_null(), "and its heap");
+    })
+    .join()
+    .unwrap();
+    // both handlers wrote the program's own statics: its thread reads them
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while flags[2].load(Ordering::SeqCst) != 17 && std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(flags[2].load(Ordering::SeqCst), 17, "the handlers ran on another copy of the program's statics");
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(end.released.callbacks, 1, "{:?}", end.released);
+    assert_eq!(unsafe { signal(SIGUSR2, 0) }, 0, "the run's handler stayed");
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 const NATIVE_FAULT: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 extern "C" { fn strlen(s: *const u8) -> usize; }
