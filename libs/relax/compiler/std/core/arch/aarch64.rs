@@ -4020,80 +4020,6 @@ pub unsafe fn vmaxq_s32(a: int32x4_t, b: int32x4_t) -> int32x4_t {
 
 // ---- zmij 1.0 (serde_json's float formatter) and chacha20 0.10's NEON paths
 
-/// MLA by scalar: a + b * c per lane (wrapping)
-pub unsafe fn vmla_n_s32(a: int32x2_t, b: int32x2_t, c: i32) -> int32x2_t {
-    let mut r = [0; 2];
-    let mut i = 0;
-    while i < 2 {
-        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
-        i += 1;
-    }
-    int32x2_t(r)
-}
-
-pub unsafe fn vmlaq_n_s16(a: int16x8_t, b: int16x8_t, c: i16) -> int16x8_t {
-    let mut r = [0; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
-        i += 1;
-    }
-    int16x8_t(r)
-}
-
-pub unsafe fn vmlaq_n_s32(a: int32x4_t, b: int32x4_t, c: i32) -> int32x4_t {
-    let mut r = [0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = a.0[i].wrapping_add(b.0[i].wrapping_mul(c));
-        i += 1;
-    }
-    int32x4_t(r)
-}
-
-/// SQDMULH by scalar: the high half of 2 * a * b (a * b >> 31), saturated (only MIN * MIN
-/// overflows)
-pub unsafe fn vqdmulh_n_s32(a: int32x2_t, b: i32) -> int32x2_t {
-    let mut r = [0; 2];
-    let mut i = 0;
-    while i < 2 {
-        r[i] = ((a.0[i] as i64 * b as i64) >> 31).min(i32::MAX as i64) as i32;
-        i += 1;
-    }
-    int32x2_t(r)
-}
-
-pub unsafe fn vqdmulhq_n_s32(a: int32x4_t, b: i32) -> int32x4_t {
-    let mut r = [0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = ((a.0[i] as i64 * b as i64) >> 31).min(i32::MAX as i64) as i32;
-        i += 1;
-    }
-    int32x4_t(r)
-}
-
-pub unsafe fn vqdmulhq_n_s16(a: int16x8_t, b: i16) -> int16x8_t {
-    let mut r = [0; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = ((a.0[i] as i32 * b as i32) >> 15).min(i16::MAX as i32) as i16;
-        i += 1;
-    }
-    int16x8_t(r)
-}
-
-/// REV64 .16b: the bytes of each 64-bit half reversed
-pub unsafe fn vrev64q_u8(a: uint8x16_t) -> uint8x16_t {
-    let mut r = [0; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = a.0[(i & !7) + 7 - (i & 7)];
-        i += 1;
-    }
-    uint8x16_t(r)
-}
-
 /// REV32 .8h: the two halfwords of each 32-bit word swapped
 pub unsafe fn vrev32q_u16(a: uint16x8_t) -> uint16x8_t {
     let mut r = [0; 8];
@@ -4145,29 +4071,6 @@ pub unsafe fn vrev16q_u8(a: uint8x16_t) -> uint8x16_t {
 #[inline(always)]
 pub unsafe fn vmovq_n_u8(value: u8) -> uint8x16_t {
     vdupq_n_u8(value)
-}
-
-/// CMGT #0: all ones where a lane is greater than zero
-pub unsafe fn vcgtzq_s8(a: int8x16_t) -> uint8x16_t {
-    let mut r = [0; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = if a.0[i] > 0 { 0xff } else { 0 };
-        i += 1;
-    }
-    uint8x16_t(r)
-}
-
-pub unsafe fn vcombine_s32(low: int32x2_t, high: int32x2_t) -> int32x4_t {
-    int32x4_t([low.0[0], low.0[1], high.0[0], high.0[1]])
-}
-
-pub unsafe fn vcreate_u64(a: u64) -> uint64x1_t {
-    uint64x1_t([a])
-}
-
-pub unsafe fn vdup_n_s32(value: i32) -> int32x2_t {
-    int32x2_t([value; 2])
 }
 
 // ---- SHA-512 (FEAT_SHA512, part of `sha3` in rustc's feature names): sha2's
@@ -4291,12 +4194,6 @@ pub type p64 = u64;
 pub unsafe fn vmull_p64(a: p64, b: p64) -> p128 {
     let r: uint64x2_t = vx::vx_binary(uint64x2_t([a, 0]), uint64x2_t([b, 0]), 90, 64);
     (r.0[0] as u128) | (r.0[1] as u128) << 64
-}
-
-/// LD1 of two registers: 32 consecutive bytes, the first 16 in `.0` (constant_time_eq).
-#[inline(always)]
-pub unsafe fn vld1q_u8_x2(a: *const u8) -> uint8x16x2_t {
-    uint8x16x2_t(vld1q_u8(a), vld1q_u8(a.add(16)))
 }
 
 /// LD1 of three registers: 48 consecutive bytes.
@@ -4674,16 +4571,6 @@ pub unsafe fn vreinterpret_s32_u16(a: uint16x4_t) -> int32x2_t {
 }
 
 #[inline(always)]
-pub unsafe fn vreinterpret_s32_u32(a: uint32x2_t) -> int32x2_t {
-    crate::ptr::read_unaligned((&a as *const uint32x2_t).cast())
-}
-
-#[inline(always)]
-pub unsafe fn vreinterpret_s32_u64(a: uint64x1_t) -> int32x2_t {
-    crate::ptr::read_unaligned((&a as *const uint64x1_t).cast())
-}
-
-#[inline(always)]
 pub unsafe fn vreinterpret_s32_f32(a: float32x2_t) -> int32x2_t {
     crate::ptr::read_unaligned((&a as *const float32x2_t).cast())
 }
@@ -4839,11 +4726,6 @@ pub unsafe fn vreinterpret_u16_s16(a: int16x4_t) -> uint16x4_t {
 }
 
 #[inline(always)]
-pub unsafe fn vreinterpret_u16_s32(a: int32x2_t) -> uint16x4_t {
-    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
-}
-
-#[inline(always)]
 pub unsafe fn vreinterpret_u16_s64(a: int64x1_t) -> uint16x4_t {
     crate::ptr::read_unaligned((&a as *const int64x1_t).cast())
 }
@@ -4896,11 +4778,6 @@ pub unsafe fn vreinterpret_u32_s8(a: int8x8_t) -> uint32x2_t {
 #[inline(always)]
 pub unsafe fn vreinterpret_u32_s16(a: int16x4_t) -> uint32x2_t {
     crate::ptr::read_unaligned((&a as *const int16x4_t).cast())
-}
-
-#[inline(always)]
-pub unsafe fn vreinterpret_u32_s32(a: int32x2_t) -> uint32x2_t {
-    crate::ptr::read_unaligned((&a as *const int32x2_t).cast())
 }
 
 #[inline(always)]
@@ -5519,11 +5396,6 @@ pub unsafe fn vreinterpretq_s64_p128(a: p128) -> int64x2_t {
 }
 
 #[inline(always)]
-pub unsafe fn vreinterpretq_u8_s16(a: int16x8_t) -> uint8x16_t {
-    crate::ptr::read_unaligned((&a as *const int16x8_t).cast())
-}
-
-#[inline(always)]
 pub unsafe fn vreinterpretq_u8_s64(a: int64x2_t) -> uint8x16_t {
     crate::ptr::read_unaligned((&a as *const int64x2_t).cast())
 }
@@ -5536,11 +5408,6 @@ pub unsafe fn vreinterpretq_u8_u16(a: uint16x8_t) -> uint8x16_t {
 #[inline(always)]
 pub unsafe fn vreinterpretq_u8_u32(a: uint32x4_t) -> uint8x16_t {
     crate::ptr::read_unaligned((&a as *const uint32x4_t).cast())
-}
-
-#[inline(always)]
-pub unsafe fn vreinterpretq_u8_u64(a: uint64x2_t) -> uint8x16_t {
-    crate::ptr::read_unaligned((&a as *const uint64x2_t).cast())
 }
 
 #[inline(always)]
@@ -5571,11 +5438,6 @@ pub unsafe fn vreinterpretq_u8_p64(a: poly64x2_t) -> uint8x16_t {
 #[inline(always)]
 pub unsafe fn vreinterpretq_u8_p128(a: p128) -> uint8x16_t {
     crate::ptr::read_unaligned((&a as *const p128).cast())
-}
-
-#[inline(always)]
-pub unsafe fn vreinterpretq_u16_s8(a: int8x16_t) -> uint16x8_t {
-    crate::ptr::read_unaligned((&a as *const int8x16_t).cast())
 }
 
 #[inline(always)]
@@ -6162,28 +6024,6 @@ pub unsafe fn vmulq_u8(a: uint8x16_t, b: uint8x16_t) -> uint8x16_t {
 }
 
 /// MVN: bitwise not
-pub unsafe fn vmvnq_s8(a: int8x16_t) -> int8x16_t {
-    let mut r = [0; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = !a.0[i];
-        i += 1;
-    }
-    int8x16_t(r)
-}
-
-/// MVN: bitwise not
-pub unsafe fn vmvnq_s16(a: int16x8_t) -> int16x8_t {
-    let mut r = [0; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = !a.0[i];
-        i += 1;
-    }
-    int16x8_t(r)
-}
-
-/// MVN: bitwise not
 pub unsafe fn vmvnq_s32(a: int32x4_t) -> int32x4_t {
     let mut r = [0; 4];
     let mut i = 0;
@@ -6192,17 +6032,6 @@ pub unsafe fn vmvnq_s32(a: int32x4_t) -> int32x4_t {
         i += 1;
     }
     int32x4_t(r)
-}
-
-/// MVN: bitwise not
-pub unsafe fn vmvnq_u16(a: uint16x8_t) -> uint16x8_t {
-    let mut r = [0; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = !a.0[i];
-        i += 1;
-    }
-    uint16x8_t(r)
 }
 
 /// FNEG: flips the sign bit, of a NaN too
