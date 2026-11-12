@@ -83,31 +83,6 @@ impl crate::default::Default for PhantomPinned {
         PhantomPinned
     }
 }
-// the derive's output for a unit struct: the bare name, no padding
-impl crate::fmt::Debug for PhantomPinned {
-    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
-        f.write_str("PhantomPinned")
-    }
-}
-impl crate::cmp::PartialEq for PhantomPinned {
-    fn eq(&self, _o: &PhantomPinned) -> bool {
-        true
-    }
-}
-impl crate::cmp::Eq for PhantomPinned {}
-impl crate::cmp::PartialOrd for PhantomPinned {
-    fn partial_cmp(&self, _o: &PhantomPinned) -> Option<crate::cmp::Ordering> {
-        Some(crate::cmp::Ordering::Equal)
-    }
-}
-impl crate::cmp::Ord for PhantomPinned {
-    fn cmp(&self, _o: &PhantomPinned) -> crate::cmp::Ordering {
-        crate::cmp::Ordering::Equal
-    }
-}
-impl crate::hash::Hash for PhantomPinned {
-    fn hash<H: crate::hash::Hasher>(&self, _state: &mut H) {}
-}
 
 #[cfg_attr(not(relax_check), lang = "tuple_trait")]
 pub trait Tuple {}

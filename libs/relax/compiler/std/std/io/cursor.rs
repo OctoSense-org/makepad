@@ -150,30 +150,6 @@ impl Write for Cursor<&mut [u8]> {
     }
 }
 
-impl<const N: usize> Write for Cursor<[u8; N]> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        slice_write(&mut self.pos, &mut self.inner, buf)
-    }
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
-        slice_write_vectored(&mut self.pos, &mut self.inner, bufs)
-    }
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl Write for Cursor<Box<[u8]>> {
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        slice_write(&mut self.pos, &mut self.inner, buf)
-    }
-    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
-        slice_write_vectored(&mut self.pos, &mut self.inner, bufs)
-    }
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 impl Write for Cursor<&mut Vec<u8>> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         vec_write(&mut self.pos, self.inner, buf)
@@ -190,6 +166,9 @@ impl Write for Cursor<Box<[u8]>> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         slice_write(&mut self.pos, &mut self.inner, buf)
     }
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
+        slice_write_vectored(&mut self.pos, &mut self.inner, bufs)
+    }
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
@@ -198,6 +177,9 @@ impl Write for Cursor<Box<[u8]>> {
 impl<const N: usize> Write for Cursor<[u8; N]> {
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         slice_write(&mut self.pos, &mut self.inner, buf)
+    }
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
+        slice_write_vectored(&mut self.pos, &mut self.inner, bufs)
     }
     fn flush(&mut self) -> Result<()> {
         Ok(())
