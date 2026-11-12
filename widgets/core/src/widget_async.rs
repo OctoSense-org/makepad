@@ -2924,6 +2924,112 @@ mod async_rooting_tests {
 }
 
 #[cfg(test)]
+mod render_place_tests {
+    use super::*;
+    use crate::view::View;
+    use crate::widget_tree::set_ui_root;
+
+    fn render(cx: &mut Cx, view: &WidgetRef) {
+        let rendered = cx.with_vm(|vm| {
+            let args = vm.new_object();
+            view.script_call(vm, live_id!(render), args.into())
+        });
+        assert!(matches!(rendered, ScriptAsyncResult::Return(_)), "{rendered:?}");
+        assert!(pump_widget_async(cx), "nothing delivered");
+    }
+
+    /// The left margin and the widget of each direct child, in order.
+    fn children(cx: &mut Cx, view: &WidgetRef) -> Vec<(f64, WidgetUid)> {
+        let children: Vec<WidgetRef> = {
+            let view = view.borrow::<View>().expect("a view");
+            view.children.iter().map(|(_, child)| child.clone()).collect()
+        };
+        children
+            .iter()
+            .map(|child| (child.walk(cx).margin.left, child.widget_uid()))
+            .collect()
+    }
+
+    /// A list draws a divider above every row but the first. The first render
+    /// here has a divider on top (as a longer list, or another page rendered
+    /// into the same view, would), the later ones do not, so the row moves
+    /// into the place the divider had. Applied over the divider's widget, the
+    /// row kept the divider's margin and stood 64 to the right of the others.
+    #[test]
+    fn a_render_builds_an_anonymous_child_anew_where_another_declaration_stood() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let view = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                let rounds = {done: 0}
+                View{ height: Fit, flow: Down, on_render: || {
+                    rounds.done += 1
+                    if rounds.done == 1 { View{height: 1., margin: Inset{left: 64.}} }
+                    View{height: 20.}
+                    View{height: 30.}
+                } }
+            });
+            WidgetRef::script_from_value(vm, v)
+        });
+        set_ui_root(&mut cx, &view);
+
+        render(&mut cx, &view);
+        let first = children(&mut cx, &view);
+        assert_eq!(first.iter().map(|child| child.0).collect::<Vec<_>>(), [64.0, 0.0, 0.0]);
+
+        render(&mut cx, &view);
+        let second = children(&mut cx, &view);
+        assert_eq!(
+            second.iter().map(|child| child.0).collect::<Vec<_>>(),
+            [0.0, 0.0],
+            "the row that took the divider's place kept the divider's margin"
+        );
+        assert_ne!(second[0].1, first[0].1, "the divider's widget was reused for the row");
+
+        // The same declarations in the same places: the widgets stay, with
+        // whatever state they hold.
+        render(&mut cx, &view);
+        let third = children(&mut cx, &view);
+        assert_eq!(
+            third.iter().map(|child| child.1).collect::<Vec<_>>(),
+            second.iter().map(|child| child.1).collect::<Vec<_>>(),
+            "a render of the same declarations built its widgets again"
+        );
+    }
+
+    /// A named child is the same child by its name, wherever it is declared:
+    /// a field that is declared in either arm of an `if` keeps what was typed
+    /// into it when the arm changes.
+    #[test]
+    fn a_render_keeps_a_named_child_declared_somewhere_else() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let view = cx.with_vm(|vm| {
+            crate::script_mod(vm);
+            let v = vm.eval(crate::makepad_script::script! {
+                use mod.prelude.widgets.*
+                let rounds = {done: 0}
+                View{ height: Fit, flow: Down, on_render: || {
+                    rounds.done += 1
+                    if rounds.done == 1 { field := View{height: 20., margin: Inset{left: 8.}} }
+                    else { field := View{height: 40.} }
+                } }
+            });
+            WidgetRef::script_from_value(vm, v)
+        });
+        set_ui_root(&mut cx, &view);
+
+        render(&mut cx, &view);
+        let first = children(&mut cx, &view);
+        render(&mut cx, &view);
+        let second = children(&mut cx, &view);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].1, first[0].1, "the named child was built again");
+    }
+}
+
+#[cfg(test)]
 mod isolate_shader_tests {
     use super::*;
 

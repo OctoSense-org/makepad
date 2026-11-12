@@ -242,6 +242,13 @@ pub struct View {
     /// body evaluated elsewhere) says nothing about them.
     #[rust]
     children_made_at: Option<ScriptIp>,
+    /// Where each anonymous child was last declared, by its number among the
+    /// anonymous children; `ScriptIp::UNKNOWN` where that is not known. An
+    /// anonymous child has no name to be the same child by, only its place,
+    /// and an `on_render` result may put another declaration in that place
+    /// (see [`applying_render`]).
+    #[rust]
+    anonymous_declared_at: Vec<ScriptIp>,
 
     #[apply_default]
     animator: Animator,
@@ -332,6 +339,34 @@ impl ViewTextureSnapshot {
     pub fn texture(&self) -> &Texture { &self.cache.color_texture }
 }
 
+thread_local! {
+    /// How many `on_render` results are being applied on this thread right now.
+    static RENDERS_BEING_APPLIED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `apply` as the application of an `on_render` result.
+///
+/// A render is the one reload whose declarations all come from the same run
+/// of the same script, so where a child was declared says which child it is.
+/// A live edit's reload is not: every declaration after the edit has moved,
+/// and the widgets must be kept all the same. Both arrive as `Apply::Reload`,
+/// and a view deep inside the rendered tree has only this to tell them apart.
+fn applying_render<R>(apply: impl FnOnce() -> R) -> R {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            let _ = RENDERS_BEING_APPLIED.try_with(|count| count.set(count.get().saturating_sub(1)));
+        }
+    }
+    let _ = RENDERS_BEING_APPLIED.try_with(|count| count.set(count.get() + 1));
+    let _leave = Leave;
+    apply()
+}
+
+fn is_applying_render() -> bool {
+    RENDERS_BEING_APPLIED.try_with(|count| count.get() > 0).unwrap_or(false)
+}
+
 impl ScriptHook for View {
     fn on_before_apply(
         &mut self,
@@ -362,11 +397,13 @@ impl ScriptHook for View {
                 vm.vec_with(obj, |vm, vec| {
                     for kv in vec {
                         // Determine the id: use prefixed id if available, otherwise use numbered id for anonymous children
+                        let mut anonymous = None;
                         let id = if let Some(id) = kv.key.as_id() {
                             Some(id)
                         } else if kv.key.is_nil() {
                             // Anonymous child widget - use numbered id
                             let id = LiveId(anon_index as u64);
+                            anonymous = Some(anon_index);
                             anon_index += 1;
                             Some(id)
                         } else {
@@ -383,10 +420,44 @@ impl ScriptHook for View {
                                 self.live_update_order.push(id);
                             }
 
+                            // An anonymous child is the same child only by its
+                            // place. When a render declares something else in
+                            // that place (a list one row shorter, another page
+                            // in the same view), the widget standing there
+                            // belongs to the other declaration: applying this
+                            // one over it would keep every property the other
+                            // set and this one does not (a divider's margin on
+                            // the row that took its place). It is built anew.
+                            let mut other_declaration = false;
+                            if let Some(slot) = anonymous {
+                                let declared_at = kv
+                                    .value
+                                    .as_object()
+                                    .map_or(ScriptIp::UNKNOWN, |obj| vm.heap().made_at(obj));
+                                if self.anonymous_declared_at.len() <= slot {
+                                    self.anonymous_declared_at.resize(slot + 1, ScriptIp::UNKNOWN);
+                                }
+                                let before = std::mem::replace(
+                                    &mut self.anonymous_declared_at[slot],
+                                    declared_at,
+                                );
+                                other_declaration = matches!(apply, Apply::Reload)
+                                    && is_applying_render()
+                                    && !before.is_unknown()
+                                    && !declared_at.is_unknown()
+                                    && before != declared_at;
+                            }
+
                             if let Some((_, node)) =
                                 self.children.iter_mut().find(|(id2, _)| *id2 == id)
                             {
-                                node.script_apply(vm, apply, scope, kv.value);
+                                if other_declaration {
+                                    *node = WidgetRef::script_from_value_scoped(
+                                        vm, scope, kv.value,
+                                    );
+                                } else {
+                                    node.script_apply(vm, apply, scope, kv.value);
+                                }
                             } else {
                                 let widget =
                                     WidgetRef::script_from_value_scoped(vm, scope, kv.value);
@@ -1683,7 +1754,13 @@ impl Widget for View {
                 let declaration = self.source.clone();
                 let style=call.method()==id!(render_style);
                 self.applying_style_render=style;
-                self.script_apply(vm, &if style {Apply::ScriptReapply}else{Apply::Reload}, &mut Scope::empty(), me_obj.into());
+                if style {
+                    self.script_apply(vm, &Apply::ScriptReapply, &mut Scope::empty(), me_obj.into());
+                } else {
+                    applying_render(|| {
+                        self.script_apply(vm, &Apply::Reload, &mut Scope::empty(), me_obj.into())
+                    });
+                }
                 self.applying_style_render=false;
                 self.source = declaration;
                 self.redraw(vm.cx_mut());
