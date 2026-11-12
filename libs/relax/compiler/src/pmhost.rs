@@ -236,6 +236,11 @@ fn world_inner(sess: &std::sync::Arc<crate::Session>, prewarm: bool) -> Option<s
         set_in_world(true);
         crate::macro_reg::set_world_builder(true);
         let _in_world = InWorld;
+        // Built on the owner (a live reload's first hosted macro once the world is gone, or was
+        // never built by a warm restore): the world's crates are parsed on this thread. A parse
+        // worker's hosted macro in one of them is a request to the owner, and the owner would be
+        // here, waiting for that worker's file.
+        let _single = crate::owner::is_owner().then(crate::preload::SingleScope::begin);
         std::sync::Arc::new(build_world(sess))
     };
     tl_set_once(1, crate::clock::ms_since_start());

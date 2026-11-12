@@ -831,9 +831,24 @@ pub static PUBLISH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub static PARSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
-    /// a crate loaded while the program runs (a run-time module): parsed on the calling thread,
-    /// no parse workers (hotreload lane)
+    /// a crate loaded while the program runs (a run-time module), or the macro world built on
+    /// the compiler's owner: parsed on the calling thread, no parse workers (hotreload lane)
     pub static SINGLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// SINGLE for a scope: what it was comes back when the scope ends, also by a panic.
+pub struct SingleScope(bool);
+
+impl SingleScope {
+    pub fn begin() -> Self {
+        SingleScope(SINGLE.with(|s| s.replace(true)))
+    }
+}
+
+impl Drop for SingleScope {
+    fn drop(&mut self) {
+        SINGLE.with(|s| s.set(self.0));
+    }
 }
 
 pub fn jobs() -> usize {

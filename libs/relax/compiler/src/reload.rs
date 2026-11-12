@@ -2010,7 +2010,10 @@ fn carry_gandalf(u: &Unit, from: u64, visible: &[bool], files: Option<&[u32]>) {
     let src = u.front.checker_id;
     let prog = &u.prog;
     crate::borrowck::lazy::carry_epoch(src, from, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), &|d: DefId| {
-        if let Some(files) = files { !files.contains(&prog.def(d).file) }
+        // (a verdict of another unit -- the macro world, alive again once an edit's derive
+        // rebuilt it -- is not this program's definition: never kept here, and carry_epoch drops
+        // only this unit's entries)
+        if let Some(files) = files { prog.defs.get(d.0 as usize).is_some_and(|def| !files.contains(&def.file)) }
         else { gandalf_keeps(prog, visible, d) }
     });
 }

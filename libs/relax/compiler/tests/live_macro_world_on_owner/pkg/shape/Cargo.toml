@@ -1,0 +1,8 @@
+[package]
+name = "relax-live-world-shape"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+relax-live-world-tag = { path = "../tag" }
