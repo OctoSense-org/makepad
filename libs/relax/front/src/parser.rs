@@ -2209,8 +2209,8 @@ impl<'a> Parser<'a> {
         let before = self.trace();
         let (pos, undo, mark) = (self.pos, self.tok_undo.len(), self.ast.mark());
         let lens = (self.item_start.len(), self.lazy_mods.len(), self.mod_stack.len(), self.scope_stack.len(), self.rule_scopes.len(), self.extra_items.len(), self.extra_assoc_items.len(), self.pending_shape.len());
-        let flags = (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth);
-        let (pending_inner, cfg_select_rest) = (self.pending_inner.clone(), self.cfg_select_rest.borrow().clone());
+        let flags = (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth, self.tail_mac);
+        let (pending_inner, cfg_select_rest, cfg_select_ends) = (self.pending_inner.clone(), self.cfg_select_rest.borrow().clone(), self.cfg_select_ends.borrow().clone());
         let r = f(self);
         self.pos = pos;
         // the `>>` / `>=` it split are whole again
@@ -2227,9 +2227,10 @@ impl<'a> Parser<'a> {
         self.extra_items.truncate(lens.5);
         self.extra_assoc_items.truncate(lens.6);
         self.pending_shape.truncate(lens.7);
-        (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth) = flags;
+        (self.next_scope, self.no_prelude, self.in_assoc, self.in_trait, self.stmt_ctx, self.range_dots, self.include_as_expr, self.foreign_abi, self.cfg_out, self.expansion_semi, self.exp_depth, self.tail_mac) = flags;
         self.pending_inner = pending_inner;
         *self.cfg_select_rest.borrow_mut() = cfg_select_rest;
+        *self.cfg_select_ends.borrow_mut() = cfg_select_ends;
         #[cfg(test)]
         assert_eq!(before, self.trace(), "Parser::look_ahead left a trace");
         r
@@ -2251,7 +2252,7 @@ impl<'a> Parser<'a> {
             pm_editions, tok_undo, frag_groups, ty_frags, path_frags, meta_frags, block_frags, synth_parens,
             mod_stack, scope_stack, no_prelude, range_dots, next_scope, rule_scopes, interp, extra_items,
             extra_assoc_items, pending_inner, in_assoc, in_trait, stmt_ctx, cfg_select_rest,
-            include_as_expr, foreign_abi, cfg_out, expansion_semi, pending_shape,
+            include_as_expr, foreign_abi, cfg_out, expansion_semi, pending_shape, cfg_select_ends, tail_mac,
         } = self;
         fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> { v.sort(); v }
         let toks: Vec<Tok> = (0..toks.len()).map(|i| toks.at(i)).collect();
@@ -2264,8 +2265,8 @@ impl<'a> Parser<'a> {
             tables {tables:?} token_input {token_input} exp_depth {exp_depth} tok_undo {tok_undo:?} frags {frags:?} interp {interp:?}\n\
             mods {mod_stack:?} scopes {scope_stack:?} {next_scope} {rule_scopes:?} no_prelude {no_prelude} range_dots {range_dots}\n\
             items {item_start:?} {extra_items:?} {extra_assoc_items:?} {pending_inner:?} {in_assoc} {in_trait} {foreign_abi:?}\n\
-            stmt {stmt_ctx} {include_as_expr} {expansion_semi} cfg {cfg_out} {:?} shapes {shapes:?}\nast {ast:?}",
-            macros.is_some(), cfg_select_rest.borrow())
+            stmt {stmt_ctx} {include_as_expr} {expansion_semi} {tail_mac} cfg {cfg_out} {:?} {:?} shapes {shapes:?}\nast {ast:?}",
+            macros.is_some(), cfg_select_rest.borrow(), cfg_select_ends.borrow())
     }
 
     /// After the one expression of an `include!` in expression position: tokens left are the
