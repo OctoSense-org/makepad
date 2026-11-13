@@ -734,6 +734,26 @@ impl Cx {
                         Err(e) => CxScriptResourceData::Error(e),
                     };
                     return;
+                } else if let Some(dep_path) = res.dependency_path.as_deref() {
+                    // `abs_path` holds the directory the resource had when it was
+                    // registered -- the one the binary was built in. Only that
+                    // machine has it, so a copy of a build found none of this
+                    // crate's resources (nav-rail icons, the back arrow, article
+                    // fonts, i18n tables) and drew a whole view without them,
+                    // while the same binary on the build machine rendered them:
+                    // there the path happens to exist.
+                    //
+                    // A desktop package lays every crate's assets under
+                    // `<exe dir>/resources/<crate>/...`, and `dependency_path` is
+                    // the path inside that crate. `load_packaged_resource` above
+                    // already searches there; this is the same search for a build
+                    // that runs unpackaged, anchored at the executable instead.
+                    if let Some(data) = crate::os::cx_native::read_file_cwd_or_exe_relative(
+                        format!("resources/{dep_path}"),
+                    ) {
+                        res.data = CxScriptResourceData::Loaded(Rc::new(data));
+                        return;
+                    }
                 }
             }
 
