@@ -422,9 +422,7 @@ fn with_isolate_installed<R>(cx: &mut Cx, vm_id: SplashVmId, f: impl FnOnce(&mut
     // this, an `await` woken by a timer or network callback never resumes
     // while the app is idle (OctoSense-App-Hub #213).
     if out.is_ok() && cx.script_vm.is_some() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::makepad_draw::makepad_platform::makepad_script_std::pump(cx);
-        }));
+        pump_isolate_tasks_under_budget(cx, isolated.time_budget);
     }
 
     isolated.vm = cx.script_vm.take();
@@ -1813,9 +1811,25 @@ fn pump_installed_isolate_tasks(cx: &mut Cx, entry: &IsolateEntry) {
     if entry.vm_id == MAIN_SPLASH_VM_ID || cx.script_vm.is_none() {
         return;
     }
+    pump_isolate_tasks_under_budget(cx, entry.time_budget);
+}
+
+/// The drain itself, for the isolate that is the installed VM. A task it
+/// resumes is guest script like any other entry into the isolate, so the drain
+/// runs under the isolate's own time budget: without one, a resumed task that
+/// never yields would hold the UI thread for good.
+fn pump_isolate_tasks_under_budget(cx: &mut Cx, budget: std::time::Duration) {
+    let old_budget = cx.with_vm(|vm| {
+        vm.bx
+            .run_budget
+            .replace(ScriptRunBudget::from_durations(budget, budget, 512))
+    });
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::makepad_draw::makepad_platform::makepad_script_std::pump(cx);
     }));
+    if cx.script_vm.is_some() {
+        cx.with_vm(|vm| vm.bx.run_budget = old_budget);
+    }
 }
 
 /// Put the outer VM back. See [`enter_isolate`].
@@ -2166,6 +2180,43 @@ mod isolate_entry_tests {
             vm.eval(script! { mod.state.resolved })
         });
         assert_eq!(resolved.as_f64(), Some(42.5), "the awaiting task resumed with the resolved value");
+
+        cx.free_splash_vm(vm_id);
+    }
+
+    /// A task the exit drain resumes runs under the isolate's time budget
+    /// like any entry: one that never yields is stopped, and the isolate
+    /// still answers afterwards.
+    #[test]
+    fn a_task_resumed_on_exit_is_stopped_at_the_isolates_time_budget() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.with_vm(crate::script_mod);
+        let vm_id = cx.alloc_splash_vm();
+
+        cx.with_script_vm_id(vm_id, |vm| {
+            let v = vm.eval(script! {
+                use mod.std
+                mod.state = {}
+                mod.state.p = std.promise()
+                std.task(|_t| {
+                    mod.state.p.await()
+                    loop {}
+                })
+            });
+            assert!(!v.is_err(), "entry eval failed: {v:?}");
+        });
+
+        let start = std::time::Instant::now();
+        cx.with_script_vm_id(vm_id, |vm| {
+            vm.eval(script! { mod.state.p.resolve(1.0) });
+        });
+        let stopped_after = start.elapsed();
+        assert!(stopped_after >= DEFAULT_SPLASH_TIME_BUDGET, "{stopped_after:?}");
+        assert!(stopped_after < std::time::Duration::from_secs(5), "{stopped_after:?}");
+        assert!(cx.with_vm(|vm| vm.bx.run_budget.is_none()), "the app VM is not budgeted");
+
+        let two = cx.with_script_vm_id(vm_id, |vm| vm.eval(script! { 1 + 1 }));
+        assert_eq!(two.as_f64(), Some(2.0), "the isolate still answers");
 
         cx.free_splash_vm(vm_id);
     }
