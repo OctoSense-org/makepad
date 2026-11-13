@@ -102,3 +102,5 @@ Cargo.lock text
 .gitattributes export-ignore
 .gitignore     export-ignore
 .gitkeep       export-ignore
+# Frozen byte manifests use LF on every platform.
+platform/tests/fixtures/font-assets-*-v1.txt text eol=lf
