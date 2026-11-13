@@ -225,7 +225,7 @@ pub fn build(g: &Graph, seeds: &[usize], req: &Request) -> Result<Built, String>
     let flags: Vec<&String> = req.cargo_flags.iter().filter(|f| f.as_str() != "--release").collect();
 
     // ---- the key
-    let mut h = fnv(b"native-link-v12", 0xcbf29ce484222325);
+    let mut h = fnv(b"native-link-v13", 0xcbf29ce484222325);
     h = fnv(req.triple.as_bytes(), h);
     h = fnv(&selection_key(&script_pkgs, &lib_pkgs).to_le_bytes(), h);
     for f in &flags {
@@ -688,10 +688,18 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
     let tmp = format!("{}.tmp{}", lib_path, std::process::id());
     let symbols_path = format!("{}.symbols", tmp);
     let mut cmd = Command::new(cc());
+    // the copies of archives this link made (`exported_archive`), removed after it
+    let mut copies: Vec<String> = Vec::new();
     if cfg!(target_os = "macos") {
         cmd.args(["-dynamiclib", "-o", &tmp, "-Wl,-undefined,dynamic_lookup"]);
-        for a in archives {
-            cmd.arg(format!("-Wl,-force_load,{}", a));
+        for (i, a) in archives.iter().enumerate() {
+            let copy = format!("{}.{}.exported.a", tmp, i);
+            if exported_archive(a, &copy)? {
+                cmd.arg(format!("-Wl,-force_load,{}", copy));
+                copies.push(copy);
+            } else {
+                cmd.arg(format!("-Wl,-force_load,{}", a));
+            }
         }
     } else {
         cmd.args(["-shared", "-fPIC", "-o", &tmp]);
@@ -781,11 +789,142 @@ fn link(lib_path: &str, archives: &[String], search: &[String], fw_search: &[Str
         let _ = std::fs::remove_file(&stubs_path);
     }
     let _ = std::fs::remove_file(&symbols_path);
+    for copy in &copies {
+        let _ = std::fs::remove_file(copy);
+    }
     if linked.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     linked?;
     std::fs::rename(&tmp, lib_path).map_err(|e| format!("{}: {}", lib_path, e))
+}
+
+/// Writes to `copy` a copy of static library `archive` in which every private extern definition
+/// is a plain extern, and says whether the archive had one (false: nothing is written and the
+/// archive is linked as it is).
+///
+/// C and assembly built with hidden visibility (ring: `-fvisibility=hidden`, `.private_extern`)
+/// define their fns as private externs. The dylib link keeps that code but exports none of it,
+/// and JIT code binds a foreign fn by name when it runs, so the first call into such a library
+/// stopped at "foreign function `ring_core_0_17_14__x25519_sc_mask` is not available on this
+/// host" (a TLS handshake through rustls' ring provider, macOS, 2026-11-12). Two private externs
+/// of one name collide in this link already, so exporting them adds no clash. A weak definition
+/// stays private: exported, dyld would coalesce it with the other images' copies.
+fn exported_archive(archive: &str, copy: &str) -> Result<bool, String> {
+    let mut bytes = std::fs::read(archive).map_err(|e| format!("{archive}: {e}"))?;
+    if export_private_externs(&mut bytes) == 0 {
+        return Ok(false);
+    }
+    std::fs::write(copy, &bytes).map_err(|e| format!("{copy}: {e}"))?;
+    Ok(true)
+}
+
+/// Clears the private-extern bit of the defined, non-weak externs in the 64-bit Mach-O members of
+/// an `ar` archive (BSD long names, as Apple's `ar` and `libtool` write them); the number changed.
+/// What it does not read is left as it is: a universal archive, a bitcode member, a short file.
+fn export_private_externs(ar: &mut [u8]) -> usize {
+    const N_STAB: u8 = 0xe0;
+    const N_PEXT: u8 = 0x10;
+    const N_TYPE: u8 = 0x0e;
+    const N_SECT: u8 = 0x0e;
+    const N_EXT: u8 = 0x01;
+    const N_WEAK_DEF: u16 = 0x0080;
+    const LC_SYMTAB: u32 = 0x2;
+    fn u32_at(b: &[u8], at: usize) -> Option<u32> {
+        b.get(at..at.checked_add(4)?).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+    }
+    if !ar.starts_with(b"!<arch>\n") {
+        return 0;
+    }
+    let mut changed = 0;
+    let mut at = 8;
+    while at + 60 <= ar.len() {
+        // name[16] mtime[12] uid[6] gid[6] mode[8] size[10] "`\n"
+        if &ar[at + 58..at + 60] != b"`\n" {
+            break;
+        }
+        let field = |from: usize, to: usize| std::str::from_utf8(&ar[at + from..at + to]).ok().map(|s| s.trim_end().to_string());
+        let Some(size) = field(48, 58).and_then(|s| s.parse::<usize>().ok()) else { break };
+        // a long name is the first <n> bytes of the member's data: `#1/<n>`
+        let name_len = field(0, 16).and_then(|n| n.strip_prefix("#1/").and_then(|n| n.parse::<usize>().ok())).unwrap_or(0);
+        let end = at + 60 + size;
+        if end > ar.len() || name_len > size {
+            break;
+        }
+        let obj = at + 60 + name_len;
+        // a 64-bit little-endian Mach-O object: its header is 32 bytes, the load commands follow
+        if u32_at(ar, obj) == Some(0xfeed_facf) {
+            let mut cmd = obj + 32;
+            for _ in 0..u32_at(ar, obj + 16).unwrap_or(0) {
+                let (Some(kind), Some(len)) = (u32_at(ar, cmd), u32_at(ar, cmd + 4)) else { break };
+                if len < 8 || cmd + len as usize > end {
+                    break;
+                }
+                if kind == LC_SYMTAB {
+                    let (Some(symoff), Some(nsyms)) = (u32_at(ar, cmd + 8), u32_at(ar, cmd + 12)) else { break };
+                    // nlist_64: n_strx u32, n_type u8, n_sect u8, n_desc u16, n_value u64
+                    for i in 0..nsyms as usize {
+                        let sym = obj + symoff as usize + i * 16;
+                        if sym + 16 > end {
+                            break;
+                        }
+                        let ty = ar[sym + 4];
+                        let desc = u16::from_le_bytes([ar[sym + 6], ar[sym + 7]]);
+                        if ty & N_STAB == 0 && ty & N_TYPE == N_SECT && ty & N_EXT != 0 && ty & N_PEXT != 0 && desc & N_WEAK_DEF == 0 {
+                            ar[sym + 4] = ty & !N_PEXT;
+                            changed += 1;
+                        }
+                    }
+                }
+                cmd += len as usize;
+            }
+        }
+        // members start at even offsets
+        at = end + (end & 1);
+    }
+    changed
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod exported_archive_tests {
+    use super::{cc, exported_archive};
+    use std::process::Command;
+
+    #[test]
+    fn a_hidden_c_fn_is_found_by_name_in_the_linked_library() {
+        let root = std::env::temp_dir().join(format!("relax-native-hidden-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = |n: &str| root.join(n).to_string_lossy().into_owned();
+        std::fs::write(p("h.c"), "int relax_hidden_fn(int x) { return x + 1; }\n__attribute__((weak)) int relax_hidden_weak(void) { return 2; }\n").unwrap();
+        let run = |cmd: &mut Command| {
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "{:?}: {}", cmd, String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let exported = |archive: &str, lib: &str| {
+            run(Command::new(cc()).args(["-dynamiclib", "-o", lib, &format!("-Wl,-force_load,{archive}")]));
+            run(Command::new("nm").args(["-gU", lib]))
+        };
+        run(Command::new(cc()).args(["-c", "-fvisibility=hidden", "-o", &p("hidden.o"), &p("h.c")]));
+        run(Command::new("ar").args(["rcs", &p("libhidden.a"), &p("hidden.o")]));
+        run(Command::new(cc()).args(["-c", "-o", &p("plain.o"), &p("h.c")]));
+        run(Command::new("ar").args(["rcs", &p("libplain.a"), &p("plain.o")]));
+
+        // as built, the link keeps the fn and exports nothing
+        let before = exported(&p("libhidden.a"), &p("before.dylib"));
+        let had_copy = exported_archive(&p("libhidden.a"), &p("libhidden.exported.a")).unwrap();
+        let after = if had_copy { exported(&p("libhidden.exported.a"), &p("after.dylib")) } else { String::new() };
+        // an archive without private externs is linked as it is
+        let plain_copy = exported_archive(&p("libplain.a"), &p("libplain.exported.a")).unwrap();
+        let plain_written = std::path::Path::new(&p("libplain.exported.a")).exists();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(!before.contains("_relax_hidden_fn"), "{before}");
+        assert!(had_copy);
+        assert!(after.contains("_relax_hidden_fn"), "{after}");
+        assert!(!after.contains("_relax_hidden_weak"), "a weak definition stays private: {after}");
+        assert!(!plain_copy && !plain_written);
+    }
 }
 
 // ---- cargo's RUSTC_WRAPPER
