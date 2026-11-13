@@ -8,7 +8,7 @@ use {
         error::Error,
         extern_::UnguardedExtern,
         extern_ref::UnguardedExternRef,
-        func::{Func, FuncEntity, UnguardedFunc},
+        func::{Func, FuncEntity, HostFuncEntity, UnguardedFunc},
         func_ref::UnguardedFuncRef,
         global::UnguardedGlobal,
         mem::UnguardedMem,
@@ -40,9 +40,9 @@ use {
 ///
 /// On 64-bit Windows platforms, the "C" ABI corresponds to the "win64" ABI. This ABI allows only
 /// the first 4 arguments to be passed in hardware registers, regardless of their type. This is
-/// insufficient for our needs, so on Windows platforms, we use the "sysv64" ABI instead.
+/// insufficient for our needs, so on x86-64 Windows, we use the "sysv64" ABI instead.
 
-#[cfg(not(windows))]
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 pub(crate) type ThreadedInstr = unsafe extern "C" fn(
     ip: Ip,
     sp: Sp,
@@ -54,7 +54,7 @@ pub(crate) type ThreadedInstr = unsafe extern "C" fn(
     cx: Cx,
 ) -> ControlFlowBits;
 
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub(crate) type ThreadedInstr = unsafe extern "sysv64" fn(
     ip: Ip,
     sp: Sp,
@@ -289,7 +289,7 @@ pub(crate) fn exec(
 // Helper macros
 
 /// A helper macro for defining a `ThreadedInstr` with the correct ABI.
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 macro_rules! threaded_instr {
     ($name:ident(
         $ip:ident: Ip,
@@ -313,7 +313,7 @@ macro_rules! threaded_instr {
         ) -> ControlFlowBits $body
     };
 }
-#[cfg(not(windows))]
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 macro_rules! threaded_instr {
     ($name:ident(
         $ip:ident: Ip,
@@ -561,6 +561,30 @@ threaded_instr!(call(
     next_instr(ip, sp, md, ms, ix, sx, dx, cx)
 });
 
+/// Calls a host function on the shared stack, returning `false` (with the
+/// error stored in `cx`) if it failed.
+///
+/// This lives out of line on purpose: the `Result` returned by the
+/// trampoline is written through a pointer to a stack slot. If that slot
+/// were in a handler's frame, its address would escape, LLVM could no longer
+/// turn the handler's call to the next instruction into a sibling call, and
+/// every host call would leave a frame behind on the native stack.
+#[inline(never)]
+unsafe fn call_host_func(func: &HostFuncEntity, sp: Sp, offset: usize, cx: Cx) -> bool {
+    let mut stack = (*cx).stack.take().unwrap_unchecked();
+    stack.set_ptr(sp.cast::<u8>().add(offset).cast());
+    match func.trampoline().clone().call((*cx).store, stack) {
+        Ok(stack) => {
+            (*cx).stack = Some(stack);
+            true
+        }
+        Err(error) => {
+            (*cx).error = Some(error);
+            false
+        }
+    }
+}
+
 threaded_instr!(call_host(
     ip: Ip,
     sp: Sp,
@@ -576,20 +600,12 @@ threaded_instr!(call_host(
     let (offset, ip) = read_imm(ip);
     let (mem, ip): (Option<UnguardedMem>, _) = read_imm(ip);
 
-    let mut stack = (*cx).stack.take().unwrap_unchecked();
-    stack.set_ptr(sp.cast::<u8>().add(offset).cast());
     let FuncEntity::Host(func) = func.as_ref() else {
         hint::unreachable_unchecked();
     };
-    let stack = match func.trampoline().clone().call((*cx).store, stack) {
-        Ok(stack) => stack,
-        Err(error) => {
-            (*cx).error = Some(error);
-            return ControlFlow::Error.to_bits();
-        }
-    };
-
-    (*cx).stack = Some(stack);
+    if !call_host_func(func, sp, offset, cx) {
+        return ControlFlow::Error.to_bits();
+    }
 
     let md;
     let ms;
@@ -659,16 +675,9 @@ threaded_instr!(call_indirect(
             next_instr(ip, sp, md, ms, ix, sx, dx, cx)
         }
         FuncEntity::Host(func) => {
-            let mut stack = (*cx).stack.take().unwrap_unchecked();
-            stack.set_ptr(sp.cast::<u8>().add(stack_offset).cast());
-            let stack = match func.trampoline().clone().call((*cx).store, stack) {
-                Ok(stack) => stack,
-                Err(error) => {
-                    (*cx).error = Some(error);
-                    return ControlFlow::Error.to_bits();
-                }
-            };
-            (*cx).stack = Some(stack);
+            if !call_host_func(func, sp, stack_offset, cx) {
+                return ControlFlow::Error.to_bits();
+            }
 
             let md;
             let ms;

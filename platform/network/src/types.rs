@@ -66,6 +66,9 @@ pub struct HttpRequest {
     pub method: HttpMethod,
     #[cfg_attr(feature = "script", live)]
     pub headers: BTreeMap<String, Vec<String>>,
+    /// Skip TLS certificate verification for this request. Intended for
+    /// loopback/dev endpoints with self-signed certificates; the per-isolate
+    /// host allowlist still applies, so this cannot widen an app's reach.
     #[cfg_attr(feature = "script", live)]
     pub ignore_ssl_cert: bool,
     #[cfg_attr(feature = "script", live)]
