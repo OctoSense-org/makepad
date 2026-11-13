@@ -163,8 +163,11 @@ fn rehome(u: &Unit, addr: u64, seen: &mut std::collections::HashMap<u64, u64>, f
     new
 }
 
-/// Blocks of the domains other than the compile domain, by base.
-static BLOCKS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Blocks of the domains other than the compile domain: (base, the compile domain of the unit
+/// whose statics the block holds). A process holds more than one unit (the program's, and the
+/// macro world's again once a live edit's derive rebuilt it beside the running program): an offset
+/// in a block is a static of the block's own unit only.
+static BLOCKS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 /// Bytes of a domain block (the unit's writable region; a block is address space until touched).
 pub const BLOCK_SIZE: usize = crate::jit::UNIT_RW_SIZE as usize;
@@ -503,7 +506,7 @@ pub fn create(u: &Unit) -> u64 {
     }
     {
         let _kept = crate::zone_alloc::kept();
-        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(base);
+        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push((base, u.syms.dom0()));
     }
     base
 }
@@ -514,22 +517,29 @@ pub fn destroy(base: u64) {
         let _ = sc.base.compare_exchange(base, 0, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Relaxed);
     }
     forget_tls_keys(base);
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| *b != base);
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|b| b.0 != base);
     if crate::web32::on() { crate::web32::free(base, BLOCK_SIZE) } else { crate::os::mem::free(base, BLOCK_SIZE) }
 }
 
 /// A static was just laid out (jit.rs `static_addr`, after its initial image was captured): copy
-/// it into the live blocks. No other domain: nothing to do.
+/// it into the live blocks of its unit. No other domain of that unit: nothing to do. Another
+/// unit's blocks are not touched: the macro world a live edit's derive rebuilds lays out its
+/// statics while the program runs, and each one's image, written at its offset into the program's
+/// app domain, went over whatever static of the program has that offset (a tokio program's
+/// thread-local keys read as never created: "there is no reactor running", or a fault).
 pub(crate) fn materialize(u: &Unit, sym: Sym) {
+    let of = u.syms.dom0();
     let blocks = BLOCKS.lock().unwrap_or_else(|e| e.into_inner());
-    for &base in blocks.iter() {
-        materialize_in(u, base, sym.id, &mut HashSet::new());
+    for &(base, unit) in blocks.iter() {
+        if unit == of {
+            materialize_in(u, base, sym.id, &mut HashSet::new());
+        }
     }
 }
 
 /// The live blocks other than domain 0 (tests, inspect).
 pub fn blocks() -> Vec<u64> {
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|b| b.0).collect()
 }
 
 // ---------------------------------------------------------------------------------------------

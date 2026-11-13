@@ -48,9 +48,14 @@ fn fixture() -> (Box<Unit>, u64, std::path::PathBuf) {
 }
 
 fn fixture_of(source: &str, entry_name: &str) -> (Box<Unit>, u64, std::path::PathBuf) {
+    fixture_in("fixture.rs", source, entry_name)
+}
+
+/// `fixture_of` with the source in `file` of the test's directory: a second unit beside the first.
+fn fixture_in(file: &str, source: &str, entry_name: &str) -> (Box<Unit>, u64, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("relax-domain-teardown-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
-    let path = root.join("fixture.rs");
+    let path = root.join(file);
     std::fs::write(&path, source).unwrap();
     // the std sources of this checkout (as lazy_reload_tests.rs does: a test binary is not next to them)
     std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
@@ -547,6 +552,67 @@ fn jit_tls_past_the_direct_slots() {
     unsafe { crate::jit::call_jit(&mut *u, entry, out.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
     assert_eq!(out, [10 * 100 + 16, 7]);
     let _ = std::fs::remove_dir_all(root);
+}
+
+// A process holds more than one unit: the program's, and the macro world's again once a live
+// edit's derive rebuilt it beside the running program. A static the second unit lays out is copied
+// into the live domains of that unit only. Copied into every live block, the world's statics went
+// over the program's at the same offsets of its app domain (a tokio daemon under `makepad run`: its
+// thread-local keys read as never created after the first live edit of a file with a derive --
+// "there is no reactor running" -- or it faulted on a pointer that was another static's image).
+const TWO_UNITS_PROGRAM: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+static mut MARKS: [u64; 4096] = [0; 4096];
+fn marks_program(p: *mut u64) {
+    let a = unsafe { &*(p as *const [AtomicU64; 4]) };
+    let marks = unsafe { &mut *(&raw mut MARKS) };
+    for m in marks.iter_mut() { *m = 0x1111_1111_1111_1111; }
+    a[3].store(marks.as_ptr() as u64, Ordering::SeqCst);
+    a[0].store(1, Ordering::SeqCst);
+    while a[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
+    a[2].store(1 + marks.iter().filter(|m| **m != 0x1111_1111_1111_1111).count() as u64, Ordering::SeqCst);
+}
+"#;
+const TWO_UNITS_OTHER: &str = r#"
+static mut IMAGE: [u64; 4096] = [0x2222_2222_2222_2222; 4096];
+fn image_unit(p: *mut u64) {
+    unsafe { *p = (&raw const IMAGE) as u64; }
+}
+"#;
+
+#[test]
+fn a_static_of_another_unit_stays_out_of_this_units_domains() {
+    isolated_test!(a_static_of_another_unit_stays_out_of_this_units_domains);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(TWO_UNITS_PROGRAM, "marks_program");
+    let flags = [const { AtomicU64::new(0) }; 4];
+    let (domain, base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[0].load(Ordering::SeqCst) != 0);
+    // the program's static is in its domain's block, written
+    let marks = flags[3].load(Ordering::SeqCst);
+    assert!((base..base + BLOCK_SIZE as u64).contains(&marks));
+    // the second unit, in its own compile domain on this thread: its static is laid out now
+    let (mut other, other_entry, _) = fixture_in("other.rs", TWO_UNITS_OTHER, "image_unit");
+    // (as the macro world's: an auxiliary unit, never the runtime's in place of the program's)
+    other.aux = true;
+    other.tier1 = None;
+    let mut image = 0u64;
+    unsafe { crate::jit::call_jit(&mut *other, other_entry, &mut image as *mut u64 as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
+    let dom0 = other.syms.dom0();
+    assert!((dom0..dom0 + BLOCK_SIZE as u64).contains(&image), "the other unit's static is in its own domain");
+    assert_eq!(unsafe { *(image as *const u64) }, 0x2222_2222_2222_2222);
+    // what the program's block holds at that static's offset is the program's
+    let there = unsafe { std::slice::from_raw_parts((base + (image - dom0)) as *const u64, 4096) };
+    assert_eq!(there.iter().filter(|w| **w == 0x2222_2222_2222_2222).count(), 0, "the other unit's static was copied into the program's domain");
+    flags[1].store(1, Ordering::SeqCst);
+    wait(|| flags[2].load(Ordering::SeqCst) != 0);
+    main.join().unwrap();
+    assert_eq!(flags[2].load(Ordering::SeqCst), 1, "the program's static kept every word it wrote");
+    wait(|| info(domain).is_some_and(|i| i.threads == 0 && i.base == 0));
+    domains().retain(|d| d.info.id != domain);
+    drop(other);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 // A callback the domain's code hands to native code runs on a thread native code owns (the HAL's
