@@ -468,6 +468,23 @@ pub fn contain_isolate_panic(what: &str, f: impl FnOnce()) -> bool {
 /// ([`CxSplashVmExt::set_splash_vm_time_budget`]).
 pub const DEFAULT_SPLASH_TIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(64);
 
+/// The budget an isolate starts with: [`DEFAULT_SPLASH_TIME_BUDGET`], unless
+/// `MAKEPAD_SPLASH_BUDGET_MS` says otherwise. The budget is wall-clock time,
+/// so it also counts time the entry spends waiting for the CPU or a lock. A
+/// test binary running a thousand tests in one process is the case for the
+/// override: there the wall clock says little about the script. A host's own
+/// budget for an isolate still takes its place.
+fn splash_entry_budget() -> std::time::Duration {
+    static BUDGET: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("MAKEPAD_SPLASH_BUDGET_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map_or(DEFAULT_SPLASH_TIME_BUDGET, std::time::Duration::from_millis)
+    })
+}
+
 /// A Splash isolate runs untrusted-ish user script on the UI thread; cap how long any
 /// single entry into it may run. The cap is the isolate's own `budget`.
 fn with_splash_budget<R>(
@@ -491,7 +508,7 @@ fn splash_vm_time_budget(cx: &mut Cx, vm_id: SplashVmId) -> std::time::Duration 
         .isolated_vms
         .vms
         .get(&vm_id)
-        .map_or(DEFAULT_SPLASH_TIME_BUDGET, |isolated| isolated.time_budget)
+        .map_or_else(splash_entry_budget, |isolated| isolated.time_budget)
 }
 
 pub trait CxSplashVmExt {
@@ -633,7 +650,7 @@ impl CxSplashVmExt for Cx {
             id,
             IsolatedSplashVm {
                 network_enabled,
-                time_budget: DEFAULT_SPLASH_TIME_BUDGET,
+                time_budget: splash_entry_budget(),
                 std,
                 vm: Some(bx),
             },
