@@ -29,7 +29,7 @@ use crate::{
             PCWSTR,
         },
         Win32::{
-            Foundation::{CloseHandle, HANDLE, HMODULE, S_FALSE, WAIT_TIMEOUT},
+            Foundation::{CloseHandle, HANDLE, HMODULE, S_FALSE, WAIT_OBJECT_0, WAIT_TIMEOUT},
             Graphics::{
                 Direct3D::{
                     Fxc::D3DCompile, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
@@ -2093,6 +2093,30 @@ impl D3d11Window {
         self.last_frame_stats = None;
         self.occluded_since = None;
         self.latency_timeout_since = None;
+    }
+
+    /// Whether this window's frame clock is ready for a frame right now: it is
+    /// unpaced, it already holds a credit, or its waitable is signaled. In the
+    /// last case the credit is taken here (a zero-timeout wait consumes one), so
+    /// the caller must go on to present this window, which spends it.
+    ///
+    /// Used during another window's beat: a secondary window whose pass is dirty
+    /// is normally held back for its own beat, but `MsgWaitForMultipleObjectsEx`
+    /// returns the lowest signaled handle, so while the primary keeps presenting
+    /// (a blinking caret is enough) the secondary's beat is never the one
+    /// returned and its frame would wait until the primary falls silent.
+    pub fn beat_ready(&self) -> bool {
+        if self.frame_latency_waitable.is_invalid() {
+            return true;
+        }
+        if try_with_win32_app(|app| app.has_beat_credit(self.window_id)).unwrap_or(false) {
+            return true;
+        }
+        let ready = unsafe { WaitForSingleObject(self.frame_latency_waitable, 0) } == WAIT_OBJECT_0;
+        if ready {
+            try_with_win32_app(|app| app.take_beat_credit(self.window_id));
+        }
+        ready
     }
 
     pub fn start_resize(&mut self) {
