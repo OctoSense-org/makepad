@@ -5,7 +5,14 @@ use crate::makepad_math::*;
 use napi_derive_ohos::napi;
 use napi_ohos::{Env, JsObject, JsString, NapiRaw};
 use ohos_sys::xcomponent::{
-    OH_NativeXComponent, OH_NativeXComponent_Callback, OH_NativeXComponent_GetTouchEvent,
+    OH_NativeXComponent, OH_NativeXComponent_Callback, OH_NativeXComponent_GetMouseEvent,
+    OH_NativeXComponent_GetTouchEvent, OH_NativeXComponent_GetTouchPointToolType,
+    OH_NativeXComponent_MouseEvent, OH_NativeXComponent_MouseEventAction,
+    OH_NativeXComponent_MouseEvent_Callback, OH_NativeXComponent_RegisterMouseEventCallback,
+    OH_NativeXComponent_TouchPointToolType, OH_NativeXComponent_GetKeyEvent,
+    OH_NativeXComponent_GetKeyEventAction, OH_NativeXComponent_GetKeyEventCode,
+    OH_NativeXComponent_KeyAction, OH_NativeXComponent_KeyCode, OH_NativeXComponent_KeyEvent,
+    OH_NativeXComponent_RegisterKeyEventCallback,
     OH_NativeXComponent_GetXComponentSize, OH_NativeXComponent_RegisterCallback,
     OH_NativeXComponent_TouchEvent, OH_NativeXComponent_TouchEventType,
 };
@@ -65,22 +72,44 @@ pub fn send_from_ohos_message(message: FromOhosMessage) {
     }
 }
 
+/// ArkTS's whole part in makepad's UI: it hands over one `NodeContent` slot
+/// (a `ContentSlot` on the page) and native code puts the XComponent in it
+/// (`node_shim.cpp`), registers its callbacks and takes its UI context for
+/// the native input method.
 #[napi]
-pub fn handle_insert_text_event(text: String) -> napi_ohos::Result<()> {
-    let e = TextInputEvent {
-        input: text,
-        replace_last: false,
-        was_paste: false,
-        ..Default::default()
-    };
-    send_from_ohos_message(FromOhosMessage::TextInput(e));
+pub fn mount_content(env: Env, content: JsObject) -> napi_ohos::Result<()> {
+    extern "C" {
+        fn makepad_ohos_mount(
+            env: napi_ohos::sys::napi_env,
+            content: napi_ohos::sys::napi_value,
+            out_xcomponent: *mut *mut OH_NativeXComponent,
+            out_context: *mut *mut c_void,
+        ) -> i32;
+    }
+    let mut xcomponent: *mut OH_NativeXComponent = core::ptr::null_mut();
+    let mut context: *mut c_void = core::ptr::null_mut();
+    let res = unsafe { makepad_ohos_mount(env.raw(), content.raw(), &mut xcomponent, &mut context) };
+    if res != 0 {
+        crate::error!("mount_content: makepad_ohos_mount failed: {res}");
+        return Ok(());
+    }
+    register_native_xcomponent_callbacks(xcomponent);
+    super::oh_ime::set_context(context);
     Ok(())
 }
 
-#[napi]
-pub fn handle_delete_left_event(length: i32) -> napi_ohos::Result<()> {
-    send_from_ohos_message(FromOhosMessage::DeleteLeft(length));
-    Ok(())
+/// A scroll from the XComponent node's NODE_ON_AXIS (mouse wheel, two-finger
+/// touchpad), from `node_shim.cpp`; positive scrolls down/right.
+#[no_mangle]
+extern "C" fn makepad_ohos_on_axis(dx: f64, dy: f64, x: f32, y: f32, tool: i32) {
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+        crate::log!("ohos axis: dx={dx} dy={dy} at {x},{y} tool={tool}");
+    }
+    if dx != 0.0 || dy != 0.0 {
+        // UI_INPUT_EVENT_TOOL_TYPE_MOUSE is 3 (a wheel); 4 is a touchpad.
+        send_from_ohos_message(FromOhosMessage::Scroll { scroll: dvec2(dx, dy), is_mouse: tool == 3 });
+    }
 }
 
 #[napi]
@@ -200,6 +229,14 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
 
     let mut touches = Vec::with_capacity(touch_event.numPoints as usize);
     for idx in 0..touch_event.numPoints {
+        // A mouse or touchpad arrives through `on_dispatch_mouse_event_cb`
+        // as mouse events; its synthesized touch would click twice.
+        let mut tool = OH_NativeXComponent_TouchPointToolType::OH_NATIVEXCOMPONENT_TOOL_TYPE_UNKNOWN;
+        if unsafe { OH_NativeXComponent_GetTouchPointToolType(component, idx, &mut tool) } == 0
+            && tool == OH_NativeXComponent_TouchPointToolType::OH_NATIVEXCOMPONENT_TOOL_TYPE_MOUSE
+        {
+            continue;
+        }
         let point = &(touch_event.touchPoints[idx as usize]);
         let touch_state = match point.type_ {
             OH_NativeXComponent_TouchEventType::OH_NATIVEXCOMPONENT_DOWN => TouchState::Start,
@@ -226,9 +263,74 @@ extern "C" fn on_dispatch_touch_event_cb(component: *mut OH_NativeXComponent, wi
             sweep_lock: Cell::new(Area::Empty),
         })
     }
-    send_from_ohos_message(FromOhosMessage::Touch(touches));
+    if !touches.is_empty() {
+        send_from_ohos_message(FromOhosMessage::Touch(touches));
+    }
     //crate::log!("OnDispatchTouchEventCallBack");
 }
+
+/// A mouse or touchpad on the XComponent (a 2-in-1 or a tablet with a
+/// pointer): press, release and motion, in the same pixels as touches.
+#[no_mangle]
+extern "C" fn on_dispatch_mouse_event_cb(component: *mut OH_NativeXComponent, window: *mut c_void) {
+    let mut mouse_event: MaybeUninit<OH_NativeXComponent_MouseEvent> = MaybeUninit::uninit();
+    let res = unsafe { OH_NativeXComponent_GetMouseEvent(component, window, mouse_event.as_mut_ptr()) };
+    if res != 0 {
+        crate::error!("OH_NativeXComponent_GetMouseEvent failed with {res}");
+        return;
+    }
+    let e = unsafe { mouse_event.assume_init() };
+    let action = match e.action {
+        OH_NativeXComponent_MouseEventAction::OH_NATIVEXCOMPONENT_MOUSE_PRESS => MouseAction::Down,
+        OH_NativeXComponent_MouseEventAction::OH_NATIVEXCOMPONENT_MOUSE_RELEASE => MouseAction::Up,
+        OH_NativeXComponent_MouseEventAction::OH_NATIVEXCOMPONENT_MOUSE_MOVE => MouseAction::Move,
+        _ => return,
+    };
+    send_from_ohos_message(FromOhosMessage::Mouse {
+        action,
+        // OpenHarmony's button values are makepad's MouseButton bits.
+        button: e.button.0,
+        abs: dvec2(e.x as f64, e.y as f64),
+        time: e.timestamp as f64 / 1000000000.0,
+    });
+}
+
+#[link(name = "ace_ndk.z")]
+extern "C" {
+    /// API 20: Ctrl/Shift/Alt/Fn held with this key (ARKUI_MODIFIER_KEY_*).
+    fn OH_NativeXComponent_GetKeyEventModifierKeyStates(
+        key_event: *mut OH_NativeXComponent_KeyEvent,
+        keys: *mut u64,
+    ) -> i32;
+}
+
+/// A hardware key on the focused XComponent. Text still arrives through the
+/// input method (`insertText`); this carries what a text path cannot:
+/// Enter, Tab, Escape, arrows, paging, function keys and modifier chords.
+#[no_mangle]
+extern "C" fn on_dispatch_key_event_cb(component: *mut OH_NativeXComponent, _window: *mut c_void) {
+    let mut event: *mut OH_NativeXComponent_KeyEvent = core::ptr::null_mut();
+    if unsafe { OH_NativeXComponent_GetKeyEvent(component, &mut event) } != 0 || event.is_null() {
+        return;
+    }
+    let mut action = OH_NativeXComponent_KeyAction(-1);
+    let mut code = OH_NativeXComponent_KeyCode(-1);
+    let mut modifiers: u64 = 0;
+    unsafe {
+        OH_NativeXComponent_GetKeyEventAction(event, &mut action);
+        OH_NativeXComponent_GetKeyEventCode(event, &mut code);
+        OH_NativeXComponent_GetKeyEventModifierKeyStates(event, &mut modifiers);
+    }
+    let down = match action {
+        OH_NativeXComponent_KeyAction::OH_NATIVEXCOMPONENT_KEY_ACTION_DOWN => true,
+        OH_NativeXComponent_KeyAction::OH_NATIVEXCOMPONENT_KEY_ACTION_UP => false,
+        _ => return,
+    };
+    send_from_ohos_message(FromOhosMessage::Key { down, code: code.0, modifiers });
+}
+
+#[no_mangle]
+extern "C" fn on_dispatch_hover_event_cb(_component: *mut OH_NativeXComponent, _is_hover: bool) {}
 
 #[no_mangle]
 extern "C" fn on_vsync_cb(_timestamp: ::core::ffi::c_longlong, data: *mut c_void) {
@@ -269,7 +371,12 @@ pub fn register_xcomponent_callbacks(env: &Env, xcomponent: &JsObject) {
         assert!(res == 0);
     }
     crate::log!("Got native_xcomponent!");
-    let cbs = Box::new(OH_NativeXComponent_Callback {
+    register_native_xcomponent_callbacks(native_xcomponent);
+}
+
+/// Surface, touch, mouse and key callbacks on makepad's XComponent, however
+/// it was created (an ArkTS `XComponent`, or natively by `mount_content`).
+pub fn register_native_xcomponent_callbacks(native_xcomponent: *mut OH_NativeXComponent) {    let cbs = Box::new(OH_NativeXComponent_Callback {
         OnSurfaceCreated: Some(on_surface_created_cb),
         OnSurfaceChanged: Some(on_surface_changed_cb),
         OnSurfaceDestroyed: Some(on_surface_destroyed_cb),
@@ -282,6 +389,20 @@ pub fn register_xcomponent_callbacks(env: &Env, xcomponent: &JsObject) {
         crate::error!("Failed to register XComponent callbacks");
     } else {
         crate::log!("Register XComponent callbacks successfully");
+    }
+    let mouse_cbs = Box::new(OH_NativeXComponent_MouseEvent_Callback {
+        DispatchMouseEvent: Some(on_dispatch_mouse_event_cb),
+        DispatchHoverEvent: Some(on_dispatch_hover_event_cb),
+    });
+    let res = unsafe {
+        OH_NativeXComponent_RegisterMouseEventCallback(native_xcomponent, Box::leak(mouse_cbs) as *mut _)
+    };
+    if res != 0 {
+        crate::error!("Failed to register XComponent mouse callbacks");
+    }
+    let res = unsafe { OH_NativeXComponent_RegisterKeyEventCallback(native_xcomponent, Some(on_dispatch_key_event_cb)) };
+    if res != 0 {
+        crate::error!("Failed to register XComponent key callback: {res}");
     }
 }
 
@@ -313,6 +434,13 @@ pub fn debug_jsobject(obj: &JsObject, obj_name: &str) -> napi_ohos::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MouseAction {
+    Down,
+    Up,
+    Move,
+}
+
 #[derive(Debug)]
 pub enum FromOhosMessage {
     Init {
@@ -342,6 +470,45 @@ pub enum FromOhosMessage {
     /// response, a finished task): dispatch it; paint only on a VSync.
     Wake,
     Touch(Vec<TouchPoint>),
+    Key {
+        down: bool,
+        code: i32,
+        modifiers: u64,
+    },
+    /// A system browser's document navigated (oh_web.rs).
+    WebNavigation {
+        id: u64,
+        url: String,
+        title: String,
+        loading: bool,
+    },
+    WebPageError {
+        id: u64,
+        code: i32,
+        description: String,
+        url: String,
+    },
+    /// A page called `octos_native.invoke`.
+    WebInvoke {
+        id: u64,
+        call_id: i64,
+        tool: String,
+        args: String,
+    },
+    ImeKey {
+        code: i32,
+        modifiers: u64,
+    },
+    Scroll {
+        scroll: Vec2d,
+        is_mouse: bool,
+    },
+    Mouse {
+        action: MouseAction,
+        button: u32,
+        abs: Vec2d,
+        time: f64,
+    },
     TextInput(TextInputEvent),
     DeleteLeft(i32),
     ResizeTextIME(bool, i32),

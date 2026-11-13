@@ -1,5 +1,11 @@
 export const onCreate: (ark_ts: object) => void;
-export const handleInsertTextEvent: (text:String) => void;
-export const handleDeleteLeftEvent: (length: number) => void
+export const mountContent: (content: object) => void
+export const webViewList: () => Array<string>;
+export const webViewTakeCommands: () => Array<string>;
+export const webViewAttached: (tag: string) => void;
+export const webViewReady: (tag: string) => void;
+export const webViewMayNavigate: (tag: string, url: string) => boolean;
+export const webViewNavigation: (tag: string, url: string, title: string, loading: boolean) => void;
+export const webViewPageError: (tag: string, code: number, description: string, url: string) => void;
 export const handleKeyboardStatus: (isOpen:boolean, keyboardHeight:number) => void;
 export const handleLocation: (lat: number, lon: number, accuracy: number) => void;

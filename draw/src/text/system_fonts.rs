@@ -68,6 +68,9 @@ pub fn font_dirs() -> Vec<PathBuf> {
                 }
             }
         }
+    } else if cfg!(any(target_os = "android", target_env = "ohos")) {
+        // Android and OpenHarmony/HarmonyOS keep the system fonts here.
+        dirs.push(PathBuf::from("/system/fonts"));
     } else if cfg!(windows) {
         if let Some(windir) = std::env::var_os("WINDIR") {
             dirs.push(PathBuf::from(windir).join("Fonts"));

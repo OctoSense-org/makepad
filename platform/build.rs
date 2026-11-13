@@ -181,6 +181,8 @@ fn main() {
             // OpenHarmony's sysroot has no xkbcommon; its keyboard comes through ArkUI.
             if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("ohos") {
                 println!("cargo:rustc-link-lib=xkbcommon");
+            } else {
+                build_ohos_node_shim(&target, &out_dir);
             }
         }
         "android" => {
@@ -188,4 +190,49 @@ fn main() {
         }
         _ => (),
     }
+}
+
+/// OpenHarmony: compile `node_shim.cpp` (makepad's ArkUI node, created with
+/// the NDK) and `web_shim.cpp` (system browsers through ArkWeb's NDK) with the
+/// SDK's clang++, which cargo-makepad exports as
+/// `CXX_<target>` (and `AR_<target>`), into a static library linked here.
+/// No `cc` build dependency: one compiler call and one archive.
+fn build_ohos_node_shim(target: &str, out_dir: &str) {
+    let srcs = ["src/os/linux/open_harmony/node_shim.cpp", "src/os/linux/open_harmony/web_shim.cpp"];
+    for src in srcs {
+        println!("cargo:rerun-if-changed={src}");
+    }
+    let key = target.replace('-', "_");
+    println!("cargo:rerun-if-env-changed=CXX_{key}");
+    println!("cargo:rerun-if-env-changed=AR_{key}");
+    let (Ok(cxx), Ok(ar)) = (env::var(format!("CXX_{key}")), env::var(format!("AR_{key}"))) else {
+        println!("cargo:warning=CXX_{key}/AR_{key} not set: building without the OpenHarmony node shim");
+        return;
+    };
+    let lib = Path::new(out_dir).join("libmakepad_ohos_node_shim.a");
+    let mut objs = Vec::new();
+    for src in srcs {
+        let obj = Path::new(out_dir).join(Path::new(src).file_stem().unwrap()).with_extension("o");
+        let status = std::process::Command::new(&cxx)
+            // No C++ runtime is linked: no exceptions, RTTI or guarded statics.
+            .args(["-c", "-fPIC", "-O2", "-std=c++17", "-fno-exceptions", "-fno-rtti", "-fno-threadsafe-statics", src, "-o"])
+            .arg(&obj)
+            .status()
+            .expect("run the OpenHarmony clang++");
+        assert!(status.success(), "compiling {src} failed");
+        objs.push(obj);
+    }
+    let _ = std::fs::remove_file(&lib);
+    let status = std::process::Command::new(&ar)
+        .arg("crs")
+        .arg(&lib)
+        .args(&objs)
+        .status()
+        .expect("run llvm-ar");
+    assert!(status.success(), "archiving the OpenHarmony shims failed");
+    println!("cargo:rustc-link-search=native={out_dir}");
+    println!("cargo:rustc-link-lib=static=makepad_ohos_node_shim");
+    println!("cargo:rustc-link-lib=ace_ndk.z");
+    println!("cargo:rustc-link-lib=ace_napi.z");
+    println!("cargo:rustc-link-lib=ohweb");
 }
