@@ -2182,6 +2182,12 @@ pub fn pre_expand_derives(krate: &str, files: &[(&str, &[u8], &[Tok])], cfg: &Cf
     if !cfg.session.options.derives || !cfg.session.options.pre_derives {
         return;
     }
+    // no workers for this load (preload::SINGLE: a run-time module, or the macro world built on
+    // the compiler's owner, where a worker's hosted derive would be a request to the thread that
+    // waits for it here): each derive is expanded when its item is parsed, on this thread
+    if crate::preload::SINGLE.with(|s| s.get()) {
+        return;
+    }
     // sites: (file, item lo, item hi)
     let mut sites: Vec<(usize, u32, u32)> = Vec::new();
     for (fi, (_, src, toks)) in files.iter().enumerate() {

@@ -1,0 +1,6 @@
+# A program tests/live_macro_world_on_owner/run.py patches (app/src/main.rs) while it runs.
+# `count` is a proc-macro crate whose dependency `shape` itself derives with the proc-macro
+# crate `tag`: the macro world holds a crate that needs a macro of an earlier stage.
+[workspace]
+members = ["tag", "shape", "count", "app"]
+resolver = "2"

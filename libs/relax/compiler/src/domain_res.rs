@@ -121,15 +121,19 @@ pub(crate) use unix::*;
 #[cfg(unix)]
 mod unix {
     use super::*;
+    use crate::os::fault::SigAction;
     use std::ffi::{c_char, c_int, c_uint, c_void};
     use std::os::fd::FromRawFd;
+    use std::sync::atomic::{AtomicPtr, Ordering};
 
     #[derive(Clone, Copy)]
     pub(super) enum Res {
         Fd { fd: c_int, dev: u64, ino: u64, socket: bool },
         Dir(usize),
         Map { addr: usize, len: usize },
-        Signal { sig: c_int, old: [u64; 32] },
+        /// `old`: the OS's action before the run's first change; `prev`: the program handler
+        /// recorded for the signal then (`PROGRAM_HANDLERS`, 0 none)
+        Signal { sig: c_int, old: [u64; 32], prev: usize },
         Key(KeyT),
         Child { pid: i32, told: bool, detached: bool },
     }
@@ -212,7 +216,7 @@ mod unix {
             pub fn mmap(addr: *mut u8, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut u8;
             pub fn munmap(addr: *mut u8, len: usize) -> c_int;
             pub fn signal(sig: c_int, handler: usize) -> usize;
-            pub fn sigaction(sig: c_int, act: *const crate::os::fault::SigAction, old: *mut crate::os::fault::SigAction) -> c_int;
+            pub fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int;
             pub fn pthread_key_create(key: *mut usize, dtor: Option<extern "C" fn(*mut u8)>) -> c_int;
             pub fn pthread_key_delete(key: KeyT) -> c_int;
             pub fn posix_spawn(pid: *mut i32, path: *const c_char, actions: *const c_void, attr: *const c_void, argv: *const usize, envp: *const usize) -> c_int;
@@ -358,26 +362,146 @@ mod unix {
         forget_range(addr as usize, pages(len));
         unsafe { sys::munmap(addr, len) }
     }
-    fn save_handler(sig: c_int) {
-        let Some(domain) = owner() else { return };
+    /// A handler the program set for a signal, with the domain it set it in. The OS has
+    /// `on_program_signal` in its place: a signal comes to whatever thread takes it, and one in
+    /// no domain (the main thread in the HAL's event loop, a device's thread) is in the default
+    /// domain, whose copy of the program's statics nothing ever set up. (A child's exit, SIGCHLD
+    /// on the main thread, ran signal-hook's handler there: its registry was not there, a panic
+    /// on a thread with no recovery point, the process's abort.) Never freed: a signal may be
+    /// reading one.
+    struct ProgramHandler {
+        handler: usize,
+        /// `domain::foreign_scope` of the thread that set it (0: in no domain, it runs as it comes)
+        scope: u64,
+    }
+
+    /// One past the last signal number with a place (Linux: 64, with the realtime ones).
+    const SIGNALS: usize = 65;
+    static PROGRAM_HANDLERS: [AtomicPtr<ProgramHandler>; SIGNALS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; SIGNALS];
+    /// `SIG_DFL` is 0; a handler is any word above this one
+    const SIG_IGN: usize = 1;
+    const SIG_ERR: usize = usize::MAX;
+
+    fn program_handler(sig: c_int) -> Option<&'static AtomicPtr<ProgramHandler>> {
+        PROGRAM_HANDLERS.get(usize::try_from(sig).ok()?)
+    }
+
+    /// The handler the program has for `sig` (0: none set through here).
+    fn program_handler_now(sig: c_int) -> usize {
+        program_handler(sig).map(|p| p.load(Ordering::Acquire)).filter(|p| !p.is_null()).map_or(0, |p| unsafe { (*p).handler })
+    }
+
+    /// Records `handler` as the program's, set by the calling thread; returns the record before
+    /// (to put back when the OS refuses the change).
+    fn set_program_handler(place: &AtomicPtr<ProgramHandler>, handler: usize) -> *mut ProgramHandler {
+        let scope = crate::domain::foreign_scope();
+        let _kept = crate::zone_alloc::kept();
+        place.swap(Box::leak(Box::new(ProgramHandler { handler, scope })), Ordering::AcqRel)
+    }
+
+    fn program_entry() -> usize {
+        on_program_signal as *const () as usize
+    }
+
+    /// What the OS calls for a signal whose handler a program set: that handler, in its domain.
+    extern "C" fn on_program_signal(sig: c_int, info: *mut c_void, context: *mut c_void) {
+        let Some(h) = program_handler(sig).map(|p| p.load(Ordering::Acquire)).filter(|p| !p.is_null()) else { return };
+        let h = unsafe { &*h };
+        // (what the signal interrupted goes on with the errno it had)
+        let _keep = crate::os::proc::KeepLastError::new();
+        // out of a provided crate's op or a compile step the signal came into
+        let _kept = crate::zone_alloc::kept();
+        let saved = crate::domain::foreign_enter(h.scope);
+        // its run ended, its code with it (`take_back_callbacks` puts back the handler before it)
+        if h.scope != 0 && !saved.entered() {
+            return;
+        }
+        let handler: extern "C" fn(c_int, *mut c_void, *mut c_void) = unsafe { std::mem::transmute(h.handler) };
+        handler(sig, info, context);
+        crate::domain::foreign_leave(saved);
+    }
+
+    /// Before the calling thread's run changes what `sig` does: what it was, for the run's end.
+    /// Whether `handler` is that action's own handler (the program read it and puts it back: it
+    /// is not the program's code, and goes to the OS as it is).
+    fn save_handler(sig: c_int, handler: usize) -> bool {
+        let Some(domain) = owner() else { return false };
         let mut old = [0u64; 32];
+        let prev = program_handler(sig).map_or(0, |p| p.load(Ordering::Acquire) as usize);
         with_table(|t| {
-            if !t.iter().any(|o| o.domain == domain && matches!(o.res, Res::Signal { sig: s, .. } if s == sig))
-                && unsafe { sys::sigaction(sig, std::ptr::null(), old.as_mut_ptr() as *mut _) } == 0
-            {
-                t.push(Owned { domain, res: Res::Signal { sig, old } });
-            }
-        });
+            let saved = t.iter().find_map(|o| match &o.res {
+                Res::Signal { sig: s, old, .. } if o.domain == domain && *s == sig => Some(old.as_ptr()),
+                _ => None,
+            });
+            let was = match saved {
+                Some(old) => old,
+                None if unsafe { sys::sigaction(sig, std::ptr::null(), old.as_mut_ptr() as *mut _) } == 0 => {
+                    t.push(Owned { domain, res: Res::Signal { sig, old, prev } });
+                    old.as_ptr()
+                }
+                None => return false,
+            };
+            let was = unsafe { (*(was as *const SigAction)).handler() };
+            was == handler && was != program_entry()
+        })
     }
     pub extern "C" fn signal(sig: c_int, handler: usize) -> usize {
-        save_handler(sig);
-        unsafe { sys::signal(sig, handler) }
+        let before = program_handler_now(sig);
+        let put_back = save_handler(sig, handler);
+        let r = match program_handler(sig) {
+            Some(place) if handler > SIG_IGN && handler != SIG_ERR && !put_back => {
+                let was = set_program_handler(place, handler);
+                let r = unsafe { sys::signal(sig, program_entry()) };
+                if r == SIG_ERR {
+                    place.store(was, Ordering::Release);
+                }
+                r
+            }
+            place => {
+                let r = unsafe { sys::signal(sig, handler) };
+                if let Some(place) = place.filter(|_| r != SIG_ERR) {
+                    place.store(std::ptr::null_mut(), Ordering::Release);
+                }
+                r
+            }
+        };
+        // (the OS knows only the runner's entry: the program gets its own handler back)
+        if r == program_entry() && before != 0 { before } else { r }
     }
-    pub extern "C" fn sigaction(sig: c_int, act: *const crate::os::fault::SigAction, old: *mut crate::os::fault::SigAction) -> c_int {
-        if !act.is_null() {
-            save_handler(sig);
+    pub extern "C" fn sigaction(sig: c_int, act: *const SigAction, old: *mut SigAction) -> c_int {
+        let before = program_handler_now(sig);
+        let r = match unsafe { act.as_ref() } {
+            None => unsafe { sys::sigaction(sig, act, old) },
+            Some(a) => {
+                let put_back = save_handler(sig, a.handler());
+                match program_handler(sig) {
+                    Some(place) if a.handler() > SIG_IGN && !put_back => {
+                        let was = set_program_handler(place, a.handler());
+                        // (its mask and flags as the program gave them)
+                        let mut ours = *a;
+                        ours.set_handler(program_entry());
+                        let r = unsafe { sys::sigaction(sig, &ours, old) };
+                        if r != 0 {
+                            place.store(was, Ordering::Release);
+                        }
+                        r
+                    }
+                    place => {
+                        let r = unsafe { sys::sigaction(sig, act, old) };
+                        if let Some(place) = place.filter(|_| r == 0) {
+                            place.store(std::ptr::null_mut(), Ordering::Release);
+                        }
+                        r
+                    }
+                }
+            }
+        };
+        // (the OS knows only the runner's entry: a program that calls the handler before its own,
+        // as signal-hook does, must find its own there, not an entry that calls it again)
+        if let Some(o) = unsafe { old.as_mut() }.filter(|o| r == 0 && before != 0 && o.handler() == program_entry()) {
+            o.set_handler(before);
         }
-        unsafe { sys::sigaction(sig, act, old) }
+        r
     }
     pub extern "C" fn pthread_key_create(key: *mut KeyT, dtor: Option<extern "C" fn(*mut u8)>) -> c_int {
         let mut k = 0usize;
@@ -590,8 +714,11 @@ mod unix {
 
     pub(super) fn give_back_callback(res: Res) -> bool {
         match res {
-            Res::Signal { sig, old } => {
+            Res::Signal { sig, old, prev } => {
                 unsafe { sys::sigaction(sig, old.as_ptr() as *const _, std::ptr::null_mut()) };
+                if let Some(place) = program_handler(sig) {
+                    place.store(prev as *mut ProgramHandler, Ordering::Release);
+                }
                 true
             }
             // (a thread leaving the run finds no destructor to call)

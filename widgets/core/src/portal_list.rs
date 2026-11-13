@@ -918,6 +918,13 @@ pub struct PortalList {
     pub capture_overload: bool,
     #[live(false)]
     keep_invisible: bool,
+    /// How many rows on each side of the ones on screen stay alive once they leave it (0: a
+    /// row goes the moment it is not drawn, and is built again from its template when it
+    /// comes back). A row that returns from within that distance is the widget it was: a
+    /// timeline read back and forth does not build every message again on every pass.
+    /// Ignored with `reuse_items` (rows are recycled) and with `keep_invisible` (all stay).
+    #[live(0usize)]
+    keep_invisible_rows: usize,
     #[live(true)]
     search_scope: bool,
 
@@ -1528,8 +1535,15 @@ impl PortalList {
             // keeps its own) and a FingerCancel follows right after this
             // draw, which this list also hands to its recycled rows.
             let area = self.area;
+            // rows near the view stay alive (`keep_invisible_rows`)
+            let near = (!self.reuse_items && self.keep_invisible_rows > 0).then(|| {
+                let last = last_visible_id.unwrap_or(self.first_id);
+                (self.first_id.saturating_sub(self.keep_invisible_rows), last.saturating_add(self.keep_invisible_rows))
+            });
             let keep_selected = |id: &usize| {
-                !self.reuse_items && selection_range.is_some_and(|(start, end)| *id >= start.0 && *id <= end.0)
+                !self.reuse_items
+                    && (selection_range.is_some_and(|(start, end)| *id >= start.0 && *id <= end.0)
+                        || near.is_some_and(|(first, last)| *id >= first && *id <= last))
             };
             let items = &self.items;
             let (leaving, staying): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pressed_rows)
@@ -1544,9 +1558,11 @@ impl PortalList {
                 self.items.retain_visible_with(|v: WidgetItem| {
                     reusable_items.entry(v.template).or_default().push(v);
                 });
-            } else if let Some((start, end)) = selection_range {
-                self.items
-                    .retain_visible_and(|item_id, _| *item_id >= start.0 && *item_id <= end.0);
+            } else if selection_range.is_some() || near.is_some() {
+                self.items.retain_visible_and(|item_id, _| {
+                    selection_range.is_some_and(|(start, end)| *item_id >= start.0 && *item_id <= end.0)
+                        || near.is_some_and(|(first, last)| *item_id >= first && *item_id <= last)
+                });
             } else {
                 self.items.retain_visible();
             }
@@ -6040,6 +6056,61 @@ mod tests {
         let clicked = rows.send(&mut cx, &finger(TouchState::Stop, at, 0.3));
         assert!(!clicked, "the recycled row clicked on the lift");
         assert!(!rows.any_pressed(&cx));
+        });
+    }
+
+    /// `keep_invisible_rows`: a row that leaves the view by no more than that many rows stays
+    /// the widget it was (nothing is built again when it comes back); one further away goes.
+    #[test]
+    fn a_row_near_the_view_stays_alive_and_one_far_from_it_goes() {
+        crate::on_test_cx(|| {
+        let mut cx = test_cx();
+        let wheel = |by: f64| Event::Scroll(ScrollEvent {
+            window_id: WindowId(1, 1),
+            scroll: dvec2(0.0, by),
+            abs: dvec2(100.0, 60.0),
+            modifiers: KeyModifiers::default(),
+            handled_x: Cell::new(false),
+            handled_y: Cell::new(false),
+            is_mouse: true,
+            time: 0.1,
+            phase: ScrollPhase::None,
+        });
+        let row = |rows: &ButtonRows, cx: &Cx, id: usize| {
+            let list = rows.list(cx);
+            let list = list.borrow().unwrap();
+            list.items.get(&id).map(|item| item.widget.clone())
+        };
+        let first_id = |rows: &ButtonRows, cx: &Cx| rows.list(cx).borrow().unwrap().first_id;
+        // as it was: a row goes the moment it is not drawn
+        let mut rows = ButtonRows::new(&mut cx);
+        rows.draw(&mut cx);
+        assert!(row(&rows, &cx, 0).is_some());
+        rows.send(&mut cx, &wheel(600.0));
+        rows.draw(&mut cx);
+        let first = first_id(&rows, &cx);
+        assert!((10..20).contains(&first), "the wheel took the list to row {first}; the test proves nothing");
+        assert!(row(&rows, &cx, 0).is_none(), "without keep_invisible_rows a row out of view stays");
+        // kept: row 0 is `first` rows out of view, within the twenty kept
+        let mut rows = ButtonRows::new(&mut cx);
+        rows.list(&cx).borrow_mut().unwrap().keep_invisible_rows = 20;
+        rows.draw(&mut cx);
+        let before = row(&rows, &cx, 0).expect("row 0 not drawn");
+        rows.send(&mut cx, &wheel(600.0));
+        rows.draw(&mut cx);
+        assert_eq!(first_id(&rows, &cx), first);
+        assert!(row(&rows, &cx, 0).is_some_and(|w| w == before), "row 0 went or was built again, {first} rows out of view with twenty kept");
+        // back in view: still that widget
+        rows.send(&mut cx, &wheel(-600.0));
+        rows.draw(&mut cx);
+        assert_eq!(first_id(&rows, &cx), 0);
+        assert!(row(&rows, &cx, 0).is_some_and(|w| w == before), "row 0 was built again on its way back");
+        // further than twenty rows from the view: it goes
+        rows.send(&mut cx, &wheel(2000.0));
+        rows.draw(&mut cx);
+        let far = first_id(&rows, &cx);
+        assert!(far > 20, "the list did not scroll far enough (first row {far}); the test proves nothing");
+        assert!(row(&rows, &cx, 0).is_none(), "row 0 stays alive {far} rows out of view");
         });
     }
 

@@ -131,6 +131,7 @@ mod imp {
         fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
     }
 
+    #[derive(Clone, Copy)]
     #[repr(C)]
     pub(crate) struct SigAction {
         handler: usize,
@@ -138,6 +139,16 @@ mod imp {
         flags: i32,
         pad: i32,
         restorer: usize,
+    }
+
+    impl SigAction {
+        /// `sa_handler` / `sa_sigaction` (one word: 0 the default action, 1 ignore).
+        pub(crate) fn handler(&self) -> usize {
+            self.handler
+        }
+        pub(crate) fn set_handler(&mut self, handler: usize) {
+            self.handler = handler;
+        }
     }
 
     #[repr(C)]
@@ -326,6 +337,7 @@ mod imp {
         fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
     }
 
+    #[derive(Clone, Copy)]
     #[repr(C)]
     pub(crate) struct SigAction {
         flags: i32,
@@ -333,6 +345,16 @@ mod imp {
         handler: usize,
         mask: u64,
         restorer: usize,
+    }
+
+    impl SigAction {
+        /// `sa_handler` / `sa_sigaction` (one word: 0 the default action, 1 ignore).
+        pub(crate) fn handler(&self) -> usize {
+            self.handler
+        }
+        pub(crate) fn set_handler(&mut self, handler: usize) {
+            self.handler = handler;
+        }
     }
 
     #[repr(C)]
@@ -522,11 +544,22 @@ mod imp {
     }
 
     /// Darwin `struct sigaction` (user side): handler, sa_mask (u32), sa_flags.
+    #[derive(Clone, Copy)]
     #[repr(C)]
     pub(crate) struct SigAction {
         handler: usize,
         mask: u32,
         flags: i32,
+    }
+
+    impl SigAction {
+        /// `sa_handler` / `sa_sigaction` (one word: 0 the default action, 1 ignore).
+        pub(crate) fn handler(&self) -> usize {
+            self.handler
+        }
+        pub(crate) fn set_handler(&mut self, handler: usize) {
+            self.handler = handler;
+        }
     }
 
     /// Darwin `stack_t`: ss_sp, ss_size, ss_flags.

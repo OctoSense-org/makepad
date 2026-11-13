@@ -658,7 +658,20 @@ impl Modal {
         // Release only this modal's block. A modal closed under another one
         // (the platform nests these) must leave the other's block in place;
         // the plain `unblock_scrolling` pops whichever block is innermost.
-        cx.unblock_scrolling_within_area(content.area());
+        //
+        // By the area the block was taken with at the last draw, not by asking
+        // the content now: a panel that closes its own modal from its event
+        // handler is borrowed for the length of this call and answers with no
+        // area at all, which left the block standing and every wheel in the
+        // window dead from then on.
+        let content_area = if self.content_area.is_empty() {
+            content.area()
+        } else {
+            self.content_area
+        };
+        if !content_area.is_empty() {
+            cx.unblock_scrolling_within_area(content_area);
+        }
     }
 
     pub fn dismissed(&self, actions: &Actions) -> bool {
@@ -1103,6 +1116,32 @@ mod tests {
         assert_eq!(cx.sweep_lock_area(), None, "the dropped modal still holds the pointer");
         let area = new.widget(&cx, ids!(under)).area();
         assert!(cx.is_scrolling_allowed_within(&area), "the dropped modal still blocks the wheel");
+        });
+    }
+
+    /// A panel that is a modal's content closes that modal from its own event
+    /// handler, so it is borrowed while the modal closes. The wheel must come
+    /// back all the same.
+    #[test]
+    fn a_modal_closed_by_its_own_content_lets_go_of_the_wheel() {
+        crate::on_test_cx(|| {
+        let mut cx = cx();
+        let mut target = Target::new(&mut cx);
+        let root = page(&mut cx);
+        target.draw(&mut cx, &root);
+        let modal = root.widget(&cx, ids!(modal)).as_modal();
+        modal.open(&mut cx);
+        target.draw(&mut cx, &root);
+        let under = root.widget(&cx, ids!(under)).area();
+        assert!(!cx.is_scrolling_allowed_within(&under), "an open modal keeps the wheel to itself");
+
+        let content = root.widget(&cx, ids!(modal.content));
+        {
+            let _handling = content.borrow_mut::<View>().expect("the content is a view");
+            modal.close(&mut cx);
+        }
+
+        assert!(cx.is_scrolling_allowed_within(&under), "the closed modal still blocks the wheel");
         });
     }
 

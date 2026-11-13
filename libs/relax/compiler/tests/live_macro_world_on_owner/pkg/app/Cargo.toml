@@ -1,0 +1,12 @@
+[package]
+name = "relax-live-world-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "relax-live-world-app"
+path = "src/main.rs"
+
+[dependencies]
+relax-live-world-count = { path = "../count" }
