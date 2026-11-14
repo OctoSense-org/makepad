@@ -422,6 +422,8 @@ pub struct Unit {
     site_ix: relax_session::sync::Mutex<HashMap<(u32, u32, String), u64>>,
     /// std's runtime-panic entry, scoped to this unit's program.
     panic_hook: std::sync::atomic::AtomicUsize,
+    /// std's record of a panic's payload with no hook run (a sandboxed module's: rt_panic_impl)
+    payload_record: std::sync::atomic::AtomicUsize,
     pub rt: Rt,
     /// the runtime entries as symbols (what compiled code calls; see syms.rs)
     pub rs: RtSyms,
@@ -3114,6 +3116,11 @@ extern "C" fn relax_set_panic_hook(hook: RuntimePanicHook) {
     unsafe { (*cur_unit()).panic_hook.store(hook as usize, Ordering::Release) };
 }
 
+/// std's payload record (rt_panic_impl: a sandboxed module's panic).
+extern "C" fn relax_set_payload_record(record: extern "C" fn(*const u8, usize)) {
+    unsafe { (*cur_unit()).payload_record.store(record as usize, Ordering::Release) };
+}
+
 /// Runtime checks keep their host calls; std records their payload and runs the hook here.
 fn raise_runtime_panic(mut message: String, site: u64, use_site_message: bool, regs: *const u64) -> ! {
     let (constant, file, line, col) = {
@@ -3135,6 +3142,8 @@ fn raise_runtime_panic(mut message: String, site: u64, use_site_message: bool, r
     if let Some(msg) = constant {
         message = msg.to_string();
     }
+    // (before std's hook: the panic that started the unwind stays the one recorded)
+    module_cleanup_panicked(&message, regs);
     let hook = unsafe { (*cur_unit()).panic_hook.load(Ordering::Acquire) };
     if hook != 0 && !in_const_eval() {
         let msg = constant.unwrap_or(&message);
@@ -3165,6 +3174,25 @@ pub(crate) fn rt_panic_impl(msg: *const u8, len: u64, file: *const u8, file_len:
     let m = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(msg, len as usize)).into_owned() };
     let f = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(file, file_len as usize)).into_owned() };
     PANIC_LOC.with(|l| *l.borrow_mut() = format!("{}:{}:{}", f, line as u32, col as u32));
+    // (first: a panic of a module's own cleanup pad ends that pad, and the panic that started
+    // the unwind stays the one recorded)
+    module_cleanup_panicked(&m, regs);
+    // A sandboxed module's panic. The program's panics reach std through core's hook: it records
+    // the payload a catch hands out, runs the panic hook, then calls this entry. A twin's core is
+    // the arena's own copy with no hook set, so std never saw the panic and the host's guard got
+    // "explicit panic" for every `panic!`, `unwrap` and `expect` of a module. Its payload is
+    // recorded here, for code whose caller is a twin -- the payload alone: the program's panic
+    // hook is the program's and does not run for a module (tests/modules/host_hook_panic.rs).
+    // (The interpreter's frames are not known here: there the payload stays unset.)
+    let ret = unsafe { *regs.add(1) };
+    let u = unsafe { &*cur_unit() };
+    if u.find_fn(ret.wrapping_sub(1)).is_some_and(|c| matches!(u.fns[c as usize].key, FnKey::Sandbox(_))) {
+        let record = u.payload_record.load(Ordering::Acquire);
+        if record != 0 && !in_const_eval() {
+            let record: extern "C" fn(*const u8, usize) = unsafe { std::mem::transmute(record) };
+            record(m.as_ptr(), m.len());
+        }
+    }
     raise_unwinding("panic", m, u64::MAX, regs)
 }
 }
@@ -3230,12 +3258,53 @@ thread_local! {
     /// is running on this thread; 0 = none. A panic raised while it runs, under the same
     /// recovery point, is a panic during cleanup: rustc aborts (panic_in_cleanup).
     static CLEANING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// whose pad that cleanup is (unwind_walk's landing): host code's, a sandboxed module's (the
+    /// frame is a twin), or the interpreter's boundary (PAD_*)
+    static CLEANING_PAD: std::cell::Cell<u8> = const { std::cell::Cell::new(PAD_HOST) };
+}
+
+const PAD_HOST: u8 = 0;
+const PAD_TWIN: u8 = 1;
+/// the interpreter runs its frames' pads itself: the walk sees none of them
+const PAD_INTERP: u8 = 2;
+
+/// A panic raised while a cleanup pad of a sandboxed module runs. For host code that is a panic
+/// during cleanup and the process aborts, as rustc's does (raise_unwinding). A module's
+/// destructors are the module's code: one may panic, and none can run once the call's fuel is
+/// spent (every block of a twin pays before it runs, a pad's too), so the abort would let any
+/// module end the process. Its frame's cleanup ends here instead and the unwind goes on with the
+/// frame's caller, whose pads run as before. The panic that started the unwind stays the one
+/// recorded, reported and caught; this one is only said, and not when it repeats the first (spent
+/// fuel stops every pad on the way out with the same message).
+///
+/// Returns when the pad is not a module's. Under the interpreter the pads between its boundary
+/// and the recovery point are not known here: inside a module's call they count as the module's.
+fn module_cleanup_panicked(message: &str, regs: *const u64) {
+    let ctx = unsafe { *ctx_ptr() };
+    if ctx == 0 || CLEANING.with(|c| c.get()) != ctx {
+        return;
+    }
+    let module = match CLEANING_PAD.with(|c| c.get()) {
+        PAD_TWIN => true,
+        PAD_INTERP => crate::sandbox::current_module().is_some(),
+        _ => false,
+    };
+    if !module {
+        return;
+    }
+    let first = PANIC.with(|p| p.borrow().as_ref().map(|i| i.message.clone())).unwrap_or_default();
+    if first != message {
+        eprintln!("makepad: a sandboxed module panicked while its frames were unwinding: {}\n  the rest of that frame's cleanup is skipped and the unwind goes on (first panic: {})", message, first);
+    }
+    CLEANING.with(|c| c.set(0));
+    unsafe { unwind_walk(regs) }
 }
 
 /// A panic from JIT code (panic trampoline): the report as `raise` makes it, then the frames'
 /// cleanup pads run on the way to the recovery point.
 fn raise_unwinding(kind: &str, message: String, site: u64, regs: *const u64) -> ! {
     let (rbp, ret) = unsafe { (*regs, *regs.add(1)) };
+    module_cleanup_panicked(&message, regs);
     let ctx = unsafe { *ctx_ptr() };
     if ctx != 0 && CLEANING.with(|c| c.get()) == ctx {
         let frames = collect_frames(rbp, ret, true);
@@ -3269,6 +3338,8 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
     let u = &*cur_unit();
     let tables = u.code.read().unwrap_or_else(|e| e.into_inner());
     let mut target: Option<(u64, u64, u64)> = None;
+    // whose pad the target is (module_cleanup_panicked)
+    let mut pad = PAD_HOST;
     for _ in 0..100_000 {
         let (fp, ret) = (r[0], r[1]);
         if fp == 0 || fp & 7 != 0 {
@@ -3278,10 +3349,11 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
         // to the interpreter (it runs the interpreted frames' cleanups, then resumes here)
         if let Some((land_pc, sp_below)) = relax_codegen::interp::unwind_boundary(ret) {
             target = Some((fp, fp - sp_below, land_pc));
+            pad = PAD_INTERP;
             break;
         }
         let pc = ret.wrapping_sub(1);
-        let Some((start, _, _)) = tables.entry_at(pc) else { break };
+        let Some((start, _, slot)) = tables.entry_at(pc) else { break };
         let image_info;
         let info = match tables.unwind.get(&start) {
             Some(i) => i,
@@ -3296,6 +3368,9 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
         let off = (ret - start) as u32;
         if let Some(&(_, stub)) = info.pads.iter().find(|p| p.0 == off) {
             target = Some((fp, fp - info.sp_off as u64, start + stub as u64));
+            if (slot as usize) < u.fns.len() && matches!(u.fns[slot as usize].key, FnKey::Sandbox(_)) {
+                pad = PAD_TWIN;
+            }
             break;
         }
         // this frame has no cleanup here: the caller's callee-saved registers come back from
@@ -3313,6 +3388,7 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
     match target {
         Some((fp, sp, pc)) => {
             CLEANING.with(|c| c.set(*ctx_ptr()));
+            CLEANING_PAD.with(|c| c.set(pad));
             // the block outlives this frame: land() reads it after sp moved up past it, so it
             // goes in a thread-local
             LAND_REGS.with(|b| {
@@ -4478,6 +4554,7 @@ impl Unit {
             sites: Default::default(),
             site_ix: Default::default(),
             panic_hook: std::sync::atomic::AtomicUsize::new(0),
+            payload_record: std::sync::atomic::AtomicUsize::new(0),
             rs: RtSyms { tls_base: relax_backend::rir::Sym::new(0), coverage_disabled: relax_backend::rir::Sym::new(0), fmt_str: relax_backend::rir::Sym::new(0), fmt_int: relax_backend::rir::Sym::new(0), fmt_float: relax_backend::rir::Sym::new(0), fmt_print: relax_backend::rir::Sym::new(0), panic_site: relax_backend::rir::Sym::new(0), panic_bounds: relax_backend::rir::Sym::new(0), str_eq: relax_backend::rir::Sym::new(0), fmod: relax_backend::rir::Sym::new(0), fmodf: relax_backend::rir::Sym::new(0), panic_impl: relax_backend::rir::Sym::new(0), thread_run: relax_backend::rir::Sym::new(0), catch_panic: relax_backend::rir::Sym::new(0), args: relax_backend::rir::Sym::new(0), memcpy: relax_backend::rir::Sym::new(0), memmove: relax_backend::rir::Sym::new(0), memset: relax_backend::rir::Sym::new(0), fmt_push: relax_backend::rir::Sym::new(0), fmt_pop: relax_backend::rir::Sym::new(0), resume: relax_backend::rir::Sym::new(0), land: relax_backend::rir::Sym::new(0), panicking: relax_backend::rir::Sym::new(0), rethrow: relax_backend::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
@@ -6208,6 +6285,12 @@ impl Unit {
         }) {
             queue::ahead(self.front.clone(), id);
         }
+    }
+
+    /// No-codegen mode: the slots of the unit's window of the precompiled pools (sandbox.rs checks
+    /// its twins' fn values against them).
+    pub(crate) fn nc_slots(&self) -> u32 {
+        self.nc_window().1
     }
 
     /// No-codegen mode: the unit's window of the precompiled slot pools, (first global slot,
@@ -9735,10 +9818,23 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
 /// `into_unverified`: the build is unverified code itself (an O3 build of an unverified body or of
 /// a twin: never cached, rebuilt once verified): it may take in unverified callees too, and then
 /// stays unverified (O3Assembled::unverified_in). A verified build never holds unverified code.
-fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Option<u8> {
+///
+/// `into_twin`: the build is a sandbox twin's (sandbox_twin). It takes in twins only, each by its
+/// base's attributes: a twin is its base's body, confined and metered before any optimiser ran
+/// (sandbox.rs transform), so the copy keeps every masked access and every fuel charge of the
+/// call it replaces. What a twin calls besides twins is the host's API, which runs unconfined
+/// and stays a call. Host code never takes a twin in.
+fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool, into_twin: bool) -> Option<u8> {
     let options = &prog.session.clone().options;
+    // (MAKEPAD_RUN_OPT=-sbinline: a twin's build takes nothing in, A/B)
+    let c = match fns[c as usize].key {
+        FnKey::Sandbox(b) if into_twin && (b as usize) < fns.len() && !relax_backend::stats::opt_off(options, "-sbinline") => b,
+        FnKey::Sandbox(_) => return None,
+        _ if into_twin => return None,
+        _ => c,
+    };
     // a sandboxed module's code is never inlined into host code (it runs only as twins)
-    if crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
+    if !into_twin && crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
         return None;
     }
     // SPEC-V: unverified code is inlined only into unverified code
@@ -9797,8 +9893,8 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // its base would (rustc inlines the callee there: `set_material`'s 15 `set_uniform` calls).
         // The build holds it as unverified code (O3Assembled::unverified_in): a failed verdict of
         // the base builds it again. Never into verified code (which never calls twins).
-        FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
-        // sandbox twins are never inlined into anything (their callers are twins built from RIR)
+        FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true, false),
+        // (a sandbox twin was answered by its base above)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
     })
 }
@@ -12327,7 +12423,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
             let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
-                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).is_some()
+                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false, false).is_some()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
                 // a snapshot O2 build makes no front end under the lock: candidates with RIR only
@@ -12385,7 +12481,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false, false) };
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
@@ -12404,7 +12500,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     // (off the owner); its RIR replaces the baseline RIR at the finish
                     if let Some(Some(p)) = collect_fronts(&mut needs, || split_upgrade(up, *c)) {
                         let u = &*up;
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false, false) };
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -12421,7 +12517,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if !wanted.contains(&c) || deferred.iter().any(|x| x.0 == c) {
                 continue;
             }
-            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false) {
+            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false, false) {
                 Some(a) => a,
                 None => continue,
             };
@@ -19138,6 +19234,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let fronts_done = std::cell::Cell::new(false);
     // (instrument) what the last take of a split did with it: 1 gave back, 2 prepared, 3 skipped
     let split_out: std::cell::RefCell<HashMap<u32, u8>> = Default::default();
+    // a sandbox twin among the candidates had no RIR (its code came from the disk cache) and its
+    // build -- on the owner: twin_rir -- needs its base's front: the round ends without a snapshot,
+    // this thread makes the fronts the take noted (`needs`) and asks again, as for `fronts`
+    let twin_wait = std::cell::Cell::new(false);
     let owner_fallback = |c: u32, upgrade: bool, split: bool| {
         let o = if split { split_out.borrow().get(&c).copied().unwrap_or(3) as usize } else { 0 };
         cand_skip(19 + if upgrade { 0 } else { 4 } + o);
@@ -19252,8 +19352,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             for i in &b.insts {
                 if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
                     // The transform already confined this body. Inlining a host API here
-                    // would introduce unconfined memory operations after that boundary.
-                    if !sandboxed && *c != id && !callees.contains(c) {
+                    // would introduce unconfined memory operations after that boundary: a
+                    // twin's candidates are the twins it calls, confined as it is.
+                    if (!sandboxed || sandbox_twin(&(&*up).fns, *c)) && *c != id && !callees.contains(c) {
                         callees.push(*c);
                     }
                 }
@@ -19304,8 +19405,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         let u = &mut *up;
         let f = &u.fns[c as usize];
-        // (an unverified-mode twin: its base's body, lowered as unverified code)
-        let base_key = match &f.key { FnKey::Plain(b) => &u.fns[*b as usize].key, k => k };
+        // (an unverified-mode twin: its base's body, lowered as unverified code; a sandbox twin
+        // called by a twin's build: its base's body confined, built here from the base's
+        // lowering -- twin_rir -- when its code came from the disk cache. Host code takes no twin
+        // in, so its build makes none.)
+        let twin_base = match f.key { FnKey::Sandbox(b) if sandboxed && (b as usize) < u.fns.len() => Some(b), _ => None };
+        let base_key = match &f.key { FnKey::Plain(b) => &u.fns[*b as usize].key, _ if twin_base.is_some() => &u.fns[twin_base.unwrap() as usize].key, k => k };
         let attr = match base_key {
             FnKey::Inst(d, _) if u.prog.def(*d).kind != DefKind::ForeignFn => inline_attrs(&u.prog, *d),
             FnKey::Shim(_) | FnKey::Glue(..) if !matches!(f.key, FnKey::Plain(_)) => 0,
@@ -19317,7 +19422,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // startup-image slot not installed yet, or one with a stored entry, too: it ran before)
         let cached_code = (&mut *up).ran_before(c);
         let u = &mut *up;
-        let source_size = src_size(u, c);
+        let source_size = src_size(u, twin_base.unwrap_or(c));
         if cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0 {
             if prefront && !fronted.contains(&c) {
                 let twin_of = match u.fns[c as usize].key { FnKey::Plain(b) => Some(b), _ => None };
@@ -19337,8 +19442,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let t = wall_ns();
             compile_watch(Some((&format!("O3 snapshot: build_rir {}", u.fns[c as usize].name), 0)));
             if build_rir_or_skip(up, c, RirMode::Tier0).is_none() {
-                if tier1_trace() { eprintln!("O3 cand #{} {} left out: its build on the owner was skipped", c, short_name(&(&*up).fns[c as usize].name)); }
-                *left_out.borrow_mut().entry(c).or_insert(0) += 1;
+                let mut l = left_out.borrow_mut();
+                let n = l.entry(c).or_insert(0);
+                *n += 1;
+                if twin_base.is_some() && *n < SPLIT_TRIES {
+                    twin_wait.set(true);
+                } else if tier1_trace() {
+                    eprintln!("O3 cand #{} {} left out: its build on the owner was skipped", c, short_name(&(&*up).fns[c as usize].name));
+                }
             }
             compile_watch(None);
             TIER1_SNAP_BUILT[0].fetch_add(1, Ordering::Relaxed);
@@ -19381,7 +19492,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         idx = 0;
     }
     // candidates whose fronts (or O1 builds) this thread runs first: asked again after them
-    if !fronts.borrow().is_empty() || !splits.borrow().is_empty() {
+    if !fronts.borrow().is_empty() || !splits.borrow().is_empty() || twin_wait.get() {
         owner_ns.set(owner_ns.get() + cpu_ns() - s0);
         return None;
     }
@@ -19464,7 +19575,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     let more = std::mem::take(&mut *fronts.borrow_mut());
     let ups = std::mem::take(&mut *splits.borrow_mut());
-    if snapped.is_some() || more.is_empty() && ups.is_empty() {
+    if snapped.is_some() || more.is_empty() && ups.is_empty() && !twin_wait.replace(false) {
         break snapped;
     }
     // this round's candidates: their type checks and lowering here, off the unit
@@ -19634,6 +19745,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let remarks = relax_backend::remark::begin();
         let (optimized, inline_rules) = optimize()?;
         func = optimized;
+        // a twin's sandbox words stay in registers between calls (sandbox.rs words_in_registers;
+        // after the inliner: the twins it took in bring their own meters and frames).
+        // MAKEPAD_RUN_OPT=-sbwords: off (A/B)
+        if sandboxed && !relax_backend::stats::opt_off(options, "-sbwords") && crate::sandbox::settle_words(&mut func) {
+            relax_backend::passes::live_dce(&mut func);
+        }
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
         inlined.extend_from_slice(&func.inl_slots);
@@ -19845,7 +19962,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             notes.push((c, if unverified_left.contains(&c) { "unverified: again at its verdict" } else { "unverified: again only with the root's verdict" }));
                             continue;
                         }
-                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified).is_none() {
+                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified, sandbox_twin(&u.fns, id)).is_none() {
                             notes.push((c, "not inlinable (build error or attributes)"));
                             continue;
                         }
@@ -21341,6 +21458,8 @@ fn o3_view(u: &Unit, c: u32) -> O3View {
 unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &crate::options::Options, id: u32, inline_all: bool, frontier: &[u32], views: &HashMap<u32, O3View>,
     callees: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) -> Vec<u32> {
     let (fns, core) = (&*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
+    // (a twin's build takes in twins only: callee_attrs)
+    let root_twin = sandbox_twin(fns, id);
     let mut next = Vec::new();
     for &c in frontier {
         let Some(v) = views.get(&c) else { continue };
@@ -21348,7 +21467,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
             // Cost-model admissions also expose calls in never-run bodies.
             let never_run = !v.ran && v.uninlined;
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
-                && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
+                && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id), sandbox_twin(fns, id))
                     .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
             if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
                 continue;
@@ -21364,6 +21483,9 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
                         relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                         _ => continue,
                     };
+                    if root_twin && !sandbox_twin(fns, *x) {
+                        continue;
+                    }
                     if *x != id && callees.len() >= 1024 && !seen.contains(x) && relax_codegen::opt::inline_trace(&fns[id as usize].name) {
                         eprintln!("inline-trace-snap {}: out fn#{} {} (1024 candidates)", fns[id as usize].name, x, fns[*x as usize].name);
                     }
@@ -21401,6 +21523,12 @@ struct O3Assembled {
     root: u32,
 }
 
+/// Whether slot `id` is a sandbox twin with a body (not the invalid-fn-pointer stand-in): what a
+/// twin's O3 build takes in (callee_attrs).
+fn sandbox_twin(fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> bool {
+    matches!(fns[id as usize].key, FnKey::Sandbox(b) if (b as usize) < fns.len())
+}
+
 /// SPEC-V: whether slot `id`'s builds are unverified code: a body without a clean verdict yet
 /// (flagged) or an unverified-mode twin.
 fn unverified_root(fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> bool {
@@ -21429,7 +21557,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), id: u32, rir
             if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (no view)", fns[id as usize].name, c, fns[c as usize].name); }
             continue;
         };
-        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
+        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified, sandbox_twin(fns, id)) {
             Some(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
             Some(a) => a,
             None => {
@@ -22123,6 +22251,7 @@ pub(crate) fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_fork_exec_done" => Some(crate::forkexec::relax_fork_exec_done as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_set_panic_hook" => Some(relax_set_panic_hook as *const () as usize),
+        b"relax_set_payload_record" => Some(relax_set_payload_record as *const () as usize),
         b"relax_before_first_frame" => Some(relax_before_first_frame as *const () as usize),
         b"relax_app_main" => Some(relax_app_main as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),

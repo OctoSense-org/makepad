@@ -1362,6 +1362,9 @@ pub struct TraitAliasItem {
 #[derive(Debug, Clone, Copy)]
 pub struct ImplItem {
     pub unsafe_: bool,
+    /// made by one of the front's builtin derives (among them the `unsafe impl TrivialClone`
+    /// derive(Clone) makes for a Copy type)
+    pub builtin_derive: bool,
     pub default_: bool,
     pub generics: Generics,
     pub negative: bool,

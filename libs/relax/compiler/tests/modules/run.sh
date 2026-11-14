@@ -22,6 +22,27 @@ fi
 echo "modules budget (tier1=$TIER): PASS ($(echo "$OUT" | grep 'budget cost:'))"
 echo "$GOT" | grep 'shared tick fuel'
 done
+# A twin's O3 build takes in the twins it calls and keeps the fuel count in a register between
+# calls: what a path costs, where a run on a budget ends and what the module did up to there are
+# the same with tiering off and after a tier-up that inlined.
+BASE_TIERS=""
+for TIER in 0 1; do
+SO=$(mktemp); SE=$(mktemp)
+MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/fuel_tiers.rs" >"$SO" 2>"$SE"
+STATUS=$?
+GOT=$(grep '^out ' "$SO")
+OUT="$(cat "$SO" "$SE")"
+rm -f "$SO" "$SE"
+if [ "$STATUS" != 0 ] || ! echo "$GOT" | grep -q '^out the same after the tier-up: true$'; then
+    echo "modules fuel tiers (tier1=$TIER): FAIL"; echo "$OUT" | tail -30; exit 1
+fi
+if [ "$TIER" = 0 ]; then BASE_TIERS="$GOT"; else
+    if [ "$GOT" != "$BASE_TIERS" ] || ! echo "$OUT" | grep -Eq '^tier1: sandbox:tiers::run installed \([0-9]+ bytes, [1-9][0-9]* callees inlined'; then
+        echo "modules fuel tiers invariance: FAIL"; echo "$OUT" | tail -30; exit 1
+    fi
+fi
+echo "modules fuel tiers (tier1=$TIER): PASS ($(echo "$GOT" | head -1 | sed 's/^out //'))"
+done
 # Host panic setup must not change sandbox reachability (run before other modules).
 for CASE in host_hook_repro host_hook_panic; do
 OUT=$("$1" test "$D/$CASE.rs" 2>&1)
@@ -38,8 +59,10 @@ for TIER in 1 0; do
     OUT=$(MAKEPAD_RUN_MODULES_TRUSTED=$TRUSTED MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=2000 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/palette.rs" 2>&1)
     STATUS=$?
     GOT=$(echo "$OUT" | grep '^out ')
-    HOT=$(echo "$OUT" | grep -Ec '^tier1: (__sbw_palette_patch_0|palette_patch)::color installed')
-    if [ "$STATUS" = 0 ] && [ "$GOT" = "out palette replace and stream: true" ] && { [ "$TIER" = 0 ] || [ "$HOT" -gt 0 ]; }; then echo "modules palette (trusted=$TRUSTED tier1=$TIER): PASS"; else echo "modules palette (trusted=$TRUSTED tier1=$TIER): FAIL (O3 color installs: $HOT)"; echo "$OUT" | tail -30; exit 1; fi
+    HOT=$(echo "$OUT" | grep -Ec '^tier1: sandbox:palette_patch::color installed')
+    # (a sandboxed module's code tiers up as its twin; a trusted module's does not tier up yet)
+    if [ "$TIER" = 1 ] && [ "$TRUSTED" = 0 ]; then HOT_OK=$([ "$HOT" -gt 0 ] && echo 1 || echo 0); else HOT_OK=$([ "$HOT" = 0 ] && echo 1 || echo 0); fi
+    if [ "$STATUS" = 0 ] && [ "$GOT" = "out palette replace and stream: true" ] && [ "$HOT_OK" = 1 ]; then echo "modules palette (trusted=$TRUSTED tier1=$TIER): PASS"; else echo "modules palette (trusted=$TRUSTED tier1=$TIER): FAIL (O3 color installs: $HOT)"; echo "$OUT" | tail -30; exit 1; fi
 done
 done
 python3 "$D/visibility.py" "$1" || exit 1
@@ -84,10 +107,42 @@ if [ "$GOT" = $'out escaping fn values refused: true\nout plain data to host API
 OUT=$(MAKEPAD_RUN_MODULE_FUEL=2000000 "$1" test "$D/shadow_threads.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-shadow-threads.out")" ]; then echo "modules shadow threads: PASS"; else echo "modules shadow threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+# No-codegen mode (arm64 Apple only): no thunk table is written, a module's fn values are its
+# twins' own precompiled thunks and each indirect call is checked against them.
+if [ "$(uname -sm)" = "Darwin arm64" ]; then
+OUT=$(MAKEPAD_RUN_NO_CODEGEN=1 MAKEPAD_RUN_SANDBOX_NOCHECK=1 "$1" test "$D/nocodegen_fns.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-nocodegen-fns.out")" ]; then echo "modules no-codegen fns: PASS"; else echo "modules no-codegen fns: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+OUT=$(MAKEPAD_RUN_NO_CODEGEN=1 "$1" test "$D/host.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules no-codegen host: PASS"; else echo "modules no-codegen host: FAIL"; diff <(echo "$GOT") "$D/expect.out"; echo "$OUT" | tail -5; exit 1; fi
+fi
 OUT=$(MAKEPAD_RUN_MODULE_FUEL=1000000 "$1" test "$D/fuel.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; else echo "modules fuel: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -6; exit 1; fi
+# A module's own cleanup fails while its frames unwind (fuel spent, a panicking destructor): the
+# call ends with the first error, the host's frames clean up, the process goes on. Both tiers.
+for TIER in 0 1; do
+OUT=$(MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 "$1" test "$D/cleanup_panic.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-cleanup-panic.out")" ]; then echo "modules cleanup panic (tier1=$TIER): PASS"; else echo "modules cleanup panic (tier1=$TIER): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+done
 bash "$D/milk.sh" "$1" || exit 1
 OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 "$1" test "$D/deadline.rs" 2>&1)
 STATUS=$?
 if [ "$STATUS" = 0 ] && echo "$OUT" | grep -q '^out deadlines: true$'; then echo "modules deadlines: PASS"; else echo "modules deadlines: FAIL"; echo "$OUT" | tail -30; exit 1; fi
+# A module derives the comparison and hash traits on its enums (the derives read the discriminant
+# in an `unsafe` block of the front's own writing); its own `unsafe` beside a derive stays refused.
+OUT=$("$1" test "$D/derive_enum.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-derive-enum.out")" ]; then echo "modules derive on enums: PASS"; else echo "modules derive on enums: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+# The source check reads the fn bodies a program's load parses on demand, not only a file's
+# items: `unsafe` inside a body is refused there too, a derive's own text is not.
+python3 "$D/source_check.py" "$1" || exit 1
+# A module's panic reaches the host with its message (panic!, unwrap, expect, assert!), both tiers.
+for TIER in 0 1; do
+OUT=$(MAKEPAD_RUN_O3=$TIER "$1" test "$D/panic_message.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-panic-message.out")" ]; then echo "modules panic message (tier1=$TIER): PASS"; else echo "modules panic message (tier1=$TIER): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+done
+echo "modules: every case PASS"

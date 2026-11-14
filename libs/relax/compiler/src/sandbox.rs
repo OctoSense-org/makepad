@@ -104,7 +104,46 @@ struct Heap {
 }
 
 /// Process-wide sandbox state (one unit hosts modules).
+/// No-codegen mode's fn values of the twins. The process makes no machine code there, so there is
+/// no thunk table to write: a twin taken as a value is named by its own slot's thunk (precompiled,
+/// one per slot of the unit's window of the pool: jit.rs Unit::nc_window), which sits among the
+/// thunks of host slots. An indirect call cannot be masked into a range of its own, so it is
+/// checked instead: a set bit per twin's slot, and the trap thunk for any other address.
+struct Fns {
+    /// the unit's first thunk, bytes per thunk, slots
+    base: u64,
+    stride: u64,
+    slots: u64,
+    given: Box<[std::sync::atomic::AtomicU64]>,
+    /// the thunk of the slot whose code panics with the reason (an invalid fn pointer)
+    trap: u64,
+}
+
+impl Fns {
+    /// Twin `t`'s thunk is a fn value from now on.
+    fn give(&self, t: u32) {
+        self.given[t as usize / 64].fetch_or(1 << (t % 64), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn thunk(&self, t: u32) -> u64 {
+        self.base + t as u64 * self.stride
+    }
+
+    /// What a call of `f` runs: `f` when it is a twin's thunk, else the trap.
+    fn target(&self, f: u64) -> u64 {
+        let d = f.wrapping_sub(self.base);
+        let k = d / self.stride;
+        if d % self.stride == 0 && k < self.slots && self.given[k as usize / 64].load(std::sync::atomic::Ordering::Acquire) & 1 << (k % 64) != 0 {
+            f
+        } else {
+            self.trap
+        }
+    }
+}
+
 struct Sb {
+    /// no-codegen mode: fn values are the twins' own thunks, checked at each call (no table)
+    fns: Option<Arc<Fns>>,
     /// TLS block offset of the sandbox words, and the symbol TlsAddr reads it from
     tls_sym: Sym,
     sbt_base: u64,
@@ -182,17 +221,27 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
     let tls_sym = u.syms.intern(SymKind::Rt("sb_tls"), tls as u64);
     let ts = jit::thunk_size() as u64;
     let bytes = (SBT_N as u64 * ts) as usize;
-    let sbt_base = crate::os::mem::reserve(bytes, 0);
+    // no-codegen mode writes no thunk table (`Fns`)
+    let no_table = u.prog.session.options.no_codegen;
+    let sbt_base = if no_table { 0 } else { crate::os::mem::reserve(bytes, 0) };
     // the slot every unused sandbox thunk jumps through: its code panics with the reason
     let trap_slot = u.fn_id(FnKey::Sandbox(u32::MAX));
-    let trap = tgt::thunk(u.slots.table(trap_slot));
-    let mut all = Vec::with_capacity(bytes);
-    for _ in 0..SBT_N {
-        all.extend_from_slice(&trap);
+    if !no_table {
+        let trap = tgt::thunk(u.slots.table(trap_slot));
+        let mut all = Vec::with_capacity(bytes);
+        for _ in 0..SBT_N {
+            all.extend_from_slice(&trap);
+        }
+        crate::os::mem::write_code(sbt_base, &all);
     }
-    crate::os::mem::write_code(sbt_base, &all);
+    let fns = no_table.then(|| {
+        let slots = u.nc_slots() as u64;
+        let base = u.slots.thunk(0);
+        Arc::new(Fns { base, stride: u.slots.thunk(1) - base, slots, given: (0..slots.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), trap: u.slots.thunk(trap_slot) })
+    });
     TLS_OFF.store(tls + 1, std::sync::atomic::Ordering::Release);
     *SB.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sb {
+        fns,
         tls_sym,
         sbt_base,
         sbt_n: 1,
@@ -306,13 +355,17 @@ pub unsafe fn twin(up: *mut Unit, base: u32) -> u32 {
     let u = &mut *up;
     let t = u.fn_id(FnKey::Sandbox(base));
     let ts = jit::thunk_size() as u64;
-    let (k, sbt) = with_sb(|s| {
+    let (k, sbt, fns) = with_sb(|s| {
         s.twins.insert(base, t);
         let k = s.sbt_n;
         s.sbt_n += 1;
         s.sbt_of.insert(t, k);
-        (k, s.sbt_base)
+        (k, s.sbt_base, s.fns.clone())
     });
+    if let Some(fns) = fns {
+        fns.give(t);
+        return t;
+    }
     if k >= SBT_N {
         panic!("makepad: sandbox thunk table full ({} functions)", SBT_N);
     }
@@ -332,7 +385,11 @@ pub fn twin_of(base: u32) -> Option<u32> {
 
 /// The sandbox thunk address of twin `t` (a fn pointer value in sandboxed code).
 fn sbthunk(t: u32) -> u64 {
-    with_sb(|s| s.sbt_base + *s.sbt_of.get(&t).unwrap_or(&0) as u64 * jit::thunk_size() as u64)
+    with_sb(|s| match &s.fns {
+        Some(fns) if s.sbt_of.contains_key(&t) => fns.thunk(t),
+        Some(fns) => fns.trap,
+        None => s.sbt_base + *s.sbt_of.get(&t).unwrap_or(&0) as u64 * jit::thunk_size() as u64,
+    })
 }
 
 /// Slots twin `t`'s code refers to without a relocation (fn pointer constants).
@@ -1280,9 +1337,20 @@ fn sb_catch_panic(f: u64, data: u64) -> u64 {
 }
 
 fn mask_thunk(f: u64) -> u64 {
+    if let Some(fns) = with_sb(|s| s.fns.clone()) {
+        return fns.target(f);
+    }
     let (base, ts) = with_sb(|s| (s.sbt_base, jit::thunk_size() as u64));
     let span = SBT_N as u64 * ts;
     base + ((f.wrapping_sub(base)) & (span - 1) & !(ts - 1))
+}
+
+rt_fn! {
+/// An indirect call's target in no-codegen mode (`Fns`: the transform's `mask_fn` calls this where
+/// it masks otherwise).
+leaf fn sb_fn_value(f: u64) -> u64 {
+    mask_thunk(f)
+}
 }
 
 /// The runtime entries a twin may call: kept (scalar arguments or no memory access), or
@@ -1529,8 +1597,8 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed modules cannot run", f.name)),
                         Callee::Fn(id) => Callee::Fn(call_target(up, id, &sandboxed)?),
                         Callee::CFn(id, sig) => Callee::CFn(call_target(up, id, &sandboxed)?, sig),
-                        Callee::Indirect(v) => Callee::Indirect(mask_fn(f, &mut insts, &mut pos, p, v)),
-                        Callee::CIndirect(v, sig) => Callee::CIndirect(mask_fn(f, &mut insts, &mut pos, p, v), sig),
+                        Callee::Indirect(v) => Callee::Indirect(mask_fn(u, f, &mut insts, &mut pos, p, v)),
+                        Callee::CIndirect(v, sig) => Callee::CIndirect(mask_fn(u, f, &mut insts, &mut pos, p, v), sig),
                         Callee::Host(s) => match u.syms.kind(s.id) {
                             Some(SymKind::Rt(name)) => match rt_policy(name) {
                                 Some(None) => Callee::Host(s),
@@ -1597,6 +1665,9 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     // MAKEPAD_RUN_SANDBOX_OPT=0/1 forces the O1 clean-up.
     let opt = options.sandbox_opt.unwrap_or(!jit::TIER1_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
     if opt {
+        if !relax_backend::stats::opt_off(options, "-sbwords") {
+            words_in_registers(f, tls_sym);
+        }
         relax_backend::passes::simplify(options, f, None, true, true);
         relax_backend::passes::licm(options, f);
         relax_backend::passes::simplify(options, f, None, true, true);
@@ -1605,8 +1676,207 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     Ok(())
 }
 
+/// The twin `f`, optimised: its sandbox words in registers (`words_in_registers`; O3's last step
+/// for a twin, after the twins it took in are part of it). True: `f` changed.
+pub(crate) fn settle_words(f: &mut Func) -> bool {
+    let tls = with_sb(|s| s.tls_sym);
+    words_in_registers(f, tls)
+}
+
+/// Keeps this thread's sandbox words in registers between calls. Every block of a twin reads and
+/// writes the fuel word, and every frame the shadow stack pointer; as memory operations each
+/// meter's load waits for the store of the one before it, so a loop's blocks form one chain
+/// through memory however independent their work is (measured: most of a hot twin's time, also
+/// once the twins it calls are inlined, since their meters come with them). Only the transform
+/// makes code that names these words -- a module's own accesses are masked into its window, and
+/// its thread-locals are redirected -- so every access is found by its address, `words + k`:
+/// - a store still happens (the word in memory is exact at every instruction: a fault, a
+///   deadline or the runtime may read it at any time) and the register takes the value too;
+/// - a load is a copy of the register wherever the register is known to hold the word: on every
+///   path since the function's entry or its last call, the word was loaded or stored. A call
+///   ends that: the callee (a twin's own meter, the runtime at an entry or a leave) writes the
+///   word. The arena base and the shadow stack's floor are the activation's and outlive calls,
+///   as the transform's own use of the base it loads at entry already assumes.
+/// The fuel charged, the instruction it runs out at and the words in memory are unchanged.
+///
+/// All or nothing: a register that may hold a words address and is used in any way but these
+/// (not a single definition, arithmetic, an indexed access, passed on) leaves the function as it
+/// is. True: `f` changed.
+fn words_in_registers(f: &mut Func, tls: Sym) -> bool {
+    use relax_backend::rir::Mem;
+    // (word offset, a call leaves it as it was)
+    const WORDS: [(i64, bool); 4] = [(W_ARENA, true), (W_SSP, false), (W_FUEL, false), (W_SSLO, true)];
+    let invariant: u8 = WORDS.iter().enumerate().filter(|(_, w)| w.1).fold(0, |m, (k, _)| m | 1 << k);
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for i in f.blocks.iter().flat_map(|b| &b.insts) {
+        relax_backend::regalloc::for_defs(i, |d| ndef[d.0 as usize] += 1);
+    }
+    // registers holding `words + k`: the TLS address, copies of it, it plus a constant
+    let mut addr: Vec<Option<i64>> = vec![None; nv];
+    loop {
+        let mut more = false;
+        for i in f.blocks.iter().flat_map(|b| &b.insts) {
+            let (d, k) = match i {
+                Inst::TlsAddr(d, s) if s.id == tls.id => (*d, s.off - tls.off),
+                Inst::Mov(d, a) => match addr[a.0 as usize] { Some(k) => (*d, k), None => continue },
+                Inst::IBinI(IOp::Add, it, d, a, c) if it.bits == 64 => match addr[a.0 as usize] { Some(k) => (*d, k + *c), None => continue },
+                _ => continue,
+            };
+            if ndef[d.0 as usize] != 1 {
+                return false;
+            }
+            if addr[d.0 as usize] != Some(k) {
+                addr[d.0 as usize] = Some(k);
+                more = true;
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+    if addr.iter().all(|a| a.is_none()) {
+        return false;
+    }
+    let word = |base: VReg, off: i32| -> Option<Result<usize, ()>> {
+        let k = addr[base.0 as usize]? + off as i64;
+        Some(WORDS.iter().position(|w| w.0 == k).ok_or(()))
+    };
+    // every use of such a register is one of the forms above or the base of a load or store of
+    // a whole word; the promoted words are only loaded, or (not the activation's) stored
+    let mut used: u8 = 0;
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            match i {
+                Inst::TlsAddr(..) => {}
+                Inst::Mov(_, a) if addr[a.0 as usize].is_some() => {}
+                Inst::IBinI(IOp::Add, it, _, a, _) if it.bits == 64 && addr[a.0 as usize].is_some() => {}
+                Inst::Load(m, _, base, off) => match word(*base, *off) {
+                    None => {}
+                    Some(w) => {
+                        if !matches!(m, Mem::Int(8, _)) || addr[base.0 as usize].is_some_and(|k| (k + *off as i64) % 8 != 0) {
+                            return false;
+                        }
+                        if let Ok(k) = w {
+                            used |= 1 << k;
+                        }
+                    }
+                },
+                Inst::Store(m, base, off, src) => {
+                    if addr[src.0 as usize].is_some() {
+                        return false;
+                    }
+                    match word(*base, *off) {
+                        None => {}
+                        Some(w) => {
+                            if !matches!(m, Mem::Int(8, _)) || addr[base.0 as usize].is_some_and(|k| (k + *off as i64) % 8 != 0) {
+                                return false;
+                            }
+                            match w {
+                                Ok(k) if WORDS[k].1 => return false,
+                                Ok(k) => used |= 1 << k,
+                                Err(()) => {}
+                            }
+                        }
+                    }
+                }
+                other => {
+                    let mut named = false;
+                    relax_backend::regalloc::for_uses(other, |u| named |= addr[u.0 as usize].is_some());
+                    if named {
+                        return false;
+                    }
+                }
+            }
+        }
+        relax_backend::regalloc::term_uses(&b.term, &mut tu);
+        if tu.iter().any(|u| addr[u.0 as usize].is_some()) {
+            return false;
+        }
+    }
+    if used == 0 {
+        return false;
+    }
+    // where each word's register holds it: at a block's entry, on every path into it
+    let step = |state: u8, i: &Inst| -> u8 {
+        match i {
+            Inst::Load(_, _, base, off) | Inst::Store(_, base, off, _) => match word(*base, *off) {
+                Some(Ok(k)) => state | 1 << k,
+                _ => state,
+            },
+            Inst::Call(..) => state & invariant,
+            _ => state,
+        }
+    };
+    let nb = f.blocks.len();
+    let mut at_entry = vec![u8::MAX; nb];
+    at_entry[0] = 0;
+    let mut work: Vec<usize> = (0..nb).collect();
+    while let Some(b) = work.pop() {
+        let out = f.blocks[b].insts.iter().fold(at_entry[b], |st, i| step(st, i));
+        for t in f.blocks[b].term.succs() {
+            let t = t as usize;
+            if at_entry[t] & out != at_entry[t] {
+                at_entry[t] &= out;
+                work.push(t);
+            }
+        }
+    }
+    let regs: Vec<VReg> = WORDS.iter().map(|_| f.vreg(Cls::I)).collect();
+    for (b, blk) in f.blocks.iter_mut().enumerate() {
+        let insts = std::mem::take(&mut blk.insts);
+        let pos = std::mem::take(&mut blk.pos);
+        let mut state = at_entry[b];
+        for (n, i) in insts.into_iter().enumerate() {
+            let p = pos.get(n).copied().unwrap_or(0);
+            let w = match &i {
+                Inst::Load(_, _, base, off) | Inst::Store(_, base, off, _) => match word(*base, *off) {
+                    Some(Ok(k)) => Some(k),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let next = step(state, &i);
+            match (i, w) {
+                (Inst::Load(_, d, _, _), Some(k)) if state & 1 << k != 0 => {
+                    blk.insts.push(Inst::Mov(d, regs[k]));
+                    blk.pos.push(p);
+                }
+                (Inst::Load(m, d, base, off), Some(k)) => {
+                    blk.insts.push(Inst::Load(m, d, base, off));
+                    blk.insts.push(Inst::Mov(regs[k], d));
+                    blk.pos.extend([p, p]);
+                }
+                (Inst::Store(m, base, off, src), Some(k)) => {
+                    blk.insts.push(Inst::Store(m, base, off, src));
+                    blk.insts.push(Inst::Mov(regs[k], src));
+                    blk.pos.extend([p, p]);
+                }
+                (i, _) => {
+                    blk.insts.push(i);
+                    blk.pos.push(p);
+                }
+            }
+            state = next;
+        }
+    }
+    true
+}
+
 /// An indirect call's target masked into the sandbox thunk table.
-fn mask_fn(f: &mut Func, insts: &mut Vec<Inst>, pos: &mut Vec<u64>, p: u64, v: VReg) -> VReg {
+fn mask_fn(u: &Unit, f: &mut Func, insts: &mut Vec<Inst>, pos: &mut Vec<u64>, p: u64, v: VReg) -> VReg {
+    // no-codegen mode: no table to mask into, the runtime checks the target (`Fns`)
+    if with_sb(|s| s.fns.is_some()) {
+        let check = u.syms.intern(SymKind::Rt("sb_fn_value"), sb_fn_value as *const () as u64);
+        let t = f.vreg(Cls::I);
+        insts.push(Inst::Call(Callee::Host(check), vec![v], vec![t]));
+        pos.push(p);
+        return t;
+    }
     let (base, ts) = with_sb(|s| (s.sbt_base, jit::thunk_size() as u64));
     let span = SBT_N as u64 * ts;
     let b = f.vreg(Cls::I);
