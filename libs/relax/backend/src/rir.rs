@@ -1319,6 +1319,12 @@ pub struct Func {
     /// patch rebuilds the callers that inlined the body). A guarded copy of this body elsewhere
     /// reads them with its own (`opt::inline_site`). Side metadata, like `patch_flag`.
     pub unguarded_flags: Vec<Sym>,
+    /// A sandbox twin: the instructions of the canonical body it was made from, and its own once
+    /// confined (the masks, the shadow frame, the meters). The inliner prices the body by that
+    /// share (`Func::priced`), so a twin's O3 build takes in the twins its base's build takes in
+    /// the bases of: its limits are about the source's code, and a confined body is two to three
+    /// times that. Side metadata, like `patch_flag`.
+    pub confined: Option<(u32, u32)>,
 }
 
 /// A named local of the source and its storage (`Func::dbg`).
@@ -1392,7 +1398,7 @@ impl Func {
     /// compared through its own map (`ma` for self, `mb` for `o`; block counts by bits). With
     /// injective maps: the bodies are equal up to a renaming of their slots.
     pub fn same_body_mapped(&self, ma: &mut dyn FnMut(u32) -> u32, o: &Func, mb: &mut dyn FnMut(u32) -> u32) -> bool {
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _ } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, confined } = self;
         let callee_eq = |a: &Callee, ma: &mut dyn FnMut(u32) -> u32, b: &Callee, mb: &mut dyn FnMut(u32) -> u32| match (a, b) {
             (Callee::Fn(x), Callee::Fn(y)) => ma(*x) == mb(*y),
             (Callee::CFn(x, xs), Callee::CFn(y, ys)) => ma(*x) == mb(*y) && xs == ys,
@@ -1447,12 +1453,13 @@ impl Func {
             && *halves == o.halves
             && guard_calls.len() == o.guard_calls.len()
             && guard_calls.iter().zip(&o.guard_calls).all(|(x, y)| x.0 == y.0 && ma(x.1) == mb(y.1))
+            && *confined == o.confined
     }
 
     /// A hash of what `same_body_mapped` compares, the function slots replaced by `m(slot)`.
     pub fn hash_body_mapped<H: std::hash::Hasher>(&self, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
         use std::hash::Hash;
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _ } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, confined } = self;
         fn callee<H: std::hash::Hasher>(c: &Callee, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
             match c {
                 Callee::Fn(x) => {
@@ -1529,6 +1536,9 @@ impl Func {
             for (p, x) in guard_calls {
                 (p, m(*x)).hash(h);
             }
+        }
+        if confined.is_some() {
+            confined.hash(h);
         }
     }
 
@@ -1670,7 +1680,15 @@ pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new() }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), confined: None }
+    }
+    /// `n` instructions (or cost units) of this body as the inliner prices them: a sandbox
+    /// twin's by its base's share (`Func::confined`).
+    pub fn priced(&self, n: usize) -> usize {
+        match self.confined {
+            Some((base, own)) if base > 0 && own > base => (n * base as usize).div_ceil(own as usize),
+            _ => n,
+        }
     }
     pub fn vreg(&mut self, c: Cls) -> VReg {
         self.vregs.push(c);
