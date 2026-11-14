@@ -19756,8 +19756,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // copies (sandbox.rs inline_copies; MAKEPAD_RUN_OPT=-sbcopy: off).
         if sandboxed {
             let copies = !relax_backend::stats::opt_off(options, "-sbcopy") && crate::sandbox::inline_copies(&*up, &mut func);
-            let words = !relax_backend::stats::opt_off(options, "-sbwords") && crate::sandbox::settle_words(&mut func);
+            // (MAKEPAD_RUN_OPT=-sbmeters: every meter keeps its own check)
+            let words = !relax_backend::stats::opt_off(options, "-sbwords") && crate::sandbox::settle_words(&mut func, !relax_backend::stats::opt_off(options, "-sbmeters"));
             if copies || words {
+                // (a chain of meters merged into one leaves its blocks as jumps to each other)
+                relax_backend::passes::merge_blocks(&mut func);
                 relax_backend::passes::local_copy_prop(&mut func);
                 relax_backend::passes::live_dce(&mut func);
             }
