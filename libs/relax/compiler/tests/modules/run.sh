@@ -226,5 +226,11 @@ if [ "$GOT" = "$(cat "$D/expect-derive-enum.out")" ]; then echo "modules derive 
 # The same in a program (`relax run`), where a file's fn bodies are parsed on demand: a derive's
 # skipped bodies pass with the rest of its text, `unsafe` inside a body of the module's is refused.
 python3 "$D/source_check.py" "$1" || FAILS=$((FAILS + 1))
+# A module's panic reaches the host with its message (panic!, unwrap, expect, assert!), both tiers.
+for TIER in 0 1; do
+OUT=$(RELAX_O3=$TIER "$1" test "$D/panic_message.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-panic-message.out")" ]; then echo "modules panic message (tier1=$TIER): PASS"; else echo "modules panic message (tier1=$TIER): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
+done
 if [ "$FAILS" != 0 ]; then echo "modules: $FAILS case(s) FAILED"; exit 1; fi
 echo "modules: every case PASS"
