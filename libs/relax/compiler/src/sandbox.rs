@@ -104,7 +104,46 @@ struct Heap {
 }
 
 /// Process-wide sandbox state (one unit hosts modules).
+/// No-codegen mode's fn values of the twins. The process makes no machine code there, so there is
+/// no thunk table to write: a twin taken as a value is named by its own slot's thunk (precompiled,
+/// one per slot of the unit's window of the pool: jit.rs Unit::nc_window), which sits among the
+/// thunks of host slots. An indirect call cannot be masked into a range of its own, so it is
+/// checked instead: a set bit per twin's slot, and the trap thunk for any other address.
+struct Fns {
+    /// the unit's first thunk, bytes per thunk, slots
+    base: u64,
+    stride: u64,
+    slots: u64,
+    given: Box<[std::sync::atomic::AtomicU64]>,
+    /// the thunk of the slot whose code panics with the reason (an invalid fn pointer)
+    trap: u64,
+}
+
+impl Fns {
+    /// Twin `t`'s thunk is a fn value from now on.
+    fn give(&self, t: u32) {
+        self.given[t as usize / 64].fetch_or(1 << (t % 64), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn thunk(&self, t: u32) -> u64 {
+        self.base + t as u64 * self.stride
+    }
+
+    /// What a call of `f` runs: `f` when it is a twin's thunk, else the trap.
+    fn target(&self, f: u64) -> u64 {
+        let d = f.wrapping_sub(self.base);
+        let k = d / self.stride;
+        if d % self.stride == 0 && k < self.slots && self.given[k as usize / 64].load(std::sync::atomic::Ordering::Acquire) & 1 << (k % 64) != 0 {
+            f
+        } else {
+            self.trap
+        }
+    }
+}
+
 struct Sb {
+    /// no-codegen mode: fn values are the twins' own thunks, checked at each call (no table)
+    fns: Option<Arc<Fns>>,
     /// TLS block offset of the sandbox words, and the symbol TlsAddr reads it from
     tls_sym: Sym,
     sbt_base: u64,
@@ -182,17 +221,27 @@ unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
     let tls_sym = u.syms.intern(SymKind::Rt("sb_tls"), tls as u64);
     let ts = jit::thunk_size() as u64;
     let bytes = (SBT_N as u64 * ts) as usize;
-    let sbt_base = crate::os::mem::reserve(bytes, 0);
+    // no-codegen mode writes no thunk table (`Fns`)
+    let no_table = u.prog.session.options.no_codegen;
+    let sbt_base = if no_table { 0 } else { crate::os::mem::reserve(bytes, 0) };
     // the slot every unused sandbox thunk jumps through: its code panics with the reason
     let trap_slot = u.fn_id(FnKey::Sandbox(u32::MAX));
-    let trap = tgt::thunk(u.slots.table(trap_slot));
-    let mut all = Vec::with_capacity(bytes);
-    for _ in 0..SBT_N {
-        all.extend_from_slice(&trap);
+    if !no_table {
+        let trap = tgt::thunk(u.slots.table(trap_slot));
+        let mut all = Vec::with_capacity(bytes);
+        for _ in 0..SBT_N {
+            all.extend_from_slice(&trap);
+        }
+        crate::os::mem::write_code(sbt_base, &all);
     }
-    crate::os::mem::write_code(sbt_base, &all);
+    let fns = no_table.then(|| {
+        let slots = u.nc_slots() as u64;
+        let base = u.slots.thunk(0);
+        Arc::new(Fns { base, stride: u.slots.thunk(1) - base, slots, given: (0..slots.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(), trap: u.slots.thunk(trap_slot) })
+    });
     TLS_OFF.store(tls + 1, std::sync::atomic::Ordering::Release);
     *SB.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sb {
+        fns,
         tls_sym,
         sbt_base,
         sbt_n: 1,
@@ -306,13 +355,17 @@ pub unsafe fn twin(up: *mut Unit, base: u32) -> u32 {
     let u = &mut *up;
     let t = u.fn_id(FnKey::Sandbox(base));
     let ts = jit::thunk_size() as u64;
-    let (k, sbt) = with_sb(|s| {
+    let (k, sbt, fns) = with_sb(|s| {
         s.twins.insert(base, t);
         let k = s.sbt_n;
         s.sbt_n += 1;
         s.sbt_of.insert(t, k);
-        (k, s.sbt_base)
+        (k, s.sbt_base, s.fns.clone())
     });
+    if let Some(fns) = fns {
+        fns.give(t);
+        return t;
+    }
     if k >= SBT_N {
         panic!("makepad: sandbox thunk table full ({} functions)", SBT_N);
     }
@@ -332,7 +385,11 @@ pub fn twin_of(base: u32) -> Option<u32> {
 
 /// The sandbox thunk address of twin `t` (a fn pointer value in sandboxed code).
 fn sbthunk(t: u32) -> u64 {
-    with_sb(|s| s.sbt_base + *s.sbt_of.get(&t).unwrap_or(&0) as u64 * jit::thunk_size() as u64)
+    with_sb(|s| match &s.fns {
+        Some(fns) if s.sbt_of.contains_key(&t) => fns.thunk(t),
+        Some(fns) => fns.trap,
+        None => s.sbt_base + *s.sbt_of.get(&t).unwrap_or(&0) as u64 * jit::thunk_size() as u64,
+    })
 }
 
 /// Slots twin `t`'s code refers to without a relocation (fn pointer constants).
@@ -1280,9 +1337,20 @@ fn sb_catch_panic(f: u64, data: u64) -> u64 {
 }
 
 fn mask_thunk(f: u64) -> u64 {
+    if let Some(fns) = with_sb(|s| s.fns.clone()) {
+        return fns.target(f);
+    }
     let (base, ts) = with_sb(|s| (s.sbt_base, jit::thunk_size() as u64));
     let span = SBT_N as u64 * ts;
     base + ((f.wrapping_sub(base)) & (span - 1) & !(ts - 1))
+}
+
+rt_fn! {
+/// An indirect call's target in no-codegen mode (`Fns`: the transform's `mask_fn` calls this where
+/// it masks otherwise).
+leaf fn sb_fn_value(f: u64) -> u64 {
+    mask_thunk(f)
+}
 }
 
 /// The runtime entries a twin may call: kept (scalar arguments or no memory access), or
@@ -1529,8 +1597,8 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
                         Callee::Asm(_) => return Err(format!("{}: inline assembly, which sandboxed modules cannot run", f.name)),
                         Callee::Fn(id) => Callee::Fn(call_target(up, id, &sandboxed)?),
                         Callee::CFn(id, sig) => Callee::CFn(call_target(up, id, &sandboxed)?, sig),
-                        Callee::Indirect(v) => Callee::Indirect(mask_fn(f, &mut insts, &mut pos, p, v)),
-                        Callee::CIndirect(v, sig) => Callee::CIndirect(mask_fn(f, &mut insts, &mut pos, p, v), sig),
+                        Callee::Indirect(v) => Callee::Indirect(mask_fn(u, f, &mut insts, &mut pos, p, v)),
+                        Callee::CIndirect(v, sig) => Callee::CIndirect(mask_fn(u, f, &mut insts, &mut pos, p, v), sig),
                         Callee::Host(s) => match u.syms.kind(s.id) {
                             Some(SymKind::Rt(name)) => match rt_policy(name) {
                                 Some(None) => Callee::Host(s),
@@ -1606,7 +1674,15 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
 }
 
 /// An indirect call's target masked into the sandbox thunk table.
-fn mask_fn(f: &mut Func, insts: &mut Vec<Inst>, pos: &mut Vec<u64>, p: u64, v: VReg) -> VReg {
+fn mask_fn(u: &Unit, f: &mut Func, insts: &mut Vec<Inst>, pos: &mut Vec<u64>, p: u64, v: VReg) -> VReg {
+    // no-codegen mode: no table to mask into, the runtime checks the target (`Fns`)
+    if with_sb(|s| s.fns.is_some()) {
+        let check = u.syms.intern(SymKind::Rt("sb_fn_value"), sb_fn_value as *const () as u64);
+        let t = f.vreg(Cls::I);
+        insts.push(Inst::Call(Callee::Host(check), vec![v], vec![t]));
+        pos.push(p);
+        return t;
+    }
     let (base, ts) = with_sb(|s| (s.sbt_base, jit::thunk_size() as u64));
     let span = SBT_N as u64 * ts;
     let b = f.vreg(Cls::I);

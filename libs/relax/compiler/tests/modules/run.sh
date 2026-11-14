@@ -84,6 +84,16 @@ if [ "$GOT" = $'out escaping fn values refused: true\nout plain data to host API
 OUT=$(MAKEPAD_RUN_MODULE_FUEL=2000000 "$1" test "$D/shadow_threads.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-shadow-threads.out")" ]; then echo "modules shadow threads: PASS"; else echo "modules shadow threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+# No-codegen mode (arm64 Apple only): no thunk table is written, a module's fn values are its
+# twins' own precompiled thunks and each indirect call is checked against them.
+if [ "$(uname -sm)" = "Darwin arm64" ]; then
+OUT=$(MAKEPAD_RUN_NO_CODEGEN=1 MAKEPAD_RUN_SANDBOX_NOCHECK=1 "$1" test "$D/nocodegen_fns.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-nocodegen-fns.out")" ]; then echo "modules no-codegen fns: PASS"; else echo "modules no-codegen fns: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+OUT=$(MAKEPAD_RUN_NO_CODEGEN=1 "$1" test "$D/host.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules no-codegen host: PASS"; else echo "modules no-codegen host: FAIL"; diff <(echo "$GOT") "$D/expect.out"; echo "$OUT" | tail -5; exit 1; fi
+fi
 OUT=$(MAKEPAD_RUN_MODULE_FUEL=1000000 "$1" test "$D/fuel.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; else echo "modules fuel: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -6; exit 1; fi
