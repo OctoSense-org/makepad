@@ -121,6 +121,8 @@ GOT=$(echo "$OUT" | grep '^out ')
 if [ "$FUEL" = 1 ]; then WANT='out a budget of 100 units: result out of fuel fuel spent 100'; else WANT='out a budget of 100 units: result true fuel spent 0'; fi
 if [ "$STATUS" = 0 ] && [ "$GOT" = "$WANT" ]; then echo "modules fuel off (fuel=$FUEL): PASS"; else echo "modules fuel off (fuel=$FUEL): FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
 done
+# A module's load links std's twins from the disk cache; its own code is built and tiers as in a cold run.
+python3 "$D/warm_cache.py" "$1" || FAILS=$((FAILS + 1))
 # Host panic setup must not change sandbox reachability (run before other modules).
 for CASE in host_hook_repro host_hook_panic; do
 OUT=$("$1" test "$D/$CASE.rs" 2>&1)
