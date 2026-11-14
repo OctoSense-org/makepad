@@ -54,9 +54,16 @@ fn cleanup_panic() {
 
     let mut budget = Budget::new(200_000, CAP);
     let short = m.call_with(&mut budget, || spin(100)).unwrap();
-    budget.reset(200_000, CAP);
-    let long = m.call_with(&mut budget, || { let _mark = Mark(&host_drops); spin(100_000_000) });
-    println!("out fuel spent under a destructor: {}", matches!(long, Err(BudgetError::Fuel { consumed: 200_000 })));
+    // (the budget's last unit falls in a different block each time: in `spin` itself, which has
+    // no cleanup to run there, or in a function it calls while `keep` is alive, whose unwind
+    // enters spin's cleanup pad)
+    let mut stopped = 0;
+    for extra in 0..32 {
+        budget.reset(200_000 + extra, CAP);
+        let long = m.call_with(&mut budget, || { let _mark = Mark(&host_drops); spin(100_000_000) });
+        stopped += matches!(long, Err(BudgetError::Fuel { consumed }) if consumed == 200_000 + extra) as u32;
+    }
+    println!("out fuel spent under a destructor: {} of 32 calls stopped", stopped);
     budget.reset(200_000, CAP);
     println!("out callable after fuel: {}", m.call_with(&mut budget, || spin(100)).ok() == Some(short));
 
