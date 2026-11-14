@@ -22,6 +22,14 @@ fi
 echo "modules budget (tier1=$TIER): PASS ($(echo "$OUT" | grep 'budget cost:'))"
 echo "$GOT" | grep 'shared tick fuel'
 done
+# MAKEPAD_RUN_SANDBOX_FUEL=0 leaves the meter out of a twin's code: a budget is neither spent nor ends a call.
+for FUEL in 1 0; do
+OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=$FUEL "$1" test "$D/fuel_off.rs" 2>&1)
+STATUS=$?
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$FUEL" = 1 ]; then WANT='out a budget of 100 units: result out of fuel fuel spent 100'; else WANT='out a budget of 100 units: result true fuel spent 0'; fi
+if [ "$STATUS" = 0 ] && [ "$GOT" = "$WANT" ]; then echo "modules fuel off (fuel=$FUEL): PASS"; else echo "modules fuel off (fuel=$FUEL): FAIL"; echo "$OUT" | tail -30; exit 1; fi
+done
 # A twin's O3 build takes in the twins it calls and keeps the fuel count in a register between
 # calls: what a path costs, where a run on a budget ends and what the module did up to there are
 # the same with tiering off and after a tier-up that inlined.
@@ -43,6 +51,71 @@ if [ "$TIER" = 0 ]; then BASE_TIERS="$GOT"; else
 fi
 echo "modules fuel tiers (tier1=$TIER): PASS ($(echo "$GOT" | head -1 | sed 's/^out //'))"
 done
+# A twin's O3 build checks a run of meters once: with every budget up to a call's cost, the fuel
+# consumed, how the call ends and the module's state after it are those of one check per block.
+BASE_CHAINS=""
+for TIER in 0 1; do
+SO=$(mktemp); SE=$(mktemp)
+MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/fuel_chains.rs" >"$SO" 2>"$SE"
+STATUS=$?
+GOT=$(grep '^out ' "$SO")
+OUT="$(cat "$SO" "$SE")"
+rm -f "$SO" "$SE"
+if [ "$STATUS" != 0 ] || [ "$(echo "$GOT" | wc -l | tr -d ' ')" != 4 ]; then
+    echo "modules fuel chains (tier1=$TIER): FAIL"; echo "$OUT" | tail -30; exit 1
+fi
+if [ "$TIER" = 0 ]; then BASE_CHAINS="$GOT"; else
+    if [ "$GOT" != "$BASE_CHAINS" ] || ! echo "$OUT" | grep -Eq '^tier1: sandbox:chains::run installed \([0-9]+ bytes, [1-9][0-9]* callees inlined' || ! echo "$OUT" | grep -Eq '^tier1: sandbox:chains::walk installed '; then
+        echo "modules fuel chains invariance: FAIL"; echo "$BASE_CHAINS"; echo "$OUT" | tail -30; exit 1
+    fi
+fi
+echo "modules fuel chains (tier1=$TIER): PASS ($(echo "$GOT" | sed -n 2p | sed 's/^out //'))"
+done
+# A twin's O3 build makes the arena copies of a known small size inline: sorts of elements of
+# 1 to 72 bytes give the host's results before and after the tier-up.
+SO=$(mktemp); SE=$(mktemp)
+MAKEPAD_RUN_O3=1 MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/copies.rs" >"$SO" 2>"$SE"
+STATUS=$?
+GOT=$(grep '^out the module' "$SO")
+OUT="$(cat "$SO" "$SE")"
+rm -f "$SO" "$SE"
+if [ "$STATUS" = 0 ] && [ "$GOT" = $'out the module, before the tier-up: true\nout the module, after it: true' ] && echo "$OUT" | grep -Eq '^tier1: sandbox:core::slice::sort::.* installed '; then
+    echo "modules copies: PASS"
+else
+    echo "modules copies: FAIL"; echo "$OUT" | tail -30; exit 1
+fi
+# A twin's O3 build optimises its body before the memory is confined: whatever address hot code
+# names (indexed, at a constant offset, struct and vector copies, a local moved out of its slot,
+# a forged fn pointer), the host's memory is neither written nor read. With the confined body as
+# the build's input (MAKEPAD_RUN_OPT=-sblate) the same holds.
+for LATE in 1 0; do
+SO=$(mktemp); SE=$(mktemp)
+if [ "$LATE" = 1 ]; then SW=""; else SW="-sblate"; fi
+MAKEPAD_RUN_OPT=$SW MAKEPAD_RUN_SANDBOX_NOCHECK=1 MAKEPAD_RUN_O3=1 MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/contain_hot.rs" >"$SO" 2>"$SE"
+STATUS=$?
+GOT=$(grep '^out ' "$SO")
+OUT="$(cat "$SO" "$SE")"
+rm -f "$SO" "$SE"
+HOT=$(echo "$OUT" | grep -E '^tier1: sandbox:hot::[a-z_]+ installed ' | sed -E 's/^tier1: sandbox:hot::([a-z_]+) .*/\1/' | sort -u | wc -l | tr -d ' ')
+if [ "$STATUS" = 0 ] && [ "$GOT" = "$(cat "$D/expect-contain-hot.out")" ] && [ "$HOT" -ge 15 ]; then
+    echo "modules contain hot (late=$LATE): PASS ($HOT twins at O3)"
+else
+    echo "modules contain hot (late=$LATE): FAIL ($HOT twins at O3)"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1
+fi
+done
+# A body the confinement refuses (MAKEPAD_RUN_TEST_SANDBOX_REFUSE=1: every one) is built again from
+# the confined body: the sorts still give the host's results once hot.
+SO=$(mktemp); SE=$(mktemp)
+MAKEPAD_RUN_TEST_SANDBOX_REFUSE=1 MAKEPAD_RUN_O3=1 MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/copies.rs" >"$SO" 2>"$SE"
+STATUS=$?
+GOT=$(grep '^out the module' "$SO")
+OUT="$(cat "$SO" "$SE")"
+rm -f "$SO" "$SE"
+if [ "$STATUS" = 0 ] && [ "$GOT" = $'out the module, before the tier-up: true\nout the module, after it: true' ] && echo "$OUT" | grep -q 'dropped(err: sandbox confinement after O3: ' && echo "$OUT" | grep -Eq '^tier1: sandbox:core::slice::sort::.* installed '; then
+    echo "modules confinement refused: PASS"
+else
+    echo "modules confinement refused: FAIL"; echo "$OUT" | grep -v '^  report' | tail -20; exit 1
+fi
 # Host panic setup must not change sandbox reachability (run before other modules).
 for CASE in host_hook_repro host_hook_panic; do
 OUT=$("$1" test "$D/$CASE.rs" 2>&1)

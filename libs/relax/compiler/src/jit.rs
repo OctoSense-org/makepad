@@ -14852,7 +14852,11 @@ impl<'a> InlineBodies<'a> {
         // a body above the largest size any rule admits (site_rule) is not prepared (one that
         // optimises down into its own rules' range still is: piano_render, brotli_decode)
         let max_insts = relax_codegen::opt::InlineLimits::tier1().always_insts;
-        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !calls || relax_codegen::opt::inst_count(o1) > max_insts {
+        // (a sandbox twin's snapshot body is its canonical one, confined and not optimised: it
+        // is prepared also when it calls nothing, so its optimised body prices its sites as a
+        // host callee's O1 body does)
+        let twin = o1.confined.is_some();
+        if attrs & relax_codegen::opt::ATTR_COLD != 0 || !(calls || twin) || o1.priced(relax_codegen::opt::inst_count(o1)) > max_insts {
             return None;
         }
         let sub = |x: u32| if self.node.get(&x).is_some_and(|n| n.0 == comp) { None } else { self.get_prepared(x) };
@@ -14908,7 +14912,7 @@ impl<'a> InlineBodies<'a> {
         if let Some(st) = stats { st.report(&format!("prep:{} (root {})", o1.name, self.root)); }
         let (raw, mut taken) = raw;
         // shared preparations outlive this build: they are copied out of its job arena
-        let prepared = (!taken.is_empty()).then(|| {
+        let prepared = (!taken.is_empty() || twin).then(|| {
             self.expand(&mut taken);
             let deps: Vec<u32> = taken.into_iter().map(|x| x.0).collect();
             crate::zone_alloc::copy_out(|| std::sync::Arc::new(Prepared { raw: raw.clone(), priced: f.clone(), deps: deps.clone() }))
@@ -15051,7 +15055,7 @@ fn tier1_simplify(options: &crate::options::Options, func: &mut relax_backend::r
     limits.cold_tiny = export_o3_mode() && crate::wasm_export::o3_cold_tiny();
     limits.lto = export_o3_mode() && crate::wasm_export::o3_lto();
     if let (Some(cap), Some(g)) = (growth_cap, limits.growth_limit.as_mut()) {
-        *g = (*g).min(cap.max(relax_codegen::opt::inst_count(func)));
+        *g = (*g).min(cap.max(func.priced(relax_codegen::opt::inst_count(func))));
     }
     let mut inlined: Vec<(u32, usize)> = Vec::new();
     if cfg.inline {
@@ -19347,6 +19351,17 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             }
         };
         let sandboxed = matches!((&*up).fns[id as usize].key, FnKey::Sandbox(_));
+        // A twin's build starts from its body in the early form (sandbox::early_rir: metered,
+        // its memory not confined yet) and confines what the optimizer leaves (sandbox::confine,
+        // below), so that inlining and scalar replacement work as on host code. When that body
+        // cannot be made now, and with MAKEPAD_RUN_OPT=-sblate, from the confined body as before.
+        let rir = match sandboxed && !relax_backend::stats::opt_off(options, "-sblate") && !crate::sandbox::late_refused(&*up, id) {
+            true => match early_rir_or_skip(up, id) {
+                Some(Ok(early)) => early,
+                _ => rir,
+            },
+            false => rir,
+        };
         let mut callees: Vec<u32> = Vec::new();
         for b in &rir.blocks {
             for i in &b.insts {
@@ -19472,7 +19487,25 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let c = frontier[idx];
             let te = cpu_ns();
             ensure_rir(c);
-            views.borrow_mut().insert(c, o3_view(&*up, c));
+            let mut view = o3_view(&*up, c);
+            // (a root in the early form takes its candidates in that form too: a candidate
+            // whose early body cannot be made stays a call; one that waits for a front is
+            // asked again once, as a twin's own build above)
+            if rir.unconfined && view.rir.is_some() {
+                view.rir = match early_rir_or_skip(up, c) {
+                    Some(r) => r.ok(),
+                    None => {
+                        let mut l = left_out.borrow_mut();
+                        let n = l.entry(c).or_insert(0);
+                        *n += 1;
+                        if *n < SPLIT_TRIES {
+                            twin_wait.set(true);
+                        }
+                        None
+                    }
+                };
+            }
+            views.borrow_mut().insert(c, view);
             TIER1_TAKE_PARTS[1].fetch_add(cpu_ns() - te, Ordering::Relaxed);
             idx += 1;
         }
@@ -19748,8 +19781,22 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // a twin's sandbox words stay in registers between calls (sandbox.rs words_in_registers;
         // after the inliner: the twins it took in bring their own meters and frames).
         // MAKEPAD_RUN_OPT=-sbwords: off (A/B)
-        if sandboxed && !relax_backend::stats::opt_off(options, "-sbwords") && crate::sandbox::settle_words(&mut func) {
-            relax_backend::passes::live_dce(&mut func);
+        // Before it, the arena copies whose size the inliner made a constant become inline
+        // copies (sandbox.rs inline_copies; MAKEPAD_RUN_OPT=-sbcopy: off).
+        if sandboxed {
+            // (a build from the early form: every access the optimizer left is masked now)
+            if func.unconfined {
+                crate::sandbox::confine(&*up, &mut func).map_err(|e| format!("{}{}", crate::sandbox::LATE_REFUSED, e))?;
+            }
+            let copies = !relax_backend::stats::opt_off(options, "-sbcopy") && crate::sandbox::inline_copies(&*up, &mut func);
+            // (MAKEPAD_RUN_OPT=-sbmeters: every meter keeps its own check)
+            let words = !relax_backend::stats::opt_off(options, "-sbwords") && crate::sandbox::settle_words(&mut func, !relax_backend::stats::opt_off(options, "-sbmeters"));
+            if copies || words {
+                // (a chain of meters merged into one leaves its blocks as jumps to each other)
+                relax_backend::passes::merge_blocks(&mut func);
+                relax_backend::passes::local_copy_prop(&mut func);
+                relax_backend::passes::live_dce(&mut func);
+            }
         }
         let mut inlined = Vec::with_capacity(inline_rules.len());
         for (c, _) in inline_rules { inlined.push(c); }
@@ -20288,6 +20335,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // SPEC-V: a callee it took in unverified was rejected meanwhile: built again
                 // without it (the snapshot leaves a rejected callee out)
                 if why == "inlined a rejected callee" {
+                    u.retier(id);
+                }
+                // a twin's build from the early form that sandbox::confine refused: built again
+                // from the confined body
+                if matches!(&built, Ok(Err(e)) if e.starts_with(crate::sandbox::LATE_REFUSED)) {
+                    crate::sandbox::refuse_late(u, id);
                     u.retier(id);
                 }
                 if tier1_trace() {
@@ -21469,7 +21522,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
                 && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id), sandbox_twin(fns, id))
                     .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
-            if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
+            if never_run && r.priced(relax_codegen::opt::inst_count(r)) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
                 continue;
             }
             for b in &r.blocks {
@@ -23618,6 +23671,23 @@ thread_local! {
     /// prepare_rir_from's own lowering (build_rir_inner) runs: a front it needs inside a take is
     /// noted and returned as NEEDS_FRONT instead of unwinding
     static PREP_LOWER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A twin's body in the early form (sandbox::early_rir) inside an O3 build's take: None when its
+/// base's lowering needs a front only the owner could run (noted for the take's next round, as
+/// build_rir_or_skip).
+unsafe fn early_rir_or_skip(up: *mut Unit, id: u32) -> Option<Result<std::sync::Arc<relax_backend::rir::Func>, String>> {
+    let _w = BuildWhy::enter(1);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::sandbox::early_rir(up, id))) {
+        Ok(r) => Some(r),
+        Err(p) => match p.downcast::<crate::preempt::PublishBail>() {
+            Ok(b) => {
+                owner::note_needs(b.slots);
+                None
+            }
+            Err(p) => std::panic::resume_unwind(p),
+        },
+    }
 }
 
 /// `build_rir_mode` inside a background build's take: a candidate whose front only the owner could
