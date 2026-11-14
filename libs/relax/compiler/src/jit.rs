@@ -9791,10 +9791,23 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
 /// `into_unverified`: the build is unverified code itself (an O3 build of an unverified body or of
 /// a twin: never cached, rebuilt once verified): it may take in unverified callees too, and then
 /// stays unverified (O3Assembled::unverified_in). A verified build never holds unverified code.
-fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool) -> Option<u8> {
+///
+/// `into_twin`: the build is a sandbox twin's (sandbox_twin). It takes in twins only, each by its
+/// base's attributes: a twin is its base's body, confined and metered before any optimiser ran
+/// (sandbox.rs transform), so the copy keeps every masked access and every fuel charge of the
+/// call it replaces. What a twin calls besides twins is the host's API, which runs unconfined
+/// and stays a call. Host code never takes a twin in.
+fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &crate::conc::AppendVec<FnEntry>, core_crate: u32, c: u32, inline_all: bool, core_hint: bool, into_unverified: bool, into_twin: bool) -> Option<u8> {
     let options = &prog.session.clone().options;
+    // (MAKEPAD_RUN_OPT=-sbinline: a twin's build takes nothing in, A/B)
+    let c = match fns[c as usize].key {
+        FnKey::Sandbox(b) if into_twin && (b as usize) < fns.len() && !relax_backend::stats::opt_off(options, "-sbinline") => b,
+        FnKey::Sandbox(_) => return None,
+        _ if into_twin => return None,
+        _ => c,
+    };
     // a sandboxed module's code is never inlined into host code (it runs only as twins)
-    if crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
+    if !into_twin && crate::sandbox::is_sandboxed_crate_key(prog, &fns[c as usize].key) {
         return None;
     }
     // SPEC-V: unverified code is inlined only into unverified code
@@ -9853,8 +9866,8 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // its base would (rustc inlines the callee there: `set_material`'s 15 `set_uniform` calls).
         // The build holds it as unverified code (O3Assembled::unverified_in): a failed verdict of
         // the base builds it again. Never into verified code (which never calls twins).
-        FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true),
-        // sandbox twins are never inlined into anything (their callers are twins built from RIR)
+        FnKey::Plain(b) if into_unverified => return callee_attrs(prog, tcx, fns, core_crate, *b, inline_all, core_hint, true, false),
+        // (a sandbox twin was answered by its base above)
         FnKey::Sandbox(_) | FnKey::Plain(_) => return None,
     })
 }
@@ -12383,7 +12396,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // refused callees (#[inline(never)], sandboxed, user code without inline_all,
             // MAKEPAD_RUN_NOINL) are not built for inlining: decided before the build, not after
             let want = (baseline && matches!(u.fns[*c as usize].key, FnKey::Glue(..)) || inline_source_wanted(u, *c, full))
-                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false).is_some()
+                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false, false).is_some()
                 && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
                 // a snapshot O2 build makes no front end under the lock: candidates with RIR only
@@ -12441,7 +12454,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false, false) };
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
@@ -12460,7 +12473,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     // (off the owner); its RIR replaces the baseline RIR at the finish
                     if let Some(Some(p)) = collect_fronts(&mut needs, || split_upgrade(up, *c)) {
                         let u = &*up;
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint, false, false) };
                         deferred.push((*c, attrs, p));
                     }
                 } else {
@@ -12477,7 +12490,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if !wanted.contains(&c) || deferred.iter().any(|x| x.0 == c) {
                 continue;
             }
-            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false) {
+            let attrs = match callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, core_hint, false, false) {
                 Some(a) => a,
                 None => continue,
             };
@@ -19194,6 +19207,10 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let fronts_done = std::cell::Cell::new(false);
     // (instrument) what the last take of a split did with it: 1 gave back, 2 prepared, 3 skipped
     let split_out: std::cell::RefCell<HashMap<u32, u8>> = Default::default();
+    // a sandbox twin among the candidates had no RIR (its code came from the disk cache) and its
+    // build -- on the owner: twin_rir -- needs its base's front: the round ends without a snapshot,
+    // this thread makes the fronts the take noted (`needs`) and asks again, as for `fronts`
+    let twin_wait = std::cell::Cell::new(false);
     let owner_fallback = |c: u32, upgrade: bool, split: bool| {
         let o = if split { split_out.borrow().get(&c).copied().unwrap_or(3) as usize } else { 0 };
         cand_skip(19 + if upgrade { 0 } else { 4 } + o);
@@ -19308,8 +19325,9 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             for i in &b.insts {
                 if let relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(c), _, _) | relax_backend::rir::Inst::FnAddr(_, c) = i {
                     // The transform already confined this body. Inlining a host API here
-                    // would introduce unconfined memory operations after that boundary.
-                    if !sandboxed && *c != id && !callees.contains(c) {
+                    // would introduce unconfined memory operations after that boundary: a
+                    // twin's candidates are the twins it calls, confined as it is.
+                    if (!sandboxed || sandbox_twin(&(&*up).fns, *c)) && *c != id && !callees.contains(c) {
                         callees.push(*c);
                     }
                 }
@@ -19360,8 +19378,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         let u = &mut *up;
         let f = &u.fns[c as usize];
-        // (an unverified-mode twin: its base's body, lowered as unverified code)
-        let base_key = match &f.key { FnKey::Plain(b) => &u.fns[*b as usize].key, k => k };
+        // (an unverified-mode twin: its base's body, lowered as unverified code; a sandbox twin:
+        // its base's body confined, built here from the base's lowering -- twin_rir -- when its
+        // code came from the disk cache)
+        let twin_base = match f.key { FnKey::Sandbox(b) if (b as usize) < u.fns.len() => Some(b), _ => None };
+        let base_key = match &f.key { FnKey::Plain(b) => &u.fns[*b as usize].key, _ if twin_base.is_some() => &u.fns[twin_base.unwrap() as usize].key, k => k };
         let attr = match base_key {
             FnKey::Inst(d, _) if u.prog.def(*d).kind != DefKind::ForeignFn => inline_attrs(&u.prog, *d),
             FnKey::Shim(_) | FnKey::Glue(..) if !matches!(f.key, FnKey::Plain(_)) => 0,
@@ -19373,7 +19394,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // startup-image slot not installed yet, or one with a stored entry, too: it ran before)
         let cached_code = (&mut *up).ran_before(c);
         let u = &mut *up;
-        let source_size = src_size(u, c);
+        let source_size = src_size(u, twin_base.unwrap_or(c));
         if cached_code || source_size <= src_toks || attr & relax_codegen::opt::ATTR_ALWAYS != 0 {
             if prefront && !fronted.contains(&c) {
                 let twin_of = match u.fns[c as usize].key { FnKey::Plain(b) => Some(b), _ => None };
@@ -19393,8 +19414,14 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             let t = wall_ns();
             compile_watch(Some((&format!("O3 snapshot: build_rir {}", u.fns[c as usize].name), 0)));
             if build_rir_or_skip(up, c, RirMode::Tier0).is_none() {
-                if tier1_trace() { eprintln!("O3 cand #{} {} left out: its build on the owner was skipped", c, short_name(&(&*up).fns[c as usize].name)); }
-                *left_out.borrow_mut().entry(c).or_insert(0) += 1;
+                let mut l = left_out.borrow_mut();
+                let n = l.entry(c).or_insert(0);
+                *n += 1;
+                if twin_base.is_some() && *n < SPLIT_TRIES {
+                    twin_wait.set(true);
+                } else if tier1_trace() {
+                    eprintln!("O3 cand #{} {} left out: its build on the owner was skipped", c, short_name(&(&*up).fns[c as usize].name));
+                }
             }
             compile_watch(None);
             TIER1_SNAP_BUILT[0].fetch_add(1, Ordering::Relaxed);
@@ -19437,7 +19464,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         idx = 0;
     }
     // candidates whose fronts (or O1 builds) this thread runs first: asked again after them
-    if !fronts.borrow().is_empty() || !splits.borrow().is_empty() {
+    if !fronts.borrow().is_empty() || !splits.borrow().is_empty() || twin_wait.get() {
         owner_ns.set(owner_ns.get() + cpu_ns() - s0);
         return None;
     }
@@ -19520,7 +19547,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     }
     let more = std::mem::take(&mut *fronts.borrow_mut());
     let ups = std::mem::take(&mut *splits.borrow_mut());
-    if snapped.is_some() || more.is_empty() && ups.is_empty() {
+    if snapped.is_some() || more.is_empty() && ups.is_empty() && !twin_wait.replace(false) {
         break snapped;
     }
     // this round's candidates: their type checks and lowering here, off the unit
@@ -19901,7 +19928,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                             notes.push((c, if unverified_left.contains(&c) { "unverified: again at its verdict" } else { "unverified: again only with the root's verdict" }));
                             continue;
                         }
-                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified).is_none() {
+                        if f.build_err.is_some() || callee_attrs(&u.prog, &u.tcx, &u.fns, core, c, inline_all, true, root_unverified, sandbox_twin(&u.fns, id)).is_none() {
                             notes.push((c, "not inlinable (build error or attributes)"));
                             continue;
                         }
@@ -21397,6 +21424,8 @@ fn o3_view(u: &Unit, c: u32) -> O3View {
 unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &crate::options::Options, id: u32, inline_all: bool, frontier: &[u32], views: &HashMap<u32, O3View>,
     callees: &mut Vec<u32>, seen: &mut std::collections::HashSet<u32>) -> Vec<u32> {
     let (fns, core) = (&*std::ptr::addr_of!((*up).fns), *std::ptr::addr_of!((*up).core_crate));
+    // (a twin's build takes in twins only: callee_attrs)
+    let root_twin = sandbox_twin(fns, id);
     let mut next = Vec::new();
     for &c in frontier {
         let Some(v) = views.get(&c) else { continue };
@@ -21404,7 +21433,7 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
             // Cost-model admissions also expose calls in never-run bodies.
             let never_run = !v.ran && v.uninlined;
             let cost_admits = !relax_backend::stats::opt_off(options, "-costmodel")
-                && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id))
+                && callee_attrs(prog, tcx, fns, core, c, inline_all, true, unverified_root(fns, id), sandbox_twin(fns, id))
                     .map_or(false, |attrs| relax_codegen::opt::rustc_inline_cost(r, c) <= relax_codegen::opt::rustc_inline_threshold(r, attrs));
             if never_run && relax_codegen::opt::inst_count(r) > relax_codegen::opt::INLINE_FREE_INSTS && !cost_admits {
                 continue;
@@ -21420,6 +21449,9 @@ unsafe fn o3_next_level(up: *mut Unit, (prog, tcx): (&Program, &Tcx), options: &
                         relax_backend::rir::Inst::Call(relax_backend::rir::Callee::Fn(x), _, _) | relax_backend::rir::Inst::FnAddr(_, x) => x,
                         _ => continue,
                     };
+                    if root_twin && !sandbox_twin(fns, *x) {
+                        continue;
+                    }
                     if *x != id && callees.len() >= 1024 && !seen.contains(x) && relax_codegen::opt::inline_trace(&fns[id as usize].name) {
                         eprintln!("inline-trace-snap {}: out fn#{} {} (1024 candidates)", fns[id as usize].name, x, fns[*x as usize].name);
                     }
@@ -21457,6 +21489,12 @@ struct O3Assembled {
     root: u32,
 }
 
+/// Whether slot `id` is a sandbox twin with a body (not the invalid-fn-pointer stand-in): what a
+/// twin's O3 build takes in (callee_attrs).
+fn sandbox_twin(fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> bool {
+    matches!(fns[id as usize].key, FnKey::Sandbox(b) if (b as usize) < fns.len())
+}
+
 /// SPEC-V: whether slot `id`'s builds are unverified code: a body without a clean verdict yet
 /// (flagged) or an unverified-mode twin.
 fn unverified_root(fns: &crate::conc::AppendVec<FnEntry>, id: u32) -> bool {
@@ -21485,7 +21523,7 @@ unsafe fn o3_assemble(up: *mut Unit, (prog, tcx): (&Program, &Tcx), id: u32, rir
             if trace { eprintln!("inline-trace-snap {}: out fn#{} {} (no view)", fns[id as usize].name, c, fns[c as usize].name); }
             continue;
         };
-        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified) {
+        let attrs = match callee_attrs(prog, tcx, fns, core, c, inline_all, true, root_unverified, sandbox_twin(fns, id)) {
             Some(a) if xcrate_unavailable(prog, fns, core, id, c) => (a & !relax_codegen::opt::ATTR_HINT) | relax_codegen::opt::ATTR_XCRATE,
             Some(a) => a,
             None => {
