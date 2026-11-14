@@ -19405,10 +19405,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         }
         let u = &mut *up;
         let f = &u.fns[c as usize];
-        // (an unverified-mode twin: its base's body, lowered as unverified code; a sandbox twin:
-        // its base's body confined, built here from the base's lowering -- twin_rir -- when its
-        // code came from the disk cache)
-        let twin_base = match f.key { FnKey::Sandbox(b) if (b as usize) < u.fns.len() => Some(b), _ => None };
+        // (an unverified-mode twin: its base's body, lowered as unverified code; a sandbox twin
+        // called by a twin's build: its base's body confined, built here from the base's
+        // lowering -- twin_rir -- when its code came from the disk cache. Host code takes no twin
+        // in, so its build makes none.)
+        let twin_base = match f.key { FnKey::Sandbox(b) if sandboxed && (b as usize) < u.fns.len() => Some(b), _ => None };
         let base_key = match &f.key { FnKey::Plain(b) => &u.fns[*b as usize].key, _ if twin_base.is_some() => &u.fns[twin_base.unwrap() as usize].key, k => k };
         let attr = match base_key {
             FnKey::Inst(d, _) if u.prog.def(*d).kind != DefKind::ForeignFn => inline_attrs(&u.prog, *d),
