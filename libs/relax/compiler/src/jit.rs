@@ -19749,6 +19749,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         // after the inliner: the twins it took in bring their own meters and frames).
         // MAKEPAD_RUN_OPT=-sbwords: off (A/B)
         if sandboxed && !relax_backend::stats::opt_off(options, "-sbwords") && crate::sandbox::settle_words(&mut func) {
+            relax_backend::passes::local_copy_prop(&mut func);
             relax_backend::passes::live_dce(&mut func);
         }
         let mut inlined = Vec::with_capacity(inline_rules.len());
