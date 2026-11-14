@@ -129,3 +129,11 @@ bash "$D/milk.sh" "$1" || exit 1
 OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 "$1" test "$D/deadline.rs" 2>&1)
 STATUS=$?
 if [ "$STATUS" = 0 ] && echo "$OUT" | grep -q '^out deadlines: true$'; then echo "modules deadlines: PASS"; else echo "modules deadlines: FAIL"; echo "$OUT" | tail -30; exit 1; fi
+# A module derives the comparison and hash traits on its enums (the derives read the discriminant
+# in an `unsafe` block of the front's own writing); its own `unsafe` beside a derive stays refused.
+OUT=$("$1" test "$D/derive_enum.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-derive-enum.out")" ]; then echo "modules derive on enums: PASS"; else echo "modules derive on enums: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+# The source check reads the fn bodies a program's load parses on demand, not only a file's
+# items: `unsafe` inside a body is refused there too, a derive's own text is not.
+python3 "$D/source_check.py" "$1" || exit 1
