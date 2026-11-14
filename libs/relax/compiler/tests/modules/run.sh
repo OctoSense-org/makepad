@@ -22,6 +22,14 @@ fi
 echo "modules budget (tier1=$TIER): PASS ($(echo "$OUT" | grep 'budget cost:'))"
 echo "$GOT" | grep 'shared tick fuel'
 done
+# MAKEPAD_RUN_SANDBOX_FUEL=0 leaves the meter out of a twin's code: a budget is neither spent nor ends a call.
+for FUEL in 1 0; do
+OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=$FUEL "$1" test "$D/fuel_off.rs" 2>&1)
+STATUS=$?
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$FUEL" = 1 ]; then WANT='out a budget of 100 units: result out of fuel fuel spent 100'; else WANT='out a budget of 100 units: result true fuel spent 0'; fi
+if [ "$STATUS" = 0 ] && [ "$GOT" = "$WANT" ]; then echo "modules fuel off (fuel=$FUEL): PASS"; else echo "modules fuel off (fuel=$FUEL): FAIL"; echo "$OUT" | tail -30; exit 1; fi
+done
 # A twin's O3 build takes in the twins it calls and keeps the fuel count in a register between
 # calls: what a path costs, where a run on a budget ends and what the module did up to there are
 # the same with tiering off and after a tier-up that inlined.

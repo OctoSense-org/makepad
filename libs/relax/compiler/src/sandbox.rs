@@ -1654,7 +1654,11 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     f.blocks.extend(out_blocks);
     f.blocks.extend(new_blocks);
     f.slots.clear();
-    add_fuel(f, t_arena, site_fuel, panic_site, pos0, &costs);
+    // MAKEPAD_RUN_SANDBOX_FUEL=0: no meter in the code at all (a host that bounds its modules by
+    // deadline alone). No per-call budget ends a call then, and a Budget's fuel is never spent.
+    if options.sandbox_fuel {
+        add_fuel(f, t_arena, site_fuel, panic_site, pos0, &costs);
+    }
     with_sb(|s| s.refs.insert(twin_id, refs));
     f.verify().map_err(|e| format!("{}: sandbox transform made invalid RIR: {}", f.name, e))?;
     // the masks the transform added: common ones merged, loop-invariant ones hoisted. Only
