@@ -346,6 +346,11 @@ fn get_path(h: HANDLE) -> io::Result<PathBuf> {
 const INTERVALS_PER_SEC: i128 = 10_000_000;
 const INTERVALS_TO_UNIX_EPOCH: i128 = 11_644_473_600 * INTERVALS_PER_SEC;
 
+/// A FILETIME count of a time given in ns since the Unix epoch (a virtual file's stat).
+fn intervals_from_unix_ns(ns: u64) -> u64 {
+    (ns / 100).saturating_add(INTERVALS_TO_UNIX_EPOCH as u64)
+}
+
 fn filetime_u64(ft: &FILETIME) -> u64 {
     (ft.dwLowDateTime as u64) | ((ft.dwHighDateTime as u64) << 32)
 }
@@ -371,7 +376,8 @@ fn intervals_from_system_time(t: SystemTime) -> io::Result<FILETIME> {
 
 pub struct File {
     handle: OwnedHandle,
-    virtual_len: Option<u64>,
+    /// A virtual file's stat (its bytes are a private copy in `handle`).
+    virtual_stat: Option<vfs::Stat>,
 }
 
 fn virtual_file() -> io::Result<File> {
@@ -477,18 +483,22 @@ impl OpenOptions {
                 let disk = vfs::edit_target(&*abs, how).unwrap_or_else(|| Err(vfs::read_only()))?;
                 return self.open_native(&maybe_verbatim(&disk)?);
             }
+            vfs::note(&abs, b'f');
             return match k {
-                vfs::Kind::File(_) => {
+                vfs::Kind::File(stat) => {
                     let data = vfs::read(&*abs)?;
                     let mut file = virtual_file()?;
                     file.write_all(&data)?;
                     file.seek(SeekFrom::Start(0))?;
-                    file.virtual_len = Some(data.len() as u64);
+                    file.virtual_stat = Some(vfs::Stat { len: data.len() as u64, mtime_ns: stat.mtime_ns });
                     Ok(file)
                 }
                 vfs::Kind::Dir => Err(os_error(ERROR_ACCESS_DENIED)),
                 vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             };
+        }
+        if self.read {
+            vfs::note(path.as_ref(), b'f');
         }
         let path = maybe_verbatim(path.as_ref())?;
         self.open_native(&path)
@@ -498,44 +508,32 @@ impl OpenOptions {
         if let Some(mode) = self.access_mode {
             return Ok(mode);
         }
+        // rustc 1.100's order: the creation flags' checks come first, an explicit access mode skips them
         match (self.read, self.write, self.append) {
+            (_, false, false) if self.truncate || self.create || self.create_new => Err(needs_write()),
+            (_, _, true) if self.truncate && !self.create_new => {
+                Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("append and truncate cannot both be enabled")))
+            }
             (true, false, false) => Ok(GENERIC_READ),
             (false, true, false) => Ok(GENERIC_WRITE),
             (true, true, false) => Ok(GENERIC_READ | GENERIC_WRITE),
             (false, _, true) => Ok(FILE_GENERIC_WRITE & !FILE_WRITE_DATA),
             (true, _, true) => Ok(GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_WRITE_DATA)),
             (false, false, false) => {
-                if self.create || self.create_new || self.truncate {
-                    Err(needs_write())
-                } else {
-                    Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("must specify at least one of read, write, or append access")))
-                }
+                Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("must specify at least one of read, write, or append access")))
             }
         }
     }
 
-    fn get_creation_mode(&self) -> io::Result<u32> {
-        match (self.write, self.append) {
-            (true, false) => {}
-            (false, false) => {
-                if self.truncate || self.create || self.create_new {
-                    return Err(needs_write());
-                }
-            }
-            (_, true) => {
-                if self.truncate && !self.create_new {
-                    return Err(needs_write());
-                }
-            }
-        }
-        Ok(match (self.create, self.truncate, self.create_new) {
+    fn get_creation_mode(&self) -> u32 {
+        match (self.create, self.truncate, self.create_new) {
             (false, false, false) => OPEN_EXISTING,
             (true, false, false) => OPEN_ALWAYS,
             (false, true, false) => TRUNCATE_EXISTING,
             // CREATE_ALWAYS replaces attributes / streams: OPEN_ALWAYS + manual truncation (#115745)
             (true, true, false) => OPEN_ALWAYS,
             (_, _, true) => CREATE_NEW,
-        })
+        }
     }
 
     fn get_flags_and_attributes(&self) -> u32 {
@@ -544,13 +542,13 @@ impl OpenOptions {
 
     /// `path` is NUL-terminated.
     fn open_native(&self, path: &[u16]) -> io::Result<File> {
-        let creation = self.get_creation_mode()?;
         let access = self.get_access_mode()?;
+        let creation = self.get_creation_mode();
         let h = unsafe { CreateFileW(path.as_ptr(), access, self.share_mode, core::ptr::null(), creation, self.get_flags_and_attributes(), core::ptr::null_mut()) };
         if h == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
-        let file = File { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) }, virtual_len: None };
+        let file = File { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) }, virtual_stat: None };
         if self.truncate && creation == OPEN_ALWAYS && last_error() == ERROR_ALREADY_EXISTS {
             // FileAllocationInfo first, FileEndOfFileInfo for filesystems without it (WINE)
             let alloc_info = FILE_ALLOCATION_INFO { AllocationSize: 0 };
@@ -623,15 +621,15 @@ impl File {
         self.sync_all()
     }
     pub fn set_len(&self, size: u64) -> io::Result<()> {
-        if self.virtual_len.is_some() {
+        if self.virtual_stat.is_some() {
             return Err(vfs::read_only());
         }
         let info = FILE_END_OF_FILE_INFO { EndOfFile: size as i64 };
         set_info(self.raw(), FileEndOfFileInfo, &info)
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
-        if let Some(len) = self.virtual_len {
-            return Ok(Metadata::virtual_entry(&vfs::Kind::File(len)));
+        if let Some(stat) = self.virtual_stat {
+            return Ok(Metadata::virtual_entry(&vfs::Kind::File(stat)));
         }
         unsafe {
             let mut info: BY_HANDLE_FILE_INFORMATION = core::mem::zeroed();
@@ -664,7 +662,7 @@ impl File {
         Ok(info)
     }
     pub fn try_clone(&self) -> io::Result<File> {
-        Ok(File { handle: self.handle.try_clone()?, virtual_len: self.virtual_len })
+        Ok(File { handle: self.handle.try_clone()?, virtual_stat: self.virtual_stat })
     }
     pub fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         let info = FILE_BASIC_INFO { CreationTime: 0, LastAccessTime: 0, LastWriteTime: 0, ChangeTime: 0, FileAttributes: perm.attrs };
@@ -804,7 +802,7 @@ impl File {
         Ok(read as usize)
     }
     fn write_raw(&self, buf: &[u8], offset: Option<u64>) -> io::Result<usize> {
-        if self.virtual_len.is_some() {
+        if self.virtual_stat.is_some() {
             return Err(vfs::read_only());
         }
         let len = if buf.len() > u32::MAX as usize { u32::MAX } else { buf.len() as u32 };
@@ -939,7 +937,7 @@ impl AsHandle for File {
 }
 impl FromRawHandle for File {
     unsafe fn from_raw_handle(handle: RawHandle) -> File {
-        File { handle: OwnedHandle::from_raw_handle(handle), virtual_len: None }
+        File { handle: OwnedHandle::from_raw_handle(handle), virtual_stat: None }
     }
 }
 impl IntoRawHandle for File {
@@ -954,7 +952,7 @@ impl From<File> for OwnedHandle {
 }
 impl From<OwnedHandle> for File {
     fn from(handle: OwnedHandle) -> File {
-        File { handle, virtual_len: None }
+        File { handle, virtual_stat: None }
     }
 }
 
@@ -1084,17 +1082,17 @@ impl Metadata {
         self.file_index
     }
 
-    /// A virtual entry of a git run (Relax's VFS): a read-only file of its size, or a folder.
+    /// A virtual entry of a git run (Relax's VFS): a read-only file of its size and time, or a folder.
     fn virtual_entry(k: &vfs::Kind) -> Metadata {
-        let (attributes, file_size) = match k {
-            vfs::Kind::File(n) => (FILE_ATTRIBUTE_READONLY, *n),
-            _ => (FILE_ATTRIBUTE_DIRECTORY, 0),
+        let (attributes, file_size, last_write_time) = match k {
+            vfs::Kind::File(s) => (FILE_ATTRIBUTE_READONLY, s.len, intervals_from_unix_ns(s.mtime_ns)),
+            _ => (FILE_ATTRIBUTE_DIRECTORY, 0, 0),
         };
         Metadata {
             attributes,
             creation_time: 0,
             last_access_time: 0,
-            last_write_time: 0,
+            last_write_time,
             change_time: None,
             file_size,
             reparse_tag: 0,
@@ -1422,6 +1420,7 @@ impl Default for DirBuilder {
 
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return vfs::read(&*abs);
     }
     let mut file = File::open(path.as_ref())?;
@@ -1432,6 +1431,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return String::from_utf8(vfs::read(&*abs)?).map_err(|_| io::Error::INVALID_UTF8);
     }
     let mut file = File::open(path.as_ref())?;
@@ -1481,12 +1481,14 @@ fn stat_native(path: &[u16], reparse_flag: u32) -> io::Result<Metadata> {
 }
 
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    if let Some((_, k)) = vfs::kind(path.as_ref()) {
+    if let Some((abs, k)) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'p');
         return match k {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             k => Ok(Metadata::virtual_entry(&k)),
         };
     }
+    vfs::note(path.as_ref(), b'p');
     let p = maybe_verbatim(path.as_ref())?;
     match stat_native(&p, 0) {
         Err(e) => {
@@ -1508,14 +1510,17 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     if vfs::kind(path.as_ref()).is_some() {
         return metadata(path);
     }
+    vfs::note(path.as_ref(), b'p');
     let p = maybe_verbatim(path.as_ref())?;
     stat_native(&p, FILE_FLAG_OPEN_REPARSE_POINT)
 }
 
 pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
-    if let Some((_, k)) = vfs::kind(path.as_ref()) {
+    if let Some((abs, k)) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'p');
         return Ok(!matches!(k, vfs::Kind::Missing));
     }
+    vfs::note(path.as_ref(), b'p');
     let p = maybe_verbatim(path.as_ref())?;
     match open_for_meta(&p, 0) {
         Ok(_) => Ok(true),
@@ -1709,24 +1714,25 @@ fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     let p = path.as_ref();
     if let Some((abs, k)) = vfs::kind(p) {
+        vfs::note(&abs, b'd');
         return match k {
             vfs::Kind::Dir => {
                 let mut virt = Vec::new();
                 for (name, is_dir) in vfs::list(&*abs)? {
                     let name_s = String::from_utf8_lossy(&name).into_owned();
-                    let file_size = if is_dir {
-                        0
+                    let (file_size, last_write_time) = if is_dir {
+                        (0, 0)
                     } else {
                         match vfs::kind(&abs.join(&name_s)) {
-                            Some((_, vfs::Kind::File(n))) => n,
-                            _ => 0,
+                            Some((_, vfs::Kind::File(s))) => (s.len, intervals_from_unix_ns(s.mtime_ns)),
+                            _ => (0, 0),
                         }
                     };
                     virt.push(FindData {
                         attributes: if is_dir { FILE_ATTRIBUTE_DIRECTORY } else { FILE_ATTRIBUTE_READONLY },
                         creation_time: 0,
                         last_access_time: 0,
-                        last_write_time: 0,
+                        last_write_time,
                         file_size,
                         reserved0: 0,
                         name: name_s.encode_utf16().collect(),
@@ -1744,6 +1750,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     if p.as_os_str().is_empty() {
         return Err(os_error(ERROR_PATH_NOT_FOUND));
     }
+    vfs::note(p, b'd');
     let root = p.to_path_buf();
     let star = p.join("*");
     let w = maybe_verbatim(&star)?;

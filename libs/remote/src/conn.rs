@@ -206,8 +206,10 @@ impl State {
 
 impl Conn {
     /// Starts the reader and writer threads over `io`, after the handshake. `initiator`: the
-    /// side that dialled (it allocates odd channel numbers, the other even).
+    /// side that dialled (it allocates odd channel numbers, the other even). A connection with a
+    /// `handler` serves its peer: its threads' CPU counts as served (else as asked).
     pub fn start(io: Io, peer: Hello, initiator: bool, handler: Option<OpenHandler>, hooks: Hooks) -> Conn {
+        let serves = handler.is_some();
         let closed = Arc::new(AtomicBool::new(false));
         let mut reader = io.reader;
         reader.cancel = Some(closed.clone());
@@ -231,12 +233,12 @@ impl Conn {
         let writer = io.writer;
         let _ = std::thread::Builder::new().name("makepad-remote-rx".into()).spawn(move || {
             (c1.0.hooks.enter)();
-            c1.read_loop(reader);
+            c1.read_loop(reader, serves);
             (c1.0.hooks.exit)();
         });
         let _ = std::thread::Builder::new().name("makepad-remote-tx".into()).spawn(move || {
             (c2.0.hooks.enter)();
-            c2.write_loop(writer);
+            c2.write_loop(writer, serves);
             (c2.0.hooks.exit)();
         });
         conn
@@ -299,7 +301,9 @@ impl Conn {
         self.0.work.notify_one();
     }
 
-    /// Says goodbye and closes once everything queued before it is written.
+    /// Says goodbye and closes. The goodbye goes ahead of queued channel data and the peer ends the
+    /// link on reading it, so data still queued may never reach it: to end after its data, close
+    /// the channel ([`ChannelTx::close`]).
     pub fn close(&self, reason: &str) {
         self.0.closing.store(true, Relaxed);
         let mut st = self.0.st.lock().unwrap();
@@ -329,6 +333,12 @@ impl Conn {
     }
 
     pub fn open_timeout(&self, service: &str, args: &str, wait: Duration) -> Result<Channel, (u16, String)> {
+        // OPEN is one control frame (only DATA is chunked). Refuse before
+        // queueing so an oversized call cannot tear down the whole carrier.
+        let bytes = service.len().saturating_add(1).saturating_add(args.len());
+        if bytes > MAX_PAYLOAD {
+            return Err((CLOSE_REFUSED, format!("the encoded call is {bytes} bytes; one call carries {MAX_PAYLOAD}. Send a smaller first part, then append the rest with the service's edit tool.")));
+        }
         if !self.is_usable() {
             return Err((CLOSE_LINK_LOST, self.close_reason()));
         }
@@ -361,8 +371,9 @@ impl Conn {
 
     // ---- reader
 
-    fn read_loop(&self, mut rd: FrameReader) {
+    fn read_loop(&self, mut rd: FrameReader, serves: bool) {
         loop {
+            crate::served::tick(serves);
             let f = match rd.next() {
                 Ok(f) => f,
                 Err(e) => {
@@ -503,11 +514,12 @@ impl Conn {
 
     // ---- writer
 
-    fn write_loop(&self, w: Box<dyn Write + Send>) {
+    fn write_loop(&self, w: Box<dyn Write + Send>, serves: bool) {
         let mut w = BufWriter::with_capacity(64 << 10, w);
         let mut flushed = true;
         let mut idle_since = std::time::Instant::now();
         loop {
+            crate::served::tick(serves);
             let work = {
                 let mut st = self.0.st.lock().unwrap();
                 loop {

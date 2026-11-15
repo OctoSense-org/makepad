@@ -209,6 +209,15 @@ impl Media {
         Media::default()
     }
 
+    /// The backend draws with another device: every player makes its texture cache on it.
+    pub fn device_replaced(&mut self, device: ObjcId) {
+        for sm in self.sessions.values_mut() {
+            for player in sm.players.values_mut() {
+                player.device_replaced(device);
+            }
+        }
+    }
+
     /// Executes a media command. False when the command is not one of this module's.
     pub fn command(&mut self, sink: &mut dyn Sink, s: &mut Session, c: &HalCmd) -> bool {
         match *c {
@@ -247,7 +256,7 @@ impl Media {
                 let entry = audio::Entry::from_cmd(entry, ctx);
                 // waits for a block of the old entry that is running: when this returns the old
                 // entry is not called any more
-                *lock(&slot) = entry;
+                slot.replace(entry);
                 true
             }
             HalCmd::Midi { op, port, data, ports } => {
@@ -618,7 +627,7 @@ impl Media {
             if let Some(audio) = sm.audio.take() {
                 let access = lock(&audio);
                 for slot in access.input_cb.iter().chain(access.output_cb.iter()) {
-                    *lock(slot) = None;
+                    slot.replace(None);
                 }
             }
         }

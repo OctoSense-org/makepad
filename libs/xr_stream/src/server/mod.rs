@@ -30,9 +30,10 @@ mod sink;
 pub use pipeline::picture_size;
 pub use sink::DrawXrBand;
 pub(crate) use sink::script_mod;
-use crate::settings_types::{HeadsetSettings, StreamAa, StreamView, MIN_RENDER_SCALE_PCT, STREAM_AA_MODES};
+use crate::settings_types::{HeadsetSettings, StreamAa, StreamView, STREAM_AA_MODES};
 
 use makepad_desk_link::xr::WorldBrick;
+use makepad_desk_link::xr_capture::{CaptureAsk, CaptureRecord};
 use makepad_desk_link::xr_pair::ServerPairing;
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::pass_load::{PassClass, PassLoadSample};
@@ -42,6 +43,24 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
+/// The lowest eye render scale (percent of the encoded eye size): the floor of
+/// [`XrServer::set_render_scale`] and of Auto's ladder.
+pub(crate) const MIN_RENDER_SCALE_PCT: u32 = 70;
+/// The headset's capture records (`XrServer::set_capture`) with the link's session id, on the
+/// session's thread. They hold the wearer's camera pictures: the sink keeps them for its app.
+pub type CaptureSink = Arc<dyn Fn(u64, CaptureRecord) + Send + Sync>;
+
+/// What the headset's microphone says to the app that asked (`XrServer::set_mic`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum MicEvent {
+    /// The microphone's state (`desk_link::xr::mic_state`) with why, when it failed.
+    State { state: u8, text: String },
+    /// The next sound: mono 16 kHz samples.
+    Pcm(Vec<i16>),
+}
+
+/// The headset's microphone events with the link's session id, on the link's thread.
+pub type MicSink = Arc<dyn Fn(u64, MicEvent) + Send + Sync>;
 
 /// The pictures are NV12 textures, one per tile, the pack rendering into their planes (the
 /// encoder takes each as it lies): D3D11. Elsewhere one packed picture (BGRA8 texels holding
@@ -62,6 +81,8 @@ pub const REFRESH_RATES: [u32; 4] = [72, 80, 90, 120];
 pub struct ServerStats {
     pub window: u64,
     pub fps: u32,
+    /// The headset's poses that came, and the frames the app built for them (per s).
+    pub poses_per_s: f64,
     pub built_per_s: f64,
     pub sent_mbps: f64,
     /// The rate controller's rate and the app's cap (Mbit/s).
@@ -69,6 +90,9 @@ pub struct ServerStats {
     pub cap_mbps: f64,
     /// Pose to picture built, the GPU's part (render + pack), the encode (ms).
     pub render_ms: f64,
+    /// Of the render: the pose waiting for the app to ask for it (it came while the app still
+    /// built the frame before; ms).
+    pub app_wait_ms: f64,
     pub gpu_ms: f64,
     pub encode_ms: f64,
     /// The encoded picture to written to the socket (ms).
@@ -78,17 +102,25 @@ pub struct ServerStats {
     pub trip_base_ms: f64,
     /// The app waited for the headset (too many pictures in flight), per second.
     pub waited_per_s: f64,
+    /// Pictures a frame or more later than the median, per second: on the host (its pose's
+    /// arrival to written to the socket) and on the link (its round trip over the idle link's).
+    pub host_late_per_s: f64,
+    pub link_late_per_s: f64,
 }
 
 /// The app's load while a headset streams, per second over the last few seconds: the GPU time
 /// of its passes by what they draw for (the headset's eyes, the desktop's windows, passes under
-/// no window such as the stream's picture pack) and its draws' CPU time.
+/// no window such as the stream's picture pack), its draws' CPU time, and its UI thread's whole
+/// time outside the idle wait with the frame builds and submits in it.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct HostLoad {
     pub eyes_gpu_ms_s: f64,
     pub desktop_gpu_ms_s: f64,
     pub other_gpu_ms_s: f64,
     pub draw_ms_s: f64,
+    pub busy_ms_s: f64,
+    pub build_ms_s: f64,
+    pub submit_ms_s: f64,
     /// The backend reported the passes' GPU times (some backends report none).
     pub timed: bool,
 }
@@ -99,12 +131,16 @@ pub(crate) const HOST_LOAD_SECONDS: usize = 5;
 impl HostLoad {
     fn of<'a>(samples: impl Iterator<Item = &'a PassLoadSample>) -> Option<HostLoad> {
         let (mut secs, mut gpu, mut draw, mut timed, mut passes) = (0.0, [0.0f64; 3], 0.0, 0u32, 0u32);
+        let (mut busy, mut build, mut submit) = (0.0, 0.0, 0.0);
         for s in samples {
             secs += s.secs;
             for i in 0..3 {
                 gpu[i] += s.gpu_ms[i];
             }
             draw += s.draw_ms;
+            busy += s.busy_ms;
+            build += s.build_ms;
+            submit += s.submit_ms;
             passes += s.passes.iter().sum::<u32>();
             timed += s.passes.iter().sum::<u32>().saturating_sub(s.untimed);
         }
@@ -113,6 +149,9 @@ impl HostLoad {
             desktop_gpu_ms_s: gpu[PassClass::Desktop as usize] / secs,
             other_gpu_ms_s: gpu[PassClass::Offscreen as usize] / secs,
             draw_ms_s: draw / secs,
+            busy_ms_s: busy / secs,
+            build_ms_s: build / secs,
+            submit_ms_s: submit / secs,
             timed: passes > 0 && timed * 2 >= passes,
         })
     }
@@ -137,11 +176,12 @@ pub(crate) struct ServerShared {
     pub(crate) room_field_wanted: AtomicBool,
     /// The user's power switches: the stream runs (pictures and sound to the headset), the room
     /// scan is allowed (the headset scans only when this and the app's want are both on); the
-    /// left menu button turns the stream on and off (the app may take the button over).
+    /// left menu button's press turns the stream on and off and its hold is the app's (the app
+    /// may take the button over).
     pub(crate) streaming: AtomicBool,
     pub(crate) room_scan: AtomicBool,
     pub(crate) menu_toggles: AtomicBool,
-    pub(crate) menu_down: AtomicBool,
+    pub(crate) menu: Mutex<pipeline::MenuPress>,
     /// The headset shows the room through the picture (mixed reality) or not (VR): the app's
     /// ask (`Cx::xr_set_see_through`) under the user's view.
     pub(crate) see_through: AtomicBool,
@@ -173,6 +213,17 @@ pub(crate) struct ServerShared {
     pub(crate) haptics: Mutex<Vec<makepad_widgets::makepad_platform::event::xr::XrHapticPulse>>,
     /// The linked headset plays haptics (`codecs::HAPTICS` in its hello).
     pub(crate) haptics_ok: AtomicBool,
+    /// The app's ask of the headset's cameras with the session it is for (None: off), whether
+    /// the linked headset captures (`codecs::CAPTURE` in its hello), and where its records go.
+    pub(crate) capture_ask: Mutex<Option<(u64, CaptureAsk)>>,
+    pub(crate) capture_ok: AtomicBool,
+    pub(crate) capture_sink: Mutex<Option<CaptureSink>>,
+    /// The app's ask of the headset's microphone: the link's session id and whether it still asks
+    /// (false: asked to stop, and the link's last sound and its off are still taken). Whether the
+    /// linked headset has one (`codecs::MIC` in its hello), and where its sound goes.
+    pub(crate) mic_ask: Mutex<Option<(u64, bool)>>,
+    pub(crate) mic_ok: AtomicBool,
+    pub(crate) mic_sink: Mutex<Option<MicSink>>,
     pub(crate) pairing: Mutex<Option<Arc<Mutex<ServerPairing>>>>,
     pub(crate) live_headset: Mutex<Option<LiveHeadset>>,
     pub(crate) server_line: Mutex<String>,
@@ -181,13 +232,15 @@ pub(crate) struct ServerShared {
     /// (`Cx::take_pass_load`, taken by the frame sink).
     pub(crate) host_load: Mutex<VecDeque<PassLoadSample>>,
     pub(crate) app_line: Mutex<String>,
-    /// Told when there is room again (a picture slot freed, or the headset decoded one), the
-    /// stream switched, or a session ended: the sink's signal.
+    /// The sink's signal: raised for the app's side when it has news the app may poll for (the
+    /// stream switched, a session began or ended, the poses stopped, a pose for an external
+    /// renderer), and for the sink's hook alone when there is room again (a picture encoded or
+    /// let go, the headset decoded one).
     pub(crate) wake: Mutex<Option<SignalToUI>>,
 }
 
 impl ServerShared {
-    fn new(log: Log) -> ServerShared {
+    pub(crate) fn new(log: Log) -> ServerShared {
         ServerShared {
             log,
             live: Mutex::new(None),
@@ -195,7 +248,7 @@ impl ServerShared {
             streaming: AtomicBool::new(true),
             room_scan: AtomicBool::new(true),
             menu_toggles: AtomicBool::new(true),
-            menu_down: AtomicBool::new(false),
+            menu: Mutex::new(pipeline::MenuPress::default()),
             see_through: AtomicBool::new(true),
             app_see_through: AtomicBool::new(true),
             view: AtomicU8::new(0),
@@ -213,6 +266,12 @@ impl ServerShared {
             headset_settings: Mutex::new(HeadsetSettings::DEFAULT),
             haptics: Mutex::new(Vec::new()),
             haptics_ok: AtomicBool::new(false),
+            capture_ask: Mutex::new(None),
+            capture_ok: AtomicBool::new(false),
+            capture_sink: Mutex::new(None),
+            mic_ask: Mutex::new(None),
+            mic_ok: AtomicBool::new(false),
+            mic_sink: Mutex::new(None),
             pairing: Mutex::new(None),
             live_headset: Mutex::new(None),
             server_line: Mutex::new(String::new()),
@@ -223,10 +282,87 @@ impl ServerShared {
         }
     }
 
+    /// News the app's side may poll for: an `Event::Signal`, which the sink hears first.
     pub(crate) fn wake(&self) {
         if let Some(s) = self.wake.lock().unwrap().as_ref() {
             s.set();
         }
+    }
+
+    /// Room again for the sink, a few times each frame: its signal hook runs on the next beat,
+    /// and no widget hears an `Event::Signal`.
+    pub(crate) fn wake_sink(&self) {
+        if let Some(s) = self.wake.lock().unwrap().as_ref() {
+            s.set_for_hooks();
+        }
+    }
+
+    /// The app's ask of the cameras of the link of `session` (another link's: none).
+    pub(crate) fn capture_ask_for(&self, session: u64) -> Option<CaptureAsk> {
+        self.capture_ask.lock().unwrap().filter(|(s, _)| *s == session).map(|(_, a)| a)
+    }
+
+    /// A capture record from the link of `session`: to the sink while the app asks that link,
+    /// else dropped (a record the app did not ask for, or one still on its way after the off).
+    pub(crate) fn capture_record(&self, session: u64, record: CaptureRecord) {
+        if self.capture_ask_for(session).is_none() {
+            return;
+        }
+        let sink = self.capture_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink(session, record);
+        }
+    }
+
+    /// Whether the app asks the microphone of the link of `session` now.
+    pub(crate) fn mic_asked(&self, session: u64) -> bool {
+        matches!(*self.mic_ask.lock().unwrap(), Some((s, true)) if s == session)
+    }
+
+    /// The microphone's word from the link of `session`: to the sink while the app asks that link
+    /// or has just asked it to stop (its last sound and its off are still on their way), else
+    /// dropped. The off ends the stop.
+    pub(crate) fn mic_event(&self, session: u64, event: MicEvent) {
+        {
+            let mut ask = self.mic_ask.lock().unwrap();
+            match *ask {
+                Some((s, _)) if s == session => {
+                    if matches!(event, MicEvent::State { state: makepad_desk_link::xr::mic_state::OFF, .. }) && !matches!(*ask, Some((_, true))) {
+                        *ask = None;
+                    }
+                }
+                _ => return,
+            }
+        }
+        let sink = self.mic_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink(session, event);
+        }
+    }
+
+    /// The link of `session` ended: an app that was asking its microphone is told it is gone.
+    pub(crate) fn mic_link_ended(&self, session: u64) {
+        let was = {
+            let mut ask = self.mic_ask.lock().unwrap();
+            match *ask {
+                Some((s, _)) if s == session => ask.take().is_some(),
+                _ => false,
+            }
+        };
+        if was {
+            let sink = self.mic_sink.lock().unwrap().clone();
+            if let Some(sink) = sink {
+                sink(session, MicEvent::State { state: makepad_desk_link::xr::mic_state::FAILED, text: "the headset's link ended".into() });
+            }
+        }
+    }
+
+    /// The headset's tracking space was set up again (a session began, its wearer recentered):
+    /// the app's XR window learns it ahead of the poses in it (`XrState::space`), so what it
+    /// placed in front of the head can be placed again.
+    pub(crate) fn new_space(&self, why: &str) {
+        (self.log)(&format!("xr host: a new tracking space: {why}"));
+        makepad_widgets::makepad_platform::makepad_hal::xr_remote::hal_xr_remote_space_reset();
     }
 
     pub(crate) fn set_streaming(&self, on: bool) {
@@ -308,6 +444,13 @@ impl ServerShared {
                 l.flow.encoded_tiles.fetch_add(l.tiles as u64, Ordering::AcqRel);
                 false
             }
+        }
+    }
+
+    /// A pose came for the app's next frame (the stats' poses per second).
+    pub(crate) fn note_pose(&self) {
+        if let Some(l) = self.live.lock().unwrap().as_ref() {
+            l.flow.poses.fetch_add(1, Ordering::AcqRel);
         }
     }
 
@@ -464,8 +607,9 @@ impl XrServer {
         self.shared.streaming_changes.load(Ordering::Acquire)
     }
 
-    /// Whether the left controller's menu button turns the stream on and off (default on;
-    /// off: the app gets the button).
+    /// Whether the left controller's menu button is the stream's (default on): a short press
+    /// turns the stream on and off, a hold reaches the app as `XrController::HOLD_MENU`. Off:
+    /// the app gets the button.
     pub fn set_menu_toggles_streaming(&self, on: bool) {
         self.shared.menu_toggles.store(on, Ordering::Release);
     }
@@ -474,6 +618,47 @@ impl XrServer {
     /// field and this is on).
     pub fn set_room_scan(&self, on: bool) {
         self.shared.room_scan.store(on, Ordering::Release);
+    }
+
+    /// Ask the headset of the link `session` ([`LiveHeadset::session`]) to capture its cameras,
+    /// or stop (None). Only that link captures: another (the headset linking again, another
+    /// headset) captures nothing until the app asks for its own session. Its records go to the
+    /// sink ([`XrServer::set_capture_sink`]); records of a link not asked are dropped.
+    pub fn set_capture(&self, ask: Option<(u64, CaptureAsk)>) {
+        *self.shared.capture_ask.lock().unwrap() = ask;
+    }
+
+    /// Where the capture records go (None: dropped as they arrive).
+    pub fn set_capture_sink(&self, sink: Option<CaptureSink>) {
+        *self.shared.capture_sink.lock().unwrap() = sink;
+    }
+
+    /// Ask the headset of the link `session` ([`LiveHeadset::session`]) for its microphone, or
+    /// stop (false). Only that link is asked. Its sound and states go to the sink
+    /// ([`XrServer::set_mic_sink`]), also the last of them after the stop, up to the headset's
+    /// off; a link that ends meanwhile says so there.
+    pub fn set_mic(&self, session: u64, on: bool) {
+        let mut ask = self.shared.mic_ask.lock().unwrap();
+        *ask = match (on, *ask) {
+            (true, _) => Some((session, true)),
+            (false, Some((s, _))) if s == session => Some((s, false)),
+            (false, other) => other,
+        };
+    }
+
+    /// Where the microphone's sound and states go (None: dropped as they arrive).
+    pub fn set_mic_sink(&self, sink: Option<MicSink>) {
+        *self.shared.mic_sink.lock().unwrap() = sink;
+    }
+
+    /// The linked headset has a microphone to give (None linked: false).
+    pub fn mic_available(&self) -> bool {
+        self.shared.mic_ok.load(Ordering::Acquire)
+    }
+
+    /// The linked headset can capture its cameras (None linked: false).
+    pub fn capture_available(&self) -> bool {
+        self.shared.capture_ok.load(Ordering::Acquire)
     }
 
     /// The display rate a streaming headset runs at (Hz, one of [`REFRESH_RATES`]; 0: its
@@ -601,5 +786,75 @@ impl XrServer {
     /// the values), oldest first.
     pub fn headset_reports(&self) -> Vec<Vec<f32>> {
         self.shared.reports.lock().unwrap().iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_link_without_a_session_id_fails() {
+        // the random source failing fails the link (never session 0 for every link)
+        let failed = session::session_id(|_| Err(std::io::Error::other("no entropy")));
+        assert!(failed.unwrap_err().contains("no entropy"));
+        let drawn = session::session_id(|b| {
+            b.copy_from_slice(&7u64.to_le_bytes());
+            Ok(())
+        });
+        assert_eq!(drawn, Ok(7));
+    }
+
+    #[test]
+    fn mic_goes_only_to_the_asked_link_until_its_off() {
+        use makepad_desk_link::xr::mic_state;
+        let shared = ServerShared::new(Arc::new(|_: &str| {}));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink_got = got.clone();
+        *shared.mic_sink.lock().unwrap() = Some(Arc::new(move |session: u64, e: MicEvent| sink_got.lock().unwrap().push((session, e))));
+        let pcm = || MicEvent::Pcm(vec![1, 2]);
+        let off = || MicEvent::State { state: mic_state::OFF, text: String::new() };
+        // nothing asked: dropped
+        shared.mic_event(7, pcm());
+        // asked for link 7: its sound goes, another link's does not
+        *shared.mic_ask.lock().unwrap() = Some((7, true));
+        assert!(shared.mic_asked(7) && !shared.mic_asked(8));
+        shared.mic_event(7, pcm());
+        shared.mic_event(8, pcm());
+        // asked to stop: the last sound and the off still go, then the gate is shut
+        *shared.mic_ask.lock().unwrap() = Some((7, false));
+        assert!(!shared.mic_asked(7));
+        shared.mic_event(7, pcm());
+        shared.mic_event(7, off());
+        shared.mic_event(7, pcm());
+        assert_eq!(*got.lock().unwrap(), vec![(7, pcm()), (7, pcm()), (7, off())]);
+        // a link that ends while asked says so, once
+        *shared.mic_ask.lock().unwrap() = Some((9, true));
+        shared.mic_link_ended(9);
+        shared.mic_link_ended(9);
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 4);
+        assert!(matches!(&got[3], (9, MicEvent::State { state: mic_state::FAILED, .. })));
+    }
+
+    #[test]
+    fn capture_goes_only_to_the_asked_link() {
+        let shared = ServerShared::new(Arc::new(|_: &str| {}));
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink_got = got.clone();
+        *shared.capture_sink.lock().unwrap() = Some(Arc::new(move |session: u64, _: CaptureRecord| sink_got.lock().unwrap().push(session)));
+        let status = || CaptureRecord::Status { state: 2, text: String::new() };
+        let ask = CaptureAsk { step_deg: 5.0, step_m: 0.02, preview_hz: 0 };
+        // nothing asked: records are dropped
+        shared.capture_record(7, status());
+        // asked for link 7: its records go, another link's are dropped, and it is asked nothing
+        *shared.capture_ask.lock().unwrap() = Some((7, ask));
+        assert_eq!((shared.capture_ask_for(7), shared.capture_ask_for(8)), (Some(ask), None));
+        shared.capture_record(7, status());
+        shared.capture_record(8, status());
+        // off: what is still on its way is dropped
+        *shared.capture_ask.lock().unwrap() = None;
+        shared.capture_record(7, status());
+        assert_eq!(*got.lock().unwrap(), vec![7]);
     }
 }

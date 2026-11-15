@@ -26,17 +26,30 @@ impl Tcx {
     pub fn instantiate_ty(&self, prog: &Program, def: DefId, args: &[GenericArg], ty: TyId) -> TyId {
         crate::types::fold::EarlyBinder::bind(&self.tys, ty).instantiate(&self.tys, &self.generic_indices_of(prog, def), args)
     }
+    /// rustc `fn_sig(def).instantiate(tcx, args)`: each type of the signature is instantiated inside the
+    /// signature's binder (depth 1, as when its fn pointer type is folded), and no fn pointer type is
+    /// interned for a signature that is only read.
+    pub fn instantiate_sig_tys(&self, prog: &Program, def: DefId, args: &[GenericArg], params: &[TyId], ret: TyId) -> (Vec<TyId>, TyId) {
+        use crate::types::fold::TypeFolder;
+        let mut f = ArgFolder { indices: self.generic_indices_of(prog, def), args };
+        let mut inst = |t| {
+            let t = self.tys.set_aliases_to_non_rigid(t);
+            if args.is_empty() { assert!(!self.tys.flags(t).contains(crate::types::TypeFlags::HAS_TY_PARAM)); return t; }
+            f.fold_ty(&self.tys, t, 1)
+        };
+        (params.iter().map(|&t| inst(t)).collect(), inst(ret))
+    }
     pub fn instantiate_predicate(&self, prog: &Program, def: DefId, args: &[GenericArg], p: &Predicate) -> Predicate {
         fold::fold_predicate(&self.tys, p, &mut ArgFolder { indices: &self.generic_indices_of(prog, def), args })
     }
     pub(crate) fn identity_impl_trait_ref(&self, prog: &Program, imp: DefId) -> &TraitRef {
-        self.declaration_queries(prog, imp).impl_trait_ref.get_or_init(|| {
+        self.declaration_queries(prog, imp).impl_trait_ref.get_or_init(|| crate::body_facts::item_text(prog, imp, crate::body_facts::ItemCell::Declaration, || {
             let def_id = self.impl_trait[&imp];
             let mut compact = vec![self.impl_self[&imp]];
             compact.extend_from_slice(self.impl_trait_args.get(&imp).map_or(&[], |a| a.as_slice()));
             let regions = self.impl_trait_regions.get(&imp).copied().unwrap_or(RegionArgsId::EMPTY);
             TraitRef { def_id, args: self.complete_args(prog, def_id, &compact, regions) }
-        })
+        }))
     }
     pub fn impl_trait_ref(&self, prog: &Program, imp: DefId, args: &[GenericArg]) -> TraitRef {
         let identity = self.identity_impl_trait_ref(prog, imp);
@@ -46,7 +59,9 @@ impl Tcx {
     }
 
     /// rustc_hir_analysis/src/collect/item_bounds.rs:526: elaborate in the impl's
-    /// identity binder once, then instantiate for each candidate.
+    /// identity binder once, then instantiate for each candidate. (Not item text of its own: it
+    /// is read from the impl's trait reference and the trait's supertraits, cells that read their
+    /// text, body_facts.rs item_text.)
     pub fn impl_super_outlives(&self, prog: &Program, imp: DefId) -> &[Predicate] {
         self.declaration_queries(prog, imp).impl_super_outlives.get_or_init(|| {
             let identity = self.identity_impl_trait_ref(prog, imp);

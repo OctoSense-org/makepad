@@ -323,9 +323,9 @@ pub struct DrawSceneSkinned {
     pub prelit: f32,
     /// x = 1: the base-colour texture's glTF sampler asks for NEAREST
     /// magnification, so a texel larger than a pixel draws as a hard square
-    /// (the classic games' look); minified texels stay filtered. y unused
-    /// (keeps the payload a multiple of eight bytes). Set per draw from the
-    /// layer's material; 0 everywhere else draws exactly as before.
+    /// (the classic games' look); minified texels stay filtered.
+    /// x = 3: MSDF text; x = 4: MSDF text with per-copy plate digits.
+    /// Set per draw from the layer's material; 0 draws exactly as before.
     /// y = the PBR lane's shading terms (`makepadShading`), packed as
     /// rim * 255 * 65536 + clearcoat * 255 * 256 + flake * 255 (0 = plain;
     /// `MaterialSurface::packed_shading`).
@@ -1287,6 +1287,28 @@ mod shader_registration_tests {
     use super::*;
     use makepad_draw::makepad_platform::makepad_script::script_eval;
 
+    #[test]
+    fn splat_relief_marches_only_inside_its_uniform_gate() {
+        let source = include_str!("shaders/splat.rs");
+        let gate = "if self.splat_relief_on > 0.5 {";
+        let start = source.find(gate).expect("draw-wide relief gate") + gate.len();
+        let mut depth = 1;
+        let end = source[start..].char_indices().find_map(|(i, c)| {
+            if c == '{' { depth += 1; }
+            if c == '}' { depth -= 1; }
+            (depth == 0).then_some(start + i)
+        }).expect("closed relief gate");
+        let gated = &source[start..end];
+        for call in ["self.splat_relief_trace(", "self.splat_relief_shadow("] {
+            assert_eq!(source.matches(call).count(), 1, "one {call} call site");
+            assert_eq!(gated.matches(call).count(), 1, "{call} must be inside the gate");
+        }
+        assert!(gated.contains("surface_param.x > 0.0 && dist < 20.0"), "visible layer and distance gate");
+        assert!(gated.contains("if dist < 8.0"), "self shadow is near-only");
+        assert!(source.contains("for i in 0..24") && source.contains("for i in 0..4"), "constant march bounds");
+        assert!(source.contains("smoothstep(12.0, 20.0, dist)") && source.contains("smoothstep(0.1391731, 0.2756374, nv)"), "distance and grazing fades");
+    }
+
     /// The hard budget the scene lanes sit against, pinned so that adding
     /// one `#[live]` field cannot silently cross it again.
     ///
@@ -1520,6 +1542,7 @@ mod shader_registration_tests {
             // here it is registered explicitly (builtin's mat_ibl_* are in
             // by custom_material::register).
             crate::renderer::ibl::script_mod(vm);
+            crate::trample::script_mod(vm);
 
             // These shaders write numeric payloads (including negatives and
             // triangle ids), not display colors. A successful shader compile
@@ -1607,6 +1630,18 @@ mod shader_registration_tests {
                 let source=vm.heap().string_with(result,|_heap,value|value.to_string()).unwrap();
                 assert!(!source.starts_with("ERRORS:"),"{name}: {source}");
                 assert!(source.contains("gi_"),"{name}: missing GI code");
+            }
+            // The trampled-grass field's passes (crate::trample) on every backend.
+            for (name,result) in [
+                ("trample feedback GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawTrampleFeedback,"glsl",false)})),
+                ("trample feedback HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawTrampleFeedback,"hlsl",false)})),
+                ("trample feedback Metal",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawTrampleFeedback,"metal",false)})),
+                ("trample stamp GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawTrampleStamp,"glsl",false)})),
+                ("trample stamp HLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawTrampleStamp,"hlsl",false)})),
+                ("trample stamp Metal",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawTrampleStamp,"metal",false)})),
+            ] {
+                let source=vm.heap().string_with(result,|_heap,value|value.to_string()).unwrap();
+                assert!(!source.starts_with("ERRORS:"),"{name}: {source}");
             }
             for (name,result) in [
                 ("sun depth GLSL",script_eval!(vm,{mod.shader.test_compile_draw_source(mod.draw.DrawLmSunDepth,"glsl",false)})),

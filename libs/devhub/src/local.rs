@@ -1,8 +1,8 @@
 //! This machine's JITs. A JIT announces itself with its discovery file (written when it starts,
 //! removed when it exits: `makepad_remote::discovery`); the hub rescans the registry every
 //! [`SCAN`] and follows each JIT's `observe` feed over its local Unix socket. `observe` is the
-//! JIT's event ring WITHOUT counting as a watcher, so a hub never makes panics park or arms the
-//! costly detectors: the program runs as if nobody were looking.
+//! JIT's event ring WITHOUT counting as a watcher, so a hub never arms the costly detectors.
+//! A parked panic waits for devhub to decide, just as it waits for a watcher.
 //!
 //! A JIT that goes away is reported: its discovery file still there with the process gone means
 //! it never ran its exit cleanup (a crash, with the tail of its session log as detail); the file
@@ -74,6 +74,8 @@ pub struct Detail {
     pub panics: u32,
     /// edits that wait for a restart (`session pending`)
     pub restart_pending: u32,
+    /// the oldest of them, as the JIT says it (`pending`; a JIT before it names none)
+    pub restart_first: String,
 }
 
 struct State {
@@ -86,6 +88,8 @@ struct State {
     /// JITs seen gone with their discovery file still there (a lister removes stale files, so
     /// the scan records it before it lists)
     crashed: std::collections::HashSet<u32>,
+    /// pid -> a second name of its session log, made at its first panic ([`kept_name`])
+    kept: BTreeMap<u32, std::path::PathBuf>,
 }
 
 pub struct Local {
@@ -102,6 +106,22 @@ pub struct Local {
     ai_hub: Mutex<Option<String>>,
     stop: AtomicBool,
     hot_ready: AtomicBool,
+    /// Run on each scan tick until each says it is done ([`Local::on_scan`]).
+    scan_tasks: Mutex<Vec<ScanTask>>,
+}
+
+/// Work the scan does on its tick until it says it is done.
+pub type ScanTask = Box<dyn FnMut() -> bool + Send>;
+
+/// Each of `tasks` once, outside the lock: a task that asks for another ([`Local::on_scan`]) adds
+/// it for the next tick instead of waiting on the lock it runs under, and `on_scan` never waits
+/// on a task's tick.
+fn run_scan_tasks(tasks: &Mutex<Vec<ScanTask>>) {
+    let mut ran = std::mem::take(&mut *tasks.lock().unwrap());
+    ran.retain_mut(|task| !task());
+    let mut held = tasks.lock().unwrap();
+    ran.append(&mut held);
+    *held = ran;
 }
 
 fn registry_file(pid: u32) -> PathBuf {
@@ -117,10 +137,11 @@ impl Local {
             hitch_ms,
             started_ms: proto::wall_ms(),
             publish,
-            state: Mutex::new(State { jits: BTreeMap::new(), jit_state: BTreeMap::new(), recent: BTreeMap::new(), cpu: CpuMeter::default(), crashed: Default::default() }),
+            state: Mutex::new(State { jits: BTreeMap::new(), jit_state: BTreeMap::new(), recent: BTreeMap::new(), cpu: CpuMeter::default(), crashed: Default::default(), kept: BTreeMap::new() }),
             ai_hub: Mutex::new(ai_hub_endpoint().map(|_| AiHub { why: "health probe pending".into(), ..AiHub::default() }.to_json())),
             stop: AtomicBool::new(false),
             hot_ready: AtomicBool::new(false),
+            scan_tasks: Mutex::new(Vec::new()),
         });
         let l = local.clone();
         let _ = std::thread::Builder::new().name("devhub-scan".into()).spawn(move || l.scan_loop());
@@ -130,6 +151,12 @@ impl Local {
     }
 
     pub fn ready(&self) { self.hot_ready.store(true, Ordering::Release); }
+
+    /// `task` on each tick of the scan ([`SCAN`]) until it says it is done: the hub's own tick, no
+    /// thread or sleep of its own (the node's LAN listener waiting for the machine's address).
+    pub fn on_scan(&self, task: ScanTask) {
+        self.scan_tasks.lock().unwrap().push(task);
+    }
 
     /// Publishes a JIT's record and keeps it in that JIT's recent list (the explorer's events).
     fn emit(&self, r: Record) {
@@ -175,6 +202,29 @@ impl Local {
         self.state.lock().unwrap().jits.values().cloned().collect()
     }
 
+    /// The session log `pid` panicked with, kept past its end ([`kept_name`]), while it is there.
+    pub fn kept_log(&self, pid: u32) -> Option<std::path::PathBuf> {
+        self.state.lock().unwrap().kept.get(&pid).filter(|p| p.exists()).cloned()
+    }
+
+    /// At `jit`'s first panic: a second name for its session log, which its clean exit does not
+    /// remove. The panic's record names the pid, and its log is what says what led to it: a job
+    /// whose test went on past a panic ended with the log gone (J13633, 11-13). It sits beside the
+    /// log, in the JIT's temp dir: a lease's goes with the lease.
+    fn keep_log(&self, jit: &Jit) {
+        let Some(log) = jit.session_log.as_deref().filter(|p| !p.is_empty()).map(std::path::Path::new) else { return };
+        if self.state.lock().unwrap().kept.contains_key(&jit.pid) {
+            return;
+        }
+        let kept = kept_name(log);
+        match std::fs::hard_link(log, &kept) {
+            Ok(()) => {
+                self.state.lock().unwrap().kept.insert(jit.pid, kept);
+            }
+            Err(e) => eprintln!("devhub: {}#{}: its session log {} is not kept: {e}", jit.app, jit.pid, log.display()),
+        }
+    }
+
     /// The AI hub's health, on its own thread: three fleet TLS requests never stall the JIT scan.
     fn ai_probe_loop(self: Arc<Self>) {
         let mut watch = AiHubWatch::default();
@@ -201,6 +251,7 @@ impl Local {
         // it is listed only when it changed (a JIT starting or ending adds or removes its file)
         let (mut seen_mtime, mut last_read) = (None, Instant::now());
         while !self.stop.load(Ordering::Acquire) {
+            run_scan_tasks(&self.scan_tasks);
             if self.hot_ready.load(Ordering::Acquire) {
                 if !hot_replayed {
                     match crate::hot::replay_failures(&|r| self.emit(r)) {
@@ -303,6 +354,9 @@ impl Local {
                     Ok(Some((_, line))) => {
                         let line = String::from_utf8_lossy(&line);
                         if let Some(r) = proto::from_jit_event(&self.machine, &jit.app, jit.pid, &line, self.hitch_ms) {
+                            if r.kind == "panic" {
+                                self.keep_log(&jit);
+                            }
                             self.emit(r);
                         }
                     }
@@ -400,9 +454,11 @@ impl Local {
                 .unwrap_or_default();
             let opt = |v: Option<f64>| v.map_or("null".to_string(), |x| format!("{x:.1}"));
             out.push(format!(
-                "{{\"pid\":{},\"app\":{},\"up_s\":{},\"cpu_pct\":{},\"rss_mb\":{},\"threads\":{},\"jit\":{},\"observe\":{},\"run\":{},\"state\":{},\"session\":{},\"fps\":{},\"warm\":{},\"code_mb\":{},\"panics\":{},\"restart_pending\":{},\"exe_replaced\":{},\"recent\":[{}]}}",
+                "{{\"pid\":{},\"app\":{},\"lease\":{},\"up_s\":{},\"cpu_pct\":{},\"rss_mb\":{},\"threads\":{},\"jit\":{},\"observe\":{},\"run\":{},\"state\":{},\"session\":{},\"fps\":{},\"warm\":{},\"code_mb\":{},\"panics\":{},\"restart_pending\":{},\"restart_first\":{},\"exe_replaced\":{},\"recent\":[{}]}}",
                 j.pid,
                 json_str(&j.app),
+                // the lease that started it ("": none, a person's app or the node's own: `devhub inspect` leaves it alone)
+                json_str(j.lease.as_deref().unwrap_or("")),
                 now.saturating_sub(j.started_ms) / 1000,
                 pct.map_or("null".to_string(), |p| format!("{p:.1}")),
                 p.rss_bytes >> 20,
@@ -417,6 +473,7 @@ impl Local {
                 opt(d.code_mb),
                 d.panics,
                 d.restart_pending,
+                json_str(&d.restart_first),
                 exe_replaced(j.pid),
                 recent.join(",")
             ));
@@ -444,7 +501,9 @@ impl Local {
         d.fps = jit.iter().find_map(|l| l.strip_prefix("frames: ")).and_then(|r| r.split_whitespace().next()).and_then(|f| f.parse().ok());
         d.code_mb = ask("code n=0").iter().find_map(|l| l.strip_prefix("code installed ")).and_then(|r| r.split_whitespace().next()).and_then(|m| m.parse().ok());
         d.panics = ask("panics").iter().filter(|l| l.starts_with('{') && !l.starts_with("{\"err\"")).count() as u32;
-        d.restart_pending = ask("session").iter().find_map(|l| makepad_strict_json::parse(l.as_bytes()).ok()?.get("restart_pending")?.as_u64()).unwrap_or(0) as u32;
+        let session = ask("session").iter().find_map(|l| makepad_strict_json::parse(l.as_bytes()).ok().filter(|v| v.get("restart_pending").is_some()));
+        d.restart_pending = session.as_ref().and_then(|v| v.get("restart_pending")?.as_u64()).unwrap_or(0) as u32;
+        d.restart_first = session.as_ref().and_then(|v| v.get("pending")?.as_arr()?.first()?.as_str().map(str::to_string)).unwrap_or_default();
         self.state.lock().unwrap().jit_state.insert(j.pid, (Instant::now(), d.clone()));
         d
     }
@@ -507,6 +566,48 @@ fn ai_hub_config(text: &str) -> AiHubEndpoint {
     endpoint
 }
 
+/// Where this node's AI hub's fleet front listens: its settings' host when it names one; for the
+/// wildcard (`0.0.0.0`, `::`, a WM's default) the address the hub binds for it, this machine's
+/// first private IPv4 (libs/ai/hub/src/node_conf.rs `lan_host`); with none set, the primary
+/// outgoing interface's address.
+fn ai_hub_host(host: Option<String>) -> io::Result<String> {
+    if matches!(host.as_deref().map(str::trim), Some("0.0.0.0" | "::")) {
+        return makepad_core_util::netif::interfaces().into_iter().map(|i| i.addr).find(|ip| ip.is_private()).map(|ip| ip.to_string()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "the hub's host is the wildcard and this machine has no private IPv4 address for it")
+        });
+    }
+    host.map(Ok).unwrap_or_else(|| {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        // UDP connect sends nothing; TEST-NET-1 selects the primary outgoing interface.
+        socket.connect("192.0.2.1:9")?;
+        socket.local_addr().map(|addr| addr.ip().to_string())
+    })
+}
+
+/// Has this node's AI hub hold the machine quiet for a timed run (`holder`, as the lease hub
+/// names it) or end that (`""`): `POST /control/local-use {"quiet": …}` through its fleet front
+/// as this machine, the route its WM reports games on. Ok(its activity answer: `reason`
+/// `timed-lease` once it holds; `refused`, `refused_said` in the answer that ended one), or
+/// Ok(None) when there is nothing to hold: no AI hub is set up here, or its front is not up (a
+/// hub with networking off, or stopped, takes no remote work).
+pub fn ai_hub_quiet(holder: &str) -> Result<Option<Value>, String> {
+    use makepad_network::fleet::id::connect;
+    use makepad_network::SocketStream;
+    let Some(endpoint) = ai_hub_endpoint() else { return Ok(None) };
+    let deadline = Instant::now() + AI_HUB_TIMEOUT;
+    let host = ai_hub_host(endpoint.host).map_err(|e| format!("its address: {e}"))?;
+    let port = endpoint.port;
+    let (stream, _, authorization) = match ai_hub_remaining(deadline).and_then(|_| connect(&host, &port.to_string())) {
+        Ok(c) => c,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return Ok(None),
+        Err(e) => return Err(format!("its fleet front: {}", proto::clean(&e.to_string(), 300))),
+    };
+    let authority = if host.contains(':') && !host.starts_with('[') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+    let body = format!("{{\"quiet\":{}}}", json_str(holder));
+    let request = format!("POST /control/local-use HTTP/1.0\r\nHost: {authority}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    ai_hub_get(stream, &request, deadline, SocketStream::set_read_timeout, SocketStream::set_write_timeout).map(Some).map_err(|e| proto::clean(&e.to_string(), 300))
+}
+
 fn ai_hub_remaining(deadline: Instant) -> io::Result<Duration> {
     deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "health probe timed out"))
 }
@@ -542,8 +643,9 @@ fn ai_hub_get<S: Read + Write>(
         if body.is_none() {
             if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
                 let headers = std::str::from_utf8(&bytes[..end]).map_err(|_| invalid())?;
-                if headers.lines().next().and_then(|s| s.split_whitespace().nth(1)) != Some("200") {
-                    return Err(invalid());
+                let status = headers.lines().next().and_then(|s| s.split_whitespace().nth(1));
+                if status != Some("200") {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, format!("the hub answered {}", status.unwrap_or("no status"))));
                 }
                 for line in headers.lines().skip(1) {
                     if let Some((key, value)) = line.split_once(':') {
@@ -582,12 +684,7 @@ fn probe_ai_hub(endpoint: AiHubEndpoint) -> AiHub {
 
     let deadline = Instant::now() + AI_HUB_TIMEOUT;
     let fleet_failed = |e: io::Error| AiHub { why: format!("fleet probe failed: {}", proto::clean(&e.to_string(), 300)), ..AiHub::default() };
-    let host = match endpoint.host.map(Ok).unwrap_or_else(|| {
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-        // UDP connect sends nothing; TEST-NET-1 selects the primary outgoing interface.
-        socket.connect("192.0.2.1:9")?;
-        socket.local_addr().map(|addr| addr.ip().to_string())
-    }) {
+    let host = match ai_hub_host(endpoint.host) {
         Ok(host) => host,
         Err(e) => return fleet_failed(e),
     };
@@ -737,6 +834,12 @@ fn exe_replaced(pid: u32) -> bool {
     std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p.to_string_lossy().ends_with(" (deleted)"))
 }
 
+/// The second name a panicked JIT's session log keeps ([`Local::keep_log`]): `x.log` -> `x.kept.log`.
+fn kept_name(log: &std::path::Path) -> std::path::PathBuf {
+    let stem = log.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    log.with_file_name(format!("{stem}.kept.log"))
+}
+
 fn log_tail(path: &str) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else { return String::new() };
@@ -749,7 +852,31 @@ fn log_tail(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::ai_hub_config;
+    use super::{ai_hub_config, run_scan_tasks, ScanTask};
+    use std::sync::{Arc, Mutex};
+
+    /// A scan task that asks for another runs on, and the new one runs from the next tick: the
+    /// tick ran its tasks under the lock `on_scan` takes, so such a task hung the scan (11-07).
+    #[test]
+    fn a_scan_task_may_add_a_task() {
+        let tasks: Arc<Mutex<Vec<ScanTask>>> = Arc::new(Mutex::new(Vec::new()));
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        let (t, r) = (tasks.clone(), ran.clone());
+        tasks.lock().unwrap().push(Box::new(move || {
+            r.lock().unwrap().push("first");
+            let r = r.clone();
+            t.lock().unwrap().push(Box::new(move || {
+                r.lock().unwrap().push("added");
+                true
+            }));
+            true
+        }));
+        run_scan_tasks(&tasks);
+        assert_eq!(*ran.lock().unwrap(), ["first"]);
+        run_scan_tasks(&tasks);
+        assert_eq!(*ran.lock().unwrap(), ["first", "added"]);
+        assert!(tasks.lock().unwrap().is_empty(), "each said it was done");
+    }
 
     #[test]
     fn ai_hub_config_reads_host_and_app_port() {

@@ -81,6 +81,10 @@ pub struct Groups {
     pub root: String,
     root_entry: Option<Entry>,
     pub manifests: Manifests,
+    /// Each block's `Contributors:` line ([`Self::credit`]; empty: none).
+    pub contributors: Vec<String>,
+    /// Each block's co-author trailers past ours ([`coauthor_lines`]).
+    pub coauthors: Vec<Vec<String>>,
 }
 
 /// `*` matches anything, `/` too; everything else is literal.
@@ -116,6 +120,179 @@ pub fn parse_blocks(text: &str) -> Vec<Block> {
         }
     }
     blocks
+}
+
+/// One commit of the set, as [`contributor_lines`] reads it: `files` are what it changed (for a
+/// merge, what it brought in over its first parent).
+#[derive(Clone, Debug, Default)]
+pub struct Landed {
+    pub name: String,
+    pub email: String,
+    pub subject: String,
+    pub body: String,
+    pub files: Vec<String>,
+}
+
+/// The PR in a merge subject: `Merge PR #N from <handle>: ...` or `Merge pull request #N from <handle>/<branch>`.
+pub fn merged_pr(subject: &str) -> Option<(String, u32)> {
+    let rest = subject.strip_prefix("Merge PR #").or_else(|| subject.strip_prefix("Merge pull request #"))?;
+    let (number, rest) = rest.split_once(" from ")?;
+    let handle: String = rest.chars().take_while(|c| !matches!(c, ':' | '/' | ' ')).collect();
+    (!handle.is_empty()).then_some(())?;
+    Some((handle, number.trim().parse().ok()?))
+}
+
+/// The number in a subject ending `(#N)`.
+fn subject_pr(subject: &str) -> Option<u32> {
+    let inner = subject.trim_end().strip_suffix(')')?;
+    inner[inner.rfind("(#")? + 2..].parse().ok()
+}
+
+/// A GitHub handle out of a no-reply address (`<id>+<handle>@users.noreply.github.com`).
+fn noreply_handle(email: &str) -> Option<String> {
+    let local = email.trim().strip_suffix("@users.noreply.github.com")?;
+    Some(local.rsplit('+').next().unwrap_or(local).to_string())
+}
+
+/// A PR a commit says it was ported from, `Based on makepad/<repo>#N by <handle>` in its body:
+/// (repo, number, handle).
+fn based_on(body: &str) -> Vec<(String, u32, String)> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.trim().strip_prefix("Based on makepad/") else { continue };
+        let Some((repo, rest)) = rest.split_once('#') else { continue };
+        let Some((number, rest)) = rest.split_once(" by ") else { continue };
+        // a login (letters, digits, hyphens) up to the first other character: the line goes on
+        // ("by octo-cat. Worktrees and clones ..." named "octo-cat. Worktrees and clones ...", 11-13)
+        let handle: String = rest.trim_start().trim_start_matches('@').chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        let handle = handle.trim_end_matches('-');
+        if let (Ok(n), false) = (number.trim().parse(), handle.is_empty()) {
+            out.push((if repo == "makepad" { String::new() } else { repo.to_string() }, n, handle.to_string()));
+        }
+    }
+    out
+}
+
+/// The `Contributors:` line of each block's commit (empty: none; `held`: the blocks with a
+/// commit). The outside people whose PRs the set carries are named by handle and PR number, never
+/// an address. A PR is one of: a `Merge PR #N from <handle>` commit (its handle; the files it
+/// brought in), a commit by someone other than `own` (by email, in any case) whose subject ends
+/// `(#N)` (its author's no-reply handle, else the handle another of their commits gave, else
+/// their name), or a `Based on makepad/<repo>#N by <handle>` port. A PR is named in each block
+/// holding a file it changed, or in the last commit when none of those has one (its change came
+/// and went). A PR of another repository reads `relax#31`, one of this repository `#1403`.
+pub fn contributor_lines(blocks: &[Block], held: &[bool], commits: &[Landed], own: &str) -> Vec<String> {
+    let is_own = |email: &str| email.trim().is_empty() || email.trim().eq_ignore_ascii_case(own.trim());
+    let mut handles: HashMap<&str, String> = HashMap::new();
+    for c in commits {
+        if let Some(h) = noreply_handle(&c.email) {
+            handles.insert(c.name.trim(), h);
+        }
+    }
+    let last = held.iter().rposition(|h| *h);
+    let mut out: Vec<BTreeMap<(String, String), BTreeSet<(String, u32)>>> = vec![BTreeMap::new(); blocks.len()];
+    for c in commits {
+        let mut prs: Vec<(String, String, u32)> = Vec::new();
+        if let Some((handle, n)) = merged_pr(&c.subject) {
+            prs.push((handle, String::new(), n));
+        } else if let (false, Some(n)) = (is_own(&c.email), subject_pr(&c.subject)) {
+            let handle = noreply_handle(&c.email).or_else(|| handles.get(c.name.trim()).cloned()).unwrap_or_else(|| c.name.trim().to_string());
+            prs.push((handle, String::new(), n));
+        }
+        prs.extend(based_on(&c.body).into_iter().map(|(repo, n, handle)| (handle, repo, n)));
+        for (handle, repo, n) in prs {
+            let mut blocks_of: BTreeSet<usize> = c.files.iter().map(|f| block_of(blocks, f)).filter(|b| held.get(*b) == Some(&true)).collect();
+            if blocks_of.is_empty() {
+                blocks_of.extend(last);
+            }
+            for b in blocks_of {
+                out[b].entry((handle.to_lowercase(), handle.clone())).or_default().insert((repo.clone(), n));
+            }
+        }
+    }
+    out.into_iter()
+        .map(|people| {
+            if people.is_empty() {
+                return String::new();
+            }
+            let named: Vec<String> = people.into_iter().map(|((_, handle), prs)| format!("{handle} ({})", pr_list(&prs.into_iter().collect::<Vec<_>>()))).collect();
+            format!("Contributors: {}", named.join(", "))
+        })
+        .collect()
+}
+
+/// The co-author trailers each block's commit carries past ours ([`super::push::TRAILER`]): Codex
+/// when any commit of the block's files carries a Codex trailer, as GitHub's `codex` account
+/// ([`super::push::CODEX_TRAILER`], whatever address the commit gave), and each other Claude model a
+/// commit names, once (a context note such as `(1M context)` is no model of its own). A commit's
+/// trailers go to each block holding a file it changed, or to the last commit when none of those
+/// has one, as [`contributor_lines`]. A collapse kept only ours, and 103 Codex trailers of a
+/// push's chain were lost (11-13).
+pub fn coauthor_lines(blocks: &[Block], held: &[bool], commits: &[Landed]) -> Vec<Vec<String>> {
+    let last = held.iter().rposition(|h| *h);
+    let mut out: Vec<BTreeSet<String>> = vec![BTreeSet::new(); blocks.len()];
+    for c in commits {
+        let lines: Vec<String> = c.body.lines().filter_map(coauthor).filter(|l| l != super::push::TRAILER).collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let mut blocks_of: BTreeSet<usize> = c.files.iter().map(|f| block_of(blocks, f)).filter(|b| held.get(*b) == Some(&true)).collect();
+        if blocks_of.is_empty() {
+            blocks_of.extend(last);
+        }
+        for b in blocks_of {
+            out[b].extend(lines.iter().cloned());
+        }
+    }
+    // the Claude models first, then Codex
+    out.into_iter().map(|set| {
+        let (codex, claude): (Vec<String>, Vec<String>) = set.into_iter().partition(|l| l == super::push::CODEX_TRAILER);
+        claude.into_iter().chain(codex).collect()
+    }).collect()
+}
+
+/// A pushed commit's last paragraph: ours ([`super::push::TRAILER`]), its other co-authors
+/// ([`coauthor_lines`]) and its `Contributors:` line (empty: none), a line each.
+fn trailers(coauthors: &[String], contributors: &str) -> String {
+    std::iter::once(super::push::TRAILER).chain(coauthors.iter().map(String::as_str)).chain(Some(contributors).filter(|c| !c.is_empty())).map(|l| format!("{l}\n")).collect()
+}
+
+/// A `Co-Authored-By:` line of a commit body as the push writes it: Codex's as
+/// [`super::push::CODEX_TRAILER`], a Claude model's as `Co-Authored-By: Claude <model>
+/// <noreply@anthropic.com>`; None for any other line, and for a person's (the `Contributors:` line
+/// names people, never by address).
+fn coauthor(line: &str) -> Option<String> {
+    let line = line.trim();
+    let (key, rest) = line.split_once(':')?;
+    if !key.trim().eq_ignore_ascii_case("co-authored-by") {
+        return None;
+    }
+    let (name, address) = rest.trim().split_once('<')?;
+    let (name, address) = (name.trim(), address.trim_end_matches('>').trim().to_ascii_lowercase());
+    let lower = name.to_ascii_lowercase();
+    if lower == "codex" || lower.starts_with("codex ") || address.ends_with("+codex@users.noreply.github.com") {
+        return Some(super::push::CODEX_TRAILER.to_string());
+    }
+    let model = name.strip_prefix("Claude ").filter(|_| address == "noreply@anthropic.com")?;
+    let model = model.split(" (").next().unwrap_or(model).trim();
+    (!model.is_empty()).then(|| format!("Co-Authored-By: Claude {model} <noreply@anthropic.com>"))
+}
+
+/// `#1403-#1405, #1409, relax#31`: runs of three or more consecutive numbers of the person's own
+/// list become a range, so a range never hides a number somebody else holds.
+fn pr_list(prs: &[(String, u32)]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut at = 0;
+    while at < prs.len() {
+        let mut end = at;
+        while end + 1 < prs.len() && prs[end + 1].0 == prs[at].0 && prs[end + 1].1 == prs[end].1 + 1 {
+            end += 1;
+        }
+        let (repo, from) = (&prs[at].0, prs[at].1);
+        out.push(if end - at >= 2 { format!("{repo}#{from}-#{}", prs[end].1) } else { (at..=end).map(|i| format!("{repo}#{}", prs[i].1)).collect::<Vec<_>>().join(", ") });
+        at = end + 1;
+    }
+    out.join(", ")
 }
 
 pub fn block_of(blocks: &[Block], path: &str) -> usize {
@@ -360,7 +537,7 @@ impl Groups {
             stat.files.sort_by(|a, b| a.path.cmp(&b.path));
         }
         let manifests = manifests_at(dir, tip, "")?;
-        Ok(Groups { base: base.to_string(), tip: tip.to_string(), base_tree, tip_tree, blocks, stats, binaries, diff, root, root_entry, manifests })
+        Ok(Groups { base: base.to_string(), tip: tip.to_string(), base_tree, tip_tree, blocks, stats, binaries, diff, root, root_entry, manifests, contributors: Vec::new(), coauthors: Vec::new() })
     }
 
     /// No file differs.
@@ -397,7 +574,44 @@ impl Groups {
             named.push_str(&format!(" and {} more", areas.len() - AREAS));
         }
         let note = note.map_or(String::new(), |n| format!("{n}\n\n"));
-        format!("{}\n\n{} files, +{} -{}. Areas: {named}.\n\n{note}{}\n", block.title, stat.files.len(), stat.added, stat.removed, super::push::TRAILER)
+        let trailers = trailers(self.coauthors.get(at).map_or(&[][..], Vec::as_slice), self.contributors.get(at).map_or("", String::as_str));
+        format!("{}\n\n{} files, +{} -{}. Areas: {named}.\n\n{note}{trailers}", block.title, stat.files.len(), stat.added, stat.removed)
+    }
+
+    /// Credits the outside contributors of the PRs the set carries (`since..tip`; `since`: the work
+    /// commit origin's tip was pushed from): [`contributor_lines`], for [`Self::message`]. The area
+    /// commits are written under our identity, and an outside contributor's authorship was lost
+    /// (PR #1390, 11-06).
+    pub fn credit(&mut self, dir: &Path, since: &str) -> Result<(), String> {
+        let own = identity(dir)?.email;
+        let range = format!("{since}..{}", self.tip);
+        // what origin/main has is not new: after a rewrite of origin's history a merge can bring its
+        // commits into work's history (`devhub push remap`), and they were credited when promoted
+        let public = "--remotes=origin/main";
+        let log = super::git(dir, &["-c", "core.quotePath=false", "log", "--no-merges", "--format=%x01%an%x02%ae%x02%s%x02%b%x03", "--name-only", &range, "--not", public])?;
+        let mut commits: Vec<Landed> = Vec::new();
+        for chunk in log.split('\u{1}').skip(1) {
+            let (head, files) = chunk.split_once('\u{3}').unwrap_or((chunk, ""));
+            let mut f = head.splitn(4, '\u{2}');
+            let (name, email, subject, body) = (f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""), f.next().unwrap_or(""));
+            commits.push(Landed { name: name.into(), email: email.into(), subject: subject.into(), body: body.into(), files: files.lines().filter(|l| !l.trim().is_empty()).map(String::from).collect() });
+        }
+        // a merge of a PR: what it brought in over its first parent
+        let merges = super::git(dir, &["log", "--merges", "--format=%H %P%x02%s", &range, "--not", public])?;
+        for row in merges.lines() {
+            let Some((ids, subject)) = row.split_once('\u{2}') else { continue };
+            if merged_pr(subject).is_none() {
+                continue;
+            }
+            let mut ids = ids.split_whitespace();
+            let (Some(sha), Some(first)) = (ids.next(), ids.next()) else { continue };
+            let files = super::git(dir, &["-c", "core.quotePath=false", "diff", "--name-only", "--no-renames", first, sha])?;
+            commits.push(Landed { subject: subject.into(), files: files.lines().map(String::from).collect(), ..Landed::default() });
+        }
+        let held: Vec<bool> = self.stats.iter().map(|s| !s.files.is_empty()).collect();
+        self.contributors = contributor_lines(&self.blocks, &held, &commits, &own);
+        self.coauthors = coauthor_lines(&self.blocks, &held, &commits);
+        Ok(())
     }
 
     /// Writes the commits on the base, one per block with changes: (block, sha), in order. The last
@@ -513,6 +727,60 @@ mod tests {
         let who = Signature { name: "t".into(), email: "t@t".into(), timestamp: 1, tz_offset: "+0000".into() };
         let commit = Commit { tree, parents: parent.into_iter().collect(), author: who.clone(), committer: who, message: "m\n".into() };
         (repo.write_commit(&commit).unwrap(), tree)
+    }
+
+    /// A PR is named by handle and number in each block holding a file it changed, once: from a
+    /// merge subject, from an outside author's `(#N)` commit (a no-reply address gives the handle,
+    /// the same name elsewhere shares it) and from a `Based on` port; our own identity never is,
+    /// and no address is ever written; a PR whose change came and went is in the last block;
+    /// consecutive numbers collapse to a range.
+    #[test]
+    fn contributors_are_named_by_handle_and_pr_in_the_blocks_holding_their_files() {
+        let blocks = parse_blocks("block First\nlibs/a/*\nblock Second\nlibs/b/*\nblock Third\nlibs/c/*\nblock Rest\n*\n");
+        let held = [true, true, false, true];
+        let c = |name: &str, email: &str, subject: &str, body: &str, files: &[&str]| Landed { name: name.into(), email: email.into(), subject: subject.into(), body: body.into(), files: files.iter().map(|f| f.to_string()).collect() };
+        let commits = vec![
+            c("", "", "Merge PR #7 from ana-gh: A fix", "", &["libs/a/x.rs", "libs/b/y.rs"]),
+            c("", "", "Merge pull request #8 from ana-gh/branch", "", &["libs/a/x.rs"]),
+            c("", "", "Merge PR #9 from ana-gh: more", "", &["libs/a/w.rs"]),
+            c("Bo Gone", "bo@example.net", "gone (#12)", "", &["libs/c/gone.rs"]),
+            c("Cy", "1+cy-gh@users.noreply.github.com", "other (#20)", "", &["libs/b/q.rs"]),
+            c("Cy", "cy@example.net", "again (#21)", "", &["libs/b/q.rs"]),
+            c("Us", "US@example.com", "ours (#30)", "Based on makepad/relax#31 by dee-gh\n", &["libs/a/z.rs"]),
+            c("Us", "US@example.com", "ours too (#32)", "", &["libs/a/z.rs"]),
+        ];
+        let lines = contributor_lines(&blocks, &held, &commits, "us@example.com");
+        assert_eq!(lines[0], "Contributors: ana-gh (#7-#9), dee-gh (relax#31)", "first block");
+        assert_eq!(lines[1], "Contributors: ana-gh (#7), cy-gh (#20, #21)", "second block");
+        assert_eq!(lines[2], "", "a block without a commit");
+        assert_eq!(lines[3], "Contributors: Bo Gone (#12)", "a change that came and went lands in the last block");
+        assert!(lines.iter().all(|l| !l.contains('@') && !l.contains("Us") && !l.contains("#30") && !l.contains("#32")), "our identity and addresses never appear");
+        // a port's line goes on past the handle (11-13)
+        let port = c("Us", "us@example.com", "ported", "Based on makepad/relax#57 by octo-cat. Worktrees and clones of one repository each had a run dir of\n", &["libs/b/r.rs"]);
+        assert_eq!(contributor_lines(&blocks, &held, &[port], "us@example.com")[1], "Contributors: octo-cat (relax#57)");
+    }
+
+    /// Each block's commit carries the co-authors of the commits of its files past ours: Codex once,
+    /// as GitHub's `codex` account whatever address a commit gave, and each other Claude model once
+    /// (its context note dropped); a person's trailer never (the Contributors line names people).
+    #[test]
+    fn a_collapsed_commit_carries_the_codex_and_claude_co_authors_of_what_it_squashes() {
+        let blocks = parse_blocks("block First\nlibs/a/*\nblock Second\nlibs/b/*\nblock Rest\n*\n");
+        let held = [true, true, true];
+        let c = |body: &str, files: &[&str]| Landed { body: body.into(), files: files.iter().map(|f| f.to_string()).collect(), ..Landed::default() };
+        let codex = super::super::push::CODEX_TRAILER;
+        let commits = vec![
+            c("x\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\nCo-Authored-By: Codex <noreply@openai.com>\n", &["libs/a/x.rs"]),
+            c("Co-Authored-By: Codex gpt-6-astra <noreply@openai.com>\nCo-authored-by: Claude Opus 5.5 (1M context) <noreply@anthropic.com>\n", &["libs/a/y.rs"]),
+            c(&format!("{codex}\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>\nCo-authored-by: Someone <someone@example.net>\n"), &["libs/b/z.rs"]),
+            c("Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>\n", &["docs/x.md"]),
+        ];
+        let lines = coauthor_lines(&blocks, &held, &commits);
+        assert_eq!(lines[0], [codex], "Codex once, at its account's address; ours is not repeated");
+        assert_eq!(lines[1], ["Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>", codex], "another Claude model, then Codex; no person");
+        assert_eq!(lines[2], ["Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"]);
+        assert_eq!(trailers(&lines[1], "Contributors: octo-cat (relax#57)"), format!("{}\nCo-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>\n{codex}\nContributors: octo-cat (relax#57)\n", super::super::push::TRAILER));
+        assert_eq!(trailers(&[], ""), format!("{}\n", super::super::push::TRAILER), "ours alone");
     }
 
     #[test]

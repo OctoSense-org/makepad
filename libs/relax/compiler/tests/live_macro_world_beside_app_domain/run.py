@@ -11,7 +11,7 @@ never created, "there is no reactor running", or a fault on a pointer that was a
 image). The program here fills a large static at its start and keeps a thread-local with drop
 glue; the proc-macro crate has a static whose image is not zeros.
 
-usage: run.py --makepad <makepad binary>   (MAKEPAD_RUN_STD in the environment)
+usage: run.py --makepad <makepad binary>   (RELAX_STD in the environment)
 
   1. app/src/main.rs: `value` returns 2 -> "patched"; the program prints the new value, no word of
      its static changed and its thread-local still holds what it stored
@@ -47,7 +47,10 @@ base = open(main_rs).read()
 assert base.count("    1\n}") == 1
 APP = "relax-live-beside-app"
 
-env = dict(os.environ, MAKEPAD_RUN_AHEAD="minimal", MAKEPAD_RUN_CACHE="0", MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1")
+# RELAX_TRUST_PROC_MACROS: makepad-widgets brings serde_json, whose build script `makepad run`
+# confines; fetched into the copy's own target folder it may not even name its build.rs. Not what
+# this test is about: third-party compile-time code runs as cargo runs it.
+env = dict(os.environ, RELAX_AHEAD="minimal", RELAX_CACHE="0", MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1", RELAX_TRUST_PROC_MACROS="1")
 p = subprocess.Popen([relax, "run", "--verbose", APP], cwd=pkg, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 out, err = [], []
 def pump(f, acc):

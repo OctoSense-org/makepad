@@ -54,7 +54,7 @@ TREE = os.path.join(tempfile.gettempdir(), "live_replay_tree")
 INDEX = os.path.join(tempfile.gettempdir(), "live_replay_index")
 COMMERCIAL = "apps/commercial"
 # the JIT binary's providers (tools/run/Cargo.toml's host-shims dependencies)
-PROVIDERS = ["makepad-live-id", "makepad-script", "makepad-script-std", "makepad-script-compute", "makepad-shader", "makepad-tween-script", "makepad-script-audio-aot", "makepad-hal", "makepad-script-census", "makepad-relax-api"]
+PROVIDERS = ["makepad-live-id", "makepad-script", "makepad-script-std", "makepad-script-compute", "makepad-shader", "makepad-tween-script", "makepad-script-audio-aot", "makepad-hal", "makepad-script-census", "relax-api"]
 JIT = ["cargo", "run", "--profile", "host", "-q", "--manifest-path", os.path.join(ROOT, "Cargo.toml"), "-p", "makepad-run", "--bin", "makepad", "--"]
 # The inspect client is a copy of this tree's binary: only a client of the app's socket, and in --host
 # the tree it would be rebuilt from changes under it (a cargo run per ask would race the JIT's rebuild).
@@ -163,9 +163,9 @@ class App:
         self.log_path = log
         self.package = package
         self.file = open(log, "w")
-        base = dict(os.environ, MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1", SANDBOX_MUTE="1", MUSIC_MUTE="1", MAKEPAD_WINDOW=os.environ.get("MAKEPAD_WINDOW", "1280x800@1"), MAKEPAD_HOME=os.path.join(WORK, "home"))
+        base = dict(os.environ, MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1", MAKEPAD_WINDOW=os.environ.get("MAKEPAD_WINDOW", "1280x800@1"), MAKEPAD_HOME=os.path.join(WORK, "home"))
         base["MAKEPAD_REMOTE"] = "1"
-        base.pop("MAKEPAD_RUN_STD", None)
+        base.pop("RELAX_STD", None)
         base.update(env or {})
         self.proc = subprocess.Popen(JIT + ["run", package, *args], cwd=cwd or TREE, env=base, stdin=subprocess.DEVNULL, stdout=self.file, stderr=self.file, start_new_session=True)
         self.pid = None
@@ -231,8 +231,10 @@ def bad_lines(text, since=0):
 
 
 # a HAL line about drawing (the GPU backends, the frame path); the media, XR-stream, input and
-# window-manager services log their own news with the same prefix
-DRAW = re.compile(r"^\[hal-(?!video|media|camera|xr-remote|gamepad|dialog|wm\]|android-permission|android-dialog)")
+# window-manager services log their own news with the same prefix, and a backend's upload pool says
+# when a submit had to make an arena (a hiccup that degrades gracefully, logged as such: an app's
+# first frames make theirs, and every replay read that as a GPU error before its edits, 11-12)
+DRAW = re.compile(r"^\[hal-(?!video|media|camera|xr-remote|gamepad|dialog|wm\]|android-permission|android-dialog|vulkan\] upload arenas: )")
 
 
 def healthy(app, since):
@@ -430,7 +432,7 @@ def verdict(app, seen, since):
             return json.loads(line)
         if not app.alive():
             return {}
-        if time.time() - t > UNSEEN and "makepad live:" not in app.text()[since:]:
+        if time.time() - t > UNSEEN and "relax live:" not in app.text()[since:]:
             return {"answer": answer.strip()[:200]} if code != 0 else {}
     return {"answer": "no verdict in %d s: %s" % (VERDICT, answer.strip()[:160])}
 
@@ -639,7 +641,7 @@ def host_case(app, what, path, n, rec):
         if "a restart applies it" in said:
             break
         if "FAILED" in said or "does not start" in said or "cannot rebuild" in said:
-            return done(rec, result="fail", kind="rebuild", why=" | ".join(l[:240] for l in said.splitlines() if "makepad live" in l)[-700:])
+            return done(rec, result="fail", kind="rebuild", why=" | ".join(l[:240] for l in said.splitlines() if "relax live" in l)[-700:])
         if not app.alive():
             return done(rec, result="fail", kind="crash", why="exited (%s) while makepad rebuilt: %s" % (app.proc.returncode, said[-400:]))
         if "is unchanged" in said:
@@ -680,6 +682,9 @@ def host_case(app, what, path, n, rec):
 
 def host(package, wm):
     os.makedirs(WORK, exist_ok=True)
+    # the edits go back once the run ends: left in the tree, they read as the tree's own changes
+    # (a lease's end saved them as unlanded work, 11-14)
+    kept = {path: open(os.path.join(ROOT, path)).read() for _, path in HOST_EDITS}
     env, session = {}, None
     if wm:
         session, socket = wm_session()
@@ -723,11 +728,14 @@ def host(package, wm):
             tally[rec["result"]] = tally.get(rec["result"], 0) + 1
             print("%-12s %-9s %-9s %-10s %s" % ("new process", rec["result"], rec["rung"], rec["kind"], rec["why"]), flush=True)
     finally:
-        said = [l[:240] for l in app.text().splitlines() if re.search(r"makepad live|relaunch|panic", l)]
+        said = [l[:240] for l in app.text().splitlines() if re.search(r"relax live|relaunch|panic", l)]
         app.stop()
         if session:
             print("the WM's log: " + " | ".join(session.text().splitlines()[-4:])[:500], flush=True)
             session.stop()
+        for path, text in kept.items():
+            with open(os.path.join(ROOT, path), "w") as f:
+                f.write(text)
     if tally.get("fail") or tally.get("silent"):
         print("\n".join(said[-30:]), flush=True)
     return rate(package + (" under the WM" if wm else "") + " rebuild", tally, {})
@@ -862,7 +870,7 @@ def main():
                     with open(os.path.join(WORK, "app-%d.log" % seq), errors="replace") as f:
                         # what the JIT said (a draw error repeated each frame buries it otherwise)
                         lines = f.read().splitlines()
-                        said = [l[:300] for l in lines if re.search(r"makepad live|makepad-run|relaunch|error|panic", l)]
+                        said = [l[:300] for l in lines if re.search(r"relax|relaunch|error|panic", l)]
                         rec["log"] = "\n".join(said[-40:]) + "\n(%d lines, %d draw errors)" % (len(lines), sum(bool(DRAW.match(l)) for l in lines))
             tally[rec["result"]] = tally.get(rec["result"], 0) + 1
             rungs[rec["rung"]] = rungs.get(rec["rung"], 0) + 1

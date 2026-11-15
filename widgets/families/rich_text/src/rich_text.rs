@@ -2174,10 +2174,11 @@ impl Widget for RichTextEditor {
                 });
             }
             Hit::FingerDown(fe) if fe.device.is_primary_hit() => {
-                if self.editable {
+                // A mouse drag always selects text, but a touch drag on a page we can't edit still scrolls.
+                if self.editable || !fe.device.is_touch() {
                     cx.claim_finger_drag(fe.digit_id);
                 }
-                cx.set_key_focus(area);
+                cx.set_key_focus_from_user(area);
                 if let Some(pos) = self.pos_at(cx, fe.abs) {
                     let extend = fe.modifiers.shift;
                     self.move_to(cx, pos, extend);

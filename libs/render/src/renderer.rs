@@ -129,9 +129,11 @@ pub struct RenderStats {
     pub stream_lights: usize,
     /// Extra triangles actually submitted for material fur this frame.
     pub fur_triangles: usize,
-    /// Grass patches drawn (one instance each) and their blade budget.
+    /// Grass patches drawn (one instance each) and their blade budget, and
+    /// the flowers' budget (their patches draw one more instance each).
     pub grass_patches: usize,
     pub grass_blades: usize,
+    pub grass_flowers: usize,
     pub gi: crate::fast_gi::GiStats,
     /// Device-local clustered light assignment/upload cost and overflow.
     pub clustered: crate::clustered::ClusterStats,
@@ -306,6 +308,12 @@ pub struct Renderer {
     /// Advanced by [`Renderer::tick_sky`]; deliberately not wall-clock, so a
     /// paused game has a still sky and a capture is reproducible.
     sky_time: f32,
+    /// The wind a host asked for ([`Renderer::set_wind`]) and the wind as
+    /// shown, carried through the host's presentation time by
+    /// [`Renderer::advance_wind`]: what swaying foliage and grass read. A
+    /// host that never advances it shows calm.
+    wind: makepad_scene::WorldWind,
+    wind_clock: makepad_scene::WindClock,
     /// Per model id: does this model cast into the GPU bake's sun-depth
     /// passes when it has no AO layout of its own? Absent = decided by size
     /// ([`casts_as_caster_only`]). The explicit answer exists because only
@@ -361,6 +369,8 @@ pub struct Renderer {
     /// Applied as the scene draw list's view transform, so it costs one
     /// uniform and never invalidates the static slabs. See stage.rs.
     stage: Stage,
+    /// Detail factor applied to each view's model LOD scale.
+    lod_bias: f32,
     /// The box an `MrBox` stage shows the world in (`set_clip_box`).
     clip_box: Option<crate::stage::ClipBox>,
     /// How many casters get a projected silhouette before the rest fall
@@ -378,6 +388,8 @@ pub struct Renderer {
     model_pack: Vec<(String, String)>,
     /// The placed and attached lists' per-frame draw order (draw_models.rs).
     model_orders: [draw_models::ModelOrder; 2],
+    /// Blended model layers held until the opaque world and alpha primitives finish.
+    blended_models: draw_models::BlendedModels,
     /// The placed list's static copies grouped by place (draw_models.rs).
     placed_blocks: draw_models::PlacedBlocks,
     /// One shell per entry — this is the whole per-frame firework upload.
@@ -426,6 +438,8 @@ pub struct Renderer {
     /// The host's clip plane (`host_clip`, see shaders/skinned.rs and
     /// [`Self::set_clip_plane`]) for the model lanes.
     clip_plane: Option<[f32; 4]>,
+    /// The world box the host keeps ([`Self::set_host_box`]) for the model lanes.
+    host_box: Option<[[f32; 4]; 3]>,
     /// See [`Self::set_element_reach`].
     element_reach: Option<(Vec3f, Vec3f)>,
     custom_draws: std::collections::BTreeMap<String, Box<CustomMaterial>>,
@@ -441,6 +455,9 @@ pub struct Renderer {
     /// visible patches per ring.
     grass: Option<crate::grass::GrassGpu>,
     grass_draw: Option<Box<crate::shaders::DrawSceneGrass>>,
+    /// Where wheels and feet pressed the grass (crate::trample), fed by
+    /// `set_ground_stamps`.
+    trample: crate::trample::TrampleField,
     /// The swaying-foliage lane's shader, and whether it can draw this
     /// frame (else foliage stays on the PBR lane).
     foliage_draw: Option<Box<crate::shaders::DrawSceneFoliageLit>>,
@@ -449,18 +466,26 @@ pub struct Renderer {
     /// (else painted tiles draw their main layer on the PBR lane).
     splat_draw: Option<Box<crate::shaders::DrawSceneSplat>>,
     splat_ready: bool,
+    /// The far stand-ins' shader (shaders/impostor.rs) for this frame's
+    /// features once its pipeline exists, else None: every model then draws
+    /// its own layers at every distance (`prepare_impostor_lane`).
+    impostor_shader: Option<DrawShaderId>,
     /// Multiplier on every model's stand-in distance (`makepadShading.impostor`):
     /// the quality tier's say in where trees turn into impostors.
     impostor_scale: f32,
-    /// The tier's grass radius multiplier and kept blade fraction.
-    grass_radius_scale: f32,
-    grass_density: f32,
+    /// The tier's narrowest far grass blade, screen pixels.
+    grass_pixels: f32,
     /// The tier's reach of terrain paint blending (quality_tier.rs).
     terrain_blend_reach: f32,
     graphics_tier: crate::quality_tier::GraphicsTier,
-    grass_rings: [Vec<(f32, f32)>; 3],
+    grass_rings: [Vec<(f32, f32)>; crate::grass::LEVELS],
+    grass_flower_rings: [Vec<(f32, f32)>; crate::grass::LEVELS],
     /// The PBR pipeline can draw this frame (`draw_models_inner`).
     pbr_ready: bool,
+    /// A secondary camera may borrow the live probe field for sampling only.
+    review_gi: bool,
+    /// Already resolved lights borrowed by a secondary camera, in lane units.
+    review_lights: Option<Vec<crate::lightmap::LmLight>>,
     /// The diffuse and PBR lanes' no-discard variants (opaque.rs).
     lane_variants: variants::LaneVariants,
     /// Whether shiny loaded models use the PBR material lane. Enabled by
@@ -502,6 +527,12 @@ pub struct Renderer {
     /// chunk (see `PreparedTexture::upload_cached`); pruned to what loaded
     /// models still reference whenever a model is replaced or unloaded.
     texture_cache: std::collections::HashMap<u64, Texture>,
+    /// See [`Renderer::set_texture_first_level`].
+    texture_first_level: Option<std::rc::Rc<dyn Fn(u64) -> usize>>,
+    /// The GPU device generation this renderer last drew on, and whether models were installed
+    /// since its last look for textures to remake (`Renderer::restore_textures`).
+    device_generation: Option<u64>,
+    restore_walk: bool,
     /// See [`Renderer::set_shadow_debug`].
     shadow_debug: bool,
     /// See [`Renderer::set_hdr_output`].
@@ -519,6 +550,8 @@ pub struct Renderer {
     auto_exposure: bool,
     /// See [`Renderer::set_grade`].
     grade: makepad_scene::ColorGrade,
+    volume_fog: volume_fog::VolumeFogState,
+    ssr: ssr::SsrState,
     /// The baked lightmap's KILL SWITCH (F9 in the sandbox,
     /// `MAKEPAD_LIGHTMAP=off` at launch). Off binds the 1x1 "fully sunlit,
     /// no lamps" stand-in instead of the atlas, so every static falls back
@@ -687,6 +720,8 @@ mod skinned;
 mod frame;
 mod frame_layers;
 mod gi;
+mod volume_fog;
+mod ssr;
 mod stream_draw;
 mod grass_draw;
 mod vfx_draw;
@@ -739,6 +774,8 @@ impl Default for Renderer {
             decal_draw: None,
             sky_draw_wait_logged: false,
             sky_time: 0.0,
+            wind: Default::default(),
+            wind_clock: Default::default(),
             model_casts_shadow: std::collections::BTreeMap::new(),
             model_lod_chains: std::collections::BTreeMap::new(),
             model_lod_chains_dirty: false,
@@ -755,12 +792,14 @@ impl Default for Renderer {
             placed_scene_signature: None,
             placed_prefix: None,
             stage: Stage::default(),
+            lod_bias: 1.0,
             clip_box: None,
             shadow_budget: DEFAULT_SHADOW_BUDGET,
             vfx: Default::default(),
             ao_textures: Vec::new(),
             model_pack: Vec::new(),
             model_orders: Default::default(),
+            blended_models: Default::default(),
             placed_blocks: Default::default(),
             firework_instances: Vec::new(),
             smoke_volumes: Vec::new(),
@@ -779,6 +818,7 @@ impl Default for Renderer {
             pbr_draw: None,
             element_lookup: None,
             clip_plane: None,
+            host_box: None,
             element_reach: None,
             custom_draws: Default::default(),
             ibl: Default::default(),
@@ -787,17 +827,21 @@ impl Default for Renderer {
             city_draw: None,
             grass: None,
             grass_draw: None,
+            trample: crate::trample::TrampleField::new(crate::quality_tier::GraphicsTier::High.budget().trample),
             foliage_draw: None,
             foliage_ready: false,
             splat_draw: None,
             splat_ready: false,
+            impostor_shader: None,
             impostor_scale: crate::quality_tier::GraphicsTier::High.budget().impostor_scale,
-            grass_radius_scale: 1.0,
-            grass_density: 1.0,
+            grass_pixels: crate::quality_tier::GraphicsTier::High.budget().grass_pixels,
             terrain_blend_reach: f32::MAX,
             graphics_tier: crate::quality_tier::GraphicsTier::High,
             grass_rings: Default::default(),
+            grass_flower_rings: Default::default(),
             pbr_ready: false,
+            review_gi: false,
+            review_lights: None,
             lane_variants: Default::default(),
             pbr_materials_enabled: true,
             ssao: None,
@@ -815,6 +859,9 @@ impl Default for Renderer {
             gi_snapshot_omitted: 0,
             shadow_debug: false,
             texture_cache: Default::default(),
+            texture_first_level: None,
+            device_generation: None,
+            restore_walk: false,
             hdr_output: false,
             output_dither: true,
             hdr_exposure: 1.0,
@@ -823,6 +870,8 @@ impl Default for Renderer {
             bloom: DEFAULT_BLOOM,
             auto_exposure: true,
             grade: Default::default(),
+            volume_fog: Default::default(),
+            ssr: Default::default(),
             star_map_loaded: false,
             star_texture: None,
             gpu_baker: {

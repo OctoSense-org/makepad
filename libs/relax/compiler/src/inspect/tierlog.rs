@@ -21,8 +21,9 @@ pub mod ev {
     pub const CHECK: u8 = 2;
     /// queued for O3: `why` = the queue reason (Q_*), `a` = rate (calls/s), `b` = the code
     pub const QUEUE: u8 = 3;
-    /// an O3 queue entry that waited past REVALIDATE_NS went back to counting: `a` = its age
-    pub const REVALIDATE: u8 = 4;
+    /// an O3 queue entry left at its pick, its code under the threshold's rate (o3_pick_cold): `why` =
+    /// the queue reason, `a` = ns it waited, `b` = its cost then
+    pub const LEFT: u8 = 4;
     /// ... but other code was installed meanwhile: it stays queued (built)
     pub const KEPT: u8 = 5;
     /// a worker took it from the queue: `why` = queue reason, `a` = ns it waited
@@ -56,16 +57,15 @@ pub mod ev {
 
 pub const ARM_NEW: u8 = 0;
 pub const ARM_REARM: u8 = 1;
-pub const ARM_REVALIDATE: u8 = 2;
+pub const ARM_LEFT: u8 = 2;
 pub const ARM_SANDBOX: u8 = 3;
 pub const ARM_IMAGE: u8 = 4;
-pub const ARM_WHY: [&str; 5] = ["new code", "new code under the open window", "counted again (queued too long)", "sandbox twin", "startup image"];
+pub const ARM_WHY: [&str; 5] = ["new code", "new code under the open window", "counted again (cold at its O3 pick)", "sandbox twin", "startup image"];
 
 pub const WIN_DONE: u8 = 0;
 pub const WIN_IDLE: u8 = 1;
 pub const WIN_WORK: u8 = 2;
-pub const WIN_CREDITED: u8 = 3;
-pub const WIN_WHY: [&str; 4] = ["entries/blocks/time reached", "went idle (built with what it has)", "lukewarm code showed work", "a hot loop ran under it"];
+pub const WIN_WHY: [&str; 3] = ["entries/blocks/time reached", "went idle (built with what it has)", "lukewarm code showed work"];
 
 pub const DROP_PANIC: u8 = 0;
 pub const DROP_CODEGEN: u8 = 1;
@@ -77,9 +77,9 @@ pub const DROP_WHY: [&str; 5] = ["build panicked", "codegen error", "a patch cha
 pub const REFUSE_VERDICT: u8 = 0;
 pub const REFUSE_TAKE: u8 = 1;
 pub const REFUSE_PROFILE_GONE: u8 = 2;
-pub const REFUSE_WHY: [&str; 3] = ["not allowed (borrow-check verdict pending, or a patch without a clean verdict)", "its snapshot bailed (a front could not be made off the owner)", "its counted profile is gone (patched or rebuilt)"];
+pub const REFUSE_WHY: [&str; 3] = ["not allowed (borrow-check verdict pending, or a patch without a clean verdict)", "its snapshot bailed", "its counted profile is gone (patched or rebuilt)"];
 
-pub const Q_WHY: [&str; 6] = ["calls", "loop", "retier", "marked", "profiled", "stored"];
+pub const Q_WHY: [&str; 5] = ["calls", "loop", "retier", "marked", "profiled"];
 
 /// One decision.
 #[derive(Clone, Copy, Default)]
@@ -111,6 +111,24 @@ pub fn note(slot: u32, ev: u8, why: u8, a: u64, b: u64) {
     if let Some(r) = RING.get() {
         r.push(Ev { t: crate::clock::wall_ns(), slot, ev, why, a, b });
     }
+}
+
+/// What a take's bail ran into (`owner::forbid_in_publish`).
+const TAKE_BAILS: [&str; 7] = ["front", "promoted initializer", "initializer", "jit", "a front write", "a wait", "a request"];
+
+/// An O3 build not started: its take bailed on `what`, needing `slot`'s front, after `rounds` rounds;
+/// `front_why` is what this thread's last front made nothing for (an index of PREFRONT_FAIL_NAMES).
+pub fn note_take_bail(slot: u32, what: &str, needs: Option<u32>, rounds: u32, front_why: u8) {
+    let what = TAKE_BAILS.iter().position(|w| *w == what).unwrap_or(TAKE_BAILS.len()) as u64;
+    note(slot, ev::O3_REFUSED, REFUSE_TAKE, what | (rounds as u64) << 8 | (front_why as u64) << 40, needs.map_or(0, |s| s as u64 + 1));
+}
+
+fn describe_take_bail(e: &Ev) -> String {
+    let what = TAKE_BAILS.get((e.a & 0xff) as usize).copied().unwrap_or("?");
+    let rounds = (e.a >> 8) & 0xffff_ffff;
+    let front = crate::jit::PREFRONT_FAIL_NAMES.get((e.a >> 40) as usize).copied().unwrap_or("?");
+    let needs = if e.b == 0 { String::new() } else { format!(" of S{}", e.b - 1) };
+    format!("its snapshot bailed on {what}{needs} after {rounds} rounds (the last front made nothing for: {front})")
 }
 
 /// A count stub went in (unit lock held, never a program thread's hot path): only a slot that
@@ -264,14 +282,19 @@ pub fn describe(e: &Ev, code: &dyn Fn(u64) -> String) -> String {
         ev::ARM => format!("count stub armed on {} ({})", code(e.b), ARM_WHY.get(e.why as usize).unwrap_or(&"?")),
         ev::CHECK => format!("cost check on {}: decayed cost {} under the threshold", code(e.b), e.a),
         ev::QUEUE => format!("queued for O3 by {}{}{}", Q_WHY.get(e.why as usize).unwrap_or(&"?"), if e.a > 0 { format!(" at {} cost/s", e.a) } else { String::new() }, if e.b != 0 { format!(" on {}", code(e.b)) } else { String::new() }),
-        ev::REVALIDATE => format!("O3 queue entry {} old: counted again", ms(e.a)),
+        ev::LEFT => format!("left the O3 queue at its pick ({}) after {}: cost {} under the threshold", Q_WHY.get(e.why as usize).unwrap_or(&"?"), ms(e.a), e.b),
         ev::KEPT => "O3 queue entry stays queued (other code was installed meanwhile)".into(),
         ev::POP => format!("taken by an O3 worker ({}) after {} in the queue", Q_WHY.get(e.why as usize).unwrap_or(&"?"), ms(e.a)),
         ev::COUNTED => format!("counted (PGO) build installed{}", if e.why == 1 { " (lukewarm: O3 once its counts show work)" } else { "" }),
         ev::WINDOW_END => format!("counted window ended: {} ({} entries/s)", WIN_WHY.get(e.why as usize).unwrap_or(&"?"), e.a),
         ev::PARKED => "parked in counted code: too little work for O3".into(),
         ev::O3_INSTALLED => format!("O3 code installed ({} build)", ms(e.a)),
-        ev::O3_DROPPED => format!("O3 build dropped: {}", DROP_WHY.get(e.why as usize).unwrap_or(&"?")),
+        ev::O3_DROPPED => {
+            // (the slot changed: the kind of the code that went in, + 1)
+            let now = (e.why == DROP_SLOT_CHANGED && e.a != 0).then(|| crate::jit::CodeKind::new(((e.a - 1) & 0xff) as u8, ((e.a - 1) >> 8) as u8));
+            format!("O3 build dropped: {}{}", DROP_WHY.get(e.why as usize).unwrap_or(&"?"), now.map_or(String::new(), |k| format!(": now {} code ({})", k.tier_name(), k.origin_name())))
+        }
+        ev::O3_REFUSED if e.why == REFUSE_TAKE => format!("O3 build not started: {}", describe_take_bail(e)),
         ev::O3_REFUSED => format!("O3 build not started: {}", REFUSE_WHY.get(e.why as usize).unwrap_or(&"?")),
         ev::RETIER => format!("queued to be built again (retier {} of 4)", e.a),
         ev::RETIER_SPENT => "retier refused: its 4 retiers are used up".into(),
@@ -313,7 +336,7 @@ fn cmd_stuck(req: &super::Req, out: &mut super::Out) {
             for l in rows {
                 out.line(&l);
             }
-            out.always("more: why-tier @<slot>");
+            out.line("more: why-tier @<slot>");
         }
         None => out.err("the owner did not answer in 10 s"),
     }
@@ -328,13 +351,14 @@ fn cmd_uncounted(req: &super::Req, out: &mut super::Out) {
     let r = crate::owner::call_within(crate::owner::Class::Job, 10_000, move || {
         let u = unsafe { &*up };
         let v = crate::jit::tier_uncounted(u);
-        let mut rows = vec![format!("{} slots are not counted (their count stub replaced while they count): they never queue O3", v.len())];
+        let never = v.iter().filter(|x| x.1).count();
+        let mut rows = vec![format!("{} slots are not counted: {} with their count stub replaced while they count, {} of a counted kind never armed (installed without a count stub): they never queue O3", v.len(), v.len() - never, never)];
         if !v.is_empty() {
-            rows.push("| slot | fn | code |".into());
-            rows.push("|---|---|---|".into());
-            for id in v.iter().take(n) {
-                let f = &u.fns[*id as usize];
-                rows.push(format!("| S{} | `{}` | {} |", id, super::short(&super::display_name(u, *id, 0), 80), super::codever::label(super::codever::kind_at(u, f.code))));
+            rows.push("| slot | fn | code | why |".into());
+            rows.push("|---|---|---|---|".into());
+            for &(id, never) in v.iter().take(n) {
+                let f = &u.fns[id as usize];
+                rows.push(format!("| S{} | `{}` | {} | {} |", id, super::short(&super::display_name(u, id, 0), 80), super::codever::label(super::codever::kind_at(u, f.code)), if never { "never armed" } else { "stub replaced" }));
             }
             if v.len() > n {
                 rows.push(format!("+{} more (n=)", v.len() - n));
@@ -347,7 +371,7 @@ fn cmd_uncounted(req: &super::Req, out: &mut super::Out) {
             for l in rows {
                 out.line(&l);
             }
-            out.always("more: why-tier @<slot>");
+            out.line("more: why-tier @<slot>");
         }
         None => out.err("the owner did not answer in 10 s"),
     }
@@ -423,7 +447,7 @@ pub fn cmd_why_tier(req: &super::Req, out: &mut super::Out) {
             for l in rows {
                 out.line(&l);
             }
-            out.always(&format!("more: versions {q2}  remarks {q2}  tier {q2} o3  count {q2}"));
+            out.line(&format!("more: versions {q2}  remarks {q2}  tier {q2} o3  count {q2}"));
         }
         Err(e) => out.err(&e),
     }
@@ -439,7 +463,10 @@ mod tests {
     #[test]
     fn histories_start_at_a_decision() {
         init();
-        let slot = 0x7fff_fff0;
+        // a slot of its own each time it runs: a warm rerun in this process finds the histories
+        // of the runs before
+        static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let slot = 0x7fff_fff0 - RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         note_arm(slot, ARM_NEW, 0x1000);
         drain();
         assert!(history(slot).0.is_none());

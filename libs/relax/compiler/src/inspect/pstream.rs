@@ -1,6 +1,6 @@
-//! The `prof` service: the live profiler stream a viewer (Scope, `makepad inspect <app> pf ...`)
-//! opens on the app's makepad-remote endpoint. Layout and record kinds: makepad-prof-stream
-//! (local/agent_state/relax-campaign/profproto.md).
+//! The `prof` service: the live profiler stream a viewer (an app, `makepad inspect <app> pf ...`)
+//! opens on the app's makepad-remote endpoint. Layout and record kinds: the makepad-prof-stream
+//! crate (libs/prof_stream).
 //!
 //! While a viewer is attached, the timeline's markers (UI phases, owner service, waits, wakes,
 //! compile jobs) also go to per-thread stream rings: fixed size, overwritten when full, written
@@ -259,7 +259,7 @@ pub fn push(kind: u8, label: &'static str, a: u64, b: u64) {
     }
 }
 
-/// MAKEPAD_RUN_FLIGHTREC_ELIDE_US: the short-span threshold (0: keep every span).
+/// RELAX_FLIGHTREC_ELIDE_US: the short-span threshold (0: keep every span).
 pub(super) fn set_elide_us(us: u64) {
     ELIDE_NS.store(us * 1000, Relaxed);
 }

@@ -160,10 +160,10 @@ fn owner_package(path: &str, root: &Path) -> Result<String, String> {
     }
     Err("cannot identify the file's package; supply pkg".into())
 }
-fn canonical(p: &str) -> String { crate::vfs::canonicalize(p).map(|p|crate::vfs::normalize_path(&p.to_string_lossy())).unwrap_or_else(|_|crate::vfs::normalize_path(p)) }
+use crate::vfs::canonical;
 
 pub fn cmd_serve(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
-    match run(sess, args) { Ok(()) => 0, Err(e) => { eprintln!("makepad serve: {e}"); 2 } }
+    match run(sess, args) { Ok(()) => 0, Err(e) => { eprintln!("relax serve: {e}"); 2 } }
 }
 fn run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> Result<(), String> {
     let mut cwd = std::env::current_dir().map_err(|e|e.to_string())?;
@@ -251,7 +251,7 @@ fn run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> Result<(), Str
                 let method = r.get("method").map_or("", Json::str);
                 let answer = (|| -> Result<String, String> {
                     match method {
-                        "status" => Ok(format!("{{\"workspace\":{},\"packages\":[{}],\"uptime_s\":{:.3}}}", quote(&root.to_string_lossy()), packages.iter().map(|(name,p)|format!("{{\"pkg\":{},\"loaded_ms\":{:.3},\"last_check_ms\":{:.3},\"items\":{},\"rss_mb\":{:.3}}}",quote(name),p.loaded_ms,p.session.ms,p.session.items.len(),p.session.rss_mb)).collect::<Vec<_>>().join(","),start.elapsed().as_secs_f64())),
+                        "status" => Ok(format!("{{\"workspace\":{},\"compiler\":{},\"packages\":[{}],\"uptime_s\":{:.3}}}", quote(&root.to_string_lossy()), quote(crate::jit::PROVENANCE), packages.iter().map(|(name,p)|format!("{{\"pkg\":{},\"loaded_ms\":{:.3},\"last_check_ms\":{:.3},\"items\":{},\"rss_mb\":{:.3}}}",quote(name),p.loaded_ms,p.session.ms,p.session.items.len(),p.session.rss_mb)).collect::<Vec<_>>().join(","),start.elapsed().as_secs_f64())),
                         "shutdown" => { serve_os::STOP.store(true, Ordering::Relaxed); Ok("null".into()) }
                         "check" | "subscribe" | "schema" => {
                             let pkg = string(params,"pkg")?;
@@ -332,9 +332,13 @@ fn run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> Result<(), Str
 }
 
 pub fn request(dir: &Path, method: &str, params: &str) -> Result<Json, String> {
+    request_within(dir, method, params, Duration::from_secs(1800))
+}
+/// `request`, waiting at most `answer` for the server's answer.
+fn request_within(dir: &Path, method: &str, params: &str, answer: Duration) -> Result<Json, String> {
     let (port, token, _) = endpoint(dir)?;
     let mut socket = TcpStream::connect_timeout(&([127,0,0,1],port).into(), Duration::from_secs(2)).map_err(|e|e.to_string())?;
-    socket.set_read_timeout(Some(Duration::from_secs(1800))).map_err(|e|e.to_string())?;
+    socket.set_read_timeout(Some(answer)).map_err(|e|e.to_string())?;
     socket.set_write_timeout(Some(Duration::from_secs(5))).map_err(|e|e.to_string())?;
     writeln!(socket,"{{\"id\":1,\"token\":{},\"method\":{},\"params\":{params}}}", quote(&token),quote(method)).map_err(|e|e.to_string())?;
     let text = line(&mut BufReader::new(socket)).map_err(|e|e.to_string())?.ok_or("server closed connection")?;
@@ -342,19 +346,61 @@ pub fn request(dir: &Path, method: &str, params: &str) -> Result<Json, String> {
     if let Some(e) = response.get("error") { return Err(e.get("message").map_or("server error",Json::str).into()); }
     match response { Json::Obj(v) => v.into_iter().find(|(k,_)|k=="result").map(|(_,v)|v).ok_or("missing result".into()), _ => Err("invalid response".into()) }
 }
+/// Stops the check server `pid` (listening on `port`) within seconds, each step said in one line:
+/// asked (`shutdown`), then SIGTERM, then SIGKILL. A busy server takes neither the ask nor SIGTERM
+/// before its current request ends, which can be minutes. It is gone once its pid is or its port no
+/// longer takes connections: a server whose parent is still running stays a zombie, alive by its
+/// pid. Whether it is gone.
+fn stop_server(dir: &Path, port: u16, pid: u32) -> bool {
+    let gone = |within: Duration| {
+        let since = Instant::now();
+        loop {
+            if !serve_os::alive(pid) || TcpStream::connect_timeout(&([127,0,0,1],port).into(), Duration::from_millis(200)).is_err() { return true; }
+            if since.elapsed() >= within { return false; }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    };
+    let answered = request_within(dir, "shutdown", "{}", Duration::from_secs(1)).is_ok();
+    if gone(Duration::from_secs(2)) { return true; }
+    eprintln!("relax: the check server (pid {pid}) still runs 2 s after it was asked to stop{}: sending SIGTERM", if answered { "" } else { " (no answer)" });
+    serve_os::stop(pid);
+    if gone(Duration::from_secs(3)) { return true; }
+    eprintln!("relax: the check server (pid {pid}) still runs 3 s after SIGTERM: sending SIGKILL");
+    serve_os::stop_now(pid);
+    if gone(Duration::from_secs(2)) { return true; }
+    eprintln!("relax: the check server (pid {pid}) still runs 2 s after SIGKILL: going on without it");
+    false
+}
 fn connect(start: bool) -> Result<PathBuf, String> {
     let root = workspace(&std::env::current_dir().map_err(|e|e.to_string())?)?;
     let dir = directory(&root)?;
-    if request(&dir,"status","{}").is_ok() { return Ok(dir); }
+    if let Ok(status) = request(&dir,"status","{}") {
+        // A server built from another compiler answers with that compiler's verdicts, stale after
+        // any upgrade: it is stopped by the pid it recorded, and this compiler checks.
+        let theirs = status.get("compiler").map_or("", Json::str);
+        if theirs == crate::jit::PROVENANCE { return Ok(dir); }
+        if let Ok((port, _, pid)) = endpoint(&dir) {
+            let name = if theirs.is_empty() { "unnamed" } else { theirs };
+            eprintln!("relax: the check server (pid {pid}) runs another compiler ({name}): asking it to stop");
+            if !stop_server(&dir, port, pid) {
+                return Err(format!("the check server (pid {pid}) of another compiler did not stop"));
+            }
+            eprintln!("relax: the check server (pid {pid}) runs another compiler ({name}): stopped it{}", if start { "" } else { "; checking in-process" });
+            if !start { return Err("the check server ran another compiler".into()); }
+        }
+    }
     if !start { return Err("no check server".into()); }
-    eprintln!("makepad: starting the check server...");
+    eprintln!("relax: starting the check server...");
     let log_path = dir.join("serve.log");
     let log = if log_path.exists() { std::fs::OpenOptions::new().append(true).open(&log_path) } else { crate::os::proc::create_private(&log_path) }.map_err(|e|e.to_string())?;
-    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(|e|e.to_string())?);
+    let mut cmd = std::process::Command::new(crate::dirs::loader_exe().map_err(|e|e.to_string())?);
     cmd.arg("serve").arg("--workspace").arg(&root).stdin(std::process::Stdio::null()).stdout(log.try_clone().map_err(|e|e.to_string())?).stderr(log);
     serve_os::detach(&mut cmd);
-    // the check server outlives what started it: not one of a devhub lease's processes
-    cmd.env_remove("MAKEPAD_DEVHUB_LEASE");
+    // the check server outlives what started it: not one of its starter's processes, its claims
+    // name no owner, and it holds no grant (options.rs GRANTS: bare `relax` reads their names)
+    cmd.env_remove("RELAX_RUN_OWNER");
+    for (_, name) in crate::options::GRANTS { cmd.env_remove(name); }
+    for k in crate::progenv::host_env().detached_remove { cmd.env_remove(k); }
     let mut child = cmd.spawn().map_err(|e|e.to_string())?; let started = Instant::now();
     loop {
         if request(&dir,"status","{}").is_ok() { return Ok(dir); }
@@ -367,7 +413,7 @@ fn connect(start: bool) -> Result<PathBuf, String> {
 /// their one-shot meaning. An explicit --serve with such flags is rejected, never ignored.
 /// `-p <package>`: a package like one named plainly. Several: each checked by a process of its own,
 /// all of them whatever one says; the exit is the worst.
-fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
+fn check_packages(args: &[String], grants: &[String]) -> Result<Vec<String>, i32> {
     let mut out = Vec::new();
     let mut packages = Vec::new();
     let mut i = 0;
@@ -375,7 +421,7 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
         match args[i].as_str() {
             "-p" | "--package" => {
                 let Some(p) = args.get(i + 1).filter(|p| !p.starts_with('-')) else {
-                    eprintln!("makepad check: {} needs a package", args[i]);
+                    eprintln!("relax check: {} needs a package", args[i]);
                     return Err(2);
                 };
                 packages.push(p.clone());
@@ -391,16 +437,16 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
         out.extend(packages);
         return Ok(out);
     }
-    let exe = std::env::current_exe().map_err(|e| {
-        eprintln!("makepad check: the loader's own path: {e}");
+    let exe = crate::dirs::loader_exe().map_err(|e| {
+        eprintln!("relax check: the loader's own path: {e}");
         2
     })?;
     let mut worst = 0;
     for p in packages {
-        let status = std::process::Command::new(&exe).arg("check").args(&out).arg(&p).status();
+        let status = std::process::Command::new(&exe).arg("check").args(grants).args(&out).arg(&p).status();
         let code = status.ok().and_then(|s| s.code()).unwrap_or(2);
         if code != 0 {
-            eprintln!("makepad check: {p}: exit {code}");
+            eprintln!("relax check: {p}: exit {code}");
         }
         worst = worst.max(code);
     }
@@ -408,7 +454,8 @@ fn check_packages(args: &[String]) -> Result<Vec<String>, i32> {
 }
 
 pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
-    let args = match check_packages(args) {
+    let grants = crate::options::grant_words(&sess.options, &sess.runtime);
+    let args = match check_packages(args, &grants) {
         Ok(a) => a,
         Err(code) => return code,
     };
@@ -417,7 +464,15 @@ pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let never = args.iter().any(|a|a=="--no-serve");
     let json = args.iter().any(|a|a=="--json");
     let rest: Vec<_> = args.iter().filter(|a| !matches!(a.as_str(),"--serve"|"--no-serve"|"--json")).collect();
-    if start && never { eprintln!("makepad: --serve and --no-serve conflict"); return 2; }
+    if start && never { eprintln!("relax: --serve and --no-serve conflict"); return 2; }
+    // the check server reads the program for the target it was started with: a check for
+    // another one (RELAX_CHECK_TARGET) runs here
+    let cross = sess.options.check_target != crate::options::CheckTarget::Host;
+    if start && cross { eprintln!("relax: --serve checks this machine's target; a RELAX_CHECK_TARGET check runs in-process (--no-serve)"); return 2; }
+    // nor does it hold a grant (it is started with none, whoever starts it): a check with one
+    // runs here, as one without never takes a server's
+    if start && !grants.is_empty() { eprintln!("relax: --serve checks without grants; a check with {} runs in-process (--no-serve)", grants.join(" ")); return 2; }
+    let never = never || cross || !grants.is_empty();
     if !never && rest.len() == 1 && !rest[0].starts_with('-') {
         let response = connect(start).and_then(|dir|request(&dir,"check",&format!("{{\"pkg\":{}}}",quote(rest[0]))));
         match response {
@@ -430,13 +485,13 @@ pub fn check(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
                 let errors = summary.get("errors").map_or(0.0,Json::num) as usize;
                 let ms = summary.get("ms").map_or(0.0,Json::num) as u64;
                 if json { println!("{{\"type\":\"summary\",\"errors\":{errors},\"warnings\":{},\"ms\":{ms}}}",summary.get("warnings").map_or(0.0,Json::num)); }
-                else { eprintln!("makepad check: {errors} errors, {ms} ms"); }
+                else { eprintln!("relax check: {errors} errors, {ms} ms"); }
                 return if errors == 0 { 0 } else { 1 };
             }
-            Err(e) if start => { eprintln!("makepad: {e}"); return 2; }
+            Err(e) if start => { eprintln!("relax: {e}"); return 2; }
             Err(_) => {},
         }
-    } else if start { eprintln!("makepad: --serve supports check [--json] <package>; use --no-serve for other check options"); return 2; }
+    } else if start { eprintln!("relax: --serve supports check [--json] <package>; use --no-serve for other check options"); return 2; }
     let mut a = vec!["--check".into()]; a.extend(args.iter().filter(|a| !matches!(a.as_str(),"--serve"|"--no-serve")).cloned());
     crate::run::cmd_run(sess, &a)
 }
@@ -445,7 +500,7 @@ pub fn query(sess: &std::sync::Arc<crate::Session>, method: &str, args: &[String
     let params = match (method, values.as_slice()) {
         ("schema", [pkg,path]) => format!("{{\"pkg\":{},\"path\":{}}}",quote(pkg),quote(path)),
         ("hover"|"definition", [pkg,path,line,col]) if line.parse::<u32>().is_ok() && col.parse::<u32>().is_ok() => format!("{{\"pkg\":{},\"path\":{},\"line\":{},\"col\":{}}}",quote(pkg),quote(&canonical(path)),line,col),
-        _ => { eprintln!("usage: makepad schema [--serve] <pkg> <item> | makepad hover|definition [--serve] <pkg> <file> <line> <col>"); return 2; }
+        _ => { eprintln!("usage: {tool} schema [--serve] <pkg> <item> | {tool} hover|definition [--serve] <pkg> <file> <line> <col>", tool = crate::tool_name()); return 2; }
     };
     let start = args.iter().any(|a|a=="--serve");
     let response = match connect(start) {
@@ -460,6 +515,6 @@ pub fn query(sess: &std::sync::Arc<crate::Session>, method: &str, args: &[String
         Err(e) => Err(e),
     };
     match response {
-        Ok(v) => { println!("{v}"); 0 }, Err(e) => { eprintln!("makepad: {e}"); 2 }
+        Ok(v) => { println!("{v}"); 0 }, Err(e) => { eprintln!("relax: {e}"); 2 }
     }
 }

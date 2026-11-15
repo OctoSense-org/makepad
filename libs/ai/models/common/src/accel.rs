@@ -1,9 +1,9 @@
 //! Cross-backend host-path dispatch (Metal first, then CUDA).
 //! Spec types live in `makepad_ai_loader::accel`.
 
+use makepad_ai_loader::{WeightKey, WeightOwner};
 use crate::gpu as cuda;
 use makepad_ai_loader::prof;
-use makepad_ai_loader::quant::bf16_to_f32;
 use makepad_ai_metal as metal;
 
 pub use makepad_ai_loader::accel::{AffineQuantizedMatmulRowsSpec, AffineQuantizedMatmulSpec};
@@ -31,18 +31,18 @@ pub fn try_matmul_nt_ggml_bytes(
     out
 }
 
-pub fn try_matmul_nt_ggml_bytes_cached<F>(
+pub fn try_matmul_nt_ggml_bytes_cached<'a, F>(
     a: &[f32],
     bt_ggml_type: u32,
     m: usize,
     k: usize,
     n: usize,
-    cache_namespace: &str,
+    owner: &WeightOwner,
     bt_cache_key: &str,
     load_bt_bytes: F,
 ) -> Option<Result<Vec<f32>, String>>
 where
-    F: FnOnce() -> Result<Vec<u8>, String>,
+    F: FnOnce() -> Result<std::borrow::Cow<'a, [u8]>, String>,
 {
     if metal::is_available() {
         match metal::try_matmul_nt_ggml_bytes_keyed(
@@ -51,7 +51,7 @@ where
             m,
             k,
             n,
-            cache_namespace,
+            owner,
             bt_cache_key,
             load_bt_bytes,
         ) {
@@ -67,64 +67,12 @@ where
             m,
             k,
             n,
-            cache_namespace,
+            owner,
             bt_cache_key,
-            load_bt_bytes,
+            || load_bt_bytes().map(std::borrow::Cow::into_owned),
         );
         if out.is_ok() {
             prof::record(prof::CAT_DENSE_TOTAL, t, ((a.len() + m * n) * 4) as u64);
-        }
-        return Some(out);
-    }
-    None
-}
-
-pub fn try_matmul_nt_ggml_bytes_cached_bf16_words<F>(
-    a_bf16_words: &[u16],
-    bt_ggml_type: u32,
-    m: usize,
-    k: usize,
-    n: usize,
-    cache_namespace: &str,
-    bt_cache_key: &str,
-    load_bt_bytes: F,
-) -> Option<Result<Vec<f32>, String>>
-where
-    F: FnOnce() -> Result<Vec<u8>, String>,
-{
-    if metal::is_available() {
-        let a = a_bf16_words
-            .iter()
-            .copied()
-            .map(bf16_to_f32)
-            .collect::<Vec<_>>();
-        let bt_bytes = match load_bt_bytes() {
-            Ok(bytes) => bytes,
-            Err(err) => return Some(Err(err)),
-        };
-        if let Some(out) = metal::try_matmul_nt_ggml_bytes(&a, &bt_bytes, bt_ggml_type, m, k, n) {
-            return Some(Ok(out));
-        }
-        return None;
-    }
-    if cuda::is_available() {
-        let t = std::time::Instant::now();
-        let out = cuda::try_matmul_nt_ggml_bytes_cached_bf16_words(
-            a_bf16_words,
-            bt_ggml_type,
-            m,
-            k,
-            n,
-            cache_namespace,
-            bt_cache_key,
-            load_bt_bytes,
-        );
-        if out.is_ok() {
-            prof::record(
-                prof::CAT_DENSE_TOTAL,
-                t,
-                (a_bf16_words.len() * 2 + m * n * 4) as u64,
-            );
         }
         return Some(out);
     }
@@ -157,17 +105,17 @@ pub fn try_get_rows_ggml_bytes(
     metal::try_get_rows_ggml_bytes(src, src_ggml_type, n_cols, n_rows, row_indices)
 }
 
-pub fn try_get_rows_ggml_bytes_cached<F>(
+pub fn try_get_rows_ggml_bytes_cached<'a, F>(
     src_ggml_type: u32,
     n_cols: usize,
     n_rows: usize,
     row_indices: &[i32],
-    cache_namespace: &str,
+    owner: &WeightOwner,
     src_cache_key: &str,
     load_src_bytes: F,
 ) -> Option<Result<Vec<f32>, String>>
 where
-    F: FnOnce() -> Result<Vec<u8>, String>,
+    F: FnOnce() -> Result<std::borrow::Cow<'a, [u8]>, String>,
 {
     if metal::is_available() {
         let src_bytes = match load_src_bytes() {
@@ -187,9 +135,9 @@ where
             n_cols,
             n_rows,
             row_indices,
-            cache_namespace,
+            owner,
             src_cache_key,
-            load_src_bytes,
+            || load_src_bytes().map(std::borrow::Cow::into_owned),
         ));
     }
     None
@@ -197,9 +145,9 @@ where
 
 pub fn try_affine_quantized_matmul_bf16<FW, FS, FB>(
     spec: AffineQuantizedMatmulSpec<'_>,
-    weight_cache_key: &str,
-    scales_cache_key: &str,
-    biases_cache_key: &str,
+    weight_cache_key: &WeightKey,
+    scales_cache_key: &WeightKey,
+    biases_cache_key: &WeightKey,
     load_weight_bytes: FW,
     load_scales_bytes: FS,
     load_biases_bytes: FB,
@@ -236,9 +184,9 @@ where
 
 pub fn try_affine_quantized_matmul_bf16_top1<FW, FS, FB>(
     spec: AffineQuantizedMatmulSpec<'_>,
-    weight_cache_key: &str,
-    scales_cache_key: &str,
-    biases_cache_key: &str,
+    weight_cache_key: &WeightKey,
+    scales_cache_key: &WeightKey,
+    biases_cache_key: &WeightKey,
     load_weight_bytes: FW,
     load_scales_bytes: FS,
     load_biases_bytes: FB,
@@ -264,9 +212,9 @@ where
 
 pub fn try_affine_quantized_matmul_bf16_rows<FW, FS, FB>(
     spec: AffineQuantizedMatmulRowsSpec<'_>,
-    weight_cache_key: &str,
-    scales_cache_key: &str,
-    biases_cache_key: &str,
+    weight_cache_key: &WeightKey,
+    scales_cache_key: &WeightKey,
+    biases_cache_key: &WeightKey,
     load_weight_bytes: FW,
     load_scales_bytes: FS,
     load_biases_bytes: FB,

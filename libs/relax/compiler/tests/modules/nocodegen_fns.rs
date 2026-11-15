@@ -1,4 +1,4 @@
-// No-codegen mode (MAKEPAD_RUN_NO_CODEGEN=1, with MAKEPAD_RUN_SANDBOX_NOCHECK=1 for the forged pointer): a
+// No-codegen mode (RELAX_NO_CODEGEN=1, with --allow-unchecked-modules for the forged pointer): a
 // module's fn values. The process writes no machine code there, so a twin taken as a value is its
 // slot's precompiled thunk and an indirect call is checked against the thunks given out, where the
 // other mode masks it into a table: fn items, closures behind `dyn Fn` and std's formatting (it

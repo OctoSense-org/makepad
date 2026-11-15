@@ -21,6 +21,9 @@ extern "C" {
     fn CFRunLoopPerformBlock(rl: *mut c_void, mode: ObjcId, block: *const c_void);
 }
 
+#[link(name = "PDFKit", kind = "framework")]
+extern "C" {}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct CAFrameRateRange {
@@ -107,7 +110,6 @@ pub struct App {
     /// The Dock icon's menu (`menu_kind::DOCK` items; the system adds the windows), nil: none.
     dock_menu: Cell<ObjcId>,
     pasteboard: Cell<ObjcId>,
-    nap: Cell<ObjcId>,
     marked_attributes: Cell<ObjcId>,
     cursor: Cell<u32>,
     cursors: RefCell<HashMap<u32, ObjcId>>,
@@ -146,7 +148,6 @@ pub fn app() -> &'static App {
             menu_delegate: Cell::new(nil),
             dock_menu: Cell::new(nil),
             pasteboard: Cell::new(nil),
-            nap: Cell::new(nil),
             marked_attributes: Cell::new(nil),
             cursor: Cell::new(cursor::DEFAULT),
             cursors: RefCell::new(HashMap::new()),
@@ -364,7 +365,7 @@ unsafe fn init() {
     // a minimal app menu (About, Quit with Cmd+Q) named after the bundle; an app's own menu
     // (`MenuSet`) replaces it
     install_app_menu();
-    begin_test_instance_activity();
+    begin_unseen_activity(policy == NSApplicationActivationPolicy::NSApplicationActivationPolicyAccessory);
     // the system appearance, now and whenever it changes
     read_appearance();
     let center: ObjcId = msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
@@ -379,23 +380,73 @@ unsafe fn init() {
     Shared::global().publish_ready(scale as f32);
 }
 
-/// Holds an `ACTIVITY_USER_INITIATED` token so a no-focus (agent, test) instance is not
-/// App-Napped during a long rest.
-unsafe fn begin_test_instance_activity() {
-    if focus_allowed() || app().nap.get() != nil {
+/// Holds an activity token so an app that works unseen is not App-Napped (its timers coalesced,
+/// its threads and I/O throttled): a no-focus (agent, test) instance during a long rest, which
+/// also keeps the Mac from idle sleep, and a menu-bar app (`accessory`: devhub's master, the AI
+/// Hub), whose work goes on with no window shown and which lets the Mac sleep as before.
+unsafe fn begin_unseen_activity(accessory: bool) {
+    let kind = if !focus_allowed() {
+        UNSEEN_NO_FOCUS
+    } else if accessory {
+        UNSEEN_MENU_BAR
+    } else {
+        return;
+    };
+    UNSEEN_KIND.store(kind, Ordering::Release);
+    start_unseen_activity();
+}
+
+/// The activity [`begin_unseen_activity`] holds (an `NSActivity` token, retained; 0: none), and
+/// which kind it is (0: none asked): held outside the main thread's state, so it ends from the
+/// thread that execs the process ([`end_unseen_activity`]).
+static UNSEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNSEEN_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const UNSEEN_NO_FOCUS: u8 = 1;
+const UNSEEN_MENU_BAR: u8 = 2;
+
+unsafe fn start_unseen_activity() {
+    let (options, reason) = match UNSEEN_KIND.load(Ordering::Acquire) {
+        UNSEEN_NO_FOCUS => (ACTIVITY_USER_INITIATED, "makepad no-focus instance"),
+        UNSEEN_MENU_BAR => (ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP, "makepad menu-bar app at work"),
+        _ => return,
+    };
+    if UNSEEN.load(Ordering::Acquire) != 0 {
         return;
     }
     let info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
-    let reason = str_to_nsstring("makepad no-focus instance");
-    let options = ACTIVITY_USER_INITIATED | ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED;
-    let token: ObjcId = msg_send![info, beginActivityWithOptions: options reason: reason];
+    let token: ObjcId = msg_send![info, beginActivityWithOptions: options reason: str_to_nsstring(reason)];
     let () = msg_send![token, retain];
-    app().nap.set(token);
+    if UNSEEN.compare_exchange(0, token as usize, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        let () = msg_send![info, endActivity: token];
+        let () = msg_send![token, release];
+    }
 }
 
-/// Foundation `NSActivityIdleSystemSleepDisabled` (`1ULL << 20`) and `NSActivityUserInitiated`.
+/// Ends the activity [`begin_unseen_activity`] holds, from any thread: before the process execs
+/// itself in place. The power assertion behind it is the pid's, which an exec keeps, so powerd
+/// never sees it end, and the next image begins its own: each self-update of devhub's master left
+/// one more (28 in a day, 11-13).
+pub fn end_unseen_activity() {
+    let token = UNSEEN.swap(0, Ordering::AcqRel) as ObjcId;
+    if token != nil {
+        unsafe {
+            let info: ObjcId = msg_send![class!(NSProcessInfo), processInfo];
+            let () = msg_send![info, endActivity: token];
+            let () = msg_send![token, release];
+        }
+    }
+}
+
+/// Begins the activity again after [`end_unseen_activity`] when the exec did not happen.
+pub fn resume_unseen_activity() {
+    unsafe { start_unseen_activity() }
+}
+
+/// Foundation `NSActivityIdleSystemSleepDisabled` (`1ULL << 20`), and
+/// `NSActivityUserInitiatedAllowingIdleSystemSleep` with and without it (`NSActivityUserInitiated`).
 const ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED: u64 = 1 << 20;
-const ACTIVITY_USER_INITIATED: u64 = 0x00FFFFFF | ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED;
+const ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 = 0x00FFFFFF;
+const ACTIVITY_USER_INITIATED: u64 = ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP | ACTIVITY_IDLE_SYSTEM_SLEEP_DISABLED;
 
 extern "C" {
     /// libobjc: the hook called with an exception object before it is thrown. The only place that
@@ -450,7 +501,7 @@ pub fn windows_gone_before_exit() {
             }
         }
         let () = msg_send![class!(CATransaction), flush];
-        if std::env::var_os("MAKEPAD_EXIT_TRACE").is_some() {
+        if relax_api::env::var_os("MAKEPAD_EXIT_TRACE").is_some() {
             let since = EXIT_REQUESTED.lock().ok().and_then(|t| *t).map(|t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3);
             eprintln!("makepad-exit: windows gone ({} ordered out, {} already closed) {} ms after the close/quit request", ordered_out, count - ordered_out, since.map_or("?".to_string(), |ms| format!("{:.1}", ms)));
         }
@@ -707,25 +758,12 @@ impl App {
     }
 
     pub fn startup_focus_hack(&self) {
-        if self.focus_hack_ran.replace(true) || !focus_allowed() {
+        // a launch the person asked to see is raised without the focus: their click takes it,
+        // not a pointer passing over the raised window (keys typed elsewhere then went to it)
+        if self.focus_hack_ran.replace(true) || !focus_allowed() || shown_for_person() {
             return;
         }
-        unsafe {
-            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-            let active: bool = msg_send![ns_app, isActive];
-            if active {
-                return;
-            }
-            let dock_array: ObjcId = msg_send![class!(NSRunningApplication), runningApplicationsWithBundleIdentifier: str_to_nsstring("com.apple.dock")];
-            let dock_count: u64 = msg_send![dock_array, count];
-            if dock_count == 0 {
-                return;
-            }
-            let dock: ObjcId = msg_send![dock_array, objectAtIndex: 0];
-            let _: BOOL = msg_send![dock, activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps];
-            let me: ObjcId = msg_send![class!(NSRunningApplication), currentApplication];
-            let () = msg_send![me, activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps];
-        }
+        activate_through_dock();
     }
 
     pub fn marked_text_attributes(&self) -> ObjcId {
@@ -1105,6 +1143,12 @@ fn command(sid: u32, cmd: OsCmd) {
         }
         OsCmd::WindowClose { id } => {
             if let Some(win) = window_of(id) {
+                // (session 0 is the host: `makepad run` closes the window it lent the app when its
+                // run ends, and says why)
+                if !win.popup && !win.dropdown {
+                    eprintln!("makepad-hal: window {} closes: session {sid}{} closed it", id.index, if sid == 0 { " (the host)" } else { "" });
+                }
+                win.close_sent.set(true);
                 unsafe {
                     let () = msg_send![win.window, close];
                 }
@@ -1189,15 +1233,24 @@ fn command(sid: u32, cmd: OsCmd) {
             if !focus_allowed() {
                 return;
             }
-            let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
-            let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
+            a.focus_hack_done();
+            if shown_for_person() {
+                activate_through_dock();
+            } else {
+                let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+                let () = msg_send![ns_app, activateIgnoringOtherApps: YES];
+            }
+            // its windows on screen, a minimised one back; a hidden one stays hidden (a tray app's
+            // closed window, its dismissed dropdown)
             let windows: Vec<&'static Win> = a.windows.borrow().iter().copied().filter(|w| !w.retired.get()).collect();
             for win in windows {
                 let miniaturized: BOOL = msg_send![win.window, isMiniaturized];
+                let visible: BOOL = msg_send![win.window, isVisible];
                 if miniaturized != NO {
                     let () = msg_send![win.window, deminiaturize: nil];
+                } else if visible != NO {
+                    let () = msg_send![win.window, orderFrontRegardless];
                 }
-                let () = msg_send![win.window, orderFrontRegardless];
             }
         },
         OsCmd::ImeShow { id, area, .. } => {
@@ -1219,11 +1272,22 @@ fn command(sid: u32, cmd: OsCmd) {
                 q.clipboard(req, true, &content);
             });
         }
-        OsCmd::ClipSet { text } => unsafe {
+        OsCmd::ClipSet { data } => unsafe {
             let pasteboard = a.pasteboard.get();
-            let array: ObjcId = msg_send![class!(NSArray), arrayWithObject: NSStringPboardType];
+            let mut types = vec![NSStringPboardType];
+            let html = str_to_nsstring("public.html");
+            let markdown = str_to_nsstring("net.daringfireball.markdown");
+            if !data.html.is_empty() { types.push(html); }
+            if !data.markdown.is_empty() { types.push(markdown); }
+            let array: ObjcId = msg_send![class!(NSArray), arrayWithObjects: types.as_ptr() count: types.len()];
             let () = msg_send![pasteboard, declareTypes: array owner: nil];
-            let () = msg_send![pasteboard, setString: str_to_nsstring(&text) forType: NSStringPboardType];
+            let () = msg_send![pasteboard, setString: str_to_nsstring(&data.text) forType: NSStringPboardType];
+            if !data.html.is_empty() {
+                let () = msg_send![pasteboard, setString: str_to_nsstring(&data.html) forType: html];
+            }
+            if !data.markdown.is_empty() {
+                let () = msg_send![pasteboard, setString: str_to_nsstring(&data.markdown) forType: markdown];
+            }
         },
         OsCmd::DragStart { id, items, image } => {
             if let Some(win) = window_of(id) {
@@ -1249,7 +1313,8 @@ fn command(sid: u32, cmd: OsCmd) {
         // (no headset here)
         OsCmd::XrFrameEyes { .. } | OsCmd::XrPoseLead { .. } | OsCmd::XrRefreshRate { .. } | OsCmd::XrHaptic { .. } => {}
         OsCmd::FileDialog { req, kind, title, location, filename, filters } => file_dialog(sid, req, kind, &title, &location, &filename, &filters),
-        OsCmd::DragReply { id, to, answer } => {
+        OsCmd::PrintPdf { req, title, pdf } => print_pdf(sid, req, &title, &pdf),
+        OsCmd::DragReply { id, to, answer, .. } => {
             if let Some(win) = window_of(id) {
                 match to {
                     input::reply::QUERY => win.caption_answer(answer),
@@ -1588,6 +1653,106 @@ pub fn dock_menu() -> ObjcId {
 
 const NS_MODAL_RESPONSE_OK: i64 = 1;
 
+// PDFKit's PDFPrintScalingMode (NSInteger): None = 0, ToFit = 1, DownToFit = 2.
+const PDF_PRINT_PAGE_SCALE_DOWN_TO_FIT: isize = 2;
+
+/// Owned until AppKit calls the sheet's completion delegate. All references are created and
+/// released on the main thread; neither the submitted byte buffer nor an autorelease pool
+/// needs to outlive the command that starts the sheet.
+struct PendingPrint {
+    sid: u32,
+    req: u32,
+    data: ObjcId,
+    document: ObjcId,
+    operation: ObjcId,
+    delegate: ObjcId,
+}
+
+impl Drop for PendingPrint {
+    fn drop(&mut self) {
+        unsafe {
+            let () = msg_send![self.operation, release];
+            let () = msg_send![self.document, release];
+            let () = msg_send![self.data, release];
+            let () = msg_send![self.delegate, release];
+        }
+    }
+}
+
+/// Called once by the print delegate with the context allocated by `print_pdf`.
+///
+/// # Safety
+/// `context` must be the live `PendingPrint` handed to AppKit, consumed once on the main thread.
+pub(super) unsafe fn print_operation_did_run(success: BOOL, context: *mut c_void) {
+    let pending = Box::from_raw(context as *mut PendingPrint);
+    let status = if success != NO { print_status::PRINTED } else { print_status::CANCELLED };
+    Shared::global().push(pending.sid, |q| q.print_result(pending.req, status, &[]));
+    // Dropping the context releases the operation, PDF, data and delegate even if posting panics.
+}
+
+/// Starts a document-modal print sheet and returns; completion is an event, never a wait on
+/// the UI thread or an application-modal print loop.
+fn print_pdf(sid: u32, req: u32, title: &str, pdf: &[u8]) {
+    let failed = |message: &str| Shared::global().push(sid, |q| q.print_result(req, print_status::FAILED, message.as_bytes()));
+    let mut pending = Box::new(PendingPrint { sid, req, data: nil, document: nil, operation: nil, delegate: nil });
+    unsafe {
+        let data: ObjcId = msg_send![class!(NSData), alloc];
+        pending.data = msg_send![data, initWithBytes: pdf.as_ptr() as *const c_void length: pdf.len()];
+        if pending.data == nil {
+            failed("could not create PDF data");
+            return;
+        }
+        let document: ObjcId = msg_send![class!(PDFDocument), alloc];
+        pending.document = msg_send![document, initWithData: pending.data];
+        if pending.document == nil {
+            failed("not a PDF");
+            return;
+        }
+
+        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+        let mut window: ObjcId = msg_send![ns_app, keyWindow];
+        if window == nil {
+            window = msg_send![ns_app, mainWindow];
+        }
+        if window == nil {
+            let windows: ObjcId = msg_send![ns_app, windows];
+            window = msg_send![windows, firstObject];
+        }
+        if window == nil {
+            failed("no window");
+            return;
+        }
+
+        let print_info: ObjcId = msg_send![class!(NSPrintInfo), sharedPrintInfo];
+        let operation: ObjcId = msg_send![pending.document,
+            printOperationForPrintInfo: print_info
+            scalingMode: PDF_PRINT_PAGE_SCALE_DOWN_TO_FIT
+            autoRotate: YES
+        ];
+        if operation == nil {
+            failed("could not create print operation");
+            return;
+        }
+        pending.operation = msg_send![operation, retain];
+        let () = msg_send![operation, setJobTitle: str_to_nsstring(title)];
+        let () = msg_send![operation, setShowsPrintPanel: YES];
+        let () = msg_send![operation, setShowsProgressPanel: YES];
+        pending.delegate = msg_send![app().classes().print_delegate, new];
+        if pending.delegate == nil {
+            failed("could not create print delegate");
+            return;
+        }
+        let delegate = pending.delegate;
+        let context = Box::into_raw(pending) as *mut c_void;
+        let () = msg_send![operation,
+            runOperationModalForWindow: window
+            delegate: delegate
+            didRunSelector: sel!(printOperationDidRun:success:contextInfo:)
+            contextInfo: context
+        ];
+    }
+}
+
 /// Every extension the dialog's filters name, flattened. A filter of `*` means "no restriction at
 /// all" and wins over every other filter. `filters` are (description, "ext,ext") pairs.
 fn filter_extensions(filters: &[String]) -> Vec<String> {
@@ -1725,4 +1890,34 @@ fn file_dialog(sid: u32, req: u32, kind: u32, title: &str, location: &str, filen
         bytes.extend_from_slice(p.as_bytes());
     }
     Shared::global().push(sid, |q| q.dialog_result(req, paths.len() as u32, &bytes));
+}
+
+/// A launch a person asked to see (`devhub show` sets `MAKEPAD_SHOW=1`): launched by a background
+/// process, its activation must go through the Dock, or its windows open behind the person's.
+pub(super) fn shown_for_person() -> bool {
+    static SHOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHOWN.get_or_init(|| std::env::var_os("MAKEPAD_SHOW").is_some_and(|v| v == "1"))
+}
+
+/// Brings this app to the front from wherever it was launched (a background process, a terminal,
+/// an agent): through the Dock, which macOS lets take the focus from another app, as a plain
+/// `activateIgnoringOtherApps` from a process the person did not start is refused. Nothing when
+/// it is the active app already.
+fn activate_through_dock() {
+    unsafe {
+        let ns_app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+        let active: bool = msg_send![ns_app, isActive];
+        if active {
+            return;
+        }
+        let dock_array: ObjcId = msg_send![class!(NSRunningApplication), runningApplicationsWithBundleIdentifier: str_to_nsstring("com.apple.dock")];
+        let dock_count: u64 = msg_send![dock_array, count];
+        if dock_count == 0 {
+            return;
+        }
+        let dock: ObjcId = msg_send![dock_array, objectAtIndex: 0];
+        let _: BOOL = msg_send![dock, activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps];
+        let me: ObjcId = msg_send![class!(NSRunningApplication), currentApplication];
+        let () = msg_send![me, activateWithOptions: NSApplicationActivationOptions::NSApplicationActivateIgnoringOtherApps];
+    }
 }

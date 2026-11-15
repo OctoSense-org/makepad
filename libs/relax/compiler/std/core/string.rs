@@ -10,7 +10,7 @@ use crate::result::Result::{self, Err, Ok};
 use crate::str::pattern::{Pattern, StrSearcher};
 use crate::str::{Chars, StrIndex, Utf8Error};
 
-#[cfg_attr(not(relax_check), lang = "String")]
+#[lang = "String"]
 pub struct String {
     vec: Vec<u8>,
 }
@@ -56,9 +56,7 @@ impl fmt::Display for FromUtf16Error {
     }
 }
 
-#[cfg(not(relax_check))]
 impl crate::error::Error for FromUtf8Error {}
-#[cfg(not(relax_check))]
 impl crate::error::Error for FromUtf16Error {}
 
 /// `bytes` with each invalid sequence replaced by U+FFFD (String::from_utf8_lossy's text).
@@ -401,7 +399,6 @@ impl String {
 }
 
 /// `String::from_utf8_lossy` (borrows when the bytes are valid).
-#[cfg(not(relax_check))]
 impl String {
     pub fn from_utf8_lossy(v: &[u8]) -> crate::borrow::Cow<'_, str> {
         let mut iter = crate::str::utf8_chunks(v);
@@ -861,8 +858,9 @@ impl Extend<String> for String {
     }
 }
 
-impl Extend<crate::boxed::Box<str>> for String {
-    fn extend<I: IntoIterator<Item = crate::boxed::Box<str>>>(&mut self, iter: I) {
+// alloc/src/string.rs (Rust 1.45; compact_str's iterators)
+impl<A: crate::heap::Allocator> Extend<crate::boxed::Box<str, A>> for String {
+    fn extend<I: IntoIterator<Item = crate::boxed::Box<str, A>>>(&mut self, iter: I) {
         let mut it = iter.into_iter();
         while let Some(s) = it.next() {
             self.push_str(&s);
@@ -870,8 +868,8 @@ impl Extend<crate::boxed::Box<str>> for String {
     }
 }
 
-impl FromIterator<crate::boxed::Box<str>> for String {
-    fn from_iter<I: IntoIterator<Item = crate::boxed::Box<str>>>(iter: I) -> String {
+impl<A: crate::heap::Allocator> FromIterator<crate::boxed::Box<str, A>> for String {
+    fn from_iter<I: IntoIterator<Item = crate::boxed::Box<str, A>>>(iter: I) -> String {
         let mut buf = String::new();
         buf.extend(iter);
         buf
@@ -904,7 +902,6 @@ pub trait ToString {
 }
 
 /// Every Display type gets `to_string` (one of the blanket impls core may write).
-#[cfg(not(relax_check))]
 impl<T: fmt::Display + ?Sized> ToString for T {
     fn to_string(&self) -> String {
         if let Some(s) = exact_to_string(self) {
@@ -922,7 +919,6 @@ impl<T: fmt::Display + ?Sized> ToString for T {
 /// real alloc's SpecToString classes, selected by type identity with lifetimes erased.
 /// A non-generic classifier keeps the comparisons out of each ToString instance; the inliner
 /// folds it for the constant type id of an instance.
-#[cfg(not(relax_check))]
 fn spec_class(id: u64) -> u8 {
     macro_rules! classes {
         ($($t:ty => $class:expr,)*) => {
@@ -969,7 +965,6 @@ fn spec_class(id: u64) -> u8 {
 }
 
 /// real alloc's SpecToString: preserve each specialized type's allocation capacity.
-#[cfg(not(relax_check))]
 fn exact_to_string<T: ?Sized>(v: &T) -> Option<String> {
     macro_rules! integer {
         (unsigned $t:ty) => {{
@@ -1042,11 +1037,10 @@ fn exact_to_string<T: ?Sized>(v: &T) -> Option<String> {
     }
 }
 
-#[cfg(not(relax_check))]
 mod borrow_impls {
     use super::String;
     use crate::borrow::{Borrow, BorrowMut, Cow, ToOwned};
-    use crate::ops::Add;
+    use crate::ops::{Add, AddAssign};
 
     impl Borrow<str> for String {
         fn borrow(&self) -> &str {
@@ -1147,6 +1141,45 @@ mod borrow_impls {
         }
     }
 
+    // library/alloc/src/borrow.rs
+    impl<'a> Add<Cow<'a, str>> for Cow<'a, str> {
+        type Output = Cow<'a, str>;
+        fn add(mut self, rhs: Cow<'a, str>) -> Cow<'a, str> {
+            self += rhs;
+            self
+        }
+    }
+
+    impl<'a> AddAssign<&'a str> for Cow<'a, str> {
+        fn add_assign(&mut self, rhs: &'a str) {
+            if self.is_empty() {
+                *self = Cow::Borrowed(rhs)
+            } else if !rhs.is_empty() {
+                if let Cow::Borrowed(lhs) = *self {
+                    let mut s = String::with_capacity(lhs.len() + rhs.len());
+                    s.push_str(lhs);
+                    *self = Cow::Owned(s);
+                }
+                self.to_mut().push_str(rhs);
+            }
+        }
+    }
+
+    impl<'a> AddAssign<Cow<'a, str>> for Cow<'a, str> {
+        fn add_assign(&mut self, rhs: Cow<'a, str>) {
+            if self.is_empty() {
+                *self = rhs
+            } else if !rhs.is_empty() {
+                if let Cow::Borrowed(lhs) = *self {
+                    let mut s = String::with_capacity(lhs.len() + rhs.len());
+                    s.push_str(lhs);
+                    *self = Cow::Owned(s);
+                }
+                self.to_mut().push_str(&rhs);
+            }
+        }
+    }
+
     impl<'a> Extend<Cow<'a, str>> for String {
         fn extend<I: IntoIterator<Item = Cow<'a, str>>>(&mut self, iter: I) {
             let mut it = iter.into_iter();
@@ -1164,7 +1197,7 @@ mod borrow_impls {
         }
     }
 
-    // library/alloc/src/string.rs: a collected Cow<str> is always the owned String.
+    // alloc/src/string.rs (Rust 1.12 / 1.19): a collected Cow<str> is an owned String
     impl<'a> FromIterator<char> for Cow<'a, str> {
         fn from_iter<I: IntoIterator<Item = char>>(it: I) -> Cow<'a, str> {
             Cow::Owned(FromIterator::from_iter(it))
@@ -1186,36 +1219,6 @@ mod borrow_impls {
     impl crate::hash::Hash for String {
         fn hash<H: crate::hash::Hasher>(&self, hasher: &mut H) {
             crate::hash::Hash::hash(self.as_str(), hasher)
-        }
-    }
-}
-
-/// rustc shim only: lets tests compare/print this String with real std's.
-#[cfg(relax_check)]
-mod check_bridge {
-    use super::String;
-
-    impl std::fmt::Debug for String {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            std::fmt::Debug::fmt(self.as_str(), f)
-        }
-    }
-
-    impl std::fmt::Display for String {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            std::fmt::Display::fmt(self.as_str(), f)
-        }
-    }
-
-    impl PartialEq<std::string::String> for String {
-        fn eq(&self, other: &std::string::String) -> bool {
-            self.as_str() == other.as_str()
-        }
-    }
-
-    impl PartialEq<String> for std::string::String {
-        fn eq(&self, other: &String) -> bool {
-            self.as_str() == other.as_str()
         }
     }
 }

@@ -1,4 +1,4 @@
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 use crate::function::*;
 use crate::heap::*;
 pub use crate::host::*;
@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-#[relax_api(handle, clone, eq, hash, debug)]
+#[relax_api(handle, clone, eq, hash, debug, run)]
 #[derive(Clone, Default, Eq, PartialEq)]
 pub struct ScriptModKey {
     pub file: String,
@@ -48,7 +48,7 @@ impl std::hash::Hash for ScriptModKey {
 }
 
 /// What a [`ScriptModKey`] holds, as views.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptModKeyView<'a> {
@@ -57,11 +57,11 @@ pub struct ScriptModKeyView<'a> {
     pub column: usize,
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptModKey {
-    #[relax_api]
+    #[relax_api(run)]
     pub fn new(file: &str, line: usize, column: usize) -> Self { Self { file: file.to_owned(), line, column } }
-    #[relax_api]
+    #[relax_api(run)]
     pub fn view(&self) -> ScriptModKeyView<'_> { ScriptModKeyView { file: &self.file, line: self.line, column: self.column } }
 }
 
@@ -79,7 +79,7 @@ impl ScriptModKey {
     }
 }
 
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 #[derive(Default, Debug)]
 pub struct ScriptMod {
     pub cargo_manifest_path: String,
@@ -92,7 +92,7 @@ pub struct ScriptMod {
 }
 
 /// A pinned heap string's text (ScriptVm::string_pin): valid until its string_unpin.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptStrPin {
@@ -114,7 +114,7 @@ impl ScriptStrPin {
 /// fat pointers and scalars (C-shaped: in the makepad loader the VM is rustc-built and the
 /// ScriptMod's owner Rapid-built, local/plans/loader-core.md section 8). The VM copies what it
 /// keeps.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ScriptModView<'a> {
@@ -127,15 +127,15 @@ pub struct ScriptModView<'a> {
     pub values: &'a [ScriptValue],
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptMod {
-    #[relax_api]
+    #[relax_api(run)]
     pub fn new(manifest: &str, module: &str, file: &str, line: usize, column: usize, code: &str, values: &[ScriptValue]) -> Self {
         Self { cargo_manifest_path: manifest.to_owned(), module_path: module.to_owned(), file: file.to_owned(), line, column, code: code.to_owned(), values: values.to_vec() }
     }
 
     /// Where the block is reported to start (a macro that wraps `script!` names its own call site).
-    #[relax_api]
+    #[relax_api(run)]
     pub fn set_line_column(&mut self, line: usize, column: usize) {
         self.line = line;
         self.column = column;
@@ -150,7 +150,7 @@ impl ScriptMod {
     }
 
     #[inline]
-    #[relax_api]
+    #[relax_api(run)]
     pub fn view(&self) -> ScriptModView<'_> {
         ScriptModView {
             cargo_manifest_path: &self.cargo_manifest_path,
@@ -182,7 +182,7 @@ pub const CALL_TRANSFORM: u32 = 2;
 /// Run the paused thread on.
 pub const CALL_RESUME: u32 = 3;
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptCallReq<'a> {
     pub mode: u32,
@@ -216,7 +216,7 @@ pub const EVAL_APPEND: u32 = 5;
 /// `image`: another VM's fn, `scope` its parent; the result is the fn object or nil.
 pub const EVAL_ADOPT: u32 = 6;
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptEvalReq<'a> {
     pub mode: u32,
@@ -325,16 +325,31 @@ impl ScriptBody {
         self.shown.clone().unwrap_or_else(|| script_mod.file.clone())
     }
 
-    /// The zero-based line the body's text starts at.
-    fn site_line0(&self, script_mod: &ScriptMod) -> u32 {
-        if self.shown.is_some() { script_mod.line.saturating_sub(1) as u32 } else { script_mod.line as u32 }
+    /// The zero-based line a text at ScriptMod line `line` starts at. Its first line is
+    /// `line`, as runtime errors count (`row + line`, [`ScriptCode::ip_to_loc`]); a text at
+    /// line 0 counts its lines from 1.
+    fn line0_of(line: usize) -> usize {
+        line.saturating_sub(1)
     }
 
-    /// The file and (line, column) offsets the body's parser reports.
+    /// The zero-based line the body's text starts at ([`Self::line0_of`]).
+    fn site_line0(&self, script_mod: &ScriptMod) -> u32 {
+        Self::line0_of(script_mod.line) as u32
+    }
+
+    /// What takes the parser's zero-based lines (from [`Self::site_line0`]) to the lines
+    /// runtime errors give: 1, or 0 for a text at line 0.
+    fn parse_line_shift(&self, script_mod: &ScriptMod) -> u32 {
+        script_mod.line as u32 - self.site_line0(script_mod)
+    }
+
+    /// The file and (line, column) offsets the body's parser reports: its `file:line:col`
+    /// text reads the line runtime errors give.
     fn parse_site(&self, script_mod: &ScriptMod) -> (String, (usize, usize)) {
+        let line0 = self.site_line0(script_mod) as usize;
         match &self.shown {
-            Some(file) => (file.clone(), (script_mod.line.saturating_sub(1), 0)),
-            None => (script_mod.file.clone(), (script_mod.line, script_mod.column)),
+            Some(file) => (file.clone(), (line0, 0)),
+            None => (script_mod.file.clone(), (line0, script_mod.column)),
         }
     }
 
@@ -367,14 +382,14 @@ impl ScriptBody {
 /// A module borrowed from the body's table. The borrow guard stays opaque so callers
 /// can inspect source views without copying the entire module or laying out RefCell state;
 /// [`Self::view`] is the one door, the readers below are inline code over it.
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 pub struct ScriptModuleRead<'a> {
     bodies: Ref<'a, Vec<ScriptBody>>,
     index: usize,
 }
 
 /// What a [`ScriptModuleRead`] shows of its body, as views into it.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptModuleView<'a> {
     pub exists: bool,
@@ -414,9 +429,9 @@ fn module_view(bodies: &[ScriptBody], index: usize) -> ScriptModuleView<'_> {
     }
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptModuleRead<'_> {
-    #[relax_api]
+    #[relax_api(run)]
     pub fn view(&self) -> ScriptModuleView<'_> {
         module_view(&self.bodies, self.index)
     }
@@ -450,14 +465,14 @@ impl ScriptModuleRead<'_> {
 
 /// Mutable body-table borrow whose representation stays inside the VM: [`Self::view`] shows a
 /// body, [`Self::set_opcode_value`] changes one of its opcodes.
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 pub struct ScriptModulesMut<'a> { bodies: std::cell::RefMut<'a, Vec<ScriptBody>> }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptModulesMut<'_> {
-    #[relax_api]
+    #[relax_api(run)]
     pub fn view(&self, index: usize) -> ScriptModuleView<'_> { module_view(&self.bodies, index) }
-    #[relax_api]
+    #[relax_api(run)]
     pub fn set_opcode_value(&mut self, index: usize, at: usize, value: ScriptValue) { self.bodies[index].parser.opcodes[at] = value; }
 }
 
@@ -481,9 +496,9 @@ impl ScriptModulesMut<'_> {
     pub fn end_or_initial_scope(&self, index: usize) -> ScriptObject { self.view(index).end_scope }
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptCode {
-    #[relax_api]
+    #[relax_api(run)]
     pub fn modules_mut(&self) -> ScriptModulesMut<'_> { ScriptModulesMut { bodies: self.bodies.borrow_mut() } }
 }
 
@@ -497,7 +512,7 @@ impl ScriptBody {
     }
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Default)]
 pub struct ScriptBuiltins {
     pub range: ScriptObject,
@@ -524,7 +539,7 @@ impl ScriptBuiltins {
 /// thing that can move or free a body's opcode buffer (a native call can
 /// re-enter `eval` and reload the very body that is running), and `run_core`
 /// compares the epoch before it trusts its cached pointer into that buffer.
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 #[derive(Default)]
 pub struct ScriptBodies {
     bodies: RefCell<Vec<ScriptBody>>,
@@ -553,7 +568,7 @@ impl ScriptBodies {
     }
 }
 
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 #[derive(Default)]
 pub struct ScriptCode {
     pub builtins: ScriptBuiltins,
@@ -585,7 +600,7 @@ pub(crate) struct ShaderFnNamespace {
 }
 
 /// One rename of a [`ShaderFnNamespace`]: `self.<from>` is `self.<to>`.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderFnRename {
@@ -594,7 +609,7 @@ pub struct ShaderFnRename {
 }
 
 /// See [`ShaderFnNamespace::input`].
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ShaderFnInput {
@@ -625,7 +640,7 @@ impl ScriptLoc {
 }
 
 /// Caller-owned source location. All methods stay on the constructing side.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 pub struct ScriptLoc {
     pub file: String,
     pub col: u32,
@@ -643,8 +658,8 @@ pub struct ScriptFnTokens {
 }
 
 /// [`ScriptFnTokens`] in flight across the relax boundary: its String and Vec as the words of
-/// their buffers (`makepad_relax_api::Words`); `ScriptVm::fn_tokens_placed` rebuilds them.
-#[relax_api(plain)]
+/// their buffers (`relax_api::Words`); `ScriptVm::fn_tokens_placed` rebuilds them.
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptFnTokensRaw {
     pub file: [usize; 3],
@@ -655,7 +670,7 @@ pub struct ScriptFnTokensRaw {
 /// One token of a script fn: as the VM read it, whether a newline
 /// preceded it, its characters in its body's code (`start` first, `end`
 /// one past the last) and where it is written (1-based line and column).
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptFnToken {
@@ -676,7 +691,7 @@ pub struct ScriptFnToken {
 /// To Relax-compiled code it is an opaque handle: the crate drops, clones and
 /// reads it (relax_api.txt ops); an empty image ([`Self::is_empty`]) stands
 /// for "no fn" where a handle crosses by value.
-#[relax_api(handle, clone, debug)]
+#[relax_api(handle, clone, debug, run)]
 #[repr(transparent)]
 pub struct ScriptFnImage(Option<Box<ScriptFnImageData>>);
 
@@ -691,7 +706,7 @@ struct ScriptFnImageData {
     hash: u64,
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptFnImage {
     fn new(file: String, line: u32, col: u32, text: String, tokens: Vec<ScriptTokenPos>, strings: Vec<(usize, String)>) -> Self {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -710,7 +725,7 @@ impl ScriptFnImage {
     pub(crate) fn empty() -> Self { Self(None) }
 
     /// What the image holds, as views.
-    #[relax_api]
+    #[relax_api(run)]
     pub fn view(&self) -> ScriptFnImageView<'_> {
         match self.data() {
             Some(d) => ScriptFnImageView { empty: false, file: &d.file, text: &d.text, line: d.line, col: d.col, hash: d.hash, tokens: &d.tokens },
@@ -721,7 +736,7 @@ impl ScriptFnImage {
 }
 
 /// What a [`ScriptFnImage`] holds, as views ([`ScriptFnImage::view`]).
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptFnImageView<'a> {
@@ -800,7 +815,7 @@ impl std::fmt::Debug for ScriptFnImage {
 
 /// Rustc-owned location storage inside an error record. Rapid callers obtain a
 /// caller-owned `ScriptLoc` through `ScriptErrorRecord::loc`, never this layout.
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 #[derive(Clone)]
 pub struct ScriptErrorLoc {
     pub file: String,
@@ -812,7 +827,7 @@ pub struct ScriptErrorLoc {
 /// source location (zero-based line and column, like [`ScriptLoc`]) and
 /// its message apart, and the text the VM has always reported it as
 /// (`file:line:col: message (origin)`), which `Display` prints.
-#[relax_api(handle, clone, debug, display)]
+#[relax_api(handle, clone, debug, display, run)]
 #[derive(Clone)]
 pub struct ScriptErrorRecord {
     pub loc: Option<ScriptErrorLoc>,
@@ -840,7 +855,7 @@ impl std::fmt::Debug for ScriptErrorRecord {
     }
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptErrorRecord {
     #[inline(always)]
     pub fn new(loc: Option<&ScriptLoc>, message: &str, text: &str) -> Self {
@@ -848,13 +863,13 @@ impl ScriptErrorRecord {
         Self::from_parts(loc.map(|l| l.file.as_str()), &at, message, text)
     }
 
-    #[relax_api]
+    #[relax_api(run)]
     pub fn from_parts(file: Option<&str>, at: &crate::vm_api::ScriptLineCol, message: &str, text: &str) -> Self {
         Self { loc: file.map(|file| ScriptErrorLoc { file: file.to_owned(), line: at.line, col: at.col }), message: message.to_owned(), text: text.to_owned() }
     }
 
     /// What the record holds, as views.
-    #[relax_api]
+    #[relax_api(run)]
     pub fn view(&self) -> ScriptErrorRecordView<'_> {
         match &self.loc {
             Some(loc) => ScriptErrorRecordView { text: &self.text, message: &self.message, has_loc: true, file: &loc.file, line: loc.line, col: loc.col },
@@ -864,7 +879,7 @@ impl ScriptErrorRecord {
 }
 
 /// What a [`ScriptErrorRecord`] holds, as views ([`ScriptErrorRecord::view`]).
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptErrorRecordView<'a> {
@@ -909,9 +924,10 @@ impl ScriptErrorRecord {
     }
 
     /// A parse error: its formatted text and, when the parser kept it, its
-    /// structured diagnostic.
-    pub fn parse(text: String, diagnostic: Option<&crate::parser::ScriptParserDiagnostic>, file: &str) -> Self {
-        let loc = diagnostic.map(|d| ScriptErrorLoc { file: file.to_string(), line: d.line, col: d.column });
+    /// structured diagnostic, whose zero-based line `line_shift` takes to the line runtime
+    /// errors give.
+    pub fn parse(text: String, diagnostic: Option<&crate::parser::ScriptParserDiagnostic>, file: &str, line_shift: u32) -> Self {
+        let loc = diagnostic.map(|d| ScriptErrorLoc { file: file.to_string(), line: d.line + line_shift, col: d.column });
         let message = diagnostic.map_or_else(|| text.clone(), |d| d.message.clone());
         Self { loc, message, text }
     }
@@ -1315,8 +1331,9 @@ impl ScriptCode {
         }
         let text: String = chars[start..end].iter().collect();
         let (row, col) = body.tokenizer.token_start_row_col(first as u32)?;
-        let (file, line0) = match body.source.written() {
-            Some(script_mod) => (body.site_file(script_mod), body.site_line0(script_mod)),
+        // The image's line is its first row's, as runtime errors count it (`row + line`).
+        let (file, first_line) = match body.source.written() {
+            Some(script_mod) => (body.site_file(script_mod), script_mod.line as u32),
             None => ("generated".to_string(), 0),
         };
         let mut out = Vec::with_capacity(last + 1 - first);
@@ -1334,7 +1351,7 @@ impl ScriptCode {
             t.rebase(start);
             out.push(t);
         }
-        Some(ScriptFnImage::new(file, line0 + row, col, text, out, strings))
+        Some(ScriptFnImage::new(file, first_line + row, col, text, out, strings))
     }
 
     /// Where `field` is written (`field: …`, `field := …`, `field +: …`) in
@@ -1561,6 +1578,12 @@ impl ScriptCode {
     }
 
     pub(crate) fn ip_to_loc_native(&self, ip: ScriptIp, file: &mut crate::vm_api::ScriptTextOut, at: &mut crate::vm_api::ScriptLineCol) -> bool {
+        // no place at all (an object made where no instruction stands): no location. The
+        // fallback below names a body's unmapped instruction, and took the unknown ip's
+        // u16::MAX / u32::MAX for a line and a column, which a caller's `col + 1` overflowed
+        if ip.is_unknown() {
+            return false;
+        }
         let found = (|| -> Option<ScriptLoc> {
             if let Some(body) = self.bodies.borrow().get(ip.body as usize) {
                 let source_map = &body.parser.source_map;
@@ -1618,14 +1641,14 @@ impl ScriptCode {
     }
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptVm<'a> {
     pub host: ScriptHostContext<'a>,
     pub bx: Box<ScriptVmBase>,
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct ScriptRunBudget {
@@ -1636,6 +1659,15 @@ pub struct ScriptRunBudget {
 }
 
 impl ScriptRunBudget {
+    /// A sliced run's budget: the run stops at `soft` from now between two instructions (a
+    /// yield: the caller gets nil, [`ScriptVm::run_yielded`] is true and [`ScriptVm::resume`]
+    /// continues it under the budget then installed) and is never cut off: no hard deadline.
+    /// Only the outermost run yields; a script call a native makes runs to its end. The clock
+    /// is read every `sample_interval_instructions` and right after a native returns.
+    pub fn slice(soft: Duration, sample_interval_instructions: u32) -> Self {
+        Self { hard_deadline: f64::INFINITY, ..Self::from_durations(soft, Duration::ZERO, sample_interval_instructions) }
+    }
+
     pub fn from_durations(soft: Duration, hard: Duration, sample_interval_instructions: u32) -> Self {
         let now = crate::clock::monotonic_now();
         let sample_interval_instructions = sample_interval_instructions.max(1);
@@ -1654,7 +1686,7 @@ enum ScriptRunBudgetHit {
     Hard,
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl<'a> ScriptVm<'a> {
     /// Where the running code is: the current instruction, then the return
     /// sites of the calls it is inside, innermost first, at most `max`. A
@@ -1798,11 +1830,26 @@ impl<'a> ScriptVm<'a> {
     /// share one cumulative allowance across several callbacks in a tick.
     #[inline(always)]
     pub fn with_heap_allocation_limit<R>(&mut self, allocation_limit: usize, f: impl FnOnce(&mut Self) -> R) -> (R, ScriptAllocationReport) {
-        self.bx.vm_ctl(&mut ScriptCtlReq::with(CTL_ALLOC_BEGIN, allocation_limit as u64));
+        self.heap_allocation_limit_begin(allocation_limit);
         let result = f(self);
+        (result, self.heap_allocation_limit_end())
+    }
+
+    /// The first half of [`Self::with_heap_allocation_limit`], for a sliced run that pauses between
+    /// frames: the ceiling holds until [`Self::heap_allocation_limit_end`]. Whatever runs in this
+    /// VM meanwhile is charged to it too.
+    #[inline(always)]
+    pub fn heap_allocation_limit_begin(&mut self, allocation_limit: usize) {
+        self.bx.vm_ctl(&mut ScriptCtlReq::with(CTL_ALLOC_BEGIN, allocation_limit as u64));
+    }
+
+    /// The second half of [`Self::with_heap_allocation_limit`]: what the run charged, and whether
+    /// an allocation was refused (recorded as a captured error).
+    #[inline(always)]
+    pub fn heap_allocation_limit_end(&mut self) -> ScriptAllocationReport {
         let mut req = ScriptCtlReq::new(CTL_ALLOC_END);
         let allocated_bytes = self.bx.vm_ctl(&mut req) as usize;
-        (result, ScriptAllocationReport { allocated_bytes, exceeded: req.b != 0 })
+        ScriptAllocationReport { allocated_bytes, exceeded: req.b != 0 }
     }
 
     /// Instructions charged by the most recent `with_instruction_limit` call.
@@ -1976,6 +2023,7 @@ impl<'a> ScriptVm<'a> {
                     self.bx.threads.cur().is_paused = true;
                     // SAFETY: The function pointer is valid as long as native functions aren't removed during execution
                     let result = unsafe { func.call(self, scope) };
+                    self.sample_budget_now();
                     // Only unpause if native didn't explicitly pause (via pause() which sets trap.on to Pause)
                     if !matches!(
                         self.bx.threads.cur().trap.get_on(),
@@ -2037,7 +2085,7 @@ impl<'a> ScriptVm<'a> {
 
     /// The one entry into running script from the host (the op `call`, `resume` and
     /// the like are inline decoders of): `req.mode` says what, see [`ScriptCallReq`].
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_call(&mut self, req: &mut ScriptCallReq) -> ScriptValue {
         crate::inspect_query::safe_point(&self.bx);
         match req.mode {
@@ -2054,8 +2102,15 @@ impl<'a> ScriptVm<'a> {
                 }
             },
             CALL_RESUME => {
-                self.bx.threads.cur().is_paused = false;
-                self.run_core()
+                let thread = self.bx.threads.cur();
+                thread.is_paused = false;
+                // A run that yielded, or one a native paused under an entry that owes its end.
+                let yielded = std::mem::take(&mut thread.yielded);
+                if yielded || !thread.completions.is_empty() {
+                    self.resume_yielded()
+                } else {
+                    self.run_core()
+                }
             }
             mode => panic!("vm_call: unknown mode {mode}"),
         }
@@ -2163,6 +2218,26 @@ impl<'a> ScriptVm<'a> {
         self.take_error_records().into_iter().map(|e| e.text().to_owned()).collect()
     }
 
+    /// The parser's warnings since errors were captured, as `file:line:col: message`, taken:
+    /// source that parses, but likely not as meant (`[0 0 -30]` is two items). A host shows
+    /// them with its errors and runs on.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        self.take_warning_records().into_iter().map(|w| w.text().to_owned()).collect()
+    }
+
+    /// [`Self::take_warnings`] with each warning's location and message apart.
+    pub fn take_warning_records(&mut self) -> Vec<ScriptErrorRecord> {
+        unsafe extern "C-unwind" fn push(ctx: *mut u8, record: *const ScriptErrorRecord) {
+            (&mut *(ctx as *mut Vec<ScriptErrorRecord>)).push((&*record).clone());
+        }
+        let mut out = Vec::new();
+        let mut req = ScriptErrorsReq::new(ERR_TAKE_WARNINGS);
+        req.ctx = &mut out as *mut Vec<ScriptErrorRecord> as *mut u8;
+        req.push = push;
+        self.bx.vm_errors(&mut req);
+        out
+    }
+
     /// [`Self::take_errors`] with each error's location and message apart.
     pub fn take_error_records(&mut self) -> Vec<ScriptErrorRecord> {
         unsafe extern "C-unwind" fn push(ctx: *mut u8, record: *const ScriptErrorRecord) {
@@ -2260,6 +2335,15 @@ impl<'a> ScriptVm<'a> {
                     .trap
                     .set_on(Some(ScriptTrapOn::Bail(error)));
             }
+        }
+    }
+
+    /// A native returned: a run under a budget reads the clock before its next instruction, so
+    /// one long native call ends a sliced run's slice.
+    #[inline(always)]
+    pub(crate) fn sample_budget_now(&mut self) {
+        if let Some(budget) = self.bx.run_budget.as_mut() {
+            budget.instructions_until_sample = 1;
         }
     }
 
@@ -2362,6 +2446,16 @@ impl<'a> ScriptVm<'a> {
     }
 
     pub fn run_core(&mut self) -> ScriptValue {
+        // How many interpreter loops are live on the Rust stack: a sliced run yields only the
+        // outermost (`check_run_budget`). A panic unwinding through leaves it raised, which only
+        // stops this VM's runs from yielding.
+        self.bx.run_depth += 1;
+        let value = self.run_core_loop();
+        self.bx.run_depth -= 1;
+        value
+    }
+
+    fn run_core_loop(&mut self) -> ScriptValue {
         // Cached pointer into the active body's opcode buffer, so the loop
         // pays no RefCell borrow per instruction. It is only trusted while
         // `bodies.epoch()` is unchanged: see `ScriptBodies`.
@@ -2412,7 +2506,13 @@ impl<'a> ScriptVm<'a> {
             } else {
                 false
             };
-            if instruction_limit_exceeded {
+            if instruction_limit_exceeded && self.bx.interrupt.is_stop() {
+                // (the host's own end of the run: the same bail, and no error of the script's)
+                self.bx.threads.cur().trap.set_on(Some(ScriptTrapOn::Bail(NIL)));
+                if let Some(value) = self.handle_trap_on() {
+                    return value;
+                }
+            } else if instruction_limit_exceeded {
                 let err = if self.bx.interrupt.is_set() {
                     script_err_limit!(self.bx.threads.cur_ref().trap, "script interrupted")
                 } else {
@@ -2436,13 +2536,15 @@ impl<'a> ScriptVm<'a> {
 
             if let Some(hit) = self.check_run_budget() {
                 match hit {
+                    // Only the outermost run yields: a deeper one is a script call a native made
+                    // (on this thread, `array.retain(fn)`), and the native needs its real value.
+                    // The outer run samples again as soon as the native returns.
+                    ScriptRunBudgetHit::Soft if self.bx.run_depth != 1 => {}
                     ScriptRunBudgetHit::Soft => {
-                        self.bx.threads.cur().is_paused = true;
-                        self.bx
-                            .threads
-                            .cur()
-                            .trap
-                            .set_on(Some(ScriptTrapOn::TimeBudgetYield));
+                        let thread = self.bx.threads.cur();
+                        thread.is_paused = true;
+                        thread.yielded = true;
+                        thread.trap.set_on(Some(ScriptTrapOn::TimeBudgetYield));
                     }
                     ScriptRunBudgetHit::Hard => {
                         let err = script_err_limit!(
@@ -2594,10 +2696,66 @@ impl<'a> ScriptVm<'a> {
         // the main interpreter loop
         self.drain_stale_errors();
         let value = self.run_core();
+        if self.bx.threads.cur_ref().run_unfinished() {
+            self.bx.threads.cur().completions.push(RunCompletion::RootEnd { body_id });
+            return value;
+        }
+        self.finish_root(body_id);
+        value
+    }
+
+    /// `run_root`'s end: the body keeps the scope its root frame ended in.
+    fn finish_root(&mut self, body_id: u16) {
         if let Some(end) = self.bx.threads.cur().root_end_scope.take() {
             let mut bodies = self.bx.code.bodies.borrow_mut();
             let body = &mut bodies[body_id as usize];
             body.end_scope = Some(if body.transient { ScriptObjectRef::unrooted(end.as_object()) } else { end });
+        }
+    }
+
+    /// `eval_body`'s end.
+    fn finish_eval_body(&mut self, body_id: u16, result: ScriptValue) {
+        self.bx.heap.touch_evaluated_body(body_id);
+        self.bx.heap.touch_map(&self.bx.code);
+        // Mark the result object with FROM_EVAL flag
+        if let Some(result_obj) = result.as_object() {
+            self.bx.heap.set_from_eval(result_obj);
+        }
+    }
+
+    /// `eval_with_append_source`'s end.
+    fn finish_streaming(&mut self, result: ScriptValue) {
+        if let Some(result_obj) = result.as_object() {
+            self.bx.heap.set_from_eval(result_obj);
+        }
+    }
+
+    /// `resume` of a run that yielded (a sliced run) or that a native paused under an entry that
+    /// owes its end: runs on under the budget installed now,
+    /// as silenced as the entry that started it; when it ends, what those entries left owed.
+    fn resume_yielded(&mut self) -> ScriptValue {
+        let streaming = self.bx.threads.cur_ref().completions.iter().any(|c| matches!(c, RunCompletion::Streaming));
+        if streaming {
+            self.bx.silence_errors = true;
+        }
+        // Every resume runs at least one instruction: a budget already past its deadline (or a
+        // fresh one sampling every instruction) would otherwise yield again before any.
+        if let Some(budget) = self.bx.run_budget.as_mut() {
+            budget.instructions_until_sample = budget.instructions_until_sample.max(2);
+        }
+        let value = self.run_core();
+        if streaming {
+            self.bx.silence_errors = false;
+        }
+        if self.bx.threads.cur_ref().run_unfinished() {
+            return value;
+        }
+        for completion in std::mem::take(&mut self.bx.threads.cur().completions) {
+            match completion {
+                RunCompletion::RootEnd { body_id } => self.finish_root(body_id),
+                RunCompletion::EvalBody { body_id } => self.finish_eval_body(body_id, value),
+                RunCompletion::Streaming => self.finish_streaming(value),
+            }
         }
         value
     }
@@ -2618,6 +2776,7 @@ impl<'a> ScriptVm<'a> {
                 // Pause thread before native call so re-entrant calls get a different thread
                 self.bx.threads.cur().is_paused = true;
                 let result = unsafe { func.call(self, obj) };
+                self.sample_budget_now();
                 // Only unpause if native didn't explicitly pause
                 if !matches!(
                     self.bx.threads.cur().trap.get_on(),
@@ -2638,6 +2797,7 @@ impl<'a> ScriptVm<'a> {
                 // Pause thread before native call so re-entrant calls get a different thread
                 self.bx.threads.cur().is_paused = true;
                 let result = unsafe { func.call(self, args_obj) };
+                self.sample_budget_now();
                 // Only unpause if native didn't explicitly pause
                 if !matches!(
                     self.bx.threads.cur().trap.get_on(),
@@ -3228,7 +3388,7 @@ impl<'a> ScriptVm<'a> {
                 }
                 body.tokenizer = ScriptTokenizer::adopted(&d.text, tokens);
                 body.parser = ScriptParser::keeping_numbers(self.bx.keep_numbers);
-                body.parser.parse(&body.tokenizer, &file, (d.line as usize, d.col as usize), &[]);
+                body.parser.parse(&body.tokenizer, &file, (ScriptBody::line0_of(d.line as usize), d.col as usize), &[]);
                 body.source_len = d.text.len();
                 body.content_hash = ScriptBody::content_hash_of(&d.text, &[]);
             }
@@ -3272,7 +3432,7 @@ impl<'a> ScriptVm<'a> {
 
     /// The one entry into evaluating source (the op the `eval_*` methods are inline
     /// decoders of): `req.mode` picks what to do with the module, see [`ScriptEvalReq`].
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_eval(&mut self, req: &mut ScriptEvalReq) -> ScriptValue {
         match req.mode {
             EVAL_ADD => {
@@ -3353,22 +3513,26 @@ impl<'a> ScriptVm<'a> {
             // surface them to a captured-diagnostics sink here or a validating
             // host reports success for a script that failed to parse.
             // (A file's errors stay with its body: the same text evaluated again reports them again.)
+            let shift = body.parse_line_shift(script_mod);
             let parse_errors = body.parser.parse_errors.clone();
             let parse_records: Vec<ScriptErrorRecord> = parse_errors.into_iter().enumerate()
-                .map(|(i, text)| ScriptErrorRecord::parse(text, body.parser.diagnostics.get(i), &body.parser.file)).collect();
+                .map(|(i, text)| ScriptErrorRecord::parse(text, body.parser.diagnostics.get(i), &body.parser.file, shift)).collect();
+            let warnings: Vec<ScriptErrorRecord> = body.parser.parse_warnings.iter().enumerate()
+                .map(|(i, text)| ScriptErrorRecord::parse(text.clone(), body.parser.warnings.get(i), &body.parser.file, shift)).collect();
             drop(bodies);
             if let Some(sink) = self.bx.captured_errors.as_mut() {
                 sink.extend(parse_records);
             }
+            if self.bx.captured_errors.is_some() {
+                self.bx.captured_warnings.extend(warnings);
+            }
             // lets point our thread to it
             let result = self.run_root(body_id);
-            self.bx.heap.touch_evaluated_body(body_id);
-            self.bx.heap.touch_map(&self.bx.code);
-            // Mark the result object with FROM_EVAL flag
-            if let Some(result_obj) = result.as_object() {
-                self.bx.heap.set_from_eval(result_obj);
+            if self.bx.threads.cur_ref().run_unfinished() {
+                self.bx.threads.cur().completions.push(RunCompletion::EvalBody { body_id });
+                return result;
             }
-
+            self.finish_eval_body(body_id, result);
             result
         } else {
             NIL
@@ -3477,6 +3641,7 @@ impl<'a> ScriptVm<'a> {
 
             // Incremental parse: continue from checkpoint, auto-close for execution
             let errors_before = body.parser.parse_errors.len();
+            let warnings_before = body.parser.parse_warnings.len();
             let (site_file, site_offsets) = body.parse_site(existing_mod);
             let cp = body.parser.parse_streaming(
                 &body.tokenizer,
@@ -3493,13 +3658,20 @@ impl<'a> ScriptVm<'a> {
             // Surface structural errors before run_root rejects the body.
             // Incomplete but valid prefixes still use the parser's auto-close;
             // recovery bytecode from an actual parse error is never executed.
+            let shift = body.parse_line_shift(existing_mod);
             let from = errors_before.min(body.parser.parse_errors.len());
             let new_parse_errors: Vec<ScriptErrorRecord> = body.parser.parse_errors[from..].iter().enumerate()
-                .map(|(i, text)| ScriptErrorRecord::parse(text.clone(), body.parser.diagnostics.get(from + i), &body.parser.file)).collect();
+                .map(|(i, text)| ScriptErrorRecord::parse(text.clone(), body.parser.diagnostics.get(from + i), &body.parser.file, shift)).collect();
+            let from = warnings_before.min(body.parser.parse_warnings.len());
+            let new_warnings: Vec<ScriptErrorRecord> = body.parser.parse_warnings[from..].iter().enumerate()
+                .map(|(i, text)| ScriptErrorRecord::parse(text.clone(), body.parser.warnings.get(from + i), &body.parser.file, shift)).collect();
 
             drop(bodies);
             if let Some(sink) = &mut self.bx.captured_errors {
                 sink.extend(new_parse_errors);
+            }
+            if self.bx.captured_errors.is_some() {
+                self.bx.captured_warnings.extend(new_warnings);
             }
             // Silence runtime errors during incremental eval — incomplete code
             // will inevitably produce errors that are meaningless until the
@@ -3507,9 +3679,11 @@ impl<'a> ScriptVm<'a> {
             self.bx.silence_errors = true;
             let result = self.run_root(body_id);
             self.bx.silence_errors = false;
-            if let Some(result_obj) = result.as_object() {
-                self.bx.heap.set_from_eval(result_obj);
+            if self.bx.threads.cur_ref().run_unfinished() {
+                self.bx.threads.cur().completions.push(RunCompletion::Streaming);
+                return result;
             }
+            self.finish_streaming(result);
             result
         } else {
             NIL
@@ -3519,7 +3693,7 @@ impl<'a> ScriptVm<'a> {
 
 /// The arithmetic operators a host may give meaning to for its own objects
 /// (see [`ScriptVmBase::object_op_hook`]).
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScriptBinOp {
     Add,
@@ -3541,7 +3715,7 @@ pub type ScriptObjectOpHook = fn(&mut ScriptHeap, ScriptBinOp, ScriptValue, Scri
 pub type ScriptLetHook = fn(&ScriptHeap, ScriptIp, LiveId, ScriptValue);
 
 /// Caller-owned function pointers are only interpreted by their caller-side trampoline.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptLetHookAbi {
@@ -3549,7 +3723,7 @@ pub struct ScriptLetHookAbi {
     pub call: unsafe extern "C-unwind" fn(*const (), *const ScriptHeap, ScriptIp, LiveId, ScriptValue),
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptObjectOpHookAbi {
@@ -3557,7 +3731,7 @@ pub struct ScriptObjectOpHookAbi {
     pub call: unsafe extern "C-unwind" fn(*const (), *mut ScriptHeap, *const ScriptBinOp, ScriptValue, ScriptValue, ScriptIp, *mut ScriptValue) -> bool,
 }
 
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 pub struct ScriptVmBase {
     pub void: usize,
     pub code: ScriptCode,
@@ -3594,9 +3768,15 @@ pub struct ScriptVmBase {
     /// eval/call, take after, to feed diagnostics back to a host (e.g. an AI
     /// agent editing the script live).
     pub captured_errors: Option<Vec<ScriptErrorRecord>>,
+    /// The parser's warnings while errors are captured (`[0 0 -30]` reads as two items), for
+    /// the host to show beside its errors: nothing refuses on them. Taken by
+    /// [`ScriptVm::take_warnings`]; without a capture they are logged as warnings.
+    pub captured_warnings: Vec<ScriptErrorRecord>,
     /// the captures capture_errors_nested put aside
     pub captured_stash: Vec<Option<Vec<ScriptErrorRecord>>>,
     pub run_budget: Option<ScriptRunBudget>,
+    /// Interpreter loops live on the Rust stack (`run_core`): a sliced run yields only at 1.
+    pub(crate) run_depth: u32,
     /// Instructions charged by the most recent with_instruction_limit call
     /// (see ScriptVm::last_limit_consumed).
     pub last_limit_consumed: u64,
@@ -3623,7 +3803,7 @@ impl Drop for ScriptVmBase {
     fn drop(&mut self) { crate::inspect_registry::unregister(self); }
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptVmBase {
     pub(crate) fn notify_let_hook(&self, id: LiveId, value: ScriptValue) {
         if let Some(hook) = self.let_hook {
@@ -3639,11 +3819,20 @@ impl ScriptVmBase {
     #[inline(always)]
     pub fn gc_if_needed(&mut self) { self.vm_ctl(&mut ScriptCtlReq::new(CTL_GC_IF_NEEDED)); }
     /// A handle another thread uses to stop this VM's runs ([`crate::interrupt`]).
-    #[relax_api]
+    #[relax_api(run)]
     pub fn interrupt_handle(&self) -> crate::interrupt::ScriptInterrupt { self.interrupt.clone() }
+    /// The host's own end of the run, from a native it is in: the VM is stopped
+    /// ([`crate::interrupt::ScriptInterrupt::stop`]) and the running thread bails here with nil,
+    /// uncatchably and with no error. One call across the API: a host built by another compiler
+    /// than the VM never touches the trap's fields itself.
+    #[relax_api(run)]
+    pub fn stop_run(&mut self) {
+        self.interrupt.stop();
+        self.threads.cur_ref().trap.set_on(Some(ScriptTrapOn::Bail(NIL)));
+    }
     #[inline(always)]
     pub fn body_count(&self) -> usize { self.vm_stat(&mut ScriptCtlReq::new(STAT_BODY_COUNT)) as usize }
-    #[relax_api]
+    #[relax_api(run)]
     pub fn body_module_read(&self, index: usize) -> ScriptModuleRead<'_> {
         ScriptModuleRead { bodies: self.code.bodies.borrow(), index }
     }
@@ -3668,7 +3857,7 @@ impl ScriptVmBase {
         self.parts().code
     }
 
-    #[relax_api]
+    #[relax_api(run)]
     pub fn empty() -> Self {
         Self {
             void: 0,
@@ -3686,8 +3875,10 @@ impl ScriptVmBase {
             allow_debug_output: true,
             bail_on_uncaught_error: false,
             captured_errors: None,
+            captured_warnings: Vec::new(),
             captured_stash: Vec::new(),
             run_budget: None,
+            run_depth: 0,
             last_limit_consumed: 0,
             last_limit_exit_remaining: 0,
             object_op_hook: None,
@@ -3698,7 +3889,7 @@ impl ScriptVmBase {
         }
     }
 
-    #[relax_api]
+    #[relax_api(run)]
     pub fn new() -> Self {
         let mut heap = ScriptHeap::empty();
         let mut native = ScriptNative::new(&mut heap);
@@ -3738,8 +3929,10 @@ impl ScriptVmBase {
             allow_debug_output: true,
             bail_on_uncaught_error: false,
             captured_errors: None,
+            captured_warnings: Vec::new(),
             captured_stash: Vec::new(),
             run_budget: None,
+            run_depth: 0,
             last_limit_consumed: 0,
             last_limit_exit_remaining: 0,
             object_op_hook: None,
@@ -4066,6 +4259,63 @@ mod tests {
         vm4.declare_lazy_modules("demo", &[id!(demo)], expand_demo);
         assert_eq!(vm4.eval(script! { mod.nothing_here ?? 3 }).as_number(), Some(3.0));
         assert_eq!(vm4.eval(script! { mod.demo.x ?? 3 }).as_number(), Some(5.0), "an optional read expands too");
+    }
+
+    thread_local! {
+        /// The stepped demo's next step, and the step that panics (none: `u32::MAX`).
+        static STEP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static STEP_PANICS_AT: std::cell::Cell<u32> = const { std::cell::Cell::new(u32::MAX) };
+    }
+
+    /// Three steps: `mod.stepped` in the first, a field of it in the second, `mod.stepped_late`
+    /// in the last. The owner of a stepped group keeps its own cursor (here `STEP`).
+    unsafe extern "C-unwind" fn step_demo(vm: *mut ScriptVm) -> bool {
+        let vm = &mut *vm;
+        let step = STEP.get();
+        if step == STEP_PANICS_AT.get() {
+            STEP_PANICS_AT.set(u32::MAX);
+            panic!("step {step} of the stepped demo fails");
+        }
+        match step {
+            0 => vm.eval(script! { mod.stepped = {a: 1} true }),
+            1 => vm.eval(script! { mod.stepped.b = 2 true }),
+            _ => vm.eval(script! { mod.stepped_late = {c: 3} true }),
+        };
+        STEP.set(step + 1);
+        step + 1 < 3
+    }
+
+    /// A stepped lazy group: `step_lazy_key` runs exactly one step and the group stays pending
+    /// until its last; a miss on a key not built yet runs the rest at once; a step that panics
+    /// leaves the group pending, for its owner to run again from the start.
+    #[test]
+    fn a_stepped_lazy_group_runs_a_step_per_call_and_a_miss_runs_the_rest() {
+        let mut host = ScriptVmHost::new((), ());
+        let mut vm = ScriptVm { host: host.host_context(), bx: Box::new(ScriptVmBase::new()) };
+        STEP.set(0);
+        vm.declare_lazy_modules_stepped("stepped", &[id!(stepped), id!(stepped_late)], step_demo);
+        assert!(vm.step_lazy_key(id!(stepped)), "steps remain after the first");
+        assert_eq!(STEP.get(), 1, "one step per call");
+        assert!(vm.has_lazy_modules(), "pending until its last step");
+        assert!(vm.step_lazy_key(id!(stepped)));
+        assert_eq!(STEP.get(), 2, "one step per call");
+        assert_eq!(vm.eval(script! { mod.stepped_late.c }).as_number(), Some(3.0), "a miss runs the rest");
+        assert_eq!(STEP.get(), 3, "the rest ran once");
+        assert!(!vm.has_lazy_modules(), "done");
+        assert!(!vm.step_lazy_key(id!(stepped)), "nothing left to step");
+        assert_eq!(vm.eval(script! { mod.stepped.a + mod.stepped.b }).as_number(), Some(3.0));
+
+        let mut vm = ScriptVm { host: host.host_context(), bx: Box::new(ScriptVmBase::new()) };
+        STEP.set(0);
+        STEP_PANICS_AT.set(1);
+        vm.declare_lazy_modules_stepped("stepped", &[id!(stepped), id!(stepped_late)], step_demo);
+        assert!(vm.step_lazy_key(id!(stepped)));
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| vm.step_lazy_key(id!(stepped))));
+        assert!(failed.is_err(), "the second step panicked");
+        assert!(vm.has_lazy_modules(), "a failed step leaves the group pending");
+        STEP.set(0);
+        assert_eq!(vm.eval(script! { mod.stepped_late.c }).as_number(), Some(3.0), "the retry runs it all");
+        assert!(!vm.has_lazy_modules());
     }
 
     unsafe extern "C-unwind" fn expand_capturing(vm: *mut ScriptVm) {

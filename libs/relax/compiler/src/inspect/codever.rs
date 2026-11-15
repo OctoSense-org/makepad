@@ -275,6 +275,9 @@ pub(crate) struct PcCode {
     pub at: String,
     /// the inlined fn, when the pc's position lies outside the slot's own fn
     pub inlined: Option<Inlined>,
+    /// the pc lies in a split body's patched path (relax_codegen::patched): its frame left the
+    /// fast code at an exit after a patch of a fn the build inlined
+    pub patched: bool,
 }
 
 /// The fn an inlined copy comes from.
@@ -538,7 +541,13 @@ pub(crate) fn describe_pc(u: &Unit, r: &mut Resolver, pc: u64) -> Option<PcCode>
     };
     // the line table's inline stack, else (older code) the fn whose span holds the position
     let inlined = pos.and_then(|p| map.and_then(|m| r.inline_stack(u, id, start, m, p)).or_else(|| r.inlined_fn(u, id, start, p)));
-    Some(PcCode { slot: id, start, len, kind, state, gen, at, inlined })
+    let patched = pos.is_some_and(relax_backend::rir::pos_patched);
+    Some(PcCode { slot: id, start, len, kind, state, gen, at, inlined, patched })
+}
+
+/// Whether pc `pc` of slot `id`'s code body at `start` lies in a split body's patched path.
+pub(crate) fn in_patched_path(u: &Unit, id: u32, start: u64, pc: u64) -> bool {
+    bodies(u, id).iter().find(|b| b.start == start).and_then(|b| b.map.lookup((pc - start) as u32)).is_some_and(relax_backend::rir::pos_patched)
 }
 
 /// The frame fields of a described pc: (fn name, file:line:col, module label, code JSON).
@@ -564,12 +573,16 @@ pub(crate) fn frame_fields(u: &Unit, c: &PcCode) -> (String, String, String, Str
         code.push_str(&format!(",\"build\":{}", json_str(crate::jit::PROVENANCE)));
     }
     if super::patches::active(c.slot) {
-        code.push_str(",\"inspect\":\"instrumented or pinned by makepad inspect (probes)\"");
+        code.push_str(&format!(",\"inspect\":\"instrumented or pinned by {tool} inspect (probes)\"", tool = crate::tool_name()));
     }
     // code made inaccessible for good (invalid.rs): a frame in it parks at its next instruction
     if let Some(r) = crate::stale::lookup(c.start) {
         module.push_str(" INVALIDATED");
         code.push_str(&format!(",\"invalidated\":{}", json_str(&r.reason)));
+    }
+    if c.patched {
+        module.push_str(&format!(" patched path of {}", short(&slot_name, 80)));
+        code.push_str(&format!(",\"patched_path\":{}", json_str(&format!("runs the patched path of `{}`: it left the fast code at an exit after a patch of a fn the build inlined, and its copies call their fns", short(&slot_name, 140)))));
     }
     let name = match &c.inlined {
         Some(i) => {
@@ -1028,7 +1041,7 @@ pub fn cmd_tier(req: &Req, out: &mut Out) {
                     let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::jit::compile_tier1(up, id) })).unwrap_or(false);
                     let row = crate::owner::call(crate::owner::Class::Program, || {
                         let u = unsafe { &*up };
-                        let r: Result<bool, String> = if ok { Ok(true) } else { Err("the O3 build was dropped (not verified, instrumented by a probe, outdated, or failed: MAKEPAD_RUN_TIER1_TRACE=1 says why)".into()) };
+                        let r: Result<bool, String> = if ok { Ok(true) } else { Err("the O3 build was dropped (not verified, instrumented by a probe, outdated, or failed: RELAX_TIER1_TRACE=1 says why)".into()) };
                         let mut s = format!("{{\"o3\":{},\"slot\":{},\"installed\":{},{}", json_str(&short(&super::display_name(u, id, 0), 160)), id, ok, patched_row(u, id, &before, &r));
                         if !ok {
                             s.push_str(&format!(",\"why\":{}", json_str(r.as_ref().err().unwrap())));
@@ -1145,7 +1158,7 @@ pub fn cmd_cache(_req: &Req, out: &mut Out) {
             for l in rows {
                 out.line(&l);
             }
-            out.always("more: pf jit  versions <fn>  why-tier <fn>");
+            out.line("more: pf jit  versions <fn>  why-tier <fn>");
         }
         None => out.err(&format!("the owner did not answer in 10 s ({})", crate::owner::serving_note())),
     }

@@ -1,10 +1,8 @@
 //! Slices: free functions, comparison helpers, indexing, iterators, sorting.
-//! The `impl<T> [T]` methods are in inherent.rs (Relax only; the rustc shim checks the
-//! free functions they forward to).
+//! The `impl<T> [T]` methods are in inherent.rs and forward to the free functions here.
 
 pub mod memchr;
-mod index;
-#[cfg(not(relax_check))]
+pub(crate) mod index;
 mod inherent;
 mod iter;
 mod join;
@@ -12,22 +10,11 @@ pub mod sort;
 
 pub use index::SliceIndex;
 pub use iter::{
-    ChunkBy, ChunkByMut, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Iter, IterMut,
+    ArrayWindows, ChunkBy, ChunkByMut, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Iter, IterMut,
     RChunks, RChunksExact, RChunksExactMut, RChunksMut, RSplit, RSplitMut, RSplitN, RSplitNMut,
     Split, SplitInclusive, SplitInclusiveMut, SplitMut, SplitN, SplitNMut, Windows,
 };
 pub use join::{Concat, Join};
-/// Constructors and helpers the rustc shim's tests call directly.
-#[cfg(relax_check)]
-pub use iter::{
-    as_chunks, as_chunks_mut, as_rchunks, as_rchunks_mut, chunk_by, chunk_by_mut,
-    chunks, chunks_exact, chunks_exact_mut, chunks_mut, rchunks, rchunks_exact,
-    rchunks_exact_mut, rchunks_mut, rsplit, rsplit_mut, rsplitn, rsplitn_mut,
-    split, split_first_chunk_mut, split_inclusive, split_inclusive_mut,
-    split_last_chunk_mut, split_mut, splitn, splitn_mut, windows,
-};
-#[cfg(relax_check)]
-pub use join::{concat_str, concat_vec, join_str, join_vec};
 
 use crate::cmp::Ordering;
 use crate::fmt::Write as _;
@@ -212,7 +199,6 @@ pub fn fill<T: Clone>(s: &mut [T], value: T) {
     // Primitive byte fills are memset. Type identity is constant per instance,
     // as in Vec's slice-iterator specialization. Size alone is insufficient:
     // a one-byte Copy type can contain uninitialized storage (MaybeUninit<u8>).
-    #[cfg(not(relax_check))]
     unsafe {
         let id = (im::type_id::<T>(), im::type_id_hi::<T>());
         if id == (im::type_id::<u8>(), im::type_id_hi::<u8>())
@@ -274,6 +260,26 @@ pub fn split_at_mut<T>(s: &mut [T], mid: usize) -> (&mut [T], &mut [T]) {
     if mid > len {
         crate::panicking::panic_str("mid > len");
     }
+    unsafe {
+        let p = s as *mut [T] as *mut T;
+        (im::slice_from_raw_mut(p, mid), im::slice_from_raw_mut(im::ptr_add_mut(p, mid), len - mid))
+    }
+}
+
+/// rustc library/core/src/slice/mod.rs `split_at_unchecked` (stable 1.79): the caller
+/// guarantees `mid <= len`.
+pub unsafe fn split_at_unchecked<T>(s: &[T], mid: usize) -> (&[T], &[T]) {
+    let len = s.len();
+    unsafe {
+        let p = s as *const [T] as *const T;
+        (im::slice_from_raw(p, mid), im::slice_from_raw(im::ptr_add(p, mid), len - mid))
+    }
+}
+
+/// rustc library/core/src/slice/mod.rs `split_at_mut_unchecked` (stable 1.79): the caller
+/// guarantees `mid <= len`.
+pub unsafe fn split_at_mut_unchecked<T>(s: &mut [T], mid: usize) -> (&mut [T], &mut [T]) {
+    let len = s.len();
     unsafe {
         let p = s as *mut [T] as *mut T;
         (im::slice_from_raw_mut(p, mid), im::slice_from_raw_mut(im::ptr_add_mut(p, mid), len - mid))
@@ -382,6 +388,12 @@ unsafe impl GetDisjointMutIndex for crate::ops::RangeInclusive<usize> {
 
 pub fn to_vec<T: Clone>(s: &[T]) -> crate::vec::Vec<T> {
     let mut v = crate::vec::Vec::with_capacity(s.len());
+    v.extend_from_slice(s);
+    v
+}
+
+pub fn to_vec_in<T: Clone, A: crate::heap::Allocator>(s: &[T], alloc: A) -> crate::vec::Vec<T, A> {
+    let mut v = crate::vec::Vec::with_capacity_in(s.len(), alloc);
     v.extend_from_slice(s);
     v
 }
@@ -553,31 +565,26 @@ impl<'a> crate::fmt::Debug for EscapeAscii<'a> {
 
 // ---------------------------------------------------------------- comparison impls on [T]
 
-#[cfg(not(relax_check))]
 impl<T: PartialEq<U>, U> PartialEq<[U]> for [T] {
     fn eq(&self, other: &[U]) -> bool {
         slice_eq(self, other)
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T: Eq> Eq for [T] {}
 
-#[cfg(not(relax_check))]
 impl<T: PartialOrd> PartialOrd for [T] {
     fn partial_cmp(&self, other: &[T]) -> Option<Ordering> {
         slice_partial_cmp(self, other)
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T: Ord> Ord for [T] {
     fn cmp(&self, other: &[T]) -> Ordering {
         slice_cmp(self, other)
     }
 }
 
-#[cfg(not(relax_check))]
 impl<T> Default for &mut [T] {
     fn default() -> Self {
         &mut []

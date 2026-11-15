@@ -8,7 +8,7 @@ use crate::shader_ir_draw::{build_gl_entries, GlDrawInfo};
 use crate::shader_ir_text::*;
 use crate::shader_output::*;
 use makepad_live_id::LiveId;
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 use std::fmt::Write;
 
 pub struct GlslDrawSources {
@@ -125,7 +125,7 @@ fn draw_sources(output: &mut ShaderOutput, types: &impl crate::shader_types::Sha
     }
     for io in &entry.outputs {
         if let IrIoBinding::Location(_) = io.binding {
-            writeln!(vertex, "out {};", cx.decl(io.ty, &io.name)).ok();
+            writeln!(vertex, "{}out {};", flat(&ir, io), cx.decl(io.ty, &io.name)).ok();
         }
     }
     for f in callees_first(&ir, &[vertex_main]) {
@@ -151,7 +151,7 @@ fn draw_sources(output: &mut ShaderOutput, types: &impl crate::shader_types::Sha
     for io in &entry.inputs {
         // gl_FragCoord (the depth output's default) is built in
         if let IrIoBinding::Location(_) = io.binding {
-            writeln!(fragment, "in {};", cx.decl(io.ty, &io.name)).ok();
+            writeln!(fragment, "{}in {};", flat(&ir, io), cx.decl(io.ty, &io.name)).ok();
         }
     }
     for io in &entry.outputs {
@@ -337,6 +337,14 @@ fn textures(cx: &TextCx, output: &ShaderOutput, fragment: bool, out: &mut String
     }
 }
 
+/// An integer varying's qualifier: GLSL requires it flat.
+fn flat(m: &IrModule, io: &IrEntryIo) -> &'static str {
+    match m.scalar_of(io.ty) {
+        Some(IrScalar::I32 | IrScalar::U32) => "flat ",
+        _ => "",
+    }
+}
+
 /// The IO a stage keeps in plain globals (records, varyings, outputs).
 fn private_globals(cx: &TextCx, ir: &IrModule, vertex: bool, out: &mut String) {
     for (g, glob) in ir.globals.iter().enumerate() {
@@ -354,6 +362,7 @@ fn private_globals(cx: &TextCx, ir: &IrModule, vertex: bool, out: &mut String) {
 
 /// Which sampler each texture is sampled with, the first sample winning, in
 /// the order the compile reached them (the vertex stage's calls first).
+/// GL binds one sampler per texture, so this rule covers filter, address and anisotropy alike.
 pub fn texture_sampler_bindings(ir: &IrModule) -> Vec<(String, usize)> {
     let mut out = Vec::new();
     let mut seen = vec![false; ir.functions.len()];

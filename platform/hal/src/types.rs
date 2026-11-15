@@ -2,7 +2,7 @@
 //! `#[relax_api(plain)]`: Relax-compiled code reads, builds and drops them itself (Relax checks
 //! rustc's size, align and field offsets against its own).
 
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 
 /// A resource id chosen by Cx: its pool slot and the slot's generation. The id space is per kind
 /// (texture, buffer, pipeline, window).
@@ -301,10 +301,18 @@ pub mod info_flags {
     /// The backend replaces a lost device: `DeviceReset` follows `DeviceLost`. Without it a lost
     /// device stays lost for the rest of the session.
     pub const DEVICE_RESET: u32 = 16384;
+    /// The backend keeps compiled pipelines across launches, and this one started with none it can
+    /// use (a fresh install, and on Vulkan an update too), so its first frame compiles them all.
+    pub const PIPELINE_CACHE_COLD: u32 = 32768;
+    /// The backend can repaint just a window pass's `Pass::damage` rects, so it's worth working them out.
+    pub const PARTIAL_REPAINT: u32 = 65536;
+    /// Draws in one pass may write different subsets of its colour attachments.
+    /// Vulkan reports this when independent blend is enabled on the device.
+    pub const MIXED_OUTPUT_PASSES: u32 = 131072;
 
     #[test]
     fn the_flags_are_distinct_bits() {
-        let all = [PRIVILEGED, EMBEDDED, DISPLAY_CLOCK, GPU_TIMESTAMPS, CLIENT_CHROME, DIRECT_DISPLAY, WINDOW_LAYERS, WINDOW_BADGES, WM_HOSTED, XR, MULTIVIEW, XR_OFFSCREEN, COMPUTE, DRAW_STORAGE_BUFFERS, DEVICE_RESET];
+        let all = [PRIVILEGED, EMBEDDED, DISPLAY_CLOCK, GPU_TIMESTAMPS, CLIENT_CHROME, DIRECT_DISPLAY, WINDOW_LAYERS, WINDOW_BADGES, WM_HOSTED, XR, MULTIVIEW, XR_OFFSCREEN, COMPUTE, DRAW_STORAGE_BUFFERS, DEVICE_RESET, PIPELINE_CACHE_COLD, PARTIAL_REPAINT, MIXED_OUTPUT_PASSES];
         for (i, a) in all.iter().enumerate() {
             assert!(a.is_power_of_two());
             assert!(all[i + 1..].iter().all(|b| a & b == 0), "flag {a} shares a bit");
@@ -412,12 +420,15 @@ impl OpenReq {
             Ok("offscreen") => (backend_id::HEADLESS, 0),
             Ok("metal") => (backend_id::METAL, window_flags),
             Ok("gl") if cfg!(target_os = "linux") => (backend_id::GL, window_flags | if hidden { open_flags::OFFSCREEN_WINDOWS } else { 0 }),
+            Ok("gl") if cfg!(target_os = "android") => (backend_id::GL, window_flags),
             Ok("vulkan") if cfg!(target_os = "linux") && !hidden => (backend_id::VULKAN, window_flags),
+            Ok("vulkan") if cfg!(target_os = "android") => (backend_id::VULKAN, window_flags),
             Ok("vulkan") => (backend_id::VULKAN, window_flags | open_flags::OFFSCREEN_WINDOWS),
             _ if cfg!(target_vendor = "apple") && hidden => (backend_id::METAL, open_flags::OFFSCREEN_WINDOWS),
             _ if cfg!(target_vendor = "apple") => (backend_id::METAL, window_flags),
             _ if cfg!(target_os = "linux") => (backend_id::AUTO, if hidden { window_flags | open_flags::OFFSCREEN_WINDOWS } else { window_flags }),
-            _ if cfg!(target_os = "android") => (backend_id::VULKAN, window_flags),
+            // Vulkan where the device has 1.1, else GLES (`backend::android::open`)
+            _ if cfg!(target_os = "android") => (backend_id::AUTO, window_flags),
             _ if cfg!(windows) => (backend_id::D3D11, if hidden { window_flags | open_flags::OFFSCREEN_WINDOWS } else { window_flags }),
             _ => (backend_id::HEADLESS, 0),
         };
@@ -487,6 +498,37 @@ impl HalInfo {
             *w = u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap());
         }
     }
+
+    /// Field by field, little-endian, for an event payload (`BackendChanged`).
+    /// Every field is named, so a new one can't be left out of the payload.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let Self { session, backend, dialect, flags, formats, storage_formats, max_workgroup_size, max_workgroup_invocations,
+            msaa, dpi, max_texture, max_window, max_buffer, working_set, vendor_id, device_kind, device_name } = *self;
+        let words = [session, backend, dialect, flags, max_workgroup_size[0], max_workgroup_size[1], max_workgroup_size[2],
+            max_workgroup_invocations, msaa, dpi.to_bits(), max_texture, max_window[0], max_window[1], vendor_id, device_kind];
+        let longs = [formats, storage_formats, max_buffer, working_set].into_iter().chain(device_name);
+        words.iter().flat_map(|w| w.to_le_bytes()).chain(longs.flat_map(u64::to_le_bytes)).collect()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // 15 u32 words, then 12 u64s (4 fields and the 8 of `device_name`), as `to_bytes` writes them
+        const WORDS: usize = 15;
+        if bytes.len() != WORDS * 4 + 12 * 8 { return None; }
+        let w = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        let l = |i: usize| u64::from_le_bytes(bytes[WORDS * 4 + i * 8..WORDS * 4 + i * 8 + 8].try_into().unwrap());
+        Some(Self { session: w(0), backend: w(1), dialect: w(2), flags: w(3), max_workgroup_size: [w(4), w(5), w(6)],
+            max_workgroup_invocations: w(7), msaa: w(8), dpi: f32::from_bits(w(9)), max_texture: w(10), max_window: [w(11), w(12)],
+            vendor_id: w(13), device_kind: w(14), formats: l(0), storage_formats: l(1), max_buffer: l(2), working_set: l(3),
+            device_name: std::array::from_fn(|i| l(4 + i)) })
+    }
+}
+
+/// A PDF print operation's outcome (`PrintResult::status`).
+pub mod print_status {
+    pub const PRINTED: u32 = 0;
+    pub const CANCELLED: u32 = 1;
+    pub const UNSUPPORTED: u32 = 2;
+    pub const FAILED: u32 = 3;
 }
 
 /// Backend ids (`OpenReq::backend`, `HalInfo::backend`).
@@ -882,6 +924,9 @@ pub mod mobile_ui {
     /// `value`: the window's background, 0xAARRGGBB, which the OS shows until the app draws
     /// (a start or a resume).
     pub const APP_BACKGROUND: u32 = 4;
+    /// The first frame waits on pipelines the cache didn't have, so the OS explains the wait until
+    /// the app draws (Android's "compiling shaders" screen; `value` is unused).
+    pub const SHADER_COMPILE_SCREEN: u32 = 5;
 
     pub mod orientation {
         pub const AUTO: u32 = 0;
@@ -1041,6 +1086,18 @@ pub struct XrPose {
     pub position: [f32; 3],
 }
 
+/// The head at a moment (`hal_xr_locate_head`): its pose in the session's reference space (as
+/// [`XrPose`]) and its motion then (m/s, rad/s in that space; zero when the runtime gave none).
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct XrHeadAt {
+    pub orientation: [f32; 4],
+    pub position: [f32; 3],
+    pub linear_velocity: [f32; 3],
+    pub angular_velocity: [f32; 3],
+}
+
 /// One eye of an `XrFrame`: where it is and its field of view (radians: left, right, up, down;
 /// left and down negative).
 #[repr(C)]
@@ -1081,6 +1138,11 @@ pub mod xr_controller {
     pub const TOUCH_THUMBSTICK: u32 = 1 << 11;
     pub const TOUCH_TRIGGER: u32 = 1 << 12;
     pub const TOUCH_THUMBREST: u32 = 1 << 13;
+    /// The menu held (a long press), from the moment the left controller's menu button, or a
+    /// tracked left hand's menu gesture, has been down a while until its release. The headset
+    /// stream's server sets it on the left controller (its short press pauses the stream), also
+    /// when only a hand holds the gesture.
+    pub const HOLD_MENU: u32 = 1 << 14;
 }
 
 /// One tracked hand (XR_EXT_hand_tracking + XR_FB_hand_tracking_aim; the old backend's
@@ -1174,7 +1236,8 @@ pub struct Pass {
     /// per colour attachment: the cube face / array slice it renders into
     pub layer: [u32; 4],
     /// x, y, w, h in target pixels. Draw scissors are relative to its origin; with an origin
-    /// (an eye of a side-by-side stereo target) the pass clears and stores from the origin on.
+    /// the pass clears and stores from the origin on. With `view_rects`: the area every view
+    /// lies in, which the pass clears and stores.
     pub viewport: [f32; 4],
     pub dpi: f32,
     /// 0 or 1: one view. 2 (`info_flags::MULTIVIEW` only): multiview, both views in one pass --
@@ -1187,12 +1250,28 @@ pub struct Pass {
     /// of its attachments' formats and size the backend keeps per attachment, resolved into the
     /// attachments at its end (colour: the samples' average; depth: sample 0). A pass that loads
     /// continues the multisampled images (the second eye of a side-by-side target), not what
-    /// another pass wrote into the attachments.
+    /// another pass wrote into the attachments. The multisampled images last for the pass alone,
+    /// never stored (on a tile GPU they stay in tile memory unless the pass spills them), unless a
+    /// pass loads them: this one, or a later MSAA pass of the submit loading one of its
+    /// attachments (`exec::twins_kept`).
     pub samples: u32,
+    /// The pass's uniform block; with `view_rects` of n rects, n blocks of equal size, view
+    /// i's at `i * len / n`.
     pub uniforms: Slice,
     pub draws: Range,
     pub name: StrId,
     pub owner: StrId,
+    /// The rects that changed since frame `damage_since` (x, y, w, h in target pixels, `buffers::read_rects`).
+    /// A target that still holds that frame can repaint just these; any other target repaints everything.
+    pub damage: Range,
+    /// The frame `damage` is measured from, or 0 when we don't know what changed.
+    pub damage_since: u64,
+    /// Empty: one view, `viewport`. Else n rects (x, y, w, h in target pixels inside
+    /// `viewport`, `CmdWriter::put_rects`), the views side by side in one target (the eyes of a
+    /// side-by-side stereo target): each draw runs once per rect in the same pass, with that
+    /// rect as viewport and scissor bound and that view's block of `uniforms`. Draw scissors
+    /// are relative to each rect's origin. Not with `views` 2, nor with `damage`.
+    pub view_rects: Range,
 }
 
 unsafe impl Plain for Pass {}
@@ -1263,6 +1342,8 @@ pub struct Draw {
     pub list_name: StrId,
     /// instance AABB in target px; NaN = unknown
     pub bounds: [f32; 4],
+    /// One bit for each of its pass's `damage` rects that this draw touches.
+    pub damage: u32,
 }
 
 impl Draw {
@@ -1352,8 +1433,9 @@ pub struct FrameMeta {
     /// the causing (oldest consumed) input event
     pub input_ns: u64,
     /// start, end per CPU phase of the app's beat (0, 0: none): dispatch (services, timers),
-    /// next-frame callbacks, draw (the draw event walk, shader compiles), then build / submit /
-    /// spare (unused; the pass's build is `build_start_ns..build_end_ns`)
+    /// next-frame callbacks, draw (the draw event walk, shader compiles), then build / submit
+    /// (unused; the pass's build is `build_start_ns..build_end_ns`) and the event loop's wait for
+    /// the GPU before the beat (its frames in flight: `gpu-wait`, not CPU work)
     pub phases: [[u64; 2]; 6],
 }
 
@@ -1492,6 +1574,28 @@ pub struct StorageImageBinding {
     pub format: u32,
 }
 
+/// Native binding of one sampled 2D texture a kernel reads, in reflection order: a Metal
+/// texture index, an HLSL t register or a Vulkan binding.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SampledImageBinding {
+    pub index: u32,
+}
+
+/// One sampler a kernel's samples use, i its place: HLSL register s<i>, Vulkan binding
+/// (storage images + sampled textures + i); Metal declares its own in the kernel, so the
+/// backend ignores these.
+#[relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComputeSamplerDesc {
+    /// 0 nearest, 1 linear
+    pub filter: u32,
+    /// 0 repeat, 1 clamp to edge, 2 clamp to zero, 3 mirrored repeat
+    pub address: u32,
+}
+
 /// Kernel ABI; ranges point into the pipeline blob, never into host pointers.
 #[relax_api(plain)]
 #[repr(C)]
@@ -1500,12 +1604,18 @@ pub struct ComputeDesc {
     pub buffers: Range,
     pub textures: Range,
     pub push_size: u32,
+    /// The parameter block's Metal buffer index, HLSL b register or Vulkan storage-buffer
+    /// binding (params up to 4096 bytes); `u32::MAX`: Vulkan push constants (up to 128).
     pub param_binding: u32,
     pub param_binding_size: u32,
     /// `u32::MAX` when absent.
     pub group_count_offset: u32,
     pub workgroup: [u32; 3],
     pub precise_math: u32,
+    /// `[SampledImageBinding]` and `[ComputeSamplerDesc]` records (empty when the kernel
+    /// samples nothing).
+    pub sampled: Range,
+    pub samplers: Range,
 }
 
 /// One dispatch. All ranges are byte ranges in the command arena; buffer and
@@ -1523,4 +1633,6 @@ pub struct Dispatch {
     pub params: Range,
     pub buffers: Range,
     pub textures: Range,
+    /// the sampled textures (any 2D texture, never one of `textures`), in reflection order
+    pub sampled: Range,
 }

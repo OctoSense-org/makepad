@@ -10,8 +10,8 @@ use crate::{
 };
 use std::sync::Arc;
 
-// Crate module tables record the modules whose file opens with `#![macro_use]`.
-pub const VERSION: u32 = 26;
+// A file's metadata records how its parse numbered it (FileMeta::numbering).
+pub const VERSION: u32 = 27;
 
 pub(crate) mod strings;
 
@@ -352,14 +352,14 @@ impl Codec for CrateMods {
         self.src.put(w);
         self.mods.put(w);
         self.items.put(w);
+        self.inner_macro_use.put(w);
         self.uses.put(w);
         self.externs.put(w);
         self.renames.put(w);
         self.recursion_limit.put(w);
-        self.inner_macro_use.put(w);
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
-        Some(Self { root: Codec::get(r)?, src: Codec::get(r)?, mods: Codec::get(r)?, items: Codec::get(r)?, uses: Codec::get(r)?, externs: Codec::get(r)?, renames: Codec::get(r)?, recursion_limit: Codec::get(r)?, inner_macro_use: Codec::get(r)?, ..Default::default() })
+        Some(Self { root: Codec::get(r)?, src: Codec::get(r)?, mods: Codec::get(r)?, items: Codec::get(r)?, inner_macro_use: Codec::get(r)?, uses: Codec::get(r)?, externs: Codec::get(r)?, renames: Codec::get(r)?, recursion_limit: Codec::get(r)?, ..Default::default() })
     }
 }
 impl Codec for MacroUse {
@@ -428,6 +428,10 @@ pub struct FileMeta {
     pub path: String,
     pub module: String,
     pub hash: u128,
+    /// how the parse this metadata was captured from numbered the file (ParsedFile::numbering):
+    /// its lazy bodies and prepared blocks hold that parse's ids, so it is restored over an
+    /// image of that parse only (front.rs restore)
+    pub numbering: u128,
     pub shared: bool,
     pub edition: u16,
     pub src_len: u32,
@@ -439,7 +443,7 @@ pub struct FileMeta {
     /// crate's unchanged file takes its image when they replay in the loader's scope
     pub replay: Blob,
 }
-fields!(FileMeta, path, module, hash, shared, edition, src_len, token_input, lazy, used, prep, replay);
+fields!(FileMeta, path, module, hash, numbering, shared, edition, src_len, token_input, lazy, used, prep, replay);
 
 /// Bytes, encoded as a length and the bytes (one copy, not a decode per byte)
 #[derive(Clone, Default)]
@@ -460,6 +464,7 @@ pub fn file_meta(path: &str, module: &str, pf: &ParsedFile, used: &MacroUse, pre
     path.to_string().put(&mut w);
     module.to_string().put(&mut w);
     pf.source_hash(path).put(&mut w);
+    pf.numbering().put(&mut w);
     shared.put(&mut w);
     pf.edition.put(&mut w);
     pf.src_len.put(&mut w);
@@ -482,7 +487,7 @@ pub fn proc_fps(crates: impl Iterator<Item = (String, Option<u128>)>) -> Option<
 }
 pub fn file_hash(path: &str, src: &[u8]) -> u128 {
     let mut h = crate::sip::Sip128::new();
-    h.str(path);
+    h.str(&crate::dirs::anchored(path));
     h.write(src);
     h.finish128()
 }
@@ -514,7 +519,7 @@ pub fn fingerprint_head(name: &str, root: &str, edition: u16, proc_macro: bool, 
     let mut h = crate::sip::Sip128::new();
     h.str("crate");
     h.str(name);
-    h.str(root);
+    h.str(&crate::dirs::anchored(root));
     h.u32(edition as u32);
     h.u8(proc_macro as u8);
     let mut cfg = cfg.to_vec();
@@ -538,9 +543,9 @@ pub struct Record {
     pub ahead: CrateAhead,
     pub files: Vec<FileMeta>,
     pub selection_hash: u128,
-    /// proc_fps of the program when it was recorded (None: one was not known): an edited
-    /// dependency changes dep_fps, but a file's parse depends on it only through its macro lookups
-    /// (replayed) and proc macros (this)
+    /// proc_fps of the program's crates loaded when it was recorded (None: one was not known): an
+    /// edited dependency changes dep_fps, but a file's parse depends on it only through its macro
+    /// lookups (replayed) and proc macros (this)
     pub proc_fps: Option<u128>,
 }
 // The fields a restore validates come first (RecordHead): the files' paths and hashes, then the
@@ -649,15 +654,20 @@ pub trait CrateImages {
     fn begin_load(&self, _crates: &[crate::preload::PreCrate]) {}
     fn end_load(&self) {}
     fn demand_image(&self, _crates: &[crate::preload::PreCrate], _graph: u128) -> Option<Arc<crate::preload::DemandImage>> { None }
+    /// The demand plan an earlier load of these crates recorded, when this load can take it as it
+    /// is although its inputs changed (PendingPlan::carried): it selected every file of the last
+    /// crate and its module probes hold.
+    fn carried_demand_image(&self, _crates: &[crate::preload::PreCrate]) -> Option<Arc<crate::preload::DemandImage>> { None }
     fn take_demand_plan(&self, _crates: &[crate::preload::PreCrate]) -> Option<Arc<crate::preload::DemandPlan>> { None }
     fn demand_parts(&self, _crates: &[crate::preload::PreCrate], _graph: u128) -> Option<DemandParts> { None }
     fn crate_image(&self, c: &crate::preload::PreCrate, dep_fps: &[u128]) -> Option<CrateImage>;
     /// A crate that is parsed (no valid image): the images of its files from an earlier record
     /// made with the same identity and dependency fingerprints (`dep_fps`; None: a dependency is
     /// parsed in this load too), with their macro lookups to replay. None: no such record.
-    /// `proc_fps`: proc_fps of its dependencies now (None: not known): a record whose dependency
-    /// fingerprints differ is taken when that is the same.
-    fn previous_files(&self, _c: &crate::preload::PreCrate, _dep_fps: Option<&[u128]>, _proc_fps: Option<u128>) -> Option<PreviousFiles> { None }
+    /// `proc_fps`: proc_fps values a record of it can hold now, each over proc-macro crates that
+    /// include all it can reach (empty: none known): a record whose dependency fingerprints
+    /// differ is taken when its proc_fps is one of them.
+    fn previous_files(&self, _c: &crate::preload::PreCrate, _dep_fps: Option<&[u128]>, _proc_fps: &[u128]) -> Option<PreviousFiles> { None }
     /// The proc-macro crates a partial restore kept (not in this load), by name and fingerprint
     fn retained_proc_macros(&self) -> Vec<(String, u128)> { Vec::new() }
     fn crate_image_selected(&self, c: &crate::preload::PreCrate, dep_fps: &[u128], plan: u128, deferred: &[String]) -> Option<CrateImage> {
@@ -688,7 +698,7 @@ impl GraphRecipe {
         for c in crates {
             let mut k = crate::sip::Sip128::new();
             for h in [&mut h, &mut k] {
-                h.str(&c.name); h.str(&c.root); h.u32(c.edition as u32);
+                h.str(&c.name); h.str(&crate::dirs::anchored(&c.root)); h.u32(c.edition as u32);
                 h.u128(parse_options(&c.cfg.session.options)); h.u8(c.proc_macro as u8);
                 let mut cfg = c.cfg.set.clone(); cfg.sort();
                 h.u32(cfg.len() as u32);
@@ -734,8 +744,14 @@ fields!(GraphImage, identity, crates, inputs, stamps, probes, demand_image);
 /// Share the whole frozen options identity with the code cache. This is conservative, but
 /// preserves sharing between apps with the same target and compiler options.
 /// rustc: compiler/rustc_session/src/options.rs:280-303 (tracked inputs).
+/// It holds the policy for third-party compile-time code too (compile_time.rs: bare `relax` Open,
+/// `makepad` Sandboxed, two binaries of one codegen identity): a registry package's proc macro
+/// expands from other inputs under each (confined, it reads nothing of the process environment
+/// or the files), so the front stores, graphs and collected programs that hold its expansions
+/// are each policy's own.
 pub fn parse_options(options: &crate::options::Options) -> u128 {
     let mut h = crate::sip::Sip128::new();
     h.u128(options.fingerprint());
+    h.u8((crate::compile_time::policy() == crate::compile_time::Policy::Sandboxed) as u8);
     h.finish128()
 }

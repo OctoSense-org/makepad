@@ -196,18 +196,18 @@ pub fn run(name: &str, policy: OnPanic, mut body: impl FnMut()) {
         match policy {
             OnPanic::Fatal => {
                 set_state(i, DEAD);
-                eprintln!("makepad-run: FATAL: JIT thread `{}` panicked: {} -- it cannot be restarted, the process ends", name, line);
+                eprintln!("relax: FATAL: JIT thread `{}` panicked: {} -- it cannot be restarted, the process ends", name, line);
                 crate::inspect::flightrec::fault_dump(&format!("thread {} panicked: {}", name, line));
                 std::process::abort();
             }
             OnPanic::Restart if restarts > MAX_RESTARTS => {
                 set_state(i, DEAD);
-                eprintln!("makepad-run: JIT thread `{}` panicked {} times, last: {} -- given up (dead: `makepad inspect threads`)", name, restarts, line);
+                eprintln!("relax: JIT thread `{}` panicked {} times, last: {} -- given up (dead: `{tool} inspect threads`)", name, restarts, line, tool = crate::tool_name());
                 return;
             }
             OnPanic::Restart => {
                 set_state(i, RESTARTING);
-                eprintln!("makepad-run: JIT thread `{}` panicked: {} -- restarted ({} of {})", name, line, restarts, MAX_RESTARTS);
+                eprintln!("relax: JIT thread `{}` panicked: {} -- restarted ({} of {})", name, line, restarts, MAX_RESTARTS);
                 std::thread::sleep(std::time::Duration::from_millis(if cfg!(test) { 1 } else { 10u64 << restarts.min(6) }));
                 set_state(i, ALIVE);
             }
@@ -226,7 +226,7 @@ pub fn spawn(name: String, policy: OnPanic, stack: Option<usize>, body: impl FnM
     match started {
         Ok(_) => true,
         Err(e) => {
-            eprintln!("makepad-run: cannot start JIT thread `{}`: {}", name, e);
+            eprintln!("relax: cannot start JIT thread `{}`: {}", name, e);
             crate::inspect::flightrec::event("thread.spawn_failed", &name, 0, 0);
             false
         }
@@ -264,16 +264,20 @@ mod tests {
 
     #[test]
     fn a_panicking_loop_restarts_and_is_reported() {
+        // a name of its own each time it runs: a warm rerun in this process finds the rows of the
+        // runs before (the registry keeps every row)
+        static RUNS: AtomicU64 = AtomicU64::new(0);
+        let name = format!("lifeline-test-restart-{}", RUNS.fetch_add(1, Ordering::SeqCst));
         let n = std::sync::Arc::new(AtomicU64::new(0));
         let n2 = n.clone();
-        assert!(spawn("lifeline-test-restart".to_string(), OnPanic::Restart, None, move || {
+        assert!(spawn(name.clone(), OnPanic::Restart, None, move || {
             if n2.fetch_add(1, Ordering::SeqCst) == 0 {
                 panic!("lifeline test panic");
             }
         }));
         let t0 = std::time::Instant::now();
         loop {
-            let row = snapshot().into_iter().find(|r| r.name == "lifeline-test-restart");
+            let row = snapshot().into_iter().find(|r| r.name == name);
             if let Some(r) = row.filter(|r| r.state == EXITED) {
                 assert_eq!(r.restarts, 1);
                 assert!(r.last_panic.contains("lifeline test panic"), "{}", r.last_panic);

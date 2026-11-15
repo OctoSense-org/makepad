@@ -23,13 +23,14 @@ pub(crate) struct SolverCache {
     global_cache: Box<[relax_session::sync::Mutex<graph::GlobalCache>]>,
 }
 /// hash -> arena index of an interned value: the value lives once, in its arena; a lookup
-/// compares against the arena entry (rustc's interner shape). Entries whose 64-bit hashes are
-/// equal beyond the first go to `more` (checked only when one exists).
-#[derive(Default)]
+/// compares against the arena entry (rustc's interner shape). The types' open-addressing index
+/// (slot: the hash's high half over the id + 1), read without a lock: a sharded RwLock map's
+/// reader counts bounced between the check's cores on every goal.
 struct IdIndex {
-    first: crate::conc::ShardMap<u64, u32>,
-    more: relax_session::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
-    has_more: std::sync::atomic::AtomicBool,
+    index: crate::types::index::Index<u64>,
+}
+impl Default for IdIndex {
+    fn default() -> Self { IdIndex { index: crate::types::index::Index::new() } }
 }
 impl IdIndex {
     fn hash_of<T: std::hash::Hash>(v: &T) -> u64 {
@@ -37,25 +38,20 @@ impl IdIndex {
         let mut h = crate::fxhash::FxHasher::default(); v.hash(&mut h); h.finish()
     }
     fn mem_stats(&self) -> (usize, usize) {
-        let (n, mut b) = self.first.mem_stats(|_, _| 0);
-        for v in self.more.lock().unwrap_or_else(|e| e.into_inner()).values() { b += v.capacity() * 4 + 64; }
-        (n, b)
+        (self.index.count(), self.index.bytes())
     }
+    #[inline]
     fn get(&self, h: u64, is: impl Fn(u32) -> bool) -> Option<u32> {
-        if let Some(id) = self.first.get(&h) {
-            if is(id) { return Some(id); }
-            if self.has_more.load(std::sync::atomic::Ordering::Acquire) {
-                let more = self.more.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ids) = more.get(&h) { return ids.iter().copied().find(|&i| is(i)); }
-            }
-        }
-        None
+        let h = (h >> 32) as u32;
+        let s = self.index.find(h, |s| (s >> 32) as u32 == h && is(s as u32 - 1))?;
+        Some(s as u32 - 1)
     }
     /// Caller holds the intern lock and has seen `get` fail.
     fn insert(&self, h: u64, id: u32) {
-        if self.first.get(&h).is_none() { self.first.insert(h, id); return; }
-        self.more.lock().unwrap_or_else(|e| e.into_inner()).entry(h).or_default().push(id);
-        self.has_more.store(true, std::sync::atomic::Ordering::Release);
+        let h = (h >> 32) as u32;
+        let slot = (h as u64) << 32 | (id as u64 + 1);
+        let mut g = self.index.lock();
+        self.index.claim(&mut g, h, slot, || self.index.table().filled().map(|s| ((s >> 32) as u32, s)).chain(std::iter::once((h, slot))));
     }
 }
 const SOLVER_CAP: usize = 1 << 26;
@@ -75,7 +71,7 @@ pub(super) struct ProofTreeCacheEntry {
     pub misses: std::sync::Arc<Vec<(u32, String)>>,
 }
 impl SolverCache {
-    /// memory report (MAKEPAD_RUN_MEM_REPORT): exact bytes per solver structure
+    /// memory report (RELAX_MEM_REPORT): exact bytes per solver structure
     pub(crate) fn mem_lines(&self) -> Vec<(String, u64)> {
         use std::mem::size_of;
         let mut out: Vec<(String, u64)> = Vec::new();
@@ -224,7 +220,7 @@ impl SolverDelegate<'_> {
 #[cfg(test)]
 pub(crate) use graph::CANDIDATE_PAIRS;
 
-/// MAKEPAD_RUN_SOLVER_WORK_TRACE histograms, printed at the first present (goal_hist_report):
+/// RELAX_SOLVER_WORK_TRACE histograms, printed at the first present (goal_hist_report):
 /// computed goals by kind+trait and by kind+trait+self type (which 0), root goals weighted by the
 /// goals their evaluation visited (1), the cycle heads of goals left out of the global cache (2),
 /// the head index of those (3).
@@ -262,8 +258,8 @@ pub fn goal_hist_report() {
     let Some(m) = g.as_ref() else { return };
     for (name, i, n) in [("computed-head", 0usize, 30usize), ("computed-full", 4, 30), ("root-weighted", 1, 30), ("cycle-head", 2, 30), ("cycle-head-index", 3, 12), ("rerun", 5, 40)] {
         let mut v: Vec<_> = m[i].iter().collect(); v.sort_by(|x, y| y.1.cmp(x.1));
-        eprintln!("makepad-run goal-hist {}: {} distinct, {} total", name, v.len(), v.iter().map(|x| *x.1).sum::<u64>());
-        for (k, c) in v.into_iter().take(n) { eprintln!("makepad-run goal-hist {} {:>9} {}", name, c, k); }
+        eprintln!("relax goal-hist {}: {} distinct, {} total", name, v.len(), v.iter().map(|x| *x.1).sum::<u64>());
+        for (k, c) in v.into_iter().take(n) { eprintln!("relax goal-hist {} {:>9} {}", name, c, k); }
     }
 }
 

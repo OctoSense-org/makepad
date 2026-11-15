@@ -20,6 +20,7 @@
 //! | [`Caches`]                             | `SmCacheMgr`, `SmCacheMgrCrv/Srf/TSrf/Brep` |
 //! | [`Kernel::fillet_point_step`], [`Kernel::latch_fillet_point_step`] | the function-static `sdStaticStep` of `SmFilletSolver::ComputePointValues` |
 //! | [`Kernel::upstream_ub_passed`], [`Kernel::note_upstream_ub`] | (none: upstream undefined behaviour the port went past) |
+//! | [`Kernel::renewed`]                    | (none: a session's kernel for its next call, see there) |
 //!
 //! Upstream seeds `rand()` from the clock in a few places; the port replaces that with
 //! [`Rng`], seeded from [`KernelOptions::seed`], so runs are reproducible. Results that
@@ -140,7 +141,7 @@ impl Caches {
 
 /// Opt-in fixes of upstream SMLib defects (`plan/upstream-issues/`), all off by default
 /// (upstream behaviour). Set them on [`Kernel::fixes`] before running operations; each
-/// field names its record (`WR-…`) and the `tangency-labs/csg_brep` issue.
+/// field names its record (`WR-…`) and the issue number in solidcore's tracker (see ATTRIBUTION.md, "References in comments").
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 #[non_exhaustive]
@@ -648,6 +649,22 @@ impl Kernel {
             fixes: UpstreamFixes::default(),
             notify_records: crate::topology::topology::NotifyRecords::new(),
         }
+    }
+
+    /// Not upstream: the kernel [`Kernel::new`] makes with this one's tolerances, fixes and
+    /// memo setting and draws from `seed`, its marks going on past this one's. A session that
+    /// keeps bodies from call to call makes each call on a renewed kernel: nothing an earlier
+    /// call left on the kernel (its random draws, the identities it issued, a latch, the flags
+    /// and leases of a call that unwound half-way) reaches the next, so a result depends on its
+    /// inputs and `seed` alone. Only the marks go on: a body still carries the marks it was
+    /// given, and a fresh kernel's first marks would be taken for them.
+    #[must_use]
+    pub fn renewed(&self, seed: u64) -> Self {
+        let mut k = Self::new(&KernelOptions { tolerances: self.tolerances, seed });
+        k.memoize_curve_caches = self.memoize_curve_caches;
+        k.fixes = self.fixes;
+        k.context.continue_marks(&self.context);
+        k
     }
 
     /// Records that an operation went past upstream undefined behaviour `id` (see

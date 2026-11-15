@@ -20,8 +20,8 @@
 //! Corner positions come from integer grid indices only, so a corner sampled
 //! twice has the same value: the signs the cells see are consistent.
 
+use crate::lipschitz::Clearance;
 use crate::sdf::Sdf3;
-use makepad_csg_math::fast_hash::{FastMap, FastSet};
 use makepad_csg_math::Vec3d;
 use makepad_csg_mesh::mesh::TriMesh;
 use std::sync::Arc;
@@ -45,16 +45,76 @@ impl Grid {
     fn corner(&self, i: [usize; 3]) -> Vec3d {
         Vec3d::new(self.origin.x + i[0] as f64 * self.cell, self.origin.y + i[1] as f64 * self.cell, self.origin.z + i[2] as f64 * self.cell)
     }
-    fn corner_key(&self, i: [usize; 3]) -> u64 {
-        (i[0] as u64) | ((i[1] as u64) << 21) | ((i[2] as u64) << 42)
-    }
     fn on_border(&self, i: [usize; 3]) -> bool {
         (0..3).any(|k| i[k] == 0 || i[k] == self.n[k])
     }
 }
 
-fn unpack(key: u64) -> [usize; 3] {
-    [(key & 0x1f_ffff) as usize, ((key >> 21) & 0x1f_ffff) as usize, (key >> 42) as usize]
+/// Cells (or corners) in a brick.
+const BRICK3: usize = BRICK * BRICK * BRICK;
+/// No crossing, no block.
+const NONE: u32 = u32::MAX;
+
+/// What the mesher knows of the grid, kept by brick: a brick's block is made when the mesher
+/// first reaches one of its corners or cells, so a sparse grid stays small and a lookup is two
+/// array reads. A corner `i` and the cell whose low corner it is share a place.
+struct Store {
+    /// Bricks per axis: a corner's index runs to `n`, one past the last cell's.
+    dims: [usize; 3],
+    /// Per brick, its block in `blocks`, or [`NONE`].
+    slot: Vec<u32>,
+    blocks: Vec<Block>,
+}
+
+struct Block {
+    value: [f64; BRICK3],
+    /// Per corner: asked for (a round of the surface following samples all it asks for, so
+    /// after the round's sampling its value is in `value`).
+    asked: [bool; BRICK3],
+    /// Per cell, a bit: visited.
+    seen: [u64; BRICK3 / 64],
+    /// Per corner and axis: the crossing on the grid edge from that corner along that axis.
+    crossing: [[u32; 3]; BRICK3],
+}
+
+impl Store {
+    fn new(n: [usize; 3]) -> Store {
+        let dims = n.map(|x| x / BRICK + 1);
+        Store { dims, slot: vec![NONE; dims[0] * dims[1] * dims[2]], blocks: Vec::new() }
+    }
+
+    fn brick(&self, i: [usize; 3]) -> usize {
+        i[0] / BRICK + self.dims[0] * (i[1] / BRICK + self.dims[1] * (i[2] / BRICK))
+    }
+
+    fn place(i: [usize; 3]) -> usize {
+        i[0] % BRICK + BRICK * (i[1] % BRICK + BRICK * (i[2] % BRICK))
+    }
+
+    /// The block and place of `i`, the block made if it is new.
+    fn at(&mut self, i: [usize; 3]) -> (&mut Block, usize) {
+        let b = self.brick(i);
+        if self.slot[b] == NONE {
+            self.slot[b] = self.blocks.len() as u32;
+            self.blocks.push(Block { value: [0.0; BRICK3], asked: [false; BRICK3], seen: [0; BRICK3 / 64], crossing: [[NONE; 3]; BRICK3] });
+        }
+        let s = self.slot[b] as usize;
+        (&mut self.blocks[s], Self::place(i))
+    }
+
+    /// A sampled corner's value.
+    fn value(&self, i: [usize; 3]) -> f64 {
+        self.blocks[self.slot[self.brick(i)] as usize].value[Self::place(i)]
+    }
+
+    /// Mark cell `i` visited: whether it was not before.
+    fn visit(&mut self, i: [usize; 3]) -> bool {
+        let (block, p) = self.at(i);
+        let bit = 1u64 << (p % 64);
+        let fresh = block.seen[p / 64] & bit == 0;
+        block.seen[p / 64] |= bit;
+        fresh
+    }
 }
 
 /// Corner `c` (bit 0 x, bit 1 y, bit 2 z) of cell `i`.
@@ -116,16 +176,33 @@ pub(crate) fn sample(field: &Arc<dyn Sdf3 + Send + Sync>, points: Vec<Vec3d>) ->
     makepad_csg_math::thread_pool::parallel_for(tasks).concat()
 }
 
+/// The field's normals at `points`, in parallel chunks.
+fn normals(field: &Arc<dyn Sdf3 + Send + Sync>, points: &Arc<Vec<Vec3d>>) -> Vec<Vec3d> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+    let chunks = (makepad_csg_math::thread_count() * 4).max(1);
+    let size = points.len().div_ceil(chunks).max(64);
+    let tasks: Vec<_> = (0..points.len().div_ceil(size))
+        .map(|c| {
+            let (field, points) = (field.clone(), points.clone());
+            move || points[c * size..((c + 1) * size).min(points.len())].iter().map(|p| field.normal(*p)).collect::<Vec<_>>()
+        })
+        .collect();
+    makepad_csg_math::thread_pool::parallel_for(tasks).concat()
+}
+
 /// One surface cell: its polygons, each a cycle of crossing edges (local
 /// edge indices) and the point its fan meets at.
 struct SurfaceCell {
     polygons: Vec<(Vec<u8>, Vec3d)>,
 }
 
-/// The polygons of a cell with corner values `v` and corner positions `pos`:
-/// the face segments (one per contour piece on each face, directed so the
-/// polygons face out of the solid) chained into cycles.
-fn surface_cell(field: &dyn Sdf3, pos: [Vec3d; 8], v: [f64; 8]) -> SurfaceCell {
+/// The polygons of a cell with corner values `v`, low and high corners `lo`, `hi` and its
+/// edges' crossings `edges` (an index into `points` and `normals` per local edge): the face
+/// segments (one per contour piece on each face, directed so the polygons face out of the
+/// solid) chained into cycles.
+fn surface_cell(lo: Vec3d, hi: Vec3d, v: [f64; 8], edges: [u32; 12], points: &[Vec3d], normals: &[Vec3d]) -> SurfaceCell {
     let inside = v.map(|x| x < 0.0);
     let mut next = [u8::MAX; 12];
     for face in FACES {
@@ -170,14 +247,11 @@ fn surface_cell(field: &dyn Sdf3, pos: [Vec3d; 8], v: [f64; 8]) -> SurfaceCell {
         let pns: Vec<(Vec3d, Vec3d)> = cycle
             .iter()
             .map(|k| {
-                let (a, b, _) = EDGES[*k as usize];
-                let t = crossing_t(v[a], v[b]);
-                let p = pos[a].lerp(pos[b], t);
-                (p, field.normal(p))
+                let c = edges[*k as usize] as usize;
+                (points[c], normals[c])
             })
             .collect();
         // The fan's point: the cycle's QEF point, kept inside the cell.
-        let (lo, hi) = (pos[0], pos[7]);
         let eps = (hi.x - lo.x) * 1e-3;
         let q = qef_vertex(&pns);
         let q = Vec3d::new(q.x.clamp(lo.x + eps, hi.x - eps), q.y.clamp(lo.y + eps, hi.y - eps), q.z.clamp(lo.z + eps, hi.z - eps));
@@ -198,9 +272,10 @@ static MESHES_BUILT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// when the box would need more than [`MAX_CELLS`] along a side). The grid has
 /// two cells of margin round the box. Triangles are wound outwards; the result
 /// is closed and edge-manifold.
-/// `lipschitz`: the field's bound ([`crate::lipschitz`]; 1 for a distance): the culling
-/// divides the value by it, so a field steeper than a distance keeps its surface bricks.
-pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, cell: f64, lipschitz: f64) -> TriMesh {
+/// `clearance`: how far the field's values prove its surface away ([`Clearance`]; a distance's
+/// value is its own radius): the culling drops a block only where its centre's value proves its
+/// whole box clear, so a field steeper than a distance keeps its surface bricks.
+pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, cell: f64, clearance: Clearance) -> TriMesh {
     MESHES_BUILT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let size = max - min;
     let extent = size.x.max(size.y).max(size.z).max(1e-9);
@@ -209,14 +284,15 @@ pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, 
     let grid = Grid { origin: min - Vec3d::new(2.0 * cell, 2.0 * cell, 2.0 * cell), cell, n };
 
     // ---- the corner values, sampled on demand
-    let mut values: FastMap<u64, f64> = Default::default();
-    let fill = |values: &mut FastMap<u64, f64>, keys: Vec<u64>| {
-        let points = keys.iter().map(|k| grid.corner(unpack(*k))).collect();
+    let mut store = Store::new(n);
+    let fill = |store: &mut Store, corners: Vec<[usize; 3]>| {
+        let points = corners.iter().map(|i| grid.corner(*i)).collect();
         let got = sample(&field, points);
-        for (k, d) in keys.into_iter().zip(got) {
+        for (i, d) in corners.into_iter().zip(got) {
             // The grid's outer corners are outside: a clipped surface is capped.
-            let d = if grid.on_border(unpack(k)) { d.max(cell * 1e-3) } else { d };
-            values.insert(k, d);
+            let d = if grid.on_border(i) { d.max(cell * 1e-3) } else { d };
+            let (block, p) = store.at(i);
+            block.value[p] = d;
         }
     };
 
@@ -237,7 +313,7 @@ pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, 
         let mut next = Vec::new();
         for ((lo, hi), d) in blocks.into_iter().zip(d) {
             let half = ((0..3).map(|k| (((hi[k] - lo[k]) * BRICK) as f64 * cell).powi(2)).sum::<f64>()).sqrt() * 0.5;
-            if d.abs() > (CULL * half + cell) * lipschitz.max(1.0) {
+            if clearance.radius(d) > CULL * half + cell {
                 continue;
             }
             if (0..3).all(|k| hi[k] - lo[k] == 1) {
@@ -258,15 +334,13 @@ pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, 
     }
 
     // ---- the bricks' cells: their corners, and the surface cells among them
-    let cell_key = |i: [usize; 3]| grid.corner_key(i);
     let mut queue: Vec<[usize; 3]> = Vec::new();
-    let mut seen: FastSet<u64> = Default::default();
     for b in &bricks {
         for z in 0..BRICK {
             for y in 0..BRICK {
                 for x in 0..BRICK {
                     let i = [b[0] * BRICK + x, b[1] * BRICK + y, b[2] * BRICK + z];
-                    if (0..3).all(|k| i[k] < n[k]) && seen.insert(cell_key(i)) {
+                    if (0..3).all(|k| i[k] < n[k]) && store.visit(i) {
                         queue.push(i);
                     }
                 }
@@ -277,20 +351,21 @@ pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, 
     // ---- follow the surface: visit every cell across a crossing edge
     let mut surface: Vec<[usize; 3]> = Vec::new();
     while !queue.is_empty() {
-        let mut need: Vec<u64> = Vec::new();
-        let mut asked: FastSet<u64> = Default::default();
+        let mut need: Vec<[usize; 3]> = Vec::new();
         for i in &queue {
             for c in 0..8 {
-                let k = grid.corner_key(cell_corner(*i, c));
-                if !values.contains_key(&k) && asked.insert(k) {
+                let k = cell_corner(*i, c);
+                let (block, p) = store.at(k);
+                if !block.asked[p] {
+                    block.asked[p] = true;
                     need.push(k);
                 }
             }
         }
-        fill(&mut values, need);
+        fill(&mut store, need);
         let mut next = Vec::new();
         for i in queue {
-            let v: [f64; 8] = std::array::from_fn(|c| values[&grid.corner_key(cell_corner(i, c))]);
+            let v: [f64; 8] = std::array::from_fn(|c| store.value(cell_corner(i, c)));
             let inside = v.map(|x| x < 0.0);
             if inside.iter().all(|s| *s) || inside.iter().all(|s| !*s) {
                 continue;
@@ -310,7 +385,7 @@ pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, 
                     let mut j = at;
                     j[u] -= du;
                     j[w] -= dw;
-                    if (0..3).all(|k| j[k] < n[k]) && seen.insert(cell_key(j)) {
+                    if (0..3).all(|k| j[k] < n[k]) && store.visit(j) {
                         next.push(j);
                     }
                 }
@@ -319,40 +394,65 @@ pub fn mesh_surface(field: Arc<dyn Sdf3 + Send + Sync>, min: Vec3d, max: Vec3d, 
         queue = next;
     }
 
+    // ---- the crossings: one per crossing edge (shared by its four cells), its point and the
+    // field's normal there, each found once
+    let corner_values: Arc<Vec<[f64; 8]>> = Arc::new(surface.iter().map(|i| std::array::from_fn(|c| store.value(cell_corner(*i, c)))).collect());
+    let mut points: Vec<Vec3d> = Vec::new();
+    let edges: Arc<Vec<[u32; 12]>> = Arc::new(
+        surface
+            .iter()
+            .zip(corner_values.iter())
+            .map(|(i, v)| {
+                let mut ids = [NONE; 12];
+                for (e, &(a, b, axis)) in EDGES.iter().enumerate() {
+                    if (v[a] < 0.0) == (v[b] < 0.0) {
+                        continue;
+                    }
+                    let (ca, cb) = (cell_corner(*i, a), cell_corner(*i, b));
+                    let (block, p) = store.at(ca);
+                    if block.crossing[p][axis] == NONE {
+                        block.crossing[p][axis] = points.len() as u32;
+                        points.push(grid.corner(ca).lerp(grid.corner(cb), crossing_t(v[a], v[b])));
+                    }
+                    ids[e] = block.crossing[p][axis];
+                }
+                ids
+            })
+            .collect(),
+    );
+    let points = Arc::new(points);
+    let normals = Arc::new(normals(&field, &points));
+
     // ---- each surface cell's polygons, in parallel
     let surface = Arc::new(surface);
-    let corner_values: Arc<Vec<[f64; 8]>> = Arc::new(surface.iter().map(|i| std::array::from_fn(|c| values[&grid.corner_key(cell_corner(*i, c))])).collect());
     let chunks = (makepad_csg_math::thread_count() * 4).max(1);
     let size = surface.len().div_ceil(chunks).max(16);
     let g = grid;
     let tasks: Vec<_> = (0..surface.len().div_ceil(size))
         .map(|c| {
-            let (field, surface, corner_values) = (field.clone(), surface.clone(), corner_values.clone());
+            let (surface, corner_values, edges, points, normals) = (surface.clone(), corner_values.clone(), edges.clone(), points.clone(), normals.clone());
             move || {
                 (c * size..((c + 1) * size).min(surface.len()))
-                    .map(|s| surface_cell(field.as_ref(), std::array::from_fn(|k| g.corner(cell_corner(surface[s], k))), corner_values[s]))
+                    .map(|s| surface_cell(g.corner(surface[s]), g.corner(cell_corner(surface[s], 7)), corner_values[s], edges[s], &points, &normals))
                     .collect::<Vec<_>>()
             }
         })
         .collect();
     let cells: Vec<SurfaceCell> = makepad_csg_math::thread_pool::parallel_for(tasks).into_iter().flatten().collect();
 
-    // ---- the mesh: one vertex per crossing edge (shared by its four cells), a fan per polygon
+    // ---- the mesh: one vertex per crossing, a fan per polygon
     let mut mesh = TriMesh::new();
-    let mut crossing: FastMap<(u64, u8), u32> = Default::default();
+    let mut vertex = vec![NONE; points.len()];
     for (s, sc) in cells.iter().enumerate() {
-        let i = surface[s];
-        let v = corner_values[s];
         for (cycle, centre) in &sc.polygons {
             let ids: Vec<u32> = cycle
                 .iter()
                 .map(|k| {
-                    let (a, b, axis) = EDGES[*k as usize];
-                    let (ca, cb) = (cell_corner(i, a), cell_corner(i, b));
-                    *crossing.entry((grid.corner_key(ca), axis as u8)).or_insert_with(|| {
-                        let t = crossing_t(v[a], v[b]);
-                        mesh.add_vertex(grid.corner(ca).lerp(grid.corner(cb), t))
-                    })
+                    let c = edges[s][*k as usize] as usize;
+                    if vertex[c] == NONE {
+                        vertex[c] = mesh.add_vertex(points[c]);
+                    }
+                    vertex[c]
                 })
                 .collect();
             if ids.len() == 3 {
@@ -449,7 +549,7 @@ mod tests {
     }
 
     fn mesh(n: SdfNode, scale: f64, lo: f64, hi: f64, cell: f64) -> TriMesh {
-        mesh_surface(Arc::new(Node(n, scale)), Vec3d::new(lo, lo, lo), Vec3d::new(hi, hi, hi), cell, 1.0)
+        mesh_surface(Arc::new(Node(n, scale)), Vec3d::new(lo, lo, lo), Vec3d::new(hi, hi, hi), cell, Clearance::uniform(1.0))
     }
 
     fn at(p: [f64; 3], of: SdfNode) -> SdfNode {
@@ -479,6 +579,25 @@ mod tests {
         // A gyroid fills its box: the box's faces close it.
         let m = mesh(SdfNode::Gyroid { period: 4.0, wall: 0.6 }, 1.0, -4.0, 4.0, 0.3);
         assert!(closed(&m));
+    }
+
+    /// A flat ellipsoid's estimate overstates how deep a point lies, by up to its radii's ratio,
+    /// most in the plane of its long radii: a brick centred there reads far more than the
+    /// distance to a small ball just over its face, which no surface leads to from elsewhere.
+    /// Culled at the shape's bound, the ball is meshed as whole as with no culling at all.
+    #[test]
+    fn a_ball_over_a_flat_ellipsoid_is_meshed() {
+        let centre = [1.0, 1.0, 1.25];
+        let ball = at(centre, SdfNode::Sphere { radius: 0.5 });
+        let root = SdfNode::Combine { op: SdfOp::Union, blend: 0.0, of: vec![SdfNode::Ellipsoid { radii: [100.0, 100.0, 0.5] }, ball] };
+        let shape = crate::SdfShape { root, min: [-100.0, -100.0, -0.5], max: [100.0, 100.0, 1.75], materials: Vec::new() };
+        // the bricks next to the ellipsoid's middle plane are centred on it
+        let near = |c: Clearance| {
+            let m = mesh_surface(shape.field(), Vec3d::new(-100.0, -100.0, -1.0), Vec3d::new(100.0, 100.0, 2.0), 0.5, c);
+            m.vertices.iter().filter(|v| (**v - Vec3d::new(centre[0], centre[1], centre[2])).length() < 1.0).count()
+        };
+        let (got, all) = (near(shape.clearance()), near(Clearance::uniform(f64::INFINITY)));
+        assert!(all > 10 && got == all, "the ball over the flat ellipsoid is meshed whole: {got} of its {all} vertices at {:?}", shape.clearance());
     }
 
     #[test]

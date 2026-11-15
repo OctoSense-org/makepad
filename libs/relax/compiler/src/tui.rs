@@ -187,9 +187,9 @@ pub fn print_slowest() {
         if l.is_empty() {
             continue;
         }
-        eprintln!("makepad-run: {title}:");
+        eprintln!("relax: {title}:");
         for (_, n, ms) in l.into_iter().take(5) {
-            eprintln!("makepad-run:   {ms:>9.1} ms  {n}");
+            eprintln!("relax:   {ms:>9.1} ms  {n}");
         }
     }
     v.clear();
@@ -238,11 +238,19 @@ pub fn finish(_summary: bool) {}
 pub(crate) fn flush() {}
 #[cfg(not(unix))]
 pub(crate) fn log_only(_line: &str) {}
+#[cfg(not(unix))]
+pub(crate) fn stderr_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stderr().is_terminal()
+}
 
 #[cfg(unix)]
 pub use unix::{finish, start};
 #[cfg(unix)]
-pub(crate) use unix::{flush, fault_fd, log_only};
+pub(crate) use unix::{flush, fault_fd, log_only, stderr_is_terminal};
+// (os/fault.rs's abort report: the pipe drained as after the panic hook)
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub(crate) use unix::{fatal_drain, hold_tee};
 
 #[cfg(unix)]
 mod unix {
@@ -257,7 +265,6 @@ mod unix {
         fn close(fd: i32) -> i32;
         fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
-        fn atexit(f: extern "C" fn()) -> i32;
         fn pipe(fds: *mut i32) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn poll(fds: *mut PollFd, nfds: NfdsT, timeout: i32) -> i32;
@@ -295,6 +302,17 @@ mod unix {
     static TEE: Mutex<Vec<u8>> = Mutex::new(Vec::new());
     /// The real stderr, kept for process lifetime so a signal never races its close.
     static OUT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+    /// Test the real stderr, not the session-log pipe installed on fd 2.
+    pub(crate) fn stderr_is_terminal() -> bool {
+        let fd = OUT.load(Ordering::Acquire);
+        if fd < 0 {
+            std::io::stderr().is_terminal()
+        } else {
+            // OUT stays open for the process lifetime; borrowing it must not close it.
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.is_terminal()
+        }
+    }
 
     /// Fault reports bypass the tee: a fatal signal kills its forwarding threads.
     pub(crate) fn fault_fd() -> i32 {
@@ -520,19 +538,19 @@ mod unix {
     /// Start a durable transcript, and optionally the terminal progress bar.
     pub fn start(progress: bool) {
         let _k = crate::zone_alloc::kept();
-        unsafe { std::env::remove_var("MAKEPAD_RUN_PROGRESS") };
-        if std::env::var_os("MAKEPAD_RUN_SCRIPT_DEPTH").is_some() || STATE.lock().unwrap().is_some() { return; }
+        unsafe { std::env::remove_var("RELAX_PROGRESS") };
+        if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() || STATE.lock().unwrap().is_some() { return; }
         let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
         let progress = progress && std::io::stderr().is_terminal()
-            && env("NO_COLOR").is_none() && env("MAKEPAD_RUN_REPORT_TO").is_none();
-        let path = std::env::temp_dir().join(format!("makepad-run-session-{}-{}.log", std::process::id(), crate::clock::wall_ns()));
+            && env("NO_COLOR").is_none() && env("RELAX_REPORT_TO").is_none();
+        let path = std::env::temp_dir().join(format!("relax-session-{}-{}.log", std::process::id(), crate::clock::wall_ns()));
         let writer = match std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path) {
             Ok(f) => f,
-            Err(e) => { eprintln!("makepad-run: cannot create session log: {e}"); return; }
+            Err(e) => { eprintln!("relax: cannot create session log: {e}"); return; }
         };
         let mut fds = [-1i32; 2];
         if unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            eprintln!("makepad-run: cannot create the session log pipe: {}", std::io::Error::last_os_error());
+            eprintln!("relax: cannot create the session log pipe: {}", std::io::Error::last_os_error());
             return;
         }
         let [read_fd, write_fd] = fds;
@@ -566,7 +584,7 @@ mod unix {
         *super::SESSION_LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_with(|| path.clone()));
         // the path is named at the start with --verbose; a run that ends badly names it when it keeps the log
         if crate::run::VERBOSE.load(Ordering::Relaxed) {
-            let note = format!("makepad-run: session log {}\n", path.display());
+            let note = format!("relax: session log {}\n", path.display());
             out_all(write_fd, note.as_bytes());
         }
         let mut st = State { out, write_fd, path, partial: Vec::new(), drawn: false, last_draw_ms: 0.0 };
@@ -576,22 +594,22 @@ mod unix {
         pump(&mut st, false);
         if progress { draw(&mut st); }
         *STATE.lock().unwrap() = Some(st);
-        if progress { unsafe { std::env::set_var("MAKEPAD_RUN_PROGRESS", "1") }; }
+        if progress { unsafe { std::env::set_var("RELAX_PROGRESS", "1") }; }
         let previous = std::panic::take_hook();
         // the hook lives as long as the process: the program's heap
         // the message reaches the transcript and the terminal before an abort can follow the hook
-        { let _k = crate::zone_alloc::kept(); std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); panic_drain(); })); }
-        unsafe { atexit(at_exit) };
+        { let _k = crate::zone_alloc::kept(); std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); fatal_drain(b""); })); }
+        makepad_core_util::process_end::at_exit(at_exit);
         { let _k = crate::zone_alloc::kept();
         if let Err(e) = std::thread::Builder::new().name("run-log-tee".into()).spawn(tee) {
             unsafe { dup2(out, 2) };
-            out_all(out, format!("makepad-run: cannot start the session log tee: {e}\n").as_bytes());
+            out_all(out, format!("relax: cannot start the session log tee: {e}\n").as_bytes());
             abnormal();
             finish(false);
             return;
         }
         if let Err(e) = std::thread::Builder::new().name("run-progress".into()).spawn(forward) {
-            eprintln!("makepad-run: cannot forward session log: {e}");
+            eprintln!("relax: cannot forward session log: {e}");
             abnormal();
             finish(false);
         }
@@ -634,31 +652,96 @@ mod unix {
         }
     }
 
-    /// After the panic hook printed: everything in the pipe to the transcript, and to the
-    /// terminal (through the display when it is free, else raw).
-    fn panic_drain() {
-        // try_lock: a panic on the tee thread itself (inside its drain) must not wait for itself;
-        // that drain is then the one that copies this message
-        if let Ok(mut g) = READER.try_lock() {
+    /// After the panic hook printed, or with an abort's report (`after`): what the display holds
+    /// and everything in the pipe, then `after`, to the transcript and the terminal. It waits for
+    /// no lock and allocates or frees nothing: a lock held by a thread that never lets go (one
+    /// stuck in the heap an abort found corrupt; the tee thread itself, when it panicked inside
+    /// its drain) leaves out what only it reaches, and a line after the rest names it.
+    pub(crate) fn fatal_drain(after: &[u8]) {
+        use std::io::Write;
+        use std::sync::TryLockError;
+        fn tried<T>(r: std::sync::TryLockResult<T>) -> Option<T> {
+            match r {
+                Ok(g) => Some(g),
+                Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            }
+        }
+        let out = fault_fd();
+        let mut skipped: [&str; 3] = [""; 3];
+        // the display: its bar off, then its partial line (the oldest bytes)
+        match tried(STATE.try_lock()) {
+            Some(mut g) => {
+                if let Some(st) = g.as_mut() {
+                    erase(st);
+                    out_all(out, &st.partial);
+                    st.partial.clear();
+                }
+            }
+            None => skipped[0] = "display: STATE lock held, its bar and partial line left as they are",
+        }
+        match tried(TEE.try_lock()) {
+            Some(mut tee) => {
+                out_all(out, &tee);
+                tee.clear();
+            }
+            None => skipped[1] = "tee: TEE lock held, what it holds not shown",
+        }
+        let mut after_out = false;
+        if let Some(mut g) = tried(READER.try_lock()) {
             if let Some(r) = g.as_mut() {
-                if drain(r) {
+                let mut buf = [0u8; 16384];
+                let ended = loop {
+                    let n = unsafe { read(r.fd, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n > 0 {
+                        let chunk = &buf[..n as usize];
+                        if let Some(f) = r.file.as_mut() {
+                            let _ = f.write_all(chunk);
+                        }
+                        out_all(out, chunk);
+                        continue;
+                    }
+                    if n == 0 {
+                        break true;
+                    }
+                    match std::io::Error::last_os_error().kind() {
+                        std::io::ErrorKind::Interrupted => continue,
+                        std::io::ErrorKind::WouldBlock => break false,
+                        _ => break true,
+                    }
+                };
+                if let Some(f) = r.file.as_mut() {
+                    let _ = f.write_all(after);
+                }
+                out_all(out, after);
+                after_out = true;
+                if ended {
                     unsafe { close(r.fd) };
                     *g = None;
                 }
+            } else {
+                out_all(out, after);
+                after_out = true;
+            }
+        } else {
+            skipped[2] = "transcript: READER lock held, the pipe not drained and this report on the terminal only";
+        }
+        if !after_out {
+            out_all(out, after);
+        }
+        for s in skipped.iter().filter(|s| !s.is_empty()) {
+            for part in [b"relax: ".as_slice(), s.as_bytes(), b"\n"] {
+                out_all(out, part);
             }
         }
-        match STATE.try_lock() {
-            Ok(mut g) => {
-                if let Some(st) = g.as_mut() { pump(st, true); }
-            }
-            Err(_) => {
-                let out = OUT.load(Ordering::Acquire);
-                if out >= 0 {
-                    let bytes = std::mem::take(&mut *TEE.lock().unwrap_or_else(|e| e.into_inner()));
-                    out_all(out, &bytes);
-                }
-            }
-        }
+    }
+
+    /// RELAX_ABORT_HOLD (os/fault.rs, tests/abort_heap's held case): the tee's lock, kept
+    /// while `then` runs.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub(crate) fn hold_tee(then: impl FnOnce()) {
+        let _tee = TEE.lock().unwrap_or_else(|e| e.into_inner());
+        then();
     }
 
     /// Takes the bar down and gives fd 2 back its terminal. `summary`: first present, print the
@@ -682,26 +765,30 @@ mod unix {
         unsafe { dup2(st.out, 2); close(st.write_fd); }
         drain_now();
         pump(st, true);
-        let clean = EXIT_CODE.load(Ordering::Acquire) == 0 && !ABNORMAL.load(Ordering::Acquire);
+        // A silent run (a program re-running itself, a test's CARGO_BIN_EXE child) ends with the
+        // program's status, and its stderr is the program's as rustc's binary's is: a nonzero
+        // status of its own is its answer, not Relax's failure (an internal error keeps the log).
+        let code = EXIT_CODE.load(Ordering::Acquire);
+        let clean = !ABNORMAL.load(Ordering::Acquire) && (code == 0 || (crate::run::silent() && !KEEP_LOG.load(Ordering::Acquire)));
         if clean {
             if let Err(e) = std::fs::remove_file(&st.path) {
-                out_all(st.out, format!("makepad-run: session log kept at {}: {e}\n", st.path.display()).as_bytes());
+                out_all(st.out, format!("relax: session log kept at {}: {e}\n", st.path.display()).as_bytes());
             }
         } else if KEEP_LOG.load(Ordering::Acquire) {
             match crate::inspect::snapshot::keep_file(&st.path, "session") {
-                Ok(kept) => out_all(st.out, format!("makepad-run: session log kept at {} (an internal compiler error)\n", kept.display()).as_bytes()),
-                Err(e) => out_all(st.out, format!("makepad-run: session log kept at {} (an internal compiler error; not copied to the captures: {e})\n", st.path.display()).as_bytes()),
+                Ok(kept) => out_all(st.out, format!("relax: session log kept at {} (an internal compiler error)\n", kept.display()).as_bytes()),
+                Err(e) => out_all(st.out, format!("relax: session log kept at {} (an internal compiler error; not copied to the captures: {e})\n", st.path.display()).as_bytes()),
             }
         } else {
-            out_all(st.out, format!("makepad-run: session log kept at {}\n", st.path.display()).as_bytes());
+            out_all(st.out, format!("relax: session log kept at {}\n", st.path.display()).as_bytes());
         }
         *g = None;
     }
 
     fn ready_line(st: &State) {
-        let pkg = std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_else(|_| "program".to_string());
+        let pkg = std::env::var("RELAX_PACKAGE").unwrap_or_else(|_| "program".to_string());
         let ahead = crate::jit::ahead_level().name();
-        let cache = match std::env::var("MAKEPAD_RUN_CACHE_STATE").as_deref() {
+        let cache = match std::env::var("RELAX_CACHE_STATE").as_deref() {
             Ok("warm") => format!(" (warm, ahead {ahead})"),
             Ok("cold") => format!(" (cold, ahead {ahead})"),
             _ => format!(" (ahead {ahead})"),

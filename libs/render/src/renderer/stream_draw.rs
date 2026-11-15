@@ -580,7 +580,7 @@ impl Renderer {
                 let axis = vec3f(v[0] * dir.x + v[4] * dir.y + v[8] * dir.z, v[1] * dir.x + v[5] * dir.y + v[9] * dir.z, v[2] * dir.x + v[6] * dir.y + v[10] * dir.z).normalize();
                 self.host_asset_lights.push(crate::lightmap::LmLight {
                     pos, color: color * (st.source.mover_light_level(m.kind as usize, st.night) * fade), radius: 26.0, dir: axis, spot: 1.0, cone: Some((10.0, 34.0)), shadows: false,
-                    area: None,
+                    area: None, volumetric: false,
                 });
             }
         }
@@ -602,7 +602,7 @@ impl Renderer {
                 let (radius, strength) = crate::lightmap::lamp_photometry(*mount);
                 self.host_asset_lights.push(crate::lightmap::LmLight {
                     pos, color: *color * (strength * st.night), radius, dir: vec3f(0.0, -1.0, 0.0), spot: 1.0, cone: None, shadows: false,
-                    area: None,
+                    area: None, volumetric: false,
                 });
             }
         }
@@ -754,7 +754,7 @@ fn city_shader_on() -> bool {
 fn stream_casters_of(casters: &mut Vec<crate::gpu_lightmap::GpuBakeMesh>, m: &LoadedModel, casting: std::ops::Range<usize>) {
     for (k, g) in std::iter::once(&m.geometry).chain(m.extra_draws.iter().map(|(g, ..)| g)).enumerate() {
         if !casting.contains(&k) { continue; }
-        casters.push(crate::gpu_lightmap::GpuBakeMesh { geometry: g.geometry_id(), transform: Mat4f::identity(), min: m.min, max: m.max, cutout: None, band: Default::default() });
+        casters.push(crate::gpu_lightmap::GpuBakeMesh { geometry: g.geometry_id(), transform: Mat4f::identity(), min: m.min, max: m.max, cutout: None, msdf: None, band: Default::default() });
     }
 }
 

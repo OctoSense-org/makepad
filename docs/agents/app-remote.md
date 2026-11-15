@@ -57,6 +57,11 @@ lease, or anything for someone typing at a terminal. Otherwise it is refused,
 with the pid it would have reached: on the user's Mac a name is their app, so
 name the pid you mean. `<node>:<name>` through the hub is refused the same way.
 
+A release Android or iOS build opens no endpoint unless asked. An Android app
+has no launch flags or environment of its own, so `adb shell setprop
+debug.makepad.remote 1` before launching it asks for one; its socket is in the
+app's cache dir, which `adb shell run-as` reaches in a debuggable APK.
+
 ## Common commands
 
 Each request is one command; the answer is the same JSON as before, one line
@@ -74,12 +79,16 @@ is a quoted shell argument. There is no HTTP, no status code and no POST body.
 | `ui find [q=QUERY] [role=button] [name=Save] [nth=N] [w=]` | Matching nodes and count (nth is zero-based) |
 | `ui act node=ID\|q=QUERY ACTION [v=] [t=] [from= to=] [dx= dy=] [name=] [wait=1]` | Action result and resulting node; rejects missing, ambiguous, hidden or disabled targets |
 | `ui act node=ID\|q=QUERY drag dx= dy= [ms=1000] [hz=120] [legs=1] [x= y=] [b=0] [mods=shift+ctrl]` | A real pointer drag: press, one move every 1/hz through the window's input queue on time whatever the app is doing, release. `legs` traversals of `dx,dy` over `ms` (even: back at the start), press at `x,y` from the node's corner, default its centre. Answers `events`, `ms`, `late_ms_max`, `frames`, `per_2s_min` (fewest frames in any 2 s window) and `gap_ms`. |
-| `ui type node=ID\|q=QUERY t=TEXT [from= to=]` | Focus and replace the selection; default range is the caret/selection |
+| `ui type node=ID\|q=QUERY t=TEXT [from= to=]` | Focus and replace the selection; default range is the caret/selection. A node without replace_text (the code editor) gets the text as text input |
+| `ui act node=ID\|q=QUERY type t=TEXT [wait=1]` | `ui type`'s last step alone: the text as text input into the focus an earlier `ui act ... focus` gave the node, posted (nothing waits for the app; `wait=1` or `ui present` waits for its frame) |
 | `ui wait q=QUERY [gone=1\|changed=1\|count=N] [timeout_ms=5000]` | Nodes and elapsed milliseconds once the condition holds |
+| `ui done req=N [timeout_ms=5000]` | The result of an action an `act` answered `action N timed out` for (still pending: the app had not taken it yet), or that answer again |
+| `ui present node=ID\|q=QUERY\|w=WINDOW [timeout_ms=5000]` | Waits for the next present of the node's window, what `act wait=1` waits for; `w=` alone names the window (an act whose press removed its node), and a window gone answers `gone` at once |
 | `ui snap name=X` / `ui diff a=X [b=now\|Y]` | Save and compare semantic trees |
 | `ui speak [since=N] [node=ID]` / `ui lint` | Announcement stream or accessibility findings |
 | `mouse k=click x=X y=Y` | Mouse input; kinds also include move, down, up, scroll; `k=drag` sends its moves in one burst, which coalesce into one (a value field reads that as the start of a drag and does not change: use `ui act ... drag`) |
 | `click x=X y=Y` | Click alias |
+| `move x=X y=Y` | Mouse move alias (hover) |
 | `key k=press c=KeyA` | Key input; down/up are also supported |
 | `text t=TEXT`, `key t=TEXT` | Text/IME input |
 | `drop path=ABSOLUTE_PATH x=X y=Y` | One file through native drag, drop, and drag-end events |
@@ -89,7 +98,7 @@ is a quoted shell argument. There is no HTTP, no status code and no POST body.
 | `settled` | Whether anything is still pending: `{"settled":bool,"reasons":[...]}` |
 | `cap start path=ABS.mp4 [fps=60]`, `cap stop` | In-process mp4 capture of the window, see below |
 | `cursor [show=1] [style=arrow]` | Synthetic cursor drawn into the frame |
-| `close [w=ID]`, `resize w=W h=H`, `window k=...` | Window operations |
+| `close [w=ID]`, `resize w=W h=H`, `window k=maximize\|fullscreen\|resize\|dragquery` | Window operations |
 | `activity` | Native user activity counters, see below |
 | `trace`, `midi`, `ai`, `ai transcript`, `handsoff`, `shader consts`, `shader const` | Diagnostics and overlays |
 | `tweak ...`, `design <op> ...` | Design feedback and source edits, see [Tweaker](tweaker.md) |
@@ -170,7 +179,7 @@ A scripted demo or a pixel test that must come out the same every time pins
 the four inputs that otherwise vary between runs, at launch:
 
 ```sh
-MAKEPAD_HIDE_WINDOWS=1 SANDBOX_MUTE=1 ./target/release/APP --remote \
+MAKEPAD_HIDE_WINDOWS=1 MAKEPAD_MUTE=1 ./target/release/APP --remote \
   --virtual-clock --window 360x640@3 --seed 1
 ```
 
@@ -233,7 +242,7 @@ MAKEPAD_HIDE_WINDOWS=1 SANDBOX_MUTE=1 ./target/release/APP --remote \
   audio tap) on the frames' sample clock, padded with silence; the device
   runs in real time, so under the virtual clock only the last 0.1 s the
   device played is kept per frame and the sound is not deterministic (run
-  with `SANDBOX_MUTE=1`). Quitting, or the app closing, with a capture open
+  with `MAKEPAD_MUTE=1`). Quitting, or the app closing, with a capture open
   finishes the file. `cap pause` and `cap resume` stop and restart
   writing without stopping the clock: while paused, `step` frames advance
   the app but are not written (nor is sound), and the file stays gapless, as
@@ -257,13 +266,12 @@ take; `cap stop`; `quit`.
 
 - The proof rig for anything visual is the native GPU backend (Metal on
   macOS) in an owned `--remote` instance. `MAKEPAD_HIDE_WINDOWS=1` keeps its
-  windows off the user's screen; grabs and input still work because `g`
-  forces a present on a hidden window. Measured on macOS (2026-09-10): the
-  first hidden `g` answers in ~100 ms, later ones in ~2 s each, and `gseq`
-  delivers at that ~2 s spacing regardless of `every_ms`; on an app that is
-  not redrawing, `gseq` can time out ("grab timeout"). Rest/settle timing
-  proofs need a window that presents on its own (the user's, or a visible
-  unfocused one).
+  windows off screen. On Apple it defaults to offscreen Metal without an
+  AppKit window; `g` requests a present directly (measured: 22–63 ms).
+  Explicit `MAKEPAD_HAL_BACKEND=metal` keeps hidden AppKit windows without
+  a display link; whether grabs hit the 2 s `FRAME_STALL` backstop is
+  **not verified**. Rest/settle timing proofs need a window that presents
+  on its own (the user's, or a visible unfocused one).
 - `MAKEPAD_HAL_BACKEND=headless` runs the HAL headless backend: the native
   client with no window, no GPU and no raster. It is for logic and
   data-structure tests only. Never use it to prove a picture or to chase a
@@ -274,7 +282,7 @@ take; `cap stop`; `quit`.
   between ticks; in the code map every `g` drops keyboard focus, click the
   map before the next key batch; `MAKEPAD_HIDE_WINDOWS` is implemented on
   macOS and Windows. Test instances of apps with audio or a shared home run with
-  `SANDBOX_MUTE=1` and their own `SANDBOX_HOME` / `--state-dir`.
+  `MAKEPAD_MUTE=1` and their own `SANDBOX_HOME` / `--state-dir`.
 
 ## Coordinate and lifecycle details
 

@@ -52,6 +52,9 @@ pub const KEEP: usize = 200;
 /// How many finished jobs it keeps.
 pub const JOBS_KEEP: usize = 500;
 
+/// The nested repository ([`crate::nested`]) a [`Pair`] holds beside makepad: its `main`.
+pub const PAIRED: &str = "commercial";
+
 /// A makepad `work` commit and the commercial `main` commit landed with it: what verify, allapps
 /// and push name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
@@ -70,9 +73,20 @@ impl Pair {
         format!("{},{}", short(&self.work), short(&self.main))
     }
 
-    /// The lease `--rev` of the pair: `work@<sha>,main@<sha>`.
+    /// The lease `--rev` of the pair: `work@<sha>,commercial=main@<sha>`.
     pub fn rev(&self) -> String {
-        if self.main.is_empty() { format!("work@{}", self.work) } else { format!("work@{},main@{}", self.work, self.main) }
+        if self.main.is_empty() { format!("work@{}", self.work) } else { format!("work@{},{PAIRED}=main@{}", self.work, self.main) }
+    }
+
+    /// The pair as a pin's key ([`crate::lease::Pin::key`]): `<work>[,commercial=<main>]`, the form
+    /// of a node's caps (`deploy`, `tree`), the roll's tips and a timed ask's deployment pin.
+    pub fn pin_key(&self) -> String {
+        if self.main.is_empty() { self.work.clone() } else { format!("{},{PAIRED}={}", self.work, self.main) }
+    }
+
+    /// The pair a pin's key names ([`Pair::pin_key`]).
+    pub fn of_pin_key(key: &str) -> Option<Pair> {
+        crate::lease::Pin::parse(key).map(|p| p.pair())
     }
 
     pub fn valid(&self) -> bool {
@@ -657,7 +671,8 @@ pub struct LaneRec {
     pub created_ms: u64,
     /// registered from an existing worktree
     pub adopted: bool,
-    /// `live`, `removed` (landed and cleaned up), `dropped`
+    /// `live`, `removed` (landed and cleaned up), `dropped`, `retired` (its worktree went, its
+    /// branches stay)
     pub state: String,
     /// when the cleanup first saw both halves landed (it waits out a grace period of no activity)
     pub landed_ms: u64,
@@ -666,6 +681,12 @@ pub struct LaneRec {
     /// `devhub lane live <name> on`: the user waits for this lane (the manager's mark): its
     /// landings take the fast path (merge + check; the boot at `devhub show`, the tests after)
     pub waited: bool,
+    /// `devhub lane first <name>.. on`: the user's priority now: the lane's leases go first,
+    /// ahead of every other lane's and of the land queue's, at interactive priority
+    /// (`Sched::first_lanes`)
+    pub first: bool,
+    /// `devhub lane park <name> [why]`: why it waits (empty: not parked); its branches are held
+    pub parked: String,
     pub ended_ms: u64,
     /// what the cleanup did, a drop's bundles, or why a landed lane is still kept
     pub note: String,
@@ -690,6 +711,14 @@ pub struct Show {
     pub pid: u32,
     /// the landed commit it runs (work at launch; a landing while it runs patches it live)
     pub sha: String,
+    /// and the commercial `main` with it
+    pub main: String,
+    /// a Mac show takes only proven tips: while the checkout's tip is not proven for its app,
+    /// why it stays at its pair (`held at <sha>: tip <sha2> <reason>`); empty: not held
+    pub held: String,
+    /// the fast bucket's red units (`check <pkg>`) when it took its pair: one of them red at a
+    /// later tip is no new break of the app
+    pub took_red: Vec<String>,
     pub added_ms: u64,
     pub started_ms: u64,
     pub ended_ms: u64,
@@ -700,12 +729,25 @@ pub struct Show {
     pub note: String,
     /// `devhub show pin`: an operation runs on it: no landing or edit reaches it, it does not restart
     pub pinned: bool,
+    /// landed edits its JIT could not apply live, waiting for the person's restart (never
+    /// devhub's): `restart pending since <sha>: N landed edit(s) not running (first: <why>)`, its
+    /// `sha` then no longer what it wholly runs; empty: none wait
+    pub restart: String,
+    /// the sha it was listed at when the first of them was seen (kept while any waits)
+    pub restart_since: String,
     /// when its launch began (its --after met)
     pub launch_ms: u64,
     /// what the launch took, stage by stage (`box 3 s, jit reused, first frame 6 s, settle 8 s`)
     pub stages: String,
     /// `devhub show <app> -- <args>`: the app's own arguments, kept for every start of this show
     pub args: Vec<String>,
+    /// how far its Mac launch's log was read for failures, the kinds of failure line it said (as
+    /// hashes) and the app records it said (`<pid>.<seq>.<its run's clock>`): kept here, not in the
+    /// process, for each landing re-execs the master (a morning's panic was said again at about 20
+    /// shows after, 11-06)
+    pub log_read: u64,
+    pub log_said: Vec<String>,
+    pub events_said: Vec<String>,
 }
 
 impl Show {
@@ -728,10 +770,19 @@ pub struct Live {
     pub env: Vec<(String, String)>,
     /// paths the run names in `DEVHUB_ALSO`: they ship with every patch, `local/` included
     pub also: Vec<String>,
+    /// `--home`: a tar archive on the master's machine whose files seed the app's own home on its
+    /// box (empty: the app reads the box user's home)
+    pub home: String,
+    /// that home on its box, once placed: the app's `MAKEPAD_TEST_HOME`
+    pub home_dir: String,
     pub lane: String,
     pub src: String,
     pub cost: String,
     pub est_min: Option<f64>,
+    /// `--cores`: what its run sees, charged its class's measure
+    pub cores: Option<f64>,
+    /// `--ram-gb`: what it asks, past its class's measure
+    pub ram_gb: Option<f64>,
     pub class: String,
     pub priority: String,
     pub loader: String,
@@ -763,6 +814,12 @@ pub struct Live {
     pub ended_ms: u64,
     /// the last edit: files, when saved, shipped, patched (or refused), the first frame after
     pub patch: Option<LivePatch>,
+    /// when a save first waited for a restart (0: none waits), how many have since and why the
+    /// last: the app runs the code before them until a relaunch. A lane that kept saving into such a session
+    /// measured code that was not running, 20 min and five saves of it (11-06)
+    pub restart_since_ms: u64,
+    pub restart_saves: u64,
+    pub restart_why: String,
     pub panic: Option<JobPanic>,
     pub log: String,
     pub note: String,
@@ -799,6 +856,7 @@ impl Live {
         if t.ran == 0 && t.skipped == 0 {
             out.push_str("no test ran");
             if let Some(hint) = crate::testlog::bin_hint(&x.app, &x.test_args) { out.push_str(&format!(": {hint}")); }
+            out.push_str(&crate::testlog::elsewhere_hint(Path::new(&x.tree), &x.rev, &x.app, &x.test_args));
             out.push('\n');
         }
         out.push_str(&p.output);
@@ -1082,6 +1140,9 @@ pub struct Job {
     pub needs: String,
     /// the node it runs on (`--node`; it waits for it), or empty
     pub node_pref: String,
+    /// `--series`: why it names that node, a series compared on that one box, or empty
+    /// ([`crate::lease::sched::Req::series`])
+    pub series: String,
     pub prio: i32,
     /// the pinned `--rev` (`branch@sha[,branch@sha]`): the snapshot's base commits
     pub rev: String,
@@ -1139,6 +1200,8 @@ pub struct Job {
     pub waited_ms: u64,
     /// the lease whose idle verdict a `job wait` told its owner: told once a lease
     pub idle_told: String,
+    /// a timed run's box was not quiet: its box and why ([`crate::lease::master::unquiet`])
+    pub unquiet: String,
     pub note: String,
 }
 
@@ -1278,7 +1341,7 @@ impl Doc {
             ci: ci_from(v.get("ci")),
             lanes: arr(Some(v), "lanes").iter().map(|l| {
                 let o = Some(l);
-                LaneRec { name: text(o, "name"), path: text(o, "path"), branch: text(o, "branch"), cbranch: text(o, "cbranch"), created_ms: uint(o, "created_ms"), adopted: flag(o, "adopted", false), state: text(o, "state"), landed_ms: uint(o, "landed_ms"), keep: flag(o, "keep", false), waited: flag(o, "waited", false), ended_ms: uint(o, "ended_ms"), note: text(o, "note") }
+                LaneRec { name: text(o, "name"), path: text(o, "path"), branch: text(o, "branch"), cbranch: text(o, "cbranch"), created_ms: uint(o, "created_ms"), adopted: flag(o, "adopted", false), state: text(o, "state"), landed_ms: uint(o, "landed_ms"), keep: flag(o, "keep", false), waited: flag(o, "waited", false), first: flag(o, "first", false), parked: text(o, "parked"), ended_ms: uint(o, "ended_ms"), note: text(o, "note") }
             }).collect(),
             shows: arr(Some(v), "shows").iter().map(show_from).collect(),
             shows_next: uint(Some(v), "shows_next"),
@@ -1570,6 +1633,8 @@ pub fn lane_value(l: &LaneRec) -> Value {
         ("landed_ms", int(l.landed_ms)),
         ("keep", Value::Bool(l.keep)),
         ("waited", Value::Bool(l.waited)),
+        ("first", Value::Bool(l.first)),
+        ("parked", s(&l.parked)),
         ("ended_ms", int(l.ended_ms)),
         ("note", s(&l.note)),
     ])
@@ -1623,10 +1688,14 @@ fn live_state_value(x: &Live) -> Value {
         ("test_args", strs(&x.test_args)),
         ("env", Value::Arr(x.env.iter().map(|(k, v)| Value::Arr(vec![s(k), s(v)])).collect())),
         ("also", strs(&x.also)),
+        ("home", s(&x.home)),
+        ("home_dir", s(&x.home_dir)),
         ("lane", s(&x.lane)),
         ("src", s(&x.src)),
         ("cost", s(&x.cost)),
         ("est_min", x.est_min.map_or(Value::Null, Value::F64)),
+        ("cores", x.cores.map_or(Value::Null, Value::F64)),
+        ("ram_gb", x.ram_gb.map_or(Value::Null, Value::F64)),
         ("class", s(&x.class)),
         ("priority", s(&x.priority)),
         ("loader", s(&x.loader)),
@@ -1644,6 +1713,9 @@ fn live_state_value(x: &Live) -> Value {
         ("touched_ms", int(x.touched_ms)),
         ("ended_ms", int(x.ended_ms)),
         ("patch", patch),
+        ("restart_since_ms", int(x.restart_since_ms)),
+        ("restart_saves", int(x.restart_saves)),
+        ("restart_why", s(&x.restart_why)),
         ("panic", panic_value(&x.panic)),
         ("log", s(&x.log)),
         ("note", s(&x.note)),
@@ -1676,10 +1748,14 @@ fn live_state_from(v: &Value) -> Live {
             Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
         }).collect(),
         also: strs_from(o, "also"),
+        home: text(o, "home"),
+        home_dir: text(o, "home_dir"),
         lane: text(o, "lane"),
         src: text(o, "src"),
         cost: text(o, "cost"),
         est_min: v.get("est_min").and_then(crate::lease::num),
+        cores: v.get("cores").and_then(crate::lease::num),
+        ram_gb: v.get("ram_gb").and_then(crate::lease::num),
         class: text(o, "class"),
         priority: text(o, "priority"),
         loader: text(o, "loader"),
@@ -1697,6 +1773,9 @@ fn live_state_from(v: &Value) -> Live {
         touched_ms: uint(o, "touched_ms"),
         ended_ms: uint(o, "ended_ms"),
         patch: p.map(|p| LivePatch { files: strs_from(Some(p), "files"), edit: text(Some(p), "edit"), group: p.get("group").and_then(Value::as_u64), seq: uint(Some(p), "seq"), cursor: text(Some(p), "cursor"), edit_ms: uint(Some(p), "edit_ms"), called_ms: uint(Some(p), "called_ms"), queued_ms: uint(Some(p), "queued_ms"), behind: text(Some(p), "behind"), shipped_ms: uint(Some(p), "shipped_ms"), outcome: text(Some(p), "outcome"), outcome_ms: uint(Some(p), "outcome_ms"), frame_ms: uint(Some(p), "frame_ms"), tests: p.get("tests").and_then(live_tests_from), verdict_ms: uint(Some(p), "verdict_ms"), log_start: uint(Some(p), "log_start"), log_end: uint(Some(p), "log_end"), output: String::new(), output_ref: TextRef::from_value(p.get("output_ref")), reason_ref: TextRef::from_value(p.get("reason_ref")), retried: flag(Some(p), "retried", false), jit_error: uint(Some(p), "jit_error"), reason: String::new() }),
+        restart_since_ms: uint(o, "restart_since_ms"),
+        restart_saves: uint(o, "restart_saves"),
+        restart_why: text(o, "restart_why"),
         panic: panic_from(v.get("panic")),
         log: text(o, "log"),
         note: text(o, "note"),
@@ -1716,6 +1795,11 @@ pub fn show_value(x: &Show) -> Value {
         ("cond", x.cond.to_value()),
         ("pid", int(x.pid as u64)),
         ("sha", s(&x.sha)),
+        ("main", s(&x.main)),
+        ("held", s(&x.held)),
+        ("restart", s(&x.restart)),
+        ("restart_since", s(&x.restart_since)),
+        ("took_red", strs(&x.took_red)),
         ("added_ms", int(x.added_ms)),
         ("started_ms", int(x.started_ms)),
         ("ended_ms", int(x.ended_ms)),
@@ -1724,6 +1808,9 @@ pub fn show_value(x: &Show) -> Value {
         ("by", s(&x.by)),
         ("log", s(&x.log)),
         ("note", s(&x.note)),
+        ("log_read", int(x.log_read)),
+        ("log_said", strs(&x.log_said)),
+        ("events_said", strs(&x.events_said)),
     ])
 }
 
@@ -1741,6 +1828,11 @@ pub fn show_from(v: &Value) -> Show {
         cond: Cond::from_value(v.get("cond")),
         pid: uint(o, "pid") as u32,
         sha: text(o, "sha"),
+        main: text(o, "main"),
+        held: text(o, "held"),
+        restart: text(o, "restart"),
+        restart_since: text(o, "restart_since"),
+        took_red: strs_from(o, "took_red"),
         added_ms: uint(o, "added_ms"),
         started_ms: uint(o, "started_ms"),
         ended_ms: uint(o, "ended_ms"),
@@ -1749,6 +1841,9 @@ pub fn show_from(v: &Value) -> Show {
         by: text(o, "by"),
         log: text(o, "log"),
         note: text(o, "note"),
+        log_read: uint(o, "log_read"),
+        log_said: strs_from(o, "log_said"),
+        events_said: strs_from(o, "events_said"),
     }
 }
 
@@ -1771,6 +1866,7 @@ pub fn job_value(j: &Job) -> Value {
         ("kind", s(&j.kind)),
         ("needs", s(&j.needs)),
         ("node_pref", s(&j.node_pref)),
+        ("series", s(&j.series)),
         ("prio", Value::Int(j.prio as i64)),
         ("rev", s(&j.rev)),
         ("repo_dir", s(&j.repo_dir)),
@@ -1809,6 +1905,7 @@ pub fn job_value(j: &Job) -> Value {
         ("released", Value::Bool(j.released)),
         ("waited_ms", int(j.waited_ms)),
         ("idle_told", s(&j.idle_told)),
+        ("unquiet", s(&j.unquiet)),
         ("note", s(&j.note)),
     ])
 }
@@ -1833,6 +1930,7 @@ pub fn job_from(v: &Value) -> Job {
         kind: text(o, "kind"),
         needs: text(o, "needs"),
         node_pref: text(o, "node_pref"),
+        series: text(o, "series"),
         prio: v.get("prio").and_then(|x| x.as_i64()).unwrap_or(5) as i32,
         rev: text(o, "rev"),
         repo_dir: text(o, "repo_dir"),
@@ -1871,6 +1969,7 @@ pub fn job_from(v: &Value) -> Job {
         released: flag(o, "released", false),
         waited_ms: uint(o, "waited_ms"),
         idle_told: text(o, "idle_told"),
+        unquiet: text(o, "unquiet"),
         note: text(o, "note"),
     }
 }
@@ -2148,9 +2247,15 @@ impl Store {
         };
         let mut entries = std::collections::BTreeMap::new();
         let key = |v: &Value| if section == "land" { uint(Some(v), "id").to_string() } else { format!("{}/{}", text(Some(v), "repo"), text(Some(v), "branch")) };
+        // a line names its section before its record ([`Self::update`]): only the section's lines
+        // are parsed (the land queue's 2.6k of 232k lines, 1.3 of 82 MB: parsing every line took
+        // 1.1 s of the master's CPU at each bucket verdict, 11-06)
+        let named = format!(",\"section\":{}", s(section).to_json());
         match std::fs::File::open(self.path.with_file_name("history.jsonl")) {
             Ok(file) => for line in std::io::BufReader::new(file.take(history_len)).lines() {
                 let line = line.map_err(|e| e.to_string())?;
+                let Some((head, _)) = line.split_once(",\"record\":") else { return Err(format!("invalid workflow history: no record in {}", line.chars().take(80).collect::<String>())) };
+                if !head.ends_with(&named) { continue; }
                 let v = makepad_strict_json::parse_depth(line.as_bytes(), 16).map_err(|e| format!("invalid workflow history: {e:?}"))?;
                 if v.get("section").and_then(Value::as_str) == Some(section) {
                     if let Some(record) = v.get("record") { entries.insert(key(record), record.clone()); }
@@ -2439,8 +2544,8 @@ mod tests {
                 Job { id: "J1".into(), batch: "B1".into(), lane: "l".into(), kind: "test".into(), prio: 5, cmd: vec!["cargo".into(), "test".into()], after: vec!["J0".into()], state: "paused".into(), snap: "S2".into(), snap_files: 3, attempts: 1, granted_ms: 5, shipped_ms: 6, first_out_ms: 7, exit: None, panic: Some(JobPanic { id: "P1".into(), pid: 9, message: "index".into(), thread: "main".into(), location: "a.rs:1".into(), at_ms: 3 }), ..Default::default() },
                 Job { id: "J2".into(), state: "failed".into(), exit: Some(101), errors: vec!["error[E1]".into()], tail: vec!["x".into()], prio: 9, ..Default::default() },
             ],
-            lanes: vec![LaneRec { name: "x".into(), path: "/w/x".into(), branch: "rc-x".into(), cbranch: "rc-x".into(), created_ms: 1, adopted: true, state: "live".into(), landed_ms: 4, keep: true, waited: true, ended_ms: 0, note: "n".into() }],
-            shows: vec![Show { id: "V1".into(), app: "makepad-foo".into(), args: vec!["--plate".into(), "a b.foo".into()], device: "mac".into(), state: "paused".into(), cond: Cond::Landed { branch: "rc-x".into(), repo: "makepad".into(), sha: String::new() }, pid: 4, sha: "s".into(), exit: Some(0), panic: Some(JobPanic { id: "P2".into(), ..Default::default() }), ..Default::default() }],
+            lanes: vec![LaneRec { name: "x".into(), path: "/w/x".into(), branch: "rc-x".into(), cbranch: "rc-x".into(), created_ms: 1, adopted: true, state: "live".into(), landed_ms: 4, keep: true, waited: true, first: true, parked: "waits".into(), ended_ms: 0, note: "n".into() }],
+            shows: vec![Show { id: "V1".into(), app: "makepad-foo".into(), args: vec!["--plate".into(), "a b.foo".into()], device: "mac".into(), state: "paused".into(), cond: Cond::Landed { branch: "rc-x".into(), repo: "makepad".into(), sha: String::new() }, pid: 4, sha: "s".into(), main: "m".into(), held: "held at s: tip t waits".into(), restart: "restart pending since s: 1 landed edit not running".into(), restart_since: "s".into(), took_red: vec!["check a".into()], exit: Some(0), panic: Some(JobPanic { id: "P2".into(), ..Default::default() }), ..Default::default() }],
             shows_next: 1,
             lives: vec![Live { id: "W1".into(), app: "makepad-app-calculator".into(), state: "running".into(), visible: true, pid: 7, ask: "18a-7-1".into(), patch: Some(LivePatch { files: vec!["a.rs".into()], edit_ms: 1, shipped_ms: 2, outcome: "patched".into(), outcome_ms: 3, frame_ms: 4, reason: String::new(), ..Default::default() }), ..Default::default() }],
             lives_next: 1,
@@ -2473,6 +2578,17 @@ mod tests {
         assert_eq!((ci.timing("jit:01"), ci.timing("test:x:lib"), ci.timing("nope")), (Some(30.0), Some(5.0), None));
         let doc = Doc { ci, ..Default::default() };
         assert_eq!(Doc::parse(&doc.to_value().to_json()), Some(doc));
+    }
+
+    /// A session keeps what it asked through a master's restart, and `live again` reads it there:
+    /// its cores and RAM, and its home (the archive, and where its box holds the app's copy).
+    #[test]
+    fn a_live_session_keeps_its_asks_and_its_home() {
+        let x = Live { id: "W1".into(), cores: Some(4.0), ram_gb: Some(12.5), home: "/a/scan.tar".into(), home_dir: "/w/tmp/L1/app-home".into(), ..Default::default() };
+        let back = live_from(&live_value(&x));
+        assert_eq!((back.cores, back.ram_gb), (Some(4.0), Some(12.5)));
+        assert_eq!((back.home.as_str(), back.home_dir.as_str()), ("/a/scan.tar", "/w/tmp/L1/app-home"));
+        assert_eq!(live_from(&live_value(&Live::default())).ram_gb, None);
     }
 
     #[test]

@@ -1263,6 +1263,18 @@ impl Widget for GlassLayer {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         self.view.handle_event(cx, event, scope);
+        // The layer's panes stand over what is drawn under them, and a wheel
+        // over one is the pane's whether anything in it scrolled or not. Left
+        // unmarked it went on to the content beneath, which zoomed or
+        // scrolled behind a panel the pointer was on. Only the panes: the
+        // layer itself spans the window, and the wheel over the gaps between
+        // its panes is the content's.
+        if let Event::Scroll(e) = event {
+            if self.view.visible && Self::pane_at(cx, &self.view, e.abs) {
+                event.set_scroll_handled(Vec2Index::X);
+                event.set_scroll_handled(Vec2Index::Y);
+            }
+        }
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -1286,6 +1298,26 @@ impl Widget for GlassLayer {
 
         self.draw_list.as_mut().unwrap().end(cx);
         DrawStep::done()
+    }
+}
+
+impl GlassLayer {
+    /// Whether one of the shown panes under `view` covers `abs`. A pane is
+    /// anything drawn: a view that draws no background is only a box that
+    /// lays its children out (with padding round them, and gaps between),
+    /// so its children are looked at instead.
+    fn pane_at(cx: &Cx, view: &View, abs: Vec2d) -> bool {
+        let mut over = false;
+        view.children(&mut |_, child| {
+            if over || !child.visible() || !child.area().clipped_rect(cx).contains(abs) {
+                return;
+            }
+            over = match child.borrow::<View>() {
+                Some(inner) if !inner.show_bg => Self::pane_at(cx, &inner, abs),
+                _ => true,
+            };
+        });
+        over
     }
 }
 
@@ -1478,7 +1510,10 @@ impl Widget for GlassRadio {
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 self.down = 1.0;
-                self.set_key_focus(cx);
+                // A touch waits until it clicks us, so a drag that scrolls from here keeps the keyboard up.
+                if !fe.device.is_touch() {
+                    cx.set_key_focus_from_user(self.area());
+                }
                 self.redraw(cx);
             }
             Hit::FingerUp(fe) => {
@@ -1486,6 +1521,9 @@ impl Widget for GlassRadio {
                 // Checkbox semantics: a click toggles this control on or off
                 // independently (with the sliding animation), it is not a radio.
                 if fe.is_over {
+                    if fe.device.is_touch() {
+                        cx.set_key_focus_from_user(self.area());
+                    }
                     self.active_target = if self.active_target > 0.5 { 0.0 } else { 1.0 };
                     self.next_frame = cx.new_next_frame();
                     cx.widget_action_with_data(&self.action_data, uid, GlassRadioAction::Clicked);
@@ -1863,12 +1901,18 @@ impl Widget for GlassButton {
                 self.redraw(cx);
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                if !self.disabled {
-                    self.set_key_focus(cx);
+                // A touch waits until it clicks us, so a drag that scrolls from here keeps the keyboard up.
+                if !self.disabled && !fe.device.is_touch() {
+                    cx.set_key_focus_from_user(self.area());
                 }
                 self.finger_down(cx);
             }
-            Hit::FingerUp(fe) => self.finger_up(cx, fe.is_over),
+            Hit::FingerUp(fe) => {
+                if !self.disabled && fe.is_over && fe.device.is_touch() {
+                    cx.set_key_focus_from_user(self.area());
+                }
+                self.finger_up(cx, fe.is_over);
+            }
             _ => {}
         }
     }
@@ -2198,7 +2242,7 @@ impl Widget for GlassSlider {
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
                 self.dragging = true;
                 cx.claim_finger_drag(fe.digit_id);
-                self.set_key_focus(cx);
+                cx.set_key_focus_from_user(self.area());
                 if self.set_value_from_x(cx, fe.abs.x) {
                     cx.widget_action_with_data(&self.action_data, uid, GlassSliderAction::Changed);
                 }
@@ -2538,7 +2582,7 @@ impl Widget for GlassSegmented {
                     self.next_frame = cx.new_next_frame();
                     cx.widget_action_with_data(&self.action_data, uid, GlassSegmentedAction::Selected);
                 }
-                self.set_key_focus(cx);
+                cx.set_key_focus_from_user(self.area());
                 self.redraw(cx);
             }
             _ => {}
@@ -3036,6 +3080,9 @@ pub struct GlassFloatingSurface {
     /// to", which is also what a caret already inside the surface counts as.
     #[rust]
     focus_before: Area,
+    /// Whether the user gave `focus_before` its focus, so it gets it back the same way.
+    #[rust]
+    is_focus_before_from_user: bool,
     /// The corner mark's hover mix.
     #[rust]
     hot: f32,
@@ -3131,9 +3178,10 @@ impl GlassFloatingSurface {
     fn take_key_focus(&mut self, cx: &mut Cx, area: Area) {
         if !self.focus_is_inside(cx) {
             self.focus_before = cx.key_focus();
+            self.is_focus_before_from_user = cx.has_key_focus_from_user(self.focus_before);
         }
         self.holds_key_focus = true;
-        cx.set_key_focus(area);
+        cx.set_key_focus_from_user(area);
     }
 
     /// Whether the caret is somewhere this surface draws.
@@ -3182,12 +3230,13 @@ impl GlassFloatingSurface {
     fn drop_key_focus(&mut self, cx: &mut Cx) {
         let took_it = self.holds_key_focus;
         let back = self.focus_before;
+        let is_back_from_user = std::mem::take(&mut self.is_focus_before_from_user);
         self.holds_key_focus = false;
         self.focus_before = Area::Empty;
         if !self.focus_is_inside(cx) {
             return;
         }
-        cx.set_key_focus(if took_it { back } else { Area::Empty });
+        cx.restore_key_focus(if took_it { back } else { Area::Empty }, took_it && is_back_from_user);
     }
 
     /// Come up, or arrive somewhere new, with the lens looking at where it
@@ -4509,6 +4558,279 @@ mod tests {
         let f = surface();
         assert_eq!(f.grip_at(dvec2(100.0, 175.0), 0.0), grip(true, false, false, false));
         assert!(f.grip_at(dvec2(101.0, 175.0), 0.0).is_empty());
+        });
+    }
+
+    /// A wheel over a pane of a glass layer is the pane's: both axes come
+    /// back marked used, so nothing drawn under the layer (a picture wall
+    /// that zooms on the wheel) takes it too. Over the layer's open window,
+    /// where no pane is, the wheel stays free, and so it does over the
+    /// padding of a box that only lays the pane out, and over a pane that
+    /// is hidden.
+    #[test]
+    fn a_wheel_over_a_glass_pane_stays_out_of_what_lies_under_it() {
+        use crate::makepad_draw::makepad_platform::event::{ScrollEvent, ScrollPhase};
+        crate::on_test_cx(|| {
+            let mut cx = test_cx();
+            let root = cx.with_vm(|vm| {
+                crate::script_mod(vm);
+                let value = crate::script_eval!(vm, {
+                    use mod.prelude.widgets.*
+                    use mod.widgets.*
+                    View{
+                        width: Fill
+                        height: Fill
+                        flow: Overlay
+                        glass.Layer{
+                            width: Fill
+                            height: Fill
+                            align: Align{x: 0.0, y: 1.0}
+                            View{
+                                width: Fit
+                                height: Fit
+                                padding: Inset{left: 18, right: 0, top: 0, bottom: 26}
+                                pane := View{width: 200. height: 100. show_bg: true}
+                            }
+                        }
+                    }
+                });
+                WidgetRef::script_from_value(vm, value)
+            });
+            let pass = DrawPass::new(&mut cx);
+            let mut list = DrawList2d::new(&mut cx);
+            let overlay = cx.with_vm(|vm| Overlay::script_new(vm));
+            let draw = |cx: &mut Cx, list: &mut DrawList2d| {
+                pass.set_size(cx, PANE);
+                let event = DrawEvent::default();
+                let mut draw = CxDraw::new(cx, &event);
+                let mut cx2d = Cx2d::new(&mut draw);
+                cx2d.begin_pass(&pass, None);
+                list.begin_always(&mut cx2d);
+                overlay.begin(&mut cx2d);
+                cx2d.begin_root_turtle(PANE, Layout::flow_down());
+                root.draw_all(&mut cx2d, &mut Scope::empty());
+                cx2d.end_pass_sized_turtle();
+                overlay.end(&mut cx2d);
+                list.end(&mut cx2d);
+                cx2d.end_pass(&pass);
+            };
+            let wheel = |at: DVec2| {
+                Event::Scroll(ScrollEvent {
+                    window_id: WindowId(1, 1),
+                    scroll: dvec2(0.0, 40.0),
+                    abs: at,
+                    modifiers: KeyModifiers::default(),
+                    handled_x: Cell::new(false),
+                    handled_y: Cell::new(false),
+                    is_mouse: true,
+                    time: 0.0,
+                    phase: ScrollPhase::None,
+                })
+            };
+            let used = |cx: &mut Cx, at: DVec2| {
+                let event = wheel(at);
+                root.handle_event(cx, &event, &mut Scope::empty());
+                [event.scroll_handled(Vec2Index::X), event.scroll_handled(Vec2Index::Y)]
+            };
+            draw(&mut cx, &mut list);
+
+            let pane = root.widget(&mut cx, ids!(pane)).area().rect(&cx);
+            assert!(
+                pane.size.y > 0.0 && (pane.pos.y + pane.size.y + 26.0 - PANE.y).abs() < 0.01,
+                "the pane {pane:?} is not at the foot of the layer"
+            );
+            let on_pane = pane.pos + pane.size * 0.5;
+            assert_eq!(used(&mut cx, on_pane), [true, true], "a wheel over the pane went on under it");
+            assert_eq!(used(&mut cx, dvec2(PANE.x - 20.0, 20.0)), [false, false], "the layer took a wheel where no pane is");
+            let on_padding = dvec2(on_pane.x, PANE.y - 10.0);
+            assert_eq!(used(&mut cx, on_padding), [false, false], "the padding round the pane took the wheel");
+
+            root.widget(&mut cx, ids!(pane)).set_visible(&mut cx, false);
+            draw(&mut cx, &mut list);
+            assert_eq!(used(&mut cx, on_pane), [false, false], "a hidden pane took the wheel");
+        });
+    }
+
+    /// A scrolling box holding a glass chip over a tall page, drawn once.
+    struct ChipPage {
+        root: WidgetRef,
+        pass: DrawPass,
+        list: DrawList2d,
+        overlay: Overlay,
+    }
+
+    impl ChipPage {
+        fn new(cx: &mut Cx) -> Self {
+            cx.init_cx_os();
+            let root = cx.with_vm(|vm| {
+                crate::script_mod(vm);
+                let value = crate::script_eval!(vm, {
+                    use mod.prelude.widgets.*
+                    use mod.widgets.*
+                    View{
+                        width: Fill
+                        height: Fill
+                        flow: Down
+                        page := ScrollYView{
+                            width: 300.
+                            height: 200.
+                            flow: Down
+                            chip := glass.GlassButton{width: 120. height: 32. text: "Show again"}
+                            View{width: Fill height: 1000.}
+                        }
+                    }
+                });
+                WidgetRef::script_from_value(vm, value)
+            });
+            let pass = DrawPass::new(cx);
+            let list = DrawList2d::new(cx);
+            let overlay = cx.with_vm(|vm| Overlay::script_new(vm));
+            let mut page = ChipPage { root, pass, list, overlay };
+            page.draw(cx);
+            page
+        }
+
+        fn draw(&mut self, cx: &mut Cx) {
+            self.pass.set_size(cx, PANE);
+            let event = DrawEvent::default();
+            let mut draw = CxDraw::new(cx, &event);
+            let mut cx2d = Cx2d::new(&mut draw);
+            cx2d.begin_pass(&self.pass, None);
+            self.list.begin_always(&mut cx2d);
+            self.overlay.begin(&mut cx2d);
+            cx2d.begin_root_turtle(PANE, Layout::flow_down());
+            self.root.draw_all(&mut cx2d, &mut Scope::empty());
+            cx2d.end_pass_sized_turtle();
+            self.overlay.end(&mut cx2d);
+            self.list.end(&mut cx2d);
+            cx2d.end_pass(&self.pass);
+        }
+
+        fn chip(&self, cx: &Cx) -> WidgetRef {
+            self.root.widget(cx, ids!(chip))
+        }
+
+        fn on_chip(&self, cx: &Cx) -> DVec2 {
+            let rect = self.chip(cx).area().rect(cx);
+            assert!(rect.size.y > 0.0, "the chip was not drawn");
+            rect.pos + rect.size * 0.5
+        }
+
+        fn scroll_y(&self, cx: &Cx) -> f64 {
+            self.root.widget(cx, ids!(page)).borrow::<View>().unwrap().scroll_extent().unwrap().pos.y
+        }
+
+        /// The clicks the chip sent out of these events.
+        fn clicks(&self, cx: &mut Cx, events: Vec<Event>) -> usize {
+            let chip = self.chip(cx).widget_uid();
+            let mut clicks = 0;
+            for event in events {
+                let actions = cx.capture_actions(|cx| self.root.handle_event(cx, &event, &mut Scope::empty()));
+                clicks += actions
+                    .iter()
+                    .filter_map(|action| action.as_widget_action())
+                    .filter(|action| {
+                        action.widget_uid == chip && matches!(action.cast::<GlassButtonAction>(), GlassButtonAction::Clicked)
+                    })
+                    .count();
+            }
+            clicks
+        }
+    }
+
+    fn touch(state: crate::makepad_draw::makepad_platform::event::TouchState, abs: DVec2, time: f64) -> Event {
+        use crate::makepad_draw::makepad_platform::event::{TouchPoint, TouchUpdateEvent};
+        Event::TouchUpdate(TouchUpdateEvent {
+            time,
+            window_id: WindowId(1, 1),
+            modifiers: KeyModifiers::default(),
+            touches: vec![TouchPoint {
+                state,
+                abs,
+                time,
+                uid: 7,
+                rotation_angle: 0.0,
+                force: 1.0,
+                radius: dvec2(1.0, 1.0),
+                handled: Cell::new(Area::Empty),
+                sweep_lock: Cell::new(Area::Empty),
+            }],
+        })
+    }
+
+    fn mouse_move(abs: DVec2, time: f64) -> Event {
+        Event::MouseMove(MouseMoveEvent {
+            abs,
+            lock_delta: DVec2::default(),
+            window_id: WindowId(1, 1),
+            modifiers: KeyModifiers::default(),
+            time,
+            handled: Cell::new(Area::Empty),
+        })
+    }
+
+    fn mouse_up(abs: DVec2, time: f64) -> Event {
+        Event::MouseUp(MouseUpEvent {
+            abs,
+            button: MouseButton::PRIMARY,
+            window_id: WindowId(1, 1),
+            modifiers: KeyModifiers::default(),
+            time,
+        })
+    }
+
+    /// A finger that lands on a glass button in a scrolling box and then
+    /// drags the box is a scroll, not a press of the button: the box scrolls
+    /// with the finger and the button sends no click when the finger lifts.
+    /// The same finger lifted where it landed is a click, so the button is
+    /// not simply deaf.
+    #[test]
+    fn a_touch_drag_that_starts_on_a_glass_button_scrolls_without_clicking_it() {
+        use crate::makepad_draw::makepad_platform::event::TouchState;
+        crate::on_test_cx(|| {
+            let mut cx = test_cx();
+            let page = ChipPage::new(&mut cx);
+            let on_chip = page.on_chip(&cx);
+            let tapped = page.clicks(&mut cx, vec![touch(TouchState::Start, on_chip, 0.0), touch(TouchState::Stop, on_chip, 0.05)]);
+            assert_eq!(tapped, 1, "a tap on the chip is a click");
+
+            let up = on_chip - dvec2(0.0, 60.0);
+            let dragged = page.clicks(
+                &mut cx,
+                vec![
+                    touch(TouchState::Start, on_chip, 1.0),
+                    touch(TouchState::Move, on_chip - dvec2(0.0, 30.0), 1.05),
+                    touch(TouchState::Move, up, 1.1),
+                    touch(TouchState::Stop, up, 1.15),
+                ],
+            );
+            assert!(page.scroll_y(&cx) > 0.0, "the drag did not scroll the box");
+            assert_eq!(dragged, 0, "the drag that scrolled the box also clicked the chip it started on");
+        });
+    }
+
+    /// The same with the mouse: a press on the chip that is dragged up the
+    /// box scrolls it, and the release clicks nothing, wherever the chip
+    /// has got to under the pointer by then.
+    #[test]
+    fn a_mouse_drag_that_starts_on_a_glass_button_scrolls_without_clicking_it() {
+        crate::on_test_cx(|| {
+            let mut cx = test_cx();
+            let page = ChipPage::new(&mut cx);
+            let on_chip = page.on_chip(&cx);
+            cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, WindowId(1, 1)));
+            let clicks = page.clicks(
+                &mut cx,
+                vec![
+                    press(on_chip),
+                    mouse_move(on_chip - dvec2(0.0, 6.0), 0.02),
+                    mouse_move(on_chip - dvec2(0.0, 12.0), 0.04),
+                    mouse_up(on_chip - dvec2(0.0, 12.0), 0.06),
+                ],
+            );
+            cx.fingers.first_mouse_button = None;
+            assert!(page.scroll_y(&cx) > 0.0, "the drag did not scroll the box");
+            assert_eq!(clicks, 0, "the drag that scrolled the box also clicked the chip it started on");
         });
     }
 }

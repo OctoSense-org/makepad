@@ -1,10 +1,10 @@
-use makepad_relax::relax;
+use relax_attr::relax;
 use {
     self::super::{from_wasm::*, to_wasm::*, web_media::CxWebMedia},
     crate::{
         cx::{Cx, OsType},
         cx_api::{CxOsApi, CxOsOp, OpenUrlInPlace},
-        draw_pass::CxDrawPassParent,
+        draw_pass::{CxDrawPassParent, TickClock},
         event::{
             DragEvent, DragItem, DragResponse, DropEvent, Event, KeyModifiers, MouseDownEvent,
             MouseMoveEvent, MouseUpEvent, NetworkResponse, ScrollEvent, TextClipboardEvent,
@@ -26,9 +26,7 @@ use {
         HttpError, HttpProgress, HttpResponse, Vec2d,
     },
     std::{
-        cell::RefCell,
         panic,
-        rc::Rc,
         sync::{Arc, Mutex},
     },
 };
@@ -36,6 +34,8 @@ use {
 impl Cx {
     pub(crate) fn poll_texture_readbacks(&mut self) {
         if !self.textures.1.readbacks.slots.is_empty() {
+            self.validate_pending_readbacks();
+            self.admit_waiting_readbacks();
             // Let JS report device loss even for tickets awaiting a producer
             // whose render commands have not reached the bridge yet.
             let registrations: Vec<_> = self.textures.1.readbacks.slots.iter()
@@ -69,7 +69,7 @@ impl Cx {
                 width: work.width, height: work.height,
             };
             self.os.texture_readbacks.push(WebTextureReadback {
-                bytes: Arc::<[u8]>::new_uninit_slice(work.width * work.height * 4),
+                bytes: Vec::with_capacity(work.width * work.height * 4),
                 received: 0, work,
             });
             self.os.from_wasm(request);
@@ -94,7 +94,7 @@ impl Cx {
         let error = if !tw.error.is_empty() {
             Some(if tw.error == "allocation changed" { ReadbackError::AllocationChanged } else { ReadbackError::Failed })
         } else if tw.width != capture.work.width || tw.height != capture.work.height || tw.offset != capture.received
-            || data.len() > 256 * 1024 || data.len() > capture.bytes.len().saturating_sub(capture.received) {
+            || data.len() > 256 * 1024 || data.len() > (capture.work.width * capture.work.height * 4).saturating_sub(capture.received) {
             Some(ReadbackError::Failed)
         } else { None };
         if let Some(error) = error {
@@ -104,12 +104,11 @@ impl Cx {
         }
         // JS bounds the total bridge traffic per animation frame, including
         // this copy into the final allocation. Never build a second full Vec.
-        let target = Arc::get_mut(&mut capture.bytes).unwrap();
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), target.as_mut_ptr().add(capture.received).cast::<u8>(), data.len()); }
+        capture.bytes.extend_from_slice(&data);
         capture.received += data.len();
         if tw.complete {
             let capture = self.os.texture_readbacks.remove(index);
-            let result = if capture.received == capture.bytes.len() { Ok(unsafe { capture.bytes.assume_init() }) } else { Err(ReadbackError::Failed) };
+            let result = if capture.received == capture.work.width * capture.work.height * 4 { Ok(crate::HostBuf::from_vec(capture.bytes)) } else { Err(ReadbackError::Failed) };
             capture.work.completion.finish(result);
             self.call_event_handler(&Event::Signal);
         }
@@ -170,9 +169,21 @@ impl Cx {
     /// Queue a WebGL2 PBO/fence readback. The bridge polls the fence on later
     /// animation frames and returns raw RGBA8 bytes without blocking this call.
     pub fn request_render_texture_capture(&mut self, texture: &crate::texture::Texture) -> bool {
-        let Ok(ticket) = texture.read_back(self, Default::default()) else { return false; };
-        self.textures.1.readbacks.slots.iter_mut().find(|slot| slot.result.ticket == ticket).unwrap().legacy = true;
-        true
+        match texture.read_back(self, Default::default()) {
+            Ok(ticket) => {
+                self.textures.1.readbacks.legacy_waiting.retain(|pending| pending != texture);
+                self.textures.1.readbacks.slots.iter_mut().find(|slot| slot.result.ticket == ticket).unwrap().legacy = true;
+                true
+            }
+            Err(crate::texture::ReadbackError::Backpressure) => {
+                self.defer_render_texture_capture(texture);
+                true
+            }
+            Err(_) => {
+                self.textures.1.readbacks.legacy_waiting.retain(|pending| pending != texture);
+                false
+            }
+        }
     }
 
     #[allow(clippy::type_complexity)]
@@ -280,6 +291,7 @@ impl Cx {
                     };
                     crate::thread::set_web_available_parallelism(self.cpu_cores);
                     self.gpu_info.float_color_targets = tw.gpu_info.float_color_targets;
+                    self.gpu_info.max_texture_size = tw.gpu_info.max_texture_size as usize;
                     self.gpu_info.init_from_info(
                         tw.gpu_info.min_uniform_vectors,
                         tw.gpu_info.vendor,
@@ -352,6 +364,10 @@ impl Cx {
                     is_animation_frame = Some(tw.time);
                     // A page without threads: this frame may run one deferred job.
                     crate::thread::frame_jobs_new_frame();
+                    if !tw.in_a_row {
+                        self.os.animation_frame_ticks.pause();
+                    }
+                    self.os.animation_frame_ticks.tick(tw.time);
                     if self.new_next_frames.len() != 0 {
                         self.call_next_frame_event(tw.time);
                     }
@@ -377,7 +393,7 @@ impl Cx {
                     } else {
                         panic!()
                     };
-                    self.fingers.process_touch_update_end(&e.touches);
+                    self.end_touch_update(&e.touches);
                 }
 
                 live_id!(ToWasmMouseDown) => {
@@ -435,14 +451,27 @@ impl Cx {
                 }
 
                 live_id!(ToWasmTextCopy) => {
-                    let response = Rc::new(RefCell::new(None));
-                    self.call_event_handler(&Event::TextCopy(TextClipboardEvent {
-                        response: response.clone(),
-                    }));
-                    let response = response.borrow_mut().take();
-                    if let Some(response) = response {
-                        self.os.from_wasm(FromWasmTextCopyResponse { response });
+                    let e = TextClipboardEvent::default();
+                    self.call_event_handler(&Event::TextCopy(e.clone()));
+                    if let Some(write) = e.written() {
+                        self.os.from_wasm(FromWasmTextCopyResponse {
+                            response: write.text,
+                            html: write.html.unwrap_or_default(),
+                            markdown: write.markdown.unwrap_or_default(),
+                        });
                     }
+                }
+
+                live_id!(ToWasmPasteFlavours) => {
+                    let tw = ToWasmPasteFlavours::read_to_wasm(&mut to_wasm);
+                    let some = |s: String| Some(s).filter(|s| !s.is_empty());
+                    self.clipboard.web_paste = Some(crate::clipboard_read::ClipboardContent {
+                        supported: true,
+                        text: some(tw.text),
+                        html: some(tw.html),
+                        markdown: some(tw.markdown),
+                        ..Default::default()
+                    });
                 }
 
                 live_id!(ToWasmGpuFrameTimes) => {
@@ -557,7 +586,10 @@ impl Cx {
                         self.handle_script_signals();
                     }
                     if tw.flags & 1 != 0 {
+                        // the signal hooks run first in it
                         self.call_event_handler(&Event::Signal);
+                    } else if tw.flags & 8 != 0 {
+                        self.run_signal_hooks();
                     }
                     if tw.flags & (1 | 4) != 0 {
                         self.dispatch_network_runtime_events();
@@ -1072,13 +1104,19 @@ impl Cx {
         // a cheap empty-queue check and bounded when work is pending.
         self.retire_webgl_resources();
 
-        if self.any_passes_dirty()
+        let wants_animation_frame = self.any_passes_dirty()
             || self.need_redrawing()
             || self.new_next_frames.len() != 0
             || self.demo_time_repaint
             || self.has_pending_webgl_resource_retirements()
-        {
+            || self.staged_uploads_pending();
+        let ticks = self.os.animation_frame_ticks;
+        if wants_animation_frame {
             self.os.from_wasm(FromWasmRequestAnimationFrame {});
+        } else if let Some(at) = self.time_repaint_tick_wake(ticks.last, ticks.interval) {
+            // The browser often serves this from the display frame it's asked in, where the frame isn't due
+            // yet, so it asks again and lands on its own display frame.
+            self.os.from_wasm(FromWasmRequestAnimationFrameAt { at });
         }
 
         //return wasm pointer to caller
@@ -1086,9 +1124,10 @@ impl Cx {
     }
 
     pub fn handle_repaint(&mut self, time: f64) {
+        self.webgl_staged_uploads();
         let mut passes_todo = Vec::new();
 
-        self.compute_pass_repaint_order(&mut passes_todo);
+        self.compute_pass_repaint_order(&mut passes_todo, time, self.os.animation_frame_ticks.interval);
         self.repaint_id += 1;
         let pass_time = self.pass_time(time);
         for draw_pass_id in &passes_todo {
@@ -1222,8 +1261,11 @@ impl Cx {
                 CxOsOp::HideTextIME => {
                     self.os.from_wasm(FromWasmHideTextIME {});
                 }
-                CxOsOp::CopyToClipboard(_) => {
-                    crate::error!("Clipboard actions not supported in web")
+                CxOsOp::CopyToClipboard(write) => {
+                    self.os.from_wasm(FromWasmCopyToClipboard {
+                        text: write.text,
+                        html: write.html.unwrap_or_default(),
+                    });
                 }
                 CxOsOp::SetPrimarySelection(_) => {}
                 CxOsOp::ShowSelectionHandles { .. } => {}
@@ -1552,6 +1594,12 @@ impl Cx {
                         max_total_size: limits.max_total_size as f64,
                     });
                 }
+                CxOsOp::PrintPdf(id, _) => {
+                    self.call_event_handler(&Event::PrintResult(crate::print::PrintResultEvent {
+                        id,
+                        result: crate::print::PrintResult::Unsupported,
+                    }));
+                }
                 CxOsOp::SaveFileDialog(dialog) => {
                     crate::error!("web save file dialogs are not supported; download support is pending");
                     self.action(FileDialogAction::FileCancelled { id: dialog.id });
@@ -1613,6 +1661,7 @@ impl CxOsApi for Cx {
             ToWasmKeyUp::to_js_code(),
             ToWasmTextInput::to_js_code(),
             ToWasmTextCopy::to_js_code(),
+            ToWasmPasteFlavours::to_js_code(),
             ToWasmStorageResult::to_js_code(),
             ToWasmModuleLinked::to_js_code(),
             ToWasmGpuFrameTimes::to_js_code(),
@@ -1665,9 +1714,11 @@ impl CxOsApi for Cx {
             FromWasmFullScreen::to_js_code(),
             FromWasmNormalScreen::to_js_code(),
             FromWasmRequestAnimationFrame::to_js_code(),
+            FromWasmRequestAnimationFrameAt::to_js_code(),
             FromWasmSetDocumentTitle::to_js_code(),
             FromWasmSetMouseCursor::to_js_code(),
             FromWasmTextCopyResponse::to_js_code(),
+            FromWasmCopyToClipboard::to_js_code(),
             FromWasmStorageGet::to_js_code(),
             FromWasmLinkModule::to_js_code(),
             FromWasmGpuFrameTimer::to_js_code(),
@@ -1704,6 +1755,7 @@ impl CxOsApi for Cx {
             FromWasmFreeWebGLResources::to_js_code(),
             FromWasmPollGpuCompletion::to_js_code(),
             FromWasmAllocTextureImage2D_BGRAu8_32::to_js_code(),
+            FromWasmUpdateTextureRect_BGRAu8_32::to_js_code(),
             FromWasmAllocTextureImage2D_Ru8::to_js_code(),
             FromWasmAllocTextureImage2D_RGBAf32::to_js_code(),
             FromWasmAllocTextureCube_BGRAu8_32::to_js_code(),
@@ -1822,7 +1874,7 @@ extern "C" {
 // storage buffers for graphics API related platform
 struct WebTextureReadback {
     work: crate::texture::ReadbackWork,
-    bytes: Arc<[std::mem::MaybeUninit<u8>]>,
+    bytes: Vec<u8>,
     received: usize,
 }
 
@@ -1860,6 +1912,8 @@ pub struct CxOs {
     /// The one-line notice that a second window maps to nothing has been
     /// given (`CxOsOp::CreateWindow`).
     pub(crate) second_window_reported: bool,
+    /// The animation frames `time_fps` frames land on.
+    pub(crate) animation_frame_ticks: TickClock,
 }
 
 impl Default for CxOs {
@@ -1889,6 +1943,7 @@ impl Default for CxOs {
             readback_device_lost: false,
             readback_registered_until: 0,
             second_window_reported: false,
+            animation_frame_ticks: TickClock::default(),
         }
     }
 }
@@ -1945,6 +2000,9 @@ pub unsafe extern "C" fn wasm_check_signal() -> u32 {
     }
     if SignalToUI::check_and_clear_internal_signal() {
         x |= 4
+    }
+    if SignalToUI::check_and_clear_hook_signal() {
+        x |= 8
     }
     x
 }

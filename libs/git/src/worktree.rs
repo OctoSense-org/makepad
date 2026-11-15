@@ -378,7 +378,12 @@ pub(crate) fn worktree_vs_index_status_for_path(
         return Ok(Some(FileStatus::Modified));
     }
 
-    let stat_matches = metadata_mtime_sec(&metadata) == idx_entry.mtime_sec
+    // as git: the size and mtime, to the nanosecond where the entry has it (an entry written
+    // without it keeps 0). A racily clean entry is smudged to size 0 first (see
+    // `smudge_racily_clean`), so its content is compared.
+    let (sec, nsec) = metadata_mtime(&metadata);
+    let stat_matches = sec == idx_entry.mtime_sec
+        && (idx_entry.mtime_nsec == 0 || nsec == idx_entry.mtime_nsec)
         && metadata.len() as u32 == idx_entry.file_size;
     if stat_matches {
         return Ok(None);
@@ -390,11 +395,25 @@ pub(crate) fn worktree_vs_index_status_for_path(
         fs::read(&file_path)?
     };
     let worktree_oid = hash_object("blob", &content);
-    if worktree_oid != idx_entry.oid {
-        Ok(Some(FileStatus::Modified))
-    } else {
+    if worktree_oid == idx_entry.oid || (!file_type.is_symlink() && converts_to_blob(workdir, path, &content, idx_entry.oid)) {
         Ok(None)
+    } else {
+        Ok(Some(FileStatus::Modified))
     }
+}
+
+/// Whether a file that differs from its blob byte for byte is that blob once git's text conversion
+/// is undone, as `git status` reads it: a racily clean `eol=crlf` script has its content compared,
+/// and its checkout CRLFs refused a lane's retire as uncommitted. What can't be proved is Modified.
+fn converts_to_blob(workdir: &Path, path: &str, content: &[u8], oid: ObjectId) -> bool {
+    // (what the conversion undoes is all it can change)
+    if !content.contains(&b'\r') && !content.windows(4).any(|w| w == b"$Id:") {
+        return false;
+    }
+    let Ok(Some(paths)) = crate::repo::repository_paths(workdir) else { return false };
+    crate::text_clean::conversion_config(&paths)
+        .and_then(|config| crate::text_clean::cleans_to(workdir, &paths.common_dir, path, oid, &config))
+        .unwrap_or(false)
 }
 
 fn compute_untracked_status_for_path(
@@ -696,11 +715,12 @@ pub fn index_entry_from_metadata(
     mode: u32,
     metadata: &fs::Metadata,
 ) -> IndexEntry {
+    let (mtime_sec, mtime_nsec) = metadata_mtime(metadata);
     IndexEntry {
-        ctime_sec: metadata_mtime_sec(metadata),
+        ctime_sec: mtime_sec,
         ctime_nsec: 0,
-        mtime_sec: metadata_mtime_sec(metadata),
-        mtime_nsec: 0,
+        mtime_sec,
+        mtime_nsec,
         dev: metadata_dev(metadata),
         ino: metadata_ino(metadata),
         mode,
@@ -789,11 +809,12 @@ pub fn stage_file(
         }
     };
 
+    let (mtime_sec, mtime_nsec) = metadata_mtime(&metadata);
     let entry = IndexEntry {
-        ctime_sec: metadata_mtime_sec(&metadata),
+        ctime_sec: mtime_sec,
         ctime_nsec: 0,
-        mtime_sec: metadata_mtime_sec(&metadata),
-        mtime_nsec: 0,
+        mtime_sec,
+        mtime_nsec,
         dev: metadata_dev(&metadata),
         ino: metadata_ino(&metadata),
         mode,
@@ -866,13 +887,25 @@ fn remove_empty_dirs_inner(dir: &Path, stop: &Path) -> Result<(), std::io::Error
     Ok(())
 }
 
-fn metadata_mtime_sec(metadata: &fs::Metadata) -> u32 {
+/// A file's mtime as the index keeps it: seconds and their nanoseconds.
+fn metadata_mtime(metadata: &fs::Metadata) -> (u32, u32) {
     metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs().min(u32::MAX as u64) as u32)
-        .unwrap_or(0)
+        .map_or((0, 0), |d| (d.as_secs().min(u32::MAX as u64) as u32, d.subsec_nanos()))
+}
+
+/// Git's racy-git rule, for an index about to be compared with its worktree: an entry whose
+/// mtime is not older than the index file's (`index_mtime`, read before the index was) is
+/// racily clean. Its file can have been rewritten in that second after it was staged, with its
+/// size and its mtime second kept, so its stat proves nothing: its size is smudged to 0, as git
+/// writes such an entry, and status compares its content.
+pub fn smudge_racily_clean(index: &mut Index, index_mtime: &fs::Metadata) {
+    let (sec, _) = metadata_mtime(index_mtime);
+    for entry in index.entries.iter_mut().filter(|e| e.mtime_sec >= sec) {
+        entry.file_size = 0;
+    }
 }
 
 #[cfg(unix)]
@@ -1255,6 +1288,42 @@ mod tests {
         write_worktree_file(workdir, "f.txt", oid, 0o100644, b"inside").unwrap();
         assert_eq!(fs::read_to_string(outside.path().join("target.txt")).unwrap(), "outside");
         assert_eq!(fs::read_to_string(workdir.join("f.txt")).unwrap(), "inside");
+    }
+
+    /// A file whose content is compared (here its index stat is empty, as a racily clean entry's
+    /// is) reads as git reads it: checkout CRLFs under its attributes are clean, an edit is not,
+    /// and where its attributes convert nothing the CRLFs are a change.
+    #[test]
+    fn status_undoes_text_conversion_as_git_does() {
+        let dir = crate::test_support::tempdir().unwrap();
+        let workdir = dir.path();
+        fs::create_dir_all(workdir.join(".git")).unwrap();
+        fs::write(workdir.join(".gitattributes"), "*.ps1 text eol=crlf\n*.txt text=auto\n*.bin -text\n").unwrap();
+        let entry = |path: &str, blob: &[u8]| IndexEntry {
+            ctime_sec: 0, ctime_nsec: 0, mtime_sec: 0, mtime_nsec: 0, dev: 0, ino: 0, mode: 0o100644, uid: 0, gid: 0, file_size: 0,
+            oid: hash_object("blob", blob), flags: path.len() as u16, path: path.to_string(),
+        };
+        let lf = b"one\ntwo\n";
+        let crlf = b"one\r\ntwo\r\n";
+        let mut entries = Vec::new();
+        for (path, on_disk) in [
+            ("script.ps1", &crlf[..]),
+            ("auto.txt", &crlf[..]),
+            ("edited.ps1", b"one\r\nthree\r\n"),
+            ("raw.bin", &crlf[..]),
+            ("plain.other", &crlf[..]),
+            ("lf_edit.ps1", b"one\nthree\n"),
+        ] {
+            fs::write(workdir.join(path), on_disk).unwrap();
+            entries.push(entry(path, lf));
+        }
+        entries.push(entry(".gitattributes", b"*.ps1 text eol=crlf\n*.txt text=auto\n*.bin -text\n"));
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let index = Index { version: 2, entries };
+        let status = compute_status_worktree_only(&index, workdir).unwrap();
+        let mut modified: Vec<_> = status.entries.iter().filter(|e| e.status == FileStatus::Modified).map(|e| e.path.as_str()).collect();
+        modified.sort();
+        assert_eq!(modified, ["edited.ps1", "lf_edit.ps1", "plain.other", "raw.bin"]);
     }
 
     /// What `git status` reports for symlinks, nested repositories, tracked

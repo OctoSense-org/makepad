@@ -314,7 +314,12 @@ pub fn fulfilled_expectations() -> Vec<AttrKey> {
     std::mem::take(&mut *FULFILLED.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Whether the command line sets any lint level (MAKEPAD_RUN_LINT_FLAGS).
+/// Restores a body's fulfilled expectations before the crate-wide expectation check.
+pub(crate) fn merge_fulfilled(fulfilled: Vec<AttrKey>) {
+    if !fulfilled.is_empty() { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).extend(fulfilled); }
+}
+
+/// Whether the command line sets any lint level (RELAX_LINT_FLAGS).
 pub fn cmdline_set() -> bool {
     !cmdline_levels().is_empty()
 }
@@ -323,7 +328,7 @@ fn cmdline_levels() -> &'static [(Level, String)] {
     &cmdline().levels
 }
 
-/// The lint flags of the command line, from `MAKEPAD_RUN_LINT_FLAGS`: rustc's `-A/-W/-D/-F`
+/// The lint flags of the command line, from `RELAX_LINT_FLAGS`: rustc's `-A/-W/-D/-F`
 /// flags in order (e.g. `-A unused -D warnings`; the UI test harness passes `-A unused`, as
 /// rustc's compiletest does) and `--cap-lints <level>`.
 struct CmdLine {
@@ -333,7 +338,7 @@ struct CmdLine {
 
 fn cmdline() -> &'static CmdLine {
     static FLAGS: std::sync::OnceLock<CmdLine> = std::sync::OnceLock::new();
-    FLAGS.get_or_init(|| parse_cmdline(&std::env::var("MAKEPAD_RUN_LINT_FLAGS").unwrap_or_default()))
+    FLAGS.get_or_init(|| parse_cmdline(&std::env::var("RELAX_LINT_FLAGS").unwrap_or_default()))
 }
 
 fn parse_cmdline(v: &str) -> CmdLine {
@@ -390,6 +395,36 @@ pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) && !SUPPRESSED.with(|
 
 thread_local! {
     static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// while `capture` runs on this thread: its reports, kept out of the sink
+    static CAPTURED: std::cell::RefCell<Option<Vec<Reported>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A report to this thread's `capture`, its body owner, or the global sink, in that order.
+fn sink(r: Reported) {
+    let mut r = CAPTURED.with(|c| match c.borrow_mut().as_mut() {
+        Some(v) => { v.push(r); None }
+        None => Some(r),
+    });
+    if r.is_some() && !crate::body_facts::record(|f| f.reported.push(r.take().unwrap())) { SINK.lock().unwrap_or_else(|e| e.into_inner()).push(r.unwrap()); }
+}
+
+/// Publishes a body's reports directly, preserving their sequence numbers and bypassing capture.
+pub(crate) fn merge_reported(reported: Vec<Reported>) {
+    if !reported.is_empty() { SINK.lock().unwrap_or_else(|e| e.into_inner()).extend(reported); }
+}
+
+/// `f`, and what it reported on this thread, kept out of the sink: a live save's lints of the
+/// bodies it changed, while other threads' reports go on to it.
+pub fn capture<R>(f: impl FnOnce() -> R) -> (R, Vec<Reported>) {
+    struct Restore(Option<Option<Vec<Reported>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) { if let Some(prev) = self.0.take() { CAPTURED.with(|c| *c.borrow_mut() = prev); } }
+    }
+    let mut restore = Restore(Some(CAPTURED.with(|c| c.replace(Some(Vec::new())))));
+    let r = f();
+    let prev = restore.0.take().unwrap_or_default();
+    let got = CAPTURED.with(|c| c.replace(prev)).unwrap_or_default();
+    (r, got)
 }
 
 /// Errors-only checks leave other threads' lint collection alone.
@@ -414,13 +449,12 @@ pub fn hard_error(prog: &Program, file: u32, pos: u32, msg: &str) {
     let line = format!("{}:{}:{}: error: {}", prog.file_paths[file as usize], l, c, msg);
     let _k = crate::zone_alloc::kept();
     let seq = REPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Reported { level: Level::Deny, lint: "", def: NO_DEF, seq, line });
+    sink(Reported { level: Level::Deny, lint: "", def: NO_DEF, seq, line });
 }
 
-/// `emit` under the attributes `inner` of a node inside `def`'s body; none given: those around
-/// `pos` in it (attrs_at).
-pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
-    if !enabled() { return; }
+/// The level `emit_in` reports `lint` at, at `pos` of `file` in `def`'s scope: under the
+/// attributes `inner`, or (none given) those around `pos`.
+pub fn level_at(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32) -> Resolved {
     let around;
     let inner = if inner.is_empty() && def != NO_DEF {
         around = attrs_at(prog, def, file, pos, pos);
@@ -428,10 +462,19 @@ pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u3
     } else {
         inner
     };
-    let spec = resolve_in(prog, def, file, inner, lint, None);
+    resolve_in(prog, def, file, inner, lint, None)
+}
+
+/// `emit` under the attributes `inner` of a node inside `def`'s body; none given: those around
+/// `pos` in it (attrs_at).
+pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
+    if !enabled() { return; }
+    let spec = level_at(prog, def, inner, lint, file, pos);
     let level = spec.level;
     if level == Level::Allow {
-        if let Some(k) = spec.expect { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).push(k); }
+        if let Some(k) = spec.expect {
+            if !crate::body_facts::record(|f| f.fulfilled.push(k)) { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).push(k); }
+        }
         return;
     }
     let (l, c) = prog.files[file as usize].line_col(pos);
@@ -439,7 +482,31 @@ pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u3
     let line = format!("{}:{}:{}: {}: {} [{}]", prog.file_paths[file as usize], l, c, kind, msg, lint.name);
     let _k = crate::zone_alloc::kept();
     let seq = REPORT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    SINK.lock().unwrap_or_else(|e| e.into_inner()).push(Reported { level, lint: lint.name, def, seq, line });
+    sink(Reported { level, lint: lint.name, def, seq, line });
+}
+
+/// `f` on each of `items` on the pool's workers (RELAX_JOBS), the next free worker taking
+/// the next item (the biggest first balance them), results in item order. A lint pass may run
+/// its crates or items so: the sink takes reports from any thread, and the check's sort orders
+/// them (check_order.rs), never the order they came in.
+pub(crate) fn par_each<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let jobs = crate::preload::jobs().min(items.len());
+    if jobs < 2 { return items.iter().map(&f).collect(); }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut parts: Vec<(usize, R)> = crate::pool::scope(|sc| {
+        let hs: Vec<_> = (0..jobs).map(|_| sc.spawn(|| {
+            let mut out = Vec::new();
+            loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(x) = items.get(k) else { break };
+                out.push((k, f(x)));
+            }
+            out
+        })).collect();
+        hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    parts.sort_by_key(|p| p.0);
+    parts.into_iter().map(|p| p.1).collect()
 }
 
 /// The lints reported since the last take: (errors, warnings).
@@ -453,6 +520,12 @@ pub fn take() -> (Vec<String>, Vec<String>) {
         if r.level >= Level::Deny { errors.push(r.line) } else { warnings.push(r.line) }
     }
     (errors, warnings)
+}
+
+/// How many reports `take_reported` would return now: the reports a pass made are the ones
+/// between its start's and its end's count (`makepad check`'s verdict reuse tags them).
+pub fn reported_len() -> usize {
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).len()
 }
 
 /// Everything reported since the last take, in report order (a report made twice is there twice).
@@ -618,6 +691,7 @@ fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::
     let od = prog.def(owner);
     let ast = &prog.files[od.file as usize].ast;
     if od.file != file { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let mut f = Find { ast, item, stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
         ItemKind::Fn(..) => {
@@ -655,6 +729,7 @@ fn attrs_around_expr(prog: &Program, def: DefId, file: u32, target: crate::ast::
     if owner == NO_DEF { return Vec::new(); }
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let ast = &prog.files[od.file as usize].ast;
     let mut f = Find { ast, target, stack: Vec::new(), found: None };
     match ast.item(od.item).kind {
@@ -692,6 +767,7 @@ pub fn attrs_at_call(prog: &Program, owner: DefId, file: u32, call: u32) -> Vec<
     }
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX || !has_body_item(od.kind) { return Vec::new(); }
+    parse_owner(prog, od.file, od.item);
     let pf = &prog.files[od.file as usize];
     let ast = &pf.ast;
     let mut f = Find { ast, pf, call: pf.diagnostic_pos(call), stack: Vec::new(), found: None };
@@ -721,6 +797,15 @@ pub fn is_automatically_derived(prog: &Program, d: DefId) -> bool {
 /// Whether a definition of this kind is an item with parameters or a body whose nodes can sit
 /// under attributes (fns, consts, statics). A module's def has none: a crate root's, or a module
 /// whose def names no item of its own, carries a placeholder item id (no item of that file).
+/// An owner can be an item inside a body the file's load skipped and nothing demanded yet (an
+/// item in a fn body): the file's lazily parsed bodies are parsed first then, as a body reader
+/// (Program::fn_body) parses them on its first need, so the attribute lookups can read the item.
+pub(crate) fn parse_owner(prog: &Program, file: u32, item: crate::ast::ItemId) {
+    if !prog.files[file as usize].ast.has_item(item) {
+        prog.part_idents(file);
+    }
+}
+
 fn has_body_item(kind: DefKind) -> bool {
     matches!(kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::ForeignStatic)
 }
@@ -764,10 +849,15 @@ pub fn attrs_at(prog: &Program, def: DefId, file: u32, lo: u32, hi: u32) -> Vec<
     if owner == NO_DEF { return Vec::new(); }
     let od = prog.def(owner);
     if od.file != file || od.item.0 == u32::MAX || !has_body_item(od.kind) { return Vec::new(); }
-    let ast = &prog.files[od.file as usize].ast;
+    parse_owner(prog, od.file, od.item);
+    let pf = &prog.files[od.file as usize];
+    let ast = &pf.ast;
     let item = ast.item(od.item);
-    // (a span outside the item is none of its body's nodes)
-    if lo < item.lo || lo >= item.hi { return Vec::new(); }
+    // (a span outside the item is none of its body's nodes; one in the text of a macro's
+    // expansion is when the call is written in the item: the attributes the expansion puts
+    // around the tokens passed in, `#[allow(unused_unsafe)] Box::new(move || $body)`, apply to
+    // them, as rustc's levels follow the HIR parents)
+    if !pf.expands_within(lo, item.lo, item.hi) { return Vec::new(); }
     let mut f = Find { ast, lo, hi, stack: Vec::new(), expr: None, binding: None };
     match item.kind {
         ItemKind::Fn(sig, _, _) => {

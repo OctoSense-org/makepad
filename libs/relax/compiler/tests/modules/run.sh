@@ -1,34 +1,30 @@
 #!/bin/bash
 # tests/modules/run.sh <makepad>: runs host.rs and compares its `out` lines with expect.out
 D=$(cd "$(dirname "$0")" && pwd)
+# the python cases run it from their own directory: take the runner as an absolute path
+set -- "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+# every case runs; each prints its own PASS/FAIL line, and the run fails if any case did
+FAILS=0
 # Instruction counts are identical with tiering disabled and after a low-threshold tier-up.
 BASE_BUDGET=""
 for TIER in 0 1; do
 # (stdout and stderr apart: an O3 trace line on stderr can land inside an `out` line of stdout)
 SO=$(mktemp); SE=$(mktemp)
-MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/budget.rs" >"$SO" 2>"$SE"
+RELAX_O3=$TIER RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test "$D/budget.rs" >"$SO" 2>"$SE"
 STATUS=$?
 GOT=$(grep '^out ' "$SO")
 OUT="$(cat "$SO" "$SE")"
 rm -f "$SO" "$SE"
 if [ "$STATUS" != 0 ] || ! echo "$GOT" | grep -q '^out owned string results: true$'; then
-    echo "modules budget (tier1=$TIER): FAIL"; echo "$OUT" | tail -50; exit 1
+    echo "modules budget (tier1=$TIER): FAIL"; echo "$OUT" | tail -50; FAILS=$((FAILS + 1)); continue
 fi
 if [ "$TIER" = 0 ]; then BASE_BUDGET="$GOT"; else
     if [ "$GOT" != "$BASE_BUDGET" ] || ! echo "$OUT" | grep -q '^tier1: sandbox:game_budget::first installed'; then
-        echo "modules budget tier invariance: FAIL"; echo "$OUT" | tail -50; exit 1
+        echo "modules budget tier invariance: FAIL"; echo "$OUT" | tail -50; FAILS=$((FAILS + 1)); continue
     fi
 fi
 echo "modules budget (tier1=$TIER): PASS ($(echo "$OUT" | grep 'budget cost:'))"
 echo "$GOT" | grep 'shared tick fuel'
-done
-# MAKEPAD_RUN_SANDBOX_FUEL=0 leaves the meter out of a twin's code: a budget is neither spent nor ends a call.
-for FUEL in 1 0; do
-OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=$FUEL "$1" test "$D/fuel_off.rs" 2>&1)
-STATUS=$?
-GOT=$(echo "$OUT" | grep '^out ')
-if [ "$FUEL" = 1 ]; then WANT='out a budget of 100 units: result out of fuel fuel spent 100'; else WANT='out a budget of 100 units: result true fuel spent 0'; fi
-if [ "$STATUS" = 0 ] && [ "$GOT" = "$WANT" ]; then echo "modules fuel off (fuel=$FUEL): PASS"; else echo "modules fuel off (fuel=$FUEL): FAIL"; echo "$OUT" | tail -30; exit 1; fi
 done
 # A twin's O3 build takes in the twins it calls and keeps the fuel count in a register between
 # calls: what a path costs, where a run on a budget ends and what the module did up to there are
@@ -36,17 +32,17 @@ done
 BASE_TIERS=""
 for TIER in 0 1; do
 SO=$(mktemp); SE=$(mktemp)
-MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/fuel_tiers.rs" >"$SO" 2>"$SE"
+RELAX_O3=$TIER RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test "$D/fuel_tiers.rs" >"$SO" 2>"$SE"
 STATUS=$?
 GOT=$(grep '^out ' "$SO")
 OUT="$(cat "$SO" "$SE")"
 rm -f "$SO" "$SE"
 if [ "$STATUS" != 0 ] || ! echo "$GOT" | grep -q '^out the same after the tier-up: true$'; then
-    echo "modules fuel tiers (tier1=$TIER): FAIL"; echo "$OUT" | tail -30; exit 1
+    echo "modules fuel tiers (tier1=$TIER): FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); continue
 fi
 if [ "$TIER" = 0 ]; then BASE_TIERS="$GOT"; else
     if [ "$GOT" != "$BASE_TIERS" ] || ! echo "$OUT" | grep -Eq '^tier1: sandbox:tiers::run installed \([0-9]+ bytes, [1-9][0-9]* callees inlined'; then
-        echo "modules fuel tiers invariance: FAIL"; echo "$OUT" | tail -30; exit 1
+        echo "modules fuel tiers invariance: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); continue
     fi
 fi
 echo "modules fuel tiers (tier1=$TIER): PASS ($(echo "$GOT" | head -1 | sed 's/^out //'))"
@@ -56,17 +52,17 @@ done
 BASE_CHAINS=""
 for TIER in 0 1; do
 SO=$(mktemp); SE=$(mktemp)
-MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/fuel_chains.rs" >"$SO" 2>"$SE"
+RELAX_O3=$TIER RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test "$D/fuel_chains.rs" >"$SO" 2>"$SE"
 STATUS=$?
 GOT=$(grep '^out ' "$SO")
 OUT="$(cat "$SO" "$SE")"
 rm -f "$SO" "$SE"
 if [ "$STATUS" != 0 ] || [ "$(echo "$GOT" | wc -l | tr -d ' ')" != 4 ]; then
-    echo "modules fuel chains (tier1=$TIER): FAIL"; echo "$OUT" | tail -30; exit 1
+    echo "modules fuel chains (tier1=$TIER): FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); continue
 fi
 if [ "$TIER" = 0 ]; then BASE_CHAINS="$GOT"; else
     if [ "$GOT" != "$BASE_CHAINS" ] || ! echo "$OUT" | grep -Eq '^tier1: sandbox:chains::run installed \([0-9]+ bytes, [1-9][0-9]* callees inlined' || ! echo "$OUT" | grep -Eq '^tier1: sandbox:chains::walk installed '; then
-        echo "modules fuel chains invariance: FAIL"; echo "$BASE_CHAINS"; echo "$OUT" | tail -30; exit 1
+        echo "modules fuel chains invariance: FAIL"; echo "$BASE_CHAINS"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); continue
     fi
 fi
 echo "modules fuel chains (tier1=$TIER): PASS ($(echo "$GOT" | sed -n 2p | sed 's/^out //'))"
@@ -74,7 +70,7 @@ done
 # A twin's O3 build makes the arena copies of a known small size inline: sorts of elements of
 # 1 to 72 bytes give the host's results before and after the tier-up.
 SO=$(mktemp); SE=$(mktemp)
-MAKEPAD_RUN_O3=1 MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/copies.rs" >"$SO" 2>"$SE"
+RELAX_O3=1 RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test "$D/copies.rs" >"$SO" 2>"$SE"
 STATUS=$?
 GOT=$(grep '^out the module' "$SO")
 OUT="$(cat "$SO" "$SE")"
@@ -82,16 +78,16 @@ rm -f "$SO" "$SE"
 if [ "$STATUS" = 0 ] && [ "$GOT" = $'out the module, before the tier-up: true\nout the module, after it: true' ] && echo "$OUT" | grep -Eq '^tier1: sandbox:core::slice::sort::.* installed '; then
     echo "modules copies: PASS"
 else
-    echo "modules copies: FAIL"; echo "$OUT" | tail -30; exit 1
+    echo "modules copies: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1))
 fi
 # A twin's O3 build optimises its body before the memory is confined: whatever address hot code
 # names (indexed, at a constant offset, struct and vector copies, a local moved out of its slot,
 # a forged fn pointer), the host's memory is neither written nor read. With the confined body as
-# the build's input (MAKEPAD_RUN_OPT=-sblate) the same holds.
+# the build's input (RELAX_OPT=-sblate) the same holds.
 for LATE in 1 0; do
 SO=$(mktemp); SE=$(mktemp)
 if [ "$LATE" = 1 ]; then SW=""; else SW="-sblate"; fi
-MAKEPAD_RUN_OPT=$SW MAKEPAD_RUN_SANDBOX_NOCHECK=1 MAKEPAD_RUN_O3=1 MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/contain_hot.rs" >"$SO" 2>"$SE"
+RELAX_OPT=$SW RELAX_O3=1 RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test --allow-unchecked-modules "$D/contain_hot.rs" >"$SO" 2>"$SE"
 STATUS=$?
 GOT=$(grep '^out ' "$SO")
 OUT="$(cat "$SO" "$SE")"
@@ -100,13 +96,13 @@ HOT=$(echo "$OUT" | grep -E '^tier1: sandbox:hot::[a-z_]+ installed ' | sed -E '
 if [ "$STATUS" = 0 ] && [ "$GOT" = "$(cat "$D/expect-contain-hot.out")" ] && [ "$HOT" -ge 15 ]; then
     echo "modules contain hot (late=$LATE): PASS ($HOT twins at O3)"
 else
-    echo "modules contain hot (late=$LATE): FAIL ($HOT twins at O3)"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1
+    echo "modules contain hot (late=$LATE): FAIL ($HOT twins at O3)"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1))
 fi
 done
-# A body the confinement refuses (MAKEPAD_RUN_TEST_SANDBOX_REFUSE=1: every one) is built again from
+# A body the confinement refuses (RELAX_TEST_SANDBOX_REFUSE=1: every one) is built again from
 # the confined body: the sorts still give the host's results once hot.
 SO=$(mktemp); SE=$(mktemp)
-MAKEPAD_RUN_TEST_SANDBOX_REFUSE=1 MAKEPAD_RUN_O3=1 MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/copies.rs" >"$SO" 2>"$SE"
+RELAX_TEST_SANDBOX_REFUSE=1 RELAX_O3=1 RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test "$D/copies.rs" >"$SO" 2>"$SE"
 STATUS=$?
 GOT=$(grep '^out the module' "$SO")
 OUT="$(cat "$SO" "$SE")"
@@ -114,108 +110,138 @@ rm -f "$SO" "$SE"
 if [ "$STATUS" = 0 ] && [ "$GOT" = $'out the module, before the tier-up: true\nout the module, after it: true' ] && echo "$OUT" | grep -q 'dropped(err: sandbox confinement after O3: ' && echo "$OUT" | grep -Eq '^tier1: sandbox:core::slice::sort::.* installed '; then
     echo "modules confinement refused: PASS"
 else
-    echo "modules confinement refused: FAIL"; echo "$OUT" | grep -v '^  report' | tail -20; exit 1
+    echo "modules confinement refused: FAIL"; echo "$OUT" | grep -v '^  report' | tail -20; FAILS=$((FAILS + 1))
 fi
+# --allow-unmetered-modules leaves the meter out of a twin's code: a budget is neither spent nor ends a call.
+for FUEL in 1 0; do
+GRANT=""; [ "$FUEL" = 0 ] && GRANT=--allow-unmetered-modules
+OUT=$("$1" test $GRANT "$D/fuel_off.rs" 2>&1)
+STATUS=$?
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$FUEL" = 1 ]; then WANT='out a budget of 100 units: result out of fuel fuel spent 100'; else WANT='out a budget of 100 units: result true fuel spent 0'; fi
+if [ "$STATUS" = 0 ] && [ "$GOT" = "$WANT" ]; then echo "modules fuel off (fuel=$FUEL): PASS"; else echo "modules fuel off (fuel=$FUEL): FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
+done
+# A module's load links std's twins from the disk cache; its own code is built and tiers as in a cold run.
+python3 "$D/warm_cache.py" "$1" || FAILS=$((FAILS + 1))
 # Host panic setup must not change sandbox reachability (run before other modules).
 for CASE in host_hook_repro host_hook_panic; do
 OUT=$("$1" test "$D/$CASE.rs" 2>&1)
 STATUS=$?
-if [ "$STATUS" = 0 ]; then echo "modules $CASE: PASS"; else echo "modules $CASE: FAIL"; echo "$OUT" | tail -30; exit 1; fi
+if [ "$STATUS" = 0 ]; then echo "modules $CASE: PASS"; else echo "modules $CASE: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
 done
-OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], timeout=120).returncode)' "$1" test "$D/guard_threads.rs" 2>&1)
+OUT=$("$1" test --allow-unmetered-modules "$D/guard_threads.rs" 2>&1)
 STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$STATUS" = 0 ] && [ "$GOT" = $'out concurrent guards: true\nout nested guards: true' ]; then echo "modules guard threads: PASS"; else echo "modules guard threads: FAIL"; echo "$OUT" | tail -30; exit 1; fi
+if [ "$STATUS" = 0 ] && [ "$GOT" = $'out concurrent guards: true\nout nested guards: true' ]; then echo "modules guard threads: PASS"; else echo "modules guard threads: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
 # Exercise the sandbox wrappers/twins and the trusted host-code inlining path.
 for TRUSTED in 0 1; do
 for TIER in 1 0; do
-    OUT=$(MAKEPAD_RUN_MODULES_TRUSTED=$TRUSTED MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=2000 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/palette.rs" 2>&1)
+    GRANT=""; [ "$TRUSTED" = 1 ] && GRANT=--allow-host-modules
+    OUT=$(RELAX_O3=$TIER RELAX_O3_CALLS=2000 RELAX_O3_TRACE=1 "$1" test $GRANT "$D/palette.rs" 2>&1)
     STATUS=$?
     GOT=$(echo "$OUT" | grep '^out ')
     HOT=$(echo "$OUT" | grep -Ec '^tier1: sandbox:palette_patch::color installed')
-    # (a sandboxed module's code tiers up as its twin; a trusted module's does not tier up yet)
+    # trusted modules do not tier up yet (open JIT work), so that case expects no tier1 line
     if [ "$TIER" = 1 ] && [ "$TRUSTED" = 0 ]; then HOT_OK=$([ "$HOT" -gt 0 ] && echo 1 || echo 0); else HOT_OK=$([ "$HOT" = 0 ] && echo 1 || echo 0); fi
-    if [ "$STATUS" = 0 ] && [ "$GOT" = "out palette replace and stream: true" ] && [ "$HOT_OK" = 1 ]; then echo "modules palette (trusted=$TRUSTED tier1=$TIER): PASS"; else echo "modules palette (trusted=$TRUSTED tier1=$TIER): FAIL (O3 color installs: $HOT)"; echo "$OUT" | tail -30; exit 1; fi
+    if [ "$STATUS" = 0 ] && [ "$GOT" = "out palette replace and stream: true" ] && [ "$HOT_OK" = 1 ]; then echo "modules palette (trusted=$TRUSTED tier1=$TIER): PASS"; else echo "modules palette (trusted=$TRUSTED tier1=$TIER): FAIL (O3 color installs: $HOT)"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
 done
 done
-python3 "$D/visibility.py" "$1" || exit 1
+python3 "$D/visibility.py" "$1" || FAILS=$((FAILS + 1))
 OUT=$("$1" test "$D/results.rs" 2>&1)
 STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$STATUS" = 0 ] && [ "$GOT" = "$(cat "$D/expect-results.out")" ]; then echo "modules results: PASS ($(echo "$OUT" | grep 'results cost:'))"; else echo "modules results: FAIL"; echo "$OUT" | tail -30; exit 1; fi
-python3 "$D/stream_watch.py" "$1" || exit 1
+if [ "$STATUS" = 0 ] && [ "$GOT" = "$(cat "$D/expect-results.out")" ]; then echo "modules results: PASS ($(echo "$OUT" | grep 'results cost:'))"; else echo "modules results: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
+python3 "$D/stream_watch.py" "$1" || FAILS=$((FAILS + 1))
 OUT=$("$1" test "$D/stream.rs" 2>&1)
 STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$STATUS" = 0 ] && [ "$GOT" = "$(cat "$D/expect-stream.out")" ]; then echo "modules stream: PASS ($(echo "$OUT" | grep 'stream cost:'))"; else echo "modules stream: FAIL"; echo "$OUT" | tail -30; exit 1; fi
+if [ "$STATUS" = 0 ] && [ "$GOT" = "$(cat "$D/expect-stream.out")" ]; then echo "modules stream: PASS ($(echo "$OUT" | grep 'stream cost:'))"; else echo "modules stream: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
 OUT=$("$1" test "$D/host.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules: PASS ($(echo "$OUT" | grep -o 'cold load of fx_a: [0-9.]* ms'))"; else echo "modules: FAIL"; diff <(echo "$GOT") "$D/expect.out"; echo "$OUT" | tail -5; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules: PASS ($(echo "$OUT" | grep -o 'cold load of fx_a: [0-9.]* ms'))"; else echo "modules: FAIL"; diff <(echo "$GOT") "$D/expect.out"; echo "$OUT" | tail -5; FAILS=$((FAILS + 1)); fi
 OUT=$("$1" test "$D/scale.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-scale.out")" ]; then echo "modules scale: PASS ($(echo "$OUT" | grep -o 'scale: .*'))"; else echo "modules scale: FAIL"; echo "$OUT" | tail -8; exit 1; fi
-OUT=$(MAKEPAD_RUN_SANDBOX_NOCHECK=1 "$1" test "$D/contain.rs" 2>&1)
+if [ "$GOT" = "$(cat "$D/expect-scale.out")" ]; then echo "modules scale: PASS ($(echo "$OUT" | grep -o 'scale: .*'))"; else echo "modules scale: FAIL"; echo "$OUT" | tail -8; FAILS=$((FAILS + 1)); fi
+OUT=$("$1" test --allow-unchecked-modules "$D/contain.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PASS"; else echo "modules contain: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PASS"; else echo "modules contain: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
 # Append-only module code (MEMRECLAIM): 400 load/edit/unload cycles keep a live module stable;
 # prints the twin code growth per hot patch. Its harness deadline includes compilation.
-OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/growth.rs" 2>&1)
+OUT=$(RELAX_WATCHDOG_MS=120000 "$1" test "$D/growth.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-growth.out")" ]; then echo "modules growth: PASS ($(echo "$OUT" | grep -o 'growth: .*'))"; else echo "modules growth: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect-growth.out")" ]; then echo "modules growth: PASS ($(echo "$OUT" | grep -o 'growth: .*'))"; else echo "modules growth: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
 # Module unload: the window is never reused; a stale access into it ends the process, named (SAFE2 F2).
 OUT=$("$1" test "$D/unload_inside.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-unload-inside.out")" ]; then echo "modules unload: PASS"; else echo "modules unload: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect-unload-inside.out")" ]; then echo "modules unload: PASS"; else echo "modules unload: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 for CASE in parked host; do
 OUT=$(SAFE2_UNLOAD_CRASH=$CASE "$1" test "$D/unload_inside.rs" 2>&1)
 STATUS=$?
-if [ "$STATUS" != 0 ] && ! echo "$OUT" | grep -q '^out ' && echo "$OUT" | grep -q 'stale access into the unloaded module `parker`'; then echo "modules stale access ($CASE) ends the process: PASS"; else echo "modules stale access ($CASE): FAIL (status $STATUS)"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+if [ "$STATUS" != 0 ] && ! echo "$OUT" | grep -q '^out ' && echo "$OUT" | grep -q 'stale access into the unloaded module `parker`'; then echo "modules stale access ($CASE) ends the process: PASS"; else echo "modules stale access ($CASE): FAIL (status $STATUS)"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 done
-python3 "$D/stale_park.py" "$1" || exit 1
+python3 "$D/stale_park.py" "$1" || FAILS=$((FAILS + 1))
 # Module code handed to the host as a value is refused at the host API boundary (SAFE2 F3).
 OUT=$("$1" test "$D/escape_fn.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = $'out escaping fn values refused: true\nout plain data to host API: true' ]; then echo "modules escape fn: PASS"; else echo "modules escape fn: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+if [ "$GOT" = $'out escaping fn values refused: true\nout plain data to host API: true' ]; then echo "modules escape fn: PASS"; else echo "modules escape fn: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 # Shadow stacks, result slots and fuel per thread and entry (SAFE2 F4).
-OUT=$(MAKEPAD_RUN_MODULE_FUEL=2000000 "$1" test "$D/shadow_threads.rs" 2>&1)
+OUT=$("$1" test --allow-module-fuel=2000000 "$D/shadow_threads.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-shadow-threads.out")" ]; then echo "modules shadow threads: PASS"; else echo "modules shadow threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect-shadow-threads.out")" ]; then echo "modules shadow threads: PASS"; else echo "modules shadow threads: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+# Thread-locals in twins: per thread, from their initialisers at each claim, destructors at its end.
+OUT=$("$1" test --allow-unchecked-modules "$D/thread_locals.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = $'out each thread its own: true\nout thread ids differ: true\nout initialised per claim: true\nout destructors at release: 4' ]; then echo "modules thread-locals: PASS"; else echo "modules thread-locals: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+# Fn values across three thunk-table chunks: each its own thunk, every call lands.
+OUT=$("$1" test "$D/fn_values.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = $'out distinct fn values: 9000\nout calls land: true' ]; then echo "modules fn values: PASS"; else echo "modules fn values: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
 # No-codegen mode (arm64 Apple only): no thunk table is written, a module's fn values are its
-# twins' own precompiled thunks and each indirect call is checked against them.
+# twins' own precompiled thunks and each indirect call is checked against the ones given out.
 if [ "$(uname -sm)" = "Darwin arm64" ]; then
-OUT=$(MAKEPAD_RUN_NO_CODEGEN=1 MAKEPAD_RUN_SANDBOX_NOCHECK=1 "$1" test "$D/nocodegen_fns.rs" 2>&1)
+OUT=$(RELAX_NO_CODEGEN=1 "$1" test --allow-unchecked-modules "$D/nocodegen_fns.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-nocodegen-fns.out")" ]; then echo "modules no-codegen fns: PASS"; else echo "modules no-codegen fns: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; exit 1; fi
-OUT=$(MAKEPAD_RUN_NO_CODEGEN=1 "$1" test "$D/host.rs" 2>&1)
+if [ "$GOT" = "$(cat "$D/expect-nocodegen-fns.out")" ]; then echo "modules no-codegen fns: PASS"; else echo "modules no-codegen fns: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+OUT=$(RELAX_NO_CODEGEN=1 "$1" test "$D/fn_values.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules no-codegen host: PASS"; else echo "modules no-codegen host: FAIL"; diff <(echo "$GOT") "$D/expect.out"; echo "$OUT" | tail -5; exit 1; fi
+if [ "$GOT" = $'out distinct fn values: 9000\nout calls land: true' ]; then echo "modules no-codegen fn values: PASS"; else echo "modules no-codegen fn values: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+OUT=$(RELAX_NO_CODEGEN=1 "$1" test "$D/host.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules no-codegen host: PASS"; else echo "modules no-codegen host: FAIL"; diff <(echo "$GOT") "$D/expect.out"; echo "$OUT" | tail -5; FAILS=$((FAILS + 1)); fi
 fi
-OUT=$(MAKEPAD_RUN_MODULE_FUEL=1000000 "$1" test "$D/fuel.rs" 2>&1)
+# More threads than segments: the rest wait for one, every call returns.
+OUT=$("$1" test --allow-unchecked-modules --allow-unmetered-modules "$D/segment_wait.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; else echo "modules fuel: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -6; exit 1; fi
-# A module's own cleanup fails while its frames unwind (fuel spent, a panicking destructor): the
-# call ends with the first error, the host's frames clean up, the process goes on. Both tiers.
-for TIER in 0 1; do
-OUT=$(MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 "$1" test "$D/cleanup_panic.rs" 2>&1)
+if [ "$GOT" = $'out calls returned: 100\nout most inside at once: 64' ]; then echo "modules segment wait: PASS"; else echo "modules segment wait: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -12; FAILS=$((FAILS + 1)); fi
+OUT=$("$1" test --allow-module-fuel=1000000 "$D/fuel.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-cleanup-panic.out")" ]; then echo "modules cleanup panic (tier1=$TIER): PASS"; else echo "modules cleanup panic (tier1=$TIER): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
-done
-bash "$D/milk.sh" "$1" || exit 1
-OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 "$1" test "$D/deadline.rs" 2>&1)
+if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; else echo "modules fuel: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -6; FAILS=$((FAILS + 1)); fi
+# A module's cleanups never end the host: a fuel stop with values to drop, a destructor that runs
+# out of fuel or panics while the module unwinds (rustc aborts there) end the call at the guard.
+OUT=$("$1" test --allow-module-fuel=1000000 "$D/fuel_cleanup.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-fuel-cleanup.out")" ]; then echo "modules fuel cleanup: PASS"; else echo "modules fuel cleanup: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
+bash "$D/milk.sh" "$1" || FAILS=$((FAILS + 1))
+OUT=$("$1" test --allow-unmetered-modules "$D/deadline.rs" 2>&1)
 STATUS=$?
-if [ "$STATUS" = 0 ] && echo "$OUT" | grep -q '^out deadlines: true$'; then echo "modules deadlines: PASS"; else echo "modules deadlines: FAIL"; echo "$OUT" | tail -30; exit 1; fi
+if [ "$STATUS" = 0 ] && echo "$OUT" | grep -q '^out deadlines: true$'; then echo "modules deadlines: PASS"; else echo "modules deadlines: FAIL"; echo "$OUT" | tail -30; FAILS=$((FAILS + 1)); fi
+# A sandboxed module's own `unsafe impl` is refused; the builtin derive(Clone)'s TrivialClone impl is not its own.
+OUT=$("$1" test "$D/unsafe_impl.rs" 2>&1)
+GOT=$(echo "$OUT" | grep '^out ')
+if [ "$GOT" = "$(cat "$D/expect-unsafe-impl.out")" ]; then echo "modules unsafe impl: PASS"; else echo "modules unsafe impl: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
 # A module derives the comparison and hash traits on its enums (the derives read the discriminant
 # in an `unsafe` block of the front's own writing); its own `unsafe` beside a derive stays refused.
 OUT=$("$1" test "$D/derive_enum.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-derive-enum.out")" ]; then echo "modules derive on enums: PASS"; else echo "modules derive on enums: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
-# The source check reads the fn bodies a program's load parses on demand, not only a file's
-# items: `unsafe` inside a body is refused there too, a derive's own text is not.
-python3 "$D/source_check.py" "$1" || exit 1
+if [ "$GOT" = "$(cat "$D/expect-derive-enum.out")" ]; then echo "modules derive on enums: PASS"; else echo "modules derive on enums: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
+# The same in a program (`relax run`), where a file's fn bodies are parsed on demand: a derive's
+# skipped bodies pass with the rest of its text, `unsafe` inside a body of the module's is refused.
+python3 "$D/source_check.py" "$1" || FAILS=$((FAILS + 1))
 # A module's panic reaches the host with its message (panic!, unwrap, expect, assert!), both tiers.
 for TIER in 0 1; do
-OUT=$(MAKEPAD_RUN_O3=$TIER "$1" test "$D/panic_message.rs" 2>&1)
+OUT=$(RELAX_O3=$TIER "$1" test "$D/panic_message.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
-if [ "$GOT" = "$(cat "$D/expect-panic-message.out")" ]; then echo "modules panic message (tier1=$TIER): PASS"; else echo "modules panic message (tier1=$TIER): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
+if [ "$GOT" = "$(cat "$D/expect-panic-message.out")" ]; then echo "modules panic message (tier1=$TIER): PASS"; else echo "modules panic message (tier1=$TIER): FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; FAILS=$((FAILS + 1)); fi
 done
+if [ "$FAILS" != 0 ]; then echo "modules: $FAILS case(s) FAILED"; exit 1; fi
 echo "modules: every case PASS"

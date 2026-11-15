@@ -1,6 +1,7 @@
 //! Off-thread prepared model payloads and their uploaded/loaded GPU forms.
 
 use super::*;
+pub use crate::material_surface::{TextureCharge, TextureSlot};
 
 /// Decode generated PNG pixels with limits enforced by the decoder before
 /// allocation. Animated PNGs are decoded as a single frame in this lane.
@@ -63,7 +64,7 @@ pub fn decode_generated_png_within(bytes: &[u8], dimension: usize, byte_limit: u
 /// This never builds CPU mips, including when image-cache mipmaps are enabled.
 pub fn upload_generated_texture(cx: &mut Cx, image: ImageBuffer) -> Texture {
     Texture::new_with_format(cx, TextureFormat::VecMipBGRAu8_32 {
-        width: image.width, height: image.height, data: Some(image.data),
+        width: image.width, height: image.height, data: Some(image.data.into()),
         max_level: Some(0), wrap: TextureWrap::Repeat, updated: TextureUpdated::Full,
     })
 }
@@ -129,7 +130,68 @@ pub struct PreparedStaticPreview {
 }
 
 impl PreparedStaticPreview {
+    /// Bytes this asset keeps on the CPU once uploaded: the picking and shadow-ray geometry
+    /// (positions, indices), the lightmap source and the authored collision meshes, over every
+    /// LOD level. The upload copies are dropped at upload and are not counted.
+    pub fn retained_cpu_bytes(&self) -> usize {
+        // Cloned level products may share buffers, so each retained Arc is charged once.
+        let mut positions = std::collections::HashSet::new();
+        let mut indices = std::collections::HashSet::new();
+        let mut lightmaps = std::collections::HashSet::new();
+        let mut collisions = std::collections::HashSet::new();
+        let mut bytes = 0;
+        for model in std::iter::once(self).chain(self.lods.iter().map(|(_, model)| model)) {
+            if positions.insert(std::sync::Arc::as_ptr(&model.positions)) {
+                bytes += model.positions.len() * std::mem::size_of::<Vec3f>();
+            }
+            if indices.insert(std::sync::Arc::as_ptr(&model.mesh_indices)) {
+                bytes += model.mesh_indices.len() * std::mem::size_of::<u32>();
+            }
+            if let Some(source) = &model.lm_source {
+                if lightmaps.insert(std::sync::Arc::as_ptr(source)) {
+                    bytes += source.ao_uv.len() * 8 + source.albedo.len() * 12 + source.caster.bytes();
+                }
+            }
+            for collision in model.authored_collisions.iter() {
+                if collisions.insert(std::sync::Arc::as_ptr(&collision.mesh)) {
+                    bytes += collision.mesh.positions.len() * 12 + collision.mesh.indices.len() * 4;
+                }
+            }
+        }
+        bytes
+    }
+
     pub fn lod_distances(&self)->impl Iterator<Item=f32>+'_ {self.lods.iter().map(|(distance,_)|*distance)}
+    /// Geometry per distance level, finest first. Model-owned sidecars stay on
+    /// `[0]`: morph, AO, shadow SDF, bake streams and sky (including its two images)
+    /// are not shared through the content cache or replaced by distance layers.
+    pub fn level_geometry_bytes(&self) -> Vec<usize> {
+        let mut levels: Vec<usize> = std::iter::once(self).chain(self.lods.iter().map(|(_, m)| m))
+            .map(|m| m.layers().map(|l| (l.vertices.len() + l.indices.len()) * 4).sum())
+            .collect();
+        levels[0] += std::iter::once(self).chain(self.lods.iter().map(|(_, m)| m))
+            .map(|m| {
+                m.morph.as_ref().map_or(0, |v| v.pixels.len() * 4)
+                    + m.ao.as_ref().map_or(0, |v| v.data.len() * 4)
+                    + m.sdf.as_ref().map_or(0, |v| v.pixels.len())
+                    + m.bake_stream.as_ref().map_or(0, |(i, v)| (i.len() + v.len()) * 4)
+                    + m.sky.as_ref().map_or(0, |s| (s.vertices.len() + s.indices.len() + s.tex0.data.len() + s.tex1.data.len()) * 4)
+            }).sum::<usize>();
+        levels
+    }
+
+    /// Content-cache keys bound by each distance level, once per key per level.
+    pub fn level_texture_keys(&self) -> Vec<Vec<u64>> {
+        std::iter::once(self).chain(self.lods.iter().map(|(_, m)| m)).map(|m| {
+            let mut seen = std::collections::HashSet::new();
+            let mut keys = Vec::new();
+            m.visit_texture_charges(&mut |charge| {
+                if seen.insert(charge.key) { keys.push(charge.key); }
+            });
+            keys
+        }).collect()
+    }
+
     pub fn triangles_at_distance(&self,distance:f32)->usize{
         let n=if distance.is_finite()&&distance>=0.{self.lods.partition_point(|(d,_)|*d<=distance)}else{0};
         let m=if n==0{self}else{&self.lods[n-1].1};
@@ -148,7 +210,8 @@ impl PreparedStaticPreview {
     /// work. The corresponding upload only consumes validated vectors.
     pub fn prepare(model: StaticModel) -> Result<Self, String> { Self::prepare_with_sidecars(model,None,None) }
     pub fn prepare_with_sidecars(mut model:StaticModel,ao_png:Option<&[u8]>,sdf_bytes:Option<&[u8]>)->Result<Self,String>{
-        let ao=ao_png.map(|bytes|decode_generated_png(bytes,4096,32*1024*1024)).transpose()?;
+        let _preparing=crate::material_surface::Preparing::begin();
+        let ao=ao_png.map(|bytes|decode_generated_png(bytes,4096,usize::MAX)).transpose()?;
         let sdf=sdf_bytes.and_then(|bytes|crate::shadow_sdf::ShadowSdfAtlas::from_shadowsdf(bytes).map(|v|v.0));
         if model.texture_uri.is_some() && model.texture_png.is_none() { return Err("model references an external texture without supplied pixels".into()); }
         let stride = crate::model::MODEL_VERTEX_FLOATS;
@@ -158,7 +221,7 @@ impl PreparedStaticPreview {
             Ok(())
         };
         check(&model.vertices,&model.indices)?;
-        if model.indices.len()<3 && model.anim_parts.is_empty() && model.driven_parts.is_empty() { return Err("prepared model has no triangles".into()); }
+        // Empty geometry is a valid distance level; its upload has no draw indices.
         let positions:Vec<Vec3f> = model.vertices.chunks_exact(stride).map(|v|vec3f(v[0],v[1],v[2])).collect();
         let mesh_indices = std::sync::Arc::new(model.indices.clone());
         let lm_source=ao.as_ref().map(|image|std::sync::Arc::new(crate::lightmap::LmMeshSource{
@@ -181,7 +244,8 @@ impl PreparedStaticPreview {
         // ONE atlas): decode, mip and charge each distinct image once, and
         // share the prepared pixels (upload dedupes them too).
         let shared = std::cell::RefCell::new(std::collections::HashMap::<(u64,usize,u32,u8),std::sync::Arc<crate::material_surface::PreparedTexture>>::new());
-        let image = |bytes:Option<&[u8]>,fallback:u32,semantic:crate::material_surface::PixelSemantic| -> Result<std::sync::Arc<crate::material_surface::PreparedTexture>,String> {
+        // `store`: the image may be kept in the store's block form (not an MSDF, whose distances need exact texels).
+        let image = |bytes:Option<&[u8]>,fallback:u32,semantic:crate::material_surface::PixelSemantic,store:bool| -> Result<std::sync::Arc<crate::material_surface::PreparedTexture>,String> {
             // The same image as colour and as a masked cutout mips differently.
             let kind=semantic as u8;
             // The load-ready form: pre-mipped UASTC (KTX2) in the GLB, keyed by
@@ -210,20 +274,38 @@ impl PreparedStaticPreview {
                 } else { let mut image=ImageBuffer::default();image.width=1;image.height=1;image.data=vec![fallback];image };
                 Ok(crate::material_surface::texture_work(crate::material_surface::TextureWork::DecodeMip,||crate::material_surface::PreparedTexture::prepare(decoded,semantic)))
             };
-            let texture=match bytes { Some(_)=>crate::material_surface::prepared_once((key.0,key.1,key.3),prepare)?, None=>std::sync::Arc::new(prepare()?) };
+            let texture=match bytes {
+                Some(bytes) if store=>{
+                    let texture=crate::material_surface::prepared_once((key.0,key.1,key.3),||{
+                        let texture=crate::material_surface::stored_device_texture(bytes,semantic,false,prepare)?;
+                        if texture.compressed.is_some() { remaining.set(remaining.get().saturating_sub(texture.bytes())); }
+                        Ok(texture)
+                    })?;
+                    // The memo may hold an out-of-scope decode of the same image.
+                    let stored=crate::material_surface::owe_unstored(bytes,semantic,false,&texture);
+                    if texture.stored.is_none() && stored.is_some() {
+                        let mut texture=std::sync::Arc::unwrap_or_clone(texture);
+                        texture.stored=stored;
+                        std::sync::Arc::new(texture)
+                    } else { texture }
+                }
+                Some(_)=>crate::material_surface::prepared_once((key.0,key.1,key.3),prepare)?,
+                None=>std::sync::Arc::new(prepare()?),
+            };
             shared.borrow_mut().insert(key,texture.clone());
             Ok(texture)
         };
         let layer = |vertices:Vec<f32>,indices:Vec<u32>,png:Option<Vec<u8>>,detail:Option<Vec<u8>>,detail_scale:[f32;2],mut pbr:crate::model::PbrMaterial| -> Result<PreparedStaticLayer,String> {
             check(&vertices,&indices)?;
             // An alpha-tested layer keeps its cutout coverage down the mips.
-            let masked=pbr.surface.as_ref().is_some_and(|s|s.alpha_mode==1);
-            let texture=image(png.as_deref(),0xffff_ffff,if masked{crate::material_surface::PixelSemantic::MaskedColor}else{crate::material_surface::PixelSemantic::Color})?;
-            let detail_on=detail.is_some();let detail=image(detail.as_deref(),0xff80_8080,crate::material_surface::PixelSemantic::Color)?;
-            let orm_on=pbr.orm_png.is_some();let orm=image(pbr.orm_png.as_deref(),0xffff_ffff,crate::material_surface::PixelSemantic::Data)?;
+            let msdf=pbr.surface.as_ref().is_some_and(|s|s.msdf.is_some());
+            let semantic=pbr.surface.as_ref().map_or(crate::material_surface::PixelSemantic::Color, |s|s.base_semantic());
+            let texture=image(png.as_deref(),0xffff_ffff,semantic,!msdf)?;
+            let detail_on=detail.is_some();let detail=image(detail.as_deref(),0xff80_8080,crate::material_surface::PixelSemantic::Color,true)?;
+            let orm_on=pbr.orm_png.is_some();let orm=image(pbr.orm_png.as_deref(),0xffff_ffff,crate::material_surface::PixelSemantic::Data,true)?;
             let surface=pbr.surface.as_ref().map(|surface|{let mut budget=remaining.get();let prepared=crate::material_surface::PreparedSurface::prepare(surface.as_ref().clone(),&mut budget)?;remaining.set(budget);Ok::<_,String>(prepared)}).transpose()?;
             pbr.orm_png=None;
-            let cutout=texture.cutout();
+            let cutout=msdf || texture.cutout();
             Ok(PreparedStaticLayer { vertices,indices,texture,detail,detail_scale:if detail_on{detail_scale}else{[0.0,0.0]},orm,orm_on,surface,pbr,cutout })
         };
         let mut layers=std::mem::take(&mut model.draw_layers).into_iter();
@@ -267,29 +349,52 @@ impl PreparedStaticPreview {
             authored_collisions:Default::default(),collider_parts,occluder_parts,anim_parts,driven_parts,sky,liquids:std::sync::Arc::new(std::mem::take(&mut model.liquids)),
             min:model.min,max:model.max,prelit:model.prelit})
     }
-    /// The GPU textures this asset uploads, as (content hash, bytes), each
-    /// once: identical images share one GPU texture across assets (see
-    /// `upload_static_preview`), so a host charging memory per asset can
-    /// charge a shared texture once.
-    pub fn texture_charges(&self)->Vec<(u64,usize)> {
-        let mut out=Vec::new();
-        self.collect_texture_charges(&mut out);
+    /// GPU textures shared through the renderer's content cache, once per key
+    /// across every distance level. A key used in several slots keeps its first slot.
+    pub fn texture_charges(&self) -> Vec<TextureCharge> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for model in std::iter::once(self).chain(self.lods.iter().map(|(_, m)| m)) {
+            model.visit_texture_charges(&mut |charge| {
+                if seen.insert(charge.key) { out.push(charge); }
+            });
+        }
         out
     }
-    fn collect_texture_charges(&self,out:&mut Vec<(u64,usize)>) {
-        for (_,lod) in &self.lods { lod.collect_texture_charges(out); }
-        for l in std::iter::once(&self.main).chain(&self.extra).chain(self.anim_parts.iter().flat_map(|p|&p.draws)).chain(self.driven_parts.iter().flat_map(|p|&p.draws)) {
-            let surface=l.surface.iter().flat_map(|s|[&s.normal,&s.occlusion,&s.emissive]);
-            let splat=l.surface.iter().filter_map(|s|s.splat.as_ref()).flat_map(|p|p.albedo.iter().chain(&p.normal).map(|t|&**t).chain(std::iter::once(&p.weights)));
-            for t in [&*l.texture,&*l.detail,&*l.orm].into_iter().chain(surface).chain(splat) {
-                if !out.iter().any(|(h,_)|*h==t.hash) { out.push((t.hash,t.bytes())); }
+
+    fn layers(&self) -> impl Iterator<Item = &PreparedStaticLayer> {
+        std::iter::once(&self.main).chain(&self.extra)
+            .chain(self.anim_parts.iter().flat_map(|p| &p.draws))
+            .chain(self.driven_parts.iter().flat_map(|p| &p.draws))
+    }
+
+    fn visit_texture_charges(&self, visit: &mut impl FnMut(TextureCharge)) {
+        use crate::material_surface::splat_array_charge;
+        for layer in self.layers() {
+            let texel_addressed = layer.pbr.mag_nearest || layer.surface.as_ref()
+                .is_some_and(|surface| surface.definition.msdf.is_some() || surface.definition.impostor > 0.0);
+            visit(layer.texture.charge(TextureSlot::Base, texel_addressed));
+            visit(layer.detail.charge(TextureSlot::Detail, texel_addressed));
+            visit(layer.orm.charge(TextureSlot::Orm, texel_addressed));
+            if let Some(surface) = &layer.surface {
+                visit(surface.normal.charge(TextureSlot::Normal, texel_addressed));
+                visit(surface.occlusion.charge(TextureSlot::Occlusion, texel_addressed));
+                visit(surface.emissive.charge(TextureSlot::Emissive, texel_addressed));
+                if let Some(splat) = &surface.splat {
+                    for (layers, slot) in [(&splat.albedo, TextureSlot::SplatAlbedo), (&splat.normal, TextureSlot::SplatNormal)] {
+                        let mut charge = splat_array_charge(layers, slot);
+                        charge.texel_addressed = texel_addressed;
+                        visit(charge);
+                    }
+                    visit(splat.weights.charge(TextureSlot::SplatWeights, true));
+                }
             }
         }
     }
-    pub fn upload_bytes(&self)->usize {
-        self.lods.iter().map(|(_,m)|m.upload_bytes()).sum::<usize>()+self.morph.as_ref().map_or(0,|m|m.pixels.len()*4)+self.ao.as_ref().map_or(0,|v|v.data.len()*4)+self.sdf.as_ref().map_or(0,|v|v.pixels.len())+self.bake_stream.as_ref().map_or(0,|(i,v)|(i.len()+v.len())*4)
-            +{let mut seen=std::collections::HashSet::new();std::iter::once(&self.main).chain(&self.extra).chain(self.anim_parts.iter().flat_map(|p|&p.draws)).chain(self.driven_parts.iter().flat_map(|p|&p.draws)).map(|l|l.bytes_unique(&mut seen)).sum::<usize>()}
-            +self.sky.as_ref().map_or(0,|s|(s.vertices.len()+s.indices.len()+s.tex0.data.len()+s.tex1.data.len())*4)
+
+    pub fn upload_bytes(&self) -> usize {
+        self.level_geometry_bytes().iter().sum::<usize>()
+            + self.texture_charges().iter().map(|t| t.bytes).sum::<usize>()
     }
 }
 #[derive(Clone)]
@@ -298,15 +403,6 @@ pub(super) struct PreparedStaticLayer {
     pub(super) orm:std::sync::Arc<crate::material_surface::PreparedTexture>,pub(super) orm_on:bool,pub(super) surface:Option<crate::material_surface::PreparedSurface>,pub(super) pbr:crate::model::PbrMaterial,
     /// The base texture can fail the alpha test (found on the worker; opaque.rs).
     pub(super) cutout:bool,
-}
-impl PreparedStaticLayer {
-    /// Geometry and surface bytes, plus each image not already in `seen`
-    /// (layers share images; a shared atlas is uploaded and counted once).
-    pub(super) fn bytes_unique(&self,seen:&mut std::collections::HashSet<*const crate::material_surface::PreparedTexture>)->usize{
-        let mut images=0;
-        for t in [&self.texture,&self.detail,&self.orm]{if seen.insert(std::sync::Arc::as_ptr(t)){images+=t.bytes();}}
-        (self.vertices.len()+self.indices.len())*4+images+self.surface.as_ref().map_or(0,|s|s.bytes())
-    }
 }
 #[derive(Clone)]
 pub(super) struct PreparedAnimPreview {pub(super) def:std::sync::Arc<crate::model::AnimPart>,pub(super) draws:Vec<PreparedStaticLayer>,pub(super) collider:std::sync::Arc<Vec<(Vec3f,Vec3f)>>}
@@ -335,6 +431,7 @@ pub struct UploadedStaticPreview {
     pub(super) triangles: usize,
     pub(super) min: Vec3f,
     pub(super) max: Vec3f,
+    pub(super) stand_in: Option<Vec3f>,
     pub(super) authored_collisions: std::sync::Arc<Vec<crate::asset_metadata::PreparedAssetCollision>>,
     pub(super) collider_parts: Colliders,
     pub(super) occluder_parts: std::sync::Arc<Vec<(Vec3f, Vec3f)>>,
@@ -421,6 +518,11 @@ pub(super) struct LoadedModel {
     /// world, it is painted on it.
     pub(super) min: Vec3f,
     pub(super) max: Vec3f,
+    /// The model-space centre of the model's far stand-in (impostor.rs), when
+    /// it has one: the stand-in casts at that centre's depth in the outer
+    /// cascades, and the model's own layers compare no deeper (shaders/csm.rs
+    /// `csm_own_limit`), so it never shadows the model it stands in for.
+    pub(super) stand_in: Option<Vec3f>,
     /// Physics collider boxes in model space — triangle-derived voxel boxes
     /// (model.rs voxel_collider_boxes): legs, decks, braces, openings.
     pub(super) authored_collisions: std::sync::Arc<Vec<crate::asset_metadata::PreparedAssetCollision>>,
@@ -531,4 +633,16 @@ pub(super) struct LoadedSky {
     /// solid), even though it is never lit or shadowed.
     pub(super) positions: std::sync::Arc<Vec<Vec3f>>,
     pub(super) indices: std::sync::Arc<Vec<u32>>,
+}
+
+/// The model-space centre of a far stand-in's quad: its corners are the
+/// centre plus and minus the radius in the model's XY plane (impostor.rs),
+/// so the middle of its vertices' bounds.
+pub(super) fn stand_in_centre(vertices: &[f32]) -> Option<Vec3f> {
+    let mut points = vertices.chunks_exact(crate::model::MODEL_VERTEX_FLOATS).map(|v| vec3f(v[0], v[1], v[2]));
+    let first = points.next()?;
+    let (lo, hi) = points.fold((first, first), |(lo, hi), p| {
+        (vec3f(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z)), vec3f(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z)))
+    });
+    Some((lo + hi) * 0.5)
 }

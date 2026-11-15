@@ -200,9 +200,13 @@ impl<K, V> BTreeMap<K, V> {
         }
     }
 
-    pub fn extract_if<F: FnMut(&K, &mut V) -> bool>(&mut self, pred: F) -> ExtractIf<'_, K, V, F> {
-        let first = self.first_node();
-        ExtractIf { map: self, cur: first, pred }
+    /// The entries of `range`, in key order, for which `pred` holds: each is removed as the
+    /// iterator yields it (real std 1.91's range-taking form; an entry the iterator does not reach
+    /// stays).
+    pub fn extract_if<R: RangeBounds<K>, F: FnMut(&K, &mut V) -> bool>(&mut self, range: R, pred: F) -> ExtractIf<'_, K, V, R, F>
+    where K: Ord,
+    {
+        ExtractIf { inner: ExtractIfInner::new(self, range), pred }
     }
 }
 
@@ -749,6 +753,13 @@ pub struct IterMut<'a, K: 'a, V: 'a> {
     _m: PhantomData<&'a mut (K, V)>,
 }
 
+impl<'a, K, V> IterMut<'a, K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        // SAFETY: the map lives for this borrow, and the cursors only visit unyielded entries.
+        Iter { map: unsafe { &*self.map }, front: self.front, back: self.back, remaining: self.remaining }
+    }
+}
+
 impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
@@ -790,6 +801,12 @@ impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
 impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {}
 impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
 
+impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'a, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 pub struct IntoIter<K, V> {
     map: BTreeMap<K, V>,
 }
@@ -812,6 +829,12 @@ impl<K, V> DoubleEndedIterator for IntoIter<K, V> {
 
 impl<K, V> ExactSizeIterator for IntoIter<K, V> {}
 impl<K, V> FusedIterator for IntoIter<K, V> {}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.map.iter()).finish()
+    }
+}
 
 pub struct Range<'a, K: 'a, V: 'a> {
     map: &'a BTreeMap<K, V>,
@@ -910,20 +933,35 @@ impl<'a, K, V> DoubleEndedIterator for RangeMut<'a, K, V> {
     }
 }
 
-pub struct ExtractIf<'a, K, V, F> {
-    map: &'a mut BTreeMap<K, V>,
-    cur: Cursor,
+pub struct ExtractIf<'a, K, V, R, F> {
+    inner: ExtractIfInner<'a, K, V, R>,
     pred: F,
 }
 
-impl<'a, K, V, F: FnMut(&K, &mut V) -> bool> Iterator for ExtractIf<'a, K, V, F> {
-    type Item = (K, V);
-    fn next(&mut self) -> Option<(K, V)> {
+/// What a map's and a set's extract_if share (real std's ExtractIfInner): the next entry of the
+/// range the predicate takes, removed.
+pub(super) struct ExtractIfInner<'a, K, V, R> {
+    map: &'a mut BTreeMap<K, V>,
+    cur: Cursor,
+    range: R,
+}
+
+impl<'a, K: Ord, V, R: RangeBounds<K>> ExtractIfInner<'a, K, V, R> {
+    pub(super) fn new(map: &'a mut BTreeMap<K, V>, range: R) -> Self {
+        let cur = map.lower_bound(range.start_bound());
+        ExtractIfInner { map, cur, range }
+    }
+    pub(super) fn next<F: FnMut(&K, &mut V) -> bool>(&mut self, pred: &mut F) -> Option<(K, V)> {
         while self.cur != NIL {
             let n = self.cur;
             let hit = {
                 let (k, v) = self.map.kv_at_mut(n);
-                (self.pred)(k, v)
+                // past the range's end: done (real std stops at the first key it does not contain)
+                if !self.range.contains(k) {
+                    self.cur = NIL;
+                    return None;
+                }
+                pred(k, v)
             };
             if hit {
                 let (pair, next) = self.map.remove_tracking(n);
@@ -934,7 +972,22 @@ impl<'a, K, V, F: FnMut(&K, &mut V) -> bool> Iterator for ExtractIf<'a, K, V, F>
         }
         None
     }
+    pub(super) fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.map.len()))
+    }
 }
+
+impl<'a, K: Ord, V, R: RangeBounds<K>, F: FnMut(&K, &mut V) -> bool> Iterator for ExtractIf<'a, K, V, R, F> {
+    type Item = (K, V);
+    fn next(&mut self) -> Option<(K, V)> {
+        self.inner.next(&mut self.pred)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, K: Ord, V, R: RangeBounds<K>, F: FnMut(&K, &mut V) -> bool> FusedIterator for ExtractIf<'a, K, V, R, F> {}
 
 pub struct Keys<'a, K: 'a, V: 'a> {
     inner: Iter<'a, K, V>,
@@ -1037,6 +1090,12 @@ impl<'a, K, V> DoubleEndedIterator for ValuesMut<'a, K, V> {
 
 impl<'a, K, V> ExactSizeIterator for ValuesMut<'a, K, V> {}
 
+impl<'a, K, V: fmt::Debug> fmt::Debug for ValuesMut<'a, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.iter().map(|(_, v)| v)).finish()
+    }
+}
+
 pub struct IntoKeys<K, V> {
     inner: IntoIter<K, V>,
 }
@@ -1066,6 +1125,12 @@ impl<K, V> DoubleEndedIterator for IntoKeys<K, V> {
 impl<K, V> ExactSizeIterator for IntoKeys<K, V> {}
 impl<K, V> FusedIterator for IntoKeys<K, V> {}
 
+impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.map.keys()).finish()
+    }
+}
+
 pub struct IntoValues<K, V> {
     inner: IntoIter<K, V>,
 }
@@ -1094,6 +1159,12 @@ impl<K, V> DoubleEndedIterator for IntoValues<K, V> {
 
 impl<K, V> ExactSizeIterator for IntoValues<K, V> {}
 impl<K, V> FusedIterator for IntoValues<K, V> {}
+
+impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.map.values()).finish()
+    }
+}
 
 impl<'a, K, V> IntoIterator for &'a BTreeMap<K, V> {
     type Item = (&'a K, &'a V);
@@ -1142,8 +1213,8 @@ unsafe impl<'a, K: Send, V: Send> Send for OccupiedEntry<'a, K, V> {}
 unsafe impl<'a, K: Sync, V: Sync> Sync for OccupiedEntry<'a, K, V> {}
 unsafe impl<'a, K: Send, V: Send> Send for VacantEntry<'a, K, V> {}
 unsafe impl<'a, K: Sync, V: Sync> Sync for VacantEntry<'a, K, V> {}
-unsafe impl<'a, K: Send, V: Send, F: Send> Send for ExtractIf<'a, K, V, F> {}
-unsafe impl<'a, K: Sync, V: Sync, F: Sync> Sync for ExtractIf<'a, K, V, F> {}
+unsafe impl<'a, K: Send, V: Send, R: Send> Send for ExtractIfInner<'a, K, V, R> {}
+unsafe impl<'a, K: Sync, V: Sync, R: Sync> Sync for ExtractIfInner<'a, K, V, R> {}
 
 // alloc/src/collections/btree/map.rs: the borrowing iterators print their remaining items
 // (matrix-sdk-crypto's `debug!(users = ?request.device_keys.keys())`)
@@ -1169,48 +1240,11 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Range<'_, K, V> {
     }
 }
 
-// The iterators that yield `&mut V` or owned items print the entries they have not yielded yet,
-// read through a borrowing iterator over the same span (serde_json's `Map` iterators are
-// `#[derive(Debug)]` wrappers around these).
-impl<'a, K, V> IterMut<'a, K, V> {
-    fn iter(&self) -> Iter<'_, K, V> {
-        Iter { map: unsafe { &*self.map }, front: self.front, back: self.back, remaining: self.remaining }
-    }
-}
-
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.iter(), f)
-    }
-}
-
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.map.iter(), f)
-    }
-}
-
+// A range that yields `&mut V` prints the entries it has not yielded yet, read through a
+// borrowing range over the same span, as the other mutable and owning iterators here do.
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for RangeMut<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let range = Range { map: unsafe { &*self.map }, front: self.front, back: self.back, done: self.done };
         fmt::Debug::fmt(&range, f)
-    }
-}
-
-impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(Values { inner: self.inner.iter() }).finish()
-    }
-}
-
-impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(Keys { inner: self.inner.map.iter() }).finish()
-    }
-}
-
-impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(Values { inner: self.inner.map.iter() }).finish()
     }
 }

@@ -14,7 +14,7 @@ use crate::{
 use makepad_hal::{media, HalEvent, Id};
 use std::sync::{Arc, Mutex};
 
-/// Event payload room for camera frames: a 1080p NV12 frame is 3 MB, a 4K BGRA readback 33 MB.
+/// Event payload room for camera frames: a 1080p NV12 frame is 3 MB.
 const FRAME_ARENA_BYTES: usize = 64 << 20;
 
 type Slot<T> = Arc<Mutex<Option<T>>>;
@@ -27,6 +27,8 @@ struct PendingCapture {
 
 pub(crate) struct CameraClient {
     descs: Vec<VideoInputDesc>,
+    /// what each listed camera tells of its optics
+    calibrations: Vec<(VideoInputId, CameraCalibration)>,
     /// the HAL has listed the cameras at least once (an empty list is a list)
     listed: bool,
     /// the (camera, format) each slot reads
@@ -90,6 +92,7 @@ impl Default for CameraClient {
     fn default() -> Self {
         Self {
             descs: Vec::new(),
+            calibrations: Vec::new(),
             listed: false,
             active: Vec::new(),
             idle: 0,
@@ -130,14 +133,16 @@ impl Cx {
         let consumers = self.hal_camera_consumers();
         let ids = slot_pairs(&self.hal.camera.active, self.hal.camera.idle);
         self.hal.frames.w.video_input(consumers, &media::pack_u64s(&ids));
-        if consumers != 0 {
-            // camera frames are megabytes: the payload room of events grows once
-            self.hal.event_arena_min = self.hal.event_arena_min.max(FRAME_ARENA_BYTES);
-        }
+        // camera frames are megabytes: the payload room of events holds them while a slot reads
+        self.hal.event_arena.standing = if consumers != 0 { FRAME_ARENA_BYTES } else { 0 };
     }
 
     pub(crate) fn hal_video_inputs(&self) -> Option<Vec<VideoInputDesc>> {
         self.hal.camera.listed.then(|| self.hal.camera.descs.clone())
+    }
+
+    pub(crate) fn hal_video_input_calibration(&self, input: VideoInputId) -> Option<CameraCalibration> {
+        self.hal.camera.calibrations.iter().find(|(i, _)| *i == input).map(|(_, c)| *c)
     }
 
     fn hal_format_of(&self, slot: usize) -> Option<VideoFormat> {
@@ -302,7 +307,6 @@ impl Cx {
         let Some(hal_texture) = self.hal_texture_of(texture_id) else { return Err(VideoEncodeError::InvalidTexture) };
         let req = self.hal_readback_request();
         self.hal.camera.captures.insert(req, PendingCapture { slot: index, timestamp_ns });
-        self.hal.event_arena_min = self.hal.event_arena_min.max(FRAME_ARENA_BYTES);
         self.hal.frames.w.texture_readback(hal_texture, req, [0, 0, w, h]);
         Ok(())
     }
@@ -327,7 +331,16 @@ impl Cx {
     pub(crate) fn hal_camera_event(&mut self, event: HalEvent<'_>) {
         match event {
             HalEvent::VideoInputs { inputs } => {
-                let descs: Vec<VideoInputDesc> = media::read_video_inputs(inputs)
+                let inputs = media::read_video_inputs(inputs);
+                self.hal.camera.calibrations = inputs
+                    .iter()
+                    .map(|i| {
+                        let c = &i.calibration;
+                        let calibration = CameraCalibration { intrinsics: c.intrinsics, distortion: c.distortion, lens_rotation: c.lens_rotation, lens_translation: c.lens_translation, lens_reference: c.lens_reference, pre_correction: c.pre_correction, active: c.active, position: c.position, passthrough: c.passthrough };
+                        (VideoInputId(LiveId(i.id)), calibration)
+                    })
+                    .collect();
+                let descs: Vec<VideoInputDesc> = inputs
                     .into_iter()
                     .map(|i| VideoInputDesc {
                         input_id: VideoInputId(LiveId(i.id)),
@@ -391,6 +404,7 @@ impl Cx {
                     matrix: match data.matrix { 0 => CameraColorMatrix::BT709, 1 => CameraColorMatrix::BT601, 2 => CameraColorMatrix::BT2020, _ => CameraColorMatrix::Unknown },
                     plane_count: data.planes.len(),
                     planes: [plane(0), plane(1), plane(2)],
+                    exposure: CameraExposure { start_ns: data.exposure.start_ns, exposure_ns: data.exposure.exposure_ns, rolling_skew_ns: data.exposure.rolling_skew_ns, frame_duration_ns: data.exposure.frame_duration_ns, sensitivity: data.exposure.sensitivity },
                 };
                 // Raw callbacks receive the native contiguous planes (including row padding).
                 // Make the aligned u32 view once per packet, shared by every selected slot.
@@ -439,30 +453,36 @@ impl Cx {
         }
     }
 
-    /// The pixels of a texture an encoder reads arrived: converted and pushed to the encoder.
+    /// Queue an encoder's texture pixels on the readback strand, preserving frame order.
     /// False when the request is not one of the camera client's.
-    pub(crate) fn hal_encoder_readback(&mut self, req: u32, status: u32, rect: [u32; 4], pixels: &[u8]) -> bool {
+    pub(crate) fn hal_encoder_readback(&mut self, req: u32, status: u32, rect: [u32; 4], pixels: &mut Option<crate::HostBuf>) -> bool {
         let Some(pending) = self.hal.camera.captures.remove(&req) else { return false };
         if status != makepad_hal::readback::OK {
             return true;
         }
-        let mut frame = CameraFrameOwned::default();
-        if !convert_rgba_8888_to_i420(pixels, rect[2] as usize, rect[3] as usize, pending.timestamp_ns, CameraColorMatrix::BT709, &mut frame) {
-            return true;
-        }
-        let plane = |i: usize| CameraFramePlaneRef { bytes: &frame.planes[i].bytes, row_stride: frame.planes[i].row_stride, pixel_stride: frame.planes[i].pixel_stride };
-        let frame_ref = CameraFrameRef {
-            timestamp_ns: frame.timestamp_ns,
-            width: frame.width,
-            height: frame.height,
-            layout: frame.layout,
-            matrix: frame.matrix,
-            plane_count: frame.plane_count,
-            planes: [plane(0), plane(1), plane(2)],
-        };
-        if let Some(encoder) = &*lock(&self.hal.camera.encoder[pending.slot]) {
-            encoder.push_frame(frame_ref);
-        }
+        let Some(pixels) = pixels.take() else { return true };
+        let encoder = self.hal.camera.encoder[pending.slot].clone();
+        self.hal.readbacks.jobs.push(Box::new(move || {
+            let mut frame = CameraFrameOwned::default();
+            if !convert_rgba_8888_to_i420(&pixels, rect[2] as usize, rect[3] as usize, pending.timestamp_ns, CameraColorMatrix::BT709, &mut frame) {
+                return;
+            }
+            let plane = |i: usize| CameraFramePlaneRef { bytes: &frame.planes[i].bytes, row_stride: frame.planes[i].row_stride, pixel_stride: frame.planes[i].pixel_stride };
+            let frame_ref = CameraFrameRef {
+                timestamp_ns: frame.timestamp_ns,
+                width: frame.width,
+                height: frame.height,
+                layout: frame.layout,
+                matrix: frame.matrix,
+                plane_count: frame.plane_count,
+                planes: [plane(0), plane(1), plane(2)],
+                exposure: frame.exposure,
+            };
+            if let Some(encoder) = &*lock(&encoder) {
+                encoder.push_frame(frame_ref);
+            }
+        }));
+        self.hal_poll_readback_images();
         true
     }
 }

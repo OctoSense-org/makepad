@@ -1,7 +1,9 @@
 //! The `cmd` service: the inspect line protocol of `makepad inspect` and native apps. One request per
 //! DATA message (a message may hold several lines); the answer is JSON lines sent as DATA, ending
 //! with an `end` line. The host plugs in `dispatch`. Several cmd channels run at once, one thread
-//! each. `Req`, `Out`, `answer` and the size limit are the inspect protocol's own, unchanged.
+//! each. `Req`, `Out` and `answer` are the inspect protocol's own. A reply is never cut: every line
+//! a command writes reaches the client, however long (the connection splits big messages into
+//! frames and the client joins them again; a slow client slows only the command's thread).
 
 use crate::conn::{ChannelTx, Event, CLOSE_NORMAL};
 use crate::endpoint::Factory;
@@ -19,29 +21,27 @@ pub fn now_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-/// Answers one request line in memory: the reply's JSON lines (no `end` line) and whether it was
-/// cut at the size limit. For hosts that call a program's commands directly (`makepad inspect`).
-pub fn answer(dispatch: fn(&Req, &mut Out), line: &str) -> (Vec<u8>, bool) {
+/// Answers one request line in memory: the reply's JSON lines (no `end` line). For hosts that
+/// call a program's commands directly (`makepad inspect`).
+pub fn answer(dispatch: fn(&Req, &mut Out), line: &str) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
-    let truncated = answer_to(dispatch, line, &mut buf);
-    (buf, truncated)
+    answer_to(dispatch, line, &mut buf);
+    buf
 }
 
 /// As [`answer`], writing the reply's lines to `w` as they are produced (a host streams them on).
-/// Returns whether the reply was cut at the size limit.
-pub fn answer_to(dispatch: fn(&Req, &mut Out), line: &str, w: &mut dyn Write) -> bool {
+pub fn answer_to(dispatch: fn(&Req, &mut Out), line: &str, w: &mut dyn Write) {
     answer_to_cancellable(dispatch, line, w, None)
 }
 
 /// In-memory/streaming consumer with the same cancellation as a remote channel.
-pub fn answer_to_cancellable(dispatch: fn(&Req, &mut Out), line: &str, w: &mut dyn Write, gone: Option<Gone>) -> bool {
+pub fn answer_to_cancellable(dispatch: fn(&Req, &mut Out), line: &str, w: &mut dyn Write, gone: Option<Gone>) {
     let req = Req::parse(line);
-    let mut out = Out { w, bytes: 0, limit: if req.get("full") == Some("1") { usize::MAX } else { LIMIT }, truncated: false, ok: true, gone };
+    let mut out = Out { w, ok: true, gone };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&req, &mut out)));
     if r.is_err() {
         out.err("internal error in this command (inspect bug)");
     }
-    out.truncated
 }
 
 /// Host-provided fields for the `end` line of every answer: the function appends `,"key":value`
@@ -50,13 +50,9 @@ pub fn answer_to_cancellable(dispatch: fn(&Req, &mut Out), line: &str, w: &mut d
 pub type EndFields = Arc<std::sync::Mutex<Option<fn(&mut String)>>>;
 
 
-/// A reply being written: JSON lines, bounded (a reply never grows past `LIMIT` bytes unless the
-/// request said `full=1`).
+/// A reply being written: JSON lines, each one whole, however many and however long.
 pub struct Out<'a> {
     w: &'a mut dyn Write,
-    bytes: usize,
-    pub limit: usize,
-    pub truncated: bool,
     ok: bool,
     /// whether the client went away (its connection closed): long commands stop early
     gone: Option<Gone>,
@@ -65,38 +61,21 @@ pub struct Out<'a> {
 /// Says whether the client of a command went away; cheap, callable from any thread.
 pub type Gone = Arc<dyn Fn() -> bool + Send + Sync>;
 
-const LIMIT: usize = 16 << 10;
-
 impl<'a> Out<'a> {
-    /// A reply written to `w`, at most `limit` bytes of `line`s (a reply relayed across a C
-    /// boundary: the other side's `Out` writes through it).
-    pub fn new(w: &'a mut dyn Write, limit: usize) -> Out<'a> {
-        Out { w, bytes: 0, limit, truncated: false, ok: true, gone: None }
+    /// A reply written to `w` (a reply relayed across a C boundary: the other side's `Out` writes
+    /// through it).
+    pub fn new(w: &'a mut dyn Write) -> Out<'a> {
+        Out { w, ok: true, gone: None }
     }
-    /// Bytes of `line`s still allowed before the limit.
-    pub fn remaining(&self) -> usize {
-        self.limit.saturating_sub(self.bytes)
-    }
-    /// Reply bytes another `Out` already formed and bounded (its lines with their newlines),
-    /// counted against this reply's limit.
+    /// Reply bytes another `Out` already formed (its lines with their newlines, in any chunks).
     pub fn relay(&mut self, b: &[u8]) {
-        self.bytes += b.len();
         self.ok &= self.w.write_all(b).is_ok();
     }
     pub fn line(&mut self, s: &str) {
-        if self.bytes + s.len() > self.limit {
-            self.truncated = true;
-            return;
-        }
-        self.bytes += s.len() + 1;
-        self.ok &= self.w.write_all(s.as_bytes()).is_ok() && self.w.write_all(b"\n").is_ok();
-    }
-    /// A line that is always written (headers, errors, the end line).
-    pub fn always(&mut self, s: &str) {
         self.ok &= self.w.write_all(s.as_bytes()).is_ok() && self.w.write_all(b"\n").is_ok();
     }
     pub fn err(&mut self, msg: &str) {
-        self.always(&format!("{{\"err\":{}}}", json_str(msg)));
+        self.line(&format!("{{\"err\":{}}}", json_str(msg)));
     }
     pub fn flush(&mut self) -> bool {
         self.ok &= self.w.flush().is_ok();
@@ -118,7 +97,7 @@ impl<'a> Out<'a> {
     /// The measurement header every reply starts with.
     pub fn measured(&mut self, what: &str, source: &str, partial: &[String]) {
         let p: Vec<String> = partial.iter().map(|s| json_str(s)).collect();
-        self.always(&format!("{{\"measured\":{},\"at_ms\":{},\"source\":{},\"partial\":[{}]}}", json_str(what), now_ms(), json_str(source), p.join(",")));
+        self.line(&format!("{{\"measured\":{},\"at_ms\":{},\"source\":{},\"partial\":[{}]}}", json_str(what), now_ms(), json_str(source), p.join(",")));
     }
 }
 
@@ -344,6 +323,36 @@ impl Write for ChanWriter {
     }
 }
 
+std::thread_local! {
+    /// The process that sent the command this thread answers now, and the name its client gave
+    /// itself (0 and empty: not known, or none).
+    static ASKER: std::cell::RefCell<(u32, String)> = const { std::cell::RefCell::new((0, String::new())) };
+}
+
+/// How a client that an agent runs names itself (`DEVHUB_AGENT`): this, then the agent's name.
+pub const AGENT_CLIENT: &str = "client of agent ";
+
+/// Who sent the command being answered on this thread, for a log line: the agent its client says
+/// it is (`DEVHUB_AGENT`), and its process and parents, where its carrier knows them (a local
+/// client over the Unix socket: its credentials, which no client can claim), as in `agent LANE7,
+/// pid 812 makepad, from 811 zsh`.
+pub fn asked_by() -> Option<String> {
+    let (pid, name) = ASKER.with(|a| a.borrow().clone());
+    let agent = name.strip_prefix(AGENT_CLIENT).map(|a| format!("agent {a}"));
+    match (pid, agent) {
+        (0, None) => None,
+        (0, Some(agent)) => Some(format!("{agent} (its process not known)")),
+        (pid, None) => Some(crate::procs::said(pid)),
+        (pid, Some(agent)) => Some(format!("{agent}, {}", crate::procs::said(pid))),
+    }
+}
+
+/// The process that sent the command being answered on this thread, as its carrier's credentials
+/// say (a Unix socket's); 0 where the carrier cannot say (the loopback carrier), or for no command.
+pub fn asker_pid() -> u32 {
+    ASKER.with(|a| a.borrow().0)
+}
+
 /// The `cmd` service served by `dispatch`.
 pub fn service(dispatch: fn(&Req, &mut Out), end_fields: EndFields) -> Factory {
     Arc::new(move |conn, open| {
@@ -377,23 +386,25 @@ fn serve(ch: crate::conn::Channel, dispatch: fn(&Req, &mut Out), end_fields: End
             let t = std::time::Instant::now();
             let conn = ch.conn().clone();
             let gone: Gone = Arc::new(move || conn.is_closed());
-            let mut out = Out { w: &mut w, bytes: 0, limit: if req.get("full") == Some("1") { usize::MAX } else { LIMIT }, truncated: false, ok: true, gone: Some(gone) };
+            let mut out = Out { w: &mut w, ok: true, gone: Some(gone) };
             let cmd = req.cmd.clone();
+            ASKER.with(|a| *a.borrow_mut() = (ch.conn().peer().pid, ch.conn().peer().name.clone()));
             // a panic in a command (a bug in the host) answers as an error, the session goes on
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&req, &mut out)));
+            ASKER.with(|a| *a.borrow_mut() = (0, String::new()));
             if r.is_err() {
                 out.err("internal error in this command (inspect bug)");
             }
-            let trunc = out.truncated;
             let mut extra = String::new();
             if let Some(fields) = *end_fields.lock().unwrap_or_else(|e| e.into_inner()) {
                 fields(&mut extra);
             }
-            out.always(&format!("{{\"end\":{},\"ms\":{}{}{}}}", json_str(&cmd), t.elapsed().as_millis(), if trunc { ",\"truncated\":true" } else { "" }, extra));
+            out.line(&format!("{{\"end\":{},\"ms\":{}{}}}", json_str(&cmd), t.elapsed().as_millis(), extra));
             if !out.flush() {
                 ch.close(CLOSE_NORMAL, "");
                 return;
             }
+            crate::served::tick(true);
         }
     }
 }

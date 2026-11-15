@@ -127,7 +127,7 @@ fn add_disc(opt: &mut Optimizer) {
         opt.params.insert(n, (**t).clone());
         opt.m.push(vec![0.0; t.len()]);
         opt.v.push(vec![0.0; t.len()]);
-        opt.ema.push(t.data.clone());
+        opt.ema.push(t.data.to_vec());
     }
 }
 
@@ -529,6 +529,10 @@ fn sample_render(dir: &Path, step: usize, ac_p: Option<&Params>, voc_p: Option<&
 }
 
 fn main() {
+    makepad_ai_metal::run_model_worker("sing_train", model_main)
+}
+
+fn model_main() {
     let a = Args(std::env::args().collect());
     let mode = a.0.get(1).cloned().unwrap_or_default();
     if mode == "check" {
@@ -731,7 +735,7 @@ fn main() {
                     opt.params.insert(n, (**t).clone());
                     opt.m.push(vec![0.0; t.len()]);
                     opt.v.push(vec![0.0; t.len()]);
-                    opt.ema.push(t.data.clone());
+                    opt.ema.push(t.data.to_vec());
                 }
             }
             opt.cfg.b1 = 0.8;

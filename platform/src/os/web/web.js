@@ -1036,6 +1036,8 @@ export class WasmWebBrowser extends WasmBridge {
         this.timers = [];
         // @section clipboard
         this.text_copy_response = "";
+        this.text_copy_html = "";
+        this.text_copy_markdown = "";
         // @end clipboard
         // @section websocket
         this.web_sockets = [];
@@ -1066,6 +1068,9 @@ export class WasmWebBrowser extends WasmBridge {
         this.thread_stack_arena = [];
         this.thread_stack_size = 2 * 1024 * 1024;
         this.ui_wake_queued = false;
+        this.frame_at = NaN;
+        this.frame_timer = 0;
+        this.frame_timer_at = NaN;
         this.buffer_upload_serial = 0;
         this.loader_removed = false;
         this.loader_seen_animation_frame = false;
@@ -1585,6 +1590,8 @@ export class WasmWebBrowser extends WasmBridge {
         if (this.webgl_context_lost || this.xr !== undefined || this.req_anim_frame_id) {
             return;
         }
+        // A frame asked for during an animation frame comes a display frame after it.
+        const in_a_row = this.in_animation_frame;
         this.req_anim_frame_id = window.requestAnimationFrame(time => {
             this.req_anim_frame_id = 0;
             if (this.wasm == null || this.webgl_context_lost) {
@@ -1617,7 +1624,7 @@ export class WasmWebBrowser extends WasmBridge {
             }
             this.gpu_timer_poll();
             const gpu_query = this.gpu_timer_begin();
-            this.to_wasm.ToWasmAnimationFrame({ time: time / 1000.0 });
+            this.to_wasm.ToWasmAnimationFrame({ time: time / 1000.0, in_a_row });
             this.in_animation_frame = true;
             this.do_wasm_pump();
             this.in_animation_frame = false;
@@ -1631,6 +1638,17 @@ export class WasmWebBrowser extends WasmBridge {
                 this.FromWasmRequestAnimationFrame();
             }
         })
+    }
+
+    FromWasmRequestAnimationFrameAt(args) {
+        this.frame_at = args.at;
+    }
+
+    clear_frame_timer() {
+        if (this.frame_timer) {
+            window.clearTimeout(this.frame_timer);
+            this.frame_timer = 0;
+        }
     }
 
     // GPU watchdog (see makepad_create_gpu_watchdog): polls the frames in
@@ -1836,6 +1854,46 @@ export class WasmWebBrowser extends WasmBridge {
     // @section clipboard
     FromWasmTextCopyResponse(args) {
         this.text_copy_response = args.response
+        this.text_copy_html = args.html
+        this.text_copy_markdown = args.markdown
+    }
+
+    // A copy or cut with richer flavours writes them all into the event's clipboard
+    // (text/markdown stays on this browser's clipboard for a paste into a page);
+    // a plain copy leaves the textarea's selected text to the browser.
+    write_copy_flavours(e) {
+        if (!this.text_copy_html && !this.text_copy_markdown) {
+            return;
+        }
+        e.clipboardData.setData('text/plain', this.text_copy_response);
+        if (this.text_copy_html) {
+            e.clipboardData.setData('text/html', this.text_copy_html);
+        }
+        if (this.text_copy_markdown) {
+            e.clipboardData.setData('text/markdown', this.text_copy_markdown);
+        }
+        e.preventDefault();
+    }
+
+    clear_copy_flavours() {
+        this.text_copy_response = "";
+        this.text_copy_html = "";
+        this.text_copy_markdown = "";
+    }
+
+    async FromWasmCopyToClipboard(args) {
+        try {
+            if (args.html) {
+                await navigator.clipboard.write([new ClipboardItem({
+                    'text/plain': new Blob([args.text], {type: 'text/plain'}),
+                    'text/html': new Blob([args.html], {type: 'text/html'})
+                })]);
+            } else {
+                await navigator.clipboard.writeText(args.text);
+            }
+        } catch (error) {
+            console.warn('Clipboard write failed', error);
+        }
     }
     // @end clipboard
 
@@ -3693,10 +3751,30 @@ export class WasmWebBrowser extends WasmBridge {
             let to_wasm = this.to_wasm;
             this.to_wasm = this.new_to_wasm();
             from_wasm = this.wasm_process_msg(to_wasm);
+            // The reply says when the next `time_fps` frame wants its animation frame, if it does.
+            this.frame_at = NaN;
             from_wasm.dispatch_on_app();
             const dispatched = from_wasm;
             from_wasm = null;
             dispatched.free();
+            const at = this.frame_at;
+            if (!Number.isFinite(at) || this.req_anim_frame_id || this.xr !== undefined || this.webgl_context_lost) {
+                this.clear_frame_timer();
+            } else if (!this.frame_timer || this.frame_timer_at !== at) {
+                this.clear_frame_timer();
+                this.frame_timer_at = at;
+                const wait = () => {
+                    this.frame_timer = 0;
+                    const now = this.js_monotonic_now();
+                    if (now >= at) {
+                        this.FromWasmRequestAnimationFrame();
+                        return;
+                    }
+                    // setTimeout counts whole milliseconds, so we round up and check again.
+                    this.frame_timer = window.setTimeout(wait, Math.min(Math.ceil((at - now) * 1000.0), 2147483647));
+                };
+                wait();
+            }
             this.update_startup_loader(performance.now() - started);
         } catch (error) {
             let context_lost = this.webgl_context_lost;
@@ -4274,8 +4352,10 @@ export class WasmWebBrowser extends WasmBridge {
 
         // @section clipboard
         this.handlers.on_cut = e => {
+            this.write_copy_flavours(e);
             setTimeout(_ => {
                 ta.value = "";
+                this.clear_copy_flavours();
                 last_len = 0;
             }, 0)
         }
@@ -4283,8 +4363,10 @@ export class WasmWebBrowser extends WasmBridge {
         ta.addEventListener('cut', e => this.handlers.on_cut(e));
 
         this.handlers.on_copy = e => {
+            this.write_copy_flavours(e);
             setTimeout(_ => {
                 ta.value = "";
+                this.clear_copy_flavours();
                 last_len = 0;
             }, 0)
         }
@@ -4293,6 +4375,15 @@ export class WasmWebBrowser extends WasmBridge {
 
         this.handlers.on_paste = e => {
             was_paste = true;
+            // the reads this paste asks for get what its clipboard holds
+            const data = e.clipboardData;
+            if (data) {
+                this.to_wasm.ToWasmPasteFlavours({
+                    text: data.getData('text/plain'),
+                    html: data.getData('text/html'),
+                    markdown: data.getData('text/markdown'),
+                });
+            }
         }
 
         ta.addEventListener('paste', e => this.handlers.on_paste(e));
@@ -4403,6 +4494,7 @@ export class WasmWebBrowser extends WasmBridge {
             // @section clipboard
             if ((code === 88 || code == 67) && (e.metaKey || e.ctrlKey)) { // copy or cut
                 // we need to request the clipboard
+                this.clear_copy_flavours();
                 this.to_wasm.ToWasmTextCopy();
                 this.do_wasm_pump();
                 ta.value = this.text_copy_response;

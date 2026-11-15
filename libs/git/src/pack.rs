@@ -66,9 +66,9 @@ impl PackLookup for PackIndex {
 /// Read and parse a v2 pack index file (or share the tables of a reader
 /// that already has).
 pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
-    let path = idx_path.canonicalize()?;
+    let path = idx_path.canonicalize().map_err(|e| GitError::io_at("resolve pack index", idx_path, e))?;
     let idx_path = path.as_path();
-    let meta = fs::metadata(idx_path)?;
+    let meta = fs::metadata(idx_path).map_err(|e| GitError::io_at("stat pack index", idx_path, e))?;
     let key = (meta.len(), meta.modified().ok());
     // Held while parsing, so readers opening together parse once.
     let mut shared = SHARED_TABLES.lock().unwrap_or_else(|e| e.into_inner());
@@ -94,7 +94,7 @@ pub fn read_pack_index(idx_path: &Path) -> Result<PackIndex, GitError> {
 }
 
 fn parse_pack_index(idx_path: &Path) -> Result<IdxTables, GitError> {
-    let data = fs::read(idx_path)?;
+    let data = fs::read(idx_path).map_err(|e| GitError::io_at("read pack index", idx_path, e))?;
 
     // Check v2 magic: ff744f63
     if data.len() < 8 + 1024 + 40 {
@@ -206,7 +206,7 @@ impl PackIndex {
     /// Open the pack handle without reading the pack into memory.
     pub fn ensure_loaded(&self) -> Result<(), GitError> {
         let mut slot = self.header_file.borrow_mut();
-        if slot.is_none() { *slot = Some(fs::File::open(&self.pack_path)?); }
+        if slot.is_none() { *slot = Some(fs::File::open(&self.pack_path).map_err(|e| GitError::io_at("open pack", &self.pack_path, e))?); }
         Ok(())
     }
 
@@ -529,14 +529,21 @@ pub fn find_packs_in_objects_dir(objects_dir: &Path) -> Result<Vec<PackIndex>, G
     let entries = match fs::read_dir(&pack_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(packs),
-        Err(e) => return Err(GitError::Io(e)),
+        Err(e) => return Err(GitError::io_at("list pack directory", &pack_dir, e)),
     };
 
     for entry in entries {
-        let entry = entry?;
+        let entry = entry.map_err(|e| GitError::io_at("list pack directory", &pack_dir, e))?;
         let path = entry.path();
         if path.extension().map(|e| e == "idx").unwrap_or(false) {
-            packs.push(read_pack_index(&path)?);
+            // an index a repack removed after the listing: its objects are in the pack that
+            // replaced it, as git skips such a pack too. Its error failed every read of a
+            // repository listed while another process repacked it (11-13).
+            match read_pack_index(&path) {
+                Ok(pack) => packs.push(pack),
+                Err(GitError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
 
@@ -564,6 +571,30 @@ mod tests {
         let changed = read_pack_index(&path).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&reopened.tables, &changed.tables), "changed size/mtime must invalidate parsed tables");
         assert_eq!(changed.tables.oids.len(), 2);
+        // an index a repack removed between the listing and its open (a dangling link stands in
+        // for it) is skipped, and the others still read
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.path().join("gone"), path.with_file_name("pack-gone.idx")).unwrap();
+            assert_eq!(find_packs(dir.path()).unwrap().len(), 1, "a vanished index is skipped");
+        }
+    }
+
+    #[test]
+    fn an_object_read_that_fails_names_what_it_did_to_which_file() {
+        // a pack directory that does not list (a file where it should be): the packs' error names
+        // the listing and its path, and the read says the object is no loose one either
+        let dir = crate::test_support::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(git_dir.join("objects").join("pack"), "").unwrap();
+        let pack_dir = git_dir.join("objects").join("pack");
+        let e = find_packs(&git_dir).err().unwrap().to_string();
+        assert!(e.starts_with(&format!("IO error: list pack directory {}: ", pack_dir.display())), "{e}");
+        let oid = ObjectId::from_hex("5e4999f3bfe35be914c4bba7b0a362112cd4474c").unwrap();
+        let mut repo = crate::Repository::open_git_dir(git_dir.clone(), dir.path().to_path_buf()).unwrap();
+        let e = repo.read_commit(&oid).err().unwrap().to_string();
+        assert!(e.contains(&format!("list pack directory {}", pack_dir.display())) && e.ends_with(&format!("; and {} is no loose object", oid.to_hex())), "{e}");
     }
 
     #[test]

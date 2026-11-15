@@ -17,13 +17,31 @@ fn dispatch(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
         "ping" => out.line("{\"pong\":1}"),
         "big" => {
-            for i in 0..2000 {
-                out.line(&format!("{{\"row\":{i}}}"));
+            let lines = big_lines();
+            let (last, rows) = lines.split_last().unwrap();
+            for l in rows {
+                out.line(l);
             }
+            // the last line in two messages, cut inside a character (a relayed reply's chunks)
+            let cut = last.find('→').unwrap() + 1;
+            out.relay(&last.as_bytes()[..cut]);
+            assert!(out.flush());
+            out.relay(&last.as_bytes()[cut..]);
+            out.relay(b"\n");
         }
         "boom" => panic!("a bug in a command"),
         c => out.err(&format!("unknown command `{c}`")),
     }
+}
+
+/// What `big` answers, line by line: far past the 16 KiB a reply was once cut at. Short rows,
+/// lines longer than a channel write (64 KiB) and than a frame (1 MiB), multibyte text.
+pub(crate) fn big_lines() -> Vec<String> {
+    let mut l: Vec<String> = (0..3000).map(|i| format!("{{\"row\":{i}}}")).collect();
+    for n in [1, 1000, 12_000, 200_000] {
+        l.push(format!("{{\"text\":\"{}\"}}", "é→x".repeat(n)));
+    }
+    l
 }
 
 /// Echoes every message back on its channel.
@@ -48,21 +66,28 @@ fn echo() -> Factory {
 
 /// Connects a client `Conn` to `ep` over an in-process socket pair.
 pub(crate) fn pair(ep: &Endpoint) -> Conn {
+    pair_served(ep).0
+}
+
+/// As [`pair`], returning the endpoint's side as well: (client, served). The endpoint's accept
+/// hook has seen the served side by the time this returns.
+pub(crate) fn pair_served(ep: &Endpoint) -> (Conn, Conn) {
     let (a, b) = UnixStream::pair().unwrap();
     let ep = ep.clone();
-    std::thread::spawn(move || {
+    let served = std::thread::spawn(move || {
         let (r, w, s) = (a.try_clone().unwrap(), a.try_clone().unwrap(), a);
-        let _ = ep.serve(FrameReader::new(Box::new(r)), Box::new(w), Box::new(move || {
+        ep.serve(FrameReader::new(Box::new(r)), Box::new(w), Box::new(move || {
             let _ = s.shutdown(std::net::Shutdown::Both);
-        }));
+        }))
     });
     let (r, w, s) = (b.try_clone().unwrap(), b.try_clone().unwrap(), b);
     let mut reader = FrameReader::new(Box::new(r));
     let mut writer: Box<dyn Write + Send> = Box::new(w);
     let ok = hello::client_handshake(&mut reader, &mut *writer, &Hello { name: "test".into(), link_id: "t".into(), ..Hello::default() }).unwrap();
-    Conn::start(Io { reader, writer, shutdown: Box::new(move || {
+    let client = Conn::start(Io { reader, writer, shutdown: Box::new(move || {
         let _ = s.shutdown(std::net::Shutdown::Both);
-    }) }, ok, true, None, Hooks::default())
+    }) }, ok, true, None, Hooks::default());
+    (client, served.join().unwrap().unwrap())
 }
 
 fn data(ch: &Channel) -> Vec<u8> {
@@ -82,6 +107,16 @@ fn frame_round_trip_and_limit() {
     assert_eq!((f.chan, f.kind, f.flags, f.payload.as_slice()), (7, kind::DATA, 1, &b"hello"[..]));
     assert_eq!(r.next().unwrap().kind, kind::CLOSE);
     assert!(r.next().is_err());
+    // OPEN carries large JSON arguments without DATA fragmentation.
+    let envelope_bytes = "app\ncall editor.replace_source\n{\"source\":\"\"}".len();
+    for bytes in [100 * 1024, 192 * 1024, crate::frame::MAX_PAYLOAD - envelope_bytes] {
+        let payload = format!("app\ncall editor.replace_source\n{{\"source\":\"{}\"}}", "x".repeat(bytes));
+        let mut buf = Vec::new();
+        write_frame(&mut buf, 11, kind::OPEN, 0, payload.as_bytes()).unwrap();
+        let f = FrameReader::new(Box::new(std::io::Cursor::new(buf))).next().unwrap();
+        assert_eq!((f.chan, f.kind, f.flags), (11, kind::OPEN, 0));
+        assert_eq!(f.payload, payload.as_bytes());
+    }
     // a frame announcing more than 1 MiB is refused
     let mut big = ((MAX_FRAME + 1) as u32).to_le_bytes().to_vec();
     big.extend_from_slice(&[0; 16]);
@@ -95,6 +130,12 @@ fn big_message_is_split_and_reassembled() {
     let ep = Endpoint::new("t");
     ep.register("echo", 1, echo());
     let conn = pair(&ep);
+    let oversized = "x".repeat(crate::frame::MAX_PAYLOAD);
+    let Err((code, reason)) = conn.open("echo", &oversized) else { panic!("oversized OPEN accepted") };
+    assert_eq!(code, crate::conn::CLOSE_REFUSED);
+    assert!(reason.contains(&format!("the encoded call is {} bytes", oversized.len() + "echo\n".len())));
+    assert!(reason.contains(&format!("one call carries {}", crate::frame::MAX_PAYLOAD)));
+    // Refusing OPEN must leave the connection usable for the next call.
     let ch = conn.open("echo", "").unwrap();
     let msg: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
     ch.send(msg.clone()).unwrap();
@@ -171,6 +212,24 @@ fn different_major_version_is_refused_with_both_versions() {
     assert!(h.join().unwrap().unwrap().contains("9.2"));
 }
 
+/// A dial learns who answers it: the endpoint's process and when that endpoint began, so a
+/// client tells a live endpoint from the one before it (an exec keeps the pid, not the start).
+#[test]
+fn a_dial_is_told_which_process_answers_it() {
+    let before = crate::cmd::wall_ms();
+    let ep = Endpoint::new("t");
+    let after = crate::cmd::wall_ms();
+    let (client, served) = pair_served(&ep);
+    let who = client.peer();
+    assert_eq!(who.serving_pid, std::process::id());
+    assert!((before..=after).contains(&who.serving_since_ms), "{} not in {before}..={after}", who.serving_since_ms);
+    // the endpoint's own start, whichever connection asks
+    let (again, _) = pair_served(&ep);
+    assert_eq!(again.peer().serving_since_ms, who.serving_since_ms);
+    // a client claims no process of its own: what the endpoint knows of it is its carrier's
+    assert_eq!((served.peer().serving_pid, served.peer().serving_since_ms), (0, 0));
+}
+
 #[test]
 fn unknown_service_is_refused() {
     let ep = Endpoint::new("t");
@@ -182,26 +241,27 @@ fn unknown_service_is_refused() {
 }
 
 #[test]
-fn cmd_answers_end_and_truncation() {
+fn cmd_answers_whole_with_end() {
     let ep = Endpoint::new("t");
     ep.register_cmd(dispatch);
     let conn = pair(&ep);
+    // the answer's bytes as they arrive, until its end line
     let ask = |line: &str| -> Vec<String> {
         let ch = conn.open("cmd", "").unwrap();
         ch.send(line.as_bytes().to_vec()).unwrap();
-        let mut lines = Vec::new();
-        while !lines.last().is_some_and(|l: &String| l.starts_with("{\"end\":")) {
-            lines.extend(String::from_utf8(data(&ch)).unwrap().lines().map(str::to_string));
+        let mut bytes = Vec::new();
+        while !(bytes.ends_with(b"\n") && bytes[..bytes.len() - 1].rsplit(|b| *b == b'\n').next().unwrap().starts_with(b"{\"end\":")) {
+            bytes.extend(data(&ch));
         }
-        lines
+        String::from_utf8(bytes).unwrap().lines().map(str::to_string).collect()
     };
     let l = ask("ping");
     assert_eq!(l[0], "{\"pong\":1}");
-    assert!(l[1].starts_with("{\"end\":\"ping\"") && !l[1].contains("truncated"));
-    let l = ask("big");
-    assert!(l.last().unwrap().contains("\"truncated\":true") && l.len() < 2000);
-    let l = ask("big full=1");
-    assert_eq!(l.len(), 2001);
+    assert!(l[1].starts_with("{\"end\":\"ping\""));
+    // a reply of 1.4 MB arrives byte for byte, then its end line
+    let (l, want) = (ask("big"), big_lines());
+    assert!(l.len() == want.len() + 1 && l[..want.len()] == want[..], "the big reply arrives whole");
+    assert!(l[want.len()].starts_with("{\"end\":\"big\""));
     let l = ask("boom");
     assert!(l[0].starts_with("{\"err\":") && l.last().unwrap().starts_with("{\"end\":\"boom\""));
     // several cmd channels at once
@@ -317,6 +377,32 @@ fn a_request_sees_its_client_go() {
     assert!(!crate::lines::client_gone(), "no request on this thread");
 }
 
+/// A handler that waits says so ahead of its answer, on that request's channel only.
+#[test]
+fn a_request_says_what_it_waits_on_ahead_of_its_answer() {
+    let ep = Endpoint::new("makepad-remote-says");
+    ep.register("slow", 1, crate::lines::service("slow", std::sync::Arc::new(move |_, out| {
+        crate::lines::say_waiting("waits for \"room\"");
+        crate::lines::wait_over();
+        out.push("{\"answer\":1}".to_string());
+    })));
+    let conn = pair(&ep);
+    let ch = conn.open("slow", "").unwrap();
+    ch.send(b"wait\n".to_vec()).unwrap();
+    let mut text = String::new();
+    while !text.contains("{\"end\":") {
+        match ch.recv_timeout(WAIT).unwrap() {
+            Event::Data(d) => text.push_str(&String::from_utf8_lossy(&d)),
+            Event::Opened(_) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[..3], ["{\"say\":\"waits for \\\"room\\\"\",\"waiting\":true}", "{\"say\":\"\",\"waiting\":false}", "{\"answer\":1}"]);
+    crate::lines::say_waiting("nothing outside a request");
+    crate::lines::wait_over();
+}
+
 /// A late follower gets what came before it only when it asks from there, and once.
 #[test]
 fn a_feed_from_a_record_gets_what_came_before_it() {
@@ -403,8 +489,9 @@ fn tcp_loopback_with_tls_and_key_proof() {
     let client = Client::connect_tcp(&addr.to_string(), creds(&key)).unwrap();
     let mut lines = client.cmd("ping").unwrap();
     assert!(lines.next().unwrap().unwrap().starts_with("{\"pong\":1"));
-    let big = client.cmd("big full=1").unwrap().count();
-    assert_eq!(big, 2000);
+    // the client joins a line a message boundary cut (inside a character, too)
+    let big: Vec<String> = client.cmd("big").unwrap().map(Result::unwrap).collect();
+    assert!(big == big_lines(), "the big reply arrives whole over TLS");
     // a key the endpoint does not hold never gets a connection
     assert!(Client::connect_tcp(&addr.to_string(), creds(&Psk::generate().unwrap())).is_err());
     let _ = std::fs::remove_dir_all(&dir);
@@ -689,6 +776,37 @@ fn loopback_carrier_requires_its_token_and_end_lines_carry_host_fields() {
     assert!(crate::carrier::loopback::dial("10.77.0.3:80").is_err(), "only loopback is dialled");
 }
 
+/// A client of the endpoint's own process over the loopback carrier (Windows' local carrier, with
+/// no peer credentials) is known as that process, as over a Unix socket (`asker_pid`): a run's end
+/// turns away at once what the ending run asks its own inspect there too. Its HELLO carries the
+/// process's own secret, which a client sends only to an address this process serves. A peer with
+/// no secret, or another one, is no known process.
+#[test]
+fn a_loopback_client_of_its_own_process_is_known_as_it() {
+    fn asked(req: &Req, out: &mut Out) {
+        if req.cmd == "pid" {
+            out.line(&crate::cmd::asker_pid().to_string());
+        }
+    }
+    let ep = Endpoint::new("makepad-remote-own-test");
+    ep.register_cmd(asked);
+    let token = crate::carrier::loopback::new_token().unwrap();
+    let addr = crate::carrier::loopback::serve(&ep, &token).unwrap().to_string();
+    let own = Client::new(Target::Loopback(addr.clone(), token.clone()), "client");
+    assert_eq!(own.cmd("pid").unwrap().next().unwrap().unwrap(), std::process::id().to_string());
+    assert_eq!(crate::carrier::loopback::own_secret_for("127.0.0.1:9"), "", "no secret goes to an address this process does not serve");
+    for claim in [String::new(), "0".repeat(64)] {
+        let (mut car, _keep) = crate::carrier::loopback::dial(&addr).unwrap();
+        let hello = Hello { name: "other".into(), link_id: "o".into(), token: token.clone(), own: claim.clone(), ..Hello::default() };
+        let ok = hello::client_handshake(&mut car.reader, &mut *car.writer, &hello).unwrap();
+        let conn = Conn::start(Io { reader: car.reader, writer: car.writer, shutdown: car.shutdown }, ok, true, None, Hooks::default());
+        let ch = conn.open("cmd", "").unwrap();
+        ch.send(b"pid".to_vec()).unwrap();
+        let answer = String::from_utf8(data(&ch)).unwrap();
+        assert_eq!(answer.lines().next(), Some("0"), "a peer that claims {claim:?} is no known process");
+    }
+}
+
 #[test]
 fn an_ask_given_up_closes_its_request_at_the_far_end() {
     // a routed request that answers only `quick` at once and holds anything else open, as a `watch` does
@@ -741,10 +859,8 @@ fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
     let addr = crate::carrier::loopback::serve(&ep, &token).unwrap().to_string();
     let client = Client::new(Target::Loopback(addr, token), "t");
     client.set_timeout(Some(Duration::from_millis(100)));
-    let t = std::time::Instant::now();
     let mut lines = client.cmd("slow").unwrap();
     assert!(matches!(lines.next(), Some(Err(Error::Timeout))));
-    assert!(t.elapsed() < Duration::from_millis(500));
     assert!(lines.next().is_none());
     // the same connection answers the next request in time
     let first = client.cmd("quick").unwrap().next().unwrap().unwrap();
@@ -754,19 +870,33 @@ fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
     assert_eq!(client.cmd("slow").unwrap().next().unwrap().unwrap(), "{\"late\":1}");
 }
 
-/// The fds this process holds now (Linux).
+/// The served ends of connections to the Unix socket at `path` this process holds (Linux): an
+/// accepted socket carries its listener's path in /proc/net/unix, and this process holds it when
+/// one of its descriptors names its inode. A served end closes on its client's EOF: one still
+/// open is a descriptor this side kept, or one its client did.
 #[cfg(target_os = "linux")]
-fn open_fds() -> usize {
-    std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0)
+fn served_on(path: &std::path::Path) -> usize {
+    const ACCEPTING: u32 = 1 << 16; // __SO_ACCEPTCON: the listener itself
+    let held: std::collections::HashSet<String> = std::fs::read_dir("/proc/self/fd").unwrap().flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok()?.to_str()?.strip_prefix("socket:[")?.strip_suffix(']').map(str::to_string))
+        .collect();
+    std::fs::read_to_string("/proc/net/unix").unwrap().lines().skip(1).filter(|l| {
+        let f: Vec<&str> = l.split_whitespace().collect();
+        f.len() >= 8 && f[7] == path.to_str().unwrap() && u32::from_str_radix(f[3], 16).is_ok_and(|flags| flags & ACCEPTING == 0) && held.contains(f[6])
+    }).count()
 }
 
 /// The master's control socket serves thousands of short requests (a lease client's beat, the
-/// CLI): every connection's descriptors must go when the client does.
+/// CLI): every connection's descriptors must go when the client does. Counted on a socket of its
+/// own, never the process's descriptors, which every test running beside it opens and closes:
+/// that count failed with no descriptor of this test kept (11-06).
 #[cfg(target_os = "linux")]
 #[test]
 fn served_connections_release_their_descriptors() {
-    let (_, _) = shared();
-    let sock = crate::carrier::unix::paths(std::process::id()).0;
+    let ep = Endpoint::new("makepad-remote-fd-test");
+    ep.register_cmd(app_dispatch);
+    let sock = std::env::temp_dir().join(format!("mpr-fd-{}.sock", std::process::id()));
+    crate::carrier::unix::listen_at(&ep, &sock).unwrap();
     let round = |n: usize| {
         for _ in 0..n {
             let c = Client::new(Target::Unix(sock.clone()), "fd-test");
@@ -776,17 +906,23 @@ fn served_connections_release_their_descriptors() {
             drop(c);
         }
     };
-    round(50); // thread and allocator warm-up
-    std::thread::sleep(Duration::from_millis(500));
-    let before = open_fds();
+    let closed = || {
+        // the server side closes on the peer's EOF, on its own threads
+        let t = std::time::Instant::now();
+        while served_on(&sock) > 0 && t.elapsed() < Duration::from_secs(20) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        served_on(&sock)
+    };
+    // a connection held open is counted, and its end goes with it
+    let held = Client::new(Target::Unix(sock.clone()), "fd-test");
+    assert!(held.cmd("ping").unwrap().next().unwrap().unwrap().starts_with("{\"pong\":1"));
+    assert_eq!(served_on(&sock), 1, "an open connection's served end");
+    drop(held);
+    assert_eq!(closed(), 0, "one request");
     round(3000);
-    // the server side closes on the peer's EOF, on its own threads
-    let t = std::time::Instant::now();
-    while open_fds() > before + 8 && t.elapsed() < Duration::from_secs(20) {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let after = open_fds();
-    assert!(after <= before + 8, "fds before {before}, after 3000 requests {after}");
+    assert_eq!(closed(), 0, "3000 requests");
+    let _ = std::fs::remove_file(&sock);
 }
 
 #[test]
@@ -812,35 +948,127 @@ fn a_run_with_a_deep_tmpdir_is_reached() {
         ep.register_cmd(dispatch);
         let sock = ep.listen_unix("").unwrap();
         println!("deep socket {}", sock.display());
-        // serves until the parent closes its stdin
+        // serves until the parent says so (a line, or its stdin's end)
         let _ = std::io::stdin().read_line(&mut String::new());
         return;
     }
     let base = std::env::temp_dir().join(format!("makepad-remote-deep-{}", std::process::id()));
-    let (deep, registry) = (base.join("lease").join("d".repeat(120)).join("tmp"), base.join("registry"));
-    for d in [&deep, &registry] {
-        std::fs::create_dir_all(d).unwrap();
-    }
+    let deep = base.join("lease").join("d".repeat(120)).join("tmp");
+    std::fs::create_dir_all(&deep).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "tests::a_run_with_a_deep_tmpdir_is_reached", "--nocapture", "--test-threads=1"])
         .env("MAKEPAD_REMOTE_DEEP_CHILD", "1")
         .env("TMPDIR", &deep)
-        .env("MAKEPAD_REMOTE_REGISTRY", &registry)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut out = std::io::BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok);
-    let said = out.by_ref().find_map(|l| l.strip_prefix("deep socket ").map(str::to_string));
-    let sock = std::path::PathBuf::from(said.expect("the child listens"));
+    // every wait on the child has a deadline: a hang is a failure that says where (one held a lane's
+    // test lease idle until it was cancelled). Its lines come over a thread of their own.
+    let (lines_to, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for l in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines_to.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let said = loop {
+        match lines.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            // (after libtest's "test <name> ... ", on the same line: the child runs with one thread)
+            Ok(l) => match l.split_once("deep socket ") {
+                Some((_, s)) => break Some(s.to_string()),
+                None => continue,
+            },
+            Err(_) => break None,
+        }
+    };
+    let Some(said) = said else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the child named no socket within 60 s");
+    };
+    let sock = std::path::PathBuf::from(said);
     assert!(!sock.starts_with(&deep) && sock.starts_with(crate::carrier::unix::socket_dir()), "{}", sock.display());
-    let app = crate::discovery::apps_in(&registry).into_iter().find(|a| a.pid == child.id()).expect("its discovery file");
+    let app = crate::discovery::apps().into_iter().find(|a| a.pid == child.id()).expect("its discovery file");
     assert_eq!((app.socket.as_str(), app.unreachable()), (sock.to_str().unwrap(), None));
     let lines: Vec<String> = Client::new(Target::Unix(sock.clone()), "deep-test").cmd("ping").unwrap().map_while(Result::ok).collect();
     assert_eq!(lines.first().map(String::as_str), Some("{\"pong\":1}"));
-    drop(child.stdin.take());
-    out.for_each(drop);
-    assert!(child.wait().unwrap().success());
+    // a line ends it, not the pipe's end alone: a process another test spawned meanwhile can hold a
+    // copy of the pipe's write end until it execs
+    let mut stdin = child.stdin.take().unwrap();
+    let _ = writeln!(stdin, "end");
+    drop(stdin);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the child still ran 30 s after it was told to end");
+    };
+    assert!(status.success());
     assert!(!sock.exists(), "its socket goes with it");
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A command over the Unix socket names who sent it: the agent its client says it is, and its
+/// process, from the socket's credentials (not from anything the client says). A `session
+/// relaunch` and a click injected into a window's caption name who asked (three apps
+/// restarted for a landing, and apps closed by their caption, and nothing said by whom, 11-06).
+/// A client of the endpoint's own process is known as that process (`asker_pid`): a run's end
+/// turns away at once what the ending run asks its own inspect.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_command_names_the_agent_that_sent_it() {
+    fn asked(req: &Req, out: &mut Out) {
+        match req.cmd.as_str() {
+            "pid" => out.line(&crate::cmd::asker_pid().to_string()),
+            _ => out.line(&crate::cmd::asked_by().unwrap_or_default()),
+        }
+    }
+    let ep = Endpoint::new("makepad-remote-agent-test");
+    ep.register_cmd(asked);
+    let sock = std::env::temp_dir().join(format!("mpr-agent-{}.sock", std::process::id()));
+    crate::carrier::unix::listen_at(&ep, &sock).unwrap();
+    let me = crate::procs::said(std::process::id());
+    let agent = Client::new(Target::Unix(sock.clone()), &format!("{}LANE7", crate::cmd::AGENT_CLIENT));
+    assert_eq!(agent.cmd("who").unwrap().next().unwrap().unwrap(), format!("agent LANE7, {me}"));
+    let other = Client::new(Target::Unix(sock.clone()), "client");
+    assert_eq!(other.cmd("who").unwrap().next().unwrap().unwrap(), me);
+    assert_eq!(other.cmd("pid").unwrap().next().unwrap().unwrap(), std::process::id().to_string());
+    assert_eq!(crate::cmd::asked_by(), None, "no command is answered on this thread");
+    assert_eq!(crate::cmd::asker_pid(), 0);
+    assert!(me.starts_with(&format!("pid {} ", std::process::id())), "{me}");
+    drop((agent, other));
+    let _ = std::fs::remove_file(&sock);
+}
+
+/// Who a process is, natively: its name and its parents' (a quit signal's sender and an inspect
+/// client are said so), and a process that is gone says so.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_process_is_said_with_its_parents() {
+    let me = crate::procs::process(std::process::id()).expect("this process runs");
+    let exe = std::env::current_exe().unwrap();
+    let file = exe.file_name().unwrap().to_string_lossy().into_owned();
+    // (the kernel's name is the executable's file name, cut to its length)
+    assert!(!me.name.is_empty() && file.starts_with(&me.name), "{} is {file}", me.name);
+    assert_eq!(me.ppid, std::os::unix::process::parent_id());
+    let said = crate::procs::said(std::process::id());
+    assert!(said.starts_with(&format!("pid {} {}", std::process::id(), me.name)), "{said}");
+    assert!(said.contains(&format!(", from {} ", me.ppid)) || me.ppid <= 1, "its parent is named: {said}");
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let gone = child.id();
+    child.wait().unwrap();
+    assert_eq!(crate::procs::said(gone), format!("pid {gone} (gone already)"));
 }

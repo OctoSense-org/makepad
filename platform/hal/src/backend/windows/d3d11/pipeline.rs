@@ -91,6 +91,10 @@ impl PipeState {
     pub fn failure(&self) -> Option<&str> {
         self.program.get().and_then(|r| r.as_ref().err()).map(|s| s.as_str())
     }
+    /// It failed for want of memory (an `E_OUTOFMEMORY` in its error), so it may build once there's room.
+    pub fn out_of_memory(&self) -> bool {
+        self.failure().is_some_and(|e| e.contains(&E_OUTOFMEMORY.to_string()))
+    }
 }
 
 /// D3D11's input-layout semantic suffix of geometry input `index`: `A`..`Z`, then `AA`, `AB`..
@@ -227,7 +231,7 @@ fn publish(path: &std::path::Path, bytes: &[u8]) {
 /// seconds; the gain at run time is small (the old backend's measured choice).
 /// `precise`: a precise-math pipeline (`pipeline_flags::PRECISE`) also compiles with IEEE
 /// strictness (its source marks its float locals `precise`, so no op fuses into a mad).
-pub(super) fn compile_stage(target: &str, entry: &str, hlsl: &str, precise: bool) -> Result<Vec<u8>, String> {
+fn compile_stage(target: &str, entry: &str, hlsl: &str, precise: bool) -> Result<Vec<u8>, String> {
     let target = format!("{target}\0");
     let entry = format!("{entry}\0");
     unsafe {
@@ -286,14 +290,44 @@ fn numbered(src: &str) -> String {
 /// E_OUTOFMEMORY
 const E_OUTOFMEMORY: makepad_windows_sys::core::HRESULT = makepad_windows_sys::core::HRESULT(0x8007000Eu32 as i32);
 
+/// `MAKEPAD_HLSL_DUMP=<dir>`: every pipeline's source, by a hash of it (compile diagnosis).
+fn dump(hlsl: &str) {
+    if let Some(dir) = std::env::var_os("MAKEPAD_HLSL_DUMP") {
+        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{:016x}.hlsl", fnv(FNV_OFFSET, hlsl.as_bytes()))), hlsl);
+    }
+}
+
+/// Compiles and creates a compute kernel's shader (any thread: no immediate-context work), its
+/// bytecode cached as a draw pipeline's stages are.
+pub fn build_compute(dev: &Device, hlsl: &str, precise: bool, name: &str) -> Result<ID3D11ComputeShader, String> {
+    dump(hlsl);
+    let create = |bytes: &[u8]| unsafe {
+        let mut cs = None;
+        dev.device.CreateComputeShader(bytes, None, Some(&mut cs)).map(|_| cs)
+    };
+    let bytes = stage_bytes("cs_5_0", "kernel_main", hlsl, precise).map_err(|e| format!("compute kernel `{name}`:\n{e}"))?;
+    let cs = match create(&bytes) {
+        Ok(cs) => cs,
+        // a removed device or exhausted memory is not the bytecode's fault
+        Err(e) if dev.check_lost() || e == E_OUTOFMEMORY => return Err(hr("CreateComputeShader", e)),
+        Err(e) => {
+            // a live device rejected the bytecode itself (a stale or foreign cache entry)
+            eprintln!("[hal-d3d11] the device rejected cached bytecode of `{name}` ({e}); recompiling");
+            if let Some(path) = cache_path("cs_5_0", "kernel_main", hlsl, precise) {
+                let _ = std::fs::remove_file(path);
+            }
+            let bytes = compile_stage("cs_5_0", "kernel_main", hlsl, precise).map_err(|e| format!("compute kernel `{name}`:\n{e}"))?;
+            create(&bytes).map_err(|e| hr("CreateComputeShader of freshly compiled bytecode", e))?
+        }
+    };
+    cs.ok_or_else(|| format!("compute kernel `{name}`: CreateComputeShader returned nothing"))
+}
+
 /// Compiles and creates a pipeline (any thread: no immediate-context work).
 pub fn build(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings: Vec<u32>, vertex_layout: Vec<u32>, storage: Vec<StorageBinding>, name: &str) -> Result<Arc<Program>, String> {
     let hlsl = &code.source;
     let precise = desc.flags & pipeline_flags::PRECISE != 0;
-    // `MAKEPAD_HLSL_DUMP=<dir>`: every pipeline's source, by a hash of it (compile diagnosis)
-    if let Some(dir) = std::env::var_os("MAKEPAD_HLSL_DUMP") {
-        let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{:016x}.hlsl", fnv(FNV_OFFSET, hlsl.as_bytes()))), hlsl);
-    }
+    dump(hlsl);
     let mut vs_bytes = stage_bytes("vs_5_0", "vertex_main", hlsl, precise).map_err(|e| format!("vertex shader `{name}`:\n{e}\n{}", numbered(hlsl)))?;
     let mut ps_bytes = stage_bytes("ps_5_0", "pixel_main", hlsl, precise).map_err(|e| format!("pixel shader `{name}`:\n{e}\n{}", numbered(hlsl)))?;
     let create = |vs_bytes: &[u8], ps_bytes: &[u8]| unsafe {
@@ -354,33 +388,7 @@ pub fn build(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings: Ve
     };
     let mut samplers = Vec::new();
     for s in &code.samplers {
-        let address = match s.address {
-            0 => D3D11_TEXTURE_ADDRESS_WRAP,
-            1 => D3D11_TEXTURE_ADDRESS_CLAMP,
-            2 => D3D11_TEXTURE_ADDRESS_BORDER,
-            _ => D3D11_TEXTURE_ADDRESS_MIRROR,
-        };
-        let filter = match (s.filter, s.compare) {
-            (0, false) => D3D11_FILTER_MIN_MAG_MIP_POINT,
-            (_, false) => D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-            (0, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
-            (_, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR,
-        };
-        let d = D3D11_SAMPLER_DESC {
-            Filter: filter,
-            AddressU: address,
-            AddressV: address,
-            AddressW: address,
-            MipLODBias: 0.0,
-            MaxAnisotropy: 1,
-            ComparisonFunc: if s.compare { D3D11_COMPARISON_LESS_EQUAL } else { D3D11_COMPARISON_NEVER },
-            BorderColor: [0.0; 4],
-            MinLOD: 0.0,
-            MaxLOD: f32::MAX,
-        };
-        let mut out = None;
-        unsafe { dev.device.CreateSamplerState(&d, Some(&mut out)) }.map_err(|e| hr("CreateSamplerState", e))?;
-        samplers.push(out);
+        samplers.push(sampler_state(dev, s)?);
     }
     if code.textures.len() + desc.instance_stride.min(1) as usize > D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize {
         return Err(format!("`{name}` binds {} textures; D3D11 has {} shader-resource slots", code.textures.len(), D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT));
@@ -399,6 +407,40 @@ pub fn build(dev: &Device, code: &HlslPipeline, desc: PipelineDesc, bindings: Ve
         stride,
         desc,
     }))
+}
+
+/// The sampler state a draw's or a kernel's sampler `s` describes.
+pub(super) fn sampler_state(dev: &Device, s: &crate::spirv::SpirvSampler) -> Result<Option<ID3D11SamplerState>, String> {
+    let address = match s.address {
+        0 => D3D11_TEXTURE_ADDRESS_WRAP,
+        1 => D3D11_TEXTURE_ADDRESS_CLAMP,
+        2 => D3D11_TEXTURE_ADDRESS_BORDER,
+        _ => D3D11_TEXTURE_ADDRESS_MIRROR,
+    };
+    // `s.anisotropy` is not applied here yet: D3D11_FILTER_ANISOTROPIC is not among the generated
+    // bindings (libs/windows/sys, tools/winbind/apis.txt), so an anisotropic request filters
+    // trilinearly on D3D11, as on a device without anisotropy.
+    let filter = match (s.filter, s.compare) {
+        (0, false) => D3D11_FILTER_MIN_MAG_MIP_POINT,
+        (_, false) => D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+        (0, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT,
+        (_, true) => D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR,
+    };
+    let d = D3D11_SAMPLER_DESC {
+        Filter: filter,
+        AddressU: address,
+        AddressV: address,
+        AddressW: address,
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: if s.compare { D3D11_COMPARISON_LESS_EQUAL } else { D3D11_COMPARISON_NEVER },
+        BorderColor: [0.0; 4],
+        MinLOD: 0.0,
+        MaxLOD: f32::MAX,
+    };
+    let mut out = None;
+    unsafe { dev.device.CreateSamplerState(&d, Some(&mut out)) }.map_err(|e| hr("CreateSamplerState", e))?;
+    Ok(out)
 }
 
 #[cfg(test)]

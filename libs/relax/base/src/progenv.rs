@@ -1,0 +1,1241 @@
+//! The program's environment under the JIT: the reserved `RELAX_*` names exist twice in a
+//! JIT process, once for the host and once for the program it runs.
+//!
+//! A JIT process is a host and a program with one process environment. The programs where that
+//! matters are Relax itself (relax-compiler and relax-base tests): the same source reads the same
+//! names as host (rustc-built) and as program (JIT-run). Under rustc the variables a program sets,
+//! or gives a child, are that program's alone; under the JIT the host read them too (a child's
+//! `RELAX_BOOT_TRACE` printed the child host's boot trace into the program's stderr, a child's
+//! `RELAX_CACHE_DIR` moved the child host's cache into the program's scratch folder).
+//!
+//! Who reads what:
+//! - A launch value (whoever started this process set it) is read by host and program, as under
+//!   rustc both the launched binary and its code see it.
+//! - A host setting (the host's `set_var`) is the host's; a program reads it by fall-through.
+//! - A program value (JIT-run code's set_var / remove_var / setenv, and a Command's env edits) is
+//!   the program's alone: it lives in the program's overlay, never in this process's environment,
+//!   and crosses a spawn as the child program's value.
+//! - A package's run-env (`set_run_env`) is a program value of any name: the overlay holds it, so
+//!   the host, its options and the tools it runs (cargo, the C compiler, build scripts) never read
+//!   it, and a self-exec child's host does not either. A provided crate's rustc code reads the
+//!   program's environment through relax-api's `env` (`program_var_os`), for a setting that only
+//!   tunes or reports the program's own run; its `std::env` stays the host's (KNOWN_GAPS 7).
+//! - A reserved name of cargo's run-time environment of the target (a build script's `rustc-env`,
+//!   `set_program_value`) is a program value too. Cargo's `[env]` sets no reserved name
+//!   (resolve.rs `cargo_env`): a repository does not set what a Relax host reads.
+//!
+//! The policy is the pure function `child_env`: what each child gets. A self-exec child (this
+//! program again, `makepad run ... --`) gets every reserved name from this process's environment
+//! (the host's) and the program's differing values in `RELAX_PROGRAM_ENV` (`encode`), which
+//! the child host takes out of its environment into the child program's overlay at its start. Any
+//! other child gets the program's view as plain variables, without the run facts (`RUN_FACTS`: what
+//! the host says of this run) the program did not write; of those only the mount crosses, into a
+//! child in this process's folder or in the mount. A shared workspace's run (vfs.rs SHARE) has a
+//! real folder, its checkout: a child in this process's folder runs there with no mount, as it does
+//! under cargo, and only a child started in a folder of the mount gets it, with the share's name.
+//!
+//! A run of a package binary the run prepared (its test's CARGO_BIN_EXE_<name>, std's spawn asks
+//! `prepared_bin`) or of this program again is built by the run that prepared it, as cargo builds
+//! the binary once in the test's build: that child's host builds with this run's build environment
+//! (`BUILD`, handed over in `BUILD_ENV` whatever environment the program gave the child), and its
+//! program gets the environment it was given, in the process environment from its start on
+//! (`program_start`), so a C library's own `getenv` and a shell it starts read that one too (relax
+//! issue 168).
+//!
+//! JIT-run code reaches the overlay through the loader's symbols (relax-compiler jit.rs
+//! `loader_symbol`): its `getenv` / `setenv` / `unsetenv` / `putenv` are `program_getenv` and the
+//! rest, so Relax std's `var_os` / `set_var` / `remove_var` and the raw reads of an allocator alike
+//! see the program's values; std's `vars_os` and a spawn's environment take `env_snapshot`, and
+//! std's own plumbing (the self-exec command line, the virtual folder) reads the host's values
+//! through `host_getenv`. Known limit: code that walks the `environ` array itself, or a C library
+//! in the process calling its own `getenv`, sees the host's values of reserved names.
+//! Windows' `Get/SetEnvironmentVariableW/A` and wide environment blocks use the same overlay;
+//! names compare without case, and std's plumbing reads `host_get_environment_variable_w`.
+
+/// The reserved namespace: names read by Relax as host and as program.
+pub const PREFIX: &[u8] = b"RELAX_";
+/// A self-exec child's program values (`encode`), for the child host to take into its overlay.
+pub const PROGRAM_ENV: &[u8] = b"RELAX_PROGRAM_ENV";
+/// The mount of a virtual folder, one unit: the folder, the mount table and the edits folder over
+/// it (vfs.rs).
+pub const WORKSPACE: &[u8] = b"RELAX_WORKSPACE";
+pub const VFS: &[u8] = b"RELAX_VFS";
+pub const EDITS: &[u8] = b"RELAX_EDITS";
+pub const MOUNT: [&[u8]; 3] = [WORKSPACE, VFS, EDITS];
+/// A shared workspace's name (vfs.rs SHARE): what makes the mount a checkout's. It says how this
+/// run reads its own folder, so it is a run fact: a runner the program starts somewhere else never
+/// finds it and mounts its own folder under this run's name.
+pub const SHARE: &[u8] = b"RELAX_SHARE";
+/// A bare `relax`'s `--allow-c` from its environment (the person's grant for this invocation; a
+/// `makepad run` host takes it as a word alone and drops this name at its start, relax-compiler
+/// lib.rs `drop_ambient_grants`): this run builds and links C, and the self-exec child, this run
+/// again, does too; a relax the program starts (`$RELAX_LOADER run` of another package) does not
+/// inherit it.
+pub const ALLOW_C: &[u8] = b"RELAX_ALLOW_C";
+/// The native build the program was built with when the run took it from the run that prepared
+/// it (a test's package binary: its test's): a run of this program again takes it too.
+pub const RUN_NATIVE: &[u8] = b"RELAX_RUN_NATIVE";
+/// Run facts: what the host says of this run, for this run again (a self-exec child) and nothing
+/// else; the mount also for a child in this process's folder or in the mount. The self-exec
+/// command line (Relax std's spawn of this program; its first word is the program's own
+/// executable, relax-compiler selfexe.rs), whether the run added its `--silent`, a bare relax's
+/// `RELAX_ALLOW_C` and the native build it took.
+pub const RUN_FACTS: [&[u8]; 8] = [b"RELAX_SELF_EXEC", b"RELAX_SELF_EXEC_SILENT_ADDED", WORKSPACE, VFS, EDITS, SHARE, ALLOW_C, RUN_NATIVE];
+/// The build environment a run hands the runs of the programs it prepared (`BUILD`, `encode`d):
+/// their hosts build as it does. Never the program's: the child host takes it out at its start.
+pub const BUILD_ENV: &[u8] = b"RELAX_BUILD_ENV";
+/// A confined build script's run (relax-front unitgraph.rs `run_one`, Policy::Sandboxed): the names
+/// its program is given, in the wire form (`encode`, names without values). The run's host takes
+/// it out at its start (`init`), and from then on the program reads those names and the reserved
+/// ones alone: every other name of this process's environment is removed from the program's view
+/// (its overlay), so `var_os`, `vars_os` and the environment of a child it starts go without them.
+/// The host keeps its environment. Not a boundary: code that walks the `environ` array, or a C
+/// library's own `getenv`, still reads this process's environment.
+pub const SCRIPT_ENV: &[u8] = b"RELAX_SCRIPT_ENV";
+/// What one process hands the next and no build reads: never part of a build environment.
+/// RELAX_LOADER is each loader's own (the runner's start sets it, from what it was started with
+/// or the loader recorded beside a run's link): a run started with it (`$RELAX_LOADER run` from a
+/// program) wrote it into its build environment, and a relaunch of its program by a shell that
+/// cleared it hid the loader its start found from the program (the build's reserved names it was
+/// not started with), which then had none.
+const HANDOVER: [&[u8]; 7] = [PROGRAM_ENV, BUILD_ENV, SCRIPT_ENV, b"RELAX_ARG0", b"RELAX_BIN_NATIVE_RECEIPT", b"RELAX_NATIVE_RECEIPT", b"RELAX_LOADER"];
+
+pub fn run_fact(name: &[u8]) -> bool {
+    RUN_FACTS.iter().any(|n| same_name(n, name))
+}
+
+/// The host states a run fact (`RUN_FACTS`).
+pub fn set_run_fact(name: &str, value: impl AsRef<std::ffi::OsStr>) {
+    assert!(run_fact(name.as_bytes()), "{name} is no run fact (progenv RUN_FACTS)");
+    std::env::set_var(name, value);
+}
+
+/// A host's own spawn of a child that is not this run (a build script, cargo, a check of a
+/// package): no run fact crosses; the caller sets what the child's folder needs.
+pub fn scrub_run_facts(cmd: &mut std::process::Command) {
+    for n in RUN_FACTS {
+        cmd.env_remove(std::str::from_utf8(n).unwrap());
+    }
+}
+
+/// The program's own variables that Relax only passes on, probes or drops, as its host names
+/// them (relax-runner Host.env). Relax reads only `RELAX_*` names; these are the program's. The
+/// bare runner names none.
+#[derive(Clone, Copy)]
+pub struct HostEnv {
+    /// what a child gets when no person should see or hear it (a replay that is not shown); the
+    /// first, set alone, says a run is not seen (its window hidden)
+    pub unseen: &'static [(&'static str, &'static str)],
+    /// what a child gets beside `RELAX_OFFLINE` (a package check run offline)
+    pub offline: &'static [(&'static str, &'static str)],
+    /// what a process that outlives its starter (the check server) must not carry
+    pub detached_remove: &'static [&'static str],
+    /// the prefixes of the variables a flight recording keeps of how its run started, for a
+    /// replay to start it the same way
+    pub recorded: &'static [&'static str],
+}
+
+static HOST_ENV: std::sync::OnceLock<HostEnv> = std::sync::OnceLock::new();
+
+/// The host's table, once, before anything reads it (relax-runner set_host).
+pub fn set_host_env(env: HostEnv) {
+    let _ = HOST_ENV.set(env);
+}
+
+pub fn host_env() -> HostEnv {
+    HOST_ENV.get().copied().unwrap_or(HostEnv { unseen: &[], offline: &[], detached_remove: &[], recorded: &[] })
+}
+
+/// Nobody sees this run: the host's first `unseen` variable is set.
+pub fn unseen_run() -> bool {
+    host_env().unseen.first().is_some_and(|(k, _)| std::env::var_os(k).is_some())
+}
+
+pub fn reserved(name: &[u8]) -> bool {
+    name.get(..PREFIX.len()).is_some_and(|n| same_name(n, PREFIX))
+}
+
+fn same_name(a: &[u8], b: &[u8]) -> bool {
+    #[cfg(not(windows))]
+    { a == b }
+    #[cfg(windows)]
+    {
+        if a.is_ascii() && b.is_ascii() {
+            return a.eq_ignore_ascii_case(b);
+        }
+        let (a, b) = (wide(a), wide(b));
+        a.len() == b.len() && unsafe { win::compare_string_ordinal(a.as_ptr(), a.len() as i32, b.as_ptr(), b.len() as i32, 1) } == 2
+    }
+}
+
+/// An environment as name / value byte pairs.
+pub type Env = Vec<(Vec<u8>, Vec<u8>)>;
+/// The program's own values of reserved names: Some(value) set, None removed.
+pub type Own = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
+/// Where a child runs.
+#[derive(Clone, Copy, Debug)]
+pub enum ChildDir<'a> {
+    /// in this process's folder (no `current_dir`)
+    Same,
+    /// in a virtual folder (a git run's): it starts in this process's real folder and its host serves
+    /// `workspace` from the mount table `vfs`
+    Virtual { workspace: &'a [u8], vfs: &'a [u8] },
+    /// in a real folder
+    Real,
+}
+
+/// One spawn as the program asks for it.
+#[derive(Clone, Copy, Debug)]
+pub struct Spawn<'a> {
+    /// the Command's env edits in order: Some(value) set, None removed
+    pub edits: &'a [(Vec<u8>, Option<Vec<u8>>)],
+    /// `env_clear`
+    pub clear: bool,
+    /// the child is this program again (its host takes `PROGRAM_ENV`)
+    pub self_exec: bool,
+    pub dir: ChildDir<'a>,
+    /// what Relax std's plumbing gives the child's host (an exec's clock origin), set last
+    pub host: &'a [(Vec<u8>, Vec<u8>)],
+}
+
+fn set(env: &mut Env, name: &[u8], value: Option<&[u8]>) {
+    match (env.iter().position(|(k, _)| same_name(k, name)), value) {
+        (Some(i), Some(v)) => env[i].1 = v.to_vec(),
+        (Some(i), None) => {
+            env.remove(i);
+        }
+        (None, Some(v)) => env.push((name.to_vec(), v.to_vec())),
+        (None, None) => {}
+    }
+}
+
+/// What the program reads: `real` (this process's environment) with its own values applied.
+pub fn program_view(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)]) -> Env {
+    let mut env: Env = real.iter().filter(|(k, _)| !same_name(k, PROGRAM_ENV)).cloned().collect();
+    for (k, v) in own.iter().filter(|(k, _)| !same_name(k, BUILD_ENV)) {
+        set(&mut env, k, v.as_deref());
+    }
+    env
+}
+
+/// The environment a child starts with: `real` is this process's environment, `own` the program's
+/// values. A self-exec child: every name outside the namespace from the program's view, every
+/// reserved name from `real` (the host's), and `PROGRAM_ENV` holding the reserved names where the
+/// program's view differs. Any other child: the program's view without the run facts the program
+/// did not write. The mount follows the child's folder: this process's keeps it, a virtual one
+/// names that folder, a real one names none (a self-exec child keeps the mount table its
+/// `--workspace-dir` reads). A shared workspace's (`SHARE` in `real`) is on disk: this process's
+/// folder is a real one there and keeps no mount, and a virtual one gets the share's name too.
+pub fn child_env(real: &[(Vec<u8>, Vec<u8>)], own: &[(Vec<u8>, Option<Vec<u8>>)], spawn: &Spawn) -> Env {
+    let mut view = if spawn.clear { Env::new() } else { program_view(real, own) };
+    // the build environment a child's host takes is std's plumbing's alone (`spawn_env`)
+    for (k, v) in spawn.edits.iter().filter(|(k, _)| !same_name(k, BUILD_ENV)) {
+        set(&mut view, k, v.as_deref());
+    }
+    let wrote = |k: &[u8]| own.iter().any(|(o, _)| same_name(o, k)) || spawn.edits.iter().any(|(e, _)| same_name(e, k));
+    let host_value = |k: &[u8]| real.iter().find(|(r, _)| same_name(r, k)).map(|(_, v)| v.clone());
+    let mut env = if spawn.self_exec {
+        let host: Env = real.iter().filter(|(k, _)| reserved(k) && !same_name(k, PROGRAM_ENV)).cloned().collect();
+        let mut differ: Own = Vec::new();
+        for (k, v) in &view {
+            if reserved(k) && !host.iter().any(|(h, hv)| same_name(h, k) && hv == v) {
+                differ.push((k.clone(), Some(v.clone())));
+            }
+        }
+        for (h, _) in &host {
+            if !view.iter().any(|(k, _)| same_name(k, h)) {
+                differ.push((h.clone(), None));
+            }
+        }
+        // a name outside the namespace that the program owns (a package's run-env,
+        // `set_run_env`): the child's host keeps this process's value, the child program gets the
+        // program's, unless the Command sets it
+        let owned: Vec<&[u8]> = own.iter().map(|(k, _)| k.as_slice()).filter(|k| !reserved(k) && !spawn.edits.iter().any(|(e, _)| same_name(e, k))).collect();
+        for k in &owned {
+            differ.push((k.to_vec(), view.iter().find(|(v, _)| same_name(v, k)).map(|(_, v)| v.clone())));
+        }
+        let mut env: Env = view.into_iter().filter(|(k, _)| !reserved(k)).collect();
+        for k in &owned {
+            set(&mut env, k, host_value(k).as_deref());
+        }
+        env.extend(host);
+        if !differ.is_empty() {
+            env.push((PROGRAM_ENV.to_vec(), encode(&differ)));
+        }
+        env
+    } else {
+        let mut env = view;
+        env.retain(|(k, _)| !run_fact(k) || wrote(k.as_slice()));
+        if matches!(spawn.dir, ChildDir::Same) && !spawn.clear && host_value(SHARE).is_none() {
+            for n in MOUNT {
+                if let Some(v) = host_value(n).filter(|_| !wrote(n)) {
+                    set(&mut env, n, Some(v.as_slice()));
+                }
+            }
+        }
+        env
+    };
+    match spawn.dir {
+        ChildDir::Same => {}
+        ChildDir::Virtual { workspace, vfs } => {
+            set(&mut env, WORKSPACE, Some(workspace));
+            set(&mut env, VFS, Some(vfs));
+            if !spawn.self_exec {
+                // the edits folder over the mount and, of a shared workspace, its name
+                for n in [EDITS, SHARE] {
+                    if let Some(v) = host_value(n).filter(|_| !wrote(n)) {
+                        set(&mut env, n, Some(v.as_slice()));
+                    }
+                }
+            }
+        }
+        ChildDir::Real if spawn.self_exec => set(&mut env, WORKSPACE, None),
+        ChildDir::Real => {}
+    }
+    for (k, v) in spawn.host {
+        set(&mut env, k, Some(v));
+    }
+    env
+}
+
+/// The wire form of program values: per entry its byte length in decimal, `:`, then `NAME=value`
+/// (set) or `NAME` (removed). Lengths, not a separator: any byte can be in a value
+/// (RELAX_SELF_EXEC itself holds `\x1f`).
+pub fn encode(own: &[(Vec<u8>, Option<Vec<u8>>)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (k, v) in own {
+        let n = k.len() + v.as_ref().map_or(0, |v| v.len() + 1);
+        out.extend_from_slice(n.to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(k);
+        if let Some(v) = v {
+            out.push(b'=');
+            out.extend_from_slice(v);
+        }
+    }
+    out
+}
+
+/// `encode`'s inverse; Err names where the text stops being the wire form.
+pub fn parse(mut s: &[u8]) -> Result<Own, String> {
+    let mut out = Own::new();
+    while !s.is_empty() {
+        let colon = s.iter().position(|&b| b == b':').ok_or_else(|| format!("no length before {:?}", String::from_utf8_lossy(s)))?;
+        let n: usize = std::str::from_utf8(&s[..colon]).ok().and_then(|d| d.parse().ok())
+            .ok_or_else(|| format!("bad length {:?}", String::from_utf8_lossy(&s[..colon])))?;
+        let e = s.get(colon + 1..colon + 1 + n).ok_or_else(|| format!("entry of {n} bytes past the end"))?;
+        // Windows keeps drive-current-directory names such as `=C:`.
+        match e.iter().enumerate().find(|&(i, b)| *b == b'=' && (!cfg!(windows) || i != 0)).map(|(i, _)| i) {
+            Some(eq) => out.push((e[..eq].to_vec(), Some(e[eq + 1..].to_vec()))),
+            None => out.push((e.to_vec(), None)),
+        }
+        s = &s[colon + 1 + n..];
+    }
+    Ok(out)
+}
+
+// ---- the program's overlay: JIT-run code's writes of reserved names
+
+/// One write of the program's, newest first. Never freed: a value pointer `getenv` gave out stays
+/// valid after the program writes the name again (libc's setenv keeps old values too).
+struct Entry {
+    name: Box<[u8]>,
+    value: Option<std::ffi::CString>,
+    next: *const Entry,
+}
+
+static WRITES: std::sync::atomic::AtomicPtr<Entry> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn write(name: &[u8], value: Option<&[u8]>) {
+    use std::sync::atomic::Ordering;
+    // (a C string from the caller: no NUL inside)
+    let value = value.map(|v| std::ffi::CString::new(v).unwrap());
+    let node = Box::into_raw(Box::new(Entry { name: name.into(), value, next: std::ptr::null() }));
+    let mut head = WRITES.load(Ordering::Acquire);
+    loop {
+        unsafe { (*node).next = head };
+        match WRITES.compare_exchange_weak(head, node, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(h) => head = h,
+        }
+    }
+}
+
+/// What the program reads of `name`, as its JIT-run code's `getenv` answers (`program_getenv`): its
+/// own value, else the process environment's. The read rustc-built code makes on the program's
+/// behalf (relax-api `env::var_os`, which the loader points here: a provided crate's bound op).
+pub fn program_var_os(name: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    #[cfg(any(unix, windows))]
+    if let Some(v) = lookup(name.as_encoded_bytes()) {
+        return v.map(|c| {
+            #[cfg(windows)]
+            {
+                use std::os::windows::ffi::OsStringExt;
+                std::ffi::OsString::from_wide(&wide(c.to_bytes()))
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                std::ffi::OsStr::from_bytes(c.to_bytes()).to_os_string()
+            }
+        });
+    }
+    std::env::var_os(name)
+}
+
+/// The program's value of `name`: Some(Some) set, Some(None) removed, None: not one of its own.
+/// No lock or ASCII-name allocation: the JIT-run allocator reads its flags here at its start.
+#[cfg(any(unix, windows))]
+fn lookup(name: &[u8]) -> Option<Option<&'static std::ffi::CStr>> {
+    let mut p = WRITES.load(std::sync::atomic::Ordering::Acquire) as *const Entry;
+    while let Some(w) = unsafe { p.as_ref() } {
+        if same_name(&w.name, name) {
+            return Some(w.value.as_deref());
+        }
+        p = w.next;
+    }
+    None
+}
+
+/// Whether JIT-run code's reads and writes of `name` are the program's own: a reserved name, or
+/// one the program's overlay holds (a package's run-env).
+#[cfg(any(unix, windows))]
+fn program_owns(name: &[u8]) -> bool {
+    reserved(name) || lookup(name).is_some()
+}
+
+/// A package's `[package.metadata.relax.run-env]` (relax-base resolve.rs `run_env`, its names
+/// checked there): values of the program's alone, in its overlay, never of this process's
+/// environment, so the host, its options and the tools it runs never read them. A name the
+/// environment (or the parent program, for a self-exec child) already sets keeps its value.
+/// Returns what it applied.
+pub fn set_run_env(values: &[(String, String)]) -> Vec<(String, String)> {
+    let own = own();
+    let mut applied = Vec::new();
+    for (k, v) in values {
+        if std::env::var_os(k).is_some() || own.iter().any(|(o, _)| same_name(o, k.as_bytes())) {
+            continue;
+        }
+        write(k.as_bytes(), Some(v.as_bytes()));
+        applied.push((k.clone(), v.clone()));
+    }
+    applied
+}
+
+/// A reserved name of cargo's run-time environment of the target (relax-front `set_program_env`:
+/// a path package's build-script `rustc-env`): the program's value, in its overlay, never this
+/// process's environment. The program and its children read it as under cargo; this host's
+/// options and a self-exec child's host never do, so a build script does not switch off the
+/// run's confinement (RELAX_SANDBOX_FUEL, RELAX_SANDBOX_NOCHECK). The overlay keeps it over a
+/// restart in place, as it keeps `set_run_env`'s; the next run writes its own.
+pub fn set_program_value(name: &str, value: &str) {
+    assert!(reserved(name.as_bytes()), "{name} is no reserved name");
+    write(name.as_bytes(), Some(value.as_bytes()));
+}
+
+/// What `set_run_env` gave the program, as the line the run prints when its session starts (the
+/// runner names the package and its manifest).
+static RUN_ENV_NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn set_run_env_note(line: String) {
+    *RUN_ENV_NOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(line);
+}
+
+/// The run-env line, once (the run's start takes it).
+pub fn take_run_env_note() -> Option<String> {
+    RUN_ENV_NOTE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// The program's own values, each name once (its latest write), oldest name first.
+pub fn own() -> Own {
+    let mut out = Own::new();
+    let mut p = WRITES.load(std::sync::atomic::Ordering::Acquire) as *const Entry;
+    while let Some(w) = unsafe { p.as_ref() } {
+        if !out.iter().any(|(k, _)| same_name(k, &w.name)) {
+            out.push((w.name.to_vec(), w.value.as_ref().map(|v| v.as_bytes().to_vec())));
+        }
+        p = w.next;
+    }
+    out.reverse();
+    out
+}
+
+/// This process's environment as it is (the host's settings).
+pub fn real() -> Env {
+    std::env::vars_os().map(|(k, v)| (k.into_encoded_bytes(), v.into_encoded_bytes())).collect()
+}
+
+#[cfg(unix)]
+mod libc {
+    use std::ffi::{c_char, c_int};
+    extern "C" {
+        pub fn getenv(name: *const c_char) -> *mut c_char;
+        pub fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int;
+        pub fn unsetenv(name: *const c_char) -> c_int;
+        pub fn putenv(string: *mut c_char) -> c_int;
+    }
+}
+
+/// `getenv` of JIT-run code.
+#[cfg(unix)]
+pub extern "C" fn program_getenv(name: *const std::ffi::c_char) -> *const std::ffi::c_char {
+    let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    if let Some(v) = lookup(n) {
+        return v.map_or(std::ptr::null(), std::ffi::CStr::as_ptr);
+    }
+    unsafe { libc::getenv(name) }
+}
+
+/// `setenv` of JIT-run code: a reserved name (or one its overlay holds) is the program's own.
+#[cfg(unix)]
+pub extern "C" fn program_setenv(name: *const std::ffi::c_char, value: *const std::ffi::c_char, overwrite: std::ffi::c_int) -> std::ffi::c_int {
+    let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    // a name with `=` is libc's EINVAL: it answers that itself
+    if !program_owns(n) || n.contains(&b'=') {
+        return unsafe { libc::setenv(name, value, overwrite) };
+    }
+    if overwrite == 0 && !program_getenv(name).is_null() {
+        return 0;
+    }
+    write(n, Some(unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes()));
+    0
+}
+
+/// `unsetenv` of JIT-run code.
+#[cfg(unix)]
+pub extern "C" fn program_unsetenv(name: *const std::ffi::c_char) -> std::ffi::c_int {
+    let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    if !program_owns(n) || n.contains(&b'=') {
+        return unsafe { libc::unsetenv(name) };
+    }
+    write(n, None);
+    0
+}
+
+/// `putenv` of JIT-run code (`NAME=value`; glibc's `NAME` alone removes it).
+#[cfg(unix)]
+pub extern "C" fn program_putenv(string: *mut std::ffi::c_char) -> std::ffi::c_int {
+    let s = unsafe { std::ffi::CStr::from_ptr(string) }.to_bytes();
+    let (n, v) = match s.iter().position(|&b| b == b'=') {
+        Some(eq) => (&s[..eq], Some(&s[eq + 1..])),
+        None => (s, None),
+    };
+    if !program_owns(n) || (v.is_none() && !cfg!(target_os = "linux")) {
+        return unsafe { libc::putenv(string) };
+    }
+    write(n, v);
+    0
+}
+
+/// Relax std's plumbing reads (the self-exec command line, the virtual folder): the host's value.
+#[cfg(unix)]
+pub extern "C" fn host_getenv(name: *const std::ffi::c_char) -> *const std::ffi::c_char {
+    unsafe { libc::getenv(name) }
+}
+
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_char;
+    #[link(name = "kernel32")]
+    extern "system" {
+        #[link_name = "GetEnvironmentVariableW"]
+        pub fn get_environment_variable_w(name: *const u16, buf: *mut u16, size: u32) -> u32;
+        #[link_name = "GetEnvironmentVariableA"]
+        pub fn get_environment_variable_a(name: *const c_char, buf: *mut c_char, size: u32) -> u32;
+        #[link_name = "SetEnvironmentVariableW"]
+        pub fn set_environment_variable_w(name: *const u16, value: *const u16) -> i32;
+        #[link_name = "SetEnvironmentVariableA"]
+        pub fn set_environment_variable_a(name: *const c_char, value: *const c_char) -> i32;
+        #[link_name = "FreeEnvironmentStringsW"]
+        pub fn free_environment_strings_w(env: *mut u16) -> i32;
+        #[link_name = "SetLastError"]
+        pub fn set_last_error(error: u32);
+        #[link_name = "CompareStringOrdinal"]
+        pub fn compare_string_ordinal(a: *const u16, a_len: i32, b: *const u16, b_len: i32, ignore_case: i32) -> i32;
+    }
+
+    // Blocks may be freed by a different thread; foreign blocks belong to kernel32.
+    pub static BLOCKS: std::sync::Mutex<Vec<Box<[u16]>>> = std::sync::Mutex::new(Vec::new());
+}
+
+#[cfg(windows)]
+unsafe fn wide_bytes(p: *const u16) -> Vec<u8> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut n = 0;
+    while unsafe { *p.add(n) } != 0 {
+        n += 1;
+    }
+    std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(p, n) }).into_encoded_bytes()
+}
+
+// WTF-8 preserves lone surrogates; the A API can also store individual non-UTF-8 bytes.
+#[cfg(windows)]
+fn wide(mut bytes: &[u8]) -> Vec<u16> {
+    let mut out = Vec::new();
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(s) => {
+                out.extend(s.encode_utf16());
+                break;
+            }
+            Err(e) => {
+                let n = e.valid_up_to();
+                out.extend(std::str::from_utf8(&bytes[..n]).unwrap().encode_utf16());
+                bytes = &bytes[n..];
+                if bytes.len() >= 3 && bytes[0] == 0xed && bytes[1] & 0xe0 == 0xa0 && bytes[2] & 0xc0 == 0x80 {
+                    out.push(((bytes[0] as u16 & 0x0f) << 12) | ((bytes[1] as u16 & 0x3f) << 6) | (bytes[2] as u16 & 0x3f));
+                    bytes = &bytes[3..];
+                } else {
+                    out.push(bytes[0] as u16);
+                    bytes = &bytes[1..];
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(windows)]
+fn copy_value<T: Copy + Default>(value: Option<&[T]>, buf: *mut T, size: u32) -> u32 {
+    let Some(value) = value else {
+        unsafe { win::set_last_error(203) }; // ERROR_ENVVAR_NOT_FOUND
+        return 0;
+    };
+    if size as usize <= value.len() {
+        return (value.len() + 1) as u32;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), buf, value.len());
+        *buf.add(value.len()) = T::default();
+        win::set_last_error(0); // an empty value is a success too
+    }
+    value.len() as u32
+}
+
+/// `GetEnvironmentVariableW` of JIT-run code.
+#[cfg(windows)]
+pub extern "system" fn program_get_environment_variable_w(name: *const u16, buf: *mut u16, size: u32) -> u32 {
+    if !name.is_null() {
+        let n = unsafe { wide_bytes(name) };
+        if let Some(v) = lookup(&n) {
+            let value = v.map(|v| wide(v.to_bytes()));
+            return copy_value(value.as_deref(), buf, size);
+        }
+    }
+    unsafe { win::get_environment_variable_w(name, buf, size) }
+}
+
+/// `GetEnvironmentVariableA` reads the same overlay, as stored bytes.
+#[cfg(windows)]
+pub extern "system" fn program_get_environment_variable_a(name: *const std::ffi::c_char, buf: *mut std::ffi::c_char, size: u32) -> u32 {
+    if !name.is_null() {
+        let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        if let Some(v) = lookup(n) {
+            return copy_value(v.map(std::ffi::CStr::to_bytes), buf as *mut u8, size);
+        }
+    }
+    unsafe { win::get_environment_variable_a(name, buf, size) }
+}
+
+/// `SetEnvironmentVariableW`: a reserved name (or one its overlay holds) is the program's own.
+#[cfg(windows)]
+pub extern "system" fn program_set_environment_variable_w(name: *const u16, value: *const u16) -> i32 {
+    if !name.is_null() {
+        let n = unsafe { wide_bytes(name) };
+        if program_owns(&n) && !n.contains(&b'=') {
+            let v = if value.is_null() { None } else { Some(unsafe { wide_bytes(value) }) };
+            write(&n, v.as_deref());
+            return 1;
+        }
+    }
+    unsafe { win::set_environment_variable_w(name, value) }
+}
+
+/// `SetEnvironmentVariableA`: a null value removes the program's value.
+#[cfg(windows)]
+pub extern "system" fn program_set_environment_variable_a(name: *const std::ffi::c_char, value: *const std::ffi::c_char) -> i32 {
+    if !name.is_null() {
+        let n = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        if program_owns(n) && !n.contains(&b'=') {
+            let v = if value.is_null() { None } else { Some(unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes()) };
+            write(n, v);
+            return 1;
+        }
+    }
+    unsafe { win::set_environment_variable_a(name, value) }
+}
+
+/// `GetEnvironmentStringsW`: the same program view as `env_snapshot`, in a Windows block.
+#[cfg(windows)]
+pub extern "system" fn program_get_environment_strings_w() -> *mut u16 {
+    let mut block = Vec::new();
+    for (k, v) in program_view(&real(), &own()) {
+        block.extend(wide(&k));
+        block.push(b'=' as u16);
+        block.extend(wide(&v));
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    let mut block = block.into_boxed_slice();
+    let p = block.as_mut_ptr();
+    win::BLOCKS.lock().unwrap().push(block);
+    p
+}
+
+#[cfg(windows)]
+pub extern "system" fn program_free_environment_strings_w(env: *mut u16) -> i32 {
+    let block = {
+        let mut blocks = win::BLOCKS.lock().unwrap();
+        blocks.iter().position(|b| b.as_ptr() == env).map(|i| blocks.swap_remove(i))
+    };
+    if let Some(block) = block {
+        drop(block);
+        1
+    } else {
+        unsafe { win::free_environment_strings_w(env) }
+    }
+}
+
+/// Relax std's plumbing reads the real environment, without the program's overlay.
+#[cfg(windows)]
+pub extern "C" fn host_get_environment_variable_w(name: *const u16, buf: *mut u16, size: u32) -> u32 {
+    unsafe { win::get_environment_variable_w(name, buf, size) }
+}
+
+std::thread_local! {
+    /// the last `env_snapshot` of this thread (std copies it right away)
+    static SNAPSHOT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Relax std's `vars_os` and a spawn's environment: the program's view of the environment, every
+/// entry set (`encode`), valid until this thread's next call.
+pub extern "C" fn env_snapshot(out: *mut *const u8, out_len: *mut usize) {
+    let view: Own = program_view(&real(), &own()).into_iter().map(|(k, v)| (k, Some(v))).collect();
+    SNAPSHOT.with(|b| {
+        let mut b = b.borrow_mut();
+        *b = encode(&view);
+        unsafe {
+            *out = b.as_ptr();
+            *out_len = b.len();
+        }
+    });
+}
+
+/// A self-exec child's start, before any thread or environment read: the program values its parent
+/// passed (`PROGRAM_ENV`) become this process's overlay and leave its environment, so the host
+/// reads its own settings and the program its own. Absent: a launch by a person or a tool, with
+/// no program values.
+pub fn init() {
+    init_handed(None)
+}
+
+/// `init` of a run's own executable that a shell or a C library launched (selfexe.rs
+/// `relaunched`): `beside` is the build environment that run handed a launch of its link
+/// (selfexe.rs `relaunch_build`), which a spawn by Relax std hands in `BUILD_ENV` (relax issue
+/// 172). A hand-off in the environment stands
+/// over it, and either goes through `take_build`: neither grants anything. One that does not parse
+/// is not taken, said in one line.
+pub fn init_handed(beside: Option<Vec<u8>>) {
+    if let Some(v) = std::env::var_os(std::str::from_utf8(PROGRAM_ENV).unwrap()) {
+        std::env::remove_var(std::str::from_utf8(PROGRAM_ENV).unwrap());
+        let own = parse(v.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_PROGRAM_ENV from the parent's Relax std: {e}"));
+        for (k, v) in &own {
+            write(k, v.as_deref());
+        }
+    }
+    // a confined build script's run: the program reads the names it was given and the reserved
+    // ones, nothing else of this environment (`SCRIPT_ENV`)
+    if let Some(v) = std::env::var_os(std::str::from_utf8(SCRIPT_ENV).unwrap()) {
+        std::env::remove_var(std::str::from_utf8(SCRIPT_ENV).unwrap());
+        let given = parse(v.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_SCRIPT_ENV from the run of the script's parent: {e}"));
+        for (k, _) in real() {
+            if !reserved(&k) && !given.iter().any(|(g, _)| same_name(g, &k)) {
+                write(&k, None);
+            }
+        }
+        let _ = GIVEN.set(given.into_iter().map(|(k, _)| k).filter(|k| !reserved(k)).collect());
+    }
+    let set = |own: Own| -> Env { own.into_iter().filter_map(|(k, v)| Some((k, v?))).collect() };
+    let build = match std::env::var_os(std::str::from_utf8(BUILD_ENV).unwrap()) {
+        Some(handed) => Some(set(parse(handed.as_encoded_bytes()).unwrap_or_else(|e| panic!("RELAX_BUILD_ENV from the parent's Relax std: {e}")))),
+        // (the names and values become this process's environment: on Windows only what is
+        // UTF-8, as any OsString's bytes are)
+        None => beside.filter(|b| !cfg!(windows) || std::str::from_utf8(b).is_ok()).and_then(|b| match parse(&b) {
+            Ok(own) => Some(set(own)),
+            Err(e) => {
+                eprintln!("relax: the build environment the run of this executable handed is not taken ({e}); it builds with its own");
+                None
+            }
+        }),
+    };
+    let start = real();
+    let Some(build) = build else {
+        let _ = BUILD.set(build_part(&start));
+        return;
+    };
+    let (host, hidden, program) = take_build(&start, &build);
+    let os = |b: &[u8]| unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b) }.to_os_string();
+    for (k, _) in &start {
+        if !host.iter().any(|(h, _)| h == k) {
+            std::env::remove_var(os(k));
+        }
+    }
+    for (k, v) in &host {
+        if !start.iter().any(|(s, sv)| s == k && sv == v) {
+            std::env::set_var(os(k), os(v));
+        }
+    }
+    for k in &hidden {
+        write(k, None);
+    }
+    // (what it hands on: without what `take_build` did not take)
+    let _ = BUILD.set(build_part(&build));
+    let _ = PROGRAM_START.set(program);
+}
+
+/// This run's build environment (`init`): the one it was handed, else its own as it started.
+static BUILD: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
+
+/// A confined build script's run (`SCRIPT_ENV`): the names its parent gave, without the reserved
+/// ones (Relax's own plumbing is never the script's).
+static GIVEN: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// A confined build script's value of `name`: one of the names its parent gave (`SCRIPT_ENV`), as
+/// the program's view has it; None for any other name, and for every name outside such a run (a
+/// confined run that was given none reads none).
+pub fn given_value(name: &[u8]) -> Option<Vec<u8>> {
+    if !GIVEN.get()?.iter().any(|g| same_name(g, name)) {
+        return None;
+    }
+    match lookup(name) {
+        Some(v) => v.map(|v| v.to_bytes().to_vec()),
+        None => std::env::var_os(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(name) }).map(std::ffi::OsString::into_encoded_bytes),
+    }
+}
+
+/// Whether this run was handed a build script's given names (`SCRIPT_ENV`): its parent confined it.
+pub fn script_env_handed() -> bool {
+    GIVEN.get().is_some()
+}
+
+/// A confined build script's whole environment (`given_value` of each given name that is set), in
+/// the wire form (`encode`, every entry set).
+pub fn given_wire() -> Vec<u8> {
+    let own: Own = GIVEN.get().map_or(&[][..], Vec::as_slice).iter().filter_map(|k| Some((k.clone(), Some(given_value(k)?)))).collect();
+    encode(&own)
+}
+
+/// This run's build environment in the wire form (`encode`): what a run of its program again
+/// builds with (`spawn_env`, and selfexe.rs `hand_build` for a launch of its link by a shell).
+pub fn build_wire() -> Vec<u8> {
+    let build: Own = BUILD.get().cloned().unwrap_or_else(|| build_part(&real())).into_iter().map(|(k, v)| (k, Some(v))).collect();
+    encode(&build)
+}
+/// The program's environment as this process was started, when its host builds with a handed one.
+static PROGRAM_START: std::sync::OnceLock<Env> = std::sync::OnceLock::new();
+
+/// `env` without what one process hands the next (`HANDOVER`), without the run facts and without
+/// the grants' names (options.rs GRANTS): a `makepad run` host takes a grant from its words alone,
+/// so the environment a run builds with, its own or one it was handed, carries none to a run it
+/// hands it to.
+fn build_part(env: &[(Vec<u8>, Vec<u8>)]) -> Env {
+    let grant = |k: &[u8]| crate::options::GRANTS.iter().any(|(_, name)| same_name(name.as_bytes(), k));
+    env.iter().filter(|(k, _)| !run_fact(k) && !grant(k) && !HANDOVER.iter().any(|h| same_name(h, k))).cloned().collect()
+}
+
+/// A child run handed a build environment (`BUILD_ENV`): `start` is its environment as started,
+/// `build` the one handed. Returns the host's environment (`build`, with the reserved names
+/// `start` sets: the run's own settings and handovers), the reserved names the program does not
+/// see (the build's alone, hidden in its overlay), and the program's environment outside the
+/// namespace (`start`'s), which it gets at its start (`program_start`).
+///
+/// The hand-off grants nothing: no run fact (`--allow-c`, the native build taken, the self-exec
+/// line, the mount) and no handover crosses in it, whoever wrote it. What is left is what a
+/// variable the program sets on the child could say to a run it starts.
+pub fn take_build(start: &[(Vec<u8>, Vec<u8>)], build: &[(Vec<u8>, Vec<u8>)]) -> (Env, Vec<Vec<u8>>, Env) {
+    let build = build_part(build);
+    let started = |k: &[u8]| start.iter().any(|(s, _)| same_name(s, k));
+    let mut host: Env = build.iter().filter(|(k, _)| !reserved(k) || !started(k)).cloned().collect();
+    host.extend(start.iter().filter(|(k, _)| reserved(k) && !same_name(k, BUILD_ENV)).cloned());
+    let hidden = build.iter().filter(|(k, _)| reserved(k) && !started(k)).map(|(k, _)| k.clone()).collect();
+    let program = start.iter().filter(|(k, _)| !reserved(k)).cloned().collect();
+    (host, hidden, program)
+}
+
+/// The program's environment outside the namespace as this process was started, when its host
+/// builds with a handed one (`init`): the run puts it in place when the program starts.
+pub fn program_start() -> Option<&'static Env> {
+    PROGRAM_START.get()
+}
+
+/// The package binaries this run prepared (its tests' CARGO_BIN_EXE_<name>, and where it put them
+/// beside a test's executable), canonical.
+static PREPARED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+pub fn set_prepared(paths: &[std::path::PathBuf]) {
+    let mut p = PREPARED.lock().unwrap_or_else(|e| e.into_inner());
+    for path in paths {
+        if let Ok(c) = path.canonicalize() {
+            if !p.contains(&c) {
+                p.push(c);
+            }
+        }
+    }
+}
+
+/// Relax std's spawn: 1 when `path` (UTF-8 or the platform's bytes) is a package binary this run
+/// prepared (`set_prepared`), so the child's host builds as this run did.
+pub extern "C" fn prepared_bin(path: *const u8, len: usize) -> i32 {
+    let bytes = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(path, len) } };
+    let path = std::path::Path::new(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(bytes) });
+    let Ok(c) = path.canonicalize() else { return 0 };
+    PREPARED.lock().unwrap_or_else(|e| e.into_inner()).contains(&c) as i32
+}
+
+/// Relax std's spawn: the child's environment (`child_env` over this process's environment and the
+/// program's values), every entry set (`encode`), valid until this thread's next call. `edits` are
+/// the Command's, `host` std's plumbing values for the child's host, both in the wire form;
+/// `flags`: 1 env_clear, 2 self-exec, 4 a virtual folder (its WORKSPACE and VFS are in `host`),
+/// 8 a real folder, 16 a package binary this run prepared (`prepared_bin`).
+pub extern "C" fn spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize) {
+    let bytes = |p: *const u8, n: usize| if n == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(p, n) } };
+    let edits = parse(bytes(edits, edits_len)).expect("a spawn's edits from Relax std");
+    let mut host: Env = parse(bytes(host, host_len)).expect("a spawn's host values from Relax std").into_iter().filter_map(|(k, v)| Some((k, v?))).collect();
+    let mount: Env = host.iter().filter(|(k, _)| same_name(k, WORKSPACE) || same_name(k, VFS)).cloned().collect();
+    let dir = if flags & 4 != 0 {
+        host.retain(|(k, _)| !same_name(k, WORKSPACE) && !same_name(k, VFS));
+        let get = |n: &[u8]| mount.iter().find(|(k, _)| same_name(k, n)).map_or(&[][..], |(_, v)| v.as_slice());
+        ChildDir::Virtual { workspace: get(WORKSPACE), vfs: get(VFS) }
+    } else if flags & 8 != 0 {
+        ChildDir::Real
+    } else {
+        ChildDir::Same
+    };
+    // a run of this program again (2) or of a package binary this run prepared (16): its host
+    // builds as this run does
+    if flags & (2 | 16) != 0 {
+        host.push((BUILD_ENV.to_vec(), build_wire()));
+    }
+    let spawn = Spawn { edits: &edits, clear: flags & 1 != 0, self_exec: flags & 2 != 0, dir, host: &host };
+    let env: Own = child_env(&real(), &own(), &spawn).into_iter().map(|(k, v)| (k, Some(v))).collect();
+    SNAPSHOT.with(|b| {
+        let mut b = b.borrow_mut();
+        *b = encode(&env);
+        unsafe {
+            *out = b.as_ptr();
+            *out_len = b.len();
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn b(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+    fn get<'a>(env: &'a Env, k: &str) -> Option<&'a [u8]> {
+        env.iter().find(|(n, _)| n == k.as_bytes()).map(|(_, v)| v.as_slice())
+    }
+    fn program_env(env: &Env) -> Own {
+        get(env, "RELAX_PROGRAM_ENV").map(|v| parse(v).unwrap()).unwrap_or_default()
+    }
+
+    /// One environment, the spawns a program makes from it, each assert naming its property.
+    /// A run of a binary its test's run prepared (relax issue 168): the host builds with the build
+    /// environment it was handed, keeping the reserved names it was started with (its handovers,
+    /// its own settings); the program gets what it was started with, and the build's reserved
+    /// names are hidden from it.
+    #[test]
+    fn a_handed_build_environment_is_the_hosts_and_the_start_the_programs() {
+        let start: Env = vec![(b("RELAX_ARG0"), b("/run/bin/app")), (b("RELAX_CACHE_DIR"), b("/given")), (b("RELAX_BUILD_ENV"), b("..."))];
+        // (a hand-off that names a grant or a handover: none of them is taken)
+        let build: Env = vec![(b("HOME"), b("/h")), (b("PATH"), b("/tools")), (b("RELAX_CACHE_DIR"), b("/test")), (b("RELAX_STD"), b("/std")),
+            (b("RELAX_ALLOW_C"), b("1")), (b("RELAX_MODULES_TRUSTED"), b("1")), (b("RELAX_MODULE_FUEL"), b("9")), (b("RELAX_RUN_NATIVE"), b("/forged.json")),
+            (b("RELAX_ARG0"), b("/forged")), (b("RELAX_BUILD_ENV"), b("x"))];
+        let (host, hidden, program) = take_build(&start, &build);
+        let mut host_names: Vec<String> = host.iter().map(|(k, v)| format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v))).collect();
+        host_names.sort();
+        assert_eq!(host_names, ["HOME=/h", "PATH=/tools", "RELAX_ARG0=/run/bin/app", "RELAX_CACHE_DIR=/given", "RELAX_STD=/std"], "the host: the build's environment, the reserved names it was started with standing");
+        assert_eq!(hidden, vec![b("RELAX_STD")], "the program does not see the build's own reserved names, and the grants did not cross");
+        assert!(program.is_empty(), "a child started with a cleared environment: the program has none outside the namespace");
+        let started: Env = vec![(b("HOME"), b("/elsewhere")), (b("TOKEN"), b("x"))];
+        let (host, _, program) = take_build(&started, &build);
+        assert_eq!(get(&host, "HOME"), Some(&b"/h"[..]), "the host keeps the build's HOME");
+        assert_eq!(get(&host, "TOKEN"), None, "and has nothing the build lacked");
+        assert_eq!(program, started, "the program gets its own");
+        let parent: Env = vec![(b("PATH"), b("/p")), (b("RELAX_SELF_EXEC"), b("x")), (b("RELAX_PROGRAM_ENV"), b("y")), (b("RELAX_ARG0"), b("z")), (b("RELAX_STD"), b("/s"))];
+        assert_eq!(build_part(&parent), vec![(b("PATH"), b("/p")), (b("RELAX_STD"), b("/s"))], "a run's build environment: no run fact or handover");
+        // a build environment the program writes (in process or on the Command) reaches no child
+        let forged: Own = vec![(b("RELAX_BUILD_ENV"), Some(b("15:RELAX_ALLOW_C=1")))];
+        for self_exec in [false, true] {
+            let child = child_env(&[], &forged, &Spawn { edits: &forged, clear: false, self_exec, dir: ChildDir::Same, host: &[] });
+            assert!(!child.iter().any(|(k, v)| same_name(k, BUILD_ENV) || v.windows(13).any(|w| w == b"RELAX_ALLOW_C")), "a program's RELAX_BUILD_ENV crossed to a child (self-exec {self_exec}): {child:?}");
+        }
+    }
+
+    #[test]
+    fn child_env_gives_each_child_its_side() {
+        let real: Env = vec![
+            (b("PATH"), b("/bin")),
+            (b("RELAX_CACHE_DIR"), b("/host/cache")),
+            (b("RELAX_SELF_EXEC"), b("/relax\x1frun\x1f--")),
+            (b("RELAX_LINT_FLAGS"), b("-D warnings")),
+            (b("RELAX_WORKSPACE"), b("/ws")),
+            (b("RELAX_VFS"), b("mounts")),
+            (b("RELAX_EDITS"), b("/edits")),
+        ];
+        // the program set STD in process and removed LINT_FLAGS
+        let own: Own = vec![(b("RELAX_STD"), Some(b("/std"))), (b("RELAX_LINT_FLAGS"), None)];
+        let edits = vec![
+            (b("RELAX_BOOT_TRACE"), Some(b("1"))),
+            (b("RELAX_CACHE_DIR"), Some(b("/scratch/cache"))),
+            (b("HOME"), Some(b("/h"))),
+            (b("PATH"), None),
+        ];
+        let spawn = Spawn { edits: &edits, clear: false, self_exec: true, dir: ChildDir::Same, host: &[] };
+
+        let view = program_view(&real, &own);
+        assert_eq!(get(&view, "RELAX_STD"), Some(&b"/std"[..]), "the program reads its own set value");
+        assert_eq!(get(&view, "RELAX_LINT_FLAGS"), None, "the program reads its own removal");
+        assert_eq!(get(&view, "RELAX_CACHE_DIR"), Some(&b"/host/cache"[..]), "a name the program did not write reads the host's");
+
+        let child = child_env(&real, &own, &spawn);
+        for (k, v) in real.iter().filter(|(k, _)| reserved(k)) {
+            let k = std::str::from_utf8(k).unwrap();
+            assert_eq!(get(&child, k), Some(v.as_slice()), "a self-exec child keeps the host's reserved value of {k}");
+        }
+        assert_eq!(get(&child, "RELAX_BOOT_TRACE"), None, "a program value is no variable of the self-exec child's host");
+        assert_eq!(get(&child, "RELAX_STD"), None, "an in-process program value is no variable of the self-exec child's host");
+        let mut travel = program_env(&child);
+        travel.sort();
+        assert_eq!(travel, vec![
+            (b("RELAX_BOOT_TRACE"), Some(b("1"))),
+            (b("RELAX_CACHE_DIR"), Some(b("/scratch/cache"))),
+            (b("RELAX_LINT_FLAGS"), None),
+            (b("RELAX_STD"), Some(b("/std"))),
+        ], "the program's set and removed reserved names travel in PROGRAM_ENV, and only those");
+        assert_eq!(get(&child, "HOME"), Some(&b"/h"[..]), "a name outside the namespace comes from the program's view (set)");
+        assert_eq!(get(&child, "PATH"), None, "a name outside the namespace comes from the program's view (removed)");
+
+        let cleared = child_env(&real, &own, &Spawn { edits: &[], clear: true, self_exec: true, dir: ChildDir::Same, host: &[] });
+        assert_eq!(get(&cleared, "RELAX_CACHE_DIR"), Some(&b"/host/cache"[..]), "after env_clear the self-exec child's host still has its own settings");
+        assert!(program_env(&cleared).iter().all(|(_, v)| v.is_none()) && program_env(&cleared).len() == real.iter().filter(|(k, _)| reserved(k)).count(),
+            "after env_clear the self-exec child program sees no reserved name: {:?}", program_env(&cleared));
+        assert_eq!(get(&cleared, "PATH"), None, "env_clear clears the names outside the namespace for both");
+
+        // a package's run-env (`set_run_env`): a program value outside the namespace
+        let run_env: Own = vec![(b("APP_MODE"), Some(b("demo"))), (b("PATH"), Some(b("/app/bin")))];
+        let ran = child_env(&real, &run_env, &Spawn { edits: &[], clear: false, self_exec: true, dir: ChildDir::Same, host: &[] });
+        assert_eq!((get(&ran, "APP_MODE"), get(&ran, "PATH")), (None, Some(&b"/bin"[..])), "a self-exec child's host does not get the run-env: it keeps this process's values");
+        let mut ran_travel = program_env(&ran);
+        ran_travel.sort();
+        assert_eq!(ran_travel, vec![(b("APP_MODE"), Some(b("demo"))), (b("PATH"), Some(b("/app/bin")))], "the run-env travels to the self-exec child program in PROGRAM_ENV");
+        let ran_foreign = child_env(&real, &run_env, &Spawn { edits: &[], clear: false, self_exec: false, dir: ChildDir::Same, host: &[] });
+        assert_eq!((get(&ran_foreign, "APP_MODE"), get(&ran_foreign, "PATH")), (Some(&b"demo"[..]), Some(&b"/app/bin"[..])), "a foreign child gets the program's view, run-env included");
+        // a bare relax's RELAX_ALLOW_C is this invocation's: a relax the program starts does not inherit it
+        let mut granted = real.clone();
+        granted.push((b("RELAX_ALLOW_C"), b("1")));
+        let nested = child_env(&granted, &own, &Spawn { edits: &[], clear: false, self_exec: false, dir: ChildDir::Same, host: &[] });
+        assert_eq!(get(&nested, "RELAX_ALLOW_C"), None, "a foreign child (a nested `$RELAX_LOADER run`) does not inherit --allow-c");
+        let again = child_env(&granted, &own, &Spawn { edits: &[], clear: false, self_exec: true, dir: ChildDir::Same, host: &[] });
+        assert_eq!(get(&again, "RELAX_ALLOW_C"), Some(&b"1"[..]), "a self-exec child, this run again, keeps --allow-c");
+
+        let plain = child_env(&real, &[], &Spawn { edits: &[], clear: false, self_exec: true, dir: ChildDir::Same, host: &[] });
+        assert_eq!(get(&plain, "RELAX_PROGRAM_ENV"), None, "a self-exec child of a program with no values of its own gets no PROGRAM_ENV");
+
+        let foreign = child_env(&real, &own, &Spawn { self_exec: false, ..spawn });
+        assert_eq!(get(&foreign, "RELAX_BOOT_TRACE"), Some(&b"1"[..]), "a foreign child gets the Command's values as plain variables");
+        assert_eq!(get(&foreign, "RELAX_STD"), Some(&b"/std"[..]), "a foreign child gets the in-process program values as plain variables");
+        assert_eq!(get(&foreign, "RELAX_LINT_FLAGS"), None, "a foreign child does not get a name the program removed");
+        assert_eq!(get(&foreign, "RELAX_PROGRAM_ENV"), None, "a foreign child gets no PROGRAM_ENV");
+
+        let virt = child_env(&real, &own, &Spawn { dir: ChildDir::Virtual { workspace: b"/ws/sub", vfs: b"mounts" }, ..spawn });
+        assert_eq!((get(&virt, "RELAX_WORKSPACE"), get(&virt, "RELAX_VFS")), (Some(&b"/ws/sub"[..]), Some(&b"mounts"[..])),
+            "a child in a virtual folder gets that folder and the mount table");
+        let real_dir = child_env(&real, &own, &Spawn { dir: ChildDir::Real, ..spawn });
+        assert_eq!(get(&real_dir, "RELAX_WORKSPACE"), None, "a child in a real folder names no virtual workspace");
+        assert_eq!((get(&real_dir, "RELAX_VFS"), get(&real_dir, "RELAX_EDITS")), (Some(&b"mounts"[..]), Some(&b"/edits"[..])),
+            "a self-exec child in a real folder keeps the mount its --workspace-dir reads");
+        let same = child_env(&real, &own, &spawn);
+        assert_eq!(get(&same, "RELAX_WORKSPACE"), Some(&b"/ws"[..]), "a child in this process's folder keeps its workspace");
+
+        let mount = |env: &Env| MOUNT.map(|n| get(env, std::str::from_utf8(n).unwrap()).map(<[u8]>::to_vec));
+        let all = [Some(b("/ws")), Some(b("mounts")), Some(b("/edits"))];
+        let foreign_same = child_env(&real, &own, &Spawn { self_exec: false, ..spawn });
+        assert_eq!(get(&foreign_same, "RELAX_SELF_EXEC"), None, "a foreign child gets no run fact the program did not write");
+        assert_eq!(mount(&foreign_same), all, "the mount crosses into a foreign child in this process's folder");
+        let foreign_virt = child_env(&real, &own, &Spawn { self_exec: false, dir: ChildDir::Virtual { workspace: b"/ws/sub", vfs: b"mounts" }, ..spawn });
+        assert_eq!(mount(&foreign_virt), [Some(b("/ws/sub")), Some(b("mounts")), Some(b("/edits"))], "the mount crosses into a foreign child in a folder of the mount");
+        let foreign_real = child_env(&real, &own, &Spawn { self_exec: false, dir: ChildDir::Real, ..spawn });
+        assert_eq!(mount(&foreign_real), [None, None, None], "a foreign child in a real folder gets none of the mount");
+        let launch = vec![(b("RELAX_EDITS"), Some(b("/app/edits")))];
+        let launched = child_env(&real, &own, &Spawn { edits: &launch, self_exec: false, dir: ChildDir::Real, ..spawn });
+        assert_eq!(get(&launched, "RELAX_EDITS"), Some(&b"/app/edits"[..]), "a run fact the program gives its child is the child's");
+        let cleared_foreign = child_env(&real, &own, &Spawn { edits: &[], clear: true, self_exec: false, dir: ChildDir::Same, host: &[] });
+        assert_eq!(mount(&cleared_foreign), [None, None, None], "env_clear clears the mount of a foreign child in this process's folder");
+        // a shared workspace's run (vfs.rs SHARE): the same environment with its name
+        let mut shared = real.clone();
+        shared.push((b("RELAX_SHARE"), b("ws")));
+        let share = |env: &Env| get(env, "RELAX_SHARE").map(<[u8]>::to_vec);
+        let shared_same = child_env(&shared, &own, &Spawn { self_exec: false, ..spawn });
+        assert_eq!((mount(&shared_same), share(&shared_same)), ([None, None, None], None), "a shared workspace's foreign child in this process's folder runs on the checkout: no mount, no name");
+        let shared_real = child_env(&shared, &own, &Spawn { self_exec: false, dir: ChildDir::Real, ..spawn });
+        assert_eq!((mount(&shared_real), share(&shared_real)), ([None, None, None], None), "a shared workspace's foreign child in another real folder mounts nothing under this run's name");
+        let shared_virt = child_env(&shared, &own, &Spawn { self_exec: false, dir: ChildDir::Virtual { workspace: b"/ws/sub", vfs: b"mounts" }, ..spawn });
+        assert_eq!((mount(&shared_virt), share(&shared_virt)), ([Some(b("/ws/sub")), Some(b("mounts")), Some(b("/edits"))], Some(b("ws"))), "a shared workspace's mount crosses, with its name, into a foreign child in a folder of the mount");
+        let shared_self = child_env(&shared, &own, &spawn);
+        assert_eq!((mount(&shared_self), share(&shared_self)), (all.clone(), Some(b("ws"))), "a self-exec child of a shared workspace's run is that run again");
+        let named = vec![(b("RELAX_SHARE"), Some(b("other")))];
+        let shared_named = child_env(&shared, &own, &Spawn { edits: &named, self_exec: false, dir: ChildDir::Real, ..spawn });
+        assert_eq!(share(&shared_named), Some(b("other")), "a share name the program gives its child is the child's");
+        let origin = vec![(b("RELAX_EXEC_ORIGIN_EPOCH"), b("12.5"))];
+        let exec = child_env(&real, &own, &Spawn { host: &origin, ..spawn });
+        assert_eq!(get(&exec, "RELAX_EXEC_ORIGIN_EPOCH"), Some(&b"12.5"[..]), "std's plumbing values reach the child's host");
+        assert!(program_env(&exec).iter().all(|(k, _)| k != b"RELAX_EXEC_ORIGIN_EPOCH"), "std's plumbing values are no program value");
+
+        let odd: Own = vec![
+            (b("RELAX_A"), Some(b("x=y\x1fz"))),
+            (b("RELAX_B"), Some(Vec::new())),
+            (b("RELAX_C"), None),
+            (b("RELAX_D"), Some(vec![0xff, 0xfe, b':', b'9'])),
+        ];
+        assert_eq!(parse(&encode(&odd)).unwrap(), odd, "the wire form round-trips `=`, `\\x1f`, an empty value, a removal and non-UTF-8 bytes");
+        assert!(parse(b"12:MAKEPAD_RUN").is_err(), "a truncated entry is an error, not a shorter list");
+    }
+
+    /// `n` as the raw platform call reads it: libc getenv (an allocator's flags) on unix,
+    /// GetEnvironmentVariableA on Windows (std reads through the W call).
+    #[cfg(any(unix, windows))]
+    fn raw(n: &str) -> Option<Vec<u8>> {
+        let c = std::ffi::CString::new(n).unwrap();
+        #[cfg(unix)]
+        {
+            let p = unsafe { super::libc::getenv(c.as_ptr()) };
+            (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec())
+        }
+        #[cfg(windows)]
+        {
+            // the size with its NUL first; 0: not set
+            let need = unsafe { super::win::get_environment_variable_a(c.as_ptr(), std::ptr::null_mut(), 0) } as usize;
+            if need == 0 {
+                return None;
+            }
+            let mut buf = vec![0u8; need];
+            let got = unsafe { super::win::get_environment_variable_a(c.as_ptr(), buf.as_mut_ptr().cast(), need as u32) } as usize;
+            buf.truncate(got);
+            Some(buf)
+        }
+    }
+
+    /// A program's writes of reserved names, read back the three ways a program reads: std's
+    /// var_os, the raw platform call and vars(). Trivial under rustc; under the JIT the proof that
+    /// the interposed platform calls and std's snapshot agree.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_programs_reserved_writes_read_back_every_way() {
+        let listed = |n: &str| std::env::vars_os().find(|(k, _)| k == n).map(|(_, v)| v.into_encoded_bytes());
+        std::env::set_var("RELAX_PROGENV_T2", "a=1");
+        assert_eq!(std::env::var("RELAX_PROGENV_T2").as_deref(), Ok("a=1"), "var_os reads the program's set value");
+        assert_eq!(raw("RELAX_PROGENV_T2"), Some(b("a=1")), "the raw call reads the program's set value");
+        assert_eq!(listed("RELAX_PROGENV_T2"), Some(b("a=1")), "vars() lists the program's set value");
+        #[cfg(windows)]
+        {
+            assert_eq!(std::env::var("makepad_run_progenv_t2").as_deref(), Ok("a=1"), "a name in another case is the same name on Windows");
+            assert_eq!(raw("Makepad_Run_Progenv_T2"), Some(b("a=1")), "the raw call matches names in any case on Windows");
+        }
+        std::env::remove_var("RELAX_PROGENV_T2");
+        assert!(std::env::var_os("RELAX_PROGENV_T2").is_none(), "var_os reads the program's removal");
+        assert_eq!(raw("RELAX_PROGENV_T2"), None, "the raw call reads the program's removal");
+        assert_eq!(listed("RELAX_PROGENV_T2"), None, "vars() does not list a removed name");
+    }
+
+    #[cfg(unix)]
+    const STAGE: &str = "PROGENV_SPAWN_STAGE";
+    #[cfg(unix)]
+    const SPAWNED: [&str; 5] = ["RELAX_BOOT_TRACE", "RELAX_TRACE", "RELAX_CACHE_DIR", "RELAX_PROGENV_GONE", "RELAX_PROGENV_GRAND"];
+
+    /// Each name of SPAWNED as std::env and the raw libc call read it, one `| ` line each (after a
+    /// line break: rustc's harness prints the test's name before its output on the same line).
+    #[cfg(unix)]
+    fn report() -> String {
+        let mut out = String::from("\n");
+        for n in SPAWNED {
+            let raw = raw(n).map(|v| String::from_utf8_lossy(&v).into_owned());
+            out.push_str(&format!("| {n} {:?} {raw:?}\n", std::env::var(n).ok()));
+        }
+        out.push_str(&format!("| PROGRAM_ENV listed {}\n", std::env::vars_os().any(|(k, _)| k == "RELAX_PROGRAM_ENV")));
+        out
+    }
+
+    #[cfg(unix)]
+    fn rerun(stage: &str) -> std::process::Command {
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        c.args(["--exact", "progenv::tests::a_child_of_this_program_reads_what_its_parent_gave_it", "--nocapture", "--test-threads=1"]).env(STAGE, stage);
+        c
+    }
+
+    /// The program spawning itself: the child and its own child read exactly what their parents
+    /// gave them, the child's host none of it (no line of its own in the child's stderr: the boot
+    /// trace a program gives its child was printed by that child's host under the JIT; no store
+    /// in the folder a program names as its child's cache), and a foreign child gets the program's
+    /// values as plain variables. Trivial under rustc; under the JIT the proof of the spawn split.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_of_this_program_reads_what_its_parent_gave_it() {
+        match std::env::var(STAGE).as_deref() {
+            Ok("grandchild") => {
+                print!("{}", report());
+                return;
+            }
+            Ok("child") => {
+                print!("{}", report());
+                let out = rerun("grandchild").env("RELAX_PROGENV_GRAND", "2").output().unwrap();
+                for l in String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.starts_with("| ")) {
+                    println!("|{l}");
+                }
+                println!("| grandchild stderr {:?}", String::from_utf8_lossy(&out.stderr));
+                return;
+            }
+            _ => {}
+        }
+        let scratch = std::env::temp_dir().join(format!("progenv-spawn-{}", std::process::id()));
+        let cache = scratch.join("cache");
+        std::env::set_var("RELAX_PROGENV_GONE", "set by the parent");
+        let out = rerun("child").env("RELAX_BOOT_TRACE", "1").env("RELAX_TRACE", "units").env("RELAX_CACHE_DIR", &cache)
+            .env_remove("RELAX_PROGENV_GONE").output().unwrap();
+        let sh = std::process::Command::new("/bin/sh").args(["-c", "echo \"$RELAX_PROGENV_GONE|${RELAX_PROGRAM_ENV-none}|${RELAX_SELF_EXEC-none}\""]).output().unwrap();
+        std::env::remove_var("RELAX_PROGENV_GONE");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+        assert!(out.status.success() && stdout.contains("1 passed"), "the child ran: {stdout}\n{stderr}");
+        let cache_s = cache.to_string_lossy().into_owned();
+        let want = |prefix: &str, grand: Option<&str>| -> Vec<String> {
+            // (std::env and the raw call agree: the same value twice)
+            let v = |s: Option<&str>| format!("{s:?} {s:?}");
+            vec![
+                format!("{prefix} RELAX_BOOT_TRACE {}", v(Some("1"))),
+                format!("{prefix} RELAX_TRACE {}", v(Some("units"))),
+                format!("{prefix} RELAX_CACHE_DIR {}", v(Some(&cache_s))),
+                format!("{prefix} RELAX_PROGENV_GONE {}", v(None)),
+                format!("{prefix} RELAX_PROGENV_GRAND {}", v(grand)),
+                format!("{prefix} PROGRAM_ENV listed false"),
+            ]
+        };
+        for l in want("|", None) {
+            assert!(stdout.lines().any(|s| s == l), "the child reads what its parent gave it: `{l}` in\n{stdout}");
+        }
+        for l in want("||", Some("2")) {
+            assert!(stdout.lines().any(|s| s == l), "the grandchild reads what both parents gave it: `{l}` in\n{stdout}");
+        }
+        assert!(stdout.contains("| grandchild stderr \"\""), "the grandchild's host printed nothing of its own: {stdout}");
+        assert!(stderr.is_empty(), "the child's host printed nothing of its own into the program's stderr:\n{stderr}");
+        assert!(!scratch.exists(), "the child's host wrote nothing into the cache folder the program gave its child");
+        assert_eq!(String::from_utf8_lossy(&sh.stdout).trim(), "set by the parent|none|none",
+            "a foreign child gets the program's values as plain variables, no PROGRAM_ENV and no run fact");
+    }
+}

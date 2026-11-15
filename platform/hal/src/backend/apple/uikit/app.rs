@@ -136,7 +136,7 @@ pub(super) fn wake_event_loop() {
     run_on_main(|| {
         if stopping() {
             drain_ops();
-            std::process::exit(0);
+            makepad_core_util::process_end::end(0);
         }
     });
 }
@@ -332,6 +332,8 @@ pub(super) fn lifecycle(kind: u32) {
                 win.focus(false);
             }
         }
+        // nothing draws in the background, so the Metal backend gives back what it can right away
+        lifecycle::BACKGROUND => Shared::global().backgrounded.store(true, Ordering::Release),
         _ => {}
     }
     a.broadcast(kind);
@@ -442,7 +444,7 @@ fn command(sid: u32, cmd: OsCmd, taken: u64) {
             }
         }
         #[cfg(target_os = "ios")]
-        OsCmd::ClipSet { text } => super::text::clipboard_set(&text),
+        OsCmd::ClipSet { data } => super::text::clipboard_set(&data),
         #[cfg(target_os = "ios")]
         OsCmd::ClipRead { req, .. } => {
             let content = super::text::clipboard_read();
@@ -462,6 +464,9 @@ fn command(sid: u32, cmd: OsCmd, taken: u64) {
             if let Some(win) = window_of(id) {
                 super::menu::selection_handles(win, op, start, end);
             }
+        }
+        OsCmd::PrintPdf { req, .. } => {
+            Shared::global().push(sid, |q| q.print_result(req, print_status::UNSUPPORTED, &[]));
         }
         #[cfg(target_os = "ios")]
         OsCmd::FileDialog { req, kind, title, location, filename, filters } => super::dialog::open(sid, req, kind, &title, &location, &filename, &filters),

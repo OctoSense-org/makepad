@@ -16,7 +16,9 @@ pub(super) const VIDEO_SHAPE: u32 = 6;
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub(super) struct PassKey { pub colors: [u32; 4], pub depth: u32, pub load: [u8; 5], /** 1, or 2: a multiview pass */ pub views: u8, /** a fragment density map attachment after the others */ pub fdm: bool,
-    /** samples per pixel: 1, or an MSAA pass (`Pass::samples`) rendering into multisampled attachments resolved into the pass's own at its end */ pub samples: u8 }
+    /** samples per pixel: 1, or an MSAA pass (`Pass::samples`) rendering into multisampled attachments resolved into the pass's own at its end */ pub samples: u8,
+    /** the depth is stored at the pass's end (`exec::depth_kept`), else nothing reads it and it stays in tile memory */ pub depth_kept: bool,
+    /** an MSAA pass's multisampled images are stored at its end (`exec::twins_kept`), else they live for the pass alone (transient: resolved, never stored) */ pub ms_kept: bool }
 
 pub(super) struct RenderPass { pub dev: Arc<Device>, pub raw: vk::RenderPass, pub key: PassKey }
 
@@ -45,9 +47,10 @@ impl RenderPass {
         }
         let depth = vk::AttachmentReference::default().attachment(attachments.len() as u32).layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         if key.depth != ABSENT {
+            let store = if key.depth_kept { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE };
             attachments.push(vk::AttachmentDescription::default().format(vk_format(key.depth).ok_or("unknown depth format")?)
-                .samples(vk::SampleCountFlags::TYPE_1).load_op(load(4)).store_op(vk::AttachmentStoreOp::STORE)
-                .stencil_load_op(load(4)).stencil_store_op(vk::AttachmentStoreOp::STORE)
+                .samples(vk::SampleCountFlags::TYPE_1).load_op(load(4)).store_op(store)
+                .stencil_load_op(load(4)).stencil_store_op(store)
                 .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL).final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL));
         }
         let mut subpass = vk::SubpassDescription::default().pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS).color_attachments(&colors);
@@ -94,9 +97,11 @@ impl RenderPass {
         let used: Vec<usize> = (0..count).filter(|i| key.colors[*i] != ABSENT).collect();
         let mut attachments = Vec::new();
         let colour = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+        // the multisampled images: stored for a pass that continues them, else resolved alone
+        let ms_store = if key.ms_kept { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE };
         for i in &used {
             let fmt = vk_format(key.colors[*i]).ok_or("unknown color format")?;
-            attachments.push(vk::AttachmentDescription2::default().format(fmt).samples(samples).load_op(load(*i)).store_op(vk::AttachmentStoreOp::STORE)
+            attachments.push(vk::AttachmentDescription2::default().format(fmt).samples(samples).load_op(load(*i)).store_op(ms_store)
                 .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE).stencil_store_op(vk::AttachmentStoreOp::DONT_CARE).initial_layout(colour).final_layout(colour));
         }
         for i in &used {
@@ -123,8 +128,8 @@ impl RenderPass {
         let depth_aspect = if key.depth == crate::types::format::DEPTH24_STENCIL8 { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
         if key.depth != ABSENT {
             let fmt = vk_format(key.depth).ok_or("unknown depth format")?;
-            attachments.push(vk::AttachmentDescription2::default().format(fmt).samples(samples).load_op(load(4)).store_op(vk::AttachmentStoreOp::STORE)
-                .stencil_load_op(load(4)).stencil_store_op(vk::AttachmentStoreOp::STORE).initial_layout(depth_layout).final_layout(depth_layout));
+            attachments.push(vk::AttachmentDescription2::default().format(fmt).samples(samples).load_op(load(4)).store_op(ms_store)
+                .stencil_load_op(load(4)).stencil_store_op(ms_store).initial_layout(depth_layout).final_layout(depth_layout));
             attachments.push(vk::AttachmentDescription2::default().format(fmt).samples(vk::SampleCountFlags::TYPE_1).load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .store_op(vk::AttachmentStoreOp::STORE).stencil_load_op(vk::AttachmentLoadOp::DONT_CARE).stencil_store_op(vk::AttachmentStoreOp::STORE)
                 .initial_layout(depth_layout).final_layout(depth_layout));
@@ -159,8 +164,8 @@ pub(super) struct Program {
     pub vertex_stride: u32,
     pub layout: vk::PipelineLayout,
     pub descriptors: vk::DescriptorSetLayout,
-    /// Held while the layout is: what is kept for it (a batch slot's descriptor pool) goes after it.
-    pub alive: Arc<()>,
+    /// What a kept descriptor set names its layout and samplers by (`sets::serial`).
+    pub serial: u64,
     pub descriptor_types: Vec<(u32, vk::DescriptorType)>,
     /// The bindings fed from the batch's upload arena (the uniform blocks, the pick block and
     /// the instance storage), by binding number: dynamic, so one written set serves every draw
@@ -193,7 +198,7 @@ impl Program {
             None => vec![dev.video_sampler(0, None)?; slots],
         };
         let mut out = Self { dev, desc, code, bindings, storage, vertex_stride, layout: vk::PipelineLayout::null(),
-            descriptors: vk::DescriptorSetLayout::null(), alive: Arc::new(()), descriptor_types: Vec::new(), dynamic: Vec::new(), samplers: Vec::new(), video,
+            descriptors: vk::DescriptorSetLayout::null(), serial: super::sets::serial(), descriptor_types: Vec::new(), dynamic: Vec::new(), samplers: Vec::new(), video,
             vertex: vk::ShaderModule::null(), fragment: vk::ShaderModule::null(),
             xr_vertex: vk::ShaderModule::null(), xr_fragment: vk::ShaderModule::null() };
         for (i, slot) in out.bindings.iter().enumerate() {
@@ -262,20 +267,35 @@ impl Program {
                 out.xr_fragment = out.dev.raw.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&out.code.xr_fragment), None).map_err(error)?;
             }
             for s in &out.code.samplers {
-                let filter = if s.filter == 0 { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
-                let address = match s.address { 0 => vk::SamplerAddressMode::REPEAT, 1 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-                    2 => vk::SamplerAddressMode::CLAMP_TO_BORDER, _ => vk::SamplerAddressMode::MIRRORED_REPEAT };
-                if s.pixel && (s.compare || !matches!(s.address, 1 | 2)) { return Err("invalid unnormalized sampler".into()); }
-                out.samplers.push(out.dev.raw.create_sampler(&vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
-                    .mipmap_mode(if s.pixel { vk::SamplerMipmapMode::NEAREST } else { vk::SamplerMipmapMode::LINEAR })
-                    .address_mode_u(address).address_mode_v(address).address_mode_w(address)
-                    .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK).unnormalized_coordinates(s.pixel)
-                    .compare_enable(s.compare).compare_op(vk::CompareOp::LESS_OR_EQUAL).min_lod(0.0)
-                    .max_lod(if s.pixel { 0.0 } else { vk::LOD_CLAMP_NONE }), None).map_err(error)?);
+                out.samplers.push(sampler(&out.dev, s, false)?);
             }
         }
         Ok(Arc::new(out))
     }
+}
+
+/// Whether sampler `s` blends texels (a linear filter, or a linear blend between mip levels),
+/// which Vulkan allows only on a format with `SAMPLED_IMAGE_FILTER_LINEAR` (a depth compare is
+/// exempt).
+pub(super) fn blends(s: &crate::spirv::SpirvSampler) -> bool { !s.compare && (s.filter != 0 || !s.pixel) }
+
+/// The sampler a draw's or a kernel's sampler `s` describes; `unfiltered`: its twin that blends
+/// nothing (nearest within and between mip levels, no anisotropy).
+pub(super) fn sampler(dev: &Device, s: &crate::spirv::SpirvSampler, unfiltered: bool) -> Result<vk::Sampler, String> {
+    let filter = if s.filter == 0 || unfiltered { vk::Filter::NEAREST } else { vk::Filter::LINEAR };
+    let address = match s.address { 0 => vk::SamplerAddressMode::REPEAT, 1 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
+        2 => vk::SamplerAddressMode::CLAMP_TO_BORDER, _ => vk::SamplerAddressMode::MIRRORED_REPEAT };
+    if s.pixel && (s.compare || !matches!(s.address, 1 | 2)) { return Err("invalid unnormalized sampler".into()); }
+    let mut info = vk::SamplerCreateInfo::default().mag_filter(filter).min_filter(filter)
+        .mipmap_mode(if s.pixel || unfiltered { vk::SamplerMipmapMode::NEAREST } else { vk::SamplerMipmapMode::LINEAR })
+        .address_mode_u(address).address_mode_v(address).address_mode_w(address)
+        .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK).unnormalized_coordinates(s.pixel)
+        .compare_enable(s.compare).compare_op(vk::CompareOp::LESS_OR_EQUAL).min_lod(0.0)
+        .max_lod(if s.pixel { 0.0 } else { vk::LOD_CLAMP_NONE });
+    if s.anisotropy > 1 && !unfiltered && dev.features.sampler_anisotropy == vk::TRUE {
+        info = info.anisotropy_enable(true).max_anisotropy((s.anisotropy as f32).min(dev.properties.limits.max_sampler_anisotropy));
+    }
+    unsafe { dev.raw.create_sampler(&info, None) }.map_err(error)
 }
 
 impl Drop for Program {
@@ -310,6 +330,16 @@ impl VariantKey {
 /// A driver call failed for want of host or device memory (as formatted by `device::error`):
 /// it may succeed once there is room, so it is not a final failure.
 pub(super) fn out_of_memory(e: &str) -> bool { e.contains("OUT_OF_DEVICE_MEMORY") || e.contains("OUT_OF_HOST_MEMORY") }
+
+/// The first pipeline the driver refused to build from our SPIR-V, which spirv-val passes: old
+/// Adreno compilers answer VK_INCOMPLETE. Android draws with GLES once it's set.
+static REFUSED: OnceLock<String> = OnceLock::new();
+
+fn note_refusal(e: &str) {
+    if e.starts_with("Vulkan: ") && !out_of_memory(e) && !e.ends_with("DEVICE_LOST") { let _ = REFUSED.set(e.to_owned()); }
+}
+
+pub fn refused_pipeline() -> Option<&'static str> { REFUSED.get().map(String::as_str) }
 
 /// A pipeline's create, as the app sent it: the program is made from it (again on a device that
 /// replaced a lost one). `key` names identical creates, which share one program.
@@ -373,12 +403,12 @@ impl State {
         if program.desc.blend & pipeline_blend::RAW != 0 { return; }
         let mut colors = [ABSENT; 4];
         for i in 0..4 { if program.desc.outputs & (1 << i) != 0 { colors[i] = program.desc.color_formats[i]; } }
-        let key = PassKey { colors, depth: format::DEPTH32F, load: [pass_load::DONT_CARE; 5], views: 1, fdm: false, samples: 1 };
+        let key = PassKey { colors, depth: format::DEPTH32F, load: [pass_load::DONT_CARE; 5], views: 1, fdm: false, samples: 1, depth_kept: true, ms_kept: false };
         // a data target (R32F depth/shadow values, ids) is drawn without blending
         let blends = matches!(colors[0], format::BGRA8 | format::RGBA8 | format::RGBA16F);
         let flags = Draw::DEPTH_WRITE | if blends { Draw::BLEND } else { 0 };
         let made = RenderPass::new(program.dev.clone(), key).and_then(|pass| create_variant(program.clone(), &pass, flags));
-        if let Err(e) = &made { eprintln!("[hal-vulkan] pipeline variant: {e}"); }
+        if let Err(e) = &made { eprintln!("[hal-vulkan] pipeline variant: {e}"); note_refusal(e); }
         // out of memory is not this pipeline's failure: the first draw that needs it tries again
         if made.as_ref().is_err_and(|e| out_of_memory(e)) { return; }
         lock(&self.variants).insert(VariantKey::new(key, flags), made);
@@ -404,7 +434,7 @@ impl State {
         let key = VariantKey::new(pass.key, flags);
         if let Some(made) = lock(&self.variants).get(&key) { return made.as_ref().ok().cloned(); }
         let made = create_variant(program, pass, flags);
-        if let Err(e) = &made { eprintln!("[hal-vulkan] pipeline variant: {e}"); }
+        if let Err(e) = &made { eprintln!("[hal-vulkan] pipeline variant: {e}"); note_refusal(e); }
         // out of memory is not kept: the next draw tries again (the frame skips it meanwhile)
         if made.as_ref().is_err_and(|e| out_of_memory(e)) { return None; }
         lock(&self.variants).entry(key).or_insert(made).as_ref().ok().cloned()
@@ -429,7 +459,7 @@ impl State {
         let key = (video.to_vec(), VariantKey::new(pass.key, flags));
         if let Some(made) = lock(&self.video_variants).get(&key) { return made.as_ref().ok().cloned(); }
         let made = create_variant(program, pass, flags);
-        if let Err(e) = &made { eprintln!("[hal-vulkan] video pipeline variant: {e}"); }
+        if let Err(e) = &made { eprintln!("[hal-vulkan] video pipeline variant: {e}"); note_refusal(e); }
         if made.as_ref().is_err_and(|e| out_of_memory(e)) { return None; }
         lock(&self.video_variants).entry(key).or_insert(made).as_ref().ok().cloned()
     }

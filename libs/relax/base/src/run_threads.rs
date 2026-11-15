@@ -27,6 +27,26 @@ fn live() -> relax_session::sync::MutexGuard<'static, Vec<(u64, String)>> {
 
 struct Running(u64);
 
+/// Run on each of the run's threads as it ends (`on_thread_end`).
+static THREAD_END: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Its thread is ending: the end hook runs on it (`on_thread_end`).
+struct Ending;
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        if let Some(end) = THREAD_END.get() {
+            end();
+        }
+    }
+}
+
+/// `end` runs on each thread `spawn` started as it ends, its function returned or unwound (once
+/// for the process: a second hook is not taken).
+pub fn on_thread_end(end: fn()) {
+    let _ = THREAD_END.set(end);
+}
+
 impl Drop for Running {
     fn drop(&mut self) {
         let mut l = live();
@@ -62,6 +82,7 @@ fn start<T: Send + 'static>(name: &str, stack: Option<usize>, f: impl FnOnce() -
     }
     builder.spawn(move || {
         let _running = running;
+        let _ending = Ending;
         f()
     })
 }
@@ -159,6 +180,29 @@ mod tests {
         begin_run();
         assert!(!ending());
         assert!(sleep(Duration::from_millis(1)));
+
+        // while a run ends, a request of another process waits for the next run; one this process
+        // asks itself is turned away at once, so a request of the ending run that waits for it
+        // (holding the gate) ends, and so does the run
+        let held = request(false).expect("no run ends");
+        run_ends();
+        assert!(request(true).is_none());
+        let gone: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+        let other = std::thread::spawn(move || {
+            let g = request(false);
+            gone.store(true, Ordering::SeqCst);
+            g.is_some()
+        });
+        drop(held);
+        let gate = reset_gate();
+        for _ in 0..1000 {
+            std::thread::yield_now();
+        }
+        assert!(!gone.load(Ordering::SeqCst), "another's request did not wait for the next run");
+        drop(gate);
+        begin_run();
+        assert!(other.join().unwrap());
+        assert!(request(true).is_some());
     }
 }
 
@@ -176,14 +220,21 @@ pub fn process_work() -> std::sync::RwLockReadGuard<'static, ()> {
 }
 
 /// `process_work` for a request of `makepad inspect`: one that comes while a run ends is answered
-/// about the next one.
-pub fn request() -> std::sync::RwLockReadGuard<'static, ()> {
+/// about the next one. Not one this process asks itself (`own`): None, at once. That one comes from
+/// the ending run, whose next run cannot begin before it is answered: the platform of a run asks the
+/// JIT how busy it is (`jit`, `owner`) while a reply from its event loop is late, and it does so
+/// for a request that holds the gate (an app command, such as `text`, asked as the run's end began),
+/// which then never ended, nor did the run, and the next one never drew (an aichat, 11-08).
+pub fn request(own: bool) -> Option<std::sync::RwLockReadGuard<'static, ()>> {
     let mut l = live();
     while RUN_ENDS.load(Ordering::SeqCst) {
+        if own {
+            return None;
+        }
         l = CHANGED.wait_timeout(l, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(l);
-    process_work()
+    Some(process_work())
 }
 
 /// The first thing a run's end does.
@@ -209,7 +260,7 @@ pub fn reset_gate() -> std::sync::RwLockWriteGuard<'static, ()> {
         }
         if !said && start.elapsed() >= Duration::from_secs(5) {
             said = true;
-            eprintln!("makepad-run: a run's end waits for a request or a watcher that has not finished");
+            eprintln!("relax: a run's end waits for a request or a watcher that has not finished");
         }
         std::thread::sleep(Duration::from_millis(1));
     }

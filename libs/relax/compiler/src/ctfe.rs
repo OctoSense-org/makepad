@@ -36,7 +36,7 @@ struct Ctx<'a> {
 
 pub(crate) fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CTFE_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_CTFE_TRACE").is_some())
 }
 
 /// Evaluates const/static `d` (instance `args`) into `buf` (its layout's size). Returns false
@@ -97,10 +97,6 @@ pub fn eval_const_block(u: &mut Unit, body: &Body, bl: crate::ast::BlockId, t: T
     (v.len() == cx.size(t) as usize).then_some(v)
 }
 
-/// The value of an `offset_of!` naming a field an edit added to a live-editable struct (M10):
-/// the field lives in the value's extension block and has no offset in the running layout.
-pub(crate) const NO_OFFSET: u64 = u64::MAX;
-
 /// Is `pos` of file `file` in an `offset_of!` expansion? Its inline const is answered from the
 /// layout (Ctx::offset_of), in a const and in a fn body alike.
 pub(crate) fn in_offset_of(prog: &crate::program::Program, file: u32, pos: u32) -> bool {
@@ -131,7 +127,7 @@ fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<
     Some(b)
 }
 
-/// MAKEPAD_RUN_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
+/// RELAX_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
 /// by type (pointers by what they point to, padding ignored); a difference is reported.
 pub fn check_mode(options: &crate::options::Options) -> bool {
     options.ctfe == crate::options::Ctfe::Check
@@ -368,7 +364,7 @@ pub fn zero_undefined(u: &mut Unit, t: TyId, a: u64) {
     }
 }
 
-/// MAKEPAD_RUN_CTFE=0: every initializer is compiled and run (the reference behaviour).
+/// RELAX_CTFE=0: every initializer is compiled and run (the reference behaviour).
 /// (The evaluator models 8-byte pointer and usize words: a wasm32 program's initializers run as
 /// code, web32.rs, whatever the option says.)
 fn off(options: &crate::options::Options) -> bool {
@@ -568,7 +564,9 @@ impl<'a> Ctx<'a> {
                 Some(Vec::new())
             }
             ExprKind::Cast(x, _) => {
-                if let Some(v) = self.variant_cast(b, x, t) { return Some(v); }
+                if let Some(v) = self.variant_cast(b, x, t) {
+                    return v;
+                }
                 let v = self.eval(b, env, x)?;
                 self.cast(&v, b.ty(x), t)
             }
@@ -742,7 +740,9 @@ impl<'a> Ctx<'a> {
                             vals.push(self.eval(b, env, *a)?);
                         }
                         let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d0, self.u.tcx.tys.list(gargs0)).expect("established instance dispatch");
-                        let relax_types::instance::InstanceKind::Item(d) = instance.def else { return None };
+                        // (an intrinsic resolves to its own instance kind: call_const_fn answers
+                        // the ones it knows, size_of and align_of among them)
+                        let (relax_types::instance::InstanceKind::Item(d) | relax_types::instance::InstanceKind::Intrinsic(d)) = instance.def else { return None };
                         if self.u.prog.def(d).kind == DefKind::Closure { return None; }
                         self.call_const_fn(d, instance.compact_args(&self.u.tcx), vals, t)
                     }
@@ -777,10 +777,8 @@ impl<'a> Ctx<'a> {
                 Some(a.to_le_bytes().to_vec())
             }
             ExprKind::ConstBlock(bl) => {
-                // a field with no offset leaves the constant to its compiled initializer, which
-                // panics saying so where it runs (lowering's offset_of!)
                 let pos = self.u.prog.files[b.file as usize].ast.expr(e).lo;
-                self.offset_of(b, pos, bl).filter(|v| v[..] != NO_OFFSET.to_le_bytes()).or_else(|| self.block(b, env, bl))
+                self.offset_of(b, pos, bl).or_else(|| self.block(b, env, bl))
             }
             ExprKind::Block(bl, l) if l.is_none() => self.block(b, env, bl),
             ExprKind::Unsafe(bl) => self.block(b, env, bl),
@@ -886,13 +884,13 @@ impl<'a> Ctx<'a> {
             match s {
                 Stmt::Let(r) if { let l = self.u.prog.files[file].ast.row(*r); l.init.is_some() && l.else_.is_none() } => {
                     let crate::ast::LetStmt { pat, init, .. } = self.u.prog.files[file].ast.row(*r).clone();
-                    let (pat, x) = (&pat, init.as_ref().unwrap());
+                    let (pat, x) = (&pat, &init.get().unwrap());
                     if matches!(self.u.prog.files[file].ast.pat(*pat), crate::ast::Pat::Wild) {
                         self.eval(b, env, *x)?;
                         continue;
                     }
                     let li = *b.pat_local.get(&pat.0)?;
-                    if !matches!(self.u.prog.files[file].ast.pat(*pat), crate::ast::Pat::Ident { by_ref: false, sub: None, .. }) {
+                    if !matches!(self.u.prog.files[file].ast.pat(*pat), crate::ast::Pat::Ident { by_ref: false, sub, .. } if sub.is_none()) {
                         return None;
                     }
                     let v = self.eval(b, env, *x)?;
@@ -901,8 +899,8 @@ impl<'a> Ctx<'a> {
                     }
                     env[li as usize] = Some(v);
                 }
-                Stmt::Expr(x, false) if k + 1 == n => return self.eval(b, env, *x),
-                Stmt::Expr(x, _) => { self.eval(b, env, *x)?; }
+                Stmt::Expr(false, x) if k + 1 == n => return self.eval(b, env, *x),
+                Stmt::Expr(_, x) => { self.eval(b, env, *x)?; }
                 Stmt::Item(_) => {}
                 _ => return None,
             }
@@ -1031,12 +1029,13 @@ impl<'a> Ctx<'a> {
         // Only the macro expansion, never a user-written pointer-to-integer const.
         if !in_offset_of(&self.u.prog, b.file, pos) { return None; }
         let ast = &self.u.prog.files[b.file as usize].ast;
-        let [Stmt::Let(r1), Stmt::Let(r2), Stmt::Let(r3), Stmt::Expr(tail, false)] = ast.stmts(bl) else { return None };
-        let (crate::ast::LetStmt { pat: up, init: Some(ui), else_: None, .. },
-             crate::ast::LetStmt { pat: bp, init: Some(bi), else_: None, .. },
-             crate::ast::LetStmt { pat: fp, init: Some(fi), else_: None, .. }) = (ast.row(*r1), ast.row(*r2), ast.row(*r3)) else { return None };
+        let [Stmt::Let(r1), Stmt::Let(r2), Stmt::Let(r3), Stmt::Expr(false, tail)] = ast.stmts(bl) else { return None };
+        let (crate::ast::LetStmt { pat: up, init: ui, else_: ue, .. },
+             crate::ast::LetStmt { pat: bp, init: bi, else_: be, .. },
+             crate::ast::LetStmt { pat: fp, init: fi, else_: fe, .. }) = (ast.row(*r1), ast.row(*r2), ast.row(*r3));
+        let (Some(ui), Some(bi), Some(fi), None, None, None) = (&ui.get(), &bi.get(), &fi.get(), ue.get(), be.get(), fe.get()) else { return None };
         for pat in [up, bp, fp] {
-            if !matches!(ast.pat(*pat), crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub: None, .. }) { return None; }
+            if !matches!(ast.pat(*pat), crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub, .. } if sub.is_none()) { return None; }
         }
         let (ul, base, field) = (*b.pat_local.get(&up.0)?, *b.pat_local.get(&bp.0)?, *b.pat_local.get(&fp.0)?);
         let TyKind::Adt(mu, _, _) = self.kind(b.ty(*ui)) else { return None };
@@ -1050,11 +1049,11 @@ impl<'a> Ctx<'a> {
         if !args.is_empty() || b.res.get(&recv.0) != Some(&Res::Local(ul)) || m.derefs != 0 || m.autoref != 1
             || self.u.prog.def(m.def).krate != self.u.core_crate || self.u.prog.name(m.def) != "as_ptr" { return None; }
         let ExprKind::Unsafe(fb) = ast.expr(*fi).kind else { return None };
-        let [Stmt::Expr(addr, false)] = ast.stmts(fb) else { return None };
+        let [Stmt::Expr(false, addr)] = ast.stmts(fb) else { return None };
         let ExprKind::AddrOf(true, false, place) = ast.expr(*addr).kind else { return None };
         // The tail is exactly `unsafe { <*const _>::cast::<u8>(field).offset_from_unsigned(base as *const u8) }`.
         let ExprKind::Unsafe(tb) = ast.expr(*tail).kind else { return None };
-        let [Stmt::Expr(dist, false)] = ast.stmts(tb) else { return None };
+        let [Stmt::Expr(false, dist)] = ast.stmts(tb) else { return None };
         let ExprKind::MethodCall(recv, mrow) = ast.expr(*dist).kind else { return None };
         let m = b.methods.get(&dist.0)?;
         if self.u.prog.def(m.def).krate != self.u.core_crate || self.u.prog.name(m.def) != "offset_from_unsigned" { return None; }
@@ -1069,10 +1068,7 @@ impl<'a> Ctx<'a> {
         for e in [recv, *origin] {
             if !matches!(self.kind(b.ty(e)), TyKind::Ptr(false, p) if matches!(self.kind(p), TyKind::Int(crate::program::Prim::U8))) { return None; }
         }
-        let offset = match self.place_offset(b, place, base)? {
-            u32::MAX => NO_OFFSET,
-            o => o as u64,
-        };
+        let offset = self.place_offset(b, place, base)? as u64;
         Some(offset.to_le_bytes().to_vec())
     }
 
@@ -1096,21 +1092,10 @@ impl<'a> Ctx<'a> {
         if self.u.lay.is_unsized(&crate::layout::LayoutCx::new(&self.u.prog), &mut self.u.tcx, t) { return None; }
         let offset = match self.kind(t) {
             TyKind::Tuple(_) => *self.layout(t).fields.get(fi as usize)?,
-            TyKind::Adt(..) => {
-                // a field in a live layout's extension block (M10) has no offset: the place has none
-                let offset = self.struct_field_off(t, fi)?;
-                if offset == u32::MAX && self.layout(t).ext.is_some() {
-                    return Some(u32::MAX);
-                }
-                offset
-            }
+            TyKind::Adt(..) => self.struct_field_off(t, fi)?,
             _ => return None,
         };
-        let outer = self.place_offset(b, x, base)?;
-        if outer == u32::MAX {
-            return Some(u32::MAX);
-        }
-        outer.checked_add(offset)
+        self.place_offset(b, x, base)?.checked_add(offset)
     }
 
     fn fn_pointer(&mut self, t: TyId) -> Option<Vec<u8>> {
@@ -1285,29 +1270,30 @@ impl<'a> Ctx<'a> {
         Some(store_int(r, n))
     }
 
-    /// `Enum::Variant as int` of a fieldless variant, written by any path (`Self::Variant` too):
-    /// the variant's discriminant, read without building the value. The value needs the enum's
-    /// layout, and the layout needs every discriminant of the enum, so an enum whose discriminant
-    /// names an earlier variant of itself (`B = Self::A as u8 | 1`) asked for the constant being
-    /// evaluated (E0391). rustc turns this cast into a literal the same way
-    /// (rustc_mir_build/src/thir/cx/expr.rs, the `hir::ExprKind::Cast` arm).
-    fn variant_cast(&mut self, b: &Body, x: ExprId, to: TyId) -> Option<Vec<u8>> {
-        if !matches!(self.kind(to), TyKind::Int(_)) { return None; }
+    /// A fieldless variant's path cast to an integer: its discriminant (lower::variant_cast_discr),
+    /// the explicit discriminant constant read as any constant is, plus the variant's offset. No
+    /// enum value is built, so no layout is asked for. None: not such a cast.
+    fn variant_cast(&mut self, b: &Body, x: ExprId, t: TyId) -> Option<Option<Vec<u8>>> {
+        if !matches!(self.kind(t), TyKind::Int(_)) {
+            return None;
+        }
         let ast = &self.u.prog.files[b.file as usize].ast;
-        let mut inner = x;
-        while let ExprKind::Paren(i) = ast.expr(inner).kind { inner = i; }
-        if !matches!(ast.expr(inner).kind, ExprKind::Path(_)) { return None; }
-        let Some(Res::Def(d)) = b.res.get(&inner.0).copied() else { return None };
-        let vd = self.u.prog.def(d);
-        if vd.kind != DefKind::Variant { return None; }
-        let vi = vd.sub;
-        // a tuple variant's path is its constructor function, not a value of the enum
-        let TyKind::Adt(adt, _, _) = self.kind(b.ty(inner)) else { return None };
-        let adt = self.u.tcx.adts.get(&adt)?;
-        if !adt.is_enum || adt.variants.iter().any(|v| !v.fields.is_empty()) { return None; }
-        let discr = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi)?.signed_value();
-        let (n, _) = self.int_of(to)?;
-        Some(store_int(discr, n))
+        let x = crate::lit::strip_paren(ast, x);
+        if !matches!(ast.expr(x).kind, ExprKind::Path(_)) {
+            return None;
+        }
+        let Some(&Res::Def(d)) = b.res.get(&x.0) else { return None };
+        let (explicit, offset, rt) = crate::lower::variant_cast_discr(self.u, d, b.ty(x))?;
+        let (n, signed) = self.int_of(rt)?;
+        let base = match explicit {
+            Some(c) => match self.const_data(c, Vec::new()) {
+                Some(a) => load_int(unsafe { std::slice::from_raw_parts(a as *const u8, n) }, n, signed),
+                None => return Some(None),
+            },
+            None => 0,
+        };
+        let repr = store_int(base.wrapping_add(offset as i128), n);
+        Some(self.cast(&repr, rt, t))
     }
 
     fn cast(&mut self, v: &[u8], from: TyId, to: TyId) -> Option<Vec<u8>> {
@@ -1377,6 +1363,7 @@ impl<'a> Ctx<'a> {
             crate::jit::cert_note_value(u, d, &args);
             return Some(a);
         }
+        if crate::jit::refuses_tainted(u, d) { return None; }
         if u.const_failed.contains(&(d, args.clone())) || self.depth >= CALL_DEPTH {
             return None;
         }
@@ -1476,7 +1463,7 @@ impl<'a> Ctx<'a> {
             // the tag (lower::emit_store_disc)
             if let Some((toff, relax_backend::rir::Mem::Int(tn, _))) = l.tag {
                 let tv = match l.enc {
-                    crate::layout::TagEnc::Direct => Some(adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi)?.val),
+                    crate::layout::TagEnc::Direct => Some(adt.tag_for_variant(&self.u.tcx, &self.u.prog, vi)?.val),
                     crate::layout::TagEnc::Single(_) => None,
                     crate::layout::TagEnc::Niche { untagged, lo, start, .. } => {
                         if vi == untagged {
@@ -1563,7 +1550,7 @@ impl<'a> Ctx<'a> {
             env[0] = Some(v);
         }
         for (p, v) in body.param_pats.iter().zip(args) {
-            if !matches!(self.u.prog.files[body.file as usize].ast.pat(*p), crate::ast::Pat::Ident { by_ref: false, sub: None, .. }) {
+            if !matches!(self.u.prog.files[body.file as usize].ast.pat(*p), crate::ast::Pat::Ident { by_ref: false, sub, .. } if sub.is_none()) {
                 return None;
             }
             let li = *body.pat_local.get(&p.0)? as usize;

@@ -16,7 +16,7 @@ pub const fn align_of<T>() -> usize {
 pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
     unsafe { im::align_of_val(val) }
 }
-pub const fn needs_drop<T>() -> bool {
+pub const fn needs_drop<T: ?Sized>() -> bool {
     unsafe { im::needs_drop::<T>() }
 }
 #[rustc_diagnostic_item = "mem_forget"]
@@ -26,7 +26,7 @@ pub const fn forget<T>(t: T) {
 #[rustc_diagnostic_item = "mem_drop"]
 pub fn drop<T>(_x: T) {}
 
-pub fn replace<T>(dest: &mut T, src: T) -> T {
+pub const fn replace<T>(dest: &mut T, src: T) -> T {
     unsafe {
         let p = dest as *mut T;
         let old = im::ptr_read(p as *const T);
@@ -50,6 +50,14 @@ pub fn take<T: Default>(dest: &mut T) -> T {
 pub const unsafe fn zeroed<T>() -> T {
     im::zeroed::<T>()
 }
+/// rustc 1.100.0 (mem_conjure_zst): the value of a zero-sized type, which has nothing to initialize. The caller
+/// guarantees that `T` is inhabited (core/src/mem/mod.rs; its run-time message).
+pub const unsafe fn conjure_zst<T>() -> T {
+    if size_of::<T>() != 0 {
+        panic!("mem::conjure_zst invoked on type {}, which is not zero-sized", crate::any::type_name::<T>());
+    }
+    MaybeUninit::uninit().assume_init()
+}
 #[deprecated(since = "1.39.0", note = "use `mem::MaybeUninit` instead")]
 #[rustc_diagnostic_item = "mem_uninitialized"]
 pub unsafe fn uninitialized<T>() -> T {
@@ -64,36 +72,38 @@ pub const unsafe fn transmute_copy<T, U>(src: &T) -> U {
     im::ptr_read(src as *const T as *const U)
 }
 
-/// Opaque enum discriminant (`mem::discriminant`).
-pub struct Discriminant<T> {
-    value: i64,
-    _m: crate::marker::PhantomData<T>,
-}
+/// Opaque enum discriminant (`mem::discriminant`): library/core/src/mem/mod.rs, held as the
+/// discriminant's own type (the enum's repr int, isize by default; u8 for a type that is no
+/// enum), so its hash, comparison and size are rustc's.
+pub struct Discriminant<T>(<T as crate::marker::DiscriminantKind>::Discriminant);
 
 pub const fn discriminant<T>(v: &T) -> Discriminant<T> {
-    Discriminant { value: unsafe { im::discriminant_value(v) }, _m: crate::marker::PhantomData }
+    // the intrinsic's i64, sign-extended to the widest discriminant type: its low bytes are the
+    // value as the discriminant type (the JIT's targets are little-endian)
+    let wide = unsafe { im::discriminant_value(v) } as i128;
+    Discriminant(unsafe { transmute_copy::<i128, <T as crate::marker::DiscriminantKind>::Discriminant>(&wide) })
 }
 
 impl<T> Clone for Discriminant<T> {
     fn clone(&self) -> Discriminant<T> {
-        Discriminant { value: self.value, _m: crate::marker::PhantomData }
+        *self
     }
 }
 impl<T> Copy for Discriminant<T> {}
 impl<T> PartialEq for Discriminant<T> {
     fn eq(&self, o: &Discriminant<T>) -> bool {
-        self.value == o.value
+        self.0 == o.0
     }
 }
 impl<T> Eq for Discriminant<T> {}
 impl<T> crate::hash::Hash for Discriminant<T> {
     fn hash<H: crate::hash::Hasher>(&self, state: &mut H) {
-        self.value.hash(state)
+        self.0.hash(state)
     }
 }
 impl<T> crate::fmt::Debug for Discriminant<T> {
     fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
-        f.debug_tuple("Discriminant").field(&self.value).finish()
+        f.debug_tuple("Discriminant").field(&self.0).finish()
     }
 }
 
@@ -102,7 +112,7 @@ impl<T> crate::fmt::Debug for Discriminant<T> {
 /// Inhibits the compiler from calling `T`'s destructor (the lang item has no drop glue); like real core a
 /// struct, so `ManuallyDrop<dyn Trait>` is a dynamically sized type.
 #[repr(transparent)]
-#[cfg_attr(not(relax_check), lang = "manually_drop")]
+#[lang = "manually_drop"]
 #[rustc_diagnostic_item = "ManuallyDrop"]
 pub struct ManuallyDrop<T: ?Sized> {
     value: T,
@@ -167,7 +177,7 @@ impl<T: ?Sized> crate::ops::DerefMut for ManuallyDrop<T> {
 // ---------------------------------------------------------------- MaybeUninit
 
 #[repr(C)]
-#[cfg_attr(not(relax_check), lang = "maybe_uninit")]
+#[lang = "maybe_uninit"]
 pub union MaybeUninit<T> {
     uninit: (),
     value: ManuallyDrop<T>,
@@ -179,14 +189,12 @@ impl<T: Copy> Clone for MaybeUninit<T> {
     }
 }
 impl<T: Copy> Copy for MaybeUninit<T> {}
-// The value may be uninitialised: the type's name from `MaybeUninit` on stands for it.
+
 impl<T> crate::fmt::Debug for MaybeUninit<T> {
     fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
-        let name = crate::any::type_name::<MaybeUninit<T>>();
-        match name.find("MaybeUninit") {
-            Some(at) => f.pad(&name[at..]),
-            None => f.pad(name),
-        }
+        let full_name = crate::any::type_name::<Self>();
+        let prefix_len = full_name.find("MaybeUninit").unwrap();
+        f.pad(&full_name[prefix_len..])
     }
 }
 
@@ -233,5 +241,77 @@ impl<T> MaybeUninit<T> {
     }
     pub const unsafe fn assume_init_drop(&mut self) {
         im::drop_in_place(self.as_mut_ptr())
+    }
+}
+
+// ---------------------------------------------------------------- DropGuard (rustc 1.100.0: drop_guard)
+
+/// Calls `f` on the value when the guard is dropped, unless `dismiss` takes the value back
+/// (core/src/mem/drop_guard.rs; `new` and `dismiss` are const only under the unstable const_drop_guard).
+pub struct DropGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    inner: ManuallyDrop<T>,
+    f: ManuallyDrop<F>,
+}
+
+impl<T, F> DropGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    #[must_use]
+    pub fn new(inner: T, f: F) -> Self {
+        Self { inner: ManuallyDrop::new(inner), f: ManuallyDrop::new(f) }
+    }
+
+    pub fn dismiss(guard: Self) -> T {
+        // the guard's own drop must not run; the value is read before the closure is dropped, so a panicking
+        // closure drop still unwinds through the value
+        let mut guard = ManuallyDrop::new(guard);
+        let value = unsafe { ManuallyDrop::take(&mut guard.inner) };
+        unsafe { ManuallyDrop::drop(&mut guard.f) };
+        value
+    }
+}
+
+impl<T, F> crate::ops::Deref for DropGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.inner
+    }
+}
+
+impl<T, F> crate::ops::DerefMut for DropGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
+
+impl<T, F> Drop for DropGuard<T, F>
+where
+    F: FnOnce(T),
+{
+    fn drop(&mut self) {
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        let f = unsafe { ManuallyDrop::take(&mut self.f) };
+        f(inner);
+    }
+}
+
+impl<T, F> crate::fmt::Debug for DropGuard<T, F>
+where
+    T: crate::fmt::Debug,
+    F: FnOnce(T),
+{
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+        crate::fmt::Debug::fmt(&**self, f)
     }
 }

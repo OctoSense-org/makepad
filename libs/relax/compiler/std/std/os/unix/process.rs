@@ -10,9 +10,9 @@ pub fn parent_id() -> u32 {
 }
 
 pub trait CommandExt {
-    /// The child's user: a `setuid` after the fork, whose failure fails the spawn.
+    /// The child's user id (setuid before its exec).
     fn uid(&mut self, id: u32) -> &mut Command;
-    /// The child's group, set before its user.
+    /// The child's group id (setgid before its exec).
     fn gid(&mut self, id: u32) -> &mut Command;
     fn arg0<S: AsRef<OsStr>>(&mut self, arg: S) -> &mut Command;
     fn process_group(&mut self, pgroup: i32) -> &mut Command;

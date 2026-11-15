@@ -1,9 +1,7 @@
 // io::Seek for Box<S> (S: Seek + ?Sized), forwarding seek, rewind, stream_position and
 // seek_relative to the boxed value, and the same full forwarding for `&mut S`. image 0.25's
 // GenericReader wraps `BufReader<Box<dyn ReadSeek>>` and forwards its own Seek impl to it
-// (src/hooks.rs: `self.0.seek(pos)`, `self.0.rewind()`, `self.0.stream_position()`); BufReader<R>
-// seeks only when R does, and the std here had no Seek impl for a Box ("no method named `seek`
-// found for `BufReader<Box<dyn image::hooks::ReadSeek>>`").
+// (src/hooks.rs: `self.0.seek(pos)`, `self.0.rewind()`, `self.0.stream_position()`).
 use std::io::{BufRead, BufReader, Cursor, Read, Result, Seek, SeekFrom};
 
 // image's shape

@@ -9,17 +9,16 @@ use crate::ledger::{Charge, Pool, Pools};
 use crate::FastMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// What a finished piece of GPU work tells the backend thread. Completion handlers run on
 /// Metal's threads: they push here and wake the pump; `Metal::step` turns them into events.
 pub(crate) enum Done {
-    Frame { sid: u32, target: crate::Id, frame: u64, gpu_ns: u64, present_ns: u64, gpu_span: [f64; 2], failed: bool, partial: bool, window: bool, kind: u32, incarnation: Arc<crate::font::FrameProgress> },
+    Frame { sid: u32, target: crate::Id, frame: u64, gpu_ns: u64, present_ns: u64, gpu_span: [f64; 2], failure: Option<Failure>, partial: bool, window: bool, kind: u32, incarnation: Arc<crate::font::FrameProgress> },
     DispatchTime { sid: u32, incarnation: Arc<crate::font::FrameProgress>, name: String, gpu_ns: u64 },
     BufferLeases { sid: u32, incarnation: Arc<crate::font::FrameProgress>, req: u32, status: u32, leases: Vec<crate::lease::Lease> },
-    Readback { sid: u32, incarnation: Arc<crate::font::FrameProgress>, req: u32, status: u32, rect: [u32; 4], pixels: Vec<u8> },
-    Pick { sid: u32, incarnation: Arc<crate::font::FrameProgress>, req: u32, ids: Vec<u32> },
+    Readback { sid: u32, incarnation: Arc<crate::font::FrameProgress>, req: u32, status: u32, rect: [u32; 4], lease: Option<crate::lease::Lease> },
     PipelineReady { sid: u32, incarnation: Arc<crate::font::FrameProgress>, id: crate::Id },
     PipelineFailed { sid: u32, incarnation: Arc<crate::font::FrameProgress>, id: crate::Id, log: String },
     /// A recorded window frame is in its capture buffer (a retained `CVPixelBuffer`).
@@ -29,7 +28,7 @@ pub(crate) enum Done {
 impl Done {
     fn sid(&self) -> u32 {
         match self {
-            Done::Frame { sid, .. } | Done::DispatchTime { sid, .. } | Done::Readback { sid, .. } | Done::BufferLeases { sid, .. } | Done::Pick { sid, .. } | Done::PipelineReady { sid, .. }
+            Done::Frame { sid, .. } | Done::DispatchTime { sid, .. } | Done::Readback { sid, .. } | Done::BufferLeases { sid, .. } | Done::PipelineReady { sid, .. }
             | Done::PipelineFailed { sid, .. } | Done::Surface { sid, .. } => *sid,
         }
     }
@@ -54,8 +53,25 @@ impl Mailbox {
         (self.notify)(sid, window);
     }
 
+    /// Rouses the session's pump without a completion (a device the system removed).
+    #[cfg(target_os = "macos")]
+    pub fn wake(&self, sid: u32) {
+        (self.notify)(sid, false);
+    }
+
     pub(crate) fn take(&self) -> Vec<Done> {
         std::mem::take(&mut *self.queue.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// The same sessions' mailbox, empty: a replacement device's, so what the old device's
+    /// handlers still push stays apart from it (`Metal::retired`).
+    pub fn fresh(&self) -> Mailbox {
+        Mailbox::new(self.notify.clone())
+    }
+
+    /// Nothing can push here any more: no handler, compile or pipeline holds it.
+    pub fn alone(&self) -> bool {
+        Arc::strong_count(&self.queue) == 1
     }
 }
 
@@ -77,12 +93,6 @@ pub struct Submission {
 /// own backpressure; past it `commandBuffer` waits inside the driver). Metal's default of 64
 /// holds barely two frames of per-pass buffers for a compositor with a 30-pass frame.
 const QUEUE_MAX_COMMAND_BUFFERS: u64 = 256;
-/// Command buffers made and not completed at once: past it a new one waits for the GPU
-/// (`IN_FLIGHT_WAIT` at most). The queue keeps driver memory for the most command buffers it
-/// ever had alive (1 MB and up each, outside `currentAllocatedSize`, given back only with the
-/// queue): a panel that once had 48 at once held 384 MB of it for the rest of its life.
-const IN_FLIGHT_MAX: u64 = 16;
-const IN_FLIGHT_WAIT: Duration = Duration::from_millis(100);
 
 /// The arena's chunk size: the uniforms, inline instances and upload staging of a batch.
 const CHUNK_BYTES: usize = 4 * 1024 * 1024;
@@ -139,9 +149,10 @@ pub struct Device {
     pub completed: Arc<AtomicU64>,
     /// the sequence number of the newest command buffer created
     pub seq: u64,
-    /// signalled by every completion: a new command buffer waiting for room (`IN_FLIGHT_MAX`)
-    room: Arc<(Mutex<()>, Condvar)>,
-    /// the most command buffers made and not completed at once (what the queue keeps memory for)
+    /// the most command buffers made and not completed at once: the queue keeps driver memory
+    /// for that many (1 MB and up each, outside `currentAllocatedSize`, given back only with the
+    /// queue; a panel that once had 48 at once held 384 MB of it), on the ledger as
+    /// `Pool::CommandBuffers`
     pub peak_in_flight: u64,
     /// frame completions waiting for a command buffer number (`when_completed`)
     waiters: Arc<Mutex<Vec<(u64, crate::completion::CompletionReply)>>>,
@@ -252,7 +263,6 @@ impl Device {
             completed,
             waiters: Default::default(),
             seq: 0,
-            room: Default::default(),
             peak_in_flight: 0,
             mailbox,
             alloc_tx: Some(alloc_tx),
@@ -312,23 +322,14 @@ impl Device {
     /// A new command buffer: enqueued at once so queue order is reserved, numbered, with the
     /// completion handler that publishes its number. Returns the buffer (owned by the caller)
     /// and its number.
+    ///
+    /// Nothing waits here: the caller is a session's thread (an app's UI thread) holding the
+    /// HAL's lock. What bounds the buffers in flight is the event loop, which holds a session's
+    /// next beat while its frames in flight (`FRAMES_IN_FLIGHT`) are on the GPU, so a producer
+    /// that runs ahead waits in its own pump. A cap of 16 here, waited for on a condition
+    /// variable up to 100 ms, held the UI thread inside its submit, and with it every other
+    /// session's.
     pub fn new_command_buffer(&mut self) -> (RcObjcId, u64) {
-        if self.seq.saturating_sub(self.completed.load(Ordering::Acquire)) >= IN_FLIGHT_MAX {
-            // what is encoded goes to the GPU first: the wait is for it
-            self.flush_submissions();
-            crate::profile::count("metal batch waited for room");
-            let deadline = Instant::now() + IN_FLIGHT_WAIT;
-            let (lock, room) = &*self.room;
-            let mut guard = crate::lock(lock);
-            while self.seq.saturating_sub(self.completed.load(Ordering::Acquire)) >= IN_FLIGHT_MAX {
-                let now = Instant::now();
-                if now >= deadline {
-                    crate::profile::count("metal batch waited for room: timed out");
-                    break;
-                }
-                guard = room.wait_timeout(guard, deadline - now).unwrap_or_else(|e| e.into_inner()).0;
-            }
-        }
         let buffer: ObjcId = unsafe { msg_send![self.queue, commandBuffer] };
         let buffer = RcObjcId::from_unowned(NonNull::new(buffer).expect("Metal command buffer"));
         let () = unsafe { msg_send![buffer.as_id(), enqueue] };
@@ -338,14 +339,9 @@ impl Device {
         let completed = self.completed.clone();
         let in_flight = self.in_flight.clone();
         let waiters = self.waiters.clone();
-        let room = self.room.clone();
         let () = unsafe {
             msg_send![buffer.as_id(), addCompletedHandler: &objc_block!(move |cb: ObjcId| {
                 completed.fetch_max(seq, Ordering::AcqRel);
-                {
-                    let _held = crate::lock(&room.0);
-                    room.1.notify_all();
-                }
                 answer_waiters(&waiters, completed.load(Ordering::Acquire));
                 let entry = {
                     let mut queue = lock_in_flight(&in_flight);
@@ -511,6 +507,16 @@ impl Device {
         }
     }
 
+    /// When a chunk `arena_trim` hadn't seen idle at `last_trim` (HAL clock ns) goes idle, if that
+    /// can let one go: a larger chunk, or any chunk while there are more than two.
+    pub fn arena_trim_due(&self, last_trim: u64) -> Option<u64> {
+        self.chunks.iter()
+            .filter(|c| self.chunks.len() > 2 || c.capacity > CHUNK_BYTES)
+            .map(|c| c.used_ns + ARENA_IDLE_NS + 1)
+            .filter(|due| *due > last_trim)
+            .min()
+    }
+
     /// The device's own count of what this process holds on it.
     pub fn device_allocated(&self) -> u64 {
         unsafe { msg_send![self.device, currentAllocatedSize] }
@@ -539,6 +545,19 @@ impl Device {
 }
 
 impl Device {
+    /// Waits up to `limit` for every command buffer made so far to complete (a replaced
+    /// device's, its workers stopped). False when some still run.
+    pub fn settle(&self, limit: std::time::Duration) -> bool {
+        let start = Instant::now();
+        while self.completed.load(Ordering::Acquire) < self.seq {
+            if start.elapsed() >= limit {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    }
+
     /// Answers `reply` once every command buffer up to the newest one created has completed.
     pub fn when_completed(&self, reply: crate::completion::CompletionReply) {
         crate::lock(&self.waiters).push((self.seq, reply));

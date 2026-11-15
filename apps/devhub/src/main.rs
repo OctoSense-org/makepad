@@ -1,14 +1,18 @@
 //! devhub, one app: a **node** when the WM names its conf (`MAKEPAD_DEVHUB_NODE_CONF`, the way it
 //! starts the AI Hub), the **master** otherwise.
 //!
-//! - Master (the user's Mac): a menu-bar icon whose glyph says idle, busy or needs a look; a click
-//!   opens its menu: the fleet at a glance (nodes up, leases, the land queue, the newest verify,
-//!   lanes, the last events) and Open devhub (the panel: the inbox and the explorer, machines → JITs
-//!   → inspect views), Pause landing, Run verify now. It listens on nothing but its control socket
-//!   and dials the nodes with the Mac's fleet identity. The profiler (`libs/prof_view`: a running makepad app's timeline, answers,
-//!   recordings and inspect console) opens from the menu's Open profiler and from a JIT row's Profile. On the Mac it runs from the Dock wrapper
-//!   (`makepad run makepad-app-devhub`, the current code under the JIT); "Open at login" makes the
-//!   per-user LaunchAgent that starts that wrapper at login and again after a crash.
+//! - Master (the user's Mac): the master itself and its menu-bar icon, in one process; the glyph
+//!   (devhub's eye) says idle, busy or needs a look; a click opens its menu: the fleet at a glance
+//!   (nodes up, leases, the land queue, the newest verify, lanes, the last events), Open panel
+//!   (apps/devhub_panel, shown as its own app: [`open_panel`]), Open devhub (the inbox and the
+//!   explorer, machines → JITs → inspect views), Pause landing, Run verify now, each node's dev
+//!   switch. It listens on nothing but its control socket and dials the nodes with the Mac's fleet
+//!   identity. The profiler (`libs/prof_view`: a running makepad app's timeline, answers,
+//!   recordings and inspect console) opens from the menu's Open profiler and from a JIT row's
+//!   Profile. It is a native build, never under the JIT it schedules: the Dock wrapper builds it in
+//!   its own target dir and runs it there, and its self-update execs into the next build there
+//!   (`makepad_devhub::orch::roll::MasterBin`); "Open at login" makes the per-user LaunchAgent that
+//!   starts that wrapper at login and again after a crash ([`installed`]).
 //! - Node (a Linux WM): a tray icon in the WM's bar with a status menu; it serves this machine's
 //!   JITs to the master. Quit writes `enabled = off` into its conf, so the WM leaves it off until
 //!   the person starts it from the launcher.
@@ -96,6 +100,7 @@ const QUIT: LiveId = live_id!(quit_devhub);
 const SEEN: LiveId = live_id!(seen_all);
 const DEVSW: LiveId = live_id!(dev_switch);
 const OPEN: LiveId = live_id!(open_window);
+const PANEL: LiveId = live_id!(open_panel);
 const PROFILE: LiveId = live_id!(open_profile);
 const LOGIN: LiveId = live_id!(open_at_login);
 const PAUSE: LiveId = live_id!(pause_landing);
@@ -176,11 +181,7 @@ struct NodeCore {
 
 impl NodeCore {
     fn lan(&self) -> String {
-        match (&self.node.addr, &self.node.lan_off) {
-            (Some(a), _) => format!("LAN {a}"),
-            (None, Some(w)) => w.clone(),
-            (None, None) => "local only".into(),
-        }
+        makepad_devhub::node::lan_said(&self.node.lan)
     }
 
     /// this machine's JITs (the scan's list: no JIT is asked)
@@ -305,7 +306,37 @@ fn size_jit_cache(m: &MasterCore, machine: String, app: Option<String>) {
     });
 }
 
+/// The devhub panel (apps/devhub_panel: every box's leases and load on one time axis, the queue,
+/// the landing strip), the master's menu's "Open panel": a show on the Mac (`devhub show
+/// makepad-app-devhub-panel`), so it is the latest landed panel under the JIT in a process of its
+/// own (a fault in it never ends the master), started once and brought to the front after.
+fn open_panel() {
+    const PANEL_APP: &str = "makepad-app-devhub-panel";
+    let Some(ctx) = makepad_devhub::orch::ctx() else {
+        return log_line("devhub: open panel: the master's jobs have not started");
+    };
+    // (a show of a running app asks its JIT to come to the front: never on the UI thread)
+    let _ = std::thread::Builder::new().name("devhub-open-panel".into()).spawn(move || {
+        let line = format!("show add {{\"app\":\"{PANEL_APP}\",\"on\":\"mac\",\"by\":\"the devhub menu\"}}");
+        match makepad_devhub::orch::show::serve(ctx, &line) {
+            Ok(said) => log_line(&format!("devhub: open panel: {said}")),
+            Err(e) => log_line(&format!("devhub: open panel: {e}")),
+        }
+    });
+}
+
 fn start_master() -> Result<MasterCore, String> {
+    // a self-update's exec keeps this process: the children the last image started (its git,
+    // cargo and lease children) are reaped as they end, before this image starts any
+    makepad_devhub::procinfo::reap_inherited();
+    // what the platform holds by this pid (the App Nap activity) goes before a self-update's exec,
+    // which keeps the pid, and comes back when the exec fails
+    makepad_devhub::node::set_exec_hooks(makepad_widgets::makepad_platform::makepad_hal::before_exec, makepad_widgets::makepad_platform::makepad_hal::exec_failed);
+    // its log with the time on every line, by a stamper that outlives its exec and a crash
+    #[cfg(unix)]
+    if let Err(e) = makepad_devhub::logstamp::stamp_output(makepad_devhub::logstamp::stamper) {
+        log_line(&format!("devhub: the master's log goes on without times: {e}"));
+    }
     let name = std::env::var("MAKEPAD_DEVHUB_NAME").ok().filter(|n| makepad_devhub_conf::valid_name(n)).unwrap_or_else(|| "mac".into());
     let master = Master::start(&name, makepad_devhub_conf::HITCH_MS, trust(&name), Arc::new(|_r| {}))?;
     log_line(&format!("devhub: master {name} up; control {}", proto::control_socket().display()));
@@ -355,11 +386,7 @@ fn start_node(conf_path: PathBuf) -> Result<Option<NodeCore>, String> {
         "devhub: node {} up; control {}; {}",
         node.conf.name,
         proto::control_socket().display(),
-        match (&node.addr, &node.lan_off) {
-            (Some(a), _) => format!("LAN {a}"),
-            (None, Some(why)) => why.clone(),
-            (None, None) => "local only".into(),
-        }
+        makepad_devhub::node::lan_said(&node.lan)
     ));
     Ok(Some(NodeCore { node, conf_path, cache: Arc::new(Mutex::new(Default::default())) }))
 }
@@ -451,7 +478,7 @@ impl App {
                 let g = glance.cloned().unwrap_or_default();
                 (g.glyph(), format!("master {} \u{b7} {} \u{b7} {}", m.master.name, g.word(), g.lines().first().cloned().unwrap_or_default()))
             }
-            Some(Core::Node(n)) => (if n.node.addr.is_some() { glyph::Glyph::Quiet } else { glyph::Glyph::Off }, format!("node {} \u{b7} {} JITs \u{b7} {}", n.node.conf.name, n.jit_count(), n.lan())),
+            Some(Core::Node(n)) => (if n.node.lan.lock().unwrap().is_ok() { glyph::Glyph::Quiet } else { glyph::Glyph::Off }, format!("node {} \u{b7} {} JITs \u{b7} {}", n.node.conf.name, n.jit_count(), n.lan())),
             None => (glyph::Glyph::Off, "off".into()),
         }
     }
@@ -479,6 +506,7 @@ impl App {
                     menu.extend(gl.events.iter().enumerate().map(|(i, e)| text(n + i, e.clone())));
                     menu.push(TrayMenuItem::Line);
                 }
+                menu.push(TrayMenuItem::item(PANEL, "Open panel"));
                 menu.push(TrayMenuItem::item(OPEN, "Open devhub"));
                 menu.push(TrayMenuItem::item(PROFILE, "Open profiler"));
                 menu.push(TrayMenuItem::check(PAUSE, "Pause landing", gl.land_paused.is_some()));
@@ -510,7 +538,8 @@ impl App {
                 menu.push(TrayMenuItem::Item { id: DEVSW, label: "Dev: this machine takes work from the network".into(), enabled: true, checked: Some(makepad_devhub::lease::exec::writes_allowed()) });
             }
             menu.push(TrayMenuItem::item(QUIT, "Quit devhub"));
-            cx.set_tray(TrayIcon { id: TRAY, image: TrayImage { width: glyph::SIZE, height: glyph::SIZE, alpha: glyph::alpha(g) }, tooltip: format!("devhub \u{b7} {status}"), menu, dropdown: glance.is_none() });
+            // no tooltip: AppKit shows a status item's changed tooltip wherever the pointer is
+            cx.set_tray(TrayIcon { id: TRAY, image: TrayImage { width: glyph::SIZE, height: glyph::SIZE, alpha: glyph::alpha(g) }, tooltip: String::new(), menu, dropdown: glance.is_none() });
         }
         if let Some(Core::Node(n)) = &self.core {
             if self.node_drop.is_open() {
@@ -912,6 +941,11 @@ impl AppMain for App {
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         match event {
+            // SIGTERM to a node (the WM that replaces it, a service stop): its hub finishes the
+            // lease start in flight and exits itself, refusing new ones
+            Event::QuitRequested(e) if e.reason == QuitReason::Signal && matches!(self.core, Some(Core::Node(_))) => {
+                if makepad_devhub::lease::exec::drain_and_exit() { e.handle(); }
+            }
             Event::Timer(t) if self.timer.is_timer(t).is_some() => self.refresh(cx),
             Event::Timer(t) if self.live_on && self.live_timer.is_timer(t).is_some() => self.redraw_live(cx),
             Event::TrayMenu(e) if e.tray == TRAY => match e.item {
@@ -962,6 +996,7 @@ impl AppMain for App {
                     self.refresh(cx);
                 }
                 id if id == PROFILE => self.open_profile(cx, None),
+                id if id == PANEL => open_panel(),
                 id if id == OPEN => {
                     self.window_shown = true;
                     self.set_looking();

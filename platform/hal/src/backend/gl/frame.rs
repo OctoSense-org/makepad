@@ -6,11 +6,11 @@
 use super::program::Attr;
 use super::render::{Renderer, Then, Token};
 use super::sys::{self, GLenum, GLuint};
-use super::{BufObj, GlBackend, PipeState, Tex, TexObj};
+use super::{BufObj, Composed, GlBackend, PipeState, Tex, TexObj};
 use crate::backend::exec::{self, LentState};
-use crate::buffers::{id_at, read_ids, read_pairs, CmdView};
+use crate::buffers::{id_at, read_ids, read_pairs, read_rects, CmdView};
 use crate::ledger::{Kind, Pool};
-use crate::session::{LentRef, Session, TextureObj};
+use crate::session::{LentRef, Session, TextureObj, HOST};
 use crate::types::*;
 use std::sync::Arc;
 
@@ -28,6 +28,10 @@ pub(super) struct FrameJob {
     pub present: Option<((u32, Id), Arc<TexObj>)>,
     /// a window image was rendered (offscreen and embedded windows are done when rendered)
     pub window: bool,
+    /// answered when done (`FrameDone`); a badge layer's replay over a new frame is not
+    pub answer: bool,
+    /// what changed in the window's image since its last frame, or `None` for all of it
+    pub damage: Option<Vec<[i32; 4]>>,
 }
 
 pub(super) struct PassJob {
@@ -39,8 +43,12 @@ pub(super) struct PassJob {
     pub clear: [[f32; 4]; 4],
     pub clear_depth: f32,
     pub viewport: [i32; 4],
+    /// the views side by side (`Pass::view_rects`), each the viewport of its draws; empty: one view
+    pub views: Vec<[i32; 4]>,
     pub mips: Vec<Arc<TexObj>>,
     pub draws: Vec<DrawJob>,
+    /// a partial repaint: only these rects are cleared, and the draws are cut to them
+    pub damage: Option<Vec<[i32; 4]>>,
 }
 
 pub(super) enum Instances {
@@ -69,7 +77,11 @@ pub(super) struct DrawJob {
     pub depth_write: bool,
     pub depth_greater: bool,
     pub cull: bool,
-    pub scissor: [i32; 4],
+    /// (view, scissor) per draw call: the draw's scissor, in a partial repaint cut to each damaged
+    /// rect it touches, or once per view of the pass clipped to that view's rect
+    pub scissors: Vec<(usize, [i32; 4])>,
+    /// the pass block's binding and, per view, its (offset, length) in the frame's uniform bytes
+    pub pass_block: Option<(u32, Vec<(u32, u32)>)>,
     pub draw_buffers: u32,
 }
 
@@ -93,6 +105,16 @@ impl FrameBytes {
         let len = bytes.len().max(size as usize).max(16);
         self.uniforms.resize(at + len, 0);
         (at as u32, len as u32)
+    }
+    /// Each view's block of the pass uniforms at the size a program declares (`sizes` holds the
+    /// sizes the pass laid out already): a program declaring that size shares them.
+    fn put_pass_blocks(&mut self, sizes: &mut Vec<(u32, Vec<(u32, u32)>)>, pass: &[u8], views: &[exec::PassView], size: u32) -> Vec<(u32, u32)> {
+        if let Some((_, blocks)) = sizes.iter().find(|(s, _)| *s == size) {
+            return blocks.clone();
+        }
+        let blocks: Vec<(u32, u32)> = views.iter().map(|v| self.put_block(&pass[v.block.clone()], size)).collect();
+        sizes.push((size, blocks.clone()));
+        blocks
     }
     fn put_instances(&mut self, bytes: &[u8], stride: usize) -> u32 {
         let stride = stride.max(4);
@@ -134,10 +156,53 @@ impl GlBackend {
         Ok(obj)
     }
 
+    /// A window with a badge layer reads as it was last presented: with the layer.
     pub(super) fn window_image(&mut self, s: &mut Session, id: Id) -> Option<Arc<TexObj>> {
         if let Some(em) = s.windows.get(s.id, id).ok().and_then(|w| w.val.embedded) { return self.resolve(s, em.tex); }
         let (sid, id) = self.window_key(s.id, id);
+        if let Some(Some(composed)) = self.badged.get(&id.index).filter(|_| sid == HOST) {
+            if composed.gen == id.gen { return Some(composed.obj.clone()); }
+        }
         self.win.get(&(sid, id.index)).filter(|t| t.gen == id.gen).map(|t| t.obj.clone())
+    }
+
+    /// The image a badge layer frame of host window `key` draws into: the window's retained image
+    /// copied into the window's composed image (made at its size) on the render thread, ahead of
+    /// the frame. `None`: nothing rendered yet.
+    fn begin_compose(&mut self, key: (u32, Id)) -> Option<Arc<TexObj>> {
+        let base = self.win.get(&(key.0, key.1.index)).filter(|t| t.gen == key.1.gen)?.obj.clone();
+        let fits = |c: &Composed| c.gen == key.1.gen && [c.obj.desc.w, c.obj.desc.h] == [base.desc.w, base.desc.h];
+        let composed = match self.badged.get(&key.1.index)?.as_ref().filter(|c| fits(c)) {
+            Some(c) => c.obj.clone(),
+            None => {
+                let obj = self.new_texture(TextureObj { format: format::BGRA8, w: base.desc.w, h: base.desc.h, depth: 1, mips: 1,
+                    usage: usage::RENDER_TARGET | usage::SAMPLED, bytes: 0, imported: false, uploaded: 0, lent: None })
+                    .map_err(|e| eprintln!("[hal-gl] badge layer image: {e}")).ok()?;
+                let charge = self.pools.charge(Pool::WindowCopies, obj.desc.bytes);
+                self.badged.insert(key.1.index, Some(Composed { gen: key.1.gen, obj: obj.clone(), _charge: charge }));
+                obj
+            }
+        };
+        let (from, to, size) = (base.key, composed.key, [base.desc.w, base.desc.h]);
+        self.queue.push(move |r| { r.blit(from, to, size); });
+        Some(composed)
+    }
+
+    /// A composed window layer's texture `layer` takes the borrower's newest frame of host window
+    /// `window` (`Gpu::layer_copy`): the window's retained image, which every frame renders into
+    /// (the surface shows a copy of it), over the area both have; copied on the render thread
+    /// ahead of session 0's frame that samples it.
+    pub(super) fn copy_into_layer(&mut self, s: &mut Session, window: Id, layer: Id) -> bool {
+        let Some(source) = self.win.get(&(HOST, window.index)).filter(|t| t.gen == window.gen).map(|t| t.obj.clone()) else { return true };
+        let Some(image) = self.resolve(s, layer) else { return true };
+        if source.desc.format != image.desc.format || Arc::ptr_eq(&source, &image) { return true }
+        if image.swizzled {
+            eprintln!("[hal-gl] window layer: its texture is not a render target");
+            return true;
+        }
+        let (from, to, size) = (source.key, image.key, [source.desc.w.min(image.desc.w), source.desc.h.min(image.desc.h)]);
+        self.queue.push(move |r| { r.blit(from, to, size); });
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -153,8 +218,38 @@ impl GlBackend {
         s.stats.max_frame_ns = s.stats.max_frame_ns.max(packet.meta.build_end_ns.saturating_sub(packet.meta.build_start_ns));
         let is_window = kind & !target::FLAGS == target::WINDOW;
         let pick = kind & target::PICK != 0;
+        let replay = kind & target::REPLAY != 0;
+        let key = self.window_key(sid, target);
+        // a window with a badge layer: its frames stay in the retained image, the layer's frame
+        // (`target::BADGES`, from the executor right after) composes and presents it
+        let layered = is_window && !pick && key.0 == HOST && self.badged.contains_key(&key.1.index);
+        let badges = layered && kind & target::BADGES != 0;
+        if badges {
+            self.compose = self.begin_compose(key);
+            // an opaque panel or a window layer (`target::OVERLAY`) needs nothing under it: with
+            // no frame of the window kept yet (an app parked before it drew under the layer) the
+            // window's retained image is made at the window pass's size and composed over as it is
+            if self.compose.is_none() && kind & target::OVERLAY != 0 {
+                let window_pass = view.passes[pr.clone()].iter().find(|p| p.kind != pass_kind::COMPUTE && p.color.iter().all(|c| c.is_none()));
+                if let Some(v) = window_pass.map(|p| p.viewport) {
+                    let size = [(v[0] + v[2]).ceil().max(1.0) as u32, (v[1] + v[3]).ceil().max(1.0) as u32];
+                    if self.window_storage(s, target, size, now).is_ok() {
+                        self.compose = self.begin_compose(key);
+                    }
+                }
+            }
+            if self.compose.is_none() {
+                // nothing rendered yet to draw the layer over
+                if !replay {
+                    let (token, frame) = (Self::token(s), packet.frame);
+                    self.queue.push(move |r| r.after_gpu(Then::Frame { token, target, kind, frame, window: false, timing: None }));
+                }
+                return Some(exec::SubmittedFrame { deps: Vec::new(), window: false });
+            }
+        }
         let mut deps = Vec::new();
         let mut window_image = None;
+        let mut window_damage = None;
         let mut bytes = FrameBytes { uniforms: Vec::new(), instances: Vec::new(), align: self.caps.ubo_align };
         let mut instance_words = false;
         let mut passes = Vec::new();
@@ -167,8 +262,12 @@ impl GlBackend {
             match self.encode_pass(s, target, is_window, pick, pass, draws, view, &mut bytes, &mut instance_words, now, &mut deps) {
                 Ok((job, image)) => {
                     s.stats.passes += 1;
+                    if image.is_some() {
+                        // a second pass into the window's image leaves us unsure what changed
+                        window_damage = if window_image.is_none() { job.damage.as_ref().map(|rects| rects.iter().copied().filter(|r| r[2] > 0 && r[3] > 0).collect()) } else { None };
+                        window_image = image;
+                    }
                     passes.push(job);
-                    if image.is_some() { window_image = image; }
                 }
                 Err(e) => {
                     failed = true;
@@ -183,7 +282,6 @@ impl GlBackend {
                 for id in pass.color.into_iter().filter(|t| !t.is_none()) {
                     if incomplete { self.pick_pending.insert((sid, id)); } else { self.pick_pending.remove(&(sid, id)); }
                 }
-                if !pass.color[0].is_none() { self.pick_ids.insert((sid, target), pass.color[0]); }
             }
         }
         let mut present = None;
@@ -193,13 +291,15 @@ impl GlBackend {
                 window = true;
                 let embedded = s.windows.get(sid, target).is_ok_and(|w| w.val.embedded.is_some());
                 let hosted = s.windows.get(sid, target).is_ok_and(|w| w.val.is_hosted());
-                if !embedded && !hosted && self.shell.is_some() {
-                    present = Some((self.window_key(sid, target), image));
+                // (a frame under a badge layer is done once rendered: the layer's frame presents)
+                if !embedded && !hosted && !(layered && !badges) && self.shell.is_some() {
+                    present = Some((key, image));
                 }
             }
         }
+        self.compose = None;
         let job = FrameJob { token: Self::token(s), target, kind, frame: packet.frame, uniforms: bytes.uniforms, instances: bytes.instances,
-            instance_words, passes, present, window };
+            instance_words, passes, present, window, answer: !replay, damage: window_damage };
         self.queue.push(move |r| r.run_frame(job));
         Some(exec::SubmittedFrame { deps, window })
     }
@@ -211,9 +311,14 @@ impl GlBackend {
         if v.iter().any(|v| !v.is_finite() || *v < 0.0) || v[2] <= 0.0 || v[3] <= 0.0 {
             return Err("invalid pass viewport".into());
         }
-        let size = [(v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32];
+        // the views side by side (`Pass::view_rects`): each draw runs once per view in this pass
+        let pviews = exec::pass_views(pass, view.arena).map_err(|e| format!("pass not drawn: {e}"))?;
+        let viewed = pass.view_rects.len != 0;
+        let mut size = [(v[0] + v[2]).ceil() as u32, (v[1] + v[3]).ceil() as u32];
         let mut colors: Vec<(usize, Arc<TexObj>)> = Vec::new();
         let mut window = None;
+        // whether the window renders into the image we keep for it from frame to frame
+        let mut retained = false;
         for (i, id) in pass.color.iter().enumerate().filter(|(_, id)| !id.is_none()) {
             let tex = self.resolve(s, *id).ok_or("missing pass color texture")?;
             if s.textures.get(s.id, *id).is_ok_and(|t| t.val.lent.is_some()) { return Err("cannot render into a lent texture".into()); }
@@ -226,9 +331,14 @@ impl GlBackend {
         }
         if colors.is_empty() && is_window {
             let embedded = s.windows.get(s.id, target).ok().and_then(|w| w.val.embedded);
-            let tex = match embedded {
-                Some(em) => self.resolve(s, em.tex).ok_or("missing embedded window storage")?,
-                None => self.window_storage(s, target, size, now)?,
+            let tex = match (embedded, self.compose.clone()) {
+                (Some(em), _) => self.resolve(s, em.tex).ok_or("missing embedded window storage")?,
+                // a badge layer is drawn over what the window has (a resize may be landing)
+                (None, Some(composed)) => {
+                    size = [size[0].min(composed.desc.w), size[1].min(composed.desc.h)];
+                    composed
+                }
+                (None, None) => { retained = !pick; self.window_storage(s, target, size, now)? }
             };
             window = Some(tex.clone());
             colors.push((0, tex));
@@ -254,13 +364,37 @@ impl GlBackend {
             let id = pass.color.iter().copied().find(|id| !id.is_none()).unwrap_or(pass.depth);
             exec::clamped_pass(s, if id.is_none() { target } else { id }, size, target_size, pass.dpi);
         }
+        let base = { let (sid, id) = self.window_key(s.id, target); (sid, id.index) };
+        // The kept image still holds the frame the pass's damage is measured from, so we only repaint the damage.
+        let partial = retained && !viewed && colors.len() == 1 && pass.load[0] == pass_load::CLEAR && (depth.is_none() || pass.load[4] != pass_load::LOAD)
+            && pass.damage_since != 0 && pass.damage.len <= 32
+            && self.damage_base.get(&base).is_some_and(|(image, frame)| *frame == pass.damage_since && *image == colors[0].1.key);
+        // the damaged rects inside the target, an empty one kept in its place since the draws' masks count them
+        let damage: Option<Vec<[i32; 4]>> = partial.then(|| read_rects(view.arena, pass.damage).map(|[x, y, w, h]| {
+            let x0 = x.max(0.0).min(target_size[0] as f32) as i32;
+            let y0 = y.max(0.0).min(target_size[1] as f32) as i32;
+            let x1 = (x + w).max(x0 as f32).min(target_size[0] as f32) as i32;
+            let y1 = (y + h).max(y0 as f32).min(target_size[1] as f32) as i32;
+            [x0, y0, x1 - x0, y1 - y0]
+        }).collect());
+        let mask = damage.as_ref().map(|rects| rects.iter().enumerate().filter(|(_, r)| r[2] > 0 && r[3] > 0).fold(0u32, |m, (i, _)| m | 1 << i));
+        let skipped_before = s.stats.skipped_draws;
         let mut prepared = Vec::new();
+        // the pass block per view, laid out once per declared size
+        let mut pass_sizes: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
         for d in draws {
             if d.storage_buffers.len != 0 { crate::compute::unsupported(); continue; }
             s.stats.draws += 1;
             if d.index[1] == 0 || d.inst.count == 0 { continue; }
-            match self.prepare(s, pass, d, view.arena, pick, &colors, &depth, target_size, bytes, instance_words, now, deps) {
-                Ok(Some(p)) => prepared.push(p),
+            // a draw outside the damage isn't drawn, but what it uses mustn't look idle
+            if mask.is_some_and(|mask| d.damage & mask == 0) {
+                s.ledger.touch(Kind::Pipeline, d.pipeline.index, d.pipeline.gen, s.frame, now);
+                for id in [d.vb, d.ib, d.inst.id].into_iter().chain(d.ubufs).filter(|i| !i.is_none()) { s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now); }
+                for id in read_ids(view.arena, d.tex).filter(|i| !i.is_none()) { s.ledger.touch(Kind::Texture, id.index, id.gen, s.frame, now); }
+                continue;
+            }
+            match self.prepare(s, pass, &pviews, &mut pass_sizes, d, view.arena, pick, &colors, &depth, target_size, damage.as_deref().zip(mask), bytes, instance_words, now, deps) {
+                Ok(Some(p)) => if !p.scissors.is_empty() { prepared.push(p) },
                 Ok(None) => s.stats.skipped_draws += 1,
                 Err(e) => {
                     eprintln!("[hal-gl] draw: {e}");
@@ -268,6 +402,10 @@ impl GlBackend {
                     s.stats.skipped_draws += 1;
                 }
             }
+        }
+        // the kept image holds all of this frame now, unless some of its draws were left out
+        if retained {
+            if s.stats.skipped_draws == skipped_before { self.damage_base.insert(base, (colors[0].1.key, s.frame)); } else { self.damage_base.remove(&base); }
         }
         let mut attachments = [(0u64, 0u32); 5];
         let mut uint_colors = 0;
@@ -282,12 +420,14 @@ impl GlBackend {
         }
         Ok((PassJob { attachments, uint_colors, depth_stencil: depth.as_ref().is_some_and(|d| d.desc.format == format::DEPTH24_STENCIL8),
             load: pass.load, clear: pass.clear, clear_depth: pass.clear_depth,
-            viewport: [v[0] as i32, v[1] as i32, v[2].round() as i32, v[3].round() as i32], mips, draws: prepared }, window))
+            viewport: [v[0] as i32, v[1] as i32, v[2].round() as i32, v[3].round() as i32],
+            views: if viewed { pviews.iter().map(|pv| { let r = pv.rect; [r[0] as i32, r[1] as i32, r[2].round() as i32, r[3].round() as i32] }).collect() } else { Vec::new() },
+            mips, draws: prepared, damage }, window))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare(&mut self, s: &mut Session, pass: &Pass, d: &Draw, arena: &[u8], pick: bool, colors: &[(usize, Arc<TexObj>)], depth: &Option<Arc<TexObj>>,
-        target_size: [u32; 2], bytes: &mut FrameBytes, instance_words: &mut bool, now: u64, deps: &mut Vec<LentRef>) -> Result<Option<DrawJob>, String> {
+    fn prepare(&mut self, s: &mut Session, pass: &Pass, pviews: &[exec::PassView], pass_sizes: &mut Vec<(u32, Vec<(u32, u32)>)>, d: &Draw, arena: &[u8], pick: bool, colors: &[(usize, Arc<TexObj>)], depth: &Option<Arc<TexObj>>,
+        target_size: [u32; 2], damage: Option<(&[[i32; 4]], u32)>, bytes: &mut FrameBytes, instance_words: &mut bool, now: u64, deps: &mut Vec<LentRef>) -> Result<Option<DrawJob>, String> {
         for id in read_ids(arena, d.tex).chain(read_ids(arena, d.pick_tex)) {
             match exec::lent_state(s, s.id, id) {
                 LentState::Own => {}
@@ -330,7 +470,17 @@ impl GlBackend {
 
         // uniform blocks into the frame's uniform bytes, padded to the size the program declares
         let mut blocks = Vec::new();
-        for (binding, source) in [(pipeline_binding::DRAW_CALL, d.uniforms[0]), (pipeline_binding::PASS, pass.uniforms),
+        // the pass's: a block per view, laid out once for the pass at the size the program declares
+        let mut pass_block = None;
+        if let Some(Some(size)) = linked.block_sizes.get(pipeline_binding::PASS) {
+            // SAFETY: the Slice is the caller's memory, borrowed for this hal_submit call
+            let data = unsafe { pass.uniforms.as_bytes() };
+            if pviews[0].block.len().max(*size as usize) > self.caps.max_ubo {
+                return Err(format!("a {}-byte uniform block exceeds the context's {} bytes", pviews[0].block.len(), self.caps.max_ubo));
+            }
+            pass_block = Some((pipeline_binding::PASS as u32, bytes.put_pass_blocks(pass_sizes, data, pviews, *size)));
+        }
+        for (binding, source) in [(pipeline_binding::DRAW_CALL, d.uniforms[0]),
             (pipeline_binding::DRAW_LIST, d.uniforms[1]), (pipeline_binding::DYN, d.uniforms[2]), (pipeline_binding::SCOPE, d.uniforms[3])] {
             let Some(Some(size)) = linked.block_sizes.get(binding) else { continue };
             // SAFETY: as above
@@ -362,7 +512,13 @@ impl GlBackend {
         for i in 0..program.code.textures.len() {
             let id = id_at(arena, d.tex, i);
             if id.is_none() { textures.push(None); continue; }
-            let tex = self.resolve(s, id).ok_or("missing sampled texture")?;
+            let tex = match self.resolve(s, id) {
+                Some(tex) => tex,
+                // a video or camera target before its first frame samples the fallback, as on
+                // Vulkan and Metal: failing the draw blanked the whole video
+                None if s.textures.get(s.id, id).is_ok_and(|t| t.val.imported && t.val.lent.is_none()) => { textures.push(None); continue; }
+                None => return Err("missing sampled texture".into()),
+            };
             if attached(&tex) { return Err("a texture sampled by the pass it renders into".into()); }
             s.ledger.touch(Kind::Texture, id.index, id.gen, s.frame, now);
             textures.push(Some(tex));
@@ -408,14 +564,37 @@ impl GlBackend {
             let y1 = (y + h).max(y0 as f32).min(target_size[1] as f32) as i32;
             [x0, y0, x1 - x0, y1 - y0]
         };
-        if scissor[2] <= 0 || scissor[3] <= 0 { return Ok(None); }
+        // a partial repaint draws once into each damaged rect the draw touches; an empty scissor
+        // draws nothing, which leaves the picture whole. A pass's views draw once per view, the
+        // draw's scissor relative to the view's rect and clipped to it.
+        let scissors: Vec<(usize, [i32; 4])> = match damage {
+            _ if pass.view_rects.len != 0 => pviews.iter().enumerate().filter_map(|(vi, pv)| {
+                let r = pv.rect;
+                let (x, y, w, h) = if d.scissor.iter().any(|n| n.is_nan()) { (r[0], r[1], r[2], r[3]) } else {
+                    let [x, y, w, h] = d.scissor;
+                    (r[0] + x, r[1] + y, w, h)
+                };
+                let x0 = x.max(r[0]).max(0.0).min(target_size[0] as f32) as i32;
+                let y0 = y.max(r[1]).max(0.0).min(target_size[1] as f32) as i32;
+                let x1 = (x + w).min(r[0] + r[2]).max(x0 as f32).min(target_size[0] as f32) as i32;
+                let y1 = (y + h).min(r[1] + r[3]).max(y0 as f32).min(target_size[1] as f32) as i32;
+                (x1 > x0 && y1 > y0).then_some((vi, [x0, y0, x1 - x0, y1 - y0]))
+            }).collect(),
+            Some((rects, mask)) => rects.iter().enumerate().filter(|(i, _)| d.damage & mask & 1 << i != 0).filter_map(|(_, r)| {
+                let (x0, y0) = (scissor[0].max(r[0]), scissor[1].max(r[1]));
+                let (x1, y1) = ((scissor[0] + scissor[2]).min(r[0] + r[2]), (scissor[1] + scissor[3]).min(r[1] + r[3]));
+                (x1 > x0 && y1 > y0).then_some((0, [x0, y0, x1 - x0, y1 - y0]))
+            }).collect(),
+            None if scissor[2] > 0 && scissor[3] > 0 => vec![(0, scissor)],
+            None => Vec::new(),
+        };
 
         s.ledger.touch(Kind::Pipeline, d.pipeline.index, d.pipeline.gen, s.frame, now);
         for id in [d.vb, d.ib, d.inst.id].into_iter().chain(d.ubufs).filter(|i| !i.is_none()) {
             s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now);
         }
         Ok(Some(DrawJob { program, vb, ib, index_u32, index: d.index, blocks, buffers, textures, twins, pick: pick_words, instances, stride,
-            ranges, blend, depth_write: depth.is_some() && d.flags & Draw::DEPTH_WRITE != 0, depth_greater: d.flags & Draw::DEPTH_GREATER != 0, cull: d.flags & Draw::CULL != 0, scissor, draw_buffers }))
+            ranges, blend, depth_write: depth.is_some() && d.flags & Draw::DEPTH_WRITE != 0, depth_greater: d.flags & Draw::DEPTH_GREATER != 0, cull: d.flags & Draw::CULL != 0, scissors, pass_block, draw_buffers }))
     }
 }
 
@@ -428,6 +607,8 @@ struct Bound {
     depth_write: Option<bool>,
     depth_greater: Option<bool>,
     cull: Option<bool>,
+    /// the view whose rect the viewport is (`PassJob::views`), None: the pass's viewport
+    view: Option<usize>,
 }
 
 unsafe fn pointer(gl: &sys::Gl, a: &Attr, stride: i32, offset: usize) {
@@ -449,6 +630,8 @@ fn draw_buffer_list(mask: u32) -> ([GLenum; 4], i32) {
 
 impl Renderer {
     pub fn run_frame(&mut self, job: FrameJob) {
+        // (a badge layer's replay is never answered, so nothing would read its time)
+        let timing = self.timer.as_mut().filter(|_| job.answer).and_then(|timer| timer.begin(&self.ctx.gl));
         let gl = &self.ctx.gl;
         unsafe {
             // fresh storage each frame: the driver keeps the previous frame's bytes for its draws
@@ -469,14 +652,22 @@ impl Renderer {
         for pass in &job.passes {
             if let Err(e) = self.run_pass(pass) { eprintln!("[hal-gl] pass: {e}"); }
         }
+        // the frame's own work, without the blit to the window and the swap
+        if let (Some(timer), Some(_)) = (&self.timer, timing) { timer.end(&self.ctx.gl); }
         let mut window = job.window;
         if let Some((key, image)) = &job.present {
-            match self.present(*key, image.key) {
-                Ok(shown) => window = shown,
+            match self.present(*key, image.key, job.damage.as_deref()) {
+                Ok(shown) => {
+                    window = shown;
+                    #[cfg(target_os = "android")]
+                    { self.presented |= shown; }
+                }
                 Err(e) => { eprintln!("[hal-gl] present: {e}"); window = false; }
             }
         }
-        self.after_gpu(Then::Frame { token: job.token, target: job.target, kind: job.kind, frame: job.frame, window });
+        if job.answer {
+            self.after_gpu(Then::Frame { token: job.token, target: job.target, kind: job.kind, frame: job.frame, window, timing });
+        }
     }
 
     fn run_pass(&mut self, p: &PassJob) -> Result<(), String> {
@@ -490,26 +681,39 @@ impl Renderer {
             (gl.glDisable)(sys::SCISSOR_TEST);
             (gl.glColorMask)(1, 1, 1, 1);
             (gl.glDepthMask)(sys::TRUE);
-            for i in 0..4 {
-                if attached & (1 << i) == 0 || p.load[i] != pass_load::CLEAR { continue; }
-                if p.uint_colors & (1 << i) != 0 {
-                    let v = p.clear[i].map(|f| f as u32);
-                    (gl.glClearBufferuiv)(sys::COLOR, i as i32, v.as_ptr());
-                } else {
-                    (gl.glClearBufferfv)(sys::COLOR, i as i32, p.clear[i].as_ptr());
-                }
-            }
             let depth = p.attachments[4].0 != 0;
-            if depth && p.load[4] == pass_load::CLEAR {
-                if p.depth_stencil { (gl.glClearBufferfi)(sys::DEPTH_STENCIL, 0, p.clear_depth, 0) }
-                else { (gl.glClearBufferfv)(sys::DEPTH, 0, &p.clear_depth) }
+            let clear = || {
+                for i in 0..4 {
+                    if attached & (1 << i) == 0 || p.load[i] != pass_load::CLEAR { continue; }
+                    if p.uint_colors & (1 << i) != 0 {
+                        let v = p.clear[i].map(|f| f as u32);
+                        (gl.glClearBufferuiv)(sys::COLOR, i as i32, v.as_ptr());
+                    } else {
+                        (gl.glClearBufferfv)(sys::COLOR, i as i32, p.clear[i].as_ptr());
+                    }
+                }
+                if depth && p.load[4] == pass_load::CLEAR {
+                    if p.depth_stencil { (gl.glClearBufferfi)(sys::DEPTH_STENCIL, 0, p.clear_depth, 0) }
+                    else { (gl.glClearBufferfv)(sys::DEPTH, 0, &p.clear_depth) }
+                }
+            };
+            match &p.damage {
+                // a partial repaint clears only the damage, the way a whole repaint's clear leaves it
+                Some(rects) => {
+                    (gl.glEnable)(sys::SCISSOR_TEST);
+                    for [x, y, w, h] in rects.iter().filter(|r| r[2] > 0 && r[3] > 0) {
+                        (gl.glScissor)(*x, *y, *w, *h);
+                        clear();
+                    }
+                }
+                None => clear(),
             }
             (gl.glViewport)(p.viewport[0], p.viewport[1], p.viewport[2], p.viewport[3]);
             (gl.glEnable)(sys::SCISSOR_TEST);
             if depth { (gl.glEnable)(sys::DEPTH_TEST) } else { (gl.glDisable)(sys::DEPTH_TEST) }
         }
         let mut bound = Bound { draw_buffers: Some(attached), ..Default::default() };
-        for d in &p.draws { self.run_draw(d, &mut bound); }
+        for d in &p.draws { self.run_draw(d, &p.views, &mut bound); }
         let gl = &self.ctx.gl;
         unsafe {
             (gl.glBindVertexArray)(0);
@@ -526,7 +730,7 @@ impl Renderer {
         Ok(())
     }
 
-    fn run_draw(&mut self, d: &DrawJob, bound: &mut Bound) {
+    fn run_draw(&mut self, d: &DrawJob, views: &[[i32; 4]], bound: &mut Bound) {
         let key = d.program.key;
         let Some(words_unit) = self.programs.get(&key).map(|p| p.words_unit) else { return };
         // instance words of a retained buffer, for a program that fetches instances by id
@@ -582,7 +786,6 @@ impl Renderer {
                 if d.cull { (gl.glEnable)(sys::CULL_FACE) } else { (gl.glDisable)(sys::CULL_FACE) }
                 bound.cull = Some(d.cull);
             }
-            (gl.glScissor)(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
             for (binding, at, len) in &d.blocks {
                 (gl.glBindBufferRange)(sys::UNIFORM_BUFFER, *binding, self.uniform_arena, *at as isize, *len as isize);
             }
@@ -590,12 +793,14 @@ impl Renderer {
                 (gl.glBindBufferBase)(sys::UNIFORM_BUFFER, *binding, buffer(b));
             }
             for (unit, target) in program.targets.iter().enumerate() {
-                let tex = d.textures.get(unit).and_then(|t| t.as_ref()).and_then(|t| self.textures.get(&t.key))
-                    .filter(|g| g.target == *target && (program.shapes[unit] != 3 || format::is_depth(g.desc.format)))
-                    .map_or(self.fallback[program.shapes[unit] as usize], |g| g.name);
+                let shape = program.shapes[unit];
+                let (tex, format) = d.textures.get(unit).and_then(|t| t.as_ref()).and_then(|t| self.textures.get(&t.key))
+                    .filter(|g| g.target == *target && (shape != 3 || format::is_depth(g.desc.format)))
+                    .map_or((self.fallback[shape as usize], if shape >= 3 { format::DEPTH32F } else { format::RGBA8 }), |g| (g.name, g.desc.format));
                 (gl.glActiveTexture)(sys::TEXTURE0 + unit as u32);
                 (gl.glBindTexture)(*target, tex);
-                (gl.glBindSampler)(unit as u32, program.samplers[unit]);
+                let filterable = super::render::filterable(&self.caps, format, program.compare[unit]);
+                (gl.glBindSampler)(unit as u32, if filterable { program.samplers[unit] } else { program.nearest[unit] });
             }
             if let Some([id, mask]) = d.pick {
                 let base = program.targets.len() as u32;
@@ -632,14 +837,28 @@ impl Renderer {
             };
             (gl.glBindBuffer)(sys::ARRAY_BUFFER, inst_buffer);
             let (index_type, width) = if d.index_u32 { (sys::UNSIGNED_INT, 4) } else { (sys::UNSIGNED_SHORT, 2) };
-            for [start, count] in &d.ranges {
-                if *count == 0 { continue; }
-                let base = first + start;
-                if inst_buffer != 0 {
-                    for a in &program.instance { pointer(gl, a, d.stride as i32, base as usize * d.stride as usize + a.offset as usize) }
+            let mut block_view = None;
+            for (vi, [x, y, w, h]) in &d.scissors {
+                if let Some([vx, vy, vw, vh]) = views.get(*vi).filter(|_| bound.view != Some(*vi)) {
+                    (gl.glViewport)(*vx, *vy, *vw, *vh);
+                    bound.view = Some(*vi);
                 }
-                if program.inst_base >= 0 { (gl.glUniform1i)(program.inst_base, base as i32) }
-                (gl.glDrawElementsInstanced)(sys::TRIANGLES, d.index[1] as i32, index_type, (d.index[0] as usize * width) as *const _, *count as i32);
+                if let Some((binding, blocks)) = d.pass_block.as_ref().filter(|_| block_view != Some(*vi)) {
+                    if let Some((at, len)) = blocks.get(*vi) {
+                        (gl.glBindBufferRange)(sys::UNIFORM_BUFFER, *binding, self.uniform_arena, *at as isize, *len as isize);
+                    }
+                    block_view = Some(*vi);
+                }
+                (gl.glScissor)(*x, *y, *w, *h);
+                for [start, count] in &d.ranges {
+                    if *count == 0 { continue; }
+                    let base = first + start;
+                    if inst_buffer != 0 {
+                        for a in &program.instance { pointer(gl, a, d.stride as i32, base as usize * d.stride as usize + a.offset as usize) }
+                    }
+                    if program.inst_base >= 0 { (gl.glUniform1i)(program.inst_base, base as i32) }
+                    (gl.glDrawElementsInstanced)(sys::TRIANGLES, d.index[1] as i32, index_type, (d.index[0] as usize * width) as *const _, *count as i32);
+                }
             }
             (gl.glBindBuffer)(sys::ARRAY_BUFFER, 0);
         }

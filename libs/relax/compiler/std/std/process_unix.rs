@@ -32,6 +32,8 @@ enum StdioKind {
     Null,
     Piped,
     Fd(OwnedFd),
+    /// this process's own stdout or stderr (real std's StaticFd): the child's stream goes where it goes
+    Static(RawFd),
 }
 
 pub struct Stdio(StdioKind);
@@ -51,6 +53,17 @@ impl Stdio {
 impl From<File> for Stdio {
     fn from(f: File) -> Stdio {
         Stdio(StdioKind::Fd(OwnedFd::from(f)))
+    }
+}
+
+impl From<io::Stdout> for Stdio {
+    fn from(_: io::Stdout) -> Stdio {
+        Stdio(StdioKind::Static(1))
+    }
+}
+impl From<io::Stderr> for Stdio {
+    fn from(_: io::Stderr) -> Stdio {
+        Stdio(StdioKind::Static(2))
     }
 }
 
@@ -207,7 +220,7 @@ impl ExitCode {
 }
 
 /// rustc library/std/src/process.rs: what `fn main` may return.
-#[cfg_attr(not(relax_check), lang = "termination")]
+#[lang = "termination"]
 pub trait Termination {
     fn report(self) -> ExitCode;
 }
@@ -218,17 +231,9 @@ impl Termination for () {
     }
 }
 
-// `!` as a type is unstable under rustc; the shim (check_os) builds without this impl.
-#[cfg(not(relax_shim))]
 impl Termination for ! {
     fn report(self) -> ExitCode {
         self
-    }
-}
-
-impl Termination for core::convert::Infallible {
-    fn report(self) -> ExitCode {
-        match self {}
     }
 }
 
@@ -301,7 +306,7 @@ pub struct Command {
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
     pgroup: Option<sys::pid_t>,
-    /// CommandExt::uid / gid: the ids the child switches to before it execs
+    /// CommandExt::uid / gid: the child's user and group, set before its exec
     uid: Option<sys::uid_t>,
     gid: Option<sys::gid_t>,
     /// CommandExt::pre_exec closures, run in the child between fork and exec
@@ -391,11 +396,33 @@ impl Command {
     pub(crate) fn set_pgroup(&mut self, pgroup: sys::pid_t) {
         self.pgroup = Some(pgroup);
     }
-    pub(crate) fn set_uid(&mut self, id: sys::uid_t) {
-        self.uid = Some(id);
+    pub(crate) fn set_uid(&mut self, uid: sys::uid_t) {
+        self.uid = Some(uid);
     }
-    pub(crate) fn set_gid(&mut self, id: sys::gid_t) {
-        self.gid = Some(id);
+    pub(crate) fn set_gid(&mut self, gid: sys::gid_t) {
+        self.gid = Some(gid);
+    }
+    /// real std (sys/process/unix/unix.rs do_exec): the group, then the user; root dropping to
+    /// another user also drops its supplementary groups (an EPERM there, no CAP_SETGID, is not
+    /// an error). Runs in the child, or in this process before CommandExt::exec.
+    unsafe fn set_ids(&self) -> io::Result<()> {
+        if let Some(gid) = self.gid {
+            if setgid(gid) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(uid) = self.uid {
+            if sys::getuid() == 0 && setgroups(0, core::ptr::null()) != 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(EPERM) {
+                    return Err(e);
+                }
+            }
+            if setuid(uid) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
     pub(crate) fn add_pre_exec(&mut self, f: alloc::boxed::Box<dyn FnMut() -> io::Result<()> + Send + Sync>, run: unsafe fn(*mut u8) -> io::Result<()>) {
         self.closures.push(PreExec { f, run });
@@ -425,59 +452,73 @@ impl Command {
         (self.env_clear || self.env.iter().any(|(k, _)| k.as_encoded_bytes() == b"PATH")) && !self.program.as_encoded_bytes().contains(&b'/')
     }
 
-    fn envp(&self) -> io::Result<Option<Vec<CString>>> {
-        if !self.env_clear && self.env.is_empty() {
-            return Ok(None);
-        }
-        let mut map: Vec<(OsString, OsString)> = Vec::new();
-        if !self.env_clear {
-            for kv in crate::env::vars_os() {
-                map.push(kv);
-            }
-        }
+    /// The child's environment, as the host's policy gives it (relax-base progenv.rs `child_env`):
+    /// under `makepad run` a run of this program again (`self_exec`) gets the host's settings for
+    /// its host and the program's own values apart; any other child the program's view. `dir`: where
+    /// the child runs; `host`: this std's plumbing values for the child's host.
+    fn envp(&self, self_exec: bool, dir: &ChildDir, host: &[(OsString, OsString)]) -> io::Result<Vec<CString>> {
+        let mut edits: Vec<u8> = Vec::new();
         for (k, v) in &self.env {
-            let mut j = 0;
-            while j < map.len() {
-                if map[j].0 == *k {
-                    map.remove(j);
-                } else {
-                    j += 1;
-                }
-            }
-            if let Some(v) = v {
-                map.push((k.clone(), v.clone()));
-            }
+            wire_push(&mut edits, k.as_encoded_bytes(), v.as_ref().map(|v| v.as_encoded_bytes()));
         }
+        let mut plumbing: Vec<u8> = Vec::new();
+        for (k, v) in host {
+            wire_push(&mut plumbing, k.as_encoded_bytes(), Some(v.as_encoded_bytes()));
+        }
+        let mut flags: u32 = 0;
+        if self.env_clear {
+            flags |= 1;
+        }
+        if self_exec {
+            flags |= 2;
+        }
+        // a package binary this run prepared (a test's CARGO_BIN_EXE_<name>): its host builds as
+        // this run did (relax-base progenv.rs, relax issue 168)
+        let program = self.program.as_encoded_bytes();
+        if unsafe { __relax_prepared_bin(program.as_ptr(), program.len()) } != 0 {
+            flags |= 16;
+        }
+        match dir {
+            ChildDir::Same => {}
+            ChildDir::Virtual(workspace, vfs) => {
+                flags |= 4;
+                wire_push(&mut plumbing, b"RELAX_WORKSPACE", Some(workspace.as_encoded_bytes()));
+                wire_push(&mut plumbing, b"RELAX_VFS", Some(vfs.as_encoded_bytes()));
+            }
+            ChildDir::Real => flags |= 8,
+        }
+        let mut p: *const u8 = core::ptr::null();
+        let mut n: usize = 0;
+        unsafe { __relax_spawn_env(edits.as_ptr(), edits.len(), plumbing.as_ptr(), plumbing.len(), flags, &mut p, &mut n) };
+        let mut s: &[u8] = if p.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } };
         let mut out = Vec::new();
-        for (k, v) in map {
-            let mut b = k.into_encoded_bytes();
-            b.push(b'=');
-            b.extend_from_slice(v.as_encoded_bytes());
-            out.push(cstring(b)?);
+        while let Some(colon) = s.iter().position(|&b| b == b':') {
+            let mut len: usize = 0;
+            for &d in &s[..colon] {
+                len = len * 10 + (d - b'0') as usize;
+            }
+            out.push(cstring(s[colon + 1..colon + 1 + len].to_vec())?);
+            s = &s[colon + 1 + len..];
         }
-        Ok(Some(out))
+        Ok(out)
     }
 
-    /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
-    /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
-    /// loader whose first argument is `run` or `app` is a launcher starting another program
-    /// through it (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`, `... app <id>`: a launch
-    /// record), and one whose first argument is `export` asks the loader for a source tree (the
-    /// runner's Install natively): those run as written.
+    /// Under `makepad run` the program's executable is its own hard link of Relax (Relax
+    /// selfexe.rs, the first word of RELAX_SELF_EXEC): spawning it runs this program again
+    /// (Relax's command line up to `--`, then the new arguments), whatever they are. A spawn of
+    /// the loader by its own name (`$RELAX_LOADER run <package>`, `... test`) is not this path, and
+    /// runs as written.
     fn self_exec_args(&self) -> Option<Vec<OsString>> {
-        let pre = crate::env::var("MAKEPAD_RUN_SELF_EXEC").ok()?;
-        if self.args.get(1).is_some_and(|a| matches!(a.as_encoded_bytes(), b"run" | b"app" | b"export")) {
-            return None;
-        }
-        // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
+        let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
+        // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
-        if crate::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_some() {
+        if crate::env::host_var_os("RELAX_AS_RUSTC").is_some() {
             return None;
         }
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
         let exe = crate::path::Path::new(parts[0]);
         let p = crate::fs::canonicalize(crate::path::Path::new(&self.program)).ok()?;
-        // the Relax executable itself runs this program
+        // the program's own executable runs this program
         if p.as_path() != exe {
             return None;
         }
@@ -487,6 +528,22 @@ impl Command {
             out.push(a.clone());
         }
         Some(out)
+    }
+
+    /// Every spawn asks the host first (Relax tool.rs), with the child's stdio ends and whether it
+    /// is plain (no exec, `pre_exec` closures, user or group). Inside a build script's run the host
+    /// answers an option-led question of the script's own `$RUSTC` in this process: its handle.
+    /// 0: a process answers (always, outside a script's run). `TOOL_REFUSED`: the spawn is refused
+    /// (a confined build script starts no process).
+    fn tool_spawn(&self, stdin: &Option<OwnedFd>, stdout: &Option<OwnedFd>, stderr: &Option<OwnedFd>, plain: bool) -> u64 {
+        let mut argv: Vec<u8> = Vec::new();
+        for a in core::iter::once(&self.program).chain(self.args.iter().skip(1)) {
+            let b = a.as_encoded_bytes();
+            argv.extend_from_slice(alloc::format!("{}:", b.len()).as_bytes());
+            argv.extend_from_slice(b);
+        }
+        let raw = |fd: &Option<OwnedFd>| fd.as_ref().map_or(-1, |fd| fd.as_raw_fd() as i64);
+        unsafe { __relax_tool_spawn(argv.as_ptr(), argv.len(), raw(stdin), raw(stdout), raw(stderr), plain as i32) }
     }
 
     /// CommandExt::exec: replaces this process (real std sys/process/unix/unix.rs exec:
@@ -503,40 +560,73 @@ impl Command {
     }
 
     /// A current folder under Relax's VFS (a git repository run) is no folder the OS knows: the
-    /// child keeps this process's real folder and gets the virtual one as MAKEPAD_RUN_WORKSPACE plus the
-    /// mount table (MAKEPAD_RUN_VFS), which a Relax program's std and Relax itself serve paths from. A
+    /// child keeps this process's real folder and gets the virtual one as RELAX_WORKSPACE plus the
+    /// mount table (RELAX_VFS), which a Relax program's std and Relax itself serve paths from. A
     /// real current folder clears an inherited virtual one.
     fn spawn_with_mode(&mut self, default: Stdio, exec: bool) -> io::Result<Child> {
         // NDK r28 spawn.h: addchdir_np requires API 34; spawning itself requires API 28.
         // The launcher will provide --cwd; never change the Activity process's cwd or fork it.
         #[cfg(target_os = "android")]
-        if self.cwd.is_some() || !self.closures.is_empty() || (!exec && (self.uid.is_some() || self.gid.is_some())) {
+        if self.cwd.is_some() || !self.closures.is_empty() || self.uid.is_some() || self.gid.is_some() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Android posix_spawn does not support cwd, pre_exec, uid or gid"));
         }
         let Some(dir) = self.cwd.clone() else {
-            return self.spawn_now(default, exec);
+            // the child runs in this program's folder: the one it changed to, if it did
+            let here = match crate::fs::vfs::chosen() {
+                None => ChildDir::Same,
+                Some(None) => ChildDir::Real,
+                Some(Some(v)) => ChildDir::Virtual(v.into_os_string(), OsString::from(crate::fs::vfs::mounts())),
+            };
+            return self.spawn_now(default, exec, &here);
         };
-        let saved_env = self.env.clone();
         let r = match crate::fs::vfs::kind(Path::new(&dir)) {
             Some((abs, _)) => {
                 self.cwd = None;
-                self.env("MAKEPAD_RUN_WORKSPACE", abs.as_os_str());
-                self.env("MAKEPAD_RUN_VFS", crate::fs::vfs::mounts());
-                self.spawn_now(default, exec)
+                self.spawn_now(default, exec, &ChildDir::Virtual(abs.as_os_str().to_os_string(), OsString::from(crate::fs::vfs::mounts())))
             }
-            None => {
-                if crate::env::var_os("MAKEPAD_RUN_WORKSPACE").is_some() {
-                    self.env_remove("MAKEPAD_RUN_WORKSPACE");
-                }
-                self.spawn_now(default, exec)
-            }
+            None => self.spawn_now(default, exec, &ChildDir::Real),
         };
         self.cwd = Some(dir);
-        self.env = saved_env;
         r
     }
 
-    fn spawn_now(&mut self, default: Stdio, exec: bool) -> io::Result<Child> {
+    /// A spawn in one order: the stdio, the host's question (`tool_spawn`), then everything that
+    /// starts a process (`spawn_process`, out of line: a confined build script never reaches it).
+    fn spawn_now(&mut self, default: Stdio, exec: bool, dir: &ChildDir) -> io::Result<Child> {
+        let default_piped = match default.0 {
+            StdioKind::Piped => true,
+            _ => false,
+        };
+        let (stdin_child, stdin_parent) = setup_stdio(self.stdin.take(), default_piped, true)?;
+        let (stdout_child, stdout_parent) = setup_stdio(self.stdout.take(), default_piped, false)?;
+        let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
+        // a build script's `$RUSTC` question: this process answers it with the child's ends of
+        // the stdio (Relax tool.rs), and no process starts; a refused spawn is a program that is
+        // not there
+        let plain = !exec && self.closures.is_empty() && self.uid.is_none() && self.gid.is_none();
+        match self.tool_spawn(&stdin_child, &stdout_child, &stderr_child, plain) {
+            0 => {}
+            TOOL_REFUSED => return Err(io::Error::from_raw_os_error(sys::os::ENOENT)),
+            tool => {
+                drop(stdin_child);
+                drop(stdout_child);
+                drop(stderr_child);
+                return Ok(Child {
+                    pid: 0,
+                    tool: Tool(tool),
+                    status: None,
+                    stdin: stdin_parent.map(|fd| ChildStdin { fd }),
+                    stdout: stdout_parent.map(|fd| ChildStdout { fd }),
+                    stderr: stderr_parent.map(|fd| ChildStderr { fd }),
+                });
+            }
+        }
+        self.spawn_process(exec, dir, (stdin_child, stdin_parent), (stdout_child, stdout_parent), (stderr_child, stderr_parent))
+    }
+
+    #[inline(never)]
+    fn spawn_process(&mut self, exec: bool, dir: &ChildDir, stdin: (Option<OwnedFd>, Option<OwnedFd>), stdout: (Option<OwnedFd>, Option<OwnedFd>), stderr: (Option<OwnedFd>, Option<OwnedFd>)) -> io::Result<Child> {
+        let ((stdin_child, stdin_parent), (stdout_child, stdout_parent), (stderr_child, stderr_parent)) = (stdin, stdout, stderr);
         let mut self_exec = self.self_exec_args();
         // the program again: what this process compiled goes to the disk cache first, so the new
         // process starts from it (Relax run.rs relax_self_spawn)
@@ -545,15 +635,16 @@ impl Command {
         }
         // replacing this process with the program again (an exec, not a spawn) continues the
         // live session: the `--silent` Relax added for re-runs (it ends live editing) goes
-        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::var_os("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED").is_some()) {
+        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::host_var_os("RELAX_SELF_EXEC_SILENT_ADDED").is_some()) {
             if v.get(2).is_some_and(|a| a.as_encoded_bytes() == b"--silent") {
                 v.remove(2);
             }
         }
         // ... and its clocks go on from this process's start (relax base clock.rs EXEC_ORIGIN_ENV)
+        let mut host: Vec<(OsString, OsString)> = Vec::new();
         if exec && self_exec.is_some() {
-            if let Some(t0) = crate::env::var_os("MAKEPAD_RUN_STARTUP_T0") {
-                self.env("MAKEPAD_RUN_EXEC_ORIGIN_EPOCH", &t0);
+            if let Some(t0) = crate::env::host_var_os("RELAX_STARTUP_T0") {
+                host.push((OsString::from("RELAX_EXEC_ORIGIN_EPOCH"), t0));
             }
         }
         let prog = match &self_exec {
@@ -569,48 +660,38 @@ impl Command {
             argv.push(a.as_ptr());
         }
         argv.push(core::ptr::null());
-        let envp_c = self.envp()?;
+        let envp_c = self.envp(self_exec.is_some(), dir, &host)?;
         let mut envp: Vec<*const c_char> = Vec::new();
-        let envp_ptr = match &envp_c {
-            Some(list) => {
-                for e in list {
-                    envp.push(e.as_ptr());
-                }
-                envp.push(core::ptr::null());
-                envp.as_ptr()
-            }
-            None => sys::os::environ(),
-        };
+        for e in &envp_c {
+            envp.push(e.as_ptr());
+        }
+        envp.push(core::ptr::null());
+        let envp_ptr = envp.as_ptr();
         let cwd = match &self.cwd {
             Some(d) => Some(cstring(d.as_encoded_bytes().to_vec())?),
             None => None,
         };
 
-        let default_piped = match default.0 {
-            StdioKind::Piped => true,
-            _ => false,
-        };
-        let (stdin_child, stdin_parent) = setup_stdio(self.stdin.take(), default_piped, true)?;
-        let (stdout_child, stdout_parent) = setup_stdio(self.stdout.take(), default_piped, false)?;
-        let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
 
         #[cfg(not(target_os = "android"))]
-        if !self.closures.is_empty() || self.searches_own_path() || self.uid.is_some() || self.gid.is_some() {
+        // (posix_spawn cannot change the child's user or group: real std forks for them too)
+        if !self.closures.is_empty() || self.uid.is_some() || self.gid.is_some() || self.searches_own_path() {
             if exec {
                 // CommandExt::exec: real std runs the closures in this process before the exec
                 for p in self.closures.iter_mut() {
                     unsafe { p.call()? };
                 }
             } else {
-                // real std: no posix_spawn when there are pre_exec closures, a uid or gid to
-                // switch to, or the Command's own PATH finds the program -- fork, set the child
-                // up, run the closures, exec; a CLOEXEC pipe carries a failure's errno back
+                // real std: no posix_spawn when there are pre_exec closures or the Command's own
+                // PATH finds the program -- fork, set the child up, run the closures, exec; a
+                // CLOEXEC pipe carries a failure's errno back
                 let pid = unsafe { self.fork_exec(&prog, &argv, envp_ptr, &cwd, &stdin_child, &stdout_child, &stderr_child)? };
                 drop(stdin_child);
                 drop(stdout_child);
                 drop(stderr_child);
                 return Ok(Child {
                     pid,
+                    tool: Tool(0),
                     status: None,
                     stdin: match stdin_parent {
                         Some(fd) => Some(ChildStdin { fd }),
@@ -629,7 +710,7 @@ impl Command {
         }
         if exec {
             // CommandExt::exec is real std's do_exec on every Unix: this process gets the child's
-            // stdio, ids, folder and process group and SIGPIPE back to its default, then execvp with the
+            // stdio, folder and process group and SIGPIPE back to its default, then execvp with the
             // new program's environment in place, whose PATH it searches (exec_path_env); it
             // returns only on failure. (An exec by Darwin's posix_spawn with POSIX_SPAWN_SETEXEC
             // failed EBADF with a `Stdio::null()` or a file for stdio: os_exec.rs a02.)
@@ -641,7 +722,7 @@ impl Command {
                         }
                     }
                 }
-                self.switch_ids()?;
+                self.set_ids()?;
                 if let Some(c) = &cwd {
                     if chdir(c.as_ptr()) != 0 {
                         return Err(io::Error::last_os_error());
@@ -707,6 +788,7 @@ impl Command {
         drop(stderr_child);
         Ok(Child {
             pid,
+            tool: Tool(0),
             status: None,
             stdin: match stdin_parent {
                 Some(fd) => Some(ChildStdin { fd }),
@@ -725,32 +807,9 @@ impl Command {
 }
 
 impl Command {
-    /// CommandExt::uid / gid in the process about to exec (real std's do_exec): the group first,
-    /// while the user may still change it, then the user. A user also drops the supplementary
-    /// groups, which only CAP_SETGID can: EPERM there is no failure.
-    unsafe fn switch_ids(&self) -> io::Result<()> {
-        if let Some(gid) = self.gid {
-            if setgid(gid) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        if let Some(uid) = self.uid {
-            if setgroups(0, core::ptr::null()) != 0 {
-                let e = io::Error::last_os_error();
-                if e.raw_os_error() != Some(sys::os::EPERM) {
-                    return Err(e);
-                }
-            }
-            if setuid(uid) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        Ok(())
-    }
-
-    /// fork + exec for commands with pre_exec closures or ids (real std's do_exec order: stdio,
-    /// ids, cwd, process group, SIGPIPE default, closures, exec). Returns the child's pid, or the
-    /// error the child reported through the CLOEXEC pipe (the child is reaped then).
+    /// fork + exec for commands with pre_exec closures (real std's do_exec order: stdio, cwd,
+    /// process group, SIGPIPE default, closures, exec). Returns the child's pid, or the error the
+    /// child reported through the CLOEXEC pipe (the child is reaped then).
     #[cfg(not(target_os = "android"))]
     unsafe fn fork_exec(&mut self, prog: &CString, argv: &Vec<*const c_char>, envp: *const *const c_char, cwd: &Option<CString>, stdin_child: &Option<OwnedFd>, stdout_child: &Option<OwnedFd>, stderr_child: &Option<OwnedFd>) -> io::Result<sys::pid_t> {
         // Under the JIT the child must find its code built: it has only this thread, and a
@@ -758,14 +817,16 @@ impl Command {
         // (POSIX: only async-signal-safe work between fork and exec). The loader builds the
         // child's half and the closures, with what they call, now; its fork marks the child
         // (a stub reached there anyway ends it with the function's name, never a hang).
-        // Under rustc (std/check_os) there is no loader: plain fork.
         // A child that reached code built only now (a vtable's fn) ended before its exec, with
         // none of its effects left: the loader built that code, and the fork goes again.
         let loader = ForkLoader::get();
         if let Some(pre) = loader.precompile {
-            pre(Self::fork_child_half as usize);
+            // each root bounded on its own (the loader's FORK_PRECOMPILE_MAX)
+            let half = Self::fork_child_half as usize;
+            pre(&half, 1, false);
             for p in &self.closures {
-                pre(p.run as usize);
+                let run = p.run as usize;
+                pre(&run, 1, false);
             }
         }
         let mut again = 0;
@@ -794,7 +855,7 @@ impl Command {
         }
     }
 
-    /// The child's half of fork_exec: stdio, ids, cwd, process group, SIGPIPE default, the
+    /// The child's half of fork_exec: stdio, cwd, process group, SIGPIPE default, the
     /// closures, exec; a failure's errno goes back through the CLOEXEC pipe `w`.
     #[cfg(not(target_os = "android"))]
     unsafe fn fork_child_half(&mut self, w: c_int, prog: &CString, argv: &Vec<*const c_char>, envp: *const *const c_char, cwd: &Option<CString>, stdin_child: &Option<OwnedFd>, stdout_child: &Option<OwnedFd>, stderr_child: &Option<OwnedFd>) -> ! {
@@ -805,7 +866,7 @@ impl Command {
                 }
             }
         }
-        if let Err(e) = self.switch_ids() {
+        if let Err(e) = self.set_ids() {
             child_fail(w, e);
         }
         if let Some(c) = cwd {
@@ -887,11 +948,11 @@ pub(crate) unsafe fn run_pre_exec<F: FnMut() -> io::Result<()>>(f: *mut u8) -> i
     (*(f as *mut F))()
 }
 
-/// The loader's fork-for-exec entry points (jit.rs / forkexec.rs, found through dlsym: none
-/// when std runs without Relax, e.g. under rustc in std/check_os).
+/// The loader's fork-for-exec entry points (jit.rs / forkexec.rs), found through dlsym.
+/// When the symbols are unavailable, spawning uses plain fork.
 #[cfg(not(target_os = "android"))]
 struct ForkLoader {
-    precompile: Option<extern "C" fn(usize) -> u64>,
+    precompile: Option<unsafe extern "C" fn(*const usize, usize, bool) -> u64>,
     fork_exec: Option<extern "C" fn() -> sys::pid_t>,
     fork_exec_done: Option<extern "C" fn(sys::pid_t) -> u32>,
 }
@@ -915,7 +976,7 @@ impl ForkLoader {
         unsafe {
             let (p, f, d) = (sym(c"__relax_precompile"), sym(c"__relax_fork_exec"), sym(c"__relax_fork_exec_done"));
             ForkLoader {
-                precompile: (p != 0).then(|| core::mem::transmute::<usize, extern "C" fn(usize) -> u64>(p)),
+                precompile: (p != 0).then(|| core::mem::transmute::<usize, unsafe extern "C" fn(*const usize, usize, bool) -> u64>(p)),
                 fork_exec: (f != 0).then(|| core::mem::transmute::<usize, extern "C" fn() -> sys::pid_t>(f)),
                 fork_exec_done: (d != 0).then(|| core::mem::transmute::<usize, extern "C" fn(sys::pid_t) -> u32>(d)),
             }
@@ -944,6 +1005,51 @@ unsafe fn exec_path_env(file: *const c_char, argv: *const *const c_char, envp: *
     sys::os::set_environ(envp);
     execvp(file, argv);
     sys::os::set_environ(was);
+}
+
+/// Where a child runs, for its environment (relax-base progenv.rs ChildDir): this process's folder,
+/// a virtual folder of a git run (the folder and the mount table), or a real folder.
+enum ChildDir {
+    Same,
+    Virtual(OsString, OsString),
+    Real,
+}
+
+/// One entry of the host's wire form (relax-base progenv.rs `encode`): its byte length, `:`,
+/// `NAME=value`, or `NAME` alone for a removal.
+fn wire_push(out: &mut Vec<u8>, k: &[u8], v: Option<&[u8]>) {
+    let n = k.len() + v.map_or(0, |v| v.len() + 1);
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut m = n;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
+    out.push(b':');
+    out.extend_from_slice(k);
+    if let Some(v) = v {
+        out.push(b'=');
+        out.extend_from_slice(v);
+    }
+}
+
+/// `__relax_tool_spawn`'s answer for a refused spawn (Relax tool.rs TOOL_REFUSED)
+const TOOL_REFUSED: u64 = u64::MAX;
+
+extern "C" {
+    fn __relax_spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize);
+    /// relax-base progenv.rs prepared_bin: 1 for a package binary this run prepared
+    fn __relax_prepared_bin(path: *const u8, len: usize) -> i32;
+    /// Relax tool.rs: a build script's `$RUSTC` question answered by this process (a handle), or 0
+    fn __relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64, plain: i32) -> u64;
+    fn __relax_tool_wait(handle: u64, block: i32) -> i64;
+    fn __relax_tool_release(handle: u64);
 }
 
 /// Iterator over a Command's arguments (Command::get_args).
@@ -1032,6 +1138,8 @@ fn setup_stdio(cfg: Option<Stdio>, default_piped: bool, readable_by_child: bool)
     match kind {
         StdioKind::Inherit => Ok((None, None)),
         StdioKind::Fd(fd) => Ok((Some(fd), None)),
+        // (a copy of the descriptor as it is at the spawn; the child's slot gets it)
+        StdioKind::Static(fd) => Ok((Some(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?), None)),
         StdioKind::Null => {
             let mut opts = crate::fs::OpenOptions::new();
             opts.read(readable_by_child).write(!readable_by_child);
@@ -1085,6 +1193,12 @@ struct PollFd {
 }
 
 const POLLIN: c_short = 1;
+const EPERM: i32 = 1;
+// setgroups' count: size_t on Linux, int on the BSDs and Darwin
+#[cfg(any(target_os = "linux", target_os = "android"))]
+type SetgroupsLen = usize;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+type SetgroupsLen = c_int;
 
 extern "C" {
     fn posix_spawnp(pid: *mut sys::pid_t, file: *const c_char, actions: *const SpawnFileActions, attr: *const SpawnAttr, argv: *const *const c_char, envp: *const *const c_char) -> c_int;
@@ -1104,10 +1218,7 @@ extern "C" {
     fn setpgid(pid: sys::pid_t, pgid: sys::pid_t) -> c_int;
     fn setuid(uid: sys::uid_t) -> c_int;
     fn setgid(gid: sys::gid_t) -> c_int;
-    #[cfg(target_vendor = "apple")]
-    fn setgroups(n: c_int, list: *const sys::gid_t) -> c_int;
-    #[cfg(not(target_vendor = "apple"))]
-    fn setgroups(n: usize, list: *const sys::gid_t) -> c_int;
+    fn setgroups(len: SetgroupsLen, groups: *const sys::gid_t) -> c_int;
     fn signal(sig: c_int, handler: usize) -> usize;
     fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int;
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
@@ -1180,6 +1291,8 @@ fn read2(out: Option<ChildStdout>, err: Option<ChildStderr>) -> io::Result<(Vec<
 
 pub struct Child {
     pid: sys::pid_t,
+    /// a build script's `$RUSTC` question this process answers, or none (a process)
+    tool: Tool,
     status: Option<ExitStatus>,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
@@ -1187,23 +1300,58 @@ pub struct Child {
 }
 
 impl Child {
+    /// (an answer of this process's: this process's id)
     pub fn id(&self) -> u32 {
+        if self.tool.0 != 0 {
+            return id();
+        }
         self.pid as u32
     }
     pub fn kill(&mut self) -> io::Result<()> {
-        if self.status.is_some() {
+        // (an answer ends by itself: it reads at most what the script writes to its stdin)
+        if self.status.is_some() || self.tool.0 != 0 {
             return Ok(());
         }
-        if unsafe { sys::kill(self.pid, sys::SIGKILL) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        self.kill_process()
     }
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
         drop(self.stdin.take());
         if let Some(s) = self.status {
             return Ok(s);
         }
+        if self.tool.0 != 0 {
+            let s = ExitStatus(((unsafe { __relax_tool_wait(self.tool.0, 1) } as c_int) & 0xff) << 8);
+            self.status = Some(s);
+            return Ok(s);
+        }
+        self.wait_process()
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if let Some(s) = self.status {
+            return Ok(Some(s));
+        }
+        if self.tool.0 != 0 {
+            let code = unsafe { __relax_tool_wait(self.tool.0, 0) };
+            if code < 0 {
+                return Ok(None);
+            }
+            let s = ExitStatus(((code as c_int) & 0xff) << 8);
+            self.status = Some(s);
+            return Ok(Some(s));
+        }
+        self.try_wait_process()
+    }
+    // A process's half, out of line as `spawn_process` is: a confined build script has only
+    // answers (a Child of its `$RUSTC` question), so its code never reaches these.
+    #[inline(never)]
+    fn kill_process(&mut self) -> io::Result<()> {
+        if unsafe { sys::kill(self.pid, sys::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[inline(never)]
+    fn wait_process(&mut self) -> io::Result<ExitStatus> {
         let mut status: c_int = 0;
         loop {
             let r = unsafe { sys::waitpid(self.pid, &mut status as *mut c_int, 0) };
@@ -1219,10 +1367,8 @@ impl Child {
         self.status = Some(s);
         Ok(s)
     }
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        if let Some(s) = self.status {
-            return Ok(Some(s));
-        }
+    #[inline(never)]
+    fn try_wait_process(&mut self) -> io::Result<Option<ExitStatus>> {
         let mut status: c_int = 0;
         let r = unsafe { sys::waitpid(self.pid, &mut status as *mut c_int, sys::WNOHANG) };
         if r < 0 {
@@ -1240,6 +1386,18 @@ impl Child {
         let (out, err) = read2(self.stdout.take(), self.stderr.take())?;
         let status = self.wait()?;
         Ok(Output { status, stdout: out, stderr: err })
+    }
+}
+
+/// A build script's `$RUSTC` question this process answers (Relax tool.rs): its handle, 0 for a
+/// process. It goes with the Child.
+struct Tool(u64);
+
+impl Drop for Tool {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { __relax_tool_release(self.0) };
+        }
     }
 }
 
@@ -1281,12 +1439,22 @@ fn fd_write(fd: &OwnedFd, buf: &[u8]) -> io::Result<usize> {
     }
 }
 
-impl Write for ChildStdin {
+// Writes through a shared reference, as real std's `impl Write for &ChildStdin`: the pipe is a
+// descriptor, so `writeln!(&stdin, ..)` needs no `&mut`.
+impl Write for &ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         fd_write(&self.fd, buf)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
     }
 }
 impl Read for ChildStdout {

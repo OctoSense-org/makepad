@@ -71,6 +71,7 @@ extern "system" {
     fn TerminateProcess(process: HANDLE, code: u32) -> BOOL;
     fn GetProcessId(process: HANDLE) -> u32;
     fn GetCurrentProcess() -> HANDLE;
+    fn GetCurrentThread() -> HANDLE;
     fn DuplicateHandle(src_process: HANDLE, src: HANDLE, dst_process: HANDLE, dst: *mut HANDLE, access: u32, inherit: BOOL, options: u32) -> BOOL;
     fn CreatePipe(read: *mut HANDLE, write: *mut HANDLE, attrs: *mut c_void, size: u32) -> BOOL;
     fn SetHandleInformation(h: HANDLE, mask: u32, flags: u32) -> BOOL;
@@ -110,6 +111,9 @@ pub fn id() -> u32 {
     unsafe { win::GetCurrentProcessId() }
 }
 
+/// `__relax_tool_spawn`'s answer for a refused spawn (Relax tool.rs TOOL_REFUSED)
+const TOOL_REFUSED: u64 = u64::MAX;
+
 extern "C" {
     /// The runtime's exit (Relax run.rs): its at-exit work, then the end of the process without
     /// the exiting thread's fiber-local destructors (as unix's exit() skips the main thread's
@@ -118,6 +122,13 @@ extern "C" {
     /// Relax run.rs relax_self_spawn: the disk cache written before this program spawns itself
     /// again.
     fn __relax_self_spawn();
+    fn __relax_spawn_env(edits: *const u8, edits_len: usize, host: *const u8, host_len: usize, flags: u32, out: *mut *const u8, out_len: *mut usize);
+    /// relax-base progenv.rs prepared_bin: 1 for a package binary this run prepared
+    fn __relax_prepared_bin(path: *const u8, len: usize) -> i32;
+    /// Relax tool.rs: a build script's `$RUSTC` question answered by this process (a handle), or 0
+    fn __relax_tool_spawn(argv: *const u8, len: usize, stdin: i64, stdout: i64, stderr: i64, plain: i32) -> u64;
+    fn __relax_tool_wait(handle: u64, block: i32) -> i64;
+    fn __relax_tool_release(handle: u64);
 }
 
 pub fn exit(code: i32) -> ! {
@@ -139,6 +150,8 @@ enum StdioKind {
     Null,
     Piped,
     Handle(OwnedHandle),
+    /// this process's own stdout or stderr (real std's InheritSpecific): its STD_*_HANDLE id
+    InheritSpecific(u32),
 }
 
 pub struct Stdio(StdioKind);
@@ -158,6 +171,17 @@ impl Stdio {
 impl From<File> for Stdio {
     fn from(f: File) -> Stdio {
         Stdio(StdioKind::Handle(OwnedHandle::from(f)))
+    }
+}
+
+impl From<io::Stdout> for Stdio {
+    fn from(_: io::Stdout) -> Stdio {
+        Stdio(StdioKind::InheritSpecific(win::STD_OUTPUT_HANDLE))
+    }
+}
+impl From<io::Stderr> for Stdio {
+    fn from(_: io::Stderr) -> Stdio {
+        Stdio(StdioKind::InheritSpecific(win::STD_ERROR_HANDLE))
     }
 }
 
@@ -279,7 +303,7 @@ impl ExitCode {
 }
 
 /// rustc library/std/src/process.rs: what `fn main` may return.
-#[cfg_attr(not(relax_check), lang = "termination")]
+#[lang = "termination"]
 pub trait Termination {
     fn report(self) -> ExitCode;
 }
@@ -290,17 +314,9 @@ impl Termination for () {
     }
 }
 
-// `!` as a type is unstable under rustc; the shim (check_os) builds without this impl.
-#[cfg(not(relax_shim))]
 impl Termination for ! {
     fn report(self) -> ExitCode {
         self
-    }
-}
-
-impl Termination for core::convert::Infallible {
-    fn report(self) -> ExitCode {
-        match self {}
     }
 }
 
@@ -502,50 +518,84 @@ impl Command {
         child.wait()
     }
 
-    /// real std's CommandEnv::capture_if_changed: None = the child inherits this environment;
-    /// otherwise the full environment, sorted by the case-insensitive ordinal key order (the
-    /// BTreeMap<EnvKey, OsString> real std builds), an existing key keeping its spelling.
-    fn capture_env_if_changed(&self) -> Option<Vec<(OsString, OsString)>> {
-        if !self.env_clear && self.env.is_empty() {
-            return None;
-        }
-        let mut map: Vec<(OsString, OsString)> = Vec::new();
-        if !self.env_clear {
-            for (k, v) in crate::env::vars_os() {
-                env_map_set(&mut map, k, Some(v));
-            }
-        }
+    /// The shared spawn policy keeps the child's host settings apart from its program values.
+    fn envp(&self, self_exec: bool, dir: &ChildDir, host: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+        let mut edits: Vec<u8> = Vec::new();
         for (k, v) in &self.env {
-            env_map_set(&mut map, k.clone(), v.clone());
+            wire_push(&mut edits, k.as_encoded_bytes(), v.as_ref().map(|v| v.as_encoded_bytes()));
+        }
+        let mut plumbing: Vec<u8> = Vec::new();
+        for (k, v) in host {
+            wire_push(&mut plumbing, k.as_encoded_bytes(), Some(v.as_encoded_bytes()));
+        }
+        let mut flags: u32 = 0;
+        if self.env_clear {
+            flags |= 1;
+        }
+        if self_exec {
+            flags |= 2;
+        }
+        // a package binary this run prepared (a test's CARGO_BIN_EXE_<name>): its host builds as
+        // this run did (relax-base progenv.rs, relax issue 168)
+        let program = self.program.as_encoded_bytes();
+        if unsafe { __relax_prepared_bin(program.as_ptr(), program.len()) } != 0 {
+            flags |= 16;
+        }
+        match dir {
+            ChildDir::Same => {}
+            ChildDir::Virtual(workspace, vfs) => {
+                flags |= 4;
+                wire_push(&mut plumbing, b"RELAX_WORKSPACE", Some(workspace.as_encoded_bytes()));
+                wire_push(&mut plumbing, b"RELAX_VFS", Some(vfs.as_encoded_bytes()));
+            }
+            ChildDir::Real => flags |= 8,
+        }
+        let mut p: *const u8 = core::ptr::null();
+        let mut n: usize = 0;
+        unsafe { __relax_spawn_env(edits.as_ptr(), edits.len(), plumbing.as_ptr(), plumbing.len(), flags, &mut p, &mut n) };
+        let mut s: &[u8] = if p.is_null() { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } };
+        let mut map: Vec<(OsString, OsString)> = Vec::new();
+        while let Some(colon) = s.iter().position(|&b| b == b':') {
+            let mut len: usize = 0;
+            for &d in &s[..colon] {
+                len = len * 10 + (d - b'0') as usize;
+            }
+            let e = &s[colon + 1..colon + 1 + len];
+            // the first '=' after position 0 splits; drive-current-directory keys start with '='
+            let mut i = 1;
+            while i < e.len() && e[i] != b'=' {
+                i += 1;
+            }
+            if i < e.len() {
+                env_map_set(&mut map, OsString::from_bytes_vec(e[..i].to_vec()), Some(OsString::from_bytes_vec(e[i + 1..].to_vec())));
+            }
+            s = &s[colon + 1 + len..];
         }
         map.sort_by(|a, b| env_key_cmp(&a.0, &b.0));
-        Some(map)
+        make_envp(map)
     }
 
-    /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
-    /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
-    /// loader whose first argument is `run` or `app` is a launcher starting another program through
-    /// it (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`, `... app <id>`), and one whose first argument is
-    /// `export` asks the loader for a source tree (the runner's Install natively): those run as written. `program` is the
-    /// resolved executable (NUL-terminated UTF-16, with its `.exe`); the result is the argument
-    /// list after argv[0] to run instead of this command's.
+    /// Under `makepad run` the program's executable is its own hard link of Relax (Relax
+    /// selfexe.rs, the first word of RELAX_SELF_EXEC): spawning it runs this program again
+    /// (Relax's command line up to `--`, then the new arguments), whatever they are. A spawn of
+    /// the loader by its own name (`$RELAX_LOADER run <package>`, `... test`) is not this path, and
+    /// runs as written. `program` is the resolved executable (NUL-terminated UTF-16, with its
+    /// `.exe`); the result is the argument list after argv[0] to run instead of this command's.
     fn self_exec_args(&self, program: &[u16]) -> Option<Vec<Arg>> {
-        let pre = crate::env::var("MAKEPAD_RUN_SELF_EXEC").ok()?;
-        if self.args.first().is_some_and(|a| matches!(a.as_os_str().as_encoded_bytes(), b"run" | b"app" | b"export")) {
-            return None;
-        }
-        // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
+        let pre = crate::env::host_var_os("RELAX_SELF_EXEC")?.into_string().ok()?;
+        // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
-        if crate::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_some() {
+        if crate::env::host_var_os("RELAX_AS_RUSTC").is_some() {
             return None;
         }
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
         let exe = Path::new(parts[0]);
         let resolved = OsString::from_wide(strip_nul(program));
         let p = crate::fs::canonicalize(Path::new(&resolved)).ok()?;
-        // the Relax executable itself, or a copy of it (makepad-cef re-execs the program from a
-        // copy of its executable inside a synthetic app bundle): the copy runs this program
-        if p.as_path() != exe && !same_file_contents(p.as_path(), exe) {
+        // the program's own executable, or a copy of it (makepad-cef re-execs the program from a
+        // copy of its executable inside a synthetic app bundle): the copy runs this program. The
+        // loader by another name has the same contents but is the same file as the link, not a copy.
+        if p.as_path() != exe && !(same_file_contents(p.as_path(), exe) && !same_file(p.as_path(), exe)) {
             return None;
         }
         let mut out: Vec<Arg> = Vec::new();
@@ -558,89 +608,54 @@ impl Command {
         Some(out)
     }
 
+    /// Every spawn asks the host first (Relax tool.rs), with the child's stdio ends. Inside a build
+    /// script's run the host answers an option-led question of the script's own `$RUSTC` in this
+    /// process: its handle. 0: a process answers (always, outside a script's run). `TOOL_REFUSED`:
+    /// the spawn is refused (a confined build script starts no process).
+    fn tool_spawn(&self, stdin: &Option<OwnedHandle>, stdout: &Option<OwnedHandle>, stderr: &Option<OwnedHandle>) -> u64 {
+        let mut argv: Vec<u8> = Vec::new();
+        let program = self.program.as_encoded_bytes();
+        argv.extend_from_slice(alloc::format!("{}:", program.len()).as_bytes());
+        argv.extend_from_slice(program);
+        for a in &self.args {
+            let b = match a {
+                Arg::Regular(s) | Arg::Raw(s) => s.as_encoded_bytes(),
+            };
+            argv.extend_from_slice(alloc::format!("{}:", b.len()).as_bytes());
+            argv.extend_from_slice(b);
+        }
+        let raw = |h: &Option<OwnedHandle>| h.as_ref().map_or(-1, |h| h.as_raw_handle() as isize as i64);
+        // (every Windows spawn is plain: no exec, closures, user or group)
+        unsafe { __relax_tool_spawn(argv.as_ptr(), argv.len(), raw(stdin), raw(stdout), raw(stderr), 1) }
+    }
+
     /// A child started in a virtual folder of a git run (Relax's VFS) cannot get it as its
     /// working directory: it runs from the current one and finds its workspace through
-    /// MAKEPAD_RUN_WORKSPACE + the mount table (MAKEPAD_RUN_VFS), as on unix (process_unix.rs).
+    /// RELAX_WORKSPACE + the mount table (RELAX_VFS), as on unix (process_unix.rs).
     fn spawn_with(&mut self, default: StdioKind, needs_stdin: bool) -> io::Result<Child> {
         let Some(dir) = self.cwd.clone() else {
-            return self.spawn_now(default, needs_stdin);
+            // the child runs in the folder set_current_dir chose, if the program changed it
+            let here = match crate::fs::vfs::chosen() {
+                None => ChildDir::Same,
+                Some(None) => ChildDir::Real,
+                Some(Some(v)) => ChildDir::Virtual(v.into_os_string(), OsString::from(crate::fs::vfs::mounts())),
+            };
+            return self.spawn_now(default, needs_stdin, &here);
         };
-        let saved_env = self.env.clone();
         let r = match crate::fs::vfs::kind(Path::new(&dir)) {
             Some((abs, _)) => {
                 self.cwd = None;
-                self.env("MAKEPAD_RUN_WORKSPACE", abs.as_os_str());
-                self.env("MAKEPAD_RUN_VFS", crate::fs::vfs::mounts());
-                self.spawn_now(default, needs_stdin)
+                self.spawn_now(default, needs_stdin, &ChildDir::Virtual(abs.as_os_str().to_os_string(), OsString::from(crate::fs::vfs::mounts())))
             }
-            None => {
-                if crate::env::var_os("MAKEPAD_RUN_WORKSPACE").is_some() {
-                    self.env_remove("MAKEPAD_RUN_WORKSPACE");
-                }
-                self.spawn_now(default, needs_stdin)
-            }
+            None => self.spawn_now(default, needs_stdin, &ChildDir::Real),
         };
         self.cwd = Some(dir);
-        self.env = saved_env;
         r
     }
 
-    fn spawn_now(&mut self, default: StdioKind, needs_stdin: bool) -> io::Result<Child> {
-        let maybe_env = self.capture_env_if_changed();
-        // real std's CommandEnv::have_changed_path: PATH set or removed, or the environment cleared
-        let mut env_saw_path = self.env_clear;
-        for (k, _) in &self.env {
-            if env_key_eq(k, OsStr::new("PATH")) {
-                env_saw_path = true;
-            }
-        }
-        let mut child_paths: Option<OsString> = None;
-        if env_saw_path {
-            if let Some(env) = &maybe_env {
-                for (k, v) in env {
-                    if env_key_eq(k, OsStr::new("PATH")) {
-                        child_paths = Some(v.clone());
-                    }
-                }
-            }
-        }
-        let program = resolve_exe(&self.program, child_paths.as_deref())?;
-        let self_exec = self.self_exec_args(&program);
-        // the program again: what this process compiled goes to the disk cache first, so the new
-        // process starts from it (Relax run.rs relax_self_spawn)
-        if self_exec.is_some() {
-            unsafe { __relax_self_spawn() };
-        }
-        let args: &[Arg] = match &self_exec {
-            Some(v) => v,
-            None => &self.args,
-        };
-        let is_batch_file = if is_verbatim(&program) {
-            has_bat_extension(strip_nul(&program))
-        } else {
-            let full = win::fill_utf16_buf(|buf, n| unsafe { GetFullPathNameW(program.as_ptr(), n, buf, core::ptr::null_mut()) })?;
-            has_bat_extension(&full)
-        };
-        let (program, mut cmd_str) = if is_batch_file {
-            (command_prompt()?, make_bat_command_line(&program, args, self.force_quotes)?)
-        } else {
-            let cmd_str = make_command_line(&self.program, args, self.force_quotes)?;
-            (program, cmd_str)
-        };
-        cmd_str.push(0);
-
-        let flags = self.flags | CREATE_UNICODE_ENVIRONMENT;
-        let mut env_block = make_envp(maybe_env)?;
-        let envp: *mut c_void = match &mut env_block {
-            Some(b) => b.as_mut_ptr() as *mut c_void,
-            None => core::ptr::null_mut(),
-        };
-        let dir = make_dirp(self.cwd.as_ref())?;
-        let dirp: *const u16 = match &dir {
-            Some((buf, start)) => buf[*start..].as_ptr(),
-            None => core::ptr::null(),
-        };
-
+    /// A spawn in one order: the stdio, the host's question (`tool_spawn`), then everything that
+    /// starts a process (`spawn_process`, out of line: a confined build script never reaches it).
+    fn spawn_now(&mut self, default: StdioKind, needs_stdin: bool, dir: &ChildDir) -> io::Result<Child> {
         // The child's stdio handles are made inheritable here, and every handle inheritable
         // while CreateProcessW runs goes to that child: one spawn at a time
         // (https://support.microsoft.com/kb/315939).
@@ -670,6 +685,69 @@ impl Command {
         let (stdin_child, stdin_parent) = to_handle(stdin_kind, win::STD_INPUT_HANDLE)?;
         let (stdout_child, stdout_parent) = to_handle(stdout_kind, win::STD_OUTPUT_HANDLE)?;
         let (stderr_child, stderr_parent) = to_handle(stderr_kind, win::STD_ERROR_HANDLE)?;
+        // a build script's `$RUSTC` question: this process answers it with the child's ends of
+        // the stdio (Relax tool.rs), and no process starts. Its process and thread handles are
+        // this process's own (as its id is): an answer has none of its own. A refused spawn is a
+        // program that is not there.
+        match self.tool_spawn(&stdin_child, &stdout_child, &stderr_child) {
+            0 => {}
+            TOOL_REFUSED => return Err(io::Error::from_raw_os_error(win::ERROR_FILE_NOT_FOUND as i32)),
+            tool => {
+                drop(stdin_child);
+                drop(stdout_child);
+                drop(stderr_child);
+                return Ok(Child {
+                    handle: dup_own(unsafe { GetCurrentProcess() })?,
+                    main_thread: dup_own(unsafe { GetCurrentThread() })?,
+                    tool: Tool(tool),
+                    stdin: stdin_parent.map(|h| ChildStdin { handle: h }),
+                    stdout: stdout_parent.map(|h| ChildStdout { handle: h }),
+                    stderr: stderr_parent.map(|h| ChildStderr { handle: h }),
+                });
+            }
+        }
+        self.spawn_process(dir, (stdin_child, stdin_parent), (stdout_child, stdout_parent), (stderr_child, stderr_parent))
+    }
+
+    /// (called with CREATE_PROCESS_LOCK held: the stdio handles are inheritable)
+    #[inline(never)]
+    fn spawn_process(&mut self, dir: &ChildDir, stdin: (Option<OwnedHandle>, Option<OwnedHandle>), stdout: (Option<OwnedHandle>, Option<OwnedHandle>), stderr: (Option<OwnedHandle>, Option<OwnedHandle>)) -> io::Result<Child> {
+        let ((stdin_child, stdin_parent), (stdout_child, stdout_parent), (stderr_child, stderr_parent)) = (stdin, stdout, stderr);
+        // Only an explicit PATH value adds the child's search path before the parent's.
+        let child_paths = self.env.iter().find(|(k, _)| env_key_eq(k, OsStr::new("PATH"))).and_then(|(_, v)| v.as_deref());
+        let program = resolve_exe(&self.program, child_paths)?;
+        let self_exec = self.self_exec_args(&program);
+        // the program again: what this process compiled goes to the disk cache first, so the new
+        // process starts from it (Relax run.rs relax_self_spawn)
+        if self_exec.is_some() {
+            unsafe { __relax_self_spawn() };
+        }
+        let args: &[Arg] = match &self_exec {
+            Some(v) => v,
+            None => &self.args,
+        };
+        let is_batch_file = if is_verbatim(&program) {
+            has_bat_extension(strip_nul(&program))
+        } else {
+            let full = win::fill_utf16_buf(|buf, n| unsafe { GetFullPathNameW(program.as_ptr(), n, buf, core::ptr::null_mut()) })?;
+            has_bat_extension(&full)
+        };
+        let (program, mut cmd_str) = if is_batch_file {
+            (command_prompt()?, make_bat_command_line(&program, args, self.force_quotes)?)
+        } else {
+            let cmd_str = make_command_line(&self.program, args, self.force_quotes)?;
+            (program, cmd_str)
+        };
+        cmd_str.push(0);
+
+        let flags = self.flags | CREATE_UNICODE_ENVIRONMENT;
+        let mut env_block = self.envp(self_exec.is_some(), dir, &[])?;
+        let envp = env_block.as_mut_ptr() as *mut c_void;
+        let dir = make_dirp(self.cwd.as_ref())?;
+        let dirp: *const u16 = match &dir {
+            Some((buf, start)) => buf[*start..].as_ptr(),
+            None => core::ptr::null(),
+        };
 
         let mut si = zeroed_startupinfo();
         // with any of the three set, all three go in (a null one stays null); with none set the
@@ -698,6 +776,7 @@ impl Command {
             Ok(Child {
                 handle: OwnedHandle::from_raw_handle(pi.hProcess),
                 main_thread: OwnedHandle::from_raw_handle(pi.hThread),
+                tool: Tool(0),
                 stdin: match stdin_parent {
                     Some(h) => Some(ChildStdin { handle: h }),
                     None => None,
@@ -712,6 +791,36 @@ impl Command {
                 },
             })
         }
+    }
+}
+
+/// Where the child runs, for relax-base progenv.rs's spawn policy.
+enum ChildDir {
+    Same,
+    Virtual(OsString, OsString),
+    Real,
+}
+
+/// One wire entry: its byte length, `:`, `NAME=value`, or `NAME` for a removal.
+fn wire_push(out: &mut Vec<u8>, k: &[u8], v: Option<&[u8]>) {
+    let n = k.len() + v.map_or(0, |v| v.len() + 1);
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    let mut m = n;
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (m % 10) as u8;
+        m /= 10;
+        if m == 0 {
+            break;
+        }
+    }
+    out.extend_from_slice(&digits[i..]);
+    out.push(b':');
+    out.extend_from_slice(k);
+    if let Some(v) = v {
+        out.push(b'=');
+        out.extend_from_slice(v);
     }
 }
 
@@ -759,6 +868,16 @@ fn zeroed_startupinfo() -> STARTUPINFOW {
     }
 }
 
+/// `h` duplicated into this process, not inherited by its children.
+fn dup_own(h: HANDLE) -> io::Result<OwnedHandle> {
+    let mut out: HANDLE = core::ptr::null_mut();
+    let ok = unsafe { DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &mut out, 0, 0, DUPLICATE_SAME_ACCESS) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedHandle::from_raw_handle(out) })
+}
+
 /// `h` duplicated into this process, inheritable.
 fn dup_inheritable(h: HANDLE) -> io::Result<OwnedHandle> {
     let mut out: HANDLE = core::ptr::null_mut();
@@ -773,7 +892,8 @@ fn dup_inheritable(h: HANDLE) -> io::Result<OwnedHandle> {
 /// pipe).
 fn to_handle(kind: &StdioKind, stdio_id: u32) -> io::Result<(Option<OwnedHandle>, Option<OwnedHandle>)> {
     match kind {
-        StdioKind::Inherit => {
+        StdioKind::Inherit | StdioKind::InheritSpecific(_) => {
+            let stdio_id = if let StdioKind::InheritSpecific(from) = kind { *from } else { stdio_id };
             let h = unsafe { win::GetStdHandle(stdio_id) };
             if h.is_null() || h == win::INVALID_HANDLE_VALUE {
                 // no stdio handle: the child gets null too
@@ -1210,11 +1330,7 @@ fn command_prompt() -> io::Result<Vec<u16>> {
 }
 
 /// The environment block: `k=v\0` per variable, then a final `\0` (an empty block is `\0\0`).
-fn make_envp(env: Option<Vec<(OsString, OsString)>>) -> io::Result<Option<Vec<u16>>> {
-    let env = match env {
-        Some(e) => e,
-        None => return Ok(None),
-    };
+fn make_envp(env: Vec<(OsString, OsString)>) -> io::Result<Vec<u16>> {
     let mut blk: Vec<u16> = Vec::new();
     if env.is_empty() {
         blk.push(0);
@@ -1228,7 +1344,7 @@ fn make_envp(env: Option<Vec<(OsString, OsString)>>) -> io::Result<Option<Vec<u1
         blk.push(0);
     }
     blk.push(0);
-    Ok(Some(blk))
+    Ok(blk)
 }
 
 /// The child's working directory, NUL-terminated, and where it starts: a verbatim prefix is
@@ -1296,6 +1412,16 @@ fn env_map_set(map: &mut Vec<(OsString, OsString)>, k: OsString, v: Option<OsStr
 }
 
 /// Whether two files have the same bytes (a copy of an executable).
+/// Whether `a` and `b` name one file (one volume, one file index: two names of a hard link).
+fn same_file(a: &Path, b: &Path) -> bool {
+    use crate::os::windows::fs::MetadataExt;
+    let id = |p: &Path| {
+        let m = File::open(p).and_then(|f| f.metadata()).ok()?;
+        Some((m.volume_serial_number()?, m.file_index()?))
+    };
+    matches!((id(a), id(b)), (Some(x), Some(y)) if x == y)
+}
+
 fn same_file_contents(a: &Path, b: &Path) -> bool {
     match (crate::fs::metadata(a), crate::fs::metadata(b)) {
         (Ok(x), Ok(y)) if x.len() == y.len() => {}
@@ -1344,6 +1470,8 @@ fn read2(out: Option<ChildStdout>, err: Option<ChildStderr>) -> io::Result<(Vec<
 pub struct Child {
     handle: OwnedHandle,
     main_thread: OwnedHandle,
+    /// a build script's `$RUSTC` question this process answers, or none (a process)
+    tool: Tool,
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<ChildStderr>,
@@ -1354,6 +1482,29 @@ impl Child {
         unsafe { GetProcessId(self.handle.as_raw_handle()) }
     }
     pub fn kill(&mut self) -> io::Result<()> {
+        // (an answer ends by itself: it reads at most what the script writes to its stdin)
+        if self.tool.0 != 0 {
+            return Ok(());
+        }
+        self.kill_process()
+    }
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        drop(self.stdin.take());
+        if self.tool.0 != 0 {
+            return Ok(ExitStatus(unsafe { __relax_tool_wait(self.tool.0, 1) } as u32));
+        }
+        self.wait_process()
+    }
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        if self.tool.0 != 0 {
+            let code = unsafe { __relax_tool_wait(self.tool.0, 0) };
+            return Ok((code >= 0).then(|| ExitStatus(code as u32)));
+        }
+        self.try_wait_process()
+    }
+    // A process's half, out of line as `spawn_process` is (process_unix.rs).
+    #[inline(never)]
+    fn kill_process(&mut self) -> io::Result<()> {
         if unsafe { TerminateProcess(self.handle.as_raw_handle(), 1) } == 0 {
             let error = io::Error::last_os_error();
             // ERROR_ACCESS_DENIED when the process has already ended (by us or otherwise): not
@@ -1364,8 +1515,8 @@ impl Child {
         }
         Ok(())
     }
-    pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        drop(self.stdin.take());
+    #[inline(never)]
+    fn wait_process(&mut self) -> io::Result<ExitStatus> {
         unsafe {
             if win::WaitForSingleObject(self.handle.as_raw_handle(), win::INFINITE) != WAIT_OBJECT_0 {
                 return Err(io::Error::last_os_error());
@@ -1377,7 +1528,8 @@ impl Child {
             Ok(ExitStatus(status))
         }
     }
-    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+    #[inline(never)]
+    fn try_wait_process(&mut self) -> io::Result<Option<ExitStatus>> {
         unsafe {
             let r = win::WaitForSingleObject(self.handle.as_raw_handle(), 0);
             if r == win::WAIT_TIMEOUT {
@@ -1407,6 +1559,18 @@ impl Child {
     }
     pub(crate) fn into_process_handle(self) -> OwnedHandle {
         self.handle
+    }
+}
+
+/// A build script's `$RUSTC` question this process answers (Relax tool.rs): its handle, 0 for a
+/// process. It goes with the Child.
+struct Tool(u64);
+
+impl Drop for Tool {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { __relax_tool_release(self.0) };
+        }
     }
 }
 
@@ -1453,12 +1617,21 @@ fn handle_write(h: &OwnedHandle, buf: &[u8]) -> io::Result<usize> {
     Ok(n as usize)
 }
 
-impl Write for ChildStdin {
+// Writes through a shared reference, as real std's `impl Write for &ChildStdin`.
+impl Write for &ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         handle_write(&self.handle, buf)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
     }
 }
 impl Read for ChildStdout {

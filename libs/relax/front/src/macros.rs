@@ -33,6 +33,9 @@ pub enum Frag {
     Vis,
     Lifetime,
     Meta,
+    /// `expr_2021`: parsed as `expr`, but whatever the edition it never begins with `_` or
+    /// `const` (rustc NonterminalKind::Expr(Expr2021))
+    Expr2021,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -177,9 +180,8 @@ pub struct CrateMods {
     pub mods: crate::fxhash::HashSet<String>,
     /// the `mod` item of each module (not the root)
     pub items: HashMap<String, ModItem>,
-    /// the modules whose file opens with `#![macro_use]`: rustc appends a module file's inner
-    /// attributes to its `mod` item's, so this is `#[macro_use]` on that item (kept apart from
-    /// `items`, which the parent's file gives: an edit of either file replaces only its own)
+    /// Modules with `#![macro_use]`, owned by the file containing their body.
+    /// Kept separate from the parent-owned `mod` item so a child-only edit replaces it.
     pub inner_macro_use: crate::fxhash::HashSet<String>,
     /// `use` / `extern crate` bindings per module
     pub uses: HashMap<String, Vec<UseItem>>,
@@ -202,16 +204,15 @@ pub struct FileImports {
     pub macro_use: Vec<String>,
     pub mods: Vec<String>,
     pub mod_items: Vec<(String, ModItem)>,
-    /// the file's module when the file opens with `#![macro_use]` (CrateMods::inner_macro_use)
-    pub inner_macro_use: Option<String>,
+    pub inner_macro_use: Vec<String>,
 }
 
 impl FileImports {
     /// The same imports (`mod` items only move with the text around them).
     pub fn same_as(&self, other: &FileImports) -> bool {
         let items = |f: &'_ FileImports| f.mod_items.iter().map(|(m, i)| (m.clone(), i.macro_use, i.is_pub)).collect::<Vec<_>>();
-        self.uses == other.uses && self.aliases == other.aliases && self.macro_use == other.macro_use && self.mods == other.mods && items(self) == items(other)
-            && self.inner_macro_use == other.inner_macro_use
+        self.uses == other.uses && self.aliases == other.aliases && self.macro_use == other.macro_use && self.mods == other.mods
+            && self.inner_macro_use == other.inner_macro_use && items(self) == items(other)
     }
 }
 
@@ -251,8 +252,8 @@ impl CrateMods {
 
     /// A copy whose scopes are computed afresh on next use.
     fn unresolved(&self) -> CrateMods {
-        CrateMods { root: self.root.clone(), src: self.src.clone(), mods: self.mods.clone(), items: self.items.clone(), inner_macro_use: self.inner_macro_use.clone(),
-            uses: self.uses.clone(), externs: self.externs.clone(), renames: self.renames.clone(), recursion_limit: self.recursion_limit, scope: Default::default() }
+        CrateMods { root: self.root.clone(), src: self.src.clone(), mods: self.mods.clone(), items: self.items.clone(), inner_macro_use: self.inner_macro_use.clone(), uses: self.uses.clone(),
+            externs: self.externs.clone(), renames: self.renames.clone(), recursion_limit: self.recursion_limit, scope: Default::default() }
     }
 
     fn replace_imports(&mut self, e: &ImportEdit) {
@@ -275,15 +276,14 @@ impl CrateMods {
             if !e.now.mod_items.iter().any(|(n, _)| n == m) { self.items.remove(m); }
         }
         self.items.extend(e.now.mod_items.iter().cloned());
-        if let Some(m) = &e.was.inner_macro_use { self.inner_macro_use.remove(m); }
-        if let Some(m) = &e.now.inner_macro_use { self.inner_macro_use.insert(m.clone()); }
+        for m in &e.was.inner_macro_use { self.inner_macro_use.remove(m); }
+        self.inner_macro_use.extend(e.now.inner_macro_use.iter().cloned());
     }
 
     /// Is the `macro_rules!` `d` of this crate in rustc's legacy (textual) scope in module `from`
     /// at source position `at` (None: at any position of it)? A definition is in scope after it
     /// in its module and in the modules declared after it inside that module; it leaves its module
-    /// only through `#[macro_use]` on the `mod` item (or `#![macro_use]` inside the module, which
-    /// rustc appends to the item's attributes), and then is in scope after that item in the
+    /// only through `#[macro_use]` on the `mod` item, and then is in scope after that item in the
     /// parent (rustc_resolve build_reduced_graph.rs: `MacroRulesScope::Binding` chained through
     /// `define_macro`, `#[macro_use]` modules `restore_macro_rules_scope` to the parent; ident.rs
     /// `visit_scopes`). What the scan has no `mod` item for (a module an expansion made) is not
@@ -307,6 +307,26 @@ impl CrateMods {
             if !it.macro_use && !self.inner_macro_use.contains(m) { return false; }
             e = it.end;
             m = parent;
+        }
+    }
+
+    /// Rank an in-scope binding by its nearest containing scope and the position
+    /// where it entered that scope. File-module definitions acquire the position
+    /// of the exporting `mod`, not an offset in the child file. Unknown generated
+    /// modules keep the resolver's existing precedence instead.
+    pub(crate) fn textual_binding_key(&self, d: &MacroDef, from: &str) -> Option<(usize, Vec<u32>)> {
+        if d.def_mod.is_empty() { return None; }
+        let mut module = d.def_mod.as_str();
+        let mut positions = vec![d.scope_pos.unwrap_or(d.def_pos)];
+        loop {
+            if from == module || from.strip_prefix(module).is_some_and(|rest| rest.starts_with("::")) {
+                // Two macros exported through the same module have the same
+                // outer position. Break ties by their order inside that module.
+                positions.reverse();
+                return Some((module.split("::").count(), positions));
+            }
+            positions.push(self.items.get(module)?.end);
+            module = module.rsplit_once("::")?.0;
         }
     }
 }
@@ -407,7 +427,13 @@ pub(crate) const PATH_FRAG: u32 = 1 << 26;
 /// the `(` a transcription puts around an expression fragment of several tokens (rustc's invisible
 /// delimiters): never a call's argument list (`!div $n / 2` with `$n` = `64 / 2` is no `div(..)`)
 pub(crate) const WRAP_PAREN: u32 = 1 << 25;
-pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG | WRAP_PAREN;
+/// a `vis` fragment that matched nothing, forwarded here (rustc's empty invisible group): no tokens,
+/// only the token it stands before (`Parser::empty_vis`)
+pub(crate) const EMPTY_VIS: u32 = 1 << 24;
+/// A `$s:stmt` fragment (rustc's `MetaVarKind::Stmt`): the statement it begins ends with it, no `;`
+/// looked for after it. Both meta bits, as no fragment is an expression and a literal at once.
+pub(crate) const STMT_FRAG: u32 = EXPR_FRAG | LIT_FRAG;
+pub(crate) const FRAG_FLAGS: u32 = TY_FRAG | EXPR_FRAG | LIT_FRAG | META_ONLY | BLOCK_FRAG | PATH_FRAG | WRAP_PAREN | EMPTY_VIS;
 
 const GLOB_ID: Name = Name(0);
 const GLOB_SEP_ID: Name = Name(1);
@@ -658,6 +684,19 @@ impl MacroTable {
         self.aliases.get(krate)?.get(alias)
     }
 
+    /// Whether an import that module `module` of crate `cur` sees binds `name` in the module
+    /// `path` names from there (empty: `module` itself). The aliases map is the crate's, from
+    /// every module's imports; an import is in scope only in its module, in the modules inside
+    /// it that glob-import it, and through `pub` re-exports (rustc_resolve ident.rs
+    /// `visit_scopes`: a plain name's module scope is the current module, not its parents).
+    /// Returns the module it asked when the path resolves.
+    pub(crate) fn import_binds(&self, cur: &str, module: &str, path: &[String], name: &str) -> (bool, Option<(String, String)>) {
+        let r = Res { table: self };
+        let Some((k, m)) = (if path.is_empty() { Some((cur, module)) } else { r.resolve_mod(cur, module, path) }) else { return (false, None) };
+        let mut seen = Seen::new();
+        (r.import_binds(cur, k, m, module, name, &mut seen), Some((k.to_string(), m.to_string())))
+    }
+
     /// Records an import alias of crate `krate` (copies that crate's map only if a snapshot
     /// still shares it).
     pub fn add_alias(&mut self, krate: String, alias: String, v: (String, String)) {
@@ -754,7 +793,7 @@ impl MacroTable {
         // Imports are only added here, so crate k's expansion index (its binding names and
         // their modules) and the alias answers grow in place instead of being rebuilt from all
         // of k's imports on the next lookup (one rebuild per parsed file: 1.3 GB of copies on
-        // a cold Stage).
+        // a large app's cold start).
         let crates = self.expansion_snapshot.crates.get_mut().unwrap();
         let mut index = crates.get_mut(k).map(std::sync::Arc::make_mut);
         let aliases = self.expansion_snapshot.aliases.get_mut().unwrap();
@@ -981,6 +1020,10 @@ fn lookup_after_textual(table: &MacroTable, name: &str, cur: &str, module: &str)
     r.std_prelude(name)
 }
 
+/// The modules `MacroScope::proc_macro_reach` finished, by (crate, module).
+#[derive(Default)]
+pub(crate) struct ProcReach(HashMap<(String, String), std::rc::Rc<crate::fxhash::HashSet<String>>>);
+
 struct Res<'a> {
     table: &'a MacroTable,
 }
@@ -1135,7 +1178,7 @@ impl<'a> Res<'a> {
             }
         }
         let mut seen = Seen::new();
-        let found = self.glob_find(k, k, m, n, &mut seen, None);
+        let found = self.glob_find(k, k, m, n, &mut seen, None, true);
         let mut deps: Vec<(String, u64)> = Vec::new();
         seen.each(|c, _| {
             if !deps.iter().any(|d| d.0 == c) {
@@ -1150,18 +1193,22 @@ impl<'a> Res<'a> {
 
     /// `type_in` through glob sources (each module once per query); `partial`: the crate whose
     /// scope is being computed and its tables so far.
-    fn type_in_seen<'b>(&self, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str)>
+    fn type_in_seen<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str)>
     where
         'a: 'b,
     {
-        self.glob_find(k, k, m, n, seen, partial).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
+        self.glob_find(from, k, m, n, seen, partial, true).map(|(_, _, t)| (t.0.as_str(), t.1.as_str()))
     }
 
     /// `type_in_seen`, with the (crate, module) whose non-glob bindings had the name. `from`: the
     /// crate asking; a module of another crate, reached through a glob, gives only what that
     /// crate exports (rustc: a glob imports the bindings visible to the importer), so its private
-    /// `mod serde_json` neither binds the name nor hides the extern crate of that name.
-    fn glob_find<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>) -> Option<(&'b str, &'b str, &'b (String, String))>
+    /// `mod serde_json` neither binds the name nor hides the extern crate of that name. In the
+    /// crate being computed, a miss of the module's own bindings waits while a single import of
+    /// the module may still bind the name (`scope_waits`); `vis`: the importing module sees the
+    /// module through the globs followed to it (a private glob of a module it is not inside
+    /// hides the module's imports from it).
+    fn glob_find<'b>(&self, from: &str, k: &'b str, m: &'b str, n: &str, seen: &mut Seen<'b>, partial: Option<(&str, &'b CrateScope)>, vis: bool) -> Option<(&'b str, &'b str, &'b (String, String))>
     where
         'a: 'b,
     {
@@ -1178,9 +1225,14 @@ impl<'a> Res<'a> {
             if foreign && sc.tpriv.get(m).is_some_and(|p| p.contains(n)) { return None; }
             return Some((k, m, t));
         }
+        let computing = partial.is_some_and(|(pk, _)| pk == k);
+        if computing && vis && scope_waits(k, m, n, true) {
+            return None;
+        }
         for (k2, m2, is_pub) in sc.tglobs.get(m).map_or(&[][..], |v| &v[..]) {
             if foreign && !is_pub { continue; }
-            if let Some(t) = self.glob_find(from, k2, m2, n, seen, partial) {
+            let vis = vis && (*is_pub || !computing || scope_asker_inside(m));
+            if let Some(t) = self.glob_find(from, k2, m2, n, seen, partial, vis) {
                 return Some(t);
             }
         }
@@ -1191,6 +1243,32 @@ impl<'a> Res<'a> {
     fn macro_in(&self, k: &str, m: &str, n: &str) -> Option<MacroRef> {
         let sc = self.scope(k)?;
         sc.mnon.get(m).and_then(|t| t.get(n)).or_else(|| sc.mglob.get(m).and_then(|t| t.get(n))).cloned()
+    }
+
+    /// Whether a `use` binds `name` (by that name) in module `m` of crate `k` as module `asker`
+    /// of crate `from` sees it: the module's own imports, then those its glob imports bring. A
+    /// private import is seen from its module and the modules inside it; through another
+    /// crate's module, or through a module `asker` is not inside, only `pub` imports and `pub`
+    /// globs count (rustc: a glob imports what is visible to the importing module).
+    fn import_binds<'b>(&self, from: &str, k: &'b str, m: &'b str, asker: &str, name: &str, seen: &mut Seen<'b>) -> bool
+    where
+        'a: 'b,
+    {
+        if !seen.insert(k, m) {
+            return false;
+        }
+        let Some(cm) = self.table.crates.get(k) else { return false };
+        let inside = from == k && (asker == m || asker.strip_prefix(m).is_some_and(|rest| rest.starts_with("::")));
+        if cm.uses.get(m).is_some_and(|v| v.iter().any(|u| u.bind.as_deref() == Some(name) && (inside || u.is_pub))) {
+            return true;
+        }
+        let Some(sc) = self.scope(k) else { return false };
+        for (k2, m2, is_pub) in sc.tglobs.get(m).map_or(&[][..], |v| &v[..]) {
+            if (inside || *is_pub) && self.import_binds(from, k2, m2, asker, name, seen) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The module path `path` names from module `m` of crate `k` (type namespace), with
@@ -1282,53 +1360,65 @@ impl CrateScope {
         let mut copied: HashMap<(String, usize), usize> = HashMap::default();
         // imports whose answer is final (found, or resolved into another crate's finished scope)
         let mut settled: crate::fxhash::HashSet<(String, usize)> = crate::fxhash::HashSet::default();
+        // rustc's fixpoint: a name a glob gives is undetermined while a single import of the module
+        // may still bind it (ScopeRun). A stall makes the imports that failed without waiting stop
+        // making names wait; one with none of those lifts the waits until the next binding
+        let outer = SCOPE_RUN.with(|c| c.replace(Some(ScopeRun::new(table, k, &mods, cm))));
+        let mut force = false;
+        let (mut waits, mut determined, mut forced) = (0usize, 0usize, 0usize);
         loop {
             let mut changed = false;
+            let mut waited = false;
+            // the single imports of this pass that failed without waiting
+            let mut failing: Vec<(usize, usize)> = Vec::new();
             passes += 1;
-            for m in &mods {
+            for (mi, m) in mods.iter().enumerate() {
                 for (ui, u) in cm.uses.get(m).unwrap_or(&empty).iter().enumerate() {
                     if settled.contains(&(m.clone(), ui)) {
                         continue;
                     }
+                    if force && changed {
+                        force = false;
+                        forced += 1;
+                    }
+                    scope_try(mi, ui, !force);
                     match &u.bind {
                         Some(b) => {
-                            let last = u.path.last().map_or("", |x| x.as_str());
-                            // only a name some module / crate has can bind one; only a macro name
-                            // (or a rename) can bind a macro
-                            let may_type = table.mod_names.contains(last) || last == "self" || last == "super" || last == "crate";
-                            let may_macro = table.defs.contains_key(last) || table.renames.contains(last);
+                            let (may_type, may_macro) = use_may_bind(table, u);
                             if !may_type && !may_macro {
                                 settled.insert((m.clone(), ui));
                                 continue;
                             }
                             // where the path's prefix leads: another crate's module is final
-                            let prefix_mod = match u.path.split_last() {
+                            let prefix_crate = match u.path.split_last() {
                                 Some((_, prefix)) if !prefix.is_empty() && !(prefix.len() == 1 && prefix[0].is_empty()) => {
-                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n))
+                                    resolve_path(&r, k, m, prefix, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|x| x.0)
                                 }
                                 _ => None,
                             };
-                            if prefix_mod.map_or(false, |(c, _)| c != k) {
-                                settled.insert((m.clone(), ui));
+                            if scope_take_wait() {
+                                waited = true;
+                                waits += 1;
+                                continue;
                             }
-                            // rustc binds an import in each namespace where the name is found and
-                            // visible. Another crate's private `mod name` beside its exported
-                            // `macro_rules! name` (zerovec's `mod zerovec;` and `zerovec!`,
-                            // imported as `use zerovec::zerovec;`) binds the macro only: the
-                            // importer's `name::..` paths still mean the crate.
-                            let hidden = prefix_mod.is_some_and(|(pk, pm)| {
-                                pk != k && r.scope(pk).is_some_and(|s| s.tpriv.get(pm).is_some_and(|p| p.contains(last)))
-                            });
+                            if prefix_crate.map_or(false, |c| c != k) {
+                                // (its answer is final: what it does not bind now, it never binds)
+                                settled.insert((m.clone(), ui));
+                                scope_final();
+                            }
                             // a module / crate under that name
-                            if may_type && !hidden && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
+                            let mut type_waited = false;
+                            if may_type && !sc.tnon.get(m).map_or(false, |t| t.contains_key(b)) {
                                 let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
-                                if let Some(t) = t {
+                                type_waited = scope_take_wait();
+                                if let Some(t) = t.filter(|_| !type_waited) {
                                     sc.tnon.entry(m.clone()).or_default().insert(b.clone(), t);
                                     if !u.is_pub { sc.tpriv.entry(m.clone()).or_default().insert(b.clone()); }
                                     changed = true;
                                 }
                             }
                             // a macro under that name
+                            let mut macro_waited = false;
                             if may_macro && !sc.mnon.get(m).map_or(false, |t| t.contains_key(b)) {
                                 let d = match u.path.split_last() {
                                     Some((last, prefix)) if prefix.is_empty() || (prefix.len() == 1 && prefix[0].is_empty()) => {
@@ -1343,14 +1433,26 @@ impl CrateScope {
                                     }
                                     None => None,
                                 };
-                                if let Some(d) = d {
+                                macro_waited = scope_take_wait();
+                                if let Some(d) = d.filter(|_| !macro_waited) {
                                     sc.mnon.entry(m.clone()).or_default().insert(b.clone(), d);
                                     changed = true;
                                 }
                             }
+                            if type_waited || macro_waited {
+                                waited = true;
+                                waits += 1;
+                            } else {
+                                failing.push((mi, ui));
+                            }
                         }
                         None => {
                             let t = resolve_path(&r, k, m, &u.path, &|kk, mm, n| sc.lookup_type(&r, k, kk, mm, n)).map(|(a, b)| (a.to_string(), b.to_string()));
+                            if scope_take_wait() {
+                                waited = true;
+                                waits += 1;
+                                continue;
+                            }
                             let Some((k2, m2)) = t else { continue };
                             if (k2.as_str(), m2.as_str()) == (k, m.as_str()) {
                                 continue;
@@ -1363,7 +1465,6 @@ impl CrateScope {
                             if copied.get(&(m.clone(), ui)) == Some(&size) {
                                 continue;
                             }
-                            copied.insert((m.clone(), ui), size);
                             // the source's modules: searched through it on demand
                             let srcs = sc.tglobs.entry(m.clone()).or_default();
                             match srcs.iter_mut().find(|x| x.0 == k2 && x.1 == m2) {
@@ -1374,8 +1475,14 @@ impl CrateScope {
                                     changed = true;
                                 }
                             }
-                            // its macros, under the names it has
+                            // its macros, under the names it has (copied again next pass while some wait)
                             let macros = sc.all_macros_of(&r, k, &k2, &m2);
+                            if scope_take_wait() {
+                                waited = true;
+                                waits += 1;
+                            } else {
+                                copied.insert((m.clone(), ui), size);
+                            }
                             copies += macros.len();
                             for (n, v) in macros {
                                 let has = sc.mnon.get(m).map_or(false, |t| t.contains_key(&n)) || sc.mglob.get(m).map_or(false, |t| t.contains_key(&n));
@@ -1388,12 +1495,31 @@ impl CrateScope {
                     }
                 }
             }
-            if !changed {
+            if changed {
+                if force {
+                    force = false;
+                    forced += 1;
+                }
+                continue;
+            }
+            // (a stall where nothing waited is the end)
+            if force || !waited {
                 break;
             }
+            let failed = SCOPE_RUN.with(|c| {
+                let mut c = c.borrow_mut();
+                let run = c.as_mut().expect("the scope run of this compute");
+                failing.iter().filter(|&&x| run.failed.insert(x)).count()
+            });
+            if failed > 0 {
+                determined += failed;
+                continue;
+            }
+            force = true;
         }
+        SCOPE_RUN.with(|c| c.replace(outer));
         if crate::preload::trace() {
-            eprintln!("boot-trace-mscope-detail: {} exported {:.2} ms, {} passes, {} copied, {} mods, {} uses", k, t_exp, passes, copies, mods.len(), cm.uses.values().map(|v| v.len()).sum::<usize>());
+            eprintln!("boot-trace-mscope-detail: {} exported {:.2} ms, {} passes, {} copied, {} mods, {} uses; {} tries waited, {} failures determined, {} forced", k, t_exp, passes, copies, mods.len(), cm.uses.values().map(|v| v.len()).sum::<usize>(), waits, determined, forced);
         }
         sc
     }
@@ -1401,12 +1527,21 @@ impl CrateScope {
     /// The module a name denotes in module `mm` of crate `kk`: this crate's partial tables, a
     /// dependency's finished ones.
     fn lookup_type<'b>(&'b self, r: &Res<'b>, k: &str, kk: &'b str, mm: &'b str, n: &str) -> Option<(&'b str, &'b str)> {
-        r.type_in_seen(kk, mm, n, &mut Seen::new(), Some((k, self)))
+        // Retain the importing crate across qualified paths. A private module
+        // beside a public macro (zerovec::zerovec) must not be imported into the
+        // type namespace and shadow the extern crate used by attribute macros.
+        r.type_in_seen(k, kk, mm, n, &mut Seen::new(), Some((k, self)))
     }
 
     fn lookup_macro(&self, r: &Res, k: &str, kk: &str, mm: &str, n: &str) -> Option<MacroRef> {
         if kk == k {
-            return self.mnon.get(mm).and_then(|t| t.get(n)).or_else(|| self.mglob.get(mm).and_then(|t| t.get(n))).cloned();
+            if let Some(d) = self.mnon.get(mm).and_then(|t| t.get(n)) {
+                return Some(d.clone());
+            }
+            if scope_waits(k, mm, n, false) {
+                return None;
+            }
+            return self.mglob.get(mm).and_then(|t| t.get(n)).cloned();
         }
         r.macro_in(kk, mm, n)
     }
@@ -1424,7 +1559,8 @@ impl CrateScope {
         sc.mnon.get(mm).map_or(0, |t| t.len()) + sc.mglob.get(mm).map_or(0, |t| t.len())
     }
 
-    /// Every macro name module `mm` of crate `kk` has (for a glob import).
+    /// Every macro name module `mm` of crate `kk` has (for a glob import); in the crate being
+    /// computed, not the glob-given names a single import of `mm` may still bind (`scope_waits`).
     fn all_macros_of(&self, r: &Res, k: &str, kk: &str, mm: &str) -> Vec<(String, MacroRef)> {
         let sc: &CrateScope = if kk == k {
             self
@@ -1435,13 +1571,124 @@ impl CrateScope {
             }
         };
         let mut macros = Vec::new();
-        for t in [sc.mnon.get(mm), sc.mglob.get(mm)].into_iter().flatten() {
-            for (n, v) in t {
+        for (glob, t) in [(false, sc.mnon.get(mm)), (true, sc.mglob.get(mm))] {
+            for (n, v) in t.into_iter().flatten() {
+                if glob && kk == k && !sc.mnon.get(mm).is_some_and(|t| t.contains_key(n)) && scope_waits(k, mm, n, false) {
+                    continue;
+                }
                 macros.push((n.clone(), v.clone()));
             }
         }
         macros
     }
+}
+
+/// Whether `use` item `u` may bind a module / crate, and a macro: only a name some module / crate
+/// has can bind one; only a macro name (or a rename) can bind a macro.
+fn use_may_bind(table: &MacroTable, u: &UseItem) -> (bool, bool) {
+    let last = u.path.last().map_or("", |x| x.as_str());
+    (table.mod_names.contains(last) || last == "self" || last == "super" || last == "crate", table.defs.contains_key(last) || table.renames.contains(last))
+}
+
+/// This thread's CrateScope::compute (a dependency's scope, computed on demand inside one, runs
+/// in its place and hands it back): the crate's single imports by module and the name they bind,
+/// the import being resolved, the imports found to fail whatever the others bind, whether the
+/// lookups wait (`block`: off for a forced step) and whether one of the import's did.
+struct ScopeRun {
+    krate: String,
+    mods: Vec<String>,
+    /// name -> the single imports binding it: (module index, use index, may bind a module, may bind
+    /// a macro, `pub`)
+    single: HashMap<String, Vec<(usize, usize, bool, bool, bool)>>,
+    current: (usize, usize),
+    block: bool,
+    waited: bool,
+    failed: crate::fxhash::HashSet<(usize, usize)>,
+}
+
+impl ScopeRun {
+    fn new(table: &MacroTable, k: &str, mods: &[String], cm: &CrateMods) -> ScopeRun {
+        let mut single: HashMap<String, Vec<(usize, usize, bool, bool, bool)>> = HashMap::default();
+        for (mi, m) in mods.iter().enumerate() {
+            for (ui, u) in cm.uses.get(m).map_or(&[][..], |v| &v[..]).iter().enumerate() {
+                let Some(b) = &u.bind else { continue };
+                let (may_type, may_macro) = use_may_bind(table, u);
+                if may_type || may_macro {
+                    single.entry(b.clone()).or_default().push((mi, ui, may_type, may_macro, u.is_pub));
+                }
+            }
+        }
+        ScopeRun { krate: k.to_string(), mods: mods.to_vec(), single, current: (usize::MAX, 0), block: true, waited: false, failed: Default::default() }
+    }
+}
+
+thread_local! {
+    static SCOPE_RUN: std::cell::RefCell<Option<ScopeRun>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The scope run tries import `ui` of module `mi`; `block`: its lookups wait.
+fn scope_try(mi: usize, ui: usize, block: bool) {
+    SCOPE_RUN.with(|c| {
+        if let Some(run) = c.borrow_mut().as_mut() {
+            run.current = (mi, ui);
+            run.block = block;
+            run.waited = false;
+        }
+    });
+}
+
+/// The import being tried has its final answer: it makes no name wait any more.
+fn scope_final() {
+    SCOPE_RUN.with(|c| {
+        if let Some(run) = c.borrow_mut().as_mut() {
+            let cur = run.current;
+            run.failed.insert(cur);
+        }
+    });
+}
+
+/// Whether a lookup of the import being tried waited since the last ask (and clears it).
+fn scope_take_wait() -> bool {
+    SCOPE_RUN.with(|c| c.borrow_mut().as_mut().is_some_and(|run| std::mem::take(&mut run.waited)))
+}
+
+/// Whether the module of the import being tried is module `m` or inside it.
+fn scope_asker_inside(m: &str) -> bool {
+    SCOPE_RUN.with(|c| {
+        c.borrow().as_ref().map_or(true, |run| {
+            let asker = run.mods.get(run.current.0).map_or("", |x| x.as_str());
+            asker == m || asker.strip_prefix(m).is_some_and(|r| r.starts_with("::"))
+        })
+    })
+}
+
+/// Whether name `n` of module `m` of crate `k`, missed by the module's own bindings of that
+/// namespace (`type_ns`: modules and crates, else macros), waits: crate `k`'s scope is being
+/// computed and a single import of `m` other than the one being tried may still bind it -- one
+/// visible from the module of the one being tried (`pub`, or that module is inside `m`) whose
+/// failure is not determined (rustc ident.rs: undetermined while such an import may still define
+/// the name). Marks the try waited.
+fn scope_waits(k: &str, m: &str, n: &str, type_ns: bool) -> bool {
+    SCOPE_RUN.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(run) = c.as_mut() else { return false };
+        if !run.block {
+            return false;
+        }
+        let Some(v) = run.single.get(n) else { return false };
+        if run.krate != k {
+            return false;
+        }
+        let asker = run.mods.get(run.current.0).map_or("", |x| x.as_str());
+        let inside = asker == m || asker.strip_prefix(m).is_some_and(|r| r.starts_with("::"));
+        let waits = v.iter().any(|&(mi, ui, may_type, may_macro, is_pub)| {
+            run.mods[mi] == m && (mi, ui) != run.current && (if type_ns { may_type } else { may_macro }) && (is_pub || inside) && !run.failed.contains(&(mi, ui))
+        });
+        if waits {
+            run.waited = true;
+        }
+        waits
+    })
 }
 
 /// The macros one parse sees: the table as the parse started (shared, read-only; files of a
@@ -1461,6 +1708,8 @@ pub struct MacroScope {
     uses_log: std::cell::RefCell<Vec<((Name, Name), Vec<Name>)>>,
     memo: std::cell::RefCell<LookupMemo>,
     forwarders: std::cell::RefCell<HashMap<(String, String, String), MacroRef>>,
+    /// `builtin_macro`'s answers, by (crate, module, path), for the table they were read from
+    builtin_paths: std::cell::RefCell<Option<(std::sync::Arc<MacroTable>, HashMap<(String, String, Vec<String>), Option<String>>)>>,
 }
 
 /// Deferred contexts share these bindings; individual lookups only retain a
@@ -1619,11 +1868,11 @@ impl MacroScope {
     }
 
     pub fn from_context(ctx: &MacroContext) -> Self {
-        Self { table: ctx.table.clone(), local: ctx.local.clone(), local_uses: std::cell::RefCell::new(ctx.uses.clone()), looked: Default::default(), uses_base: ctx.uses.clone(), uses_log: Default::default(), memo: Default::default(), forwarders: Default::default() }
+        Self { table: ctx.table.clone(), local: ctx.local.clone(), local_uses: std::cell::RefCell::new(ctx.uses.clone()), looked: Default::default(), uses_base: ctx.uses.clone(), uses_log: Default::default(), memo: Default::default(), forwarders: Default::default(), builtin_paths: Default::default() }
     }
 
     pub fn new(table: std::sync::Arc<MacroTable>) -> MacroScope {
-        MacroScope { table, local: Vec::new(), looked: Default::default(), local_uses: Default::default(), uses_base: Default::default(), uses_log: Default::default(), memo: Default::default(), forwarders: Default::default() }
+        MacroScope { table, local: Vec::new(), looked: Default::default(), local_uses: Default::default(), uses_base: Default::default(), uses_log: Default::default(), memo: Default::default(), forwarders: Default::default(), builtin_paths: Default::default() }
     }
 
     pub(crate) fn define_tokens(&mut self, name: &str, krate: &str, edition: u16, file: &str, module: &str, pos: u32, scope_pos: Option<u32>, exported: bool, local_inner: bool, tokens: &[MTok]) -> Result<(), String> {
@@ -1747,6 +1996,27 @@ impl MacroScope {
         })
     }
 
+    /// `MacroTable::import_binds`, with the imports macro expansions wrote: this parse's and the
+    /// crate's earlier ones (a binding of the name in that module, or any glob of theirs there:
+    /// expansion-made globs are not followed, so one is taken to bind it).
+    pub(crate) fn import_binds(&self, cur: &str, module: &str, path: &[String], name: &str) -> bool {
+        let (bound, at) = self.table.import_binds(cur, module, path, name);
+        if bound {
+            return true;
+        }
+        let Some((k, m)) = at else { return false };
+        if k != cur {
+            return false;
+        }
+        let names = &*self.table.names;
+        let mid = names.id(&m);
+        let local = self.local_uses.borrow();
+        if local.bindings.contains_key(&(mid, names.id(name))) || local.bindings.contains_key(&(mid, GLOB_ID)) {
+            return true;
+        }
+        self.table.exp_uses.get(cur).is_some_and(|t| t.contains_key(&(m.clone(), name.to_string())) || t.contains_key(&(m, GLOB.to_string())))
+    }
+
     /// An explicit binding, or an attribute exported through a glob. The outer Option keeps
     /// an explicit import of the builtin from falling through to an outer scope's proc macro.
     pub(crate) fn proc_macro_import(&self, cur: &str, module: &str, uses: &[UseItem], name: &str, kind: crate::macro_reg::Kind) -> Option<Option<crate::macro_reg::Entry>> {
@@ -1784,6 +2054,25 @@ impl MacroScope {
         self.proc_macro_in(k, m, name, kind, k != cur, seen)
     }
 
+    /// `builtin_macro_path` of a lookup of its own (no walk in progress): the answer reads only
+    /// the table, so each (crate, module, path) is walked once per table.
+    pub fn builtin_macro(&self, cur: &str, module: &str, path: &[String]) -> Option<String> {
+        let key = (cur.to_string(), module.to_string(), path.to_vec());
+        if let Some((table, known)) = self.builtin_paths.borrow().as_ref() {
+            if std::sync::Arc::ptr_eq(table, &self.table) {
+                if let Some(r) = known.get(&key) { return r.clone(); }
+            }
+        }
+        let r = self.builtin_macro_path(cur, module, path, &mut Default::default());
+        let mut memo = self.builtin_paths.borrow_mut();
+        let (_, known) = match &mut *memo {
+            Some(m) if std::sync::Arc::ptr_eq(&m.0, &self.table) => m,
+            m => m.insert((self.table.clone(), HashMap::default())),
+        };
+        known.insert(key, r.clone());
+        r
+    }
+
     /// Follow standard macro re-exports as well as re-exported library modules.
     pub(crate) fn builtin_macro_path(&self, cur: &str, module: &str, path: &[String], seen: &mut crate::fxhash::HashSet<(String, String, String)>) -> Option<String> {
         let (name, prefix) = path.split_last()?;
@@ -1794,13 +2083,12 @@ impl MacroScope {
         if matches!(k, "core" | "std" | "alloc") && m == k && (crate::program::BUILTIN_MACROS.contains(&name.as_str()) || (k == "std" && name == "dbg")) {
             return Some(name.clone());
         }
-        // The provided smallvec (std/substitutes.txt) has no `macro_rules! smallvec`: its
-        // `smallvec!` is a built-in like std's `vec!`, by its path too (stylo's stylist.rs:
-        // `smallvec::smallvec![CascadeLayer::root()]`). A crate of the name that defines the
-        // macro itself keeps its own. The crate is known by its original name: a graph with
-        // two smallvec units (a path copy next to the registry's) renames one of them.
-        if crate::crates::base_crate_name(k) == "smallvec" && m == k && name == "smallvec"
-            && !self.table.defs.get(name.as_str()).into_iter().flatten().any(|d| d.builtin == 0 && d.krate == k) {
+        // the smallvec Relax provides (std/substitutes.txt) has no `macro_rules! smallvec`: its root's
+        // `smallvec!` is the built-in one, through the crate's path as through an import (a smallvec
+        // compiled from its own source defines the macro, and the call resolves to that first).
+        // The crate is known by its original name: a graph with two smallvec units (a path copy
+        // next to the registry's, as an app on a makepad checkout has) renames one of them.
+        if crate::crates::base_crate_name(krate_name(k)) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m {
             return Some(name.clone());
         }
         let uses = self.table.crates.get(k)?.uses.get(m)?;
@@ -1869,6 +2157,71 @@ impl MacroScope {
             if let Some(e) = self.proc_macro_path(k, m, &path, kind, seen) { return Some(e); }
         }
         None
+    }
+
+    /// The names of `names` a `proc_macro_in` walk from module `m` of crate `k` can find a proc macro
+    /// for, or more, never fewer: the names the module's imports bind, those its crate's root
+    /// exports, and those of every module its glob imports read, through glob cycles. A name
+    /// outside it has no proc macro there, so it needs no walk. (Every import counts, `pub` or not:
+    /// the walk's visibility and its `seen` set only take names away.)
+    pub(crate) fn proc_macro_reach(&self, k: &str, m: &str, names: &crate::fxhash::HashSet<String>, memo: &mut ProcReach) -> std::rc::Rc<crate::fxhash::HashSet<String>> {
+        let first = (k.to_string(), m.to_string());
+        if let Some(x) = memo.0.get(&first) { return x.clone(); }
+        let r = Res { table: &self.table };
+        // the modules the globs reach that are not finished: each one's own names and glob targets
+        // (a module of this walk, or a finished set)
+        let mut keys: Vec<(String, String)> = vec![first.clone()];
+        let mut index: HashMap<(String, String), usize> = HashMap::default();
+        index.insert(first.clone(), 0);
+        let mut sets: Vec<crate::fxhash::HashSet<String>> = Vec::new();
+        let mut reads: Vec<Vec<Result<usize, std::rc::Rc<crate::fxhash::HashSet<String>>>>> = Vec::new();
+        let mut i = 0;
+        while i < keys.len() {
+            let (k, m) = keys[i].clone();
+            let mut own = crate::fxhash::HashSet::default();
+            if r.crate_root(&k).1 == m {
+                for (n, _) in crate::macro_reg::exported_proc_macros(krate_name(&k)) {
+                    if names.contains(&n) { own.insert(n); }
+                }
+            }
+            let mut read = Vec::new();
+            if let Some(uses) = self.table.crates.get(&k).and_then(|c| c.uses.get(&m)) {
+                for u in uses.iter() {
+                    if let Some(b) = u.bind.as_deref() {
+                        if names.contains(b) { own.insert(b.to_string()); }
+                        continue;
+                    }
+                    let target = if u.path.is_empty() { Some((k.as_str(), m.as_str())) } else { r.resolve_mod(&k, &m, &u.path) };
+                    let Some((k2, m2)) = target else { continue };
+                    let key = (k2.to_string(), m2.to_string());
+                    if let Some(x) = memo.0.get(&key) { read.push(Err(x.clone())); continue; }
+                    let j = match index.get(&key) {
+                        Some(&j) => j,
+                        None => { index.insert(key.clone(), keys.len()); keys.push(key); keys.len() - 1 }
+                    };
+                    read.push(Ok(j));
+                }
+            }
+            sets.push(own);
+            reads.push(read);
+            i += 1;
+        }
+        // each module's names grow by those of the modules it reads until none grows (the sets only
+        // grow, within `names`)
+        loop {
+            let mut grew = false;
+            for a in (0..keys.len()).rev() {
+                let mut add: Vec<String> = Vec::new();
+                for x in &reads[a] {
+                    let from = match x { Ok(j) => &sets[*j], Err(done) => &**done };
+                    add.extend(from.iter().filter(|n| !sets[a].contains(*n)).cloned());
+                }
+                if !add.is_empty() { grew = true; sets[a].extend(add); }
+            }
+            if !grew { break; }
+        }
+        for (key, set) in keys.into_iter().zip(sets) { memo.0.insert(key, std::rc::Rc::new(set)); }
+        memo.0[&first].clone()
     }
 
     pub(crate) fn proc_macro_use(&self, cur: &str, name: &str, kind: crate::macro_reg::Kind) -> Option<crate::macro_reg::Entry> {
@@ -2151,13 +2504,14 @@ impl MacroUse {
         Self { local, uses, looked: Vec::new(), uses_base: Default::default(), uses_log: Vec::new(), names: None, trusted_image: true, replay_image: None }
     }
 
-    /// The names of this parse's lookups that found no definition: textual ones and `crate::`
-    /// ones (another crate's path never names one of this crate's). Calls in code the cfg drops
-    /// make no lookup.
-    pub fn failed_lookups(&self) -> std::collections::BTreeSet<String> {
+    /// The names of this parse's lookups that found no definition: textual ones, and ones by a
+    /// path into this crate (`crate::`, `self::`, `super::`, or a first segment `is_crate` does not
+    /// take for another crate: `m::inner::bar!()`). Another crate's path never names one of this
+    /// crate's. Calls in code the cfg drops make no lookup.
+    pub fn failed_lookups(&self, is_crate: impl Fn(&str) -> bool) -> std::collections::BTreeSet<String> {
         let Some(names) = &self.names else { return Default::default() };
         self.looked.iter().filter(|l| l.got.is_none() && matches!(l.was, None | Some(None)))
-            .filter(|l| l.path.is_empty() || l.path.len() == 1 && names.str(l.path[0]) == "crate")
+            .filter(|l| l.path.first().is_none_or(|&first| matches!(names.str(first), "crate" | "self" | "super") || !is_crate(names.str(first))))
             .map(|l| names.str(l.name).to_string()).collect()
     }
 
@@ -2432,7 +2786,25 @@ pub mod uses {
     static USED: Mutex<Option<HashSet<(String, u32, u32)>>> = Mutex::new(None);
 
     pub fn record(on: bool) { ON.store(on, Ordering::Relaxed); }
-    pub fn recording() -> bool { ON.load(Ordering::Relaxed) }
+    pub fn recording() -> bool { ON.load(Ordering::Relaxed) && !PREVIEW.with(|p| p.get()) }
+
+    // This thread is expanding the file-selection outline (rs_expand), whose expansion text is its
+    // own: a position in it is no position of the parsed file's, so a definition recorded there
+    // is one the program never has (a `macro_rules!` an item macro writes, reported unused at
+    // whatever another expansion put at that offset of the parsed file). The parse expands every
+    // call again while recording (parse_work's reuse is off then) and records what the program
+    // holds.
+    thread_local! { static PREVIEW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+    /// `f` with this thread's recording off (the outline's expansion).
+    pub fn unrecorded<R>(f: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) { PREVIEW.with(|p| p.set(self.0)); }
+        }
+        let _restore = Restore(PREVIEW.with(|p| p.replace(true)));
+        f()
+    }
 
     pub(super) fn defined(d: &MacroDef) {
         if !recording() || d.builtin != 0 { return; }
@@ -2611,7 +2983,8 @@ pub(crate) fn close_of(toks: &[MTok], i: usize) -> usize {
 /// rustc_expand mbe/quoted.rs: `pat` is `PatParam` (no top-level `|`) before edition 2021.
 fn frag_of(s: &str, edition: u16) -> Option<Frag> {
     Some(match s {
-        "expr" | "expr_2021" => Frag::Expr,
+        "expr" => Frag::Expr,
+        "expr_2021" => Frag::Expr2021,
         "ident" => Frag::Ident,
         "ty" => Frag::Ty,
         "tt" => Frag::Tt,
@@ -2670,6 +3043,9 @@ fn parse_matcher(toks: &[MTok], edition: u16) -> Result<Vec<MNode>, String> {
             let n = &toks[i + 1];
             if n.kind == T::OpenParen {
                 let (lo, hi, sep, op, next) = rep_at(toks, i).ok_or("bad repetition in macro matcher")?;
+                if sep.is_some() && op == b'?' {
+                    return Err("the `?` macro repetition operator does not take a separator".to_string());
+                }
                 let inner = parse_matcher(&toks[lo..hi], edition)?;
                 // mbe/macro_rules.rs check_lhs_no_empty_seq: a repetition without separator must not match nothing
                 if sep.is_none()
@@ -2806,6 +3182,7 @@ enum Follow {
 fn frag_name(f: Frag) -> &'static str {
     match f {
         Frag::Expr => "expr",
+        Frag::Expr2021 => "expr_2021",
         Frag::Ident => "ident",
         Frag::Ty => "ty",
         Frag::Tt => "tt",
@@ -2858,7 +3235,7 @@ fn follow_ok(frag: Frag, fol: &Follow, edition: u16) -> bool {
     }
     let tok_in = |set: &[&str]| matches!(fol, Follow::Tok(t) if set.contains(&t.as_str()));
     match frag {
-        Frag::Expr | Frag::Stmt => matches!(fol, Follow::End) || tok_in(&["=>", ",", ";"]),
+        Frag::Expr | Frag::Expr2021 | Frag::Stmt => matches!(fol, Follow::End) || tok_in(&["=>", ",", ";"]),
         Frag::Pat if edition >= 2021 => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "if", "in"]),
         Frag::Pat => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "|", "if", "in"]),
         Frag::PatParam => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "|", "if", "in"]),
@@ -2961,10 +3338,137 @@ fn tvars_of(nodes: &[TNode], out: &mut Vec<String>) {
     }
 }
 
+/// A matcher flattened into locations (rustc_expand mbe/macro_parser.rs `MatcherLoc`, made by
+/// `compute_locs`); a matcher position is an index into them.
+enum MLoc<'m> {
+    /// a token to match; `true`: a group's opening delimiter (a synthetic parenthesis around
+    /// an interpolated expression does not match one)
+    Token(&'m MTok, bool),
+    /// `$(`: the `vars` metavariables declared inside are numbered from `first_var`; `after`
+    /// is the location past the repetition, `depth` the number of repetitions around it
+    Sequence { op: u8, vars: usize, after: usize, first_var: usize, depth: usize },
+    /// the end of a repetition without a separator: repeat (from `first`) or leave
+    KleeneNoSep { op: u8, first: usize },
+    /// the end of a repetition with a separator, before it: take it and repeat, or leave
+    Sep(&'m MTok),
+    /// past a separator: repeat
+    KleeneAfterSep { first: usize },
+    /// `$name:frag`
+    Var { name: &'m str, frag: Frag, var: usize, depth: usize },
+    /// past the matcher's end
+    Eof,
+}
+
+/// rustc `compute_locs`; the caller pushes the final `Eof`.
+fn compute_locs<'m>(nodes: &'m [MNode], locs: &mut Vec<MLoc<'m>>, next_var: &mut usize, depth: usize) {
+    for n in nodes {
+        match n {
+            MNode::Tok(t) => locs.push(MLoc::Token(t, false)),
+            MNode::Group(open, close, inner) => {
+                locs.push(MLoc::Token(open, true));
+                compute_locs(inner, locs, next_var, depth);
+                locs.push(MLoc::Token(close, false));
+            }
+            MNode::Rep(inner, sep, op) => {
+                let at = locs.len();
+                // overwritten once the repetition's end is known
+                locs.push(MLoc::Eof);
+                let first_var = *next_var;
+                let first = locs.len();
+                compute_locs(inner, locs, next_var, depth + 1);
+                match sep {
+                    Some(s) => {
+                        locs.push(MLoc::Sep(s));
+                        locs.push(MLoc::KleeneAfterSep { first });
+                    }
+                    None => locs.push(MLoc::KleeneNoSep { op: *op, first }),
+                }
+                locs[at] = MLoc::Sequence { op: *op, vars: *next_var - first_var, after: locs.len(), first_var, depth };
+            }
+            MNode::Var(name, frag) => {
+                locs.push(MLoc::Var { name, frag: *frag, var: *next_var, depth });
+                *next_var += 1;
+            }
+        }
+    }
+}
+
+/// A matcher position: a location and the fragments matched on the way to it, one entry per
+/// metavariable in declaration order (rustc `MatcherPos`); positions that split share them
+/// until one adds to them.
+struct MPos {
+    idx: usize,
+    matches: std::rc::Rc<Vec<Bind>>,
+    /// the forwarded empty `vis` fragments it took before a token: (the token, how many)
+    vis_taken: (usize, u32),
+}
+
+impl MPos {
+    /// rustc `MatcherPos::push_match`: outside a repetition the next metavariable's entry; inside
+    /// `depth` repetitions an element of the innermost sequence being built.
+    fn push_match(&mut self, var: usize, depth: usize, m: Bind) {
+        let matches = std::rc::Rc::make_mut(&mut self.matches);
+        if depth == 0 {
+            debug_assert_eq!(var, matches.len());
+            matches.push(m);
+            return;
+        }
+        let mut cur = &mut matches[var];
+        for _ in 0..depth - 1 {
+            match cur {
+                Bind::Seq(v) => cur = v.last_mut().unwrap(),
+                Bind::One(..) => unreachable!(),
+            }
+        }
+        match cur {
+            Bind::Seq(v) => v.push(m),
+            Bind::One(..) => unreachable!(),
+        }
+    }
+}
+
+fn is_kw(k: T) -> bool {
+    (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))
+}
+
+fn is_lit(k: T) -> bool {
+    matches!(k, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte)
+}
+
+/// The reserved words the lexer gives as identifiers (rustc `Ident::is_reserved`: the unused
+/// keywords, `gen` from edition 2024).
+fn is_reserved_word(s: &[u8], edition: u16) -> bool {
+    matches!(s, b"abstract" | b"become" | b"do" | b"final" | b"macro" | b"override" | b"priv" | b"typeof" | b"unsized" | b"virtual")
+        || (edition >= 2024 && s == b"gen")
+}
+
+/// What a fragment parse failure names.
+fn frag_desc(f: Frag) -> &'static str {
+    match f {
+        Frag::Expr | Frag::Expr2021 => "expression",
+        Frag::Ident => "identifier",
+        Frag::Ty => "type",
+        Frag::Tt => "token tree",
+        Frag::Pat | Frag::PatParam => "pattern",
+        Frag::Path => "path",
+        Frag::Literal => "literal",
+        Frag::Block => "`{`",
+        Frag::Item => "item",
+        Frag::Stmt => "statement",
+        Frag::Vis => "visibility",
+        Frag::Lifetime => "lifetime",
+        Frag::Meta => "meta item",
+    }
+}
+
 impl<'a> Parser<'a> {
     fn mtok_eq(&self, i: usize, m: &MTok) -> bool {
         let t = self.toks.at(i);
         if t.kind != m.kind {
+            return false;
+        }
+        // a forwarded statement is one opaque nonterminal, not its first written token
+        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ t.lo }) {
             return false;
         }
         match t.kind {
@@ -2992,67 +3496,74 @@ impl<'a> Parser<'a> {
         None
     }
 
-    /// One fragment at token `i` (ending by `end`): its end index.
-    fn match_frag(&mut self, f: Frag, i: usize, end: usize) -> Option<(usize, Option<(u32, u32)>, bool)> {
+    /// One fragment at token `i` (ending by `end`): its end index, or the fragment parser's error
+    /// (rustc parse_nonterminal).
+    fn match_frag(&mut self, f: Frag, i: usize, end: usize) -> Result<(usize, Option<(u32, u32)>, bool), String> {
+        let expected = || -> Result<(usize, Option<(u32, u32)>, bool), String> { Err(format!("expected {}", frag_desc(f))) };
         if i > end {
-            return None;
+            return expected();
         }
         let k = if i < end { self.toks.at(i).kind } else { T::Eof };
+        // a forwarded `$s:stmt` matched as a statement again: the whole fragment, as one
+        if f == Frag::Stmt && i < end && !self.stmt_frags.is_empty() && self.stmt_frags.contains(&{ self.toks.at(i).lo }) {
+            let Some(&hi) = self.frag_groups.get(&{ self.toks.at(i).lo }) else { return expected() };
+            return (i..end).find(|&j| self.toks.at(j).hi == hi).map(|j| (j + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)));
+        }
         match f {
             Frag::Ident => {
                 if i < end && (matches!(k, T::Ident | T::RawIdent) || (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))) && self.tok_text(self.toks.at(i)) != b"_" {
-                    Some((i + 1, None, false))
+                    Ok((i + 1, None, false))
                 } else {
-                    None
+                    expected()
                 }
             }
-            Frag::Lifetime => (i < end && k == T::Lifetime).then_some((i + 1, None, false)),
+            Frag::Lifetime => if i < end && k == T::Lifetime { Ok((i + 1, None, false)) } else { expected() },
             Frag::Literal => {
                 let mut j = i;
                 if j < end && self.toks.at(j).kind == T::Minus {
                     j += 1;
                 }
                 if j < end && matches!(self.toks.at(j).kind, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse) {
-                    Some((j + 1, None, false))
+                    Ok((j + 1, None, false))
                 } else {
-                    None
+                    expected()
                 }
             }
             Frag::Tt => {
                 if i >= end {
-                    return None;
+                    return expected();
                 }
                 let tok_lo = self.toks.at(i).lo;
                 if let Some(&group_end) = self.frag_groups.get(&tok_lo) {
-                    return (i..end).find(|&j| self.toks.at(j).hi == group_end).map(|j| (j + 1, None, false));
+                    return (i..end).find(|&j| self.toks.at(j).hi == group_end).map(|j| (j + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)));
                 }
                 if is_open(k) {
-                    self.tok_close_of(i, end).map(|c| (c + 1, None, false))
+                    self.tok_close_of(i, end).map(|c| (c + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)))
                 } else if is_close(k) {
-                    None
+                    expected()
                 } else {
-                    Some((i + 1, None, false))
+                    Ok((i + 1, None, false))
                 }
             }
             Frag::Block => {
                 if i < end && k == T::OpenBrace {
-                    self.tok_close_of(i, end).map(|c| (c + 1, None, false))
+                    self.tok_close_of(i, end).map(|c| (c + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)))
                 } else {
-                    None
+                    expected()
                 }
             }
             Frag::Vis => {
                 if i < end && k == T::KwPub {
                     if i + 1 < end && self.toks.at(i + 1).kind == T::OpenParen {
-                        return self.tok_close_of(i + 1, end).map(|c| (c + 1, None, false));
+                        return self.tok_close_of(i + 1, end).map(|c| (c + 1, None, false)).ok_or_else(|| format!("expected {}", frag_desc(f)));
                     }
-                    return Some((i + 1, None, false));
+                    return Ok((i + 1, None, false));
                 }
-                Some((i, None, false))
+                Ok((i, None, false))
             }
             _ => {
                 if i >= end {
-                    return None;
+                    return expected();
                 }
                 let save = self.pos;
                 let undo = self.tok_undo.len();
@@ -3065,11 +3576,13 @@ impl<'a> Parser<'a> {
                     Frag::Expr => self.expr().map(|id| {
                         // rustc_ast classify::expr_requires_semi_to_be_stmt: such an expression
                         // is its own statement where the fragment starts one
-                        { use crate::ast::ExprKind as K; bare = matches!(self.ast.expr(id).kind, K::If(..) | K::Match(..) | K::Block(..) | K::Unsafe(..) | K::ConstBlock(..) | K::While(..) | K::Loop(..) | K::For(..)); }
+                        { use crate::ast::ExprKind as K; bare = matches!(self.ast.expr(id).kind, K::If(..) | K::Match(..) | K::Block(..) | K::Unsafe(..) | K::ConstBlock(..) | K::TryBlock(..) | K::While(..) | K::Loop(..) | K::For(..)); }
                     }),
                     // `...` is no type start (rustc Token::can_begin_type): only a C-variadic parameter
                     Frag::Ty if k == T::DotDotDot => Err(crate::parser::PErr { pos: self.toks.at(i).lo, msg: "expected a type".to_string() }),
-                    Frag::Ty => self.ty().map(|_| ()),
+                    // rustc_parse nonterminal.rs: `ty` is parse_ty_no_question_mark_recover, `+`
+                    // bounds allowed (a bare `Display + Send` is one type)
+                    Frag::Ty => self.ty_plus().map(|_| ()),
                     Frag::Pat => self.pat_top().map(|_| ()),
                     Frag::PatParam => self.pat_no_or().map(|_| ()),
                     Frag::Path => self.path(false).map(|_| ()),
@@ -3100,7 +3613,11 @@ impl<'a> Parser<'a> {
                 }
                 // Keep the remainder for this matcher, but restore it if the arm fails.
                 if let Some(s) = split { self.tok_undo.push(s); }
-                if ok { Some((e, taken, bare)) } else { None }
+                if ok {
+                    Ok((e, taken, bare))
+                } else {
+                    Err(match r { Err(err) => err.msg, Ok(()) => format!("expected {}", frag_desc(f)) })
+                }
             }
         }
     }
@@ -3116,13 +3633,6 @@ impl<'a> Parser<'a> {
         i < hi && self.toks.at(i).kind == T::Not && i + 1 < hi && is_open(self.toks.at(i + 1).kind) && self.tok_close_of(i + 1, hi) == Some(hi - 1)
     }
 
-    fn match_seq(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
-        let undo = self.tok_undo.len();
-        let matched = self.match_seq_inner(nodes, i, end, binds);
-        if !matched { self.restore_match_tokens(undo); }
-        matched
-    }
-
     fn restore_match_tokens(&mut self, undo: usize) {
         while self.tok_undo.len() > undo {
             let (k, t) = self.tok_undo.pop().unwrap();
@@ -3130,75 +3640,265 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn match_seq_inner(&mut self, nodes: &[MNode], i: &mut usize, end: usize, binds: &mut HashMap<String, Bind>) -> bool {
-        for n in nodes {
-            match n {
-                MNode::Tok(m) => {
-                    if *i >= end || !self.mtok_eq(*i, m) {
-                        return false;
-                    }
-                    *i += 1;
-                }
-                MNode::Group(open, _, inner) => {
-                    // rustc_expand mbe/macro_parser.rs: an interpolated expression
-                    // is an opaque nonterminal, not a written parenthesis group.
-                    if *i >= end || self.toks.at(*i).kind != open.kind
-                        || self.synth_parens.contains(&{ self.toks.at(*i).lo }) {
-                        return false;
-                    }
-                    let c = match self.tok_close_of(*i, end) {
-                        Some(c) => c,
-                        None => return false,
-                    };
-                    let mut j = *i + 1;
-                    if !self.match_seq(inner, &mut j, c, binds) || j != c {
-                        return false;
-                    }
-                    *i = c + 1;
-                }
-                MNode::Var(name, f) => match self.match_frag(*f, *i, end) {
-                    Some((e, taken, bare)) => {
-                        binds.insert(name.clone(), Bind::One(*i, e, *f, taken, bare));
-                        *i = e;
-                    }
-                    None => return false,
-                },
-                MNode::Rep(inner, sep, op) => {
-                    let mut names = Vec::new();
-                    vars_of(inner, &mut names);
-                    let mut iters: Vec<HashMap<String, Bind>> = Vec::new();
-                    loop {
-                        let start = *i;
-                        let mut j = *i;
-                        if !iters.is_empty() {
-                            if let Some(s) = sep {
-                                if j >= end || !self.mtok_eq(j, s) {
-                                    break;
-                                }
-                                j += 1;
-                            }
+    /// What the token at `i` begins when it starts a forwarded fragment: rustc forwards a
+    /// matched fragment as one invisible group of its kind (`OpenInvisible(MetaVar(kind))`),
+    /// whatever its first token; None for written tokens and the kinds that forward as their
+    /// tokens (ident, lifetime, tt).
+    fn forwarded_kind(&self, lo: u32) -> Option<Frag> {
+        // an outer statement stays a statement when it begins with a captured expression
+        if !self.stmt_frags.is_empty() && self.stmt_frags.contains(&lo) {
+            return Some(Frag::Stmt);
+        }
+        if self.synth_parens.contains(&lo) {
+            return Some(Frag::Expr);
+        }
+        if self.ty_frags.contains(&lo) {
+            return Some(Frag::Ty);
+        }
+        if self.path_frags.contains(&lo) {
+            return Some(Frag::Path);
+        }
+        if self.block_frags.contains(&lo) {
+            return Some(Frag::Block);
+        }
+        match self.meta_frags.get(&lo) {
+            Some(&"expr") => Some(Frag::Expr),
+            Some(_) => Some(Frag::Literal),
+            None => None,
+        }
+    }
+
+    /// rustc_parse nonterminal.rs `nonterminal_may_begin_with`: can a fragment of kind `f`
+    /// begin with the token at `i`? A matcher position waits for the fragment parser only
+    /// where it can.
+    fn may_begin(&self, f: Frag, i: usize, edition: u16) -> bool {
+        let t = self.toks.at(i);
+        let k = t.kind;
+        if is_close(k) {
+            return false;
+        }
+        if let Some(fk) = self.forwarded_kind(t.lo) {
+            // a forwarded statement is no expression, type, pattern or literal (rustc
+            // `can_begin_expr` & co. take no `MetaVarKind::Stmt`); where rustc would try another
+            // kind on it and fail, the arm is skipped here
+            if fk == Frag::Stmt {
+                return matches!(f, Frag::Stmt | Frag::Tt);
+            }
+            return match f {
+                Frag::Tt | Frag::Item | Frag::Stmt | Frag::Vis => true,
+                Frag::Ident | Frag::Lifetime => false,
+                Frag::Expr | Frag::Expr2021 => matches!(fk, Frag::Block | Frag::Expr | Frag::Literal | Frag::Path),
+                Frag::Ty => matches!(fk, Frag::Ty | Frag::Path),
+                // an expression that is a literal (a forwarded one-token expression)
+                Frag::Literal => fk == Frag::Literal || (fk == Frag::Expr && !self.synth_parens.contains(&{ t.lo }) && is_lit(k)),
+                Frag::Block => matches!(fk, Frag::Block | Frag::Expr | Frag::Literal),
+                Frag::Path | Frag::Meta | Frag::Pat | Frag::PatParam => fk != Frag::Block,
+            };
+        }
+        let any_ident = matches!(k, T::Ident | T::RawIdent) || is_kw(k);
+        match f {
+            Frag::Tt | Frag::Item | Frag::Stmt => true,
+            Frag::Ident => any_ident && self.tok_text(t) != b"_",
+            Frag::Lifetime => k == T::Lifetime,
+            Frag::Literal => is_lit(k) || matches!(k, T::Minus | T::KwTrue | T::KwFalse),
+            Frag::Block => k == T::OpenBrace,
+            Frag::Path | Frag::Meta => any_ident || k == T::PathSep,
+            Frag::Vis => any_ident || k == T::Comma || self.can_begin_type(i, edition),
+            Frag::Ty => self.can_begin_type(i, edition),
+            Frag::Pat | Frag::PatParam => {
+                any_ident || is_lit(k)
+                    || matches!(k, T::OpenParen | T::OpenBracket | T::And | T::Minus | T::AndAnd | T::DotDot | T::DotDotDot | T::PathSep | T::Lt | T::Shl | T::Interp)
+                    || (k == T::Or && f == Frag::Pat)
+            }
+            // `let` never begins one; `const` and `_` only begin edition 2024's `expr`, never
+            // `expr_2021` nor `expr` before edition 2024
+            Frag::Expr | Frag::Expr2021 => {
+                let current = f == Frag::Expr && edition >= 2024;
+                k != T::KwLet
+                    && (current || k != T::KwConst)
+                    && (self.can_begin_expr_tok(i, edition) || (current && k == T::Ident && self.tok_text(t) == b"_"))
+            }
+        }
+    }
+
+    /// rustc_ast token.rs `Token::can_begin_expr`.
+    fn can_begin_expr_tok(&self, i: usize, edition: u16) -> bool {
+        let t = self.toks.at(i);
+        match t.kind {
+            T::Ident => {
+                let s = self.tok_text(t);
+                s != b"_" && (!is_reserved_word(s, edition) || s == b"do" || s == b"gen")
+            }
+            T::RawIdent | T::Lifetime | T::OpenParen | T::OpenBrace | T::OpenBracket | T::Not | T::Minus | T::Star | T::Or | T::OrOr
+            | T::And | T::AndAnd | T::DotDot | T::DotDotDot | T::DotDotEq | T::Lt | T::Shl | T::PathSep | T::Pound | T::Interp => true,
+            k if is_lit(k) => true,
+            // the keywords that begin an expression, and the path-segment keywords
+            T::KwAsync | T::KwBox | T::KwBreak | T::KwConst | T::KwContinue | T::KwFalse | T::KwFor | T::KwIf | T::KwLet | T::KwLoop
+            | T::KwMatch | T::KwMove | T::KwReturn | T::KwTrue | T::KwTry | T::KwUnsafe | T::KwWhile | T::KwYield | T::KwStatic
+            | T::KwSelfValue | T::KwSelfType | T::KwSuper | T::KwCrate => true,
+            _ => false,
+        }
+    }
+
+    /// rustc_ast token.rs `Token::can_begin_type`.
+    fn can_begin_type(&self, i: usize, edition: u16) -> bool {
+        let t = self.toks.at(i);
+        match t.kind {
+            T::Ident => {
+                let s = self.tok_text(t);
+                s == b"_" || s == b"typeof" || !is_reserved_word(s, edition)
+            }
+            T::RawIdent | T::OpenParen | T::OpenBracket | T::Not | T::Star | T::And | T::AndAnd | T::Question | T::Lifetime | T::Lt
+            | T::Shl | T::PathSep => true,
+            T::KwSelfValue | T::KwSelfType | T::KwSuper | T::KwCrate | T::KwFor | T::KwImpl | T::KwFn | T::KwUnsafe | T::KwExtern
+            | T::KwDyn => true,
+            _ => false,
+        }
+    }
+
+    /// rustc_expand mbe/macro_parser.rs `TtParser::parse_tt`: tokens `[lo, hi)` against one
+    /// arm's matcher locations. Every matcher position is advanced over a token at once (a
+    /// repetition's end splits a position: one leaves the repetition, one repeats it), with
+    /// no backtracking; the fragment parser runs only when exactly one position waits for a
+    /// fragment and no position wants a token. Ok(Some): the bindings; Ok(None): no match
+    /// (the next arm is tried); Err: a fragment that did not parse, or an ambiguity.
+    fn parse_tt(&mut self, locs: &[MLoc], name: &str, edition: u16, lo: usize, hi: usize) -> Result<Option<HashMap<String, Bind>>, String> {
+        let mut cur = vec![MPos { idx: 0, matches: std::rc::Rc::new(Vec::new()), vis_taken: (usize::MAX, 0) }];
+        let mut next: Vec<MPos> = Vec::new();
+        let mut bb: Vec<MPos> = Vec::new();
+        let mut i = lo;
+        loop {
+            next.clear();
+            bb.clear();
+            let eof = i >= hi;
+            let mut eof_mps: Vec<MPos> = Vec::new();
+            // parse_tt_inner
+            while let Some(mut mp) = cur.pop() {
+                match &locs[mp.idx] {
+                    &MLoc::Token(t, open) => {
+                        // an interpolated expression's synthetic parenthesis is no written group
+                        if !eof && self.mtok_eq(i, t) && !(open && self.synth_parens.contains(&{ self.toks.at(i).lo })) {
+                            mp.idx += 1;
+                            next.push(mp);
                         }
-                        let mut b = HashMap::default();
-                        if !self.match_seq(inner, &mut j, end, &mut b) || j == start {
-                            break;
+                    }
+                    &MLoc::Sequence { op, vars, after, first_var, depth } => {
+                        // an empty sequence for each metavariable inside
+                        for v in first_var..first_var + vars {
+                            mp.push_match(v, depth, Bind::Seq(Vec::new()));
                         }
-                        *i = j;
-                        iters.push(b);
-                        if *op == b'?' {
-                            break;
+                        if op != b'+' {
+                            // zero repetitions: skip it
+                            cur.push(MPos { idx: after, matches: mp.matches.clone(), vis_taken: mp.vis_taken });
+                        }
+                        // one or more: enter it
+                        mp.idx += 1;
+                        cur.push(mp);
+                    }
+                    &MLoc::KleeneNoSep { op, first } => {
+                        // end the repetition (fails quietly next round when it cannot)
+                        cur.push(MPos { idx: mp.idx + 1, matches: mp.matches.clone(), vis_taken: mp.vis_taken });
+                        if op != b'?' {
+                            mp.idx = first;
+                            cur.push(mp);
                         }
                     }
-                    if *op == b'+' && iters.is_empty() {
-                        return false;
+                    &MLoc::Sep(sep) => {
+                        // end the repetition, or take the separator and repeat
+                        cur.push(MPos { idx: mp.idx + 2, matches: mp.matches.clone(), vis_taken: mp.vis_taken });
+                        if !eof && self.mtok_eq(i, sep) {
+                            mp.idx += 1;
+                            next.push(mp);
+                        }
                     }
-                    for nm in names {
-                        let seq: Vec<Bind> = iters.iter().map(|b| b.get(&nm).cloned().unwrap_or(Bind::Seq(Vec::new()))).collect();
-                        binds.insert(nm, Bind::Seq(seq));
+                    &MLoc::KleeneAfterSep { first } => {
+                        mp.idx = first;
+                        cur.push(mp);
+                    }
+                    &MLoc::Var { frag, .. } => {
+                        // a forwarded empty `vis` is a token of its own for rustc (an invisible
+                        // group), before a closing delimiter and at the end of the input too
+                        if (!eof && self.may_begin(frag, i, edition)) || (frag == Frag::Vis && self.empty_vis_left(&mp, i) > 0) {
+                            bb.push(mp);
+                        }
+                    }
+                    MLoc::Eof => {
+                        if eof {
+                            eof_mps.push(mp);
+                        }
                     }
                 }
             }
+            // at the end of the input exactly one position must be past the matcher's end (one
+            // that waits for a forwarded empty `vis` first takes it)
+            if eof && bb.is_empty() {
+                return match eof_mps.len() {
+                    0 => Ok(None),
+                    1 => {
+                        let mp = eof_mps.pop().unwrap();
+                        let matches = std::rc::Rc::try_unwrap(mp.matches).unwrap_or_else(|m| (*m).clone());
+                        let mut binds = HashMap::default();
+                        for loc in locs {
+                            if let &MLoc::Var { name, var, .. } = loc {
+                                binds.insert(name.to_string(), matches[var].clone());
+                            }
+                        }
+                        Ok(Some(binds))
+                    }
+                    _ => Err("ambiguity: multiple successful parses".to_string()),
+                };
+            }
+            match (next.len(), bb.len()) {
+                (0, 0) => return Ok(None),
+                (_, 0) => {
+                    std::mem::swap(&mut cur, &mut next);
+                    i += 1;
+                }
+                (0, 1) => {
+                    // the black-box parser: one fragment
+                    let mut mp = bb.pop().unwrap();
+                    let MLoc::Var { frag: declared, var, depth, .. } = locs[mp.idx] else { unreachable!() };
+                    // `expr_2021` only differs in what may begin it
+                    let frag = if declared == Frag::Expr2021 { Frag::Expr } else { declared };
+                    let (e, taken, bare) = if frag == Frag::Vis && self.empty_vis_left(&mp, i) > 0 {
+                        // the forwarded empty fragment itself, not the tokens after it
+                        mp.vis_taken = (i, if mp.vis_taken.0 == i { mp.vis_taken.1 + 1 } else { 1 });
+                        (i, None, false)
+                    } else {
+                        self.match_frag(frag, i, hi).map_err(|m| format!("{m} (while parsing argument for this `{}` macro fragment)", frag_name(declared)))?
+                    };
+                    mp.push_match(var, depth, Bind::One(i, e, frag, taken, bare));
+                    mp.idx += 1;
+                    i = e;
+                    cur.push(mp);
+                }
+                (n, _) => {
+                    let nts: Vec<String> = bb.iter().map(|mp| match locs[mp.idx] {
+                        MLoc::Var { name, frag, .. } => format!("{} ('{}')", frag_name(frag), name),
+                        _ => unreachable!(),
+                    }).collect();
+                    let nts = nts.join(" or ");
+                    return Err(match n {
+                        0 => format!("local ambiguity when calling macro `{name}`: multiple parsing options: built-in NTs {nts}."),
+                        n => format!("local ambiguity when calling macro `{name}`: multiple parsing options: built-in NTs {nts} or {n} other option{}.", if n == 1 { "" } else { "s" }),
+                    });
+                }
+            }
         }
-        true
+    }
+
+    /// The forwarded empty `vis` fragments before token `i` (Parser::empty_vis: by the token
+    /// they stand before, so a token list out of text order -- a call's desugared doc comments
+    /// among its tokens -- keeps them) that `mp` has not taken.
+    fn empty_vis_before(&self, i: usize) -> u32 {
+        if self.empty_vis.is_empty() {
+            return 0;
+        }
+        self.empty_vis.get(&{ self.toks.at(i).lo }).copied().unwrap_or(0)
+    }
+
+    fn empty_vis_left(&self, mp: &MPos, i: usize) -> u32 {
+        self.empty_vis_before(i).saturating_sub(if mp.vis_taken.0 == i { mp.vis_taken.1 } else { 0 })
     }
 
     fn lookup_bind<'b>(binds: &'b HashMap<String, Bind>, name: &str, idx: &[usize]) -> Option<&'b Bind> {
@@ -3238,24 +3938,49 @@ impl<'a> Parser<'a> {
                             out.groups.push((at, at | WRAP_PAREN | META_ONLY));
                             out.push(T::OpenParen, "(", None, u32::MAX);
                         }
-                        let group_start = out.s.len() + 1;
+                        let group_start = if lo < hi {
+                            let t = self.toks.at(*lo);
+                            out.start(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo))
+                        } else if let Some((a, b)) = *taken {
+                            let part = self.bytes(a, b);
+                            out.start(lexed_kind(part), &String::from_utf8_lossy(part), Some(a))
+                        } else {
+                            out.s.len() as u32 + 1
+                        } as usize;
                         let mut groups = Vec::new();
+                        if *f == Frag::Vis && lo == hi && taken.is_none() {
+                            // an empty `vis` goes on as one (rustc: an empty invisible group)
+                            out.empty_vis += 1;
+                        }
                         for k in *lo..*hi {
+                            // the forwarded empty `vis` fragments inside go on with the copy (a
+                            // group matched as one `tt`)
+                            if k > *lo {
+                                out.empty_vis += self.empty_vis_before(k);
+                            }
                             let t = self.toks.at(k);
                             // A forwarded outer fragment must retain the invisible
                             // expression groups nested inside it. Their synthetic
                             // parentheses have no ordinary frag_groups entry.
+                            let text = String::from_utf8_lossy(self.tok_text(t));
                             if self.synth_parens.contains(&{ t.lo }) {
-                                let at = out.s.len() as u32 + 1;
+                                let at = out.start(t.kind, &text, Some(t.lo));
                                 out.groups.push((at, at | WRAP_PAREN | META_ONLY));
                             }
                             // rustc_expand mbe/transcribe.rs: transcribe_pnr preserves
                             // invisible groups inside every captured fragment, including
                             // a path inside a type-macro call subsequently matched as tt.
                             if let Some((end, flags)) = self.fragment_group(t.lo) {
-                                groups.push((end, out.s.len() as u32 + 1, flags));
+                                groups.push((end, out.start(t.kind, &text, Some(t.lo)), flags));
+                            } else if let Some(&kind) = self.meta_frags.get(&{ t.lo }) {
+                                // a one-token expression or literal inside the copy stays one: its
+                                // kind, and a proc macro's invisible group (builtins.rs
+                                // group_fragments; const_format's `__str_const!` passes on the block
+                                // holding `formatcp!`'s `"b"` argument)
+                                let kind = if kind == "expr" { EXPR_FRAG } else { LIT_FRAG };
+                                groups.push((t.hi, out.start(t.kind, &text, Some(t.lo)), kind | META_ONLY));
                             }
-                            out.push(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
+                            out.push(t.kind, &text, Some(t.lo), u32::MAX);
                             while groups.last().is_some_and(|&(end, _, _)| end == t.hi) {
                                 let (_, start, flags) = groups.pop().unwrap();
                                 out.groups.push((start, out.s.len() as u32 | flags));
@@ -3274,8 +3999,10 @@ impl<'a> Parser<'a> {
                         // rustc_expand mbe/transcribe.rs: transcribe_pnr wraps even a
                         // one-token path in MetaVarKind::Path invisible delimiters.
                         let path_frag = *f == Frag::Path;
-                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, _ => 0 };
-                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag);
+                        let kind_flag = match f { Frag::Expr if !wrap => EXPR_FRAG, Frag::Literal => LIT_FRAG, Frag::Block if !wrap => BLOCK_FRAG, Frag::Path => PATH_FRAG, Frag::Stmt => STMT_FRAG, _ => 0 };
+                        // (a `$s:stmt` of one token too: `break` is a statement of its own before the next)
+                        let stmt_frag = *f == Frag::Stmt;
+                        let group = opaque && out.s.len() > group_start && (hi - lo + usize::from(taken.is_some()) > 1 || ty_frag || path_frag || stmt_frag);
                         if group || (kind_flag != 0 && out.s.len() > group_start) {
                             out.groups.push((group_start as u32, out.s.len() as u32 | if ty_frag { TY_FRAG } else { 0 } | kind_flag | if group { 0 } else { META_ONLY }));
                         }
@@ -3383,13 +4110,26 @@ impl<'a> Parser<'a> {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules", &def.name);
         let (lo, hi) = self.desugar_doc_comments(lo, hi);
         uses::used(def, uses::RESOLVED);
+        // the definition's edition decides which tokens can begin an `expr` (rustc: the
+        // metavariable's span edition)
+        let edition = if def.edition == 0 { self.edition } else { def.edition };
         for (arm, (matcher, body)) in def.arms.iter().enumerate() {
-            let mut binds = HashMap::default();
-            let mut i = lo;
             // rustc_expand mbe/macro_rules.rs: try_match_macro starts each arm with
             // a fresh parser. A failed arm must not leave grammar-split tokens behind.
             let undo = self.tok_undo.len();
-            if self.match_seq(matcher, &mut i, hi, &mut binds) && i == hi {
+            let mut locs = Vec::new();
+            compute_locs(matcher, &mut locs, &mut 0, 0);
+            locs.push(MLoc::Eof);
+            // Failure: the next arm; an error (a fragment that did not parse, an ambiguity)
+            // ends the call, as rustc's ErrorReported / Error do
+            let binds = match self.parse_tt(&locs, &def.name, edition, lo, hi) {
+                Ok(b) => b,
+                Err(m) => {
+                    self.restore_match_tokens(undo);
+                    return Err(m);
+                }
+            };
+            if let Some(binds) = binds {
                 uses::used(def, arm as u32);
                 // `$crate` names the defining crate by identity (rustc: the `$crate` token keeps the
                 // definition's hygiene), wherever the transcribed tokens end up: a caller that reaches
@@ -3411,29 +4151,68 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// A transcription being written: the text (each token preceded by a space) with the tokens
-/// over it (kind and position as the definition's and the call's tokens have them, no lexing),
-/// per token substituted from a fragment (offset, its position), per token of the definition
-/// body (offset, its position in the definition).
+/// A transcription being written: the text (each token preceded by a space, unless it is a
+/// fragment token that followed the previous one with nothing between at the call) with the tokens
+/// over it (kind and position as the definition's and the call's tokens have them, no lexing), per
+/// token substituted from a fragment (offset, its position), per token of the definition body
+/// (offset, its position in the definition).
 #[derive(Default)]
 pub struct Transcript {
     /// the edition the text is read in: the expanding parser's, whichever edition a token was lexed in
     edition: u16,
+    /// where the last token, a fragment token, ended at the call
+    last: Option<u32>,
     s: String,
     toks: Vec<Tok>,
     origins: Vec<(u32, u32, u32)>,
     bodies: Vec<(u32, u32, u32)>,
     groups: Vec<(u32, u32)>,
+    /// forwarded empty `vis` fragments waiting for the token they stand before (EMPTY_VIS)
+    empty_vis: u32,
 }
 
 impl Transcript {
-    fn push(&mut self, kind: T, t: &str, origin: Option<u32>, bp: u32) {
-        // an identifier or keyword is classified by the edition of the expansion (`dyn`, `async`,
-        // `try` are keywords from 2018), as lexing the text would
-        let kind = if kind == T::Ident || (kind as u8 >= T::KwAs as u8 && kind as u8 <= T::KwTry as u8) {
+    /// rustc_expand mbe/transcribe.rs: a token substituted from a fragment keeps the spacing it
+    /// was lexed with, and a proc macro reads it (`Spacing::Joint` before adjacent punctuation:
+    /// `::<`, `!-`, `&&!` passed on through `$($t:tt)*`); a token of the body is `Alone`. A
+    /// fragment token that followed the previous one with nothing between at the call follows it
+    /// so here too: the text is then a copy of the call's, which lexes to the same tokens. A token
+    /// a match split from one the lexer read whole (`>>`, the `0.1` of `x.0.1`) is spelled apart
+    /// from its other part, as before.
+    fn joins(&self, kind: T, text: &str, origin: Option<u32>) -> bool {
+        let adjacent = origin.is_some() && self.last == origin;
+        let op = |k: T| !k.is_ident_like() && !k.is_number() && !k.is_literal() && !k.is_trivia()
+            && !matches!(k, T::Eof | T::Lifetime | T::RawBody | T::OpenParen | T::CloseParen | T::OpenBracket | T::CloseBracket | T::OpenBrace | T::CloseBrace);
+        adjacent && self.toks.last().is_none_or(|prev| {
+            let splittable = (op(prev.kind) && op(kind)) || (prev.kind.is_number() && (kind == T::Dot || kind.is_ident_like()));
+            !splittable || {
+                let joined = format!("{}{}", &self.s[prev.lo as usize..prev.hi as usize], text);
+                let mut lexed = Vec::new();
+                crate::lexer::lex(joined.as_bytes(), self.edition, &mut lexed).is_ok()
+                    && matches!(&lexed[..], [a, b, ..] if a.kind == prev.kind && a.hi == prev.hi - prev.lo && b.kind == kind && b.hi as usize == joined.len())
+            }
+        })
+    }
+
+    /// Where a fragment token pushed next starts.
+    fn start(&self, kind: T, text: &str, origin: Option<u32>) -> u32 {
+        self.s.len() as u32 + u32::from(!self.joins(self.classify(kind, text), text, origin))
+    }
+
+    /// An identifier or keyword is classified by the edition of the expansion (`dyn`, `async`,
+    /// `try` are keywords from 2018), as lexing the text would.
+    fn classify(&self, kind: T, t: &str) -> T {
+        if kind == T::Ident || (kind as u8 >= T::KwAs as u8 && kind as u8 <= T::KwTry as u8) {
             crate::lexer::keyword(t.as_bytes(), self.edition).unwrap_or(T::Ident)
-        } else { kind };
-        self.s.push(' ');
+        } else { kind }
+    }
+
+    fn push(&mut self, kind: T, t: &str, origin: Option<u32>, bp: u32) {
+        let kind = self.classify(kind, t);
+        if !self.joins(kind, t, origin) {
+            self.s.push(' ');
+        }
+        self.last = origin.map(|o| o + t.len() as u32);
         let at = self.s.len() as u32;
         if let Some(o) = origin {
             self.origins.push((at, o, t.len() as u32));
@@ -3441,11 +4220,17 @@ impl Transcript {
             self.bodies.push((at, bp, t.len() as u32));
         }
         self.s.push_str(t);
+        // (before a doc comment they stand where no token starts: rustc's `vis` may not be
+        // followed by `#`, so nothing matches them there)
+        for _ in 0..std::mem::take(&mut self.empty_vis) {
+            self.groups.push((at, at | EMPTY_VIS | META_ONLY));
+        }
         // rustc_expand mbe/transcribe.rs: transcribe retains DocComment tokens.
         // Keep ours as lexer trivia until parser_from_cx desugars the next call;
         // a generated macro definition must still ignore docs in its matcher.
         if kind == T::DocComment {
             self.s.push('\n');
+            self.last = None;
         } else {
             self.toks.push(Tok { kind, lo: at, hi: at + t.len() as u32 });
         }
@@ -3466,6 +4251,28 @@ fn lexed_kind(part: &[u8]) -> T {
 /// Owned tokens of a token range (definition bodies outlive the parse of their file).
 pub fn mtoks(p: &Parser, toks: &[Tok]) -> Vec<MTok> {
     definition_tokens(toks, |lo, hi| p.bytes(lo, hi))
+}
+
+/// A definition's tokens with each `$crate` named as crate `krate`, the way a transcription
+/// names it (`__relax_crate_<krate>`): for a `macro_rules!` whose `$crate` is not the crate that
+/// holds it (Parser::dollar_crate_of). `$$crate` stays: it writes a `$crate` for a later macro.
+pub(crate) fn name_dollar_crate(toks: Vec<MTok>, krate: &str) -> Vec<MTok> {
+    let mut out: Vec<MTok> = Vec::with_capacity(toks.len());
+    let mut escaped = false;
+    let mut i = 0;
+    while i < toks.len() {
+        let t = &toks[i];
+        if t.kind == T::Dollar && !escaped && toks.get(i + 1).is_some_and(|n| n.kind == T::KwCrate) {
+            out.push(MTok { kind: T::Ident, text: format!("__relax_crate_{krate}"), pos: t.pos });
+            i += 2;
+            continue;
+        }
+        // (`$$` is one escape: the `$` after it is the escaped one)
+        escaped = t.kind == T::Dollar && !escaped;
+        out.push(t.clone());
+        i += 1;
+    }
+    out
 }
 
 /// rustc_expand mbe/quoted.rs: parse_tree retains DocComment tokens in definitions.
@@ -3642,12 +4449,94 @@ mod replay_tests {
         assert!(cm.in_textual_scope(&d1, "c", Some(61)) && cm.in_textual_scope(&d1, "c::m::sib", None));
         let s1 = def("c::m::sib", 32);
         assert!(!cm.in_textual_scope(&s1, "c::m", None) && !cm.in_textual_scope(&s1, "c", None));
-        // `mod x;` whose file opens with `#![macro_use]`: the same as `#[macro_use]` on the item
-        let x1 = def("c::x", 5);
-        assert!(!cm.in_textual_scope(&x1, "c", Some(72)));
-        cm.inner_macro_use.insert("c::x".into());
-        assert!(cm.in_textual_scope(&x1, "c", Some(72)) && !cm.in_textual_scope(&x1, "c", Some(69)));
-        assert!(!cm.in_textual_scope(&x1, "c::b", None));
+    }
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+    use crate::pm_tokens::TokenTree;
+
+    /// The expansion of the last call `name!(..)` in `src` of the `macro_rules! name` written there,
+    /// both in a crate of `edition`: its text and tokens, or the matcher's error.
+    fn expand_in(src: &str, name: &str, edition: u16) -> Result<(String, Vec<Tok>), String> {
+        let mut toks = Vec::new();
+        crate::lexer::lex(src.as_bytes(), edition, &mut toks).unwrap_or_else(|e| panic!("{}", e.msg));
+        let text = |i: usize| &src[toks[i].lo as usize..toks[i].hi as usize];
+        let close = |open: usize| {
+            let mut depth = 0;
+            (open..toks.len()).find(|&i| {
+                match toks[i].kind {
+                    T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                    T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            }).unwrap()
+        };
+        let at = (2..toks.len()).find(|&i| text(i) == name && text(i - 2) == "macro_rules").unwrap();
+        let end = close(at + 1);
+        let rules = definition_tokens(&toks[at + 2..end], |lo, hi| &src.as_bytes()[lo as usize..hi as usize]);
+        let def = parse_def(name, "c", edition, &rules)?;
+        let call = (end..toks.len()).rev().find(|&i| text(i) == name).unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut p = Parser::new(&session, src.as_bytes(), toks.clone(), edition);
+        p.expand_rules(&def, call + 3, close(call + 2)).map(|(s, etoks, ..)| (s, etoks))
+    }
+
+    /// The expansion of the last call `name!(..)` in `src` of the `macro_rules! name` written there:
+    /// its text, and the punctuation inside the group after its `m!`, with the spacing a proc macro
+    /// reads (pm_tokens::from_toks, as a call's input is built).
+    fn expand(src: &str, name: &str) -> (String, String) {
+        let (s, etoks) = expand_in(src, name, 2021).unwrap();
+        // the transcription's text lexes back to its tokens (RELAX_VERIFY_TOKENS)
+        let mut lexed = Vec::new();
+        crate::lexer::lex(s.as_bytes(), 2021, &mut lexed).unwrap_or_else(|e| panic!("{}", e.msg));
+        lexed.retain(|t| t.kind != T::Eof);
+        assert_eq!(lexed.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), etoks.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), "{s}");
+        let m = etoks.iter().position(|t| &s[t.lo as usize..t.hi as usize] == "m").unwrap();
+        let stream = crate::pm_tokens::from_toks(s.as_bytes(), &etoks[m..], &|_, _| crate::pm_tokens::Span::DUMMY).unwrap();
+        let Some(TokenTree::Group(g)) = stream.trees.get(2) else { panic!("no group after m! in {s}") };
+        let puncts = g.stream().trees.iter().filter_map(|t| match t {
+            TokenTree::Punct(p) => Some(format!("'{}' {:?}", p.as_char(), p.spacing())),
+            _ => None,
+        }).collect::<Vec<_>>().join(", ");
+        (s, puncts)
+    }
+
+    /// rustc keeps the spacing a fragment token was lexed with through a transcription, and a proc
+    /// macro reads it (relax issue 9: equator's `assert!` passes `$($tokens:tt)*` on to a proc macro that
+    /// tells a turbofish `::<` from a comparison by the spacing of the second `:`).
+    #[test]
+    fn transcribed_tokens_keep_the_spacing_they_were_lexed_with() {
+        let rustc = "':' Joint, ':' Joint, '<' Alone, '>' Alone, '!' Joint, '-' Alone, '&' Joint, '&' Joint, '!' Alone";
+        let defs = "macro_rules! fwd { ($($t:tt)*) => { m!($($t)*) } }\nmacro_rules! body { () => { m!(f::<u32>() !-x &&!x) } }\n";
+        assert_eq!(expand(&format!("{defs}fwd!(f::<u32>() !-x &&!x)"), "fwd").1, rustc, "forwarded through a tt repetition");
+        // rustc transcribes a body token `Alone` (only a multi-char token's inner chars are Joint)
+        assert_eq!(expand(&format!("{defs}body!()"), "body").1,
+            "':' Joint, ':' Alone, '<' Alone, '>' Alone, '!' Alone, '-' Alone, '&' Joint, '&' Alone, '!' Alone", "written in the definition's body");
+        // tokens apart where they were lexed stay apart
+        assert_eq!(expand(&format!("{defs}fwd!(f :: < u32 > () ! - x & & ! x)"), "fwd").1,
+            "':' Joint, ':' Alone, '<' Alone, '>' Alone, '!' Alone, '-' Alone, '&' Alone, '&' Alone, '!' Alone");
+        // a match that split a token the lexer read whole (the float `0.1` of `x.0.1`) leaves its
+        // parts apart in the text: it still lexes to the transcribed tokens (checked in `expand`)
+        let (s, _) = expand("macro_rules! fld { ($e:expr) => { m!($e) } }\nfld!(x.0.1)", "fld");
+        assert!(s.contains("x.0"), "{s}");
+    }
+
+    /// rustc nonterminal_may_begin_with: `expr_2021` never begins with `_`, whatever the edition,
+    /// so in an edition-2024 crate a `_ => ..` arm after `$($m:expr_2021 => ..),+` is no ambiguity
+    /// (relax issue 113); edition 2024's `expr` does begin with `_`, and there it is one.
+    #[test]
+    fn an_expr_2021_fragment_never_begins_with_an_underscore() {
+        let def = "macro_rules! pick { ($($m:expr_2021 => $s:expr),+ , _ => $f:expr $(,)?) => { [$($s),+, $f] } }\n";
+        let call = "pick!(a(1) => 1, b => 2, _ => 3,)";
+        match expand_in(&format!("{def}{call}"), "pick", 2024) {
+            Ok((s, _)) => assert!(s.contains('3'), "{s}"),
+            Err(e) => panic!("expr_2021 at `_`: {e}"),
+        }
+        let e = expand_in(&format!("{}{call}", def.replace("expr_2021", "expr")), "pick", 2024).expect_err("expr at `_` in edition 2024");
+        assert!(e.contains("local ambiguity") && e.contains("expr ('m') or 1 other option"), "{e}");
     }
 }
 

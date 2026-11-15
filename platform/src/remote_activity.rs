@@ -8,18 +8,15 @@ use crate::cx_api::CxOsApi;
 use crate::event::{DigitDevice, Event, KeyCode, MouseButton, PinchPhase, TouchState};
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const QUIET_PERIOD: Duration = Duration::from_secs(2);
 
-/// Advances on every native input. A number of its own (not inside the `Cx`), so the endpoint's
-/// command threads can stamp every answer with it without asking the UI thread.
-static USER_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// The user sequence as the command threads see it.
+/// The user sequence as the command threads see it: the HAL's count, advanced on every native
+/// input (not inside the `Cx`), so the endpoint's command threads and the semantic tree's consumers
+/// read it without asking the UI thread.
 pub(crate) fn user_seq_now() -> u64 {
-    USER_SEQ.load(Ordering::Acquire)
+    makepad_hal::a11y::user_seq()
 }
 
 /// What the person has done to this instance natively, and what remote input
@@ -42,6 +39,9 @@ pub(crate) struct RemoteActivity {
     /// `remote::remote_input_scope`); shared so the scope guard needs no
     /// borrow of the `Cx` across the dispatch.
     pub(crate) remote_input: Rc<Cell<bool>>,
+    /// Who sent the injected input being dispatched (`remote::remote_input_scope_by`; empty: not
+    /// known, or none).
+    pub(crate) remote_by: Rc<std::cell::RefCell<String>>,
 }
 
 impl RemoteActivity {
@@ -245,7 +245,7 @@ pub(crate) fn note_user_event(cx: &mut Cx, event: &Event) {
     activity.kind = kind;
     activity.window = window;
     activity.last_input = Some(Instant::now());
-    USER_SEQ.fetch_add(1, Ordering::Release);
+    makepad_hal::a11y::note_user_input();
     if activity.remote_buttons.is_empty() && activity.remote_keys.is_empty() {
         return;
     }

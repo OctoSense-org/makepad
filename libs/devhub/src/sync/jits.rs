@@ -1,5 +1,5 @@
 //! This machine's JITs as sync sees them: which run from the synced checkout, what their live
-//! patcher did with a sync's edits (the JIT's `makepad-run-live-<pid>.jsonl`, its `edit`
+//! patcher did with a sync's edits (the JIT's `relax-live-<pid>.jsonl`, its `edit`
 //! records), whether they still run a `makepad` binary a build replaced, and the session tick a
 //! JIT reports (for coordinated patches).
 //!
@@ -73,11 +73,11 @@ pub fn exe_replaced(pid: u32) -> bool {
 
 /// Where the JIT writes its live-edit records.
 pub fn live_log(pid: u32) -> PathBuf {
-    if let Some(p) = environ(pid, "MAKEPAD_RUN_LIVE_LOG").filter(|p| !p.is_empty()) {
+    if let Some(p) = environ(pid, &crate::run_names::var("LIVE_LOG")).filter(|p| !p.is_empty()) {
         return PathBuf::from(p);
     }
     let tmp = environ(pid, "TMPDIR").filter(|t| !t.is_empty()).unwrap_or_else(|| "/tmp".into());
-    Path::new(&tmp).join(format!("makepad-run-live-{pid}.jsonl"))
+    crate::run_names::live_log(Path::new(&tmp), pid)
 }
 
 pub fn log_len(path: &Path) -> u64 {
@@ -186,6 +186,26 @@ impl Ticker {
         }
         found.ok_or_else(|| format!("JIT {pid}: `{}` answered no tick", self.cmd))
     }
+}
+
+/// Asks the JIT `pid` for `session relaunch`: the edits waiting for a restart apply (the app
+/// starts again in place). Its answer, or why not.
+pub fn relaunch(pid: u32) -> Result<String, String> {
+    let client = Client::connect(&pid.to_string()).map_err(|e| format!("JIT {pid}: {e}"))?;
+    client.set_timeout(Some(Duration::from_secs(5)));
+    let answer = client.cmd("session relaunch").map_err(|e| format!("JIT {pid}: {e}")).and_then(|lines| {
+        let mut said = Vec::new();
+        for l in lines {
+            let l = l.map_err(|e| format!("JIT {pid}: {e}"))?;
+            if l.starts_with("{\"err\":") {
+                return Err(format!("JIT {pid}: {}", crate::proto::clean(&l, 200)));
+            }
+            said.push(l);
+        }
+        Ok(crate::proto::clean(&said.join(" "), 200))
+    });
+    client.close();
+    answer
 }
 
 pub fn tick_of(line: &str) -> Option<u64> {

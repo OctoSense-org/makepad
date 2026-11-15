@@ -315,7 +315,7 @@ pub(crate) fn object_sources(common_dir: &Path) -> Result<ObjectSources, GitErro
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(GitError::Io(e)),
+        Err(e) => return Err(GitError::io_at("read alternates", &alt_file, e)),
     }
     Ok(ObjectSources {
         loose_dirs,
@@ -421,19 +421,20 @@ impl Repository {
         // millions in a history scan. An id names one content, so where
         // it is found does not change what is read.
         let packed = self.ensure_packs();
-        if let Some(packs) = &self.packs {
-            for pack in packs {
-                if let Some(offset) = pack.find_offset(oid) {
-                    return pack.read_object(offset);
-                }
-            }
+        let packed_read = self.packs.iter().flatten().find_map(|pack| pack.find_offset(oid).map(|offset| pack.read_object(offset)));
+        match packed_read {
+            Some(Ok(obj)) => return Ok(obj),
+            // its pack removed by a repack meanwhile: in the packs that replaced it
+            Some(Err(_)) if self.packs_moved() => return self.read_object_uncached(oid),
+            Some(Err(e)) => return Err(e),
+            None => {}
         }
         match read_loose_object(&self.common_dir, oid) {
             Ok(obj) => return Ok(obj),
             Err(GitError::ObjectNotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        packed?;
+        neither(packed, oid)?;
 
         // Try alternates (loose + packs)
         self.ensure_alternates()?;
@@ -454,7 +455,9 @@ impl Repository {
                 }
             }
         }
-
+        if self.packs_moved() {
+            return self.read_object_uncached(oid);
+        }
         Err(GitError::ObjectNotFound(oid.to_hex()))
     }
 
@@ -502,17 +505,19 @@ impl Repository {
     pub fn object_size(&mut self, oid: &ObjectId) -> Result<u64, GitError> {
         // Packs first (see `read_object_uncached`).
         let packed = self.ensure_packs();
-        for pack in self.packs.iter().chain(self.alternate_packs.iter()).flatten() {
-            if let Some(offset) = pack.find_offset(oid) {
-                return pack.object_size(offset);
-            }
+        let packed_size = self.packs.iter().chain(self.alternate_packs.iter()).flatten().find_map(|pack| pack.find_offset(oid).map(|offset| pack.object_size(offset)));
+        match packed_size {
+            Some(Ok(size)) => return Ok(size),
+            Some(Err(_)) if self.packs_moved() => return self.object_size(oid),
+            Some(Err(e)) => return Err(e),
+            None => {}
         }
         match read_loose_object(&self.common_dir, oid) {
             Ok(obj) => return Ok(obj.data.len() as u64),
             Err(GitError::ObjectNotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        packed?;
+        neither(packed, oid)?;
         if let Some(alt_dirs) = &self.alternates {
             for alt_dir in alt_dirs {
                 match read_loose_object_from_objects_dir(alt_dir, oid) {
@@ -521,6 +526,9 @@ impl Repository {
                     Err(e) => return Err(e),
                 }
             }
+        }
+        if self.packs_moved() {
+            return self.object_size(oid);
         }
         Err(GitError::ObjectNotFound(oid.to_hex()))
     }
@@ -630,6 +638,20 @@ impl Repository {
             }),
             other => other,
         }
+    }
+
+    /// The index as status compares it with the worktree: its file's stat taken before it is
+    /// read, its racily clean entries smudged ([`worktree::smudge_racily_clean`]). Status never
+    /// writes it.
+    fn index_for_status(&self) -> Result<Index, GitError> {
+        let path = self.git_dir.join("index");
+        let before = fs::metadata(&path);
+        let mut index = self.read_index()?;
+        // (no index then: one made since is no older than its entries' read)
+        if let Ok(stat) = before.or_else(|_| fs::metadata(&path)) {
+            worktree::smudge_racily_clean(&mut index, &stat);
+        }
+        Ok(index)
     }
 
     /// Write the index.
@@ -932,17 +954,12 @@ impl Repository {
         old_tree_oid: &ObjectId,
         new_tree_oid: &ObjectId,
     ) -> Result<Vec<TreeChange>, GitError> {
-        self.ensure_object_sources()?;
-        let old_tree = self.read_tree(old_tree_oid)?;
-        let new_tree = self.read_tree(new_tree_oid)?;
-        // We need a closure that can call self.read_tree, but self is already borrowed.
-        // Workaround: use the lower-level read_object to avoid borrowing self in closure.
-        let git_dir = self.common_dir.clone();
-        let packs_ref = &self.packs;
-        let alts = &self.alternates;
-        diff::diff_trees(&old_tree, &new_tree, "", &mut |oid| {
-            let obj = read_tree_standalone(&git_dir, oid, packs_ref, alts)?;
-            Ok(obj)
+        self.again(|repo| {
+            repo.ensure_object_sources()?;
+            let old_tree = repo.read_tree(old_tree_oid)?;
+            let new_tree = repo.read_tree(new_tree_oid)?;
+            let (git_dir, packs, alts) = (&repo.common_dir, &repo.packs, &repo.alternates);
+            diff::diff_trees(&old_tree, &new_tree, "", &mut |oid| read_tree_standalone(git_dir, oid, packs, alts))
         })
     }
 
@@ -977,26 +994,20 @@ impl Repository {
         cancel: &dyn Fn() -> bool,
     ) -> Result<worktree::Status, GitError> {
         self.ensure_object_sources()?;
-        let index = self.read_index()?;
+        let index = self.index_for_status()?;
 
         // Try to build HEAD tree file map. If HEAD objects are missing locally
         // (e.g. partial clones), fall back to index/worktree-only status.
-        let head_files = match (|| -> Result<HashMap<String, ObjectId>, GitError> {
-            match self.head_oid() {
-                Ok(head_oid) => {
-                    let commit = self.read_commit(&head_oid)?;
-                    let tree = self.read_tree(&commit.tree)?;
-                    let git_dir = self.common_dir.clone();
-                    let packs = &self.packs;
-                    let alts = &self.alternates;
-                    worktree::flatten_tree(&tree, "", &mut |oid| {
-                        read_tree_standalone(&git_dir, oid, packs, alts)
-                    })
-                }
-                Err(GitError::RefNotFound(_)) => Ok(HashMap::new()),
-                Err(e) => Err(e),
+        let head_files = match self.again(|repo| match repo.head_oid() {
+            Ok(head_oid) => {
+                let commit = repo.read_commit(&head_oid)?;
+                let tree = repo.read_tree(&commit.tree)?;
+                let (git_dir, packs, alts) = (&repo.common_dir, &repo.packs, &repo.alternates);
+                worktree::flatten_tree(&tree, "", &mut |oid| read_tree_standalone(git_dir, oid, packs, alts))
             }
-        })() {
+            Err(GitError::RefNotFound(_)) => Ok(HashMap::new()),
+            Err(e) => Err(e),
+        }) {
             Ok(head_files) => head_files,
             Err(GitError::ObjectNotFound(_)) => {
                 return worktree::compute_status_worktree_only_cancellable(
@@ -1051,7 +1062,7 @@ impl Repository {
         if path.is_empty() {
             return Ok(None);
         }
-        let index = self.read_index()?;
+        let index = self.index_for_status()?;
         let options = worktree::StatusOptions {
             skip_hidden: true,
             skip_target_dirs: true,
@@ -1098,7 +1109,7 @@ impl Repository {
     /// under `GIT_OPTIONAL_LOCKS=0`.
     pub fn status_of_paths(&mut self, paths: &[String]) -> Result<Vec<worktree::PathStatus>, GitError> {
         self.ensure_object_sources()?;
-        let index = self.read_index()?;
+        let index = self.index_for_status()?;
         let staged: HashMap<&str, &IndexEntry> = index.entries.iter().filter(|e| e.stage() == 0).map(|e| (e.path.as_str(), e)).collect();
         let unmerged: std::collections::HashSet<&str> = index.entries.iter().filter(|e| e.stage() != 0).map(|e| e.path.as_str()).collect();
         let root = match self.head_oid() {
@@ -1360,13 +1371,11 @@ impl Repository {
         &mut self,
         tree: &ObjectId,
     ) -> Result<HashMap<String, (ObjectId, u32)>, GitError> {
-        self.ensure_object_sources()?;
-        let root = self.read_tree(tree)?;
-        let git_dir = self.common_dir.clone();
-        let packs = &self.packs;
-        let alts = &self.alternates;
-        merge::flatten_tree_with_mode(&root, "", &mut |oid| {
-            read_tree_standalone(&git_dir, oid, packs, alts)
+        self.again(|repo| {
+            repo.ensure_object_sources()?;
+            let root = repo.read_tree(tree)?;
+            let (git_dir, packs, alts) = (&repo.common_dir, &repo.packs, &repo.alternates);
+            merge::flatten_tree_with_mode(&root, "", &mut |oid| read_tree_standalone(git_dir, oid, packs, alts))
         })
     }
 
@@ -1378,16 +1387,16 @@ impl Repository {
         oid_a: &ObjectId,
         oid_b: &ObjectId,
     ) -> Result<Option<ObjectId>, GitError> {
-        self.ensure_object_sources()?;
-        let git_dir = self.common_dir.clone();
-        let packs = &self.packs;
-        let alts = &self.alternates;
-        merge::find_merge_base(oid_a, oid_b, &mut |oid| {
-            let obj = read_object_standalone(&git_dir, oid, packs, alts)?;
-            if obj.kind != ObjectKind::Commit {
-                return Err(GitError::InvalidObject("expected commit".into()));
-            }
-            parse_commit(&obj.data)
+        self.again(|repo| {
+            repo.ensure_object_sources()?;
+            let (git_dir, packs, alts) = (&repo.common_dir, &repo.packs, &repo.alternates);
+            merge::find_merge_base(oid_a, oid_b, &mut |oid| {
+                let obj = read_object_standalone(git_dir, oid, packs, alts)?;
+                if obj.kind != ObjectKind::Commit {
+                    return Err(GitError::InvalidObject("expected commit".into()));
+                }
+                parse_commit(&obj.data)
+            })
         })
     }
 
@@ -1683,6 +1692,38 @@ impl Repository {
         self.ensure_object_sources()
     }
 
+    /// After a miss (or a pack that no longer reads): true, and the packs dropped to be read
+    /// again, when the packs on disk are no longer those read. A repack (`git gc`, `git repack
+    /// -d`, by any process) packs loose objects and removes their files, and may remove the packs
+    /// it replaced, so an object loose when the packs were read can be in a pack this reader never
+    /// listed by now. git's reader lists its packs again on a miss too (`reprepare_packed_git`).
+    /// A real miss costs a listing of the pack directories.
+    fn packs_moved(&mut self) -> bool {
+        let Some(packs) = &self.packs else { return false };
+        let read: std::collections::BTreeSet<std::ffi::OsString> = packs.iter().filter_map(|p| p.pack_path.with_extension("idx").file_name().map(|n| n.to_os_string())).collect();
+        if pack_index_names(&self.common_dir) == read {
+            return false;
+        }
+        self.packs = None;
+        self.alternates = None;
+        self.alternate_packs = None;
+        true
+    }
+
+    /// `op` once more, over the packs on disk, when it failed and the packs it read are gone: for
+    /// an operation that reads through a snapshot of the packs ([`read_object_standalone`]), which
+    /// cannot list them again itself as [`Self::read_object`] does ([`Self::packs_moved`]). A
+    /// repack meanwhile packed an object that was loose when `op` read the packs and removed its
+    /// file: `devhub push`'s diff of two commits missed a subtree of its tip, written loose by the
+    /// landing's merge a moment before, while the auto maintenance that merge started repacked
+    /// (11-10); a retry a minute later read it. git's operations retry the same way.
+    fn again<T>(&mut self, mut op: impl FnMut(&mut Self) -> Result<T, GitError>) -> Result<T, GitError> {
+        match op(self) {
+            Err(_) if self.packs_moved() => op(self),
+            done => done,
+        }
+    }
+
     /// Read the pack indexes now (otherwise at the first object read). A
     /// repository kept open shares them with every other reader of the
     /// same packs opened meanwhile, so a job that opens the repository in
@@ -1694,6 +1735,29 @@ impl Repository {
     fn ensure_alternates(&mut self) -> Result<(), GitError> {
         self.ensure_object_sources()
     }
+}
+
+/// The pack indexes on disk by file name (a pack is named by its content's hash): the store's and
+/// each alternate's, as [`object_sources`] reads them.
+fn pack_index_names(common_dir: &Path) -> std::collections::BTreeSet<std::ffi::OsString> {
+    let primary = common_dir.join("objects");
+    let mut dirs = vec![primary.clone()];
+    if let Ok(content) = fs::read_to_string(primary.join("info").join("alternates")) {
+        dirs.extend(content.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(|l| resolve_alternate(common_dir, l)));
+    }
+    dirs.iter().filter_map(|d| fs::read_dir(d.join("pack")).ok()).flatten().flatten()
+        .map(|e| e.file_name())
+        .filter(|n| Path::new(n).extension().is_some_and(|x| x == "idx"))
+        .collect()
+}
+
+/// The packs' error when they did not open and the object is no loose one either: both said
+/// (the packs' error alone named neither the loose file's absence nor what it read, 11-07).
+fn neither(packed: Result<(), GitError>, oid: &ObjectId) -> Result<(), GitError> {
+    packed.map_err(|e| match e {
+        GitError::Io(io) => GitError::Io(std::io::Error::new(io.kind(), format!("{io}; and {} is no loose object", oid.to_hex()))),
+        e => e,
+    })
 }
 
 fn normalize_rel_path(path: &str) -> String {
@@ -1718,7 +1782,7 @@ pub(crate) fn read_loose_object_from_objects_dir(
         if e.kind() == std::io::ErrorKind::NotFound {
             GitError::ObjectNotFound(oid.to_hex())
         } else {
-            GitError::Io(e)
+            GitError::io_at("read loose object", &path, e)
         }
     })?;
 

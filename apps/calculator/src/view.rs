@@ -726,7 +726,7 @@ impl CalculatorView {
         if navigation.destination_view() == page {
             return;
         }
-        navigation.end_interactive_pop_without_animation(cx);
+        navigation.end_interactive_transition_without_animation(cx);
         match page {
             Some(page) => navigation.push(cx, page),
             None => navigation.pop_to_root(cx),
@@ -1608,7 +1608,7 @@ mod tests {
         view.handle_event(&mut cx, &input, &mut Scope::empty());
         assert_eq!(view.doc.session.value, 5.0);
         let response = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let copy = Event::TextCopy(TextClipboardEvent { response: response.clone() });
+        let copy = Event::TextCopy(TextClipboardEvent { response: response.clone(), ..Default::default() });
         view.handle_event(&mut cx, &copy, &mut Scope::empty());
         assert_eq!(response.borrow().as_deref(), Some("5"));
     }
@@ -1661,7 +1661,7 @@ mod tests {
             let other = 1 - index;
             assert_eq!(views.borrow()[other].doc.session.source, if index == 0 { "0" } else { "23" });
             let response = Rc::new(RefCell::new(None));
-            let copy = Event::TextCopy(TextClipboardEvent { response: response.clone() });
+            let copy = Event::TextCopy(TextClipboardEvent { response: response.clone(), ..Default::default() });
             for view in views.borrow_mut().iter_mut() {
                 view.handle_event(&mut cx, &copy, &mut Scope::empty());
             }
@@ -1686,7 +1686,7 @@ mod tests {
                 assert_eq!(view.label(&mut cx, id).text(), expected, "{source}");
             }
             let response = std::rc::Rc::new(std::cell::RefCell::new(None));
-            view.handle_event(&mut cx, &Event::TextCopy(TextClipboardEvent { response: response.clone() }), &mut Scope::empty());
+            view.handle_event(&mut cx, &Event::TextCopy(TextClipboardEvent { response: response.clone(), ..Default::default() }), &mut Scope::empty());
             assert_eq!(response.borrow().as_deref(), Some(expected), "{source}");
             assert_eq!(apply(&mut view.doc, &mut view.ui, Command::Copy).copied.as_deref(), Some(expected));
         }

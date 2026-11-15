@@ -9,6 +9,11 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Makepad Code's agent core: model loop, tools and sessions, no UI"
 
+# `devhub test` runs these tests in the lane's tree, never a JIT overlay: one runs cargo metadata
+# on the checkout, and an overlay's tree is one only the JIT process reads
+[package.metadata.makepad]
+test-tree = "a test runs cargo metadata on the checkout"
+
 [dependencies]
 # The hub chat's election only (machine node, LAN fleet): no in-process
 # model runtime, so no `llm`.
@@ -18,6 +23,8 @@ makepad-ai-services = { path = "../../../libs/ai/services", default-features = f
 makepad-regex = { path = "../../../libs/regex" }
 makepad-strict-json = { path = "../../../libs/strict_json" }
 makepad-git = { path = "../../../libs/git" }
+# The file index watches the folder (index.rs).
+makepad-filesystem-watcher = { path = "../../../libs/filesystem_watcher" }
 # Running makepad apps here and on paired hosts (remote.rs).
 makepad-remote = { path = "../../../libs/remote" }
 # The app table builds and runs come from (runs.rs).

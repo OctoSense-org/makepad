@@ -4,7 +4,8 @@ use crate::*;
 use makepad_csg_cad as cad;
 use makepad_csg_cad::Region;
 use makepad_csg_math::{dvec3, Vec3d};
-use std::collections::HashMap;
+use makepad_csg_mesh::subdiv::{catmull_clark, Levels};
+use std::collections::{HashMap, HashSet};
 
 const SANS: &[u8] = include_bytes!("../../../../widgets/resources/IBMPlexSans-SemiBold.ttf");
 const MONO: &[u8] = include_bytes!("../../../../widgets/resources/LiberationMono-Regular.ttf");
@@ -52,9 +53,13 @@ pub struct Evaluator {
     pub brep_chord: f64,
 }
 
+/// The chord (mm) exact bodies and cages are meshed at for print: about how far the mesh may
+/// stray from the true surface.
+pub const PRINT_CHORD: f64 = 0.05;
+
 impl Default for Evaluator {
     fn default() -> Self {
-        Evaluator { tolerance: Tolerance::default(), draft: 1.0, finest_cell: 0.25, cache: HashMap::new(), round: 0, built: 0, brep: None, brep_chord: 0.05 }
+        Evaluator { tolerance: Tolerance::default(), draft: 1.0, finest_cell: 0.25, cache: HashMap::new(), round: 0, built: 0, brep: None, brep_chord: PRINT_CHORD }
     }
 }
 
@@ -208,6 +213,120 @@ impl Evaluator {
         Ok(m)
     }
 
+    /// Builds the meshes [`Self::mesh`] would build for `ids` side by side, and keeps them as it
+    /// would: the nodes below each id not kept yet, in groups that build none in common, each on an
+    /// evaluator of its own (these settings, the kept meshes it reads), the caller building groups
+    /// too while the CSG pool's workers take the others. `mesh` then finds them, the same meshes
+    /// it builds itself. An id that builds an exact body is left to `mesh` (the B-rep engine
+    /// reports on the thread that asks), and so is a mesh that fails.
+    pub fn mesh_ahead(&mut self, g: &Graph, ids: &[NodeId], cancelled: Option<&dyn Fn() -> bool>) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Mutex};
+        let workers = makepad_csg_math::thread_pool::thread_count();
+        if workers < 2 || cancelled.is_some_and(|c| c()) {
+            return;
+        }
+        // per id: the meshes it would build, and the kept ones they read
+        struct Group {
+            ids: Vec<NodeId>,
+            builds: HashSet<(Key, u64)>,
+            reads: HashMap<(Key, u64), (Arc<TriMesh>, u64)>,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        'ids: for &id in ids {
+            let mut group = Group { ids: vec![id], builds: HashSet::new(), reads: HashMap::new() };
+            let mut stack = vec![id];
+            while let Some(n) = stack.pop() {
+                let node = g.node(n);
+                let at = (node.key, if self.drafted(g, n) { (self.draft_scale() * self.brep_chord).to_bits() } else { 0 });
+                if let Some(kept) = self.cache.get(&at) {
+                    group.reads.insert(at, kept.clone());
+                } else if matches!(node.op, Op::Brep { .. }) {
+                    continue 'ids;
+                } else if group.builds.insert(at) {
+                    stack.extend(node.op.inputs());
+                }
+            }
+            if group.builds.is_empty() {
+                continue;
+            }
+            // ids that build a mesh in common are one group
+            for other in std::mem::take(&mut groups) {
+                if other.builds.is_disjoint(&group.builds) {
+                    groups.push(other);
+                } else {
+                    group.ids.splice(0..0, other.ids);
+                    group.builds.extend(other.builds);
+                    group.reads.extend(other.reads);
+                }
+            }
+            groups.push(group);
+        }
+        let total = groups.len();
+        if total < 2 {
+            return;
+        }
+        let (tolerance, draft, finest_cell, round, brep_chord) = (self.tolerance, self.draft, self.finest_cell, self.round, self.brep_chord);
+        let build = move |g: &Graph, group: Group, cancelled: &dyn Fn() -> bool| {
+            let mut e = Evaluator { tolerance, draft, finest_cell, cache: group.reads, round, built: 0, brep: None, brep_chord };
+            for id in group.ids {
+                if e.mesh(g, id, Some(cancelled)).is_err() {
+                    break;
+                }
+            }
+            e
+        };
+        let graph = Arc::new(g.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(Mutex::new(groups));
+        let (done, finished) = mpsc::channel::<Option<Evaluator>>();
+        for _ in 1..total.min(workers) {
+            let (graph, stop, queue, done) = (graph.clone(), stop.clone(), queue.clone(), done.clone());
+            makepad_csg_math::thread_pool::spawn(move || loop {
+                let Some(group) = queue.lock().unwrap().pop() else { break };
+                // a panic is `mesh`'s to meet again; the caller hears the group is done
+                let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&graph, group, &|| stop.load(Ordering::Relaxed))));
+                if done.send(e.ok()).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(done);
+        let mut merge = |e: Option<Evaluator>| {
+            if let Some(e) = e {
+                self.built += e.built;
+                self.cache.extend(e.cache);
+            }
+        };
+        // the caller's groups, with its cancel (which stops the others too)
+        let watch = || {
+            let c = cancelled.is_some_and(|c| c());
+            if c {
+                stop.store(true, Ordering::Relaxed);
+            }
+            c
+        };
+        let mut merged = 0;
+        loop {
+            let Some(group) = queue.lock().unwrap().pop() else { break };
+            merge(Some(build(g, group, &watch)));
+            merged += 1;
+        }
+        // then the ones the workers took
+        while merged < total {
+            match finished.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(e) => {
+                    merge(e);
+                    merged += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    watch();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
     /// An exact body's mesh at `chord` (mm), whatever `brep_chord` is: what a view shows it at.
     /// `None`: `id` is no exact body. Kept with the meshes [`Self::mesh`] makes (one chord's
     /// mesh is the same mesh whichever asked for it).
@@ -242,10 +361,11 @@ impl Evaluator {
         if self.draft.is_finite() && self.draft > 0.0 { self.draft } else { 1.0 }
     }
 
-    /// Whether the node's mesh depends on the draft (a field or a shell below it).
+    /// Whether the node's mesh depends on the draft (a field, a shell, an exact body or a cage
+    /// below it).
     fn drafted(&self, g: &Graph, id: NodeId) -> bool {
         match &g.node(id).op {
-            Op::Field { .. } | Op::Shell { .. } | Op::Brep { .. } => true,
+            Op::Field { .. } | Op::Shell { .. } | Op::Offset { .. } | Op::Brep { .. } | Op::Cage { .. } => true,
             op => op.inputs().into_iter().any(|i| self.drafted(g, i)),
         }
     }
@@ -400,6 +520,7 @@ impl Evaluator {
                 Ok(if *keep { cad::union(source, &m) } else { m })
             }
             Op::Shell { thickness, open, cell, .. } => shell(&inputs[0], *thickness, *open, cell.map(|c| c * self.draft_scale()), self.draft_scale()),
+            Op::Offset { distance, cell, .. } => offset(&inputs[0], *distance, cell.map(|c| c * self.draft_scale()), self.draft_scale()),
             Op::Boolean { mode, .. } => {
                 let mut out = (*inputs[0]).clone();
                 for other in &inputs[1..] {
@@ -441,12 +562,21 @@ impl Evaluator {
                     return Err("an SDF's bounds need min below max on every axis".into());
                 }
                 let cell = cell.unwrap_or_else(|| makepad_csg_sdf::default_cell(min, max, self.finest_cell)) * self.draft_scale();
-                nonempty(makepad_csg_sdf::mesh_field(shape.field(), min, max, cell, shape.lipschitz()), "shape (nothing inside its surface)")
+                nonempty(makepad_csg_sdf::mesh_field(shape.field(), min, max, cell, shape.clearance()), "shape (nothing inside its surface)")
             }
             Op::Mesh { mesh } => Ok((**mesh).clone()),
             // `mesh` hands these to the engine before it gets here.
             Op::Brep { .. } => Err("an exact body reached the mesh builder".into()),
             Op::Links { links, sides, .. } => nonempty(links.mesh(*sides), "links (no link has three points)"),
+            // A coarser draft (live editing) takes one level fewer; a finer one (export) a
+            // finer chord.
+            Op::Cage { points, faces, levels } => {
+                let levels = match levels {
+                    Some(n) => Levels::Steps(*n),
+                    None => Levels::Chord(self.brep_chord * self.draft_scale().min(1.0)),
+                };
+                catmull_clark(&points.iter().map(|p| v3(*p)).collect::<Vec<_>>(), faces, levels, self.draft_scale() > 1.0)
+            }
         }
     }
 }
@@ -585,6 +715,44 @@ impl makepad_csg_sdf::Sdf3 for Cavity {
     fn distance(&self, p: Vec3d) -> f64 {
         self.bvh.signed_distance(p) + self.t
     }
+}
+
+/// A solid with its surface moved out by `d`.
+struct Grown {
+    bvh: cad::measure::Bvh,
+    d: f64,
+}
+
+impl makepad_csg_sdf::Sdf3 for Grown {
+    fn distance(&self, p: Vec3d) -> f64 {
+        self.bvh.signed_distance(p) - self.d
+    }
+}
+
+/// `source` with its surface moved out by `d` (in, negative), meshed from the solid's distance
+/// field at `cell`.
+fn offset(source: &TriMesh, d: f64, cell: Option<f64>, draft: f64) -> Result<TriMesh, String> {
+    if d == 0.0 {
+        return Ok(source.clone());
+    }
+    let bb = source.bounding_box();
+    let ext = bb.max - bb.min;
+    let largest = ext.x.max(ext.y).max(ext.z);
+    let cell = cell.unwrap_or((largest / 64.0).clamp(0.1, 2.0) * draft);
+    let depth = ((largest / cell).log2().ceil() as usize).clamp(4, 8);
+    let pad = d.max(0.0) + cell;
+    let pad = dvec3(pad, pad, pad);
+    let mut grown = makepad_csg_sdf::sdf_to_mesh(Grown { bvh: cad::measure::Bvh::build(source), d }, bb.min - pad, bb.max + pad, depth);
+    if grown.triangles.is_empty() {
+        return Err(format!("an offset of {d} leaves nothing of the solid"));
+    }
+    if cad::signed_volume(&grown) < 0.0 {
+        grown.clear_normals();
+        for tri in &mut grown.triangles {
+            tri.swap(1, 2);
+        }
+    }
+    Ok(grown)
 }
 
 /// Hollow `source` to walls of `t`: the outer skin stays exactly as it was; the

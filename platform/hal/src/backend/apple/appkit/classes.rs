@@ -24,6 +24,7 @@ pub struct Classes {
     pub menu_delegate: *const Class,
     pub app_delegate: *const Class,
     pub pulse: *const Class,
+    pub print_delegate: *const Class,
 }
 
 impl Classes {
@@ -39,6 +40,7 @@ impl Classes {
             menu_delegate: define_menu_delegate(),
             app_delegate: define_app_delegate(),
             pulse: define_pulse_class(),
+            print_delegate: define_print_delegate(),
         }
     }
 }
@@ -88,9 +90,10 @@ fn define_pulse_class() -> *const Class {
 // ------------------------------------------------------------------ application, menu
 
 fn define_app_delegate() -> *const Class {
-    extern "C" fn application_should_terminate(_: &Object, _: Sel, _: ObjcId) -> isize {
+    extern "C" fn application_should_terminate(_: &Object, _: Sel, sender: ObjcId) -> isize {
         const CANCEL: isize = 0;
         const NOW: isize = 1;
+        eprintln!("makepad-hal: asked to quit (applicationShouldTerminate:): sender {}, {}", super::close_why::sender(sender), super::close_why::cause());
         app::note_exit_requested();
         // the sessions decide: each is asked to quit, the app answers with a `Quit` command
         if app().ask_sessions_to_quit() {
@@ -157,6 +160,19 @@ fn define_app_delegate() -> *const Class {
     decl.register()
 }
 
+fn define_print_delegate() -> *const Class {
+    extern "C" fn print_operation_did_run(_: &Object, _: Sel, _: ObjcId, success: BOOL, context: *mut c_void) {
+        shielded("print", std::panic::AssertUnwindSafe(|| unsafe {
+            app::print_operation_did_run(success, context);
+        }));
+    }
+    let mut decl = ClassDecl::new("HalPrintDelegate", class!(NSObject)).unwrap();
+    unsafe {
+        decl.add_method(sel!(printOperationDidRun:success:contextInfo:), print_operation_did_run as extern "C" fn(&Object, Sel, ObjcId, BOOL, *mut c_void));
+    }
+    decl.register()
+}
+
 fn define_menu_target_class() -> *const Class {
     extern "C" fn menu_action(this: &Object, _sel: Sel, _item: ObjcId) {
         shielded("menu", std::panic::AssertUnwindSafe(|| {
@@ -187,10 +203,22 @@ fn define_tray_target_class() -> *const Class {
             super::tray::click(sid as u32, tray as u64);
         }));
     }
+    // the pointer entered a tray's button: nothing to do, but the tracking area asks for
+    // entered and exited, and an owner without this selector aborts the app on hover
+    extern "C" fn tray_entered(_this: &Object, _sel: Sel, _event: ObjcId) {}
+    // the pointer left a tray's button (its tracking area's owner)
+    extern "C" fn tray_exited(this: &Object, _sel: Sel, _event: ObjcId) {
+        shielded("tray exit", std::panic::AssertUnwindSafe(|| {
+            let (sid, tray): (usize, usize) = unsafe { (*this.get_ivar("sid"), *this.get_ivar("tray_u64")) };
+            super::tray::pointer_left(sid as u32, tray as u64);
+        }));
+    }
     let mut decl = ClassDecl::new("HalTrayTarget", class!(NSObject)).unwrap();
     unsafe {
         decl.add_method(sel!(trayAction:), tray_action as extern "C" fn(&Object, Sel, ObjcId));
         decl.add_method(sel!(trayClick:), tray_click as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(mouseEntered:), tray_entered as extern "C" fn(&Object, Sel, ObjcId));
+        decl.add_method(sel!(mouseExited:), tray_exited as extern "C" fn(&Object, Sel, ObjcId));
     }
     decl.add_ivar::<usize>("sid");
     decl.add_ivar::<usize>("tray_u64");
@@ -845,9 +873,10 @@ fn define_view_class() -> *const Class {
     }
 
     extern "C" fn accepts_first_mouse(this: &Object, _: Sel, event: ObjcId) -> BOOL {
-        // The caption answer crosses the asynchronous pipe. Accept the press here, then
-        // mouseDown asks the app; only its Caption reply can start a native window drag.
-        if event != nil && !win_of(this).retired.get() { YES } else { NO }
+        // Like AppKit's own title bar, a press on an inactive window's caption bar drags it right away.
+        // The app's caption answer crosses the asynchronous pipe, so the strip stands in for it here.
+        let win = win_of(this);
+        if event != nil && !win.retired.get() && win.accepts_first_mouse(event_pos(this, event)[1]) { YES } else { NO }
     }
 
     let mut decl = ClassDecl::new("HalView", class!(NSView)).unwrap();

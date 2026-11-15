@@ -38,6 +38,10 @@ pub mod intrinsics {
     pub use super::intrinsics_simd as simd;
     /// rustc's `intrinsics::assume` (UB when false): hint::assert_unchecked
     pub use crate::hint::assert_unchecked as assume;
+    /// rustc's `intrinsics::cold_path`, safe and const: `#[cold]`, with the empty body rustc's
+    /// fallback (its spec). hint::cold_path calls it.
+    #[cold]
+    pub const fn cold_path() {}
 }
 
 /// rustc's generic SIMD intrinsics (`core::intrinsics::simd`) on `#[repr(simd)]` types, lane-wise
@@ -147,7 +151,7 @@ pub mod intrinsics_mem {
         #[rustc_intrinsic_const_stable_indirect]
         pub fn align_of_val<T: ?Sized>(v: *const T) -> usize;
         #[rustc_intrinsic_const_stable_indirect]
-        pub fn needs_drop<T>() -> bool;
+        pub fn needs_drop<T: ?Sized>() -> bool;
         /// `T: Copy` for this instantiation (a constant per instance): std's Copy fast paths
         /// (real std specializes Clone-for-Copy into memcpy)
         pub fn is_copy<T>() -> bool;
@@ -159,6 +163,13 @@ pub mod intrinsics_mem {
         /// `T: TrustedLen` for this instantiation (a constant per instance): Vec's extend takes
         /// one loop per iterator type, as real alloc's SpecExtend specialization picks one
         pub fn is_trusted_len<T>() -> bool;
+        /// `T: TrustedRandomAccess` for this instantiation (a constant per instance): Zip takes
+        /// its indexed path, as real core's ZipImpl specialization picks it
+        pub fn is_trusted_random_access<T>() -> bool;
+        /// `T: TrustedRandomAccessNoCoerce` for this instantiation (Zip's indexed fold and size)
+        pub fn is_trusted_random_access_no_coerce<T>() -> bool;
+        /// `<T as TrustedRandomAccessNoCoerce>::MAY_HAVE_SIDE_EFFECT`, false when T is not one
+        pub fn may_have_side_effect<T>() -> bool;
         pub fn drop_in_place<T: crate::marker::PointeeSized>(p: *mut T);
         #[rustc_intrinsic_const_stable_indirect]
         pub fn ptr_read<T>(p: *const T) -> T;
@@ -358,7 +369,8 @@ pub mod intrinsics_vx {
     // vx_sha1rnds4: x86, immediate FUNC in 0..=3, checked at lowering.
     // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
     // vx_crc32: Arm crc32{b,h,w,x} of data's low `bytes` (1/2/4/8, constant) bytes into crc;
-    // aarch64 targets only, checked at lowering.
+    // aarch64 targets only, checked at lowering. vx_crc32c: the same for CRC-32C (Arm
+    // crc32c{b,h,w,x}, x86 SSE4.2 crc32); aarch64 and x86_64 targets.
     // Unary: 0 abs, 1 shl, 2 unsigned shr, 3 signed shr, 4 shuffle i32,
     // 5/6 byte shift right/left, 7 SSE sqrt, 8 float abs, 9 NEON sqrt f32, 10 float neg
     // 11 SSE4.1 round to integral, imm & 3 = nearest-even / down / up / toward zero
@@ -371,6 +383,7 @@ pub mod intrinsics_vx {
         pub fn vx_sha1rnds4<T>(a: T, b: T, func: i32) -> T;
         pub fn vx_sha1h(a: u32) -> u32;
         pub fn vx_crc32(crc: u32, data: u64, bytes: u32) -> u32;
+        pub fn vx_crc32c(crc: u32, data: u64, bytes: u32) -> u32;
         pub fn vx_unary<T>(a: T, op: u32, width: u32, imm: i32) -> T;
         pub fn vx_splat<T>(a: u64, width: u32) -> T;
         pub fn vx_load<T>(p: *const u8) -> T;

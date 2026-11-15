@@ -18,6 +18,7 @@ use {
         cell::RefCell,
         hash::{Hash, Hasher},
         mem,
+        ops::Range,
         rc::Rc,
     },
     unicode_segmentation::UnicodeSegmentation,
@@ -1735,10 +1736,13 @@ impl LaidoutText {
         (descender + cap_height - ascender) * 0.5
     }
 
+    /// Where `cursor` is: its row, and its x in the text's coordinates (the
+    /// row's alignment shift included, where the row draws). The positions,
+    /// points and selection spans of a laid-out text all share them.
     pub fn cursor_to_position(&self, cursor: Cursor) -> CursorPosition {
         let row_index = self.cursor_to_row_index(cursor);
         let row = &self.rows[row_index];
-        let x_in_lpxs = row.index_to_x_in_lpxs(cursor.index - row.text.start_in_parent());
+        let x_in_lpxs = row.origin_in_lpxs.x + row.index_to_x_in_lpxs(cursor.index - row.text.start_in_parent());
         CursorPosition {
             row_index,
             x_in_lpxs,
@@ -1793,7 +1797,7 @@ impl LaidoutText {
 
     pub fn position_to_cursor(&self, position: CursorPosition) -> Cursor {
         let row = &self.rows[position.row_index];
-        let index = row.x_in_lpxs_to_index(position.x_in_lpxs);
+        let index = row.x_in_lpxs_to_index(position.x_in_lpxs - row.origin_in_lpxs.x);
         Cursor {
             index: row.text.start_in_parent() + index,
             prefer_next_row: index == 0,
@@ -1809,13 +1813,20 @@ impl LaidoutText {
             row_index: end_row_index,
             x_in_lpxs: end_x_in_lpxs,
         } = self.cursor_to_position(selection.end());
+        // Both ends within their rows.
+        let start_x_in_lpxs = start_x_in_lpxs - self.rows[start_row_index].origin_in_lpxs.x;
+        let end_x_in_lpxs = end_x_in_lpxs - self.rows[end_row_index].origin_in_lpxs.x;
         let mut selection_rects = Vec::new();
         for row_index in start_row_index..=end_row_index {
             let row = &self.rows[row_index];
+            // Spans take x within the row, and sit where the row draws.
             let mut push_span = |x_in_lpxs: f32, width_in_lpxs: f32| {
                 selection_rects.push(SelectionRect {
                     rect_in_lpxs: Rect::new(
-                        Point::new(x_in_lpxs, row.origin_in_lpxs.y - row.ascender_in_lpxs),
+                        Point::new(
+                            row.origin_in_lpxs.x + x_in_lpxs,
+                            row.origin_in_lpxs.y - row.ascender_in_lpxs,
+                        ),
                         Size::new(width_in_lpxs, row.ascender_in_lpxs - row.descender_in_lpxs),
                     ),
                     ascender_in_lpxs: row.ascender_in_lpxs,
@@ -1824,7 +1835,7 @@ impl LaidoutText {
             let is_start_row = row_index == start_row_index;
             let is_end_row = row_index == end_row_index;
             if !is_start_row && !is_end_row {
-                push_span(row.origin_in_lpxs.x, row.width_in_lpxs);
+                push_span(0.0, row.width_in_lpxs);
                 continue;
             }
             let row_start = row.text.start_in_parent();
@@ -1926,7 +1937,7 @@ impl LaidoutRow {
         };
         if self.is_left_to_right() {
             return self
-                .find_visual_grapheme(None, |grapheme| {
+                .find_visual_grapheme(|grapheme| {
                     is_before_middle(&grapheme).then_some(grapheme.start)
                 })
                 .unwrap_or(self.text.len());
@@ -1940,7 +1951,7 @@ impl LaidoutRow {
     pub fn index_to_x_in_lpxs(&self, index: usize) -> f32 {
         if self.is_left_to_right() {
             return self
-                .find_visual_grapheme(None, |grapheme| {
+                .find_visual_grapheme(|grapheme| {
                     (grapheme.start == index).then_some(grapheme.x_in_lpxs)
                 })
                 .unwrap_or(self.width_in_lpxs);
@@ -1973,47 +1984,56 @@ impl LaidoutRow {
 
     /// Returns the row's graphemes from left to right.
     fn get_visual_graphemes(&self) -> Vec<VisualGrapheme> {
-        // Clusters go down from left to right in RTL text.
-        let mut clusters: Vec<usize> = self.glyphs.iter().map(|glyph| glyph.cluster).collect();
-        clusters.sort_unstable();
         let mut graphemes = Vec::with_capacity(self.glyphs.len());
-        self.find_visual_grapheme(Some(&clusters), |grapheme| {
+        self.find_visual_grapheme(|grapheme| {
             graphemes.push(grapheme);
             None::<()>
         });
         graphemes
     }
 
-    /// Returns the first thing `f` finds in the row's graphemes, going from left to right.
-    ///
-    /// A cluster's text ends at the next larger cluster, which we find in `sorted_clusters` unless
-    /// the row is left to right. A ligature's width is split evenly between its graphemes.
-    fn find_visual_grapheme<T>(
+    /// Consecutive glyphs of each cluster, its text range and its right edge.
+    /// Empty ranges are kept so glyphs without their own text can still be captured.
+    pub(crate) fn glyph_clusters(
         &self,
-        sorted_clusters: Option<&[usize]>,
-        mut f: impl FnMut(VisualGrapheme) -> Option<T>,
-    ) -> Option<T> {
-        use {super::slice::SliceExt, unicode_segmentation::UnicodeSegmentation};
+    ) -> impl Iterator<Item = (&[LaidoutGlyph], Range<usize>, f32)> {
+        use super::slice::SliceExt;
 
-        let mut rtl_graphemes = Vec::new();
-        let mut glyph_groups = self
-            .glyphs
-            .group_by(|glyph_0, glyph_1| glyph_0.cluster == glyph_1.cluster)
-            .peekable();
-        while let Some(glyph_group) = glyph_groups.next() {
-            let start = glyph_group[0].cluster;
-            let start_x_in_lpxs = glyph_group[0].origin_in_lpxs.x;
-            let next_glyph_group = glyph_groups.peek();
-            let end_x_in_lpxs = next_glyph_group.map_or(self.width_in_lpxs, |next_glyph_group| {
-                next_glyph_group[0].origin_in_lpxs.x
-            });
-            let end = match sorted_clusters {
+        let sorted_clusters = (!self.is_left_to_right()).then(|| {
+            let mut clusters: Vec<usize> = self.glyphs.iter().map(|glyph| glyph.cluster).collect();
+            clusters.sort_unstable();
+            clusters
+        });
+        let mut groups = self.glyphs.group_by(|a, b| a.cluster == b.cluster).peekable();
+        std::iter::from_fn(move || {
+            let group = groups.next()?;
+            let start = group[0].cluster;
+            let next = groups.peek();
+            let end = match &sorted_clusters {
                 Some(clusters) => clusters
                     .get(clusters.partition_point(|&cluster| cluster <= start))
                     .copied(),
-                None => next_glyph_group.map(|next_glyph_group| next_glyph_group[0].cluster),
+                None => next.map(|group| group[0].cluster),
             };
-            let text = &self.text[start..end.unwrap_or(self.text.len())];
+            let end_x = next.map_or(self.width_in_lpxs, |group| group[0].origin_in_lpxs.x);
+            Some((group, start..end.unwrap_or(self.text.len()), end_x))
+        })
+    }
+
+    /// Returns the first thing `f` finds in the row's graphemes, going from left to right.
+    ///
+    /// A ligature's width is split evenly between its graphemes.
+    fn find_visual_grapheme<T>(
+        &self,
+        mut f: impl FnMut(VisualGrapheme) -> Option<T>,
+    ) -> Option<T> {
+        use unicode_segmentation::UnicodeSegmentation;
+
+        let mut rtl_graphemes = Vec::new();
+        for (glyph_group, range, end_x_in_lpxs) in self.glyph_clusters() {
+            let start = range.start;
+            let start_x_in_lpxs = glyph_group[0].origin_in_lpxs.x;
+            let text = &self.text[range];
             // The ellipsis has no text of its own.
             if text.is_empty() {
                 continue;
@@ -3005,6 +3025,41 @@ mod tests {
         assert_eq!(get_row_texts(&laidout), [text]);
         let width = measure_width(&mut layouter, LATIN_FAMILY, text);
         assert!((laidout.rows[0].width_in_lpxs - width).abs() < 0.01);
+    }
+
+    #[test]
+    fn aligned_rows_select_and_place_carets_where_they_draw() {
+        use super::{Cursor, CursorPosition, Point, Selection};
+        let mut layouter = real_font_layouter();
+        let text = "aa bbbb cc";
+        let max_width = measure_width(&mut layouter, LATIN_FAMILY, "bbbb ") + 1.0;
+        for align in [0.0, 0.5, 1.0] {
+            let laidout = layout_text(&mut layouter, LATIN_FAMILY, text, LayoutOptions { align, ..wrapping_options(max_width) });
+            assert_eq!(get_row_texts(&laidout), ["aa ", "bbbb ", "cc"]);
+            let shift = |row: usize| laidout.rows[row].origin_in_lpxs.x;
+            assert!(align == 0.0 || (shift(0) > 0.0 && shift(2) > 0.0), "align {align}: short rows shift");
+            // A selection over all three rows: first, middle and last row
+            // each start where their text does.
+            let rects = laidout.selection_rects(Selection {
+                anchor: Cursor { index: 0, prefer_next_row: false },
+                cursor: Cursor { index: text.len(), prefer_next_row: false },
+            });
+            assert_eq!(rects.len(), 3);
+            for (row, rect) in rects.iter().enumerate() {
+                assert!((rect.rect_in_lpxs.origin.x - shift(row)).abs() < 0.01, "align {align}: row {row}'s span starts at its text");
+            }
+            // A caret is where its row draws, and a point there finds it.
+            for index in [0, 3, 8, text.len()] {
+                let position = laidout.cursor_to_position(Cursor { index, prefer_next_row: index != 0 });
+                let row = &laidout.rows[position.row_index];
+                let at = row.origin_in_lpxs.x + row.index_to_x_in_lpxs(index - row.text.start_in_parent());
+                assert!((position.x_in_lpxs - at).abs() < 0.01, "align {align}: caret {index} sits on its text");
+                let back = laidout.point_in_lpxs_to_cursor(Point::new(position.x_in_lpxs, row.origin_in_lpxs.y));
+                assert_eq!(back.index, index, "align {align}: the point at caret {index} finds it");
+                let moved = laidout.position_to_cursor(CursorPosition { row_index: position.row_index, x_in_lpxs: position.x_in_lpxs });
+                assert_eq!(moved.index, index, "align {align}: its position finds it");
+            }
+        }
     }
 
     #[test]

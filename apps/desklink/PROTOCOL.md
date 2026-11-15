@@ -1,4 +1,4 @@
-# Desk Link protocol, version 8
+# Desk Link protocol, version 9
 
 Desk Link is how a viewer (this app) sees and drives a desktop (the window manager's
 `desk_link` server, `apps/wm/src/desk_link/`; the macOS / Windows Desk Host; a JIT host serving
@@ -16,9 +16,12 @@ question). It lists, in this order:
   endpoint in the `caps` the Mac's devhub master asks for every 10 s (`desk_link`:
   `{"on","port","note"}`; `libs/devhub/src/embed.rs`). The master writes the listening ones to
   `~/.makepad/devhub/desk-links`, one `<node> <ip>:<port>` line each, and the viewer adds those as
-  desktops named by node (`quest`), at launch and once a second after (a tab stays when its
-  endpoint goes off and shows it offline). The master already dials every node from its
-  `nodes.conf` over fleet TLS, so nothing new listens or announces.
+  desktops named by node (`quest`). The master already dials every node from its `nodes.conf`
+  over fleet TLS, so nothing new listens or announces.
+
+The viewer reads the saved hosts and the devhub's list at launch and once a second after, so a
+line added to either while it runs becomes a tab. A tab stays when its line goes, and shows its
+desktop offline when the endpoint goes.
 
 `makepad devhub desk <node> on|off` switches a JIT host's endpoint (the node's `desk` service,
 through the master's router; `desk <node>` says what it does). The host registers the switch with
@@ -279,11 +282,14 @@ takes the `Window` of the viewer that connected last (not view-only, its window 
 earlier ones see that size scaled. When it leaves, the one that connected before it decides
 again (`server::size_owner`).
 
-## Semantic inspection (version 8)
+## Semantic inspection (versions 8 and 9)
 
 Version 8 adds viewer message **25**, `A11yQuery { req u64, line str }`, and desktop
 message **109**, `A11yReply { req u64, text str }`. The text is the ordinary `ui`
 interpreter reply (including JSON when requested); request IDs correlate concurrent callers.
+Version 9 adds desktop message **110**, `A11yReplyPart { req u64, text str }`: a reply is
+never cut. One longer than 1 MiB goes first as `A11yReplyPart`s of at most 1 MiB each, cut on
+character boundaries; the `A11yReply` carries the rest, and the viewer joins them in order.
 Only `ui` commands are accepted. The desktop runs them on reusable session workers so a wait
 cannot hold up pings, video, input, or the semantic action that satisfies it. Workers
 grow to the session's observed query concurrency and stop when it disconnects. The same TLS fleet proof and `Need::Admin` check
@@ -300,5 +306,5 @@ then selects a window within it. `if_user_seq` is checked on the selected deskto
 not against the viewer's activity counter.
 
 A disconnected or timed-out query reports an error; actions are never replayed on reconnect.
-Version 7 peers are refused during Hello. Live tree embedding in the viewer's own OS
+A peer of another version is refused during Hello; the desktop's `Refused` names both versions. Live tree embedding in the viewer's own OS
 accessibility tree is not part of the query/reply transport.

@@ -28,7 +28,7 @@ fn image_read(r: &mut Reader<'_>, l: &Limits) -> Result<RgbaImage> {
     let image = RgbaImage {
         width: r.u32()?,
         height: r.u32()?,
-        pixels: r.blob(l.max_texture_bytes)?.to_vec(),
+        pixels: r.blob()?.to_vec(),
     };
     image.validate(l)?;
     Ok(image)
@@ -75,10 +75,10 @@ fn derivation_write(w: &mut Writer, recipe: &SurfaceDerivation) -> Result<()> {
     for value in [recipe.strength, recipe.roughness_min, recipe.roughness_max, recipe.metallic] { w.f64(value)?; }
     w.u8(recipe.wrap as u8)
 }
-fn derivation_read(r: &mut Reader<'_>, limits: &Limits) -> Result<SurfaceDerivation> {
+fn derivation_read(r: &mut Reader<'_>, _limits: &Limits) -> Result<SurfaceDerivation> {
     Ok(SurfaceDerivation {
         source_channel: channel_read(r)?,
-        source_layer: if boolean(r)? { Some(r.string(limits.max_name_bytes)?) } else { None },
+        source_layer: if boolean(r)? { Some(r.string()?) } else { None },
         strength: r.f64()?, roughness_min: r.f64()?, roughness_max: r.f64()?, metallic: r.f64()?,
         wrap: boolean(r)?,
     })
@@ -115,10 +115,10 @@ fn layer_write(w: &mut Writer, l: &SurfaceLayer) -> Result<()> {
     Ok(())
 }
 fn layer_read(r: &mut Reader<'_>, l: &Limits) -> Result<SurfaceLayer> {
-    let id = r.string(l.max_name_bytes)?;
+    let id = r.string()?;
     let image = image_read(r, l)?;
     let mask = if boolean(r)? {
-        Some(r.blob(l.max_texture_bytes / 4)?.to_vec())
+        Some(r.blob()?.to_vec())
     } else {
         None
     };
@@ -136,7 +136,7 @@ fn layer_read(r: &mut Reader<'_>, l: &Limits) -> Result<SurfaceLayer> {
     let pattern = if recipe_flags & 1 != 0 { Some(pattern_read(r)?) } else { None };
     let derived = if recipe_flags & 2 != 0 { Some(derivation_read(r, l)?) } else { None };
     let mut mips = Vec::new();
-    for _ in 0..r.count(32)? {
+    for _ in 0..r.count(12)? {
         mips.push(image_read(r, l)?);
     }
     Ok(SurfaceLayer {
@@ -152,6 +152,9 @@ fn layer_read(r: &mut Reader<'_>, l: &Limits) -> Result<SurfaceLayer> {
     })
 }
 fn material_write(w: &mut Writer, m: &SurfaceMaterial) -> Result<()> {
+    if m.shading.is_some_and(|s| s.msdf > 0.0 && s.crown > 0.0) {
+        return Err(Error::Invalid("surface shading: msdf and crown never combine"));
+    }
     write_array(w, &m.base_color)?;
     for v in [
         m.metallic,
@@ -173,16 +176,32 @@ fn material_write(w: &mut Writer, m: &SurfaceMaterial) -> Result<()> {
     let plate = m.shading.is_some_and(|s| s.plate > 0.0);
     // Bit 5: a vehicle lamp role (only when set).
     let lamp = m.shading.and_then(|s| s.lamp);
-    w.u8(m.double_sided as u8 | ((m.fur.is_some() as u8) << 1) | ((m.shading.is_some() as u8) << 2) | ((rim as u8) << 3) | ((plate as u8) << 4) | ((lamp.is_some() as u8) << 5))?;
+    // Bit 6: the shading block carries distance-field terms.
+    let msdf = m.shading.is_some_and(|s| s.msdf > 0.0);
+    // Bit 7: with bit 6, the MSDF block carries plate cells (bit 4 is required).
+    // With bit 6 clear, an extension byte follows wind, clearcoat, flake and
+    // impostor, before rim. Its bit 0 marks crown normals; all other bits are
+    // reserved. This unused flag combination preserves existing material bytes.
+    let cells = m.shading.and_then(|s| s.msdf_plate_cells);
+    let crown = m.shading.is_some_and(|s| s.crown > 0.0);
+    w.u8(m.double_sided as u8 | ((m.fur.is_some() as u8) << 1) | ((m.shading.is_some() as u8) << 2) | ((rim as u8) << 3) | ((plate as u8) << 4) | ((lamp.is_some() as u8) << 5) | ((msdf as u8) << 6) | (((cells.is_some() || crown) as u8) << 7))?;
     if let Some(fur) = m.fur {
         for value in [fur.length, fur.density, fur.scale] { w.f64(value)?; }
         w.u32(fur.seed)?;
     }
     if let Some(s) = m.shading {
         for value in [s.wind, s.clearcoat, s.flake, s.impostor] { w.f64(value)?; }
+        if crown { w.u8(1)?; }
         if rim { w.f64(s.rim)?; }
         if plate { w.f64(s.plate)?; }
         if let Some(lamp) = lamp { w.u8(lamp_code(lamp))?; }
+        if msdf {
+            write_array(w, &s.msdf_fill)?;
+            write_array(w, &s.msdf_border)?;
+            w.f64(s.msdf_border_width)?;
+            w.f64(s.msdf_range)?;
+            if let Some(cells) = cells { write_array(w, &cells)?; }
+        }
     }
     w.count(m.channels.len())?;
     for (ch, layers) in &m.channels {
@@ -225,7 +244,7 @@ fn material_read(r: &mut Reader<'_>, l: &Limits) -> Result<SurfaceMaterial> {
     };
     let alpha_cutoff = r.f64()?;
     let flags = r.u8()?;
-    if flags > 63 || (flags & 56 != 0 && flags & 4 == 0) { return Err(Error::Corrupt("surface material flags")); }
+    if (flags & 248 != 0 && flags & 4 == 0) || (flags & 192 == 192 && flags & 16 == 0) { return Err(Error::Corrupt("surface material flags")); }
     let double_sided = flags & 1 != 0;
     let fur = if flags & 2 != 0 {
         Some(makepad_gltf::GlbFurMaterial {
@@ -234,10 +253,24 @@ fn material_read(r: &mut Reader<'_>, l: &Limits) -> Result<SurfaceMaterial> {
     } else { None };
     let shading = if flags & 4 != 0 {
         let (wind, clearcoat, flake, impostor) = (r.f64()?, r.f64()?, r.f64()?, r.f64()?);
+        let crown = if flags & 192 == 128 {
+            let extension = r.u8()?;
+            if extension & !1 != 0 { return Err(Error::Corrupt("surface shading extension flags")); }
+            (extension & 1) as f64
+        } else { 0.0 };
         let rim = if flags & 8 != 0 { r.f64()? } else { 0.0 };
         let plate = if flags & 16 != 0 { r.f64()? } else { 0.0 };
         let lamp = if flags & 32 != 0 { Some(lamp_from_code(r.u8()?)?) } else { None };
-        Some(makepad_gltf::GlbShading { wind, clearcoat, flake, impostor, rim, plate, lamp })
+        let mut shading = makepad_gltf::GlbShading { wind, clearcoat, flake, impostor, rim, crown, plate, lamp, ..Default::default() };
+        if flags & 64 != 0 {
+            shading.msdf = 1.0;
+            shading.msdf_fill = read_array(r)?;
+            shading.msdf_border = read_array(r)?;
+            shading.msdf_border_width = r.f64()?;
+            shading.msdf_range = r.f64()?;
+            if flags & 128 != 0 { shading.msdf_plate_cells = Some(read_array(r)?); }
+        }
+        Some(shading)
     } else { None };
     let mut channels = BTreeMap::new();
     for _ in 0..r.count(5)? {
@@ -282,18 +315,15 @@ pub(crate) fn write_surface(w: &mut Writer, s: &SurfaceState) -> Result<()> {
 }
 pub(crate) fn read_surface(r: &mut Reader<'_>, l: &Limits) -> Result<SurfaceState> {
     let mut s = SurfaceState::default();
-    for _ in 0..r.count(l.max_materials)? {
+    for _ in 0..r.count(114)? {
         let id = r.u32()?;
         let value = material_read(r, l)?;
         if s.materials.insert(id, value).is_some() {
             return Err(Error::Corrupt("duplicate surface material"));
         }
-        if s.memory_bytes() > l.max_source_bytes {
-            return Err(Error::Budget("surface source"));
-        }
     }
-    for _ in 0..r.count(l.mesh.max_vertices)? {
-        let name = r.string(l.max_name_bytes)?;
+    for _ in 0..r.count(44)? {
+        let name = r.string()?;
         let id = mesh::VertexId(r.u64()?);
         let color = read_array(r)?;
         if s.vertex_colors.insert((name, id), color).is_some() {
@@ -308,8 +338,8 @@ fn target_write(w: &mut Writer, id: u32, ch: SurfaceChannel, layer: &str) -> Res
     w.u8(ch as u8)?;
     w.string(layer)
 }
-fn target_read(r: &mut Reader<'_>, l: &Limits) -> Result<(u32, SurfaceChannel, String)> {
-    Ok((r.u32()?, channel_read(r)?, r.string(l.max_name_bytes)?))
+fn target_read(r: &mut Reader<'_>, _l: &Limits) -> Result<(u32, SurfaceChannel, String)> {
+    Ok((r.u32()?, channel_read(r)?, r.string()?))
 }
 pub(crate) fn write_surface_operation(w: &mut Writer, op: &SurfaceOperation) -> Result<()> {
     use SurfaceOperation::*;
@@ -535,7 +565,7 @@ pub(crate) fn read_surface_operation(r: &mut Reader<'_>, l: &Limits) -> Result<S
                 channel,
                 layer,
                 mask: if boolean(r)? {
-                    Some(r.blob(l.max_texture_bytes / 4)?.to_vec())
+                    Some(r.blob()?.to_vec())
                 } else {
                     None
                 },
@@ -553,7 +583,7 @@ pub(crate) fn read_surface_operation(r: &mut Reader<'_>, l: &Limits) -> Result<S
         7 => {
             let (material, channel, layer) = target_read(r, l)?;
             let mut points = Vec::new();
-            for _ in 0..r.count(256)? {
+            for _ in 0..r.count(16)? {
                 points.push(read_array(r)?);
             }
             Stroke {
@@ -571,7 +601,7 @@ pub(crate) fn read_surface_operation(r: &mut Reader<'_>, l: &Limits) -> Result<S
         8 => {
             let (material, channel, layer) = target_read(r, l)?;
             ProjectedStroke {
-                object: r.string(l.max_name_bytes)?,
+                object: r.string()?,
                 material,
                 channel,
                 layer,
@@ -586,9 +616,9 @@ pub(crate) fn read_surface_operation(r: &mut Reader<'_>, l: &Limits) -> Result<S
             }
         }
         9 => {
-            let object = r.string(l.max_name_bytes)?;
+            let object = r.string()?;
             let mut vertices = Vec::new();
-            for _ in 0..r.count(l.mesh.max_vertices)? {
+            for _ in 0..r.count(8)? {
                 vertices.push(mesh::VertexId(r.u64()?));
             }
             VertexPaint {
@@ -601,8 +631,8 @@ pub(crate) fn read_surface_operation(r: &mut Reader<'_>, l: &Limits) -> Result<S
         10 => {
             let (material, channel, layer) = target_read(r, l)?;
             Bake {
-                source: r.string(l.max_name_bytes)?,
-                target: r.string(l.max_name_bytes)?,
+                source: r.string()?,
+                target: r.string()?,
                 material,
                 channel,
                 layer,
@@ -639,9 +669,9 @@ pub(crate) fn read_surface_operation(r: &mut Reader<'_>, l: &Limits) -> Result<S
             Derive { material, channel, layer, recipe }
         }
         14 => {
-            let object = r.string(l.max_name_bytes)?;
+            let object = r.string()?;
             let (mut vertices, mut colors) = (Vec::new(), Vec::new());
-            for _ in 0..r.count(l.mesh.max_vertices)? {
+            for _ in 0..r.count(40)? {
                 vertices.push(mesh::VertexId(r.u64()?));
                 colors.push(read_array(r)?);
             }
@@ -667,14 +697,14 @@ mod compatibility_tests {
         assert_eq!(layer.id, "legacy");
         assert!(layer.derived.is_none());
         assert_eq!(layer.image.pixels, [64, 128, 192, 255]);
-        let mut writer = Writer::new(1024);
+        let mut writer = Writer::new();
         layer_write(&mut writer, &layer).unwrap();
         assert_eq!(writer.bytes, bytes);
     }
 
     #[test]
     fn a_rim_term_roundtrips_and_leaves_older_shading_bytes_alone() {
-        let encode = |m: &SurfaceMaterial| { let mut w = Writer::new(4096); material_write(&mut w, m).unwrap(); w.bytes };
+        let encode = |m: &SurfaceMaterial| { let mut w = Writer::new(); material_write(&mut w, m).unwrap(); w.bytes };
         let coat = makepad_gltf::GlbShading { clearcoat: 1.0, flake: 0.5, ..Default::default() };
         let plain = SurfaceMaterial { shading: Some(coat), ..Default::default() };
         let toy = SurfaceMaterial { shading: Some(makepad_gltf::GlbShading { rim: 0.6, ..coat }), ..Default::default() };
@@ -690,8 +720,86 @@ mod compatibility_tests {
     }
 
     #[test]
+    fn msdf_roundtrips_without_changing_legacy_material_bytes() {
+        let encode = |m: &SurfaceMaterial| { let mut w = Writer::new(); material_write(&mut w, m).unwrap(); w.bytes };
+        // Legacy default material layout, independent of the optional MSDF block.
+        let hex = "000000000000f03f000000000000f03f000000000000f03f000000000000f03f0000000000000000000000000000f03f000000000000f03f000000000000f03f000000000000000000000000000000000000000000000000000000000000f03f00000000000000e03f0000000000";
+        let legacy: Vec<u8> = hex.as_bytes().chunks_exact(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap()).collect();
+        assert_eq!(encode(&SurfaceMaterial::default()), legacy, "ordinary materials retain their wire bytes");
+        // The old shading block follows the flags and precedes the channel count.
+        // Crown being off must preserve that layout, including an optional rim.
+        let flags_at = legacy.len() - 5;
+        let mut shaded_legacy = legacy.clone();
+        shaded_legacy[flags_at] = 4 | 8;
+        let terms = [0.25f64, 1.0, 0.5, 12.0, 0.6];
+        shaded_legacy.splice(flags_at + 1..flags_at + 1, terms.into_iter().flat_map(f64::to_le_bytes));
+        let shaded = SurfaceMaterial { shading: Some(makepad_gltf::GlbShading {
+            wind: 0.25, clearcoat: 1.0, flake: 0.5, impostor: 12.0, rim: 0.6, ..Default::default()
+        }), ..Default::default() };
+        assert_eq!(encode(&shaded), shaded_legacy, "shading without crown retains its wire bytes");
+        let mut material = SurfaceMaterial {
+            shading: Some(makepad_gltf::GlbShading {
+                plate: 1.0, msdf: 1.0, msdf_fill: [0.2, 0.4, 0.6, 0.8],
+                msdf_border: [0.9, 0.1, 0.3, 1.0], msdf_border_width: 2.0, msdf_range: 8.0,
+                msdf_plate_cells: Some([0.5, 0.1, 0.0, 0.1]), ..Default::default()
+            }), ..Default::default()
+        };
+        let data = RgbaImage { width: 2, height: 1, pixels: vec![64, 128, 192, 0, 192, 64, 0, 255] };
+        material.channels.insert(SurfaceChannel::BaseColor, vec![SurfaceLayer::new("text", data.clone())]);
+        let bytes = encode(&material);
+        let back = material_read(&mut Reader::new(&bytes), &Limits::default()).unwrap();
+        assert_eq!(back, material, "colours, texel range and plate cells survive checkpointing");
+        assert_eq!(encode(&back), bytes);
+        let flat = back.flatten(SurfaceChannel::BaseColor, &Limits::default(), &mut mesh::Context::default()).unwrap().unwrap();
+        assert_eq!(flat, data, "zero badge distance must not erase RGB text distance");
+        let mips = flat.mip_chain(ImageEncoding::Linear, &Limits::default(), &mut mesh::Context::default()).unwrap();
+        assert_eq!(mips[0].pixels, [128, 96, 96, 128], "data mips average all four distances independently");
+    }
+
+    #[test]
+    fn crown_roundtrips_in_the_shading_extension_and_rejects_invalid_flags() {
+        let encode = |m: &SurfaceMaterial| { let mut w = Writer::new(); material_write(&mut w, m).unwrap(); w.bytes };
+        // The default material ends with its flags and the four-byte channel count.
+        let flags_at = encode(&SurfaceMaterial::default()).len() - 5;
+        let extension_at = flags_at + 1 + 4 * 8;
+        for shading in [
+            makepad_gltf::GlbShading::default(),
+            makepad_gltf::GlbShading { wind: 0.25, clearcoat: 1.0, flake: 0.5, impostor: 12.0, rim: 0.6, plate: 1.0, lamp: Some(makepad_gltf::GlbLamp::Tail), ..Default::default() },
+        ] {
+            let plain = SurfaceMaterial { shading: Some(shading), ..Default::default() };
+            let material = SurfaceMaterial { shading: Some(makepad_gltf::GlbShading { crown: 1.0, ..shading }), ..Default::default() };
+            let bytes = encode(&material);
+            let mut expected = encode(&plain);
+            expected[flags_at] |= 128;
+            expected.insert(extension_at, 1);
+            assert_eq!(bytes, expected, "crown adds only bit 7 and an extension byte before rim");
+            let mut reader = Reader::new(&bytes);
+            let back = material_read(&mut reader, &Limits::default()).unwrap();
+            reader.end().unwrap();
+            assert_eq!(back, material, "crown and following optional terms survive checkpointing");
+            assert_eq!(encode(&back), bytes);
+            let mut corrupt = bytes.clone();
+            for bit in 1..8 {
+                corrupt[extension_at] = 1 | (1 << bit);
+                assert!(matches!(material_read(&mut Reader::new(&corrupt), &Limits::default()), Err(Error::Corrupt(_))), "reserved extension bit {bit} must be rejected");
+            }
+            let mut absent = bytes.clone();
+            absent[extension_at] = 0;
+            assert_eq!(material_read(&mut Reader::new(&absent), &Limits::default()).unwrap(), plain, "a clear crown bit means off");
+            corrupt[flags_at] &= !4;
+            assert!(matches!(material_read(&mut Reader::new(&corrupt), &Limits::default()), Err(Error::Corrupt(_))), "extensions require a shading block");
+        }
+        let material = SurfaceMaterial { shading: Some(makepad_gltf::GlbShading {
+            crown: 1.0, msdf: 1.0, msdf_range: 8.0, ..Default::default()
+        }), ..Default::default() };
+        let mut writer = Writer::new();
+        assert_eq!(material_write(&mut writer, &material), Err(Error::Invalid("surface shading: msdf and crown never combine")));
+        assert!(writer.bytes.is_empty(), "incompatible shading is rejected before writing");
+    }
+
+    #[test]
     fn a_lamp_role_roundtrips_in_one_byte() {
-        let encode = |m: &SurfaceMaterial| { let mut w = Writer::new(4096); material_write(&mut w, m).unwrap(); w.bytes };
+        let encode = |m: &SurfaceMaterial| { let mut w = Writer::new(); material_write(&mut w, m).unwrap(); w.bytes };
         let plain = SurfaceMaterial { shading: Some(makepad_gltf::GlbShading::default()), ..Default::default() };
         let tail = SurfaceMaterial { shading: Some(makepad_gltf::GlbShading { lamp: Some(makepad_gltf::GlbLamp::Reverse), ..Default::default() }), ..Default::default() };
         let (a, b) = (encode(&plain), encode(&tail));

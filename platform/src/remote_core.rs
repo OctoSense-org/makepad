@@ -111,6 +111,8 @@ pub const GRAB_ID_BASE: u64 = 1 << 62;
 
 pub const MAX_PENDING_GRABS: usize = 64;
 
+/// Grab pixels waiting for the encoder above which a frame is halved before it queues, where
+/// its requested output size allows ([`submit_encode`]); also the largest scaled grab.
 pub const MAX_GRAB_BYTES: usize = 64 * 1024 * 1024;
 
 pub static PENDING_GRABS: AtomicUsize = AtomicUsize::new(0);
@@ -159,6 +161,8 @@ pub struct WinInfo {
     pub pass_dpi: f64,
     pub x: f64,
     pub y: f64,
+    /// it has the keyboard focus
+    pub key: bool,
 }
 
 pub struct GrabSink {
@@ -210,7 +214,7 @@ pub struct EncodeJob {
     pub sink: GrabSink,
     pub width: u32,
     pub height: u32,
-    pub pixels: Arc<[u8]>,
+    pub pixels: crate::HostBuf,
     pub stride: usize,
     pub order: GrabOrder,
     pub origin: GrabOrigin,
@@ -297,7 +301,7 @@ pub fn halve_grab(job: &mut EncodeJob) -> bool {
             }
         }
     }
-    job.pixels = Arc::from(out.into_boxed_slice());
+    job.pixels = crate::HostBuf::from_vec(out);
     job.width = w2 as u32;
     job.height = h2 as u32;
     job.stride = w2 * 4;
@@ -309,28 +313,31 @@ pub fn submit_encode(mut job: EncodeJob, raw: bool) {
     if job.sink.cancelled.load(Ordering::Relaxed) {
         return;
     }
-    // Over the pixel budget (a fast /gseq of a large window outruns the
-    // encoder): halve the frame until it fits instead of failing, so the
-    // sequence degrades to smaller frames. A requested scale <= 0.5
-    // loses nothing, since the encoder would have scaled down anyway.
-    let len = loop {
-        let len = job.pixels.len();
-        let fits = GRAB_BYTES
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                used.checked_add(len)
-                    .filter(|total| *total <= MAX_GRAB_BYTES)
-            })
-            .is_ok();
-        if fits {
-            break len;
-        }
-        if !raw || job.width < 2 || job.height < 2 || !halve_grab(&mut job) {
-            let _ = job.sink.tx.try_send(Err(
-                "grab pixel budget full; retry at a slower cadence".into()
-            ));
-            return;
-        }
-    };
+    // Over the pixel budget (a fast gseq of a large window outruns the encoder): halve the
+    // frame while its requested output size allows (a requested scale <= 0.5 loses nothing,
+    // the encoder would scale down anyway). Past that the frame queues as it is and the
+    // encoder catches up: a sequence slows down, but no frame shrinks below the size asked
+    // for and none is refused. The queue's depth (MAX_PENDING_GRABS) bounds what waits.
+    while raw
+        && job.sink.scale <= 0.5
+        && job.width >= 2
+        && job.height >= 2
+        && GRAB_BYTES.load(Ordering::Relaxed) + job.pixels.len() > MAX_GRAB_BYTES
+        && halve_grab(&mut job)
+    {}
+    let len = job.pixels.len();
+    let used = GRAB_BYTES.fetch_add(len, Ordering::Relaxed) + len;
+    static OVER_BUDGET: AtomicBool = AtomicBool::new(false);
+    let over = used > MAX_GRAB_BYTES;
+    if over && !OVER_BUDGET.swap(true, Ordering::Relaxed) {
+        crate::log!(
+            "[makepad-remote] grabs outrun the encoder: {} MiB of pixels wait (budget {} MiB); frames queue at their requested size",
+            used >> 20,
+            MAX_GRAB_BYTES >> 20
+        );
+    } else if !over {
+        OVER_BUDGET.store(false, Ordering::Relaxed);
+    }
     job.bytes = Some(GrabBytes(len));
     job.backend_png = !raw;
     let tx = encoder().lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -352,6 +359,36 @@ pub struct QueuedCmd {
     pub cmd: Cmd,
     pub user_seq: Option<u64>,
     pub deadline: CommandDeadline,
+    /// who sent it ([`asked_by`]; empty: not known): the input it injects says it with what it
+    /// reaches (a window's close or caption button)
+    pub by: String,
+}
+
+/// Who sent the command being queued, on the endpoint's thread that answers it: the agent and its
+/// process (`makepad_remote::cmd::asked_by`); empty where not known. Under the JIT the host's
+/// endpoint answers, and its host says.
+#[cfg(not(relax))]
+pub fn asked_by() -> String {
+    makepad_remote::cmd::asked_by().unwrap_or_default()
+}
+
+#[cfg(all(relax, any(unix, windows)))]
+pub fn asked_by() -> String {
+    let hook = crate::cx::relax_host_symbol(c"relax_inspect_asker");
+    if hook.is_null() {
+        return String::new();
+    }
+    // SAFETY: the host's `relax_inspect_asker(buf, cap) -> len`
+    let asker = unsafe { std::mem::transmute::<*mut std::ffi::c_void, extern "C" fn(*mut u8, usize) -> usize>(hook) };
+    let mut buf = vec![0u8; 512];
+    let n = asker(buf.as_mut_ptr(), buf.len());
+    buf.truncate(n.min(512));
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[cfg(all(relax, not(any(unix, windows))))]
+pub fn asked_by() -> String {
+    String::new()
 }
 
 /// Native commands expire at their deadline. A JIT command stays live while its requester
@@ -364,7 +401,7 @@ pub struct CommandDeadline {
 }
 
 impl CommandDeadline {
-    fn at(at: Instant) -> Self {
+    pub(crate) fn at(at: Instant) -> Self {
         Self {
             at,
             #[cfg(relax)]
@@ -423,14 +460,17 @@ pub enum Cmd {
     /// Is anything still moving: a pending NextFrame, redraw, repaint or
     /// virtual timer due within the next frame?
     Settled(Sender<Reply>),
-    /// The UI thread's own counters (`uicounts`): read on the thread that runs the event loop.
-    UiCounts(Sender<Reply>),
+    /// The UI thread's own counters (`uicounts`): read on the thread that runs the event loop;
+    /// with what the app's other threads waited for a core (`waited=1`).
+    UiCounts(bool, Sender<Reply>),
     CapStop(Sender<Reply>),
     /// `/cap/pause` (true) and `/cap/resume` (false).
     CapPause(bool, Sender<Reply>),
     /// A command built by a platform-side route (`/cap/start`, `/cursor`):
     /// its payload names platform types, so only platform's `apply` reads it.
     Platform(Box<dyn std::any::Any + Send>),
+    /// `front`: the person asked to see the app ([`crate::cx::Cx::show_to_person`]).
+    Front(Sender<Reply>),
     Close {
         window: Option<usize>,
         /// `ask=1`: the user's close (title-bar button, Cmd+W): the app is asked first
@@ -579,6 +619,9 @@ pub enum Input {
     /// The window's own maximise (macOS: toggleFullScreen) — the test
     /// hook for the maximise/occlusion proof.
     Maximize,
+    /// The window's fullscreen (`CxOsOp::FullscreenWindow`): under a window manager the whole
+    /// screen at its own size, where a maximise keeps the bar and the dock.
+    Fullscreen,
     /// Resize the window's inner size (points): responsive-layout checks
     /// without relaunching.
     Resize(f64, f64),
@@ -661,14 +704,30 @@ pub fn request_from(args: impl Iterator<Item = String>, env: Option<&str>) -> Re
 }
 
 pub fn request() -> Request {
-    match request_from(std::env::args(), std::env::var("MAKEPAD_REMOTE").ok().as_deref()) {
+    let asked = std::env::var("MAKEPAD_REMOTE").ok();
+    // an Android app gets no environment of its own, so `adb shell setprop debug.makepad.remote 1` asks too
+    #[cfg(target_os = "android")]
+    let asked = asked.or_else(|| {
+        let value = makepad_hal::backend::android::system_property("debug.makepad.remote")?;
+        // every makepad app on the device reads it, so a value it can't use is ignored instead of ending the app
+        if let Request::Refused(_) = request_from(std::iter::empty(), Some(&value)) {
+            eprintln!("[makepad-remote] debug.makepad.remote={value} is ignored: 1 asks for the endpoint, 0 turns it off");
+            return None;
+        }
+        Some(value)
+    });
+    match request_from(std::env::args(), asked.as_deref()) {
         Request::Off | Request::Local if std::env::var("MAKEPAD_INSPECT").as_deref() == Ok("1") => Request::On,
+        // nothing outside a release Android or iOS app can reach its socket, and the system kills such
+        // an app without running exit handlers, so its socket and discovery file would only pile up
+        Request::Local if cfg!(all(any(target_os = "android", target_os = "ios", target_os = "tvos"), not(debug_assertions), not(relax))) => Request::Off,
         request => request,
     }
 }
 
 /// True when this process was launched for an agent or a test (`--remote`,
-/// `MAKEPAD_REMOTE=1` or `MAKEPAD_INSPECT=1`); the endpoint itself is open in every process unless `MAKEPAD_REMOTE=0`.
+/// `MAKEPAD_REMOTE=1` or `MAKEPAD_INSPECT=1`); the endpoint itself is open in every process unless `MAKEPAD_REMOTE=0`
+/// (a release Android or iOS app opens it only when asked).
 /// Pure argv + env, usable before the endpoint itself is up: the platform's focus policy reads
 /// it while the first window is being created.
 pub fn requested() -> bool {
@@ -789,7 +848,7 @@ pub fn err(msg: &str) -> Answer {
 /// (`cap pause`, `tweak apply`); `design <op>` takes the designer op as its second word.
 /// `grab`, `gseq`, `gq` and `tweak grab` are client side: they open the `frames` service.
 pub const COMMANDS: &[Command] = &[
-    Command { words: "status", args: "[w=ID]", answers: "{\"app\",\"pid\",\"w\":[{\"i\":id,\"t\":title,\"sz\":[w,h],\"px\":[w,h],\"dpi\",\"pass_dpi\",\"pos\":[x,y]}],\"activity\"}", service: "ui", risk: CmdRisk::Read, params: "\"w\":{\"type\":\"integer\",\"description\":\"window id (status lists them)\"}", required: &[], positional: &[] },
+    Command { words: "status", args: "[w=ID]", answers: "{\"app\",\"pid\",\"w\":[{\"i\":id,\"t\":title,\"sz\":[w,h],\"px\":[w,h],\"dpi\",\"pass_dpi\",\"pos\":[x,y],\"key\":has the keyboard focus}],\"activity\"}", service: "ui", risk: CmdRisk::Read, params: "\"w\":{\"type\":\"integer\",\"description\":\"window id (status lists them)\"}", required: &[], positional: &[] },
     Command { words: "gamepads", args: "", answers: "connected controllers and their current input states", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
     Command { words: "activity", args: "", answers: "native user activity: user_active, user_seq, idle_ms, quiet_ms, held, last_input, window (also in status)", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
     Command { words: "grab", args: "[w=ID] [scale=1] [out=FILE]", answers: "client side (frames service): the window as a PNG file; prints {\"png\":path,\"w\",\"sz\",\"capture_ms\",\"encode_ms\",\"capture_kind\"}", service: "ui", risk: CmdRisk::Read, params: makepad_remote::params::GRAB, required: &[], positional: &[] },
@@ -798,10 +857,11 @@ pub const COMMANDS: &[Command] = &[
     Command { words: "gq", args: "[scale=1] [w=ID]", answers: "client side: FINISH HERE: grab every window, then quit. {\"png\":[paths],\"quit\":1}", service: "ui", risk: CmdRisk::Destructive, params: makepad_remote::params::GQ, required: &[], positional: &[] },
     Command { words: "mouse", args: "k=move|down|up|click|scroll|pinch|touch x= y= [b=0] [dx= dy=] [scale= phase=begin|update|end] [scroll phase=touched|began|changed|ended|momentum|momentum_ended: a touchpad scroll] [touch phase=start|move|stop|cancel id=N: one finger] [time=] [hw=1] [native=1: AppKit primary click] [shift=1 ctrl=1 alt=1 logo=1] [w=ID] [wait=1]", answers: "inject a mouse event through the real event path", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"move\",\"down\",\"up\",\"click\",\"scroll\",\"pinch\",\"touch\"]},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"b\":{\"type\":\"integer\"},\"dx\":{\"type\":\"number\"},\"dy\":{\"type\":\"number\"},\"scale\":{\"type\":\"number\"},\"phase\":{\"type\":\"string\",\"enum\":[\"begin\",\"update\",\"end\",\"touched\",\"began\",\"changed\",\"ended\",\"momentum\",\"momentum_ended\",\"start\",\"move\",\"stop\",\"cancel\"]},\"id\":{\"type\":\"integer\"},\"time\":{\"type\":\"number\"},\"hw\":{\"type\":\"boolean\"},\"native\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"x1\":{\"type\":\"number\"},\"y1\":{\"type\":\"number\"},\"steps\":{\"type\":\"integer\"},\"back\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["k"], positional: &[] },
     Command { words: "click", args: "x= y= [b=0] [w=ID] [wait=1]", answers: "mouse k=click", service: "ui", risk: CmdRisk::Act, params: "\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"b\":{\"type\":\"integer\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"hw\":{\"type\":\"boolean\"},\"native\":{\"type\":\"boolean\"},\"time\":{\"type\":\"number\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["x", "y"], positional: &[] },
+    Command { words: "move", args: "x= y= [hw=1] [w=ID] [wait=1]", answers: "mouse k=move", service: "ui", risk: CmdRisk::Act, params: "\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"hw\":{\"type\":\"boolean\"},\"time\":{\"type\":\"number\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["x", "y"], positional: &[] },
     Command { words: "key", args: "t=TEXT | c=KeyA [k=down|up|press] [shift=1 ...] [w=ID] [wait=1]", answers: "type text or press a key (Escape ReturnKey Tab Backspace ArrowLeft F1 Key1 ..)", service: "ui", risk: CmdRisk::Act, params: "\"t\":{\"type\":\"string\",\"description\":\"text to type\"},\"c\":{\"type\":\"string\",\"description\":\"a key code: Escape ReturnKey Tab Backspace ArrowLeft F1 KeyA Key1 ..\"},\"k\":{\"type\":\"string\",\"enum\":[\"down\",\"up\",\"press\"]},\"shift\":{\"type\":\"boolean\"},\"ctrl\":{\"type\":\"boolean\"},\"alt\":{\"type\":\"boolean\"},\"logo\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "text", args: "t=TEXT [w=ID] [wait=1]", answers: "type text", service: "ui", risk: CmdRisk::Act, params: "\"t\":{\"type\":\"string\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["t"], positional: &[] },
     Command { words: "drop", args: "path=ABS x= y= [w=ID] [wait=1]", answers: "drop one absolute file path through Drag/Drop/DragEnd", service: "ui", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["path"], positional: &[] },
-    Command { words: "window", args: "k=maximize | k=resize width= height= | k=dragquery x= y= [w=ID] [wait=1]", answers: "window operations (the maximise/occlusion proof, the caption hit test)", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"maximize\",\"resize\",\"dragquery\"]},\"width\":{\"type\":\"number\"},\"height\":{\"type\":\"number\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["k"], positional: &[] },
+    Command { words: "window", args: "k=maximize | k=fullscreen | k=resize width= height= | k=dragquery x= y= [w=ID] [wait=1]", answers: "window operations (the maximise/occlusion proof, fullscreen at the screen's size, the caption hit test)", service: "ui", risk: CmdRisk::Act, params: "\"k\":{\"type\":\"string\",\"enum\":[\"maximize\",\"fullscreen\",\"resize\",\"dragquery\"]},\"width\":{\"type\":\"number\"},\"height\":{\"type\":\"number\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"},\"wait\":{\"type\":\"boolean\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["k"], positional: &[] },
     Command { words: "cpu", args: "", answers: "shared CPU budget and app pool summary", service: "platform", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
     Command { words: "log", args: "[n=50] [since=N]", answers: "{\"n\":lastseq,\"l\":[lines]}", service: "logs", risk: CmdRisk::Read, params: "\"n\":{\"type\":\"integer\"},\"since\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "net", args: "", answers: "the app's HTTP requests and network event queue, answered off the UI thread: a verdict per runtime first (STUCK: an answer waits unread in the app's queue, with when the app last read it / WAITING: in flight with nothing from the backend / OK), then per request: id, method and URL, the backend's answer and when, whether the app read it", service: "logs", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
@@ -809,8 +869,8 @@ pub const COMMANDS: &[Command] = &[
     Command { words: "midi", args: "a= b= c= [p=PORT] | k=ports n=NAME[,NAME] | k=out | k=reset", answers: "inject a MIDI message as if a device sent it; declare ports; read back what the app sent", service: "ui", risk: CmdRisk::Act, params: "\"a\":{\"type\":\"integer\"},\"b\":{\"type\":\"integer\"},\"c\":{\"type\":\"integer\"},\"p\":{\"type\":\"string\"},\"k\":{\"type\":\"string\",\"enum\":[\"ports\",\"out\",\"reset\"]},\"n\":{\"type\":\"string\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "trace", args: "[topics=a,b] [off=1]", answers: "get / set the trace topics", service: "logs", risk: CmdRisk::Act, params: "\"topics\":{\"type\":\"string\"},\"off\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
     Command { words: "step", args: "[frames=1] [fps=60] [wait_loads=1] [w=ID]", answers: "--virtual-clock only: run frames of 1/fps; answers {\"frame\",\"time\"} after the last", service: "ui", risk: CmdRisk::Act, params: "\"frames\":{\"type\":\"integer\"},\"fps\":{\"type\":\"number\"},\"wait_loads\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
-    Command { words: "settled", args: "", answers: "{\"settled\":bool,\"reasons\":[next_frame|redraw|repaint|timer|step|shaders|loads],\"loads\":{kind:n}}", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
-    Command { words: "uicounts", args: "", answers: "{\"ins\":n,\"cyc\":n,\"cpu_ns\":n} of the UI thread so far (ins/cyc: thread_counters, user mode: macOS thread_selfcounts, Linux perf_event; else 0)", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
+    Command { words: "settled", args: "", answers: "{\"settled\":bool,\"reasons\":[next_frame|redraw|repaint|timer|step|shaders|loads|pool],\"loads\":{kind:n},\"pool\":{\"queued\":[interactive,visible,background],\"running\":n,\"taken\":n}} (pool: the app pool's jobs waiting for a worker and its CPU permit, on its workers, and taken so far)", service: "ui", risk: CmdRisk::Read, params: "", required: &[], positional: &[] },
+    Command { words: "uicounts", args: "[waited=1]", answers: "{\"ins\":n,\"cyc\":n,\"cpu_ns\":n,\"process_cpu_ns\":n,\"served_cpu_ns\":n,\"runtime_cpu_ns\":n,\"faults\":n} of the UI thread so far (ins/cyc: thread_counters, user mode: macOS thread_selfcounts, Linux perf_event; else 0), the CPU of all the process's threads, and of that what serving remote peers cost it (its serving threads, and its UI thread answering their commands) and what the runtime's own threads ran (under makepad run, the JIT's; natively 0), and the process's major page faults so far (getrusage; 0 on Windows); waited=1 adds \"waited_ns\":n, what the app's threads that run now (not the UI thread, the serving ones or the runtime's) have spent runnable, waiting for a core (Linux schedstat run_delay; 0 where the OS keeps none per thread: macOS, Windows), a file or two a thread: ask it seldom", service: "ui", risk: CmdRisk::Read, params: "\"waited\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "cap start", args: "path=ABS.mp4 [fps=60] [audio=1] [overwrite=1] [w=ID]", answers: "record the window in process (native pixels, H.264)", service: "ui", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"},\"fps\":{\"type\":\"number\"},\"audio\":{\"type\":\"boolean\"},\"overwrite\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"}", required: &["path"], positional: &[] },
     Command { words: "cap stop", args: "[hashes=1]", answers: "finalize the recording: {\"frames\",\"sz\",\"missing\",\"hash\"}", service: "ui", risk: CmdRisk::Act, params: "\"hashes\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
     Command { words: "input record", args: "path=<file>", answers: "record the person's native pointer, wheel, key and text input as the commands that inject it (one line each: ms, presented frame, command)", service: "ui", risk: CmdRisk::Act, params: "\"path\":{\"type\":\"string\"}", required: &["path"], positional: &[] },
@@ -820,6 +880,7 @@ pub const COMMANDS: &[Command] = &[
     Command { words: "cap pause", args: "", answers: "stop writing without stopping the clock", service: "ui", risk: CmdRisk::Act, params: "", required: &[], positional: &[] },
     Command { words: "cap resume", args: "", answers: "restart writing", service: "ui", risk: CmdRisk::Act, params: "", required: &[], positional: &[] },
     Command { words: "cursor", args: "[show=1|0] [style=arrow|hand|text|crosshair|app] [x= y=] [w=ID]", answers: "a pointer drawn into the frame, moved by injected mouse input", service: "ui", risk: CmdRisk::Act, params: "\"show\":{\"type\":\"boolean\"},\"style\":{\"type\":\"string\",\"enum\":[\"arrow\",\"hand\",\"text\",\"crosshair\",\"app\"]},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"},\"w\":{\"type\":\"integer\"}", required: &[], positional: &[] },
+    Command { words: "front", args: "", answers: "the person asked to see the app (a repeat `devhub show`): it comes to the front, and a tray app with no window open opens what a click on its icon opens; {\"front\":1}", service: "ui", risk: CmdRisk::Act, params: "", required: &[], positional: &[] },
     Command { words: "close", args: "[w=ID] [ask=1]", answers: "close one window the normal way; ask=1 asks the app first like the window's close button (it may keep or hide the window)", service: "ui", risk: CmdRisk::Destructive, params: "\"w\":{\"type\":\"integer\"},\"ask\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &[], positional: &[] },
     Command { words: "resize", args: "w= h= [window=ID]", answers: "give the window a new inner size in layout points; answers after the frame that shows it", service: "ui", risk: CmdRisk::Act, params: "\"w\":{\"type\":\"number\"},\"h\":{\"type\":\"number\"},\"window\":{\"type\":\"integer\"},\"if_user_seq\":{\"type\":\"integer\"}", required: &["w", "h"], positional: &[] },
     Command { words: "handsoff", args: "[on=1|0]", answers: "the red hands-off frame round the window", service: "ui", risk: CmdRisk::Act, params: "\"on\":{\"type\":\"boolean\"}", required: &[], positional: &[] },
@@ -874,7 +935,17 @@ pub fn resolve(words: &[String]) -> Result<Resolved, String> {
     }
     match COMMANDS.iter().find(|c| c.words == first) {
         Some(c) => Ok(Resolved { key: c.words, sub: None, used: 1 }),
-        None => Err(format!("unknown command `{first}` (try `help`)")),
+        None => {
+            let mut names = Vec::new();
+            for command in COMMANDS {
+                if let Some(name) = command.words.split_whitespace().next() {
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+            }
+            Err(format!("unknown command `{first}`: the commands are {} (`help` describes each)", names.join(", ")))
+        }
     }
 }
 
@@ -970,7 +1041,7 @@ pub fn route_status(p: &Params) -> Answer {
         }
         index += 1;
         out.push_str(&format!(
-            "{{\"i\":{},\"t\":{},\"sz\":[{},{}],\"px\":[{},{}],\"dpi\":{},\"pass_dpi\":{},\"pos\":[{},{}]}}",
+            "{{\"i\":{},\"t\":{},\"sz\":[{},{}],\"px\":[{},{}],\"dpi\":{},\"pass_dpi\":{},\"pos\":[{},{}],\"key\":{}}}",
             window.id,
             json_str(&window.title),
             num(window.w),
@@ -981,6 +1052,7 @@ pub fn route_status(p: &Params) -> Answer {
             num(window.pass_dpi),
             num(window.x),
             num(window.y),
+            window.key,
         ));
     }
     out.push(']');
@@ -1365,6 +1437,7 @@ impl Drop for PendingGrabs {
                 cmd: Cmd::CancelGrabs(self.ids.clone()),
                 user_seq: None,
                 deadline: CommandDeadline::at(Instant::now()),
+                by: String::new(),
             });
         wake();
     }
@@ -1842,6 +1915,7 @@ where
     let pending = PendingReply(Arc::new(AtomicBool::new(true)));
     queue().lock().unwrap().push(QueuedCmd {
         cmd: make(tx),
+        by: asked_by(),
         user_seq: REQUEST_USER_SEQ.get(),
         deadline: CommandDeadline {
             at: Instant::now() + timeout,
@@ -2028,6 +2102,7 @@ mod tests {
             ("activity", 1),
             ("mouse", 1),
             ("click", 1),
+            ("move", 1),
             ("key", 1),
             ("text", 1),
             ("drop", 1),
@@ -2043,6 +2118,7 @@ mod tests {
             ("input replay", 2),
             ("input stop", 2),
             ("input status", 2),
+            ("front", 1),
             ("close", 1),
             ("resize", 1),
             ("window", 1),
@@ -2078,6 +2154,11 @@ mod tests {
             assert!(resolve(&words(removed)).unwrap_err().contains("unknown command"));
         }
         assert!(resolve(&words("nope")).unwrap_err().contains("unknown command"));
+        let unknown = resolve(&words("m")).unwrap_err();
+        assert!(unknown.starts_with("unknown command `m`: the commands are "), "{unknown}");
+        assert!(unknown.contains("mouse, click, move"), "{unknown}");
+        assert_eq!(unknown.matches("cap").count(), 1, "{unknown}");
+        assert!(unknown.ends_with("(`help` describes each)"), "{unknown}");
         // the table has no command the test above does not know of
         // design, and the four client-side ones
         assert_eq!(COMMANDS.len(), routes.len() + 1 + CLIENT_SIDE.len(), "COMMANDS and the route list disagree");
@@ -2092,5 +2173,49 @@ mod tests {
         for name in CLIENT_SIDE {
             assert!(COMMANDS.iter().any(|c| c.words == *name), "{name} is documented in help");
         }
+    }
+
+    /// A gseq of a 4K window outran the encoder and its frames came back halved again and again
+    /// (1920x1080 down to 7x4): over the pixel budget a frame is halved only while its requested
+    /// size allows, then it queues as it is.
+    #[test]
+    fn a_grab_over_the_pixel_budget_keeps_its_requested_size() {
+        start_encoder().unwrap();
+        // other grabs' pixels fill the budget
+        GRAB_BYTES.fetch_add(MAX_GRAB_BYTES, Ordering::Relaxed);
+        let mut sizes = Vec::new();
+        for (i, scale) in [0.5, 1.0].into_iter().enumerate() {
+            let (tx, rx) = sync_channel(1);
+            PENDING_GRABS.fetch_add(1, Ordering::Relaxed);
+            let sink = GrabSink {
+                id: GRAB_ID_BASE + (1 << 40) + i as u64,
+                window: None,
+                requested_at: Instant::now(),
+                scale,
+                raw_output: true,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                tx,
+            };
+            let pixels = crate::HostBuf::from_vec(vec![128u8; 64 * 32 * 4]);
+            submit_encode(
+                EncodeJob {
+                    sink,
+                    width: 64,
+                    height: 32,
+                    pixels,
+                    stride: 64 * 4,
+                    order: GrabOrder::Rgba,
+                    origin: GrabOrigin::TopLeft,
+                    capture_ms: 0.0,
+                    backend_png: false,
+                    bytes: None,
+                },
+                true,
+            );
+            let grabbed = rx.recv_timeout(Duration::from_secs(10)).expect("the grab is answered");
+            sizes.push(grabbed.map(|g| (g.width, g.height)));
+        }
+        GRAB_BYTES.fetch_sub(MAX_GRAB_BYTES, Ordering::Relaxed);
+        assert_eq!(sizes, vec![Ok((32, 16)), Ok((64, 32))], "each grab arrives at its requested size, none refused");
     }
 }

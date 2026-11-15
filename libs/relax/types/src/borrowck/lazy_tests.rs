@@ -8,9 +8,9 @@ const SOURCE: &str = "#[lang = \"sized\"] trait Sized {} #[lang = \"copy\"] trai
 // The worker and event bus are process-wide, as in the compiler's settle harness.
 fn child(name: &str) -> bool {
     if std::env::var_os("GANDALF_TEST_CHILD").is_some() { return false; }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    let status = crate::test_child::status(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &format!("borrowck::lazy::lazy_tests::{name}"), "--test-threads=1"])
-        .env("GANDALF_TEST_CHILD", "1").status().unwrap();
+        .env("GANDALF_TEST_CHILD", "1"));
     assert!(status.success()); true
 }
 fn fixture(dir: &str, source: &str) -> (Program, Tcx) {
@@ -196,11 +196,11 @@ fn guard_filters_non_app() {
     assert!(!app_crate(&prog, 0));
     // The one all-crates switch applies on top of the compiled default.
     assert!(!admit(&prog, 0));
-    std::env::set_var("MAKEPAD_RUN_GANDALF_ALL", "1");
+    std::env::set_var("RELAX_GANDALF_ALL", "1");
     assert!(admit(&prog, 0));
-    std::env::set_var("MAKEPAD_RUN_GANDALF_ALL", "0");
+    std::env::set_var("RELAX_GANDALF_ALL", "0");
     assert!(!admit(&prog, 0));
-    std::env::remove_var("MAKEPAD_RUN_GANDALF_ALL");
+    std::env::remove_var("RELAX_GANDALF_ALL");
     unsubscribe(id);
 }
 
@@ -411,4 +411,18 @@ fn round42_cancelled_gandalf_check_has_no_persisted_verdict() {
     assert_eq!(wait_verdict(&front, def), FnVerdict::Clean);
     assert!(take_verdict_keys().contains(&(42, StoredVerdict::Clean)));
     stop();
+}
+
+/// Two programs of one process (the application's and the proc-macro world's) each number their
+/// crates from 0: a crate's user-types decision is its own, not that of the other program's crate
+/// with the same number (an app crate after serde's derive: E0596 on `&mut self.values[i]`).
+#[test]
+fn a_crates_user_types_decision_is_not_another_programs_same_numbered_crate() {
+    if child("a_crates_user_types_decision_is_not_another_programs_same_numbered_crate") { return; }
+    use super::super::event::user_types_wanted;
+    let (framework, _) = fixture("framework", SOURCE);
+    let (app, _) = fixture("app", SOURCE);
+    assert!(!user_types_wanted(&framework, 0), "the framework crate is no app crate");
+    assert!(user_types_wanted(&app, 0), "the app's crate 0 keeps its user types");
+    assert!(!user_types_wanted(&framework, 0), "and the framework's crate 0 still does not");
 }

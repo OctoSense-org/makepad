@@ -19,7 +19,12 @@ use makepad_remote::watch::WatchSink;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How often the master asks a node for the JIT's hot records past the ones it has (and at once
+/// after its link came back). It asked once for each record the node's feed brought, a route
+/// through its own hub each time: about 100 routes a second, 2.8k threads in 25 s (11-06).
+const HOT_LOOK: Duration = Duration::from_secs(2);
 
 /// Where records go besides the control feed (the inbox, the tray).
 pub type OnRecord = Arc<dyn Fn(&Record) + Send + Sync>;
@@ -145,8 +150,8 @@ impl Master {
         // a second master stops before it starts anything (its landing train, its jobs): one
         // already serves the control socket
         // (one this master's previous image kept open for it answers no probe: it queues the dial)
-        if !crate::node::control_kept() && Client::new(Target::Unix(proto::control_socket()), "probe").conn().is_ok() {
-            return Err(format!("a devhub already serves {}", proto::control_socket().display()));
+        if let Some(who) = (!crate::node::control_kept()).then(|| crate::node::who_serves(&proto::control_socket())).flatten() {
+            return Err(format!("a devhub ({who}) already serves {}", proto::control_socket().display()));
         }
         let niced = start_level()?;
         // Validate and retain the shared state before starting any master services.
@@ -245,6 +250,14 @@ impl Master {
             s.emit(&r.to_json());
             o(&r);
         }));
+        // every inspect, grab and act on a node's app routes through here: a lane's screen run
+        // of the app is in use, and so is a live session that runs it
+        let l = leases.clone();
+        hub.set_route_seen(Arc::new(move |node, spec, service, _caller| {
+            l.app_touched(node, spec, service);
+            #[cfg(feature = "checkout")]
+            crate::orch::live::app_routed(node, spec, service, _caller);
+        }));
         // the workflow jobs (verify, after, allapps, push) and their state
         #[cfg(feature = "checkout")]
         {
@@ -267,15 +280,35 @@ impl Master {
             s.emit(&r.to_json());
             o(&r);
         }));
+        // a landing holds what reaches a Mac show until its tip is proven (orch/show.rs)
+        #[cfg(feature = "checkout")]
+        land.before_ff(Arc::new(crate::orch::show::before_landing));
         #[cfg(feature = "checkout")]
         {
             let home = proto::home();
             let repo = crate::lease::wt::default_repo();
             let proofs = Arc::new(crate::gateproof::Store::open(&home));
-            let run = crate::bucket::fast(repo.clone(), home.clone(), proofs);
+            let run = crate::bucket::fast(repo.clone(), home.clone(), proofs.clone());
+            let (s, o) = (sink.clone(), on_record.clone());
+            let timing = crate::bucket::Timing::pipelined();
+            crate::bucket::spawn("fast", timing, repo.clone(), home.clone(), Arc::new(move |r: Record| {
+                s.emit(&r.to_json());
+                o(&r);
+            }), run, |_| None);
+            // the reached test targets under the JIT, after landing and in the background
+            let run = crate::bucket::tests(repo.clone(), home.clone(), proofs.clone());
             let (s, o) = (sink.clone(), on_record.clone());
             let timing = crate::bucket::Timing::after(Duration::from_secs(60), Duration::from_secs(10 * 60));
-            crate::bucket::spawn("fast", timing, repo.clone(), home.clone(), Arc::new(move |r: Record| {
+            crate::bucket::spawn("tests", timing, repo.clone(), home.clone(), Arc::new(move |r: Record| {
+                s.emit(&r.to_json());
+                o(&r);
+            }), run, |_| None);
+            // every package's tests, no proof reused: once a day at 17:00 on this Mac's clock, done
+            // before the daily push review (19:13) reads its red list, and on demand
+            let run = crate::bucket::full(repo.clone(), home.clone(), proofs);
+            let (s, o) = (sink.clone(), on_record.clone());
+            let timing = crate::bucket::Timing { every: Duration::ZERO, quiet: Duration::ZERO, cap: Duration::ZERO, daily: Some(17) };
+            crate::bucket::spawn(crate::bucket::FULL, timing, repo.clone(), home.clone(), Arc::new(move |r: Record| {
                 s.emit(&r.to_json());
                 o(&r);
             }), run, |_| None);
@@ -294,8 +327,11 @@ impl Master {
                 s.emit(&r.to_json());
                 o(&r);
             }), run, crate::orch::ci::last_rolling);
-            ep.register("bucket", 1, makepad_remote::lines::service("bucket", Arc::new(move |_, out| {
-                out.extend(crate::bucket::status(&home));
+            ep.register("bucket", 1, makepad_remote::lines::service("bucket", Arc::new(move |line, out| {
+                match line.split_whitespace().skip_while(|w| *w == "bucket").collect::<Vec<_>>()[..] {
+                    ["run", name] => out.push(crate::bucket::kick(&home, name)),
+                    _ => out.extend(crate::bucket::status(&home)),
+                }
             })));
         }
         // `jitcache plan|clear`: this Mac's JIT caches (a node's through `route <node> jitcache`)
@@ -431,6 +467,7 @@ impl Master {
         let mut feed = Client::routed(&me, &host).watch();
         let mut up = false;
         let mut hot_cursor = 0usize;
+        let (mut hot, mut hot_asked) = (crate::cli::NodeAsks::new(&host, "hot"), None::<Instant>);
         loop {
             if !self.hosts().hosts.iter().any(|h| h.name == host) {
                 // another name of a machine followed under its nodes.conf name
@@ -439,23 +476,26 @@ impl Master {
             }
             // The durable JIT channel is independent of the lossy event ring.
             // Replay after reconnect/start; identical record ids are idempotent.
-            let mut next_cursor = hot_cursor;
-            let mut imported = true;
-            let replay = makepad_remote::hub::ask(&me, &host, "hot", "", &format!("records {hot_cursor}"), &mut |line| {
-                if let Some(mut hot) = makepad_remote::hot::Record::parse(line) {
-                    hot.node = host.clone();
-                    match crate::hot::ingest(hot.clone()) {
-                        Ok(true) => self.publish(crate::proto::from_hot(&hot)),
-                        Ok(false) => {},
-                        Err(e) => { eprintln!("devhub hot: {e}"); imported = false; },
+            if hot_asked.is_none_or(|t| t.elapsed() >= HOT_LOOK) {
+                hot_asked = Some(Instant::now());
+                let mut next_cursor = hot_cursor;
+                let mut imported = true;
+                let replay = hot.ask(&me, &format!("records {hot_cursor}"));
+                for line in replay.iter().flatten() {
+                    if let Some(mut hot) = makepad_remote::hot::Record::parse(line) {
+                        hot.node = host.clone();
+                        match crate::hot::ingest(hot.clone()) {
+                            Ok(true) => self.publish(crate::proto::from_hot(&hot)),
+                            Ok(false) => {},
+                            Err(e) => { eprintln!("devhub hot: {e}"); imported = false; },
+                        }
+                    } else if let Ok(v) = makepad_strict_json::parse(line.as_bytes()) {
+                        if let Some(cursor) = v.get("cursor").and_then(|v| v.as_u64()) { next_cursor = cursor as usize; }
+                        if v.get("err").is_some() { imported = false; }
                     }
-                } else if let Ok(v) = makepad_strict_json::parse(line.as_bytes()) {
-                    if let Some(cursor) = v.get("cursor").and_then(|v| v.as_u64()) { next_cursor = cursor as usize; }
-                    if v.get("err").is_some() { imported = false; }
                 }
-                true
-            });
-            if replay.is_ok() && imported { hot_cursor = next_cursor; }
+                if replay.is_ok() && imported { hot_cursor = next_cursor; }
+            }
             match feed.next(Duration::from_secs(2), 1) {
                 Ok(Some((_, line))) => {
                     if !up {
@@ -482,6 +522,7 @@ impl Master {
                     }
                     std::thread::sleep(Duration::from_secs(15));
                     feed = Client::routed(&me, &host).watch();
+                    hot_asked = None;
                 }
             }
         }
@@ -546,14 +587,41 @@ mod tests {
         assert_eq!(names, vec!["n1", "n2", "node-c"]);
     }
 
+    /// The Unix sockets this process holds above stdio, by the path each is bound at: each
+    /// descriptor of its listing (/proc/self/fd on Linux, /dev/fd on macOS) whose getsockname
+    /// names a path. A listener and the connections it accepted all name its path.
+    #[cfg(unix)]
+    fn sockets_held() -> Vec<(i32, std::path::PathBuf)> {
+        use std::os::unix::io::FromRawFd;
+        let listing = if cfg!(target_os = "linux") { "/proc/self/fd" } else { "/dev/fd" };
+        let fds: Vec<i32> = std::fs::read_dir(listing).unwrap().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).filter(|&fd| fd > 2).collect();
+        fds.into_iter()
+            .filter_map(|fd| {
+                // only looked at: ManuallyDrop leaves the descriptor open; one that is no Unix
+                // socket fails (ENOTSOCK, another family)
+                // SAFETY: getsockname on a descriptor number
+                let s = std::mem::ManuallyDrop::new(unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) });
+                Some((fd, s.local_addr().ok()?.as_pathname()?.to_path_buf()))
+            })
+            .collect()
+    }
+
     /// The role of [`a_dial_during_the_masters_exec_waits_for_the_next_build`]: a master's control
     /// socket whose "ping" names the image that answers. "before" execs into "after" as
-    /// `restart_master` does; "after" listens only once the test has dialed.
+    /// `restart_master` does; "after" listens only once the test has dialed, then starts a run
+    /// ("child"), which says which listeners it holds.
     #[cfg(unix)]
     #[test]
     fn exec_role_master() {
         let Ok(role) = std::env::var("DEVHUB_EXEC_ROLE") else { return };
         let base = std::path::PathBuf::from(std::env::var_os("DEVHUB_EXEC_BASE").unwrap());
+        let sock = base.join("home/devhub/devhub.sock");
+        let at_sock = |held: &[(i32, std::path::PathBuf)]| held.iter().filter(|(_, at)| *at == sock).count();
+        if role == "child" {
+            let held = sockets_held();
+            std::fs::write(base.join("child holds"), format!("{} of the master's\n{held:?}", at_sock(&held))).unwrap();
+            return;
+        }
         let wait_for = |f: &str| {
             while !base.join(f).exists() {
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -569,6 +637,12 @@ mod tests {
             wait_for("dialed");
         }
         crate::node::listen_control(&ep).unwrap();
+        if role == "after" {
+            // the scan sees the master's sockets where they are: this image's own
+            assert!(at_sock(&sockets_held()) > 0, "the scan misses the kept listener: {:?}", sockets_held());
+            let mut run = crate::testenv::role("master::tests::exec_role_master", &base);
+            assert!(run.args(["--nocapture", "--test-threads=1"]).env("DEVHUB_EXEC_ROLE", "child").status().unwrap().success());
+        }
         std::fs::write(base.join(format!("{role} listens")), "").unwrap();
         if role == "before" {
             wait_for("exec");
@@ -594,6 +668,7 @@ mod tests {
         let mut role = crate::testenv::role("master::tests::exec_role_master", &base);
         role.args(["--nocapture", "--test-threads=1"]).env("DEVHUB_EXEC_ROLE", "before").env("DEVHUB_EXEC_BASE", &base).env("MAKEPAD_HOME", base.join("home")).env_remove("DEVHUB_CONTROL_FD");
         let mut child = role.stdin(std::process::Stdio::null()).stdout(std::fs::File::create(&log).unwrap()).stderr(std::process::Stdio::from(std::fs::File::options().append(true).open(&log).unwrap())).spawn().unwrap();
+        let pid = child.id();
         let mut wait_for = |f: &str| {
             while !base.join(f).exists() {
                 if let Some(st) = child.try_wait().unwrap() {
@@ -609,6 +684,8 @@ mod tests {
         };
         wait_for("before listens");
         assert_eq!(ask().unwrap(), vec!["before".to_string()]);
+        let before = crate::node::who_serves(&sock).expect("the first image answers who it is");
+        assert_eq!(before.pid, pid);
         std::fs::write(base.join("exec"), "").unwrap();
         // the next build runs and does not listen yet: it waits for "dialed"
         wait_for("execd");
@@ -619,6 +696,14 @@ mod tests {
         std::fs::write(base.join("dialed"), "").unwrap();
         assert_eq!(answer.join().unwrap().unwrap(), vec!["after".to_string()]);
         wait_for("after listens");
+        // the same process, a later image: who answers tells them apart
+        let after = crate::node::who_serves(&sock).expect("the next image answers who it is");
+        assert!(after.pid == before.pid && after.since_ms > before.since_ms, "{before} then {after}");
+        // the kept listener is the new image's alone: a run it starts holds no listener (the
+        // exec cleared close-on-exec to hand it over, and every run inherited it until the
+        // master's socket outlived the master, 11-08)
+        let held = std::fs::read_to_string(base.join("child holds")).unwrap();
+        assert!(held.starts_with("0 of the master's"), "a run holds the master's socket: {held}");
         std::fs::write(base.join("done"), "").unwrap();
         drop(queued);
         assert!(child.wait().unwrap().success(), "{}", std::fs::read_to_string(&log).unwrap_or_default());

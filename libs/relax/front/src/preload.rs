@@ -128,7 +128,17 @@ pub struct Preparsed {
     pub prep: Option<crate::program::FilePrep>,
     pub mod_path: String,
     pub src_len: usize,
+    /// the bytes of the image the worker wrote for `parsed` (0: none; parse_job)
+    pub image_bytes: usize,
 }
+
+/// Images parse workers wrote (parse_job), and of those the ones a publication kept (the rest are
+/// parses the load made again or did not take: unreferenced entries in the run store), with bytes,
+/// for the run summary
+pub static WORKER_IMAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WORKER_IMAGE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WORKER_IMAGES_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static WORKER_IMAGE_BYTES_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Files of parsed crates taken from an earlier record's images (Pool::previous), for the summary
 pub static PREVIOUS_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -181,6 +191,10 @@ type ScanPriority = (usize, u64);
 struct PoolState {
     stopped: bool,
     planning: bool,
+    /// Work the pool's threads owned ended in a panic (the plan, a scan, a parse): what it would
+    /// have published never comes, so the loader's waits fail with this (take_ahead, wait_inner)
+    /// and the workers end, rather than wait for work nobody owns.
+    failed: Option<String>,
     /// Crates whose parse scope has dependency imports and their own scan publication.
     parse_ready: HashSet<u32>,
     /// Crates successfully collected and sealed by the loader.
@@ -225,6 +239,9 @@ pub struct Pool {
     /// per crate parsed (no crate image): its unchanged files' images from an earlier record
     /// (CrateImages::previous_files), taken instead of a parse when the loader replays them
     previous: Vec<Option<crate::crate_image::PreviousFiles>>,
+    /// what writes a parse's images (the program's front sink): a worker writes them as it ends
+    /// its parse (parse_job), set before the loader starts any crate's parses
+    sink: std::sync::OnceLock<Arc<dyn crate::parser::ImageSink>>,
     st: Mutex<PoolState>,
     cv: Condvar,
 }
@@ -252,6 +269,11 @@ impl Pool {
     pub(crate) fn outline_macros(&self, ci: u32) -> Option<Vec<MacroRef>> {
         self.demand_plan.as_ref()?.outline_macros(ci as usize + self.plan_offset)
     }
+    /// The program's image sink (Program::front_sink), before its first start_parsing.
+    pub fn set_sink(&self, sink: Arc<dyn crate::parser::ImageSink>) {
+        let _ = self.sink.set(sink);
+    }
+
     /// The demand plan's outline of crate `ci`: its expansion-made imports (PendingPlan::outline_expansions).
     pub(crate) fn outline_expansions(&self, ci: u32) -> Option<Arc<crate::fxhash::HashMap<(String, String), Vec<String>>>> {
         self.demand_plan.as_ref()?.outline_expansions(ci as usize + self.plan_offset)
@@ -311,6 +333,11 @@ impl Pool {
                 WAIT_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 return a;
             }
+            if let Some(why) = st.failed.clone() {
+                // (not under the lock: the pool's teardown takes it on the way out)
+                drop(st);
+                panic!("the load of crate {} cannot complete: {why}", self.crates[ci as usize].name);
+            }
             // the loader thread helps with scans (never with a parse: those must not wait on it)
             if let Some(key) = Self::next_scan(&st, Some(ci as usize)) {
                 let key = st.scans.remove(&key).unwrap();
@@ -344,6 +371,10 @@ impl Pool {
             if let Some(x) = st.done.remove(key) {
                 return Some(x);
             }
+            if let Some(why) = st.failed.clone() {
+                drop(st);
+                panic!("the parse of {} cannot complete: {why}", key.1);
+            }
             if !st.running.contains(key) {
                 let k = st.jobs.iter().find(|(_, j)| j.krate == key.0 && j.path == key.1).map(|(k, _)| *k);
                 let Some(k) = k else { return None };
@@ -356,7 +387,7 @@ impl Pool {
                 }
                 self.cv.notify_all();
                 drop(st);
-                return Some(parse_job(sess, job, true).1);
+                return Some(parse_job(sess, job, true, self.sink.get()).1);
             }
             let _wait = crate::load_profile::span(sess.runtime.profile, "wait-parse", &key.1);
             st = self.cv.wait(st).unwrap();
@@ -380,7 +411,8 @@ impl Pool {
     }
 
     pub fn stop(&self) {
-        self.st.lock().unwrap().stopped = true;
+        // (also on the way out of a failed load)
+        self.st.lock().unwrap_or_else(|e| e.into_inner()).stopped = true;
         self.cv.notify_all();
     }
 
@@ -550,7 +582,10 @@ impl Pool {
         let mut inputs = Vec::new();
         let mut probes = Vec::new();
         let mut stack = vec![(c.root.clone(), crate::program::dir_of(&c.root).to_string(), c.name.clone())];
+        // each file and the module it is parsed as (its first); `walked`: every (file, module),
+        // one file declared as two modules (`#[path]`) being two modules with their own imports
         let mut seen: HashMap<String, String> = HashMap::default();
+        let mut walked: crate::fxhash::HashSet<(String, String)> = Default::default();
         let mut defs = Vec::new();
         let mut aliases = Vec::new();
         let mut macro_use: Vec<String> = Vec::new();
@@ -561,15 +596,25 @@ impl Pool {
         let mut lexed: Vec<(String, Vec<u8>, Vec<Tok>)> = Vec::new();
         let replay = crate::load_profile::span(c.cfg.session.runtime.profile, "publish-replay", &c.name);
         while let Some((path, dir, mpath)) = stack.pop() {
-            if seen.contains_key(&path) {
+            if !walked.insert((path.clone(), mpath.clone())) {
                 continue;
             }
-            seen.insert(path.clone(), mpath.clone());
-            let Some(Some(s)) = scanned.remove(&(ci, path.clone(), dir, mpath)) else {
-                complete = false;
-                continue;
+            // a file met again under another module: that module's items, imports and children
+            // count; the file's input and its parse job are the first module's
+            let first = !seen.contains_key(&path);
+            if first {
+                seen.insert(path.clone(), mpath.clone());
+            }
+            let s = match scanned.remove(&(ci, path.clone(), dir, mpath)) {
+                Some(Some(s)) => s,
+                // (a file that includes itself: the scan stopped at the repeat)
+                _ if !first => continue,
+                _ => { complete = false; continue; }
             };
-            inputs.push((path.clone(), crate::crate_image::file_hash(&path, &s.src[..s.src_len])));
+            if first {
+                inputs.push((path.clone(), crate::crate_image::file_hash(&path, &s.src[..s.src_len])));
+                inputs.extend(s.included);
+            }
             probes.extend(s.probes);
             if path == c.root && s.recursion_limit.is_some() {
                 cmods.recursion_limit = s.recursion_limit;
@@ -585,9 +630,7 @@ impl Pool {
                 cmods.mods.insert(m);
             }
             cmods.items.extend(s.mod_items);
-            if s.inner_macro_use {
-                cmods.inner_macro_use.insert(seen[&path].clone());
-            }
+            cmods.inner_macro_use.extend(s.inner_macro_use);
             for u in s.uses {
                 if let Some(b) = &u.bind {
                     if u.path.last() != Some(b) {
@@ -613,7 +656,7 @@ impl Pool {
             }
             // Stack traversal must publish sibling definitions in source order.
             stack.extend(s.children.into_iter().rev());
-            if !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
+            if first && !self.demand_plan.as_ref().is_some_and(|p| p.skips(&c.root, c.cfg.holds("test"), &path)) {
                 lexed.push((path, s.src[..s.src_len].to_vec(), s.toks.into_vec()));
             }
         }
@@ -667,13 +710,21 @@ impl Pool {
         Publication { ahead, jobs, done }
     }
 
+    /// The work a thread of the pool owns ends in a panic (`what`): the pool fails (`failed`).
+    fn fail(&self, what: &str) {
+        let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
+        st.failed.get_or_insert_with(|| format!("{what} panicked on its thread"));
+        drop(st);
+        self.cv.notify_all();
+    }
+
     fn work(&self, sess: &std::sync::Arc<crate::Session>, _worker: usize) {
         let _reads = self.contexts.first().map(|c| c.bind_source_reads());
         loop {
             let w = {
                 let mut st = self.st.lock().unwrap();
                 loop {
-                    if st.stopped { return; }
+                    if st.stopped || st.failed.is_some() { return; }
                     let scan = Self::next_scan(&st, None);
                     // Syntax, derives and file preparation run on workers. The loader
                     // validates recorded macro lookups in its exact textual environment
@@ -695,10 +746,11 @@ impl Pool {
                     st = self.cv.wait(st).unwrap();
                 }
             };
+            let _owned = OwnedWork(self, match &w { Work::Scan(k) => format!("the scan of {}", k.1), Work::Parse(j) => format!("the parse of {}", j.path) });
             match w {
                 Work::Scan(k) => self.scan(k),
                 Work::Parse(job) => {
-                    let ((krate, path), x) = parse_job(sess, job, false);
+                    let ((krate, path), x) = parse_job(sess, job, false, self.sink.get());
                     let mut st = self.st.lock().unwrap();
                     let key = (krate, path);
                     st.running.remove(&key);
@@ -712,9 +764,29 @@ impl Pool {
     }
 }
 
+/// Work a worker of the pool owns (a scan, a parse): a panic that ends it fails the pool.
+struct OwnedWork<'a>(&'a Pool, String);
+impl Drop for OwnedWork<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() { self.0.fail(&self.1); }
+    }
+}
+
+/// The planning thread's plan: a panic that ends it fails the pool (if the load still has it).
+struct OwnedPlan(std::sync::Weak<Pool>);
+impl Drop for OwnedPlan {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Some(pool) = self.0.upgrade() { pool.fail("the demand plan"); }
+        }
+    }
+}
+
 /// Parses one file against its crate's table snapshot. A speculative failure is
-/// retried in the loader's scope; only that scope can certify a parse error.
-fn parse_job(_sess: &std::sync::Arc<crate::Session>, job: Job, in_scope: bool) -> ((u32, String), Preparsed) {
+/// retried in the loader's scope; only that scope can certify a parse error. With a `sink`, the
+/// finished parse's image is written here, by the thread that made it (Program::write_image): the
+/// loader no longer encodes the files it publishes as they are, and their arrays leave the heap now.
+fn parse_job(_sess: &std::sync::Arc<crate::Session>, job: Job, in_scope: bool, sink: Option<&Arc<dyn crate::parser::ImageSink>>) -> ((u32, String), Preparsed) {
     let Job { krate, path, mod_path, src, toks, ctx } = job;
     struct World((bool, bool));
     impl Drop for World {
@@ -727,7 +799,7 @@ fn parse_job(_sess: &std::sync::Arc<crate::Session>, job: Job, in_scope: bool) -
     let src_len = src.len();
     let t = std::time::Instant::now();
     if trace() && crate::memstat::enabled() { eprintln!("boot-trace-job-start: {} {} src={}KB", ctx.name, path, src_len >> 10); }
-    // MAKEPAD_RUN_BOOT_TRACE with MAKEPAD_RUN_MEM_REPORT: the bytes this job retains on its thread and its peak
+    // RELAX_BOOT_TRACE with RELAX_MEM_REPORT: the bytes this job retains on its thread and its peak
     let (live0, peak) = (crate::memstat::thread_live(), crate::memstat::peak_start());
     let bctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&ctx.name, &path, &mod_path, &ctx.cfg));
     let r = ctx.context.parse_input(src, Some(toks), ctx.edition, Some(crate::macros::MacroScope::new(ctx.table.clone())), bctx, crate::parser::lazy_auto());
@@ -751,29 +823,37 @@ fn parse_job(_sess: &std::sync::Arc<crate::Session>, job: Job, in_scope: bool) -
         if pf.lazy.is_some() { let _ = pf.part(&ctx.cfg); }
         prep
     });
+    let mut image_bytes = 0;
+    if let (Some(sink), Some((pf, _))) = (sink, parsed.as_mut()) {
+        image_bytes = crate::program::write_image(sink, &path, pf);
+        if image_bytes > 0 {
+            WORKER_IMAGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WORKER_IMAGE_BYTES.fetch_add(image_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     let verify = ctx.cfg.session.runtime.parse_verify.then(|| VERIFY.get().copied()).flatten();
-    ((krate, path), Preparsed { parsed, prep, mod_path, src_len, verify, error })
+    ((krate, path), Preparsed { parsed, prep, mod_path, src_len, verify, error, image_bytes })
 }
 
-/// MAKEPAD_RUN_BOOT_TRACE=1: boot-path timing and why files were parsed again (stderr `boot-trace`).
+/// RELAX_BOOT_TRACE=1: boot-path timing and why files were parsed again (stderr `boot-trace`).
 pub fn trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var("MAKEPAD_RUN_BOOT_TRACE").is_ok())
+    *T.get_or_init(|| std::env::var("RELAX_BOOT_TRACE").is_ok())
 }
 
-/// MAKEPAD_RUN_TRACE, read once (parse workers ask per expansion; std::env::var takes the env lock and
+/// RELAX_TRACE, read once (parse workers ask per expansion; std::env::var takes the env lock and
 /// allocates).
 pub fn relax_trace() -> Option<&'static str> {
     static T: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    relax_session::phase::env_once(&T, "MAKEPAD_RUN_TRACE")
+    relax_session::phase::env_once(&T, "RELAX_TRACE")
 }
 
-/// MAKEPAD_RUN_DERIVES=0 (derives are not expanded; measurement baseline), read once.
+/// RELAX_DERIVES=0 (derives are not expanded; measurement baseline), read once.
 pub fn derives_off(options: &crate::options::Options) -> bool {
     !options.derives
 }
 
-/// Parse-time split for MAKEPAD_RUN_BOOT_TRACE: 0 fn bodies, 1 derives, 2 macro_rules transcription,
+/// Parse-time split for RELAX_BOOT_TRACE: 0 fn bodies, 1 derives, 2 macro_rules transcription,
 /// 3 built-in macros (format family etc.), 4 hosted / native fn-like macros; outermost call per slot only.
 pub static PHASE_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -802,7 +882,7 @@ pub fn timed<R>(slot: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// Per macro name: (calls, ns) for MAKEPAD_RUN_BOOT_TRACE.
+/// Per macro name: (calls, ns) for RELAX_BOOT_TRACE.
 pub static BY_NAME: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
 
 pub fn timed_named<R>(slot: usize, name: &str, f: impl FnOnce() -> R) -> R {
@@ -831,31 +911,16 @@ pub static PUBLISH_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 pub static PARSE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 thread_local! {
-    /// a crate loaded while the program runs (a run-time module), or the macro world built on
-    /// the compiler's owner: parsed on the calling thread, no parse workers (hotreload lane)
+    /// a crate loaded while the program runs (a run-time module): parsed on the calling thread,
+    /// no parse workers (hotreload lane)
     pub static SINGLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// SINGLE for a scope: what it was comes back when the scope ends, also by a panic.
-pub struct SingleScope(bool);
-
-impl SingleScope {
-    pub fn begin() -> Self {
-        SingleScope(SINGLE.with(|s| s.replace(true)))
-    }
-}
-
-impl Drop for SingleScope {
-    fn drop(&mut self) {
-        SINGLE.with(|s| s.set(self.0));
-    }
 }
 
 pub fn jobs() -> usize {
     if SINGLE.with(|s| s.get()) {
         return 1;
     }
-    std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(crate::options::default_parse_jobs).clamp(1, 32)
+    std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(crate::options::default_parse_jobs).clamp(1, 32)
 }
 
 /// A scanned file's source bytes: its own, a mapped image's, or the registry's authored bytes
@@ -906,11 +971,42 @@ struct Scanned {
     mods: Vec<String>,
     /// the `mod` item of each module declared in the file
     mod_items: Vec<(String, crate::macros::ModItem)>,
+    /// `#![macro_use]` belongs to this file's module bodies, not their declarations.
+    inner_macro_use: Vec<String>,
     /// `#![recursion_limit = ".."]` in the file's leading inner attributes
     pub(crate) recursion_limit: Option<u32>,
-    /// `#![macro_use]` in the file's leading inner attributes: its module's `macro_rules!` leave
-    /// it as with `#[macro_use]` on its `mod` item (CrateMods::inner_macro_use)
-    inner_macro_use: bool,
+    /// the files `include!`d at item position, with their content hashes: inputs of the scan
+    included: Vec<(String, u128)>,
+}
+
+/// The text of a plain string literal token (`"a/b.rs"`, `r"a/b.rs"`, `r#"a/b.rs"#`); None for one
+/// with escapes or a byte or C string.
+fn plain_str(lit: &[u8]) -> Option<String> {
+    let lit = std::str::from_utf8(lit).ok()?;
+    let raw = lit.strip_prefix('r').map(|r| r.trim_matches('#'));
+    let body = raw.unwrap_or(lit).strip_prefix('"')?.strip_suffix('"')?;
+    (raw.is_some() || !body.contains('\\')).then(|| body.to_string())
+}
+
+std::thread_local! {
+    /// the files an `include!` scan is inside of on this thread (a file that includes itself, a
+    /// rustc error, stops at the repeat)
+    static INCLUDING: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The scan of a file `include!`d into module `mpath`, and its content hash. Its `mod x;` resolve
+/// in its own folder, in any module (rustc's expand_include sets the module's directory to the
+/// included file's and owns it).
+fn scan_included(path: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, context: &crate::source_context::Context, surface: ScanSurface) -> Option<(u128, Scanned)> {
+    if INCLUDING.with(|c| c.borrow().iter().any(|p| p == path)) { return None; }
+    let src = context.read_source(path).ok()?.src.to_vec();
+    let hash = crate::crate_image::file_hash(path, &src);
+    let mut toks = Vec::with_capacity(src.len() / 4);
+    crate::lexer::lex(&src, edition, &mut toks).ok()?;
+    INCLUDING.with(|c| c.borrow_mut().push(path.to_string()));
+    let s = scan_tokens(path, crate::program::dir_of(path), mpath, krate, edition, cfg, src.len(), src.into(), toks, context, surface);
+    INCLUDING.with(|c| { c.borrow_mut().pop(); });
+    Some((hash, s?))
 }
 
 /// The bindings of a `use` tree in tokens `lo..hi` (after `use`, before `;`) under `prefix`.
@@ -1042,9 +1138,8 @@ fn decl_attrs(src: &[u8], toks: &[Tok], i: usize, cfg: &CfgSet) -> DeclAttrs {
     out
 }
 
-/// The leading inner attributes (`#![..]`) of a file, or of an inline module's body when `toks`
-/// starts after its `{`, as written (cfg_attr not expanded).
-fn leading_inner_attrs(toks: &[Tok]) -> Vec<Attr> {
+/// Leading inner attributes, configured just like the parser's `inner_attrs`.
+fn inner_attrs(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> Vec<Attr> {
     let mut attrs = Vec::new();
     let mut i = 0;
     while i + 2 < toks.len() && toks[i].kind == T::Pound && toks[i + 1].kind == T::Not && toks[i + 2].kind == T::OpenBracket {
@@ -1066,23 +1161,18 @@ fn leading_inner_attrs(toks: &[Tok]) -> Vec<Attr> {
         attrs.push(Attr { inner: true, toks: TokRange { lo: (i + 3) as u32, hi: j as u32 } });
         i = j + 1;
     }
-    attrs
+    crate::cfg::expand_cfg_attr_list(Src { src, plain: toks, ext: &[], parts: None }, &attrs, cfg)
 }
 
 /// The file's leading inner attributes (`#![..]`) hold their #[cfg]s.
 pub fn file_cfg_active(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
-    let attrs = leading_inner_attrs(toks);
-    attrs.is_empty() || crate::cfg::active(Src { src, plain: toks, ext: &[], parts: None }, &attrs, cfg)
+    let attrs = inner_attrs(src, toks, cfg);
+    crate::cfg::active(Src { src, plain: toks, ext: &[], parts: None }, &attrs, cfg)
 }
 
-/// Do the leading inner attributes (configured) of a file, or of an inline module's body when
-/// `toks` starts after its `{`, hold `#![macro_use]`? rustc appends a module's inner attributes to
-/// its `mod` item's (rustc_expand module.rs parse_external_mod, rustc_parse parse_item_mod), so
-/// this is `#[macro_use]` on the item: the module's `macro_rules!` stay in scope after it.
 fn inner_macro_use(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
     let p = Src { src, plain: toks, ext: &[], parts: None };
-    let attrs = crate::cfg::expand_cfg_attr_list(p, &leading_inner_attrs(toks), cfg);
-    attrs.iter().any(|a| a.toks.hi > a.toks.lo && crate::cfg::tok_str(p, a.toks.lo as usize) == b"macro_use")
+    inner_attrs(src, toks, cfg).iter().any(|a| a.toks.hi > a.toks.lo && crate::cfg::tok_str(p, a.toks.lo as usize) == b"macro_use")
 }
 
 fn scan_file(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, context: &crate::source_context::Context) -> Option<Scanned> {
@@ -1141,8 +1231,7 @@ fn file_imports(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, c
     let mut toks = Vec::with_capacity(src.len() / 4);
     crate::lexer::lex(src, edition, &mut toks).ok()?;
     let scan = scan_tokens(path, dir, mpath, krate, edition, cfg, src.len(), src.to_vec().into(), toks, context, ScanSurface::Imports)?;
-    let inner_macro_use = scan.inner_macro_use.then(|| mpath.to_string());
-    Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items, inner_macro_use })
+    Some(crate::macros::FileImports { uses: scan.uses, aliases: scan.aliases, macro_use: scan.macro_use, mods: scan.mods, mod_items: scan.mod_items, inner_macro_use: scan.inner_macro_use })
 }
 
 /// What a scan reads besides the file's modules.
@@ -1157,19 +1246,36 @@ pub(crate) enum ScanSurface {
 fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src_len: usize,
     src: ScanBytes, toks: Vec<Tok>, context: &crate::source_context::Context, surface: ScanSurface,
 ) -> Option<Scanned> {
+    // A scan of one of the macro world's crates runs for the world's builder, on whichever thread
+    // takes it (a parse worker, a demand plan's discovery). A hosted item macro in it that the boot
+    // world lacks (builtins.rs prescan_defs) must not wait for the world, as on the builder's own
+    // thread: the builder waits for this scan (take_ahead). A parse job carries the same state
+    // (CrateCtx::world). Before: every scan worker stood in pmhost world_inner behind the builder,
+    // which stood in take_ahead (sqlx-macros' world holds tokio, serde_json and time).
+    struct ForBuilder(bool);
+    impl Drop for ForBuilder {
+        fn drop(&mut self) { crate::macro_reg::set_world_builder(self.0); }
+    }
+    let _for_builder = context.world_builder().then(|| {
+        let was = crate::macro_reg::world_builder();
+        crate::macro_reg::set_world_builder(true);
+        ForBuilder(was)
+    });
     let mut defs = Vec::new();
     let mut children = Vec::new();
     let mut probes = Vec::new();
     let mut aliases = Vec::new();
+    let mut included: Vec<(String, u128)> = Vec::new();
     let mut macro_use = Vec::new();
     let mut uses: Vec<crate::macros::UseItem> = Vec::new();
     let mut mods: Vec<String> = vec![mpath.to_string()];
     let mut mod_items: Vec<(String, crate::macros::ModItem)> = Vec::new();
     if !file_cfg_active(&src, &toks, cfg) {
         // `#![cfg(false)]` file: removed with its module; nothing in it counts
-        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new(), mod_items: Vec::new(), recursion_limit: None, inner_macro_use: false });
+        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new(), mod_items: Vec::new(), inner_macro_use: Vec::new(), recursion_limit: None, included: Vec::new() });
     }
-    let file_macro_use = inner_macro_use(&src, &toks, cfg);
+    let mut inner_macro_uses = Vec::new();
+    if inner_macro_use(&src, &toks, cfg) { inner_macro_uses.push(mpath.to_string()); }
     let mut recursion_limit = None;
     {
         let mut i = 0;
@@ -1309,9 +1415,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                     let pa = attrs.path;
                     if cur_active && active {
                         let is_pub = i >= 1 && toks[i - 1].kind == T::KwPub;
-                        // an inline module's own `#![macro_use]` is its item's (inner_macro_use)
-                        let macro_use = attrs.macro_use || toks[i + 2].kind == T::OpenBrace && inner_macro_use(&src, &toks[i + 3..], cfg);
-                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use, is_pub }));
+                        mod_items.push((child_path.clone(), crate::macros::ModItem { pos: toks[i].lo, end: toks[i + 2].hi, macro_use: attrs.macro_use, is_pub }));
                     }
                     if toks[i + 2].kind == T::Semi {
                         if cur_active && active {
@@ -1342,10 +1446,52 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
                         let active = active && file_cfg_active(&src, &toks[i + 3..], cfg);
                         if cur_active && active {
                             mods.push(child_path.clone());
+                            if inner_macro_use(&src, &toks[i + 3..], cfg) { inner_macro_uses.push(child_path.clone()); }
                         }
-                        let child_dir = pa.map_or_else(|| format!("{}/{}", cur, name), |p| crate::crates::join_path(&cur, &p));
+                        // at file level an explicit path is relative to the file, as a `mod x;`'s is, not
+                        // to the module directory a non-mod.rs file implies
+                        let child_dir = pa.map_or_else(|| format!("{}/{}", cur, name), |p| crate::crates::join_path(if dirs.len() > 1 { &cur } else { &fdir }, &p));
                         dirs.push((depth + 1, child_dir, child_path, cur_active && active));
                     }
+                }
+                // `include!("file.rs");` at item position (rustc_builtin_macros source_util.rs
+                // expand_include): the file's items are this module's, so its `use`s and `mod`
+                // declarations are scanned as the module's, and its `mod x;` resolve in the
+                // included file's folder. Its macro definitions come from the parse, as before.
+                // (A module the included file declares got no imports: relax issue 173.)
+                T::Ident
+                    if text(i) == b"include"
+                        && i + 4 < toks.len()
+                        && toks[i + 1].kind == T::Not
+                        && toks[i + 2].kind == T::OpenParen
+                        && toks[i + 3].kind == T::Str
+                        && toks[i + 4].kind == T::CloseParen
+                        && dirs.last().map_or(false, |l| l.0 == depth && l.3) =>
+                {
+                    if let Some(name) = decl_attrs(&src, &toks, i, cfg).active.then(|| plain_str(text(i + 3))).flatten() {
+                        let inc = crate::crates::join_path(&fdir, &name);
+                        let module = dirs.last().unwrap().2.clone();
+                        let inc_surface = if surface == ScanSurface::Macros { ScanSurface::Imports } else { surface };
+                        match scan_included(&inc, &module, krate, edition, cfg, context, inc_surface) {
+                            Some((hash, s)) => {
+                                probes.push((inc.clone(), true));
+                                included.push((inc, hash));
+                                included.extend(s.included);
+                                probes.extend(s.probes);
+                                children.extend(s.children);
+                                aliases.extend(s.aliases);
+                                macro_use.extend(s.macro_use);
+                                uses.extend(s.uses);
+                                for m in s.mods {
+                                    if !mods.contains(&m) { mods.push(m); }
+                                }
+                                mod_items.extend(s.mod_items);
+                            }
+                            None => probes.push((inc, false)),
+                        }
+                    }
+                    i += 5;
+                    continue;
                 }
                 T::Ident
                     if i + 2 < toks.len()
@@ -1413,7 +1559,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cf
             i += 1;
         }
     }
-    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods, mod_items, recursion_limit, inner_macro_use: file_macro_use })
+    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods, mod_items, inner_macro_use: inner_macro_uses, recursion_limit, included })
 }
 
 /// Starts the pipeline for `crates` (load order): scans (all crates at once, earliest crate
@@ -1478,17 +1624,24 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         if image.is_none() { wants_previous.push((ci, deps)); }
         restored.push(image);
     }
-    // a parsed crate's unchanged files: earlier records' images (the proc-macro crates of the
-    // whole program known by now: those this load restores and those a partial restore kept)
+    // a parsed crate's unchanged files: earlier records' images. The proc-macro crates known by
+    // now (those a partial restore kept and those this load restores) as a record hashes them:
+    // those loaded up to its crate (a record written as its crate loaded) or the whole
+    // program's (one written at the end of the load). Either holds every proc macro its crate
+    // can reach, the loads being in dependency order.
     if let Some(i) = images {
-        let mut procs: Vec<(String, Option<u128>)> = crates.iter().enumerate().filter(|(_, c)| c.proc_macro).map(|(k, c)| (c.name.clone(), fps[k])).collect();
-        procs.extend(i.retained_proc_macros().into_iter().map(|(n, f)| (n, Some(f))));
-        let proc = crate::crate_image::proc_fps(procs.into_iter());
+        let retained: Vec<(String, Option<u128>)> = i.retained_proc_macros().into_iter().map(|(n, f)| (n, Some(f))).collect();
+        let procs: Vec<(usize, String, Option<u128>)> = crates.iter().enumerate().filter(|(_, c)| c.proc_macro).map(|(k, c)| (k, c.name.clone(), fps[k])).collect();
+        let upto = |last: usize| crate::crate_image::proc_fps(retained.iter().cloned()
+            .chain(procs.iter().filter(|(k, _, _)| *k <= last).map(|(_, n, f)| (n.clone(), *f))));
+        let whole = upto(n);
         for (ci, deps) in wants_previous {
             let c = &crates[ci];
-            previous[ci] = if deps.is_some() || proc.is_some() { i.previous_files(c, deps.as_deref(), proc) } else { None };
+            let mut proc: Vec<u128> = upto(ci).into_iter().chain(whole).collect();
+            proc.dedup();
+            previous[ci] = if deps.is_some() || !proc.is_empty() { i.previous_files(c, deps.as_deref(), &proc) } else { None };
             if trace() {
-                eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if previous[ci].is_some() { "yes" } else if deps.is_none() && proc.is_none() { "dependencies not restored" } else { "none" });
+                eprintln!("boot-trace: {}: parsed; earlier images: {}", c.name, if previous[ci].is_some() { "yes" } else if deps.is_none() && proc.is_empty() { "dependencies not restored" } else { "none" });
             }
         }
     }
@@ -1497,9 +1650,9 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let count = restored.iter().flatten().count();
         let files: usize = restored.iter().flatten().map(|i| i.files.len()).sum();
         if planning {
-            eprintln!("makepad-run front: {count} crate image candidates ({files} files); selection validation on planning worker");
+            eprintln!("relax front: {count} crate image candidates ({files} files); selection validation on planning worker");
         } else {
-            eprintln!("makepad-run front: {} crates from crate images ({} files, no parse), {} crates parsed", count, files, n - count);
+            eprintln!("relax front: {} crates from crate images ({} files, no parse), {} crates parsed", count, files, n - count);
         }
     }
     let pending_images = if planning { std::mem::replace(&mut restored, (0..n).map(|_| None).collect()) }
@@ -1507,6 +1660,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
     let mut st = PoolState {
         stopped: false,
         planning,
+        failed: None,
         parse_ready: Default::default(),
         loaded: vec![false; n],
         images: restored,
@@ -1543,7 +1697,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let seq = st.scan_seq;
         st.scans.insert((ci, seq), k);
     }
-    let pool = Arc::new(Pool { demand_plan, plan_offset, contexts, crates, parse: jobs >= 2, previous, st: Mutex::new(st), cv: Condvar::new() });
+    let pool = Arc::new(Pool { demand_plan, plan_offset, contexts, crates, parse: jobs >= 2, previous, sink: std::sync::OnceLock::new(), st: Mutex::new(st), cv: Condvar::new() });
     if let Some(plan) = &pool.demand_plan {
         let weak = Arc::downgrade(&pool);
         plan.on_early_publish(move || {
@@ -1567,7 +1721,10 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let in_world = crate::macro_reg::in_world();
         let _ = relax_base::run_threads::spawn("run-demand-select", move || { let _z = crate::zone_alloc::compiler_thread();
             crate::macro_reg::set_in_world(in_world);
-            plan.complete();
+            {
+                let _owned = OwnedPlan(weak.clone());
+                plan.complete();
+            }
             if let Some(pool) = weak.upgrade() {
                 let mut st = pool.st.lock().unwrap();
                 st.planning = false;
@@ -1607,14 +1764,26 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
         let mut reachable = Vec::new();
         let root = c.root_path().to_string();
         let mut todo = vec![(root.clone(), crate::program::dir_of(&root).to_string(), name.clone())];
+        // every (file, module): one file declared as two modules (`#[path]`) is two modules with
+        // their own imports; a file that includes itself (its path an enclosing module's: rustc's
+        // error) stops at the repeat
+        let mut walked: crate::fxhash::HashSet<(String, String)> = Default::default();
+        let mut file_of: HashMap<String, String> = HashMap::default();
         while let Some((path, dir, module)) = todo.pop() {
-            if reachable.contains(&path) { continue; }
-            reachable.push(path.clone());
+            let mut up = module.rsplit_once("::").map(|(m, _)| m);
+            let mut on_chain = false;
+            while let (false, Some(m)) = (on_chain, up) {
+                on_chain = file_of.get(m) == Some(&path);
+                up = m.rsplit_once("::").map(|(m, _)| m);
+            }
+            if on_chain || !walked.insert((path.clone(), module.clone())) { continue; }
+            file_of.insert(module.clone(), path.clone());
+            if !reachable.contains(&path) { reachable.push(path.clone()); }
             let text = files.iter().find(|(f, _)| prog.file_paths[*f as usize] == path).map(|(_, t)| t.clone())
                 .or_else(|| crate::vfs::read(&path).ok());
             if let Some(scan) = text.and_then(|t| scan_text(&path, &dir, &module, &name, c.edition, &c.cfg, t.into(), &c.context)) {
                 todo.extend(scan.children.iter().rev().cloned());
-                scans.push((module, scan));
+                scans.push(scan);
             }
         }
         contexts.push((k as u32, reachable, mods, scans));
@@ -1625,7 +1794,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
     table.crates.remove(&name); table.crates.remove(&format!("{}\u{1}lib", name));
     let mut reached = Vec::new();
     for (k, reachable, mut mods, scans) in contexts {
-        for (module, scan) in scans {
+        for scan in scans {
             if scan.recursion_limit.is_some() && mods.recursion_limit.is_none() {
                 mods.recursion_limit = scan.recursion_limit;
             }
@@ -1634,7 +1803,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
             table.macro_use.entry(name.clone()).or_default().extend(scan.macro_use);
             mods.mods.extend(scan.mods);
             mods.items.extend(scan.mod_items);
-            if scan.inner_macro_use { mods.inner_macro_use.insert(module); }
+            mods.inner_macro_use.extend(scan.inner_macro_use);
             for u in scan.uses { mods.add_use(u); }
         }
         table.add_crate(name.clone(), std::sync::Arc::new(mods));
@@ -1646,6 +1815,33 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
 #[cfg(test)]
 mod cold_tests {
     use super::*;
+
+    /// A file-level inline module's `#[path]` is relative to its file: in a non-mod.rs file the
+    /// scan finds the module's children there, and their imports (relax PR 182).
+    #[test]
+    fn inline_path_scans_imports_relative_to_the_containing_file() {
+        let dir = std::env::temp_dir().join(format!("relax-inline-path-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(dir.join("custom")).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _cleanup = Cleanup(dir.clone());
+        let file = dir.join("module.rs").to_string_lossy().into_owned();
+        let child = dir.join("custom/leaf.rs").to_string_lossy().into_owned();
+        let source = b"#[path=\"custom\"] mod inside { mod leaf; }";
+        let imported = b"use dep::answer;";
+        std::fs::write(&file, source).unwrap();
+        std::fs::write(&child, imported).unwrap();
+        let sess = Arc::new(crate::Session::default());
+        let cfg = CfgSet::host(&sess, &[]);
+        let context = crate::source_context::Context::new(&file, Default::default(), &sess);
+        let module_dir = dir.join("module").to_string_lossy().into_owned();
+        let scan = scan_text_mode(&file, &module_dir, "app::module", "app", 2021, &cfg, source.to_vec().into(), &context, false).unwrap();
+        let expected = (child, dir.join("custom/leaf").to_string_lossy().into_owned(), "app::module::inside::leaf".to_string());
+        assert_eq!(scan.children, vec![expected.clone()], "the child is found beside the file");
+        let (path, dir, module) = expected;
+        let child = scan_text_mode(&path, &dir, &module, "app", 2021, &cfg, imported.to_vec().into(), &context, false).unwrap();
+        assert!(child.uses.iter().any(|u| u.module == module && u.bind.as_deref() == Some("answer")), "its import is scanned");
+    }
 
     #[test]
     fn configured_inner_attributes_do_not_absorb_the_next_items_cfg() {
@@ -1692,6 +1888,7 @@ mod cold_tests {
             mods.externs.extend(deps.iter().map(|dep| (dep.to_string(), dep.to_string())));
             mods.mods.extend(scan.mods);
             mods.items.extend(scan.mod_items);
+            mods.inner_macro_use.extend(scan.inner_macro_use);
             for u in scan.uses {
                 if let Some(bind) = &u.bind {
                     if u.path.last() != Some(bind) { mods.renames.insert(bind.clone()); }
@@ -1834,6 +2031,7 @@ mod cold_tests {
             mods.externs.extend(deps.into_iter().map(|dep| (dep.into(), dep.into())));
             mods.mods.extend(scan.mods);
             mods.items.extend(scan.mod_items);
+            mods.inner_macro_use.extend(scan.inner_macro_use);
             for u in scan.uses {
                 if let Some(bind) = &u.bind {
                     if u.path.last() != Some(bind) { mods.renames.insert(bind.clone()); }
@@ -1938,103 +2136,43 @@ mod lowered_scope_tests {
         }
     }
 
-
-}
-
-#[cfg(test)]
-mod inner_macro_use_tests {
-    use super::*;
-
-    /// `#![macro_use]` opening a module (its file, or an inline module's body) is `#[macro_use]` on
-    /// its `mod` item: rustc appends a module's inner attributes to the item's.
     #[test]
-    fn a_modules_inner_macro_use_is_its_items() {
+    fn inner_macro_use_is_configured_and_owned_by_the_module_body() {
         let sess = Arc::new(crate::Session::default());
-        let path = "inner_macro_use.rs";
-        let context = crate::source_context::Context::new(path, Default::default(), &sess);
-        let source = br#"#![macro_use]
-            //! a doc comment after the attribute (xml-rs 1.4 macros.rs)
-            mod plain { macro_rules! a { () => {} } }
-            mod inline { #![macro_use] macro_rules! b { () => {} } }
-            mod configured { #![cfg_attr(feature = "selected", macro_use)] macro_rules! c { () => {} } }
-            #[macro_use] mod outer { macro_rules! d { () => {} } }
-        "#;
-        for features in [vec![], vec!["selected".to_string()]] {
-            let cfg = CfgSet::host(&sess, &features);
-            let scan = scan_text(path, ".", "t::m", "t", 2021, &cfg, source.to_vec().into(), &context).unwrap();
-            assert!(scan.inner_macro_use);
-            let macro_use = |m: &str| scan.mod_items.iter().find(|(p, _)| p == m).unwrap().1.macro_use;
-            assert!(!macro_use("t::m::plain") && macro_use("t::m::inline") && macro_use("t::m::outer"));
-            assert_eq!(macro_use("t::m::configured"), !features.is_empty());
-        }
         let cfg = CfgSet::host(&sess, &[]);
-        let plain = scan_text(path, ".", "t::m", "t", 2021, &cfg, b"#![allow(unused)] mod x {}".to_vec().into(), &context).unwrap();
-        assert!(!plain.inner_macro_use);
-        let configured_out = scan_text(path, ".", "t::m", "t", 2021, &cfg, b"#![cfg_attr(any(), macro_use)] mod x {}".to_vec().into(), &context).unwrap();
-        assert!(!configured_out.inner_macro_use);
+        let path = "defs.rs";
+        let context = crate::source_context::Context::new(path, Default::default(), &sess);
+        let source = br#"
+            #![cfg_attr(all(), macro_use)]
+            mod enabled { #![cfg_attr(all(), macro_use)] }
+            mod disabled { #![cfg_attr(any(), macro_use)] }
+            mod removed { #![cfg(any())] #![macro_use] }
+        "#;
+        for declarations_only in [false, true] {
+            let scan = scan_text_mode(path, ".", "c::defs", "c", 2021, &cfg, source.to_vec().into(), &context, declarations_only).unwrap();
+            assert_eq!(scan.inner_macro_use, ["c::defs", "c::defs::enabled"]);
+            assert!(scan.mod_items.iter().all(|(_, item)| !item.macro_use), "inner attributes do not rewrite parent declarations");
+        }
+        let before = file_imports(path, ".", "c::defs", "c", 2021, &cfg, source, &context).unwrap();
+        let changed = String::from_utf8(source.to_vec()).unwrap().replacen("cfg_attr(all(), macro_use)", "cfg_attr(any(), macro_use)", 1);
+        let after = file_imports(path, ".", "c::defs", "c", 2021, &cfg, changed.as_bytes(), &context).unwrap();
+        assert!(!before.same_as(&after), "removing a child-owned attribute changes its import snapshot");
+        let parent = file_imports("root.rs", ".", "c", "c", 2021, &cfg, b"mod defs;", &context).unwrap();
+        assert!(parent.inner_macro_use.is_empty());
+        assert!(!parent.mod_items[0].1.macro_use);
     }
 
-    /// xml-rs 1.4: `pub mod macros;` whose file opens with `#![macro_use]`, its `gen_setters!` called
-    /// in a module declared after it in another file and expanding to calls of `gen_setter!`; an
-    /// inline module's `#![macro_use]` exports its macro too. Before, the crate's modules reported
-    /// "cannot find macro" and the setters did not exist.
-    #[test]
-    fn a_module_files_inner_macro_use_reaches_the_modules_after_it() {
-        let dir = std::env::temp_dir().join(format!("relax-inner-macro-use-{}-{}", std::process::id(), crate::clock::wall_ns()));
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("lib.rs"), r#"
-            pub mod macros;
-            pub mod sub;
-            pub mod inline {
-                #![macro_use]
-                macro_rules! twice { ($e:expr) => { $e * 2 } }
-            }
-            pub fn four() -> u32 { twice!(2) }
-        "#).unwrap();
-        std::fs::write(dir.join("macros.rs"), r#"#![macro_use]
-            //! the crate's macros
-            macro_rules! gen_setter {
-                ($field:ident : $t:ty) => { pub fn $field(mut self, value: $t) -> Self { self.$field = value; self } };
-            }
-            macro_rules! gen_setters {
-                ($target:ident, $($field:ident : $t:ty),+) => { impl $target { $(gen_setter! { $field : $t })+ } };
-            }
-        "#).unwrap();
-        std::fs::write(dir.join("sub/mod.rs"), r#"
-            pub struct Config { pub trim: bool, pub depth: u32 }
-            gen_setters! { Config, trim: bool, depth: u32 }
-        "#).unwrap();
-        let root = dir.join("lib.rs").to_string_lossy().into_owned();
-        // eager, then lazy with the files nothing demands loaded afterwards in either order (the
-        // post-boot loader's)
-        for (lazy, reverse) in [(false, false), (true, false), (true, true)] {
-            let mut session = crate::Session::default();
-            session.options.rs_lazy = lazy;
-            let session = Arc::new(session);
-            let cfg = CfgSet::host(&session, &[]);
-            let mut p = crate::program::Program::new(&session);
-            if lazy {
-                p.preload(vec![PreCrate { name: "inner_mu".into(), root: root.clone(), edition: 2021, cfg: cfg.clone(), deps: Vec::new(),
-                    proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() }]);
-            }
-            p.load_crate("inner_mu", &root, 2021, cfg, Vec::new()).unwrap();
-            p.resolve_imports();
-            let mut skipped: Vec<u32> = p.skipped_files.keys().copied().collect();
-            skipped.sort_unstable();
-            if reverse { skipped.reverse(); }
-            for m in skipped { p.load_deferred_module(m).unwrap(); }
-            assert!(p.errors.is_empty(), "lazy {lazy}: {:?}", p.errors);
-            let methods: Vec<&str> = p.defs.iter().filter(|d| d.kind == crate::program::DefKind::AssocFn).map(|d| p.syms.str(d.name)).collect();
-            assert!(methods.contains(&"trim") && methods.contains(&"depth"), "lazy {lazy}: {methods:?}");
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
+
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&PREVIOUS_FILES, std::sync::atomic::AtomicU64::new(0));
+    reset(&WORKER_IMAGES, std::sync::atomic::AtomicU64::new(0));
+    reset(&WORKER_IMAGE_BYTES, std::sync::atomic::AtomicU64::new(0));
+    reset(&WORKER_IMAGES_USED, std::sync::atomic::AtomicU64::new(0));
+    reset(&WORKER_IMAGE_BYTES_USED, std::sync::atomic::AtomicU64::new(0));
     reset(&PHASE_NS, [const { std::sync::atomic::AtomicU64::new(0) }; 5]);
     reset(&BY_NAME, Mutex::new(Vec::new()));
     reset(&WAIT_NS, std::sync::atomic::AtomicU64::new(0));

@@ -1,7 +1,7 @@
 //! The Metal backend of the HAL: `Backend` for macOS over the HAL tables. Resources come from
 //! commands (`TextureCreate`, `BufferCreate`, `PipelineCreate` ... keyed by the ids Cx chose),
 //! frames come as packets (`Frame`) and are encoded here and nowhere else, results go out as
-//! events (`FrameDone` with GPU time, `Readback`, `PickResult`, `PipelineReady`).
+//! events (`FrameDone` with GPU time, `Readback`, `PipelineReady`).
 //!
 //! A window is a `CAMetalLayer` of the AppKit shell (`super::appkit`): a window frame renders into
 //! the layer's next drawable and presents it. With `open_flags::OFFSCREEN_WINDOWS` (a permanent
@@ -32,6 +32,7 @@ use crate::ledger::{Kind, LedgerEntry};
 use crate::session::*;
 use crate::types::*;
 use device::{Device, Done, Mailbox};
+use timing::Failure;
 pub use pipeline::compile_msl;
 use makepad_apple_sys::*;
 use resources::*;
@@ -47,6 +48,13 @@ const HOUSEKEEPING_NS: u64 = 250_000_000;
 /// How long the compiled pipelines of a closed session wait for the next session to take them
 /// (`pipeline::Compiled`), from the close or from the last one taken.
 const KEPT_NS: u64 = 30_000_000_000;
+/// A lost device is made again this long after a try that failed, the wait doubling up to the
+/// second (`Metal::recover`).
+const RESET_RETRY_NS: u64 = 250_000_000;
+const RESET_RETRY_MAX_NS: u64 = 8_000_000_000;
+/// How long a device reset waits for the old device's command buffers, so what they owe the
+/// sessions comes before `DeviceReset`; what runs longer answers after it (`Metal::retired`).
+const OLD_DEVICE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
 /// Retained instance data the HAL may drop is dropped, least recently used first, once the
 /// device holds more than this fraction of its recommended working set, down to the low mark.
 const RESIDENCY_HIGH: (u64, u64) = (3, 4);
@@ -97,8 +105,6 @@ pub struct Metal {
     composing: bool,
     /// Dismissal retries when AppKit temporarily has no drawable.
     restores: FastMap<Id, Win>,
-    /// per window: the id texture the newest pick frame drew into (`Pick` reads it back)
-    pick_ids: FastMap<(u32, u32), Id>,
     /// Pick targets whose latest replay skipped a not-yet-ready draw.
     pick_pending: std::collections::HashSet<(u32, Id)>,
     batch: Option<frame::Batch>,
@@ -119,8 +125,14 @@ pub struct Metal {
     /// the pool of capture buffers a recorder's frames are copied into, and when it was last used
     capture: Option<super::media::capture::Pool>,
     capture_ns: u64,
-    /// `frame::depth_only`'s scratch: the (pipeline, blend) pairs of a pass already asked
+    /// `frame::depth_only`'s and `frame::pass_samples`' scratch: the (pipeline, blend) pairs of a
+    /// pass already asked
     depth_only_seen: Vec<(u32, bool)>,
+    /// an MSAA pass into a window layer's segment drew single sampled, and said so
+    segment_msaa_said: bool,
+    /// an MSAA pass made a twin of an attachment (`frame::twins`): passes drawn single sampled
+    /// mark what they draw into as not held by its twin
+    twinned: bool,
     /// the GPU profiler's encoders of the frame being encoded (moved into its ticket)
     prof: Vec<frame::ProfPass>,
     /// the profiled frame being encoded
@@ -128,8 +140,24 @@ pub struct Metal {
     /// Draws left out so far for a pipeline variant still compiling (a frame that adds to it is
     /// partial, `FramePartial`).
     pending_draws: u64,
-    /// Failed command buffers must not silently strand their clients.
+    /// The sessions heard `DeviceLost` and the device is not made again yet (`recover`).
     lost_posted: bool,
+    /// a device loss to simulate (`simulate_device_loss`; `MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_MS`
+    /// after the backend was made)
+    simulate: bool,
+    simulate_at_ns: Option<u64>,
+    /// the system said the GPU went away (`removal`)
+    removed: Arc<std::sync::atomic::AtomicBool>,
+    /// the device the removal observer watches for (its pointer), and the observer
+    watched: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(target_os = "macos")]
+    _observer: Option<RemovalObserver>,
+    /// when a reset that failed is tried again, and how many tries failed since the loss
+    retry_ns: u64,
+    reset_failures: u32,
+    /// the mailboxes of replaced devices: what their command buffers still answer the sessions,
+    /// until nothing can push there
+    retired: Vec<Mailbox>,
     /// the compiled pipelines of the app session that closed last, for the next one to take
     /// (`pipeline::Compiled`), and when that session closed or the next took one
     kept: Vec<pipeline::Compiled>,
@@ -158,6 +186,11 @@ impl Metal {
             let astc: bool = if msg_send![dev.device, respondsToSelector: sel!(supportsFamily:)] { msg_send![dev.device, supportsFamily: 1002i64] } else { false };
             (bc, astc)
         };
+        // the sample counts an MSAA pass may ask for (`Pass::samples`), as the GPU has them
+        let msaa = [2u32, 4, 8].into_iter().fold(1, |m, n| {
+            let has: bool = unsafe { msg_send![dev.device, supportsTextureSampleCount: n as u64] };
+            if has { m | n } else { m }
+        });
         let mut formats = (1u64 << format::COUNT) - 1;
         if !texture_compression.0 {
             formats &= !(1 << format::BC7 | 1 << format::BC5);
@@ -170,11 +203,11 @@ impl Metal {
             session: 0,
             backend: backend_id::METAL,
             dialect: dialect::MSL,
-            flags: info_flags::WINDOW_LAYERS | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS
+            flags: info_flags::WINDOW_LAYERS | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS | info_flags::DEVICE_RESET
                 | if shell.is_some() { info_flags::DISPLAY_CLOCK } else { 0 }
                 | if shell.is_some() && cfg!(target_os = "macos") { info_flags::WINDOW_BADGES } else { 0 },
             formats,
-            msaa: 1,
+            msaa,
             dpi: shell.map_or(1.0, |s| s.dpi()),
             max_texture: 16384,
             max_window: [16384, 16384],
@@ -191,6 +224,10 @@ impl Metal {
         };
         let mut info = info;
         info.set_device_name(&dev.name);
+        let removed: Arc<std::sync::atomic::AtomicBool> = Default::default();
+        let watched = Arc::new(std::sync::atomic::AtomicUsize::new(dev.device as usize));
+        #[cfg(target_os = "macos")]
+        let _observer = RemovalObserver::new(watched.clone(), removed.clone(), dev.mailbox.fresh());
         Some(Metal {
             dev,
             info,
@@ -205,7 +242,6 @@ impl Metal {
             badged: FastMap::default(),
             composing: false,
             restores: FastMap::default(),
-            pick_ids: FastMap::default(),
             pick_pending: Default::default(),
             batch: None,
             uploads: Vec::new(),
@@ -220,10 +256,21 @@ impl Metal {
             capture: None,
             capture_ns: 0,
             depth_only_seen: Vec::new(),
+            segment_msaa_said: false,
+            twinned: false,
             prof: Vec::new(),
             prof_key: None,
             pending_draws: 0,
             lost_posted: false,
+            simulate: false,
+            simulate_at_ns: crate::backend::simulated_loss_at(),
+            removed,
+            watched,
+            #[cfg(target_os = "macos")]
+            _observer,
+            retry_ns: 0,
+            reset_failures: 0,
+            retired: Vec::new(),
             kept: Vec::new(),
             kept_ns: 0,
         })
@@ -269,15 +316,24 @@ impl Metal {
     fn drain(&mut self, world: &mut World) {
         let completions = self.dev.mailbox.take();
         // Announce loss before any completion in the same drain can retire its
-        // dispatch metadata or publish bytes from a later command buffer.
-        if !self.lost_posted && completions.iter().any(|done| matches!(done, Done::Frame { failed: true, .. } | Done::BufferLeases { status: crate::readback::DEVICE_LOST, .. })) {
+        // dispatch metadata or publish bytes from a later command buffer. Only a failure that
+        // took the device is a loss (`timing::Failure`); one that failed its own work is not.
+        if !self.lost_posted && completions.iter().any(|done| matches!(done, Done::Frame { failure: Some(Failure::Device), .. } | Done::BufferLeases { status: crate::readback::DEVICE_LOST, .. })) {
             exec::device_lost(world);
             self.lost_posted = true;
         }
-        for done in completions {
+        // What replaced devices still answer: their frames and reads, owed and delivered; never
+        // a loss (it was replaced) nor a pipeline (rebuilt on this device, it answers again).
+        let mut owed = Vec::new();
+        self.retired.retain(|mailbox| {
+            let alone = mailbox.alone();
+            owed.extend(mailbox.take().into_iter().filter(|done| !matches!(done, Done::PipelineReady { .. } | Done::PipelineFailed { .. })));
+            !alone
+        });
+        for done in owed.into_iter().chain(completions) {
             let (sid, incarnation) = match &done {
                 Done::Frame { sid, incarnation, .. } | Done::DispatchTime { sid, incarnation, .. } | Done::Readback { sid, incarnation, .. } | Done::BufferLeases { sid, incarnation, .. }
-                | Done::Pick { sid, incarnation, .. } | Done::PipelineReady { sid, incarnation, .. }
+                | Done::PipelineReady { sid, incarnation, .. }
                 | Done::PipelineFailed { sid, incarnation, .. } | Done::Surface { sid, incarnation, .. } => (*sid, incarnation),
             };
             // Every completion belongs to a session incarnation, including driver callbacks
@@ -288,16 +344,20 @@ impl Metal {
             }
             match done {
                 Done::DispatchTime { sid, name, gpu_ns, .. } => world.to_session(sid, |q| q.dispatch_time(name.as_bytes(), gpu_ns)),
-                Done::Frame { sid, target, frame, gpu_ns, present_ns, gpu_span, failed, partial, window, kind, .. } => {
-                    if window && !failed && kind & target::OVERLAY == 0 {
+                Done::Frame { sid, target, frame, gpu_ns, present_ns, gpu_span, failure, partial, window, kind, .. } => {
+                    let ran = failure.is_none();
+                    if window && ran && kind & target::OVERLAY == 0 {
                         world.window_presented(sid, target, frame, gpu_ns, present_ns);
                         if let Some(shell) = self.shell {
                             shell.presented();
                         }
                     }
                     if let Some(s) = world.session_mut(sid) {
-                        if failed {
-                            s.stats.bad_args += 1;
+                        if failure == Some(Failure::Work) {
+                            s.stats.failed_frames += 1;
+                            // what it drew (and the retained copies) never landed: the app draws
+                            // again, in full (this backend draws no damage rects)
+                            s.events.redraw(target, false);
                         }
                         s.stats.frames += 1;
                         if gpu_ns > 0 {
@@ -306,9 +366,12 @@ impl Metal {
                             s.stats.gpu_ns_max = s.stats.gpu_ns_max.max(gpu_ns);
                         }
                     }
-                    // the one place FrameDone is posted: the presenter, and the parent of a lent window
-                    if !failed {
-                        if partial { world.frame_partial(sid, target, frame); }
+                    // the one place FrameDone is posted: the presenter, and the parent of a lent
+                    // window. A frame whose buffer failed its own work is finished all the same,
+                    // never presented, and its app paints again; one of a lost device is not
+                    // (the sessions heard DeviceLost).
+                    if failure != Some(Failure::Device) {
+                        if partial && ran { world.frame_partial(sid, target, frame); }
                         world.frame_done(sid, target, kind, frame, gpu_ns, present_ns, gpu_span);
                     }
                 }
@@ -318,15 +381,9 @@ impl Metal {
                     None => unsafe { CFRelease(buffer as *const std::ffi::c_void) },
                 },
                 Done::BufferLeases { sid, req, status, leases, .. } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
-                Done::Readback { sid, req, status, rect, pixels, .. } => {
+                Done::Readback { sid, req, status, rect, lease, .. } => {
                     if let Some(s) = world.session_mut(sid) {
-                        s.events.readback(req, status, rect, &pixels);
-                    }
-                }
-                Done::Pick { sid, req, ids, .. } => {
-                    if let Some(s) = world.session_mut(sid) {
-                        let bytes: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
-                        s.events.pick_result(req, &bytes);
+                        s.events.readback(req, status, rect, lease);
                     }
                 }
                 Done::PipelineReady { sid, id, .. } => {
@@ -481,13 +538,22 @@ impl Backend for Metal {
         Some(self)
     }
 
+    fn simulate_device_loss(&mut self) {
+        self.simulate = true;
+    }
+
     fn step(&mut self, world: &mut World, sid: u32) {
         let _pool = Pool::new();
         if let Some(shell) = self.shell {
             shell.drain_events(sid, world);
+            // gone to the background: the arena's free chunks past the first two go now, not once idle
+            if shell.backgrounded.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                self.dev.arena_trim(u64::MAX);
+            }
         }
         self.dev.flush_submissions();
         self.drain(world);
+        self.recover(world);
         self.housekeeping(world);
         let now = world.now();
         if sid == HOST && !self.restores.is_empty() {
@@ -513,7 +579,12 @@ impl Backend for Metal {
                 .min()
         });
         let restore = (sid == HOST && !self.restores.is_empty()).then(|| world.now() + 16_666_667);
-        timer.into_iter().chain(trim).chain(restore).chain(self.native_windows.next_due(sid, world.now())).min()
+        // the arena's next spare chunk going idle, which `housekeeping` gives back even if nothing else wakes the pump
+        let arena = self.dev.arena_trim_due(self.housekept_ns).map(|due| due.max(self.housekept_ns + HOUSEKEEPING_NS));
+        // a lost device is tried again (`recover`) without anything else to wake the HAL, and a
+        // simulated loss comes at its time
+        let reset = self.lost_posted.then(|| self.retry_ns.max(world.now() + 1_000_000));
+        timer.into_iter().chain(trim).chain(restore).chain(arena).chain(reset).chain(self.simulate_at_ns).chain(self.native_windows.next_due(sid, world.now())).min()
     }
 
     fn session_closed(&mut self, world: &mut World, sid: u32) {
@@ -559,7 +630,6 @@ impl Backend for Metal {
                 self.dev.retire(Box::new(w.tex));
             }
         }
-        self.pick_ids.retain(|k, _| !own(k));
         self.pick_pending.retain(|(session, _)| *session != sid);
         self.layer_sizes.retain(|k, _| !own(k));
         if let Some(shell) = self.shell {
@@ -754,10 +824,6 @@ impl Gpu for Metal {
         self.encode_frame(s, sid, target, kind, packet, view, now)
     }
 
-    fn pick(&mut self, s: &mut Session, window: Id, req: u32, pos: [f32; 2]) {
-        self.read_pick(s, window, req, pos);
-    }
-
     fn snapshot(&mut self, s: &mut Session, window: Id, req: u32) {
         self.readback_window(s, window, req);
     }
@@ -776,7 +842,6 @@ impl Gpu for Metal {
         if let Some(w) = self.win.remove(&(sid, id.index)) {
             self.dev.retire(Box::new(w.tex));
         }
-        self.pick_ids.remove(&(sid, id.index));
         self.layer_sizes.remove(&(sid, id.index));
     }
 
@@ -784,8 +849,10 @@ impl Gpu for Metal {
         self.set_overlay(s, id, rect, layer, now);
     }
 
-    /// Panels are composed here (`set_overlay`, `composite_overlay`), over the base frame kept for them.
+    /// Panels and window layers are composed here (`set_overlay`, `composite_overlay`,
+    /// `copy_layer_image`), over the base frame kept for them.
     fn overlays(&self) -> bool { true }
+    fn layers(&self) -> bool { true }
 
     fn badge_layer(&mut self, window: Id, on: bool) {
         if on {
@@ -804,7 +871,6 @@ impl Gpu for Metal {
             self.window_aliases.insert((sid, id), host);
         } else {
             self.window_aliases.remove(&(sid, id));
-            self.pick_ids.remove(&(sid, id.index));
             self.pick_pending.retain(|(s, w)| *s != sid || *w != id);
         }
         if let Some(shell) = self.shell {
@@ -826,6 +892,153 @@ impl Gpu for Metal {
             }
             None => false,
         }
+    }
+}
+
+impl Metal {
+    /// A lost device is made again: the sessions heard `DeviceLost` (a failure that took the
+    /// device, the system's removal notice or a simulated loss), then `exec::device_reset` runs
+    /// until a device can be made (tried again after a doubling wait, logged once per loss).
+    fn recover(&mut self, world: &mut World) {
+        if self.simulate_at_ns.is_some_and(|t| crate::clock_ns() >= t) {
+            self.simulate_at_ns = None;
+            self.simulate = true;
+        }
+        let simulated = std::mem::take(&mut self.simulate);
+        let removed = self.removed.swap(false, std::sync::atomic::Ordering::AcqRel);
+        if !(simulated || removed || self.lost_posted) {
+            return;
+        }
+        if !self.lost_posted {
+            exec::device_lost(world);
+            self.lost_posted = true;
+        }
+        if self.reset_failures == 0 && self.retry_ns == 0 {
+            eprintln!("[hal-metal] device generation {} lost{}; making a new one", world.device_generation, if removed { " (removed)" } else { "" });
+        }
+        let now = crate::clock_ns();
+        if now < self.retry_ns {
+            return;
+        }
+        if exec::device_reset(self, world) {
+            eprintln!("[hal-metal] device generation {} on {:?}{}", world.device_generation, self.dev.name,
+                if self.reset_failures > 0 { format!(" after {} attempts", self.reset_failures + 1) } else { String::new() });
+            self.lost_posted = false;
+            self.retry_ns = 0;
+            self.reset_failures = 0;
+        } else {
+            self.retry_ns = now + (RESET_RETRY_NS << self.reset_failures.min(5)).min(RESET_RETRY_MAX_NS);
+            self.reset_failures += 1;
+        }
+    }
+}
+
+impl exec::DeviceReset for Metal {
+    fn replace_device(&mut self, world: &mut World) -> Result<(), String> {
+        let _pool = Pool::new();
+        let dev = Device::new(self.dev.mailbox.fresh()).ok_or("no Metal device")?;
+        // The old device's work: what was encoded is committed, its threads stop, its command
+        // buffers run out (bounded) and what they answer is delivered before the tables are
+        // emptied; what answers later comes through its mailbox (`retired`), after the reset.
+        self.end_batch();
+        self.dev.stop_workers();
+        if !self.dev.settle(OLD_DEVICE_SETTLE) {
+            eprintln!("[hal-metal] device reset: the old device's work still runs after {OLD_DEVICE_SETTLE:?}; its answers come later");
+        }
+        self.drain(world);
+        let old = std::mem::replace(&mut self.dev, dev);
+        self.retired.push(old.mailbox.clone());
+        // the old device's objects go; the tables keep their entries, and the next frames make
+        // window targets, twins and the arena again on the new device
+        self.tex.clear();
+        self.buf.clear();
+        self.win.clear();
+        self.restores.clear();
+        for composed in self.badged.values_mut() {
+            *composed = None;
+        }
+        for overlay in self.overlays.values_mut() {
+            overlay.device_replaced();
+        }
+        self.frame_drawable = None;
+        self.uploads.clear();
+        self.batch = None;
+        self.capture = None;
+        self.leases = Default::default();
+        self.kept.clear();
+        self.depth_only_seen.clear();
+        self.pick_pending.clear();
+        self.twinned = false;
+        self.prof.clear();
+        self.prof_key = None;
+        drop(old);
+        // what draws with the device draws with the new one: the windows' layers, the native
+        // layers' segments, the video players
+        let device = self.dev.device;
+        self.watched.store(device as usize, std::sync::atomic::Ordering::Release);
+        if let Some(shell) = self.shell {
+            shell.device_replaced(device);
+        }
+        self.native_windows.device_replaced(device);
+        self.media.device_replaced(device);
+        self.info.set_device_name(&self.dev.name);
+        self.info.device_kind = if self.dev.unified_memory { device_kind::INTEGRATED } else { device_kind::DISCRETE };
+        Ok(())
+    }
+
+    fn rebuild_pipelines(&mut self, world: &mut World) {
+        // each pipeline compiles again from its session's own copy of what it was made from;
+        // its first answer ends its pending count, as on its first create
+        let pipes: Vec<(u32, u32, u32, bool)> = self.pipe.iter().map(|(k, p)| (k.0, k.1, p.gen, p.announced))
+            .chain(self.compute.iter().map(|(k, p)| (k.0, k.1, p.gen, p.announced))).collect();
+        self.pipe.clear();
+        self.compute.clear();
+        for (sid, index, gen, announced) in pipes {
+            let Some(s) = world.session_mut(sid) else { continue };
+            let id = Id::new(index, gen);
+            let Ok(entry) = s.pipelines.get(sid, id) else { continue };
+            let bytes = entry.val.blob.clone();
+            let Some(blob) = PipelineBlob::parse(&bytes) else { continue };
+            if announced {
+                s.pipelines_pending += 1;
+            }
+            if let PipeStatus::Failed(error) = self.pipeline_create(s, id, dialect::MSL, &blob, Attr::default()) {
+                s.pipelines_pending = s.pipelines_pending.saturating_sub(1);
+                s.events.pipeline_failed(id, error.as_bytes());
+            }
+        }
+    }
+}
+
+/// The system's notice that a GPU went away (an external GPU unplugged): the device the backend
+/// draws with (`watched`) is lost (`removed`) and the HAL wakes to make another (through a
+/// mailbox of its own, which nothing pushes to: it only rouses the pump).
+#[cfg(target_os = "macos")]
+struct RemovalObserver(RcObjcId);
+
+#[cfg(target_os = "macos")]
+impl RemovalObserver {
+    fn new(watched: Arc<std::sync::atomic::AtomicUsize>, removed: Arc<std::sync::atomic::AtomicBool>, mailbox: Mailbox) -> Option<RemovalObserver> {
+        let handler = objc_block!(move |device: ObjcId, name: ObjcId| {
+            let gone: BOOL = unsafe { msg_send![name, isEqualToString: MTLDeviceWasRemovedNotification] };
+            if gone == YES && device as usize == watched.load(std::sync::atomic::Ordering::Acquire) {
+                removed.store(true, std::sync::atomic::Ordering::Release);
+                mailbox.wake(HOST);
+            }
+        });
+        let mut observer: ObjcId = nil;
+        let devices = unsafe { MTLCopyAllDevicesWithObserver(&mut observer, &handler as *const _ as *const std::ffi::c_void) };
+        if devices != nil {
+            let () = unsafe { msg_send![devices, release] };
+        }
+        NonNull::new(observer).map(RcObjcId::from_unowned).map(RemovalObserver)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for RemovalObserver {
+    fn drop(&mut self) {
+        unsafe { MTLRemoveDeviceObserver(self.0.as_id()) };
     }
 }
 

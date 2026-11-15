@@ -19,7 +19,7 @@ use crate::backend::vulkan::{Device, Image};
 use crate::dmabuf::DmaBuf;
 use crate::hosted_ipc::{self, ClientEndpoint};
 use crate::types::*;
-use crate::window_controls::{HostedAppFrame, HostedResize};
+use crate::window_controls::{hosted_window_op, HostedAppFrame, HostedClipboard, HostedResize, HostedWindow, WINDOW_OP_FULLSCREEN};
 use crate::{session, wm_socket, Id};
 use makepad_micro_serde::SerBin;
 use makepad_studio_protocol::{
@@ -547,6 +547,8 @@ pub(super) struct App {
     /// WM as relays; relay id -> (session, its request id).
     clip_reads: HashMap<u64, (u32, u64)>,
     next_clip_read: u64,
+    /// A read's richer flavours the WM sent just ahead of its answer (`HostedClipboard`).
+    clip_flavours: Option<HostedClipboard>,
     /// The last primary selection this process made (also sent to the WM).
     selection: crate::clipboard::ClipboardData,
     /// The WM's drag queries (`HostedDragQuery` ids) the app has not answered yet, oldest first:
@@ -609,7 +611,7 @@ impl App {
         lock(&PACE).started = true;
         Ok(Self { state, hub, aux_path: hosted_ipc::aux_path(port, &client.to_string()), aux: None,
             pending: Vec::new(), windows: HashMap::new(), early: HashMap::new(), next_window: 0, ticking: false, asked_frame: false, app_drawn: false, hidden: false,
-            clip_reads: HashMap::new(), next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(), trays: HashMap::new(),
+            clip_reads: HashMap::new(), next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(), trays: HashMap::new(),
             hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false })
     }
 
@@ -771,14 +773,14 @@ impl App {
                     self.hub.send(vec![AppToStudio::TickDone]);
                 }
             }
-            StudioToApp::MouseDown(e) => self.pointer(|q, id| q.mouse_down(id, e.x, e.y, e.button_raw_bits, mods(&e.modifiers))),
-            StudioToApp::MouseMove(e) => self.pointer(|q, id| q.mouse_move(id, e.x, e.y, 0.0, 0.0, mods(&e.modifiers))),
-            StudioToApp::MouseUp(e) => self.pointer(|q, id| q.mouse_up(id, e.x, e.y, e.button_raw_bits, mods(&e.modifiers))),
-            StudioToApp::MouseCancel(e) => self.pointer(|q, id| q.mouse_cancel(id, e.x, e.y, e.button_raw_bits, mods(&e.modifiers))),
-            StudioToApp::Scroll(e) => self.pointer(|q, id| q.scroll(id, e.x, e.y, e.sx, e.sy, mods(&e.modifiers), !e.is_mouse, phase(e.phase))),
+            StudioToApp::MouseDown(e) => self.pointer_to(e.x, e.y, |q, id, x, y| q.mouse_down(id, x, y, e.button_raw_bits, mods(&e.modifiers))),
+            StudioToApp::MouseMove(e) => self.pointer_to(e.x, e.y, |q, id, x, y| q.mouse_move(id, x, y, 0.0, 0.0, mods(&e.modifiers))),
+            StudioToApp::MouseUp(e) => self.pointer_to(e.x, e.y, |q, id, x, y| q.mouse_up(id, x, y, e.button_raw_bits, mods(&e.modifiers))),
+            StudioToApp::MouseCancel(e) => self.pointer_to(e.x, e.y, |q, id, x, y| q.mouse_cancel(id, x, y, e.button_raw_bits, mods(&e.modifiers))),
+            StudioToApp::Scroll(e) => self.pointer_to(e.x, e.y, |q, id, x, y| q.scroll(id, x, y, e.sx, e.sy, mods(&e.modifiers), !e.is_mouse, phase(e.phase))),
             StudioToApp::Pinch(e) => {
                 let phase = match e.phase { PinchPhase::Begin => input::pinch::BEGIN, PinchPhase::Update => input::pinch::UPDATE, PinchPhase::End => input::pinch::END };
-                self.pointer(|q, id| q.pinch(id, e.x, e.y, e.scale, phase));
+                self.pointer_to(e.x, e.y, |q, id, x, y| q.pinch(id, x, y, e.scale, phase));
             }
             StudioToApp::KeyDown(e) => {
                 let m = key_mods(e.modifiers.shift, e.modifiers.control, e.modifiers.alt, e.modifiers.logo);
@@ -804,11 +806,16 @@ impl App {
                 }
             }
             StudioToApp::Custom(json) => {
+                // A clipboard read's flavours, just ahead of its answer.
+                if let Some(flavours) = HostedClipboard::parse(&json) {
+                    self.clip_flavours = Some(flavours);
+                    return;
+                }
                 // A press in the window: the app's drag query says whether it is its caption.
                 if let Some(query) = HostedDragQuery::parse(&json) {
-                    if let Some(key) = self.input_recipient() {
+                    if let Some((key, x, y)) = self.pointer_at(query.x, query.y) {
                         self.drag_queries.push_back(query.id);
-                        self.state.shared.push(key, |q, id| q.drag_query(id, query.x, query.y));
+                        self.state.shared.push(key, |q, id| q.drag_query(id, x, y));
                     }
                     return;
                 }
@@ -875,8 +882,11 @@ impl App {
                 }
             }
             StudioToApp::Relay(HostRelay::Clipboard { request_id, text, png }) => {
+                // the flavours the host sent just ahead, when they go with this text
+                let flavours = self.clip_flavours.take().filter(|f| f.request == request_id && f.text == text).unwrap_or_default();
                 if let Some((sid, req)) = self.clip_reads.remove(&request_id) {
-                    let bytes = crate::clipboard::ClipboardData { text, png, files: Vec::new() }.pack();
+                    let (html, markdown) = (flavours.html, flavours.markdown);
+                    let bytes = crate::clipboard::ClipboardData { text, html, markdown, png, files: Vec::new() }.pack();
                     self.state.shared.push((sid, Id::NONE), |q, _| q.clipboard(req, true, &bytes));
                 }
             }
@@ -887,6 +897,24 @@ impl App {
     fn pointer(&self, f: impl FnOnce(&mut crate::buffers::EventQueue, Id)) {
         if let Some(key) = self.input_recipient() {
             self.state.shared.push(key, f);
+        }
+    }
+
+    /// The window a pointer message at `x, y` (the child's window space, where a later window
+    /// sits at its own origin: its geometry's left and top) is for, and the point in it. A point
+    /// in no window is the first window's, as the native hosted path does (`window_id_contains`).
+    fn pointer_at(&self, x: f64, y: f64) -> Option<(Key, f64, f64)> {
+        let inside = self.windows.values().filter(|w| !w.dropdown).find_map(|w| {
+            let ([left, top, width, height], _, _) = w.geom?;
+            (x >= left && y >= top && x <= left + width && y <= top + height).then_some((w.recipient, x - left, y - top))
+        });
+        inside.or_else(|| self.input_recipient().map(|key| (key, x, y)))
+    }
+
+    /// A pointer message at `x, y` to the window it is in, with the point in that window.
+    fn pointer_to(&self, x: f64, y: f64, f: impl FnOnce(&mut crate::buffers::EventQueue, Id, f64, f64)) {
+        if let Some((key, x, y)) = self.pointer_at(x, y) {
+            self.state.shared.push(key, |q, id| f(q, id, x, y));
         }
     }
 
@@ -1164,6 +1192,10 @@ impl Shell for App {
                         // window off the screen. It asks the process to end with it (`Kill`).
                         if tile {
                             self.window_op(window_op::CLOSE);
+                        } else {
+                            // A later window (an output window) is a tile of its own: the WM
+                            // takes it off the desk, or it stays there with its last frame.
+                            self.hub.send(vec![AppToStudio::Custom(HostedWindow::new(w.window_id, hosted_window_op::CLOSED).to_json())]);
                         }
                     }
                 }
@@ -1177,6 +1209,22 @@ impl Shell for App {
                             self.hub.send(vec![AppToStudio::Custom(HostedDropdown::new(window_id, dropdown_op::HIDE).to_json())]);
                         }
                         return;
+                    }
+                    // A later window (an output window) is a tile of its own on the desk: what
+                    // the app asks of it names it (`HostedWindow`), the tile's own ops do not.
+                    if self.tile_window() != Some(key) {
+                        let op = match state {
+                            window_state::MINIMIZE => Some(hosted_window_op::MINIMIZE),
+                            window_state::MAXIMIZE => Some(hosted_window_op::MAXIMIZE),
+                            window_state::RESTORE => Some(hosted_window_op::RESTORE),
+                            window_state::FULLSCREEN => Some(hosted_window_op::FULLSCREEN),
+                            _ => None,
+                        };
+                        if let Some(op) = op {
+                            let window_id = self.windows[&key].window_id;
+                            self.hub.send(vec![AppToStudio::Custom(HostedWindow::new(window_id, op).to_json())]);
+                            return;
+                        }
                     }
                     match state {
                         // A hidden window (a tray app's closed one) is a minimised tile.
@@ -1193,6 +1241,7 @@ impl Shell for App {
                         }
                         window_state::MAXIMIZE => self.window_op(window_op::MAXIMIZE),
                         window_state::RESTORE => self.window_op(window_op::RESTORE),
+                        window_state::FULLSCREEN => self.window_op(WINDOW_OP_FULLSCREEN),
                         // The app-drawn caption's close: the app is asked first (a tray app hides
                         // its window); the WM's own close of a main tile would end the process.
                         window_state::CLOSE => {
@@ -1223,10 +1272,12 @@ impl Shell for App {
                     let show = HostedDropdown { tray, w: w as f64, h: h as f64, ..HostedDropdown::new(window_id, dropdown_op::SHOW) };
                     self.hub.send(vec![AppToStudio::Custom(show.to_json())]);
                 }
-                OsCmd::DragReply { to: input::reply::QUERY, answer, .. } => {
+                OsCmd::DragReply { to: input::reply::QUERY, answer, fullscreen, .. } => {
                     if let Some(id) = self.drag_queries.pop_front() {
                         let response = u8::try_from(answer).unwrap_or(drag_answer::NO_ANSWER);
-                        self.hub.send(vec![AppToStudio::Custom(HostedDragAnswer { id, response, double_click: drag_double::MAXIMISE }.to_json())]);
+                        // what a double click there does is the window's own declaration
+                        let double_click = if fullscreen { drag_double::FULLSCREEN } else { drag_double::MAXIMISE };
+                        self.hub.send(vec![AppToStudio::Custom(HostedDragAnswer { id, response, double_click }.to_json())]);
                     }
                 }
                 OsCmd::FrameRequest { id } => {
@@ -1252,7 +1303,16 @@ impl Shell for App {
                     }
                 }
                 OsCmd::Cursor { cursor, .. } => self.hub.send(vec![AppToStudio::SetCursor(mouse_cursor(cursor))]),
-                OsCmd::ClipSet { text } => self.hub.send(vec![AppToStudio::SetClipboard(text)]),
+                // the flavours go just ahead of the text the studio protocol carries
+                OsCmd::ClipSet { data } => {
+                    let flavours = HostedClipboard { request: 0, text: data.text.clone(), html: data.html, markdown: data.markdown };
+                    let mut msgs = Vec::new();
+                    if flavours.any() {
+                        msgs.push(AppToStudio::Custom(flavours.to_json()));
+                    }
+                    msgs.push(AppToStudio::SetClipboard(data.text));
+                    self.hub.send(msgs);
+                }
                 // A drag out of the window: the WM carries the files from here (`StartFileDrag`),
                 // so the app's own gesture ends now, as when a desktop drag session ends.
                 OsCmd::DragStart { id, items, .. } => {
@@ -1280,6 +1340,7 @@ impl Shell for App {
                     self.clip_reads.insert(self.next_clip_read, (sid, req));
                     self.hub.send(vec![AppToStudio::Relay(ChildRelay::ReadClipboard { request_id: self.next_clip_read })]);
                 }
+                OsCmd::PrintPdf { req, .. } => self.state.shared.push((sid, Id::NONE), |q, _| q.print_result(req, crate::print_status::UNSUPPORTED, &[])),
                 OsCmd::FileDialog { req, .. } => self.state.shared.push((sid, Id::NONE), |q, _| q.dialog_result(req, 0, &[])),
                 OsCmd::DirectDisplay { req, command } => self.state.shared.push((sid, Id::NONE), |q, _| {
                     q.direct_display_result(req, command.tag() as u32, false, b"a WM-hosted window does not own direct displays");
@@ -1485,7 +1546,7 @@ mod tests {
         let hub = Hub::connect(port, 78, "makepad-app-hidden", state.clone()).unwrap();
         let mut app = App { state, hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let key = (9_001, Id::new(1, 1));
         app.windows.insert(key, Win { window_id: 0, recipient: key, requested: false, awaiting: false, ahead: 0, geom: None, dropdown: false });
@@ -1516,7 +1577,7 @@ mod tests {
         let hub = Hub::connect(port, 79, "makepad-app-resize", state.clone()).unwrap();
         let mut app = App { state, hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let (tile, later) = ((9_002, Id::new(1, 1)), (9_002, Id::new(2, 1)));
         app.windows.insert(tile, Win { window_id: 0, recipient: tile, requested: false, awaiting: false, ahead: 0, geom: None, dropdown: false });
@@ -1553,7 +1614,7 @@ mod tests {
         let hub = Hub::connect(port, 79, "makepad-app-aihub", state.clone()).unwrap();
         let mut app = App { state, hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let item = |kind, cmd| MenuItem { parent: 0, kind, cmd, key: 0, str: Default::default() };
         let items = vec![
@@ -1607,7 +1668,7 @@ mod tests {
         let hub = Hub::connect(port, 81, "makepad-app-aihub", state.clone()).unwrap();
         let mut app = App { state, hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 0, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let id = Id::new(5, 1);
         app.command(Op::Cmd(6, OsCmd::WindowCreate { id, kind: window_kind::DROPDOWN, parent: Id::NONE, geom: [0.0; 4] }));
@@ -1650,7 +1711,7 @@ mod tests {
         let hub = Hub::connect(port, 80, "makepad-app-game", state.clone()).unwrap();
         let mut app = App { state: state.clone(), hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let key = (9_003, Id::new(1, 1));
         app.windows.insert(key, Win { window_id: 0, recipient: key, requested: false, awaiting: false, ahead: 0, geom: None, dropdown: false });
@@ -1697,7 +1758,7 @@ mod tests {
         let hub = Hub::connect(port, 79, "makepad-app-game", state.clone()).unwrap();
         let mut app = App { state: state.clone(), hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let key = (9_002, Id::new(1, 1));
         app.windows.insert(key, Win { window_id: 0, recipient: key, requested: false, awaiting: false, ahead: 0, geom: None, dropdown: false });
@@ -1725,6 +1786,8 @@ mod tests {
     /// `makepad run` under the WM draws its own caption: the WM's drag query reaches the app's
     /// window (lent to the app's domain), the app's answer goes back under the WM's id, and the
     /// caption buttons of the lent window become the WM's window ops; the app closing that window closes the tile.
+    /// A later window gets the presses made in it, its answer carries its own double click, and
+    /// one the app closes is said to the WM by its id, so its tile leaves the desk.
     #[test]
     fn the_caption_of_a_lent_window_answers_the_wm_and_the_wm_appearance_reaches_host_dark() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1735,14 +1798,14 @@ mod tests {
             let mut byte = [0u8];
             while !request.ends_with(b"\r\n\r\n") { stream.read_exact(&mut byte).unwrap(); request.push(byte[0]); }
             stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n").unwrap();
-            (0..5).map(|_| AppToStudioVec::deserialize_bin(&read_client_frame(&mut stream).1).unwrap().0).collect::<Vec<_>>()
+            (0..10).map(|_| AppToStudioVec::deserialize_bin(&read_client_frame(&mut stream).1).unwrap().0).collect::<Vec<_>>()
         });
         let state = Arc::new(State { shared: Shared::global(), inbox: Default::default(), hung_up: AtomicBool::new(false), detached: AtomicBool::new(false),
             rings: Default::default(), finished: Default::default(), in_flight: Default::default(), device: Default::default() });
         let hub = Hub::connect(port, 79, "makepad-app-clock", state.clone()).unwrap();
         let mut app = App { state, hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let host = (session::HOST, Id::new(1, 1));
         let lent = (9_002, Id::new(4, 1));
@@ -1752,13 +1815,33 @@ mod tests {
         app.message(StudioToApp::Custom(HostedDragQuery { id: 12, x: 41.0, y: 8.0 }.to_json()));
         assert_eq!(app.drag_queries, [11, 12]);
         assert!(lock(&app.state.shared.inbox).contains_key(&lent.0), "the query goes to the session the window is lent to");
-        let reply = |answer| OsCmd::DragReply { id: lent.1, to: input::reply::QUERY, answer };
+        let reply = |answer| OsCmd::DragReply { id: lent.1, to: input::reply::QUERY, answer, fullscreen: false };
         app.command(Op::Cmd(lent.0, reply(input::drag_query::CAPTION)));
         app.command(Op::Cmd(lent.0, reply(input::drag_query::CLIENT)));
         assert!(app.drag_queries.is_empty());
         // the caption's buttons, sent by the app's domain on its alias of the window
         app.command(Op::Cmd(lent.0, OsCmd::WindowState { id: lent.1, state: window_state::MAXIMIZE }));
         app.command(Op::Cmd(lent.0, OsCmd::WindowState { id: lent.1, state: window_state::MINIMIZE }));
+        app.command(Op::Cmd(lent.0, OsCmd::WindowState { id: lent.1, state: window_state::FULLSCREEN }));
+        // a later window (an output window) is a tile of its own: what the app asks of it names it
+        let later = (lent.0, Id::new(5, 1));
+        let origin = ([100_000.0, 0.0, 300.0, 200.0], 1.0, None);
+        app.windows.insert(later, Win { window_id: 3, recipient: later, requested: false, awaiting: false, ahead: 0, geom: Some(origin), dropdown: false });
+        app.command(Op::Cmd(lent.0, OsCmd::WindowState { id: later.1, state: window_state::FULLSCREEN }));
+        app.command(Op::Cmd(lent.0, OsCmd::WindowState { id: later.1, state: window_state::RESTORE }));
+        // a press in it (at its origin in the child's window space) is asked of that window, at
+        // its own point, so a window that drags by its content drags
+        lock(&app.state.shared.inbox).remove(&lent.0);
+        app.message(StudioToApp::Custom(HostedDragQuery { id: 13, x: 100_040.0, y: 8.0 }.to_json()));
+        let mut asked = Vec::new();
+        if let Some(mut q) = lock(&app.state.shared.inbox).remove(&lent.0) {
+            q.drain_with(|e, payload| if let Some(crate::HalEvent::DragQuery { window, x, y }) = e.decode(payload) { asked.push((window, x, y)); });
+        }
+        assert_eq!(asked, [(later.1, 40.0, 8.0)]);
+        // it drags by its content and a double click makes it fullscreen (its own declaration)
+        app.command(Op::Cmd(lent.0, OsCmd::DragReply { id: later.1, to: input::reply::QUERY, answer: input::drag_query::CAPTION, fullscreen: true }));
+        app.command(Op::Cmd(lent.0, OsCmd::WindowClose { id: later.1 }));
+        assert!(!app.windows.contains_key(&later));
         // a window this shell does not have asks nothing
         app.command(Op::Cmd(lent.0, OsCmd::WindowState { id: Id::new(9, 1), state: window_state::MAXIMIZE }));
         // the WM's dark/light reaches `host_dark` (the run's load screen reads it) and wakes it
@@ -1785,7 +1868,12 @@ mod tests {
         assert_eq!(HostedDragAnswer::parse(&sent[1]), Some(HostedDragAnswer { id: 12, response: drag_answer::CLIENT, double_click: drag_double::MAXIMISE }));
         assert_eq!(HostedWindowOp::parse(&sent[2]), Some(HostedWindowOp { op: window_op::MAXIMIZE }));
         assert_eq!(HostedWindowOp::parse(&sent[3]), Some(HostedWindowOp { op: window_op::MINIMIZE }));
-        assert_eq!(HostedWindowOp::parse(&sent[4]), Some(HostedWindowOp { op: window_op::CLOSE }));
+        assert_eq!(HostedWindowOp::parse(&sent[4]), Some(HostedWindowOp { op: WINDOW_OP_FULLSCREEN }));
+        assert_eq!(HostedWindow::parse(&sent[5]), Some(HostedWindow::new(3, hosted_window_op::FULLSCREEN)));
+        assert_eq!(HostedWindow::parse(&sent[6]), Some(HostedWindow::new(3, hosted_window_op::RESTORE)));
+        assert_eq!(HostedDragAnswer::parse(&sent[7]), Some(HostedDragAnswer { id: 13, response: drag_answer::CAPTION, double_click: drag_double::FULLSCREEN }));
+        assert_eq!(HostedWindow::parse(&sent[8]), Some(HostedWindow::new(3, hosted_window_op::CLOSED)));
+        assert_eq!(HostedWindowOp::parse(&sent[9]), Some(HostedWindowOp { op: window_op::CLOSE }));
     }
 
     /// `makepad run` under the WM: the WM's style sheet and its activation of the tile arrive while
@@ -1809,7 +1897,7 @@ mod tests {
         server.join().unwrap();
         let mut app = App { state, hub, aux_path: Default::default(), aux: None, pending: Vec::new(), windows: HashMap::new(),
             early: HashMap::new(), next_window: 1, ticking: false, asked_frame: false, app_drawn: false, hidden: false, clip_reads: HashMap::new(),
-            next_clip_read: 0, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
+            next_clip_read: 0, clip_flavours: None, selection: Default::default(), drag_queries: VecDeque::new(), wm_state: Vec::new(), wm_focus: HashMap::new(),
             trays: HashMap::new(), hidden_windows: Default::default(), detached_at: None, reattach_error: None, quit_sent: false, stopping: false };
         let host = (session::HOST, Id::new(77, 1));
         app.windows.insert(host, Win { window_id: 0, recipient: host, requested: false, awaiting: false, ahead: 0, geom: None, dropdown: false });

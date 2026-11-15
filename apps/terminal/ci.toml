@@ -2,17 +2,17 @@
 
 [app.linux]
 capture = ""
-date = "2026-11-05"
-digest = "f0f852e91372bb9437eb22096aa2d84fb461dcec7f201848ce5c28fa98f14be5"
-main = "bac634fd1103ed3453797a04fb1bdf0dd8a1ba9c"
-work = "7954fb8a65f663048b1ea7dfcbc6e4a8c5d65464"
+date = "2026-11-14"
+digest = "a531299ca87fcf67b992f2064eceacb136a5b86a8e73f502bb574fc7b68d11c7"
+main = "2c5a7f1c3138dd2656863c83f7b4d9f3ee78e5fd"
+work = "77672e7bbfe8c75357c8eb6b6a9439f39684e92a"
 
 [app.windows]
 capture = ""
-date = "2026-11-05"
-digest = "4e9bfbe8a50fbd7ecb10fc3623722a98ba6e0659b782c26b8f8510396e8c2efc"
-main = "71832f8fa1c5a3f6f589b89749c6a99c189e3e8e"
-work = "5300f14ac2c7b3d5aa16bd89d98d789111fbbeb8"
+date = "2026-11-13"
+digest = "6435091e095e8b604acf4a391d71068b71fcdbd1eb91ebc2ec16441b36d38538"
+main = "55cec3ecfa5501e0c1fa8fc2af52c395d491fcf8"
+work = "3f13cc2e91a1af0d9980a807a717a3d54c7debaa"
 
 [job.jit_05.linux]
 date = "2026-11-04"

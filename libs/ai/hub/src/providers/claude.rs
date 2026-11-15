@@ -29,7 +29,7 @@
 
 use crate::chat_wire::{ChatRole, ProviderAvailability, ProviderKind};
 use crate::providers::cli::{categorize_cli_error, cli_command, turn_dir, CliTurn};
-use crate::providers::provider::{validate_tool_images, ChatProvider, ProviderEvent, ToolImage, TurnInput};
+use crate::providers::provider::{tool_image_media_type, validate_tool_images, ChatProvider, ProviderEvent, ToolImage, TurnInput};
 use makepad_strict_json::{self as json, Value};
 use std::path::PathBuf;
 
@@ -87,6 +87,11 @@ impl LiveSession {
 impl ClaudeCodeChatProvider {
     pub fn new(model: Option<String>) -> ClaudeCodeChatProvider {
         ClaudeCodeChatProvider { cli: find_cli(), model, mcp: None, resume: None, turn: None, images: Vec::new(), live: false, effort: None, session: None }
+    }
+
+    /// The arguments used for a turn, without starting the CLI.
+    pub fn arguments(&self, system: &str) -> Vec<String> {
+        build_args_with_mcp(&self.model, &self.resume, system, self.mcp.as_ref())
     }
 
     /// One process for the whole conversation (see the module doc).
@@ -248,7 +253,7 @@ pub fn build_args_with_mcp(model: &Option<String>, resume: &Option<String>, syst
 
 /// The stdin line for a turn that carries images: one stream-json user
 /// message (`--input-format stream-json`) with the prompt as a text block
-/// and each PNG as a base64 image block.
+/// and each PNG or JPEG as a base64 image block.
 pub fn image_message(prompt: &str, images: &[ToolImage]) -> String {
     let mut content = vec![json::obj(vec![("type", json::s("text")), ("text", json::s(prompt))])];
     for image in images {
@@ -256,7 +261,7 @@ pub fn image_message(prompt: &str, images: &[ToolImage]) -> String {
         content.push(json::obj(vec![("type", json::s("text")), ("text", json::s(format!("[image: {}]", image.label)))]));
         content.push(json::obj(vec![
             ("type", json::s("image")),
-            ("source", json::obj(vec![("type", json::s("base64")), ("media_type", json::s("image/png")), ("data", json::s(data))])),
+            ("source", json::obj(vec![("type", json::s("base64")), ("media_type", json::s(tool_image_media_type(&image.png).expect("validated tool image"))), ("data", json::s(data))])),
         ]));
     }
     let message = json::obj(vec![
@@ -524,7 +529,7 @@ impl ChatProvider for ClaudeCodeChatProvider {
             return self.begin_live(cli, input);
         }
         let mut prompt = render_prompt(input, self.resume.is_some());
-        let mut args = build_args_with_mcp(&self.model, &self.resume, &input.system_with_dynamic(), self.mcp.as_ref());
+        let mut args = self.arguments(&input.system_with_dynamic());
         if let Some(effort) = &self.effort {
             args.push("--effort".into());
             args.push(effort.clone());
@@ -650,6 +655,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w[0] == "--tools" && w[1].is_empty()));
         assert!(args.windows(2).any(|w| w[0] == "--model" && w[1] == "claude-opus-5-5"));
         let provider = ClaudeCodeChatProvider::new(None);
+        assert!(!provider.arguments("sys").iter().any(|arg| arg == "--model"));
         assert!(!provider.tools_over_mcp());
         assert!(provider.with_mcp(mcp.0.clone(), mcp.1.clone()).tools_over_mcp());
     }

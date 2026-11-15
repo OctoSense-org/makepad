@@ -7,7 +7,8 @@
 use crate::heap::ScriptHeap;
 use crate::vm::ScriptVmBase;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use makepad_relax_api::sync::Mutex;
+use relax_api::relax_api;
+use relax_api::sync::Mutex;
 use std::sync::Arc;
 
 struct Entry {
@@ -74,7 +75,7 @@ fn now_ms() -> u64 {
 }
 
 fn note_diag(e: &Entry, kind: &'static str, at: Option<(&str, u32)>, text: &str) {
-    makepad_relax_api::process_heap(|| note_diag_here(e, kind, at, text))
+    relax_api::process_heap(|| note_diag_here(e, kind, at, text))
 }
 
 fn note_diag_here(e: &Entry, kind: &'static str, at: Option<(&str, u32)>, text: &str) {
@@ -112,6 +113,46 @@ static ERROR_HOOK: AtomicUsize = AtomicUsize::new(0);
 /// the hooks cost one relaxed load (a native build never pays more)
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+std::thread_local! {
+    /// this thread runs an evaluation whose errors are its answer ([`unreported`])
+    static UNREPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f`, with the errors of the evaluations this thread runs in it kept out of the registry and
+/// the error hook: an evaluation whose errors are its answer (a file read only to say why it does
+/// not read) is no run's error. Its capture still gets them.
+pub fn unreported<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            set_unreported(self.0);
+        }
+    }
+    let _back = Back(set_unreported(true));
+    f()
+}
+
+/// Sets whether this thread's evaluations are unreported ([`unreported`]) and gives what it was.
+/// This and [`is_unreported`] are ops, so under `makepad run` the flag is always the loader's
+/// thread-local, whichever side sets or reads it. [`unreported`] is generic and compiles from
+/// source there, and the VM's ops file their errors in the loader. A thread-local that either
+/// side touched itself would be that side's own copy: thread-locals are never shared across the
+/// boundary.
+#[relax_api(run)]
+pub fn set_unreported(on: bool) -> bool {
+    UNREPORTED.with(|u| u.replace(on))
+}
+
+/// Whether this thread's evaluations are unreported ([`set_unreported`]).
+#[relax_api(run)]
+pub fn is_unreported() -> bool {
+    UNREPORTED.with(|u| u.get())
+}
+
+fn reported() -> bool {
+    ENABLED.load(Relaxed) && !is_unreported()
+}
+
 /// Live counts (allocated slots) and the retained slot bytes of the object, string and array
 /// tables: slots * size_of the table element (heap-owned buffers inside elements not counted).
 fn counts(heap: &ScriptHeap) -> (u64, u64, u64, u64) {
@@ -139,7 +180,7 @@ fn find(addr: usize, by_heap: bool) -> Option<Arc<Entry>> {
 
 /// Register a VM base (its address must be stable: it is boxed). A second call is a no-op.
 pub fn register(base: *const ScriptVmBase, label: &'static str) {
-    makepad_relax_api::process_heap(|| register_here(base, label))
+    relax_api::process_heap(|| register_here(base, label))
 }
 
 fn register_here(base: *const ScriptVmBase, label: &'static str) {
@@ -213,7 +254,7 @@ pub(crate) fn gc_done(heap: &ScriptHeap, ns: u64) {
 
 /// An error was drained on this VM; `line` formats it only when a hook is set.
 pub(crate) fn error(base: &ScriptVmBase, line: impl FnOnce() -> String) {
-    if !ENABLED.load(Relaxed) {
+    if !reported() {
         return;
     }
     let text = line();
@@ -231,7 +272,7 @@ pub(crate) fn error(base: &ScriptVmBase, line: impl FnOnce() -> String) {
 /// A host diagnostic at script site `at` (vm_ctl ERR_PUSH_DIAGNOSTIC / _ERROR): counted on every call, the
 /// error hook (the `scripterr` event) only at a site's `first` report.
 pub(crate) fn diagnostic(base: &ScriptVmBase, at: Option<(&str, u32)>, text: &str, first: bool) {
-    if !ENABLED.load(Relaxed) {
+    if !reported() {
         return;
     }
     let addr = base as *const ScriptVmBase as usize;
@@ -378,7 +419,7 @@ pub(crate) fn eval_guard(base: &ScriptVmBase) -> EvalGuard {
                     e.1 = base as *const ScriptVmBase as usize;
                     e.2 += 1;
                 }
-                None => makepad_relax_api::process_heap(|| v.push((key, base as *const ScriptVmBase as usize, 1))),
+                None => relax_api::process_heap(|| v.push((key, base as *const ScriptVmBase as usize, 1))),
             }
         }
     }

@@ -1,8 +1,8 @@
 // The module source check in a program (`relax run`), where a file's fn bodies are parsed on
 // demand, after its items: `unsafe` and raw pointers inside a body are refused as they are in
 // an item, wherever the body is -- a fn, a closure, a method, a fn nested in a fn, a macro's
-// expansion. (The single-file test harness parses whole files at once and never showed this.)
-// What a builtin derive writes stays out of it.
+// expansion. What a builtin derive writes stays out of it, its skipped bodies too (an enum's
+// PartialEq, PartialOrd, Ord and Hash read the discriminant in an `unsafe` block).
 use std::relax::Module;
 
 const CASES: &[(&str, &str)] = &[

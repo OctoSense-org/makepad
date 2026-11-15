@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// holds N; `MAKEPAD_WIN_LATENCY=1` trades that for the lowest latency (drawing/ink).
 fn latency() -> u32 {
     static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *V.get_or_init(|| if std::env::var("MAKEPAD_WIN_LATENCY").ok().as_deref() == Some("1") { 1 } else { 2 })
+    *V.get_or_init(|| if relax_api::env::var("MAKEPAD_WIN_LATENCY").ok().as_deref() == Some("1") { 1 } else { 2 })
 }
 
 struct Chain {
@@ -209,6 +209,9 @@ impl Chains {
         }
         // S_OK, or DXGI_STATUS_OCCLUDED (the window is not visible; the frame still counts)
         shell.presented(key);
+        if chain.waitable {
+            shell.measure_refresh(key, unsafe { chain.swap.GetFrameStatistics() }.ok());
+        }
         true
     }
 

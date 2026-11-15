@@ -1,4 +1,4 @@
-//! Domain-local statics (local/agent_state/fast-rust/android/DESIGN-domains.md §2).
+//! Domain-local statics.
 //!
 //! Several apps ("domains") may run in one process on the same compiled code, so each needs its
 //! own copy of every static. A domain symbol (`SymClass::Domain`: a static, a writable block
@@ -64,7 +64,7 @@ pub(crate) fn const_copy(u: &Unit, addr: u64) -> u64 {
 /// static initializer that runs as code fills its promoted temporaries (`&CONST` /
 /// `&[..]` borrows lowered as a per-domain block written by the initializer, lower.rs
 /// promote_rvalue) in the compile domain only; without their images every other domain's copy
-/// of the static pointed at zeroed blocks (Sandbox's race kit read each event payload's
+/// of the static pointed at zeroed blocks (a game's kit read each event payload's
 /// FieldDefs as zeros: no names). `rehome` does the same for constants.
 pub(crate) fn capture_static(u: &Unit, sym: Sym) {
     crate::sandbox::capture_initial_data(u, sym);
@@ -278,11 +278,6 @@ impl ForeignSaved {
     pub fn from_words(w: [u64; 3]) -> ForeignSaved {
         ForeignSaved { base: w[0], heap: w[1] as *const (), entered: w[2] != 0 }
     }
-    /// Whether the thread was put in the scope's domain (not for no scope, nor for one whose
-    /// domain ended).
-    pub fn entered(&self) -> bool {
-        self.entered
-    }
 }
 
 /// Puts the calling thread (any: a realtime audio thread, a driver's worker) in the domain of
@@ -422,13 +417,15 @@ impl Callback {
         let token = {
             let mut ds = domains();
             let d = ds.iter_mut().find(|d| d.info.base == self.base && d.started == self.started)?;
-            if d.info.id == 0 { drop(ds); return Some(f()); }
+            if d.info.id == 0 { drop(ds); return crate::jit::guarded(f); }
             if d.reclaiming || !cleanup && (d.cancel || !matches!(d.info.state, DomainState::Running)) { return None; }
             let token = NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             d.threads.push(DomainThread::new(token, "host callback".into(), crate::inspect::threads::self_os_id(), crate::os::thread::current()));
             token
         };
-        Some(crate::jit::domain_callback(self.base, token, f))
+        // (under a recovery point: a run's end that comes while it is in the program's code ends
+        // the call, None, instead of leaving the thread in the ended code with what it holds)
+        crate::jit::domain_callback(self.base, token, || crate::jit::guarded(f))
     }
 }
 
@@ -617,6 +614,8 @@ pub struct DomainInfo {
     pub arena_committed: usize,
     /// bytes touched in small chunks / in live slots / in large blocks (the arena's detail)
     pub arena_detail: (usize, usize, usize),
+    /// address space the heap's regions reserved (a full region makes the heap reserve another)
+    pub arena_reserved: usize,
     pub static_committed: u64,
 }
 
@@ -645,9 +644,17 @@ struct Domain {
     args: Vec<Vec<u8>>,
     /// the domain's main thread has returned (its block can go)
     thread_done: bool,
+    /// the main's thread token (its row in `threads`; 0: none started)
+    main: u64,
+    /// the main is held for good (a stale access's fault, a frame in code a layout patch replaced):
+    /// it leaves only at its run's end, so a stop does not wait for it to return
+    main_held: bool,
     compiling: bool,
     reclaiming: bool,
     cancel: bool,
+    /// the threads that still held the domain when a relaunch could not reuse it were reported
+    /// (report_retained: once)
+    reported: bool,
     /// the unit whose code it runs (0: not started on one yet)
     unit: usize,
     threads: Vec<DomainThread>,
@@ -694,6 +701,19 @@ fn domains() -> Registry {
     Registry { guard: DOMAINS.lock().unwrap_or_else(|e| e.into_inner()), _kept: kept }
 }
 
+/// The program thread `os_id` as its domain knows it -- `<package> thread-<n>`, or the name it gave
+/// itself -- for a thread the OS names by its creator (Linux: one spawned unnamed takes its
+/// creator's name, often the binary's: a deadlock read `makepad.jit-e85 (T41)`). None: no domain
+/// has it, or the registry is busy (a reader never waits for it).
+pub fn program_thread_name(os_id: u64) -> Option<String> {
+    let ds = match DOMAINS.try_lock() {
+        Ok(ds) => ds,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    ds.iter().find_map(|d| d.threads.iter().find(|t| t.os_id == os_id && os_id != 0).map(|t| format!("{} {}", d.info.package, t.name)))
+}
+
 /// The host's callback for state changes (compiling phases, running, crashed, exited).
 pub fn set_observer(f: impl Fn(DomainId, &DomainState) + Send + Sync + 'static) {
     *OBSERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(f));
@@ -713,11 +733,13 @@ fn set_state(id: DomainId, st: DomainState) {
 /// A non-HAL `makepad run` booted `package` in the unit's own domain: domain 0.
 pub(crate) fn register_boot(package: &str, base: u64) {
     domains().push(Domain {
-        info: DomainInfo { id: 0, package: package.to_string(), parent: None, state: DomainState::Running, base, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), static_committed: 0 },
+        info: DomainInfo { id: 0, package: package.to_string(), parent: None, state: DomainState::Running, base, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), arena_reserved: 0, static_committed: 0 },
         started: std::time::Instant::now(),
         args: Vec::new(),
         thread_done: false,
-        compiling: false, reclaiming: false, cancel: false, unit: 0, threads: Vec::new(), heap: None,
+        main: 0,
+        main_held: false,
+        compiling: false, reclaiming: false, cancel: false, reported: false, unit: 0, threads: Vec::new(), heap: None,
     });
     let token = relax_domain_reserve(base);
     relax_domain_enter(base, token);
@@ -730,7 +752,7 @@ pub(crate) fn first_present() {
         let mut d = domains();
         if let Some(x) = d.iter_mut().find(|x| x.info.base == base && x.info.first_frame_ms.is_none()) {
             x.info.first_frame_ms = Some(x.started.elapsed().as_secs_f64() * 1e3);
-            crate::run::domain_present();
+            crate::run::domain_present(format!("{} (id {})", x.info.package, x.info.id));
         }
     }
     CHANGED.notify_all();
@@ -742,6 +764,7 @@ fn snapshot(d: &Domain) -> DomainInfo {
     i.thread_names = d.threads.iter().map(|t| t.name.clone()).collect();
     (i.arena_in_use, i.arena_committed) = d.heap.as_ref().map_or((0, 0), |h| h.stats());
     i.arena_detail = d.heap.as_ref().map_or((0, 0, 0), |h| { let x = h.detail(); (x.0, x.1, x.2) });
+    i.arena_reserved = d.heap.as_ref().map_or(0, |h| h.ranges().map(|r| r.1).sum());
     i
 }
 fn with_block_memory(mut i: DomainInfo) -> DomainInfo {
@@ -769,6 +792,15 @@ pub fn app_heap_stats() -> Option<(usize, usize)> {
 
 pub fn state(id: DomainId) -> Option<DomainState> {
     domains().iter().find(|d| d.info.id == id).map(|d| d.info.state.clone())
+}
+
+/// How long ago domain `id` presented its first frame (`first_present`: a window's frame, or a
+/// tray app's first tray); None before it has. No snapshot: the run's window looks every turn.
+pub fn presented_ago(id: DomainId) -> Option<std::time::Duration> {
+    let d = domains();
+    let d = d.iter().find(|d| d.info.id == id)?;
+    let at = std::time::Duration::from_secs_f64(d.info.first_frame_ms? / 1e3);
+    Some(d.started.elapsed().saturating_sub(at))
 }
 
 pub fn info(id: DomainId) -> Option<DomainInfo> {
@@ -812,18 +844,31 @@ pub enum Stop {
 /// retire this run. Its thread registrations are the completion latch: the
 /// last TLS exit reclaims the mapping, never a clock or a forced termination.
 /// The host may launch a fresh id while this latch is still outstanding.
+/// The threads still there now are on their way out (a pool's worker, a thread
+/// in its TLS destructors): no report. One that holds the domain when it is
+/// wanted again is (report_retained), as is one a run's end leaves (end_run).
 pub fn retire(id: DomainId) -> Result<(), String> {
     if id == 0 { return Err("domain 0 is the process's own app".into()); }
-    let names = {
+    {
         let mut ds = domains();
         let d = ds.iter_mut().find(|d| d.info.id == id).ok_or_else(|| format!("no domain {id}"))?;
         d.cancel = true;
-        d.threads.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
-    };
+    }
     CHANGED.notify_all();
     teardown(id);
-    if !names.is_empty() { report_teardown_threads(id, &names); }
     Ok(())
+}
+
+/// A relaunch could not reuse domain `id` (still_owned): the threads that hold its mapping since
+/// its stop are reported, once.
+pub fn report_retained(id: DomainId) {
+    let names = {
+        let mut ds = domains();
+        let Some(d) = ds.iter_mut().find(|d| d.info.id == id) else { return };
+        if std::mem::replace(&mut d.reported, true) { return; }
+        d.threads.iter().map(|t| t.name.clone()).collect::<Vec<_>>()
+    };
+    if !names.is_empty() { report_teardown_threads(id, &names); }
 }
 
 /// The app's end at quit: admission closes, its pools and workers are cancelled (`retire`),
@@ -837,17 +882,35 @@ pub fn stop(id: DomainId, _how: Stop) -> Result<(), String> {
     Ok(())
 }
 
-/// Until the domain's main has returned and no teardown is under way (or the domain is gone).
+/// Until the domain's main has returned and no teardown is under way (or the domain is gone). A
+/// main held for good returns only at its run's end, which comes after this: it is not waited for.
+/// (A quit waited for a main held at a stale access, and the access waited for the run's end: the
+/// app ignored SIGTERM, 11-08.)
 fn wait_app_thread(id: DomainId) {
     let mut d = domains();
     loop {
         match d.iter().find(|x| x.info.id == id) {
             // (a teardown already under way, started by the last worker's exit, completes first)
-            Some(x) if x.reclaiming || !x.thread_done && (x.compiling || x.info.base != 0) => {}
+            Some(x) if x.reclaiming || !x.thread_done && !x.main_held && (x.compiling || x.info.base != 0) => {}
             _ => return,
         }
         d = d.wait();
     }
+}
+
+/// Thread `os_id` is held for good (stale.rs: a fault's thread parked until its run ends, or one
+/// held out of code a layout patch replaced): when it is a domain's main, that domain's stop no
+/// longer waits for it.
+pub(crate) fn held_for_good(os_id: u64) {
+    if os_id == 0 { return; }
+    let mut ds = domains();
+    for d in ds.iter_mut() {
+        if d.main != 0 && d.threads.iter().any(|t| t.token == d.main && t.os_id == os_id) {
+            d.main_held = true;
+        }
+    }
+    drop(ds);
+    CHANGED.notify_all();
 }
 
 /// What ending a run found (`end_run`).
@@ -935,6 +998,9 @@ fn kick_threads(unit: usize) -> bool {
 ///
 /// A thread that does not leave within `grace` (a native wait nobody ends) does not hold up the
 /// caller: it is named and kicked on until it goes.
+///
+/// `up` null: the run's boot ended before its unit was in (its build failed), so it has no code
+/// and no program threads; nothing is ended.
 pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let unit = up as usize;
     let (threads, bases) = {
@@ -955,7 +1021,12 @@ pub fn end_run(up: *mut Unit, grace: std::time::Duration) -> RunEnd {
     let start = std::time::Instant::now();
     // (first: from here a signal, a fork or a thread's exit calls nothing of the run's)
     let callbacks = crate::domain_res::take_back_callbacks(&bases);
-    unsafe { (*up).end_code() };
+    if !up.is_null() {
+        unsafe { (*up).end_code() };
+        // (a thread held for good at a layout patch leaves as the others do now: no frame of it
+        // can run the code it was held out of)
+        crate::inspect::instrument::release_held_for_good();
+    }
     let mut backoff = std::time::Duration::from_millis(1);
     let end = |left, ms| RunEnd {
         threads,
@@ -1042,7 +1113,7 @@ pub fn report_teardown_threads(domain: DomainId, names: &[String]) {
         .map(|d| d.threads.iter().map(|t| (t.name.clone(), t.os_id)).collect::<Vec<_>>())
         .unwrap_or_default();
     if threads.is_empty() { return; }
-    eprintln!("makepad-run domain: {domain}: retaining mapping until thread exit: {}", names.join(", "));
+    eprintln!("relax domain: {domain}: retaining mapping until thread exit: {}", names.join(", "));
     crate::inspect::say_teardown_threads(domain, &threads);
 }
 
@@ -1077,13 +1148,17 @@ fn teardown(id: DomainId) {
         destroy(base);
     }
     if let Some(heap) = heap {
-        let (base, size) = heap.range();
-        crate::run_end::heap_goes(base..base + size);
-        crate::inspect::heap::forget_range(base, size);
+        let ranges: Vec<(usize, usize)> = heap.ranges().collect();
+        for &(base, size) in &ranges {
+            crate::run_end::heap_goes(base..base + size);
+            crate::inspect::heap::forget_range(base, size);
+        }
         freed += (heap.stats().1 + heap.metadata_bytes()) as u64;
         drop(heap);
         #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-        crate::run_end::leftovers::heap_gone(base, size);
+        for (base, size) in ranges {
+            crate::run_end::leftovers::heap_gone(base, size);
+        }
     }
     drop((args, threads, crates));
     // The process heap keeps what the domain's threads freed in their malloc arenas (free but
@@ -1365,11 +1440,13 @@ pub fn prepare(spec: &AppSpec) -> Result<DomainId, Vec<String>> {
             d.remove(k);
         }
         d.push(Domain {
-            info: DomainInfo { id, package: spec.package.clone(), parent: spec.parent, state: DomainState::Compiling("package graph".into()), base: 0, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), static_committed: 0 },
+            info: DomainInfo { id, package: spec.package.clone(), parent: spec.parent, state: DomainState::Compiling("package graph".into()), base: 0, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), arena_reserved: 0, static_committed: 0 },
             started: t0,
             args: spec.argv.clone().unwrap_or_else(|| std::iter::once(spec.package.clone().into_bytes()).chain(spec.args.iter().map(|a| a.clone().into_bytes())).collect()),
             thread_done: false,
-            compiling: true, reclaiming: false, cancel: false, threads: Vec::new(), unit: 0, heap: None,
+            main: 0,
+            main_held: false,
+            compiling: true, reclaiming: false, cancel: false, reported: false, threads: Vec::new(), unit: 0, heap: None,
         });
         id
     };
@@ -1474,16 +1551,16 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let (_, missing, callbacks) = match crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, g.native.as_ref(), first_file, Some(&crates)) {
         Ok(linked) => linked,
         Err(error) => {
-            eprintln!("makepad-run domain: {error}");
+            eprintln!("relax domain: {error}");
             return fail(id, vec![error]);
         }
     };
     if let Err(error) = crate::owner::call(crate::owner::Class::Program, || crate::run::bind_native_callbacks(unsafe { &*(upn as *const Unit) }, &callbacks, Some(id))) {
-        eprintln!("makepad-run domain: {error}");
+        eprintln!("relax domain: {error}");
         return fail(id, vec![error]);
     }
     if !missing.is_empty() && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("makepad-run domain: libraries not found: {:?}", missing);
+        eprintln!("relax domain: libraries not found: {:?}", missing);
     }
     // the macro world only the load needed goes again (hot reload and later loads rebuild it)
     if crate::pmhost::free_world() {
@@ -1496,6 +1573,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         if crate::run::app_domain() == Some(id) { crate::layout::set_root_crate(root); }
         let main_def = crate::run::find_main(&u.prog, root).ok_or_else(|| format!("no `fn main` at the root of {}", spec.package))?;
         let fid = u.fn_id(crate::jit::FnKey::Inst(main_def, Vec::new()));
+        crate::wasm_export::entry(u.wasm_export_id, fid);
         let entry = u.entry(fid);
         let (target, arg) = crate::run::main_call(u, main_def, entry)?;
         Ok::<_, String>((target, arg, create(u)))
@@ -1532,14 +1610,16 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     }
     // the domain's main thread (its name, its handle) is process state
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} launching at t={:.1} ms", crate::clock::ms_since_start()); }
-    let launched = crate::zone_alloc::kept_with(|| launch_main(upn, id, base, target, arg, &spec.package, spec.around.clone()));
+    let launched = crate::zone_alloc::kept_with(|| launch_main(upn, id, base, target, arg, Some(root), &spec.package, spec.around.clone()));
     if let Err(e) = launched {
         return fail(id, vec![e]);
     }
     Ok(id)
 }
 
-fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, package: &str, around: Option<Around>) -> Result<std::thread::JoinHandle<()>, String> {
+/// `root`: the program crate whose constructors run before its main (None: an entry that is no
+/// program's main, a fixture's).
+fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, root: Option<u32>, package: &str, around: Option<Around>) -> Result<std::thread::JoinHandle<()>, String> {
     if crate::run::app_domain() == Some(id) {
         // (its block and heap are in the registry: a native thread's call finds them from now)
         RUN_SCOPE.store(foreign_scope_of(base), std::sync::atomic::Ordering::Release);
@@ -1548,6 +1628,7 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
     let name = format!("domain-{id}-{package}");
     if let Some(d) = domains().iter_mut().find(|d| d.info.id == id) {
         d.unit = upn;
+        d.main = token;
         if let Some(t) = d.threads.iter_mut().find(|t| t.token == token) { t.name = name.clone(); }
     }
     let spawned = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || {
@@ -1563,6 +1644,8 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
         }
         let up = upn as *mut Unit;
         relax_domain_enter(base, token);
+        // the domain's main thread runs the program: its signal handlers run here (os/progsig.rs)
+        let _program = crate::os::program_thread();
         let mut run = || {
             // A stop between spawning and entry must never run app code.
             {
@@ -1572,6 +1655,13 @@ fn launch_main(upn: usize, id: DomainId, base: u64, target: u64, arg: u64, packa
                 d.info.state = DomainState::Running;
             }
             notify_state(id, &DomainState::Running);
+            // the platform's start code runs the program's constructors before its main (sections.rs)
+            if let Some(root) = root {
+                if let Err(e) = unsafe { crate::sections::run_constructors(up, root, Some(base)) } {
+                    end(id, DomainState::Crashed(e));
+                    return;
+                }
+            }
             if crate::run::app_domain() == Some(id) { crate::first_frame::main_entered(); }
             match unsafe { crate::jit::call_jit_in(up, base, target, arg) } {
                 Ok(_) => end(id, DomainState::Exited(0)),
@@ -1603,8 +1693,11 @@ pub(crate) const EXIT_KIND: &str = "domain exit";
 
 /// The domain ends in `st` (exited or crashed); a domain that already ended keeps its first end.
 fn end(id: DomainId, st: DomainState) {
-    if crate::run::app_domain() == Some(id) && crate::hot_failure::replacement_running() {
-        if let DomainState::Crashed(why) = &st { crate::hot_failure::restart_failed(why); }
+    if crate::run::app_domain() == Some(id) {
+        crate::first_frame::app_ended();
+        if crate::hot_failure::replacement_running() {
+            if let DomainState::Crashed(why) = &st { crate::hot_failure::restart_failed(why); }
+        }
     }
     if matches!(state(id), Some(DomainState::Compiling(_) | DomainState::Running)) {
         set_state(id, st);
@@ -1768,8 +1861,8 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
             if crate::run_state::observed() {
                 for e in &added.errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
             }
-            let max: usize = std::env::var("MAKEPAD_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-            eprintln!("makepad-run domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
+            let max: usize = std::env::var("RELAX_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            eprintln!("relax domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
             for e in added.errs.iter().take(max) {
                 eprintln!("  {}", e);
             }
@@ -1779,7 +1872,7 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
             record_loaded(idents[ci], added.crates[b], &g.crates[ci], &cfgs[ci]);
         }
         // provided crates (rustc-built into the loader) that only this app brings, like the
-        // compute crate for Stage, bind their ops now, as the booted program's do
+        // compute crate for an app, bind their ops now, as the booted program's do
         { let _fw = crate::jit::front_write(); u.bind_added_provided(&added.crates); }
     }
     if cancelled(id) { return Err(vec!["domain compilation cancelled".into()]); }
@@ -1808,14 +1901,14 @@ pub(crate) fn run_vehicle(up: *mut Unit, packages: Vec<String>) {
         let primary = crate::run::app_domain().unwrap_or(0);
         let ff0 = wait_first_frame(primary, wait);
         let (rss, pss) = process_memory_kb();
-        eprintln!("makepad-run domain: id={primary} first_frame_ms={} rss_kb={} pss_kb={}", ff0.map_or("none".to_string(), |x| format!("{x:.0}")), rss, pss);
+        eprintln!("relax domain: id={primary} first_frame_ms={} rss_kb={} pss_kb={}", ff0.map_or("none".to_string(), |x| format!("{x:.0}")), rss, pss);
         for pkg in packages {
             let (rss0, pss0) = process_memory_kb();
             let t = std::time::Instant::now();
             let id = match start(up, AppSpec { package: pkg.clone(), ..Default::default() }) {
                 Ok(id) => id,
                 Err(e) => {
-                    eprintln!("makepad-run domain: {pkg}: start failed: {}", e.join(" | "));
+                    eprintln!("relax domain: {pkg}: start failed: {}", e.join(" | "));
                     continue;
                 }
             };
@@ -1826,13 +1919,13 @@ pub(crate) fn run_vehicle(up: *mut Unit, packages: Vec<String>) {
             let (rss2, pss2) = process_memory_kb();
             let i = info(id).unwrap();
             eprintln!(
-                "makepad-run domain: id={id} pkg={pkg} state={:?} crates={} reused={} new={} start_call_ms={started_ms:.0} resolve_ms={:.0} load_ms={:.0} spawn_ms={:.0} first_frame_ms={} block_committed_kb={} new_crates=[{}] rss_kb={rss0}/{rss1}/{rss2} pss_kb={pss0}/{pss1}/{pss2}",
+                "relax domain: id={id} pkg={pkg} state={:?} crates={} reused={} new={} start_call_ms={started_ms:.0} resolve_ms={:.0} load_ms={:.0} spawn_ms={:.0} first_frame_ms={} block_committed_kb={} new_crates=[{}] rss_kb={rss0}/{rss1}/{rss2} pss_kb={pss0}/{pss1}/{pss2}",
                 i.state, i.crates, i.reused, i.loaded, i.resolve_ms, i.load_ms, i.spawn_ms,
                 ff.map_or("none".to_string(), |x| format!("{x:.0}")), block_committed(i.base) / 1024, i.new_crates.join(",")
             );
         }
         for d in list() {
-            eprintln!("makepad-run domain: list id={} pkg={} state={:?} first_frame_ms={:?}", d.id, d.package, d.state, d.first_frame_ms.map(|x| x.round()));
+            eprintln!("relax domain: list id={} pkg={} state={:?} first_frame_ms={:?}", d.id, d.package, d.state, d.first_frame_ms.map(|x| x.round()));
         }
     });
 }
@@ -2002,6 +2095,41 @@ mod tests {
         assert!(u.errors.is_empty(), "{:?}", u.errors);
         destroy(b);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A quit's stop waits for the app's main to return. A main held for good (its stale access
+    /// parked until the run's end, which comes after that wait) never does: the stop waits no more
+    /// once it is held. (The quit waited for it and the app ignored SIGTERM, 11-08.)
+    #[test]
+    fn a_stop_does_not_wait_for_a_main_held_for_good() {
+        isolated_test!(a_stop_does_not_wait_for_a_main_held_for_good);
+        let (id, main_os_id): (DomainId, u64) = (77, 4242);
+        domains().push(Domain {
+            info: DomainInfo { id, package: "held".into(), parent: None, state: DomainState::Running, base: 0x7000_0000, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None, threads: 0, thread_names: Vec::new(), arena_in_use: 0, arena_committed: 0, arena_detail: (0, 0, 0), arena_reserved: 0, static_committed: 0 },
+            started: std::time::Instant::now(),
+            args: Vec::new(),
+            thread_done: false,
+            main: 9,
+            main_held: false,
+            compiling: false, reclaiming: false, cancel: false, reported: false, unit: 0,
+            threads: vec![DomainThread::new(9, "domain-77-held".into(), main_os_id, 0), DomainThread::new(10, "worker".into(), 4343, 0)],
+            heap: None,
+        });
+        let stop = std::thread::spawn(move || wait_app_thread(id));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!stop.is_finished(), "the stop waits for a main that runs");
+        // a worker held for good holds nothing up: the stop still waits for the main
+        held_for_good(4343);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!stop.is_finished(), "a held worker is not the main");
+        held_for_good(main_os_id);
+        let t0 = std::time::Instant::now();
+        while !stop.is_finished() && t0.elapsed().as_secs() < 10 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(stop.is_finished(), "the stop waits no more for a main held for good");
+        stop.join().unwrap();
+        domains().retain(|d| d.info.id != id);
     }
 }
 

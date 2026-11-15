@@ -19,6 +19,20 @@ use makepad_hal::{XR_EYE_FAR_M as EYE_FAR, XR_EYE_NEAR_M as EYE_NEAR};
 
 /// The app uses the room field (`Cx::xr_set_room_field`): the depth readback is integrated.
 pub(crate) static ROOM_FIELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The app keeps the newest environment depth image's texels (`Cx::xr_set_depth_tap`), and
+/// that image.
+pub(crate) static DEPTH_TAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static NEWEST_DEPTH: std::sync::Mutex<Option<XrDepthTexels>> = std::sync::Mutex::new(None);
+
+/// An environment depth image read back (`Cx::xr_newest_depth_texels`): the display time of
+/// the frame that acquired it (HAL clock, ns), its header (size, layers, range, each eye's depth
+/// camera) and its texels, the layers one after another (eye 0's first).
+#[derive(Clone, Debug)]
+pub struct XrDepthTexels {
+    pub display_ns: u64,
+    pub header: XrDepth,
+    pub texels: std::sync::Arc<[u16]>,
+}
 
 pub(crate) struct HalXr {
     /// the Cx window standing for the HAL's XR window
@@ -55,6 +69,8 @@ pub(crate) struct HalXr {
     pub(crate) supersample: f32,
     /// `Cx::xr_set_msaa`: the XR passes' samples per pixel (1: none)
     pub(crate) msaa: u32,
+    /// The tracking space's generation (the newest `XrSpace`): `XrState::space` of the frames
+    pub(crate) space: u32,
 }
 
 /// A local-space point seen by eye 0's environment depth camera: its depth along that camera's
@@ -129,7 +145,7 @@ impl Cx {
         self.hal.windows.insert(window.0, super::HalWindow::default());
         // the HAL sizes it (its first Geom confirms it)
         self.hal.frames.w.window_create(hal_window_id(window), window_kind::XR, Id::NONE, [0.0; 4], false);
-        self.hal.xr = Some(HalXr { window, frame: None, display_ns: 0, clock_offset_ns: 0, last: Rc::new(XrState::default()), eye_uniforms: Default::default(), depth_writer: None, env_depth: None, hand_check_at: None, env_images: Vec::new(), env_depth_ns: 0, scene_to_room: Mat4f::identity(), supersample: SUPERSAMPLE.with(|s| s.get()), msaa: MSAA.with(|m| m.get()) });
+        self.hal.xr = Some(HalXr { window, frame: None, display_ns: 0, clock_offset_ns: 0, last: Rc::new(XrState::default()), eye_uniforms: Default::default(), depth_writer: None, env_depth: None, hand_check_at: None, env_images: Vec::new(), env_depth_ns: 0, scene_to_room: Mat4f::identity(), supersample: SUPERSAMPLE.with(|s| s.get()), msaa: MSAA.with(|m| m.get()), space: 0 });
         if SEE_THROUGH.with(|s| s.get()) { self.hal_xr_see_through(true); }
         let refresh = REFRESH_MHZ.with(|r| r.get());
         if refresh != 0 { self.hal_xr_refresh_rate(refresh); }
@@ -270,6 +286,7 @@ impl Cx {
         let state = Rc::new(XrState {
             time,
             head_pose: pose(&frame.head),
+            space: xr.space,
             order_counter: last.order_counter.wrapping_add(1),
             left_controller: controller(&frame.controllers[0]),
             right_controller: controller(&frame.controllers[1]),
@@ -281,10 +298,19 @@ impl Cx {
         // the XR pass draws with the new eyes
         // (what is redrawn from here is for the headset's frame: it paints no window)
         let in_xr = std::mem::replace(&mut self.in_xr_update, true);
+        self.xr_frame_due = true;
         let passes: Vec<_> = self.passes.id_iter().filter(|p| matches!(self.passes[*p].parent, CxDrawPassParent::Xr)).collect();
         for pass in passes { self.redraw_pass_and_child_passes(pass); }
         self.call_event_handler(&Event::XrUpdate(XrUpdateEvent { state, last }));
         self.in_xr_update = in_xr;
+    }
+
+    /// An `XrSpace`: the tracking space was set up again; the frames from here on carry its
+    /// generation (`XrState::space`).
+    pub(crate) fn hal_xr_space(&mut self, generation: u32) {
+        if let Some(xr) = self.hal.xr.as_mut() {
+            xr.space = generation;
+        }
     }
 
     /// An `XrDepth`: the headset's environment depth. A header alone announces a newly
@@ -315,9 +341,13 @@ impl Cx {
             xr.env_depth_ns = display_ns;
             return;
         };
+        let all: Vec<u16> = raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        if DEPTH_TAP.load(std::sync::atomic::Ordering::Acquire) {
+            let kept = XrDepthTexels { display_ns, header, texels: all.as_slice().into() };
+            *NEWEST_DEPTH.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
+        }
         // (a readback still in flight when the app stopped wanting the field: dropped)
         if !ROOM_FIELD.load(std::sync::atomic::Ordering::Acquire) { return; }
-        let all: Vec<u16> = raw.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
         let Some(xr) = self.hal.xr.as_mut() else { return };
         if xr.depth_writer.is_none() {
             match makepad_tsdf::DepthWriter::new() {

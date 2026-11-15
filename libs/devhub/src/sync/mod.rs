@@ -86,6 +86,12 @@ pub fn ensure_rev(control: &makepad_remote::Client, node: &str, repo: &str, dir:
     cli::ensure_rev(control, node, repo, dir, branch, sha)
 }
 
+/// Leases: sends `node`'s store of `repo` the objects `ids` it lacks ([`crate::lease::NO_OBJECTS`]).
+#[cfg(feature = "checkout")]
+pub fn fill_objects(control: &makepad_remote::Client, node: &str, repo: &str, dir: &std::path::Path, ids: &[String]) -> Result<(), String> {
+    cli::fill_objects(control, node, repo, dir, ids)
+}
+
 /// Whether the master's auto-sync follows `node` (its `nodes` list, all when it has none).
 #[cfg(feature = "checkout")]
 pub fn autosync_covers(home: &std::path::Path, node: &str) -> bool {
@@ -94,21 +100,33 @@ pub fn autosync_covers(home: &std::path::Path, node: &str) -> bool {
     c.enabled && c.nodes.as_ref().is_none_or(|n| n.iter().any(|x| x == node))
 }
 
-/// Moves `node`'s tree to the tips of work and commercial main, with no build and no restart (a
-/// node the auto-sync does not follow: the self-update brings its code itself), or to `at`
-/// (`makepad,commercial`: a timed ask's pin). Returns the exit code and the node's lines.
+/// The repositories the deployments follow from the checkout at `repo`, each with its branch,
+/// makepad first: makepad's `work`, then the nested ones the buckets prove
+/// ([`crate::nested::branches`]: the paired one's `main`, each other at the branch its checkout is
+/// on).
+#[cfg(feature = "checkout")]
+pub fn followed(repo: &std::path::Path) -> Vec<(String, String)> {
+    std::iter::once(("makepad".to_string(), "work".to_string())).chain(crate::nested::branches(repo)).collect()
+}
+
+/// Moves `node`'s tree to the tips of the followed repositories ([`followed`]), with no build and
+/// no restart (a node the auto-sync does not follow: the self-update brings its code itself), or
+/// to `at` (a timed ask's pin, [`crate::lease::Pin::key`]). Returns the exit code and the node's
+/// lines.
 #[cfg(feature = "checkout")]
 pub fn push_tree(control: &makepad_remote::Client, repo: &std::path::Path, node: &str, at: Option<&str>) -> (i32, Vec<String>) {
     let mut lines = Vec::new();
-    let code = cli::push_and_apply(control, repo, "work", Some("main"), at, &[node.to_string()], "off", "none", false, "", &mut |n, l| lines.push(format!("{n} {l}")));
+    let code = cli::push_and_apply(control, repo, &followed(repo), at, &[node.to_string()], "off", "none", false, "", None, &mut |n, l| lines.push(format!("{n} {l}")));
     (code, lines)
 }
 
-/// Whether deployment `deploy` holds `at` (both `makepad,commercial`; the commercial checkout
-/// sits in `repo`'s apps/commercial): a move there would be none, or one back.
+/// Whether deployment `deploy` holds `at` (both pins' keys, [`crate::lease::Pin::key`]; each
+/// nested repository's checkout sits in `repo`'s apps/<name>): a move there would be none, or one
+/// back.
 pub fn deploy_has(repo: &std::path::Path, deploy: &str, at: &str) -> bool {
-    let (Some((dm, dc)), Some((am, ac))) = (deploy.split_once(','), at.split_once(',')) else { return false };
-    crate::gitread::is_ancestor(repo, am, dm) && crate::gitread::is_ancestor(&repo.join("apps/commercial"), ac, dc)
+    let (Some(d), Some(a)) = (crate::lease::Pin::parse(deploy), crate::lease::Pin::parse(at)) else { return false };
+    crate::gitread::is_ancestor(repo, &a.makepad, &d.makepad)
+        && a.nested.iter().all(|(name, sha)| d.nested.get(name).is_some_and(|has| crate::gitread::is_ancestor(&repo.join(crate::nested::dir(name)), sha, has)))
 }
 
 /// The node's bare store of `repo` (`~/devhub/git/<repo>.git`): where lease worktrees come from.
@@ -139,6 +157,18 @@ pub fn register_control(ep: &Endpoint, _hub: &makepad_remote::hub::Hub) {
     );
     #[cfg(not(feature = "checkout"))]
     let _ = ep;
+}
+
+/// Why the auto-sync holds `node`'s deployment where it is: a user's WM node, for a tip the fast
+/// bucket has not proven (None: it follows the tips, or moves).
+pub fn deploy_held(node: &str) -> Option<String> {
+    #[cfg(feature = "checkout")]
+    return autosync::held(node);
+    #[cfg(not(feature = "checkout"))]
+    {
+        let _ = node;
+        None
+    }
 }
 
 /// A landing happened (`landed_ms`): the master's auto-sync starts a round now.

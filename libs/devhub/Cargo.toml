@@ -6,6 +6,11 @@ license = "MIT OR Apache-2.0"
 publish = false
 description = "devhub: observes every JIT on the LAN (events, explorer, full remote inspect for the master), one app with master and node roles"
 
+# `devhub test` runs these tests in the lane's tree, never a JIT overlay (which holds the pinned
+# commit alone, at a root only the JIT's process sees)
+[package.metadata.makepad]
+test-tree = "its tests walk this checkout's git history and run cargo tree on it"
+
 # `makepad devhub <words>` is this binary (the JIT binary forwards to it through cargo): a devhub change
 # never rebuilds the JIT, and a JIT change never rebuilds devhub
 [[bin]]
@@ -15,10 +20,10 @@ required-features = ["checkout"]
 
 [dependencies]
 relax-base = { workspace = true, optional = true }
-makepad-ci-merge = { path = "../../tools/ci_merge" }
+# CI proofs' digests and doc files (the checkout applier's)
+makepad-ci-merge = { path = "../../tools/ci_merge", optional = true }
 # git reads and writes in process (refs, worktrees, config, history): rounds never spawn git
 makepad-git = { path = "../git" }
-makepad-ci-judge = { path = "../ci_judge", optional = true }
 makepad-network = { path = "../../platform/network" }
 makepad-devhub-conf = { path = "../devhub_conf" }
 makepad-remote = { workspace = true }
@@ -26,16 +31,20 @@ makepad-strict-json = { workspace = true }
 makepad-toml-parser = { path = "../toml_parser" }
 makepad-core-util = { path = "../core_util" }
 makepad-civil-time = { path = "../civil_time" }
+makepad-change-report = { path = "../change_report" }
 # sync: launches and prebuilds use the WM's own launch commands and environment
 makepad-app-registry = { path = "../app_registry", optional = true }
 # the worktree monitor (dirty sets without scans): FSEvents / inotify / ReadDirectoryChangesW
 makepad-filesystem-watcher = { path = "../filesystem_watcher", optional = true }
 
+[dev-dependencies]
+makepad-zip-file = { path = "../zip_file" }
+
 [features]
 # the checkout applier (desktop nodes: git, prebuild, launches, the master CLI); a JIT host with no
 # checkout (tools/run/android_host) builds without it and installs its source store instead
 default = ["checkout"]
-checkout = ["dep:relax-base", "dep:makepad-app-registry", "dep:makepad-filesystem-watcher", "dep:makepad-ci-judge"]
+checkout = ["dep:relax-base", "dep:makepad-app-registry", "dep:makepad-filesystem-watcher", "dep:makepad-ci-merge"]
 
 # the hosted wire's fingerprint: a box's WM must speak it for gui work (caps::display; Android
 # shares the Linux probes)

@@ -7,6 +7,213 @@ script_mod! {
     use mod.widgets.*
     use mod.geom
 
+    // Installed ONLY by the opaque reflections variant in renderer/variants.rs.
+    // Stock and blended shaders never declare these outputs. BGRA8 storage
+    // exposes logical RGBA channels, as every other eight-bit scene target does.
+    mod.draw.pbr_reflections = {
+        fb1: fragment_output(1, vec4f)
+        fb2: fragment_output(2, vec4f)
+        ssr_surface: fn(n: vec3, rough: float, env: vec3, reflectance: vec3) {
+            var oct = n / max(abs(n.x) + abs(n.y) + abs(n.z), 0.000001)
+            if oct.z < 0.0 {
+                let signs = vec2(mix(-1.0, 1.0, step(0.0, oct.x)), mix(-1.0, 1.0, step(0.0, oct.y)))
+                oct = vec3((vec2(1.0, 1.0) - abs(oct.yx)) * signs, oct.z)
+            }
+            self.fb1 = vec4(oct.xy * 0.5 + vec2(0.5, 0.5), 1.0 - rough, 1.0)
+            // Coloured metals use an achromatic SSR reflectance: the largest
+            // component of their own environment Fresnel, not a guessed F0.
+            self.fb2 = vec4(env, clamp(max(reflectance.x, max(reflectance.y, reflectance.z)), 0.0, 1.0))
+        }
+        ssr_coat: fn(env: vec3, reflectance: vec3, base_share: float) {
+            self.fb2 = vec4(self.fb2.xyz * base_share + env,
+                clamp(self.fb2.w * base_share + max(reflectance.x, max(reflectance.y, reflectance.z)), 0.0, 1.0))
+        }
+        ssr_finish: fn(lit: vec3, least: vec3, fin: vec4) {
+            // Carry the captured term through the same floor, finish and
+            // analytic fog as scene colour. No second environment lookup.
+            let without = self.mat_finish(vec4(self.to_display(max(lit - self.fb2.xyz, least)), 1.0))
+            let with_fog = self.scene_fogged(fin.xyz, self.v_fog, self.v_csm.xyz, self.fog_density)
+            let without_fog = self.scene_fogged(without.xyz, self.v_fog, self.v_csm.xyz, self.fog_density)
+            self.fb2 = vec4(max(with_fog * fin.w - without_fog * without.w, vec3(0.0, 0.0, 0.0)), self.fb2.w)
+        }
+        // Opt-in copies of the stock finish and coat below, with captures at
+        // their existing environment additions. Kept out of the base shader
+        // so off means exactly its previous program and pipeline.
+        clear_coat: fn(base: vec3, n: vec3, v: vec3, l: vec3, albedo: vec3, sun: vec3, amb_occ: float, spec_occ: float) -> vec3 {
+            let ndv = max(dot(n, v), 0.0001)
+            let r = n * (2.0 * ndv) - v
+            let packed_all = floor(self.tex_mag.y + 0.5)
+            let rim = floor(packed_all / 65536.0)
+            let packed = packed_all - rim * 65536.0
+            let coat = floor(packed / 256.0) / 255.0
+            let flake = (packed - floor(packed / 256.0) * 256.0) / 255.0
+            let fc = (0.04 + 0.96 * self.pow5(1.0 - ndv)) * coat
+            var env = self.sky_env(normalize(r), 0.03)
+            // The treeline is car paint's; a toy (rim set) reflects a plain
+            // studio sky, and skips the two noise taps.
+            if rim < 0.5 { env = self.coat_treeline(env, r) }
+            env = env * spec_occ
+            let h = normalize(l + v)
+            let ndh = max(dot(n, h), 0.0)
+            let a2 = 0.0016
+            let den = ndh * ndh * (a2 - 1.0) + 1.0
+            let glint = a2 / max(3.14159265 * den * den, 0.0001) * 0.25
+            let coat_env = env * (fc * amb_occ)
+            self.ssr_coat(coat_env, vec3(fc, fc, fc), 1.0 - fc)
+            var out = base * (1.0 - fc) + coat_env + sun * (glint * fc)
+            if flake > 0.0 {
+                let cell = floor(self.v_csm.xyz * 900.0)
+                let fh = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453)
+                let fh2 = fract(fh * 17.13 + 0.37)
+                let tilt = normalize(n + (vec3(fh, fh2, fract(fh * 7.7)) - vec3(0.5, 0.5, 0.5)) * 0.5)
+                let sparkle = pow(max(dot(tilt, h), 0.0), 220.0) * step(0.55, fh2)
+                let flake_env = env * albedo * (flake * 0.12 * amb_occ)
+                self.ssr_coat(flake_env, albedo * (flake * 0.12), 1.0)
+                out = out + sun * albedo * (sparkle * flake * 6.0) + flake_env
+            }
+            if rim > 0.0 { out = out + self.toy_rim(n, v, l, amb_occ) * (rim / 255.0) }
+            return out
+        }
+
+        shade_mr_surface: fn(albedo: vec3, surf_w: float, mr: vec2, n: vec3, least: vec3, f0: vec3, sun_visibility: float) -> vec4 {
+            let rough = mr.y
+            let metal = mr.x
+            // Occlusion, sun visibility and lamps: verbatim from
+            // DrawSceneSkinned, so a PBR prop sits in the same light as the
+            // wall behind it.
+            var baked = 0.0
+            if self.ao_enabled > 0.5 { baked = self.ao_map.sample(self.v_ao_uv).x }
+            let hash = fract(
+                sin(dot(self.world.xy + self.world.zz, vec2(12.9898, 78.233))) * 43758.5453
+            )
+            let ao = clamp(
+                mix(mix(self.v_tint.w,1.0,self.surface_on), baked, self.ao_enabled) + (hash - 0.5) * 0.03,
+                0.0, 1.0
+            )
+            // AO takes some of the DIRECT term too (a crease reads in sunlight);
+            // the HDR lane keeps less of that stylisation — its real shadows
+            // and fill already carry the contrast.
+            let ao_direct = mix(1.0, ao, mix(0.75, 0.35, self.lin_ctl.x))
+            // Screen-space AO on the ambient terms only, exactly as
+            // DrawSceneSkinned: the diffuse fill below and the ambient
+            // specular — never the sun's diffuse or its lobe.
+            var sao = 1.0
+            if self.ssao_ctl.x > 0.001 {
+                let sp = self.v_spos.xy / max(self.v_spos.w, 0.000001)
+                let suv = vec2(sp.x * 0.5 + 0.5, 0.5 - sp.y * 0.5)
+                sao = 1.0 - (1.0 - self.ssao_map.sample_nearest(suv).x) * self.ssao_ctl.x
+            }
+            // Realtime cascades with clustered lamps read none of the baked
+            // atlas (DrawSceneSkinned explains): its three reads are skipped.
+            var lm = vec4(0.0, 0.0, 0.0, 0.0)
+            var sun_vis_g = 1.0
+            if self.csm_p.x < 0.5 || self.cluster_on < 0.5 {
+                lm = self.light_map.sample(self.v_lm_uv)
+                let lmg = self.light_map.sample(self.v_lmg.xy)
+                let top_g = self.lm_top_decode.x
+                    + self.top_map.sample(self.v_lmg.xy).x * self.lm_top_decode.y
+                let occ_g = 1.0 - smoothstep(top_g - 0.15, top_g + 0.15, self.v_lmg.w)
+                sun_vis_g = mix(1.0, smoothstep(0.2, 0.8, lmg.w), self.v_lmg.z * occ_g)
+            }
+            let has_lm = step(0.000001, self.lm_rect.z)
+            let sun_vis = mix(1.0, smoothstep(0.2, 0.8, lm.w), has_lm)
+            // Swaying foliage (the wind flag, morph_ctl.w = -1) reads the
+            // cascades with one tap: leaf cards overdraw several deep.
+            var csm = 1.0
+            if self.morph_ctl.w < -0.5 {
+                csm = self.csm_vis_fast(self.v_csm.xyz, self.v_csm_n, self.v_csm.w)
+            } else {
+                csm = self.csm_vis(self.v_csm.xyz, self.v_csm_n, self.v_csm.w)
+            }
+            let sun_all = mix(sun_vis * sun_vis_g, csm, self.csm_p.x) * sun_visibility
+            // 0.9 = lightmap::LM_LAMP_CEIL — the atlas RGB decode.
+            let lamps = lm.xyz * (0.9 * has_lm) * (1.0 - self.cluster_on)
+            // Legacy local diffuse; clustered PBR evaluates the same light
+            // list once below, including each lamp's GGX specular response.
+            var local = lamps + self.v_dl
+            if self.cluster_on > 0.5 { local = vec3(0.0,0.0,0.0) }
+            let sun_lit = self.sun_filled(sun_all, local)
+
+            let l = normalize(self.light_dir)
+            let te = self.toward_eye(self.v_csm.xyz)
+            let v = normalize(te)
+            let h = normalize(l + v)
+            let ndv = max(dot(n, v), 0.0001)
+            let ndl = max(dot(n, l), 0.0001)
+            let ndh = max(dot(n, h), 0.0001)
+            let vdh = max(dot(v, h), 0.0)
+
+            // Cook-Torrance: GGX distribution, Schlick-GGX geometry with the
+            // direct-lighting k, Schlick Fresnel off an F0 that a metal takes
+            // from its own albedo (that colour shift IS what reads as metal).
+            let f = f0 + (vec3(1.0, 1.0, 1.0) - f0) * self.pow5(1.0 - vdh)
+            let a2 = rough * rough * rough * rough
+            let den = ndh * ndh * (a2 - 1.0) + 1.0
+            let dist = a2 / max(3.14159265 * den * den, 0.0001)
+            let k = (rough + 1.0) * (rough + 1.0) * 0.125
+            let geo = (ndv / max(ndv * (1.0 - k) + k, 0.0001))
+                * (ndl / max(ndl * (1.0 - k) + k, 0.0001))
+            // v_direct is already sun_color * N.L, so the BRDF here carries
+            // no cosine of its own — the two compose to the standard
+            // radiance * BRDF * N.L. Shadowed exactly like the diffuse sun:
+            // a highlight surviving inside a shadow is the classic tell.
+            let surface_direct=mix(self.v_direct,self.sun_color*ndl,self.surface_on)
+            // GI occludes the material's fill (an environment map's) and adds its bounce.
+            let hemisphere_ambient=self.mat_ambient(n,mix(self.v_ambient,mix(self.sun_ground,self.sun_sky,clamp(n.y*0.5+0.5,0.0,1.0)),self.surface_on))
+            let surface_ambient=self.gi_ambient(self.v_csm.xyz,n,hemisphere_ambient)
+            let spec_occ=self.gi_specular_occlusion(surface_ambient,hemisphere_ambient)
+            // Light arrives as irradiance/pi units (the diffuse lobe carries
+            // no 1/pi), so the HDR lane lifts the lobe by pi to match.
+            let sun_spec = surface_direct * (dist * geo / max(4.0 * ndv * ndl, 0.0001)) * mix(1.0, 3.14159265, self.lin_ctl.x)
+                * (sun_lit * ao_direct)
+
+            // Ambient specular from the analytic sky environment (sky_env)
+            // along the reflected view ray, gated by the roughness-aware
+            // Fresnel (Karis' EnvBRDF fallback). A polished surface picks up
+            // the bright horizon, the sky above and the ground below, and
+            // the reflection slides as the camera orbits; a rough one
+            // collapses back to the flat ambient.
+            let refl = n * (2.0 * ndv) - v
+            let env = self.sky_env(normalize(refl), rough)
+            let smooth3 = 1.0 - rough
+            let fr = max(vec3(smooth3, smooth3, smooth3), f0)
+            let f_env = f0 + (fr - f0) * self.pow5(1.0 - ndv)
+            let amb_spec = env * f_env * (ao * sao * spec_occ)
+
+            // A metal has no diffuse lobe at all; a dielectric keeps all of
+            // it. (The (1 - F) half of the split is deliberately dropped:
+            // at grazing angles it only ever darkens, and without an
+            // environment probe there is nothing to hand the energy to.)
+            let analytic = surface_ambient * (ao * sao)
+                + surface_direct * (ao_direct * sun_lit)
+                + local * ao_direct
+            let local_pbr = self.cluster_lights_f0(self.v_csm.xyz, n, self.v_csm.xyz + te, albedo, rough, metal, 1.0, f0)
+            // Per-draw factors of zero fold these maps out: skip the reads.
+            var occlusion=1.0
+            if self.occlusion_strength*self.surface_on>0.0 {occlusion=mix(1.0,self.occlusion_map.sample_repeat(self.v_uv).x,self.occlusion_strength*self.surface_on)}
+            var emission=vec3(0.0,0.0,0.0)
+            if max(self.emissive.x,max(self.emissive.y,self.emissive.z))>0.0 {emission=self.to_scene(self.emissive_map.sample_repeat(self.v_uv).xyz)*self.emissive}
+            emission = self.mat_emission(emission)
+            // The sun as the light hook sees it: its radiance (colour and
+            // shadow, before N.L) and its specular lobe per unit N.L.
+            let sun_rad = self.sun_color * (ao_direct * sun_lit)
+            let lobe = (dist * geo / max(4.0 * ndv * ndl, 0.0001)) * mix(1.0, 3.14159265, self.lin_ctl.x)
+            let spec_sun = sun_spec * f
+            let added_env = amb_spec * occlusion
+            let spec_local = local_pbr * ao_direct
+            self.ssr_surface(n, rough, self.fur_shade(added_env, n, te), f_env)
+            var lit = self.fur_shade(self.mat_compose(albedo, metal, surface_ambient*(ao*sao*occlusion), surface_direct*(ao_direct*sun_lit), local*ao_direct, spec_sun, added_env, spec_local, n, l, v, sun_rad, f, lobe), n, te) + emission
+            if self.tex_mag.y > 0.5 {
+                lit = self.clear_coat(lit, n, v, l, albedo, surface_direct * (sun_lit * ao_direct), ao * sao, spec_occ)
+            }
+            lit = max(lit, least)
+            let fin = self.finish_lit(lit, spec_sun + added_env + spec_local, surf_w, f_env)
+            self.ssr_finish(lit, least, fin)
+            let coverage=fin.w
+            return self.csm_debug_view(self.gi_display(vec4(self.scene_fogged(fin.xyz, self.v_fog, self.v_csm.xyz, self.fog_density)*coverage,coverage),self.v_csm.xyz,n),self.v_csm.xyz,n)
+        }
+    }
+
     // Static props whose glTF material actually carries SHININESS: a
     // metallic-roughness texture, or a roughness the author narrowed below 1
     // (model.rs PbrMaterial::is_shiny). Everything else keeps DrawSceneSkinned.
@@ -45,7 +252,8 @@ script_mod! {
         // term in this file that needs the eye: everything else here is
         // view-independent. TRUE world, not stage world, so it matches
         // v_csm.xyz and v_csm_n — the same convention the cascades and the
-        // dynamic lights already use.
+        // dynamic lights already use. Read it through `toward_eye`, which
+        // also holds for an orthographic view.
         eye: uniform(vec4(0.0, 0.0, 0.0, 0.0))
 
         // ---- this layer's material, off the vertex stream ----
@@ -85,6 +293,16 @@ script_mod! {
         mat_ambient: fn(n: vec3, a: vec3) -> vec3 { return a }
         mat_lighting: fn(direct: vec3, ambient: vec3) -> vec3 { return direct + ambient }
         mat_finish: fn(c: vec4) -> vec4 { return c }
+        finish_lit: fn(lit: vec3, spec: vec3, surf_w: float, f_env: vec3) -> vec4 {
+            if self.alpha_mode > 1.5 {
+                // Coverage attenuates diffuse/emission, not reflection; Fresnel
+                // also attenuates the background transmitted through the surface.
+                let alpha_out = surf_w + (1.0 - surf_w) * max(f_env.x, max(f_env.y, f_env.z))
+                let rgb = (max(lit - spec, vec3(0.0, 0.0, 0.0)) * surf_w + spec) / max(alpha_out, 0.0001)
+                return self.mat_finish(vec4(self.to_display(rgb), alpha_out))
+            }
+            return self.mat_finish(vec4(self.to_display(lit), 1.0))
+        }
         // The lit colour from its parts (see mat_compose_hooked in
         // render-material for what a light or lighting hook swaps in): the
         // ambient, sun and lamp diffuse (a, s, l) under the diffuse albedo,
@@ -156,7 +374,7 @@ script_mod! {
         // the reflection reads as a place and slides over the
         // body as the car turns. Flakes are hashed facets ~1 mm across that
         // catch the sun a little off the mirror direction.
-        clear_coat: fn(base: vec3, n: vec3, v: vec3, l: vec3, albedo: vec3, sun: vec3, amb_occ: float) -> vec3 {
+        clear_coat: fn(base: vec3, n: vec3, v: vec3, l: vec3, albedo: vec3, sun: vec3, amb_occ: float, spec_occ: float) -> vec3 {
             let ndv = max(dot(n, v), 0.0001)
             let r = n * (2.0 * ndv) - v
             let packed_all = floor(self.tex_mag.y + 0.5)
@@ -169,6 +387,7 @@ script_mod! {
             // The treeline is car paint's; a toy (rim set) reflects a plain
             // studio sky, and skips the two noise taps.
             if rim < 0.5 { env = self.coat_treeline(env, r) }
+            env = env * spec_occ
             let h = normalize(l + v)
             let ndh = max(dot(n, h), 0.0)
             let a2 = 0.0016
@@ -194,6 +413,19 @@ script_mod! {
             let e = 1.0 - max(dot(n, v), 0.0)
             let back = 0.35 + 0.65 * max(0.0 - dot(l, v), 0.0)
             return (self.sun_color * (back * mix(1.0, 3.14159265, self.lin_ctl.x) * 0.45) + self.sun_sky * 0.8) * (e * e * e * amb_occ)
+        }
+
+        // From the surface point `p` (true world) toward the eye: to the
+        // eye itself in perspective; in an orthographic view, along the
+        // view's back axis (its rays all run parallel to it, wherever on it
+        // the eye stands), as far as `p` lies below the eye. The pass view
+        // differs from true world only by a translation, so its axis is the
+        // same in both.
+        toward_eye: fn(p: vec3) -> vec3 {
+            let d = self.eye.xyz - p
+            if (self.draw_pass.camera_projection * vec4(0.0, 0.0, -1.0, 0.0)).w > 0.5 { return d }
+            let back = normalize((self.draw_pass.camera_inv * vec4(0.0, 0.0, 1.0, 0.0)).xyz)
+            return back * dot(d, back)
         }
 
         pixel: fn() {
@@ -239,7 +471,7 @@ script_mod! {
                 // as a checker grid from the air. With distance, blend in a
                 // second top-down read at an unrelated scale and offset, and
                 // drift the brightness over ~60 m, so no period survives.
-                let dist = length(self.eye.xyz - self.v_csm.xyz)
+                let dist = length(self.toward_eye(self.v_csm.xyz))
                 let far = smoothstep(25.0, 140.0, dist)
                 if far > 0.001 {
                     let t2 = self.tex.sample_repeat(vec2(wp.x * 0.173 + 0.31, wp.z * 0.173 - 0.47))
@@ -277,13 +509,17 @@ script_mod! {
                 tex = vec4(tex.xyz * (0.86 + 0.28 * drift), tex.w)
             }
             let base = self.to_scene(vec3(tex.x, tex.y, tex.z))
+            var material_tint = self.to_scene(self.v_tint.xyz)
+            // The text decoder already used the material factor as ink;
+            // multiplying it again would tint the badge fill and border.
+            if self.tex_mag.x > 2.5 { material_tint = vec3(1.0, 1.0, 1.0) }
             // `surface` is the game.material hook (DrawSceneCustom overrides
             // it; stock PBR keeps the identity). A custom surface that cuts
             // alpha under 0.5 discards; on the stock lane that case was
             // already discarded above (tex.w < 0.5), so output is unchanged.
             let surf = self.surface(vec4(self.color_adjust(
                 // the vertex tint is encoded like a texel: both scene-referred lanes decode it
-                base * self.to_scene(self.v_tint.xyz),
+                base * material_tint,
                 self.tint,
                 self.color_adjust_ctl
             ), alpha))
@@ -333,7 +569,7 @@ script_mod! {
                 clamp(self.roughness * mix(1.0, orm.y, self.orm_on), 0.045, 1.0)
             ))
             var n=normalize(self.v_csm_n)
-            if self.double_sided>0.5 && dot(n,self.eye.xyz-self.v_csm.xyz)<0.0 {n=n*(-1.0)}
+            if self.double_sided>0.5 && dot(n,self.toward_eye(self.v_csm.xyz))<0.0 {n=n*(-1.0)}
             if self.surface_on>0.5 && abs(self.normal_scale)>0.00001 {
                 let dp1=dFdx(self.v_csm.xyz)
                 let dp2=dFdy(self.v_csm.xyz)
@@ -359,7 +595,9 @@ script_mod! {
         // of metal/roughness `mr` and shading normal `n` (true world): the
         // splat lane (shaders/splat.rs) comes here with its own. `least`: the
         // least light the surface shows at (a floored paint's, `paint_floor`).
-        shade_mr: fn(albedo: vec3, surf_w: float, mr: vec2, n: vec3, least: vec3) -> vec4 {
+        // Explicit F0 and direct-sun visibility also serve layered surfaces.
+        // The stock entry below supplies the original dielectric/metal F0.
+        shade_mr_surface: fn(albedo: vec3, surf_w: float, mr: vec2, n: vec3, least: vec3, f0: vec3, sun_visibility: float) -> vec4 {
             let rough = mr.y
             let metal = mr.x
             // Occlusion, sun visibility and lamps: verbatim from
@@ -409,7 +647,7 @@ script_mod! {
             } else {
                 csm = self.csm_vis(self.v_csm.xyz, self.v_csm_n, self.v_csm.w)
             }
-            let sun_all = mix(sun_vis * sun_vis_g, csm, self.csm_p.x)
+            let sun_all = mix(sun_vis * sun_vis_g, csm, self.csm_p.x) * sun_visibility
             // 0.9 = lightmap::LM_LAMP_CEIL — the atlas RGB decode.
             let lamps = lm.xyz * (0.9 * has_lm) * (1.0 - self.cluster_on)
             // Legacy local diffuse; clustered PBR evaluates the same light
@@ -419,7 +657,8 @@ script_mod! {
             let sun_lit = self.sun_filled(sun_all, local)
 
             let l = normalize(self.light_dir)
-            let v = normalize(self.eye.xyz - self.v_csm.xyz)
+            let te = self.toward_eye(self.v_csm.xyz)
+            let v = normalize(te)
             let h = normalize(l + v)
             let ndv = max(dot(n, v), 0.0001)
             let ndl = max(dot(n, l), 0.0001)
@@ -429,7 +668,6 @@ script_mod! {
             // Cook-Torrance: GGX distribution, Schlick-GGX geometry with the
             // direct-lighting k, Schlick Fresnel off an F0 that a metal takes
             // from its own albedo (that colour shift IS what reads as metal).
-            let f0 = mix(vec3(0.04, 0.04, 0.04), albedo, metal)
             let f = f0 + (vec3(1.0, 1.0, 1.0) - f0) * self.pow5(1.0 - vdh)
             let a2 = rough * rough * rough * rough
             let den = ndh * ndh * (a2 - 1.0) + 1.0
@@ -443,7 +681,9 @@ script_mod! {
             // a highlight surviving inside a shadow is the classic tell.
             let surface_direct=mix(self.v_direct,self.sun_color*ndl,self.surface_on)
             // GI occludes the material's fill (an environment map's) and adds its bounce.
-            let surface_ambient=self.gi_ambient(self.v_csm.xyz,n,self.mat_ambient(n,mix(self.v_ambient,mix(self.sun_ground,self.sun_sky,clamp(n.y*0.5+0.5,0.0,1.0)),self.surface_on)))
+            let hemisphere_ambient=self.mat_ambient(n,mix(self.v_ambient,mix(self.sun_ground,self.sun_sky,clamp(n.y*0.5+0.5,0.0,1.0)),self.surface_on))
+            let surface_ambient=self.gi_ambient(self.v_csm.xyz,n,hemisphere_ambient)
+            let spec_occ=self.gi_specular_occlusion(surface_ambient,hemisphere_ambient)
             // Light arrives as irradiance/pi units (the diffuse lobe carries
             // no 1/pi), so the HDR lane lifts the lobe by pi to match.
             let sun_spec = surface_direct * (dist * geo / max(4.0 * ndv * ndl, 0.0001)) * mix(1.0, 3.14159265, self.lin_ctl.x)
@@ -460,7 +700,7 @@ script_mod! {
             let smooth3 = 1.0 - rough
             let fr = max(vec3(smooth3, smooth3, smooth3), f0)
             let f_env = f0 + (fr - f0) * self.pow5(1.0 - ndv)
-            let amb_spec = env * f_env * (ao * sao)
+            let amb_spec = env * f_env * (ao * sao * spec_occ)
 
             // A metal has no diffuse lobe at all; a dielectric keeps all of
             // it. (The (1 - F) half of the split is deliberately dropped:
@@ -469,7 +709,7 @@ script_mod! {
             let analytic = surface_ambient * (ao * sao)
                 + surface_direct * (ao_direct * sun_lit)
                 + local * ao_direct
-            let local_pbr = self.cluster_pbr(self.v_csm.xyz, n, self.eye.xyz, albedo, rough, metal)
+            let local_pbr = self.cluster_lights_f0(self.v_csm.xyz, n, self.v_csm.xyz + te, albedo, rough, metal, 1.0, f0)
             // Per-draw factors of zero fold these maps out: skip the reads.
             var occlusion=1.0
             if self.occlusion_strength*self.surface_on>0.0 {occlusion=mix(1.0,self.occlusion_map.sample_repeat(self.v_uv).x,self.occlusion_strength*self.surface_on)}
@@ -480,14 +720,21 @@ script_mod! {
             // shadow, before N.L) and its specular lobe per unit N.L.
             let sun_rad = self.sun_color * (ao_direct * sun_lit)
             let lobe = (dist * geo / max(4.0 * ndv * ndl, 0.0001)) * mix(1.0, 3.14159265, self.lin_ctl.x)
-            var lit = self.fur_shade(self.mat_compose(albedo, metal, surface_ambient*(ao*sao*occlusion), surface_direct*(ao_direct*sun_lit), local*ao_direct, sun_spec*f, amb_spec*occlusion, local_pbr*ao_direct, n, l, v, sun_rad, f, lobe), n, self.eye.xyz-self.v_csm.xyz) + emission
+            let spec_sun = sun_spec * f
+            let added_env = amb_spec * occlusion
+            let spec_local = local_pbr * ao_direct
+            var lit = self.fur_shade(self.mat_compose(albedo, metal, surface_ambient*(ao*sao*occlusion), surface_direct*(ao_direct*sun_lit), local*ao_direct, spec_sun, added_env, spec_local, n, l, v, sun_rad, f, lobe), n, te) + emission
             if self.tex_mag.y > 0.5 {
-                lit = self.clear_coat(lit, n, v, l, albedo, surface_direct * (sun_lit * ao_direct), ao * sao)
+                lit = self.clear_coat(lit, n, v, l, albedo, surface_direct * (sun_lit * ao_direct), ao * sao, spec_occ)
             }
             lit = max(lit, least)
-            let fin=self.mat_finish(vec4(self.to_display(lit),mix(1.0,surf_w,step(1.5,self.alpha_mode))))
+            let fin = self.finish_lit(lit, spec_sun + added_env + spec_local, surf_w, f_env)
             let coverage=fin.w
             return self.csm_debug_view(self.gi_display(vec4(self.scene_fogged(fin.xyz, self.v_fog, self.v_csm.xyz, self.fog_density)*coverage,coverage),self.v_csm.xyz,n),self.v_csm.xyz,n)
+        }
+
+        shade_mr: fn(albedo: vec3, surf_w: float, mr: vec2, n: vec3, least: vec3) -> vec4 {
+            return self.shade_mr_surface(albedo, surf_w, mr, n, least, mix(vec3(0.04, 0.04, 0.04), albedo, mr.x), 1.0)
         }
 
         // shade for a program whose composition reads no light (Unlit,
@@ -496,7 +743,7 @@ script_mod! {
         // a clear coat: an unlit surface reflects nothing).
         shade_unlit: fn(albedo: vec3, surf_w: float, least: vec3) -> vec4 {
             var n=normalize(self.v_csm_n)
-            if self.double_sided>0.5 && dot(n,self.eye.xyz-self.v_csm.xyz)<0.0 {n=n*(-1.0)}
+            if self.double_sided>0.5 && dot(n,self.toward_eye(self.v_csm.xyz))<0.0 {n=n*(-1.0)}
             if self.surface_on>0.5 && abs(self.normal_scale)>0.00001 {
                 let dp1=dFdx(self.v_csm.xyz)
                 let dp2=dFdy(self.v_csm.xyz)
@@ -514,12 +761,13 @@ script_mod! {
             }
             n = self.mat_normal(n)
             let l = normalize(self.light_dir)
-            let v = normalize(self.eye.xyz - self.v_csm.xyz)
+            let te = self.toward_eye(self.v_csm.xyz)
+            let v = normalize(te)
             var emission=vec3(0.0,0.0,0.0)
             if max(self.emissive.x,max(self.emissive.y,self.emissive.z))>0.0 {emission=self.to_scene(self.emissive_map.sample_repeat(self.v_uv).xyz)*self.emissive}
             emission = self.mat_emission(emission)
             let none = vec3(0.0,0.0,0.0)
-            let lit = max(self.fur_shade(self.mat_compose(albedo, 0.0, none, none, none, none, none, none, n, l, v, none, none, 0.0), n, self.eye.xyz-self.v_csm.xyz) + emission, least)
+            let lit = max(self.fur_shade(self.mat_compose(albedo, 0.0, none, none, none, none, none, none, n, l, v, none, none, 0.0), n, te) + emission, least)
             let fin=self.mat_finish(vec4(self.to_display(lit),mix(1.0,surf_w,step(1.5,self.alpha_mode))))
             let coverage=fin.w
             return self.csm_debug_view(self.gi_display(vec4(self.scene_fogged(fin.xyz, self.v_fog, self.v_csm.xyz, self.fog_density)*coverage,coverage),self.v_csm.xyz,n),self.v_csm.xyz,n)

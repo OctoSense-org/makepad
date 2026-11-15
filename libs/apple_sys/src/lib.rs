@@ -197,12 +197,19 @@ extern "C" {
 pub const kCGEventLeftMouseDown: u32 = 1;
 pub const kCGEventLeftMouseUp: u32 = 2;
 pub const kCGMouseEventClickState: u32 = 1;
+/// The process that made or posted an event (0: the hardware, the window server's HID stream).
+pub const kCGEventSourceUnixProcessID: u32 = 41;
+/// What the poster's event source carries as its own (`CGEventSourceSetUserData`).
+pub const kCGEventSourceUserData: u32 = 42;
+/// The event source's state: 1 the HID system's, 0 the session's combined, else a private one.
+pub const kCGEventSourceStateID: u32 = 45;
 //pub const kCGEventSourceStateHIDSystemState: u32 = 1;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     pub fn CGEventSourceCreate(state_id: u32) -> ObjcId;
     pub fn CGEventSetIntegerValueField(event: ObjcId, field: u32, value: u64);
+    pub fn CGEventGetIntegerValueField(event: ObjcId, field: u32) -> i64;
     pub fn CGEventCreateMouseEvent(
         source: ObjcId,
         mouse_type: u32,
@@ -251,6 +258,14 @@ extern "C" {
     pub fn MTLCreateSystemDefaultDevice() -> ObjcId;
     #[cfg(target_os = "macos")]
     pub fn MTLCopyAllDevices() -> ObjcId; //TODO: Array
+    /// The devices (+1) and, through `observer` (+0), the token `MTLRemoveDeviceObserver` takes;
+    /// `handler` is a block `(device, notification name)` the system copies.
+    #[cfg(target_os = "macos")]
+    pub fn MTLCopyAllDevicesWithObserver(observer: *mut ObjcId, handler: *const c_void) -> ObjcId;
+    #[cfg(target_os = "macos")]
+    pub fn MTLRemoveDeviceObserver(observer: ObjcId);
+    #[cfg(target_os = "macos")]
+    pub static MTLDeviceWasRemovedNotification: ObjcId;
 }
 
 #[link(name = "AVFoundation", kind = "framework")]
@@ -1301,6 +1316,7 @@ pub enum MTLTextureType {
     Cube = 5,
     CubeArray = 6,
     D3 = 7,
+    D2MultisampleArray = 8,
 }
 
 #[repr(u64)]

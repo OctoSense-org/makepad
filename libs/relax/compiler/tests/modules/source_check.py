@@ -1,4 +1,4 @@
-"""The module source check under `makepad run`: a file's fn bodies are parsed on demand there."""
+"""The module source check under `relax run`: a file's fn bodies are parsed on demand there."""
 import os
 import pathlib
 import shutil
@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="module-source-check-") as tmp:
     p = subprocess.run(
         [os.path.abspath(sys.argv[1]), "run", "--quiet", "module-source-check"],
         cwd=pkg,
-        env=dict(os.environ, MAKEPAD_RUN_CACHE="0"),
+        env=dict(os.environ, RELAX_CACHE="0"),
         capture_output=True, text=True,
     )
 got = "\n".join(s for s in p.stdout.splitlines() if s.startswith("out "))

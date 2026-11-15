@@ -59,7 +59,9 @@ macro_rules! android_jni_entry {
 pub unsafe fn android_on_load(vm: *mut std::ffi::c_void, app: fn()) -> i32 {
     makepad_android_state::jni_on_load(vm);
     unsafe fn activity_ready(activity: makepad_jni_sys::jobject) {
-        if let Some(set) = makepad_android_state::get_activity_setter_fn() {
+        // The setter is handed out only once, and each later Activity needs it too.
+        static SET_ACTIVITY: std::sync::OnceLock<Option<unsafe fn(makepad_jni_sys::jobject)>> = std::sync::OnceLock::new();
+        if let Some(set) = SET_ACTIVITY.get_or_init(makepad_android_state::get_activity_setter_fn) {
             set(activity);
         }
     }
@@ -113,17 +115,15 @@ pub fn run_app(app: fn()) {
             eprintln!("[hal-linux] main loop returned; joining app thread");
         }
         let panicked = thread.join().is_err();
-        // the process exits next (main returns): the HAL's driver threads stop and are joined
-        // before exit() runs the driver's exit handlers, which fault a thread still inside it
-        makepad_hal::Hal::global().before_exit();
-        if panicked {
-            std::process::exit(101);
-        }
         #[cfg(target_os = "linux")]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
-            eprintln!("[hal-linux] app thread joined, HAL stopped; run_app returning");
+            eprintln!("[hal-linux] app thread joined; the process ends");
         }
-        return;
+        // the HAL's driver threads stop and are joined, then the process ends on its main thread
+        // through the C library's exit (process_end::end): every atexit handler (the process's
+        // own exit work once among them, a profile or sanitizer runtime's), the C streams' flushes
+        makepad_hal::Hal::global().before_exit();
+        makepad_core_util::process_end::end(if panicked { 101 } else { 0 });
     }
     let _ = hosted;
     app();

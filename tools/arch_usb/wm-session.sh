@@ -17,7 +17,7 @@ if test ! -x target/release/makepad-app-wm || test "${MAKEPAD_WM_BUILD:-0}" = 1;
     cargo build --offline --release -p makepad-app-wm
 fi
 # The WM's own flags (which apps run under the JIT); the prebuild below reads the same ones.
-wm_flags=(--jit sandbox)
+wm_flags=(--jit sandbox --jit arch-installer)
 # The AI Hub app and the JIT tool are built the way the WM starts them: `makepad-wm-build` runs
 # the WM's own start command of each (`cargo run --release -p makepad-app-aihub --features
 # <features>`, hub_app.rs; `cargo run --release -p makepad-run --bin makepad`) with `build`, in
@@ -32,19 +32,18 @@ fi
 # the render-on GPU migrated from the legacy display-gpu file for one
 # release when display-layout does not exist yet. The renderer finds the
 # file itself; see tools/linux/display-layout-env.sh for what this
-# exports. Never fatal: a
-# missing or malformed file falls back to the renderer's automatic
-# choices, logged to stderr.
+# exports. Never fatal: a missing or malformed file falls back to the
+# renderer's automatic choices, logged to stderr.
 if test -r "$MAKEPAD_WM_ROOT/tools/linux/display-layout-env.sh"; then
     . "$MAKEPAD_WM_ROOT/tools/linux/display-layout-env.sh"
 fi
 # Sandbox runs under the JIT (`makepad run makepad-sandbox`, apps/wm/src/apps.rs `--jit`), so
 # every node's Sandbox can be inspected and live-patched from the dev machine. Its session
-# transcript and inspect socket live on disk (~/.makepad-run/tmp, the TMPDIR the remote hosts
+# transcript and inspect socket live on disk (~/.relax/tmp, the TMPDIR the remote hosts
 # entries use), not on the /tmp tmpfs other jobs fill: ~/.makepad/wm/jit.env, seeded once.
 jit_env="$HOME/.makepad/wm/jit.env"
 if test ! -e "$jit_env"; then
-    mkdir -p "$HOME/.makepad/wm" "$HOME/.makepad-run/tmp"
-    printf 'MAKEPAD_RUN_VERBOSE=1\nTMPDIR=%s/.makepad-run/tmp\n' "$HOME" > "$jit_env"
+    mkdir -p "$HOME/.makepad/wm" "$HOME/.relax/tmp"
+    printf 'RELAX_VERBOSE=1\nTMPDIR=%s/.relax/tmp\n' "$HOME" > "$jit_env"
 fi
 exec target/release/makepad-app-wm "-scale=${MAKEPAD_WM_SCALE:-1.3}" "${wm_flags[@]}" "$@"

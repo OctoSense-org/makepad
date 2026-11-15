@@ -66,7 +66,7 @@ fn dispatch(w: &mut CmdWriter, k: &CompiledKernel, pipeline: Id, groups: [u32; 3
         }
     }
     Dispatch { pipeline, timer: 0, groups, indirect_buffer: if indirect { ARGS } else { Id::NONE }, indirect_offset: 0,
-        params: w.put_bytes(&params), buffers: Range { off: b.off * 8, len: b.len * 8 }, textures: Range { off: t.off * 8, len: t.len * 8 } }
+        params: w.put_bytes(&params), buffers: Range { off: b.off * 8, len: b.len * 8 }, textures: Range { off: t.off * 8, len: t.len * 8 }, sampled: Range::default() }
 }
 fn draw_pipeline(vm: &mut ScriptVm, dialect: u32) -> (Vec<u8>, Vec<Id>, Vec<Id>) {
     use makepad_script::shader_backend::ShaderBackend;
@@ -79,13 +79,13 @@ fn draw_pipeline(vm: &mut ScriptVm, dialect: u32) -> (Vec<u8>, Vec<Id>, Vec<Id>)
     let textures = reflection.io().iter().filter(|io| io.kind().as_texture().is_some()).map(|io| match io.name().to_string().as_str() {
         "half_image" => HALF, "byte_image" => BYTE, name => panic!("unexpected draw texture {name}"),
     }).collect();
-    let sampler = spirv::SpirvSampler { filter: 0, address: 1, compare: false, pixel: false };
+    let sampler = spirv::SpirvSampler { filter: 0, address: 1, compare: false, pixel: false, anisotropy: 1 };
     let code = if dialect == dialect::SPIRV {
         let spirv = view.spirv.unwrap().view(); let stage = &spirv.stages[0];
         spirv::SpirvPipeline { vertex: stage.vertex.to_vec(), fragment: stage.fragment.to_vec(), xr_vertex: vec![], xr_fragment: vec![],
             texture_base: stage.info.texture_binding_base(), sampler_base: stage.info.sampler_binding_base(), depth_binding: stage.info.xr_depth_binding(),
             instance_binding: stage.info.instance_binding().unwrap_or(u32::MAX), pick_binding: u32::MAX, pick_texture_base: u32::MAX,
-            textures: vec![0, 0], samplers: vec![sampler] }.encode()
+            textures: vec![0, 0], samplers: vec![sampler], sampler_textures: stage.info.sampler_textures().to_vec() }.encode()
     } else if dialect == dialect::HLSL { hlsl::HlslPipeline { source: view.combined.into(), textures: vec![0, 0], samplers: vec![sampler] }.encode() }
     else { view.combined.as_bytes().to_vec() };
     let storage: Vec<_> = view.storage_buffers.iter().map(|b| StorageBinding { index: b.index, offset: b.offset, writable: 0 }).collect();
@@ -156,7 +156,12 @@ pub fn run() {
                 read.insert(req, unsafe { std::slice::from_raw_parts(record.ptr as *const u8, record.len as usize) }.to_vec());
                 hal_lease_release(record.token);
             }
-            HalEvent::Readback { req, status, pixels, .. } => { assert_eq!(status, readback::OK); read.insert(req, pixels.to_vec()); }
+            HalEvent::Readback { req, status, lease, .. } => {
+                // SAFETY: this process pumped the event and takes its lease once.
+                let pixels = unsafe { makepad_hal::lease::Held::from_payload(lease) }.unwrap();
+                assert_eq!(status, readback::OK);
+                read.insert(req, pixels.to_vec());
+            }
             HalEvent::FrameDone { frame, gpu_ns, .. } => { times.insert(frame, gpu_ns); }
             _ => {}
         }

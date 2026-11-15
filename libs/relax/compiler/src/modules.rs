@@ -31,7 +31,7 @@ static ANY_MODULE_CRATE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 fn module_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some())
+    *ON.get_or_init(|| std::env::var_os("RELAX_MODULE_TRACE").is_some())
 }
 
 fn note_module_crate(krate: u32) {
@@ -106,83 +106,76 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
     let files: std::collections::BTreeSet<u32> = prog.mods.iter().filter(|m| m.krate == krate).map(|m| m.file).collect();
     for &f in &files {
         let pf = &prog.files[f as usize];
-        // The file's whole tree: its first parse, then the fn bodies that parse skipped. A program
-        // run loads bodies on demand (ParsedFile::part, a tree of their own after the file's), and
-        // the type checks before this parsed them; read from the file's tree alone, the check saw
-        // items and signatures and no body: `unsafe` inside a fn, a closure or a method loaded.
-        let cfg = &prog.crates[krate as usize].cfg;
-        let _ = pf.part(cfg);
-        let root = &pf.ast;
-        let trees = || std::iter::successors(Some(root), |a| a.part.get().map(|p| &**p));
-        let tok = |i: u32| -> &[u8] {
-            let t = pf.tok(i);
-            pf.bytes(t.lo, t.hi)
-        };
+        // every fn body, those the load skipped too: a `makepad run` parses a body a later parse
+        // can do alone on its first need, into the part that continues the file's tree. All of
+        // them are parsed here, before any of the module's code can run, and read with the tree.
+        let _ = pf.part(&prog.crates[krate as usize].cfg);
+        let ast = &pf.ast;
+        let trees: Vec<&crate::ast::Ast> = std::iter::successors(Some(ast), |t| t.part.get().map(|p| &**p)).collect();
+        // (the accessors of `ast` read the part's ids too)
+        let tok = |i: u32| -> &[u8] { let t = pf.tok(i); pf.bytes(t.lo, t.hi) };
+        for it in trees.iter().flat_map(|t| &t.items) {
+            for a in ast.list(it.attrs) {
+                if a.toks.hi > a.toks.lo {
+                    let n = tok(a.toks.lo);
+                    if matches!(n, b"no_mangle" | b"export_name" | b"link" | b"link_section" | b"used" | b"naked" | b"link_name") {
+                        out.push(format!("{}: `#[{}]` is not allowed in a sandboxed module -- remove it", at(f, it.lo), String::from_utf8_lossy(n)));
+                    }
+                }
+            }
+            let bad = match &it.kind {
+                ItemKind::Fn(sig, _, _) if ast.fn_sig(*sig).unsafe_ => Some("`unsafe fn`"),
+                ItemKind::Fn(sig, _, _) if ast.fn_sig(*sig).abi.is_some() => Some("an `extern` fn"),
+                ItemKind::Impl(r) if ast.row(*r).unsafe_ && !ast.row(*r).builtin_derive => Some("`unsafe impl`"),
+                ItemKind::Trait(r) if ast.row(*r).unsafe_ => Some("`unsafe trait`"),
+                ItemKind::ForeignMod(..) => Some("an `extern` block"),
+                ItemKind::Static(true, _, _) => Some("`static mut`"),
+                ItemKind::Union(..) => Some("a `union`"),
+                ItemKind::MacroRules(_) => None,
+                _ => None,
+            };
+            if let Some(b) = bad {
+                out.push(format!("{}: {} is not allowed in a sandboxed module -- use safe code and the host's API", at(f, it.lo), b));
+            }
+        }
         // what a builtin derive wrote is the front's own text, not the module's: the expressions
         // parsed for its impl and that impl's items, their skipped bodies too (an enum's PartialEq,
         // PartialOrd, Ord and Hash read the discriminant in an `unsafe` block)
         let mut derived: Vec<(u32, u32)> = Vec::new();
-        for it in trees().flat_map(|a| &a.items) {
+        for it in trees.iter().flat_map(|t| &t.items) {
             if let ItemKind::Impl(r) = &it.kind {
-                if root.row(*r).builtin_derive {
+                if ast.row(*r).builtin_derive {
                     derived.push((it.ranges[0], it.ranges[1]));
-                    for m in root.list(root.row(*r).items) {
-                        let mi = root.item(*m);
+                    for m in ast.list(ast.row(*r).items) {
+                        let mi = ast.item(*m);
                         derived.push((mi.ranges[0], mi.ranges[1]));
-                        if let Some(Ok((_, body))) = pf.lazy_body(*m, cfg) {
+                        if let Some(Ok((_, body))) = pf.lazy_body(*m, &prog.crates[krate as usize].cfg) {
                             derived.push((body[0], body[1]));
                         }
                     }
                 }
             }
         }
-        let mut raw_pointer = false;
-        for ast in trees() {
-            for it in &ast.items {
-                for a in root.list(it.attrs) {
-                    if a.toks.hi > a.toks.lo {
-                        let n = tok(a.toks.lo);
-                        if matches!(n, b"no_mangle" | b"export_name" | b"link" | b"link_section" | b"used" | b"naked" | b"link_name") {
-                            out.push(format!("{}: `#[{}]` is not allowed in a sandboxed module -- remove it", at(f, it.lo), String::from_utf8_lossy(n)));
-                        }
-                    }
+        // (a part's ids continue the trees before it)
+        for (id, e) in trees.iter().flat_map(|t| t.exprs.iter().enumerate().map(move |(k, e)| (t.base[0] + k as u32, e))) {
+            match &e.kind {
+                ExprKind::Unsafe(_) if derived.iter().any(|r| r.0 <= id && id < r.1) => {}
+                ExprKind::Unsafe(_) => out.push(format!("{}: `unsafe` is not allowed in a sandboxed module -- use safe code and the host's API", at(f, e.lo))),
+                ExprKind::Mac(m) if ast.row(*m).args != crate::ast::NO_MAC_ARGS && ast.mac_arg(ast.row(*m).args).asm.is_some() => {
+                    out.push(format!("{}: `asm!` is not allowed in a sandboxed module", at(f, e.lo)))
                 }
-                let bad = match &it.kind {
-                    ItemKind::Fn(sig, _, _) if root.fn_sig(*sig).unsafe_ => Some("`unsafe fn`"),
-                    ItemKind::Fn(sig, _, _) if root.fn_sig(*sig).abi.is_some() => Some("an `extern` fn"),
-                    ItemKind::Impl(r) if root.row(*r).unsafe_ && !root.row(*r).builtin_derive => Some("`unsafe impl`"),
-                    ItemKind::Trait(r) if root.row(*r).unsafe_ => Some("`unsafe trait`"),
-                    ItemKind::ForeignMod(..) => Some("an `extern` block"),
-                    ItemKind::Static(true, _, _) => Some("`static mut`"),
-                    ItemKind::Union(..) => Some("a `union`"),
-                    ItemKind::MacroRules(_) => None,
-                    _ => None,
-                };
-                if let Some(b) = bad {
-                    out.push(format!("{}: {} is not allowed in a sandboxed module -- use safe code and the host's API", at(f, it.lo), b));
-                }
+                _ => {}
             }
-            for (k, e) in ast.exprs.iter().enumerate() {
-                // (a part's ids continue the trees before it)
-                let id = ast.base[0] + k as u32;
-                match &e.kind {
-                    ExprKind::Unsafe(_) if derived.iter().any(|r| r.0 <= id && id < r.1) => {}
-                    ExprKind::Unsafe(_) => out.push(format!("{}: `unsafe` is not allowed in a sandboxed module -- use safe code and the host's API", at(f, e.lo))),
-                    ExprKind::Mac(m) if root.row(*m).args != crate::ast::NO_MAC_ARGS && root.mac_arg(root.row(*m).args).asm.is_some() => {
-                        out.push(format!("{}: `asm!` is not allowed in a sandboxed module", at(f, e.lo)))
-                    }
-                    _ => {}
-                }
-            }
-            raw_pointer |= ast.tys.iter().any(|t| matches!(t, Ty::Ptr(..)));
         }
-        if raw_pointer {
+        if trees.iter().flat_map(|t| &t.tys).any(|t| matches!(t, Ty::Ptr(..))) {
             out.push(format!("{}: raw pointers are not allowed in a sandboxed module -- use references", at(f, 0)));
         }
-        // built-in macros that read the host's files or environment (expanded before the tree)
-        for (i, t) in pf.toks.iter().enumerate() {
-            let w = &pf.src[t.lo as usize..t.hi as usize];
-            if matches!(w, b"include_bytes" | b"include_str" | b"include" | b"env" | b"option_env" | b"asm" | b"global_asm") && tok(i as u32 + 1) == b"!" {
+        // built-in macros that read the host's files or environment (expanded before the tree):
+        // the file's tokens with its expansions, then those of its lazily parsed bodies
+        let part_toks = pf.parts().flat_map(|p| p.toks.iter().enumerate().map(move |(j, t)| (p.tok_base + j as u32, t)));
+        for (i, t) in pf.toks.iter().enumerate().map(|(i, t)| (i as u32, t)).chain(part_toks) {
+            let w = pf.bytes(t.lo, t.hi);
+            if matches!(w, b"include_bytes" | b"include_str" | b"include" | b"env" | b"option_env" | b"asm" | b"global_asm") && tok(i + 1) == b"!" {
                 out.push(format!("{}: `{}!` is not allowed in a sandboxed module", at(f, t.lo), String::from_utf8_lossy(w)));
             }
         }
@@ -279,7 +272,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
         crate::run::preserve_collected_boot(u);
         u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // parsed on this thread (no parse workers for one small crate)
-        crate::preload::SINGLE.with(|s| s.set(true));
+        let single_before = crate::preload::SINGLE.with(|s| s.replace(true));
         let mut failed = None;
         for (done, nc) in new.iter().enumerate() {
             if domain.is_some() { crate::run_state::progress(domain, crate::run_state::Phase::Parse,
@@ -307,7 +300,8 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
                 }
             }
         }
-        crate::preload::SINGLE.with(|s| s.set(false));
+        // as it was: a world build's single-thread load may hold it (pmhost SingleLoad)
+        crate::preload::SINGLE.with(|s| s.set(single_before));
         marks.push(("parse", std::time::Instant::now()));
         if let Some(e) = failed {
             u.prog.reclaim_caches();
@@ -354,7 +348,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
     }
     marks.push(("collect", std::time::Instant::now()));
     if tr {
-        let mut line = format!("makepad-run module: {} crate(s) front:", new.len());
+        let mut line = format!("relax module: {} crate(s) front:", new.len());
         for w in marks.windows(2) {
             line.push_str(&format!(" {} {:.2}", w[1].0, (w[1].1 - w[0].1).as_secs_f64() * 1e3));
         }
@@ -408,7 +402,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
                         }
                         bodies.push(b);
                     }
-                    Err(_) => errs.push(format!("internal compiler error type-checking {} -- makepad run bug, report it", u.prog.def_path(d))),
+                    Err(_) => errs.push(format!("internal compiler error type-checking {} -- Relax bug, report it", u.prog.def_path(d))),
                 }
             }
         }
@@ -419,7 +413,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
     }
     marks.push(("check", std::time::Instant::now()));
     if tr {
-        let mut line = format!("makepad-run module: {} front:", name);
+        let mut line = format!("relax module: {} front:", name);
         for w in marks.windows(2) {
             line.push_str(&format!(" {} {:.2}", w[1].0, (w[1].1 - w[0].1).as_secs_f64() * 1e3));
         }
@@ -471,7 +465,7 @@ fn root_fns(u: &Unit, defs: &[DefId]) -> Vec<DefId> {
     defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) && u.tcx.fn_sig(&u.prog, *d).map_or(false, |s| s.n_generics == 0)).collect()
 }
 
-/// Loads a trusted module (MAKEPAD_RUN_MODULES_TRUSTED=1; on the owner thread): it runs as host code.
+/// Loads a trusted module (`--allow-host-modules`; on the owner thread): it runs as host code.
 unsafe fn load(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
     let (krate, root_file, defs) = front(up, name, path, deps, sandbox)?;
     note_module_crate(krate);
@@ -590,7 +584,7 @@ pub(crate) unsafe fn load_in_module(up: *mut Unit, parent: u32, name: &str, v: c
                             }
                         }
                     }
-                    Err(_) => errs.push(format!("internal compiler error type-checking {} -- makepad run bug, report it", u.prog.def_path(d))),
+                    Err(_) => errs.push(format!("internal compiler error type-checking {} -- Relax bug, report it", u.prog.def_path(d))),
                 }
             }
         }
@@ -720,7 +714,7 @@ pub(crate) fn plain_result(u: &Unit, t: crate::types::TyId) -> bool {
         if depth > 16 { return false; }
         match u.tcx.tys.kind(t).clone() {
             TyKind::Adt(d, args, _) => {
-                !crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(d, Vec::new()))
+                !crate::sandbox::is_sandboxed_crate_key(&u.sandbox, &u.prog, &FnKey::Inst(d, Vec::new()))
                     && u.tcx.tys.list(args).iter().all(|a| host_types(u, *a, depth + 1))
                     && u.tcx.adts.get(&d).map_or(false, |a| a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| host_types(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args)), depth + 1))))
             }
@@ -843,7 +837,8 @@ fn wrapper_source(u: &Unit, krate: u32, modname: &str, idx: u32, defs: &[DefId])
         } else {
             let n = ty_src(u, rt);
             let boxed = match u.tcx.tys.kind(rt) {
-                TyKind::Adt(d, a, _) if u.tcx.adts.get(d).is_some_and(|adt| adt.is_box()) && !a.is_empty() => match u.tcx.tys.kind(u.tcx.tys.list(*a)[0]) {
+                // (a Box in the global allocator: the host frees it as one)
+                TyKind::Adt(d, a, _) if u.tcx.adts.get(d).is_some_and(|adt| adt.is_box()) && !a.is_empty() && u.tcx.tys.list(*a)[1..].iter().all(|x| crate::provided::is_global_alloc(&u.tcx, *x)) => match u.tcx.tys.kind(u.tcx.tys.list(*a)[0]) {
                     TyKind::Adt(d, _, _) => u.prog.def(*d).krate == krate,
                     _ => false,
                 },
@@ -885,7 +880,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let sess = &session;
     let runtime = &sess.runtime;
     let options = &sess.options;
-    // MAKEPAD_RUN_SANDBOX_NOCHECK=1 (tests of the memory confinement alone): no compile-time refusal
+    // --allow-unchecked-modules (tests of the memory confinement alone): no compile-time refusal
     let check = !options.sandbox_nocheck;
     let t0 = std::time::Instant::now();
     let (krate, root_file, mut defs) = front(up, name, path, deps, check)?;
@@ -900,7 +895,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     }
     let mem: u64 = runtime.module_mem_mb << 20;
     let fuel: i64 = runtime.module_fuel;
-    let arena = match crate::sandbox::new_arena(idx, name, mem, fuel) {
+    let arena = match crate::sandbox::new_arena(up, idx, name, mem, fuel) {
         Ok(a) => a,
         Err(e) => return Err(fail(up, &defs, vec![e])),
     };
@@ -909,7 +904,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let _ = std::fs::create_dir_all(&dir);
     let wpath = dir.join(format!("__sbw_{}_{}.rs", name, idx));
     if let Err(e) = std::fs::write(&wpath, &src) {
-        crate::sandbox::free_arena(&arena);
+        crate::sandbox::free_arena(&*up, &arena);
         return Err(fail(up, &defs, vec![format!("cannot write the module wrapper: {}", e)]));
     }
     let wname = format!("__sbw_{}_{}", name, idx);
@@ -919,33 +914,35 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let (wk, _, wdefs) = match front(up, &wname, &wpath.to_string_lossy(), &wdeps, false) {
         Ok(x) => x,
         Err(e) => {
-            crate::sandbox::free_arena(&arena);
+            crate::sandbox::free_arena(&*up, &arena);
             let mut e = e;
-            e.insert(0, format!("{}: the generated wrapper did not compile (makepad run bug, report it):", path));
+            e.insert(0, format!("{}: the generated wrapper did not compile (Relax bug, report it):", path));
             return Err(fail(up, &defs, e));
         }
     };
-    crate::sandbox::add_wrapper_crate(wk);
+    crate::sandbox::add_wrapper_crate(&*up, wk);
     let t_wrap = t1.elapsed();
     let t2 = std::time::Instant::now();
     let u = &mut *up;
     let roots: Vec<u32> = root_fns(u, &wdefs).into_iter().map(|d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
     let fns0 = u.fns.len();
+    let linked0 = jit::CACHE_AHEAD.load(std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = compile_all(up, roots, &|_, _| true, &|u, id| crate::reload::module_own(u, id)) {
         drop_defs(up, &wdefs);
-        crate::sandbox::free_arena(&arena);
+        crate::sandbox::free_arena(&*up, &arena);
         return Err(fail(up, &defs, e));
     }
-    // MAKEPAD_RUN_MODULE_TRACE=1: where a load's time goes
+    // RELAX_MODULE_TRACE=1: where a load's time goes
     if module_trace() {
         eprintln!(
-            "makepad-run module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots)",
+            "relax module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots, {} linked from the disk cache)",
             name,
             t0.elapsed().as_secs_f64() * 1e3,
             t_front.as_secs_f64() * 1e3,
             t_wrap.as_secs_f64() * 1e3,
             t2.elapsed().as_secs_f64() * 1e3,
-            (*up).fns.len() - fns0
+            (*up).fns.len() - fns0,
+            jit::CACHE_AHEAD.load(std::sync::atomic::Ordering::Relaxed) - linked0
         );
     }
     defs.extend(wdefs);
@@ -995,7 +992,7 @@ unsafe fn ensure_export(up: *mut Unit, idx: usize, m: &mut Module, name: &str) -
     let mut deps = vec![m.name.clone()];
     deps.extend(u.prog.crates[m.krate as usize].deps.iter().map(|(n, _)| u.prog.syms.str(*n).to_string()));
     let (wk, _, defs) = front(up, &wname, &path.to_string_lossy(), &deps, false).map_err(|e| e.join("\n"))?;
-    crate::sandbox::add_wrapper_crate(wk);
+    crate::sandbox::add_wrapper_crate(&*up, wk);
     let u = &mut *up;
     let roots = root_fns(u, &defs).into_iter().map(|d| u.fn_id(FnKey::Inst(d, Vec::new()))).collect();
     if let Err(e) = compile_all(up, roots, &|_, _| true, &|u, id| crate::reload::module_own(u, id)) {
@@ -1065,7 +1062,7 @@ pub extern "C" fn __relax_module_load_src(name: *const u8, nlen: usize, path: *c
         Ok(h) => h,
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            set_error(format!("internal compiler error loading a module: {}{} -- makepad run bug, report it", msg, jit::take_ice_location()));
+            set_error(format!("internal compiler error loading a module: {}{} -- Relax bug, report it", msg, jit::take_ice_location()));
             0
         }
     }
@@ -1103,7 +1100,7 @@ fn load_src_inner(name: *const u8, nlen: usize, path: *const u8, plen: usize, sr
     }
     let session = unsafe { crate::jit::unit_session(up) };
     let options = &session.options;
-    // MAKEPAD_RUN_MODULES_TRUSTED=1: a trusted module (host code, no sandbox; diagnosis only)
+    // --allow-host-modules: a trusted module (host code, no sandbox; diagnosis only)
     let trusted = options.modules_trusted;
     let fix = |t: String| -> String {
         match &temp {
@@ -1219,7 +1216,7 @@ pub extern "C" fn __relax_module_unload(h: u64) {
                 m.alive = false;
                 m.gen += 1;
                 if let Some(a) = m.arena.take() {
-                    crate::sandbox::free_arena(&a);
+                    crate::sandbox::free_arena(unsafe { &*jit::current_unit() }, &a);
                 }
                 std::mem::take(&mut m.defs)
             }
@@ -1266,13 +1263,14 @@ pub extern "C" fn __relax_module_error(buf: *mut u8, cap: usize) -> usize {
     })
 }
 
-/// A wrapper enters module `idx`'s arena: 0, or 1 (the module was unloaded), or 2 (every
-/// per-thread segment of the module is in use).
+/// A wrapper enters module `idx`'s arena: 0, or 1 (the module was unloaded), or 2 (this thread
+/// cannot have a segment: it is past its thread-local destructors, or the segment cannot be
+/// mapped). A thread that finds every segment in use waits for one.
 pub extern "C" fn __relax_sb_enter(idx: u32) -> u32 {
     match crate::sandbox::enter_module(idx) {
         Ok(()) => 0,
         Err(crate::sandbox::EnterError::Unloaded) => 1,
-        Err(crate::sandbox::EnterError::Busy) => 2,
+        Err(crate::sandbox::EnterError::NoSegment) => 2,
     }
 }
 
@@ -1402,7 +1400,8 @@ pub fn guard_reset(m: GuardMark) {
 /// every version stays), image ro bytes, image rw bytes, arenas live, unloaded modules' windows
 /// (reserved, inaccessible, never reused)].
 pub extern "C" fn __relax_sb_stats(out: *mut [u64; 5]) {
-    let (ro, rw, n) = crate::sandbox::stats();
+    let up = jit::current_unit();
+    let (ro, rw, n) = if up.is_null() { (0, 0, 0) } else { crate::sandbox::stats(unsafe { &*up }) };
     unsafe { *out = [crate::sandbox::twin_code_bytes(), ro as u64, rw as u64, n as u64, crate::sandbox::dead_arenas() as u64] };
 }
 

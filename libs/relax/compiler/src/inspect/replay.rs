@@ -1,10 +1,12 @@
 //! `makepad inspect file=<x.mkpf> rec replay [until=<s>] [show=1] [home=<dir>] [dry=1]`: turns
 //! "the person saw it once" into a repro. The flight recorder's recording holds how the run was
-//! started (args, folder, MAKEPAD_* environment, home), the first window's size and scale, the
-//! script random seed and every input event with the frame it arrived in; the replay starts the
-//! same program the same way, hidden (MAKEPAD_HIDE_WINDOWS, muted) and from the same build and
-//! cache (the same home), and the program plays the input back from its start, each event at its
-//! recorded frame (MAKEPAD_INPUT_REPLAY). The instance stays up at the end for inspection.
+//! started (args, folder, the program's environment the host names, home), the first window's size
+//! and scale, the script random seed and every input event with the frame it arrived in; the
+//! replay starts the same program the same way, hidden and muted (the host's unseen variables) and
+//! from the same build and cache (the same home), and the program plays the input back from its
+//! start, each event at its recorded frame. The program reads the replay from RELAX_REPLAY_INPUT
+//! (the input file), RELAX_REPLAY_SEED and RELAX_REPLAY_WINDOW (`WxH@scale`). The instance stays
+//! up at the end for inspection.
 //!
 //! Exact only when the recording reaches back to the run's start (input before the oldest record
 //! is lost: the answer says so) and the program's logic follows its frames, the input and the
@@ -37,7 +39,7 @@ pub fn file_main(path: &str, words: &[String]) -> i32 {
     };
     let ev = |cat: &str| p.events.iter().find(|e| p.s(e.cat) == cat);
     let Some(args) = ev("run.args").map(|e| e.text.split(SEP).map(str::to_string).collect::<Vec<_>>()) else {
-        println!("{path} has no run record (not a flight recorder recording, or an older one): cannot replay\nmore: makepad inspect file={path} pf brief");
+        println!("{path} has no run record (not a flight recorder recording, or an older one): cannot replay\nmore: {tool} inspect file={path} pf brief", tool = crate::tool_name());
         return 1;
     };
     let cwd = ev("run.cwd").map(|e| e.text.clone()).unwrap_or_default();
@@ -63,7 +65,7 @@ pub fn file_main(path: &str, words: &[String]) -> i32 {
     }
     let injected = inputs.iter().filter(|i| i.injected).count();
     if injected > 0 {
-        notes.push(format!("{injected} of the events were injected by makepad remote (an agent), replayed as recorded"));
+        notes.push(format!("{injected} of the events were injected by {tool} remote (an agent), replayed as recorded", tool = crate::tool_name()));
     }
     let seed = ev("seed.script").map(|e| e.a).filter(|&s| s != 0);
     let window = p.events.iter().find(|e| p.s(e.cat) == "window.geom" && e.a == 0).or_else(|| ev("window.geom")).map(|e| e.text.clone());
@@ -84,25 +86,25 @@ pub fn file_main(path: &str, words: &[String]) -> i32 {
     if !cwd.is_empty() {
         cmd.current_dir(&cwd);
     }
+    let unseen = crate::progenv::host_env().unseen;
     for (k, v) in &env {
-        // the replay's own settings below win; a recorded replay's replay settings do not carry
-        if !matches!(k.as_str(), "MAKEPAD_INPUT_REPLAY" | "MAKEPAD_FLIGHT_SEED" | "MAKEPAD_WINDOW" | "MAKEPAD_HIDE_WINDOWS") {
+        // the replay says itself whether it is seen (show=1)
+        if !unseen.iter().any(|(u, _)| u == k) {
             cmd.env(k, v);
         }
     }
     if let Some(h) = &home {
-        cmd.env("MAKEPAD_RUN_HOME", h);
+        cmd.env("RELAX_HOME", h);
     }
-    cmd.env("MAKEPAD_INPUT_REPLAY", &input_path);
+    cmd.env("RELAX_REPLAY_INPUT", &input_path);
     if let Some(s) = seed {
-        cmd.env("MAKEPAD_FLIGHT_SEED", s.to_string());
+        cmd.env("RELAX_REPLAY_SEED", s.to_string());
     }
     if let Some(w) = &window {
-        cmd.env("MAKEPAD_WINDOW", w);
+        cmd.env("RELAX_REPLAY_WINDOW", w);
     }
     if get("show").as_deref() != Some("1") {
-        cmd.env("MAKEPAD_HIDE_WINDOWS", "1");
-        cmd.env("SANDBOX_MUTE", "1");
+        cmd.envs(unseen.iter().copied());
     }
     let what = format!(
         "{} input events (frames {}..{}{}) into `{}`{}{}",
@@ -146,7 +148,7 @@ pub fn file_main(path: &str, words: &[String]) -> i32 {
             if first_input_frame == 0 && inputs.is_empty() {
                 println!("note: the recording has no input: the replay only starts the program");
             }
-            println!("more: makepad inspect {} input status  makepad inspect {} events  makepad inspect {} rec save  makepad inspect {} ui", child.id(), child.id(), child.id(), child.id());
+            println!("more: {tool} inspect {} input status  {tool} inspect {} events  {tool} inspect {} rec save  {tool} inspect {} ui", child.id(), child.id(), child.id(), child.id(), tool = crate::tool_name());
             0
         }
         Err(e) => {

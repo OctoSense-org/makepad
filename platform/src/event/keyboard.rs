@@ -1,9 +1,10 @@
 use {
-    crate::{area::Area, event::finger::KeyModifiers, window::WindowId},
+    crate::{area::Area, event::{finger::KeyModifiers, VirtualKeyboardEvent}, window::WindowId},
     std::cell::RefCell,
     std::rc::Rc,
 };
 
+pub use crate::clipboard_read::ClipboardWrite;
 pub use makepad_studio_protocol::{
     CharOffset, FullTextState, ImeAction, ImeActionEvent, KeyCode, KeyEvent, TextInputEvent,
 };
@@ -13,19 +14,42 @@ pub struct CxKeyboard {
     pub(crate) prev_key_focus: Area,
     pub(crate) next_key_focus: Area,
     pub(crate) key_focus: Area,
-    /// The key focus of each window that lost the keyboard, restored when it gets it back. Kept
-    /// here, not in the window widget, so a redraw while it is away moves it like the live focus
-    /// (update_area): a stale copy would never match the widget's area again.
-    pub(crate) parked_key_focus: Vec<(WindowId, Area)>,
+    /// Whether the user gave `key_focus` its focus, e.g., with a press or Tab, rather than code.
+    pub(crate) is_key_focus_from_user: bool,
+    pub(crate) is_prev_key_focus_from_user: bool,
+    pub(crate) is_next_key_focus_from_user: bool,
+    /// The key focus of each window that lost the keyboard and whether the user gave it, restored
+    /// when it gets it back. Kept here, not in the window widget, so a redraw while it is away moves
+    /// it like the live focus (update_area): a stale copy would never match the widget's area again.
+    pub(crate) parked_key_focus: Vec<(WindowId, Area, bool)>,
     #[allow(dead_code)]
     pub(crate) keys_down: Vec<KeyEvent>,
     pub(crate) text_ime_dismissed: bool,
+    /// Whether a hide of the soft keyboard is waiting for the last finger to lift.
+    pub(crate) is_text_ime_hide_deferred: bool,
+    /// Whether that hide was cancelled while the key focus was changing, see `Cx::cancel_text_ime_hide`.
+    pub(crate) is_text_ime_hide_cancelled: bool,
     pub(crate) has_physical_keyboard: bool,
+    /// The soft keyboard's height from the latest `VirtualKeyboard` event, or 0 once it's hiding.
+    pub(crate) virtual_keyboard_height: f64,
 }
 
 impl CxKeyboard {
     pub fn has_physical_keyboard(&self) -> bool {
         self.has_physical_keyboard
+    }
+
+    pub fn virtual_keyboard_height(&self) -> f64 {
+        self.virtual_keyboard_height
+    }
+
+    /// Keeps a `VirtualKeyboard` event's height. Anything that hands one straight to a `KeyboardView`
+    /// has to call this too, since that view catches up with this height when it draws.
+    pub fn note_virtual_keyboard_event(&mut self, event: &VirtualKeyboardEvent) {
+        self.virtual_keyboard_height = match event {
+            VirtualKeyboardEvent::WillShow { height, .. } | VirtualKeyboardEvent::DidShow { height, .. } => *height,
+            VirtualKeyboardEvent::WillHide { .. } | VirtualKeyboardEvent::DidHide { .. } => 0.0,
+        };
     }
 
     pub fn modifiers(&self) -> KeyModifiers {
@@ -39,6 +63,20 @@ impl CxKeyboard {
     pub fn set_key_focus(&mut self, focus_area: Area) {
         self.text_ime_dismissed = false;
         self.next_key_focus = focus_area;
+        self.is_next_key_focus_from_user = false;
+    }
+
+    /// Like [`Self::set_key_focus`], for focus the user gave, e.g., by pressing on `focus_area` or tabbing to it.
+    pub fn set_key_focus_from_user(&mut self, focus_area: Area) {
+        self.set_key_focus(focus_area);
+        self.is_next_key_focus_from_user = true;
+    }
+
+    /// Gives `focus_area` the key focus back, as the user's if `is_from_user`,
+    /// e.g., where it was before a popup took it.
+    pub fn restore_key_focus(&mut self, focus_area: Area, is_from_user: bool) {
+        self.set_key_focus(focus_area);
+        self.is_next_key_focus_from_user = is_from_user;
     }
 
     pub fn key_focus(&self) -> Area {
@@ -47,10 +85,17 @@ impl CxKeyboard {
 
     pub fn revert_key_focus(&mut self) {
         self.next_key_focus = self.prev_key_focus;
+        self.is_next_key_focus_from_user = self.is_prev_key_focus_from_user;
     }
 
     pub fn has_key_focus(&self, focus_area: Area) -> bool {
         self.key_focus == focus_area
+    }
+
+    /// Whether `focus_area` has key focus that the user gave it, rather than code.
+    pub fn has_key_focus_from_user(&self, focus_area: Area) -> bool {
+        // Nothing focused is never the user's, e.g., when a restore finds its area gone.
+        !focus_area.is_empty() && self.key_focus == focus_area && self.is_key_focus_from_user
     }
 
     pub fn set_text_ime_dismissed(&mut self) {
@@ -62,20 +107,20 @@ impl CxKeyboard {
     }
 
     pub fn park_key_focus(&mut self, window: WindowId) {
-        self.parked_key_focus.retain(|(w, _)| *w != window);
-        self.parked_key_focus.push((window, self.key_focus));
+        self.parked_key_focus.retain(|(w, ..)| *w != window);
+        self.parked_key_focus.push((window, self.key_focus, self.is_key_focus_from_user));
         self.set_key_focus(Area::Empty);
     }
 
     pub fn unpark_key_focus(&mut self, window: WindowId) {
-        if let Some(i) = self.parked_key_focus.iter().position(|(w, _)| *w == window) {
-            let (_, area) = self.parked_key_focus.remove(i);
-            self.set_key_focus(area);
+        if let Some(i) = self.parked_key_focus.iter().position(|(w, ..)| *w == window) {
+            let (_, area, is_from_user) = self.parked_key_focus.remove(i);
+            self.restore_key_focus(area, is_from_user);
         }
     }
 
     pub(crate) fn update_area(&mut self, old_area: Area, new_area: Area) {
-        for (_, parked) in self.parked_key_focus.iter_mut() {
+        for (_, parked, _) in self.parked_key_focus.iter_mut() {
             if *parked == old_area {
                 *parked = new_area;
             }
@@ -94,7 +139,9 @@ impl CxKeyboard {
     pub(crate) fn cycle_key_focus_changed(&mut self) -> Option<(Area, Area)> {
         if self.next_key_focus != self.key_focus {
             self.prev_key_focus = self.key_focus;
+            self.is_prev_key_focus_from_user = self.is_key_focus_from_user;
             self.key_focus = self.next_key_focus;
+            self.is_key_focus_from_user = self.is_next_key_focus_from_user;
             return Some((self.prev_key_focus, self.key_focus));
         }
         None
@@ -152,9 +199,31 @@ pub struct KeyFocusEvent {
     pub focus: Area,
 }
 
-#[derive(Clone, Debug)]
+/// A copy or cut asks the focused widget for its selection: the widget answers in `response`
+/// with plain text, or with `answer` for its richer flavours too.
+#[derive(Clone, Debug, Default)]
 pub struct TextClipboardEvent {
     pub response: Rc<RefCell<Option<String>>>,
+    /// The answer's richer flavours (HTML, Markdown) beside `response`'s text, set by `answer`.
+    pub rich: Rc<RefCell<Option<ClipboardWrite>>>,
+}
+
+impl TextClipboardEvent {
+    /// Answers with the selection's text and its richer flavours.
+    pub fn answer(&self, write: ClipboardWrite) {
+        *self.response.borrow_mut() = Some(write.text.clone());
+        *self.rich.borrow_mut() = Some(write);
+    }
+
+    /// What the copy puts on the clipboard; `None` (nothing selected) leaves the clipboard as it
+    /// is. The richer flavours go along only with the text they were answered with.
+    pub fn written(&self) -> Option<ClipboardWrite> {
+        let text = self.response.borrow().clone().filter(|t| !t.is_empty())?;
+        match self.rich.borrow().clone() {
+            Some(write) if write.text == text => Some(write),
+            _ => Some(ClipboardWrite::text(text)),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

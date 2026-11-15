@@ -45,6 +45,16 @@ pub fn star_map_path() -> Option<std::path::PathBuf> {
 }
 
 impl Renderer {
+    /// Detail factor on every view's LOD distances: above 1 coarser levels are drawn
+    /// nearer, below 1 detail is kept further; 1 is the screen-error rule (lod_view.rs).
+    pub fn set_lod_bias(&mut self, bias: f32) {
+        self.lod_bias = if bias.is_finite() && bias > 0.0 { bias } else { 1.0 };
+    }
+
+    pub fn lod_bias(&self) -> f32 {
+        self.lod_bias
+    }
+
     /// Opt into the linear HDR lighting convention. The HOST must then
     /// render the scene pass into an RGBA16F colour target
     /// (`TextureFormat::RenderRGBAf16`, see `GpuInfo::float16_blend_targets`)
@@ -55,6 +65,7 @@ impl Renderer {
     /// (the default) is the legacy display-space lane, unchanged for every
     /// host that did not ask.
     pub fn set_hdr_output(&mut self, on: bool) {
+        if self.hdr_output != on { self.volume_fog.reset(); self.ssr.reset(); }
         self.hdr_output = on;
         // GI traces the same scene: its albedo decodes with the lanes'.
         self.set_gi_linear_albedo(on);
@@ -133,16 +144,27 @@ impl Renderer {
         self.grade = grade;
     }
 
-    /// Record the HDR post chain (bloom + auto-exposure) for this frame.
+    /// Record the HDR post chain (reflections, volume fog, bloom + auto-exposure) for this frame.
     /// `scene` is the host's RGBA16F scene target of logical `size`,
     /// `parent` the pass that composites it. Returns the pass the host must
     /// parent its scene pass under, so the scene renders before the chain.
     pub fn run_post(&mut self, cx: &mut Cx2d, size: DVec2, scene: &Texture, parent: DrawPassId) -> Option<DrawPassId> {
+        let ssr_first = self.record_ssr(cx, scene, parent);
+        let reflected = self.ssr.pass.applied().cloned();
+        let scene = reflected.as_ref().unwrap_or(scene);
+        let fog_first = self.record_volume_fog(cx, scene, parent);
+        if let Some(first) = fog_first { self.ssr.pass.parent_apply(cx.cx, first); }
         if !self.hdr_output || (self.bloom <= 0.0 && !self.auto_exposure) {
-            return None;
+            return ssr_first.or(fog_first);
         }
-        self.post.run(cx, size, scene, parent);
-        self.post.first_pass_id()
+        let fogged = self.volume_fog.pass.applied().cloned();
+        self.post.run(cx, size, fogged.as_ref().unwrap_or(scene), parent);
+        let post_first = self.post.first_pass_id();
+        if let Some(first) = post_first {
+            if fog_first.is_some() { self.volume_fog.pass.parent_apply(cx.cx, first); }
+            else if ssr_first.is_some() { self.ssr.pass.parent_apply(cx.cx, first); }
+        }
+        ssr_first.or(fog_first).or(post_first)
     }
 
     /// GPU ms of the post chain (a frame or two behind).
@@ -150,10 +172,16 @@ impl Renderer {
         self.post.gpu_ms
     }
 
-    /// Everything the composite needs: post controls, texel, and the bloom
+    /// Bind after the host sets scene texture slot 0: reflections and fog replace
+    /// it with their applied HDR scene. Also binds post controls, texel, and the bloom
     /// and exposure textures. `texels` is the scene target in pixels.
     pub fn bind_composite(&self, draw: &mut makepad_render_graph::DrawSceneTexture, texels: Vec2f) {
         draw.post = self.composite_post();
+        if self.hdr_output {
+            if let Some(fogged) = self.volume_fog.pass.applied().or_else(|| self.ssr.pass.applied()) {
+                draw.draw_vars.set_texture(0, fogged);
+            }
+        }
         // The HDR composite writes alpha 1 everywhere (tone-mapped colour,
         // dithered): premultiplied-over then IS a plain write. Drawn without
         // blending it is an opaque draw, so a tile GPU's hidden-surface
@@ -161,32 +189,27 @@ impl Renderer {
         draw.draw_vars.options.alpha_blend = !self.hdr_output;
         draw.texel = vec2(1.0 / texels.x.max(1.0), 1.0 / texels.y.max(1.0));
         let bloom = self.post.bloom().filter(|_| self.hdr_output && self.bloom > 0.0);
-        let g = &self.grade;
-        let finite = |v: f32, d: f32| if v.is_finite() { v } else { d };
         draw.post2 = vec4(
             if bloom.is_some() { self.bloom } else { 0.0 },
-            AUTO_EXPOSURE_KEY,
-            2.0f32.powf(finite(g.auto_min_ev, -0.415).clamp(-8.0, 0.0)),
-            1.0 / self.post.levels().max(1) as f32,
+            0.0, 0.0, 1.0 / self.post.levels().max(1) as f32,
         );
-        draw.grade = vec4(
-            finite(g.contrast, 1.0).clamp(0.25, 4.0),
-            finite(g.saturation, 1.0).clamp(0.0, 4.0),
-            2.0f32.powf(finite(g.auto_max_ev, 0.678).clamp(0.0, 8.0)),
-            2.0f32.powf(finite(g.exposure_ev, 0.0).clamp(-8.0, 8.0)),
-        );
-        draw.tilt = vec4(
-            finite(g.tilt, 0.0).clamp(0.0, 1.0),
-            finite(g.tilt_center, 0.6).clamp(0.0, 1.0),
-            finite(g.tilt_width, 0.2).clamp(0.0, 1.0),
-            0.0,
-        );
-        if let Some(bloom) = bloom {
-            draw.draw_vars.set_texture(1, bloom);
-        }
-        if let (Some(exposure), true) = self.post.exposure() {
-            draw.draw_vars.set_texture(2, exposure);
-        }
+        if let Some(bloom) = bloom { draw.draw_vars.set_texture(1, bloom); }
+        self.bind_live_look(draw);
+    }
+
+    /// Use another camera's current exposure and grade after binding this
+    /// camera's own scene/fog/bloom. The adapted luminance lives on the GPU;
+    /// copying only `exposure()` would silently meter the new view instead.
+    pub fn bind_live_look(&self, draw: &mut makepad_render_graph::DrawSceneTexture) {
+        draw.post = self.composite_post();
+        let g = self.grade;
+        let finite = |v: f32, d: f32| if v.is_finite() { v } else { d };
+        draw.post2.y = AUTO_EXPOSURE_KEY;
+        draw.post2.z = 2.0f32.powf(finite(g.auto_min_ev, -0.415).clamp(-8.0, 0.0));
+        draw.grade = vec4(finite(g.contrast, 1.0).clamp(0.25, 4.0), finite(g.saturation, 1.0).clamp(0.0, 4.0),
+            2.0f32.powf(finite(g.auto_max_ev, 0.678).clamp(0.0, 8.0)), 2.0f32.powf(finite(g.exposure_ev, 0.0).clamp(-8.0, 8.0)));
+        draw.tilt = vec4(finite(g.tilt, 0.0).clamp(0.0, 1.0), finite(g.tilt_center, 0.6).clamp(0.0, 1.0), finite(g.tilt_width, 0.2).clamp(0.0, 1.0), 0.0);
+        if let (Some(exposure), true) = self.post.exposure() { draw.draw_vars.set_texture(2, exposure); }
     }
 
     /// What each stateful subsystem of this renderer is doing
@@ -214,6 +237,7 @@ impl Renderer {
             (Subsystem::RenderScale, if self.thermometer.level() == 0 { Usage::Analytic } else { Usage::History }),
             (Subsystem::LightmapBake, bake),
             (Subsystem::Ssao, if self.ssao.is_some() { Usage::History } else { Usage::Off }),
+            (Subsystem::PassHistory, if self.hdr_output && (self.volume_fog.params.active() || self.ssr.active() || self.ssr.pass.applied().is_some()) { Usage::History } else { Usage::Off }),
             (Subsystem::FastGi, if self.gi.mode() == crate::fast_gi::GiMode::Off { Usage::Off } else { Usage::History }),
             (Subsystem::VfxParticles, if self.vfx.records.is_empty() { Usage::Off } else { Usage::History }),
             (Subsystem::OccluderDither, Usage::Stateless),
@@ -385,16 +409,16 @@ impl Renderer {
     }
 
     /// Spend what `tier` allows (quality_tier.rs): impostor distances,
-    /// grass reach and density, the sun cascades. Screen-space occlusion and
+    /// the grass's screen density, the trampled-grass field, the sun cascades. Screen-space occlusion and
     /// the render scale are the host's passes: it reads them from the same
     /// [`crate::quality_tier::TierBudget`].
     pub fn set_graphics_tier(&mut self, tier: crate::quality_tier::GraphicsTier) {
         let b = tier.budget();
         self.graphics_tier = tier;
         self.impostor_scale = b.impostor_scale;
-        self.grass_radius_scale = b.grass_radius;
-        self.grass_density = b.grass_density;
+        self.grass_pixels = b.grass_pixels;
         self.terrain_blend_reach = b.terrain_blend_reach;
+        self.trample.set_budget(b.trample);
         self.set_csm_config(b.csm_resolution, b.csm_range);
     }
 
@@ -475,6 +499,14 @@ impl Renderer {
     /// everything. A model drawn while a plane is set takes its lane's discarding shader.
     pub fn set_clip_plane(&mut self, plane: Option<[f32; 4]>) {
         self.clip_plane = plane;
+    }
+
+    /// A world box the model lanes keep, turned as it likes (`host_box0..2`: a fragment where
+    /// abs(dot(row, (p, 1))) > 1 on any of the three rows is cut away), for the draws recorded
+    /// from now on. `None` keeps everything. A model drawn while a box is set takes its lane's
+    /// discarding shader.
+    pub fn set_host_box(&mut self, rows: Option<[[f32; 4]; 3]>) {
+        self.host_box = rows;
     }
 
     /// Moves the clip plane in the draws already recorded into `list` and the lists it holds:

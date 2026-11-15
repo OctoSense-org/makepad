@@ -2,7 +2,7 @@
 use crate::os::web::CxOsTexture;
 use {
     crate::{
-        cx::Cx, id_pool::*, makepad_error_log::*, makepad_math::*, makepad_script::*, script::vm::*,
+        cx::Cx, id_pool::*, makepad_error_log::*, makepad_math::*, makepad_script::*, script::vm::*, HostBuf,
     },
     std::{
         rc::Rc,
@@ -74,6 +74,8 @@ pub enum ReadbackError {
     UnsupportedFormat,
     InvalidSize,
     NotRendered,
+    /// The context has [`TEXTURE_READBACK_MAX_REQUESTS`] outstanding tickets.
+    /// No ticket is accepted; retain the request and retry after taking results.
     Backpressure,
     Cancelled,
     AllocationChanged,
@@ -116,19 +118,27 @@ pub struct TextureReadback {
     pub producer_serial: u64,
     pub width: usize,
     pub height: usize,
-    pub data: Result<Arc<[u8]>, ReadbackError>,
+    pub data: Result<crate::HostBuf, ReadbackError>,
 }
 
-/// Per-context limits. Admission reserves staging AND result capacity before
-/// returning a ticket. Keep/retry a rejected request after draining results.
+/// Per-context admitted staging/result byte bound. Requests that cannot fit
+/// wait with tickets in first-come, first-served order, uncharged until room
+/// frees. Later requests cannot overtake a waiter. An oversized request is
+/// admitted alone when no bytes are reserved.
 pub const TEXTURE_READBACK_MAX_BYTES: usize = 32 * 1024 * 1024;
 pub const TEXTURE_READBACK_MAX_REQUESTS: usize = 256;
 
+/// Per-context requests and admitted reservations. Requests of any size that
+/// cannot fit wait with tickets in first-come, first-served order; later
+/// requests queue behind them. Waiting tickets reserve no bytes until admitted.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TextureReadbackUsage {
     pub requests: usize,
-    /// Includes queued, in-flight and undelivered results. Each reservation
-    /// covers a staging allocation and, independently, its CPU result.
+    /// Uncharged tickets of any size waiting for room or behind an earlier
+    /// waiter, in first-come, first-served order.
+    pub waiting: usize,
+    /// Admitted staging/result capacity, including requests awaiting a producer,
+    /// in-flight copies and undelivered results.
     pub reserved_bytes: usize,
 }
 
@@ -144,9 +154,11 @@ pub(crate) struct ReadbackSlot {
     pub previous_serial: u64,
     pub pending: bool,
     pub cancelled: bool,
+    /// The reservation is charged until this slot's result is taken.
+    pub admitted: bool,
     pub reserved_bytes: usize,
     pub result: TextureReadback,
-    pub receive: Option<crate::makepad_network::mpsc::Receiver<Result<Arc<[u8]>, ReadbackError>>>,
+    pub receive: Option<crate::makepad_network::mpsc::Receiver<Result<crate::HostBuf, ReadbackError>>>,
 }
 
 #[derive(Default)]
@@ -154,17 +166,20 @@ pub(crate) struct TextureReadbacks {
     pub next_ticket: u64,
     pub slots: Vec<ReadbackSlot>,
     pub reserved_bytes: usize,
+    /// Legacy captures refused a ticket, retained until a later frame admits them.
+    pub legacy_waiting: Vec<Texture>,
+    pub legacy_retry: crate::event::NextFrame,
 }
 
 /// A one-shot completion sender. Capacity is reserved per ticket; unrelated
 /// completions can never fill it. A dropped sender becomes an explicit error
 /// when the owning renderer polls the receiver.
 pub(crate) struct ReadbackCompletion(
-    pub crate::makepad_network::mpsc::SyncSender<Result<Arc<[u8]>, ReadbackError>>,
+    pub crate::makepad_network::mpsc::SyncSender<Result<crate::HostBuf, ReadbackError>>,
 );
 
 impl ReadbackCompletion {
-    pub fn finish(self, result: Result<Arc<[u8]>, ReadbackError>) {
+    pub fn finish(self, result: Result<crate::HostBuf, ReadbackError>) {
         // There is exactly one producer and one message in this channel. The
         // only possible send failure is teardown of the owning Cx.
         let _ = self.0.try_send(result);
@@ -184,6 +199,38 @@ pub(crate) struct ReadbackWork {
 }
 
 impl Cx {
+    pub(crate) fn defer_render_texture_capture(&mut self, texture: &Texture) {
+        if !self.textures.1.readbacks.legacy_waiting.contains(texture) {
+            crate::log!("render texture capture: context readback request limit reached; texture {:?} waits", texture.texture_id());
+            self.textures.1.readbacks.legacy_waiting.push(texture.clone());
+        }
+        if self.textures.1.readbacks.legacy_retry == crate::event::NextFrame::default() {
+            self.textures.1.readbacks.legacy_retry = self.new_next_frame();
+        }
+    }
+
+    /// Admit waiting tickets in slot order. Returns whether a copy can issue
+    /// without a producer repaint, so callers outside the poll path can poll it.
+    pub(crate) fn admit_waiting_readbacks(&mut self) -> bool {
+        let mut copy_ready = false;
+        for index in 0..self.textures.1.readbacks.slots.len() {
+            let state = &self.textures.1.readbacks;
+            let slot = &state.slots[index];
+            if !slot.pending || slot.admitted { continue; }
+            let fits = if slot.reserved_bytes > TEXTURE_READBACK_MAX_BYTES { state.reserved_bytes == 0 }
+                else { slot.reserved_bytes <= TEXTURE_READBACK_MAX_BYTES.saturating_sub(state.reserved_bytes) };
+            if !fits { break; }
+            let painted = self.textures[slot.texture.texture_id()].producer_serial > slot.previous_serial;
+            let state = &mut self.textures.1.readbacks;
+            let slot = &mut state.slots[index];
+            slot.admitted = true;
+            if painted { slot.pass = None; }
+            state.reserved_bytes += slot.reserved_bytes;
+            copy_ready |= slot.pass.is_none();
+        }
+        copy_ready
+    }
+
     pub(crate) fn validate_pending_readbacks(&mut self) {
         let mut latest = None;
         for index in 0..self.textures.1.readbacks.slots.len() {
@@ -228,7 +275,7 @@ impl Cx {
         let mut work = Vec::new();
         for index in 0..self.textures.1.readbacks.slots.len() {
             let slot = &self.textures.1.readbacks.slots[index];
-            if !slot.pending || slot.pass != pass { continue; }
+            if !slot.pending || !slot.admitted || slot.pass != pass { continue; }
             let id = slot.texture.texture_id();
             let texture = &self.textures[id];
             let error = if texture.allocation_generation != slot.result.allocation_generation {
@@ -313,10 +360,15 @@ impl Texture {
     /// frame) is copied as it is now, whatever `next_render` says; its result
     /// carries `producer_serial` 0. Other formats return UnsupportedFormat.
     ///
-    /// Admission reserves bounded staging/result bytes and pins this handle.
-    /// Backpressure accepts no ticket: retain the request and retry after
-    /// draining results. Every accepted ticket yields exactly one result,
-    /// including cancellation, allocation changes and device errors. Poll
+    /// Tickets pin this handle. Requests of any size that cannot fit the room
+    /// under [`TEXTURE_READBACK_MAX_BYTES`] wait with tickets, uncharged, in
+    /// first-come, first-served order; later requests cannot overtake them.
+    /// Oversized requests are admitted alone when no bytes are reserved.
+    /// Backpressure means [`TEXTURE_READBACK_MAX_REQUESTS`] tickets are already
+    /// outstanding (or the ticket counter overflowed). It accepts no ticket:
+    /// retain the request and retry after taking results.
+    /// Every accepted ticket yields exactly one result, including cancellation,
+    /// allocation changes and device errors. Poll
     /// `Cx::try_take_texture_readbacks` on Event::Signal. No redraw is needed
     /// for a copy of an existing allocation.
     pub fn read_back(&self, cx: &mut Cx, request: ReadbackRequest) -> Result<ReadbackTicket, ReadbackError> {
@@ -366,17 +418,28 @@ impl Texture {
         let previous_serial = texture.producer_serial;
         let pass_generation = pending_pass.map(|pass| cx.passes.0.pool[pass.0].generation);
         let state = &mut cx.textures.1.readbacks;
-        if state.slots.len() >= TEXTURE_READBACK_MAX_REQUESTS || reserved_bytes > TEXTURE_READBACK_MAX_BYTES.saturating_sub(state.reserved_bytes) {
+        let oversized = reserved_bytes > TEXTURE_READBACK_MAX_BYTES;
+        let fits = if oversized { state.reserved_bytes == 0 }
+            else { reserved_bytes <= TEXTURE_READBACK_MAX_BYTES.saturating_sub(state.reserved_bytes) };
+        let waiting = state.slots.iter().any(|slot| slot.pending && !slot.admitted) || !fits;
+        if state.slots.len() >= TEXTURE_READBACK_MAX_REQUESTS {
             return Err(ReadbackError::Backpressure);
         }
         let ticket = ReadbackTicket(state.next_ticket.checked_add(1).ok_or(ReadbackError::Backpressure)?);
+        if oversized {
+            if waiting {
+                crate::log!("texture readback {width}x{height}: {} MiB is over the {} MiB per-context bound; waiting with {} MiB reserved by other readbacks; later requests queue behind it", reserved_bytes as f64 / (1024.0 * 1024.0), TEXTURE_READBACK_MAX_BYTES / (1024 * 1024), state.reserved_bytes as f64 / (1024.0 * 1024.0));
+            } else {
+                crate::log!("texture readback {width}x{height}: {} MiB is over the {} MiB per-context bound; admitted alone", reserved_bytes as f64 / (1024.0 * 1024.0), TEXTURE_READBACK_MAX_BYTES / (1024 * 1024));
+            }
+        }
         state.next_ticket = ticket.0;
-        state.reserved_bytes += reserved_bytes;
+        if !waiting { state.reserved_bytes += reserved_bytes; }
         state.slots.push(ReadbackSlot {
             legacy: false,
             texture: self.clone(), pass: pending_pass, pending: true, cancelled: false,
             pass_generation, next_render: request.next_render, external, previous_serial,
-            reserved_bytes, receive: None,
+            admitted: !waiting, reserved_bytes, receive: None,
             result: TextureReadback {
                 ticket, allocation_generation: generation, producer_serial, width, height,
                 data: Err(ReadbackError::NotRendered),
@@ -579,10 +642,11 @@ pub enum TextureFormat {
         data: Option<Vec<u32>>,
         updated: TextureUpdated,
     },
+    /// The mip chain is shared, not copied, with its producer; a clone shares it.
     VecMipBGRAu8_32 {
         width: usize,
         height: usize,
-        data: Option<Vec<u32>>,
+        data: Option<HostBuf<u32>>,
         max_level: Option<usize>,
         wrap: TextureWrap,
         updated: TextureUpdated,
@@ -598,11 +662,12 @@ pub enum TextureFormat {
     /// level 0 first, each level's 16-byte 4x4 blocks in raster order
     /// (`ceil(w/4) * ceil(h/4)` blocks). Only create one for a format the
     /// backend reports in `GpuInfo` (`texture_bc7`, `texture_astc4x4`).
+    /// The mip chain is shared, not copied, with its producer; a clone shares it.
     VecMipCompressed {
         width: usize,
         height: usize,
         format: CompressedTextureFormat,
-        data: Option<Vec<u8>>,
+        data: Option<HostBuf<u8>>,
         max_level: Option<usize>,
         wrap: TextureWrap,
         updated: TextureUpdated,
@@ -611,23 +676,25 @@ pub enum TextureFormat {
     /// coordinate's z, an integer). `layers` images of `width` x `height`,
     /// layer-major: each layer's mip chain as in [`TextureFormat::VecMipBGRAu8_32`]
     /// (levels 0..=max_level concatenated), then the next layer's.
+    /// The mip chains are shared, not copied, with their producer; a clone shares them.
     VecArrayMipBGRAu8_32 {
         width: usize,
         height: usize,
         layers: usize,
-        data: Option<Vec<u32>>,
+        data: Option<HostBuf<u32>>,
         max_level: Option<usize>,
         wrap: TextureWrap,
         updated: TextureUpdated,
     },
     /// The block-compressed [`TextureFormat::VecArrayMipBGRAu8_32`]: each
     /// layer's mip chain as in [`TextureFormat::VecMipCompressed`], layer-major.
+    /// The mip chains are shared, not copied, with their producer; a clone shares them.
     VecArrayMipCompressed {
         width: usize,
         height: usize,
         layers: usize,
         format: CompressedTextureFormat,
-        data: Option<Vec<u8>>,
+        data: Option<HostBuf<u8>>,
         max_level: Option<usize>,
         wrap: TextureWrap,
         updated: TextureUpdated,
@@ -1109,6 +1176,9 @@ impl CxTexture {
     #[allow(unused)]
     pub(crate) fn take_updated(&mut self) -> TextureUpdated {
         let updated = self.updated();
+        if !updated.is_empty() {
+            self.texel_generation += 1;
+        }
         self.set_updated(TextureUpdated::Empty);
         updated
     }
@@ -1195,12 +1265,11 @@ impl CxTexture {
 }
 
 impl TextureFormat {
-    /// CPU pixel bytes this format currently holds (capacity, not length).
+    /// CPU pixel bytes this format currently holds (Vec capacity or shared chain length).
     pub(crate) fn cpu_data_bytes(&self) -> usize {
         match self {
             TextureFormat::VecBGRAu8_32 { data, .. }
-            | TextureFormat::VecCubeBGRAu8_32 { data, .. }
-            | TextureFormat::VecMipBGRAu8_32 { data, .. } => data
+            | TextureFormat::VecCubeBGRAu8_32 { data, .. } => data
                 .as_ref()
                 .map_or(0, |data| data.capacity().saturating_mul(4)),
             TextureFormat::VecMipRGBAf32 { data, .. }
@@ -1211,25 +1280,25 @@ impl TextureFormat {
             TextureFormat::VecRu8 { data, .. } | TextureFormat::VecRGu8 { data, .. } => {
                 data.as_ref().map_or(0, |data| data.capacity())
             }
-            TextureFormat::VecMipCompressed { data, .. } | TextureFormat::VecArrayMipCompressed { data, .. } => data.as_ref().map_or(0, |data| data.capacity()),
-            TextureFormat::VecArrayMipBGRAu8_32 { data, .. } => data.as_ref().map_or(0, |data| data.capacity().saturating_mul(4)),
+            TextureFormat::VecMipCompressed { data, .. } | TextureFormat::VecArrayMipCompressed { data, .. } => data.as_ref().map_or(0, |data| data.len() * std::mem::size_of::<u8>()),
+            TextureFormat::VecMipBGRAu8_32 { data, .. } | TextureFormat::VecArrayMipBGRAu8_32 { data, .. } => data.as_ref().map_or(0, |data| data.len() * std::mem::size_of::<u32>()),
             _ => 0,
         }
     }
 
-    /// Release any CPU pixel `Vec` held by a `Vec*` variant, keeping format and dimensions intact.
+    /// Release any CPU pixel storage held by a `Vec*` variant, keeping format and dimensions intact.
     pub(crate) fn discard_cpu_data(&mut self) {
         match self {
             TextureFormat::VecBGRAu8_32 { data, .. }
-            | TextureFormat::VecCubeBGRAu8_32 { data, .. }
-            | TextureFormat::VecMipBGRAu8_32 { data, .. }
+            | TextureFormat::VecCubeBGRAu8_32 { data, .. } => *data = None,
+            TextureFormat::VecMipBGRAu8_32 { data, .. }
             | TextureFormat::VecArrayMipBGRAu8_32 { data, .. } => *data = None,
             TextureFormat::VecMipRGBAf32 { data, .. }
             | TextureFormat::VecRGBAf32 { data, .. }
             | TextureFormat::VecRf32 { data, .. } => *data = None,
             TextureFormat::VecMipCompressed { data, .. }
-            | TextureFormat::VecArrayMipCompressed { data, .. }
-            | TextureFormat::VecRu8 { data, .. }
+            | TextureFormat::VecArrayMipCompressed { data, .. } => *data = None,
+            TextureFormat::VecRu8 { data, .. }
             | TextureFormat::VecRGu8 { data, .. } => *data = None,
             _ => {}
         }
@@ -1694,6 +1763,24 @@ impl Texture {
         cx.textures[self.texture_id()].discard_cpu_after_upload
     }
 
+    /// Stage this `Vec*` texture's uploads: what it waits to upload (all of it once allocated, a
+    /// dirty rect after) goes up in row bands within the frame's staged-upload budget
+    /// ([`STAGED_UPLOAD_BYTES`]), on each frame whether it is drawn or not, so a large image
+    /// lands over a few frames instead of costing one. While [`Self::upload_pending`], a draw
+    /// samples a part-uploaded image: show it once that is false.
+    pub fn set_staged_upload(&self, cx: &mut Cx, staged: bool) {
+        let id = self.texture_id();
+        cx.textures[id].staged_upload = staged;
+        if staged && !cx.staged_textures.contains(&id) {
+            cx.staged_textures.push(id);
+        }
+    }
+
+    /// Whether some of this texture's data has not gone to the GPU yet.
+    pub fn upload_pending(&self, cx: &Cx) -> bool {
+        !cx.textures[self.texture_id()].updated().is_empty()
+    }
+
     /// Records that this texture holds a shrunk copy of an image (or of each frame of an
     /// animation) that's `natural_size` pixels big, so it can still be laid out at that size.
     pub fn set_natural_size(&self, cx: &mut Cx, natural_size: Option<(usize, usize)>) {
@@ -1723,6 +1810,12 @@ impl Texture {
     /// `CxTexture::append_rows`). Off by default.
     pub fn set_append_rows(&self, cx: &mut Cx, append_rows: bool) {
         cx.textures[self.texture_id()].append_rows = append_rows;
+    }
+
+    /// Says that texels a draw already samples only change when `epoch` does,
+    /// like in a glyph atlas that only reuses its slots after a reset.
+    pub fn set_content_epoch(&self, cx: &mut Cx, epoch: u64) {
+        cx.textures[self.texture_id()].content_epoch = Some(epoch);
     }
 
     pub fn animation<'a>(&self, cx: &'a mut Cx) -> &'a Option<TextureAnimation> {
@@ -1856,6 +1949,10 @@ pub struct CxTexture {
     pub(crate) alloc: Option<TextureAlloc>,
     pub(crate) allocation_generation: u64,
     pub(crate) producer_serial: u64,
+    /// Goes up whenever an update of its texels goes up to the GPU.
+    pub(crate) texel_generation: u64,
+    /// Set by `Texture::set_content_epoch`, and `None` when its texels can change without us knowing.
+    pub(crate) content_epoch: Option<u64>,
     pub(crate) animation: Option<TextureAnimation>,
     pub(crate) natural_size: Option<(usize, usize)>,
     /// A render target the application keeps as a cache: a software backend
@@ -1863,8 +1960,9 @@ pub struct CxTexture {
     /// handle lives (GPU backends keep every target anyway).
     pub(crate) retained_render_target: bool,
     /// A render target that carries a mip chain, rebuilt from level 0 after
-    /// every pass that renders into it (for shaders that minify it with
-    /// `sample_grad` / `sample_lod`). Metal; other backends keep level 0 only.
+    /// every pass that renders into it (for shaders that minify it: a plain
+    /// `sample`, `sample_grad`, `sample_lod`). Every GPU backend builds the
+    /// levels on the GPU after the pass.
     pub(crate) render_mips: bool,
     /// An append-only data texture that grows by rows (the SLUG glyph
     /// atlas): a backend that updates rows in place may allocate spare rows
@@ -1884,6 +1982,28 @@ pub struct CxTexture {
     pub(crate) transient: bool,
     /// Release `Vec*` CPU pixel data (`data = None`) once the upload batch has been submitted.
     pub(crate) discard_cpu_after_upload: bool,
+    /// Uploads go up in row bands within each frame's budget ([`Texture::set_staged_upload`]).
+    pub(crate) staged_upload: bool,
+}
+
+/// The bytes staged uploads ([`Texture::set_staged_upload`]) send in one frame, all such
+/// textures together: about a millisecond of copying into upload memory on a laptop.
+pub const STAGED_UPLOAD_BYTES: usize = 4 << 20;
+
+impl Cx {
+    /// Whether a staged texture still waits to upload: the loop keeps beating until it is up.
+    pub(crate) fn staged_uploads_pending(&self) -> bool {
+        self.staged_textures.iter().any(|id| {
+            self.textures.0.is_live_generation(id.0, id.generation()) && !self.textures[*id].updated().is_empty()
+        })
+    }
+
+    /// The staged textures still alive and staged, in the order they were staged.
+    pub(crate) fn take_staged_textures(&mut self) -> Vec<TextureId> {
+        let mut ids = std::mem::take(&mut self.staged_textures);
+        ids.retain(|id| self.textures.0.is_live_generation(id.0, id.generation()) && self.textures[*id].staged_upload);
+        ids
+    }
 }
 
 #[cfg(test)]

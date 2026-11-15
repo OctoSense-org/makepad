@@ -113,7 +113,8 @@ impl<'a> Rig<'a> {
         g(&repo, &["add", "."])?;
         let committed = commit(&repo, "committed edit")?;
         if import(&repo, lease)? != committed { return Err("fixture bundle imported a different commit".into()); }
-        let pin = Pin { makepad: Store::open("makepad")?.rev(git::SYNCED_REF).ok_or("selftest: box has no synced makepad pin")?, commercial: Store::open("commercial")?.rev(git::SYNCED_REF) };
+        let pin = Pin::at(&Store::open("makepad")?.rev(git::SYNCED_REF).ok_or("selftest: box has no synced makepad pin")?);
+        let pin = match Store::open(crate::state::PAIRED)?.rev(git::SYNCED_REF) { Some(c) => pin.with(crate::state::PAIRED, &c), None => pin };
         let lane = format!("overlay-selftest-{lease}");
         relaxgit::prepare(work, &lane, lease, &pin)?;
         let empty = makepad_strict_json::Value::Obj(Vec::new());
@@ -156,7 +157,7 @@ impl<'a> Rig<'a> {
             "base" | "build-env" => {}
             _ => return Err(format!("unknown case {case}")),
         }
-        let pin = Pin { makepad: sha.clone(), commercial: None };
+        let pin = Pin::at(&sha);
         let mut env = relaxgit::prepare(&self.work, lane, &self.lease, &pin)?;
         let (shipped, deleted) = super::ship::uncommitted(&tree, &pin)?;
         let bases = super::ship::bases_json(&tree, &pin, &shipped.iter().chain(&deleted).cloned().collect::<Vec<_>>())?;
@@ -185,16 +186,16 @@ impl<'a> Rig<'a> {
             .env("DEVHUB_FIXTURE_VALUE", if case == "build-env" { "env2" } else { "env1" });
         if case == "concurrent" {
             let jobs = (self.cores / 2).max(1);
-            cmd.env("MAKEPAD_RUN_JOBS", jobs.to_string());
+            cmd.env("RELAX_JOBS", jobs.to_string());
         }
         // The fixture repositories hold no makepad run std: both sides name the box's own explicitly, so
         // the overlay's automatic std check (which would print a disk-std notice) is not part of the diff.
-        cmd.env("MAKEPAD_RUN_STD", self.box_work.join("dev/tree/libs/relax/compiler/std"));
-        for key in ["MAKEPAD_RUN_VFS", "MAKEPAD_RUN_WORKSPACE", "MAKEPAD_RUN_EDITS", "MAKEPAD_RUN_HOME", "MAKEPAD_RUN_CACHE_DIR", "MAKEPAD_RUN_CACHE_MAX"] { cmd.env_remove(key); }
+        cmd.env("RELAX_STD", self.box_work.join("dev/tree/libs/relax/compiler/std"));
+        for key in ["VFS", "WORKSPACE", "EDITS", "HOME", "CACHE_DIR", "CACHE_MAX"].iter().map(|v| crate::run_names::var(v)) { cmd.env_remove(key); }
         if overlay {
             cmd.envs(env.iter().cloned()).current_dir(self.work.join("dev/lane").join(tree.file_name().unwrap()).join("run"));
         } else {
-            cmd.current_dir(tree).env("CARGO_TARGET_DIR", self.root.join("tree-target")).env("MAKEPAD_RUN_HOME", self.root.join("tree-home"));
+            cmd.current_dir(tree).env("CARGO_TARGET_DIR", self.root.join("tree-target")).env("RELAX_HOME", self.root.join("tree-home"));
         }
         (self.spawn)(&cmd)
     }

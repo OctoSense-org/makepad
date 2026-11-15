@@ -30,8 +30,22 @@ pub use makepad_strict_json as json;
 /// cache built products by program hash mix it into the key, so a change to
 /// generated geometry rebuilds them once. 2: portable transcendentals (the
 /// same bits on every platform, so a product built on one machine is the
-/// one every other machine would build).
-pub const MODEL_GENERATOR_VERSION: u32 = 2;
+/// one every other machine would build). 3: model-wide automatic LODs with
+/// world-space screen error, per-part overrides, mesh reuse and empty levels.
+/// 4: script-authored rounded boxes choose their recorded segments from the
+/// radius and chord-error target. 5: LOD levels keep the part's own vertices,
+/// bounded by sampled world-space surface deviation. 6: automatic LODs add a
+/// third level at 100 radii, and an authored empty level alone hides a part
+/// from its distance while keeping nearer automatic levels.
+/// 7: LOD bounds are certified (every point, both directions), not sampled.
+/// 8: a document holds canonical zeros (-0.0 is +0.0), so a product built in
+/// memory is the one its reopened source builds.
+/// 9: a far stand-in carries its depth atlas (render impostor.rs) in its
+/// material's occlusion layer.
+/// 10: a far stand-in's albedo carries no occlusion and its leaf mips
+/// average in linear light; its occlusion rides in the depth atlas's blue,
+/// and a crown tree's stand-in is a crown layer.
+pub const MODEL_GENERATOR_VERSION: u32 = 10;
 pub use makepad_mesh_edit as mesh;
 
 mod schema;
@@ -64,8 +78,11 @@ mod review_pose;
 pub mod templates;
 mod character_mesh;
 pub mod character;
-pub mod stencil;
+pub mod msdf_text;
+pub use msdf_text::{msdf_text, MsdfTextSpec, MsdfTextImage};
 pub mod import;
 mod program;
 pub use program::*;
+mod build_detail;
+pub use build_detail::{CompileTimings, GeometryTimings, OperationTiming, ProgramBuildDetail, TextureGenerationTimer, TextureTiming, WeatheringTiming};
 pub use review_pose::*;

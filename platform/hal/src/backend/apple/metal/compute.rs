@@ -34,10 +34,17 @@ impl Metal {
 
     pub(super) fn create_compute(&mut self, s: &mut Session, id: Id, blob: &PipelineBlob) -> PipeStatus {
         let layout = match KernelLayout::parse(blob) { Ok(l) => l, Err(e) => return PipeStatus::Failed(e) };
+        // the argument table a kernel binds into: 31 buffers (its own and the params) and 31 textures
+        if layout.buffers.iter().any(|b| b.index >= 31) || (layout.desc.push_size != 0 && layout.desc.param_binding >= 31)
+            || layout.textures.iter().any(|t| t.index >= 31) || layout.sampled.iter().any(|t| t.index >= 31) {
+            return PipeStatus::Failed("Metal compute permits 31 buffer and 31 texture slots".into());
+        }
         if let Err(e) = layout.validate_device(&self.info) { return PipeStatus::Failed(e); }
         let source = match std::str::from_utf8(blob.code) { Ok(s) => s.to_owned(), Err(e) => return PipeStatus::Failed(e.to_string()) };
         let precise = layout.desc.precise_math != 0;
         let invocations = layout.desc.workgroup.iter().map(|n| *n as u64).product::<u64>();
+        // the kernel's name on its pipeline: what Metal's validation and GPU tools report
+        let label = s.string(blob.desc.name).unwrap_or("compute").to_string();
         let state = Arc::new(State(OnceLock::new()));
         self.compute.insert((s.id, id.index), Pipe { gen: id.gen, layout, state: state.clone(), announced: false });
         let device = RcObjcId::from_unowned(NonNull::new(self.dev.device).unwrap());
@@ -69,7 +76,7 @@ impl Metal {
                 let answer = answer.clone();
                 // the function, held until its pipeline is made
                 let kept = function.clone();
-                let made = objc_block!(move |pipe: ObjcId, error: ObjcId| {
+                let made = objc_block!(move |pipe: ObjcId, _reflection: ObjcId, error: ObjcId| {
                     let _ = &kept;
                     let result = match NonNull::new(pipe) {
                         None => Err(super::pipeline::describe_error(error, "no compute pipeline")),
@@ -81,7 +88,13 @@ impl Metal {
                     };
                     answer(result);
                 });
-                unsafe { let _: () = msg_send![callback_device.as_id(), newComputePipelineStateWithFunction: function.as_id() completionHandler: &made]; }
+                unsafe {
+                    let descriptor = RcObjcId::from_owned(NonNull::new(msg_send![class!(MTLComputePipelineDescriptor), new]).expect("compute pipeline descriptor"));
+                    let _: () = msg_send![descriptor.as_id(), setComputeFunction: function.as_id()];
+                    let _: () = msg_send![descriptor.as_id(), setLabel: str_to_nsstring(&label)];
+                    // MTLPipelineOptionNone
+                    let _: () = msg_send![callback_device.as_id(), newComputePipelineStateWithDescriptor: descriptor.as_id() options: 0u64 completionHandler: &made];
+                }
             });
             unsafe { let _: () = msg_send![device.as_id(), newLibraryWithSource: str_to_nsstring(&source) options: options.as_id() completionHandler: &completion]; }
         }));
@@ -173,6 +186,13 @@ impl Metal {
                     t.last_bound = seq;
                     unsafe { let _: () = msg_send![encoder, setTexture: t.obj.as_id() atIndex: binding.index as u64]; }
                 }
+                // sampled textures after the storage images, resolved as a draw's are (storage a
+                // transient target gave back is made again); the kernel declares its samplers
+                let sampled = compute::ids(view.arena, d.sampled).ok_or("invalid compute sampled textures")?;
+                for (id, binding) in sampled.iter().zip(&p.layout.sampled) {
+                    let obj = super::frame::texture_obj(&mut self.tex, self.dev.device, s, *id, seq).ok_or("missing sampled texture")?;
+                    unsafe { let _: () = msg_send![encoder, setTexture: obj atIndex: binding.index as u64]; }
+                }
                 if !params.is_empty() { unsafe { let _: () = msg_send![encoder, setBytes: params.as_ptr() as *const std::ffi::c_void length: params.len() as u64 atIndex: p.layout.desc.param_binding as u64]; } }
                 let [x, y, z] = p.layout.desc.workgroup;
                 let threads = MTLSize { width: x as u64, height: y as u64, depth: z as u64 };
@@ -235,9 +255,13 @@ impl Metal {
             let incarnation = s.font_frames.clone();
             unsafe { let _: () = msg_send![cb, addCompletedHandler: &objc_block!(move |cb: ObjcId| {
                 if let Some(reads) = resources.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    let status: u64 = unsafe { msg_send![cb, status] };
-                    let leases = if status == 4 { reads.into_iter().map(|(_, _, _, _, _, lease)| lease).collect() } else { Vec::new() };
-                    mailbox.push(Done::BufferLeases { sid, incarnation: incarnation.clone(), req, status: if status == 4 { readback::OK } else { readback::DEVICE_LOST }, leases });
+                    let status = match super::timing::command_buffer_failure(cb) {
+                        None => readback::OK,
+                        Some(super::timing::Failure::Work) => readback::FAILED,
+                        Some(super::timing::Failure::Device) => readback::DEVICE_LOST,
+                    };
+                    let leases = if status == readback::OK { reads.into_iter().map(|(_, _, _, _, _, lease)| lease).collect() } else { Vec::new() };
+                    mailbox.push(Done::BufferLeases { sid, incarnation: incarnation.clone(), req, status, leases });
                 }
             })]; }
             Ok::<_, String>(())

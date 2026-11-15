@@ -31,11 +31,11 @@ pub(crate) fn running_tests(line: &str) -> bool {
 
 fn summary_line(line: &str) -> bool {
     line.starts_with("error: could not compile")
-        || line.starts_with("makepad-run:") && (line.contains("unresolved imports") || line.contains("signature errors") || line.contains("load error"))
+        || crate::run_names::after(line, "").is_some() && (line.contains("unresolved imports") || line.contains("signature errors") || line.contains("load error"))
 }
 
 /// The JIT's own word that it could not build a target: `makepad test`'s `error: could not compile ..`
-/// summary or a makepad-run load failure. Test output never says this.
+/// summary or a relax load failure. Test output never says this.
 pub(crate) fn build_failed(log: &str) -> bool {
     plain(log).lines().map(str::trim).any(summary_line)
 }
@@ -45,7 +45,7 @@ pub(crate) fn build_failed(log: &str) -> bool {
 /// compile error counts even when other targets ran. Diagnostics in a failing test's captured
 /// output inside its window never turn that test into a JIT miss; a test's own uncaptured
 /// `test result:` text does not end the window.
-/// The JIT's live-edit reports (`makepad live:` lines) and restart reasons (also with a prefix a
+/// The JIT's live-edit reports (`relax live:` lines) and restart reasons (also with a prefix a
 /// log window cut off) reach devhub through its patch events: never a build's compile errors (a
 /// restart reason's edit is applied by the warm restart). Neither are a run's crash reports
 /// (`report: {..}`): a failing assertion is the program's own verdict.
@@ -60,9 +60,9 @@ pub(crate) fn compile_errors(log: &str) -> Vec<String> {
             if line.starts_with("test result: ok.") || line.starts_with("test result: FAILED.") { harness = false; }
             continue;
         }
-        if line.starts_with("makepad live:") || line.contains("restart the app") { continue; }
+        if crate::run_names::after(line, "live").is_some() || line.contains("restart the app") || app_log(line) { continue; }
         // A run's crash report (a test's panic, a fault): the program's verdict, never a build's.
-        if line.starts_with("report: {") || line.contains(" report: {") { continue; }
+        if line.starts_with("report: {") || line.contains(" report: {") || line.starts_with("report (caught): {") { continue; }
         if let Ok(v) = makepad_strict_json::parse(line.as_bytes()) {
             if text(&v, "severity") == "error" {
                 let file = text(&v, "file");
@@ -84,6 +84,8 @@ pub(crate) fn compile_errors(log: &str) -> Vec<String> {
             || line.ends_with("restart the app") // A live restart notice, not a build error.
         {
             continue;
+        } else if located_note(line) {
+            continue;
         } else if line.starts_with("error:") || line.starts_with("error[")
             || line.contains(": error:") || line.contains(": error[")
             || line.split_once(".rs:").is_some_and(|(_, rest)| {
@@ -95,6 +97,29 @@ pub(crate) fn compile_errors(log: &str) -> Vec<String> {
         }
     }
     if errors.is_empty() { summary } else { errors }
+}
+
+/// A line of the program's own log (`log!`, `error!`: `[I] <file>:<line>:<col> - <message>`, and
+/// `[E]`, `[W]`, `[!]`, `[.]`): what the app said while it ran, never a build's error. An app's
+/// `[I]` line at a source line read as one, and its runs went to cargo as JIT misses (M75-M77, 11-07).
+fn app_log(line: &str) -> bool {
+    ["[I] ", "[E] ", "[W] ", "[!] ", "[.] "].iter().any(|p| line.starts_with(p))
+}
+
+/// A located diagnostic that is no error: `<file>.rs:<line>:<col>: warning|note|help: ..`. A JIT
+/// warning (`unused imports`) read as a compile error sent a failing test run to cargo as a JIT
+/// miss (M71, 11-07).
+fn located_note(line: &str) -> bool {
+    let Some((_, rest)) = line.split_once(".rs:") else { return false };
+    let mut text = rest;
+    for _ in 0..2 {
+        match text.split_once(':') {
+            Some((n, after)) if n.trim().parse::<u64>().is_ok() => text = after,
+            _ => break,
+        }
+    }
+    let text = text.trim_start();
+    ["warning", "note", "help"].iter().any(|k| text.strip_prefix(k).is_some_and(|after| after.starts_with(':') || after.starts_with('[')))
 }
 
 /// The spelling distinguishes `--lib` from a test target actually named `lib`.
@@ -124,6 +149,9 @@ struct Miss {
     closed_ms: u64,
     /// how to see it again, for one filed by hand (`jit miss add --repro`)
     repro: String,
+    /// what its package's build read when the JIT last failed on it ([`crate_inputs`]): other
+    /// inputs, another JIT try
+    inputs: String,
 }
 
 impl Miss {
@@ -134,6 +162,7 @@ impl Miss {
             ("lane", s(&self.lane)), ("pair", obj(vec![("work", s(&self.pair.work)), ("main", s(&self.pair.main))])),
             ("first_ms", Value::Int(self.first_ms as i64)), ("last_ms", Value::Int(self.last_ms as i64)),
             ("count", Value::Int(self.count as i64)), ("closed_ms", Value::Int(self.closed_ms as i64)), ("repro", s(&self.repro)),
+            ("inputs", s(&self.inputs)),
         ])
     }
 
@@ -145,12 +174,12 @@ impl Miss {
         }
         let n = |k| v.get(k).and_then(Value::as_u64).unwrap_or(0);
         let pair = v.get("pair").map(|p| crate::state::Pair::new(text(p, "work"), text(p, "main"))).unwrap_or_default();
-        Ok(Self { id: id.into(), pkg: text(v, "pkg").into(), target: text(v, "target").into(), error: errors, lane: text(v, "lane").into(), pair, first_ms: n("first_ms"), last_ms: n("last_ms"), count: n("count"), closed_ms: n("closed_ms"), repro: text(v, "repro").into() })
+        Ok(Self { id: id.into(), pkg: text(v, "pkg").into(), target: text(v, "target").into(), error: errors, lane: text(v, "lane").into(), pair, first_ms: n("first_ms"), last_ms: n("last_ms"), count: n("count"), closed_ms: n("closed_ms"), repro: text(v, "repro").into(), inputs: text(v, "inputs").into() })
     }
 
     fn touch(&mut self, req: &Value, now: u64, set_pair: bool) -> Result<(), String> {
         let pin = crate::lease::Pin::of_rev(text(req, "rev")).ok_or("jit misses: missing commit pair")?;
-        if set_pair { self.pair = crate::state::Pair::new(&pin.makepad, pin.commercial.as_deref().unwrap_or("")); }
+        if set_pair { self.pair = pin.pair(); }
         self.lane = text(req, "lane").into();
         self.last_ms = now;
         self.count += 1;
@@ -161,23 +190,130 @@ impl Miss {
 
 pub(crate) fn notice(v: &Value) -> String {
     let error = v.get("error").and_then(Value::as_arr).and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
-    format!("devhub test: JIT miss on {} {} (recorded {}): {error}; this verdict is cargo's", text(v, "pkg"), text(v, "target"), text(v, "id"))
+    // (the line is the JIT's; cargo's part is that the package builds: "this verdict is cargo's"
+    // after the JIT's line read as cargo printing it, 11-07)
+    format!("devhub test: JIT miss on {} {} (recorded {}): the JIT said {error}; cargo builds it", text(v, "pkg"), text(v, "target"), text(v, "id"))
 }
 
 /// Whether a package is JIT-own; an empty repo uses the local checkout.
 pub(crate) fn jit_own(repo: &Path, pair: &crate::state::Pair, pkg: &str) -> Result<bool, String> {
+    test_package(repo, pair, pkg).map(|p| p.own)
+}
+
+/// What routing reads of a package's tests ([`test_package`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct TestPackage {
+    /// compiled only into the JIT binary ([`jit_own`])
+    pub own: bool,
+    /// why its tests run in the lane's tree, never a JIT overlay: its `[package.metadata.makepad]
+    /// test-tree` reason. An overlay holds the pinned commit alone, at a root only the JIT's own
+    /// process reads: a test that walks the checkout's history or runs cargo on it failed there for
+    /// want of them, never of its code (devhub's, 11-07).
+    pub tree: Option<String>,
+    /// the test targets that run under cargo, never the JIT, each with why: its
+    /// `[package.metadata.makepad.native-tests]` ([`native_selected`])
+    pub native: std::collections::BTreeMap<String, String>,
+}
+
+/// The declared native targets (`native`, as its Cargo.toml names them: `lib`, `bin:<name>`,
+/// `test:<name>`) a test run selecting `select` runs, each with why. `select` is in the same form,
+/// or `bins`, `tests` (cargo's `--tests`: the lib and bins built as tests too) or `all-targets`;
+/// empty: the package's default run, every one of them. makepad-run's confined_macros re-runs its
+/// own binary as each case's runner, and under `makepad test` each runner was a JIT of its own:
+/// six at once took 41 GB, and the tests bucket had it red from the day it came (11-13).
+pub(crate) fn native_selected<'a>(native: &'a std::collections::BTreeMap<String, String>, select: &[String]) -> Vec<(&'a str, &'a str)> {
+    native.iter().filter(|(target, _)| {
+        select.is_empty() || select.iter().any(|s| s == *target || matches!(s.as_str(), "tests" | "all-targets") || (s == "bins" && target.starts_with("bin:")))
+    }).map(|(t, why)| (t.as_str(), why.as_str())).collect()
+}
+
+/// Whether a package is JIT-own, why its tests run in the lane's tree, and which of its targets
+/// run under cargo ([`TestPackage`]). An empty repo uses the local checkout.
+pub(crate) fn test_package(repo: &Path, pair: &crate::state::Pair, pkg: &str) -> Result<TestPackage, String> {
     #[cfg(feature = "checkout")]
     {
-        use crate::orch::ci::{jit_own_dirs, package_dirs, Tree};
         let repo = if repo.as_os_str().is_empty() { crate::orch::repo() } else { repo.to_path_buf() };
-        let tree = Tree::at(&repo, pair)?;
-        Ok(package_dirs(&tree).get(pkg).is_some_and(|dir| jit_own_dirs(&tree).contains(dir)))
+        Ok(package_of(&crate::orch::ci::Tree::at(&repo, pair)?, pkg))
     }
     #[cfg(not(feature = "checkout"))]
     {
         let _ = (repo, pair, pkg);
-        Ok(false)
+        Ok(TestPackage::default())
     }
+}
+
+/// The package a JIT `makepad test` command tests: the first word after `test` that is no option,
+/// as makepad test reads it (relax test_pkg.rs: `-p` / `--package` only mark it; an option before
+/// it may take a value).
+pub(crate) fn tested_package(argv: &[String]) -> Option<&str> {
+    let (first, rest) = crate::lease::loaders::cargo_run_args(argv)?.split_first()?;
+    if first != "test" { return None; }
+    let mut words = rest.iter();
+    while let Some(w) = words.next() {
+        match w.as_str() {
+            "--" => return None,
+            "--features" | "-F" | "--cfg" | "--report-to" | "--run-dir" | "--workspace-dir" => { words.next(); }
+            w if w.starts_with('-') => {}
+            pkg => return Some(pkg),
+        }
+    }
+    None
+}
+
+/// The cargo command a JIT `makepad test` command `argv` stands for, as `devhub test --native`
+/// runs it: `cargo test --release -p <pkg>` with its targets, features and test arguments, after
+/// its `env` assignments. Err: not a JIT test, or an option only makepad test has.
+#[cfg(feature = "checkout")]
+pub(crate) fn native_test_argv(argv: &[String]) -> Result<Vec<String>, String> {
+    let args = crate::lease::loaders::cargo_run_args(argv).ok_or("not a JIT command")?;
+    let Some(("test", rest)) = args.split_first().map(|(f, r)| (f.as_str(), r)) else {
+        return Err(format!("`makepad {}` has no cargo form: give the cargo command itself", args.first().map_or("", String::as_str)));
+    };
+    let (mut pkg, mut out, mut words) = (None, Vec::new(), rest.iter());
+    while let Some(w) = words.next() {
+        match w.as_str() {
+            "--" => {
+                out.push(w.clone());
+                out.extend(words.by_ref().cloned());
+            }
+            "--release" | "-p" | "--package" => {}
+            "--cfg" | "--report-to" | "--run-dir" | "--workspace-dir" => return Err(format!("`{w}` is makepad test's own option, which cargo test has not")),
+            "--features" | "-F" | "--bin" | "--test" | "--example" | "--bench" | "--target" | "-j" | "--jobs" => {
+                out.push(w.clone());
+                out.extend(words.next().cloned());
+            }
+            o if o.starts_with('-') => out.push(w.clone()),
+            p if pkg.is_none() => pkg = Some(p.to_string()),
+            _ => out.push(w.clone()),
+        }
+    }
+    let pkg = pkg.ok_or("it names no package")?;
+    let mut cmd: Vec<String> = argv.iter().take_while(|w| *w == "env" || (w.contains('=') && !w.starts_with('-'))).cloned().collect();
+    cmd.extend(["cargo", "test", "--release", "-p", &pkg].map(String::from));
+    cmd.extend(out);
+    Ok(cmd)
+}
+
+/// What a lane's run of the JIT `makepad test` command `argv` says as it takes the lane's tree
+/// rather than an overlay: its package's `test-tree` reason at `pair` ([`test_package`]). None:
+/// the command tests no package that says it.
+pub(crate) fn test_tree_of(repo: &Path, pair: &crate::state::Pair, argv: &[String]) -> Result<Option<String>, String> {
+    let Some(pkg) = tested_package(argv) else { return Ok(None) };
+    Ok(test_package(repo, pair, pkg)?.tree.map(|why| tree_line(pkg, &why)))
+}
+
+/// A run that takes the lane's tree for its package's `test-tree` says so in these words.
+pub(crate) fn tree_line(pkg: &str, why: &str) -> String {
+    format!("{pkg} runs in the lane's tree: {why} (its Cargo.toml's test-tree)")
+}
+
+#[cfg(feature = "checkout")]
+fn package_of(tree: &crate::orch::ci::Tree, pkg: &str) -> TestPackage {
+    use crate::orch::ci::{jit_own_dirs, krate, package_dirs};
+    let Some(dir) = package_dirs(tree).remove(pkg) else { return TestPackage::default() };
+    let manifest = if dir.is_empty() { "Cargo.toml".to_string() } else { format!("{dir}/Cargo.toml") };
+    let (tree_why, native) = krate(tree, &manifest).map_or((None, Default::default()), |k| (k.test_tree, k.native_tests));
+    TestPackage { own: jit_own_dirs(tree).contains(&dir), tree: tree_why, native }
 }
 
 /// The packages the JIT binary is built from.
@@ -188,6 +324,103 @@ pub(crate) fn jit_binary_packages(repo: &Path, pair: &crate::state::Pair) -> Res
     let tree = Tree::at(&repo, pair)?;
     let dirs = jit_binary_dirs(&tree);
     Ok(package_dirs(&tree).into_iter().filter(|(_, dir)| dirs.contains(dir)).map(|(pkg, _)| pkg).collect())
+}
+
+/// The packages the lane's diff touches at `pin`, to check without their tests ([`check_failures`]):
+/// each path the lane changed since it left work (and commercial main), committed or, unless
+/// `commits_only`, not ([`crate::lease::ship::uncommitted`]: what ships with its runs), in the
+/// package that holds it ([`packages_touched`]).
+#[cfg(feature = "checkout")]
+pub(crate) fn touched_packages(repo: &Path, pin: &crate::lease::Pin, commits_only: bool) -> Result<Vec<String>, String> {
+    use crate::orch::ci::{Tree, COMMERCIAL};
+    let pair = pin.pair();
+    let mut paths = Vec::new();
+    for (dir, sha, branch, prefix) in [(repo.to_path_buf(), &pair.work, "refs/heads/work", ""), (repo.join(COMMERCIAL), &pair.main, "refs/heads/main", "apps/commercial/")] {
+        if sha.is_empty() || !dir.join(".git").exists() { continue; }
+        let base = crate::orch::git(&dir, &["merge-base", sha, branch])?;
+        paths.extend(crate::orch::git(&dir, &["diff", "--name-only", base.trim(), sha])?.lines().map(|p| format!("{prefix}{p}")));
+    }
+    if !commits_only {
+        let (files, deleted) = crate::lease::ship::uncommitted(repo, pin)?;
+        paths.extend(files.into_iter().chain(deleted));
+    }
+    Ok(packages_touched(&Tree::at(repo, &pair)?, &paths))
+}
+#[cfg(not(feature = "checkout"))]
+pub(crate) fn touched_packages(_: &Path, _: &crate::lease::Pin, _: bool) -> Result<Vec<String>, String> {
+    Ok(Vec::new())
+}
+
+/// The root workspace's packages that hold `paths`, each path in the package whose directory
+/// holds it most closely. A document, and a file of a package's tests, benches or examples, is in
+/// no build that ships; a package of another workspace is left to the buckets (its check runs from
+/// its own directory).
+#[cfg(feature = "checkout")]
+pub(crate) fn packages_touched(tree: &crate::orch::ci::Tree, paths: &[String]) -> Vec<String> {
+    use crate::orch::ci::{members, package_dirs};
+    let dirs = package_dirs(tree);
+    let root: std::collections::BTreeSet<String> = members(tree).into_iter().map(|k| k.package).collect();
+    let mut out = std::collections::BTreeSet::new();
+    for path in paths.iter().filter(|p| !makepad_ci_merge::doc_file(p)) {
+        let holds = |d: &&String| d.is_empty() || path.strip_prefix(d.as_str()).is_some_and(|r| r.starts_with('/'));
+        let Some((name, dir)) = dirs.iter().filter(|(_, d)| holds(d)).max_by_key(|(_, d)| d.len()) else { continue };
+        let inside = if dir.is_empty() { path.as_str() } else { &path[dir.len() + 1..] };
+        if ["tests/", "benches/", "examples/"].iter().any(|t| inside.starts_with(t)) { continue; }
+        if root.contains(name) { out.insert(name.clone()); }
+    }
+    out.into_iter().collect()
+}
+
+/// One run of the pre-land check without tests ([`check_runs`]): its packages, its lease's class,
+/// its command and the command that shows it alone.
+#[derive(Debug, PartialEq)]
+pub(crate) struct CheckRun {
+    /// cargo checks it: the JIT is built from these crates, and their tests run under cargo too
+    pub own: bool,
+    pub packages: Vec<String>,
+    pub class: String,
+    pub cmd: Vec<String>,
+    pub alone: String,
+}
+
+/// The pre-land check's runs of the packages a lane's diff touches (each with whether the JIT is
+/// built from it): one `makepad check -p .. -p ..` of those the JIT checks, a process each inside
+/// one JIT run, and one `cargo check -p .. -p ..` of the JIT's own crates. A run per package queued
+/// one lease per package for each `devhub test`: a rename that touched 36 packages queued 145 small
+/// leases for four commands, ahead of other lanes' work on four boxes, and those that found no JIT
+/// on their box built one each (11-12). A run of one package keeps that package's class, and its
+/// measure.
+pub(crate) fn check_runs(touched: &[(String, bool)]) -> Vec<CheckRun> {
+    [false, true].into_iter().filter_map(|own| {
+        let packages: Vec<String> = touched.iter().filter(|(_, o)| *o == own).map(|(p, _)| p.clone()).collect();
+        let (first, rest) = packages.split_first()?;
+        let class = if rest.is_empty() { format!("check:{first}") } else { format!("check:{first} +{}", rest.len()) };
+        let flags: Vec<String> = packages.iter().flat_map(|p| ["-p".to_string(), p.clone()]).collect();
+        let (head, alone): (&[&str], &str) = if own { (&["cargo", "check", "--release", "--message-format", "short"], "cargo check --release") }
+            else { (&["cargo", "run", "--profile", "host", "-q", "-p", "makepad-run", "--bin", "makepad", "--", "check"], "makepad check") };
+        Some(CheckRun {
+            own,
+            class: if own { format!("native:{class}") } else { class },
+            cmd: head.iter().map(|w| w.to_string()).chain(flags.iter().cloned()).collect(),
+            alone: format!("{alone} {}", flags.join(" ")),
+            packages,
+        })
+    }).collect()
+}
+
+/// What fails a check of a package without its tests: its compile errors and each warning at a
+/// source line, as the compiler said them. A fn only its tests call is used under cfg(test) and
+/// dead in the build that ships, which only a check without the tests says.
+pub(crate) fn check_failures(log: &str) -> Vec<String> {
+    // `<path>:<line>:<col>: warning..`
+    let located = |l: &&str| l.split_once(": warning").is_some_and(|(at, _)| {
+        let mut f = at.rsplitn(3, ':');
+        let number = |s: Option<&str>| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+        number(f.next()) && number(f.next()) && f.next().is_some_and(|p| !p.is_empty())
+    });
+    let mut out = compile_errors(log);
+    out.extend(log.lines().filter(located).map(str::to_string));
+    out
 }
 
 /// The old CI refusal seeds a miss once. A closed row overrides the stale mark, allowing the
@@ -237,6 +470,43 @@ pub(crate) fn behind_work_jit(repo: &Path, pin: &crate::state::Pair) -> Option<S
 }
 #[cfg(not(feature = "checkout"))]
 pub(crate) fn behind_work_jit(_: &Path, _: &crate::state::Pair) -> Option<String> { None }
+
+/// What a package's build reads of the lane's trees, as one key (its miss's, [`Miss::inputs`]):
+/// each file under its own and its path dependencies' dirs ([`crate::orch::roll::crate_dirs_from`])
+/// and the workspace's root manifests, by git blob id, as the commits of `pin` hold them with the
+/// lane's edits on top ([`crate::lease::ship::uncommitted`]: what ships with its runs). An edit
+/// and its commit key the same. Err: the trees or the package cannot be read.
+#[cfg(feature = "checkout")]
+pub(crate) fn crate_inputs(repo: &Path, pin: &crate::lease::Pin, pkg: &str) -> Result<String, String> {
+    use crate::orch::ci::{package_dirs, Tree};
+    let pair = pin.pair();
+    let tree = Tree::at(repo, &pair)?;
+    let dir = package_dirs(&tree).remove(pkg).ok_or_else(|| format!("no package {pkg} at {}", pair.short()))?;
+    let dirs = crate::orch::roll::crate_dirs_from(&dir, &|p| tree.read(p));
+    let under = |p: &str| ["Cargo.toml", ".cargo/config.toml"].contains(&p) || dirs.iter().any(|d| d.is_empty() || p.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with('/')));
+    let (edited, deleted) = crate::lease::ship::uncommitted(repo, pin)?;
+    let mut files: std::collections::BTreeMap<String, String> = tree.files.iter().filter(|f| under(f)).map(|f| (f.clone(), tree.blob(f).unwrap_or("").to_string())).collect();
+    for f in deleted.iter().filter(|f| under(f)) { files.remove(f); }
+    for f in edited.into_iter().filter(|f| under(f)) {
+        let path = repo.join(&f);
+        let bytes = match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.file_type().is_symlink() => std::fs::read_link(&path).map(|t| t.to_string_lossy().into_owned().into_bytes()),
+            _ => std::fs::read(&path),
+        }.map_err(|e| format!("{}: {e}", path.display()))?;
+        files.insert(f, makepad_git::oid::hash_object("blob", &bytes).to_hex());
+    }
+    let text: String = files.iter().map(|(f, blob)| format!("{f}\t{blob}\n")).collect();
+    Ok(makepad_network::digest::sha256_hash(text.as_bytes())[..8].iter().map(|b| format!("{b:02x}")).collect())
+}
+#[cfg(not(feature = "checkout"))]
+pub(crate) fn crate_inputs(_: &Path, _: &crate::lease::Pin, _: &str) -> Result<String, String> { Ok(String::new()) }
+
+/// [`crate_inputs`] of `pkg` in the lane's worktree `repo` at its pin `rev`; None: no worktree or
+/// pin, or they cannot be read.
+pub(crate) fn inputs_at(repo: &str, rev: &str, pkg: &str) -> Option<String> {
+    let pin = crate::lease::Pin::of_rev(rev).filter(|_| !repo.is_empty())?;
+    crate_inputs(Path::new(repo), &pin, pkg).ok()
+}
 
 /// Whether the JIT's inputs differ between the pair of a miss's last JIT failure and the
 /// requester's (the JIT id changed): CI's own JIT-input rule. Commits git cannot compare
@@ -289,7 +559,7 @@ pub(crate) fn serve(home: &Path, line: &str, now: u64, event: &dyn Fn(&str, &Val
             if pkg.is_empty() || error.is_empty() { return Err("jit miss add <pkg> \"<error line>\" [--repro \"<cmd>\"]".into()); }
             let i = entries.iter().position(|m| m.pkg == pkg && m.target == "manual" && m.closed_ms == 0 && m.error.first().map(String::as_str) == Some(error)).unwrap_or_else(|| {
                 let id = entries.iter().filter_map(|m| m.id[1..].parse::<u64>().ok()).max().unwrap_or(0) + 1;
-                entries.push(Miss { id: format!("M{id}"), pkg: pkg.into(), target: "manual".into(), error: vec![error.into()], lane: String::new(), pair: Default::default(), first_ms: now, last_ms: now, count: 0, closed_ms: 0, repro: String::new() });
+                entries.push(Miss { id: format!("M{id}"), pkg: pkg.into(), target: "manual".into(), error: vec![error.into()], lane: String::new(), pair: Default::default(), first_ms: now, last_ms: now, count: 0, closed_ms: 0, repro: String::new(), inputs: String::new() });
                 entries.len() - 1
             });
             let m = &mut entries[i];
@@ -310,8 +580,12 @@ pub(crate) fn serve(home: &Path, line: &str, now: u64, event: &dyn Fn(&str, &Val
             let errors = if verb == "lookup" {
                 if let Some(i) = existing {
                     if let Some(pin) = crate::lease::Pin::of_rev(text(&req, "rev")) {
-                        let to = crate::state::Pair::new(&pin.makepad, pin.commercial.as_deref().unwrap_or(""));
-                        if jit_changed(text(&req, "repo"), &entries[i].pair, &to) {
+                        let to = pin.pair();
+                        // the JIT's inputs changed, or the package's: the miss was the JIT's
+                        // failure on others (M64 kept a crate's E0700 on cargo after its line
+                        // changed, 11-06)
+                        let repo = text(&req, "repo");
+                        if jit_changed(repo, &entries[i].pair, &to) || (!repo.is_empty() && crate_inputs(Path::new(repo), &pin, pkg).ok().as_deref() != Some(entries[i].inputs.as_str())) {
                             entries[i].closed_ms = now;
                             write_ledger(home, &path, &entries)?;
                             let value = entries[i].value();
@@ -331,12 +605,19 @@ pub(crate) fn serve(home: &Path, line: &str, now: u64, event: &dyn Fn(&str, &Val
             if errors.is_empty() { return Err("jit misses: error lines required".into()); }
             let i = entries.iter().position(|m| m.pkg == pkg && m.target == target && m.error.first() == errors.first()).unwrap_or_else(|| {
                 let id = entries.iter().filter_map(|m| m.id[1..].parse::<u64>().ok()).max().unwrap_or(0) + 1;
-                entries.push(Miss { id: format!("M{id}"), pkg: pkg.into(), target: target.into(), error: errors.clone(), lane: String::new(), pair: Default::default(), first_ms: now, last_ms: now, count: 0, closed_ms: 0, repro: String::new() });
+                entries.push(Miss { id: format!("M{id}"), pkg: pkg.into(), target: target.into(), error: errors.clone(), lane: String::new(), pair: Default::default(), first_ms: now, last_ms: now, count: 0, closed_ms: 0, repro: String::new(), inputs: String::new() });
                 entries.len() - 1
             });
             let action = if verb == "lookup" && existing.is_some() { "used" } else { "recorded" };
             entries[i].touch(&req, now, action == "recorded")?;
             entries[i].error = errors;
+            if action == "recorded" {
+                // a record's: those its failing JIT run read, as its client read them when the run
+                // shipped, never the lane's once cargo has answered (M64's lane edited its crate
+                // in between); a miss a lookup seeds from CI's error, the lane's now. None
+                // (unreadable) equals no lookup's: the next one tries the JIT.
+                entries[i].inputs = if verb == "record" { text(&req, "inputs").to_string() } else { inputs_at(text(&req, "repo"), text(&req, "rev"), pkg).unwrap_or_default() };
+            }
             (i, action)
         }
         _ => return Err("jit misses [--all] | close <id>".into()),
@@ -384,6 +665,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A miss is the JIT's failure on its package's inputs: an edit to the package or a crate it
+    /// depends on by path (committed or not) tries the JIT again; an edit elsewhere does not, and
+    /// a commit of the same edit is the same inputs.
+    #[cfg(feature = "checkout")]
+    #[test]
+    fn a_miss_is_retried_once_its_crates_inputs_change() {
+        let repo = std::env::temp_dir().join(format!("devhub-miss-inputs-{}", std::process::id()));
+        let home = repo.with_extension("home");
+        let _ = (std::fs::remove_dir_all(&repo), std::fs::remove_dir_all(&home));
+        let git = |args: &[&str]| crate::orch::git(&repo, &[&["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"][..], args].concat()).unwrap().trim().to_string();
+        let write = |p: &str, text: &str| { let f = repo.join(p); std::fs::create_dir_all(f.parent().unwrap()).unwrap(); std::fs::write(f, text).unwrap(); };
+        write("Cargo.toml", "[workspace]\nmembers = [\"tools/run\", \"libs/relax\", \"apps/a\", \"libs/b\", \"apps/c\"]\n");
+        write("tools/run/Cargo.toml", "[package]\nname = \"makepad-run\"\n[dependencies]\nrelax = { path = \"../../libs/relax\" }\n");
+        write("libs/relax/Cargo.toml", "[package]\nname = \"relax\"\n");
+        write("apps/a/Cargo.toml", "[package]\nname = \"a\"\n[dependencies]\nb = { path = \"../../libs/b\" }\n");
+        write("apps/a/src/lib.rs", "pub fn f() -> impl Sized { b::g() }\n");
+        write("libs/b/Cargo.toml", "[package]\nname = \"b\"\n");
+        write("libs/b/src/lib.rs", "pub fn g() {}\n");
+        write("apps/c/Cargo.toml", "[package]\nname = \"c\"\n");
+        write("apps/c/src/lib.rs", "\n");
+        git(&["init", "-q", "-b", "work"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "base"]);
+        let events = Mutex::new(Vec::new());
+        let dir = repo.to_string_lossy().into_owned();
+        // a record carries the inputs its JIT run shipped, as the client reads them then
+        let ask = |verb: &str, sha: &str, now: u64, inputs: Option<&str>| {
+            let req = format!(r#"{{"pkg":"a","target":"--lib","lane":"l","rev":"work@{sha}","repo":{},"error":["apps/a/src/lib.rs:1:15: error[E0700]: hidden type captures lifetime"],"inputs":{}}}"#, makepad_remote::json_str(&dir), inputs.map_or("null".to_string(), makepad_remote::json_str));
+            serve(&home, &format!("misses {verb} {req}"), now, &|action, _| events.lock().unwrap().push(action.to_string())).unwrap()
+        };
+        let shipped = |sha: &str| inputs_at(&dir, &format!("work@{sha}"), "a");
+        let base = git(&["rev-parse", "HEAD"]);
+        assert!(ask("record", &base, 1, shipped(&base).as_deref()).contains("\"id\":\"M1\""));
+        assert!(ask("lookup", &base, 2, None).contains("\"id\":\"M1\""), "the same inputs: cargo's verdict stands");
+        write("apps/c/src/lib.rs", "pub fn h() {}\n");
+        assert!(ask("lookup", &base, 3, None).contains("\"id\":\"M1\""), "a crate it does not build");
+        write("libs/b/src/lib.rs", "pub fn g() -> u8 { 1 }\n");
+        assert_eq!(ask("lookup", &base, 4, None), "null", "a crate it builds changed: the JIT tries again");
+        assert_eq!(events.lock().unwrap().last().map(String::as_str), Some("retried"));
+        // the JIT failed again on these: the miss reopens, at them
+        assert!(ask("record", &base, 5, shipped(&base).as_deref()).contains("\"closed_ms\":0"));
+        assert!(ask("lookup", &base, 6, None).contains("\"id\":\"M1\""));
+        git(&["commit", "-qam", "b"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        assert!(ask("lookup", &head, 7, None).contains("\"id\":\"M1\""), "its edit committed: the same inputs");
+        // M64: the lane edits its crate between the JIT's failure and cargo's answer; the miss is
+        // keyed by what the JIT read, so the next lookup tries the edit on it
+        let before_edit = shipped(&head);
+        write("libs/b/src/lib.rs", "pub fn g() -> u16 { 2 }\n");
+        assert!(ask("record", &head, 8, before_edit.as_deref()).contains("\"closed_ms\":0"));
+        assert_eq!(ask("lookup", &head, 9, None), "null", "the edit the JIT never read is tried");
+        // a client that could not read them keys it by none, which no lookup's are
+        assert!(ask("record", &head, 10, None).contains("\"closed_ms\":0"));
+        assert_eq!(ask("lookup", &head, 11, None), "null");
+        let _ = (std::fs::remove_dir_all(&repo), std::fs::remove_dir_all(&home));
+    }
+
     #[test]
     fn a_miss_filed_by_hand_is_listed_and_counted() {
         let home = std::env::temp_dir().join(format!("devhub-miss-add-{}", std::process::id()));
@@ -414,13 +752,110 @@ test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         assert_eq!(compile_errors(&log), vec![error.to_string()]);
     }
 
+    /// A line of the app's own log at a source line is no compile error: an `[I]` line of a guard
+    /// run was its JIT miss (M75-M77, 11-07).
+    #[test]
+    fn an_apps_log_line_is_no_compile_error() {
+        let log = "[I] apps/x/src/fx.rs:628:17 - effects: bloom read (144.5 ms)\n[E] apps/x/src/fx.rs:9:1 - no such picture\n[W] src/a.rs:3:2 - slow\n";
+        assert!(compile_errors(log).is_empty(), "{:?}", compile_errors(log));
+        let error = "/tree/src/b.rs:1:2: E0308: mismatched types";
+        assert_eq!(compile_errors(&format!("{log}{error}\n")), vec![error.to_string()]);
+    }
+
+    /// A package says why its tests need the lane's tree; one that says nothing runs in an
+    /// overlay. devhub's own tests walk this checkout's history and run cargo tree on it, which
+    /// an overlay lacks (11-07). It also names the test targets that run under cargo, and a run
+    /// goes there when its selection runs one of them. The pre-land check also checks each package a lane's diff touches
+    /// without its tests: a path's package is the one that holds it most closely, and a document, a
+    /// file of its tests, benches or examples, or a package of another workspace touches none.
+    #[cfg(feature = "checkout")]
+    #[test]
+    fn a_package_whose_tests_read_the_checkout_runs_in_the_tree() {
+        let t = crate::orch::ci::Tree::mem(vec![
+            ("Cargo.toml", "[workspace]\nmembers = [\"libs/*\", \"libs/a/inner\"]\nexclude = [\"libs/own\"]\n"),
+            ("libs/a/Cargo.toml", "[package]\nname = \"a\"\n[package.metadata.makepad]\ntest-tree = \"its tests read the history\"\n"),
+            ("libs/a/inner/Cargo.toml", "[package]\nname = \"a-inner\"\n"),
+            ("libs/b/Cargo.toml", "[package]\nname = \"b\"\n[package.metadata.makepad]\nplatforms = [\"desktop\"]\n[package.metadata.makepad.native-tests]\n\"test:spawns\" = \"its runner is its own binary\"\n"),
+            ("libs/own/Cargo.toml", "[package]\nname = \"own\"\n[workspace]\n"),
+        ]);
+        let (a, b) = (super::package_of(&t, "a"), super::package_of(&t, "b"));
+        assert_eq!((a.own, a.tree.as_deref(), a.native.len()), (false, Some("its tests read the history"), 0));
+        assert_eq!((b.tree, b.native.into_iter().collect::<Vec<_>>()), (None, vec![("test:spawns".to_string(), "its runner is its own binary".to_string())]));
+        assert_eq!(super::package_of(&t, "c"), super::TestPackage::default());
+        // the package's default run, `--tests` and `--test spawns` run the declared target; `--lib`,
+        // `--bins` and another test do not
+        let native = std::collections::BTreeMap::from([("test:spawns".to_string(), "why".to_string())]);
+        let runs = |select: &[&str]| !super::native_selected(&native, &select.iter().map(|w| w.to_string()).collect::<Vec<_>>()).is_empty();
+        let selects: [&[&str]; 6] = [&[], &["tests"], &["test:spawns"], &["lib"], &["bins"], &["test:other"]];
+        assert_eq!(selects.map(runs), [true, true, true, false, false, false]);
+        let touched = |paths: &[&str]| super::packages_touched(&t, &paths.iter().map(|p| p.to_string()).collect::<Vec<_>>());
+        assert_eq!(touched(&["libs/a/src/lib.rs", "libs/a/inner/src/x.rs", "libs/a/Cargo.toml"]), ["a", "a-inner"], "each path in the package that holds it most closely");
+        assert_eq!(touched(&["libs/b/README.md", "libs/b/tests/t.rs", "libs/b/benches/x.rs", "libs/b/examples/e.rs", "libs/own/src/lib.rs", "docs/x.rs", "libs/bb/src/y.rs"]), Vec::<String>::new(),
+            "a document, tests, benches, examples, another workspace's package, a path in no package");
+        let own = makepad_toml_parser::parse_toml(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap()).unwrap();
+        assert!(own.get_path(&["package", "metadata", "makepad", "test-tree"]).and_then(makepad_toml_parser::Toml::as_str).is_some(), "devhub's tests read the checkout: its Cargo.toml says so");
+        // the packages a diff touches are checked in one run per checker, never a lease each: 36
+        // touched packages queued 36 leases for each `devhub test` of a lane (11-12)
+        let many: Vec<(String, bool)> = (0..36).map(|i| (format!("p{i:02}"), i % 9 == 0)).collect();
+        let runs = super::check_runs(&many);
+        assert_eq!(runs.len(), 2, "one JIT run and one cargo check: {runs:?}");
+        let (jit, cargo) = (&runs[0], &runs[1]);
+        assert_eq!((jit.own, jit.packages.len(), jit.class.as_str()), (false, 32, "check:p01 +31"));
+        assert_eq!(crate::lease::loaders::cargo_run_args(&jit.cmd).map(|a| a.len()), Some(1 + 2 * 32), "the JIT's run of them all, as the box runs a JIT run");
+        assert!(jit.alone.starts_with("makepad check -p p01 -p p02 "), "{}", jit.alone);
+        assert_eq!((cargo.own, cargo.packages.join(" "), cargo.class.as_str()), (true, "p00 p09 p18 p27".to_string(), "native:check:p00 +3"));
+        assert_eq!(cargo.cmd.join(" "), "cargo check --release --message-format short -p p00 -p p09 -p p18 -p p27");
+        assert!(crate::lease::native::builds(&cargo.cmd, &|_| None).is_empty(), "a cargo check builds nothing the JIT-first gate refuses");
+        // one package keeps its own class; none touched, no run
+        let one = super::check_runs(&[("a".to_string(), false)]);
+        assert_eq!((one.len(), one[0].class.as_str(), one[0].alone.as_str()), (1, "check:a", "makepad check -p a"));
+        assert!(super::check_runs(&[]).is_empty());
+    }
+
+    /// The package a JIT `makepad test` command tests, as makepad test reads it: past its
+    /// options (with their values) and the `-p` marker; nothing for other commands.
+    #[test]
+    fn a_jit_test_command_names_its_package() {
+        let w = |c: &str| c.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        for (cmd, pkg) in [
+            ("makepad test -p pkg-a --release -- one", Some("pkg-a")),
+            ("env CARGO_INCREMENTAL=0 makepad test --package pkg-a", Some("pkg-a")),
+            ("makepad test --features x,y --live pkg-b --lib", Some("pkg-b")),
+            ("cargo run --profile host -q -p makepad-run --bin makepad -- test pkg-c", Some("pkg-c")),
+            ("makepad test -- pkg-d", None),
+            ("makepad run pkg-e", None),
+            ("cargo test -p pkg-f", None),
+        ] {
+            assert_eq!(super::tested_package(&w(cmd)), pkg, "{cmd}");
+        }
+    }
+
+    /// A JIT warning or note at a source line is no compile error: M71 recorded a test run's
+    /// `unused imports` warning as its JIT miss (11-07).
+    #[test]
+    fn a_located_warning_or_note_is_no_compile_error() {
+        let warn = "/tree/libs/video/tests/color.rs:20:94: warning: unused imports: `VideoMatrix` and `VideoRange` [unused_imports]";
+        let log = format!("{warn}\n/tree/src/a.rs:3:1: warning[W1]: x\n/tree/src/a.rs:4:1: note: y\n/tree/src/a.rs:5: help: z\nrelax test: 1 warning\n");
+        assert!(compile_errors(&log).is_empty(), "{:?}", compile_errors(&log));
+        let error = "/tree/src/b.rs:1:2: E0308: mismatched types";
+        assert_eq!(compile_errors(&format!("{log}{error}\n")), vec![error.to_string()]);
+        assert_eq!(compile_errors("/tree/src/b.rs:9:3: error: expected `;`\n"), vec!["/tree/src/b.rs:9:3: error: expected `;`".to_string()]);
+        // a check without the tests fails on a warning as on an error, each listed as the compiler
+        // said it: a fn only tests call is dead in the build that ships (#4005, #4024, 11-12)
+        let dead = "/tree/libs/relax/compiler/src/check_reuse.rs:401:19: warning: associated function `open_verify` is never used";
+        let check = format!("relax check: relax-compiler\n{dead}\nnote: `#[warn(dead_code)]` on by default\nwarning: `relax-compiler` (lib) generated 1 warning\nrelax check: all, 0 errors\n");
+        assert_eq!(check_failures(&check), vec![dead.to_string()], "the warning at its line, not the summary or the note");
+        assert_eq!(check_failures(&format!("{log}{error}\n")), vec![error.to_string(), warn.to_string(), "/tree/src/a.rs:3:1: warning[W1]: x".to_string()], "errors, then warnings");
+        assert!(check_failures("relax check: all, 0 errors\nwarning: unused manifest key\n").is_empty(), "a warning at no source line is no failure of the code");
+    }
+
     #[test]
     fn a_tests_crash_report_is_not_a_miss() {
         let log = r#"running 1 test
 test an_unbaked_protected_request_is_traced ... FAILED
 test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
   report: {"kind":"panic","message":"at rest the tracer still holds 507392 bytes of GPU buffers","location":"/tree/apps/x/tests/trace_unbaked.rs:112:13"}
-makepad-run: main panic report: {"kind":"panic","location":"/tree/src/main.rs:3:5"}
+relax: main panic report: {"kind":"panic","location":"/tree/src/main.rs:3:5"}
 "#;
         assert!(compile_errors(log).is_empty(), "{:?}", compile_errors(log));
         let none = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n\nerror: no test matched no_such_test\n";
@@ -430,10 +865,10 @@ makepad-run: main panic report: {"kind":"panic","location":"/tree/src/main.rs:3:
     #[test]
     fn a_warm_restarts_reasons_are_not_misses() {
         let log = "testverdict group=1 ran=101 passed=101 failed=0
-makepad live:   /tree/src/lease/exec.rs:2435:1: mod `tests` changed: a module's item list changed -- restart the app
-makepad live:   /tree/src/proto.rs:1:1: const `HUB_PROTO` is used in a type: its users' types change -- restart the app
-makepad live:   /tree/src/jit_misses.rs:147:9: use use crate::x; added here (inside a fn body) -- adding this kind of item is not applied live yet: restart the app
-makepad live: restarting (/tree/src/a.rs, /tree/src/b.rs)
+relax live:   /tree/src/lease/exec.rs:2435:1: mod `tests` changed: a module's item list changed -- restart the app
+relax live:   /tree/src/proto.rs:1:1: const `BUFFER_SIZE` is used in a type: its users' types change -- restart the app
+relax live:   /tree/src/jit_misses.rs:147:9: use use crate::x; added here (inside a fn body) -- adding this kind of item is not applied live yet: restart the app
+relax live: restarting (/tree/src/a.rs, /tree/src/b.rs)
 running 103 tests
 test a ... ok
 test b ... ok

@@ -497,6 +497,13 @@ pub struct IterMut<'a, K: 'a, V: 'a> {
     _m: PhantomData<&'a mut (K, V)>,
 }
 
+impl<'a, K, V> IterMut<'a, K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        // SAFETY: the table lives for this borrow, and iteration starts after all yielded entries.
+        Iter { table: unsafe { &*self.table }, pos: self.pos, remaining: self.remaining }
+    }
+}
+
 impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
     fn next(&mut self) -> Option<(&'a K, &'a mut V)> {
@@ -518,9 +525,21 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
 impl<'a, K, V> ExactSizeIterator for IterMut<'a, K, V> {}
 impl<'a, K, V> FusedIterator for IterMut<'a, K, V> {}
 
+impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'a, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 pub struct IntoIter<K, V> {
     table: RawTable<(K, V)>,
     pos: usize,
+}
+
+impl<K, V> IntoIter<K, V> {
+    fn iter(&self) -> Iter<'_, K, V> {
+        Iter { table: &self.table, pos: self.pos, remaining: self.table.len() }
+    }
 }
 
 impl<K, V> Iterator for IntoIter<K, V> {
@@ -540,6 +559,12 @@ impl<K, V> Iterator for IntoIter<K, V> {
 
 impl<K, V> ExactSizeIterator for IntoIter<K, V> {}
 impl<K, V> FusedIterator for IntoIter<K, V> {}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
 
 pub struct Drain<'a, K: 'a, V: 'a> {
     table: &'a mut RawTable<(K, V)>,
@@ -679,6 +704,12 @@ impl<'a, K, V> Iterator for ValuesMut<'a, K, V> {
 impl<'a, K, V> ExactSizeIterator for ValuesMut<'a, K, V> {}
 impl<'a, K, V> FusedIterator for ValuesMut<'a, K, V> {}
 
+impl<'a, K, V: fmt::Debug> fmt::Debug for ValuesMut<'a, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.iter().map(|(_, v)| v)).finish()
+    }
+}
+
 pub struct IntoKeys<K, V> {
     inner: IntoIter<K, V>,
 }
@@ -698,6 +729,12 @@ impl<K, V> Iterator for IntoKeys<K, V> {
 
 impl<K, V> ExactSizeIterator for IntoKeys<K, V> {}
 
+impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.iter().map(|(k, _)| k)).finish()
+    }
+}
+
 pub struct IntoValues<K, V> {
     inner: IntoIter<K, V>,
 }
@@ -716,6 +753,12 @@ impl<K, V> Iterator for IntoValues<K, V> {
 }
 
 impl<K, V> ExactSizeIterator for IntoValues<K, V> {}
+
+impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.iter().map(|(_, v)| v)).finish()
+    }
+}
 
 impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
     type Item = (&'a K, &'a V);
@@ -751,60 +794,19 @@ impl<K: Eq + Hash, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, Random
     }
 }
 
-// The iterators that yield `&mut V` or owned items print the entries they have not yielded yet,
-// read through a borrowing iterator from the same position (slotmap's SparseSecondaryMap
-// iterators are `#[derive(Debug)]` wrappers around Drain, IntoIter and IterMut).
-impl<'a, K, V> IterMut<'a, K, V> {
-    fn iter(&self) -> Iter<'_, K, V> {
-        Iter { table: unsafe { &*self.table }, pos: self.pos, remaining: self.remaining }
-    }
-}
-
-impl<K, V> IntoIter<K, V> {
-    fn iter(&self) -> Iter<'_, K, V> {
-        Iter { table: &self.table, pos: self.pos, remaining: self.table.len() }
-    }
-}
-
+// A drain prints the entries it has not yielded yet, read through a borrowing iterator from the
+// same position, as IterMut and IntoIter do (slotmap's SparseSecondaryMap iterators are
+// `#[derive(Debug)]` wrappers around all three).
 impl<'a, K, V> Drain<'a, K, V> {
-    fn iter(&self) -> Iter<'_, K, V> {
+    /// (hash_set's Drain prints its keys through it)
+    pub(super) fn iter(&self) -> Iter<'_, K, V> {
         Iter { table: &*self.table, pos: self.pos, remaining: self.remaining }
-    }
-}
-
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IterMut<'_, K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.iter(), f)
-    }
-}
-
-impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for IntoIter<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&self.iter(), f)
     }
 }
 
 impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Drain<'_, K, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.iter(), f)
-    }
-}
-
-impl<K, V: fmt::Debug> fmt::Debug for ValuesMut<'_, K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(Values { inner: self.inner.iter() }).finish()
-    }
-}
-
-impl<K: fmt::Debug, V> fmt::Debug for IntoKeys<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(Keys { inner: self.inner.iter() }).finish()
-    }
-}
-
-impl<K, V: fmt::Debug> fmt::Debug for IntoValues<K, V> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list().entries(Values { inner: self.inner.iter() }).finish()
     }
 }
 

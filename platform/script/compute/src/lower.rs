@@ -366,10 +366,23 @@ impl Builder {
                     map.remove(&Key::Get(var));
                 }
             }
-            IS::Store { region, base, off, val, .. } => {
+            IS::Store { region, base, extent, off, val } => {
                 let region = *region;
+                // The words the store may write: its own, or its whole range
+                // with an offset. In u64: a range ending past u32::MAX (an
+                // emit's word k of u32::MAX) must not wrap to a low end and
+                // read as a miss.
+                let lo = *base as u64;
+                let hi = lo + if off.is_some() { *extent as u64 } else { 1 };
                 for (map, _) in &mut self.cse {
-                    map.retain(|k, _| !matches!(k, Key::Load(r, ..) if *r == region));
+                    map.retain(|k, _| match *k {
+                        Key::Load(r, ..) if r != region => true,
+                        // Two words past a host buffer's end clamp to the same word: any may alias.
+                        Key::Load(Region::Buf(_), ..) => false,
+                        // A load keeps its value while the store misses every word it may read.
+                        Key::Load(_, b, e, ..) => b as u64 + e as u64 <= lo || hi <= b as u64,
+                        _ => true,
+                    });
                 }
                 // A later load of that word (same type) in this block reads
                 // the stored value. Not host buffers: two words past a
@@ -553,8 +566,9 @@ impl Builder {
         // A constant offset folds into the base.
         if let Some(o) = off {
             if let Some(c) = self.cst(o) {
+                // (Saturating: past u32::MAX is the last word, never a low one.)
                 let c = ir::clamp_off(c, extent);
-                return self.raw(ty, Op::Load { region, base: base + c, extent: 1, off: None }, None);
+                return self.raw(ty, Op::Load { region, base: base.saturating_add(c), extent: 1, off: None }, None);
             }
         }
         self.raw(ty, Op::Load { region, base, extent, off }, None)
@@ -563,7 +577,7 @@ impl Builder {
         if let Some(o) = off {
             if let Some(c) = self.cst(o) {
                 let c = ir::clamp_off(c, extent);
-                self.push(IS::Store { region, base: base + c, extent: 1, off: None, val });
+                self.push(IS::Store { region, base: base.saturating_add(c), extent: 1, off: None, val });
                 return;
             }
         }
@@ -2649,35 +2663,34 @@ impl Lowerer {
     }
 
     fn assign_vars(&mut self, t: &T, vars: &[Var], v: &V, span: Span) -> LResult<()> {
-        match t {
-            T::F => {
-                let x = self.to_f(v, span)?;
-                self.b.set(vars[0], x);
-            }
-            T::I => {
-                let x = match v {
-                    V::I(_) | V::Lit(_) => self.to_i(v, span)?,
-                    _ => return err(span, format!("expected i32, found {} (use int(x))", self.vname(v))),
-                };
-                self.b.set(vars[0], x);
-            }
-            T::B => {
-                let V::B(x) = v else { return err(span, format!("expected bool, found {}", self.vname(v))) };
-                self.b.set(vars[0], *x);
-            }
-            T::D => {
-                let x = self.to_d(v, span)?;
-                self.b.set(vars[0], x);
-            }
-            T::Vec(n) => {
-                let l = self.to_vec(v, *n, span)?;
-                for k in 0..*n as usize {
+        match self.held(t, v, span)? {
+            V::F(x) | V::I(x) | V::B(x) | V::D(x) => self.b.set(vars[0], x),
+            V::Vec(n, l) => {
+                for k in 0..n as usize {
                     self.b.set(vars[k], l[k]);
                 }
             }
             _ => unreachable!(),
         }
         Ok(())
+    }
+
+    /// `v` as a variable of type `t` holds it.
+    fn held(&mut self, t: &T, v: &V, span: Span) -> LResult<V> {
+        Ok(match t {
+            T::F => V::F(self.to_f(v, span)?),
+            T::I => match v {
+                V::I(_) | V::Lit(_) => V::I(self.to_i(v, span)?),
+                _ => return err(span, format!("expected i32, found {} (use int(x))", self.vname(v))),
+            },
+            T::B => {
+                let V::B(x) = v else { return err(span, format!("expected bool, found {}", self.vname(v))) };
+                V::B(*x)
+            }
+            T::D => V::D(self.to_d(v, span)?),
+            T::Vec(n) => V::Vec(*n, self.to_vec(v, *n, span)?),
+            _ => unreachable!(),
+        })
     }
 
     fn read_vars(&mut self, t: &T, vars: &[Var]) -> V {
@@ -2714,6 +2727,8 @@ impl Lowerer {
     /// Lowers statements; the value is the last expression statement's.
     fn stmts(&mut self, stmts: &[Stmt]) -> LResult<V> {
         let mut last = V::Unit;
+        // the names whose assignments here each name a new value (`assigned_in_line`)
+        let mut in_line: Vec<&str> = Vec::new();
         for (k, s) in stmts.iter().enumerate() {
             last = V::Unit;
             match s {
@@ -2735,12 +2750,27 @@ impl Lowerer {
                         _ => v,
                     };
                     // A traced lowering's values lead to their defs (`trace.rs`): a let never
-                    // assigned again names its value, as a parameter does.
-                    let bind = match v {
-                        V::Lit(_) | V::F(_) | V::I(_) | V::B(_) | V::D(_) | V::Vec(..) if self.trace.is_some() && !assigns(&stmts[k + 1..], name) => Bind::Value(v),
+                    // assigned again names its value, as a parameter does; one assigned again
+                    // only in line names each value in turn, as a chain of lets would.
+                    in_line.retain(|n| *n != name.as_str());
+                    let rest = &stmts[k + 1..];
+                    let bind = match Self::value_t(&v) {
+                        Some(_) if self.trace.is_some() && !assigns(rest, name) => Bind::Value(v),
+                        Some(t) if self.trace.is_some() && assigned_in_line(rest, name) => {
+                            in_line.push(name.as_str());
+                            Bind::Value(self.held(&t, &v, *span)?)
+                        }
                         _ => self.new_local(&v, *span)?,
                     };
                     self.bind(name, bind);
+                }
+                Stmt::Assign { target: Expr { kind: ExprKind::Ident(name), .. }, op, value, span } if in_line.contains(&name.as_str()) => {
+                    let rhs = self.expr(value)?;
+                    let Some(Bind::Value(old)) = self.lookup(name) else { unreachable!("a name assigned in line is bound to its value") };
+                    let t = Self::value_t(&old).expect("a value a variable could hold");
+                    let v = self.combined(*op, old, rhs, *span)?;
+                    let v = self.held(&t, &v, *span)?;
+                    self.bind(name, Bind::Value(v));
                 }
                 Stmt::Assign { target, op, value, span } => self.assign(target, *op, value, *span)?,
                 Stmt::Expr(e) => {
@@ -2833,19 +2863,22 @@ impl Lowerer {
         Ok(last)
     }
 
+    /// What `op` makes of a target holding `old` and the value `rhs`.
+    fn combined(&mut self, op: AssignOp, old: V, rhs: V, span: Span) -> LResult<V> {
+        let bop = match op {
+            AssignOp::Set => return Ok(rhs),
+            AssignOp::Add => BinOp::Add,
+            AssignOp::Sub => BinOp::Sub,
+            AssignOp::Mul => BinOp::Mul,
+            AssignOp::Div => BinOp::Div,
+            AssignOp::Rem => BinOp::Rem,
+        };
+        self.binary(bop, old, rhs, span)
+    }
+
     fn assign(&mut self, target: &Expr, op: AssignOp, value: &Expr, span: Span) -> LResult<()> {
         let rhs = self.expr(value)?;
-        let combine = |l: &mut Self, old: V| -> LResult<V> {
-            let bop = match op {
-                AssignOp::Set => return Ok(rhs.clone()),
-                AssignOp::Add => BinOp::Add,
-                AssignOp::Sub => BinOp::Sub,
-                AssignOp::Mul => BinOp::Mul,
-                AssignOp::Div => BinOp::Div,
-                AssignOp::Rem => BinOp::Rem,
-            };
-            l.binary(bop, old, rhs.clone(), span)
-        };
+        let combine = |l: &mut Self, old: V| -> LResult<V> { l.combined(op, old, rhs.clone(), span) };
         match &target.kind {
             ExprKind::Ident(name) => match self.lookup(name) {
                 Some(Bind::Local(t, vars)) => {
@@ -4575,35 +4608,70 @@ fn assigns(body: &[Stmt], name: &str) -> bool {
             _ => None,
         }
     }
-    fn expr(e: &Expr, name: &str) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::Assign { target, value, .. } => root(target) == Some(name) || assigns_expr(value, name),
+        Stmt::Let { value, .. } => assigns_expr(value, name),
+        Stmt::Expr(e) => assigns_expr(e, name),
+        Stmt::For { from, to, body, .. } => assigns_expr(from, name) || assigns_expr(to, name) || assigns(body, name),
+        Stmt::While { cond, body, .. } => assigns_expr(cond, name) || assigns(body, name),
+        Stmt::Loop { body, .. } => assigns(body, name),
+        Stmt::Return(Some(e), _) => assigns_expr(e, name),
+        _ => false,
+    })
+}
+
+/// Is `name` assigned anywhere in `e`?
+fn assigns_expr(e: &Expr, name: &str) -> bool {
+    match &e.kind {
+        ExprKind::If(arms, else_) => {
+            arms.iter().any(|(c, b)| assigns_expr(c, name) || assigns(b, name)) || else_.as_ref().is_some_and(|b| assigns(b, name))
+        }
+        ExprKind::Match(s, arms) => assigns_expr(s, name) || arms.iter().any(|(_, b)| assigns(b, name)),
+        ExprKind::Block(b) => assigns(b, name),
+        ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) | ExprKind::ArrayRepeat(a, b) => assigns_expr(a, name) || assigns_expr(b, name),
+        ExprKind::Neg(a) | ExprKind::Not(a) | ExprKind::Field(a, _) => assigns_expr(a, name),
+        ExprKind::Call(_, args) | ExprKind::ArrayList(args) => args.iter().any(|a| assigns_expr(a, name)),
+        ExprKind::StructLit(_, f) => f.iter().any(|(_, a)| assigns_expr(a, name)),
+        // A local function assigning a captured name assigns it.
+        ExprKind::Lambda(f) => assigns(&f.body, name),
+        _ => false,
+    }
+}
+
+/// Is there a function (`fn(..) {..}`, a local `fn`) anywhere in `body`?
+fn lambda_in(body: &[Stmt]) -> bool {
+    fn expr(e: &Expr) -> bool {
         match &e.kind {
-            ExprKind::If(arms, else_) => {
-                arms.iter().any(|(c, b)| expr(c, name) || stmts(b, name)) || else_.as_ref().is_some_and(|b| stmts(b, name))
-            }
-            ExprKind::Match(s, arms) => expr(s, name) || arms.iter().any(|(_, b)| stmts(b, name)),
-            ExprKind::Block(b) => stmts(b, name),
-            ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) | ExprKind::ArrayRepeat(a, b) => expr(a, name) || expr(b, name),
-            ExprKind::Neg(a) | ExprKind::Not(a) | ExprKind::Field(a, _) => expr(a, name),
-            ExprKind::Call(_, args) | ExprKind::ArrayList(args) => args.iter().any(|a| expr(a, name)),
-            ExprKind::StructLit(_, f) => f.iter().any(|(_, a)| expr(a, name)),
-            // A local function assigning a captured name assigns it.
-            ExprKind::Lambda(f) => stmts(&f.body, name),
+            ExprKind::Lambda(_) => true,
+            ExprKind::If(arms, else_) => arms.iter().any(|(c, b)| expr(c) || lambda_in(b)) || else_.as_ref().is_some_and(|b| lambda_in(b)),
+            ExprKind::Match(s, arms) => expr(s) || arms.iter().any(|(_, b)| lambda_in(b)),
+            ExprKind::Block(b) => lambda_in(b),
+            ExprKind::Bin(_, a, b) | ExprKind::Index(a, b) | ExprKind::ArrayRepeat(a, b) => expr(a) || expr(b),
+            ExprKind::Neg(a) | ExprKind::Not(a) | ExprKind::Field(a, _) => expr(a),
+            ExprKind::Call(_, args) | ExprKind::ArrayList(args) => args.iter().any(expr),
+            ExprKind::StructLit(_, f) => f.iter().any(|(_, a)| expr(a)),
             _ => false,
         }
     }
-    fn stmts(b: &[Stmt], name: &str) -> bool {
-        b.iter().any(|s| match s {
-            Stmt::Assign { target, value, .. } => root(target) == Some(name) || expr(value, name),
-            Stmt::Let { value, .. } => expr(value, name),
-            Stmt::Expr(e) => expr(e, name),
-            Stmt::For { from, to, body, .. } => expr(from, name) || expr(to, name) || stmts(body, name),
-            Stmt::While { cond, body, .. } => expr(cond, name) || stmts(body, name),
-            Stmt::Loop { body, .. } => stmts(body, name),
-            Stmt::Return(Some(e), _) => expr(e, name),
-            _ => false,
+    body.iter().any(|s| match s {
+        Stmt::Let { value, .. } | Stmt::Expr(value) | Stmt::Return(Some(value), _) => expr(value),
+        Stmt::Assign { target, value, .. } => expr(target) || expr(value),
+        Stmt::For { from, to, body, .. } => expr(from) || expr(to) || lambda_in(body),
+        Stmt::While { cond, body, .. } => expr(cond) || lambda_in(body),
+        Stmt::Loop { body, .. } => lambda_in(body),
+        _ => false,
+    })
+}
+
+/// Is `name` assigned in `rest` (the statements after its `let`, in its block) only by whole
+/// assignments standing in `rest` itself: none in a branch, a loop or a function, and no function
+/// there to close over it? Then each assignment can name its value in turn.
+fn assigned_in_line(rest: &[Stmt], name: &str) -> bool {
+    !lambda_in(rest)
+        && rest.iter().all(|s| match s {
+            Stmt::Assign { target: Expr { kind: ExprKind::Ident(n), .. }, value, .. } if n == name => !assigns_expr(value, name),
+            s => !assigns(std::slice::from_ref(s), name),
         })
-    }
-    stmts(body, name)
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
@@ -4723,4 +4791,36 @@ pub fn lower(items: &[Item], prelude_base: usize) -> Result<Lowered, ShaderError
         state_vars: l.state_vars,
         shared_init: l.shared_init,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store drops every value-numbered load of a word it may write, also
+    /// for ranges that end past u32::MAX: summed in u32 such a range wrapped
+    /// to a low end, read as a miss, and a later load reused the value from
+    /// before the store.
+    #[test]
+    fn a_store_drops_the_loads_it_may_write_at_the_top_of_the_range() {
+        let top = u32::MAX;
+        let mut b = Builder::new();
+        let x = b.ci(7);
+        let i = b.ci(0);
+        // A load whose range runs past the top, a store inside it.
+        let wide = Key::Load(Region::Frame, top - 4, 8, Some(i), Ty::I32);
+        // A store whose range runs past the top, a load inside it.
+        let word = Key::Load(Region::Frame, top - 1, 1, None, Ty::I32);
+        // A load of words the store misses keeps its value.
+        let below = Key::Load(Region::Frame, 0, 4, Some(i), Ty::I32);
+        for key in [wide, word, below] {
+            b.cse[0].0.insert(key, x);
+        }
+        b.push(IS::Store { region: Region::Frame, base: top - 2, extent: 1, off: None, val: x });
+        assert!(b.lookup(&wide).is_none(), "a store to word top-2 drops a load of top-4..top+4");
+        assert!(b.lookup(&word).is_some(), "a store to word top-2 keeps a load of word top-1");
+        b.push(IS::Store { region: Region::Frame, base: top - 2, extent: 8, off: Some(i), val: x });
+        assert!(b.lookup(&word).is_none(), "a store to top-2..top+6 drops a load of word top-1");
+        assert_eq!(b.lookup(&below), Some(x), "a store to top-2..top+6 keeps a load of words 0..4");
+    }
 }

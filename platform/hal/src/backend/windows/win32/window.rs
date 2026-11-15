@@ -15,6 +15,7 @@ use makepad_windows_sys::Win32::Graphics::Gdi::*;
 use makepad_windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use makepad_windows_sys::Win32::System::Ole::{IDropTarget, OleInitialize};
 use makepad_windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use makepad_windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use makepad_windows_sys::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use makepad_windows_sys::Win32::UI::HiDpi::*;
 use makepad_windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -34,6 +35,7 @@ const CLASS: &str = "MakepadHalWindow";
 const DISPATCH_CLASS: &str = "MakepadHalDispatch";
 /// the resize band of a client-sized window, in points
 const RESIZE_EDGE: f64 = 8.0;
+const WM_ENDSESSION: u32 = 0x0016;
 
 #[derive(Clone, Copy)]
 pub(super) struct Press {
@@ -42,6 +44,8 @@ pub(super) struct Press {
     y: f64,
     mods: u32,
     screen: POINT,
+    /// its message's time (`GetMessageTime`): how long the app takes to answer does not count
+    time: u32,
 }
 
 pub(super) struct Win {
@@ -57,6 +61,10 @@ pub(super) struct Win {
     pub(super) dpi: Cell<f64>,
     tracking: Cell<bool>,
     pub(super) pending: Cell<Option<Press>>,
+    /// a left press the next one can close a double click with: no answer put it off the caption
+    click: Cell<Option<Press>>,
+    /// a press closed a double click: the next answer says whether it was on the caption
+    double: Cell<bool>,
     high_surrogate: Cell<u16>,
     cursor: Cell<u32>,
     /// closed because its session went: no `Closed` event
@@ -432,6 +440,8 @@ fn create(s: &'static Shared, sid: u32, id: Id, kind: u32, parent: Id, geom: [f3
         dpi: Cell::new(dpi),
         tracking: Cell::new(false),
         pending: Cell::new(None),
+        click: Cell::new(None),
+        double: Cell::new(false),
         high_surrogate: Cell::new(0),
         cursor: Cell::new(cursor::DEFAULT),
         silent: Cell::new(false),
@@ -644,7 +654,7 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
                 }
             }
         }
-        OsCmd::DragReply { id, to, answer } => {
+        OsCmd::DragReply { id, to, answer, .. } => {
             if let Some(w) = target(id) {
                 match to {
                     input::reply::QUERY => query_answer(&w, answer),
@@ -652,7 +662,7 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
                 }
             }
         }
-        OsCmd::ClipSet { text } => clipboard::set_text(&text),
+        OsCmd::ClipSet { data } => clipboard::set(&data),
         OsCmd::ClipRead { req, .. } => clipboard::read(HWND(s.dispatch.load(Ordering::Acquire) as _), sid, req),
         OsCmd::ImeShow { id, area, .. } => {
             if let Some(w) = target(id) {
@@ -679,6 +689,7 @@ fn command(s: &'static Shared, sid: u32, cmd: OsCmd) {
             }
         }
         OsCmd::TrayRemove { tray } => tray::remove(sid, tray),
+        OsCmd::PrintPdf { req, .. } => s.push((sid, Id::NONE), |q, _| q.print_result(req, print_status::UNSUPPORTED, &[])),
         OsCmd::FileDialog { req, kind, title, location, filename, filters } => {
             let owner = APP.with_borrow(|a| session_window(a, sid).map(|w| w.hwnd.get().0 as usize)).unwrap_or(0);
             dialog::open(dialog::Request { sid, req, kind, title, location, filename, filters, owner });
@@ -770,6 +781,7 @@ pub(super) fn handles(cmd: &OsCmd) -> bool {
             | OsCmd::XrRefreshRate { .. }
             | OsCmd::XrHaptic { .. }
             | OsCmd::FileDialog { .. }
+            | OsCmd::PrintPdf { .. }
             | OsCmd::AppIcon { .. }
     )
 }
@@ -861,6 +873,8 @@ fn set_cursor(cursor: u32) {
         }
         cursor::CROSSHAIR => IDC_CROSS,
         cursor::HAND => IDC_HAND,
+        // Default to Hand for non-supported cursors, until we include our own custom cursor files.
+        cursor::GRAB | cursor::GRABBING => IDC_HAND,
         cursor::MOVE => IDC_SIZEALL,
         cursor::TEXT => IDC_IBEAM,
         cursor::WAIT => IDC_WAIT,
@@ -881,11 +895,27 @@ fn set_cursor(cursor: u32) {
 }
 
 /// The app's answer to a press's drag query: a caption drag hands the press to the system move
-/// loop, anything else delivers it as a click.
+/// loop, anything else delivers it as a click. A double click on the caption goes to the system
+/// instead, also when a tap's release has already delivered its press as a click.
 fn query_answer(w: &Rc<Win>, answer: u32) {
+    let double = w.double.take();
+    if answer != input::drag_query::CAPTION {
+        w.click.set(None);
+    } else if double {
+        w.pending.set(None);
+        unsafe {
+            // a press still held keeps the capture, and with it Windows does nothing here
+            let _ = ReleaseCapture();
+            // maximizes or restores as for a real caption; a window without the box stays
+            SendMessageW(w.hwnd.get(), WM_NCLBUTTONDBLCLK, Some(WPARAM(HTCAPTION as usize)), None);
+        }
+        return;
+    }
     let Some(press) = w.pending.take() else { return };
     let hwnd = w.hwnd.get();
     if answer == input::drag_query::CAPTION && press.button == 1 {
+        // the move loop takes this press's release, and the app never heard the press
+        w.buttons.set(w.buttons.get() & !press.button);
         unsafe {
             let _ = ReleaseCapture();
             let lp = LPARAM(((press.screen.y as u16 as isize) << 16) | press.screen.x as u16 as isize);
@@ -893,6 +923,8 @@ fn query_answer(w: &Rc<Win>, answer: u32) {
             SendMessageW(hwnd, WM_NCLBUTTONDOWN, Some(WPARAM(HTCAPTION as usize)), Some(lp));
         }
     } else if answer == input::drag_query::SYS_MENU || (answer == input::drag_query::CAPTION && press.button == 2) {
+        // the menu's loop takes the release too
+        w.buttons.set(w.buttons.get() & !press.button);
         unsafe {
             let menu = GetSystemMenu(hwnd, false);
             let cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD.0 as u32, press.screen.x, press.screen.y, hwnd, None);
@@ -902,6 +934,19 @@ fn query_answer(w: &Rc<Win>, answer: u32) {
         }
     } else {
         w.push(|q, id| q.mouse_down(id, press.x, press.y, press.button, press.mods));
+    }
+}
+
+/// Whether a press follows another within the system's double click time and rectangle (the
+/// caption is client area here, and the window class takes no double clicks).
+fn closes_double_click(first: Press, press: Press) -> bool {
+    let (dx, dy) = (press.screen.x - first.screen.x, press.screen.y - first.screen.y);
+    unsafe {
+        let (half_x, half_y) = (GetSystemMetrics(SM_CXDOUBLECLK) / 2, GetSystemMetrics(SM_CYDOUBLECLK) / 2);
+        // centred on the first press and, like any RECT, without its right and bottom edges
+        press.time.wrapping_sub(first.time) <= GetDoubleClickTime()
+            && (-half_x..half_x).contains(&dx)
+            && (-half_y..half_y).contains(&dy)
     }
 }
 
@@ -933,7 +978,11 @@ fn mouse_button(w: &Rc<Win>, button: u32, down: bool, lparam: LPARAM) {
             unsafe {
                 let _ = ClientToScreen(hwnd, &mut screen);
             }
-            w.pending.set(Some(Press { button, x, y, mods, screen }));
+            let press = Press { button, x, y, mods, screen, time: unsafe { GetMessageTime() } as u32 };
+            let double = w.click.take().is_some_and(|first| button == 1 && closes_double_click(first, press));
+            w.double.set(double);
+            w.click.set((button == 1 && !double).then_some(press));
+            w.pending.set(Some(press));
             w.push(|q, id| q.drag_query(id, x, y));
         } else {
             w.push(|q, id| q.mouse_down(id, x, y, button, mods));
@@ -953,6 +1002,37 @@ fn mouse_button(w: &Rc<Win>, button: u32, down: bool, lparam: LPARAM) {
         if button == 1 {
             rawinput::button_up(hwnd);
         }
+    }
+}
+
+/// Ends the presses of the `lost` buttons, whose releases went to some other window. Their ups
+/// land off the window, so a lost release never counts as a click or a drop.
+fn release_lost_buttons(w: &Win, lost: u32) {
+    let lost = lost & w.buttons.get();
+    if lost == 0 {
+        return;
+    }
+    let hwnd = w.hwnd.get();
+    w.buttons.set(w.buttons.get() & !lost);
+    if w.buttons.get() == 0 && unsafe { GetCapture() } == hwnd {
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+    let mut ups = lost;
+    // a press still waiting on its drag query never reached the app, so it gets no up
+    if let Some(p) = w.pending.get().filter(|p| lost & p.button != 0) {
+        w.pending.set(None);
+        ups &= !p.button;
+    }
+    let mods = modifiers();
+    for button in [1, 2, 4, 8, 16] {
+        if ups & button != 0 {
+            w.push(|q, id| q.mouse_up(id, -100000.0, -100000.0, button, mods));
+        }
+    }
+    if lost & 1 != 0 {
+        rawinput::button_up(hwnd);
     }
 }
 
@@ -1103,6 +1183,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
     let Some(w) = win_of(hwnd) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
     if (msg == WM_CAPTURECHANGED && lparam.0 != hwnd.0 as isize) || msg == WM_CANCELMODE {
         super::super::media::web_view_runtime::capture_lost(hwnd.0 as usize);
+        // A capture taken on this thread (OLE's drag loop, a menu) ends its own press, but one lost
+        // to nobody or to another thread (Alt+Tab, a UAC prompt) sends our button-ups elsewhere.
+        if msg == WM_CANCELMODE || GetWindowThreadProcessId(HWND(lparam.0 as _), None) != GetCurrentThreadId() {
+            release_lost_buttons(&w, u32::MAX);
+        }
     }
     match route_to_layer(&w, msg, wparam, lparam) {
         Some(result) => return result,
@@ -1282,6 +1367,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             w.push(|q, id| q.close_requested(id));
             return LRESULT(0);
         }
+        // the session ends: Windows ends this process once we return, skipping the exit handlers
+        // that remove the makepad-remote endpoint's files
+        WM_ENDSESSION if wparam.0 != 0 => makepad_remote::carrier::unix::withdraw(),
         WM_DESTROY => {
             let key = w.recipient.get();
             a11y::unregister(crate::a11y::window_key(key.0, key.1.index));
@@ -1313,6 +1401,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             if rawinput::held(hwnd) {
                 return LRESULT(0);
             }
+            // A button we count as down but the move says is up lost its release elsewhere (a desktop
+            // switch). MK_MBUTTON and the XBUTTONs sit two bits above our 4, 8 and 16.
+            let keys = wparam.0 as u32;
+            release_lost_buttons(&w, !((keys & 0x3) | ((keys >> 2) & 0x1c)));
             let (px, py) = lparam_point(lparam);
             let dpi = w.dpi.get();
             let (x, y) = (px as f64 / dpi, py as f64 / dpi);

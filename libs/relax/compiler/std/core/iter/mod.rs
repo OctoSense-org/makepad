@@ -19,12 +19,12 @@ pub use sources::{
 use crate::cmp::Ordering;
 use crate::ops::{Add, Mul};
 
-#[cfg_attr(not(relax_check), lang = "iterator")]
+#[lang = "iterator"]
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub trait Iterator {
     type Item;
 
-    #[cfg_attr(not(relax_check), lang = "next")]
+    #[lang = "next"]
     fn next(&mut self) -> Option<Self::Item>;
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -655,6 +655,24 @@ pub trait Iterator {
     {
         self.map(f).is_sorted()
     }
+
+    /// Element `idx` of a `TrustedRandomAccessNoCoerce` iterator, counted from where it stood when
+    /// Zip took it (real core's hidden `Iterator::__iterator_get_unchecked`). Real core bounds it
+    /// by `Self: TrustedRandomAccessNoCoerce` and reaches it from generic code through
+    /// specialization (zip.rs `try_get_unchecked`); Relax's std has no specialization, so the
+    /// method takes no such bound and this default body is that specialization's general arm.
+    /// Every TrustedRandomAccess iterator overrides it.
+    ///
+    /// # Safety
+    /// `idx` is below the iterator's size at that point, no index is taken twice, and the
+    /// iterator's other methods are not used afterwards, except as TrustedRandomAccess allows.
+    #[doc(hidden)]
+    unsafe fn __iterator_get_unchecked(&mut self, _idx: usize) -> Self::Item
+    where
+        Self: Sized,
+    {
+        crate::panicking::panic_str("Should only be called on TrustedRandomAccess iterators")
+    }
 }
 
 impl<'a, I: Iterator + ?Sized> Iterator for &'a mut I {
@@ -752,16 +770,36 @@ pub trait ExactSizeIterator: Iterator {
     }
 }
 
-#[cfg_attr(not(relax_check), lang = "fused_iterator")]
+#[lang = "fused_iterator"]
 pub trait FusedIterator: Iterator {}
 
 pub unsafe trait TrustedLen: Iterator {}
+
+/// An iterator whose items can be taken by index in O(1) without moving it, for Zip (real
+/// core's iter/adapters/zip.rs). After `__iterator_get_unchecked` the iterator may still be
+/// cloned and asked for `size`, and `next_back` works as Zip's TrustedRandomAccess path uses it.
+#[doc(hidden)]
+pub unsafe trait TrustedRandomAccess: TrustedRandomAccessNoCoerce {}
+
+/// Like `TrustedRandomAccess`, minus the guarantees a subtype coercion of the iterator could
+/// break: enough for a fold or a `size_hint` over indices.
+#[doc(hidden)]
+pub unsafe trait TrustedRandomAccessNoCoerce: Sized {
+    fn size(&self) -> usize
+    where
+        Self: Iterator,
+    {
+        self.size_hint().0
+    }
+    /// Whether taking an element may have side effects (inner iterators included).
+    const MAY_HAVE_SIDE_EFFECT: bool;
+}
 
 #[rustc_skip_during_method_dispatch(array, boxed_slice)]
 pub trait IntoIterator {
     type Item;
     type IntoIter: Iterator<Item = Self::Item>;
-    #[cfg_attr(not(relax_check), lang = "into_iter")]
+    #[lang = "into_iter"]
     fn into_iter(self) -> Self::IntoIter;
 }
 
@@ -833,7 +871,8 @@ macro_rules! impl_extend_tuple {
             fn extend_reserve(&mut self, additional: usize) { $(Extend::<$ty>::extend_reserve(&mut self.$i, additional);)+ }
         }
         impl<$($ty,)+ $($ex: Default + Extend<$ty>,)+> FromIterator<($($ty,)+)> for ($($ex,)+) {
-            fn from_iter<I: IntoIterator<Item = ($($ty,)+)>>(iter: I) -> Self {
+            // (`Iter`, not `I`: the tuples of nine and more name their ninth element type `I`)
+            fn from_iter<Iter: IntoIterator<Item = ($($ty,)+)>>(iter: Iter) -> Self {
                 let mut res = ($($ex::default(),)+);
                 res.extend(iter);
                 res

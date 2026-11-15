@@ -76,7 +76,7 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             return 1;
         }
     };
-    // a live session: the crate's structs take the live layout (M10, layout.rs live_editable)
+    // a live session (reload.rs)
     crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
     crate::layout::set_root_crate(krate);
     // Single-file live sessions have one app crate and no Cargo unit graph.
@@ -94,8 +94,25 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         return 1;
     }
     jit::enable_pipelining(options);
+    // the platform's start code runs the program's constructors before the harness (sections.rs)
+    if let Err(e) = unsafe { crate::sections::run_constructors(&mut *u, krate, None) } {
+        eprintln!("error: {e}");
+        return 101;
+    }
     println!("v0: first run (lazy compile on first call)");
     run_tests(&mut u, &tests);
+    // RELAX_LIVE_SETTLE (a case's env): the second run starts once the first run's O3 work
+    // is done and stays done a moment (a thread the first run left running turns its code hot
+    // meanwhile), so the edits meet settled code: O3 builds and the guarded copies they inline
+    if std::env::var_os("RELAX_LIVE_SETTLE").is_some() {
+        let up: *const Unit = &*u;
+        let mut quiet = 0;
+        while quiet < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let settled = crate::owner::call(crate::owner::Class::Program, || jit::o3_settled(unsafe { &*up }));
+            quiet = if settled { quiet + 1 } else { 0 };
+        }
+    }
     println!("v0: second run (all compiled)");
     run_tests(&mut u, &tests);
     let mut undos: Vec<crate::reload::Undo> = Vec::new();
@@ -111,14 +128,24 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         let mut edits = Vec::new();
         let mut bad = None;
         let mut included = Vec::new();
+        let mut sources = Vec::new();
+        // the Rust files the code include!d: no file of the running crate, their includers' text
+        let late = crate::sip::late_files();
         for (loaded, src_path) in files {
-            if !loaded.is_empty() && !loaded.ends_with(".rs") && !loaded.ends_with(".context") {
+            let rust_included = loaded.ends_with(".rs") && !running.iter().any(|(p, _)| *p == loaded) && late.contains(&crate::vfs::normalize_path(&loaded));
+            if !loaded.is_empty() && (!loaded.ends_with(".rs") || rust_included) && !loaded.ends_with(".context") {
                 // an included file: its includers take the edit
-                if let Err(e) = crate::vfs::read(&src_path).and_then(|b| std::fs::write(&loaded, b)) {
-                    bad = Some(format!("{}: {}", src_path, e));
-                    break;
-                }
-                included.push(crate::vfs::normalize_path(&loaded));
+                let text = match crate::vfs::read(&src_path).and_then(|b| std::fs::write(&loaded, &b).map(|_| b)) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        bad = Some(format!("{}: {}", src_path, e));
+                        break;
+                    }
+                };
+                let path = crate::vfs::normalize_path(&loaded);
+                // the includer's parse registers an included Rust file's text: the edit's snapshot
+                if rust_included { sources.push(crate::reload::Edit { file: u32::MAX, path: path.clone(), src: text }); }
+                included.push(path);
                 continue;
             }
             let loaded = if loaded.is_empty() { root.clone() } else { loaded };
@@ -157,7 +184,7 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             let path = u.prog.file_paths[edit.file as usize].clone();
             unsafe { crate::reload::apply_stream(up, &path, edit.src) }
         } else {
-            unsafe { crate::reload::apply(up, edits) }
+            unsafe { crate::reload::apply_with_sources(up, edits, &sources) }
         };
         println!(
             "edit {}: rung={} {} changed item(s), {} fn(s) installed {:?}; parse+classify {:.3} ms, check {:.3} ms, compile {:.3} ms, install {:.3} ms",

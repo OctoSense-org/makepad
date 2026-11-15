@@ -45,19 +45,31 @@ pub mod synthetic_cursor;
 pub(crate) struct RemoteInputScope {
     origin: std::rc::Rc<std::cell::Cell<bool>>,
     previous: bool,
+    sender: std::rc::Rc<std::cell::RefCell<String>>,
+    previous_by: String,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn remote_input_scope(cx: &crate::cx::Cx) -> RemoteInputScope {
+    remote_input_scope_by(cx, "")
+}
+
+/// [`remote_input_scope`] for a command `by` sent (`QueuedCmd::by`: the agent and process, empty
+/// where not known): what the injected input reaches says who sent it ([`crate::cx::Cx::injected_by`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn remote_input_scope_by(cx: &crate::cx::Cx, by: &str) -> RemoteInputScope {
     let origin = cx.remote_activity.remote_input.clone();
     let previous = origin.replace(true);
-    RemoteInputScope { origin, previous }
+    let sender = cx.remote_activity.remote_by.clone();
+    let previous_by = sender.replace(by.to_string());
+    RemoteInputScope { origin, previous, sender, previous_by }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for RemoteInputScope {
     fn drop(&mut self) {
         self.origin.set(self.previous);
+        self.sender.replace(std::mem::take(&mut self.previous_by));
     }
 }
 
@@ -84,7 +96,7 @@ mod imp {
     use crate::cx::Cx;
     use crate::cx_api::CxOsApi;
     use crate::makepad_math::{dvec2, Vec2d};
-    use crate::texture::{ReadbackRequest, ReadbackTicket, TextureReadback};
+    use crate::texture::{ReadbackError, ReadbackRequest, ReadbackTicket, TextureReadback};
     use crate::texture::{ReadbackChannelOrder, ReadbackOrigin};
     use crate::window::WindowId;
     use makepad_studio_protocol::{
@@ -166,6 +178,7 @@ mod imp {
             "activity" => reply_to_answer(ask(Cmd::Activity, ACTIVITY_WAIT_SECS)),
             "mouse" => route_mouse(p, None),
             "click" => route_mouse(p, Some("click")),
+            "move" => route_mouse(p, Some("move")),
             "key" => route_key(p),
             "text" => route_text(p),
             "drop" => route_drop(p),
@@ -175,9 +188,14 @@ mod imp {
             "loop" => Answer::Text(crate::os::hal::loop_watch::report()),
             "step" => route_step(p),
             "settled" => reply_to_answer(ask(Cmd::Settled, 4)),
-            "uicounts" => reply_to_answer(ask(Cmd::UiCounts, 4)),
+            // counts so far: a read waits for the UI thread through a stall and misses nothing
+            "uicounts" => {
+                let waited = p.flag(&["waited"]);
+                reply_to_answer(ask(move |tx| Cmd::UiCounts(waited, tx), ACTIVITY_WAIT_SECS))
+            }
             "cap pause" => reply_to_answer(ask(|tx| Cmd::CapPause(true, tx), 4)),
             "cap resume" => reply_to_answer(ask(|tx| Cmd::CapPause(false, tx), 4)),
+            "front" => reply_to_answer(ask(Cmd::Front, 4)),
             "close" => {
                 let window = p.window();
                 let ask_app = p.flag(&["ask"]);
@@ -197,9 +215,12 @@ mod imp {
                 reply_to_answer(ask(move |tx| Cmd::Resize { window, size: dvec2(w, h), tx }, 6))
             }
             // `window k=maximize`: the window's own maximise, answered after the
-            // next drawn frame with `wait` (the maximise/occlusion proof).
+            // next drawn frame with `wait` (the maximise/occlusion proof);
+            // `k=fullscreen`: the whole screen at its own size (a window
+            // manager's maximise keeps its bar and dock).
             "window" => match p.get(&["k", "kind"]) {
                 Some("maximize") | Some("max") => send_input(p.window(), vec![Input::Maximize], p.flag(&["wait"])),
+                Some("fullscreen") => send_input(p.window(), vec![Input::Fullscreen], p.flag(&["wait"])),
                 Some("dragquery") => match (p.get(&["x"]).and_then(|v| v.parse::<f64>().ok()), p.get(&["y"]).and_then(|v| v.parse::<f64>().ok())) {
                     (Some(x), Some(y)) => send_input(p.window(), vec![Input::DragQuery(x, y)], p.flag(&["wait"])),
                     _ => err("dragquery needs x= and y= (window points)"),
@@ -208,7 +229,7 @@ mod imp {
                     (Some(w), Some(h)) if w >= 1.0 && h >= 1.0 => send_input(p.window(), vec![Input::Resize(w, h)], p.flag(&["wait"])),
                     _ => err("resize needs width= and height= (points)"),
                 },
-                other => err(&format!("unknown window op {other:?}; k=maximize|resize|dragquery")),
+                other => err(&format!("unknown window op {other:?}; k=maximize|fullscreen|resize|dragquery")),
             },
             // The AI chat overlay (apps/aichat, seated in every Window on F10):
             // `ai on=1|0` toggles, `ai say=TEXT` types a line, `ai transcript`
@@ -372,6 +393,7 @@ mod imp {
         due: Instant,
         every: Duration,
         last_request: Option<u64>,
+        readback_wait_logged: bool,
         cancelled: Arc<AtomicBool>,
     }
 
@@ -512,7 +534,8 @@ mod imp {
     /// Opens the process's makepad-remote endpoint (the one place it is opened, from `Cx::new`,
     /// so every process with a `Cx` gets it): a same-user Unix socket, nothing on the network,
     /// in every app unless `MAKEPAD_REMOTE=0`, so a local agent reaches the apps the person
-    /// started. The `cmd` service answers the remote commands and the GPU ledger's, the `frames`
+    /// started (a release Android or iOS app opens it only when asked, see [`request`]). The
+    /// `cmd` service answers the remote commands and the GPU ledger's, the `frames`
     /// service streams window images, and upper crates add theirs ([`register_service`]: the
     /// `app` service of the AI tools). An instance launched for an agent (`--remote`,
     /// `MAKEPAD_REMOTE=1`, `MAKEPAD_INSPECT=1`) prints `[makepad-remote] pid=<pid> app=<app> socket=<path>`. A port or
@@ -523,7 +546,7 @@ mod imp {
             Request::Off => return,
             Request::Refused(why) => {
                 eprintln!("[makepad-remote] {why}");
-                std::process::exit(2);
+                makepad_core_util::process_end::end(2);
             }
             Request::Local => false,
             Request::On => true,
@@ -651,7 +674,7 @@ mod imp {
             Ok(l) => l,
             Err(why) => return Some(result_line(call_id, false, &why)),
         };
-        let (reply, _) = makepad_remote::cmd::answer(dispatch, &line);
+        let reply = makepad_remote::cmd::answer(dispatch, &line);
         let text = String::from_utf8_lossy(&reply).trim_end().to_string();
         let failed = text.lines().any(|l| l.starts_with("{\"err\":"));
         Some(result_line(call_id, !failed, &text))
@@ -811,7 +834,6 @@ mod imp {
                 words.extend(req.pos.iter().cloned());
                 if let Err(e) = req.validate_params(params(&words)) { return out.err(&e); }
                 let kv = req.kv.clone();
-                out.limit = usize::MAX;
                 match ask(move |tx| Cmd::Platform(Box::new(PlatformCmd::AppQuery { f, words, kv, tx })), 6) {
                     Reply::Text(t) => {
                         for l in t.lines() {
@@ -835,8 +857,6 @@ mod imp {
                     "why-slow" => return crate::prof_sampler::cmd_why_slow(req, out),
                     _ => {}
                 }
-                // A semantic tree or an app query may contain every visible item.
-                out.limit = usize::MAX;
                 let mut words = vec![req.cmd.clone()];
                 words.extend(req.pos.iter().cloned());
                 let resolved = match resolve(&words) {
@@ -858,9 +878,9 @@ mod imp {
     // ------------------------------------------------------------------
 
     /// A command for the Relax host: the request line in, the reply lines out through `sink`
-    /// as they are produced (chunks, not lines); true when the reply was cut at the size limit.
+    /// as they are produced (chunks, not lines).
     #[cfg(relax)]
-    pub(crate) extern "C" fn host_query(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void) -> bool {
+    pub(crate) extern "C" fn host_query(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void) {
         struct SinkWriter(extern "C" fn(*const u8, usize, *mut std::ffi::c_void), *mut std::ffi::c_void);
         impl Write for SinkWriter {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -873,9 +893,8 @@ mod imp {
         }
         let line = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(line, len)) };
         let mut w = std::io::BufWriter::with_capacity(64 << 10, SinkWriter(sink, ctx));
-        let truncated = makepad_remote::cmd::answer_to(dispatch, line, &mut w);
+        makepad_remote::cmd::answer_to(dispatch, line, &mut w);
         let _ = w.flush();
-        truncated
     }
 
     /// The host's sink of a service channel: `kind` 0 sends `ptr..len` as one message (false: the
@@ -980,6 +999,13 @@ mod imp {
             || PENDING_GRABS.load(Ordering::Relaxed) != 0
             || STEP.with_borrow(|step| step.is_some())
             || CAPTURE.with_borrow(|capture| capture.as_ref().is_some_and(|c| !c.virtual_clock))
+    }
+
+    /// A remote request waits for the next painted frame (a resize, an input
+    /// or a tweak with `wait`): under the virtual clock the app draws for it
+    /// (`app_draws_now`).
+    pub(crate) fn frame_awaited() -> bool {
+        FRAME_WAITERS.with_borrow(|waiters| !waiters.is_empty())
     }
 
     // ------------------------------------------------------------------
@@ -1116,7 +1142,7 @@ mod imp {
                             sink,
                             width,
                             height,
-                            pixels: Arc::from(png),
+                            pixels: crate::HostBuf::from_vec(png.to_vec()),
                             stride: 0,
                             order: GrabOrder::Rgba,
                             origin: GrabOrigin::TopLeft,
@@ -1140,7 +1166,7 @@ mod imp {
         request_ids: Vec<u64>,
         width: u32,
         height: u32,
-        pixels: Arc<[u8]>,
+        pixels: crate::HostBuf,
         stride: usize,
         order: ReadbackChannelOrder,
         origin: ReadbackOrigin,
@@ -1149,7 +1175,8 @@ mod imp {
             return request_ids;
         }
         let captured = Instant::now();
-        // Only the GPU callback takes this blocking lock. The UI uses try_lock.
+        // Every holder of this lock keeps it for a few map updates (a send under it never
+        // waits), so the UI takes it too: the HAL's grabs come here from the UI thread.
         let Ok(mut sinks) = grab_sinks().lock() else {
             return request_ids;
         };
@@ -1292,11 +1319,25 @@ mod imp {
                     .and_then(|pass| cx.passes[pass].color_textures.first())
                     .map(|color| color.texture.clone());
                 let texture = if cx.in_makepad_studio { texture } else { None };
-                let ticket = texture.and_then(|texture| {
-                    texture
-                        .read_back(cx, ReadbackRequest { next_render: true })
-                        .ok()
-                });
+                let ticket = match texture {
+                    Some(texture) => match texture.read_back(cx, ReadbackRequest { next_render: true }) {
+                        Ok(ticket) => {
+                            batch.readback_wait_logged = false;
+                            Some(ticket)
+                        }
+                        Err(ReadbackError::Backpressure) => {
+                            if !batch.readback_wait_logged {
+                                crate::log!("remote grab: context readback request limit reached; grab {id} waits");
+                                batch.readback_wait_logged = true;
+                            }
+                            // The next presentation polls this same batch again.
+                            cx.request_remote_window_present(batch.window);
+                            return true;
+                        }
+                        Err(_) => None,
+                    },
+                    None => None,
+                };
                 if let Some(ticket) = ticket {
                     cx.textures
                         .1
@@ -1316,6 +1357,7 @@ mod imp {
                         kind_id: 0,
                     });
                 }
+                batch.readback_wait_logged = false;
                 batch.ids.pop_front();
                 batch.last_request = Some(id);
                 batch.due += batch.every;
@@ -1383,7 +1425,11 @@ mod imp {
                 Cmd::Tweak { wait: true, .. } | Cmd::Ai { wait: true, .. } => Some(None),
                 _ => None,
             };
+            // answering is observing the app, not its own work: what this thread runs for the
+            // command is counted as served (a test's idle rule leaves it out, wherever its asks fall)
+            let start = makepad_hal::clock::thread_cpu_ns();
             apply(cx, cmd);
+            makepad_remote::charge_served(makepad_hal::clock::thread_cpu_ns().saturating_sub(start));
             // Do not batch later input ahead of a grab in this same drain.
             poll_captures(cx);
             pending |= drive_step(cx);
@@ -1638,32 +1684,60 @@ mod imp {
     /// readback still ends in a finished file.
     const CAPTURE_SHUTDOWN_WAIT: Duration = Duration::from_secs(20);
 
+    /// The process's major page faults so far: each one a wait for a page read back from disk
+    /// (swap, or a mapped file's page). A test's idle rule tells an app that waits on memory from
+    /// one that sits idle by them: neither runs CPU. One getrusage call; 0 where none counts them
+    /// (Windows' fault count has the soft ones in it).
+    fn major_faults() -> u64 {
+        #[cfg(unix)]
+        {
+            #[repr(C)]
+            struct Rusage {
+                /// ru_utime and ru_stime (two timevals, two longs' room each)
+                times: [std::ffi::c_long; 4],
+                /// ru_maxrss .. ru_nivcsw; ru_majflt is the sixth
+                counts: [std::ffi::c_long; 14],
+            }
+            extern "C" {
+                fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+            }
+            const RUSAGE_SELF: i32 = 0;
+            let mut usage = Rusage { times: [0; 4], counts: [0; 14] };
+            // SAFETY: `usage` is a valid struct rusage for the call to fill
+            if unsafe { getrusage(RUSAGE_SELF, &mut usage) } == 0 { usage.counts[5].max(0) as u64 } else { 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
+    }
+
+    /// Who holds the process's CPU budget slots now, for `/settled` while pool jobs wait (a starved
+    /// pool's verdict names them): one entry per class, client, label and lent, with how many hold
+    /// it and the longest any has held its slot. A lent slot's thread sleeps and its token is back.
+    fn budget_slots() -> Vec<String> {
+        let mut slots: Vec<(u8, u8, String, bool, usize, u64)> = Vec::new();
+        for h in makepad_cpu_budget::tokens().holders {
+            match slots.iter_mut().find(|s| s.0 == h.class && s.1 == h.client && s.2 == h.label && s.3 == h.lent) {
+                Some(s) => {
+                    s.4 += 1;
+                    s.5 = s.5.max(h.held_ns);
+                }
+                None => slots.push((h.class, h.client, h.label, h.lent, 1, h.held_ns)),
+            }
+        }
+        slots.sort_by(|a, b| b.5.cmp(&a.5));
+        let class = |c: u8| ["interactive", "visible", "background"].get(c as usize).copied().unwrap_or("?");
+        let client = |c: u8| ["app", "jit", "hal"].get(c as usize).copied().unwrap_or("?");
+        slots
+            .iter()
+            .map(|(c, k, label, lent, n, ns)| {
+                format!("{{\"class\":\"{}\",\"client\":\"{}\",\"label\":{},\"lent\":{lent},\"n\":{n},\"held_ms\":{}}}", class(*c), client(*k), json_str(label), ns / 1_000_000)
+            })
+            .collect()
+    }
+
     /// `/settled`: why the app would still change if time moved on.
-    /// The calling thread's CPU time (CLOCK_THREAD_CPUTIME_ID; 0 where there is none).
-    #[cfg(unix)]
-    fn thread_cpu_ns() -> u64 {
-        #[repr(C)]
-        struct Ts {
-            sec: i64,
-            nsec: i64,
-        }
-        extern "C" {
-            fn clock_gettime(id: i32, t: *mut Ts) -> i32;
-        }
-        #[cfg(target_os = "macos")]
-        const THREAD_CPUTIME: i32 = 16;
-        #[cfg(not(target_os = "macos"))]
-        const THREAD_CPUTIME: i32 = 3;
-        let mut t = Ts { sec: 0, nsec: 0 };
-        if unsafe { clock_gettime(THREAD_CPUTIME, &mut t) } != 0 {
-            return 0;
-        }
-        t.sec as u64 * 1_000_000_000 + t.nsec as u64
-    }
-    #[cfg(not(unix))]
-    fn thread_cpu_ns() -> u64 {
-        0
-    }
     fn settled_json(cx: &Cx) -> String {
         let mut reasons = Vec::new();
         if !cx.new_next_frames.is_empty() {
@@ -1691,6 +1765,12 @@ mod imp {
         if cx.pipelines_pending() > 0 {
             reasons.push("shaders");
         }
+        // Jobs on the app's pool that wait for a worker or a CPU permit: their results are still
+        // to come (a starved pool runs nothing, and its app no CPU).
+        let pool = cx.task_pool_backlog();
+        if pool.as_ref().is_some_and(|p| p.queued.iter().any(|&n| n > 0)) {
+            reasons.push("pool");
+        }
         let list: Vec<String> = reasons.iter().map(|reason| format!("\"{reason}\"")).collect();
         let mut out = format!(
             "{{\"settled\":{},\"reasons\":[{}]",
@@ -1703,6 +1783,12 @@ mod imp {
                 .map(|(kind, count)| format!("{}:{count}", json_str(kind)))
                 .collect();
             out.push_str(&format!(",\"loads\":{{{}}}", entries.join(",")));
+        }
+        if let Some(p) = &pool {
+            out.push_str(&format!(",\"pool\":{{\"queued\":[{},{},{}],\"running\":{},\"taken\":{}}}", p.queued[0], p.queued[1], p.queued[2], p.running, p.taken));
+        }
+        if reasons.contains(&"pool") {
+            out.push_str(&format!(",\"slots\":[{}]", budget_slots().join(",")));
         }
         if let Some(now) = app_clock::now() {
             out.push_str(&format!(",\"frame\":{},\"time\":{}", app_clock::frame(), num(now)));
@@ -1774,6 +1860,7 @@ mod imp {
                     && info.pass_dpi == main_pass_dpi(cx, window_id)
                     && info.x == geom.position.x
                     && info.y == geom.position.y
+                    && info.key == window.key
             });
         if same {
             return;
@@ -1791,6 +1878,7 @@ mod imp {
                     pass_dpi: main_pass_dpi(cx, window_id),
                     x: geom.position.x,
                     y: geom.position.y,
+                    key: window.key,
                 }
             })
             .collect();
@@ -1835,7 +1923,7 @@ mod imp {
             }
         }
         let user_seq = cx.remote_activity.user_seq();
-        let _origin = super::remote_input_scope(cx);
+        let _origin = super::remote_input_scope_by(cx, &request.by);
         match request.cmd {
             Cmd::Gamepads(tx) => {
                 use crate::game_input::CxGameInputApi;
@@ -1969,6 +2057,7 @@ mod imp {
                                 let native = cx.windows[window_id].layout_vec2d_to_native_points(dvec2(x, y));
                                 let deadline = request.deadline;
                                 let input_deadline = deadline.clone();
+                                let native_by = request.by.clone();
                                 makepad_hal::backend::apple::media::native_click(sid, id, native.x, native.y,
                                     move || !input_deadline.expired() && activity::user_seq_now() == user_seq,
                                     move |result| match result {
@@ -1979,7 +2068,7 @@ mod imp {
                                             }).collect();
                                             queue().lock().unwrap().push(QueuedCmd {
                                                 cmd: Cmd::Input { window: Some(window_id.id()), inputs, wait, tx },
-                                                user_seq: Some(user_seq), deadline,
+                                                user_seq: Some(user_seq), deadline, by: native_by,
                                             });
                                             wake();
                                         }
@@ -2132,6 +2221,12 @@ mod imp {
                             cx.redraw_all();
                             continue;
                         }
+                        Input::Fullscreen => {
+                            cx.push_unique_platform_op(crate::cx_api::CxOsOp::FullscreenWindow(window_id));
+                            input_result = Some("{\"ok\":1,\"fullscreen\":1}".to_string());
+                            cx.redraw_all();
+                            continue;
+                        }
                         Input::DragQuery(x, y) => {
                             let response = std::rc::Rc::new(std::cell::Cell::new(crate::event::WindowDragQueryResponse::NoAnswer));
                             cx.call_event_handler(&crate::event::Event::WindowDragQuery(crate::event::WindowDragQueryEvent {
@@ -2170,14 +2265,22 @@ mod imp {
                             continue;
                         }
                     };
-                    // A HAL app's copy / cut chord, as a physical key press gives it (hal_intake):
-                    // the focused widget's text goes on the clipboard before the key itself.
+                    // A copy / cut chord, as a physical key press gives it, before the key itself:
+                    // a HAL app asks its focused widget and sets the clipboard (hal_intake); a
+                    // hosted app gets the TextCopy / TextCut its host sends for a physical chord,
+                    // and its answer goes to the host's clipboard.
                     if let StudioToApp::KeyDown(e) = &msg {
-                        if (e.modifiers.control || e.modifiers.logo) && cx.hal.hosted.is_none() {
-                            match e.key_code {
-                                crate::event::KeyCode::KeyC => cx.hal_clipboard_chord(true),
-                                crate::event::KeyCode::KeyX => cx.hal_clipboard_chord(false),
-                                _ => {}
+                        let copy = match e.key_code {
+                            crate::event::KeyCode::KeyC => Some(true),
+                            crate::event::KeyCode::KeyX => Some(false),
+                            _ => None,
+                        };
+                        if let Some(copy) = copy.filter(|_| e.modifiers.control || e.modifiers.logo) {
+                            if cx.hal.hosted.is_none() {
+                                cx.hal_clipboard_chord(copy);
+                            } else {
+                                let chord = if copy { StudioToApp::TextCopy } else { StudioToApp::TextCut };
+                                cx.dispatch_studio_msg(chord, window_id, dvec2(0.0, 0.0));
                             }
                         }
                     }
@@ -2218,6 +2321,7 @@ mod imp {
                         due: started,
                         every,
                         last_request: None,
+                        readback_wait_logged: false,
                         cancelled,
                     })
                 });
@@ -2291,9 +2395,18 @@ mod imp {
             Cmd::Settled(tx) => {
                 let _ = tx.send(Reply::Text(settled_json(cx)));
             }
-            Cmd::UiCounts(tx) => {
+            Cmd::UiCounts(waited, tx) => {
                 let (ins, cyc) = crate::thread_counters::read().unwrap_or((0, 0));
-                let _ = tx.send(Reply::Text(format!("{{\"ins\":{ins},\"cyc\":{cyc},\"cpu_ns\":{}}}", thread_cpu_ns())));
+                let (cpu, process, served, runtime) = (makepad_hal::clock::thread_cpu_ns(), makepad_hal::clock::process_cpu_ns(), makepad_remote::served_cpu_ns(), makepad_remote::runtime_cpu_ns());
+                let faults = major_faults();
+                // what the app's other threads wanted and a loaded box did not give them: not this
+                // thread's (its CPU says its work; its waits are mostly to answer asks such as this
+                // one), nor the serving threads', nor the runtime's (a busy JIT is none of the app's)
+                let waited = match waited {
+                    true => format!(",\"waited_ns\":{}", makepad_hal::clock::threads_waited_ns(makepad_remote::own_thread).saturating_sub(makepad_remote::runtime_waited_ns())),
+                    false => String::new(),
+                };
+                let _ = tx.send(Reply::Text(format!("{{\"ins\":{ins},\"cyc\":{cyc},\"cpu_ns\":{cpu},\"process_cpu_ns\":{process},\"served_cpu_ns\":{served},\"runtime_cpu_ns\":{runtime},\"faults\":{faults}{waited}}}")));
             }
             Cmd::Platform(payload) => match *payload
                 .downcast::<PlatformCmd>()
@@ -2466,6 +2579,10 @@ mod imp {
                     )));
                 }
             }
+            Cmd::Front(tx) => {
+                cx.show_to_person();
+                let _ = tx.send(Reply::Text("{\"front\":1}".into()));
+            }
             Cmd::Close { window, ask, tx } => {
                 let window_id = match resolve_window(cx, window) {
                     Ok(window_id) => window_id,
@@ -2480,10 +2597,11 @@ mod imp {
                 if ask {
                     cx.call_event_handler(&crate::event::Event::WindowCloseRequested(crate::event::WindowCloseRequestedEvent { window_id, accept_close: accept_close.clone() }));
                 }
+                let by = cx.injected_by().unwrap_or_default();
                 let line = if accept_close.get() {
-                    format!("[makepad-remote] remote closed window {}", window_id.id())
+                    format!("[makepad-remote] remote closed window {}, asked by {by}", window_id.id())
                 } else {
-                    format!("[makepad-remote] remote close of window {} declined by the app", window_id.id())
+                    format!("[makepad-remote] remote close of window {} declined by the app, asked by {by}", window_id.id())
                 };
                 println!("{line}");
                 let _ = std::io::stdout().flush();
@@ -3028,7 +3146,7 @@ mod imp {
                 assert!(answer.contains("unknown parameter") && answer.contains("typo") && answer.contains("known:"), "{command}: {answer}");
             }
             for line in ["status typo=1", r#"{"cmd":"resize","typo":1}"#, "settled typo=1"] {
-                let (bytes, _) = makepad_remote::cmd::answer(dispatch, line);
+                let bytes = makepad_remote::cmd::answer(dispatch, line);
                 let answer = String::from_utf8(bytes).unwrap();
                 assert!(answer.contains("unknown parameter") && answer.contains("known:"), "{line}: {answer}");
             }
@@ -3038,10 +3156,10 @@ mod imp {
             let cross = answered("tweak op", &[("op", "state"), ("splash", "{}")]);
             assert!(cross.contains("unknown parameter"), "{cross}");
             register_app_query("parameter_test", "[limit=]", "parameter validation", |_| r#""limit":{"type":"integer"}"#, |_, _, _| panic!("invalid request reached the UI"));
-            let (bytes, _) = makepad_remote::cmd::answer(dispatch, "parameter_test typo=1");
+            let bytes = makepad_remote::cmd::answer(dispatch, "parameter_test typo=1");
             let answer = String::from_utf8(bytes).unwrap();
             APP_QUERIES.lock().unwrap().retain(|q| q.0 != "parameter_test");
-            assert!(answer.contains("unknown parameter") && answer.contains("known: limit, full"), "{answer}");
+            assert!(answer.contains("unknown parameter") && answer.contains("known: limit"), "{answer}");
         }
 
         #[test]
@@ -3055,7 +3173,7 @@ mod imp {
             assert!(answered("shader const", &[]).contains("need shader="));
             assert!(answered("shader const", &[("shader", "1"), ("i", "0")]).contains("need v="));
             assert!(answered("tweak op", &[]).contains("need op="));
-            assert!(answered("window", &[("k", "nope")]).contains("unknown window op"));
+            assert!(answered("window", &[("k", "nope")]).contains("k=maximize|fullscreen|resize|dragquery"));
             assert!(answered("cap start", &[]).contains("needs path="));
             assert!(answered("cursor", &[("style", "x")]).contains("cursor style"));
             assert!(answered("midi", &[("k", "bogus")]).contains("bad kind"));
@@ -3064,13 +3182,41 @@ mod imp {
             assert!(answered("trace", &[("off", "1")]).contains("topics"));
         }
 
+        /// `window k=...` reaches the platform as that window's own op, for the window it names.
+        #[test]
+        fn window_ops_reach_the_platform_for_the_window() {
+            use crate::cx_api::CxOsOp;
+            let mut cx = Cx::new(Box::new(|_, _| {}));
+            let window_id = crate::window::WindowHandle::new(&mut cx).window_id();
+            cx.windows[window_id].is_created = true;
+            for (input, op, answer) in [
+                (Input::Maximize, CxOsOp::MaximizeWindow(window_id), "\"maximize\":1"),
+                (Input::Fullscreen, CxOsOp::FullscreenWindow(window_id), "\"fullscreen\":1"),
+                (Input::Resize(640.0, 360.0), CxOsOp::ResizeWindow(window_id, dvec2(640.0, 360.0)), "\"resize\":[640,360]"),
+            ] {
+                let (tx, rx) = std::sync::mpsc::channel();
+                cx.platform_ops.clear();
+                apply(&mut cx, QueuedCmd {
+                    cmd: Cmd::Input { window: Some(window_id.id()), inputs: vec![input], wait: false, tx },
+                    user_seq: None,
+                    deadline: CommandDeadline::at(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+                    by: String::new(),
+                });
+                assert!(cx.platform_ops.contains(&op), "{answer}: the op reaches the platform");
+                match rx.try_recv() {
+                    Ok(Reply::Text(text)) => assert!(text.contains(answer), "{answer}: answered {text}"),
+                    _ => panic!("{answer}: no answer"),
+                }
+            }
+        }
+
         /// `dispatch` is the `cmd` service: it answers help with every command, resolves words
         /// the way a typed line and a JSON request both give them, and refuses what it does not
         /// know.
         #[test]
         fn dispatch_answers_help_and_refuses_unknown_commands() {
             let run = |line: &str| {
-                let (reply, _) = makepad_remote::cmd::answer(dispatch, line);
+                let reply = makepad_remote::cmd::answer(dispatch, line);
                 String::from_utf8(reply).unwrap()
             };
             let help = run("help");
@@ -3079,7 +3225,9 @@ mod imp {
             }
             assert!(help.contains("\"tool\":\"ui.cap_start\""), "help names each command's tool");
             assert!(help.contains("\"cmd\":\"gpu top\""), "help lists the GPU ledger's commands");
-            assert!(run("frobnicate").contains("unknown command `frobnicate`"));
+            let unknown = run("frobnicate");
+            assert!(unknown.contains("unknown command `frobnicate`"), "{unknown}");
+            assert!(unknown.contains(", move, "), "{unknown}");
             assert!(run("grab").contains("client-side"));
             assert!(run("ping").contains("\"pid\""));
             // the words of a command arrive as positional words or inside a JSON `cmd`
@@ -3206,7 +3354,7 @@ pub(crate) mod host_registration {
             usize,
             extern "C" fn(*const u8, usize, *mut std::ffi::c_void),
             *mut std::ffi::c_void,
-        ) -> bool;
+        );
         let register = host_symbol(c"relax_register_inspect".as_ptr());
         if register.is_null() {
             return;

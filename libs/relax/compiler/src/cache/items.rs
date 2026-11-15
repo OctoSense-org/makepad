@@ -55,7 +55,7 @@ pub(crate) fn file_digest(pf: &ParsedFile) -> FileDigest {
     digest_into(pf, None)
 }
 
-/// The interface text of a file (holes marked `{..}`): MAKEPAD_RUN_CACHE_IFACE diagnostics.
+/// The interface text of a file (holes marked `{..}`): RELAX_CACHE_IFACE diagnostics.
 pub(crate) fn iface_text(pf: &ParsedFile) -> Vec<u8> {
     let mut v = Vec::new();
     digest_into(pf, Some(&mut v));
@@ -76,7 +76,7 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
             ItemKind::Trait(r) => stack.extend_from_slice(ast.list(ast.row(*r).items)),
             ItemKind::Impl(r) => stack.extend_from_slice(ast.list(ast.row(*r).items)),
             ItemKind::ForeignMod(r) => stack.extend_from_slice(ast.list(ast.row(*r).items)),
-            ItemKind::Mod(Some(items)) => stack.extend_from_slice(ast.list(*items)),
+            ItemKind::Mod(crate::ast::Opt::Some(items)) => stack.extend_from_slice(ast.list(*items)),
             _ => {}
         }
     }
@@ -115,28 +115,13 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
             let ItemKind::Fn(sig, body, _) = &it.kind else { continue };
             let s = ast.fn_sig(*sig);
             if s.konst || s.asyncness { continue; }
-            let (blo, bhi, eager) = match (body, s.lazy_body) {
+            let (blo, bhi, eager) = match (&body.get(), s.lazy_body.get()) {
                 (Some(b), _) => { let b = ast.block(*b); (b.lo, b.hi, true) }
                 (None, Some(r)) if r.lo > 0 => (pf.tok(r.lo - 1).lo, pf.tok(r.hi).hi, false),
                 _ => continue,
             };
             if blo < lo || bhi > hi || blo < it.lo || blo >= bhi || bhi > it.hi { continue; }
-            // `impl Trait` in the return type: callers' types are the body's. (In an argument the
-            // fn is generic: an instance is a slot of its own, keyed by this body.) An `impl` after
-            // the first `->` outside brackets: an arrow inside the generics (`F: Fn() -> u32`)
-            // comes first and only makes an argument's `impl` count as the return's.
-            let t0 = pf.toks.partition_point(|t| t.lo < it.lo);
-            let mut depth = 0i32;
-            let mut ret = false;
-            if pf.toks.iter_from(t0).take_while(|t| t.lo < blo).any(|t| {
-                match t.kind {
-                    T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
-                    T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
-                    T::RArrow if depth <= 0 => ret = true,
-                    _ => {}
-                }
-                ret && t.kind == T::KwImpl
-            }) { continue; }
+            if pf.returns_impl(it.lo, blo) { continue; }
             // the items the body defines (written there or expanded from there)
             let Some(v) = (if eager { in_body(blo, bhi) } else { Some(Vec::new()) }) else { continue };
             nested_in.extend(v.into_iter().map(|x| (x, i as u32)));
@@ -256,12 +241,20 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
 /// The hash of fn item `item`'s body (a static's initializer) when it is a hole (not in the
 /// interface).
 pub(crate) fn body_hash(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> Option<u128> {
+    hash_body(pf, d, item, false)
+}
+
+/// `body_hash`; with `no_include`, None for a body that includes a file (an `include!` in its
+/// text or in an expansion it calls).
+fn hash_body(pf: &ParsedFile, d: &FileDigest, item: ItemId, no_include: bool) -> Option<u128> {
     // an item a body defines: that body's text
     let item = match d.nested_in.binary_search_by_key(&item.0, |x| x.0) {
         Ok(k) => ItemId(d.nested_in[k].1),
         Err(_) => item,
     };
     let (lo, hi) = d.hole(item.0)?;
+    let includes = |text: &[u8]| no_include && super::deps::invokes_include(text);
+    if includes(&pf.src[lo as usize..hi as usize]) { return None; }
     let mut h = Sip128::new();
     h.str("body");
     h.write(&pf.src[lo as usize..hi as usize]);
@@ -274,6 +267,7 @@ pub(crate) fn body_hash(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> Option
             h.u8(0xfd);
             for (ea, eb) in exp {
                 if ea < eb && (eb as usize) <= pf.src.len() {
+                    if includes(&pf.src[ea as usize..eb as usize]) { return None; }
                     h.u32(eb - ea);
                     h.write(&pf.src[ea as usize..eb as usize]);
                     h.u8(0xfc);
@@ -287,6 +281,30 @@ pub(crate) fn body_hash(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> Option
         h.u32(lo);
     }
     Some(h.finish128())
+}
+
+/// The hash of fn item `item`'s body when no other item's check sees it (check_bodies.rs keys a
+/// stored body verdict by it): a hole (`body_hash`), and for a fn a hole body defines, one that is
+/// not const, not async and returns no `impl Trait` (its body is the hole's text). None for a body
+/// that includes a file: the front counts that read as the crate's interface, not the body's
+/// (Parser::late_flags), so the body is checked in every check of its crate.
+pub(crate) fn owner_body_hash(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> Option<u128> {
+    let ast = &pf.ast;
+    let it = ast.items.get(item.0 as usize)?;
+    let ItemKind::Fn(sig, body, _) = &it.kind else { return None };
+    if d.nested_in.binary_search_by_key(&item.0, |x| x.0).is_ok() {
+        let s = ast.fn_sig(*sig);
+        if s.konst || s.asyncness { return None; }
+        let blo = match (&body.get(), s.lazy_body.get()) {
+            (Some(b), _) => ast.block(*b).lo,
+            (None, Some(r)) if r.lo > 0 => pf.tok(r.lo - 1).lo,
+            _ => return None,
+        };
+        if pf.returns_impl(it.lo, blo) { return None; }
+    } else {
+        d.hole(item.0)?;
+    }
+    hash_body(pf, d, item, true)
 }
 
 /// For an item a body defines (a local struct, fn, static): that body's hash. Types made of
@@ -345,7 +363,7 @@ pub(crate) fn pos_digest(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> u128 
         let source = if file == 0 { None } else { pf.sources.as_ref().and_then(|s| s.get(file).ok()) };
         match source {
             Some(sf) => {
-                h.str(&sf.path);
+                h.str(&crate::dirs::anchored(&sf.path));
                 let (l, c) = sf.line_col(lo);
                 h.u64(l as u64);
                 h.u64(c as u64);
@@ -375,11 +393,12 @@ pub(crate) fn crate_ifaces(prog: &crate::program::Program, fps: &[u128], digests
 /// `crate_ifaces` when the first crates' interfaces are `known` (a partial collected restore keeps
 /// them): only the other crates' files need digests.
 pub(crate) fn crate_ifaces_from(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>], known: &[u128]) -> Vec<u128> {
-    crate_ifaces_keeping(prog, fps, digests, &|c| known.get(c).copied())
+    crate_ifaces_keeping(prog, fps, digests, &[], &|c| known.get(c).copied())
 }
 
 /// `crate_ifaces` with the interfaces `known` gives kept: only the other crates' files need digests.
-pub(crate) fn crate_ifaces_keeping(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>], known: &dyn Fn(usize) -> Option<u128>) -> Vec<u128> {
+/// `added`: the files of modules live edits added (Program::edit_added_files), after the boot's.
+pub(crate) fn crate_ifaces_keeping(prog: &crate::program::Program, fps: &[u128], digests: &[Option<std::sync::Arc<FileDigest>>], added: &[u32], known: &dyn Fn(usize) -> Option<u128>) -> Vec<u128> {
     let nc = prog.crates.len();
     let mut per: Vec<Sip128> = (0..nc)
         .map(|c| {
@@ -392,13 +411,15 @@ pub(crate) fn crate_ifaces_keeping(prog: &crate::program::Program, fps: &[u128],
             h
         })
         .collect();
-    // the boot's files only: a program restored with the files the lazy selection skipped
-    // loaded keeps the interfaces (and code keys) of the boot that recorded its code
-    for (i, d) in digests.iter().enumerate().take(prog.boot_files) {
+    // the boot's files (a program restored with the files the lazy selection skipped loaded keeps
+    // the interfaces, and code keys, of the boot that recorded its code), and those of the
+    // modules live edits added: they are the edited text's
+    let added = added.iter().map(|&f| f as usize).filter(|&f| f >= prog.boot_files);
+    for i in (0..prog.boot_files.min(digests.len())).chain(added) {
         if prog.front_macro_fragments.contains(&i) { continue; }
-        let (Some(&c), Some(d)) = (prog.file_crate.get(i), d.as_ref()) else { continue };
+        let (Some(&c), Some(d)) = (prog.file_crate.get(i), digests.get(i).and_then(|d| d.as_ref())) else { continue };
         if let Some(h) = per.get_mut(c as usize) {
-            h.str(prog.file_paths.get(i).map_or("", |p| p.as_str()));
+            h.str(&crate::dirs::anchored(prog.file_paths.get(i).map_or("", |p| p.as_str())));
             h.u128(d.iface);
         }
     }
@@ -427,6 +448,84 @@ pub(crate) fn crate_ifaces_keeping(prog: &crate::program::Program, fps: &[u128],
     }
     for c in 0..nc {
         go(c, prog, &per, &mut out, &mut done, 0);
+    }
+    out
+}
+
+/// Whether file `f` (any version of it) is one the boot's file selection skipped: loaded after the
+/// boot by the post-boot loader, and not by an edit that added its module (whose files the item
+/// graph has: deps.rs text_files).
+pub(crate) fn outside_boot_text(prog: &crate::program::Program, f: u32) -> bool {
+    let b = prog.first_version(f);
+    (b as usize) >= prog.boot_files && (b as usize) < prog.files.len() && !prog.front_macro_fragments.contains(&(b as usize))
+        && !prog.edit_added_files().iter().any(|x| x.0 == b)
+}
+
+/// Per crate: the text of its files the boot's file selection skipped (0: none) -- those the
+/// post-boot loader loaded since, as their versions now are, and those it has still to load, as
+/// on disk (a restored image holds the first kind past its boot files, a cold boot has only the
+/// second: the same files). The item graph and the interfaces are of the boot's files only, so
+/// the code keys take this in whole (`late_views`) and the fingerprint checks with it
+/// (Cache::fp_now): a warm run of an edit of such a file never links the old text's code.
+/// `memo`: the hash of each loaded file version so far.
+pub(crate) fn late_texts(prog: &crate::program::Program, memo: &mut std::collections::HashMap<u32, u128>) -> Vec<u128> {
+    let mut per: Vec<Vec<(&str, u128)>> = vec![Vec::new(); prog.crates.len()];
+    let added = prog.edit_added_files();
+    for f in prog.boot_files.min(prog.files.len())..prog.files.len() {
+        let f32 = f as u32;
+        if prog.is_edit_version(f32) || prog.front_macro_fragments.contains(&f) || added.iter().any(|x| x.0 == f32) { continue; }
+        let Some(&c) = prog.file_crate.get(f) else { continue };
+        let Some(path) = prog.file_paths.get(f) else { continue };
+        let now = prog.current_versions().get(&f32).copied().unwrap_or(f32);
+        let h = *memo.entry(now).or_insert_with(|| {
+            let pf = &prog.files[now as usize];
+            crate::crate_image::file_hash(path, &pf.src[..(pf.src_len as usize).min(pf.src.len())])
+        });
+        if let Some(v) = per.get_mut(c as usize) { v.push((path.as_str(), h)); }
+    }
+    for (m, (path, _, _)) in &prog.skipped_files {
+        let Some(md) = prog.mods.get(*m as usize) else { continue };
+        // (an unreadable file: its absence is the input, its load reports it)
+        let h = crate::vfs::read(path).map_or(0, |src| crate::crate_image::file_hash(path, &src));
+        if let Some(v) = per.get_mut(md.krate as usize) { v.push((path.as_str(), h)); }
+    }
+    per.into_iter().map(|mut v| {
+        if v.is_empty() { return 0; }
+        v.sort_unstable();
+        v.dedup();
+        let mut h = Sip128::new();
+        h.str("late-text");
+        for (p, x) in v { h.str(&crate::dirs::anchored(p)); h.u128(x); }
+        h.finish128()
+    }).collect()
+}
+
+/// Per crate: the late text (`late_texts`) of it and of every crate it depends on, which its code
+/// can name (0: none has any -- that crate's keys are as without it).
+pub(crate) fn late_views(prog: &crate::program::Program, late: &[u128]) -> Vec<u128> {
+    let nc = prog.crates.len();
+    let mut out = vec![0u128; nc];
+    let mut done = vec![false; nc];
+    fn go(c: usize, prog: &crate::program::Program, late: &[u128], out: &mut Vec<u128>, done: &mut Vec<bool>, depth: u32) -> u128 {
+        if done[c] || depth > 512 {
+            return out[c];
+        }
+        let mut deps: Vec<u128> = prog.crates[c].deps.iter().filter(|&&(_, d)| d as usize != c).map(|&(_, d)| go(d as usize, prog, late, out, done, depth + 1)).filter(|&x| x != 0).collect();
+        let own = late.get(c).copied().unwrap_or(0);
+        out[c] = if own == 0 && deps.is_empty() { 0 } else {
+            deps.sort_unstable();
+            deps.dedup();
+            let mut h = Sip128::new();
+            h.str("late-view");
+            h.u128(own);
+            for d in deps { h.u128(d); }
+            h.finish128()
+        };
+        done[c] = true;
+        out[c]
+    }
+    for c in 0..nc {
+        go(c, prog, late, &mut out, &mut done, 0);
     }
     out
 }

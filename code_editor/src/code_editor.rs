@@ -269,6 +269,10 @@ pub struct CodeEditor {
     /// A line to scroll to the middle of the view (caret untouched).
     #[rust]
     center_line: Option<usize>,
+    /// A line to scroll to a height in the view: its top that far below the
+    /// view's top (caret untouched).
+    #[rust]
+    place_line: Option<(usize, f64)>,
     /// Find matches, sorted, each within one line; drawn behind the text.
     #[rust]
     pub find_matches: Vec<(Position, Position)>,
@@ -835,6 +839,19 @@ impl CodeEditor {
             }
             KeepCursorInView::Off => {}
         }
+        if let Some((line, view_y)) = self.place_line {
+            if self.viewport_rect.size.y > 0.0 {
+                let line = line.min(session.document().as_text().as_lines().len().saturating_sub(1));
+                let (_, y) = session.layout().logical_to_normalized_position(
+                    Position { line_index: line, byte_index: 0 },
+                    Affinity::Before,
+                );
+                let y = (y * self.cell_size.y - view_y).max(0.0);
+                let x = self.scroll_bars.get_scroll_pos().x;
+                self.scroll_bars.set_scroll_pos_no_clip(cx, dvec2(x, y));
+                self.place_line = None;
+            }
+        }
         if let Some(line) = self.center_line {
             if self.viewport_rect.size.y > 0.0 {
                 let line = line.min(session.document().as_text().as_lines().len().saturating_sub(1));
@@ -1046,6 +1063,27 @@ impl CodeEditor {
         self.redraw(cx);
     }
 
+    /// Scroll `line` (0-based) so its top is `view_y` below the view's top,
+    /// leaving the caret: a host keeping a line where another view showed it.
+    pub fn place_line(&mut self, cx: &mut Cx, line: usize, view_y: f64) {
+        self.place_line = Some((line, view_y));
+        self.redraw(cx);
+    }
+
+    /// How far below the view's top `line`'s top is, as last scrolled
+    /// (negative above the view). None before the first draw.
+    pub fn line_view_y(&self, session: &CodeSession, line: usize) -> Option<f64> {
+        if self.viewport_rect.size.y <= 0.0 {
+            return None;
+        }
+        let line = line.min(session.document().as_text().as_lines().len().saturating_sub(1));
+        let (_, y) = session.layout().logical_to_normalized_position(
+            Position { line_index: line, byte_index: 0 },
+            Affinity::Before,
+        );
+        Some(y * self.cell_size.y - self.scroll_bars.get_scroll_pos().y)
+    }
+
     /// The lines drawn last frame (0-based, half-open); empty before the
     /// first draw.
     pub fn semantics(&self, cx: &Cx, session: &CodeSession, node: &mut a11y_tree::Node) {
@@ -1086,12 +1124,12 @@ impl CodeEditor {
                 let line = layout.line(index);
                 let bytes = layout.line_byte_range(index);
                 let mut last_row = None;
-                for (byte, _) in content[bytes.clone()]
-                    .char_indices()
-                    .map(|(b, c)| (bytes.start + b, c))
-                    .chain(std::iter::once((bytes.end, '\0')))
+                // One pass over the line gives every char's grid position.
+                for (byte, row, col) in line
+                    .grid_positions()
+                    .skip_while(|&(byte, _, _)| byte < bytes.start)
+                    .take_while(|&(byte, _, _)| byte <= bytes.end)
                 {
-                    let (row, col) = line.logical_to_grid_position(byte, Affinity::After);
                     let rect = self
                         .grid_rect(line, row, col, 1)
                         .translate(self.unscrolled_rect.pos);
@@ -1650,7 +1688,7 @@ impl CodeEditor {
                 ..
             }) => {
                 self.animator_play(cx, ids!(focus.on));
-                cx.set_key_focus(self.scroll_bars.area());
+                cx.set_key_focus_from_user(self.scroll_bars.area());
                 let ((cursor, affinity), is_in_gutter) = self.pick(session, abs);
                 session.add_selection(
                     cursor,
@@ -1720,7 +1758,7 @@ impl CodeEditor {
     /// Puts the cursor at `abs`, or selects the word or line there on a double or triple press.
     fn select_at(&mut self, cx: &mut Cx, session: &CodeSession, abs: Vec2d, tap_count: u32) {
         self.animator_play(cx, ids!(focus.on));
-        cx.set_key_focus(self.scroll_bars.area());
+        cx.set_key_focus_from_user(self.scroll_bars.area());
         let ((cursor, affinity), is_in_gutter) = self.pick(session, abs);
         session.set_selection(
             cursor,
@@ -2008,26 +2046,7 @@ impl CodeEditor {
                                     };
                                     let (text_0, text_1) = text.split_at(token.len);
                                     text = text_1;
-                                    self.draw_text.color = match token.kind {
-                                        TokenKind::Unknown => self.token_colors.unknown,
-                                        TokenKind::BranchKeyword => {
-                                            self.token_colors.branch_keyword
-                                        }
-                                        TokenKind::Comment => self.token_colors.comment,
-                                        TokenKind::Constant => self.token_colors.constant,
-                                        TokenKind::Delimiter => self.token_colors.delimiter,
-                                        TokenKind::Identifier => self.token_colors.identifier,
-                                        TokenKind::Macro => self.token_colors.macro_identifier,
-                                        TokenKind::Attribute => self.token_colors.attribute,
-                                        TokenKind::LoopKeyword => self.token_colors.loop_keyword,
-                                        TokenKind::Number => self.token_colors.number,
-                                        TokenKind::OtherKeyword => self.token_colors.other_keyword,
-                                        TokenKind::Punctuator => self.token_colors.punctuator,
-                                        TokenKind::String => self.token_colors.string,
-                                        TokenKind::Function => self.token_colors.function,
-                                        TokenKind::Typename => self.token_colors.typename,
-                                        TokenKind::Whitespace => self.token_colors.whitespace,
-                                    };
+                                    self.draw_text.color = self.token_colors.color(token.kind);
                                     self.draw_text.outline = 0.0;
                                     if let TokenKind::Delimiter = token.kind {
                                         if highlighted_delimiter_positions.contains(&Position {
@@ -2930,8 +2949,10 @@ struct ActiveSelection {
     start_x: f64,
 }
 
+/// The colour of each kind of token, as the editor draws them; a view that
+/// shows code outside an editor colours it the same way.
 #[derive(Script, ScriptHook)]
-struct TokenColors {
+pub struct TokenColors {
     #[live]
     unknown: Vec4f,
     #[live]
@@ -2970,6 +2991,30 @@ struct TokenColors {
     error_decoration: Vec4f,
     #[live]
     warning_decoration: Vec4f,
+}
+
+impl TokenColors {
+    /// The colour a token of `kind` draws in.
+    pub fn color(&self, kind: TokenKind) -> Vec4f {
+        match kind {
+            TokenKind::Unknown => self.unknown,
+            TokenKind::BranchKeyword => self.branch_keyword,
+            TokenKind::Comment => self.comment,
+            TokenKind::Constant => self.constant,
+            TokenKind::Delimiter => self.delimiter,
+            TokenKind::Identifier => self.identifier,
+            TokenKind::Macro => self.macro_identifier,
+            TokenKind::Attribute => self.attribute,
+            TokenKind::LoopKeyword => self.loop_keyword,
+            TokenKind::Number => self.number,
+            TokenKind::OtherKeyword => self.other_keyword,
+            TokenKind::Punctuator => self.punctuator,
+            TokenKind::String => self.string,
+            TokenKind::Function => self.function,
+            TokenKind::Typename => self.typename,
+            TokenKind::Whitespace => self.whitespace,
+        }
+    }
 }
 
 #[derive(Script, ScriptHook)]

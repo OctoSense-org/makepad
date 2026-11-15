@@ -1,5 +1,5 @@
-use makepad_relax::relax;
-use makepad_relax_api::relax_api;
+use relax_attr::relax;
+use relax_api::relax_api;
 use crate::array::*;
 use crate::function::*;
 use crate::handle::*;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 /// Tracks heap statistics from the last garbage collection run.
 /// Used to determine when to trigger the next GC cycle.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Default, Clone, Copy)]
 pub struct ScriptHeapGcLast {
     pub objects: usize,
@@ -242,7 +242,7 @@ macro_rules! mark_value_fields {
     };
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptHeap {
     /// Recursively mark a value and all reachable values as static (permanent).
     /// This walks the object graph similar to GC marking but sets the static flag instead.
@@ -487,7 +487,7 @@ impl ScriptHeap {
     ///
     /// # Safety
     /// `ctx` must remain valid for `insert` throughout this synchronous walk.
-    #[relax_api]
+    #[relax_api(run)]
     pub unsafe fn reach_count_with(&self, seeds: &[ScriptObject], ctx: *mut u8, insert: unsafe extern "C-unwind" fn(*mut u8, ScriptObject) -> bool) -> usize {
         let mut arrays_seen: std::collections::HashSet<ScriptArray> = Default::default();
         let mut count = 0usize;
@@ -556,7 +556,7 @@ impl ScriptHeap {
         }
     }
 
-    #[relax_api]
+    #[relax_api(run)]
     #[relax(keep_reachable)]
     pub fn mark(&mut self, threads: &ScriptThreads, code: &ScriptCode) {
         self.mark_vec.clear();
@@ -792,7 +792,7 @@ impl ScriptHeap {
         }
     }
 
-    #[relax_api]
+    #[relax_api(run)]
     #[relax(keep_reachable)]
     pub fn sweep(&mut self, log_stats: bool) {
         let start = crate::clock::monotonic_now();
@@ -990,10 +990,11 @@ impl ScriptHeap {
 
     /// Check if garbage collection should be triggered.
     ///
-    /// Uses a growth-based heuristic similar to Lua and V8:
-    /// - Trigger when any heap category has grown by 2x since last GC
-    /// - Use minimum thresholds to avoid GC thrashing on small heaps
-    /// - Objects are weighted more heavily as they're the primary allocation type
+    /// Objects and pods are summed: collect when their sum has doubled since
+    /// the last collection and reached their combined minimum thresholds,
+    /// because a mark costs in proportion to the live set. Strings, arrays,
+    /// handles and regexes double on their own, each with a minimum threshold
+    /// to avoid GC thrashing on small heaps.
 
     #[inline]
     pub fn needs_gc(&self) -> bool {
@@ -1021,17 +1022,17 @@ impl ScriptHeap {
         let pods = self.pods.len() - self.pods_free.len();
         let handles = self.handles.len() - self.handles_free.len();
 
-        // Check each category: must exceed minimum AND have grown by factor
-        if objects >= MIN_OBJECTS && objects >= self.gc_last.objects * GROWTH_FACTOR {
+        // Objects and pods grow together; other categories grow independently.
+        let grown = objects + pods;
+        if grown >= MIN_OBJECTS + MIN_PODS
+            && grown >= (self.gc_last.objects + self.gc_last.pods) * GROWTH_FACTOR
+        {
             return true;
         }
         if strings >= MIN_STRINGS && strings >= self.gc_last.strings * GROWTH_FACTOR {
             return true;
         }
         if arrays >= MIN_ARRAYS && arrays >= self.gc_last.arrays * GROWTH_FACTOR {
-            return true;
-        }
-        if pods >= MIN_PODS && pods >= self.gc_last.pods * GROWTH_FACTOR {
             return true;
         }
         if handles >= MIN_HANDLES && handles >= self.gc_last.handles * GROWTH_FACTOR {
@@ -1045,6 +1046,19 @@ impl ScriptHeap {
         }
 
         false
+    }
+
+    /// Current allocated entries by category, excluding free slots.
+    #[relax_api(run)]
+    pub fn gc_live_counts(&self) -> ScriptHeapGcLast {
+        ScriptHeapGcLast {
+            objects: self.objects.len() - self.objects_free.len(),
+            strings: self.strings.len() - self.strings_free.len(),
+            arrays: self.arrays.len() - self.arrays_free.len(),
+            pods: self.pods.len() - self.pods_free.len(),
+            handles: self.handles.len() - self.handles_free.len(),
+            regexes: self.regexes.len() - self.regexes_free.len(),
+        }
     }
 
     #[inline]
@@ -1104,14 +1118,14 @@ impl ScriptHeap {
     }
 
     /// Diagnostic/test accessor for the escape barrier.
-    #[relax_api]
+    #[relax_api(run)]
     pub fn is_object_reffed(&self, obj: ScriptObject) -> bool {
         self.objects.is_valid(obj) && self.objects[obj].tag.is_reffed()
     }
 
     /// Live (allocated, non-free) object slot count — the flat-heap metric
     /// for host transient tests.
-    #[relax_api]
+    #[relax_api(run)]
     pub fn live_object_len(&self) -> usize {
         self.objects.len() - self.objects_free.len()
     }

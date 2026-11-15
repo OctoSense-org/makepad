@@ -88,21 +88,29 @@ impl Drop for Lists {
 }
 
 impl Lists {
-    /// A heap copy of `live` (positions, words and bucket heads as they are), with nothing
-    /// mapped: the settle rebuild's restored interner (Types::top_up_from). Every list is complete,
-    /// since nothing interns while it copies.
-    pub(super) fn copy_of(live: &Lists) -> Self {
-        let mut l = Lists::new();
-        let words = live.tail_words(0);
-        for (p, &w) in words.iter().enumerate() {
+    /// The settle rebuild's top-up (Types::top_up_from): `self`, restored from an image of `live`
+    /// and unused since, gets the lists `live` made past the image's end, their words at the same
+    /// positions and their slots claimed in position order (as `intern` claims them). Nothing
+    /// interns into either while it runs.
+    pub(super) fn top_up_from(&mut self, live: &Lists) {
+        let (e0, e1) = (self.end(), live.end());
+        for p in e0..e1 {
+            // (word_at: a chunk skipped over whole, after a mapped prefix, was never allocated)
+            let w = live.word_at(p);
             if w != 0 {
-                let c = l.chunk(p >> LIST_CHUNK_BITS);
+                let c = self.chunk(p >> LIST_CHUNK_BITS);
                 unsafe { *c.add(p & (LIST_CHUNK - 1)) = w };
             }
         }
-        l.end.store(words.len() as u32, Ordering::Release);
-        l.index = Index::copy_of(&live.index);
-        l
+        self.end.store(e1 as u32, Ordering::Release);
+        // the new lists' slots: the live table's entries whose words start past the image's end
+        let mut new: Vec<u64> = live.index.table().filled().filter(|&s| ((s as u32) >> LEN_BITS) as usize >= e0).collect();
+        new.sort_unstable_by_key(|&s| (s as u32) >> LEN_BITS);
+        let mut g = self.index.lock();
+        for slot in new {
+            let h = (slot >> 32) as u32;
+            self.index.claim(&mut g, h, slot, || self.index.table().filled().map(|s| ((s >> 32) as u32, s)).chain(std::iter::once((h, slot))));
+        }
     }
 
     pub(super) fn new() -> Self {
@@ -174,12 +182,12 @@ impl Lists {
         let long = w.len() >= LONG as usize;
         let head_words = long as usize;
         let need = w.len() + head_words;
-        assert!(need <= LIST_CHUNK, "makepad: interned list of {} words", w.len());
+        assert!(need <= LIST_CHUNK, "relax: interned list of {} words", w.len());
         let mut p = self.end.load(Ordering::Relaxed) as usize;
         if (p & (LIST_CHUNK - 1)) + need > LIST_CHUNK {
             p = (p | (LIST_CHUNK - 1)) + 1;
         }
-        assert!(p >> LIST_CHUNK_BITS < LIST_MAX_CHUNKS, "makepad: list arena full");
+        assert!(p >> LIST_CHUNK_BITS < LIST_MAX_CHUNKS, "relax: list arena full");
         let c = self.chunk(p >> LIST_CHUNK_BITS);
         let at = unsafe { c.add(p & (LIST_CHUNK - 1)) };
         unsafe {
@@ -231,34 +239,35 @@ impl Lists {
         (chunks * LIST_CHUNK * 4, self.index.bytes())
     }
 
-    /// The words from position `from` to the end (image tail), skipped words as 0.
+    /// The word at position `p`; a skipped one as 0 (its chunk may never have been allocated).
     fn word_at(&self, p: usize) -> u32 {
         if p < self.mapped.len() { return self.mapped[p]; }
         let c = self.chunks[p >> LIST_CHUNK_BITS].load(Ordering::Acquire);
         if c.is_null() { 0 } else { unsafe { *c.add(p & (LIST_CHUNK - 1)) } }
     }
 
-    pub(super) fn tail_words(&self, from: usize) -> Vec<u32> {
-        (from..self.end()).map(|p| self.word_at(p)).collect()
-    }
-
-    /// tail_words as the bytes of the words (an image section's tail, taken once)
-    pub(super) fn tail_word_bytes(&self, from: usize, end: usize) -> Vec<u8> {
+    /// The words from `from` to `end` as bytes (an image section's tail, taken once), asking
+    /// `stop` every 64Ki words (None: it said yes)
+    pub(super) fn tail_word_bytes(&self, from: usize, end: usize, stop: &dyn Fn() -> bool) -> Option<Vec<u8>> {
         let mut b = Vec::with_capacity(end.saturating_sub(from) * 4);
-        for p in from..end { b.extend_from_slice(&self.word_at(p).to_ne_bytes()); }
-        b
+        for p in from..end {
+            if (p - from) % (1 << 16) == (1 << 16) - 1 && stop() { return None; }
+            b.extend_from_slice(&self.word_at(p).to_ne_bytes());
+        }
+        Some(b)
     }
 
     /// The image's view of the table: the end position and the slots of the lists below it.
     /// Read under the lock, so every list below the end is in the table read; a list claimed
     /// since lies past the end and reads as empty, which cuts no other list's probe run (slots
     /// are claimed in position order). A table replaced meanwhile stays allocated.
-    pub(super) fn image_slots(&self) -> (usize, Vec<u64>) {
+    /// `stop`: as Table::snapshot.
+    pub(super) fn image_slots(&self, stop: &dyn Fn() -> bool) -> Option<(usize, Vec<u64>)> {
         let (end, t) = {
             let _g = self.index.lock();
             (self.end(), self.index.table())
         };
-        (end, t.snapshot(|s| ((s as u32) >> LEN_BITS) as usize >= 1 && (((s as u32) >> LEN_BITS) as usize) < end))
+        Some((end, t.snapshot(|s| ((s as u32) >> LEN_BITS) as usize >= 1 && (((s as u32) >> LEN_BITS) as usize) < end, stop)?))
     }
 
     /// A collected image's words and intern table; new lists follow the mapped words.

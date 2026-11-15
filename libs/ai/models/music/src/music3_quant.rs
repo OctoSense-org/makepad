@@ -125,6 +125,7 @@ impl Music3GgufPaths {
 }
 
 pub struct Music3GgufFile {
+    pub(crate) owner: Arc<makepad_ai_common::backend::WeightOwner>,
     pub role: Music3GgufRole,
     pub path: PathBuf,
     pub architecture: String,
@@ -133,6 +134,8 @@ pub struct Music3GgufFile {
     pub file: GgufFile,
     byte_cache: RefCell<HashMap<String, Arc<Vec<u8>>>>,
     bf16_as_f16: RefCell<HashMap<String, Arc<Vec<u8>>>>,
+    /// Each BF16 tensor's F16 sidecar sub-key, made at open so a call formats nothing.
+    f16_keys: HashMap<String, String>,
     io: RefCell<File>,
 }
 
@@ -160,7 +163,14 @@ impl Music3GgufFile {
         let io = File::open(&path).map_err(|err| {
             DiffusionError::model(format!("music3 gguf {}: {err}", path.display()))
         })?;
+        let f16_keys = file
+            .tensors
+            .iter()
+            .filter(|info| info.tensor_type == TensorType::BF16)
+            .map(|info| (info.name.clone(), format!("f16::{}", info.name)))
+            .collect();
         Ok(Self {
+            owner: Arc::new(makepad_ai_common::backend::WeightOwner::new("music3")),
             role,
             path,
             architecture,
@@ -169,6 +179,7 @@ impl Music3GgufFile {
             file,
             byte_cache: RefCell::new(HashMap::new()),
             bf16_as_f16: RefCell::new(HashMap::new()),
+            f16_keys,
             io: RefCell::new(io),
         })
     }
@@ -429,7 +440,6 @@ impl Music3GgufFile {
     /// pad to 32: that selected `mul_mm` and produced all-zero outputs.
     /// If Metal returns zeros, Q4_0 falls back to packed `vec_dot` GEMV.
     pub fn linear_nt(&self, name: &str, a: &[f32], m: usize) -> Result<Vec<f32>> {
-        let info = self.require(name)?;
         let (k, n, ty) = self.linear_kn(name)?;
         if a.len() != m.saturating_mul(k) {
             return Err(DiffusionError::model(format!(
@@ -438,9 +448,7 @@ impl Music3GgufFile {
                 m * k
             )));
         }
-        if info.dimensions.len() != 2 {
-            return self.linear_nt_host_f32(name, a, m, k, n);
-        }
+        // Squeezed size-1 dims keep element order, so linear_kn's (k, n) is exact for 3-D GGUF weights too.
         // Native `m` — do not pad decode (m=1) to 32. Padding forced
         // `kernel_mul_mm_q4_0_f32`, which wrote zeros on the older metallib.
         // m=1 hits official `kernel_mul_mv_q4_0_f32`.
@@ -532,7 +540,6 @@ impl Music3GgufFile {
 
     pub fn keyed_mat<'a>(
         &'a self,
-        ns: &'a str,
         name: &'a str,
     ) -> Option<makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix<'a>> {
         let (_k, n, ty) = self.linear_kn(name).ok()?;
@@ -543,18 +550,16 @@ impl Music3GgufFile {
             makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix {
                 bt_ggml_type: ty.ggml_type(),
                 n,
-                namespace: ns,
+                owner: &self.owner,
                 cache_key: name,
             },
         )
     }
 
     /// Keyed matrix that also serves BF16 weights through the F16 sidecar
-    /// namespace (`load_keyed_bytes` converts on first touch).
+    /// sub-key made at open (`load_keyed_bytes` converts on first touch).
     pub fn keyed_mat_any<'a>(
-        &self,
-        ns: &'a str,
-        ns_f16: &'a str,
+        &'a self,
         name: &'a str,
     ) -> Option<makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix<'a>> {
         let (_k, n, ty) = self.linear_kn(name).ok()?;
@@ -562,21 +567,21 @@ impl Music3GgufFile {
             makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix {
                 bt_ggml_type: TensorType::F16.ggml_type(),
                 n,
-                namespace: ns_f16,
-                cache_key: name,
+                owner: &self.owner,
+                cache_key: self.f16_keys.get(name)?.as_str(),
             }
         } else {
             makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix {
                 bt_ggml_type: ty.ggml_type(),
                 n,
-                namespace: ns,
+                owner: &self.owner,
                 cache_key: name,
             }
         })
     }
 
-    pub fn load_keyed_bytes(&self, namespace: &str, key: &str) -> std::result::Result<Vec<u8>, String> {
-        if namespace.ends_with("-f16") {
+    pub fn load_keyed_bytes(&self, _owner: &makepad_ai_common::backend::WeightOwner, key: &str) -> std::result::Result<Vec<u8>, String> {
+        if let Some(key) = key.strip_prefix("f16::") {
             self.bf16_as_f16_uncached(key)
                 .ok_or_else(|| format!("music3 bf16-as-f16 {key}"))
         } else {
@@ -590,9 +595,7 @@ impl Music3GgufFile {
         a: &[f32],
         m: usize,
     ) -> Option<Vec<Vec<f32>>> {
-        let ns = format!("music3-{}", self.role.as_str());
-        let ns_f16 = format!("music3-{}-f16", self.role.as_str());
-        let mut specs: Vec<(&str, u32, usize, bool)> = Vec::with_capacity(names.len());
+        let mut specs: Vec<(&str, u32, usize)> = Vec::with_capacity(names.len());
         let mut k0 = 0usize;
         for name in names {
             let (k, n, ty) = self.linear_kn(name).ok()?;
@@ -605,17 +608,17 @@ impl Music3GgufFile {
                 return None;
             }
             if ty == TensorType::BF16 {
-                specs.push((*name, TensorType::F16.ggml_type(), n, true));
+                specs.push((self.f16_keys.get(*name)?.as_str(), TensorType::F16.ggml_type(), n));
             } else {
-                specs.push((*name, ty.ggml_type(), n, false));
+                specs.push((*name, ty.ggml_type(), n));
             }
         }
         let mats: Vec<makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix<'_>> = specs
             .iter()
-            .map(|(name, ty, n, is_f16)| makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix {
+            .map(|(name, ty, n)| makepad_ai_common::backend::metal::MatmulNtGgmlBytesKeyedMatrix {
                 bt_ggml_type: *ty,
                 n: *n,
-                namespace: if *is_f16 { ns_f16.as_str() } else { ns.as_str() },
+                owner: &self.owner,
                 cache_key: name,
             })
             .collect();
@@ -624,30 +627,8 @@ impl Music3GgufFile {
             m,
             k0,
             &mats,
-            |namespace, key| self.load_keyed_bytes(namespace, key),
+            |owner, key| self.load_keyed_bytes(owner, key).map(std::borrow::Cow::Owned),
         )
-    }
-
-    fn linear_nt_host_f32(
-        &self,
-        name: &str,
-        a: &[f32],
-        m: usize,
-        k: usize,
-        n: usize,
-    ) -> Result<Vec<f32>> {
-        let w = self.read_f32_any(name)?;
-        if w.len() != n.saturating_mul(k) {
-            return Err(DiffusionError::model(format!(
-                "music3 {name}: dense weight {} values, expected {}",
-                w.len(),
-                n * k
-            )));
-        }
-        match makepad_ai_common::backend::metal::try_matmul_nt_f32(a, &w, m, k, n) {
-            Some(y) if y.iter().any(|v| v.is_finite() && *v != 0.0) => Ok(y),
-            _ => matmul_nt_f32_cpu(a, &w, m, k, n),
-        }
     }
 
     fn try_metal_quant_linear(
@@ -660,10 +641,9 @@ impl Music3GgufFile {
         ty: TensorType,
     ) -> Option<Vec<f32>> {
         let ggml_type = ty.ggml_type();
-        let ns = format!("music3-{}", self.role.as_str());
-        let load = || self.read_bytes_uncached(name).map_err(|err| err.to_string());
+        let load = || self.read_bytes_uncached(name).map(std::borrow::Cow::Owned).map_err(|err| err.to_string());
         makepad_ai_common::backend::metal::try_matmul_nt_ggml_bytes_keyed(
-            a, ggml_type, m, k, n, &ns, name, load,
+            a, ggml_type, m, k, n, &self.owner, name, load,
         )
     }
 
@@ -675,9 +655,10 @@ impl Music3GgufFile {
         k: usize,
         n: usize,
     ) -> Option<Vec<f32>> {
-        let ns = format!("music3-{}-f16", self.role.as_str());
+        let key = self.f16_keys.get(name)?;
         let load = || {
             self.bf16_as_f16_uncached(name)
+                .map(std::borrow::Cow::Owned)
                 .ok_or_else(|| format!("music3 bf16-as-f16 {name}"))
         };
         makepad_ai_common::backend::metal::try_matmul_nt_ggml_bytes_keyed(
@@ -686,8 +667,8 @@ impl Music3GgufFile {
             m,
             k,
             n,
-            &ns,
-            name,
+            &self.owner,
+            key,
             load,
         )
     }

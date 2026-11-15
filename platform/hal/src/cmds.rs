@@ -175,7 +175,8 @@ hal_commands! {
     ImeSync = 32, ime_sync { id: obj, sel_start: u32, sel_end: u32, comp_start: u32, comp_end: u32, text: rng };
 
     // ---- clipboard, drag, menu, dialogs
-    ClipSet = 40, clip_set { text: rng };
+    /// A copy: a packed `clipboard::ClipboardData` (the text and its richer flavours).
+    ClipSet = 40, clip_set { data: rng };
     /// The Linux primary selection.
     SelectionSet = 41, selection_set { text: rng };
     /// A drag out of the app from window `id`: `items` holds `count` flat `DragItem`s, then the
@@ -230,14 +231,15 @@ hal_commands! {
     // ---- frames
     /// Render `packet` (index into `CmdBuf::frames`) to `target`; `kind` is `target::*`.
     Frame = 70, frame { target: obj, kind: u32, packet: u32 };
-    /// A pick-mode frame request at `pos`; answered by `PickResult`.
-    Pick = 71, pick { window: obj, req: u32, pos: v2 };
     /// Answered by a `Readback` event with the same `req`.
     Snapshot = 72, snapshot { window: obj, req: u32 };
 
     /// Answers a `DragQuery` (`to` = [`input::reply::QUERY`], `answer` = a `drag_query` value) or a
     /// `DragOver` (`to` = [`input::reply::OVER`], `answer` = a `drag_response` value).
-    DragReply = 73, drag_reply { window: obj, to: u32, answer: u32 };
+    /// `fullscreen` (a `DragQuery`'s answer): a double click there makes the window fullscreen on
+    /// its screen instead of maximising it, the window's own declaration. A host window manager
+    /// reads it; window systems ignore it.
+    DragReply = 73, drag_reply { window: obj, to: u32, answer: u32, fullscreen: bool };
 
     /// The app has work for `window`: one `FrameReady` follows at the next vsync (a backend with
     /// a display clock; the others answer at once). Asked again after each frame while the app
@@ -350,7 +352,7 @@ hal_commands! {
     // ---- the mobile system UI (the UIKit shell; other backends ignore them)
     /// `mobile_ui::*` and its value: the status bar's icon tone, the orientations the app
     /// allows, keeping the screen on, the screen edges whose system gestures wait for the app,
-    /// the color shown in place of the window before it draws.
+    /// the color shown in place of the window before it draws, and Android's compile screen.
     MobileUi = 139, mobile_ui { op: u32, value: u32 };
     /// The text selection's drag handles in window `id` (window points): `op` is
     /// `selection_handles::*`, `start` / `end` the handles' anchor points (the bottom of the
@@ -438,4 +440,6 @@ hal_commands! {
     FrameRateBoost = 165, frame_rate_boost {};
     /// Ask device clients to release reclaimable memory for foreground work.
     GpuReclaim = 166, gpu_reclaim { bytes: u64 };
+    /// A finished PDF for the system print UI; answered by `PrintResult` with the same `req`.
+    PrintPdf = 167, print_pdf { req: u32, title: sid, pdf: rng };
 }

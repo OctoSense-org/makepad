@@ -1,7 +1,6 @@
 // io::Write for Cursor<Box<[u8]>> (stable since 1.5) and Cursor<[u8; N]> (1.61): a cursor over a
-// buffer it owns and cannot grow. The std here wrote through `&mut [u8]`, `&mut Vec<u8>` and
-// `Vec<u8>` only, so tokio's `impl AsyncWrite for io::Cursor<Box<[u8]>>` (src/io/async_write.rs)
-// and futures-util's (src/io/cursor.rs) did not compile. Both crates also forward
+// buffer it owns and cannot grow, as tokio's `impl AsyncWrite for io::Cursor<Box<[u8]>>`
+// (src/io/async_write.rs) and futures-util's (src/io/cursor.rs) use it. Both crates also forward
 // `write_vectored`, which std's cursors answer with every buffer that fits, not the first one.
 use std::io::{self, Cursor, IoSlice, Read, Seek, SeekFrom, Write};
 

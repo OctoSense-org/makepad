@@ -1,12 +1,13 @@
 # Offline regressions for the bootstrap's PowerShell steps. No downloads or builds.
-param([ValidateSet('Paths', 'Update', 'Rust')][string]$Case = 'Paths')
+param([ValidateSet('Paths', 'Update', 'Rust', 'Folder')][string]$Case = 'Paths')
 $ErrorActionPreference = 'Stop'
 $source = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot 'makepad.bat')
 $base = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N') + " O'Brien (2) [data]")
 [IO.Directory]::CreateDirectory($base) | Out-Null
 $utf8 = New-Object Text.UTF8Encoding($false)
+# A fragment's errors go to :fail, which shows them on makepad.bat's screen: here it only exits 1.
 function Run-Fragment([string]$text) {
-    [IO.File]::WriteAllText((Join-Path $base 'step.bat'), "@echo off`r`nsetlocal EnableExtensions EnableDelayedExpansion`r`n" + ($text -replace "`r?`n", "`r`n") + "`r`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $base 'step.bat'), "@echo off`r`nsetlocal EnableExtensions EnableDelayedExpansion`r`n" + ($text -replace "`r?`n", "`r`n") + "`r`n:fail`r`nexit /b 1`r`n", $utf8)
     # From its folder: cmd /c strips the quotes of a path with parentheses in it.
     Push-Location -LiteralPath $base
     try { & cmd.exe /d /c step.bat } finally { Pop-Location }
@@ -117,6 +118,55 @@ try {
         [IO.File]::Delete((Join-Path $env:RUST 'bin\rustc.exe'))
         $code = Run-Fragment $check
         Require ($code[-1] -eq 7) 'Rust without rustc was reused'
+    }
+    if ($Case -eq 'Folder') {
+        # The folder choice as makepad.bat runs it from where it lies. Opened inside a zip it runs in a
+        # temporary folder (TEMP, or only TMP, its long name or its short one): it goes to the profile's
+        # folder and says why (NOTE and NOTE2, lines of its screen). The folder Extract All makes of a
+        # second download, "(1)" in its name, is its own; a download among other files goes to the
+        # profile's folder, and says so.
+        $choose = [regex]::Match($source, '(?ms)^set "ROOT=%~dp0"\r?$.*?^if /i not "%~dp0"==.*?$').Value
+        Require ($choose.Length -gt 0) 'folder choice missing'
+        $check = [regex]::Match($source, '(?ms)^:temporary\r?$.*?^exit /b 0').Value
+        Require ($check.Length -gt 0) 'temporary folder check missing'
+        Remove-Item Env:MAKEPAD_LOADER_ROOT -ErrorAction SilentlyContinue
+        $env:USERPROFILE = Join-Path $base 'profile'
+        $profileRoot = Join-Path $env:USERPROFILE 'makepad-runner'
+        $temp = Join-Path $base 'Local Temp'
+        $other = Join-Path $base 'Other Temp'
+        $downloads = Join-Path $base 'Downloads'
+        foreach ($dir in $temp, $other, $downloads) { [IO.Directory]::CreateDirectory($dir) | Out-Null }
+        function Choose([string]$dir, [string]$tempVar, [string]$tmpVar) {
+            # with no MAKEPAD_LOADER_ROOT the profile is the test's own, never the real one
+            Require ($env:USERPROFILE -eq (Join-Path $base 'profile') -and -not $env:MAKEPAD_LOADER_ROOT) 'a folder choice outside the test''s own profile'
+            $env:TEMP = $tempVar; $env:TMP = $tmpVar
+            [IO.Directory]::CreateDirectory($dir) | Out-Null
+            $bat = "@echo off`nsetlocal EnableExtensions EnableDelayedExpansion`n$choose`necho ROOT=!ROOT!`necho NOTE=!NOTE! !NOTE2!`nexit /b 0`n$check`n"
+            [IO.File]::WriteAllText((Join-Path $dir 'makepad.bat'), ($bat -replace "`r?`n", "`r`n"), $utf8)
+            Push-Location -LiteralPath $dir
+            try { return (& cmd.exe /d /c makepad.bat) -join "`n" } finally { Pop-Location }
+        }
+        function At([string]$out, [string]$dir) { $out -match ('(?m)^ROOT=' + [regex]::Escape($dir) + '\r?$') }
+        $short = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($temp).ShortPath
+        "temporary folder: $temp"
+        "its short name:   $short"
+        foreach ($run in @(
+                @('Temp1_makepad-runner.zip', $temp, $temp, 'TEMP'),
+                @('Temp2_makepad-runner.zip', $other, $temp, 'only TMP'),
+                @('Temp3_makepad-runner.zip', $short, $short, 'a short TEMP'))) {
+            $out = Choose (Join-Path $temp $run[0]) $run[1] $run[2]
+            Require (At $out $profileRoot) "inside a zip, $($run[3]): not the profile's folder: $out"
+            Require ($out -match 'This is a temporary folder') "inside a zip, $($run[3]): no line saying why: $out"
+        }
+        Require ([IO.File]::Exists((Join-Path $profileRoot 'makepad.bat'))) 'makepad.bat was not copied to the profile''s folder'
+        $second = Join-Path $downloads 'makepad-runner (1)'
+        $out = Choose $second $temp $temp
+        Require (At $out $second) "a second download's folder is not its own: $out"
+        Require ($out -notmatch 'Makepad goes into') "a second download's folder: a line saying it moved: $out"
+        [IO.File]::WriteAllText((Join-Path $downloads 'other.txt'), 'other', $utf8)
+        $out = Choose $downloads $temp $temp
+        Require (At $out $profileRoot) "a download among other files: not the profile's folder: $out"
+        Require ($out -match 'This folder holds other files') "a download among other files: no line saying why: $out"
     }
     "PASS $Case"
 } finally {

@@ -7,7 +7,7 @@
 H=$(cd "$(dirname "$0")" && pwd)
 ERR=$(mktemp)
 trap 'rm -f "$ERR"' EXIT
-export MAKEPAD_RUN_CACHE=off
-OUT=$(cd "$H" && MAKEPAD_RUN_STD=$H/../../std "$1" run --quiet ddm-app 2>>"$ERR")
+export RELAX_CACHE=off
+OUT=$(cd "$H" && RELAX_STD=$H/../../std "$1" run --quiet ddm-app 2>>"$ERR")
 echo "$OUT"
 if [ "$OUT" = "declared derive Outer Inner" ]; then echo "derive_declared_by_dep_macro: ok"; else tail -5 "$ERR"; echo "derive_declared_by_dep_macro: FAILED"; exit 1; fi

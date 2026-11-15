@@ -35,6 +35,20 @@ fn len_between<T>(p: *const T, end: *const T) -> usize {
     if zst::<T>() { bytes } else { bytes / crate::mem::size_of::<T>() }
 }
 
+/// advance_by (advance_back_by) of a slice iterator, whose nth (nth_back) is O(1): at most the
+/// items left, in one nth
+macro_rules! advance_by_nth {
+    ($it:expr, $n:expr, $nth:ident) => {{
+        let n = $n;
+        let len = $it.len_left();
+        let k = if n < len { n } else { len };
+        if k > 0 {
+            $it.$nth(k - 1);
+        }
+        if k < n { Err(n - k) } else { Ok(()) }
+    }};
+}
+
 pub struct Iter<'a, T> {
     ptr: *const T,
     end: *const T,
@@ -107,6 +121,11 @@ impl<'a, T> Iterator for Iter<'a, T> {
     fn count(self) -> usize {
         self.len_left()
     }
+    // core slice iter macros: advance_by moves the pointer in O(1) (Chain::nth and VecDeque's
+    // iterators lean on it)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        advance_by_nth!(self, n, nth)
+    }
     fn nth(&mut self, n: usize) -> Option<&'a T> {
         if n >= self.len_left() {
             if zst::<T>() {
@@ -142,6 +161,13 @@ impl<'a, T> Iterator for Iter<'a, T> {
             i += 1;
         }
         None
+    }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a T {
+        // SAFETY: idx is below the iterator's size where Zip took it, so ptr + idx is an element of the
+        // slice (for a zero-sized T, ptr itself)
+        unsafe { &*self.ptr.add(idx) }
     }
 }
 
@@ -180,9 +206,16 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
             }
         }
     }
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        advance_by_nth!(self, n, nth_back)
+    }
 }
 
 impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for Iter<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for Iter<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 unsafe impl<'a, T> crate::iter::TrustedLen for Iter<'a, T> {}
 impl<'a, T> FusedIterator for Iter<'a, T> {}
 
@@ -251,6 +284,9 @@ impl<'a, T> Iterator for IterMut<'a, T> {
     fn count(self) -> usize {
         self.len_left()
     }
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        advance_by_nth!(self, n, nth)
+    }
     fn nth(&mut self, n: usize) -> Option<&'a mut T> {
         if n >= self.len_left() {
             if zst::<T>() {
@@ -273,6 +309,12 @@ impl<'a, T> Iterator for IterMut<'a, T> {
             }
         }
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut T {
+        // SAFETY: as Iter's; no index is taken twice, so the references do not alias
+        unsafe { &mut *self.ptr.add(idx) }
+    }
 }
 
 impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
@@ -292,9 +334,35 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             }
         }
     }
+    // core slice iter macros: end moves back by n + 1 in O(1)
+    fn nth_back(&mut self, n: usize) -> Option<&'a mut T> {
+        let len = self.len_left();
+        if n >= len {
+            self.end = self.ptr;
+            None
+        } else {
+            // SAFETY: n < len
+            unsafe {
+                if zst::<T>() {
+                    self.end = (self.end as *mut u8).wrapping_sub(n + 1) as *mut T;
+                    Some(&mut *self.ptr)
+                } else {
+                    self.end = self.end.sub(n + 1);
+                    Some(&mut *self.end)
+                }
+            }
+        }
+    }
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        advance_by_nth!(self, n, nth_back)
+    }
 }
 
 impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for IterMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for IterMut<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 unsafe impl<'a, T> crate::iter::TrustedLen for IterMut<'a, T> {}
 impl<'a, T> FusedIterator for IterMut<'a, T> {}
 
@@ -366,6 +434,12 @@ impl<'a, T> Iterator for Windows<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a [T] {
+        // SAFETY: idx is below the number of windows, so idx + size is within the slice
+        unsafe { super::from_raw_parts(self.v.as_ptr().add(idx), self.size) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for Windows<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -384,7 +458,75 @@ impl<'a, T> DoubleEndedIterator for Windows<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for Windows<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for Windows<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for Windows<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for Windows<'a, T> {}
+
+// ---------------------------------------------------------------- ArrayWindows
+
+/// `<[T]>::array_windows::<N>()` (core slice/iter.rs, stable 1.94): the overlapping windows of
+/// `N` elements as `&[T; N]`. `v` is what is left (core's one field: its Debug shows it), and a
+/// step past either end leaves it as core does.
+pub struct ArrayWindows<'a, T, const N: usize> {
+    v: &'a [T],
+}
+
+pub const fn array_windows<T, const N: usize>(v: &[T]) -> ArrayWindows<'_, T, N> {
+    const { assert!(N != 0, "window size must be non-zero") }
+    ArrayWindows { v }
+}
+impl<'a, T, const N: usize> Clone for ArrayWindows<'a, T, N> {
+    fn clone(&self) -> Self {
+        ArrayWindows { v: self.v }
+    }
+}
+impl<'a, T: fmt::Debug, const N: usize> fmt::Debug for ArrayWindows<'a, T, N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArrayWindows").field("v", &self.v).finish()
+    }
+}
+impl<'a, T, const N: usize> Iterator for ArrayWindows<'a, T, N> {
+    type Item = &'a [T; N];
+    fn next(&mut self) -> Option<&'a [T; N]> {
+        let r = self.v.first_chunk::<N>();
+        if r.is_some() {
+            self.v = &self.v[1..];
+        }
+        r
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.v.len().saturating_sub(N - 1);
+        (n, Some(n))
+    }
+    fn count(self) -> usize {
+        self.len()
+    }
+    fn nth(&mut self, n: usize) -> Option<&'a [T; N]> {
+        let at = if n < self.v.len() { n } else { self.v.len() };
+        self.v = &self.v[at..];
+        self.next()
+    }
+    fn last(self) -> Option<&'a [T; N]> {
+        self.v.last_chunk::<N>()
+    }
+}
+impl<'a, T, const N: usize> DoubleEndedIterator for ArrayWindows<'a, T, N> {
+    fn next_back(&mut self) -> Option<&'a [T; N]> {
+        let r = self.v.last_chunk::<N>();
+        if r.is_some() {
+            self.v = &self.v[..self.v.len() - 1];
+        }
+        r
+    }
+    fn nth_back(&mut self, n: usize) -> Option<&'a [T; N]> {
+        self.v = &self.v[..self.v.len().saturating_sub(n)];
+        self.next_back()
+    }
+}
+impl<'a, T, const N: usize> ExactSizeIterator for ArrayWindows<'a, T, N> {}
+impl<'a, T, const N: usize> FusedIterator for ArrayWindows<'a, T, N> {}
 
 // ---------------------------------------------------------------- Chunks
 // Keep mutable remaining slices disjoint from every yielded slice. Taking the
@@ -477,6 +619,17 @@ impl<'a, T> Iterator for Chunks<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a [T] {
+        let start = idx * self.chunk_size;
+        // SAFETY: idx is below the number of chunks, so start is within the slice and the chunk
+        // ends at its end at the latest
+        unsafe {
+            let len = crate::cmp::min(self.v.len() - start, self.chunk_size);
+            super::from_raw_parts(self.v.as_ptr().add(start), len)
+        }
+    }
 }
 impl<'a, T> DoubleEndedIterator for Chunks<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -509,6 +662,10 @@ impl<'a, T> DoubleEndedIterator for Chunks<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for Chunks<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for Chunks<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for Chunks<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for Chunks<'a, T> {}
 
 pub struct ChunksMut<'a, T> {
@@ -579,6 +736,16 @@ impl<'a, T> Iterator for ChunksMut<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut [T] {
+        let start = idx * self.chunk_size;
+        // SAFETY: as Chunks'; no index is taken twice, so the chunks do not alias
+        unsafe {
+            let len = crate::cmp::min(self.v.len() - start, self.chunk_size);
+            super::from_raw_parts_mut(self.v.as_mut_ptr().add(start), len)
+        }
+    }
 }
 impl<'a, T> DoubleEndedIterator for ChunksMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -611,6 +778,10 @@ impl<'a, T> DoubleEndedIterator for ChunksMut<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for ChunksMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for ChunksMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for ChunksMut<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for ChunksMut<'a, T> {}
 
 pub struct ChunksExact<'a, T> {
@@ -695,6 +866,13 @@ impl<'a, T> Iterator for ChunksExact<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a [T] {
+        let start = idx * self.chunk_size;
+        // SAFETY: idx is below the number of whole chunks
+        unsafe { super::from_raw_parts(self.v.as_ptr().add(start), self.chunk_size) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for ChunksExact<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -727,6 +905,10 @@ impl<'a, T> DoubleEndedIterator for ChunksExact<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for ChunksExact<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for ChunksExact<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for ChunksExact<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for ChunksExact<'a, T> {}
 
 pub struct ChunksExactMut<'a, T> {
@@ -806,6 +988,13 @@ impl<'a, T> Iterator for ChunksExactMut<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut [T] {
+        let start = idx * self.chunk_size;
+        // SAFETY: as ChunksExact's; no index is taken twice, so the chunks do not alias
+        unsafe { super::from_raw_parts_mut(self.v.as_mut_ptr().add(start), self.chunk_size) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for ChunksExactMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -838,6 +1027,10 @@ impl<'a, T> DoubleEndedIterator for ChunksExactMut<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for ChunksExactMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for ChunksExactMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for ChunksExactMut<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for ChunksExactMut<'a, T> {}
 
 pub struct RChunks<'a, T> {
@@ -910,6 +1103,17 @@ impl<'a, T> Iterator for RChunks<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a [T] {
+        let end = self.v.len() - idx * self.chunk_size;
+        let start = match end.checked_sub(self.chunk_size) {
+            None => 0,
+            Some(start) => start,
+        };
+        // SAFETY: idx is below the number of chunks, so start..end is within the slice
+        unsafe { super::from_raw_parts(self.v.as_ptr().add(start), end - start) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for RChunks<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -942,6 +1146,10 @@ impl<'a, T> DoubleEndedIterator for RChunks<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for RChunks<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for RChunks<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for RChunks<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for RChunks<'a, T> {}
 
 pub struct RChunksMut<'a, T> {
@@ -1012,6 +1220,17 @@ impl<'a, T> Iterator for RChunksMut<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut [T] {
+        let end = self.v.len() - idx * self.chunk_size;
+        let start = match end.checked_sub(self.chunk_size) {
+            None => 0,
+            Some(start) => start,
+        };
+        // SAFETY: as RChunks'; no index is taken twice, so the chunks do not alias
+        unsafe { super::from_raw_parts_mut(self.v.as_mut_ptr().add(start), end - start) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for RChunksMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -1044,6 +1263,10 @@ impl<'a, T> DoubleEndedIterator for RChunksMut<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for RChunksMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for RChunksMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for RChunksMut<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for RChunksMut<'a, T> {}
 
 pub struct RChunksExact<'a, T> {
@@ -1126,6 +1349,14 @@ impl<'a, T> Iterator for RChunksExact<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a [T] {
+        let end = self.v.len() - idx * self.chunk_size;
+        let start = end - self.chunk_size;
+        // SAFETY: idx is below the number of whole chunks
+        unsafe { super::from_raw_parts(self.v.as_ptr().add(start), self.chunk_size) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for RChunksExact<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -1158,6 +1389,10 @@ impl<'a, T> DoubleEndedIterator for RChunksExact<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for RChunksExact<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for RChunksExact<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for RChunksExact<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for RChunksExact<'a, T> {}
 
 pub struct RChunksExactMut<'a, T> {
@@ -1235,6 +1470,14 @@ impl<'a, T> Iterator for RChunksExactMut<'a, T> {
     fn last(mut self) -> Option<Self::Item> {
         self.next_back()
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut [T] {
+        let end = self.v.len() - idx * self.chunk_size;
+        let start = end - self.chunk_size;
+        // SAFETY: as RChunksExact's; no index is taken twice, so the chunks do not alias
+        unsafe { super::from_raw_parts_mut(self.v.as_mut_ptr().add(start), self.chunk_size) }
+    }
 }
 impl<'a, T> DoubleEndedIterator for RChunksExactMut<'a, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -1267,6 +1510,10 @@ impl<'a, T> DoubleEndedIterator for RChunksExactMut<'a, T> {
     }
 }
 impl<'a, T> ExactSizeIterator for RChunksExactMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for RChunksExactMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for RChunksExactMut<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 impl<'a, T> FusedIterator for RChunksExactMut<'a, T> {}
 
 // ---------------------------------------------------------------- Split family
@@ -2029,7 +2276,6 @@ impl<'a, T: fmt::Debug, P> fmt::Debug for ChunkByMut<'a, T, P> {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<'a, T> crate::iter::IntoIterator for &'a [T] {
     type Item = &'a T;
     type IntoIter = Iter<'a, T>;
@@ -2038,7 +2284,6 @@ impl<'a, T> crate::iter::IntoIterator for &'a [T] {
     }
 }
 
-#[cfg(not(relax_check))]
 impl<'a, T> crate::iter::IntoIterator for &'a mut [T] {
     type Item = &'a mut T;
     type IntoIter = IterMut<'a, T>;

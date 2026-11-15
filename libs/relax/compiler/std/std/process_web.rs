@@ -187,7 +187,7 @@ impl ExitCode {
 }
 
 /// rustc library/std/src/process.rs: what `fn main` may return.
-#[cfg_attr(not(relax_check), lang = "termination")]
+#[lang = "termination"]
 pub trait Termination {
     fn report(self) -> ExitCode;
 }
@@ -198,17 +198,9 @@ impl Termination for () {
     }
 }
 
-// `!` as a type is unstable under rustc; the shim (check_os) builds without this impl.
-#[cfg(not(relax_shim))]
 impl Termination for ! {
     fn report(self) -> ExitCode {
         self
-    }
-}
-
-impl Termination for core::convert::Infallible {
-    fn report(self) -> ExitCode {
-        match self {}
     }
 }
 
@@ -525,12 +517,21 @@ pub struct ChildStdin(io::PipeWriter);
 pub struct ChildStdout(io::PipeReader);
 pub struct ChildStderr(io::PipeReader);
 
-impl Write for ChildStdin {
+// Writes through a shared reference, as real std's `impl Write for &ChildStdin`.
+impl Write for &ChildStdin {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        (&self.0).write(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.0.flush()
+        (&self.0).flush()
+    }
+}
+impl Write for ChildStdin {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self).write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self).flush()
     }
 }
 impl Read for ChildStdout {

@@ -23,6 +23,8 @@ pub const SC_PAGESIZE: c_int = 0x27;
 pub const SC_NPROCESSORS_ONLN: c_int = 0x61;
 
 pub const O_CREAT: c_int = 0x40;
+/// fcntl.h (glibc and bionic): the current directory, for the *at calls.
+pub const AT_FDCWD: c_int = -100;
 pub const O_EXCL: c_int = 0x80;
 pub const O_TRUNC: c_int = 0x200;
 pub const O_APPEND: c_int = 0x400;
@@ -37,7 +39,6 @@ pub const O_DIRECTORY: c_int = 0x4000;
 #[cfg(target_arch = "aarch64")]
 pub const O_NOFOLLOW: c_int = 0x8000;
 pub const O_CLOEXEC: c_int = 0x80000;
-pub const MFD_CLOEXEC: core::ffi::c_uint = 0x1;
 
 pub const LOCK_SH: c_int = 1;
 pub const LOCK_EX: c_int = 2;
@@ -147,11 +148,14 @@ pub struct stat_t {
 }
 
 impl stat_t {
-    /// A stat of a file Relax's VFS serves (git runs): its type bits and size only.
-    pub fn synthetic(mode: u32, size: i64) -> stat_t {
+    /// A stat of a file Relax's VFS serves (git runs): its type bits, size and modification time
+    /// (ns since the Unix epoch).
+    pub fn synthetic(mode: u32, size: i64, mtime_ns: u64) -> stat_t {
         let mut st = stat_t::zeroed();
         st.st_mode = mode as u32;
         st.st_size = size;
+        st.st_mtime = (mtime_ns / 1_000_000_000) as _;
+        st.st_mtime_nsec = (mtime_ns % 1_000_000_000) as _;
         st
     }
     pub fn zeroed() -> stat_t {
@@ -207,7 +211,6 @@ extern "C" {
     pub fn stat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn lstat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn fstat(fd: c_int, buf: *mut stat_t) -> c_int;
-    pub fn memfd_create(name: *const c_char, flags: core::ffi::c_uint) -> c_int;
     pub fn readdir(dir: *mut c_void) -> *mut dirent_t;
     fn pthread_setname_np(thread: usize, name: *const c_char) -> c_int;
     fn pthread_self() -> usize;

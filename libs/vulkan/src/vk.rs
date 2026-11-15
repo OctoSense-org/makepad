@@ -54,6 +54,7 @@ pub const KHR_DISPLAY_NAME: &CStr = c"VK_KHR_display";
 pub const KHR_DRIVER_PROPERTIES_NAME: &CStr = c"VK_KHR_driver_properties";
 pub const KHR_EXTERNAL_MEMORY_FD_NAME: &CStr = c"VK_KHR_external_memory_fd";
 pub const KHR_EXTERNAL_SEMAPHORE_FD_NAME: &CStr = c"VK_KHR_external_semaphore_fd";
+pub const KHR_FORMAT_FEATURE_FLAGS_2_NAME: &CStr = c"VK_KHR_format_feature_flags2";
 pub const KHR_IMAGE_FORMAT_LIST_NAME: &CStr = c"VK_KHR_image_format_list";
 pub const KHR_PRESENT_ID_NAME: &CStr = c"VK_KHR_present_id";
 pub const KHR_PRESENT_WAIT_NAME: &CStr = c"VK_KHR_present_wait";
@@ -3716,6 +3717,26 @@ match self.0 {
 }
 } }
 #[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ClearAttachment {
+    pub aspect_mask: ImageAspectFlags,
+    pub color_attachment: u32,
+    pub clear_value: ClearValue,
+}
+impl Default for ClearAttachment { fn default() -> Self {
+    unsafe { core::mem::zeroed() }
+} }
+unsafe impl Send for ClearAttachment {}
+unsafe impl Sync for ClearAttachment {}
+impl ClearAttachment {
+    #[inline]
+    pub fn aspect_mask(mut self, value: ImageAspectFlags) -> Self { self.aspect_mask = value; self }
+    #[inline]
+    pub fn color_attachment(mut self, value: u32) -> Self { self.color_attachment = value; self }
+    #[inline]
+    pub fn clear_value(mut self, value: ClearValue) -> Self { self.clear_value = value; self }
+}
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub union ClearColorValue {
     pub float32: [f32; 4 as usize],
@@ -3744,6 +3765,26 @@ impl ClearDepthStencilValue {
     pub fn depth(mut self, value: f32) -> Self { self.depth = value; self }
     #[inline]
     pub fn stencil(mut self, value: u32) -> Self { self.stencil = value; self }
+}
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ClearRect {
+    pub rect: Rect2D,
+    pub base_array_layer: u32,
+    pub layer_count: u32,
+}
+impl Default for ClearRect { fn default() -> Self {
+    unsafe { core::mem::zeroed() }
+} }
+unsafe impl Send for ClearRect {}
+unsafe impl Sync for ClearRect {}
+impl ClearRect {
+    #[inline]
+    pub fn rect(mut self, value: Rect2D) -> Self { self.rect = value; self }
+    #[inline]
+    pub fn base_array_layer(mut self, value: u32) -> Self { self.base_array_layer = value; self }
+    #[inline]
+    pub fn layer_count(mut self, value: u32) -> Self { self.layer_count = value; self }
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -7281,6 +7322,7 @@ impl ImageUsageFlags {
     pub const STORAGE: Self = Self(8 as u32);
     pub const TRANSFER_DST: Self = Self(2 as u32);
     pub const TRANSFER_SRC: Self = Self(1 as u32);
+    pub const TRANSIENT_ATTACHMENT: Self = Self(64 as u32);
     pub const VIDEO_ENCODE_DPB_KHR: Self = Self(32768 as u32);
     pub const VIDEO_ENCODE_QUANTIZATION_DELTA_MAP_KHR: Self = Self(33554432 as u32);
     pub const VIDEO_ENCODE_SRC_KHR: Self = Self(16384 as u32);
@@ -7970,6 +8012,7 @@ impl MemoryPropertyFlags {
     pub const HOST_CACHED: Self = Self(8 as u32);
     pub const HOST_COHERENT: Self = Self(4 as u32);
     pub const HOST_VISIBLE: Self = Self(2 as u32);
+    pub const LAZILY_ALLOCATED: Self = Self(16 as u32);
     pub const PROTECTED: Self = Self(32 as u32);
     #[inline]
     pub const fn from_bits_retain(value: u32) -> Self { Self(value) }

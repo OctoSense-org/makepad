@@ -167,7 +167,7 @@ impl ConstInterner {
         // Acquire: pairs with the chunk's publication (whoever holds `ct` got it after its entry
         // was written)
         let c = self.chunks[i >> CONST_CHUNK_BITS].load(std::sync::atomic::Ordering::Acquire);
-        assert!(!c.is_null(), "makepad: constant {} not interned", i);
+        assert!(!c.is_null(), "relax: constant {} not interned", i);
         unsafe { &*c.add(i & (CONST_CHUNK - 1)) }
     }
 
@@ -181,7 +181,7 @@ impl ConstInterner {
             let _g = self.grow.lock().unwrap_or_else(|e| e.into_inner());
             let i = self.len.load(std::sync::atomic::Ordering::Relaxed) as usize;
             let ci = i >> CONST_CHUNK_BITS;
-            assert!(ci < CONST_MAX_CHUNKS, "makepad: too many constants");
+            assert!(ci < CONST_MAX_CHUNKS, "relax: too many constants");
             let mut c = self.chunks[ci].load(std::sync::atomic::Ordering::Relaxed);
             if c.is_null() {
                 let layout = std::alloc::Layout::array::<ConstKind>(CONST_CHUNK).unwrap();
@@ -412,7 +412,8 @@ impl Types {
                 ValTreeKind::Branch(_) => "{aggregate}".into(),
             },
             ConstKind::Param(p) => format!("N{}", p.index),
-            ConstKind::Infer(InferConst::Var(v)) => format!("?C{}", v.0),
+            // rustc_middle/src/ty/print/pretty.rs pretty_print_const: an inference variable is `_`
+            ConstKind::Infer(InferConst::Var(_)) => "_".into(),
             ConstKind::Bound(d, b) => format!("^{}.C{}", d, b.var.0),
             ConstKind::Placeholder(p) => format!("!{}.C{}", p.universe.0, p.bound.var.0),
             ConstKind::Alias(_, alias) => format!("const#{}", alias.kind.def_id().0),

@@ -4,7 +4,7 @@
 //! [`fncost`], [`warm`] and [`exec_census`] the compile profilers.
 
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
-// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// log in a full tmpfs /tmp aborted a fleet run inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
 #[cfg(not(test))]
 #[allow(unused_macros)]
@@ -34,8 +34,10 @@ pub mod interp;
 pub mod exec_census;
 pub mod warm;
 pub mod loops;
+pub mod vectorize;
 pub mod native;
 pub mod opt;
+pub mod patched;
 pub mod ranges;
 pub mod version;
 pub mod web32;

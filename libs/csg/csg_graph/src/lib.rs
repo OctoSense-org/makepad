@@ -15,9 +15,11 @@ pub mod edges;
 pub mod eval;
 mod hash;
 
-pub use eval::{Evaluator, Failure};
+pub use eval::{Evaluator, Failure, PRINT_CHORD};
 pub use makepad_csg_cad::{Seg, Shape, Sketch, Tolerance};
+pub use makepad_csg_cad::bool3::disjoint_tool_bounds;
 pub use makepad_csg_mesh::mesh::TriMesh;
+pub use makepad_csg_mesh::subdiv;
 
 use hash::Hasher;
 pub use makepad_csg_sdf::{SdfKernel, SdfNode, SdfOp, SdfShape};
@@ -128,8 +130,9 @@ pub enum BrepOp {
     Extrude { sketch: Sketch, plane: Plane, height: f64, both: bool },
     /// About Y: sketch u is the radius, v the height.
     Revolve { sketch: Sketch, angle: f64 },
-    /// The sketch carried along a smooth path through `path`.
-    Sweep { sketch: Sketch, path: Vec<P3> },
+    /// The sketch carried along a smooth path through `path`, `scale[i]` times its size at
+    /// `path[i]` (empty: its own size all the way).
+    Sweep { sketch: Sketch, path: Vec<P3>, scale: Vec<f64> },
     Loft { sections: Vec<LoftSection>, plane: Plane },
     /// The first input combined with every other in order.
     Boolean { mode: BoolMode },
@@ -198,6 +201,9 @@ pub trait BrepEngine: Send + Sync {
     fn measure(&self, steps: Vec<BrepStep>) -> Result<BrepMeasure, BrepFailure>;
     /// Its exact (edges, faces).
     fn entities(&self, steps: Vec<BrepStep>) -> Result<(Vec<BrepEntity>, Vec<BrepEntity>), BrepFailure>;
+    /// Whether the engine holds the body of every step keyed in `keys`: a recipe of those steps
+    /// builds nothing. Answered at once, whatever the engine is building.
+    fn built(&self, keys: &[Key]) -> bool;
 }
 
 /// One operation. Positions of generators are their own frame (centred on the
@@ -231,6 +237,8 @@ pub enum Op {
     Mirror { source: NodeId, plane: MirrorPlane, center: P3, keep: bool },
     /// Walls of `thickness`; the cavity is meshed from the source's distance at `cell`.
     Shell { source: NodeId, thickness: f64, open: Open, cell: Option<f64> },
+    /// The surface moved out by `distance` (in, negative), meshed from the source's distance at `cell`.
+    Offset { source: NodeId, distance: f64, cell: Option<f64> },
     /// `a` combined with every `b` in order (n-ary). `tolerance` none: scaled to the part.
     Boolean { mode: BoolMode, a: NodeId, b: Vec<NodeId> },
     /// Scale, then rotate X, Y, Z (degrees), then move by `at`.
@@ -244,13 +252,17 @@ pub enum Op {
     /// Separate links (chains, chainmail) as tubes of `sides` facets round. Their colours are
     /// paint, not shape: a fill gives each link one material.
     Links { links: Arc<makepad_csg_sdf::Links>, sides: u32 },
+    /// The Catmull-Clark surface over a closed cage of points and faces (each face's points
+    /// counter-clockwise seen from outside): `levels` steps, or (none) as many as bring it within
+    /// an exact body's chord of its limit surface.
+    Cage { points: Vec<P3>, faces: Vec<Vec<u32>>, levels: Option<u32> },
 }
 
 impl Op {
     /// The nodes it reads.
     pub fn inputs(&self) -> Vec<NodeId> {
         match self {
-            Op::Fillet { source, .. } | Op::Chamfer { source, .. } | Op::Hole { source, .. } | Op::Mirror { source, .. } | Op::Shell { source, .. } | Op::Transform { source, .. } => vec![*source],
+            Op::Fillet { source, .. } | Op::Chamfer { source, .. } | Op::Hole { source, .. } | Op::Mirror { source, .. } | Op::Shell { source, .. } | Op::Offset { source, .. } | Op::Transform { source, .. } => vec![*source],
             Op::Boolean { a, b, .. } => std::iter::once(*a).chain(b.iter().copied()).collect(),
             Op::Gear { mesh_with: Some((g, _)), .. } => vec![*g],
             Op::Brep { inputs, .. } => inputs.clone(),
@@ -276,6 +288,7 @@ impl Op {
             Op::Hole { .. } => "hole",
             Op::Mirror { .. } => "mirror",
             Op::Shell { .. } => "shell",
+            Op::Offset { .. } => "offset",
             Op::Boolean { mode: BoolMode::Union, .. } => "union",
             Op::Boolean { mode: BoolMode::Difference, .. } => "difference",
             Op::Boolean { mode: BoolMode::Intersection, .. } => "intersection",
@@ -283,6 +296,7 @@ impl Op {
             Op::Field { .. } => "sdf",
             Op::Mesh { .. } => "mesh",
             Op::Links { .. } => "links",
+            Op::Cage { .. } => "cage",
             Op::Brep { .. } => "brep",
         }
     }
@@ -479,6 +493,11 @@ impl Graph {
                 h.u(*open as u64);
                 h.opt(*cell);
             }
+            Op::Offset { source, distance, cell } => {
+                child(&mut h, *source);
+                h.f(*distance);
+                h.opt(*cell);
+            }
             Op::Boolean { mode, a, b } => {
                 h.u(*mode as u64);
                 child(&mut h, *a);
@@ -498,6 +517,18 @@ impl Graph {
             Op::Links { links, sides, .. } => {
                 h.bytes(&links.key());
                 h.u(*sides as u64);
+            }
+            Op::Cage { points, faces, levels } => {
+                h.u(points.len() as u64);
+                for p in points {
+                    h.p3(*p);
+                }
+                h.u(faces.len() as u64);
+                for f in faces {
+                    h.u(f.len() as u64);
+                    f.iter().for_each(|v| h.u(*v as u64));
+                }
+                h.u(levels.map_or(0, |n| n as u64 + 1));
             }
             // Debug writes every field, floats exactly; the inputs hash by their keys.
             Op::Brep { op, inputs } => {

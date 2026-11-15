@@ -41,7 +41,8 @@ pub(crate) mod tests;
 pub(super) struct Breakable {
     pub label: Option<ast::Ident>,
     pub scope: ScopeId,
-    /// A labeled block: only a labeled `break` reaches it.
+    /// A labeled block: only a labeled `break` reaches it. Without a label, a `try` block: only
+    /// its `?`s leave to it.
     pub is_block: bool,
 }
 
@@ -428,7 +429,7 @@ impl<'a> Cx<'a> {
         let (tb, ast) = (self.tb(), self.ast());
         let mut out = Vec::new();
         let mut next_param = 0usize;
-        if let Some(self_param) = sig.self_param {
+        if let Some(self_param) = sig.self_param.get() {
             let Some(index) = tb.locals.iter().position(|l| l.pat == u32::MAX) else {
                 return self.unresolved(self.span(0, 0), "self parameter local");
             };

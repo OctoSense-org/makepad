@@ -3,7 +3,7 @@
 //! ParsedFile::part publishes it), into the run's image store (cache/front_run.rs), and from
 //! then on read through the mapping -- clean file pages instead of heap. Warm runs map the same
 //! images (crate stores refer to them) and read them through the same functions (restore,
-//! apply_part). MAKEPAD_RUN_FRONT_VERIFY=1 compares every section with the parse it replaces.
+//! apply_part). RELAX_FRONT_VERIFY=1 compares every section with the parse it replaces.
 
 use crate::arena::Arena;
 use crate::image::{Reader, Writer};
@@ -25,6 +25,9 @@ const S_SOURCES: u32 = 8;
 const S_GATED: u32 = 9;
 /// `ParsedFile::pm_editions`, after the gated syntax
 const S_PM_EDITIONS: u32 = 10;
+/// `ParsedFile::numbering` of the parse the image holds (two u64 halves), after the editions: a
+/// record made over a parse (its file metadata) is restored over that parse's image only
+const S_NUMBERING: u32 = 11;
 /// tree arrays: 100 + index in AST_ARRAYS order
 const S_AST: u32 = 100;
 
@@ -45,14 +48,14 @@ pub static MISMATCHED: AtomicU64 = AtomicU64::new(0);
 fn mismatch(path: &str, section: &str) -> bool {
     MISMATCHED.fetch_add(1, Ordering::Relaxed);
     if crate::preload::trace() {
-        eprintln!("makepad-run front mismatch: {} {}", path, section);
+        eprintln!("relax front mismatch: {} {}", path, section);
     }
     false
 }
 
 pub fn verify() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_FRONT_VERIFY").map_or(false, |v| v == "1"))
+    *ON.get_or_init(|| std::env::var("RELAX_FRONT_VERIFY").map_or(false, |v| v == "1"))
 }
 
 /// The image of a loaded file (its arrays as they are after the load; the lazily parsed part
@@ -69,8 +72,10 @@ pub fn image(pf: &ParsedFile) -> Writer<'_> {
     w.add(S_TOK_ORIGIN, pf.tok_origin.bytes());
     w.add(S_RULES_EXP, pf.rules_exp.bytes());
     w.add(S_BODY_ORIGIN, pf.body_origin.bytes());
-    w.add(S_TOKEN_ORIGINS, pf.token_origins.bytes());
-    w.add_chunks(S_SOURCES, source_chunks(pf, &pf.token_origins));
+    let mut local = LocalSources::default();
+    local.number(&pf.token_origins);
+    local.add_origins(&mut w, S_TOKEN_ORIGINS, &pf.token_origins);
+    w.add_chunks(S_SOURCES, source_chunks(pf, &local, &pf.token_origins));
     let a = &pf.ast;
     let mut k = 0u32;
     macro_rules! put {
@@ -86,6 +91,8 @@ pub fn image(pf: &ParsedFile) -> Writer<'_> {
     }).collect();
     w.add_owned(S_GATED, &gated);
     w.add(S_PM_EDITIONS, pf.pm_editions.bytes());
+    let n = pf.numbering();
+    w.add_owned(S_NUMBERING, &[n as u64, (n >> 64) as u64]);
     w
 }
 
@@ -161,6 +168,8 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
     pf.rules_exp = re;
     pf.body_origin = bo;
     pf.pm_editions = pe;
+    // (a table the image renumbered is the run's own again: heap, not mapped)
+    before = before.saturating_sub(origins.heap_bytes());
     pf.token_origins = origins;
     let a = &mut pf.ast;
     macro_rules! set {
@@ -219,8 +228,12 @@ pub fn part_image<'a>(pf: &'a ParsedFile, fp: &'a crate::parser::FilePart, a: &'
     w.add(P_TOK_ORIGIN, fp.tok_origin.bytes());
     w.add_owned(P_BODIES, &bodies);
     w.add(P_BASE, &a.base[..]);
-    w.add(P_TOKEN_ORIGINS, fp.token_origins.bytes());
-    w.add_chunks(P_SOURCES, source_chunks(pf, &fp.token_origins));
+    // the part's sources continue its file's numbers (restore_origins: a certified part adopts them)
+    let mut local = LocalSources::default();
+    local.number(&pf.token_origins);
+    local.number(&fp.token_origins);
+    local.add_origins(&mut w, P_TOKEN_ORIGINS, &fp.token_origins);
+    w.add_chunks(P_SOURCES, source_chunks(pf, &local, &fp.token_origins));
     let mut k = 0u32;
     macro_rules! put {
         ($($f:ident: $t:ident),*) => {
@@ -349,21 +362,50 @@ pub fn apply_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &cra
     true
 }
 
-/// Store source identities and immutable snapshots next to the arena. Numeric IDs in an
-/// image are local to this manifest; restore never treats them as IDs in another load.
-fn source_chunks(pf: &ParsedFile, origins: &Table<Origins>) -> Vec<crate::image::Chunk<'static>> {
+/// An image's own numbers for the other files its token origins come from: 1, 2, ... in the
+/// order the origins first name them. The run's registry hands its ids out in arrival order
+/// (SourceRegistry::source_id, from parse workers), so an image written with those would differ
+/// from run to run for the same parse; with these, the same parse gives the same bytes.
+#[derive(Default)]
+struct LocalSources {
+    of: std::collections::HashMap<u32, u32>,
+    /// whether every number is the run's id already (nothing to rewrite)
+    renumbered: bool,
+}
+
+impl LocalSources {
+    /// Numbers the files `origins` names that have none yet, after those that have.
+    fn number(&mut self, origins: &Table<Origins>) {
+        for o in origins.iter() {
+            let id = o.source.file;
+            if id == 0 || self.of.contains_key(&id) { continue; }
+            let n = self.of.len() as u32 + 1;
+            self.renumbered |= n != id;
+            self.of.insert(id, n);
+        }
+    }
+
+    /// `origins` as section `sec`, with these numbers.
+    fn add_origins<'a>(&self, w: &mut Writer<'a>, sec: u32, origins: &'a Table<Origins>) {
+        if self.renumbered { w.add_owned(sec, origins.remap_files(|id| self.of[&id]).bytes()); } else { w.add(sec, origins.bytes()); }
+    }
+}
+
+/// Store source identities and immutable snapshots next to the arena, under the image's own
+/// numbers (LocalSources); restore never treats them as IDs in another load.
+fn source_chunks(pf: &ParsedFile, local: &LocalSources, origins: &Table<Origins>) -> Vec<crate::image::Chunk<'static>> {
     use crate::image::Chunk;
     use crate::crate_image::Codec;
-    let mut ids: Vec<_> = origins.iter().map(|o| o.source.file).filter(|id| *id != 0).collect();
+    let mut ids: Vec<(u32, u32)> = origins.iter().map(|o| o.source.file).filter(|id| *id != 0).map(|id| (local.of[&id], id)).collect();
     ids.sort_unstable();
     ids.dedup();
     let mut head = Vec::new();
     ids.len().put(&mut head);
     let mut chunks = vec![Chunk::Owned(head)];
-    for id in ids {
+    for (n, id) in ids {
         let src = pf.sources.as_ref().expect("origin source registry").get(id).expect("origin source snapshot");
         let mut head = Vec::new();
-        id.put(&mut head);
+        n.put(&mut head);
         src.path.put(&mut head);
         src.src.len().put(&mut head);
         chunks.push(Chunk::Owned(head));
@@ -444,17 +486,21 @@ fn same_origins(a: &ParsedFile, ao: &Table<Origins>, b: &ParsedFile, bo: &Table<
 pub fn summary() -> Option<String> {
     let (m, r) = (MAPPED_FILES.load(Ordering::Relaxed), RECORDED_FILES.load(Ordering::Relaxed));
     let bad = MISMATCHED.load(Ordering::Relaxed);
+    let worker = crate::preload::WORKER_IMAGES.load(Ordering::Relaxed);
     if m + r + bad == 0 {
         return None;
     }
     Some(format!(
-        "makepad-run front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB), {} images not matching the parse, {} mapped arrays copied back by a change ({:.1} MB); {} files of parsed crates taken from earlier images",
+        "relax front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB; {} by parse workers, {} of them for parses the load made again or did not take, {:.1} MB), {} images not matching the parse, {} mapped arrays copied back by a change ({:.1} MB); {} files of parsed crates taken from earlier images",
         PARTS_MAPPED.load(Ordering::Relaxed),
         PARTS_RECORDED.load(Ordering::Relaxed),
         m,
         MAPPED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
         r,
         RECORDED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+        worker,
+        worker - crate::preload::WORKER_IMAGES_USED.load(Ordering::Relaxed).min(worker),
+        (crate::preload::WORKER_IMAGE_BYTES.load(Ordering::Relaxed).saturating_sub(crate::preload::WORKER_IMAGE_BYTES_USED.load(Ordering::Relaxed))) as f64 / 1e6,
         bad,
         crate::arena::COPIES.load(Ordering::Relaxed),
         crate::arena::COPIED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
@@ -495,6 +541,16 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
     if meta.token_input {
         sources.get_or_insert_with(Default::default).register_mapped(&meta.path, &src[..meta.src_len as usize]).ok()?;
     }
+    // the record (its file metadata: lazy bodies, prepared blocks; a collected program's ids)
+    // was made over one parse of the file: an image of another parse of the same text is not it
+    let numbering = match r.slice::<u64>(10 + k, S_NUMBERING)? {
+        &[lo, hi] => lo as u128 | (hi as u128) << 64,
+        _ => return None,
+    };
+    if numbering != meta.numbering {
+        mismatch(&meta.path, "numbering");
+        return None;
+    }
     Some(ParsedFile {
         src: Arena::Mapped(src),
         toks: PackedToks::mapped(r.slice(1, S_TOKS)?)?,
@@ -502,6 +558,7 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
         edition: meta.edition,
         src_len: meta.src_len,
         source_hash: std::sync::OnceLock::from((meta.path.clone(), meta.hash)),
+        numbering: std::sync::OnceLock::from(numbering),
         token_input: meta.token_input,
         sources,
         token_origins: origins,
@@ -638,6 +695,39 @@ mod tests {
         let restored = restore(&mut meta, image(encode(&f))).unwrap();
         assert_eq!(restored.ast.gated_syntax, f.ast.gated_syntax);
         verify_file(&restored, &f);
+    }
+
+    /// A file's record (its metadata: skipped bodies, prepared blocks, and the ids a collected
+    /// program keeps) holds one parse's numbering; an image of the same text that numbers it
+    /// another way (one load skipped a body another parsed in its tree) is refused, not restored
+    /// under the record. The image's numbering is the restored file's.
+    #[test]
+    fn a_record_is_restored_over_an_image_of_its_own_parse_only() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let path = "numbered.rs";
+        let parse = |lazy: bool| {
+            let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", path, "test", &cfg));
+            let table = std::sync::Arc::new(crate::macros::MacroTable::default());
+            let (mut f, used) = crate::parser::parse_owned_ctx(sess,
+                b"pub fn f(x: u32) -> u32 { let c = |y: u32| y + x; c(3) }\n".to_vec(), None, 2021,
+                Some(crate::macros::MacroScope::new(table)), "test", Some(ctx), lazy,
+            ).unwrap();
+            let prep = crate::program::prepare_file(&mut f, &cfg);
+            let meta = crate::crate_image::file_meta(path, "test", &f, &used.unwrap(), &prep, false);
+            (f, meta)
+        };
+        let ((skipped, skipped_meta), (eager, eager_meta)) = (parse(true), parse(false));
+        assert_ne!(skipped.numbering(), eager.numbering());
+        let (skipped_image, eager_image) = (image(encode(&skipped)), image(encode(&eager)));
+        let mut meta: crate::crate_image::FileMeta = crate::crate_image::decode(&skipped_meta).unwrap();
+        let restored = restore(&mut meta, skipped_image).unwrap();
+        assert_eq!(restored.numbering(), skipped.numbering());
+        verify_file(&restored, &skipped);
+        let mut meta: crate::crate_image::FileMeta = crate::crate_image::decode(&skipped_meta).unwrap();
+        assert!(restore(&mut meta, eager_image).is_none(), "a record restored over another parse's image");
+        let mut meta: crate::crate_image::FileMeta = crate::crate_image::decode(&eager_meta).unwrap();
+        assert!(restore_certified(&mut meta, skipped_image).is_none(), "a collected file restored over another parse's image");
     }
 
     fn lazy_file(sess: &std::sync::Arc<crate::Session>) -> (ParsedFile, crate::cfg::CfgSet) {

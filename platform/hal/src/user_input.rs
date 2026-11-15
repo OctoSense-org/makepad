@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 /// Where a counted input came from.
-#[makepad_relax_api::relax_api(plain)]
+#[relax_api::relax_api(plain)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
@@ -22,7 +22,7 @@ pub enum Origin {
 }
 
 /// What the input was.
-#[makepad_relax_api::relax_api(plain)]
+#[relax_api::relax_api(plain)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum What {
@@ -33,7 +33,7 @@ pub enum What {
 
 /// The last counted input: how many so far (this process), when (`crate::clock_ns`), from
 /// where, what.
-#[makepad_relax_api::relax_api(plain)]
+#[relax_api::relax_api(plain)]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UserInput {
@@ -49,15 +49,42 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 static VIEWERS: AtomicU64 = AtomicU64::new(0);
 
 /// The WM says how many Desk Link viewers show it now (connected and not paused).
-#[makepad_relax_api::relax_api]
+#[relax_api::relax_api]
 pub fn set_viewers(n: usize) {
     VIEWERS.store(n as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Desk Link viewers showing this desktop now.
-#[makepad_relax_api::relax_api]
+#[relax_api::relax_api]
 pub fn viewers() -> u64 {
     VIEWERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A keyboard, mouse, touchpad or touchscreen this process's own device reader (a WM's direct
+/// input) has open: its node `/dev/input/event<event>`, and whether it has sent a key, a button
+/// or a motion since it opened. A wireless device whose receiver is plugged in but that is off or
+/// out of range has not.
+#[relax_api::relax_api(plain)]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OpenDevice {
+    pub event: u32,
+    pub reported: bool,
+}
+
+/// The device reader's open devices, as it last said (`set_open`).
+static OPEN: std::sync::Mutex<Vec<OpenDevice>> = std::sync::Mutex::new(Vec::new());
+
+/// The device reader's open devices now: it says so when one opens, closes or first reports.
+#[cfg(target_os = "linux")]
+pub(crate) fn set_open(devices: Vec<OpenDevice>) {
+    *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = devices;
+}
+
+/// The `index`th device this process's device reader has open, None past the last.
+#[relax_api::relax_api]
+pub fn open_device(index: usize) -> Option<OpenDevice> {
+    OPEN.lock().unwrap_or_else(|e| e.into_inner()).get(index).copied()
 }
 
 static AT_NS: AtomicU64 = AtomicU64::new(0);
@@ -98,7 +125,7 @@ pub fn note(origin: Origin, what: What) {
 }
 
 /// The last counted input; None before the first.
-#[makepad_relax_api::relax_api]
+#[relax_api::relax_api]
 pub fn last() -> Option<UserInput> {
     let seq = SEQ.load(Ordering::Acquire);
     let kind = KIND.load(Ordering::Acquire);

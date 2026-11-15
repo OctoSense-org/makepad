@@ -26,6 +26,7 @@ mod readback;
 mod shader;
 mod software_video;
 pub(crate) mod xr;
+pub use xr::XrDepthTexels;
 
 pub use fonts::*;
 
@@ -152,6 +153,9 @@ pub struct HalClient {
     /// the color last given to the Activity to show in place of its surface
     #[cfg(target_os = "android")]
     pub(crate) app_background_argb: Option<u32>,
+    /// the Activity's "compiling shaders" screen was already asked for, which only the first frame needs
+    #[cfg(target_os = "android")]
+    pub(crate) shader_compile_screen_requested: bool,
     /// the oldest input event (HAL ns) consumed since the last frame was built
     pub(crate) input_ns: u64,
     /// a composition is in flight (`Ime` start / update seen, not yet committed or cancelled)
@@ -159,12 +163,33 @@ pub struct HalClient {
     /// the soft keyboard is up and its height (layout points), to drop repeated reports
     pub(crate) ime_visible: bool,
     pub(crate) ime_height: f64,
+    /// The keyboard config we last showed, until our own hide or a closed report clears it. A child
+    /// session embedded in a parent doesn't keep one, since its shows get dropped while unfocused.
+    #[cfg(target_os = "android")]
+    pub(crate) ime_shown: Option<u32>,
+    /// Set by `HideTextIME`, which waits until after the next draw, so that moving focus
+    /// from one text input to another keeps the keyboard up instead of hiding it.
+    #[cfg(target_os = "android")]
+    pub(crate) pending_ime_hide: bool,
+    /// The backend answers no frame requests without a surface or while the Activity is
+    /// paused, so a pending IME hide can't wait for a draw then.
+    #[cfg(target_os = "android")]
+    pub(crate) no_surface: bool,
+    #[cfg(target_os = "android")]
+    pub(crate) activity_paused: bool,
     /// a window announced a frame (`FrameReady`)
     pub(crate) beat: bool,
     /// the flip (HAL ns, 0: unknown) the last `FrameReady` aims at, until a beat takes it
     pub(crate) ready_flip: Option<u64>,
     /// `MAKEPAD_TRACE=frames`: what woke each beat, the next-frame and present gaps
     pub(crate) frame_trace: crate::frame_trace::FrameTrace,
+    /// How far apart the display's ticks are, from the last `FrameReady` that predicted the next
+    /// one (0 when none has), so a `time_fps` frame can take the tick nearest its due.
+    pub(crate) frame_interval: f64,
+    /// The display tick of the `FrameReady` that starts the next beat, which `time_fps` frames go by.
+    pub(crate) frame_tick: Option<f64>,
+    /// The window's surface is gone (Android), so nothing can show a `time_fps` frame till it's back.
+    pub(crate) surface_lost: bool,
     /// A window close is on its way (asked of the window system, or accepted and sent):
     /// since when. Until the HAL answers, the loop sends at once and draws nothing, so a close
     /// never waits behind a slow frame. Bounded by `CLOSE_WAIT` should no answer come.
@@ -176,8 +201,14 @@ pub struct HalClient {
     pub(crate) profile_beat: u64,
     pub(crate) profile_input_ns: u64,
     /// this beat's CPU phases (`FrameMeta::phases`): start, end of dispatch, next-frame
-    /// callbacks, draw, then build / submit / spare (unused)
+    /// callbacks, draw, then build / submit (unused) and the wait for the GPU that held it
     pub(crate) beat_phases: [[u64; 2]; 6],
+    /// the pump's waits for the GPU since the last beat (`PumpWait::Gpu`): from the first one's
+    /// start to the last one's end, the next beat's `gpu-wait` phase
+    pub(crate) gpu_waited: [u64; 2],
+    /// the submission serial and time after each beat that submitted frames, until the GPU
+    /// completed them: a beat waits while `FRAMES_IN_FLIGHT` are (`Cx::hal_frames_room`)
+    pub(crate) in_flight: std::collections::VecDeque<(u64, std::time::Instant)>,
     /// the HAL said the GPU device is lost and has not reset it yet: no frames are built
     pub(crate) device_lost: bool,
     /// device replacements so far: GPU contents made on an older generation are gone
@@ -193,6 +224,9 @@ pub struct HalClient {
     /// file dialogs the HAL was asked for and has not answered: request id -> what to post
     pub(crate) dialogs: HashMap<u32, PendingDialog>,
     pub(crate) next_dialog: u32,
+    /// PDF print requests awaiting a system result: wire request -> application's id.
+    pub(crate) prints: HashMap<u32, crate::print::PrintId>,
+    pub(crate) next_print: u32,
     /// request ids of `hal_start_domain` / `hal_list_domains`
     pub(crate) next_domain_request: u32,
     /// the application icon went to the HAL
@@ -213,12 +247,14 @@ pub struct HalClient {
     /// videos the app's own decoder plays, and the ones the HAL's native player plays
     pub(crate) software_videos: HashMap<crate::makepad_live_id::LiveId, software_video::SoftwareVideo>,
     pub(crate) native_videos: HashMap<crate::makepad_live_id::LiveId, software_video::NativeVideo>,
-    /// the least event payload room the session needs (camera frames and readbacks are large)
-    pub(crate) event_arena_min: usize,
+    /// the event store's payload room: grows at once, gives back what went unused
+    pub(crate) event_arena: event_loop::EventArena,
     pub(crate) readbacks: readback::Readbacks,
     pub(crate) compute: crate::gpu_compute::ComputeState,
     /// font service answers the text stack has not taken yet
     pub(crate) font_events: Vec<HalFontEvent>,
+    /// The app is in the background: font answers wait for the draw when it's back.
+    pub(crate) in_background: bool,
     pub(crate) glyph_wait: fonts::GlyphWait,
     /// the GLES backend's share group and the Cx thread's GL context (`Cx::with_gl`)
     #[cfg(not(target_os = "android"))]
@@ -252,18 +288,33 @@ impl Default for HalClient {
             internal_drag_items: None,
             #[cfg(target_os = "android")]
             app_background_argb: None,
+            #[cfg(target_os = "android")]
+            shader_compile_screen_requested: false,
             input_ns: 0,
             composing: false,
             ime_visible: false,
             ime_height: 0.0,
+            #[cfg(target_os = "android")]
+            ime_shown: None,
+            #[cfg(target_os = "android")]
+            pending_ime_hide: false,
+            #[cfg(target_os = "android")]
+            no_surface: false,
+            #[cfg(target_os = "android")]
+            activity_paused: false,
             beat: false,
             ready_flip: None,
             frame_trace: crate::frame_trace::FrameTrace::new(),
+            frame_interval: 0.0,
+            frame_tick: None,
+            surface_lost: false,
             close_pending: None,
             xr_beat: false,
             profile_beat: 0,
             profile_input_ns: 0,
             beat_phases: [[0; 2]; 6],
+            gpu_waited: [0; 2],
+            in_flight: std::collections::VecDeque::new(),
             device_lost: false,
             device_generation: 0,
             wake: false,
@@ -272,6 +323,8 @@ impl Default for HalClient {
             gpu_prof: None,
             dialogs: HashMap::new(),
             next_dialog: 0,
+            prints: HashMap::new(),
+            next_print: 0,
             next_domain_request: 0,
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             icon_sent: false,
@@ -287,8 +340,9 @@ impl Default for HalClient {
             native_videos: HashMap::new(),
             readbacks: Default::default(),
             compute: Default::default(),
-            event_arena_min: 0,
+            event_arena: Default::default(),
             font_events: Vec::new(),
+            in_background: false,
             glyph_wait: Default::default(),
             #[cfg(not(target_os = "android"))]
             gl: Default::default(),
@@ -494,6 +548,10 @@ impl CxMediaApi for Cx {
     fn video_input_close(&mut self, index: usize) {
         self.hal_video_input_close(index);
     }
+
+    fn video_input_calibration(&self, input: VideoInputId) -> Option<crate::video::CameraCalibration> {
+        self.hal_video_input_calibration(input)
+    }
 }
 
 #[cfg(target_os = "android")]
@@ -576,11 +634,14 @@ impl Cx {
     /// Asking counts: a pipeline asked for while it compiles is one the frame would draw (a frame
     /// that waits waits for it, and it goes ahead in the HAL's compile queue).
     pub fn is_draw_shader_window_ready(&self, shader_id: crate::draw_shader::DrawShaderId) -> bool {
-        self.draw_shaders.shaders[shader_id.index].pipeline_id.is_some_and(|pipe| {
+        let ready = self.draw_shaders.shaders[shader_id.index].pipeline_id.is_some_and(|pipe| {
             let ready = self.hal.frames.pipeline_is_ready(pipe);
             if !ready { self.hal.frames.probed_unready(pipe); }
             ready
-        })
+        });
+        // the caller hears `Event::DrawShadersReady` once a pipeline answers
+        if !ready { self.hal.frames.asked_unready(); }
+        ready
     }
 
     pub(crate) fn poll_texture_lifetimes(&mut self) {

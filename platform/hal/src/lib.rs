@@ -112,7 +112,7 @@ pub use session::World;
 pub use types::*;
 
 use backend::{headless::Headless, Backend};
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
@@ -405,6 +405,10 @@ static GLOBAL: OnceLock<Arc<Hal>> = OnceLock::new();
 /// exit() then ran the driver's exit handlers under them (a SIGSEGV in a batch's completion).
 /// Registered once the backend, and with it the driver, is made: exit() runs the handlers
 /// last registered first, so this one runs before those the driver registered as it loaded.
+/// The C library's list only, not the process's exit work (`makepad_core_util::process_end`): a
+/// process that ends that way stopped the HAL already (a native app's `run_app`), or hosts it
+/// (the JIT, whose own exit work still draws and reads the run's window: stopped first, the runs
+/// of `makepad run` ended with 1).
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn before_exit_at_exit() {
     extern "C" { fn atexit(f: extern "C" fn()) -> i32; }
@@ -520,8 +524,8 @@ impl Hal {
                 #[cfg(target_os = "android")]
                 // the Activity's events and frame callbacks make the pumps look (no `Wake` for every
                 // app); a GPU result its own session's
-                backend_id::VULKAN => match backend::android::AndroidBackend::new(req.flags, sessions.clone(), notify.clone()) {
-                    Ok(v) => Some(Box::new(v)),
+                backend_id::AUTO | backend_id::VULKAN | backend_id::GL => match backend::android::open(id, req.flags, sessions.clone(), wake.clone(), notify.clone()) {
+                    Ok(b) => Some(b),
                     Err(e) => { eprintln!("[hal-android] {e}"); None }
                 },
                 _ => None,
@@ -560,6 +564,7 @@ impl Hal {
             st.world.font_notify = Some(notify.clone());
         }
         let mut info = backend_info_of(&*st.backend.as_ref().expect("backend").1);
+        st.world.max_texture = info.max_texture;
         if req.parent != 0 || req.flags & open_flags::OFFSCREEN_WINDOWS != 0 {
             info.flags &= !info_flags::DIRECT_DISPLAY;
         }
@@ -643,7 +648,7 @@ impl Hal {
         // Stopping or relaunching an app waits for its threads and frees its heap: never on the caller's
         // thread (a window manager's render thread would stall for the whole teardown). Starts already
         // run on the host's loader threads.
-        let off_thread = std::env::var_os("MAKEPAD_SYNC_STOP").is_none()
+        let off_thread = relax_api::env::var_os("MAKEPAD_SYNC_STOP").is_none()
             && calls.iter().any(|c| matches!(c, session::HostCall::Stop { .. } | session::HostCall::Relaunch(_)));
         // the thread runs them on this instance (not the process-wide one: a test's or a runner's
         // own Hal has its own domain host)
@@ -651,13 +656,13 @@ impl Hal {
             let _ = std::thread::Builder::new().name("hal-host-calls".into()).spawn(move || {
                 let t0 = std::time::Instant::now();
                 hal.run_host_calls(calls);
-                if std::env::var_os("MAKEPAD_FRAME_LOG").is_some() { eprintln!("[hal] domain stop/relaunch host calls took {:.0} ms (off the caller's thread)", t0.elapsed().as_secs_f64() * 1e3); }
+                if relax_api::env::var_os("MAKEPAD_FRAME_LOG").is_some() { eprintln!("[hal] domain stop/relaunch host calls took {:.0} ms (off the caller's thread)", t0.elapsed().as_secs_f64() * 1e3); }
             });
             return;
         }
         let t0 = std::time::Instant::now();
         self.run_host_calls(calls);
-        if std::env::var_os("MAKEPAD_FRAME_LOG").is_some() { eprintln!("[hal] host calls took {:.0} ms on the caller's thread", t0.elapsed().as_secs_f64() * 1e3); }
+        if relax_api::env::var_os("MAKEPAD_FRAME_LOG").is_some() { eprintln!("[hal] host calls took {:.0} ms on the caller's thread", t0.elapsed().as_secs_f64() * 1e3); }
     }
 
     fn run_host_calls(&self, calls: Vec<session::HostCall>) {
@@ -782,7 +787,7 @@ impl Hal {
         let run = lock(&self.runners).remove(&session);
         if let Some(run) = run {
             if !run.finish(self) {
-                std::process::exit(1);
+                makepad_core_util::process_end::end(1);
             }
         }
     }
@@ -817,6 +822,7 @@ impl Hal {
                     // glyphs the font workers finished go to the atlas and to the sessions
                     if let Some(gpu) = b.host_gpu() {
                         font::service(gpu, &mut st.world);
+                        font::trim(gpu, &mut st.world);
                     }
                 }
                 // A completion or a lent window's geometry can notify another session while
@@ -830,7 +836,7 @@ impl Hal {
                 // embedded windows' frames (no display link of their own) at display rate
                 let embedded_due = st.world.deliver_embedded_frames(sid, now);
                 let due = st.backend.as_ref().and_then(|(_, b)| b.next_due(&st.world, sid));
-                let due = match (due, embedded_due) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) };
+                let due = [due, embedded_due, font::trim_at(&st.world)].into_iter().flatten().min();
                 if st.world.session(sid).is_none() {
                     // the session was ended under its app (killed, crashed, its parent closed):
                     // the app hears one quit request and ends its run
@@ -912,7 +918,7 @@ impl Hal {
 
     /// Tests and automation: the backend handles its device as lost on its next step and replaces
     /// it (sessions hear `DeviceLost`, then `DeviceReset`). No effect on a backend without a
-    /// device reset (headless; Metal and Vulkan implement the two hooks after the HAL push).
+    /// device reset (`info_flags::DEVICE_RESET`: headless has none).
     pub fn simulate_device_loss(&self) {
         {
             let mut guard = lock(&self.state);
@@ -931,6 +937,10 @@ impl Hal {
     /// ends, and the process's exit calls it for the global Hal (`before_exit_at_exit`); once is
     /// enough.
     pub fn before_exit(&self) {
+        // a host may end the process without exit handlers after this (`_exit`, TerminateProcess),
+        // which would leave the makepad-remote endpoint's socket and discovery file behind
+        #[cfg(not(target_arch = "wasm32"))]
+        makepad_remote::carrier::unix::withdraw();
         let backend = {
             let mut guard = lock(&self.state);
             guard.exited = true;
@@ -1056,6 +1066,13 @@ impl Hal {
 
     /// Asks the app: a `Query` event carrying `request`, answered by a `QueryReply` command.
     /// Returns the reply bytes, or `None` when the app did not answer within `timeout`.
+    /// A request for the session that wants no reply (`query` without the wait): it reaches the
+    /// session in order with the queries and events after it.
+    pub fn post(&self, session: u32, request: &[u8]) {
+        let req = self.next_req.fetch_add(1, Ordering::Relaxed);
+        self.with_events(session, |q| q.query(req, request));
+    }
+
     pub fn query(&self, session: u32, request: &[u8], timeout: Duration) -> Option<Vec<u8>> {
         let req = self.next_req.fetch_add(1, Ordering::Relaxed);
         self.with_events(session, |q| q.query(req, request));
@@ -1240,6 +1257,21 @@ pub fn end_run() {
     backend::end_run();
 }
 
+/// Before this process execs itself in place (a self-update that keeps its pid, from any thread):
+/// what the OS holds for the process by its pid and would keep past the exec goes. macOS: the
+/// activity an unseen app (menu-bar, no-focus) holds against App Nap, whose power assertion an
+/// exec would leave behind while the next image begins another. [`exec_failed`] takes it back.
+pub fn before_exec() {
+    #[cfg(target_os = "macos")]
+    backend::apple::appkit::end_unseen_activity();
+}
+
+/// The exec [`before_exec`] prepared for did not happen: the process goes on as it was.
+pub fn exec_failed() {
+    #[cfg(target_os = "macos")]
+    backend::apple::appkit::resume_unseen_activity();
+}
+
 /// Ends [`run_main_loop`] (any thread), as the app does when it is done.
 pub fn stop_main_loop() {
     main_loop::stop()
@@ -1345,7 +1377,7 @@ pub fn hal_open(req: &OpenReq) -> HalInfo {
         Ok(script) => script,
         Err(error) => {
             println!("{{\"summary\":true,\"ok\":false,\"error\":{}}}", automation::json(&error));
-            std::process::exit(2);
+            makepad_core_util::process_end::end(2);
         }
     });
     let info = hal.open_as(req, CAPS.with(|c| c.get()), false, false);
@@ -1746,6 +1778,21 @@ pub fn hal_xr_environment_depth(on: bool) {
     backend::android::xr::environment_depth(on);
     #[cfg(not(target_os = "android"))]
     let _ = on;
+}
+
+/// The head at `time_ns` (the HAL clock: OpenXR's on Android), as the runtime tracked or
+/// predicts it: a moment a little past (a camera frame's exposure) is interpolated from its
+/// history, never the newest pose. None without a running XR session, or when the runtime has
+/// no valid pose then (Android XR; elsewhere always None).
+#[relax_api]
+pub fn hal_xr_locate_head(time_ns: u64) -> Option<XrHeadAt> {
+    #[cfg(target_os = "android")]
+    return backend::android::xr::locate_head(time_ns);
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = time_ns;
+        None
+    }
 }
 
 /// The environment depth images are read back to the app for its room field (`on`; off at

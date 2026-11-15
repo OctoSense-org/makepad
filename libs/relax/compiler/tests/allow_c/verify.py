@@ -1,28 +1,40 @@
 #!/usr/bin/env python3
-"""Run on a build node: verify.py <makepad binary> <scratch directory>.
+"""verify.py [<makepad binary> <scratch directory>]: without them (CI, from the workspace root) it
+builds this tree's makepad and works in a scratch dir under its target folder.
 
 Uses the existing offline C fixture, cargo and the system C toolchain. Keeps
 outputs in scratch for inspection; no fixture source or workspace is rewritten.
 """
+import atexit
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
-binary = str(Path(sys.argv[1]).resolve())
-scratch = Path(sys.argv[2]).resolve()
-scratch.mkdir(parents=True, exist_ok=True)
+if len(sys.argv) > 2:
+    binary = str(Path(sys.argv[1]).resolve())
+    scratch = Path(sys.argv[2]).resolve()
+    scratch.mkdir(parents=True, exist_ok=True)
+else:
+    # CI, from the workspace root: this tree's makepad, and a scratch dir under its target folder
+    # that goes with the run
+    subprocess.run(["cargo", "build", "--profile", "host", "-q", "-p", "makepad-run", "--bin", "makepad"], check=True)
+    target = Path(os.environ.get("CARGO_TARGET_DIR", "target")).resolve()
+    binary = str(target / "host" / "makepad")
+    scratch = Path(tempfile.mkdtemp(prefix=Path(__file__).parent.name + "-", dir=target))
+    atexit.register(shutil.rmtree, scratch, True)
 fixture = scratch / "fixture"
 shutil.copytree(Path(__file__).parent, fixture,
                 ignore=shutil.ignore_patterns("target", "Cargo.lock", "__pycache__"))
 env = dict(os.environ, CARGO_INCREMENTAL="0", CARGO_NET_OFFLINE="true",
            CARGO_TARGET_DIR=str(scratch / "cargo"),
-           MAKEPAD_RUN_CACHE_DIR=str(scratch / "jit"))
+           RELAX_CACHE_DIR=str(scratch / "jit"))
 
 
-def run(label, args, success=True):
-    result = subprocess.run(args, cwd=fixture, env=env, capture_output=True, text=True)
+def run(label, args, success=True, extra=None):
+    result = subprocess.run(args, cwd=fixture, env=dict(env, **(extra or {})), capture_output=True, text=True)
     (scratch / (label + ".stdout")).write_text(result.stdout)
     (scratch / (label + ".stderr")).write_text(result.stderr)
     assert (result.returncode == 0) == success, (
@@ -48,6 +60,7 @@ command = [binary, "run", "--allow-c", "allow-c-fixture"]
 first = run("first", command)
 assert first.stdout == baseline.stdout, "native/JIT fixture output differs from cargo"
 assert "callback 50\n" in first.stdout, f"C code calling back into Rust: {first.stdout}"
+assert "shadowed cnative cnative\n" in first.stdout, f"a system library's copy of a name the C defines: {first.stdout}"
 assert "building native dependencies with cargo" in first.stderr, "cold native build was not exercised"
 
 native = scratch / "jit" / "native"
@@ -67,12 +80,36 @@ assert keys == sorted(p.name for p in native.iterdir() if (p / "messages.jsonl")
 assert receipts == {key: (native / key / "messages.jsonl").stat().st_mtime_ns for key in keys}, "warm launch rewrote native build receipt"
 print("PASS cache: reordered unused patches keep one key; second launch reuses native build")
 
-# Keep the loader case independent of Cargo's unused-patch order checks. Even
-# equivalent patch ordering can make Cargo demand a lock rewrite on a cold build;
-# --locked correctly refuses that instead of mutating the input behind the key.
+# A variable a build script declares (`rerun-if-env-changed`, as a -sys crate's OPENSSL_DIR) is an
+# input of the native build: another value builds again, as cargo runs the script again, and the
+# value it had before builds again too (relax review B-M5: the build under the key was reused, and
+# the library built with the old value stayed linked)
+assert "offset 7\n" in baseline.stdout, f"cargo's baseline: {baseline.stdout}"
+changed = run("env-changed", command, extra={"CNATIVE_OFFSET": "9"})
+assert "offset 9\n" in changed.stdout, f"a changed declared variable reused the native build: {changed.stdout}"
+assert "building native dependencies with cargo" in changed.stderr, "a changed declared variable was not built again"
+back = run("env-back", command)
+assert back.stdout == baseline.stdout, f"the variable unset again: {back.stdout}"
+print("PASS env: a variable a build script declares builds the native library again when it changes")
+
+# `makepad selftest --allow-c` builds every fn against the libraries the run links: `add` reads the
+# C static cn_offset, which a selftest that linked nothing reported as "foreign static not found"
+selftest = run("selftest", [binary, "selftest", "--allow-c", "allow-c-fixture"])
+assert "foreign static" not in selftest.stderr, f"selftest: {selftest.stderr}"
+print("PASS selftest: every fn builds against the native library, its C static included")
+
+# Keep the loader case independent of Cargo's unused-patch order checks.
 manifest = fixture / "Cargo.toml"
 manifest.write_text(manifest.read_text().split("[patch.crates-io]")[0])
 run("lock-without-patches", ["cargo", "generate-lockfile", "--offline"])
+
+# An integration test that starts the package's binary (CARGO_BIN_EXE_<bin>) gets it as cargo builds it:
+# its argv[0] names the binary, and nothing of Relax's is on its stderr (relax issue 119: argv[0] was
+# the Relax binary's, and the child's native build printed its status line on the child's stderr)
+run("cargo-bin-exe", ["cargo", "test", "--release", "--locked", "--quiet", "--test", "bin_exe"])
+bin_exe = run("bin-exe", [binary, "test", "--allow-c", "allow-c-fixture", "--test", "bin_exe"])
+assert "test result: ok. 1 passed" in bin_exe.stdout, f"bin exe: {bin_exe.stdout}\n{bin_exe.stderr}"
+print("PASS bin exe: the integration test's CARGO_BIN_EXE child names itself, its stderr empty")
 
 # An unused function still carries an unresolved import. Neither a library nor
 # the program defines it: the native bundle is rejected before even the
@@ -89,24 +126,42 @@ for expected in ["cannot load", "libnative.", "--allow-c native library of cnati
 print("PASS loader: unresolved import reports library, crate and loader error; exit 1; no program output")
 
 # C code calling into the program while the library loads (a C constructor) runs before the
-# loader binds the callbacks: the stub reports the symbol on stderr and exits 1 (cargo's static
-# link has no such window).
+# loader binds the callbacks: the stub's trap reports the symbol on stderr and exits 1, on every
+# platform (cargo's static link has no such window).
 c_source.write_text(c_text + '\n__attribute__((constructor)) static void cn_init(void) { (void)cn_rust_square(3); }\n')
 early = run("constructor", command, success=False)
 assert early.returncode == 1, f"constructor callback exit status: {early.returncode}"
 assert not early.stdout, "program started after a constructor called into it"
-for expected in ["cannot load the --allow-c native library", "`cn_rust_square`", "a C constructor"]:
+for expected in ["the --allow-c native library's C code calls `cn_rust_square`", "a C constructor calls it while the library loads"]:
     assert expected in early.stderr, f"missing constructor diagnostic {expected!r}: {early.stderr}"
 c_source.write_text(c_text)
 print("PASS constructor: a C constructor calling into Rust reports the symbol; exit 1; no program output")
 
-# --locked must reject a changed graph rather than repairing its lockfile.
-# Change the path dependency's version after resolution has a lock to read.
+# Cargo.lock is no tracked file: a tree keeps its own, and a workspace member
+# added since that lock was made is not in it. The native build brings the lock
+# up to date, as cargo run does, and runs. The C changes so that the build is cold.
+member = fixture / "newmember"
+(member / "src").mkdir(parents=True)
+(member / "Cargo.toml").write_text('[package]\nname = "newmember"\nversion = "0.1.0"\nedition = "2021"\n')
+(member / "src" / "lib.rs").write_text("")
+manifest = fixture / "Cargo.toml"
+manifest.write_text(manifest.read_text().replace("[workspace]\n", '[workspace]\nmembers = ["newmember"]\n'))
+assert "newmember" not in lock.read_text(), "the lock already lists the new member"
+c_source.write_text(c_text + "\n/* built again with the new member */\n")
+stale = run("new-member", command)
+assert stale.stdout == baseline.stdout, "fixture output with a new workspace member differs from cargo"
+assert "building native dependencies with cargo" in stale.stderr, "the new member's native build was not cold"
+assert 'name = "newmember"' in lock.read_text(), "the native build left the lock without the new member"
+print("PASS member: a workspace member the lock lacks; the native build updates the lock and runs")
+
+# A path package's new version updates its entry. Relax reads the version from the
+# manifest, so it is in the key: a new key builds, beside the earlier ones.
 manifest = fixture / "cnative" / "Cargo.toml"
 manifest.write_text(manifest.read_text().replace('version = "0.1.0"', 'version = "0.1.1"'))
-lock_before = lock.read_bytes()
-locked = run("locked", command, success=False)
-assert lock.read_bytes() == lock_before, "native cargo rewrote a stale lockfile"
-assert "locked" in locked.stderr.lower(), f"missing locked diagnostic: {locked.stderr}"
-assert not locked.stdout, "program started with a stale lockfile"
-print("PASS locked: changed graph fails without rewriting Cargo.lock or starting program")
+before = {p.name for p in native.iterdir() if (p / "messages.jsonl").is_file()}
+bumped = run("path-version", command)
+assert bumped.stdout == baseline.stdout, "fixture output after a path version change differs from cargo"
+assert "building native dependencies with cargo" in bumped.stderr, "a path version change reused a native build"
+assert len({p.name for p in native.iterdir() if (p / "messages.jsonl").is_file()} - before) == 1, "a path version change kept the native key"
+assert 'name = "cnative"\nversion = "0.1.1"' in lock.read_text(), "the native build left cnative's old version in the lock"
+print("PASS path version: the native build updates the lock entry under a new key and runs")

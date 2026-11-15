@@ -1,11 +1,5 @@
-//! Relax runtime hooks used by std (declared in core::intrinsics_rt). The rustc shim
-//! (check_os, built with --cfg relax_shim) uses check_os/src/rt_shim.rs instead.
+//! Relax runtime hooks used by std (declared in core::intrinsics_rt).
 
-#[cfg(relax_shim)]
-#[path = "../../check_os/src/rt_shim.rs"]
-mod imp;
-
-#[cfg(not(relax_shim))]
 mod imp {
 use core::ffi::c_char;
 
@@ -64,6 +58,7 @@ type RuntimePanicHook = extern "C" fn(*const u8, usize, *const u8, usize, u32, u
 #[cfg(not(relax_web))]
 extern "C" {
     fn relax_set_panic_hook(hook: RuntimePanicHook);
+    fn relax_set_payload_end(end: extern "C" fn());
     fn relax_set_payload_record(record: extern "C" fn(*const u8, usize));
 }
 
@@ -73,6 +68,13 @@ extern "C" {
 extern "C" fn payload_record(msg: *const u8, len: usize) {
     let msg = unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg, len)) };
     crate::panic::record_payload(format_args!("{}", msg));
+}
+
+/// A catch of native code (a catch_unwind of a provided crate's rustc code around a callback)
+/// ended this thread's panic: the payload kept for catch_unwind / join goes.
+#[cfg(not(relax_web))]
+extern "C" fn payload_end() {
+    crate::panic::clear_payload();
 }
 
 /// Static message bytes are interned by the loader; formatted bytes live through this call.
@@ -105,6 +107,7 @@ pub fn set_panic_trampoline(f: fn(&str, &core::panic::Location<'_>)) {
     #[cfg(not(relax_web))]
     unsafe {
         relax_set_panic_hook(runtime_panic_hook);
+        relax_set_payload_end(payload_end);
         relax_set_payload_record(payload_record);
     }
     core::panicking::set_depth_fn(crate::panic::panic_depth_step);
@@ -117,6 +120,7 @@ pub fn install_core_hook() {
     #[cfg(not(relax_web))]
     unsafe {
         relax_set_panic_hook(runtime_panic_hook);
+        relax_set_payload_end(payload_end);
         relax_set_payload_record(payload_record);
     }
     core::panicking::set_depth_fn(crate::panic::panic_depth_step);

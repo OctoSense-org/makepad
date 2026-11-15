@@ -26,18 +26,6 @@ fn word(src: &[u8], t: &Tok) -> String {
     String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).trim_start_matches("r#").into()
 }
 
-/// Does one of the leading inner attributes (`#![..]`) of `toks` (a file, or an inline module's
-/// body) say `name`?
-fn leading_inner_attr(src: &[u8], toks: &[Tok], name: &str) -> bool {
-    let mut i = 0;
-    while i + 2 < toks.len() && toks[i].kind == T::Pound && toks[i + 1].kind == T::Not && toks[i + 2].kind == T::OpenBracket {
-        let end = close(toks, i + 2);
-        if toks.get(i + 3..end).is_some_and(|attr| attr.iter().any(|t| is_word(src, t, name))) { return true; }
-        i = end + 1;
-    }
-    false
-}
-
 fn is_word(src: &[u8], token: &Tok, expected: &str) -> bool {
     // the spelling is the word or `r#` and the word: any other length cannot match
     let len = (token.hi - token.lo) as usize;
@@ -225,10 +213,15 @@ impl Names {
         self.externs.extend(other.externs);
         self.empty_rules.extend(other.empty_rules);
     }
-    pub fn add(&mut self, ci: usize, module: &str, src: &[u8], toks: &[Tok], _uses: &[crate::macros::UseItem], mods: &[String]) {
+    pub fn add(&mut self, ci: usize, module: &str, src: &[u8], toks: &[Tok], _uses: &[crate::macros::UseItem], mods: &[String], inner_macro_use: &[String]) {
         self.reset_view();
         self.modules.extend(mods.iter().cloned());
         self.modules.insert(module.into());
+        for child in inner_macro_use {
+            if let Some((parent, _)) = child.rsplit_once("::") {
+                self.macro_uses.push((parent.into(), child.clone(), false));
+            }
+        }
         self.scan(ci, module, src, toks);
         for name in fixed_function_macros(src, toks).values().flatten() {
             self.symbols.insert(format!("{module}::{name}"));
@@ -236,11 +229,6 @@ impl Names {
         }
     }
     fn scan(&mut self, ci: usize, module: &str, src: &[u8], toks: &[Tok]) {
-        // `#![macro_use]` opening the module (its file, or an inline module's body) is
-        // `#[macro_use]` on its `mod` item: rustc appends the inner attributes to the item's
-        if let Some((parent, _)) = module.rsplit_once("::") {
-            if leading_inner_attr(src, toks, "macro_use") { self.macro_uses.push((parent.into(), module.into(), false)); }
-        }
         let mut i = 0;
         let mut exported = false;
         let mut macro_use = false;
@@ -1500,7 +1488,7 @@ impl Names {
     }
     /// `snapshot(ci)` of each of `cis` (crates whose names no other crate of the graph has),
     /// from one pass over each table: a snapshot per crate filtered every table, which made
-    /// the demand record of a 257-crate graph quadratic (Stage: 11.6 s). An entry belongs to
+    /// the demand record of a 257-crate graph quadratic (a large app: 11.6 s). An entry belongs to
     /// the crate its first path segment names (`within`; crate names have no `::`).
     pub fn snapshots(&self, cis: &[usize]) -> Vec<(Vec<u8>, u128)> {
         let slot: HashMap<&str, usize> = cis.iter().enumerate().map(|(k, &ci)| (self.crates[ci].name.as_str(), k)).collect();
@@ -1645,9 +1633,9 @@ impl Predecoded {
     }
 }
 
-// Only deferred executable outlines change the namespace after discovery. The
-// writer records that delta, so an edit restores it without a second full
-// namespace decode/import fixed point. All identities on disk are spellings.
+// A namespace's tables (or the additions to them, as a closure delta). Nothing after the plan's
+// crate loop writes a namespace, so the delta a recording stores is empty; a local selection
+// applies it over the restored namespaces. All identities on disk are spellings.
 #[derive(Clone, Default)]
 pub(crate) struct NamespaceDelta {
     symbols: Vec<String>, types: Vec<String>, traits: Vec<String>, values: Vec<String>,
@@ -1663,11 +1651,21 @@ impl NamespaceDelta {
     pub(super) fn legacy_size(&self, delta: bool) -> usize {
         self.plain_size() - self.bindings.plain_size() + self.bindings.legacy_size(delta)
     }
+    /// The record check's report: each nonempty table's length, or "empty".
+    pub(super) fn summary(&self) -> String {
+        let lengths = [("symbols", self.symbols.len()), ("types", self.types.len()), ("traits", self.traits.len()),
+            ("values", self.values.len()), ("public", self.public.len()), ("modules", self.modules.len()),
+            ("module_macros", self.module_macros.len()), ("macros", self.macros.len()), ("uses", self.uses.len()),
+            ("macro_uses", self.macro_uses.len()), ("externs", self.externs.len()), ("empty_rules", self.empty_rules.len()),
+            ("bindings", self.bindings.entries.len()), ("binding_strings", self.bindings.strings.len())];
+        let set = lengths.iter().filter(|(_, n)| *n > 0).map(|(table, n)| format!("{table}={n}")).collect::<Vec<_>>();
+        if set.is_empty() { "empty".into() } else { set.join(" ") }
+    }
 }
 /// A part's closure delta, always as the bytes it is stored as: the recorder encodes it once, a
 /// stored part reads those bytes without decoding them (a decoded delta is one owned spelling per
-/// name, 0.4 GB on a cold Stage), and only a load that applies the delta decodes it. The legacy
-/// size is MAKEPAD_RUN_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
+/// name, 0.4 GB on a large app's cold start), and only a load that applies the delta decodes it. The legacy
+/// size is RELAX_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
 pub(crate) struct ClosureDelta { image: Vec<u8>, legacy: usize }
 impl Codec for ClosureDelta {
     fn put(&self, w: &mut Vec<u8>) {
@@ -1693,6 +1691,26 @@ impl ClosureDelta {
         value.bindings.valid().then_some(value)
     }
     pub(super) fn legacy_size(&self) -> usize { self.legacy }
+}
+/// The record check's report on two namespace images that differ: each table that differs, as
+/// its lengths and, for the name lists, one name only `a` has and one only `b` has.
+pub(super) fn namespace_differences(a: &[u8], b: &[u8]) -> String {
+    let (Some(a), Some(b)) = (strings::decode::<NamespaceDelta>(a), strings::decode::<NamespaceDelta>(b)) else { return "undecodable".into() };
+    let mut out = Vec::new();
+    let only = |x: &[String], y: &[String]| { let y = y.iter().collect::<HashSet<_>>(); x.iter().find(|s| !y.contains(s)).cloned().unwrap_or_default() };
+    for (table, x, y) in [("symbols", &a.symbols, &b.symbols), ("types", &a.types, &b.types), ("traits", &a.traits, &b.traits),
+        ("values", &a.values, &b.values), ("public", &a.public, &b.public), ("modules", &a.modules, &b.modules),
+        ("module_macros", &a.module_macros, &b.module_macros), ("macros", &a.macros, &b.macros), ("binding_strings", &a.bindings.strings, &b.bindings.strings)] {
+        if x != y { out.push(format!("{table} {}/{} {:?}/{:?}", x.len(), y.len(), only(x, y), only(y, x))); }
+    }
+    if a.uses != b.uses { out.push(format!("uses {}/{}", a.uses.len(), b.uses.len())); }
+    if a.macro_uses != b.macro_uses { out.push(format!("macro_uses {}/{}", a.macro_uses.len(), b.macro_uses.len())); }
+    if a.externs != b.externs { out.push(format!("externs {}/{}", a.externs.len(), b.externs.len())); }
+    if a.empty_rules != b.empty_rules { out.push(format!("empty_rules {}/{}", a.empty_rules.len(), b.empty_rules.len())); }
+    if a.bindings.sets != b.bindings.sets || a.bindings.entries != b.bindings.entries {
+        out.push(format!("bindings {}/{} sets {}/{}", a.bindings.entries.len(), b.bindings.entries.len(), a.bindings.sets.len(), b.bindings.sets.len()));
+    }
+    if out.is_empty() { "same tables, other bytes".into() } else { out.join(", ") }
 }
 pub(super) fn namespace_legacy_size(bytes: &[u8]) -> Option<usize> {
     let image: NamespaceDelta = strings::decode(bytes)?;
@@ -1789,32 +1807,6 @@ mod image_tests {
         let mut truncated = bytes.clone();
         truncated.pop();
         assert!(strings::decode::<BindingImage>(&truncated).is_none());
-    }
-}
-
-#[cfg(test)]
-mod macro_use_tests {
-    use super::*;
-    /// `#![macro_use]` opening a module's file or an inline module's body hands its macros to the
-    /// parent, as `#[macro_use]` on the `mod` item does (xml-rs 1.4's macros.rs).
-    #[test]
-    fn inner_macro_use_hands_the_modules_macros_to_its_parent() {
-        let sess = std::sync::Arc::new(crate::Session::default());
-        let cfg = CfgSet::host(&sess, &[]);
-        let krate = PreCrate { name: "c".into(), root: "lib.rs".into(), edition: 2021, cfg, deps: Vec::new(), proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new() };
-        let mut names = Names::new(&[krate]);
-        let scan = |names: &mut Names, module: &str, text: &str| {
-            let mut toks = Vec::new();
-            let _ = crate::lexer::lex(text.as_bytes(), 2021, &mut toks);
-            names.add(0, module, text.as_bytes(), &toks, &[], &[]);
-        };
-        scan(&mut names, "c::macros", "#![macro_use]\nmacro_rules! gen { () => {} }");
-        scan(&mut names, "c::plain", "#![allow(unused)]\nmacro_rules! hidden { () => {} }");
-        scan(&mut names, "c", "#![macro_use] pub mod macros; mod inline { #![macro_use] macro_rules! twice { () => {} } } mod other { macro_rules! kept { () => {} } } #[macro_use] mod outer;");
-        let mut uses = names.macro_uses.clone();
-        uses.sort();
-        let expected = [("c", "c::inline"), ("c", "c::macros"), ("c", "c::outer")].map(|(scope, target)| (scope.to_string(), target.to_string(), false));
-        assert_eq!(uses, expected);
     }
 }
 

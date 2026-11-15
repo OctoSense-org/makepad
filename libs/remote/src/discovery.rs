@@ -267,17 +267,32 @@ pub(crate) fn rewrite_caps(file: &std::path::Path, caps: &[String]) {
 /// ([`crate::carrier::unix::socket_dir`]; its path is in the file).
 /// A makepad WM gives its JIT apps an on-disk TMPDIR (`~/.makepad/wm/jit.env`), and `makepad
 /// inspect` from a shell has another: with the files in the temp dir it found none of them
-/// (166, 2026-10-25). Linux (and other Unix with a session): `$XDG_RUNTIME_DIR`, the user's 0700
-/// runtime dir; elsewhere the temp dir (macOS's is per user already).
+/// (2026-10-25). Linux (and other Unix with a session): `$XDG_RUNTIME_DIR`, the user's 0700
+/// runtime dir; elsewhere the temp dir (macOS's is per user already). This crate's own tests use
+/// [`crate::carrier::unix::test_root`] instead.
 pub fn registry_dir() -> std::path::PathBuf {
+    #[cfg(not(test))]
+    {
+        registry_dir_of(std::env::var_os("MAKEPAD_REMOTE_REGISTRY"), std::env::var_os("XDG_RUNTIME_DIR"))
+    }
+    #[cfg(test)]
+    {
+        crate::carrier::unix::test_root()
+    }
+}
+
+/// [`registry_dir`] from `MAKEPAD_REMOTE_REGISTRY` and `XDG_RUNTIME_DIR`.
+fn registry_dir_of(registry: Option<std::ffi::OsString>, xdg: Option<std::ffi::OsString>) -> std::path::PathBuf {
     // a run whose TMPDIR is its own (a devhub lease on a Mac) still announces where its node's hub looks
-    if let Some(dir) = std::env::var_os("MAKEPAD_REMOTE_REGISTRY").map(std::path::PathBuf::from).filter(|d| d.is_absolute()) {
+    if let Some(dir) = registry.map(std::path::PathBuf::from).filter(|d| d.is_absolute()) {
         return dir;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
+    if let Some(dir) = xdg.map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
         return dir;
     }
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    drop(xdg);
     std::env::temp_dir()
 }
 
@@ -340,6 +355,17 @@ fn no_endpoint(spec: &str) -> String {
     format!("no running makepad-remote endpoint `{spec}`")
 }
 
+/// Lists [`apps`] on a thread of its own, which removes the files killed launches left in a phone
+/// app's temp dir. A desktop keeps them, since the devhub reads one left behind as a crash.
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+pub(crate) fn remove_stale(hooks: crate::conn::Hooks) {
+    let _ = std::thread::Builder::new().name("makepad-remote-sweep".into()).spawn(move || {
+        (hooks.enter)();
+        let _ = apps();
+        (hooks.exit)();
+    });
+}
+
 /// `spec` is a pid, an app name for `caller` ([`named`]), or a
 /// `tcp:` socket a discovery file names.
 pub fn find(spec: &str, caller: &Caller) -> Result<App, String> {
@@ -374,26 +400,26 @@ mod caller_tests {
     /// An agent's mistyped command on a machine where someone works: it must not reach their app.
     #[test]
     fn a_bare_name_refuses_an_app_the_caller_did_not_start_and_says_which() {
-        let list = [app(7, "fab", None), app(9, "fab", Some("L1"))];
+        let list = [app(7, "tool-a", None), app(9, "tool-a", Some("L1"))];
         for who in [caller(false, None), caller(false, Some("L2"))] {
-            let why = named(&list, "fab", &who).unwrap_err();
+            let why = named(&list, "tool-a", &who).unwrap_err();
             assert!(why.contains("pid 9") && why.contains("newest of 2") && why.contains("the pid in place of the name"), "{why}");
         }
-        assert!(named(&[app(7, "fab", None)], "fab", &caller(false, None)).unwrap_err().contains("would reach pid 7"));
-        assert!(named(&[], "fab", &caller(false, None)).unwrap_err().contains("no running"));
+        assert!(named(&[app(7, "tool-a", None)], "tool-a", &caller(false, None)).unwrap_err().contains("would reach pid 7"));
+        assert!(named(&[], "tool-a", &caller(false, None)).unwrap_err().contains("no running"));
     }
 
     #[test]
     fn a_lease_reaches_its_own_by_name_and_a_person_the_newest() {
-        let list = [app(7, "fab", Some("L1")), app(9, "fab", Some("L2")), app(11, "fab", None)];
-        assert_eq!(named(&list, "fab", &caller(false, Some("L1"))).unwrap().pid, 7);
-        assert_eq!(named(&list, "fab", &caller(true, None)).unwrap().pid, 11);
+        let list = [app(7, "tool-a", Some("L1")), app(9, "tool-a", Some("L2")), app(11, "tool-a", None)];
+        assert_eq!(named(&list, "tool-a", &caller(false, Some("L1"))).unwrap().pid, 7);
+        assert_eq!(named(&list, "tool-a", &caller(true, None)).unwrap().pid, 11);
     }
 
     #[test]
     fn all_needs_a_terminal_or_a_lease_of_its_own() {
-        let list = [app(7, "fab", None)];
-        assert!(caller(false, None).all_refused(&list).unwrap().contains("7 fab"));
+        let list = [app(7, "tool-a", None)];
+        assert!(caller(false, None).all_refused(&list).unwrap().contains("7 tool-a"));
         assert!(caller(false, Some("L1")).all_refused(&list).is_none() && !caller(false, Some("L1")).reaches(&list[0]));
         assert!(caller(true, None).all_refused(&list).is_none() && caller(true, None).reaches(&list[0]));
     }
@@ -426,14 +452,23 @@ mod registry_tests {
     /// The discovery file is in the registry dir, not the temp dir: a process with another TMPDIR
     /// (a WM's JIT apps, `~/.makepad/wm/jit.env`) still lists in `makepad inspect` from a shell.
     /// Its socket is in the socket dir, not the temp dir either (a deep one cannot hold it).
+    /// The registry is the one a run is told (`MAKEPAD_REMOTE_REGISTRY`), else on Linux the
+    /// session's runtime dir, else the temp dir. This crate's tests announce in neither the
+    /// process's own registry nor its socket dir: a live JIT's endpoint is there, under their pid.
     #[test]
     fn discovery_files_go_to_the_registry_dir() {
+        use super::registry_dir_of as of;
+        use std::path::PathBuf;
         let (sock, disc) = crate::carrier::unix::paths(7);
         assert_eq!(disc.parent(), Some(super::registry_dir().as_path()));
         assert_eq!(sock.parent(), Some(crate::carrier::unix::socket_dir().as_path()));
-        #[cfg(all(unix, not(target_os = "macos")))]
-        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
-            assert_eq!(super::registry_dir(), xdg);
-        }
+        assert_eq!(of(Some("/told".into()), Some("/".into())), PathBuf::from("/told"), "the registry a run is told comes first");
+        assert_eq!(of(Some("told".into()), None), std::env::temp_dir(), "a relative one is not a registry");
+        let runtime = if cfg!(all(unix, not(target_os = "macos"))) { PathBuf::from("/") } else { std::env::temp_dir() };
+        assert_eq!(of(None, Some("/".into())), runtime, "Linux: the session's runtime dir");
+        assert_eq!(of(None, Some("/no/such/runtime".into())), std::env::temp_dir(), "a runtime dir that is not there is not one");
+        let own = of(std::env::var_os("MAKEPAD_REMOTE_REGISTRY"), std::env::var_os("XDG_RUNTIME_DIR"));
+        assert_ne!(super::registry_dir(), own, "the tests announce in a registry of their own");
+        assert_ne!(crate::carrier::unix::socket_dir(), crate::carrier::unix::user_socket_dir(), "and listen in a socket dir of their own");
     }
 }

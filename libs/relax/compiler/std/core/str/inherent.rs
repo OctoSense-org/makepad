@@ -1,24 +1,25 @@
-//! `impl str` (Relax only: real core owns str's inherent methods). Each method forwards to
-//! the free fns in str/ and string.rs, which the rustc shim tests against real std.
+//! Relax's `impl str`. Each method forwards to the free fns in str/ and string.rs.
 
 use super::pattern::{DoubleEndedSearcher, Pattern, ReverseSearcher};
 use super::*;
 use crate::string::String;
 
 impl str {
-    // The associated conversions (Rust 1.87): `str::from_utf8(..)` names them through the
-    // primitive type, without the `core::str` module in scope (yoke-derive 0.8 does).
-    pub const fn from_utf8(v: &[u8]) -> Result<&str, Utf8Error> {
-        from_utf8(v)
+    /// `core::str::from_utf8`, reachable as `str::from_utf8` (an associated function since 1.87).
+    pub const fn from_utf8(v: &[u8]) -> Result<&str, crate::str::Utf8Error> {
+        crate::str::from_utf8(v)
     }
-    pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
-        from_utf8_mut(v)
+    /// `core::str::from_utf8_mut` as an associated function.
+    pub const fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, crate::str::Utf8Error> {
+        crate::str::from_utf8_mut(v)
     }
+    /// `core::str::from_utf8_unchecked` as an associated function.
     pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
-        unsafe { from_utf8_unchecked(v) }
+        crate::str::from_utf8_unchecked(v)
     }
+    /// `core::str::from_utf8_unchecked_mut` as an associated function.
     pub const unsafe fn from_utf8_unchecked_mut(v: &mut [u8]) -> &mut str {
-        unsafe { from_utf8_unchecked_mut(v) }
+        crate::str::from_utf8_unchecked_mut(v)
     }
     pub fn into_string(self: crate::boxed::Box<str>) -> crate::string::String {
         let len = (*self).len();
@@ -52,6 +53,8 @@ impl str {
     pub const fn as_mut_ptr(&mut self) -> *mut u8 {
         self.as_ptr() as *mut u8
     }
+    // core's own attribute: a crate's extension trait `as_str` (shellexpand's) is the one picked
+    #[unstable(feature = "str_as_str", issue = "130366")]
     pub const fn as_str(&self) -> &str {
         self
     }
@@ -248,6 +251,16 @@ impl str {
         P::Searcher: ReverseSearcher<'a>,
     {
         strip_suffix(self, suffix)
+    }
+    /// rustc 1.100.0 (trim_prefix_suffix): `self` without `prefix` if it starts with it, else `self`
+    pub fn trim_prefix<'a, P: Pattern<'a>>(&'a self, prefix: P) -> &'a str {
+        strip_prefix(self, prefix).unwrap_or(self)
+    }
+    pub fn trim_suffix<'a, P: Pattern<'a>>(&'a self, suffix: P) -> &'a str
+    where
+        P::Searcher: ReverseSearcher<'a>,
+    {
+        strip_suffix(self, suffix).unwrap_or(self)
     }
     pub const fn trim_ascii_start(&self) -> &str {
         trim_ascii_start(self)

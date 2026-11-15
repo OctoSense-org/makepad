@@ -18,7 +18,7 @@ pub enum Kind {
     Fpe,
     Trap,
     Other,
-    /// the hang watchdog's / MAKEPAD_RUN_COMPILE_WATCH's interrupt (thread::kick)
+    /// the hang watchdog's / RELAX_COMPILE_WATCH's interrupt (thread::kick)
     Watchdog,
 }
 
@@ -65,7 +65,7 @@ pub struct Hooks<'a> {
     pub prepare: &'a dyn Fn(),
     /// a library's handler is chained (faults outside JIT code go to it first)
     pub chained: bool,
-    /// MAKEPAD_RUN_FAULT_REGS: a register dump of a fault the policy handles
+    /// RELAX_FAULT_REGS: a register dump of a fault the policy handles
     pub debug: &'a dyn Fn(),
 }
 
@@ -82,22 +82,374 @@ mod unix {
     #[cfg(target_vendor = "apple")]
     pub const SIGBUS: i32 = 10;
 
-    /// Reports SIGABRT before the handler restores the default action.
     #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    pub unsafe fn report_abort(pc: u64, fp: u64) {
-        use crate::jit::{collect_frames, cur_unit, PanicInfo};
-        let tname = crate::os::thread::name(crate::os::thread::current());
-        if cur_unit().is_null() {
-            eprintln!("makepad: SIGABRT on thread '{}' (no JIT unit)", tname);
-            return;
+    pub use abort::{report_abort, start_reporter};
+
+    /// Raises SIGABRT again on this thread, from its SIGABRT handler once the default action is
+    /// back: the signal stays blocked until the handler returns, and the process ends there.
+    /// abort() would raise it again itself; a SIGABRT from outside would not, and the process
+    /// went on after its report. Async-signal-safe.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    pub unsafe fn raise_abort() {
+        extern "C" {
+            fn raise(sig: i32) -> i32;
         }
-        let frames = collect_frames(fp, pc, false);
-        let info = PanicInfo { kind: "abort".to_string(), message: format!("SIGABRT (abort() called) on thread '{}'", tname), site: u64::MAX, frames, fault_addr: 0, location: String::new() };
-        let unit_here = cur_unit() as usize; // the calling thread's unit; the closure runs on the owner
-        // 0 allows 2 ms for the owner to start; owner-thread calls run inline.
-        match crate::owner::call_within(crate::owner::Class::Job, 0, || (&*(unit_here as *mut crate::jit::Unit)).report(&info)) {
-            Some(r) => eprintln!("makepad: abort on thread '{}'\n  report: {}", tname, r),
-            None => eprintln!("makepad: SIGABRT on thread '{}' while the compiler is busy", tname),
+        raise(SIGABRT);
+    }
+
+    /// SIGABRT's report, made off the aborting thread. glibc's malloc checks call abort() with
+    /// the thread's arena locked, and a report on that thread reaches glibc's malloc again:
+    /// besides its own blocks, its first block in the compiler arena and its first wait on the
+    /// compiler's owner register thread-local destructors (glibc's __cxa_thread_atexit_impl
+    /// callocs). 11-09: three test threads of a JIT waited on that lock in this handler for 10
+    /// minutes, and no report came. The aborting thread hands its pc, frames and name to the
+    /// reporter thread, which did all of that once at its start, and waits for the report with
+    /// atomics and futex calls only.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    mod abort {
+        use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
+
+        /// A timespec (`clock_gettime`).
+        #[cfg(target_os = "linux")]
+        #[repr(C)]
+        struct Ts {
+            s: i64,
+            ns: i64,
+        }
+        extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_getname_np(t: usize, name: *mut u8, len: usize) -> i32;
+            fn getpid() -> i32;
+            #[cfg(target_os = "linux")]
+            fn syscall(n: i64, ...) -> i64;
+            #[cfg(target_os = "linux")]
+            fn pthread_getcpuclockid(t: usize, clock: *mut i32) -> i32;
+            #[cfg(target_os = "linux")]
+            fn clock_gettime(clock: i32, t: *mut Ts) -> i32;
+            #[cfg(target_vendor = "apple")]
+            fn pthread_mach_thread_np(t: usize) -> u32;
+            #[cfg(target_vendor = "apple")]
+            fn thread_info(port: u32, flavor: u32, info: *mut u32, count: *mut u32) -> i32;
+            #[cfg(target_vendor = "apple")]
+            fn __ulock_wait(op: u32, addr: *mut u8, value: u64, timeout_us: u32) -> i32;
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        const SYS_FUTEX: i64 = 202;
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const SYS_FUTEX: i64 = 98;
+        /// FUTEX_WAIT_PRIVATE
+        #[cfg(target_os = "linux")]
+        const FUTEX_WAIT: i32 = 128;
+        /// UL_COMPARE_AND_WAIT | ULF_NO_ERRNO
+        #[cfg(target_vendor = "apple")]
+        const UL_WAIT: u32 = 0x0100_0001;
+
+        const FRAMES: usize = 64;
+        /// How long an abort's report waits for the compiler's owner to start its lookups.
+        const OWNER_WAIT_MS: u64 = 1000;
+        /// How often an aborting thread looks at the report it waits for, and how long nothing
+        /// may move before it ends the process without it (longer than the one bounded wait a
+        /// report has, OWNER_WAIT_MS).
+        const POLL_MS: u64 = 100;
+        const STUCK_MS: u64 = OWNER_WAIT_MS + 2000;
+        /// `STEP`: where the report is. An aborting thread reads it.
+        const STEP_WAITING: u32 = 0;
+        const STEP_ASK_OWNER: u32 = 1;
+        const STEP_ON_OWNER: u32 = 2;
+        const STEP_WRITE: u32 = 3;
+        static STEP: AtomicU32 = AtomicU32::new(STEP_WAITING);
+        /// The CPU clocks (`self_cpu_clock`) of the reporter and, once its lookups run there, of
+        /// the compiler's owner. 0: none.
+        static REPORTER_CLOCK: AtomicU64 = AtomicU64::new(0);
+        static OWNER_CLOCK: AtomicU64 = AtomicU64::new(0);
+        /// `HANDOVER.state`: the reporter waits; an aborting thread fills the hand-over; it is
+        /// posted; the report is out (the process ends: one report per process)
+        const IDLE: u32 = 0;
+        const FILLING: u32 = 1;
+        const POSTED: u32 = 2;
+        const DONE: u32 = 3;
+        struct Handover {
+            state: AtomicU32,
+            unit: AtomicUsize,
+            pc: AtomicU64,
+            n: AtomicUsize,
+            frames: [AtomicU64; FRAMES],
+            name: [AtomicU8; 64],
+        }
+        static HANDOVER: Handover = Handover {
+            state: AtomicU32::new(IDLE),
+            unit: AtomicUsize::new(0),
+            pc: AtomicU64::new(0),
+            n: AtomicUsize::new(0),
+            frames: [const { AtomicU64::new(0) }; FRAMES],
+            name: [const { AtomicU8::new(0) }; 64],
+        };
+        /// The reporter's pthread once it is ready (0 before), and its process (a forked child
+        /// has no reporter).
+        static REPORTER: AtomicUsize = AtomicUsize::new(0);
+        static REPORTER_PID: AtomicU32 = AtomicU32::new(0);
+
+        use crate::os::progsig::{futex_wait, futex_wake};
+        /// `futex_wait` for at most `ms`.
+        fn futex_wait_ms(w: &AtomicU32, v: u32, ms: u64) {
+            #[cfg(target_os = "linux")]
+            {
+                let t = [(ms / 1000) as i64, (ms % 1000 * 1_000_000) as i64];
+                unsafe { syscall(SYS_FUTEX, w.as_ptr(), FUTEX_WAIT, v, t.as_ptr()) };
+            }
+            #[cfg(target_vendor = "apple")]
+            unsafe { __ulock_wait(UL_WAIT, w.as_ptr() as *mut u8, v as u64, (ms * 1000) as u32) };
+        }
+        /// The calling thread's CPU clock, for `cpu_ns` on any thread, also once this one ended.
+        fn self_cpu_clock() -> u64 {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let mut clock = 0i32;
+                if pthread_getcpuclockid(pthread_self(), &mut clock) == 0 { clock as u32 as u64 } else { 0 }
+            }
+            #[cfg(target_vendor = "apple")]
+            unsafe { pthread_mach_thread_np(pthread_self()) as u64 }
+        }
+        /// The CPU time a thread has used (0 when it cannot be read: it ended). Async-signal-safe.
+        fn cpu_ns(clock: u64) -> u64 {
+            if clock == 0 {
+                return 0;
+            }
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let mut t = Ts { s: 0, ns: 0 };
+                if clock_gettime(clock as u32 as i32, &mut t) == 0 { t.s as u64 * 1_000_000_000 + t.ns as u64 } else { 0 }
+            }
+            #[cfg(target_vendor = "apple")]
+            unsafe {
+                // THREAD_BASIC_INFO: user_time, system_time (seconds, microseconds), then the rest
+                let mut info = [0u32; 10];
+                let mut count = 10u32;
+                if thread_info(clock as u32, 3, info.as_mut_ptr(), &mut count) != 0 {
+                    return 0;
+                }
+                (info[0] as u64 + info[2] as u64) * 1_000_000_000 + (info[1] as u64 + info[3] as u64) * 1000
+            }
+        }
+        fn wait_for(w: &AtomicU32, want: u32) {
+            loop {
+                let s = w.load(Acquire);
+                if s == want {
+                    return;
+                }
+                futex_wait(w, s);
+            }
+        }
+
+        /// Starts the reporter thread (once; with the compiler's owner).
+        pub fn start_reporter() {
+            static STARTED: std::sync::Once = std::sync::Once::new();
+            STARTED.call_once(|| {
+                let _k = crate::zone_alloc::kept();
+                let _ = std::thread::Builder::new().name("run-abort-report".into()).stack_size(4 << 20).spawn(reporter);
+            });
+        }
+
+        /// RELAX_ABORT_HOLD (tests/abort_heap's held and stuck cases). `locks`: once an
+        /// abort's report is on the owner, a thread takes every lock it could wait for and keeps
+        /// them (`holder`); the report goes on with what it reaches and names what it left out.
+        /// `stuck`: the lookups on the owner never return; the aborting thread ends the process.
+        static HOLD: AtomicU32 = AtomicU32::new(HOLD_OFF);
+        const HOLD_OFF: u32 = 0;
+        const HOLD_ARMED: u32 = 1;
+        const HOLD_GO: u32 = 2;
+        const HOLD_HELD: u32 = 3;
+        const HOLD_STUCK: u32 = 4;
+
+        fn reporter() {
+            let _z = crate::zone_alloc::compiler_thread();
+            // what a report would register in the system heap, registered now: the fault stack and
+            // bounds, a block in the compiler arena, the wait row of a request to the owner
+            crate::jit::ensure_altstack();
+            drop(std::hint::black_box(String::from("run-abort-report")));
+            let _ = crate::owner::call_within(crate::owner::Class::Job, 0, || ());
+            match std::env::var_os("RELAX_ABORT_HOLD").as_deref().and_then(|v| v.to_str()) {
+                Some("locks") => {
+                    HOLD.store(HOLD_ARMED, Release);
+                    let _ = std::thread::Builder::new().name("run-abort-hold".into()).spawn(holder);
+                }
+                Some("stuck") => HOLD.store(HOLD_STUCK, Release),
+                _ => {}
+            }
+            REPORTER_CLOCK.store(self_cpu_clock(), Release);
+            REPORTER_PID.store(unsafe { getpid() } as u32, Release);
+            REPORTER.store(unsafe { pthread_self() }, Release);
+            wait_for(&HANDOVER.state, POSTED);
+            serve();
+            HANDOVER.state.store(DONE, Release);
+            futex_wake(&HANDOVER.state);
+        }
+
+        fn holder() {
+            wait_for(&HOLD, HOLD_GO);
+            let up = HANDOVER.unit.load(Acquire) as *mut crate::jit::Unit;
+            crate::jit::hold_report_locks(up, || {
+                let _stderr = std::io::stderr().lock();
+                crate::tui::hold_tee(|| {
+                    HOLD.store(HOLD_HELD, Release);
+                    futex_wake(&HOLD);
+                    // kept until the process ends
+                    loop {
+                        futex_wait(&HOLD, HOLD_HELD);
+                    }
+                })
+            });
+        }
+
+        /// The posted abort's report, on the reporter thread: its lookups on the owner, where
+        /// none waits for a lock (Unit::report_nowait), then out with what the session log's
+        /// pipe still holds (glibc's "malloc(): ..." line), lock-free (tui fatal_drain). The
+        /// process dies when the aborting thread's handler returns.
+        fn serve() {
+            use crate::jit::{PanicInfo, Unit};
+            let up = HANDOVER.unit.load(Acquire) as *mut Unit;
+            let pc = HANDOVER.pc.load(Relaxed);
+            let n = HANDOVER.n.load(Relaxed).min(FRAMES);
+            let raw: Vec<u64> = HANDOVER.frames[..n].iter().map(|f| f.load(Relaxed)).collect();
+            let name: Vec<u8> = HANDOVER.name.iter().map(|c| c.load(Relaxed)).take_while(|&c| c != 0).collect();
+            let tname = String::from_utf8_lossy(&name).into_owned();
+            let message = format!("SIGABRT (abort() called) on thread '{}'", tname);
+            // what the reporter knows without the unit: the frames by address
+            let by_address = |why: String| {
+                let pcs: Vec<String> = std::iter::once(pc).chain(raw.iter().map(|r| r.wrapping_sub(1))).map(|p| format!("{{\"pc\":\"{:#x}\"}}", p)).collect();
+                format!("{{\"kind\":\"abort\",\"message\":{:?},\"build\":{:?},\"backtrace\":[{}],\"skipped\":[{:?}]}}", message, crate::jit::PROVENANCE, pcs.join(","), why)
+            };
+            let report = if up.is_null() {
+                by_address("unit: no JIT unit, frames by address only".to_string())
+            } else {
+                let unit_here = up as usize;
+                let on_owner = || {
+                    OWNER_CLOCK.store(self_cpu_clock(), Release);
+                    STEP.store(STEP_ON_OWNER, Release);
+                    match HOLD.load(Acquire) {
+                        HOLD_ARMED => {
+                            HOLD.store(HOLD_GO, Release);
+                            futex_wake(&HOLD);
+                            wait_for(&HOLD, HOLD_HELD);
+                        }
+                        HOLD_STUCK => loop {
+                            futex_wait(&HOLD, HOLD_STUCK);
+                        },
+                        _ => {}
+                    }
+                    let up = unit_here as *mut Unit;
+                    let mut skipped = Vec::new();
+                    let frames = crate::jit::frames_from_raw_in(up, pc, false, &raw, Some(&mut skipped));
+                    let info = PanicInfo { kind: "abort".to_string(), message: message.clone(), site: u64::MAX, frames, fault_addr: 0, location: String::new() };
+                    unsafe { (&*up).report_nowait(&info, skipped) }
+                };
+                // the unit's tables are the owner's: the lookups run there. A busy owner (in a
+                // compile; the aborting thread itself) leaves them out.
+                STEP.store(STEP_ASK_OWNER, Release);
+                match crate::owner::call_within(crate::owner::Class::Job, OWNER_WAIT_MS, on_owner) {
+                    Some(r) => r,
+                    None => by_address(format!("owner: busy for {} ms ({}), frames by address only", OWNER_WAIT_MS, crate::owner::serving_detail())),
+                }
+            };
+            let text = format!("relax: abort on thread '{}'\n  report: {}\n", tname, report);
+            STEP.store(STEP_WRITE, Release);
+            crate::tui::fatal_drain(text.as_bytes());
+        }
+
+        /// Reports SIGABRT (on the aborting thread, before its handler restores the default
+        /// action): a line on the real stderr, then the reporter's report. Async-signal-safe.
+        pub unsafe fn report_abort(pc: u64, fp: u64) {
+            let mut name = [0u8; 64];
+            pthread_getname_np(pthread_self(), name.as_mut_ptr(), name.len());
+            let len = name.iter().position(|&c| c == 0).unwrap_or(0);
+            let mut line = [0u8; 128];
+            let mut k = 0;
+            for &c in b"relax: SIGABRT on thread '".iter().chain(&name[..len]).chain(b"'\n") {
+                if k < line.len() {
+                    line[k] = c;
+                    k += 1;
+                }
+            }
+            crate::os::fault::raw_stderr(&line[..k]);
+            let r = REPORTER.load(Acquire);
+            if r == 0 || r == pthread_self() || REPORTER_PID.load(Acquire) != getpid() as u32 {
+                return;
+            }
+            if HANDOVER.state.compare_exchange(IDLE, FILLING, AcqRel, Acquire).is_ok() {
+                HANDOVER.unit.store(crate::jit::cur_unit() as usize, Relaxed);
+                HANDOVER.pc.store(pc, Relaxed);
+                let mut raw = [0u64; FRAMES];
+                let n = crate::jit::raw_frames_here(fp, &mut raw);
+                for (slot, &f) in HANDOVER.frames.iter().zip(&raw[..n]) {
+                    slot.store(f, Relaxed);
+                }
+                HANDOVER.n.store(n, Relaxed);
+                for (slot, &c) in HANDOVER.name.iter().zip(&name) {
+                    slot.store(c, Relaxed);
+                }
+                HANDOVER.state.store(POSTED, Release);
+                futex_wake(&HANDOVER.state);
+            }
+            // a second aborting thread waits for the first one's report too: a return ends the
+            // process
+            wait_for_report();
+        }
+
+        /// An aborting thread's wait for the report: until it is out, or until nothing can bring
+        /// it, so that a reporter blocked for good (on something this thread holds) does not keep
+        /// the process alive. Not a cap on the report: its step or the CPU time of the threads
+        /// making it moving keeps the wait going, however long it takes. Async-signal-safe.
+        fn wait_for_report() {
+            fn progress() -> (u32, u64) {
+                let step = STEP.load(Acquire);
+                let owner = if step == STEP_ON_OWNER { cpu_ns(OWNER_CLOCK.load(Acquire)) } else { 0 };
+                (step, cpu_ns(REPORTER_CLOCK.load(Acquire)).wrapping_add(owner))
+            }
+            let mut last = progress();
+            let mut still = 0;
+            loop {
+                let s = HANDOVER.state.load(Acquire);
+                if s == DONE {
+                    return;
+                }
+                futex_wait_ms(&HANDOVER.state, s, POLL_MS);
+                let now = progress();
+                if now != last {
+                    last = now;
+                    still = 0;
+                    continue;
+                }
+                still += POLL_MS;
+                if still >= STUCK_MS {
+                    report_stuck(now.0);
+                    return;
+                }
+            }
+        }
+
+        /// What the reporter would have had: the frames by address, with where it stopped.
+        fn report_stuck(step: u32) {
+            let raw = crate::os::fault::raw_stderr;
+            raw(b"relax: the abort's report is stuck ");
+            raw(match step {
+                STEP_ASK_OWNER => b"asking the compiler's owner",
+                STEP_ON_OWNER => b"in its lookups on the compiler's owner",
+                STEP_WRITE => b"writing itself out",
+                _ => b"before it started",
+            });
+            raw(b", nothing moves: the process ends without it; frames by address:");
+            let hex = |word: u64| {
+                let mut b = *b" 0x0000000000000000";
+                for (i, c) in b[3..].iter_mut().enumerate() {
+                    *c = b"0123456789abcdef"[(word >> (60 - 4 * i)) as usize & 15];
+                }
+                raw(&b);
+            };
+            hex(HANDOVER.pc.load(Relaxed));
+            for f in &HANDOVER.frames[..HANDOVER.n.load(Relaxed).min(FRAMES)] {
+                hex(f.load(Relaxed));
+            }
+            raw(b"\n");
         }
     }
 
@@ -117,7 +469,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::unix::{kind, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
+    use super::unix::{kind, raise_abort, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
     use super::{Action, Fault, Hooks};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -131,7 +483,6 @@ mod imp {
         fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
     }
 
-    #[derive(Clone, Copy)]
     #[repr(C)]
     pub(crate) struct SigAction {
         handler: usize,
@@ -139,16 +490,6 @@ mod imp {
         flags: i32,
         pad: i32,
         restorer: usize,
-    }
-
-    impl SigAction {
-        /// `sa_handler` / `sa_sigaction` (one word: 0 the default action, 1 ignore).
-        pub(crate) fn handler(&self) -> usize {
-            self.handler
-        }
-        pub(crate) fn set_handler(&mut self, handler: usize) {
-            self.handler = handler;
-        }
     }
 
     #[repr(C)]
@@ -174,12 +515,13 @@ mod imp {
             if sig == SIGABRT {
                 report_abort(*gregs.add(16), *gregs.add(10));
                 default_action(SIGABRT);
+                raise_abort();
                 return;
             }
-            // MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
+            // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*gregs.add(16), *gregs.add(10));
-                eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
+                eprintln!("relax watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
                 return;
             }
             let f = Fault { kind: kind(sig), sig, pc: *gregs.add(16), sp: *gregs.add(15), fp: *gregs.add(10), addr: *(info.add(16) as *const u64), lr: 0 };
@@ -256,6 +598,12 @@ mod imp {
                 handler.store(0, Ordering::Relaxed);
             }
         }
+        // the program's handlers behind the trampoline are given back by progsig.rs
+        for row in CHAINED.iter() {
+            if row[0].load(Ordering::Relaxed) == crate::os::progsig::trampoline_addr() {
+                row[0].store(0, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Puts our handlers back on top where the program replaced them, keeping the replacement as
@@ -276,6 +624,16 @@ mod imp {
         }
     }
 
+    /// The host's fault handler (progsig.rs: where the kernel shows it, the trampoline may be chained behind it).
+    pub(crate) fn host_handler() -> usize {
+        on_signal as *const () as usize
+    }
+
+    /// The handler chained behind ours for `sig` (0: none).
+    pub(crate) fn chained_handler(sig: i32) -> usize {
+        CHAINED.get(sig as usize).map_or(0, |c| c[0].load(Ordering::SeqCst))
+    }
+
     /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
     unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
         let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
@@ -283,6 +641,10 @@ mod imp {
         if h <= 1 {
             // SIG_DFL / SIG_IGN
             return false;
+        }
+        // a program handler: the trampoline says whether it took the signal
+        if h == crate::os::progsig::trampoline_addr() {
+            return crate::os::progsig::chained(sig, info, uc);
         }
         unsafe {
             if flags & SA_SIGINFO != 0 {
@@ -337,7 +699,6 @@ mod imp {
         fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
     }
 
-    #[derive(Clone, Copy)]
     #[repr(C)]
     pub(crate) struct SigAction {
         flags: i32,
@@ -345,16 +706,6 @@ mod imp {
         handler: usize,
         mask: u64,
         restorer: usize,
-    }
-
-    impl SigAction {
-        /// `sa_handler` / `sa_sigaction` (one word: 0 the default action, 1 ignore).
-        pub(crate) fn handler(&self) -> usize {
-            self.handler
-        }
-        pub(crate) fn set_handler(&mut self, handler: usize) {
-            self.handler = handler;
-        }
     }
 
     #[repr(C)]
@@ -377,10 +728,10 @@ mod imp {
             // the handler allocates: in the system heap, never in the faulting thread's arena (the fault may be inside its allocator)
             let _kept = crate::zone_alloc::kept();
             let reg = |i: usize| uc.add(OFFSETS[i]) as *mut u64;
-            // MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
+            // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == watchdog_signal() && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*reg(14), *reg(11));
-                eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
+                eprintln!("relax watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
                 return;
             }
             let f = Fault { kind: kind(sig), sig, pc: *reg(14), sp: *reg(13), fp: *reg(11), addr: *(info.add(OFFSETS[7]) as *const u64), lr: *reg(12) };
@@ -480,6 +831,12 @@ mod imp {
                 handler.store(0, Ordering::Relaxed);
             }
         }
+        // the program's handlers behind the trampoline are given back by progsig.rs
+        for row in CHAINED.iter() {
+            if row[0].load(Ordering::Relaxed) == crate::os::progsig::trampoline_addr() {
+                row[0].store(0, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Puts our handlers back on top where the program replaced them, keeping the replacement as
@@ -500,6 +857,16 @@ mod imp {
         }
     }
 
+    /// The host's fault handler (progsig.rs: where the kernel shows it, the trampoline may be chained behind it).
+    pub(crate) fn host_handler() -> usize {
+        on_signal as *const () as usize
+    }
+
+    /// The handler chained behind ours for `sig` (0: none).
+    pub(crate) fn chained_handler(sig: i32) -> usize {
+        CHAINED.get(sig as usize).map_or(0, |c| c[0].load(Ordering::SeqCst))
+    }
+
     /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
     unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
         let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
@@ -507,6 +874,10 @@ mod imp {
         if h <= 1 {
             // SIG_DFL / SIG_IGN
             return false;
+        }
+        // a program handler: the trampoline says whether it took the signal
+        if h == crate::os::progsig::trampoline_addr() {
+            return crate::os::progsig::chained(sig, info, uc);
         }
         unsafe {
             if flags & SA_SIGINFO != 0 {
@@ -525,7 +896,7 @@ mod imp {
 /// (Chromium's in CefInitialize) stay chained.
 #[cfg(target_vendor = "apple")]
 mod imp {
-    use super::unix::{kind, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
+    use super::unix::{kind, raise_abort, report_abort, SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGTRAP};
     use super::{Action, Fault, Hooks};
     use crate::jit::cur_unit;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -544,22 +915,11 @@ mod imp {
     }
 
     /// Darwin `struct sigaction` (user side): handler, sa_mask (u32), sa_flags.
-    #[derive(Clone, Copy)]
     #[repr(C)]
     pub(crate) struct SigAction {
         handler: usize,
         mask: u32,
         flags: i32,
-    }
-
-    impl SigAction {
-        /// `sa_handler` / `sa_sigaction` (one word: 0 the default action, 1 ignore).
-        pub(crate) fn handler(&self) -> usize {
-            self.handler
-        }
-        pub(crate) fn set_handler(&mut self, handler: usize) {
-            self.handler = handler;
-        }
     }
 
     /// Darwin `stack_t`: ss_sp, ss_size, ss_flags.
@@ -591,7 +951,7 @@ mod imp {
         }
     }
 
-    /// MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is (no lock:
+    /// RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is (no lock:
     /// that thread is the one holding it, stuck)
     unsafe fn watch_dump(uc: *mut u8) {
         let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
@@ -599,20 +959,20 @@ mod imp {
         let (pc, lr, fp) = (reg(SS_PC), reg(SS + 240), reg(SS_FP));
         if !cur_unit().is_null() {
             let nm = crate::jit::fn_name_at;
-            eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) lr {:#x} ({}) fp {:#x}; on_signal at {:#x}", crate::os::thread::current(), pc, nm(pc), lr, nm(lr), fp, on_signal as *const () as usize);
+            eprintln!("relax watch: stuck thread {:#x} at pc {:#x} ({}) lr {:#x} ({}) fp {:#x}; on_signal at {:#x}", crate::os::thread::current(), pc, nm(pc), lr, nm(lr), fp, on_signal as *const () as usize);
             let mut f = fp;
             for _ in 0..12 {
                 if f == 0 || f % 8 != 0 {
                     break;
                 }
                 let ret = *((f + 8) as *const u64);
-                eprintln!("makepad-run watch:   frame ret {:#x} ({})", ret, nm(ret));
+                eprintln!("relax watch:   frame ret {:#x} ({})", ret, nm(ret));
                 f = *(f as *const u64);
             }
         }
     }
 
-    /// MAKEPAD_RUN_FAULT_REGS: registers and the call sequence around a fault (arm64 encodings).
+    /// RELAX_FAULT_REGS: registers and the call sequence around a fault (arm64 encodings).
     unsafe fn fault_regs(uc: *mut u8) {
         // (read once at install: no environment lock in a signal handler)
         if !FAULT_REGS.load(Ordering::Relaxed) {
@@ -639,10 +999,10 @@ mod imp {
             }
         }
         let ins = |a: u64| if a >= 8 { *((a) as *const u32) } else { 0 };
-        eprintln!("makepad-run fault-regs: pc {:#x} ({}) lr {:#x} ({}) fp {:#x} x16 {:#x} ({}) x17 {:#x}; table slots holding x16/pc: {:?}; insts at lr-12..lr: {:08x} {:08x} {:08x}", pc, nm(pc), lr, nm(lr), fp, x16, nm(x16), x17, slots, ins(lr - 12), ins(lr - 8), ins(lr - 4));
+        eprintln!("relax fault-regs: pc {:#x} ({}) lr {:#x} ({}) fp {:#x} x16 {:#x} ({}) x17 {:#x}; table slots holding x16/pc: {:?}; insts at lr-12..lr: {:08x} {:08x} {:08x}", pc, nm(pc), lr, nm(lr), fp, x16, nm(x16), x17, slots, ins(lr - 12), ins(lr - 8), ins(lr - 4));
         if let Some(id) = find(lr) {
             let f = &u.fns[id as usize];
-            eprintln!("makepad-run fault-regs: caller {} code {:#x} len {} lr off {:#x}", f.name, f.code, f.code_len, lr.wrapping_sub(f.code));
+            eprintln!("relax fault-regs: caller {} code {:#x} len {} lr off {:#x}", f.name, f.code, f.code_len, lr.wrapping_sub(f.code));
         }
         // the call's slot address from the movz/movk sequence before `ldr x16, [x16]; blr x16`
         let mut a: u64 = 0;
@@ -662,9 +1022,9 @@ mod imp {
             let id = id as usize;
             let t = *(a as *const u64);
             let f = &u.fns[id];
-            eprintln!("makepad-run fault-regs: called slot {} = {} (compiled {}, code {:#x}) table now {:#x} ({})", id, f.name, f.compiled, f.code, t, nm(t));
+            eprintln!("relax fault-regs: called slot {} = {} (compiled {}, code {:#x}) table now {:#x} ({})", id, f.name, f.compiled, f.code, t, nm(t));
         } else {
-            eprintln!("makepad-run fault-regs: slot addr {:#x} not in the table", a);
+            eprintln!("relax fault-regs: slot addr {:#x} not in the table", a);
         }
     }
 
@@ -676,8 +1036,8 @@ mod imp {
                 let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
                 let reg = |off: usize| -> *mut u64 { mc.add(off) as *mut u64 };
                 report_abort(*reg(SS_PC), *reg(SS_FP));
-                // back to the default action: abort() raises again and the process ends
                 default_action(SIGABRT);
+                raise_abort();
                 return;
             }
             if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(Ordering::Relaxed) {
@@ -747,7 +1107,7 @@ mod imp {
     static FAULT_REGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     pub fn install() {
-        FAULT_REGS.store(std::env::var_os("MAKEPAD_RUN_FAULT_REGS").is_some(), Ordering::Relaxed);
+        FAULT_REGS.store(std::env::var_os("RELAX_FAULT_REGS").is_some(), Ordering::Relaxed);
         unsafe {
             for sig in OUR_SIGNALS {
                 let act = SigAction { handler: on_signal as *const () as usize, mask: 0, flags: SA_SIGINFO | SA_ONSTACK };
@@ -766,6 +1126,12 @@ mod imp {
         for handler in CHAINED.iter().flatten() {
             if crate::stale::lookup(handler.load(Ordering::Relaxed) as u64).is_some() {
                 handler.store(0, Ordering::Relaxed);
+            }
+        }
+        // the program's handlers behind the trampoline are given back by progsig.rs
+        for row in CHAINED.iter() {
+            if row[0].load(Ordering::Relaxed) == crate::os::progsig::trampoline_addr() {
+                row[0].store(0, Ordering::Relaxed);
             }
         }
     }
@@ -787,6 +1153,16 @@ mod imp {
         }
     }
 
+    /// The host's fault handler (progsig.rs: where the kernel shows it, the trampoline may be chained behind it).
+    pub(crate) fn host_handler() -> usize {
+        on_signal as *const () as usize
+    }
+
+    /// The handler chained behind ours for `sig` (0: none).
+    pub(crate) fn chained_handler(sig: i32) -> usize {
+        CHAINED.get(sig as usize).map_or(0, |c| c[0].load(Ordering::SeqCst))
+    }
+
     /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
     unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
         let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
@@ -794,6 +1170,10 @@ mod imp {
         if h <= 1 {
             // SIG_DFL / SIG_IGN
             return false;
+        }
+        // a program handler: the trampoline says whether it took the signal
+        if h == crate::os::progsig::trampoline_addr() {
+            return crate::os::progsig::chained(sig, info, uc);
         }
         unsafe {
             if flags & SA_SIGINFO != 0 {
@@ -881,7 +1261,7 @@ mod imp {
         }
     }
 
-    /// MAKEPAD_RUN_FAULT_TRACE=1: every exception the handlers see, with the module holding its pc
+    /// RELAX_FAULT_TRACE=1: every exception the handlers see, with the module holding its pc
     /// (diagnostics for faults outside JIT code; no debugger needed).
     fn trace() -> bool {
         static T: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
@@ -889,7 +1269,7 @@ mod imp {
         if t != 2 {
             return t == 1;
         }
-        let on = std::env::var_os("MAKEPAD_RUN_FAULT_TRACE").is_some();
+        let on = std::env::var_os("RELAX_FAULT_TRACE").is_some();
         T.store(on as u8, std::sync::atomic::Ordering::Relaxed);
         on
     }
@@ -903,7 +1283,7 @@ mod imp {
             n = GetModuleFileNameW(m, name.as_mut_ptr(), 260) as usize;
         }
         let module = String::from_utf16_lossy(&name[..n]);
-        let msg = format!("makepad-run fault-trace: {} exception {:#x} at pc {:#x} = {}+{:#x}{}\n", if first { "first-chance" } else { "unhandled" }, code, pc, if n > 0 { module.as_str() } else { "?" }, pc.wrapping_sub(m as u64), if crate::jit::in_jit_code(pc) { " (JIT code)" } else { "" });
+        let msg = format!("relax fault-trace: {} exception {:#x} at pc {:#x} = {}+{:#x}{}\n", if first { "first-chance" } else { "unhandled" }, code, pc, if n > 0 { module.as_str() } else { "?" }, pc.wrapping_sub(m as u64), if crate::jit::in_jit_code(pc) { " (JIT code)" } else { "" });
         let mut w = 0u32;
         WriteFile(GetStdHandle(-12i32 as u32), msg.as_ptr(), msg.len() as u32, &mut w, std::ptr::null_mut());
     }
@@ -946,7 +1326,7 @@ mod imp {
 
     pub fn reassert() {}
 
-    /// Suspends thread `t` and reads its context. MAKEPAD_RUN_COMPILE_WATCH: prints where it is. Hang
+    /// Suspends thread `t` and reads its context. RELAX_COMPILE_WATCH: prints where it is. Hang
     /// A run's end (domain.rs end_run): no signal ends a wait here. A synchronous I/O call is
     /// cancelled, and the program's waits end by themselves (domain_threads.rs `waits`). Back in JIT
     /// code the thread faults and ends as on unix.
@@ -975,7 +1355,7 @@ mod imp {
                 if GetThreadContext(h, &mut *ctx) != 0 {
                     let (pc, fp, sp) = (ctx.get(CTX_RIP), ctx.get(CTX_RBP), ctx.get(CTX_RSP));
                     if crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", t, pc, crate::jit::fn_name_at(pc), fp);
+                        eprintln!("relax watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", t, pc, crate::jit::fn_name_at(pc), fp);
                     } else {
                         let tramp = crate::jit::HANG_TRAMP.load(std::sync::atomic::Ordering::Relaxed);
                         if tramp != 0 && crate::jit::in_jit_code(pc) && pc != tramp {
@@ -998,6 +1378,12 @@ mod imp {
 
 #[cfg(not(target_os = "android"))]
 pub fn watchdog_signal() -> i32 { SIG_WATCHDOG }
+
+/// Starts the thread SIGABRT's report is made on (`unix::abort`), with the compiler's owner.
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub fn start_abort_reporter() {
+    unix::start_reporter()
+}
 
 /// Fault stack memory: ALTSTACK bytes above one PROT_NONE guard page, so a handler that
 /// overflows its alternate stack faults on the guard (the process dies) instead of writing into
@@ -1076,6 +1462,37 @@ pub fn stack_bounds_of_self() -> (u64, u64) {
     }
 }
 
+/// The word at `addr`, None where it cannot be read: the kernel reads it, so a bad address is an
+/// error and not a fault. Signal-safe (no allocation, no lock).
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+pub fn read_word_checked(addr: u64) -> Option<u64> {
+    let mut word = 0u64;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        #[repr(C)]
+        struct IoVec {
+            base: *mut u8,
+            len: usize,
+        }
+        extern "C" {
+            fn getpid() -> i32;
+            fn process_vm_readv(pid: i32, local: *const IoVec, n_local: u64, remote: *const IoVec, n_remote: u64, flags: u64) -> isize;
+        }
+        let local = IoVec { base: (&mut word as *mut u64).cast(), len: 8 };
+        let remote = IoVec { base: addr as *mut u8, len: 8 };
+        (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == 8).then_some(word)
+    }
+    #[cfg(target_vendor = "apple")]
+    unsafe {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_read_overwrite(task: u32, addr: u64, size: u64, data: u64, out_size: *mut u64) -> i32;
+        }
+        let mut n = 0u64;
+        (mach_vm_read_overwrite(mach_task_self_, addr, 8, &mut word as *mut u64 as u64, &mut n) == 0 && n == 8).then_some(word)
+    }
+}
+
 /// Writes `b` to stderr with one system call: no allocation, no lock (a fault handler's report).
 pub fn raw_stderr(b: &[u8]) {
     #[cfg(unix)]
@@ -1112,4 +1529,80 @@ pub fn die_by(sig: i32) -> ! {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     imp::reset_statics();
+}
+
+#[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
+mod abort_tests {
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+        fn setrlimit(resource: i32, limit: *const [u64; 2]) -> i32;
+    }
+
+    /// A chain walked with no recorded stack bounds ends at the first word it cannot read, with
+    /// the frames before it, and does not fault.
+    #[test]
+    fn a_frame_chain_without_stack_bounds_ends_at_an_unreadable_page() {
+        extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+            fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
+            fn munmap(addr: *mut u8, len: usize) -> i32;
+        }
+        const PAGE: usize = 1 << 16;
+        // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+        let anon = if cfg!(target_vendor = "apple") { 0x1002 } else { 0x22 };
+        let base = unsafe { mmap(std::ptr::null_mut(), 2 * PAGE, 3, anon, -1, 0) };
+        assert_ne!(base as isize, -1);
+        assert_eq!(unsafe { mprotect(base.add(PAGE), PAGE, 0) }, 0);
+        let words = base as *mut u64;
+        let at = |i: usize| base as u64 + 8 * i as u64;
+        for (i, w) in [at(2), 0xa, at(4), 0xb, base as u64 + PAGE as u64, 0xc].into_iter().enumerate() {
+            unsafe { words.add(i).write(w) };
+        }
+        let mut out = [0u64; 8];
+        let n = crate::jit::walk_fp_checked(at(0), &mut out);
+        assert_eq!(&out[..n], &[0xa, 0xb, 0xc]);
+        // the same word read by hand: the page itself answers None
+        assert_eq!(super::read_word_checked(base as u64 + PAGE as u64), None);
+        assert_eq!(super::read_word_checked(at(1)), Some(0xa));
+        unsafe { munmap(base, 2 * PAGE) };
+    }
+
+    /// A SIGABRT sent from outside ends the process after its report line, as abort()'s does. A JIT
+    /// parked at a compile error took one, reported it and stayed parked for good.
+    #[test]
+    fn a_sigabrt_from_outside_ends_the_process() {
+        const CHILD: &str = "RELAX_OUTSIDE_SIGABRT_CHILD";
+        const READY: &str = "waiting for the signal";
+        if std::env::var_os(CHILD).is_some() {
+            // (no core file: writing one is most of the time an abort takes; RLIMIT_CORE)
+            unsafe { setrlimit(4, &[0, 0]) };
+            super::install();
+            super::start_abort_reporter();
+            println!("{READY}");
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            std::process::exit(7);
+        }
+        let _slot = crate::test_child::slot();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "os::fault::abort_tests::a_sigabrt_from_outside_ends_the_process", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while !line.contains(READY) {
+            line.clear();
+            assert!(out.read_line(&mut line).unwrap() > 0, "the child ended before it waited for the signal");
+        }
+        assert_eq!(unsafe { kill(child.id() as i32, 6) }, 0);
+        let output = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(6), "status {:?}:\n{err}", output.status);
+        assert!(err.contains("SIGABRT on thread"), "no report line:\n{err}");
+    }
 }

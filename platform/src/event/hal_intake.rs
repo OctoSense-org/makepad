@@ -20,7 +20,7 @@ use crate::{
     window::{CxWindowPool, WindowId},
 };
 use makepad_hal::{buffers::{read_domains, read_drag_items, read_items, read_strs}, domain_state, input, window_state, HalEvent, Id};
-use std::{cell::Cell, cell::RefCell, rc::Rc, sync::{Arc, Mutex}};
+use std::{cell::Cell, rc::Rc, sync::{Arc, Mutex}};
 
 pub(crate) fn window_id(id: Id) -> WindowId {
     WindowId(id.index as usize, id.gen as u64)
@@ -98,10 +98,12 @@ impl Cx {
         if matches!(
             event,
             HalEvent::MouseDown { .. } | HalEvent::MouseMove { .. } | HalEvent::MouseUp { .. } | HalEvent::Scroll { .. } | HalEvent::Pinch { .. } | HalEvent::Touch { .. } | HalEvent::KeyDown { .. } | HalEvent::KeyUp { .. } | HalEvent::Text { .. } | HalEvent::Ime { .. }
-        ) && self.hal.input_ns == 0
-        {
+        ) {
+            self.hal.frame_trace.work_from(time_ns as f64 * 1e-9);
             // the oldest input a frame consumes is its cause (FrameMeta::input_ns)
-            self.hal.input_ns = time_ns;
+            if self.hal.input_ns == 0 {
+                self.hal.input_ns = time_ns;
+            }
         }
         if makepad_hal::profile::on() {
             use makepad_hal::profile::{input, Input};
@@ -110,6 +112,17 @@ impl Cx {
                 HalEvent::MouseDown { .. } => input(Input::ButtonDown),
                 HalEvent::MouseUp { .. } => input(Input::ButtonUp),
                 HalEvent::Scroll { .. } => input(Input::Scroll),
+                _ => {}
+            }
+        }
+        // A pending IME hide needs to know when there's no draw coming to wait for.
+        #[cfg(target_os = "android")]
+        if let HalEvent::Lifecycle { kind } = event {
+            match kind {
+                makepad_hal::lifecycle::PAUSE => self.hal.activity_paused = true,
+                makepad_hal::lifecycle::RESUME => self.hal.activity_paused = false,
+                makepad_hal::lifecycle::SURFACE_LOST => self.hal.no_surface = true,
+                makepad_hal::lifecycle::SURFACE_AVAILABLE => self.hal.no_surface = false,
                 _ => {}
             }
         }
@@ -379,7 +392,7 @@ impl Cx {
                 self.call_event_handler(&Event::TextInput(TextInputEvent { input, replace_last: false, was_paste, ..Default::default() }));
             }
             HalEvent::PayloadSize { bytes } => {
-                self.hal.event_arena_min = self.hal.event_arena_min.max(bytes as usize);
+                self.hal.event_arena.ask(bytes as usize);
             }
             #[cfg(target_os = "linux")]
             HalEvent::DirectDisplays { window, generation, inventory } => self.hal_display_inventory(window, generation, inventory),
@@ -404,6 +417,8 @@ impl Cx {
                     Some(data) if supported => ClipboardContent {
                         supported: true,
                         text: (!data.text.is_empty()).then_some(data.text),
+                        html: (!data.html.is_empty()).then_some(data.html),
+                        markdown: (!data.markdown.is_empty()).then_some(data.markdown),
                         image: (!data.png.is_empty()).then_some(ClipboardImage::Png(Arc::new(data.png))),
                         files: data.files.into_iter().map(|(url, path)| ClipboardFile { url, path }).collect(),
                     },
@@ -427,6 +442,9 @@ impl Cx {
                 self.call_event_handler(&Event::ImeAction(ImeActionEvent { action }));
             }
             HalEvent::ImeResize { window, height, open } => {
+                // Every closed report lets the next show go out, even one the checks below ignore.
+                #[cfg(target_os = "android")]
+                if !open { self.hal.ime_shown = None; }
                 let window_id = window_id(window);
                 if !self.windows.is_valid(window_id) {
                     return true;
@@ -531,6 +549,7 @@ impl Cx {
                 if !self.windows.is_valid(window_id) {
                     return true;
                 }
+                self.windows[window_id].key = focused;
                 if focused {
                     self.hal.focused = Some(window_id);
                     // repaint all window passes: a window can come back without its frame
@@ -546,10 +565,14 @@ impl Cx {
             }
             HalEvent::Geom { window, x, y, w, h, dpi, state } => self.hal_window_geom(window_id(window), dvec2(x, y), dvec2(w, h), dpi as f64, state),
             HalEvent::Display { window, dpi, refresh: _ } => {
+                #[cfg(target_os = "android")]
+                self.hal_update_android_os_type();
                 let window_id = window_id(window);
                 if self.windows.is_valid(window_id) {
                     let geom = self.windows[window_id].window_geom.clone();
-                    let state = if geom.is_fullscreen { window_state::FULLSCREEN } else { window_state::RESTORE };
+                    // the state the backend last reported: maximized first, since a hosted window's
+                    // `is_fullscreen` can come from its host while the backend has it maximized
+                    let state = if geom.is_maximized { window_state::MAXIMIZE } else if geom.is_fullscreen { window_state::FULLSCREEN } else { window_state::RESTORE };
                     // the layout geometry back to what the OS reported (`native_window_geom_to_layout` inverse)
                     let scale = geom.dpi_factor / self.windows[window_id].native_dpi_factor();
                     self.hal_window_geom(window_id, geom.position, geom.inner_size * scale, dpi as f64, state);
@@ -608,7 +631,7 @@ impl Cx {
                 }
                 self.hal.windows.remove(&window_id.0);
                 if self.hal_hosted_extra_window(window_id) {
-                    Self::send_hosted_window(crate::ime::HostedWindow::new(window_id.id(), crate::ime::hosted_window_op::CLOSED));
+                    Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::new(window_id.id(), makepad_hal::window_controls::hosted_window_op::CLOSED));
                 }
                 if let Some(hosted) = self.hal.hosted.as_mut() {
                     hosted.window_closed(window_id);
@@ -622,6 +645,8 @@ impl Cx {
                     if user_closed {
                         crate::remote::note_user_closed_last_window();
                     }
+                    // why it closed is the backend's line before this one (makepad-hal: ...)
+                    crate::log!("hal: the last window closed ({title:?})");
                     self.call_event_handler(&Event::Shutdown);
                     return false;
                 }
@@ -631,7 +656,9 @@ impl Cx {
             }
             HalEvent::DragQuery { window, x, y } => {
                 if let Some(answer) = self.hal_drag_query(window, x, y) {
-                    self.hal.frames.w.drag_reply(window, input::reply::QUERY, answer);
+                    // what a double click there does: the window's own declaration (a host WM reads it)
+                    let fullscreen = self.windows[window_id(window)].double_click_fullscreen;
+                    self.hal.frames.w.drag_reply(window, input::reply::QUERY, answer, fullscreen);
                 }
             }
             HalEvent::AppMessage { window, message } => {
@@ -668,7 +695,7 @@ impl Cx {
                     DragResponse::Link => input::drag_response::LINK,
                     DragResponse::Move => input::drag_response::MOVE,
                 };
-                self.hal.frames.w.drag_reply(window, input::reply::OVER, answer);
+                self.hal.frames.w.drag_reply(window, input::reply::OVER, answer, false);
             }
             HalEvent::DragDrop { window, x, y, dropped, count, items } => {
                 let window_id = window_id(window);
@@ -713,12 +740,17 @@ impl Cx {
             // ---- app
             // (every backend paints its windows once after the app started)
             HalEvent::Startup {} => {
+                #[cfg(target_os = "android")]
+                self.hal_update_android_os_type();
                 if self.hal.hosted.is_some() {
                     Self::send_studio_message(crate::studio::AppToStudio::BeforeStartup);
                     self.set_physical_keyboard_state(true);
                 }
                 self.call_event_handler(&Event::Startup);
                 self.redraw_all();
+                if crate::app_open::shown_for_person() {
+                    self.open_for_person();
+                }
                 if self.hal.hosted.is_some() {
                     use crate::studio::AppToStudio;
                     Self::send_studio_message(AppToStudio::AfterStartup);
@@ -728,8 +760,17 @@ impl Cx {
                 }
             }
             HalEvent::Lifecycle { kind } => match kind {
-                makepad_hal::lifecycle::FOREGROUND => self.call_event_handler(&Event::Foreground),
-                makepad_hal::lifecycle::BACKGROUND => self.call_event_handler(&Event::Background),
+                makepad_hal::lifecycle::FOREGROUND => {
+                    self.hal.in_background = false;
+                    if !self.hal.font_events.is_empty() {
+                        self.redraw_all();
+                    }
+                    self.call_event_handler(&Event::Foreground);
+                }
+                makepad_hal::lifecycle::BACKGROUND => {
+                    self.hal.in_background = true;
+                    self.call_event_handler(&Event::Background);
+                }
                 makepad_hal::lifecycle::PAUSE => self.call_event_handler(&Event::Pause),
                 makepad_hal::lifecycle::RESUME => {
                     // Java may cover the surface across a pause, and only a present lifts that.
@@ -739,11 +780,16 @@ impl Cx {
                 }
                 // the window's focus has its own event; the surface is the backend's (it rebuilds
                 // the swapchain and reports the geometry), Cx only paints into the new one
-                makepad_hal::lifecycle::FOCUS_GAINED | makepad_hal::lifecycle::FOCUS_LOST | makepad_hal::lifecycle::SURFACE_LOST => {}
-                makepad_hal::lifecycle::SURFACE_AVAILABLE => self.hal_repaint_all(),
+                makepad_hal::lifecycle::FOCUS_GAINED | makepad_hal::lifecycle::FOCUS_LOST => {}
+                makepad_hal::lifecycle::SURFACE_LOST => self.hal.surface_lost = true,
+                makepad_hal::lifecycle::SURFACE_AVAILABLE => {
+                    self.hal.surface_lost = false;
+                    self.hal_repaint_all();
+                }
                 _ => {
                     self.request_quit(QuitReason::App);
                     if !self.hal_handle_platform_ops() {
+                        crate::log!("hal: the app quit: the window system asked it to (lifecycle {kind})");
                         self.call_event_handler(&Event::Shutdown);
                         return false;
                     }
@@ -855,13 +901,27 @@ impl Cx {
             HalEvent::XrDepth { window: _, display_ns, depth } => {
                 self.hal_xr_depth(display_ns, depth);
             }
+            HalEvent::XrSpace { window: _, generation } => {
+                self.hal_xr_space(generation);
+            }
             HalEvent::FrameReady { window, next_ns } => {
                 let window_id = window_id(window);
                 if self.windows.is_valid(window_id) {
                     self.hal.beat = true;
                     self.hal.ready_flip = Some(next_ns);
-                    if self.hal.xr.as_ref().is_some_and(|xr| xr.window == window_id) {
+                    if let Some(xr) = self.hal.xr.as_ref().filter(|xr| xr.window == window_id) {
                         self.hal.xr_beat = true;
+                        // the headset's frame comes right before this and is stamped on the same clock
+                        self.hal.frame_interval = next_ns.saturating_sub(xr.display_ns) as f64 / 1e9;
+                    } else {
+                        let flags = self.hal_info_flags();
+                        if flags & makepad_hal::info_flags::DISPLAY_CLOCK != 0 {
+                            self.hal.frame_tick = Some(time);
+                        }
+                        if next_ns > time_ns && flags & makepad_hal::info_flags::DIRECT_DISPLAY == 0 {
+                            // a direct display's `next_ns` is only its next vblank, so there we stay at 0 and wait for the due
+                            self.hal.frame_interval = (next_ns - time_ns) as f64 / 1e9;
+                        }
                     }
                     if let Some(w) = self.hal.windows.get_mut(&window_id.0) {
                         w.paced = true;
@@ -889,6 +949,7 @@ impl Cx {
                     if pass.painted_frame == frame {
                         pass.painted_serial = pass.painted_before;
                         pass.incomplete = true;
+                        pass.left_out = true;
                     }
                 }
             }
@@ -1001,7 +1062,8 @@ impl Cx {
                 // Nothing is drawn until DeviceReset: the event loop waits on the HAL's events
                 // (no frames are built or asked of a host meanwhile), so this is said once.
                 if !std::mem::replace(&mut self.hal.device_lost, true) {
-                    crate::error!("hal: GPU device {generation} was lost; pending compute=[{}]; waiting for the HAL to replace it", String::from_utf8_lossy(dispatches));
+                    let next = if self.gpu_device_recovers() { "waiting for the HAL to replace it" } else { "this backend cannot replace a device: it is gone for this session" };
+                    crate::error!("hal: GPU device {generation} was lost; pending compute=[{}]; {next}", String::from_utf8_lossy(dispatches));
                     self.hal_fail_device_readbacks();
                     self.call_event_handler(&Event::GpuLost);
                 }
@@ -1012,6 +1074,10 @@ impl Cx {
                 }
             }
             HalEvent::DeviceReset { generation } => self.hal_device_reset(generation),
+            HalEvent::BackendChanged { info } => match makepad_hal::HalInfo::from_bytes(info) {
+                Some(info) => self.hal_backend_changed(info),
+                None => crate::error!("hal: BackendChanged came without the new backend's info"),
+            },
             HalEvent::GpuPressure { wanted_mb, free_mb, budget_mb, reserve_mb, failed } => {
                 self.call_event_handler(&Event::GpuPressure(GpuPressureEvent { wanted_mb, free_mb, budget_mb, reserve_mb, failed }));
             }
@@ -1028,14 +1094,31 @@ impl Cx {
                     Self::send_studio_message(crate::studio::AppToStudio::DrawCompleteAndFlip(draw));
                 }
             }
-            HalEvent::Readback { req, status, rect, pixels } => {
+            HalEvent::Readback { req, status, rect, lease } => {
+                use makepad_hal::buffers::Wire;
+                let pixels = (lease.len() == makepad_hal::lease::Record::SIZE).then(|| {
+                    let record = makepad_hal::lease::Record::read(lease);
+                    // SAFETY: this event transfers one lease from the HAL in this process.
+                    unsafe { texture_readback_pixels(record) }
+                });
                 self.hal_readback(req, status, rect, pixels);
             }
             HalEvent::BufferLeases { req, status, records } => self.hal_buffer_leases(req, status, records),
-            // Cx asks for full pick images through TextureReadback; point picks belong to the host.
-            HalEvent::PickResult { .. } => {},
 
             // ---- results
+            HalEvent::PrintResult { req, status, message } => {
+                use crate::print::{PrintResult, PrintResultEvent};
+                use makepad_hal::print_status;
+                let Some(id) = self.hal.prints.remove(&req) else { return true };
+                let result = match status {
+                    print_status::PRINTED => PrintResult::Printed,
+                    print_status::CANCELLED => PrintResult::Cancelled,
+                    print_status::UNSUPPORTED => PrintResult::Unsupported,
+                    print_status::FAILED => PrintResult::Failed(String::from_utf8_lossy(message).into_owned()),
+                    _ => PrintResult::Failed(format!("unknown print status {status}: {}", String::from_utf8_lossy(message))),
+                };
+                self.call_event_handler(&Event::PrintResult(PrintResultEvent { id, result }));
+            }
             HalEvent::DialogResult { req, count, paths } => {
                 use crate::file_dialogs::FileDialogAction as A;
                 use crate::os::DialogKind as K;
@@ -1114,6 +1197,16 @@ impl Cx {
         self.redraw_all();
     }
 
+    /// The HAL draws with another backend now (Android's GLES fallback): we take its info and
+    /// compile every shader for its dialect. The `DeviceReset` right after repaints everything.
+    pub(crate) fn hal_backend_changed(&mut self, info: makepad_hal::HalInfo) {
+        let info = makepad_hal::HalInfo { session: self.hal.info.map_or(info.session, |i| i.session), ..info };
+        crate::log!("hal: the HAL moved to another backend ({}), compiling every shader for it", info.device_name());
+        self.hal_take_info(info);
+        self.hal.frames.backend_changed(info);
+        self.hal_recompile_shaders();
+    }
+
     pub(crate) fn hal_repaint_all(&mut self) {
         for id in self.passes.id_iter().collect::<Vec<_>>() {
             if self.passes[id].main_draw_list_id.is_some() {
@@ -1158,6 +1251,7 @@ impl Cx {
         new_geom.dpi_factor = dpi;
         // A hosted window is fullscreen when its host window manager says so (`HostedFullscreen`).
         new_geom.is_fullscreen = state == window_state::FULLSCREEN || self.windows[window_id].hosted_fullscreen;
+        new_geom.is_maximized = state == window_state::MAXIMIZE;
         let safe = self.hal.safe_area;
         let window = &mut self.windows[window_id];
         window.os_dpi_factor = Some(dpi);
@@ -1177,12 +1271,26 @@ impl Cx {
     /// Copy or cut: asks the focused widget for its text and puts the answer on the clipboard.
     /// A copy or cut of nothing (no selection) leaves the clipboard as it is.
     pub(crate) fn hal_clipboard_chord(&mut self, copy: bool) {
-        let response = Rc::new(RefCell::new(None));
-        let e = TextClipboardEvent { response: response.clone() };
-        self.call_event_handler(&if copy { Event::TextCopy(e) } else { Event::TextCut(e) });
-        let text = response.borrow().clone();
-        if let Some(text) = text.filter(|t| !t.is_empty()) {
-            self.hal.frames.w.clip_set(text.as_bytes());
+        let e = TextClipboardEvent::default();
+        let event = if copy { Event::TextCopy(e.clone()) } else { Event::TextCut(e.clone()) };
+        self.call_event_handler(&event);
+        if let Some(write) = e.written() {
+            self.hal_clipboard_write(write);
+        }
+    }
+
+    /// Puts a copy on the clipboard: a hosted child's goes to its host's.
+    pub(crate) fn hal_clipboard_write(&mut self, write: ClipboardWrite) {
+        if self.hal.hosted.is_some() {
+            Self::send_hosted_clipboard(write);
+        } else {
+            let data = makepad_hal::clipboard::ClipboardData {
+                text: write.text,
+                html: write.html.unwrap_or_default(),
+                markdown: write.markdown.unwrap_or_default(),
+                ..Default::default()
+            };
+            self.hal.frames.w.clip_set(&data.pack());
         }
     }
 
@@ -1223,7 +1331,7 @@ impl Cx {
                 }
             }
         }
-        self.fingers.process_touch_update_end(&e.touches);
+        self.end_touch_update(&e.touches);
     }
 
     /// Signals, actions, script tasks and network events the loop services on a wake and on
@@ -1232,6 +1340,7 @@ impl Cx {
         let _phase = crate::thread::ui_phase(crate::thread::UiPhase::Signals);
         let internal_signal = SignalToUI::check_and_clear_internal_signal();
         let ui_signal = SignalToUI::check_and_clear_ui_signal();
+        let hook_signal = SignalToUI::check_and_clear_hook_signal();
         let mut did = false;
         if internal_signal || ui_signal {
             #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -1240,8 +1349,12 @@ impl Cx {
             did = true;
         }
         if ui_signal {
+            // the signal hooks run first in it
             self.call_event_handler(&Event::Signal);
+        } else if hook_signal {
+            self.run_signal_hooks();
         }
+        did |= hook_signal;
         // a headset linked to the app's XR server: the remote headset slot is there from now on
         // (an XR display), the app's next drawing finds it
         if !self.hal.xr_remote_seen && makepad_hal::xr_remote::hal_xr_remote_enabled() {
@@ -1278,6 +1391,15 @@ impl Cx {
     }
 }
 
+fn release_texture_lease(token: u64) { makepad_hal::hal_lease_release(token); }
+
+/// # Safety
+/// The HAL delivered this record in this process; its one release obligation moves here.
+pub(crate) unsafe fn texture_readback_pixels(record: makepad_hal::lease::Record) -> crate::HostBuf {
+    // SAFETY: the caller transfers immutable storage and its release obligation.
+    unsafe { crate::HostBuf::from_lease(record.ptr as *const u8, record.len as usize, record.token, release_texture_lease) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1311,6 +1433,25 @@ mod tests {
         let items = drag_items(&payload, 2);
         assert_eq!(items[0], DragItem::FilePath { path: "/a/b".into(), internal_id: None });
         assert_eq!(items[1], DragItem::String { value: "x".into(), internal_id: None });
+    }
+
+    /// A maximized window says so (`is_maximized`, not `is_fullscreen`), and a display change,
+    /// which sends its geometry again at the new dpi, keeps it maximized, also while its host has
+    /// it fullscreen: the maximize button restores it then.
+    #[test]
+    fn a_maximized_window_stays_maximized_through_a_display_change() {
+        let mut cx = Cx::new(Box::new(|_: &mut Cx, _: &Event| {}));
+        let window = crate::window::WindowHandle::new(&mut cx);
+        let id = window.window_id();
+        cx.hal_window_geom(id, dvec2(0.0, 0.0), dvec2(800.0, 600.0), 1.0, window_state::MAXIMIZE);
+        assert!(window.is_maximized(&cx) && !window.is_fullscreen(&cx), "maximized, not fullscreen");
+        cx.windows[id].hosted_fullscreen = true;
+        cx.hal_intake(0, HalEvent::Display { window: hal_window_id(id), dpi: 2.0, refresh: 60.0 });
+        assert_eq!(cx.windows[id].window_geom.dpi_factor, 2.0, "the geometry at the new dpi");
+        assert!(window.is_maximized(&cx) && window.is_fullscreen(&cx), "still maximized, and fullscreen by its host");
+        cx.windows[id].hosted_fullscreen = false;
+        cx.hal_window_geom(id, dvec2(0.0, 0.0), dvec2(400.0, 300.0), 2.0, window_state::RESTORE);
+        assert!(!window.is_maximized(&cx) && !window.is_fullscreen(&cx), "restored");
     }
 
     #[test]

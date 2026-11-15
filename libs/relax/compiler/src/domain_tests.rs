@@ -58,7 +58,7 @@ fn fixture_in(file: &str, source: &str, entry_name: &str) -> (Box<Unit>, u64, st
     let path = root.join(file);
     std::fs::write(&path, source).unwrap();
     // the std sources of this checkout (as lazy_reload_tests.rs does: a test binary is not next to them)
-    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let sess = std::sync::Arc::new(crate::Session::default());
     let (prog, core, _) = crate::load_with_std(&sess, path.to_str().unwrap(), "teardown_fixture", false).unwrap();
     let mut tcx = crate::tcx::Tcx::new();
@@ -96,6 +96,7 @@ fn launch_with(u: &mut Unit, entry: u64, id: Option<DomainId>, arg: u64) -> (Dom
         base,
         entry,
         arg,
+        None,
         "teardown-fixture",
         None,
     )
@@ -115,21 +116,14 @@ fn heap_in_use() -> u64 {
 }
 
 /// The heap check counts the whole process, so what grows it besides the fixture is settled first.
-/// Each of these is one-off process state that the cycles would otherwise create in whichever
-/// cycle first needs it, which depends on how the threads interleave (and so on machine load):
-/// lazy compiles of the fixture's code, and the symbol tables of the images a teardown stack
-/// dump names (it runs only when a thread outlives its domain's stop).
+/// The lazy compiles of the fixture's code are one-off process state that the cycles would
+/// otherwise make in whichever cycle first needs them, which depends on how the threads
+/// interleave (and so on machine load). The tier workers also belong to the process:
+/// their lazy start on a hot call must precede the heap baseline. (Nothing in the cycles reads
+/// symbol tables: a stop reports no thread that is on its way out, so no stack is dumped.)
 #[cfg(target_os = "linux")]
 fn warm_process_state(u: &mut Unit, entry: u64) {
-    extern "C" {
-        fn getpid() -> i32;
-    }
     crate::jit::precompile_reachable(u, entry);
-    assert!(crate::inspect::symbols::host_symbol(getpid as *const () as usize as u64).is_some());
-    // This test's own code is in a host image only in a rustc build: under the JIT it is JIT
-    // code, which no image's symbol table holds (a stack dump names it from the JIT's tables).
-    #[cfg(not(relax))]
-    assert!(crate::inspect::symbols::host_symbol(warm_process_state as *const () as usize as u64).is_some());
 }
 
 #[test]
@@ -228,106 +222,23 @@ fn teardown_fixture_cycles_and_retiring_thread() {
     assert!(freed_by_teardown() > freed);
     next_flags[1].store(1, Ordering::SeqCst);
     stop(replacement, Stop::Quit).unwrap();
-    // `stop` returns once the replacement's main is done: its worker may still be in its TLS
-    // destructor, which is JIT code reading the domain's statics. The unit goes only after it.
+    // its main returned long ago, so the stop does not wait for the worker: the worker ends (its
+    // TLS destructor on the replacement's heap) before the record and that heap go
     wait_thread_done(replacement);
     domains().retain(|d| d.info.id != domain && d.info.id != replacement);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
 }
 
-// Compile the production pool, CPU budget and stop_workers into the JIT fixture,
-// with only their UI/logging/priority adapters replaced. No GPU, package resolver,
-// external tools or copied implementation of the pool is involved.
+// The CPU budget's source and an app whose task pool lives in a static (tests/static_pool/pool.rs).
+// The budget's `#[relax_api]` marks name a crate a one-file program does not have.
 fn static_pool_fixture() -> String {
-    let budget = include_str!("../../../../platform/cpu_budget/src/lib.rs")
-        .replace("use makepad_relax_api::relax_api;\n", "")
+    let budget = include_str!("../../../../libs/cpu_budget/src/lib.rs")
+        .replace("use relax_api::relax_api;\n", "")
         .replace("#[relax_api]\n", "");
-    let source = include_str!("../../../../platform/src/thread.rs");
-    let network = source.split_once("pub use makepad_network::{").unwrap().1
-        .split_once("};").unwrap().0;
-    let runtime = source.replacen("pub mod ui_hang;", r#"
-        pub mod ui_hang {
-            pub struct UiPhase;
-            pub struct UiPhaseGuard;
-            pub struct UiIdleGuard;
-            pub fn ui_phase() {}
-            pub fn ui_event_phase() {}
-            pub fn ui_idle() -> UiIdleGuard { UiIdleGuard }
-            pub mod relax_timeline {
-                pub struct Hooks {
-                    pub begin: fn(*const u8, usize),
-                    pub end: fn(*const u8, usize),
-                }
-                pub fn hooks() -> Option<&'static Hooks> { None }
-            }
-        }
-    "#, 1).replacen(&format!("pub use makepad_network::{{{network}}};"), r#"
-        pub struct SignalToUI;
-        impl SignalToUI {
-            pub fn set_ui_signal() {}
-            pub fn set_internal_signal() {}
-        }
-    "#, 1);
-    let restart = include_str!("../../../../platform/src/restart.rs");
-    let stop = restart.split_once("pub(crate) fn stop_workers(").unwrap().1
-        .split_once("\n}").unwrap().0;
-    let adapters = r#"
-        #[macro_export] macro_rules! log { ($($t:tt)*) => {} }
-        #[macro_export] macro_rules! error { ($($t:tt)*) => {} }
-        #[macro_export] macro_rules! trace { ($($t:tt)*) => {} }
-        mod os { pub fn wake_ui_event_loop() {} }
-        mod log { pub fn stop_sink() {} }
-        mod remote { pub fn stop_encoder() {} }
-        mod event {
-            #[derive(Clone, Copy)] pub struct Timer(pub u64);
-            pub struct TimerEvent { pub timer_id: u64 }
-            pub enum Event { Shutdown, Timer(TimerEvent) }
-        }
-        mod cx_api {
-            #[derive(Clone, Copy, Debug, Default)]
-            pub enum CxThreadPriority { #[default] Utility, UserInitiated, UserInteractive }
-        }
-        mod cx {
-            pub struct Cx {
-                pub thread_spawner: crate::thread::ThreadSpawner,
-                pub task_pool: std::cell::OnceCell<crate::thread::TaskPool>,
-                pub cpu_cores: usize,
-            }
-            impl Cx {
-                pub fn monotonic_now() -> f64 {
-                    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
-                }
-                pub fn set_thread_priority(_: crate::cx_api::CxThreadPriority) -> crate::thread::PriorityStatus {
-                    crate::thread::PriorityStatus::Applied
-                }
-                pub fn stop_timer(&mut self, _: crate::event::Timer) {}
-                pub fn start_timeout(&mut self, _: f64) -> crate::event::Timer { crate::event::Timer(1) }
-            }
-        }
-    "#;
-    format!("{adapters}\nmod makepad_cpu_budget {{\n{budget}\n}}\nmod thread {{\n{runtime}\nuse crate::makepad_cpu_budget;\npub(crate) fn fixture_pool(spawner: ThreadSpawner) -> TaskPool {{ let pool = TaskPool::create(spawner, 3).unwrap(); while pool.inner.workers.iter().any(|worker| !worker.idle.load(Ordering::Acquire)) {{ std::thread::yield_now(); }} pool }}\n}}\nmod restart {{\nstatic STOP_WAKER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);\npub(crate) fn stop_workers({stop}\n}}\n}}\n{STATIC_POOL_APP}")
+    let app = include_str!("../tests/static_pool/pool.rs");
+    format!("mod makepad_cpu_budget {{\n{budget}\n}}\n{app}")
 }
-
-const STATIC_POOL_APP: &str = r#"
-use std::sync::{OnceLock, atomic::{AtomicU64, Ordering}};
-use thread::{TaskPool, ThreadSpawner, Class};
-static POOL: OnceLock<TaskPool> = OnceLock::new();
-fn static_pool_app(p: *mut u64) {
-    let flags = unsafe { &*(p as *const [AtomicU64; 4]) };
-    assert!(POOL.get().is_none(), "relaunch must start from its own static image");
-    let spawner = ThreadSpawner::for_current_thread(4);
-    let pool = POOL.get_or_init(|| thread::fixture_pool(spawner.clone()));
-    flags[0].store(1, Ordering::SeqCst);
-    while flags[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
-    restart::stop_workers(&spawner);
-    assert!(!pool.is_open());
-    assert!(pool.submit(Class::Visible, || ()).is_err());
-    assert!(POOL.get().is_some(), "the pool handle remains in the static");
-    flags[2].store(1, Ordering::SeqCst);
-}
-"#;
 
 #[test]
 fn static_task_pool_relaunches_in_place_without_live_threads() {
@@ -343,7 +254,7 @@ fn static_task_pool_relaunches_in_place_without_live_threads() {
         wait(|| flags[0].load(Ordering::SeqCst) != 0);
         let live = info(domain).unwrap();
         for index in 0..3 {
-            assert!(live.thread_names.contains(&format!("makepad-pool-{index}")));
+            assert!(live.thread_names.contains(&format!("pool-{index}")));
         }
         flags[1].store(1, Ordering::SeqCst);
         main.join().unwrap();
@@ -414,11 +325,12 @@ fn a_build_script_start_under_a_loading_domain_finishes() {
         });
         let _ = done_tx.send(status.map(|s| s.map(|s| s.success())));
     });
-    // a deadline only to report the deadlock (the threads stay stuck when it is there)
-    match done_rx.recv_timeout(Duration::from_secs(60)) {
+    // (a process start that waits for the loader's compile job, the deadlock this is about,
+    // holds the test here, a hung test)
+    match done_rx.recv() {
         Ok(Ok(Ok(true))) => {}
         Ok(r) => panic!("the build script did not run: {:?}", r.map(|r| r.map_err(|e| e.to_string()))),
-        Err(_) => panic!("a process start under a loading domain's compile job never finished (fork waits for the loader's job)"),
+        Err(_) => panic!("the process start's thread ended without an answer"),
     }
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
@@ -698,8 +610,8 @@ fn fixture(p: *mut u64) {
 "#;
 
 /// A thread in no domain calls into the run's app: the call writes the app's static (the app's
-/// thread reads every write), its Box and an extension block are in the app's heap, and the
-/// thread is back in no domain after it.
+/// thread reads every write), its Box is in the app's heap, and the thread is back in no domain
+/// after it.
 #[test]
 fn a_native_thread_in_no_domain_calls_into_the_runs_app() {
     isolated_test!(a_native_thread_in_no_domain_calls_into_the_runs_app);
@@ -714,22 +626,19 @@ fn a_native_thread_in_no_domain_calls_into_the_runs_app() {
     wait(|| flags[0].load(Ordering::SeqCst) != 0);
     let (lo, len) = domains().iter().find(|d| d.info.id == domain).and_then(|d| d.heap.as_deref()).expect("the app's heap").range();
     let tap = flags[0].load(Ordering::SeqCst);
-    // tap, n -> the Box's address, the extension block's
+    // tap, n -> the Box's address
     extern "C" fn thunk(p: *mut u8) {
-        let c = unsafe { &mut *(p as *mut [u64; 4]) };
+        let c = unsafe { &mut *(p as *mut [u64; 3]) };
         let tap: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(c[0] as usize) };
         c[2] = tap(c[1]);
-        // (JIT code reaching a value's extension block: the same call on the same thread)
-        let mut word = 0u64;
-        c[3] = crate::lower::rt_ext_get(&mut word as *mut u64 as u64, 64, 16);
     }
     let made = std::thread::spawn(move || {
         (1..=3u64).map(|n| {
-            let mut c = [tap, n, 0, 0];
-            assert!(crate::jit::app_call(thunk, &mut c as *mut [u64; 4] as *mut u8));
+            let mut c = [tap, n, 0];
+            assert!(crate::jit::app_call(thunk, &mut c as *mut [u64; 3] as *mut u8));
             assert_eq!(current(), default_base(), "the call leaves the thread in no domain");
             assert!(crate::zone_alloc::domain::current().is_null(), "and with no heap");
-            (c[2], c[3])
+            c[2]
         }).collect::<Vec<_>>()
     }).join().unwrap();
     flags[1].store(1, Ordering::SeqCst);
@@ -737,9 +646,8 @@ fn a_native_thread_in_no_domain_calls_into_the_runs_app() {
     assert_eq!(flags[2].load(Ordering::SeqCst), 6, "the app's static holds every native call's write");
     assert_eq!(flags[3].load(Ordering::SeqCst), 3);
     let in_heap = |a: u64| (lo as u64..(lo + len) as u64).contains(&a);
-    for (boxed, ext) in made {
+    for boxed in made {
         assert!(in_heap(boxed), "Box {boxed:#x} outside the app's heap");
-        assert!(in_heap(ext), "extension block {ext:#x} outside the app's heap");
     }
     wait(|| info(domain).is_some_and(|i| i.threads == 0 && i.base == 0));
     domains().retain(|d| d.info.id != domain);
@@ -968,7 +876,6 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
     let (domain, _base, main) = launch(&mut u, entry, None, &flags);
     wait_at_place(domain, &flags);
     let end = end_run(up, Duration::from_secs(10));
-    eprintln!("{}", end.line());
     assert!(end.left.is_empty(), "left: {:?}", end.left);
     main.join().unwrap();
     wait_thread_done(domain);
@@ -979,6 +886,46 @@ fn a_run_ends_with_every_thread_wherever_it_is() {
     assert_eq!(end.called_in, 0);
     // no native frame was left behind on the way: nothing of the runtime's can stay locked
     assert_eq!(end.abandoned, Vec::new());
+    domains().retain(|d| d.info.id != domain);
+    drop(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+// flags[0]: the thread to hold runs
+const HELD_RUN: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
+fn fixture(p: *mut u64) {
+    let a = p as usize;
+    std::thread::Builder::new().name("held-for-good".into()).spawn(move || {
+        flags(a)[0].fetch_add(1, Ordering::SeqCst);
+        loop { std::thread::sleep(std::time::Duration::from_millis(20)); }
+    }).unwrap();
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A thread held for good (a frame of it in code a layout patch replaced: stale.rs `park_held`)
+/// leaves with its run: once the run's code is gone the end lets it go, and it ends as every other
+/// thread of the run does, its domain's memory back.
+#[test]
+fn a_thread_held_for_good_leaves_with_its_run() {
+    isolated_test!(a_thread_held_for_good_leaves_with_its_run);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(HELD_RUN, "fixture");
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, _base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[0].load(Ordering::SeqCst) == 1);
+    let held = crate::inspect::threads::list().into_iter().find(|t| t.name == "held-for-good").expect("the fixture's thread");
+    assert!(crate::inspect::instrument::hold_for_good(&held), "the thread is held");
+    let end = end_run(up, Duration::from_secs(10));
+    assert!(end.left.is_empty(), "left: {:?}", end.left);
+    main.join().unwrap();
+    wait_thread_done(domain);
+    let dead = info(domain).unwrap();
+    assert_eq!((dead.threads, dead.base), (0, 0));
+    assert_eq!(dead.state, DomainState::Stopped);
     domains().retain(|d| d.info.id != domain);
     drop(u);
     std::fs::remove_dir_all(root).unwrap();
@@ -1008,6 +955,142 @@ fn fixture(p: *mut u64) {
     loop { std::thread::park(); }
 }
 "#;
+
+const HOST_CALLBACK: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+static FLAGS: AtomicU64 = AtomicU64::new(0);
+fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
+/// An app command's answer: it waits for the program's event loop, which never answers (a
+/// `status` waits up to 600 s).
+extern "C" fn query() {
+    let a = FLAGS.load(Ordering::SeqCst) as usize;
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    // (its wait compiled before the call is counted as in it)
+    let _ = rx.recv_timeout(std::time::Duration::from_millis(1));
+    flags(a)[0].fetch_add(1, Ordering::SeqCst);
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(600));
+    drop(tx);
+    flags(a)[1].fetch_add(1, Ordering::SeqCst);
+}
+fn fixture(p: *mut u64) {
+    let a = p as usize;
+    FLAGS.store(a as u64, Ordering::SeqCst);
+    let q: extern "C" fn() = query;
+    flags(a)[3].store(q as usize as u64, Ordering::SeqCst);
+    loop { std::thread::park(); }
+}
+"#;
+
+/// A host call into the program (an inspect app command, `Callback::call`) that waits in there when
+/// the run ends comes back None at once: the end kicks its wait and the call leaves the ended code
+/// for its recovery point. No code of the ended run runs after, the host's frames around the call
+/// go on with what they hold (its lock is free), and the run's end is not held. Without the
+/// recovery point the thread stayed in the ended code with an inspect request's run gate, and a
+/// restart in place never finished (11-08).
+#[test]
+fn a_host_call_into_the_program_ends_with_the_run() {
+    isolated_test!(a_host_call_into_the_program_ends_with_the_run);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut u, entry, root) = fixture_of(HOST_CALLBACK, "fixture");
+    let up = &mut *u as *mut Unit;
+    let flags: [AtomicU64; 4] = Default::default();
+    let (domain, base, main) = launch(&mut u, entry, None, &flags);
+    wait(|| flags[3].load(Ordering::SeqCst) != 0);
+    let query = flags[3].load(Ordering::SeqCst) as usize;
+    let scope = domains().iter().find(|d| d.info.base == base).map(|d| Callback { id: d.info.id, base, started: d.started }).unwrap();
+    static CALLER_LOCK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+    let caller = std::thread::spawn(move || {
+        let _g = CALLER_LOCK.lock().unwrap();
+        let q: extern "C" fn() = unsafe { std::mem::transmute(query) };
+        scope.call(|| q())
+    });
+    wait(|| flags[0].load(Ordering::SeqCst) == 1);
+    // (a grace far past a kick's round trip: a call that stays is named in `left`, not waited for)
+    let end = end_run(up, Duration::from_secs(60));
+    assert!(end.left.is_empty(), "the call left with the run: {:?}", end.left);
+    assert!(caller.join().unwrap().is_none(), "the call came back saying the run ended");
+    assert!(CALLER_LOCK.try_lock().is_ok());
+    assert_eq!(flags[1].load(Ordering::SeqCst), 0, "code of the ended run ran");
+    assert!(scope.call(|| ()).is_none(), "a call after the run's end comes back at once");
+    main.join().unwrap();
+    wait_thread_done(domain);
+    assert_eq!(CALLED_IN.load(Ordering::SeqCst), 0, "no call stayed in the ended run");
+    domains().retain(|d| d.info.id != domain);
+    std::mem::forget(u);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+const HOST_QUERY: &str = r#"
+use std::sync::atomic::{AtomicU64, Ordering};
+static FLAGS: AtomicU64 = AtomicU64::new(0);
+fn flags(a: usize) -> &'static [AtomicU64; 4] { unsafe { &*(a as *const [AtomicU64; 4]) } }
+/// A quick answer of an app command (a wake of the event loop), read through the run's statics.
+extern "C" fn query() {
+    let a = FLAGS.load(Ordering::SeqCst) as usize;
+    flags(a)[0].fetch_add(1, Ordering::SeqCst);
+}
+fn fixture(p: *mut u64) {
+    let a = p as usize;
+    FLAGS.store(a as u64, Ordering::SeqCst);
+    let q: extern "C" fn() = query;
+    flags(a)[3].store(q as usize as u64, Ordering::SeqCst);
+    while flags(a)[1].load(Ordering::SeqCst) == 0 { std::thread::yield_now(); }
+}
+"#;
+
+/// A host thread that stays (the inspect server's) calls into each run in turn: a `session
+/// relaunch` wakes the program's event loop through `Callback::call` on it, run after run. Each call
+/// runs in its run's domain, with its statics, and leaves nothing registered there. The recovery
+/// point around the call once met the thread as new after the first run's end and freed the thread
+/// block the call had just been given: the app died at its second relaunch (11-09).
+#[test]
+fn a_host_thread_calls_into_each_run_in_turn() {
+    isolated_test!(a_host_thread_calls_into_each_run_in_turn);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (asks, asked) = std::sync::mpsc::channel::<(Callback, usize)>();
+    let (answers, answered) = std::sync::mpsc::channel::<Option<()>>();
+    let worker = std::thread::spawn(move || {
+        for (scope, query) in asked {
+            let q: extern "C" fn() = unsafe { std::mem::transmute(query) };
+            answers.send(scope.call(|| q())).unwrap();
+        }
+    });
+    let (mut units, mut roots) = (Vec::new(), Vec::new());
+    for run in 0..3 {
+        let (mut u, entry, root) = fixture_of(HOST_QUERY, "fixture");
+        u.tier1 = None;
+        let up = &mut *u as *mut Unit;
+        let flags: [AtomicU64; 4] = Default::default();
+        let (domain, base, main) = launch(&mut u, entry, None, &flags);
+        wait(|| flags[3].load(Ordering::SeqCst) != 0);
+        let scope = domains().iter().find(|d| d.info.base == base).map(|d| Callback { id: d.info.id, base, started: d.started }).unwrap();
+        for k in 1..=2u64 {
+            asks.send((scope, flags[3].load(Ordering::SeqCst) as usize)).unwrap();
+            assert_eq!(answered.recv().unwrap(), Some(()), "run {run}: call {k} came back");
+            assert_eq!(flags[0].load(Ordering::SeqCst), k, "run {run}: call {k} ran with its run's statics");
+            let stayed = domains().iter().filter(|d| d.info.base == base).map(|d| d.threads.iter().filter(|t| t.name == "host callback").count()).sum::<usize>();
+            assert_eq!(stayed, 0, "run {run}: call {k} left its registration in the domain");
+        }
+        flags[1].store(1, Ordering::SeqCst);
+        main.join().unwrap();
+        wait_thread_done(domain);
+        let end = end_run(up, Duration::from_secs(10));
+        assert!(end.left.is_empty(), "left: {:?}", end.left);
+        crate::jit::thread_locals_end();
+        unsafe { crate::os::tls::reset_statics() };
+        domains().retain(|d| d.info.id != domain);
+        units.push(u);
+        roots.push(root);
+    }
+    drop(asks);
+    worker.join().unwrap();
+    std::mem::forget(units);
+    // (each run's fixture is in the one folder of this process)
+    roots.dedup();
+    for root in roots {
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
 
 static HOST_LOCK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
 static IN_NATIVE: AtomicU64 = AtomicU64::new(0);
@@ -1044,6 +1127,9 @@ fn a_run_ends_with_native_frames_in_it_and_no_host_lock_stays_held() {
     extern "C" fn thunk(p: *mut u8) {
         let f: extern "C" fn() = unsafe { std::mem::transmute(p) };
         f();
+        // (no tail call: a frame of its own where the build keeps frame records, as a native
+        // caller's function has)
+        std::hint::black_box(p);
     }
     // a native thread with a lock of its own, in a callback that waits
     static CALLER_LOCK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
@@ -1056,7 +1142,6 @@ fn a_run_ends_with_native_frames_in_it_and_no_host_lock_stays_held() {
     });
     wait(|| flags[0].load(Ordering::SeqCst) == 1);
     let end = end_run(up, Duration::from_millis(300));
-    eprintln!("{}", end.line());
     assert!(end.left.iter().any(|l| l.1 == "in-native"), "the call is never cut off: {:?}", end.left);
     assert!(!caller.join().unwrap(), "the callback's call came back saying the run ended");
     assert!(CALLER_LOCK.try_lock().is_ok());
@@ -1174,11 +1259,16 @@ fn the_next_run_finds_nothing_locked_and_its_crash_is_a_crash() {
 const HOLDS: &str = r#"
 use std::sync::atomic::{AtomicU64, Ordering};
 extern "C" fn called_after_the_end() {}
+// pthread_key_t: an unsigned long on Apple's systems, an unsigned int on the others
+#[cfg(target_vendor = "apple")]
+type Key = usize;
+#[cfg(all(unix, not(target_vendor = "apple")))]
+type Key = u32;
 #[cfg(unix)]
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn signal(sig: i32, handler: usize) -> usize;
-    fn pthread_key_create(key: *mut u32, dtor: usize) -> i32;
+    fn pthread_key_create(key: *mut Key, dtor: usize) -> i32;
     fn pthread_atfork(prepare: Option<extern "C" fn()>, parent: Option<extern "C" fn()>, child: Option<extern "C" fn()>) -> i32;
 }
 #[cfg(unix)]
@@ -1193,7 +1283,7 @@ fn platform() -> *mut u8 {
     const SIGUSR2: i32 = 31;
     unsafe {
         signal(SIGUSR2, called_after_the_end as usize);
-        let mut key = 0;
+        let mut key: Key = 0;
         pthread_key_create(&mut key, called_after_the_end as usize);
         pthread_atfork(Some(called_after_the_end), None, None);
         mmap(std::ptr::null_mut(), 1 << 20, 3, 2 | MAP_ANON, -1, 0)
@@ -1304,19 +1394,41 @@ fn end_process(pid: u32) {
     }
 }
 
-/// What the process has open now.
-fn open_count() -> usize {
+/// What the process has open now: each descriptor and the file it names ("" for a pipe or a
+/// socket where the system names none), but the listing's own; on Windows, one row per handle.
+fn open_now() -> Vec<(u64, String)> {
     #[cfg(target_os = "linux")]
-    return std::fs::read_dir("/proc/self/fd").unwrap().count();
+    return std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).map(|e| {
+        (e.file_name().to_string_lossy().parse().unwrap_or(u64::MAX), std::fs::read_link(e.path()).map(|t| t.to_string_lossy().into_owned()).unwrap_or_default())
+    }).filter(|(_, file)| *file != format!("/proc/{}/fd", std::process::id())).collect();
     #[cfg(target_vendor = "apple")]
-    return std::fs::read_dir("/dev/fd").unwrap().count();
+    {
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_GETPATH: i32 = 50;
+        return std::fs::read_dir("/dev/fd").unwrap().filter_map(|e| e.ok()).filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok()).map(|fd| {
+            let mut buf = [0u8; 1024];
+            let named = unsafe { fcntl(fd, F_GETPATH, buf.as_mut_ptr()) } == 0;
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+            (fd as u64, if named { String::from_utf8_lossy(&buf[..end]).into_owned() } else { String::new() })
+        }).filter(|(_, file)| file != "/dev/fd").collect();
+    }
     #[cfg(windows)]
     {
         use crate::os::win32::{GetCurrentProcess, GetProcessHandleCount};
         let mut n = 0;
         unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) };
-        n as usize
+        (0..n as u64).map(|i| (i, String::new())).collect()
     }
+}
+
+/// A file the compiler has open for itself: a source file a lazy compile read (kept for the rest
+/// of the process), a cache store (any generation) or a store write in progress. Under load the
+/// compiler's work for the first round lands in a later one, and so do these
+fn the_compilers(file: &str) -> bool {
+    let name = file.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(file);
+    name.ends_with(".rs") || name.contains(".rcs")
 }
 
 /// The run's end gives back what the run held, though it never did: the next run binds the same
@@ -1325,20 +1437,19 @@ fn open_count() -> usize {
 fn a_run_ends_with_what_it_held_given_back() {
     isolated_test!(a_run_ends_with_what_it_held_given_back);
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let mut counts = Vec::new();
+    let (mut counts, mut lefts) = (Vec::new(), Vec::new());
     for _ in 0..3 {
         let (mut u, entry, root) = fixture_of(HOLDS, "fixture");
         u.tier1 = None;
         let up = &mut *u as *mut Unit;
         let flags: [AtomicU64; 4] = Default::default();
-        let open_before = open_count();
+        let open_before = open_now();
         let (domain, _base, main) = launch(&mut u, entry, None, &flags);
         wait(|| {
             if let Some(DomainState::Crashed(why)) = state(domain) { panic!("the fixture crashed: {why}"); }
             flags[0].load(Ordering::SeqCst) == 1
         });
         let end = end_run(up, Duration::from_secs(10));
-        eprintln!("{}", end.line());
         assert!(end.left.is_empty(), "left: {:?}", end.left);
         main.join().unwrap();
         wait_thread_done(domain);
@@ -1370,14 +1481,16 @@ fn a_run_ends_with_what_it_held_given_back() {
             }
             assert_eq!(unsafe { signal(SIGUSR2, 0) }, 0, "the run's handler stayed");
         }
-        counts.push(open_count() as i64 - open_before as i64);
+        // what the round left open, by what it names: not a count of the whole process
+        let left: Vec<_> = open_now().into_iter().filter(|f| !open_before.contains(f) && !the_compilers(&f.1)).collect();
+        counts.push(left.len());
+        lefts.push(left);
         domains().retain(|d| d.info.id != domain);
         drop(u);
         std::fs::remove_dir_all(root).unwrap();
     }
-    eprintln!("left open by each round: {counts:?}");
     // (the first round's lazy compiles open what stays open for the whole process)
-    assert_eq!(&counts[1..], &[0, 0], "left open: {counts:?}");
+    assert_eq!(&counts[1..], &[0, 0], "left open: {lefts:?}");
 }
 
 // Sets one handler with `signal`, a second over it with `sigaction` that calls the one before it
@@ -1562,25 +1675,15 @@ fn a_fault_deeper_in_native_code_ends_the_process_at_once() {
         return;
     }
     let log = std::env::temp_dir().join(format!("relax-native-fault-{}.log", std::process::id()));
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", THIS, "--test-threads=1", "--nocapture"])
-        .env(CHILD, "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::fs::File::create(&log).unwrap())
-        .spawn()
-        .unwrap();
-    let since = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        // (the fixture's compile comes first, on a loaded machine; the end is what is bounded)
-        if since.elapsed().as_secs() >= 300 {
-            child.kill().unwrap();
-            panic!("the process stayed up after its fault:\n{}", std::fs::read_to_string(&log).unwrap_or_default());
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    // (the fixture's compile comes first; a process that stayed up after its fault holds the
+    // test here, a hung test)
+    let status = crate::test_child::status(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", THIS, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap()),
+    );
     let told = std::fs::read_to_string(&log).unwrap();
     std::fs::remove_file(&log).unwrap();
     assert!(told.contains("the process ends"), "{status:?}\n{told}");
@@ -1588,4 +1691,15 @@ fn a_fault_deeper_in_native_code_ends_the_process_at_once() {
     assert_eq!(status.code(), Some(0xc000_0005u32 as i32), "{told}");
     #[cfg(unix)]
     assert!(std::os::unix::process::ExitStatusExt::signal(&status).is_some(), "{status:?}\n{told}");
+}
+
+/// A run whose boot ended before its unit was in (its build failed) has no code and no program
+/// threads: its end, for a restart asked meanwhile (`session relaunch`), ends nothing and reads no
+/// unit (the end read through the missing unit and the process died, 11-07).
+#[test]
+fn a_run_with_no_unit_ends_with_nothing_to_end() {
+    isolated_test!(a_run_with_no_unit_ends_with_nothing_to_end);
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let end = end_run(std::ptr::null_mut(), Duration::from_millis(100));
+    assert_eq!((end.threads, end.left.len()), (0, 0), "{}", end.line());
 }

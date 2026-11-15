@@ -48,6 +48,16 @@ struct Pipe {
     epoch: u64,
     announced: bool,
 }
+/// A program that ran out of memory on a live device. Its pipelines keep the failure until a
+/// build made again in the background fits, then they move to that build.
+struct Starved {
+    failed: Arc<PipeState>,
+    next: Option<Arc<PipeState>>,
+    /// when `next` starts, if it isn't running (HAL clock ns)
+    retry_ns: u64,
+}
+/// How long a program that ran out of memory waits to be built again, as on Vulkan.
+const STARVED_RETRY_NS: u64 = 16_000_000;
 
 /// How often the device's memory count is read.
 const COUNT_NS: u64 = 250_000_000;
@@ -64,6 +74,7 @@ pub struct D3d11 {
     compute: HashMap<(u32, u32), compute::Pipe>,
     /// compiled pipelines shared by identical sources and layouts (by `PipeSrc::hash_key`)
     programs: HashMap<u64, Vec<Weak<PipeState>>>,
+    starved: Vec<Starved>,
     /// windows' retained images, by (owner, index)
     win: HashMap<(u32, u32), Tex>,
     /// session 0's windows with a badge layer (by index), and the image each last presented: its
@@ -72,8 +83,7 @@ pub struct D3d11 {
     /// the composed image the badge frame being encoded draws into
     compose: Option<Arc<Texture>>,
     aliases: HashMap<(u32, Id), Id>,
-    /// the id target of each window's newest pick frame, and the targets missing a draw
-    pick_ids: HashMap<(u32, Id), Id>,
+    /// Pick targets whose latest replay skipped a draw.
     pick_pending: std::collections::HashSet<(u32, Id)>,
     /// window capture textures (recording), reused once no sink holds them
     captures: Vec<([u32; 2], makepad_windows_sys::Win32::Graphics::Direct3D11::ID3D11Texture2D, crate::ledger::Charge)>,
@@ -139,7 +149,7 @@ impl D3d11 {
             msaa: 1,
             dpi: shell.map_or_else(win32::system_dpi, |s| s.dpi()),
             // offscreen too: a badge layer is composed into the retained image's copy either way
-            flags: info_flags::GPU_TIMESTAMPS | info_flags::WINDOW_BADGES | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS | info_flags::DEVICE_RESET,
+            flags: info_flags::GPU_TIMESTAMPS | info_flags::WINDOW_BADGES | info_flags::WINDOW_LAYERS | info_flags::COMPUTE | info_flags::DRAW_STORAGE_BUFFERS | info_flags::DEVICE_RESET,
             max_workgroup_size: [1024, 1024, 64],
             max_workgroup_invocations: 1024,
             storage_formats: (0..format::COUNT).filter(|f| device::dxgi(*f).is_some_and(|fmt| unsafe { dev.device.CheckFormatSupport(fmt.resource) }.unwrap_or(0) & 0x02000000 != 0)).fold(0, |bits, f| bits | (1u64 << f)),
@@ -186,11 +196,11 @@ impl D3d11 {
             pipe: HashMap::new(),
             compute: HashMap::new(),
             programs: HashMap::new(),
+            starved: Vec::new(),
             win: HashMap::new(),
             badged: HashMap::new(),
             compose: None,
             aliases: HashMap::new(),
-            pick_ids: HashMap::new(),
             pick_pending: Default::default(),
             acquired: Vec::new(),
             captures: Vec::new(),
@@ -318,8 +328,7 @@ impl D3d11 {
                     world.frame_done(sid, target, kind, frame, gpu_ns, done.time, gpu_span);
                 }
                 Event::BufferLeases { req, status, leases } => world.to_session(sid, |q| q.buffer_leases(req, status, leases)),
-                Event::Readback { req, status, rect, pixels } => world.to_session(sid, |q| q.readback(req, status, rect, &pixels)),
-                Event::Pick { req, ids } => world.to_session(sid, |q| q.pick_result(req, &ids.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>())),
+                Event::Readback { req, status, rect, lease } => world.to_session(sid, |q| q.readback(req, status, rect, lease)),
             }
         }
         for ((sid, index), pipe) in &mut self.pipe {
@@ -336,6 +345,11 @@ impl D3d11 {
             }
             if let Some(e) = pipe.state.failure() {
                 eprintln!("[hal-d3d11] pipeline {id:?} failed: {}", e.lines().next().unwrap_or(""));
+                // D3D11 can't ask the apps for room, so `step` builds it again until some frees up
+                if pipe.state.out_of_memory() && !self.dev.check_lost() && !self.starved.iter().any(|st| Arc::ptr_eq(&st.failed, &pipe.state)) {
+                    eprintln!("[hal-d3d11] `{}` ran out of memory; building it again until it fits", pipe.state.src.name);
+                    self.starved.push(Starved { failed: pipe.state.clone(), next: None, retry_ns: crate::clock_ns() + STARVED_RETRY_NS });
+                }
                 let log = e.to_owned();
                 world.to_session(*sid, |q| q.pipeline_failed(id, log.as_bytes()));
             } else if pipe.state.ready().is_some() {
@@ -408,6 +422,38 @@ impl Backend for D3d11 {
     }
     fn step(&mut self, world: &mut World, sid: u32) {
         self.recover(world);
+        // A program that ran out of memory is built again until a build fits. Its pipelines move
+        // to that build, and the `drain` below tells them how it went.
+        if !self.starved.is_empty() && !self.dev.check_lost() {
+            let now = crate::clock_ns();
+            for mut st in std::mem::take(&mut self.starved) {
+                // no pipeline uses it anymore
+                if Arc::strong_count(&st.failed) == 1 {
+                    continue;
+                }
+                match st.next.take() {
+                    None if now < st.retry_ns => {}
+                    None => {
+                        let next = PipeState::new(st.failed.src.clone());
+                        self.compile(&next);
+                        st.next = Some(next);
+                    }
+                    Some(next) => match next.program.get() {
+                        None => st.next = Some(next),
+                        Some(_) if next.out_of_memory() => st.retry_ns = now + STARVED_RETRY_NS,
+                        Some(_) => {
+                            for pipe in self.pipe.values_mut().filter(|p| Arc::ptr_eq(&p.state, &st.failed)) {
+                                pipe.state = next.clone();
+                                pipe.epoch = 0;
+                            }
+                            self.programs.entry(next.src.hash_key()).or_default().push(Arc::downgrade(&next));
+                            continue;
+                        }
+                    },
+                }
+                self.starved.push(st);
+            }
+        }
         self.drain(world);
         if let Some(shell) = self.shell {
             for (owner, id) in shell.drain_events(sid, world) {
@@ -428,7 +474,9 @@ impl Backend for D3d11 {
         exec::step_timers(world, sid);
     }
     fn next_due(&self, world: &World, sid: u32) -> Option<u64> {
-        exec::next_timer(world, sid)
+        // timers, and the next build of a program that ran out of memory
+        let retry = self.starved.iter().filter(|st| st.next.is_none()).map(|st| st.retry_ns).min();
+        exec::next_timer(world, sid).into_iter().chain(retry).min()
     }
     fn session_closed(&mut self, world: &mut World, sid: u32) {
         if let Some(shell) = self.shell {
@@ -445,7 +493,6 @@ impl Backend for D3d11 {
         self.native_fallback.retain(|k| k.0 != sid);
         if sid == HOST { self.badged.clear(); }
         self.aliases.retain(|k, _| k.0 != sid);
-        self.pick_ids.retain(|k, _| k.0 != sid);
         self.pick_pending.retain(|k| k.0 != sid);
         self.programs.retain(|_, list| {
             list.retain(|w| w.strong_count() > 0);
@@ -491,7 +538,6 @@ impl exec::DeviceReset for D3d11 {
         self.segments.clear();
         self.segment_depths.clear();
         for composed in self.badged.values_mut() { *composed = None; }
-        self.pick_ids.clear();
         self.pick_pending.clear();
         self.captures.clear();
         self.acquired.clear();
@@ -522,6 +568,8 @@ impl exec::DeviceReset for D3d11 {
             }
         }
         self.programs.clear();
+        // every program is built again below, the ones that ran out of memory too
+        self.starved.clear();
         let mut rebuilt: HashMap<*const PipeState, Arc<PipeState>> = HashMap::new();
         let keys: Vec<(u32, u32)> = self.pipe.keys().copied().collect();
         for key in keys {
@@ -598,6 +646,7 @@ impl Gpu for D3d11 {
     }
 
     fn badges(&self) -> bool { true }
+    fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, _now: u64) -> bool { self.copy_into_layer(s, window, layer) }
     fn badge_layer(&mut self, window: Id, on: bool) {
         if on { self.badged.entry(window.index).or_insert(None); } else { self.badged.remove(&window.index); }
     }
@@ -632,11 +681,11 @@ impl Gpu for D3d11 {
     }
     fn texture_readback(&mut self, s: &mut Session, id: Id, req: u32, rect: [u32; 4]) {
         if self.pick_pending.contains(&(s.id, id)) {
-            s.events.readback(req, crate::types::readback::INCOMPLETE, rect, &[]);
+            s.events.readback(req, crate::types::readback::INCOMPLETE, rect, None);
             return;
         }
         let t = self.resolve(s, id);
-        self.read(s, t, req, rect, None);
+        self.read(s, t, req, rect);
     }
     fn texture_share(&mut self, s: &mut Session, id: Id) {
         let key = self.tex.get(&(s.id, id.index)).filter(|t| t.gen == id.gen).and_then(|t| t.tex.shared.as_ref()).map_or(0, |sh| sh.key);
@@ -653,6 +702,11 @@ impl Gpu for D3d11 {
     }
     fn buffer_create(&mut self, s: &mut Session, id: Id, b: &mut BufferObj) -> Result<(), String> {
         let buf = Buffer::new(self.dev.clone(), b.kind, b.size)?;
+        // A retained buffer reads as zero where nothing wrote it, as on Vulkan and Metal. D3D11
+        // leaves a new buffer's bytes undefined (the driver hands out memory the process freed),
+        // so a storage buffer is cleared on the GPU here; the other kinds are read only where
+        // uploaded (a uniform buffer is written whole).
+        if let Some(uav) = &buf.uav { unsafe { self.dev.ctx.ClearUnorderedAccessViewUint(uav, &[0; 4]) } }
         b.bytes = buf.bytes;
         self.buf.insert((s.id, id.index), Buf { gen: id.gen, buf, evictable: b.evictable });
         Ok(())
@@ -727,13 +781,10 @@ impl Gpu for D3d11 {
     fn frame(&mut self, s: &mut Session, sid: u32, target: Id, kind: u32, packet: u32, view: &CmdView, now: u64) -> Option<exec::SubmittedFrame> {
         self.encode_frame(s, sid, target, kind, packet, view, now)
     }
-    fn pick(&mut self, s: &mut Session, window: Id, req: u32, pos: [f32; 2]) {
-        self.read_pick(s, window, req, pos);
-    }
     fn snapshot(&mut self, s: &mut Session, window: Id, req: u32) {
         let t = self.window_image(s, window);
         let rect = t.as_ref().map_or([0; 4], |t| [0, 0, t.desc.w, t.desc.h]);
-        self.read(s, t, req, rect, None);
+        self.read(s, t, req, rect);
     }
     fn window_copy(&mut self, s: &mut Session, window: Id, texture: Id, req: u32) {
         self.copy_window(s, window, texture, req);
@@ -744,7 +795,6 @@ impl Gpu for D3d11 {
         self.segment_depths.retain(|k, _| (k.0, k.1) != (sid, id.index));
         self.native_fallback.remove(&(sid, id));
         if sid == HOST { self.badged.remove(&id.index); }
-        self.pick_ids.remove(&(sid, id));
         if let Some(shell) = self.shell {
             self.chains.remove(shell, (sid, id));
         }
@@ -757,7 +807,6 @@ impl Gpu for D3d11 {
             self.aliases.insert((sid, id), host);
         } else {
             self.aliases.remove(&(sid, id));
-            self.pick_ids.remove(&(sid, id));
         }
     }
 }

@@ -7,7 +7,8 @@
 //!   no trailers, bounded hex size lines).
 //! - Budgets everywhere: head bytes, header line bytes, header count, target
 //!   length, query pair count, body bytes, chunk size digits.
-//! - No percent-decoding: a literal `%` in the target is refused, so routes
+//! - The target takes RFC 3986's characters (unreserved, sub-delims, `:`
+//!   `@` `/` `?`), but no percent-decoding: a literal `%` is refused, so routes
 //!   only ever see the byte-for-byte charset below and no decoded alias can
 //!   smuggle separators. Path segments `.` and `..` are refused outright.
 //! - Duplicate tracked headers and duplicate query keys are refused.
@@ -111,6 +112,9 @@ pub struct Head {
     pub origin: Option<String>,
     /// `Content-Type` as sent (bounded); routes decide what they accept.
     pub content_type: Option<String>,
+    /// `Content-Length` as declared, `Some(0)` included; `None` when the
+    /// request sent none (chunked or no body), so a route can require one.
+    pub content_length: Option<u64>,
     /// `Accept` as sent (bounded).
     pub accept: Option<String>,
     /// `MCP-Protocol-Version` as sent (bounded).
@@ -161,23 +165,54 @@ enum Fill {
     Retry,
 }
 
-pub struct Conn {
-    stream: TcpStream,
+/// What a [`Conn`] runs over: a TCP stream, or a stream layered on one (TLS)
+/// whose socket options reach that TCP stream. Reads that time out report
+/// `WouldBlock` or `TimedOut`, as a TCP stream's do.
+pub trait Transport: Read + Write {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()>;
+    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr>;
+}
+
+impl Transport for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+
+    fn set_nonblocking(&self, nonblocking: bool) -> std::io::Result<()> {
+        TcpStream::set_nonblocking(self, nonblocking)
+    }
+
+    fn peer_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        TcpStream::peer_addr(self)
+    }
+}
+
+pub struct Conn<S: Transport = TcpStream> {
+    stream: S,
     buf: Vec<u8>,
     pos: usize,
     read_timeout: Duration,
 }
 
-impl Conn {
+impl Conn<TcpStream> {
     pub fn new(stream: TcpStream, read_timeout_ms: u64, write_timeout_ms: u64) -> std::io::Result<Conn> {
         stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(Duration::from_millis(write_timeout_ms.max(1))))?;
-        Ok(Conn {
+        Ok(Conn::over(stream, read_timeout_ms))
+    }
+}
+
+impl<S: Transport> Conn<S> {
+    /// A connection over any transport. The caller has set its write timeout
+    /// (and TCP_NODELAY) on the socket underneath.
+    pub fn over(stream: S, read_timeout_ms: u64) -> Conn<S> {
+        Conn {
             stream,
             buf: Vec::with_capacity(16 * 1024),
             pos: 0,
             read_timeout: Duration::from_millis(read_timeout_ms.max(1)),
-        })
+        }
     }
 
     /// Is the peer on this machine's loopback interface?
@@ -534,8 +569,11 @@ impl Conn {
 
     /// Decide whether the connection can be kept alive after a response, and
     /// drain a small unread Length remainder if that is all that blocks it.
+    /// A request that closes its connection has what came of its body read
+    /// away first ([`Conn::drain_arrived`]).
     pub fn finish_request(&mut self, head: &mut Head) -> bool {
         if head.close {
+            self.drain_arrived(head);
             return false;
         }
         if head.body.consumed() {
@@ -560,6 +598,34 @@ impl Conn {
             }
             _ => false,
         }
+    }
+
+    /// Reads away what has come of an unread Length body, buffered or in the
+    /// socket, and waits for none of the rest: a connection that closes over
+    /// unread bytes closes with a reset ([`Conn::drain_remaining`]), so the
+    /// client may never read the response, while a body that has not come
+    /// (one that timed out) is not waited for again.
+    fn drain_arrived(&mut self, head: &mut Head) {
+        if head.continue_pending {
+            return;
+        }
+        let BodyState::Length { remaining, .. } = &mut head.body else { return };
+        let buffered = ((self.buf.len() - self.pos) as u64).min(*remaining);
+        self.consume(buffered as usize);
+        *remaining -= buffered;
+        if *remaining == 0 || self.stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        let mut sink = [0u8; 16 * 1024];
+        while *remaining > 0 {
+            let want = (*remaining).min(sink.len() as u64) as usize;
+            match self.stream.read(&mut sink[..want]) {
+                Ok(n) if n > 0 => *remaining -= n as u64,
+                // the peer closed, or nothing more has come (WouldBlock)
+                _ => break,
+            }
+        }
+        let _ = self.stream.set_nonblocking(false);
     }
 
     pub fn write_resp(&mut self, is_head: bool, resp: &Resp) -> std::io::Result<()> {
@@ -632,6 +698,7 @@ pub fn reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         408 => "Request Timeout",
         409 => "Conflict",
+        411 => "Length Required",
         413 => "Payload Too Large",
         414 => "URI Too Long",
         416 => "Range Not Satisfiable",
@@ -682,10 +749,15 @@ fn find_terminator(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
+/// RFC 3986 `pchar` and `query` characters except `%` (refused before this
+/// check, since targets are never percent-decoded): unreserved, sub-delims,
+/// `:` and `@`, plus `/` and `?`. A comma-separated list value is legal.
 fn target_byte_ok(b: u8) -> bool {
     matches!(b,
         b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'
-        | b'-' | b'_' | b'.' | b'/' | b':' | b'?' | b'=' | b'&')
+        | b'-' | b'_' | b'.' | b'~'
+        | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'='
+        | b':' | b'@' | b'/' | b'?')
 }
 
 fn token_byte_ok(b: u8) -> bool {
@@ -878,6 +950,7 @@ pub fn parse_head(block: &[u8]) -> Result<Head, (u16, &'static str)> {
     };
 
     // ---- body framing ----
+    let mut declared_length = None;
     if content_length.is_some() && transfer_encoding.is_some() {
         return Err((400, "content-length with transfer-encoding"));
     }
@@ -897,6 +970,7 @@ pub fn parse_head(block: &[u8]) -> Result<Head, (u16, &'static str)> {
             return Err((400, "malformed content-length"));
         }
         let n: u64 = cl.parse().map_err(|_| (400, "malformed content-length"))?;
+        declared_length = Some(n);
         if n == 0 {
             BodyState::None
         } else {
@@ -921,6 +995,7 @@ pub fn parse_head(block: &[u8]) -> Result<Head, (u16, &'static str)> {
         authorization,
         origin,
         content_type,
+        content_length: declared_length,
         accept,
         mcp_protocol_version,
         mcp_session_id,
@@ -1083,6 +1158,13 @@ mod tests {
         assert_eq!(head_of(b"GET /a?x=1&x=2 HTTP/1.1\r\nHost: x\r\n\r\n").unwrap_err().0, 400);
         assert_eq!(head_of(b"GET http://h/a HTTP/1.1\r\nHost: x\r\n\r\n").unwrap_err().0, 400);
         assert_eq!(head_of(b"GET /a b HTTP/1.1\r\nHost: x\r\n\r\n").unwrap_err().0, 400);
+        assert_eq!(head_of(b"GET /a%2Cb HTTP/1.1\r\nHost: x\r\n\r\n").unwrap_err().0, 400, "no percent-decoding");
+        assert_eq!(head_of(b"GET /a\"b HTTP/1.1\r\nHost: x\r\n\r\n").unwrap_err().0, 400, "outside RFC 3986");
+        // RFC 3986 sub-delims and the rest of pchar are legal in path and query.
+        let head = head_of(b"GET /a,b;c@d~e!$'()*+ HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert_eq!(head.segs, vec!["a,b;c@d~e!$'()*+".to_string()]);
+        let head = head_of(b"GET /a?list=x,y:z/w HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        assert_eq!(head.query_get("list"), Some("x,y:z/w"));
     }
 
     #[test]
@@ -1154,6 +1236,32 @@ mod tests {
         assert_eq!(parse_range(Some("bytes=a-b"), 100), RangeSpec::None);
         assert_eq!(parse_range(Some("bites=0-1"), 100), RangeSpec::None);
         assert_eq!(parse_range(Some("bytes=5-2"), 100), RangeSpec::None);
+    }
+
+    /// A request that closes its connection is answered before its body is read (a refusal of
+    /// its target): the body is read away first, so the close is clean and the client reads the
+    /// whole response, not a reset.
+    #[test]
+    fn a_closing_request_answered_before_its_body_closes_cleanly() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let unread = server.try_clone().unwrap();
+        let mut conn = Conn::new(server, 5000, 5000).unwrap();
+        client.write_all(b"PUT /x HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\n").unwrap();
+        let Ok(mut head) = conn.next_request(5000, 5000, &AtomicBool::new(false)) else { panic!("the head never came") };
+        // the body comes after the head was read: it waits in the socket, unread
+        client.write_all(b"hello").unwrap();
+        let mut seen = [0u8; 8];
+        while !matches!(unread.peek(&mut seen), Ok(5)) {}
+        drop(unread);
+        assert!(!conn.finish_request(&mut head), "a closing request kept its connection");
+        conn.write_resp(false, &Resp::bytes(400, "text/plain; charset=utf-8", b"bad name".to_vec()).closing()).unwrap();
+        drop(conn);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).expect("the close reset the connection");
+        assert!(bytes.starts_with(b"HTTP/1.1 400"), "{}", String::from_utf8_lossy(&bytes));
     }
 
     #[test]

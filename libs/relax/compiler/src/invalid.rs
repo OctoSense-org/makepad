@@ -22,8 +22,11 @@
 //! the generation (or a later layout patch) invalidates it with the rest.
 //!
 //! First code cannot be made inaccessible (it shares pages). A layout-changing patch therefore
-//! pauses the program while it installs and holds every thread with a frame in the first code of
-//! a fn it rebuilt (`hold_old_frames`, stale.rs `park_held`): such a thread never returns there.
+//! pauses the program, and with a thread in code of a fn it rebuilds (`frame_in`) it does not
+//! install: the edit is a restart, offered, and the running code goes on. Under the same pause it
+//! installs, and a thread found in such code after all (one the pause did not stop entered it) is
+//! held for good (`hold_old_frames`, stale.rs `park_held`): it never returns there, and the app
+//! runs on without it until the restart that is offered.
 
 use crate::jit::{FnKey, Unit};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -343,7 +346,10 @@ pub fn stats_line() -> String {
 /// with the program threads paused (inspect::instrument::pause_for_patch, before its install;
 /// `paused`: that call paused them) and its code installed: the threads with a frame in the
 /// replaced code of a slot the patch rebuilt are held for good and reported (stale::park_held);
-/// every other thread resumes. Returns how many were held.
+/// every other thread resumes. Returns how many were held. The patch was asked first whether a
+/// thread is in such code (`frame_in`, under the same pause: it then does not install), so this
+/// finds only a thread the pause did not stop (Linux: one blocked in a read or a poll that came
+/// back and called into it before the install).
 ///
 /// Why frames only: the earlier patch versions of those slots are in groups (invalidated by the
 /// patch, PROT_NONE: a return into them parks by its fault). A slot's first code shares its pages
@@ -357,7 +363,7 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
     let caps = if affected.is_empty() { Ok(Vec::new()) } else { crate::inspect::capture_all(&crate::inspect::instrument::program_thread) };
     let mut held = Vec::new();
     match caps {
-        Err(e) => eprintln!("makepad: layout patch gen {}: the program's stacks could not be read ({}): a thread still in first-version code of a rebuilt fn is not held", gen, e),
+        Err(e) => eprintln!("relax: layout patch gen {}: the program's stacks could not be read ({}): a thread still in first-version code of a rebuilt fn is not held", gen, e),
         Ok(caps) => {
             let code = u.code.read().unwrap_or_else(|e| e.into_inner());
             for c in caps {
@@ -379,7 +385,9 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
                 });
                 if let Some((k, start, len, slot)) = hit {
                     let ok = crate::inspect::instrument::hold_for_good(&c.t);
-                    let what = format!("slot #{} `{}` first-version code [{:#x}, {:#x}) (+{:#x})", slot, u.fns[slot as usize].name, start, start + len as u64, at.iter().find(|x| x.0 == k).map_or(0, |x| x.1 - start));
+                    let pc = at.iter().find(|x| x.0 == k).map_or(start, |x| x.1);
+                    let path = if crate::inspect::codever::in_patched_path(u, slot, start, pc) { ", its patched path" } else { "" };
+                    let what = format!("slot #{} `{}` first-version code [{:#x}, {:#x}) (+{:#x}{})", slot, u.fns[slot as usize].name, start, start + len as u64, pc - start, path);
                     held.push((c.t.os_id, c.frames.clone(), k, what, ok));
                 }
             }
@@ -394,6 +402,55 @@ pub(crate) fn hold_old_frames(u: &Unit, gen: u32, layout: &str, paused: bool) ->
         crate::stale::park_held(os_id, frames, k, what, reason.clone(), ok);
     }
     n
+}
+
+/// A patch that changes a struct's layout in place (reload.rs fresh_layout_struct), about to
+/// install with the program threads paused (inspect::instrument::pause_for_patch): the first frame
+/// of a program thread in code of one of `slots` (any version: what the patch rebuilds was built
+/// for the old layout), or in an earlier version of any slot (code of a text no longer the
+/// program's, whose types are not asked), named for the restart's reason. Every thread's frames
+/// are read, those of a walk that ends short too: a frame found is the answer. Err: none was
+/// found, and a stack could not be read to its end (what it hides is not known).
+pub(crate) fn frame_in(u: &Unit, slots: &crate::fxhash::HashSet<u32>) -> Result<Option<String>, String> {
+    let caps = crate::inspect::capture_all(&crate::inspect::instrument::program_thread)?;
+    let code = u.code.read().unwrap_or_else(|e| e.into_inner());
+    // (a thread is named as reports name it: one nobody named is its program thread, or `unnamed`)
+    let listed: Vec<crate::inspect::threads::Thread> = caps.iter().map(|c| c.t.clone()).collect();
+    let mut unread = None;
+    for c in caps {
+        if let Some(e) = c.err {
+            unread.get_or_insert_with(|| format!("thread {}: {}", c.t.os_id, e));
+            continue;
+        }
+        if let Some(why) = c.stops() {
+            unread.get_or_insert_with(|| format!("thread {}: {}", c.t.os_id, why));
+        }
+        let mut at: Vec<u64> = c.frames.iter().enumerate().map(|(k, &a)| if k == 0 { a } else { a.wrapping_sub(1) }).collect();
+        if c.lr != 0 {
+            at.push(c.lr.wrapping_sub(1));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if c.sp != 0 {
+            if let Some(w) = crate::inspect::threads::read_mem(c.sp, 8) {
+                at.push(u64::from_le_bytes(w[..8].try_into().unwrap()).wrapping_sub(1));
+            }
+        }
+        let thread = format!("`{}` (tid {})", crate::inspect::shown_name(&c.t, &listed), c.t.os_id);
+        for a in at {
+            let Some((start, _, slot)) = code.entry_at(a) else { continue };
+            let f = &u.fns[slot as usize];
+            if slots.contains(&slot) {
+                return Ok(Some(format!("`{}` is running on thread {}", f.name, thread)));
+            }
+            if start != f.code {
+                return Ok(Some(format!("`{}` runs code from before an earlier edit on thread {}", f.name, thread)));
+            }
+        }
+    }
+    match unread {
+        Some(e) => Err(e),
+        None => Ok(None),
+    }
 }
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.

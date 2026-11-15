@@ -4,8 +4,9 @@
 #   Stage cold (present, idle, the first-visit tab burst), Stage warm (same home: warm start + burst),
 #   Calculator cold, Sandbox boot into the race game, three rwbench workloads (lowering + O3 compile),
 #   `makepad check` of makepad-widgets and makepad-platform (front end, typeck, borrowck), `makepad test relax-lex` (test harness).
-# Every app is stopped with SIGTERM (makepad run's quit path: the process exits normally, so the profile
-# runtime writes its .profraw; a forced exit would lose that run's counts). Runs need the source tree with
+# Every app is stopped with SIGTERM (makepad run's quit path: the JIT's exit writes the profile runtime's
+# .profraw, as build.sh gen passes --cfg makepad_profile_runtime; a second, forced signal would lose that
+# run's counts). Runs need the source tree with
 # apps/commercial (Stage, Sandbox); a missing app is skipped with a note.
 # Linux: runs on the current Wayland/X display, or starts a headless weston for the training (stopped by PID).
 # macOS: hidden windows (MAKEPAD_HIDE_WINDOWS=1).
@@ -19,9 +20,9 @@ mkdir -p "$RAW" "$W"
 RAW=$(cd "$RAW" && pwd)
 W=$(cd "$W" && pwd)
 export LLVM_PROFILE_FILE=$RAW/makepad_%m_%p.profraw
-export MAKEPAD_HIDE_WINDOWS=1 SANDBOX_MUTE=1 MUSIC_MUTE=1 MAKEPAD_GGML_NO_CUDA=1
+export MAKEPAD_HIDE_WINDOWS=1 MAKEPAD_MUTE=1 MAKEPAD_GGML_NO_CUDA=1
 # the tree's own std (the binary may live outside the tree)
-export MAKEPAD_RUN_STD=$root/libs/relax/compiler/std
+export RELAX_STD=$root/libs/relax/compiler/std
 weston_pid=""
 if [ "$(uname)" = Linux ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
     export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)} WAYLAND_DISPLAY=wayland-hosttrain-$$
@@ -40,7 +41,7 @@ app() {
     local rep=$W/$label.report log=$W/$label.log
     : > "$rep"
     local t0=$SECONDS
-    ( cd "$root" && exec env MAKEPAD_RUN_HOME=$h MAKEPAD_RUN_TARGET_DIR=$h/target MAKEPAD_RUN_CACHE_DIR=$h/cache \
+    ( cd "$root" && exec env RELAX_HOME=$h RELAX_TARGET_DIR=$h/target RELAX_CACHE_DIR=$h/cache \
         TMPDIR=$h/tmp nice -n 10 "$BIN" run --report-to "$rep" "$@" ) > "$log" 2>&1 &
     local pid=$!
     local k
@@ -69,7 +70,7 @@ app() {
 cmd() {
     local h=$W/home-$1 label=$2 dir=$3; shift 3
     local t0=$SECONDS
-    ( cd "$dir" && exec env MAKEPAD_RUN_HOME=$h MAKEPAD_RUN_TARGET_DIR=$h/target MAKEPAD_RUN_CACHE_DIR=$h/cache \
+    ( cd "$dir" && exec env RELAX_HOME=$h RELAX_TARGET_DIR=$h/target RELAX_CACHE_DIR=$h/cache \
         TMPDIR=$h/tmp nice -n 10 "$@" ) > "$W/$label.log" 2>&1
     echo "train: $label rc=$? in $((SECONDS - t0)) s"
 }

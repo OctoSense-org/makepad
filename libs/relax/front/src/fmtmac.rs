@@ -158,7 +158,7 @@ impl<'a> Parser<'a> {
             let mut full = Vec::new();
             if path.global() { full.push(String::new()); }
             full.extend(segs.iter().map(|s| self.seg_text(s)));
-            let Some(resolved) = self.macros.as_ref().and_then(|m| m.builtin_macro_path(&self.krate, &self.cur_module(), &full, &mut Default::default())) else {
+            let Some(resolved) = self.macros.as_ref().and_then(|m| m.builtin_macro(&self.krate, &self.cur_module(), &full)) else {
                 return Ok(None);
             };
             name = resolved;
@@ -343,20 +343,26 @@ impl<'a> Parser<'a> {
                 tg!(&mut g; , #caller_location() #close() #close_brace() #close_brace() #close_brace());
             }
             "vec" => {
+                // a false `#[cfg]` removes an element (Parser::vec_elem): from the array, or from
+                // `from_elem`'s arguments, which leaves that call short (E0061) as in rustc
                 if self.pos >= hi {
                     tg!(&mut g; #core() :: vec :: Vec :: new ());
                 } else {
-                    let first = self.expr()?;
+                    let first = self.vec_elem()?;
                     if self.eat(T::Semi) {
-                        let n = self.expr()?;
-                        tg!(&mut g; #core() :: vec :: from_elem (#expr(first), #expr(n)));
+                        let n = self.vec_elem()?;
+                        tg!(&mut g; #core() :: vec :: from_elem #open());
+                        for e in [first, n].into_iter().flatten() {
+                            tg!(&mut g; #expr(e) ,);
+                        }
+                        tg!(&mut g; #close());
                     } else {
-                        let mut v = vec![first];
+                        let mut v: Vec<ExprId> = first.into_iter().collect();
                         while self.eat(T::Comma) {
                             if self.pos >= hi {
                                 break;
                             }
-                            v.push(self.expr()?);
+                            v.extend(self.vec_elem()?);
                         }
                         // rustc: `<[_]>::into_vec(box [a, b, ..])` -- the expected `Vec<T>`
                         // reaches the elements (each coerces to T: `vec![Box::new(|x| ..), ..]`
@@ -373,9 +379,9 @@ impl<'a> Parser<'a> {
                 if self.pos >= hi {
                     tg!(&mut g; smallvec :: SmallVec :: new ());
                 } else {
-                    let first = self.expr()?;
+                    let first = self.mac_list_elem()?;
                     if self.eat(T::Semi) {
-                        let n = self.expr()?;
+                        let n = self.mac_list_elem()?;
                         tg!(&mut g; smallvec :: SmallVec :: from_elem (#expr(first), #expr(n)));
                     } else {
                         let mut v = vec![first];
@@ -383,7 +389,7 @@ impl<'a> Parser<'a> {
                             if self.pos >= hi {
                                 break;
                             }
-                            v.push(self.expr()?);
+                            v.push(self.mac_list_elem()?);
                         }
                         tg!(&mut g; smallvec :: SmallVec :: from_vec #open() < [_] > :: into_vec #open() #core() :: boxed :: Box :: new #open() #open_bracket());
                         for e in v {
@@ -722,10 +728,10 @@ impl<'a> Parser<'a> {
             | ExprKind::Index(a, b) | ExprKind::Repeat(a, b) => self.expr_may_yield(a) || self.expr_may_yield(b),
             ExprKind::Call(f, args) => self.expr_may_yield(f) || self.ast.list(args).iter().any(|&x| self.expr_may_yield(x)),
             ExprKind::MethodCall(recv, row) => self.expr_may_yield(recv) || self.ast.list(self.ast.row(row).args).iter().any(|&x| self.expr_may_yield(x)),
-            ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::Loop(b, _) => self.block_may_yield(b),
+            ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::TryBlock(b) | ExprKind::Loop(b, _) => self.block_may_yield(b),
             ExprKind::If(c, b, other) => self.expr_may_yield(c) || self.block_may_yield(b) || other.get().is_some_and(|x| self.expr_may_yield(x)),
             ExprKind::Let(_, x) => self.expr_may_yield(x),
-            ExprKind::Match(x, arms) => self.expr_may_yield(x) || self.ast.list(arms).iter().any(|a| a.guard.is_some_and(|g| self.expr_may_yield(g)) || self.expr_may_yield(a.body)),
+            ExprKind::Match(x, arms) => self.expr_may_yield(x) || self.ast.list(arms).iter().any(|a| a.guard.get().is_some_and(|g| self.expr_may_yield(g)) || self.expr_may_yield(a.body)),
             ExprKind::While(row) => { let w = self.ast.row(row); self.expr_may_yield(w.cond) || self.block_may_yield(w.body) }
             ExprKind::For(row) => { let f = self.ast.row(row); self.expr_may_yield(f.iter) || self.block_may_yield(f.body) }
             ExprKind::Break(_, x) | ExprKind::Return(x) => x.get().is_some_and(|x| self.expr_may_yield(x)),
@@ -736,7 +742,7 @@ impl<'a> Parser<'a> {
                 let m = self.ast.row(row);
                 if m.args == NO_MAC_ARGS { return true; }
                 let args = self.ast.mac_arg(m.args);
-                self.ast.list(args.exprs).iter().any(|&x| self.expr_may_yield(x)) || args.guard.is_some_and(|x| self.expr_may_yield(x))
+                self.ast.list(args.exprs).iter().any(|&x| self.expr_may_yield(x)) || args.guard.get().is_some_and(|x| self.expr_may_yield(x))
             }
             // Nested async, closure and const bodies do not execute while evaluating this slot.
             ExprKind::Async(..) | ExprKind::Closure(_) | ExprKind::ConstBlock(_)
@@ -746,8 +752,8 @@ impl<'a> Parser<'a> {
 
     fn block_may_yield(&self, b: BlockId) -> bool {
         self.ast.stmts(b).iter().any(|s| match *s {
-            Stmt::Let(row) => { let l = self.ast.row(row); l.init.is_some_and(|x| self.expr_may_yield(x)) || l.else_.is_some_and(|b| self.block_may_yield(b)) }
-            Stmt::Expr(e, _) => self.expr_may_yield(e),
+            Stmt::Let(row) => { let l = self.ast.row(row); l.init.get().is_some_and(|x| self.expr_may_yield(x)) || l.else_.get().is_some_and(|b| self.block_may_yield(b)) }
+            Stmt::Expr(_, e) => self.expr_may_yield(e),
             Stmt::Attrs(row) => self.expr_may_yield(self.ast.row(row).expr),
             Stmt::Item(_) | Stmt::Empty => false,
         })

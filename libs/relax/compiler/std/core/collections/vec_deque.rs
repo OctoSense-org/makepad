@@ -732,7 +732,7 @@ impl<T> Index<usize> for VecDeque<T> {
     fn index(&self, index: usize) -> &T {
         match self.get(index) {
             Some(v) => v,
-            None => crate::panicking::panic_str("Out of bounds access"),
+            None => crate::panicking::panic_str("out of bounds access"),
         }
     }
 }
@@ -741,7 +741,7 @@ impl<T> IndexMut<usize> for VecDeque<T> {
     fn index_mut(&mut self, index: usize) -> &mut T {
         match self.get_mut(index) {
             Some(v) => v,
-            None => crate::panicking::panic_str("Out of bounds access"),
+            None => crate::panicking::panic_str("out of bounds access"),
         }
     }
 }
@@ -857,6 +857,30 @@ impl<'a, T> Iterator for Iter<'a, T> {
         let n = self.a.len() + self.b.len();
         (n, Some(n))
     }
+    // core vec_deque iter.rs: the front half, then the rest of `n` in the back one, each in O(1)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.a.advance_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.a.advance_by(k)
+            }
+        }
+    }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a T {
+        // SAFETY: TrustedRandomAccess callers pass an index below the items left, which are a's
+        // and then b's
+        unsafe {
+            let a_len = self.a.len();
+            if idx < a_len {
+                self.a.__iterator_get_unchecked(idx)
+            } else {
+                self.b.__iterator_get_unchecked(idx - a_len)
+            }
+        }
+    }
 }
 
 impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
@@ -869,10 +893,24 @@ impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
             }
         }
     }
+    // core vec_deque iter.rs: the back half from its end, then the rest of `n` in the front one
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.b.advance_back_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.b.advance_back_by(k)
+            }
+        }
+    }
 }
 
 impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
 impl<'a, T> FusedIterator for Iter<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for Iter<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for Iter<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 
 impl<'a, T: fmt::Debug> fmt::Debug for Iter<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -900,6 +938,30 @@ impl<'a, T> Iterator for IterMut<'a, T> {
         let n = self.a.len() + self.b.len();
         (n, Some(n))
     }
+    // core vec_deque iter.rs: the front half, then the rest of `n` in the back one, each in O(1)
+    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.a.advance_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.a.advance_by(k)
+            }
+        }
+    }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> &'a mut T {
+        // SAFETY: TrustedRandomAccess callers pass an index below the items left, which are a's
+        // and then b's
+        unsafe {
+            let a_len = self.a.len();
+            if idx < a_len {
+                self.a.__iterator_get_unchecked(idx)
+            } else {
+                self.b.__iterator_get_unchecked(idx - a_len)
+            }
+        }
+    }
 }
 
 impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
@@ -912,13 +974,39 @@ impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
             }
         }
     }
+    // core vec_deque iter.rs: the back half from its end, then the rest of `n` in the front one
+    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        match self.b.advance_back_by(n) {
+            Ok(()) => Ok(()),
+            Err(k) => {
+                crate::mem::swap(&mut self.a, &mut self.b);
+                self.b.advance_back_by(k)
+            }
+        }
+    }
 }
 
 impl<'a, T> ExactSizeIterator for IterMut<'a, T> {}
 impl<'a, T> FusedIterator for IterMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccess for IterMut<'a, T> {}
+unsafe impl<'a, T> crate::iter::TrustedRandomAccessNoCoerce for IterMut<'a, T> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 
 pub struct IntoIter<T> {
     inner: VecDeque<T>,
+}
+
+// alloc/src/collections/vec_deque/into_iter.rs (`cycle()` clones the IntoIter)
+impl<T: Clone> Clone for IntoIter<T> {
+    fn clone(&self) -> Self {
+        IntoIter { inner: self.inner.clone() }
+    }
+}
+impl<T: fmt::Debug> fmt::Debug for IntoIter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("IntoIter").field(&self.inner).finish()
+    }
 }
 
 impl<T> Iterator for IntoIter<T> {

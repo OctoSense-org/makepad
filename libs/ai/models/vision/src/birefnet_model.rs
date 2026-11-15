@@ -7,6 +7,8 @@
 //! `[channel, y * width + x]` storage.  The only host transfer in a warm
 //! forward is the final one-channel matte.
 
+use crate::backend::WeightOwner;
+use std::sync::Arc;
 use crate::backend::{
     gpu_add, gpu_birefnet_broadcast, gpu_birefnet_deform_conv2d_cached,
     gpu_birefnet_global_avg_pool, gpu_birefnet_image_to_patches,
@@ -20,7 +22,7 @@ use crate::backend::{
 };
 use crate::birefnet::{
     BiRefNetCancel, BiRefNetImage, BiRefNetMatte, BiRefNetWeights,
-    BIREFNET_BN_EPS, BIREFNET_CACHE_NAMESPACE, BIREFNET_DEPTHS,
+    BIREFNET_BN_EPS, BIREFNET_DEPTHS,
     BIREFNET_HEADS, BIREFNET_INPUT_SIZE, BIREFNET_LN_EPS,
     BIREFNET_WINDOW_SIZE,
 };
@@ -76,6 +78,7 @@ struct WindowIndices {
 /// byte representation.  Convolution tensors are expanded once to f32 because
 /// the shared convolution API performs its own deterministic device packing.
 pub(crate) struct BiRefNetModel {
+    owner: Arc<WeightOwner>,
     matrices: HashMap<String, MatrixWeight>,
     floats: HashMap<String, FloatWeight>,
     indices: HashMap<String, Vec<i64>>,
@@ -83,6 +86,7 @@ pub(crate) struct BiRefNetModel {
 
 impl BiRefNetModel {
     pub(crate) fn prepare(
+        owner: &Arc<WeightOwner>,
         weights: &BiRefNetWeights,
         cancel: Option<BiRefNetCancel<'_>>,
         mut progress: Option<ProgressHook>,
@@ -147,6 +151,7 @@ impl BiRefNetModel {
         }
 
         let mut model = Self {
+            owner: Arc::clone(owner),
             matrices,
             floats,
             indices,
@@ -275,10 +280,10 @@ impl BiRefNetModel {
         let part = GpuLinearPart {
             bt_ggml_type: weight.ggml_type,
             n: weight.shape[0],
-            cache_key: &weight_name,
+            cache_key: weight_name.as_str(),
             bytes: &weight.bytes,
         };
-        gpu_linear_nt_cached(input, BIREFNET_CACHE_NAMESPACE, &[part], bias)
+        gpu_linear_nt_cached(input, &self.owner, &[part], bias)
             .map_err(|error| device_error(prefix, error))
     }
 
@@ -316,7 +321,7 @@ impl BiRefNetModel {
             input,
             width,
             height,
-            BIREFNET_CACHE_NAMESPACE,
+            &self.owner,
             &weight_name,
             &weight.values,
             bias,
@@ -438,7 +443,7 @@ impl BiRefNetModel {
         };
         gpu_linear_nt_cached(
             &patches,
-            BIREFNET_CACHE_NAMESPACE,
+            &self.owner,
             &[part],
             self.values("bb.patch_embed.proj.bias")?,
         )
@@ -486,7 +491,7 @@ impl BiRefNetModel {
             &q,
             &k,
             &v,
-            BIREFNET_CACHE_NAMESPACE,
+            &self.owner,
             &format!("{prefix}.attn"),
             &relative_bias,
             regions_gpu.as_ref(),
@@ -920,7 +925,7 @@ impl BiRefNetModel {
             &modulator,
             width,
             height,
-            BIREFNET_CACHE_NAMESPACE,
+            &self.owner,
             &weight_name,
             &weight.values,
             bias,

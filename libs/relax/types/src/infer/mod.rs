@@ -46,6 +46,8 @@ pub struct InferCtxt<'a> {
     pub tcx: &'a Tcx,
     pub typing_mode: Cell<TypingMode>,
     pub recursion_limit: crate::tcx::RecursionLimit,
+    /// the body whose crate root attributes `recursion_limit` read and checked last (NO_DEF: none)
+    recursion_read: Cell<crate::program::DefId>,
     pub skip_leak_check: bool,
     pub cause: crate::next_solver::fulfill::ObligationCause,
     /// rustc `InferCtxt::in_hir_typeck`; set only for the bodies of checked crates (whose borrowck
@@ -61,6 +63,11 @@ pub struct InferCtxt<'a> {
     /// dependency graph are not candidates. None = every crate (codegen of concrete types).
     pub impl_view: Option<u32>,
     pub inner: RefCell<InferCtxtInner>,
+    /// The next solver's forward-compatibility rerun: a root goal that overflows is evaluated once
+    /// more at twice the recursion limit (rustc 1.99.1 with -Znext-solver proves a 60-deep `Send`
+    /// goal under `recursion_limit = "32"`). Off where stable rustc already solved with the next
+    /// solver before: coherence (orphan and overlap checks) and impossible clauses.
+    pub rerun_overflow_at_twice_the_limit: bool,
     universe: Cell<UniverseIndex>,
     pub(crate) lexical_region_resolutions: RefCell<Option<lexical_region_resolve::LexicalRegionResolutions>>,
     pub(crate) canonicalizer_state: RefCell<crate::next_solver::canonical::CanonicalizerState>,
@@ -94,7 +101,7 @@ impl<'a> InferCtxt<'a> {
         std::mem::take(&mut inner.hir_typeck_potentially_region_dependent_goals)
     }
     pub fn new(tcx: &'a Tcx, typing_mode: TypingMode, recursion_limit: crate::tcx::RecursionLimit) -> Self {
-        Self { tcx, typing_mode: Cell::new(typing_mode), recursion_limit, skip_leak_check: false, cause: Default::default(), in_hir_typeck: false, origin_span: Cell::new(0), errors: tcx.dcx.into_taintable(), diagnostic_checkpoint: tcx.dcx.checkpoint(), tainted: Cell::new(false), coherence_crate: None, impl_view: None, inner: RefCell::new(InferCtxtInner { region_constraint_storage: Some(Default::default()), ..Default::default() }), lexical_region_resolutions: RefCell::new(None), universe: Cell::new(UniverseIndex::ROOT), canonicalizer_state: RefCell::new(Default::default()) }
+        Self { tcx, typing_mode: Cell::new(typing_mode), recursion_limit, recursion_read: Cell::new(crate::program::NO_DEF), skip_leak_check: false, cause: Default::default(), in_hir_typeck: false, origin_span: Cell::new(0), errors: tcx.dcx.into_taintable(), diagnostic_checkpoint: tcx.dcx.checkpoint(), tainted: Cell::new(false), coherence_crate: None, impl_view: None, inner: RefCell::new(InferCtxtInner { region_constraint_storage: Some(Default::default()), ..Default::default() }), rerun_overflow_at_twice_the_limit: true, lexical_region_resolutions: RefCell::new(None), universe: Cell::new(UniverseIndex::ROOT), canonicalizer_state: RefCell::new(Default::default()) }
     }
     pub fn for_item(tcx: &'a Tcx, prog: &crate::program::Program, typing_mode: TypingMode, def: crate::program::DefId) -> Self {
         let mut infcx = Self::new(tcx, typing_mode, crate::tcx::RecursionLimit::for_item(prog, def));
@@ -106,8 +113,9 @@ impl<'a> InferCtxt<'a> {
         infcx
     }
     pub fn recursion_limit(&self, prog: &crate::program::Program) -> usize {
-        // The crate root's attributes: that crate's declaration input (lead decision 52 R1).
-        if self.cause.body_id != crate::program::NO_DEF {
+        // The crate root's attributes: that crate's declaration input (lead decision 52 R1), read
+        // and checked once per body (rustc's `limits` query reads them once; every root goal asks)
+        if self.cause.body_id != crate::program::NO_DEF && self.recursion_read.replace(self.cause.body_id) != self.cause.body_id {
             self.tcx.queries.read_def_declarations(prog, self.cause.body_id).expect("collected program");
             let krate = prog.def(self.cause.body_id).krate;
             let root = &prog.mods[prog.crates[krate as usize].root_mod as usize];
@@ -155,23 +163,28 @@ impl<'a> InferCtxt<'a> {
                 let root = table.root_var(vid);
                 let value = table.probe(root).known();
                 drop(inner);
-                match value { Some(ty) => self.shallow_resolve(ty), None => self.tcx.tys.intern(TyKind::Infer(root)) }
+                // infer/mod.rs:1268: an unknown root var is `ty` itself when `ty` names the root
+                match value { Some(ty) => self.shallow_resolve(ty), None if root == vid => ty, None => self.tcx.tys.intern(TyKind::Infer(root)) }
             }
             TyKind::IntVar(vid) => {
                 use unify_key::IntVarValue::*;
                 let mut table = inner.int_unification_table();
                 let root = table.find(vid);
-                self.tcx.tys.intern(match table.probe_value(root) {
-                    Unknown => TyKind::IntVar(root), IntType(p) | UintType(p) => TyKind::Int(p),
-                })
+                match table.probe_value(root) {
+                    Unknown if root == vid => ty,
+                    Unknown => self.tcx.tys.intern(TyKind::IntVar(root)),
+                    IntType(p) | UintType(p) => self.tcx.tys.intern(TyKind::Int(p)),
+                }
             }
             TyKind::FloatVar(vid) => {
                 use unify_key::FloatVarValue::*;
                 let mut table = inner.float_unification_table();
                 let root = table.find(vid);
-                self.tcx.tys.intern(match table.probe_value(root) {
-                    Unknown => TyKind::FloatVar(root), Known(p) => TyKind::Float(p),
-                })
+                match table.probe_value(root) {
+                    Unknown if root == vid => ty,
+                    Unknown => self.tcx.tys.intern(TyKind::FloatVar(root)),
+                    Known(p) => self.tcx.tys.intern(TyKind::Float(p)),
+                }
             }
             _ => ty,
         }

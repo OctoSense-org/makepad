@@ -3,7 +3,7 @@ use {
         area::Area,
         cx::Cx,
         cx_api::CxOsApi,
-        draw_pass::{CxDrawPassParent, DrawPassId},
+        draw_pass::{CxDrawPassParent, DrawPassId, TimeFpsClock, TimeFpsFrames},
         event::{
             DrawEvent, Event, KeyFocusEvent, NextFrameEvent, TextClipboardEvent,
             TimerEvent, TriggerEvent,
@@ -16,7 +16,7 @@ use {
         hub_protocol::FrameCodec, AppToStudio, EventSample, RunViewFrameData, RunViewFrameRequest,
         RunViewKeyFocusRect, ScreenshotResponse, StudioToApp,
     },
-    std::cell::{Cell, RefCell},
+    std::cell::Cell,
     std::collections::{HashMap, HashSet},
     std::rc::Rc,
 };
@@ -46,6 +46,16 @@ static SCREENSHOT_FILE_NEXT_ID: std::sync::atomic::AtomicU64 =
 
 fn screenshot_file_sinks() -> &'static std::sync::Mutex<HashMap<u64, std::path::PathBuf>> {
     SCREENSHOT_FILE_SINKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Half the time between presents, so a `time_fps` frame takes the present nearest its due, or 0
+/// when there are no presents to go by and it waits for the moment it's due.
+fn time_fps_tolerance(frame_interval: f64) -> f64 {
+    if frame_interval > 0.0 && frame_interval.is_finite() {
+        frame_interval * 0.5
+    } else {
+        0.0
+    }
 }
 
 impl Cx {
@@ -80,6 +90,31 @@ impl Cx {
             }
         }
         false
+    }
+
+    /// When the soonest `time_fps` frame is due, in the clock the backend gives
+    /// `compute_pass_repaint_order`, for a loop that paints as soon as it wakes.
+    pub(crate) fn time_repaint_at(&self) -> Option<f64> {
+        self.time_fps_clock.next_due.filter(|at| at.is_finite())
+    }
+
+    /// When a loop that paints on display ticks should ask for the tick the next `time_fps` frame lands on.
+    /// That's the tick before the one nearest its due, on the grid `interval` apart through `last_tick`.
+    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+    pub(crate) fn time_repaint_tick_wake(&self, last_tick: f64, interval: f64) -> Option<f64> {
+        let due = self.time_repaint_at()?;
+        if !(interval > 0.0 && interval.is_finite()) {
+            return Some(due);
+        }
+        let ticks = ((due - time_fps_tolerance(interval) - last_tick) / interval).ceil().max(1.0);
+        Some(last_tick + (ticks - 1.0) * interval)
+    }
+
+    /// When a loop that waits for its backend to start a frame should ask for the next `time_fps` frame: the
+    /// first moment it may paint, which puts it on the present nearest its due.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn time_repaint_request_at(&self, frame_interval: f64) -> Option<f64> {
+        self.time_repaint_at().map(|due| due - time_fps_tolerance(frame_interval))
     }
 
     /// The window a pass ultimately presents into (through any chain of
@@ -152,7 +187,14 @@ impl Cx {
         self.draw_lists[list_id].redraw_id >= reference
     }
 
-    pub(crate) fn compute_pass_repaint_order(&mut self, passes_todo: &mut Vec<DrawPassId>) {
+    /// `frame_time` is the flip, tick or moment this repaint is for, in the clock the backend runs `time_fps`
+    /// frames on, and `frame_interval` the display's refresh when the backend knows it, else 0.
+    pub(crate) fn compute_pass_repaint_order(
+        &mut self,
+        passes_todo: &mut Vec<DrawPassId>,
+        frame_time: f64,
+        frame_interval: f64,
+    ) {
         passes_todo.clear();
 
         // A pass whose last handle was dropped lets go of its attachments
@@ -170,6 +212,7 @@ impl Cx {
                     pass.attached_by = None;
                     pass.paint_dirty = false;
                     pass.incomplete = false;
+                    pass.left_out = false;
                     pass.kept_recording = false;
                 }
             }
@@ -211,23 +254,30 @@ impl Cx {
         // its behalf. The one exception is an explicit `repaint_pass`, which
         // paints it this once.
         let mut time_owed = false;
+        // A `time_fps` pass holds the pass clock between its frames, and once a frame's due the pass
+        // is just dirty, so a paint the backend skips keeps it dirty like any other.
+        let tolerance = time_fps_tolerance(frame_interval);
+        let mut time_held = false;
+        let mut next_due: Option<f64> = None;
         for draw_pass_id in self.passes.id_iter() {
             let requested = self.passes[draw_pass_id].repaint_requested;
             if !requested && live[draw_pass_id.0] != Some(true) {
                 self.passes[draw_pass_id].paint_dirty = false;
                 // an orphan's picture is final as it stands: nothing it was drawing waits on it
                 self.passes[draw_pass_id].incomplete = false;
+                self.passes[draw_pass_id].left_out = false;
             }
             let repaint_next = std::mem::take(&mut self.passes[draw_pass_id].repaint_next);
             let pass = &self.passes[draw_pass_id];
-            if !(repaint_next || pass.time_owed) {
+            let (was_dirty, frames) = (pass.paint_dirty, pass.time_fps_frames);
+            if !(repaint_next || pass.time_owed || frames.due.is_some()) {
                 continue;
             }
             let live_for_time = live[draw_pass_id.0] == Some(true)
                 && self.pass_live_for_time_repaint(draw_pass_id);
             // A pass that per-window pacing skipped is still dirty, so it keeps owing its frame,
             // but one that can't paint anymore (closed window, stale child) owes nothing.
-            if !pass.paint_dirty || !live_for_time {
+            if !was_dirty || !live_for_time {
                 self.passes[draw_pass_id].time_owed = false;
             }
             if repaint_next && live_for_time {
@@ -235,6 +285,21 @@ impl Cx {
                 self.passes[draw_pass_id].time_owed = true;
             }
             time_owed |= self.passes[draw_pass_id].time_owed;
+            let Some(due) = frames.due else {
+                continue;
+            };
+            // Queued and painted since its `time_fps` shaders last asked, so they're gone.
+            let is_gone = !frames.asked && !was_dirty;
+            if is_gone || !live_for_time || self.passes.0.is_free(draw_pass_id.0) {
+                self.passes[draw_pass_id].time_fps_frames = TimeFpsFrames::default();
+                continue;
+            }
+            time_held = true;
+            if frame_time >= due - tolerance {
+                self.passes[draw_pass_id].paint_dirty = true;
+            } else {
+                next_due = Some(next_due.map_or(due, |next_due| next_due.min(due)));
+            }
         }
 
         // we need this because we don't mark the entire deptree of passes dirty every small paint
@@ -304,6 +369,7 @@ impl Cx {
             if self.passes[draw_pass_id].paint_dirty
                 && (live[draw_pass_id.0] == Some(true) || requested)
             {
+                self.passes[draw_pass_id].time_fps_frames.asked = false;
                 passes_todo.push(draw_pass_id);
                 window_requested |= requested && self.pass_root_window(draw_pass_id).is_some();
             }
@@ -355,8 +421,9 @@ impl Cx {
             }
         };
         passes_todo.sort_by_key(|id| std::cmp::Reverse(depth_of(*id)));
-        self.pass_time_rebase = !time_owed;
+        self.pass_time_rebase = !(time_owed || time_held);
         self.demo_time_repaint = false;
+        self.time_fps_clock = TimeFpsClock { frame_time, tolerance, next_due };
     }
 
     /// Whether a pass's own list was recorded by the current drawing (any of
@@ -902,7 +969,7 @@ impl Cx {
         let event = Event::TouchUpdate(e);
         self.call_event_handler(&event);
         if let Event::TouchUpdate(e) = event {
-            self.fingers.process_touch_update_end(&e.touches);
+            self.end_touch_update(&e.touches);
         }
     }
 
@@ -937,7 +1004,7 @@ impl Cx {
             self.drag_drop.cycle_drag();
         }
         if let Event::TouchUpdate(e) = event {
-            self.fingers.process_touch_update_end(&e.touches);
+            self.end_touch_update(&e.touches);
         }
     }
 
@@ -983,6 +1050,16 @@ impl Cx {
         }));
         self.fingers.mouse_up(button);
         self.fingers.cycle_hover_area(live_id!(mouse).into());
+    }
+
+    /// The copy or cut chord the host sends: the focused widget's answer goes to the host's
+    /// clipboard. A copy or cut of nothing leaves that clipboard as it is.
+    fn hosted_clipboard_chord(&mut self, copy: bool) {
+        let e = TextClipboardEvent::default();
+        self.call_event_handler(&if copy { Event::TextCopy(e.clone()) } else { Event::TextCut(e.clone()) });
+        if let Some(write) = e.written() {
+            Cx::send_hosted_clipboard(write);
+        }
     }
 
     pub fn dispatch_studio_msg(
@@ -1117,28 +1194,8 @@ impl Cx {
                 }));
                 self.call_event_handler(&Event::DragEnd);
             }
-            StudioToApp::TextCopy => {
-                let response = Rc::new(RefCell::new(None));
-                self.call_event_handler(&Event::TextCopy(TextClipboardEvent {
-                    response: response.clone(),
-                }));
-                let text = response.borrow().clone();
-                // a copy or cut of nothing leaves the host's clipboard as it is
-                if let Some(text) = text.filter(|t| !t.is_empty()) {
-                    Cx::send_studio_message(AppToStudio::SetClipboard(text));
-                }
-            }
-            StudioToApp::TextCut => {
-                let response = Rc::new(RefCell::new(None));
-                self.call_event_handler(&Event::TextCut(TextClipboardEvent {
-                    response: response.clone(),
-                }));
-                let text = response.borrow().clone();
-                // a copy or cut of nothing leaves the host's clipboard as it is
-                if let Some(text) = text.filter(|t| !t.is_empty()) {
-                    Cx::send_studio_message(AppToStudio::SetClipboard(text));
-                }
-            }
+            StudioToApp::TextCopy => self.hosted_clipboard_chord(true),
+            StudioToApp::TextCut => self.hosted_clipboard_chord(false),
             StudioToApp::Screenshot(request) => {
                 self.screenshot_requests.push(request);
                 self.redraw_all();
@@ -1184,7 +1241,10 @@ impl Cx {
                 return true;
             }
             StudioToApp::Custom(data) => {
-                if crate::ime::HostedBack::parse(&data).is_some_and(|back| back.handled.is_none()) {
+                // a read's flavours, ahead of its answer (handle_host_relay)
+                if let Some(flavours) = crate::window_controls::HostedClipboard::parse(&data) {
+                    self.clipboard.hosted_flavours = Some(flavours);
+                } else if crate::ime::HostedBack::parse(&data).is_some_and(|back| back.handled.is_none()) {
                     let event = Event::BackPressed { handled: std::cell::Cell::new(false) };
                     self.call_event_handler(&event);
                     let Event::BackPressed { handled } = event else { unreachable!() };
@@ -1214,9 +1274,9 @@ impl Cx {
                     }
                     #[cfg(target_arch = "wasm32")]
                     let _ = dropdown;
-                } else if let Some(window) = crate::ime::HostedWindow::parse(&data) {
+                } else if let Some(window) = crate::window_controls::HostedWindow::parse(&data) {
                     #[cfg(not(target_arch = "wasm32"))]
-                    if window.op == crate::ime::hosted_window_op::CLOSE_REQUEST {
+                    if window.op == crate::window_controls::hosted_window_op::CLOSE_REQUEST {
                         self.hal_hosted_close_request(window.window_id);
                     }
                     #[cfg(target_arch = "wasm32")]
@@ -1334,6 +1394,9 @@ impl Cx {
             for file in &patched.files {
                 self.live_code_patched(file);
             }
+        }
+        if seen != SEEN.load(Ordering::Relaxed) {
+            self.first_draw.note_patch();
         }
         SEEN.store(seen, Ordering::Relaxed);
         self.live_patches = seen;
@@ -1611,6 +1674,10 @@ impl Cx {
         if let Some((prev, focus)) = self.keyboard.cycle_key_focus_changed() {
             self.inner_call_event_handler(&Event::KeyFocus(KeyFocusEvent { prev, focus }));
         }
+        // A text input that lost the key focus may have asked for a hide after the one that took it cancelled it.
+        if std::mem::take(&mut self.keyboard.is_text_ime_hide_cancelled) {
+            self.keyboard.is_text_ime_hide_deferred = false;
+        }
     }
 
     pub fn handle_triggers(&mut self) {
@@ -1685,11 +1752,8 @@ impl Cx {
     }
 
     pub(crate) fn call_event_handler(&mut self, event: &Event) {
-        // One dispatch for every backend, including remote input. Hover and plain
-        // pointer motion leave startup warm-up alone; an actual gesture ends it.
-        if crate::thread::ends_warmup(event) {
-            makepad_cpu_budget::end_warmup();
-        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.first_draw.note_event(event);
         #[cfg(not(target_arch = "wasm32"))]
         if matches!(event, Event::Shutdown) {
             self.splash_trace_exit();
@@ -1717,10 +1781,21 @@ impl Cx {
         self.call_event_handler_once(event)
     }
 
+    /// The signal hooks (`Cx::signal_hooks`): before the app hears an `Event::Signal`, and on a
+    /// beat whose wake was a hook's own signal (`SignalToUI::set_for_hooks`) alone.
+    pub(crate) fn run_signal_hooks(&mut self) {
+        for hook in self.signal_hooks.clone() {
+            hook(self);
+        }
+    }
+
     fn call_event_handler_once(&mut self, event: &Event) {
         let _phase = crate::thread::ui_event_phase(event);
         if self.event_dispatch_is_reentrant(event) {
             return;
+        }
+        if let Event::VirtualKeyboard(keyboard_event) = event {
+            self.keyboard.note_virtual_keyboard_event(keyboard_event);
         }
         crate::remote::note_user_event(self, event);
         match event {
@@ -1729,9 +1804,10 @@ impl Cx {
             _ => {}
         }
         if let Event::Signal = event {
-            for hook in self.signal_hooks.clone() {
-                hook(self);
-            }
+            self.run_signal_hooks();
+        }
+        for i in 0..self.event_hooks.len() {
+            (self.event_hooks[i])(self, event);
         }
         if let Event::Shutdown = event {
             // every quit path ends here (a window close, a lost session): the shutdown starts
@@ -1740,12 +1816,18 @@ impl Cx {
             crate::remote::finish_capture_on_shutdown(self);
         }
         if let Some(drag) = self.drag_drop.internal_drag_event(event) {
-            // The pointer event goes out first and the drag one is appended, the
-            // way every other backend orders it: a widget that ends its gesture on
-            // FingerUp never sees one otherwise, and stays stuck mid-drag.
-            self.drag_drop.suspend_internal_drag();
-            self.call_event_handler(event);
-            self.drag_drop.resume_internal_drag();
+            if let crate::event::InternalDragEvent::End = drag {
+                // The Escape that calls a drag off belongs to the drag, as in an OS drag: the app
+                // never hears it, so its release has no cancel scope to close.
+                self.cancel_scopes.handle_event(event, false, true, None);
+            } else {
+                // The pointer event goes out first and the drag one is appended, the
+                // way every other backend orders it: a widget that ends its gesture on
+                // FingerUp never sees one otherwise, and stays stuck mid-drag.
+                self.drag_drop.suspend_internal_drag();
+                self.call_event_handler(event);
+                self.drag_drop.resume_internal_drag();
+            }
             match drag {
                 crate::event::InternalDragEvent::Drag(event) => {
                     self.call_event_handler(&Event::Drag(event));
@@ -1795,12 +1877,13 @@ impl Cx {
         // the tweaker's pick — works on the exploded app. (After the pin
         // hook: leaving mid-drag must never strand a hidden cursor.)
         let intercepted = self.sploded_intercept(event);
+        let starts_scroll_gesture = matches!(event, Event::Scroll(e) if self.fingers.scroll_latch.starts_finger_gesture(e));
         // Settle ownership before widget dispatch, including presses consumed by a
         // platform overlay so their release cannot cancel a second thing underneath.
-        let widget_owner = self.cancel_scopes.resolve_widget_owner(event, intercepted, |lookup| {
-            self.cancel_scope_resolver.and_then(|resolve| resolve(self, lookup))
+        let widget_owner = self.cancel_scopes.resolve_widget_owner(event, starts_scroll_gesture, intercepted, |swipe_window, lookup| {
+            self.cancel_scope_resolver.and_then(|resolve| resolve(self, swipe_window, lookup))
         });
-        self.cancel_scopes.handle_event(event, intercepted, widget_owner);
+        self.cancel_scopes.handle_event(event, starts_scroll_gesture, intercepted, widget_owner);
         if intercepted {
             return;
         }
@@ -1933,6 +2016,9 @@ impl Cx {
         self.drawing_start = self.redraw_id;
         self.in_draw_redraws.clear();
         self.in_draw_event = true;
+        self.drawing_xr_frame = std::mem::take(&mut self.xr_frame_due);
+        // A draw that unwound (e.g., a panic the platform caught) can't leave a KeyboardView's scope behind.
+        self.ime_scope = 0;
         crate::frame_trace::note_drawn();
         // The flag comes down whether the draw returned or unwound: a
         // platform that catches the panic and goes on must not have every
@@ -1943,6 +2029,7 @@ impl Cx {
         }));
         self.pass_load.draw_end();
         self.in_draw_event = false;
+        self.drawing_xr_frame = false;
         if let Err(payload) = drawn {
             std::panic::resume_unwind(payload);
         }
@@ -1984,6 +2071,16 @@ impl Cx {
         std::mem::swap(&mut set, &mut self.new_next_frames);
 
         self.performance_stats.process_frame_data(time);
+
+        if set.contains(&self.textures.1.readbacks.legacy_retry) {
+            self.textures.1.readbacks.legacy_retry = Default::default();
+            let waiting = self.textures.1.readbacks.legacy_waiting.clone();
+            for texture in waiting {
+                self.request_render_texture_capture(&texture);
+                // The context is still full: later captures keep their place.
+                if self.textures.1.readbacks.legacy_waiting.contains(&texture) { break; }
+            }
+        }
 
         self.call_event_handler(&Event::NextFrame(NextFrameEvent {
             set,
@@ -2029,8 +2126,14 @@ pub(crate) struct SampledPicture {
     pub(crate) to_paint: bool,
     /// A producer's picture is unfinished (`CxDrawPass::incomplete`: painted
     /// with a draw left out, or keeping an older picture, while a pipeline
-    /// compiles), dirty or not: the consumer's paint is not whole. Nothing is
-    /// owed a repaint for it (the pipeline's answer repaints every pass).
+    /// compiles): the consumer's paint is not whole. Nothing is owed a
+    /// repaint for it (the pipeline's answer repaints every pass). Of a
+    /// producer still to paint, only what it left out itself counts
+    /// (`CxDrawPass::left_out`): what it sampled is judged again when it
+    /// paints. Counted as well, a feedback loop (a probe field whose next
+    /// rays read its last frame) never painted whole after one draw left
+    /// out: each pass sampled the unfinished picture of the one before, and
+    /// the window drawn from it was never grabbed (11-11).
     pub(crate) unfinished: bool,
 }
 
@@ -2053,7 +2156,7 @@ pub(crate) fn sampled_picture(
         }
         if pass.color_textures.iter().any(|attachment| attachment.texture.texture_id() == texture) {
             picture.to_paint |= pass.paint_dirty;
-            picture.unfinished |= pass.incomplete;
+            picture.unfinished |= if pass.paint_dirty { pass.left_out } else { pass.incomplete };
         }
     }
     picture
@@ -2152,11 +2255,11 @@ mod tests {
         cx.passes[p].paint_dirty = true;
         assert_eq!(sampled(&cx, c), picture(true, true));
         // painted whole: the sample is final
-        cx.passes[p].painted(true, 3);
+        cx.passes[p].painted(true, true, 3);
         cx.passes[p].paint_dirty = false;
         assert_eq!(sampled(&cx, c), picture(false, false));
         // withdrawn after a partial paint: nothing draws from it until it records again
-        cx.passes[p].painted(false, 4);
+        cx.passes[p].painted(false, false, 4);
         assert_eq!(sampled(&cx, c), picture(false, true));
         producer.withdraw(&mut cx);
         assert_eq!(sampled(&cx, c), picture(false, false));
@@ -2166,12 +2269,53 @@ mod tests {
         let uniforms_gen = cx.next_uniform_gen();
         cx.draw_lists[list.id()].clear_draw_items(1, recording_gen, uniforms_gen);
         cx.attach_child_pass(p, c, Some(list.id()));
-        cx.passes[p].painted(false, 5);
+        cx.passes[p].painted(false, false, 5);
         let recording_gen = cx.next_uniform_gen();
         let uniforms_gen = cx.next_uniform_gen();
         cx.draw_lists[list.id()].clear_draw_items(2, recording_gen, uniforms_gen);
-        cx.compute_pass_repaint_order(&mut Vec::new());
+        cx.compute_pass_repaint_order(&mut Vec::new(), 0.0, 0.0);
         assert_eq!(sampled(&cx, c), picture(false, false));
+    }
+
+    /// A feedback loop (a probe field whose next rays read its last frame: relight reads the
+    /// field, the field is drawn from relight's output) paints whole the frame after its last
+    /// draw left out; a pass that keeps leaving its own draw out stays unfinished. Counted as
+    /// the producer's whole paint, the one draw left out at its start latched the loop: each
+    /// pass sampled the unfinished picture of the one before, and the window drawn from it was
+    /// never grabbed (probe GI, 11-11).
+    #[test]
+    fn a_feedback_loop_paints_whole_once_no_draw_is_left_out() {
+        use crate::draw_pass::DrawPassClearColor;
+        use crate::makepad_math::vec4;
+        use crate::texture::{Texture, TextureFormat, TextureSize};
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let target = |cx: &mut Cx| Texture::new_with_format(cx, TextureFormat::RenderBGRAu8 {
+            size: TextureSize::Fixed { width: 4, height: 4 },
+            initial: true,
+        });
+        let (pass_a, pass_b) = (DrawPass::new(&mut cx), DrawPass::new(&mut cx));
+        let (ta, tb) = (target(&mut cx), target(&mut cx));
+        pass_a.add_color_texture(&mut cx, &ta, DrawPassClearColor::ClearWith(vec4(0.0, 0.0, 0.0, 0.0)));
+        pass_b.add_color_texture(&mut cx, &tb, DrawPassClearColor::ClearWith(vec4(0.0, 0.0, 0.0, 0.0)));
+        let (a, b) = (pass_a.draw_pass_id(), pass_b.draw_pass_id());
+        // one frame: `a` reads the picture `b` painted last, then `b` paints from `a`'s; each is
+        // whole when it drew all its draws (`drew`) from whole pictures, as the frame build judges
+        let frame = |cx: &mut Cx, n: u64, drew: [bool; 2]| {
+            cx.passes[a].paint_dirty = true;
+            cx.passes[b].paint_dirty = true;
+            for (i, (pass, reads)) in [(a, tb.texture_id()), (b, ta.texture_id())].into_iter().enumerate() {
+                let picture = sampled_picture(&cx.passes, &cx.textures, reads, pass);
+                cx.passes[pass].painted(drew[i] && !picture.unfinished, drew[i], n);
+                cx.passes[pass].paint_dirty = false;
+            }
+            (cx.passes[a].incomplete, cx.passes[b].incomplete)
+        };
+        assert_eq!(frame(&mut cx, 1, [false, true]), (true, true), "frame 0: a draw of `a` left out, and `b` drew from it");
+        assert_eq!(frame(&mut cx, 2, [true, true]), (false, false), "frame 1: nothing left out, the loop is whole");
+        assert_eq!(cx.passes[b].painted_serial, 2, "and its paint counts");
+        for n in 3..6 {
+            assert_eq!(frame(&mut cx, n, [false, true]), (true, true), "frame {n}: `a` leaves its own draw out again");
+        }
     }
 
     #[test]
@@ -2217,11 +2361,11 @@ mod tests {
         let pass = DrawPass::new(&mut cx);
         let p = pass.draw_pass_id();
         // a draw left out: the serial stays, the picture is unfinished
-        cx.passes[p].painted(false, 7);
+        cx.passes[p].painted(false, false, 7);
         assert_eq!(cx.passes[p].painted_serial, 0);
         assert!(cx.passes[p].incomplete);
         // whole: the serial moves and the picture is final
-        cx.passes[p].painted(true, 8);
+        cx.passes[p].painted(true, true, 8);
         assert_eq!(cx.passes[p].painted_serial, 8);
         assert!(!cx.passes[p].incomplete);
         // kept its older picture for a compiling pipeline: nothing to paint
@@ -2448,7 +2592,7 @@ mod tests {
         assert!(cx.pass_attachment_is_stale(ring_id), "the later drawing dropped the tile");
         cx.frame_drawn_again();
         cx.call_draw_event(0.0);
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&ring_id), "the tile the first drawing recorded paints");
         assert!(todo.contains(&history_id));
         assert!(cx.pass_attachment_is_stale(ring_id), "kept, its attachment stamp as it was recorded");
@@ -2457,17 +2601,17 @@ mod tests {
         // kept through the next frame, which records no tile either.
         cx.release_painted_recordings();
         cx.call_draw_event(0.0);
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&ring_id), "kept until it paints whole");
         // Painted whole: an orphan again, as any pass a frame does not record.
         cx.repaint_id += 1;
         let repaint = cx.repaint_id;
-        cx.passes[ring_id].painted(true, repaint);
+        cx.passes[ring_id].painted(true, true, repaint);
         cx.passes[ring_id].paint_dirty = false;
         cx.release_painted_recordings();
         cx.call_draw_event(0.0);
         cx.passes[ring_id].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(!todo.contains(&ring_id));
         assert!(!cx.passes[ring_id].kept_recording);
 
@@ -2593,7 +2737,7 @@ mod tests {
         cx.attach_child_pass(child_id, parent_id, Some(list.id()));
         cx.passes[child_id].live_with_parent = true;
         cx.passes[parent_id].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&child_id));
         assert!(todo.contains(&parent_id));
 
@@ -2605,29 +2749,29 @@ mod tests {
         cx.draw_lists[list.id()].clear_draw_items(2, recording_gen, uniforms_gen);
         cx.passes[parent_id].paint_dirty = true;
         cx.passes[child_id].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(!todo.contains(&child_id));
         assert!(todo.contains(&parent_id));
         assert!(!cx.passes[child_id].paint_dirty);
 
         // An explicit request paints an orphan this once.
         cx.repaint_pass(child_id);
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&child_id));
         cx.passes[child_id].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(!todo.contains(&child_id));
 
         // Re-attached by the current recording: live again.
         cx.attach_child_pass(child_id, parent_id, Some(list.id()));
         cx.passes[child_id].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&child_id));
 
         // A freed attaching list orphans too.
         drop(list);
         cx.passes[child_id].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(!todo.contains(&child_id));
     }
 
@@ -2664,26 +2808,26 @@ mod tests {
         cx.note_window_redraw();
         cx.in_xr_update = false;
         cx.passes[pass].paint_dirty = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(!todo.contains(&pass), "a headset frame alone paints no window");
         assert!(!cx.any_passes_dirty(), "and asks for no frame");
         // the window's own cause: painted at once
         cx.note_window_redraw();
         assert!(cx.any_passes_dirty(), "the window's own change asks for a frame");
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&pass), "the window's own change paints it");
         // a grab: painted at once
         cx.passes[pass].paint_dirty = true;
         cx.screenshot_requests.push(makepad_studio_protocol::ScreenshotRequest { request_id: 7, kind_id: 0 });
         assert!(cx.any_passes_dirty(), "a grab wakes the loop");
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&pass), "a grab paints the window");
         cx.screenshot_requests.clear();
         // a remote present request (repaint_pass) likewise
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(!todo.contains(&pass));
         cx.request_remote_window_present(window);
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.contains(&pass), "an explicit repaint paints the window");
     }
 
@@ -2697,13 +2841,13 @@ mod tests {
 
         cx.passes[animated].repaint_next = true;
         cx.demo_time_repaint = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert_eq!(todo, vec![animated]);
         assert!(!cx.passes[idle].paint_dirty);
 
         // The flag is used up: without another request nothing repaints.
         cx.passes[animated].paint_dirty = false;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert!(todo.is_empty());
     }
 
@@ -2719,23 +2863,23 @@ mod tests {
 
         // An animating pass holds the origin, even on a beat that skips painting it.
         cx.passes[pass].repaint_next = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert_eq!(cx.pass_time(101.0), 1.0);
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert_eq!(cx.pass_time(101.5), 1.5);
 
         // Once it painted without asking again, the next repaint starts the clock over.
         cx.passes[pass].paint_dirty = false;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert_eq!(cx.pass_time(200.0), 0.0);
         assert_eq!(cx.pass_time(200.25), 0.25);
 
         // A pass that still owes a frame but was left behind by a redraw can't paint, so it owes nothing.
         cx.passes[pass].repaint_next = true;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert_eq!(cx.pass_time(201.0), 1.0);
         cx.redraw_id += 1;
-        cx.compute_pass_repaint_order(&mut todo);
+        cx.compute_pass_repaint_order(&mut todo, 0.0, 0.0);
         assert_eq!(cx.pass_time(300.0), 0.0);
     }
 

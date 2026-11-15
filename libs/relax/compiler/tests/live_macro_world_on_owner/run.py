@@ -11,7 +11,7 @@ Past that, the borrow checker's carry-over of the edit read the rebuilt world's 
 definitions of the program (an index past its last one): "internal compiler error applying the
 edit", and the app restarted.
 
-usage: run.py --makepad <makepad binary> [--warm]   (MAKEPAD_RUN_STD in the environment)
+usage: run.py --makepad <makepad binary> [--warm]   (RELAX_STD in the environment)
 
   1. app/src/main.rs: `value` returns 2 -> "patched", the program prints the new value
   2. the same again with 3 (the world is alive now)        -> "patched", the new value
@@ -42,9 +42,9 @@ with open(os.path.join(pkg, "shape", "src", "more.rs"), "w") as f:
 # shape::base(): "Seven77" has 7 letters, each "T" 1
 COUNT = 700 + MODS
 
-base_env = dict(os.environ, MAKEPAD_RUN_AHEAD="minimal")
+base_env = dict(os.environ, RELAX_AHEAD="minimal")
 if warm:
-    env = dict(base_env, MAKEPAD_RUN_CACHE_DIR=os.path.join(tmp, "cache"), MAKEPAD_RUN_TARGET_DIR=os.path.join(tmp, "target"))
+    env = dict(base_env, RELAX_CACHE_DIR=os.path.join(tmp, "cache"), RELAX_TARGET_DIR=os.path.join(tmp, "target"))
     open(os.path.join(pkg, "stop"), "w").close()
     fill = subprocess.run([relax, "run", "--quiet", APP], cwd=pkg, env=env, capture_output=True, text=True, timeout=600)
     os.remove(os.path.join(pkg, "stop"))
@@ -52,7 +52,7 @@ if warm:
     if fill.returncode != 0:
         print(fill.stderr[-3000:]); sys.exit(1)
 else:
-    env = dict(base_env, MAKEPAD_RUN_CACHE="0")
+    env = dict(base_env, RELAX_CACHE="0")
 p = subprocess.Popen([relax, "run", "--verbose", APP], cwd=pkg, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 out, err = [], []
 def pump(f, acc):

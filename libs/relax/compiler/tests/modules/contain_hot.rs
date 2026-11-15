@@ -1,11 +1,11 @@
-// Memory confinement of hot code (MAKEPAD_RUN_SANDBOX_NOCHECK=1: the compile-time refusal is off, so
+// Memory confinement of hot code (--allow-unchecked-modules: the compile-time refusal is off, so
 // the module may use unsafe). A twin's O3 build optimises its body before the memory is confined
 // (sandbox.rs early_rir / confine), so every kind of access the optimizer can leave is tried
 // here once the code is hot: indexed, at a large constant offset, struct copies, loops the
 // vectoriser takes, copies and fills of a known and of an unknown size, a local's address moved
 // far outside it, a pointer loaded from memory, a forged fn pointer. Whatever address the
 // module names, the host's memory is neither written nor read.
-// Run: MAKEPAD_RUN_SANDBOX_NOCHECK=1 MAKEPAD_RUN_O3_CALLS=100 makepad test tests/modules/contain_hot.rs
+// Run: RELAX_O3_CALLS=100 relax test --allow-unchecked-modules tests/modules/contain_hot.rs
 const WORDS: usize = 4096;
 const MARK: u64 = 0x5ec0_0000_0000_0000;
 static mut SECRET: [u64; WORDS] = [0; WORDS];
@@ -105,9 +105,12 @@ fn contain_hot() {
     let chase: fn(u64) -> u64 = m.get("chase").unwrap();
     let call_many: fn(u64, u64) -> u64 = m.get("call_many").unwrap();
     let (own, double) = (own(), fn_addr());
-    // every function used as intended, until its twin is hot
+    // every function used as intended, until its twin is hot: for three seconds without a pause
+    // (a queued O3 build whose code no longer runs when it is picked leaves the queue)
     let mut sane = true;
-    for k in 0..4000u64 {
+    let warm = std::time::Instant::now();
+    let mut k = 0u64;
+    while k < 4000 || warm.elapsed() < std::time::Duration::from_millis(3000) {
         sane &= index_write(own, k % 32, k) == 1 && index_read(own, k % 32) == k;
         sane &= const_off_write(own.wrapping_sub(0x7fff_0000), k) == 1 && const_off_read(own.wrapping_sub(0x7fff_0000)) == k;
         sane &= struct_write(own + 64, k) == 1 && struct_read(own + 64) == k;
@@ -119,8 +122,8 @@ fn contain_hot() {
         sane &= past_local_write(k % 4, 9) >= 5 && past_local_read(k % 4) == k % 4 + 1;
         sane &= index_write(own, 40, own + 128) == 1 && chase(own + 320) == k;
         sane &= call_many(double, 5) == 14;
+        k += 1;
     }
-    std::thread::sleep(std::time::Duration::from_millis(3000));
     println!("out as intended, hot: {}", sane && (0..200u64).all(|k| index_write(own, 1, k) == 1 && index_read(own, 1) == k && call_many(double, 5) == 14));
     let host = unsafe { &raw const SECRET as u64 } + (WORDS as u64 / 2) * 8;
     let leak_at = leak as fn(u64) -> u64 as u64;

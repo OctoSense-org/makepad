@@ -11,6 +11,10 @@ pub struct Context {
     outline_reuse: Mutex<BTreeMap<String, Arc<crate::parse_work::Reuse>>>,
     demand_identity: OnceLock<u128>,
     fingerprint: OnceLock<u128>,
+    /// made by the thread that builds the macro world (macro_reg world_builder), for a crate of
+    /// that world: its scans run for the builder on whichever thread takes them (preload.rs
+    /// scan_tokens)
+    world_builder: bool,
 }
 impl Context {
     pub fn new(_root: &str, sources: Arc<SourceRegistry>, session: &crate::Session) -> Arc<Self> {
@@ -19,8 +23,10 @@ impl Context {
     fn with_reads(sources: Arc<SourceRegistry>, session: &crate::Session, reads: Arc<crate::vfs::ReadSnapshot>) -> Arc<Self> {
         Arc::new(Self { sources, reads, session: crate::Session { options: session.options.clone(), runtime: session.runtime.clone() },
             rust_outlines: Default::default(), outline_reuse: Default::default(),
-            demand_identity: OnceLock::new(), fingerprint: OnceLock::new() })
+            demand_identity: OnceLock::new(), fingerprint: OnceLock::new(), world_builder: crate::macro_reg::world_builder() })
     }
+    /// Whether the macro world's builder made this context (a crate of the world it builds).
+    pub(crate) fn world_builder(&self) -> bool { self.world_builder }
     pub fn for_units(crates: &[crate::crates::CrateUnit], sources: Arc<SourceRegistry>, session: &crate::Session) -> Vec<Arc<Self>> {
         let reads = crate::vfs::ReadSnapshot::new(session.runtime.profile);
         crates.iter().map(|_| Self::with_reads(sources.clone(), session, reads.clone())).collect()
@@ -49,6 +55,11 @@ impl Context {
     }
     pub(crate) fn set_outline_reuse(&self, path: &str, reuse: Arc<crate::parse_work::Reuse>) {
         self.outline_reuse.lock().unwrap().insert(path.into(), reuse);
+    }
+    /// Whether a demand load's outline reuse for `path` is still on this context (its plan has not
+    /// completed, release_prescan): a parse of `path` in this context opens it as its session.
+    pub(crate) fn holds_outline_reuse(&self, path: &str) -> bool {
+        self.outline_reuse.lock().unwrap().contains_key(path)
     }
     pub fn rust_outline(&self, path: &str, src: &[u8], edition: u16, cfg: &crate::cfg::CfgSet) -> Option<Arc<crate::rs_outline::Outline>> {
         let key = (crate::vfs::normalize_path(path), edition);
@@ -185,7 +196,7 @@ fn output_dir_entry(dir: &Path, name: &str) -> bool {
 
 fn directory_hash(path: &str, entries: &[(String, bool)]) -> u128 {
     let mut hash = crate::sip::Sip128::new();
-    hash.str(path);
+    hash.str(&crate::dirs::anchored(path));
     for (name, dir) in entries {
         hash.str(name);
         hash.u32(*dir as u32);
@@ -224,7 +235,7 @@ pub fn input_stamp(path: &str, hash: u128, now_ns: u64) -> Option<crate::vfs::Fi
 }
 pub fn cmd_lex(args: &[String]) -> i32 {
     let Some(path) = args.first() else {
-        eprintln!("usage: makepad lex <file>");
+        eprintln!("usage: {tool} lex <file>", tool = crate::tool_name());
         return 2;
     };
     let src = match crate::vfs::read(path) {

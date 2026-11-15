@@ -403,7 +403,7 @@ mod control_worker {
             None => 0,
         };
         let (residual, trouble) =
-            match makepad_ai_common::backend::release_gpu_runtime_namespaces(&[""]) {
+            match makepad_ai_common::backend::release_gpu_runtime_all() {
                 Ok(count) => (count, String::new()),
                 Err(error) => (0, format!(", release error: {error}")),
             };
@@ -675,6 +675,7 @@ mod tests {
             chat_session: String::new(),
             chat_system: String::new(),
             chat_messages: Vec::new(),
+            claude_model: String::new(),
             chat_images: Vec::new(),
             target_domain: "image".to_string(),
             identity_anchor: String::new(),

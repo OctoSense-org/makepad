@@ -11,15 +11,16 @@
 //! next frame so streaming, deadlines and the cloud provider's polling all
 //! advance without a host timer.
 
-use crate::attach::{self, Attachment, Source};
+use crate::attach::{self, Dropped, Source};
 use crate::bus::ServiceBus;
+use crate::pictures::{self, ChatPictures, PictureKept};
 #[cfg(feature = "gen")]
 use crate::gen::GenService;
 use crate::settings::AiSettings;
 #[cfg(feature = "engine")]
 use makepad_ai_services::engine::models::{build_model, fallback_choice, hub_generation, hub_rows, provider_rows};
 use makepad_ai_services::engine::NoModelWithReason;
-use makepad_ai_services::engine::{EngineCore, EngineEvent, ModelImage, ServiceRegistry};
+use makepad_ai_services::engine::{EngineCore, EngineEvent, ModelImage, SentPicture, ServiceRegistry};
 use makepad_ai_services::mcp::mcpb;
 use makepad_ai_services::provider::{CLAUDE_DESKTOP, PROVIDER_ENV};
 use makepad_ai_services::card::{Card, CardValues, Field, MAX_FIELDS};
@@ -151,6 +152,46 @@ script_mod! {
         }
     }
 
+    // Annotate: a marker pen, slanted; the lit one has the accent behind it.
+    let AnnotateButton = GlyphButton{
+        draw_bg +: {
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(vec4(self.face_hover.xyz, self.face_hover.w * max(self.hover, self.down)))
+                let ink = mix(self.ink, self.ink_hover, self.hover)
+                let mid = self.rect_size * 0.5
+                // the barrel, from lower left to upper right, and its tip
+                sdf.move_to(mid.x - 5.5, mid.y + 5.5)
+                sdf.line_to(mid.x + 4.5, mid.y - 4.5)
+                sdf.stroke(ink, 4.0)
+                sdf.move_to(mid.x - 6.5, mid.y + 6.5)
+                sdf.line_to(mid.x - 5.0, mid.y + 5.0)
+                sdf.stroke(ink, 1.6)
+                return sdf.result
+            }
+        }
+    }
+    let AnnotateOnButton = GlyphButton{
+        draw_bg +: {
+            accent: uniform(theme.color_primary)
+            ink_on: uniform(theme.color_on_primary)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(mix(self.accent, mix(self.accent, #xFFFFFFFF, 0.15), self.hover))
+                let mid = self.rect_size * 0.5
+                sdf.move_to(mid.x - 5.5, mid.y + 5.5)
+                sdf.line_to(mid.x + 4.5, mid.y - 4.5)
+                sdf.stroke(self.ink_on, 4.0)
+                sdf.move_to(mid.x - 6.5, mid.y + 6.5)
+                sdf.line_to(mid.x - 5.0, mid.y + 5.0)
+                sdf.stroke(self.ink_on, 1.6)
+                return sdf.result
+            }
+        }
+    }
+
     // Send: an arrow on the accent; greyed while there is nothing to send.
     let SendButton = GlyphButton{
         width: 28
@@ -190,6 +231,61 @@ script_mod! {
                 sdf.stroke(self.ring, 1.0)
                 sdf.box(mid.x - 4., mid.y - 4., 8., 8., 1.5)
                 sdf.fill(mix(self.ink, self.ink_hover, self.hover))
+                return sdf.result
+            }
+        }
+    }
+
+    // Speak to the chat: a microphone. Listening turns it red and a click stops it.
+    let MicButton = GlyphButton{
+        width: 28
+        height: 28
+        draw_bg +: {
+            live: uniform(theme.color_error)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                sdf.box(1., 1., self.rect_size.x - 2., self.rect_size.y - 2., self.border_radius)
+                sdf.fill(vec4(self.face_hover.xyz, self.face_hover.w * max(self.hover, self.down)))
+                let ink = mix(self.ink, self.ink_hover, self.hover)
+                let mid = self.rect_size * 0.5
+                sdf.box(mid.x - 2.5, mid.y - 7., 5., 9., 2.5)
+                sdf.stroke(ink, 1.3)
+                sdf.move_to(mid.x - 5., mid.y - 1.)
+                sdf.line_to(mid.x - 5., mid.y + 0.5)
+                sdf.line_to(mid.x - 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 5., mid.y + 0.5)
+                sdf.line_to(mid.x + 5., mid.y - 1.)
+                sdf.move_to(mid.x, mid.y + 3.5)
+                sdf.line_to(mid.x, mid.y + 7.)
+                sdf.stroke(ink, 1.3)
+                return sdf.result
+            }
+        }
+    }
+
+    // Stop listening: the microphone on a red disc, in place of the microphone while it listens.
+    let MicLiveButton = GlyphButton{
+        width: 28
+        height: 28
+        draw_bg +: {
+            live: uniform(theme.color_error)
+            pixel: fn() {
+                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                let mid = self.rect_size * 0.5
+                sdf.circle(mid.x, mid.y, min(mid.x, mid.y) - 1.0)
+                sdf.fill(mix(self.live, #xFFFFFFFF, 0.15 * self.hover))
+                sdf.box(mid.x - 2.5, mid.y - 7., 5., 9., 2.5)
+                sdf.fill_keep(#xFFFFFFFF)
+                sdf.move_to(mid.x - 5., mid.y - 1.)
+                sdf.line_to(mid.x - 5., mid.y + 0.5)
+                sdf.line_to(mid.x - 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 3., mid.y + 3.5)
+                sdf.line_to(mid.x + 5., mid.y + 0.5)
+                sdf.line_to(mid.x + 5., mid.y - 1.)
+                sdf.move_to(mid.x, mid.y + 3.5)
+                sdf.line_to(mid.x, mid.y + 7.)
+                sdf.stroke(#xFFFFFFFF, 1.3)
                 return sdf.result
             }
         }
@@ -387,13 +483,15 @@ script_mod! {
                     body: ""
                 }
             }
-            // One line per call: a dot for how it went, what it did, and
-            // a click for the arguments and the answer.
+            // One call: a dot for how it went, the tool and its arguments cut to
+            // the row's width (a click shows them whole, with the answer), and Stop
+            // while it runs. Under it, on a line of its own, what it is doing and,
+            // when the call counts its steps, a bar under that with how far it is.
             ToolRow := Row{
                 padding: Inset{left: 14 right: 12 top: 0 bottom: 0}
                 tool_head := View{
                     width: Fill
-                    height: 20
+                    height: 24
                     flow: Right
                     spacing: 8
                     align: Align{y: 0.5}
@@ -408,31 +506,61 @@ script_mod! {
                     tool_title := Label{
                         width: Fill
                         max_lines: 1
+                        text_overflow: TextOverflow.Ellipsis
                         draw_text +: {
                             color: theme.color_text_meta
                             text_style: theme.font_regular{font_size: 8.5}
                         }
                     }
-                    tool_note := Meta{
-                        draw_text +: { text_style: theme.font_regular{font_size: 8.0} }
+                    tool_stop := ButtonFlat{
+                        visible: false
+                        text: "Stop"
+                        height: 20
+                        margin: 0
+                        padding: Inset{left: 8 right: 8 top: 0 bottom: 0}
                     }
-                    tool_stop := ButtonFlat{ text: "Stop" visible: false }
+                }
+                tool_status := View{
+                    visible: false
+                    width: Fill
+                    height: Fit
+                    flow: Down
+                    spacing: 2
+                    margin: Inset{left: 17 bottom: 4}
+                    tool_note := Label{
+                        width: Fill
+                        max_lines: 1
+                        text_overflow: TextOverflow.Ellipsis
+                        draw_text +: {
+                            color: theme.color_text_meta
+                            text_style: theme.font_regular{font_size: 8.0}
+                        }
+                    }
+                    tool_bar_box := View{
+                        visible: false
+                        width: Fill
+                        height: Fit
+                        tool_bar := ProgressBarFlat{
+                            width: Fill
+                            height: 12
+                            show_percent: true
+                            draw_bg +: { thickness: 2.0 }
+                            draw_text +: {
+                                color: theme.color_text_meta
+                                text_style: theme.font_regular{font_size: 8.0}
+                            }
+                        }
+                    }
                 }
                 tool_problem := Label{
                     visible: false
                     width: Fill
                     max_lines: 2
-                    margin: Inset{left: 14 bottom: 3}
+                    margin: Inset{left: 17 bottom: 3}
                     draw_text +: {
                         color: mix(theme.color_error, theme.color_text_meta, 0.35)
                         text_style: theme.font_regular{font_size: 8.0}
                     }
-                }
-                tool_bar := SolidView{
-                    width: Fill
-                    height: 2
-                    margin: Inset{left: 14 bottom: 3}
-                    draw_bg +: { color: theme.color_primary }
                 }
                 tool_detail := RoundedView{
                     visible: false
@@ -717,6 +845,33 @@ script_mod! {
                 }
             }
 
+            // The marks drawn on the page for the next line.
+            marks_row := RoundedView{
+                visible: false
+                width: Fill
+                height: Fit
+                flow: Right
+                spacing: 6
+                margin: Inset{bottom: 2}
+                padding: Inset{left: 8 right: 2 top: 2 bottom: 2}
+                align: Align{y: 0.5}
+                draw_bg +: { color: theme.color_u_1 border_radius: 5.0 }
+                marks_label := Label{
+                    width: Fill
+                    max_lines: 1
+                    text: ""
+                    draw_text +: {
+                        color: theme.color_text
+                        text_style: theme.font_regular{font_size: 8.0}
+                    }
+                }
+                Tip{
+                    text: "Clear the marks"
+                    place: TopEnd
+                    marks_clear := CloseButtonSm{}
+                }
+            }
+
             // Pictures that go with the next line.
             attach_row := View{
                 visible: false
@@ -786,6 +941,18 @@ script_mod! {
                     place: TopStart
                     attach_button := AttachButton{}
                 }
+                annotate_tip := Tip{
+                    visible: false
+                    text: "Annotate: draw on the page with a marker for the AI (Esc to stop)"
+                    place: TopStart
+                    annotate_button := AnnotateButton{}
+                }
+                annotate_on_tip := Tip{
+                    visible: false
+                    text: "Annotating: drag on the page to draw (Esc or press to stop; the marks stay)"
+                    place: TopStart
+                    annotate_on_button := AnnotateOnButton{}
+                }
                 // What the turn is about: the page and what is open on it.
                 // It follows the page; it is not removed by hand.
                 target_row := View{
@@ -811,6 +978,18 @@ script_mod! {
                     }
                 }
                 bar_gap := View{width: Fill height: 1}
+                mic_tip := Tip{
+                    text: "Speak to the chat (the headset's microphone)"
+                    place: TopEnd
+                    visible: false
+                    mic_button := MicButton{}
+                }
+                mic_live_tip := Tip{
+                    text: "Stop listening and write what was said"
+                    place: TopEnd
+                    visible: false
+                    mic_live_button := MicLiveButton{}
+                }
                 send_tip := Tip{
                     text: "Send (Enter; Shift+Enter for a new line)"
                     place: TopEnd
@@ -826,6 +1005,20 @@ script_mod! {
     }
 }
 
+/// The composer's microphone button, as the host sets it ([`AiChatPanel::set_voice`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VoiceUi {
+    /// No microphone to offer: the button is not shown.
+    #[default]
+    Hidden,
+    /// Ready: a press starts listening.
+    Idle,
+    /// Listening: the button is red and a press stops it.
+    Listening,
+    /// What was said is being turned into text: the button waits.
+    Busy,
+}
+
 /// What the panel tells its host.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub enum AiChatPanelAction {
@@ -839,22 +1032,79 @@ pub enum AiChatPanelAction {
     /// The person cleared the selected element under the context line: the
     /// host deselects it on the page (the next target it sets has none).
     SelectionCleared,
+    /// The microphone button was pressed (shown only while the host offers one,
+    /// [`AiChatPanel::set_voice`]): the host starts or stops listening.
+    VoiceToggled,
+    /// The person switched the marker on (true) or off: the host draws, the panel only asks.
+    Annotate(bool),
+    /// The person cleared the marks from the chip.
+    MarksCleared,
+    /// A line is waiting to go with the marks: the host reads the page's picture and answers
+    /// with [`AiChatPanel::release_marks`].
+    MarksWanted,
     #[default]
     None,
 }
 
-/// The pictures the person sent in this conversation (PNG, as the model got them), by name:
-/// an app's tool reads one as its input (`ChatPictures::get`).
-#[derive(Default)]
-pub struct ChatPictures {
-    pub pictures: Vec<(String, Arc<[u8]>)>,
+/// A line waiting for its marks. The text goes only after the host has every mark resolved and has
+/// read the picture they are drawn in: it is never taken before [`Hold::begin_release`], however
+/// long the host takes to resolve.
+#[derive(Debug, Default, PartialEq)]
+pub struct Hold {
+    text: Option<String>,
+    asked: bool,
+    releasing: bool,
 }
 
-impl ChatPictures {
-    /// The newest picture of that name, or with no name the newest.
-    pub fn get(&self, name: Option<&str>) -> Option<&(String, Arc<[u8]>)> {
-        self.pictures.iter().rev().find(|(n, _)| name.is_none_or(|want| n == want))
+impl Hold {
+    /// The person sent `text` while marks exist.
+    pub fn take_line(&mut self, text: String) {
+        *self = Hold { text: Some(text), asked: false, releasing: false };
     }
+
+    pub fn is_waiting(&self) -> bool {
+        self.text.is_some()
+    }
+
+    pub fn releasing(&self) -> bool {
+        self.releasing
+    }
+
+    /// Whether the host should be asked for the marks' picture now: once, when the line waits and
+    /// no mark is still being resolved.
+    pub fn wants_picture(&mut self, resolving: usize) -> bool {
+        if self.text.is_some() && !self.asked && !self.releasing && resolving == 0 {
+            self.asked = true;
+            return true;
+        }
+        false
+    }
+
+    /// The host answered with the picture (or none): false when no line waits.
+    pub fn begin_release(&mut self) -> bool {
+        if self.text.is_none() {
+            return false;
+        }
+        self.releasing = true;
+        true
+    }
+
+    /// The line to send now (its marks are in), or to give back.
+    pub fn finish(&mut self) -> Option<String> {
+        self.asked = false;
+        self.releasing = false;
+        self.text.take()
+    }
+}
+
+/// What the panel shows of the host's marks: the Annotate button (when the host offers it), the
+/// marker on, how many marks there are and how many the host is still resolving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct MarksUi {
+    pub offered: bool,
+    pub on: bool,
+    pub count: usize,
+    pub resolving: usize,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -863,9 +1113,9 @@ pub struct AiChatPanel {
     source: ScriptObjectRef,
     #[deref]
     view: View,
-    /// The host's model for this panel, by provider slug (`claude-cli`,
-    /// `codex-cli`, `local`, …); empty keeps the person's saved choice.
-    /// `MAKEPAD_AI_PROVIDER` overrides both.
+    /// The host's initial model, by provider slug (`claude-cli`,
+    /// `codex-cli`, `local`, …), until the person picks one: the saved pick
+    /// wins over it. `MAKEPAD_AI_PROVIDER` overrides both.
     #[live]
     provider: String,
     /// The window's F10 overlay made this panel; any other is the app's own chat.
@@ -873,13 +1123,32 @@ pub struct AiChatPanel {
     in_overlay: bool,
     /// Pictures waiting for the next line.
     #[rust]
-    attachments: Vec<Attachment>,
+    attachments: Vec<Dropped>,
+    /// The microphone button's state, set by the host.
+    #[rust]
+    voice: VoiceUi,
     /// Dropped pictures being decoded on the task pool.
     #[rust]
-    loading: Vec<TaskHandle<Result<Attachment, String>>>,
+    loading: Vec<TaskHandle<Result<Dropped, String>>>,
+    /// Pictures the model asked to see again (`chat.picture`), being fitted to it on the task
+    /// pool, by call id.
+    #[rust]
+    fitting: Vec<(String, TaskHandle<Result<Vec<u8>, String>>)>,
+    /// The small copies of a restored chat's pictures, being made on the task pool.
+    #[rust]
+    thumbs_loading: Option<TaskHandle<Vec<(String, Arc<[u8]>)>>>,
     /// The attachment chips show this many pictures.
     #[rust]
     attach_shown: Option<(usize, usize)>,
+    /// The host's marks on the page, as it last said.
+    #[rust]
+    marks: MarksUi,
+    /// A line waiting for its marks: it goes once the host has them resolved and their picture.
+    #[rust]
+    hold: Hold,
+    /// The line being sent already has its marks.
+    #[rust]
+    marks_through: bool,
     /// The clipboard read a paste in the composer asked for (a copied
     /// picture is attached; text is the input's own paste).
     #[rust]
@@ -887,17 +1156,15 @@ pub struct AiChatPanel {
     /// Pictures pasted so far (names them apart).
     #[rust]
     pasted: usize,
-    /// The small copies of the pictures each sent line carried, by entry
-    /// index, for the transcript.
+    /// The small copies of the pictures the person sent, by file, for the transcript's lines
+    /// and the task cards.
     #[rust]
-    sent_thumbs: HashMap<usize, Vec<Arc<[u8]>>>,
-    /// The entry whose pictures each transcript row last loaded.
+    thumbs: HashMap<String, Arc<[u8]>>,
+    /// The entry whose pictures each transcript row last loaded, and how many of them had
+    /// their small copy then.
     #[rust]
-    pics_filled: HashMap<WidgetUid, usize>,
-    /// Sent pictures by name, using the small copy for task cards.
-    #[rust]
-    pic_thumbs: HashMap<String, Arc<[u8]>>,
-    /// Result PNGs read once per path, including missing files.
+    pics_filled: HashMap<WidgetUid, (usize, usize)>,
+    /// Result pictures read once per path, including missing files.
     #[rust]
     result_pics: HashMap<String, Option<Arc<[u8]>>>,
     /// The picture each recycled task row last loaded (input/result keys are distinct).
@@ -906,6 +1173,9 @@ pub struct AiChatPanel {
     /// Avoid rebuilding labels and the stage-history tooltip on animation-only redraws.
     #[rust]
     task_rows_filled: HashMap<WidgetUid, (String, u64)>,
+    /// Each call's row line ([`AiChatPanel::tool_line`]) by call id: its arguments read once.
+    #[rust]
+    tool_lines: HashMap<String, String>,
     /// Stage + ETA per live task, including calls scrolled out of view.
     #[rust]
     task_tracks: HashMap<String, ProgressTracker>,
@@ -962,12 +1232,35 @@ pub struct AiChatPanel {
     /// `None` keeps nothing.
     #[rust]
     chat_key: Option<String>,
+    /// The conversation's pictures moved since the app's tools were shown them ([`Self::share_pictures`]).
+    #[rust]
+    pictures_moved: bool,
     /// The engine generation last written to the chat file.
     #[rust]
     chat_written: Option<u64>,
+    /// What [`Self::publish_unsaved`] last told the platform.
+    #[rust]
+    unsaved_published: Option<String>,
 }
 
 impl AiChatPanel {
+    /// A draft or picture not sent yet, or a reply still coming, is unsaved work
+    /// (`restart::set_unsaved`, per panel): a restart that ends this app waits for it, the WM
+    /// session's restart for a deploy among them (one ended two chats with the WM, 11-06).
+    fn publish_unsaved(&mut self, cx: &mut Cx) {
+        let replying = self.engine.as_ref().is_some_and(|e| matches!(e.state().status, Status::Thinking | Status::Streaming | Status::WaitingForTool));
+        let typed = !self.view.text_input(cx, ids!(input)).text().trim().is_empty() || !self.attachments.is_empty() || self.marks.count > 0;
+        let what = if replying { Some("an AI chat reply still coming") } else if typed { Some("an AI chat message not sent") } else { None };
+        if what != self.unsaved_published.as_deref() {
+            self.unsaved_published = what.map(str::to_string);
+            makepad_widgets::makepad_platform::restart::set_unsaved(&self.unsaved_key(), what);
+        }
+    }
+
+    fn unsaved_key(&self) -> String {
+        format!("aichat-{}", self.widget_uid().0)
+    }
+
     /// The registry a host plugs in-process links into.
     pub fn registry(&self) -> &ServiceRegistry {
         &self.registry
@@ -1032,27 +1325,56 @@ impl AiChatPanel {
     /// Keep this conversation on disk under `key` (the host's product, `fab`):
     /// it is written after every change once the turn settles, and comes
     /// back when the app starts again (a crash, a live-patch relaunch) until
-    /// the person starts a new chat.
+    /// the person starts a new chat. The pictures the person sends are kept
+    /// beside it (`<key>.pictures/`), as they were dropped.
     pub fn keep_chat(&mut self, key: &str) {
         let key: String = key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
         if key.is_empty() || self.chat_key.as_deref() == Some(key.as_str()) {
             return;
         }
         self.chat_key = Some(key);
-        // An engine already up with nothing said yet takes the saved chat now.
-        let path = self.chat_path();
-        if let (Some(engine), Some(path)) = (self.engine.as_mut(), path) {
-            if engine.state().entries.is_empty() {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    let _ = engine.restore_chat(&text);
-                }
-            }
-        }
+        // An engine already up takes the saved chat now if nothing was said yet.
+        self.keep_engine_chat();
     }
 
     fn chat_path(&self) -> Option<std::path::PathBuf> {
         let key = self.chat_key.as_ref()?;
         AiSettings::path().and_then(|settings| settings.parent().map(|dir| dir.join("chats").join(format!("{key}.json"))))
+    }
+
+    /// The engine keeps the conversation under the chat's key: what was saved comes back (if
+    /// nothing was said yet), with its pictures.
+    fn keep_engine_chat(&mut self) {
+        let Some(path) = self.chat_path() else { return };
+        let Some(engine) = self.engine.as_mut() else { return };
+        let saved = engine.state().entries.is_empty().then(|| std::fs::read_to_string(&path).ok()).flatten();
+        if let Err(e) = engine.keep_chat(path.with_extension("pictures"), saved.as_deref()) {
+            log!("aichat: the saved chat {} did not come back: {e}", path.display());
+        }
+        self.pictures_moved = true;
+    }
+
+    /// The pictures of the conversation moved (sent, restored, cleared): the app's tools see
+    /// them now ([`ChatPictures`]), and the small copies of those the panel has none of yet
+    /// are made on the task pool.
+    fn share_pictures(&mut self, cx: &mut Cx) {
+        self.pictures_moved = false;
+        let Some(engine) = self.engine.as_ref() else { return };
+        *cx.global::<ChatPictures>() = ChatPictures::of(engine);
+        if self.thumbs_loading.is_some() {
+            // The job under way covers what it was given; the rest on its return.
+            self.pictures_moved = true;
+            return;
+        }
+        let missing: Vec<SentPicture> = engine.pictures().iter().filter(|p| !self.thumbs.contains_key(&p.file)).cloned().collect();
+        if missing.is_empty() {
+            return;
+        }
+        let job = move || missing.iter().filter_map(|p| p.data().and_then(|data| attach::thumb(&data, &p.name)).ok().map(|thumb| (p.file.clone(), thumb))).collect();
+        match cx.task_pool().submit(Class::Background, job) {
+            Ok(handle) => self.thumbs_loading = Some(handle),
+            Err(e) => log!("aichat: the chat's pictures are not shown ({e:?})"),
+        }
     }
 
     /// Write the conversation when it moved and no turn is running. A temp
@@ -1081,7 +1403,11 @@ impl AiChatPanel {
 
     fn settings(&mut self) -> &AiSettings {
         if self.settings.is_none() {
-            self.settings = Some(AiSettings::load());
+            // The launch names the model outright (Claude Desktop, tests).
+            self.settings = Some(match std::env::var(PROVIDER_ENV).ok().filter(|s| !s.trim().is_empty()) {
+                Some(slug) => AiSettings::for_provider(&slug),
+                None => AiSettings::load_with_provider(&self.provider),
+            });
         }
         self.settings.as_ref().unwrap()
     }
@@ -1091,25 +1417,18 @@ impl AiChatPanel {
     fn ensure_engine(&mut self) -> &mut EngineCore {
         if self.engine.is_none() {
             let lease_id = self.widget_uid().0;
-            let mut settings = self.settings().clone();
-            // A host (or the environment) naming its model picks it for
-            // this panel: that is the person's explicit choice for the app.
-            let host = std::env::var(PROVIDER_ENV).ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| self.provider.clone());
-            if !host.trim().is_empty() {
-                settings.provider = ProviderChoice::from_slug(&host);
-                settings.local_only = !settings.provider.is_cloud();
-            } else {
-                // The saved (or default) choice is not built into this app
-                // (Local without `localai`): start on the first provider
-                // that can answer here. Only this panel's copy changes, so
-                // a `localai` build still starts on Local; the lock guards
-                // a local model this build does not have.
-                #[cfg(feature = "engine")]
+            let settings = self.settings().clone();
+            // A saved pick wins over the host default; only an unavailable
+            // default Local choice needs the usual provider fallback.
+            #[cfg(feature = "engine")]
+            let settings = {
+                let mut settings = settings;
                 if let Some(choice) = fallback_choice(&settings.provider) {
                     settings.provider = choice;
                     settings.local_only = false;
                 }
-            }
+                settings
+            };
             // The real models ride the `engine` feature; a build without a
             // runtime (the web page) says so and keeps the tool console.
             #[cfg(feature = "engine")]
@@ -1128,10 +1447,8 @@ impl AiChatPanel {
             // it, so provider facts go in through the core.
             self.provider_rows = rows.clone();
             core.set_provider_facts(settings.provider.clone(), rows, settings.local_only);
-            if let Some(text) = self.chat_path().and_then(|path| std::fs::read_to_string(path).ok()) {
-                let _ = core.restore_chat(&text);
-            }
             self.engine = Some(core);
+            self.keep_engine_chat();
             #[cfg(feature = "gen")]
             {
                 self.gen = GenService::open(&self.registry);
@@ -1196,6 +1513,34 @@ impl AiChatPanel {
         cx.seconds_since_app_start()
     }
 
+    /// The microphone button: hidden, ready, listening or waiting ([`VoiceUi`]).
+    pub fn set_voice(&mut self, cx: &mut Cx, voice: VoiceUi) {
+        if self.voice != voice {
+            self.voice = voice;
+            self.view.redraw(cx);
+        }
+    }
+
+    /// What was said, written after what is in the composer (a space between), and the composer
+    /// focused: the person reads it and sends it, or says more.
+    pub fn dictate(&mut self, cx: &mut Cx, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let input = self.view.text_input(cx, ids!(input));
+        let before = input.text();
+        let joined = if before.trim().is_empty() { text.to_string() } else { format!("{} {text}", before.trim_end()) };
+        input.set_text(cx, &joined);
+        input.take_key_focus(cx);
+        self.view.redraw(cx);
+    }
+
+    /// A line the person must read, in the chat's notice style (a microphone that cannot be used).
+    pub fn notify(&mut self, cx: &mut Cx, text: String) {
+        self.note(cx, text);
+    }
+
     /// A line as if typed and sent — the bridge's `/ai?say=`.
     pub fn say(&mut self, cx: &mut Cx, text: String) {
         self.send(cx, text);
@@ -1249,10 +1594,20 @@ impl AiChatPanel {
                 Ok(m) => m,
                 Err(reason) => Box::new(NoModelWithReason::new(reason)),
             };
-            let rows = self.provider_rows.clone();
+            let settings = AiSettings { provider: choice.clone(), local_only };
+            if let Err(reason) = settings.allows(&choice) {
+                self.note(cx, reason);
+                return;
+            }
+            let rows = provider_rows(local_only);
+            self.provider_rows = rows.clone();
             let engine = self.engine.as_mut().unwrap();
             engine.set_model(model);
             engine.set_provider_facts(choice, rows, local_only);
+            if let Err(reason) = settings.save() {
+                self.note(cx, format!("Could not save the provider choice: {reason}"));
+            }
+            self.settings = Some(settings);
         }
         self.view.redraw(cx);
     }
@@ -1283,6 +1638,102 @@ impl AiChatPanel {
                 }
                 None => i += 1,
             }
+        }
+        if self.hold.releasing() && self.loading.is_empty() {
+            self.finish_release(cx);
+        }
+    }
+
+    /// The host's marks changed: the Annotate button and the chip show them, and a held line
+    /// goes on when its marks are resolved.
+    pub fn set_marks(&mut self, cx: &mut Cx, marks: MarksUi) {
+        if self.marks == marks {
+            return;
+        }
+        self.marks = marks;
+        self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, marks.offered && !marks.on);
+        self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, marks.offered && marks.on);
+        self.view.widget(cx, ids!(marks_row)).set_visible(cx, marks.count > 0);
+        let words = match (marks.count, marks.resolving) {
+            (1, 0) => "1 mark goes with the next line".to_string(),
+            (n, 0) => format!("{n} marks go with the next line"),
+            (n, r) => format!("{n} marks, {r} still being read"),
+        };
+        self.view.label(cx, ids!(marks_label)).set_text(cx, &words);
+        if self.hold.is_waiting() {
+            if marks.count == 0 && !self.hold.releasing() {
+                // cleared while the line waited: it goes as it was typed
+                let text = self.hold.finish().unwrap_or_default();
+                self.marks_through = true;
+                self.send(cx, text);
+            } else {
+                self.ask_marks(cx);
+            }
+        }
+        self.view.redraw(cx);
+    }
+
+    /// Ask the host for the marks' picture once they are resolved.
+    fn ask_marks(&mut self, cx: &mut Cx) {
+        if self.hold.wants_picture(self.marks.resolving) {
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::MarksWanted);
+        }
+    }
+
+    /// The host has the marks' picture (none: the marks go as text alone): the held line goes
+    /// with it.
+    pub fn release_marks(&mut self, cx: &mut Cx, picture: Option<Source>) {
+        if !self.hold.begin_release() {
+            return;
+        }
+        match picture {
+            Some(source) => self.attach(cx, source),
+            None => self.finish_release(cx),
+        }
+    }
+
+    fn finish_release(&mut self, cx: &mut Cx) {
+        if let Some(text) = self.hold.finish() {
+            self.marks_through = true;
+            self.send(cx, text);
+        }
+    }
+
+    /// The person gave up on the held line: it is back in the composer.
+    fn cancel_held(&mut self, cx: &mut Cx) {
+        if let Some(text) = self.hold.finish() {
+            self.view.text_input(cx, ids!(input)).set_text(cx, &text);
+            self.note(cx, "not sent: the marks were not ready".into());
+        }
+    }
+
+    /// Take what the task pool finished: pictures fitted for the model, and a restored chat's
+    /// small copies.
+    fn poll_pictures(&mut self, cx: &mut Cx) {
+        let mut i = 0;
+        while i < self.fitting.len() {
+            match self.fitting[i].1.try_take() {
+                Some(result) => {
+                    let (call_id, handle) = self.fitting.remove(i);
+                    handle.detach();
+                    let fitted = result.unwrap_or_else(|e| Err(format!("the picture could not be read ({e:?})")));
+                    self.ensure_engine().picture_fitted(&call_id, fitted);
+                    self.view.redraw(cx);
+                }
+                None => i += 1,
+            }
+        }
+        if let Some(result) = self.thumbs_loading.as_mut().and_then(|handle| handle.try_take()) {
+            if let Some(handle) = self.thumbs_loading.take() {
+                handle.detach();
+            }
+            match result {
+                Ok(thumbs) => self.thumbs.extend(thumbs),
+                Err(e) => log!("aichat: the chat's pictures are not shown ({e:?})"),
+            }
+            // Task cards show their input pictures too.
+            self.task_rows_filled.clear();
+            self.view.redraw(cx);
         }
     }
 
@@ -1319,42 +1770,40 @@ impl AiChatPanel {
             self.view.text_input(cx, ids!(input)).set_text(cx, "");
             return;
         }
-        let mut text = text;
-        let mut thumbs = Vec::new();
+        // Marks on the page go with the line: it waits until the host has them resolved and
+        // their picture (the host's `MarksWanted`), and the person's text is never sent without.
+        if self.marks.count > 0 && !self.marks_through && !text.trim().starts_with('/') {
+            self.hold.take_line(text);
+            let input = self.view.text_input(cx, ids!(input));
+            input.set_text(cx, "");
+            input.take_key_focus(cx);
+            self.ask_marks(cx);
+            self.view.redraw(cx);
+            return;
+        }
+        self.marks_through = false;
+        let mut sent = false;
         if !self.attachments.is_empty() && !text.trim().starts_with('/') {
             let pictures = std::mem::take(&mut self.attachments);
-            let names: Vec<String> = pictures.iter().map(|p| p.name.clone()).collect();
-            thumbs = pictures.iter().map(|p| p.thumb.clone().unwrap_or_else(|| p.png.clone())).collect();
-            let sent: Vec<(String, Arc<[u8]>)> = pictures.iter().map(|p| (p.name.clone(), p.png.clone())).collect();
-            let images = pictures.into_iter().map(|p| ModelImage { label: format!("reference: {}", p.name), png: p.png }).collect();
-            match self.ensure_engine().model_mut().attach_images(images) {
-                Ok(()) => {
-                    // The app's tools can take what the person showed (by name).
-                    cx.global::<ChatPictures>().pictures.extend(sent);
-                    for (name, thumb) in names.iter().zip(&thumbs) {
-                        if self.pic_thumbs.insert(name.clone(), thumb.clone()).is_some() {
-                            // A newly sent picture may reuse an earlier name.
-                            self.task_pics_filled.retain(|_, key| key.strip_prefix("input:") != Some(name.as_str()));
-                        }
-                    }
-                    if text.trim().is_empty() {
-                        text = "Use the attached picture as the reference.".into();
-                    }
-                    text.push_str(&format!("\n[attached: {}]", names.join(", ")));
-                }
-                Err(e) => {
-                    thumbs.clear();
-                    self.note(cx, format!("the pictures were not sent: {e}"));
-                }
-            }
             self.attach_shown = None;
-        }
-        self.ensure_engine().send(&text, now);
-        if !thumbs.is_empty() {
-            let entries = self.ensure_engine().state().entries.clone();
-            if let Some(at) = entries.iter().rposition(|entry| matches!(entry, Entry::User { .. })) {
-                self.sent_thumbs.insert(at, thumbs);
+            for picture in &pictures {
+                let thumb = picture.sent.thumb.clone().unwrap_or_else(|| picture.sent.png.clone());
+                self.thumbs.insert(picture.file.clone(), thumb);
             }
+            // The line goes with its pictures; the chat keeps them, and the app's tools take
+            // them by name.
+            match self.ensure_engine().send_pictures(&text, pictures.into_iter().map(Dropped::into_new).collect(), now) {
+                Ok(()) => {
+                    sent = true;
+                    self.share_pictures(cx);
+                }
+                Err(e) => self.note(cx, format!("the pictures were not sent: {e}")),
+            }
+        }
+        if !sent {
+            // Marks whose picture the model cannot take still go, as text.
+            let line = if text.trim().is_empty() && self.marks.count > 0 { "What I marked on the page.".to_string() } else { text };
+            self.ensure_engine().send(&line, now);
         }
         let input = self.view.text_input(cx, ids!(input));
         input.set_text(cx, "");
@@ -1446,6 +1895,12 @@ impl AiChatPanel {
             self.task_tracks.entry(t.call_id.clone()).or_default().observe(phase, fraction, now);
         }
         self.task_tracks.retain(|call_id, _| running.contains(call_id.as_str()));
+    }
+
+    /// The small copy of the picture sent in this chat under `name`.
+    fn named_thumb(&self, name: &str) -> Option<&Arc<[u8]>> {
+        let file = &self.engine.as_ref()?.pictures().iter().find(|p| p.name == name)?.file;
+        self.thumbs.get(file)
     }
 
     /// Fill one compact task card; only a changed picture is decoded for a recycled row.
@@ -1543,7 +1998,7 @@ impl AiChatPanel {
         row.tip(cx, ids!(task_tip)).set_text(&tip);
 
         // The input: a picture sent in this chat by name, else a picture file (read once).
-        if !task.picture.is_empty() && !self.pic_thumbs.contains_key(&task.picture) && !self.result_pics.contains_key(&task.picture) {
+        if !task.picture.is_empty() && self.named_thumb(&task.picture).is_none() && !self.result_pics.contains_key(&task.picture) {
             let png = Path::new(&task.picture).is_file().then(|| std::fs::read(&task.picture).ok()).flatten().map(Arc::<[u8]>::from);
             self.result_pics.insert(task.picture.clone(), png);
         }
@@ -1557,7 +2012,7 @@ impl AiChatPanel {
         } else {
             None
         };
-        let input = self.pic_thumbs.get(&task.picture).or_else(|| self.result_pics.get(&task.picture).and_then(Option::as_ref));
+        let input = self.named_thumb(&task.picture).or_else(|| self.result_pics.get(&task.picture).and_then(Option::as_ref));
         let picture = result.map(|png| ("result:", task.result_picture.as_str(), png)).or_else(|| {
             input.filter(|_| !task.picture.is_empty()).map(|png| ("input:", task.picture.as_str(), png))
         });
@@ -1565,7 +2020,7 @@ impl AiChatPanel {
         image.set_visible(cx, picture.is_some());
         if let Some((prefix, key, png)) = picture {
             if self.task_pics_filled.get(&uid).and_then(|last| last.strip_prefix(prefix)) != Some(key) {
-                let _ = image.load_png_from_data(cx, png);
+                let _ = image.load_image_from_data(cx, png);
                 self.task_pics_filled.insert(uid, format!("{prefix}{key}"));
             }
         } else {
@@ -1621,8 +2076,9 @@ impl AiChatPanel {
             Status::Streaming => Some(format!("Writing{rate}")),
             Status::WaitingForTool => state.entries.iter().rev().find_map(|entry| match entry {
                 Entry::Tool(t) => match t.status {
-                    // Stop at the newest active call, even when its card replaces the line.
-                    ToolStatus::Running { .. } | ToolStatus::NotResponding { .. } => Some(t.task.is_none().then(|| format!("Running {}…", t.tool))),
+                    // The newest active call's own row (or card) says it runs, with its
+                    // Stop and how far it is: no second line for it.
+                    ToolStatus::Running { .. } | ToolStatus::NotResponding { .. } => Some(None),
                     ToolStatus::Confirm => Some(Some(format!("{} waits for your answer", t.tool))),
                     _ => None,
                 },
@@ -1631,13 +2087,10 @@ impl AiChatPanel {
         }
     }
 
-    /// A tool card's one line: the call without the service's name (the
-    /// context line already says where it runs), its arguments as plain
-    /// `key: value` text.
     /// An entry as plain text, for a copy of a row that is not drawn.
     fn entry_text(entry: &Entry) -> String {
         match entry {
-            Entry::User { text } | Entry::Assistant { text, .. } | Entry::System { text } => text.clone(),
+            Entry::User { text, .. } | Entry::Assistant { text, .. } | Entry::System { text } => text.clone(),
             Entry::Event(e) => e.text.clone(),
             Entry::Tool(t) => match &t.task {
                 Some(task) => {
@@ -1653,12 +2106,12 @@ impl AiChatPanel {
         }
     }
 
+    /// A call in one line: the tool without its service's name (the context
+    /// line already says where it runs), then its arguments ([`args_line`]);
+    /// a row cuts it to its width.
     fn tool_line(t: &ToolEntry) -> String {
-        let prefix = format!("{} · ", t.service_label);
-        let title = t.title.strip_prefix(prefix.as_str()).unwrap_or(&t.title);
-        let line = title.replace("\":\"", ": ").replace("\":", ": ").replace("\",\"", ", ").replace('"', "");
-        // The engine cuts long arguments: no dangling separator at the cut.
-        line.trim_end_matches([',', ' ', '{', '[', ':']).to_string()
+        let args = args_line(&t.args);
+        if args.is_empty() { t.tool.clone() } else { format!("{}  {args}", t.tool) }
     }
 
     /// Open the platform's picture picker; the answer arrives as a
@@ -1673,6 +2126,67 @@ impl AiChatPanel {
     }
 }
 
+/// The most of a call's arguments a row's line holds: more than any row is wide.
+const ARGS_LINE_CHARS: usize = 240;
+
+/// A call's arguments as plain `key: value` text on one line: `views: [front,
+/// "35,0"], focus: {object: a/b}`. A string goes bare unless it holds what
+/// separates the values; arguments that are no JSON go as they are.
+fn args_line(args: &str) -> String {
+    use makepad_strict_json::Value;
+    fn value(v: &Value, out: &mut String) {
+        match v {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+            Value::Int(i) => out.push_str(&i.to_string()),
+            Value::F64(f) => out.push_str(&f.to_string()),
+            Value::Str(s) if s.is_empty() || s.trim() != s || s.contains([',', ':', '[', ']', '{', '}', '"']) => {
+                out.push('"');
+                out.push_str(&s.replace('"', "\\\""));
+                out.push('"');
+            }
+            Value::Str(s) => out.push_str(s),
+            Value::Arr(items) => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    value(item, out);
+                }
+                out.push(']');
+            }
+            Value::Obj(fields) => {
+                out.push('{');
+                pairs(fields, out);
+                out.push('}');
+            }
+        }
+    }
+    fn pairs(fields: &[(String, Value)], out: &mut String) {
+        for (i, (key, v)) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(key);
+            out.push_str(": ");
+            value(v, out);
+        }
+    }
+    let mut out = String::new();
+    match makepad_strict_json::parse(args.trim().as_bytes()) {
+        Ok(Value::Obj(fields)) => pairs(&fields, &mut out),
+        Ok(other) => value(&other, &mut out),
+        Err(_) => out.push_str(args.trim()),
+    }
+    let mut line: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some((at, _)) = line.char_indices().nth(ARGS_LINE_CHARS) {
+        line.truncate(at);
+        line.push('…');
+    }
+    line
+}
+
 impl Drop for AiChatPanel {
     fn drop(&mut self) {
         // The engine only enqueues Unsubscribe frames. Flush them while the
@@ -1681,6 +2195,10 @@ impl Drop for AiChatPanel {
             engine.shutdown();
         }
         self.bus.relay_down(&self.registry);
+        // a closed panel holds no restart
+        if self.unsaved_published.is_some() {
+            makepad_widgets::makepad_platform::restart::set_unsaved(&self.unsaved_key(), None);
+        }
     }
 }
 
@@ -1729,7 +2247,16 @@ impl Widget for AiChatPanel {
             if ke.key_code == KeyCode::Escape && composing {
                 let busy = self.engine.as_ref().map(|e| e.state().status.is_busy()).unwrap_or(false);
                 let empty = self.view.text_input(cx, ids!(input)).text().trim().is_empty();
-                if busy {
+                if self.hold.is_waiting() {
+                    self.cancel_held(cx);
+                    self.view.redraw(cx);
+                } else if self.marks.on {
+                    self.marks.on = false;
+                    cx.widget_action(self.widget_uid(), AiChatPanelAction::Annotate(false));
+                    self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, self.marks.offered);
+                    self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, false);
+                    self.view.redraw(cx);
+                } else if busy {
                     let now = Self::now(cx);
                     self.ensure_engine().cancel(now);
                     self.view.redraw(cx);
@@ -1774,11 +2301,17 @@ impl Widget for AiChatPanel {
                 }
             }
         }
+        if self.pictures_moved {
+            self.share_pictures(cx);
+        }
+        self.poll_pictures(cx);
         // Drive the engine on every event; the bus relays what it sent.
         let now = Self::now(cx);
         let mut changed = false;
         let mut busy = false;
         let uid = self.widget_uid();
+        let mut wanted = Vec::new();
+        let mut keep = Vec::new();
         if let Some(engine) = self.engine.as_mut() {
             for ev in engine.pump(now) {
                 match ev {
@@ -1787,9 +2320,32 @@ impl Widget for AiChatPanel {
                     EngineEvent::ToolCallPartial { call_id, name, partial_json } => {
                         cx.widget_action(uid, AiChatPanelAction::ToolCallPartial { call_id, name, partial_json });
                     }
+                    EngineEvent::PictureWanted { call_id, picture, rect } => wanted.push((call_id, picture, rect)),
+                    EngineEvent::KeepPicture(write) => keep.push(write),
                 }
             }
             busy = engine.needs_pump() || engine.state().status.is_busy();
+        }
+        // The pool's picture jobs are polled on the frames they ask for.
+        busy |= self.thumbs_loading.is_some();
+        // A picture the person sent is written to its file on the task pool, and its end wakes
+        // the app: what waits for the file (the app's picture tools) goes on then.
+        for write in keep {
+            let refused = write.clone();
+            match cx.task_pool().submit(Class::Visible, move || {
+                write.run();
+                Cx::post_action(PictureKept);
+            }) {
+                Ok(handle) => handle.detach(),
+                Err(e) => refused.abandon(format!("the task pool did not take its write ({e:?})")),
+            }
+        }
+        // A picture the model asks to see again: read and fitted on the task pool.
+        for (call_id, picture, rect) in wanted {
+            match cx.task_pool().submit(Class::Visible, move || pictures::fit_for_model(&picture, rect)) {
+                Ok(handle) => self.fitting.push((call_id, handle)),
+                Err(e) => self.ensure_engine().picture_fitted(&call_id, Err(format!("the picture could not be read ({e:?})"))),
+            }
         }
         self.bus.relay_down(&self.registry);
         if changed {
@@ -1802,6 +2358,7 @@ impl Widget for AiChatPanel {
         }
         self.view.handle_event(cx, event, scope);
         self.widget_match_event(cx, event, scope);
+        self.publish_unsaved(cx);
     }
 
     fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
@@ -1852,6 +2409,9 @@ impl Widget for AiChatPanel {
         self.view.button(cx, ids!(stop_button)).set_visible(cx, busy);
         let typed = !self.view.text_input(cx, ids!(input)).text().trim().is_empty() || !self.attachments.is_empty();
         self.view.widget(cx, ids!(send_button)).set_disabled(cx, !typed);
+        self.view.widget(cx, ids!(mic_tip)).set_visible(cx, matches!(self.voice, VoiceUi::Idle | VoiceUi::Busy));
+        self.view.widget(cx, ids!(mic_button)).set_disabled(cx, self.voice == VoiceUi::Busy);
+        self.view.widget(cx, ids!(mic_live_tip)).set_visible(cx, self.voice == VoiceUi::Listening);
 
         let allowed: Vec<String> = self.engine.as_ref().map(|engine| engine.allowed().map(str::to_string).collect()).unwrap_or_default();
         self.view.view(cx, ids!(allowed_row)).set_visible(cx, !allowed.is_empty());
@@ -1863,7 +2423,7 @@ impl Widget for AiChatPanel {
         if self.attach_shown != Some(shown) {
             self.attach_shown = Some(shown);
             self.view.view(cx, ids!(attach_row)).set_visible(cx, shown.0 + shown.1 > 0);
-            let mut names: Vec<String> = self.attachments.iter().map(|a| format!("{} ({}×{})", a.name, a.width, a.height)).collect();
+            let mut names: Vec<String> = self.attachments.iter().map(|a| format!("{} ({}×{})", a.sent.name, a.width, a.height)).collect();
             if !self.loading.is_empty() {
                 names.push("reading…".into());
             }
@@ -1873,7 +2433,7 @@ impl Widget for AiChatPanel {
                 match self.attachments.get(slot) {
                     Some(picture) => {
                         chip.set_visible(cx, true);
-                        let thumb = picture.thumb.clone().unwrap_or_else(|| picture.png.clone());
+                        let thumb = picture.sent.thumb.clone().unwrap_or_else(|| picture.sent.png.clone());
                         let _ = chip.image(cx, ids!(pic)).load_png_from_data(cx, &thumb);
                     }
                     None => chip.set_visible(cx, false),
@@ -1965,16 +2525,18 @@ impl Widget for AiChatPanel {
                 }
                 let entry = &state.entries[index];
                 let row = match entry {
-                    Entry::User { text } => {
+                    Entry::User { text, pictures } => {
                         let row = list.item(cx, index, id!(UserRow));
                         row.label(cx, ids!(user_text)).set_text(cx, text);
-                        let thumbs = self.sent_thumbs.get(&index);
-                        row.view(cx, ids!(user_pics)).set_visible(cx, thumbs.is_some());
-                        if self.pics_filled.get(&row.widget_uid()) != Some(&index) {
-                            self.pics_filled.insert(row.widget_uid(), index);
+                        // The line's pictures that have their small copy (a restored chat's
+                        // come from the task pool a moment later).
+                        let thumbs: Vec<&Arc<[u8]>> = pictures.iter().filter_map(|p| self.thumbs.get(&p.file)).collect();
+                        row.view(cx, ids!(user_pics)).set_visible(cx, !thumbs.is_empty());
+                        if self.pics_filled.get(&row.widget_uid()) != Some(&(index, thumbs.len())) {
+                            self.pics_filled.insert(row.widget_uid(), (index, thumbs.len()));
                             for (slot, id) in USER_PICS.iter().enumerate() {
                                 let image = row.image(cx, &[*id]);
-                                match thumbs.and_then(|thumbs| thumbs.get(slot)) {
+                                match thumbs.get(slot) {
                                     Some(png) => {
                                         image.set_visible(cx, true);
                                         let _ = image.load_png_from_data(cx, png);
@@ -2033,42 +2595,42 @@ impl Widget for AiChatPanel {
                     }
                     Entry::Tool(t) => {
                         let row = list.item(cx, index, id!(ToolRow));
+                        // the status line: what it is doing now (or a note it ended with), and how
+                        // far, when it counts; a failure's reason in its own words below
                         let (kind, note, problem, permille, detail) = match &t.status {
-                            ToolStatus::Running { note, permille } => {
-                                let note = if note.is_empty() && *permille > 0 { format!("{}%", permille / 10) } else { note.clone() };
-                                (StatusKind::InProgress, note, String::new(), *permille, String::new())
-                            }
+                            ToolStatus::Running { note, permille } => (StatusKind::InProgress, note.clone(), String::new(), *permille, String::new()),
                             ToolStatus::NotResponding { note, permille } => {
-                                (StatusKind::Pending, "not responding".into(), String::new(), *permille, note.clone())
+                                let line = if note.is_empty() { "not responding".to_string() } else { format!("{note} · not responding") };
+                                (StatusKind::Pending, line, String::new(), *permille, note.clone())
                             }
                             ToolStatus::Done { outcome, note, text } if outcome.is_ok() => {
                                 let note = if note.is_empty() || note == "ok" { String::new() } else { note.clone() };
-                                (StatusKind::Success, note, String::new(), 1000, text.clone())
+                                (StatusKind::Success, note, String::new(), 0, text.clone())
                             }
                             ToolStatus::Done { outcome, note, text } => {
-                                let problem = if note.is_empty() { text.lines().next().unwrap_or("").to_string() } else { note.clone() };
-                                (StatusKind::Error, outcome.slug().to_string(), problem, 1000, text.clone())
+                                let reason = if note.is_empty() { text.lines().next().unwrap_or("") } else { note.as_str() };
+                                let problem = if reason.is_empty() { outcome.slug().to_string() } else { reason.to_string() };
+                                (StatusKind::Error, String::new(), problem, 0, text.clone())
                             }
                             ToolStatus::Confirm => (StatusKind::Pending, String::new(), String::new(), 0, String::new()),
                         };
+                        let running = matches!(t.status, ToolStatus::Running { .. } | ToolStatus::NotResponding { .. });
                         row.widget(cx, ids!(tool_dot)).set_text(cx, kind.name());
-                        row.label(cx, ids!(tool_title)).set_text(cx, &Self::tool_line(t));
+                        let line = self.tool_lines.entry(t.call_id.clone()).or_insert_with(|| Self::tool_line(t));
+                        row.label(cx, ids!(tool_title)).set_text(cx, line);
+                        row.button(cx, ids!(tool_stop)).set_visible(cx, running);
+                        let counted = running && permille > 0;
+                        row.view(cx, ids!(tool_status)).set_visible(cx, !note.is_empty() || counted);
                         row.label(cx, ids!(tool_note)).set_text(cx, &note);
-                        row.button(cx, ids!(tool_stop)).set_visible(cx, matches!(t.status, ToolStatus::Running { .. } | ToolStatus::NotResponding { .. }));
+                        row.view(cx, ids!(tool_bar_box)).set_visible(cx, counted);
+                        let bar = row.progress_bar(cx, ids!(tool_bar));
+                        let value = permille.min(1000) as f64 / 1000.0;
+                        if counted && bar.value() != value {
+                            bar.set_value(cx, value);
+                        }
                         let problem_label = row.label(cx, ids!(tool_problem));
                         problem_label.set_visible(cx, !problem.is_empty() && !t.expanded);
                         problem_label.set_text(cx, &problem);
-                        let bar_visible = matches!(t.status, ToolStatus::Running { .. });
-                        row.view(cx, ids!(tool_bar)).set_visible(cx, bar_visible);
-                        if bar_visible {
-                            // The bar is a fraction of the row's inner width
-                            // (the row's rect is last frame's; the first
-                            // frame of a card draws it at a token width).
-                            let inner = (row.area().rect(cx).size.x - 40.0).max(24.0);
-                            let px = inner * (permille as f64 / 1000.0).max(0.05);
-                            let mut bar = row.view(cx, ids!(tool_bar));
-                            script_apply_eval!(cx, bar, { width: #(px) });
-                        }
                         row.view(cx, ids!(tool_detail)).set_visible(cx, t.expanded);
                         if t.expanded {
                             let mut detail = if detail.is_empty() { t.args.clone() } else { format!("{}\n\n{}", t.args, detail) };
@@ -2166,12 +2728,12 @@ impl WidgetMatchEvent for AiChatPanel {
         let returned = input.returned(actions).map(|(text, _)| text);
         if let Some(text) = returned {
             // Enter on an empty line with no picture sends nothing.
-            if !text.trim().is_empty() || !self.attachments.is_empty() {
+            if !text.trim().is_empty() || !self.attachments.is_empty() || self.marks.count > 0 {
                 self.send(cx, text);
             }
         } else if self.view.button(cx, ids!(send_button)).clicked(actions) {
             let text = input.text();
-            if !text.trim().is_empty() || !self.attachments.is_empty() {
+            if !text.trim().is_empty() || !self.attachments.is_empty() || self.marks.count > 0 {
                 self.send(cx, text);
             }
         }
@@ -2200,6 +2762,9 @@ impl WidgetMatchEvent for AiChatPanel {
         if self.view.button(cx, ids!(attach_button)).clicked(actions) {
             self.pick_pictures(cx);
         }
+        if self.view.button(cx, ids!(mic_button)).clicked(actions) || self.view.button(cx, ids!(mic_live_button)).clicked(actions) {
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::VoiceToggled);
+        }
         for action in actions {
             match action.downcast_ref::<FileDialogAction>() {
                 Some(FileDialogAction::FileSelected { id, paths }) if *id == ATTACH_DIALOG => {
@@ -2214,6 +2779,23 @@ impl WidgetMatchEvent for AiChatPanel {
                 }
                 _ => {}
             }
+        }
+        if self.view.button(cx, ids!(annotate_button)).clicked(actions) {
+            self.marks.on = true;
+            self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, false);
+            self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, true);
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::Annotate(true));
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(annotate_on_button)).clicked(actions) {
+            self.marks.on = false;
+            self.view.widget(cx, ids!(annotate_tip)).set_visible(cx, true);
+            self.view.widget(cx, ids!(annotate_on_tip)).set_visible(cx, false);
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::Annotate(false));
+            self.view.redraw(cx);
+        }
+        if self.view.button(cx, ids!(marks_clear)).clicked(actions) {
+            cx.widget_action(self.widget_uid(), AiChatPanelAction::MarksCleared);
         }
         if self.view.button(cx, ids!(selection_clear)).clicked(actions) {
             // Shown cleared at once; the host deselects on the page.
@@ -2259,13 +2841,13 @@ impl WidgetMatchEvent for AiChatPanel {
             let now = Self::now(cx);
             self.notice = None;
             self.ensure_engine().clear(now);
-            cx.global::<ChatPictures>().pictures.clear();
-            self.sent_thumbs.clear();
+            self.thumbs.clear();
+            self.share_pictures(cx);
             self.pics_filled.clear();
-            self.pic_thumbs.clear();
             self.result_pics.clear();
             self.task_pics_filled.clear();
             self.task_rows_filled.clear();
+            self.tool_lines.clear();
             self.task_tracks.clear();
             self.view.redraw(cx);
         }
@@ -2320,5 +2902,43 @@ impl WidgetMatchEvent for AiChatPanel {
             }
         }
         let _ = scope;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call's row reads its arguments as `key: value` text, a string that holds a separator in
+    /// quotes; a long one is cut with an ellipsis, short of what a row could hold.
+    /// A line sent with marks still being resolved (the worker is behind a long build) waits: the
+    /// host is not asked for the picture, and the text is not taken, until every mark is in; then
+    /// it is asked once, and the text goes only when released. Giving up returns the text.
+    #[test]
+    fn a_line_waits_for_marks_still_resolving() {
+        let mut hold = Hold::default();
+        hold.take_line("what did I circle?".into());
+        for _ in 0..5 {
+            assert!(!hold.wants_picture(2), "asked for the picture with marks unresolved");
+        }
+        assert!(hold.is_waiting() && !hold.releasing());
+        assert!(!hold.wants_picture(1));
+        assert!(hold.wants_picture(0), "asked once they are all in");
+        assert!(!hold.wants_picture(0), "and only once");
+        assert!(hold.begin_release() && hold.releasing());
+        assert!(!hold.wants_picture(0), "not again while the picture is read");
+        assert_eq!(hold.finish().as_deref(), Some("what did I circle?"));
+        assert!(!hold.is_waiting() && !hold.begin_release(), "nothing left to release");
+        hold.take_line("again".into());
+        assert_eq!(hold.finish().as_deref(), Some("again"), "given up: the text is back");
+    }
+
+    #[test]
+    fn a_call_s_arguments_read_as_one_plain_line() {
+        assert_eq!(args_line(r#"{"views":["front","35,0"],"focus":{"object":"a/b"},"ortho":true}"#), r#"views: [front, "35,0"], focus: {object: a/b}, ortho: true"#);
+        assert_eq!(args_line("{}"), "");
+        assert_eq!(args_line("not json\n at all"), "not json at all");
+        let long = args_line(&format!(r#"{{"source":"{}"}}"#, "let a = 1\\n".repeat(100)));
+        assert!(long.ends_with('…') && long.chars().count() == ARGS_LINE_CHARS + 1, "{long}");
     }
 }

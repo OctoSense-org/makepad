@@ -154,7 +154,7 @@ pub(super) fn branch_sha(repo: &Path, branch: &str) -> Result<String, String> {
 /// One repo to push: where it is, the branch, its commit.
 #[derive(Clone)]
 struct Push {
-    repo: &'static str,
+    repo: String,
     dir: PathBuf,
     branch: String,
     sha: String,
@@ -301,6 +301,83 @@ impl Bundles {
     }
 }
 
+/// Sends `node`'s store of `repo` the objects `ids` (trees and blobs this repo at `dir` has) its
+/// store lacks: a store holding a commit can lack objects of its tree, and every bundle of a pin
+/// leaves out what the store's refs reach. One commit of a tree that names each of them, bundled
+/// with no bases: the objects and all they hold. It lands on the node's `devhub-fill` ref.
+pub fn fill_objects(control: &Client, node: &str, repo: &str, dir: &Path, ids: &[String]) -> Result<(), String> {
+    if !super::git::valid_repo(repo) {
+        return Err(format!("no repo `{repo}`"));
+    }
+    if ids.is_empty() || !ids.iter().all(|id| valid_sha(id)) {
+        return Err("no object ids".into());
+    }
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("devhub-fill-{}-{n}-{repo}.bundle", std::process::id()));
+    let scratch = path.with_extension("git");
+    let made = (|| -> Result<String, String> {
+        let common = crate::gitread::paths(dir).ok_or_else(|| format!("{}: no repository", dir.display()))?.common_dir.to_string_lossy().into_owned();
+        git(dir, &["init", "-q", "--bare", &scratch.to_string_lossy()])?;
+        std::fs::write(scratch.join("objects/info/alternates"), format!("{common}/objects\n")).map_err(|e| format!("{}: {e}", scratch.display()))?;
+        // (a tree entry per object, named by its id: what git's tree format takes for each kind)
+        let mut entries = String::new();
+        for id in ids {
+            match git(&scratch, &["cat-file", "-t", id])?.as_str() {
+                "blob" => entries.push_str(&format!("100644 blob {id}\t{id}\n")),
+                "tree" => entries.push_str(&format!("040000 tree {id}\t{id}\n")),
+                other => return Err(format!("{id} is a {other}, not a tree or blob")),
+            }
+        }
+        let tree = git_in(&scratch, &["mktree"], entries.as_bytes())?;
+        let commit = git_in(&scratch, &["-c", "user.name=devhub", "-c", "user.email=devhub@localhost", "commit-tree", &tree, "-m", "devhub fill"], &[])?;
+        git(&scratch, &["update-ref", "refs/heads/devhub-fill", &commit])?;
+        git(&scratch, &["bundle", "create", "-q", &path.to_string_lossy(), "refs/heads/devhub-fill"])?;
+        Ok(commit)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let sent = made.and_then(|commit| {
+        let (hash, size) = digest(&path)?;
+        let p = Push { repo: repo.to_string(), dir: dir.to_path_buf(), branch: "devhub-fill".into(), sha: commit };
+        send_bundle(control, node, &p, &path, &hash, size).map(|_| ())
+    });
+    let _ = std::fs::remove_file(&path);
+    sent
+}
+
+/// [`git`] with `input` on its stdin.
+fn git_in(repo: &Path, args: &[&str], input: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = crate::git_exec::command().arg("-C").arg(repo).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("git: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("git: no stdin")?;
+    let written = stdin.write_all(input);
+    drop(stdin);
+    let out = child.wait_with_output().map_err(|e| format!("git: {e}"))?;
+    written.map_err(|e| format!("git {}: {e}", args.first().unwrap_or(&"")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!("git {}: {}", args.first().unwrap_or(&""), proto::clean(String::from_utf8_lossy(&out.stderr).trim(), 300)))
+    }
+}
+
+/// A bundle file's sha256 (as its signed order names it) and size.
+fn digest(path: &Path) -> Result<(String, u64), String> {
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut h = makepad_network::digest::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut size = 0u64;
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((sign::hex(&h.finalise()), size))
+}
+
 fn make_bundle(p: &Push, bases: &[String]) -> Result<(PathBuf, String, u64), String> {
     // unique per call: parallel node pushes with different bases make bundles of one commit at once
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -308,7 +385,9 @@ fn make_bundle(p: &Push, bases: &[String]) -> Result<(PathBuf, String, u64), Str
     let path = std::env::temp_dir().join(format!("devhub-push-{}-{n}-{}-{}.bundle", std::process::id(), p.repo, &p.sha[..12]));
     // the bundle names `refs/heads/<branch>` at exactly `p.sha`, even when the branch has moved
     // since (another landing): it is made in a scratch bare repo that borrows the user repo's
-    // objects (alternates), so nothing is written to the user's repo and no ref is read twice
+    // objects (alternates), so nothing is written to the user's repo and no ref is read twice.
+    // Git writes it (`init --bare`, `update-ref`, `bundle create`): makepad-git reads packs but
+    // writes none. Three execs per node push of a landing.
     let scratch = path.with_extension("git");
     let made = (|| {
         let common = crate::gitread::paths(&p.dir).ok_or_else(|| format!("{}: no repository", p.dir.display()))?.common_dir.to_string_lossy().into_owned();
@@ -322,19 +401,8 @@ fn make_bundle(p: &Push, bases: &[String]) -> Result<(PathBuf, String, u64), Str
     })();
     let _ = std::fs::remove_dir_all(&scratch);
     made?;
-    let mut f = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-    let mut h = makepad_network::digest::Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let mut size = 0u64;
-    loop {
-        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        h.update(&buf[..n]);
-        size += n as u64;
-    }
-    Ok((path, sign::hex(&h.finalise()), size))
+    let (hash, size) = digest(&path)?;
+    Ok((path, hash, size))
 }
 
 /// Sends one bundle down `node`'s `sync-push`.
@@ -385,7 +453,7 @@ fn push_to(c: &Client, node: &str, pushes: &[Push], bundles: &Bundles, out: &mut
     prune_stale(c, node, &status, pushes, out);
     for p in pushes {
         // bases this repo knows; a node that holds the commit (or a descendant) needs no bundle
-        let (bases, there) = bases_for(p, &node_has(&status, p.repo))?;
+        let (bases, there) = bases_for(p, &node_has(&status, &p.repo))?;
         if there {
             out(node, &format!("{} {} {}: already there", p.repo, p.branch, &p.sha[..10]));
             continue;
@@ -434,7 +502,7 @@ fn prune_stale(c: &Client, node: &str, status: &str, pushes: &[Push], out: &mut 
 /// push), read from git here, sent as a file tree over `sync-files`.
 fn push_files(c: &Client, node: &str, status: &str, p: &Push, out: &mut dyn FnMut(&str, &str)) -> Result<(), String> {
     let v = makepad_strict_json::parse(status.as_bytes()).map_err(|_| "a bad status")?;
-    let r = v.get("repos").and_then(|r| r.get(p.repo));
+    let r = v.get("repos").and_then(|r| r.get(&p.repo));
     let from = r.and_then(|r| r.get("checkout")).and_then(|c| c.as_str()).map(str::to_string);
     let prefixes: Vec<String> = r.and_then(|r| r.get("prefixes")).and_then(|a| a.as_arr()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
     if from.as_deref() == Some(p.sha.as_str()) {
@@ -535,15 +603,13 @@ pub(super) fn tree_changes(repo: &Path, from: Option<&str>, to: &str, prefixes: 
 }
 
 /// For leases (DESIGN §11): makes sure `node`'s store holds commit `sha` (pinned from `branch`
-/// when the lease was ordered) of the repo at `dir` (`repo` = makepad | commercial), pushing a
-/// signed bundle when it does not; moves no checkout. Returns the commit. The lease then makes its worktree from the node's store
-/// ([`super::store_dir`]).
+/// when the lease was ordered) of the repo at `dir` (`repo`: makepad, or a nested repository's
+/// name), pushing a signed bundle when it does not; moves no checkout. Returns the commit. The
+/// lease then makes its worktree from the node's store ([`super::store_dir`]).
 pub fn ensure_rev(control: &Client, node: &str, repo: &str, dir: &Path, branch: &str, sha: &str) -> Result<String, String> {
-    let repo: &'static str = match repo {
-        "makepad" => "makepad",
-        "commercial" => "commercial",
-        _ => return Err(format!("no repo `{repo}`")),
-    };
+    if !super::git::valid_repo(repo) {
+        return Err(format!("no repo `{repo}`"));
+    }
     if !valid_branch(branch) || !valid_sha(sha) {
         return Err(format!("`{branch}@{sha}` is not branch@sha"));
     }
@@ -551,7 +617,7 @@ pub fn ensure_rev(control: &Client, node: &str, repo: &str, dir: &Path, branch: 
     if Known::with(dir, |k, repo| k.time(repo, &oid))?.is_none() {
         return Err(format!("{}: no commit {sha}", dir.display()));
     }
-    let p = Push { repo, dir: dir.to_path_buf(), branch: branch.to_string(), sha: sha.to_string() };
+    let p = Push { repo: repo.to_string(), dir: dir.to_path_buf(), branch: branch.to_string(), sha: sha.to_string() };
     let bundles = Bundles::default();
     let r = push_to(control, node, std::slice::from_ref(&p), &bundles, &mut |n, l| println!("{n} {l}"));
     bundles.remove_all();
@@ -582,16 +648,44 @@ fn retired_refusal(repo: &Path, line: &str) -> Option<&'static str> {
     (crate::gitread::Pass::default().retired_holds(repo, from) == Some(true)).then_some("makepad")
 }
 
-/// `at`: the commits to move to (`makepad,commercial`, a timed ask's pin) in place of the branches'
-/// tips; the branches name them on the node.
-pub(super) fn push_and_apply(c: &Client, repo: &Path, makepad_branch: &str, commercial: Option<&str>, at: Option<&str>, nodes: &[String], build: &str, restart: &str, prewarm: bool, extra: &str, out: &mut dyn FnMut(&str, &str)) -> i32 {
+/// What a building apply does about its box's deployment-build room ([`push_and_apply`]'s `room_for`).
+pub(super) enum RoomNow {
+    /// it builds under this room, released once its node answers
+    Built(crate::orch::roll::DeployRoom),
+    /// it builds under a room its caller holds, on these jobs
+    Held(Option<u32>),
+    /// its tree moves alone: its room waits in line, and the box builds once it is granted
+    Tree,
+    /// a bench box whose room waits in line: its tree moves with its build, once it is granted
+    InLine,
+    /// timed work on the box goes first: it waits for the gap after
+    Waits,
+}
+
+/// How a building apply gets its box's room: (node, its wait lines' sink).
+pub(super) type RoomFor<'a> = dyn Fn(&str, &mut dyn FnMut(&str)) -> Result<RoomNow, String> + Sync + 'a;
+
+/// `follow`: the repositories to move, each with its branch (makepad first, [`super::followed`]);
+/// `at`: the commits to move to (a timed ask's pin, [`crate::lease::Pin::key`]) in place of the
+/// branches' tips; the branches name them on the node. `room_for`: how a building apply gets its
+/// box's room (None: it waits in line for it, [`crate::orch::roll::deploy_build_room`]).
+pub(super) fn push_and_apply(c: &Client, repo: &Path, follow: &[(String, String)], at: Option<&str>, nodes: &[String], build: &str, restart: &str, prewarm: bool, extra: &str, room_for: Option<&RoomFor>, out: &mut dyn FnMut(&str, &str)) -> i32 {
     let mut pushes = Vec::new();
-    let mut pinned = at.map(|a| a.split(','));
-    for (name, dir, branch) in [("makepad", repo.to_path_buf(), Some(makepad_branch)), ("commercial", repo.join("apps/commercial"), commercial)] {
-        let pin = pinned.as_mut().map(|p| p.next().filter(|sha| valid_sha(sha)).map(str::to_string).ok_or_else(|| format!("`{}` names no {name} commit", at.unwrap_or(""))));
-        let Some(branch) = branch else { continue };
+    let pinned = at.map(|a| crate::lease::Pin::parse(a).ok_or_else(|| format!("`{a}` is no pin (`<makepad sha>[,<name>=<sha>]...`)")));
+    for (name, branch) in follow {
+        let dir = if name == "makepad" { repo.to_path_buf() } else { repo.join(crate::nested::dir(name)) };
+        // a pin that names none of a nested repository other than the paired one leaves it where
+        // it is (a timed ask's pin names the repositories its run reads)
+        if pinned.as_ref().is_some_and(|p| p.as_ref().is_ok_and(|p| name != "makepad" && name != crate::state::PAIRED && !p.nested.contains_key(name))) {
+            continue;
+        }
+        let pin = pinned.as_ref().map(|p| {
+            let p = p.as_ref().map_err(String::clone)?;
+            let sha = if name == "makepad" { Some(p.makepad.clone()) } else { p.nested.get(name).cloned() };
+            sha.ok_or_else(|| format!("`{}` names no {name} commit", at.unwrap_or("")))
+        });
         match pin.unwrap_or_else(|| branch_sha(&dir, branch)) {
-            Ok(sha) => pushes.push(Push { repo: name, dir, branch: branch.to_string(), sha }),
+            Ok(sha) => pushes.push(Push { repo: name.clone(), dir, branch: branch.clone(), sha }),
             Err(e) => {
                 for n in nodes {
                     out(n, &format!("{{\"err\":{}}}", makepad_remote::json_str(&e)));
@@ -632,19 +726,41 @@ pub(super) fn push_and_apply(c: &Client, repo: &Path, makepad_branch: &str, comm
             }
         }
     }
-    // 2. apply, keeping the node's fast-forward check and restart policy
-    let words = format!("apply{revs} build={build} restart={restart}{}{extra}", if prewarm { " prewarm=on" } else { "" });
+    // 2. apply, keeping the node's fast-forward check and restart policy. One that builds holds its
+    // box's deployment-build room until its node answers: the prebuild is charged and queues like
+    // any build ([`crate::orch::roll::deploy_build_room`]), on the jobs of its grant
+    let words = |build: &str| format!("apply{revs} build={build} restart={restart}{}{extra}", if prewarm { " prewarm=on" } else { "" });
     let answers = std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
         let hs: Vec<_> = ready.into_iter().map(|n| {
-            let words = &words;
+            let (words, tx) = (&words, tx.clone());
             (n, s.spawn(move || {
-                let order = sign::sign(words)?;
+                let mut waits = |l: &str| { let _ = tx.send((String::new(), format!("{n}: {l}"))); };
+                let room = match build {
+                    "on" => match room_for {
+                        Some(f) => f(n, &mut waits)?,
+                        None => crate::orch::roll::deploy_build_room(repo, n, &mut waits)?.map_or(RoomNow::Waits, RoomNow::Built),
+                    },
+                    _ => RoomNow::Tree,
+                };
+                let (words, _room) = match room {
+                    RoomNow::Waits => return Ok(vec![format!("{{\"err\":\"waits: timed work runs or waits at {n}: its deployment builds in the gap after it\"}}")]),
+                    RoomNow::InLine => return Ok(vec![format!("{{\"err\":\"waits: {n} is a bench box: its tree moves with its build, once its deployment-build room waiting in line is granted\"}}")]),
+                    RoomNow::Tree => (words("off"), None),
+                    RoomNow::Held(jobs) => (with_jobs(words("on"), jobs), None),
+                    RoomNow::Built(room) => (with_jobs(words("on"), room.jobs()), Some(room)),
+                };
+                let order = sign::sign(&words)?;
                 let answer = ask(c, n, "sync", &format!("apply {order}"))?;
                 let Some(repoint) = answer.iter().find_map(|l| retired_refusal(repo, l)) else { return Ok(answer) };
                 let order = sign::sign(&format!("{words} repoint={repoint}"))?;
                 ask(c, n, "sync", &format!("apply {order}"))
             }))
         }).collect();
+        drop(tx);
+        for (n, l) in rx {
+            out(&n, &l);
+        }
         hs.into_iter().map(|(n, h)| (n, h.join().unwrap_or_else(|_| Err("panicked".into())))).collect::<Vec<_>>()
     });
     for (n, r) in answers {
@@ -660,6 +776,14 @@ pub(super) fn push_and_apply(c: &Client, repo: &Path, makepad_branch: &str, comm
         }
     }
     code
+}
+
+/// An apply order's words with the jobs of its room's grant (`deploy-jobs`).
+fn with_jobs(words: String, jobs: Option<u32>) -> String {
+    match jobs {
+        Some(j) => format!("{words} jobs={j}"),
+        None => words,
+    }
 }
 
 fn sync_push(c: &Client, args: &[&str]) -> i32 {
@@ -680,7 +804,7 @@ fn sync_push(c: &Client, args: &[&str]) -> i32 {
     let mut pushes = Vec::new();
     let mut add = |repo_name: &'static str, dir: PathBuf, branch: &str| match branch_sha(&dir, branch) {
         Ok(sha) => {
-            pushes.push(Push { repo: repo_name, dir, branch: branch.to_string(), sha });
+            pushes.push(Push { repo: repo_name.to_string(), dir, branch: branch.to_string(), sha });
             Ok(())
         }
         Err(e) => Err(e),
@@ -716,8 +840,8 @@ fn sync_push(c: &Client, args: &[&str]) -> i32 {
         if n.is_empty() { println!("{l}"); } else { println!("{n} {l}"); }
     };
     let Some(session) = flag(args, "--session") else {
-        let commercial = (!args.contains(&"--no-commercial")).then(|| flag(args, "--commercial").unwrap_or("main"));
-        return push_and_apply(c, &repo, flag(args, "--makepad").unwrap_or("work"), commercial, None, &nodes, build, restart, args.contains(&"--prewarm"), "", &mut out);
+        let follow: Vec<(String, String)> = pushes.iter().map(|p| (p.repo.clone(), p.branch.clone())).collect();
+        return push_and_apply(c, &repo, &follow, None, &nodes, build, restart, args.contains(&"--prewarm"), "", None, &mut out);
     };
     let revs: String = pushes.iter().map(|p| format!(" {}={}", p.repo, p.sha)).collect();
     for p in &pushes {
@@ -887,7 +1011,7 @@ pub fn main(args: &[&str]) -> Option<i32> {
     }
     // the dock's app on this machine, from its own shell: no hub, no master
     if let ("open", [app]) = (verb, &args[1..]) {
-        return Some(match super::launch::show(app) {
+        return Some(match super::launch::show(app, false) {
             Ok(_) => 0,
             Err(e) => {
                 eprintln!("makepad devhub open: {e}");
@@ -1035,13 +1159,14 @@ mod tests {
             g(r, &["commit", "-q", "-m", "1"]);
         }
         g(&d, &["branch", "rc-x"]);
-        let spec = crate::lease::pin_revs(&d, "rc-x,main").unwrap();
-        let (mk, com) = crate::lease::parse_pinned(&spec).unwrap();
+        let spec = crate::lease::pin_revs(&d, "rc-x,commercial=main").unwrap();
+        let (mk, nested) = crate::lease::parse_pinned(&spec).unwrap();
         assert_eq!((mk.branch.as_str(), mk.sha.as_str()), ("rc-x", g(&d, &["rev-parse", "rc-x"]).as_str()));
-        assert_eq!(com.unwrap().sha, g(&c, &["rev-parse", "main"]));
+        assert_eq!((nested[0].0.as_str(), nested[0].1.sha.clone()), ("commercial", g(&c, &["rev-parse", "main"])));
+        assert!(crate::lease::pin_revs(&d, "rc-x,main").unwrap_err().contains("as in `work,commercial=main`"), "the old form is refused");
         // an explicit short pin expands; a bare name is not accepted past the CLI
         assert_eq!(crate::lease::pin_revs(&d, &format!("rc-x@{}", &mk.sha[..10])).unwrap(), format!("rc-x@{}", mk.sha));
-        assert!(crate::lease::parse_pinned("rc-x,main").is_err());
+        assert!(crate::lease::parse_pinned("rc-x,main").is_err() && crate::lease::parse_pinned(&format!("rc-x@{},main@{}", mk.sha, mk.sha)).is_err());
         assert!(crate::lease::pin_revs(&d, "no-such").is_err());
         // another landing moves rc-x
         g(&d, &["checkout", "-q", "rc-x"]);
@@ -1050,7 +1175,7 @@ mod tests {
         let moved = g(&d, &["rev-parse", "rc-x"]);
         assert_ne!(moved, mk.sha);
         let refs_before = g(&d, &["for-each-ref"]);
-        let p = super::Push { repo: "makepad", dir: d.clone(), branch: "rc-x".into(), sha: mk.sha.clone() };
+        let p = super::Push { repo: "makepad".into(), dir: d.clone(), branch: "rc-x".into(), sha: mk.sha.clone() };
         let (bundle, _, _) = super::make_bundle(&p, &[]).unwrap();
         let heads = g(&d, &["bundle", "list-heads", &bundle.to_string_lossy()]);
         assert_eq!(heads, format!("{} refs/heads/rc-x", mk.sha));
@@ -1062,7 +1187,7 @@ mod tests {
         // two gate leases ordered at once for this commit bundle it at the same moment (FABIO: they
         // collided on git's `<bundle>.lock`, one never started): every call gets its own path
         let made: Vec<_> = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| super::make_bundle(&super::Push { repo: "makepad", dir: d.clone(), branch: "rc-x".into(), sha: mk.sha.clone() }, &[]))).collect();
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| super::make_bundle(&super::Push { repo: "makepad".into(), dir: d.clone(), branch: "rc-x".into(), sha: mk.sha.clone() }, &[]))).collect();
             hs.into_iter().map(|h| h.join().unwrap().unwrap()).collect()
         });
         let mut paths: Vec<_> = made.iter().map(|(p, _, _)| p.clone()).collect();
@@ -1096,7 +1221,7 @@ mod tests {
         g(&["commit", "-q", "--allow-empty", "-m", "s"]);
         let side = g(&["rev-parse", "HEAD"]);
         let missing = "ab".repeat(20);
-        let p = super::Push { repo: "makepad", dir: d.clone(), branch: "work".into(), sha: two.clone() };
+        let p = super::Push { repo: "makepad".into(), dir: d.clone(), branch: "work".into(), sha: two.clone() };
         let before = crate::git_exec::on_this_thread();
         for _ in 0..2 {
             assert_eq!(super::bases_for(&p, &[three.clone(), side.clone(), missing.clone()]).unwrap(), (vec![three.clone(), side.clone()], true));
@@ -1111,7 +1236,7 @@ mod tests {
     fn stale_pushed_refs_are_the_landed_and_gone_lanes() {
         let st = r#"{"repos":{"makepad":{"checkout":null,"refs":[{"ref":"refs/devhub/checkout","sha":"x"},{"ref":"refs/devhub/pushed/work","sha":"x"},{"ref":"refs/devhub/pushed/rc-open","sha":"x"},{"ref":"refs/devhub/pushed/rc-landed","sha":"x"},{"ref":"refs/devhub/pushed/rc-now","sha":"x"},{"ref":"refs/devhub/pushed/rc-gone","sha":"x"}]}}}"#;
         let open: std::collections::HashSet<String> = ["rc-open".to_string()].into();
-        let now = super::Push { repo: "makepad", dir: std::path::PathBuf::new(), branch: "rc-now".into(), sha: String::new() };
+        let now = super::Push { repo: "makepad".into(), dir: std::path::PathBuf::new(), branch: "rc-now".into(), sha: String::new() };
         assert_eq!(super::stale_pushed(st, "makepad", &open, &[now]), vec!["rc-landed".to_string(), "rc-gone".to_string()]);
         assert!(super::stale_pushed(st, "commercial", &open, &[]).is_empty());
     }

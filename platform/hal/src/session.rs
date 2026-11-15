@@ -23,6 +23,10 @@ use std::collections::BTreeMap;
 /// Session 0: the host.
 pub const HOST: u32 = 0;
 
+/// Who asked for a lent window's next display beat (`WindowObj::beat_asked`).
+pub const BEAT_HOST: u8 = 1;
+pub const BEAT_BORROWER: u8 = 2;
+
 /// A table slot.
 #[derive(Debug)]
 pub struct Entry<T> {
@@ -192,8 +196,8 @@ pub struct PipelineObj {
     pub blob: std::sync::Arc<[u8]>,
 }
 
-/// An opaque host panel. Its pixels and the application's pixels have separate
-/// lifetimes; an idle or parked application need not redraw to show or dismiss it.
+/// An opaque host panel, or a window layer. Its pixels and the application's pixels have
+/// separate lifetimes; an idle or parked application need not redraw to show or dismiss it.
 #[derive(Clone, Debug)]
 pub struct WindowOverlay {
     pub rect: [f32; 4],
@@ -202,10 +206,15 @@ pub struct WindowOverlay {
     pub layer: Id,
     /// a window layer that takes the window's input from the borrower (a panel always does)
     pub input: bool,
-    /// The executor composes this opaque panel as the window's layer (`Gpu::overlays` false: the
-    /// backend draws no panels itself): while it is up the borrower's frames render into the
-    /// window's retained image and never reach the window; only the panel's frames present.
+    /// The executor composes this panel or window layer as the window's badge layer
+    /// (`Gpu::overlays` / `Gpu::layers` false: the backend composes neither itself): while it is
+    /// up the borrower's frames render into the window's retained image and never reach the
+    /// window; only session 0's frames of the window present.
     pub composed: bool,
+    /// A composed window layer: its texture has not taken the borrower's newest frame yet (a new
+    /// frame, or one still with the window system); `Gpu::layer_copy` before session 0's next
+    /// frame of the window.
+    pub fresh: bool,
 }
 
 impl WindowObj {
@@ -262,11 +271,33 @@ pub struct WindowObj {
     pub badge_hovered: bool,
     /// That badge takes a press (`window_style::BADGE_PRESS`).
     pub badge_press: bool,
+    /// Session 0's window: the pointer buttons held down on it now (`MouseDown` and `MouseUp`
+    /// bits, as they reach the window): a press while another one is down began elsewhere (a
+    /// drag across the badge, a second button), never the badge's.
+    pub buttons_down: u32,
     /// Session 0's window: its badge layer (`target::BADGES`), drawn over every frame it presents.
     pub badges: Option<std::sync::Arc<KeptFrame>>,
     /// Session 0's window: the backend has its layer on (`Gpu::badge_layer`) for its badges or a
     /// composed panel (`exec::sync_layer` keeps the two in step).
     pub layer_on: bool,
+    /// Session 0's lent window: whose `FrameRequest` asked for its next display beat
+    /// (`BEAT_HOST`, `BEAT_BORROWER`). The backend has one request per window, made by the
+    /// borrower's alias; the beat's `FrameReady` goes to each side that asked
+    /// (`World::window_event`), so session 0 draws its layer on the display's beats as the app
+    /// draws its frames.
+    pub beat_asked: u8,
+    /// Session 0's lent window: the beats handed out so far.
+    pub beats: u64,
+    /// The beat the borrower has and has not drawn a frame with yet.
+    pub borrower_beat: Option<u64>,
+    /// Session 0's badge frame that rides the borrower's frame (its serial, and the beat the
+    /// first of the frames it replaced began to wait at): kept, not presented; the borrower's
+    /// next frame shows it, or session 0's next `FrameRequest` two beats on presents it alone.
+    pub ride: Option<(u64, u64)>,
+    /// Session 0's lent window: the beat its last badge frame showed on (with the borrower's
+    /// frame, or presented alone). The next one, drawn on that beat, is the next beat's: it
+    /// rides the borrower's next frame (`World::badge_rides`).
+    pub shown_beat: Option<u64>,
 }
 
 /// A frame kept past its batch (session 0's badge layer): its packet with its own passes and
@@ -399,6 +430,9 @@ pub struct Stats {
     /// (`exec::clamped_pass`; a pass is sized as its target, so any is a caller's bug)
     pub clamped_passes: u64,
     pub frames: u64,
+    /// frames whose GPU work failed on its own (the device stood): finished, never presented,
+    /// and drawn again on the next beat
+    pub failed_frames: u64,
     /// frames of this session that reached one of its windows, and the newest
     pub window_frames: u64,
     pub last_window_frame: u64,
@@ -424,6 +458,9 @@ pub struct Stats {
     /// upload arenas (uniforms, inline instances, texture upload staging) the backend had to
     /// allocate for this session's frames and uploads; steady frames reuse theirs and add none
     pub arena_allocs: u64,
+    /// framebuffers the backend made for this session's passes; a pass drawn again into the same
+    /// attachments at the same size reuses its framebuffer, so steady frames add none (Vulkan)
+    pub framebuffers_made: u64,
     /// media commands a backend without media received
     pub media_unsupported: u64,
     /// WindowOverlay requests a backend could not draw
@@ -600,6 +637,8 @@ pub struct World {
     /// the font service (made at its first command), and the call its workers wake the pumps with
     pub fonts: Option<Box<crate::font::FontService>>,
     pub font_notify: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// the largest texture dimension the device takes (`HalInfo::max_texture`), 0 before a backend opens
+    pub max_texture: u32,
     next_key: u64,
     /// sessions whose queue got an event from another session's command: the caller wakes them
     notified: Vec<u32>,
@@ -700,6 +739,7 @@ impl World {
             next_lent: 0,
             fonts: None,
             font_notify: None,
+            max_texture: 0,
             next_key: 1,
             notified: Vec::new(),
             listeners: Default::default(),
@@ -719,6 +759,17 @@ impl World {
     pub fn font_service(&mut self) -> &mut crate::font::FontService {
         let notify = self.font_notify.clone();
         self.fonts.get_or_insert_with(|| Box::new(crate::font::FontService::new(notify)))
+    }
+
+    /// A shell's `Lifecycle` event on its way to a session: going to the background lets the
+    /// font service give back the memory a grown atlas took, and not take more until it's back.
+    pub(crate) fn note_lifecycle(&mut self, kind: u32) {
+        let Some(fonts) = self.fonts.as_mut() else { return };
+        match kind {
+            crate::types::lifecycle::BACKGROUND => fonts.app_backgrounded(),
+            crate::types::lifecycle::FOREGROUND => fonts.app_foregrounded(),
+            _ => {}
+        }
     }
 
     /// A fresh id of the HAL's own (lent) range: what a session samples a host-owned texture by.
@@ -967,6 +1018,10 @@ impl World {
         let Some(wid) = wid else { return };
         let Some(host) = self.sessions.get_mut(&HOST) else { return };
         let Ok(w) = host.windows.get_mut(HOST, wid) else { return };
+        // session 0's frames of a window under its panel or layer are the overlay's (`target::OVERLAY`),
+        // not the window's presentations: they neither open the first-frame gate nor count as the
+        // app's frames (a backend reports them by window, not kind)
+        if sid == HOST && w.val.overlay.is_some() { return; }
         w.val.presentations += 1;
         if w.lent_to == sid && sid != HOST { w.val.borrower_presented = true; }
         // The owner reads the presentation record above. Do not give its native Cx
@@ -1400,6 +1455,9 @@ impl World {
         e.lent_to = session;
         e.val.borrower_frame = false;
         e.val.borrower_presented = false;
+        e.val.beat_asked = 0;
+        e.val.borrower_beat = None;
+        e.val.shown_beat = None;
         let alias = WindowObj { alias_of: Some(pick), overlay: None, ..e.val.clone() };
         let (geom, keeps) = (e.val.geom, e.val.keeps_geom);
         let s = self.sessions.get_mut(&session)?;
@@ -1409,6 +1467,7 @@ impl World {
     }
 
     fn unlend(&mut self, id: Id) {
+        let mut ride = None;
         if let Some(host) = self.sessions.get_mut(&HOST) {
             for hid in host.windows.keys_of(HOST) {
                 if hid == id {
@@ -1417,10 +1476,46 @@ impl World {
                         e.val.borrower_frame = false;
                         e.val.borrower_presented = false;
                         e.val.overlay = None;
+                        e.val.beat_asked = 0;
+                        e.val.borrower_beat = None;
+                        e.val.shown_beat = None;
+                        ride = e.val.ride.take();
                     }
                 }
             }
         }
+        // a badge frame that waited for the borrower's frame stays the window's layer (the next
+        // frame shows it); session 0 hears it is done, and stops asking beats for it
+        if let Some((frame, _)) = ride {
+            let now = self.now();
+            self.retire_frame(HOST, id, frame, now);
+        }
+    }
+
+    /// Frame `frame` of `target` is done without a completion of its own (dropped before the
+    /// GPU, or a badge frame shown with another session's frame): its `FrameDone`, held while
+    /// an earlier frame of the session is still on the GPU, so completion serials never run
+    /// ahead of in-flight work.
+    pub(crate) fn retire_frame(&mut self, sid: u32, target: Id, frame: u64, now: u64) {
+        if frame == 0 { return; }
+        if let Some(s) = self.session_mut(sid) {
+            if s.last_frame_done < s.frame {
+                s.dropped_frames.push((s.frame, target, frame, now));
+                return;
+            }
+            s.last_frame_done = s.last_frame_done.max(frame);
+        }
+        self.to_session(sid, |q| q.frame_done(target, frame, 0, now, 0.0, 0.0));
+    }
+
+    /// A badge frame of session 0's lent window `hid` drawn now rides the borrower's frame: the
+    /// borrower draws with its beat (or with the one before: its frame is still coming), or the
+    /// last badge frame showed on this beat and the borrower asked for the next (the new one is
+    /// that beat's, so session 0 draws it as soon as the last one showed, a frame ahead).
+    pub fn badge_rides(&self, hid: Id) -> bool {
+        let Some(w) = self.sessions.get(&HOST).and_then(|s| s.windows.get(HOST, hid).ok()) else { return false };
+        w.lent_to != 0 && (w.val.borrower_beat.is_some_and(|b| b + 1 >= w.val.beats)
+            || w.val.shown_beat == Some(w.val.beats) && w.val.beat_asked & BEAT_BORROWER != 0)
     }
 
     /// Whether the host window `id` is lent, and to whom.
@@ -1434,7 +1529,8 @@ impl World {
     }
 
     /// Native input follows the visible owner through adoption. Geometry is mirrored
-    /// regardless of ownership; frame beats keep reaching the borrower so it can boot.
+    /// regardless of ownership; frame beats keep reaching the borrower so it can boot, and
+    /// reach session 0 too when it asked for one (`lent_beat`).
     pub fn window_event(&mut self, sid: u32, mut event: RawEvent, payload: &[u8]) {
         let alias = self.session(sid).and_then(|s| s.windows.get(sid, event.window).ok())
             .and_then(|w| w.val.alias_of);
@@ -1452,9 +1548,19 @@ impl World {
                 self.window_geom(sid, window, geom, dpi, state);
             }
         }
+        if let Some(crate::HalEvent::Lifecycle { kind }) = event.decode(payload) {
+            self.note_lifecycle(kind);
+        }
+        if let (Some(hid), Some(crate::HalEvent::FrameReady { next_ns, .. })) = (alias, event.decode(payload)) {
+            if !self.lent_beat(sid, hid, next_ns) {
+                return;
+            }
+        }
         if let Some(hid) = alias {
             self.badge_hover(hid, &event, payload);
-            if self.badge_pressed(hid, &event, payload) {
+            let pressed = self.badge_pressed(hid, &event, payload);
+            self.note_buttons(hid, &event, payload);
+            if pressed {
                 return;
             }
         }
@@ -1476,23 +1582,66 @@ impl World {
         });
     }
 
+    /// A display beat of lent window `hid` (its `FrameReady` to borrower `sid`'s alias): to
+    /// session 0 when it asked for it, to the borrower when it asked or no one did (a backend's
+    /// own beat). False: it is not the borrower's.
+    fn lent_beat(&mut self, sid: u32, hid: Id, next_ns: u64) -> bool {
+        let Some(w) = self.sessions.get_mut(&HOST).and_then(|s| s.windows.get_mut(HOST, hid).ok()) else { return true };
+        if w.lent_to != sid {
+            return true;
+        }
+        let asked = std::mem::take(&mut w.val.beat_asked);
+        w.val.beats += 1;
+        let host = asked & BEAT_HOST != 0;
+        let borrower = asked & BEAT_BORROWER != 0 || !host;
+        if borrower {
+            w.val.borrower_beat = Some(w.val.beats);
+        }
+        if host {
+            self.to_session(HOST, |q| q.frame_ready(hid, next_ns));
+        }
+        borrower
+    }
+
     /// An injected pointer event on a borrowed window (`Hal::inject`) meets the window's badges as
     /// the OS's does ([`Self::window_event`]). True: it was a press on one, no longer the session's.
     pub(crate) fn injected_on_badge(&mut self, sid: u32, event: &RawEvent) -> bool {
         let alias = self.session(sid).and_then(|s| s.windows.get(sid, event.window).ok()).and_then(|w| w.val.alias_of);
         let Some(hid) = alias else { return false };
         self.badge_hover(hid, event, &[]);
-        self.badge_pressed(hid, event, &[])
+        let pressed = self.badge_pressed(hid, event, &[]);
+        self.note_buttons(hid, event, &[]);
+        pressed
+    }
+
+    /// The buttons held down on lent window `hid` ([`WindowObj::buttons_down`]) after `event`.
+    fn note_buttons(&mut self, hid: Id, event: &RawEvent, payload: &[u8]) {
+        let Some(w) = self.sessions.get_mut(&HOST).and_then(|s| s.windows.get_mut(HOST, hid).ok()) else { return };
+        match event.decode(payload) {
+            Some(crate::HalEvent::MouseDown { button, .. }) => w.val.buttons_down |= button,
+            Some(crate::HalEvent::MouseUp { button, .. } | crate::HalEvent::MouseCancel { button, .. }) => w.val.buttons_down &= !button,
+            // (a release the window never saw, as it lost the focus, holds nothing down)
+            Some(crate::HalEvent::Focus { focused: false, .. }) => w.val.buttons_down = 0,
+            _ => {}
+        }
     }
 
     /// A press on lent window `hid`'s badge that takes presses (`window_style::BADGE_PRESS`): it
-    /// goes to session 0 as an event of the badge. True: it is not the window owner's.
+    /// goes to session 0 as an event of the badge. True: it is not the window owner's. Only a
+    /// press that begins on the badge is: one while another press that began elsewhere is still
+    /// down (a drag across the badge, a second button) is the app's. A press held as the badge
+    /// came reaches it as no press at all: its release is the app's, as its press was.
     fn badge_pressed(&mut self, hid: Id, event: &RawEvent, payload: &[u8]) -> bool {
-        let Some(crate::HalEvent::MouseDown { x, y, .. }) = event.decode(payload) else { return false };
+        let Some(crate::HalEvent::MouseDown { x, y, button, .. }) = event.decode(payload) else { return false };
         let Some(w) = self.session(HOST).and_then(|s| s.windows.get(HOST, hid).ok()) else { return false };
         let Some((badge, [bx, by, bw, bh])) = w.val.badge_hover.filter(|_| w.val.badge_press) else { return false };
         let (fx, fy) = (x as f32, y as f32);
         if !(fx >= bx && fy >= by && fx < bx + bw && fy < by + bh) {
+            return false;
+        }
+        let held = w.val.buttons_down & !button;
+        if held != 0 {
+            eprintln!("makepad-hal: a press on window {}'s badge is the app's: a press that began elsewhere is still down (buttons {held:#x})", hid.index);
             return false;
         }
         let mut copy = *event;

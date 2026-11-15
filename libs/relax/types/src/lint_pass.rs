@@ -15,14 +15,12 @@ use crate::typeck::{Body, Res};
 pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
     crate::lint_early::check_items(prog, tcx, own);
-    crate::lint_late::check_items(prog, tcx, own);
-    for i in 0..prog.defs.len() {
-        let def = prog.defs[i];
-        if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
-        let d = DefId(i as u32);
-        if lint::generated(prog, d) { continue; }
-        nonstandard_style_item(prog, d);
-    }
+    let mut pt = crate::lint_dead::PartTimes::new("lint_pass::check_items");
+    crate::lint_late::check_items(prog, tcx, own, &mut pt);
+    let defs: Vec<DefId> = (0..prog.defs.len() as u32).map(DefId).filter(|&d| own.get(prog.def(d).krate as usize).copied().unwrap_or(false) && !lint::generated(prog, d)).collect();
+    lint::par_each(&defs, |&d| nonstandard_style_item(prog, d));
+    pt.mark("nonstandard_style");
+    pt.report(own.iter().filter(|&&o| o).count());
 }
 
 // ---------------------------------------------------------------- nonstandard_style
@@ -152,7 +150,7 @@ fn nonstandard_style_item(prog: &Program, d: DefId) {
         DefKind::Fn | DefKind::AssocFn => {
             let ItemKind::Fn(sig, _, _) = item.kind else { return };
             let sig = *ast.fn_sig(sig);
-            let rust_abi = match sig.abi { None => true, Some(None) => false, Some(Some(a)) => site.text(a).trim_matches('"') == "Rust" };
+            let rust_abi = match sig.abi.get() { None => true, Some(None) => false, Some(Some(a)) => site.text(a).trim_matches('"') == "Rust" };
             if kind == DefKind::Fn {
                 if rust_abi || !no_mangle() { site.snake("function", item.name); }
             } else if parent_kind == DefKind::Trait {
@@ -161,7 +159,7 @@ fn nonstandard_style_item(prog: &Program, d: DefId) {
                 if rust_abi || !no_mangle() { site.snake("method", item.name); }
             }
             // a trait method without a body names its parameters here (they are no patterns of a body)
-            if parent_kind == DefKind::Trait && !matches!(item.kind, ItemKind::Fn(_, Some(_), _)) && sig.lazy_body.is_none() {
+            if parent_kind == DefKind::Trait && !matches!(item.kind, ItemKind::Fn(_, body, _) if body.is_some()) && sig.lazy_body.is_none() {
                 for p in ast.list(sig.params) { snake_pat_idents(&site, ast, p.pat); }
             }
         }
@@ -206,7 +204,7 @@ fn nonstandard_style_item(prog: &Program, d: DefId) {
     // fields and variants
     let fields = |list: List<FieldDef>, inner_extra: &[Attr]| {
         for f in ast.list(list) {
-            if let Some(n) = f.name {
+            if let Some(n) = f.name.get() {
                 let mut inner = inner_extra.to_vec();
                 inner.extend_from_slice(ast.list(f.attrs));
                 let s = Site { prog, def: d, file, inner: &inner };
@@ -312,7 +310,7 @@ impl<'a> Visitor<'a> for Late<'a> {
                     if self.prog.def(*c).kind == DefKind::Const { self.site().upper("constant in pattern", name); }
                 }
             }
-            Pat::Struct(_, fs, _) => {
+            Pat::Struct(_, _, fs) => {
                 for f in self.ast.list(fs) {
                     self.enter_attrs(f.attrs);
                     if !(f.shorthand && matches!(self.ast.pat(f.pat), Pat::Ident { .. })) { self.pat(f.pat); }

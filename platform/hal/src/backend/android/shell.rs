@@ -1,5 +1,5 @@
-use super::{jni, surface::{AndroidSurfaces, Registry}};
-use crate::{backend::{exec::{Gpu, OsCmd}, vulkan::{Shell, Vulkan}, Backend, Pixels}, buffers::{CmdView, EventQueue}, session::{World, HOST}, *};
+use super::{jni, surface::{AndroidEglSurfaces, AndroidSurfaces, Registry}};
+use crate::{backend::{exec::{self, Gpu, OsCmd}, gl::GlBackend, vulkan::Vulkan, Backend, Pixels, Shell}, buffers::{CmdView, EventQueue}, session::{World, HOST}, *};
 use std::{collections::HashSet, sync::{Arc, Mutex, MutexGuard, OnceLock}};
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> { m.lock().unwrap_or_else(|e| e.into_inner()) }
@@ -12,14 +12,15 @@ pub struct AndroidParams {
     pub emulator: bool,
     pub android_version: String,
     pub build_number: String,
-    pub kernel_version: String,
+    /// the package's version and last update time, which every new or reinstalled APK changes
+    pub app_build: String,
     /// the system's dark mode (at start, kept current by `onNightModeChanged`)
     pub night_mode: bool,
     /// `Display.getRotation()` in quarter turns (camera orientation; the surface itself arrives upright)
     pub rotation: u32,
 }
 impl Default for AndroidParams {
-    fn default() -> Self { Self { cache_path: String::new(), data_path: String::new(), density: 1., emulator: false, android_version: String::new(), build_number: String::new(), kernel_version: String::new(), night_mode: false, rotation: 0 } }
+    fn default() -> Self { Self { cache_path: String::new(), data_path: String::new(), density: 1., emulator: false, android_version: String::new(), build_number: String::new(), app_build: String::new(), night_mode: false, rotation: 0 } }
 }
 
 pub(super) struct State {
@@ -27,6 +28,7 @@ pub(super) struct State {
     pub events: Vec<(Option<u32>, EventQueue)>,
     pub ime_session: Option<u32>,
     pub params: AndroidParams,
+    /// the display's frame rate for this app, which each `FrameReady` predicts the next vsync from
     pub refresh: f32,
     pub insets: [f32; 4],
     pub pending: HashSet<(u32, Id)>,
@@ -34,6 +36,9 @@ pub(super) struct State {
     pub focused: bool,
     pub physical_keyboard: Option<bool>,
     pub ime: Option<(i32, bool)>,
+    /// The session that asked for fullscreen: the system bars stay hidden, also after a resume,
+    /// until it restores its window or closes.
+    pub fullscreen: Option<u32>,
     pub wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// An immersive (OpenXR) build: the host window is the XR panel, this many pixels at this
     /// density, whatever the Activity's own surface is.
@@ -42,13 +47,16 @@ pub(super) struct State {
 pub(super) struct Shared {
     pub registry: Mutex<Registry>,
     pub state: Mutex<State>,
+    /// Lets go of the Activity's window before `surfaceDestroyed` returns (the GLES core's
+    /// EGL surfaces; Vulkan's swapchains keep a lease and fail their next present instead).
+    pub release_window: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 impl Shared {
     pub fn global() -> &'static Self {
         static VALUE: OnceLock<Shared> = OnceLock::new();
         VALUE.get_or_init(|| Self { registry: Mutex::new(Registry::default()), state: Mutex::new(State {
-            recipient: None, ime_session: None, events: Vec::new(), params: AndroidParams::default(), refresh: 60., insets: [0.; 4], pending: HashSet::new(), active: false, focused: false, physical_keyboard: None, ime: None, wake: None, xr: None,
-        }) })
+            recipient: None, ime_session: None, events: Vec::new(), params: AndroidParams::default(), refresh: 60., insets: [0.; 4], pending: HashSet::new(), active: false, focused: false, physical_keyboard: None, ime: None, fullscreen: None, wake: None, xr: None,
+        }), release_window: Mutex::new(None) })
     }
     pub fn dpi(&self) -> f32 { let s = lock(&self.state); s.xr.map_or(s.params.density, |(_, dpi)| dpi) }
     pub fn emit(&self, time: u64, f: impl FnOnce(&mut EventQueue, Id)) {
@@ -70,9 +78,10 @@ impl Shared {
             Some((size, dpi)) => (size, dpi, s.refresh, [0.; 4]),
             None => (size, s.params.density, s.refresh, s.insets),
         } };
+        let state = if lock(&self.state).fullscreen.is_some() { window_state::FULLSCREEN } else { window_state::RESTORE };
         self.emit(clock_ns(), |q, id| {
             q.display(id, dpi, refresh);
-            q.geom(id, 0., 0., size[0] as f64 / dpi as f64, size[1] as f64 / dpi as f64, dpi, window_state::RESTORE);
+            q.geom(id, 0., 0., size[0] as f64 / dpi as f64, size[1] as f64 / dpi as f64, dpi, state);
             // the Activity reports the insets in logical points already (MakepadSystemInsets divides by the density)
             q.safe_area(id, insets[0] as f64, insets[1] as f64, insets[2] as f64, insets[3] as f64);
         });
@@ -107,6 +116,14 @@ impl Shared {
     }
 }
 
+/// The backend the app picked in its Cargo.toml (`[package.metadata.makepad.android] hal_backend`,
+/// `gl` or `vulkan`), which cargo-makepad writes into the manifest. `vulkan` keeps the default.
+static APP_HAL_BACKEND: OnceLock<String> = OnceLock::new();
+
+pub(super) unsafe extern "system" fn app_hal_backend(env: *mut makepad_jni_sys::JNIEnv, _: makepad_jni_sys::jclass, backend: makepad_jni_sys::jstring) {
+    let _ = APP_HAL_BACKEND.set(makepad_jni_sys::registration::string(env, backend));
+}
+
 struct AndroidShell;
 impl Shell for AndroidShell {
     fn auto_adopt(&self) -> bool { true }
@@ -125,9 +142,17 @@ impl Shell for AndroidShell {
     }
     fn command(&mut self, sid: u32, cmd: OsCmd) -> bool {
         match cmd {
+            // The executor immediately answers unsupported requests.
+            OsCmd::PrintPdf { .. } => false,
             OsCmd::WindowGeom { id, .. } if lock(&Shared::global().state).recipient == Some((sid, id)) => {
                 // The Activity determines its geometry; application resize requests cannot
                 // change the canonical host window independently of the Android surface.
+                Shared::global().display(); true
+            }
+            OsCmd::WindowState { id, state: state @ (window_state::FULLSCREEN | window_state::RESTORE) } if lock(&Shared::global().state).recipient == Some((sid, id)) => {
+                let fullscreen = state == window_state::FULLSCREEN;
+                lock(&Shared::global().state).fullscreen = fullscreen.then_some(sid);
+                jni::set_full_screen(fullscreen);
                 Shared::global().display(); true
             }
             OsCmd::WindowCreate { id, kind, .. } if kind & 0xff == window_kind::XR => {
@@ -152,29 +177,108 @@ impl Shell for AndroidShell {
                 if lock(&Shared::global().state).ime_session != Some(sid) { return false; }
                 jni::ime_command(cmd)
             },
+            OsCmd::ClipSet { data } => jni::copy_to_clipboard(&data),
+            OsCmd::ClipRead { req, .. } => {
+                let Some(content) = jni::read_clipboard() else { return false; };
+                let content = content.pack();
+                Shared::global().emit_to(sid, Id::NONE, clock_ns(), |q, _| {
+                    q.payload_size(content.len() as u32);
+                    q.clipboard(req, true, &content);
+                });
+                true
+            }
+            // they sit at the asking window's points, so only the Activity's own window places them (a hide always goes)
+            OsCmd::SelectionHandles { id, op: action, start, end } if action == selection_handles::HIDE || lock(&Shared::global().state).recipient == Some((sid, id)) => jni::selection_handles(action, start, end),
+            OsCmd::ClipboardActions { id, show, area, selection } if !show || lock(&Shared::global().state).recipient == Some((sid, id)) => jni::clipboard_actions(show, area, selection),
             OsCmd::BackUnhandled => jni::back_unhandled(),
             OsCmd::NativeAppearance { value } => jni::set_native_appearance(value),
+            OsCmd::MobileUi { op: mobile_ui::STATUS_BAR_DARK_ICONS, value } => jni::set_system_bar_appearance(value != 0),
+            OsCmd::MobileUi { op: mobile_ui::ORIENTATION, value } => jni::set_screen_orientation(value),
+            OsCmd::MobileUi { op: mobile_ui::KEEP_SCREEN_ON, value } => jni::set_keep_screen_on(value != 0),
             OsCmd::MobileUi { op: mobile_ui::APP_BACKGROUND, value } => jni::set_app_background(value),
+            OsCmd::MobileUi { op: mobile_ui::SHADER_COMPILE_SCREEN, .. } => jni::show_shader_compile_screen(),
             _ => false,
         }
     }
 }
 
-pub struct AndroidBackend { core: Vulkan, host: Option<Id>, offscreen: bool }
+/// Vulkan where the device has Vulkan 1.1 and its driver takes our pipelines, else GLES 3.
+/// `MAKEPAD_HAL_BACKEND` or `debug.makepad.hal_backend` (`gl`, `vulkan`) picks one for good.
+pub fn open(backend: u32, flags: u32, sessions: crate::backend::SessionNotify, wake: Arc<dyn Fn() + Send + Sync>, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Box<dyn Backend>, String> {
+    let backend = match (backend, super::xr::system_property("debug.makepad.hal_backend").as_deref()) {
+        (backend_id::AUTO, Some("gl")) => backend_id::GL,
+        (backend_id::AUTO, Some("vulkan")) => backend_id::VULKAN,
+        (backend_id::AUTO, _) if APP_HAL_BACKEND.get().is_some_and(|b| b == "gl") => backend_id::GL,
+        (backend, _) => backend,
+    };
+    if backend == backend_id::AUTO && super::gles_fallback::remembered() {
+        match AndroidBackend::with_gl(flags, wake.clone(), notify.clone()) {
+            Ok(gl) => {
+                eprintln!("[hal-android] this Vulkan driver refused our pipelines before, drawing with GLES");
+                return Ok(Box::new(gl));
+            }
+            Err(e) => eprintln!("[hal-android] this Vulkan driver refused our pipelines before, but GLES failed ({e})"),
+        }
+    }
+    if backend != backend_id::GL {
+        let fallback = (backend == backend_id::AUTO).then(|| wake.clone());
+        match AndroidBackend::new(flags, sessions, notify.clone(), fallback) {
+            Ok(vulkan) => return Ok(Box::new(vulkan)),
+            Err(e) if backend == backend_id::VULKAN => return Err(e),
+            Err(e) => eprintln!("[hal-android] no Vulkan 1.1 ({e}), drawing with GLES"),
+        }
+    }
+    Ok(Box::new(AndroidBackend::with_gl(flags, wake, notify)?))
+}
+
+/// What makes the GLES core if the Vulkan driver refuses one of our pipelines.
+struct GlesFallback { flags: u32, wake: Arc<dyn Fn() + Send + Sync>, notify: Arc<dyn Fn() + Send + Sync>, driver: [u32; 3] }
+
+pub struct AndroidBackend { core: Box<dyn Backend>, host: Option<Id>, offscreen: bool, gles_fallback: Option<GlesFallback> }
 impl AndroidBackend {
     /// `notify` makes every pump look (the Activity's events and frame callbacks); `sessions` the
-    /// session a GPU result is for.
-    pub fn new(flags: u32, sessions: crate::backend::SessionNotify, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+    /// session a GPU result is for. With `wake`, a driver that refuses a pipeline gets GLES instead.
+    pub fn new(flags: u32, sessions: crate::backend::SessionNotify, notify: Arc<dyn Fn() + Send + Sync>, wake: Option<Arc<dyn Fn() + Send + Sync>>) -> Result<Self, String> {
         let offscreen = flags & open_flags::OFFSCREEN_WINDOWS != 0;
         // A Quest build carries the OpenXR loader: the host window is shown in an XR session.
-        let source: Box<dyn crate::backend::vulkan::VkSurfaceSource> = match (!offscreen).then(super::xr::XrSurfaces::try_new).flatten() {
-            Some(xr) => Box::new(xr?),
-            None => Box::new(AndroidSurfaces),
+        let (source, xr): (Box<dyn crate::backend::vulkan::VkSurfaceSource>, bool) = match (!offscreen).then(super::xr::XrSurfaces::try_new).flatten() {
+            Some(xr) => (Box::new(xr?), true),
+            None => (Box::new(AndroidSurfaces), false),
         };
         let mut core = Vulkan::with_sources(flags, sessions, source, Box::new(crate::backend::vulkan::shared_images()))?;
         if !offscreen { core.set_shell(Box::new(AndroidShell)); }
+        // an XR session needs Vulkan, so there's nothing to fall back to
+        let gles_fallback = wake.filter(|_| !xr).map(|wake| GlesFallback { flags, wake, notify: notify.clone(), driver: core.driver() });
         lock(&Shared::global().state).wake = Some(notify);
-        Ok(Self { core, host: None, offscreen })
+        Ok(Self { core: Box::new(core), host: None, offscreen, gles_fallback })
+    }
+
+    /// GLES 3 through EGL on the Activity's `ANativeWindow`, for devices without Vulkan 1.1.
+    pub fn with_gl(flags: u32, wake: Arc<dyn Fn() + Send + Sync>, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
+        let offscreen = flags & open_flags::OFFSCREEN_WINDOWS != 0;
+        let shell: Option<Box<dyn Shell>> = if offscreen { None } else { Some(Box::new(AndroidShell)) };
+        let core = GlBackend::with_source(wake, Box::new(AndroidEglSurfaces { offscreen }), shell)?;
+        if !offscreen { *lock(&Shared::global().release_window) = Some(core.window_release()); }
+        lock(&Shared::global().state).wake = Some(notify);
+        Ok(Self { core: Box::new(core), host: None, offscreen, gles_fallback: None })
+    }
+
+    /// The Vulkan driver refused one of our pipelines: we move every session to a GLES core, much
+    /// like after a device loss, and note it for this driver and system build.
+    fn fall_back_if_refused(&mut self, world: &mut World) {
+        if self.gles_fallback.is_none() { return; }
+        let Some(why) = crate::backend::vulkan::refused_pipeline() else { return };
+        let Some(fallback) = self.gles_fallback.take() else { return };
+        let gl = match Self::with_gl(fallback.flags, fallback.wake, fallback.notify) {
+            Ok(gl) => gl,
+            Err(e) => return eprintln!("[hal-android] the Vulkan driver refused a pipeline ({why}), and GLES failed ({e})"),
+        };
+        eprintln!("[hal-android] the Vulkan driver refused a pipeline ({why}), drawing with GLES");
+        super::gles_fallback::remember(fallback.driver, why);
+        self.core.retire(world);
+        self.core = gl.core;
+        let info = self.info();
+        if let Some(gpu) = self.core.host_gpu() { exec::backend_changed(gpu, world, info); }
     }
     pub fn params() -> AndroidParams { lock(&Shared::global().state).params.clone() }
     fn ensure_host(&mut self, world: &mut World) {
@@ -196,8 +300,10 @@ impl AndroidBackend {
             // Child domains receive input only through their parent's Forward commands.
             q.drain_with(|mut e, payload| {
                 if remap { e.window = recipient.map_or(Id::default(), |(_, id)| id); }
-                if let Some(HalEvent::Geom { window, x, y, w, h, dpi, state }) = e.decode(payload) {
-                    world.window_geom(sid, window, [x as f32, y as f32, w as f32, h as f32], dpi, state);
+                match e.decode(payload) {
+                    Some(HalEvent::Geom { window, x, y, w, h, dpi, state }) => world.window_geom(sid, window, [x as f32, y as f32, w as f32, h as f32], dpi, state),
+                    Some(HalEvent::Lifecycle { kind }) => world.note_lifecycle(kind),
+                    _ => {}
                 }
                 world.to_session(sid, |q| q.push_with_payload(e, payload));
             });
@@ -207,7 +313,9 @@ impl AndroidBackend {
 impl Backend for AndroidBackend {
     fn info(&self) -> HalInfo {
         let info = self.core.info();
-        HalInfo { dpi: Shared::global().dpi(), flags: info.flags | if super::xr::active() { info_flags::XR } else { 0 }, ..info }
+        // the Choreographer (or an XR session's frame loop) answers frame requests at each vsync
+        let display_clock = if self.offscreen { 0 } else { info_flags::DISPLAY_CLOCK };
+        HalInfo { dpi: Shared::global().dpi(), flags: info.flags | display_clock | if super::xr::active() { info_flags::XR } else { 0 }, ..info }
     }
     fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
         self.ensure_host(world);
@@ -216,9 +324,10 @@ impl Backend for AndroidBackend {
         let allowed = owner == Some(sid) || world.session(sid).is_some_and(|s| s.focused && s.parent != 0 && Some(s.parent) == owner);
         lock(&Shared::global().state).ime_session = allowed.then_some(sid);
         self.core.submit(world, sid, view);
+        self.fall_back_if_refused(world);
         self.drain(world);
     }
-    fn step(&mut self, world: &mut World, sid: u32) { self.ensure_host(world); self.drain(world); self.core.step(world, sid); }
+    fn step(&mut self, world: &mut World, sid: u32) { self.ensure_host(world); self.drain(world); self.core.step(world, sid); self.fall_back_if_refused(world); }
     fn next_due(&self, world: &World, sid: u32) -> Option<u64> { self.core.next_due(world, sid) }
     fn window_pixels(&mut self, world: &mut World, sid: u32, window: Option<Id>) -> Option<Pixels> { self.core.window_pixels(world, sid, window) }
     fn host_gpu(&mut self) -> Option<&mut dyn Gpu> { self.core.host_gpu() }
@@ -230,7 +339,11 @@ impl Backend for AndroidBackend {
         state.events.retain(|(s, _)| *s != Some(sid));
         state.pending.retain(|(s, _)| *s != sid);
         if state.recipient.is_some_and(|(s, _)| s == sid) { state.recipient = self.host.map(|id| (HOST, id)); }
+        let restore = state.fullscreen == Some(sid);
+        if restore { state.fullscreen = None; }
         drop(state);
+        // its fullscreen ends with it, so the next app gets the system bars back
+        if restore { jni::set_full_screen(false); shared.display(); }
         let mut registry = lock(&shared.registry);
         if registry.xr_window.is_some_and(|(s, _)| s == sid) { registry.xr_window = None; }
     }
