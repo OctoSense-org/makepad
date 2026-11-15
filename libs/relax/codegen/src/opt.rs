@@ -146,7 +146,7 @@ pub fn rustc_inline_cost(callee: &Func, _callee_id: u32) -> usize {
             Term::Jump(..) | Term::Ret(..) | Term::Invoke(..) => {}
         }
     }
-    penalty.saturating_sub(bonus)
+    callee.priced(penalty).saturating_sub(bonus)
 }
 
 pub fn rustc_inline_threshold(callee: &Func, attrs: u8) -> usize {
@@ -179,7 +179,8 @@ fn callee_shape(f: &Func, callee_id: u32) -> (usize, bool, bool) {
             }
         }
     }
-    (n, leaf, rec)
+    // (a sandbox twin by its base's share: `Func::priced`)
+    (f.priced(n), leaf, rec)
 }
 
 /// Which rule (if any) inlines this call.
@@ -352,8 +353,10 @@ pub fn inline_calls(options: &relax_session::Options, f: &mut Func, self_id: u32
 /// Fraction of the hottest block required for the hot-site rule.
 pub const HOT_FREQ: f32 = 0.05;
 
+/// The size the inliner prices `f` at: its instructions, a sandbox twin's by its base's share
+/// (`Func::priced`).
 fn inline_inst_count(f: &Func) -> usize {
-    f.blocks.iter().map(|b| b.insts.len()).sum()
+    f.priced(f.blocks.iter().map(|b| b.insts.len()).sum())
 }
 
 /// Optional diagnostics. Rejections describe the last inline round; successes span both.
@@ -1239,6 +1242,8 @@ fn inline_site(f: &mut Func, bi: usize, ii: usize, callee: &Func, args: &[VReg],
     for &(p, s) in &callee.guard_calls {
         f.guard_calls.push((ctx_of(p), s));
     }
+    // (a sandbox twin's body not confined yet makes the body that takes it in one too)
+    f.unconfined |= callee.unconfined;
     let m = |v: VReg| vmap[v.0 as usize];
     // calls that may unwind in the callee's blocks, when the callee is inlined at an
     // Invoke: each ends a block of its own whose Invoke continues at the caller's pad
@@ -6811,6 +6816,23 @@ mod inline_priority_tests {
         assert_eq!(stats.growth_after, inline_inst_count(&f));
         assert!(inline_calls_ordered(options, &mut f, 0, &get, &|_| None, &|_, _| false, &|_| false, &lim, None, Some(&mut stats)).is_empty());
         f.verify().unwrap();
+    }
+
+    /// A sandbox twin is priced by its base's share of its confined body (`Func::priced`): its
+    /// size, its rustc cost and with them the rule a site takes it by.
+    #[test]
+    fn a_twin_is_priced_by_its_base() {
+        let lim = InlineLimits::tier1();
+        let mut f = callee(4 * lim.leaf_insts);
+        let (size, cost) = (inline_inst_count(&f), rustc_inline_cost(&f, 0));
+        assert!(inline_rule(&f, 1, 0, 0, 0, &lim).is_none(), "a body four times the leaf rule's size");
+        f.confined = Some((lim.leaf_insts as u32, 4 * lim.leaf_insts as u32));
+        assert_eq!(inline_inst_count(&f), size.div_ceil(4));
+        assert_eq!(rustc_inline_cost(&f, 0), cost.div_ceil(4));
+        assert!(inline_rule(&f, 1, 0, 0, 0, &lim).is_some(), "the twin of a body the leaf rule takes");
+        // (never above its own size)
+        f.confined = Some((u32::MAX, 4));
+        assert_eq!(inline_inst_count(&f), size);
     }
 
     #[test]
