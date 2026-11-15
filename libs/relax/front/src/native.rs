@@ -1555,7 +1555,10 @@ fn macho_archive_symbols(archives: &[String]) -> Result<(std::collections::BTree
             }
             let Some(open) = line.find('(') else { continue };
             let Some(close) = line[open..].find(") ").map(|k| open + k) else { continue };
-            let Some(name) = line[close + 2..].split_whitespace().last() else { continue };
+            let Some(name) = macho_symbol_name(&line[close + 2..]) else { continue };
+            // a name with a space is no C name: Swift's symbolic references (`_symbolic SS`) come
+            // into the link with the member that holds them, and nothing looks one up
+            if name.contains(' ') { continue; }
             if members.is_empty() {
                 members.push(Default::default());
             }
@@ -1571,6 +1574,40 @@ fn macho_archive_symbols(archives: &[String]) -> Result<(std::collections::BTree
         }
     }
     Ok((symbols, members))
+}
+
+/// A symbol's name in what follows the section of a `nm -m` line: it comes after the visibility
+/// words and the attributes (`[weak ][private ]external [automatically hidden ]`, then
+/// `[no dead strip] `, `[alt entry] ` ..) and runs to the end of the line, spaces included. The
+/// line's last word is not the name: a Swift archive (robius-speech's bridge) defines
+/// `_symbolic SS`, `_symbolic So13AVAudioEngineCSg` and the like, and their last words went to
+/// the link as roots no member defines.
+fn macho_symbol_name(rest: &str) -> Option<&str> {
+    let at = rest.find("external ")?;
+    let mut name = &rest[at + "external ".len()..];
+    name = name.strip_prefix("automatically hidden ").unwrap_or(name);
+    while name.starts_with('[') {
+        name = &name[name.find("] ")? + 2..];
+    }
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(test)]
+mod macho_symbol_name_tests {
+    use super::macho_symbol_name;
+
+    #[test]
+    fn a_name_runs_to_the_end_of_the_line() {
+        assert_eq!(macho_symbol_name("external _sqlite3_open"), Some("_sqlite3_open"));
+        assert_eq!(macho_symbol_name("private external _ring_core_0_17_14__x25519_NEON"), Some("_ring_core_0_17_14__x25519_NEON"));
+        assert_eq!(macho_symbol_name("weak external automatically hidden _$s12RobiusSpeech0B5ErrorOMa"), Some("_$s12RobiusSpeech0B5ErrorOMa"));
+        assert_eq!(macho_symbol_name("weak private external _symbolic So13AVAudioEngineCSg"), Some("_symbolic So13AVAudioEngineCSg"));
+        assert_eq!(macho_symbol_name("weak private external _symbolic _____ 12RobiusSpeech06NativeB0C"), Some("_symbolic _____ 12RobiusSpeech06NativeB0C"));
+        assert_eq!(macho_symbol_name("external [no dead strip] _$s12RobiusSpeech010stopNativeB0yys6UInt64V_SbtF"), Some("_$s12RobiusSpeech010stopNativeB0yys6UInt64V_SbtF"));
+        assert_eq!(macho_symbol_name("private external [alt entry] _$s12RobiusSpeech06NativeB0CN"), Some("_$s12RobiusSpeech06NativeB0CN"));
+        assert_eq!(macho_symbol_name("weak private external [no dead strip] _symbolic $sSY"), Some("_symbolic $sSY"));
+        assert_eq!(macho_symbol_name("external "), None);
+    }
 }
 
 // ---- cargo's RUSTC_WRAPPER
