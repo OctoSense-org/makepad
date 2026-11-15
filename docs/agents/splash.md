@@ -154,6 +154,11 @@ colors such as `#x2ecc71` and `#x1e1e2e` where a digit followed by `e` or
 For Rust action enums, use `#[derive(Default)]` and `#[default]` on the
 default variant, not the old `DefaultNone` derive.
 
+Array items may be separated by spaces, but write commas whenever an item is
+negative: `[0, 0, -30deg]`. `[0 0 -30deg]` reads as `[0, 0 - 30deg]` (two items,
+the minus a subtraction), and the parser warns about a `-` with a space before
+it and none after inside `[ ]`.
+
 In script functions, `a.b ?? d` reads an optional field: a missing field
 (or a field of nil) is `d`, where `a.b |? d` only replaces a nil value.
 `mod(a, b)` is the floored modulo of shading languages (the result takes
@@ -227,8 +232,11 @@ the widget path and file:line: add the missing template to that widget's
 - Texture declarations use `texture_2d(float)`.
 - Shader functions use `pixel: fn() {...}` and method calls use `.`, not
   Rust `::`. Chained `color.mix(other, amount)` is a useful styling idiom.
-- Use `modf(a, b)` for float modulo and `atan2(y, x)` for the two-argument
-  arctangent. `atan(x)` and `fract(x)` are also available.
+- Use `mod(a, b)` for float modulo (floored: the result takes b's sign) and
+  `modf(a, b)` for the truncating remainder (a's sign), the same on every
+  backend and as in script functions; both take floats and float vectors,
+  and a scalar beside a vector applies to every lane. `atan2(y, x)` is the
+  two-argument arctangent; `atan(x)` and `fract(x)` are also available.
 - Animator states use id values such as `default: @off`. Use the current
   Button implementation for state definitions and transition constructors.
 - Prefer enum `match` with a catch-all. A failure in supported shader enum

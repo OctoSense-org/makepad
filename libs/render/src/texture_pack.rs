@@ -1,5 +1,5 @@
 //! Load-ready model images. At build/publish time every image embedded in a
-//! GLB is decoded once, mipped for its material role and encoded to UASTC
+//! GLB texture source is decoded once, mipped for its material role and encoded to UASTC
 //! (Basis Universal, KTX2); the KTX2 replaces the PNG in the GLB itself
 //! (`KHR_texture_basisu`) and carries a content id. A load then remaps UASTC
 //! to the GPU's block format (ASTC 4x4 is nearly direct, BC7 a fast per-block
@@ -31,19 +31,21 @@ pub fn content_id(bytes: &[u8]) -> Option<u64> {
 }
 
 /// A load-ready BC5 normal map: its blocks as they are where BC is sampled,
-/// else RGBA mips decoded from them. `None` when `bytes` is not BC5.
-fn texture_from_bc5(bytes: &[u8]) -> Option<Result<PreparedTexture, String>> {
-    let view = makepad_texcomp::rgtc::Bc5View::parse(bytes).ok()?;
-    let hash = view.content_id.unwrap_or(bytes.len() as u64 ^ 0x4b54_5832_4243_3500);
+/// else RGBA mips decoded from them, keeping levels `k..` only. `None` when `bytes` is not BC5.
+fn texture_from_bc5(bytes: &[u8], k: usize, hash: Option<u64>) -> Option<Result<PreparedTexture, String>> {
+    let mut view = makepad_texcomp::rgtc::Bc5View::parse(bytes).ok()?;
+    if k >= view.levels.len() { return Some(Err(format!("KTX2 image has no level {k}"))); }
+    view.levels.drain(..k);
+    let hash = hash.or(view.content_id).unwrap_or(bytes.len() as u64 ^ 0x4b54_5832_4243_3500);
     let (width, height, _) = view.levels[0];
     let max_level = view.levels.len() - 1;
     if crate::material_surface::bc5_normal_maps() {
-        let blocks = view.levels.iter().flat_map(|l| l.2.iter().copied()).collect();
-        return Some(Ok(PreparedTexture { width: width as usize, height: height as usize, data: Vec::new(), max_level, hash,
-            compressed: Some((crate::material_surface::GpuCompressedFormat::Bc5, blocks)) }));
+        let blocks: Vec<u8> = view.levels.iter().flat_map(|l| l.2.iter().copied()).collect();
+        return Some(Ok(PreparedTexture { width: width as usize, height: height as usize, data: Vec::new().into(), max_level, hash, stored: None,
+            compressed: Some((crate::material_surface::GpuCompressedFormat::Bc5, blocks.into())) }));
     }
-    let data = view.levels.iter().flat_map(|&(w, h, blocks)| xy_bgra(makepad_texcomp::rgtc::decode_image(blocks, w, h, 2))).collect();
-    Some(Ok(PreparedTexture { width: width as usize, height: height as usize, data, max_level, hash, compressed: None }))
+    let data: Vec<u32> = view.levels.iter().flat_map(|&(w, h, blocks)| xy_bgra(makepad_texcomp::rgtc::decode_image(blocks, w, h, 2))).collect();
+    Some(Ok(PreparedTexture { width: width as usize, height: height as usize, data: data.into(), max_level, hash, stored: None, compressed: None }))
 }
 
 /// Decoded BC5 (X, Y bytes) as BGRA words: X in red, Y in green, blue 0.
@@ -55,12 +57,21 @@ fn xy_bgra(xy: Vec<u8>) -> impl Iterator<Item = u32> {
 /// the UASTC mips remapped to the host's compression target, else RGBA mips
 /// decoded from UASTC. `None` when `bytes` is not KTX2.
 pub fn texture_from_ktx2(bytes: &[u8]) -> Option<Result<PreparedTexture, String>> {
+    texture_from_ktx2_from(bytes, 0, None)
+}
+
+/// [`texture_from_ktx2`] holding levels `k..` only (level `k` becomes level 0), named `hash`
+/// when given (else its content id, as `texture_from_ktx2`). `Some(Err)` when the file has no
+/// level `k`. Only the kept levels are transcoded or decoded.
+pub fn texture_from_ktx2_from(bytes: &[u8], k: usize, hash: Option<u64>) -> Option<Result<PreparedTexture, String>> {
     if !is_ktx2(bytes) { return None; }
-    if let Some(texture) = texture_from_bc5(bytes) { return Some(texture); }
+    if let Some(texture) = texture_from_bc5(bytes, k, hash) { return Some(texture); }
     Some((|| {
-        let view = makepad_texcomp::basis::UastcView::parse(bytes)?;
+        let mut view = makepad_texcomp::basis::UastcView::parse(bytes)?;
+        if k >= view.levels.len() { return Err(format!("KTX2 image has no level {k}")); }
+        view.levels.drain(..k);
         // An image built without an id still dedupes within its own load.
-        let hash = view.content_id.unwrap_or(bytes.len() as u64 ^ 0x4b54_5832_0000_0000);
+        let hash = hash.or(view.content_id).unwrap_or(bytes.len() as u64 ^ 0x4b54_5832_0000_0000);
         if let Some(target) = crate::material_surface::compressed_texture_target() {
             return PreparedTexture::from_uastc_view(&view, target, hash).ok_or_else(|| "KTX2 image has no levels".to_string());
         }
@@ -69,7 +80,7 @@ pub fn texture_from_ktx2(bytes: &[u8]) -> Option<Result<PreparedTexture, String>
         for &(w, h, blocks) in &view.levels {
             data.extend(bgra(&makepad_texcomp::uastc::decode_image(blocks, w, h)?));
         }
-        Ok(PreparedTexture { width: width as usize, height: height as usize, data, max_level: view.levels.len() - 1, hash, compressed: None })
+        Ok(PreparedTexture { width: width as usize, height: height as usize, data: data.into(), max_level: view.levels.len() - 1, hash, stored: None, compressed: None })
     })())
 }
 
@@ -113,9 +124,11 @@ fn image_semantics(doc: &makepad_gltf::GltfDocument) -> HashMap<usize, PixelSema
     let mut out = HashMap::new();
     for material in doc.materials.as_deref().unwrap_or(&[]) {
         let masked = material.alpha_mode.as_deref() == Some("MASK");
+        let msdf = material.extras.as_ref().and_then(|e| e.key("makepadShading")).and_then(|s| s.key("msdf"))
+            .and_then(|v| v.as_f64()).is_some_and(|v| v > 0.5);
         let pbr = material.pbr_metallic_roughness.as_ref();
         let uses = [
-            (source(pbr.and_then(|p| p.base_color_texture.as_ref()).map(|t| t.index)), if masked { PixelSemantic::MaskedColor } else { PixelSemantic::Color }),
+            (source(pbr.and_then(|p| p.base_color_texture.as_ref()).map(|t| t.index)), if msdf { PixelSemantic::Data } else if masked { PixelSemantic::MaskedColor } else { PixelSemantic::Color }),
             (source(pbr.and_then(|p| p.metallic_roughness_texture.as_ref()).map(|t| t.index)), PixelSemantic::Data),
             (source(material.normal_texture.as_ref().map(|t| t.index)), PixelSemantic::Normal),
             (source(material.occlusion_texture.as_ref().map(|t| t.index)), PixelSemantic::Data),
@@ -126,19 +139,41 @@ fn image_semantics(doc: &makepad_gltf::GltfDocument) -> HashMap<usize, PixelSema
     out
 }
 
-/// The base-colour images of impostor materials (`makepadShading.impostor`,
-/// impostor.rs): an atlas of many small views, magnified about three times
-/// where the stand-in takes over, where 4x4 compression blocks of its noisy
-/// leaf texels showed as squares. They stay PNG (RGBA8 on the GPU, a few MB
-/// per species), which also spares their encode on a model's first load.
-/// Their normal atlases are smooth and compress well (two channels).
-fn impostor_color_images(doc: &makepad_gltf::GltfDocument) -> std::collections::HashSet<usize> {
+/// The base-colour and depth images of impostor materials
+/// (`makepadShading.impostor`, impostor.rs). The colour atlas holds many
+/// small views, magnified about three times where the stand-in takes over,
+/// where 4x4 compression blocks of its noisy leaf texels showed as squares.
+/// The depth atlas (the occlusion slot, `ImpostorBake::depth`) splits 16
+/// bits over two bytes, which block compression would not keep. Both stay
+/// PNG (RGBA8 on the GPU, a few MB per species), which also spares their
+/// encode on a model's first load. Their normal atlases are smooth and
+/// compress well (two channels).
+fn impostor_images(doc: &makepad_gltf::GltfDocument) -> std::collections::HashSet<usize> {
     let textures = doc.textures.as_deref().unwrap_or(&[]);
     doc.materials.as_deref().unwrap_or(&[]).iter()
         .filter(|m| m.extras.as_ref().and_then(|e| e.key("makepadShading")).and_then(|s| s.key("impostor"))
             .is_some_and(|d| match d { makepad_gltf::JsonValue::F64(x) => *x > 0.0, makepad_gltf::JsonValue::U64(x) => *x > 0, makepad_gltf::JsonValue::I64(x) => *x > 0, _ => false }))
-        .filter_map(|m| m.pbr_metallic_roughness.as_ref()?.base_color_texture.as_ref())
-        .filter_map(|t| textures.get(t.index)?.source).collect()
+        .flat_map(|m| [m.pbr_metallic_roughness.as_ref().and_then(|p| p.base_color_texture.as_ref()).map(|t| t.index), m.occlusion_texture.as_ref().map(|t| t.index)])
+        .flatten()
+        .filter_map(|t| textures.get(t)?.source).collect()
+}
+
+/// Splat arrays consume RGBA PNGs: height and roughness live in alpha.
+/// In particular, a normal-alpha layer must never become two-channel BC5.
+fn splat_images(doc: &makepad_gltf::GltfDocument) -> std::collections::HashSet<usize> {
+    let textures = doc.textures.as_deref().unwrap_or(&[]);
+    let mut out = std::collections::HashSet::new();
+    let mut add = |v: Option<&makepad_gltf::JsonValue>| {
+        if let Some(image) = v.and_then(|v| v.as_u64()).and_then(|i| textures.get(i as usize)).and_then(|t| t.source) { out.insert(image); }
+    };
+    for material in doc.materials.as_deref().unwrap_or(&[]) {
+        let Some(splat) = material.extras.as_ref().and_then(|e| e.key("makepadSplat")) else { continue; };
+        add(splat.key("weights"));
+        if let Some(layers) = splat.key("layers").and_then(|l| l.as_array()) {
+            for layer in layers { add(layer.key("albedo")); add(layer.key("normal")); }
+        }
+    }
+    out
 }
 
 /// Images sampled with NEAREST magnification anywhere in the document
@@ -149,6 +184,44 @@ fn nearest_images(doc: &makepad_gltf::GltfDocument) -> std::collections::HashSet
     doc.textures.as_deref().unwrap_or(&[]).iter()
         .filter(|t| t.sampler.and_then(|i| samplers.get(i)).is_some_and(|s| s.mag_filter == Some(NEAREST)))
         .filter_map(|t| t.source).collect()
+}
+
+/// Authored mip snapshots are image indices, not texture sources. Retain
+/// their single PNG level: encoding each snapshot as another complete chain
+/// repeats the base texture's work. Any actual texture reference takes priority.
+fn authored_mip_images(glb: &[u8], doc: &makepad_gltf::GltfDocument) -> Result<std::collections::HashSet<usize>, String> {
+    use makepad_draw::makepad_micro_serde::DeJson;
+    use makepad_gltf::JsonValue;
+    let mut images = std::collections::HashSet::new();
+    for material in doc.materials.as_deref().unwrap_or(&[]) {
+        if let Some(JsonValue::Object(channels)) = material.extras.as_ref().and_then(|e| e.key("makepadMips")) {
+            for levels in channels.values().filter_map(JsonValue::as_array) {
+                for image in levels.iter().filter_map(JsonValue::as_u64) {
+                    if let Ok(image) = usize::try_from(image) { images.insert(image); }
+                }
+            }
+        }
+    }
+    if images.is_empty() { return Ok(images); }
+    // GltfTexture intentionally models only core fields, so inspect raw JSON
+    // as well to protect extension sources (Basis, WebP, or future extensions).
+    fn protect_sources(value: &JsonValue, images: &mut std::collections::HashSet<usize>) {
+        match value {
+            JsonValue::Object(fields) => {
+                if let Some(source) = fields.get("source").and_then(JsonValue::as_u64).and_then(|v| usize::try_from(v).ok()) {
+                    images.remove(&source);
+                }
+                for value in fields.values() { protect_sources(value, images); }
+            }
+            JsonValue::Array(values) => for value in values { protect_sources(value, images); },
+            _ => {}
+        }
+    }
+    let chunks = makepad_gltf::split_glb(glb).map_err(|e| format!("GLB: {e:?}"))?;
+    let root = JsonValue::deserialize_json_lenient(chunks.json.trim_end_matches(['\0', ' ', '\n', '\r', '\t']))
+        .map_err(|e| format!("GLB texture sources: {e:?}"))?;
+    if let Some(textures) = root.key("textures") { protect_sources(textures, &mut images); }
+    Ok(images)
 }
 
 /// A palettized PNG (IHDR colour type 3: pixel art, palette colormaps), or
@@ -165,7 +238,7 @@ fn low_colour(png: &[u8], image: &ImageBuffer) -> bool {
 
 /// Build time: replace every embedded PNG of `glb` with its load-ready KTX2
 /// (decoded once, mipped for its material role, UASTC-encoded at `quality`
-/// on `threads` cores; normal maps BC5-encoded). Content ids are the PNG's prepared-texture key,
+/// through `encode`; normal maps BC5-encoded). Content ids are the PNG's prepared-texture key,
 /// computed here once. Images already KTX2, or not PNG, stay as they are,
 /// and so do pixel-art images: NEAREST-magnified or low-colour (see
 /// [`low_colour`]); those are small and decode cheaply.
@@ -173,13 +246,13 @@ fn low_colour(png: &[u8], image: &ImageBuffer) -> bool {
 /// One PNG in the load-ready form (pre-mipped UASTC, or BC5 for a normal
 /// map, as KTX2 carrying its content id). `None` when the image is low-colour
 /// and stays PNG.
-pub fn load_ready_image(png: &[u8], semantic: PixelSemantic, quality: makepad_texcomp::uastc::Quality, threads: usize) -> Result<Option<Vec<u8>>, String> {
+pub fn load_ready_image(png: &[u8], semantic: PixelSemantic, quality: makepad_texcomp::uastc::Quality, encode: &(dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync)) -> Result<Option<Vec<u8>>, String> {
     let image = crate::renderer::decode_generated_png(png, 4096, 256 * 1024 * 1024)?;
     if low_colour(png, &image) { return Ok(None); }
     let prepared = PreparedTexture::prepare(image, semantic);
     let id = crate::material_surface::prepared_texture_key(png, semantic);
-    if matches!(semantic, PixelSemantic::Normal) { return prepared.to_bc5_ktx2(id, threads).map(Some); }
-    prepared.to_uastc(false, quality, threads)?.to_ktx2_with(Some(id)).map(Some)
+    if matches!(semantic, PixelSemantic::Normal) { return prepared.to_bc5_ktx2(id, encode).map(Some); }
+    prepared.to_uastc(false, quality, encode)?.to_ktx2_with(Some(id)).map(Some)
 }
 
 /// [`load_ready_image`], remembered by its exact inputs for this process.
@@ -187,9 +260,9 @@ pub fn load_ready_image(png: &[u8], semantic: PixelSemantic, quality: makepad_te
 /// a wood and a flagstone material) embed byte-identical pattern PNGs, and
 /// each would be re-encoded to UASTC per model. The key is the whole PNG
 /// plus semantic and quality, and the encode is deterministic, so a hit
-/// returns exactly the bytes the encode would. `threads` only splits the
-/// work. Bounded: past 96 MiB of entries the memo starts over.
-fn load_ready_image_memo(png: &[u8], semantic: PixelSemantic, quality: makepad_texcomp::uastc::Quality, threads: usize) -> Result<Option<Vec<u8>>, String> {
+/// returns exactly the bytes the encode would, regardless of executor order.
+/// Bounded: past 96 MiB of entries the memo starts over.
+fn load_ready_image_memo(png: &[u8], semantic: PixelSemantic, quality: makepad_texcomp::uastc::Quality, encode: &(dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync)) -> Result<Option<Vec<u8>>, String> {
     use std::collections::HashMap;
     use std::sync::Mutex;
     type Key = (Vec<u8>, u8, u8);
@@ -198,7 +271,7 @@ fn load_ready_image_memo(png: &[u8], semantic: PixelSemantic, quality: makepad_t
     if let Some((map, _)) = MEMO.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if let Some(hit) = map.get(&key) { return Ok(hit.clone()); }
     }
-    let out = load_ready_image(png, semantic, quality, threads)?;
+    let out = load_ready_image(png, semantic, quality, encode)?;
     let mut memo = MEMO.lock().unwrap_or_else(|e| e.into_inner());
     let (map, bytes) = memo.get_or_insert_with(|| (HashMap::new(), 0));
     let cost = key.0.len() + out.as_ref().map_or(0, |k| k.len());
@@ -208,22 +281,67 @@ fn load_ready_image_memo(png: &[u8], semantic: PixelSemantic, quality: makepad_t
     Ok(out)
 }
 
-pub fn embed_load_ready_images(glb: &[u8], quality: makepad_texcomp::uastc::Quality, threads: usize) -> Result<Option<Vec<u8>>, String> {
+/// One embedded image's load-ready preparation, including memo lookup,
+/// decoding, mips and encoding. Retained PNGs have one level.
+#[derive(Clone, Debug)]
+pub struct LoadReadyImageTiming {
+    pub image: usize,
+    pub width: u32,
+    pub height: u32,
+    pub mip_levels: u32,
+    pub elapsed: std::time::Duration,
+    pub format: &'static str,
+}
+
+pub fn embed_load_ready_images(glb: &[u8], quality: makepad_texcomp::uastc::Quality, encode: &(dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync)) -> Result<Option<Vec<u8>>, String> {
+    embed_load_ready_images_with_timings(glb, quality, encode, None)
+}
+
+/// As `embed_load_ready_images`, with an optional observer on the calling
+/// worker. Authored mip snapshots stay PNG; their base texture alone receives
+/// a full encoded chain. Their original payload and metadata remain in the GLB.
+pub fn embed_load_ready_images_with_timings(glb: &[u8], quality: makepad_texcomp::uastc::Quality, encode: &(dyn Fn(usize, &(dyn Fn(usize) + Sync)) + Sync), mut observe: Option<&mut dyn FnMut(LoadReadyImageTiming)>) -> Result<Option<Vec<u8>>, String> {
     let parsed = makepad_gltf::parse_glb_bytes(glb).map_err(|e| format!("GLB: {e:?}"))?;
     let semantics = image_semantics(&parsed.document);
     let mut keep_png = nearest_images(&parsed.document);
-    keep_png.extend(impostor_color_images(&parsed.document));
+    keep_png.extend(impostor_images(&parsed.document));
+    keep_png.extend(splat_images(&parsed.document));
+    let authored_mips = authored_mip_images(glb, &parsed.document)?;
+    let has_authored_mips = !authored_mips.is_empty();
+    keep_png.extend(authored_mips);
     drop(parsed);
     let mut failure = None;
     let mut changed = false;
     let out = makepad_gltf::embed_ktx2_images(glb, |index, png| {
-        if failure.is_some() || !png.starts_with(b"\x89PNG") || keep_png.contains(&index) { return None; }
-        let semantic = semantics.get(&index).copied().unwrap_or(PixelSemantic::Color);
-        match load_ready_image_memo(png, semantic, quality, threads) {
-            Ok(Some(ktx)) => { changed = true; Some(ktx) }
-            Ok(None) => None,
-            Err(error) => { failure = Some(format!("image {index}: {error}")); None }
+        let started = observe.as_ref().map(|_| makepad_draw::Cx::monotonic_now());
+        let replacement = if failure.is_some() || !png.starts_with(b"\x89PNG") || keep_png.contains(&index) { None } else {
+            let semantic = semantics.get(&index).copied().unwrap_or(PixelSemantic::Color);
+            // A fresh conversion of authored chains exposes the actual work
+            // each build performs, without depending on the process memo.
+            let result = if has_authored_mips { load_ready_image(png, semantic, quality, encode) }
+                else { load_ready_image_memo(png, semantic, quality, encode) };
+            match result {
+                Ok(Some(ktx)) => { changed = true; Some(ktx) }
+                Ok(None) => None,
+                Err(error) => { failure = Some(format!("image {index}: {error}")); None }
+            }
+        };
+        if let (Some(observe), Some(started)) = (observe.as_deref_mut(), started) {
+            let elapsed = std::time::Duration::from_secs_f64((makepad_draw::Cx::monotonic_now() - started).max(0.));
+            let bytes = replacement.as_deref().unwrap_or(png);
+            let dimensions = if is_ktx2(bytes) {
+                makepad_texcomp::ktx2::Reader::new(bytes).ok().map(|reader| {
+                    let header = reader.header();
+                    (header.width, header.height, header.levels.max(1), "ktx2")
+                })
+            } else if bytes.starts_with(b"\x89PNG") && bytes.len() >= 24 {
+                Some((u32::from_be_bytes(bytes[16..20].try_into().unwrap()), u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 1, "png retained"))
+            } else { None };
+            if let Some((width, height, mip_levels, format)) = dimensions {
+                observe(LoadReadyImageTiming { image: index, width, height, mip_levels, elapsed, format });
+            }
         }
+        replacement
     }).map_err(|e| format!("GLB rewrite: {e:?}"))?;
     if let Some(error) = failure { return Err(error); }
     Ok(changed.then_some(out))
@@ -253,23 +371,104 @@ mod tests {
     /// The memo returns exactly what a fresh encode produces, for every
     /// semantic, on a first and on a repeated call.
     #[test]
+    fn msdf_base_images_use_data_mips() {
+        let document = makepad_gltf::parse_gltf_json(r#"{
+            "asset":{"version":"2.0"}, "images":[{"uri":"text.png"}], "textures":[{"source":0}],
+            "materials":[{"alphaMode":"MASK","pbrMetallicRoughness":{"baseColorTexture":{"index":0}},
+                "extras":{"makepadShading":{"msdf":1}}}]
+        }"#).unwrap();
+        assert!(matches!(image_semantics(&document).get(&0), Some(PixelSemantic::Data)), "build-time compression must treat RGB and alpha as four distances");
+        let mut image = ImageBuffer::default();
+        image.width=2; image.height=1; image.data=vec![0x0040_80c0,0xffc0_4000];
+        let prepared = PreparedTexture::prepare(image, PixelSemantic::Data);
+        assert_eq!(prepared.data[2], 0x8080_6060, "mips neither apply sRGB nor premultiply by badge alpha");
+    }
+
+    #[test]
     fn load_ready_memo_matches_a_fresh_encode() {
         let rgba: Vec<u8> = (0..128 * 128).flat_map(|i| [(i % 128 * 2) as u8, (i / 128 * 2) as u8, (i * 7 % 251) as u8, 255]).collect();
         let png = Cx::encode_rgba_as_png(128, 128, &rgba).unwrap();
         for semantic in [PixelSemantic::Color, PixelSemantic::Data, PixelSemantic::Normal, PixelSemantic::MaskedColor] {
-            let fresh = load_ready_image(&png, semantic, makepad_texcomp::uastc::Quality::Fast, 3).unwrap();
+            let fresh = load_ready_image(&png, semantic, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap();
             assert!(fresh.is_some());
             for _ in 0..2 {
-                assert_eq!(load_ready_image_memo(&png, semantic, makepad_texcomp::uastc::Quality::Fast, 1).unwrap(), fresh);
+                assert_eq!(load_ready_image_memo(&png, semantic, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap(), fresh);
             }
         }
     }
 
     #[test]
     fn load_ready_images_replace_pngs_and_load_without_decode() {
+        // An authored 256..1 chain has nine images but only one texture.
+        // The runtime consumes its base image's KTX2 levels, not makepadMips.
+        let pngs: Vec<_> = (0..9).map(|level| {
+            let size = 256usize >> level;
+            let rgba: Vec<u8> = (0..size * size).flat_map(|i|
+                [(i % size) as u8, (i / size) as u8, (i * 29 % 251) as u8, 255]).collect();
+            Cx::encode_rgba_as_png(size as u32, size as u32, &rgba).unwrap()
+        }).collect();
+        let mesh = makepad_gltf::write_glb_mesh(&[[0., 0., 0.], [1., 0., 0.], [0., 0., 1.]], &[0, 1, 2]);
+        let material = makepad_gltf::GlbPbrMaterial {
+            fur: None, shading: None, base_color: [1.; 4], metallic: 0., roughness: 1., normal_scale: 1.,
+            occlusion_strength: 1., emissive: [0.; 3], emissive_strength: 1., alpha_mode: "OPAQUE".into(),
+            alpha_cutoff: 0.5, double_sided: false,
+            base_color_texture: Some(makepad_gltf::GlbPbrTexture { png: pngs[0].clone(), mip_pngs: pngs[1..].to_vec() }),
+            metallic_roughness_texture: None, normal_texture: None, occlusion_texture: None, emissive_texture: None,
+        };
+        let authored = makepad_gltf::augment_glb_pbr(&mesh, &[material], &[makepad_gltf::GlbPbrPrimitive {
+            mesh: 0, primitive: 0, material: 0, colors: Vec::new(), tangents: Vec::new(),
+        }]).unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let encode = |n, work: &(dyn Fn(usize) + Sync)| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            makepad_texcomp::run_inline(n, work);
+        };
+        let mut timings = Vec::new();
+        let ready = embed_load_ready_images_with_timings(&authored, makepad_texcomp::uastc::Quality::Fast,
+            &encode, Some(&mut |t| timings.push(t))).unwrap().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 9, "one encoder dispatch per base-chain level");
+        assert_eq!(timings.len(), 9);
+        assert_eq!((timings[0].width, timings[0].height, timings[0].mip_levels, timings[0].format), (256, 256, 9, "ktx2"));
+        for (level, timing) in timings.iter().enumerate().skip(1) {
+            assert_eq!((timing.width, timing.height, timing.mip_levels, timing.format), (256 >> level, 256 >> level, 1, "png retained"));
+        }
+        let parsed = makepad_gltf::parse_glb_bytes(&ready).unwrap();
+        let before = makepad_gltf::parse_glb_bytes(&authored).unwrap();
+        let extras = |doc: &makepad_gltf::GltfDocument| doc.materials.as_deref().unwrap_or(&[])
+            .iter().map(|material| material.extras.clone()).collect::<Vec<_>>();
+        assert_eq!(extras(&parsed.document), extras(&before.document), "authoring mip metadata preserved");
+        for (index, original) in pngs.iter().enumerate().skip(1) {
+            let image = &parsed.document.images_slice()[index];
+            assert_eq!(image.mime_type.as_deref(), Some("image/png"));
+            let view = &parsed.document.buffer_views.as_ref().unwrap()[image.buffer_view.unwrap()];
+            let offset = view.byte_offset.unwrap_or(0);
+            assert_eq!(&parsed.bin_chunk.as_ref().unwrap()[offset..offset + view.byte_length], original);
+        }
+        let model = crate::model::StaticModel::parse_glb(&ready).unwrap();
+        let bytes = model.texture_png.as_deref().or_else(|| model.draw_layers.first().and_then(|l| l.texture_png.as_deref())).unwrap();
+        let view = makepad_texcomp::basis::UastcView::parse(bytes).unwrap();
+        assert_eq!(view.levels.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), (0..9).map(|l| (256 >> l, 256 >> l)).collect::<Vec<_>>());
+        let texture = texture_from_ktx2(bytes).unwrap().unwrap();
+        assert_eq!((texture.width, texture.height, texture.max_level), (256, 256, 8));
+        // A mip image reused as any texture source must not be skipped.
+        // Include an extension-only source, absent from typed GltfTexture.
+        let chunks = makepad_gltf::split_glb(&authored).unwrap();
+        use makepad_draw::makepad_micro_serde::{DeJson, SerJson};
+        let mut root = makepad_gltf::JsonValue::deserialize_json_lenient(chunks.json).unwrap();
+        if let makepad_gltf::JsonValue::Object(fields) = &mut root {
+            if let Some(makepad_gltf::JsonValue::Array(textures)) = fields.get_mut("textures") {
+                textures.push(makepad_gltf::JsonValue::deserialize_json_lenient(r#"{"source":1,"extensions":{"EXT_texture_webp":{"source":2}}}"#).unwrap());
+            }
+        }
+        let reused = makepad_gltf::assemble_glb(&root.serialize_json(), chunks.bin);
+        let reused_doc = makepad_gltf::parse_glb_bytes(&reused).unwrap().document;
+        let snapshots = authored_mip_images(&reused, &reused_doc).unwrap();
+        assert!(!snapshots.contains(&1) && !snapshots.contains(&2), "core and extension texture sources take priority");
+        assert!(snapshots.contains(&3));
+
         let glb = textured_glb();
-        let ready = embed_load_ready_images(&glb, makepad_texcomp::uastc::Quality::Fast, 2).unwrap().expect("PNGs converted");
-        assert!(embed_load_ready_images(&ready, makepad_texcomp::uastc::Quality::Fast, 2).unwrap().is_none());
+        let ready = embed_load_ready_images(&glb, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap().expect("PNGs converted");
+        assert!(embed_load_ready_images(&ready, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap().is_none());
         let doc = makepad_gltf::parse_glb_bytes(&ready).unwrap().document;
         // Only images change: nodes (sockets, movers and their extras),
         // samplers, materials, meshes and accessors are kept as they were.
@@ -296,7 +495,7 @@ mod tests {
         let reference = PreparedTexture::prepare(crate::renderer::decode_generated_png(&Cx::encode_rgba_as_png(64, 64,
             &(0..64 * 64).flat_map(|i| [(i % 64 * 4) as u8, (i / 64 * 4) as u8, 128, 255]).collect::<Vec<u8>>()).unwrap(), 64, 1 << 20).unwrap(), PixelSemantic::Color);
         assert_eq!(texture.data.len(), reference.data.len());
-        let worst = texture.data.iter().zip(&reference.data)
+        let worst = texture.data.iter().zip(reference.data.iter())
             .flat_map(|(a, b)| (0..4).map(move |s| ((a >> (s * 8)) as u8).abs_diff((b >> (s * 8)) as u8)))
             .max().unwrap();
         assert!(worst <= 12, "UASTC round trip within 12 levels, got {worst}");
@@ -314,6 +513,7 @@ mod tests {
     /// (X, Y, 0) elsewhere, the same texels either way.
     #[test]
     fn normal_maps_are_stored_as_bc5() {
+        let _bc5 = crate::material_surface::BC5_NORMAL_MAPS_TEST_LOCK.lock().unwrap();
         let n = 64usize;
         let mut image = ImageBuffer::default();
         image.width = n; image.height = n;
@@ -325,14 +525,14 @@ mod tests {
             0xff00_0000 | b(v[0]) << 16 | b(v[1]) << 8 | b(z)
         }).collect();
         let prepared = PreparedTexture::prepare(image, PixelSemantic::Normal);
-        let ktx = prepared.to_bc5_ktx2(0xabc, 2).unwrap();
+        let ktx = prepared.to_bc5_ktx2(0xabc, &makepad_texcomp::run_inline).unwrap();
         assert!(is_ktx2(&ktx));
         assert_eq!(content_id(&ktx), Some(0xabc));
         crate::material_surface::set_bc5_normal_maps(false);
         let decoded = texture_from_ktx2(&ktx).unwrap().unwrap();
         assert_eq!((decoded.width, decoded.height, decoded.max_level, decoded.hash), (64, 64, 6, 0xabc));
         assert_eq!(decoded.data.len(), prepared.data.len());
-        let worst = decoded.data.iter().zip(&prepared.data).flat_map(|(a, b)| [((a >> 16) as u8).abs_diff((b >> 16) as u8), ((a >> 8) as u8).abs_diff((b >> 8) as u8)]).max().unwrap();
+        let worst = decoded.data.iter().zip(prepared.data.iter()).flat_map(|(a, b)| [((a >> 16) as u8).abs_diff((b >> 16) as u8), ((a >> 8) as u8).abs_diff((b >> 8) as u8)]).max().unwrap();
         assert!(worst <= 8, "BC5 X/Y within 8 levels of the mipped normals, got {worst}");
         assert!(decoded.data.iter().all(|t| t & 0xff == 0 && t >> 24 == 255), "blue 0, opaque: Z is rebuilt in the shader");
         crate::material_surface::set_bc5_normal_maps(true);
@@ -360,14 +560,14 @@ mod tests {
             uvs: &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], indices: &[0, 1, 2],
             base_color_png: &flat, metallic_roughness_png: Some(&flat), double_sided: false, colors: None,
         });
-        assert!(embed_load_ready_images(&glb, makepad_texcomp::uastc::Quality::Fast, 2).unwrap().is_none());
+        assert!(embed_load_ready_images(&glb, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap().is_none());
         // A rich image magnified NEAREST stays PNG too.
         let rich = textured_glb();
         let mut nearest = rich.clone();
         let (from, to) = (b"\"magFilter\":9729", b"\"magFilter\":9728");
         let at = nearest.windows(from.len()).position(|w| w == from).expect("fixture has a sampler to switch");
         nearest[at..at + to.len()].copy_from_slice(to);
-        assert!(embed_load_ready_images(&nearest, makepad_texcomp::uastc::Quality::Fast, 2).unwrap().is_none());
+        assert!(embed_load_ready_images(&nearest, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap().is_none());
         // A generated two-colour pattern (a blend between two colours: at
         // most 256 distinct values) is smooth art and goes to Basis.
         let blend: Vec<u8> = (0..64 * 64).flat_map(|i| { let t = ((i % 64) * 4 + (i / 64)) as u32 % 256; [(40 + t * 150 / 255) as u8, (30 + t * 60 / 255) as u8, (20 + t * 30 / 255) as u8, 255] }).collect();
@@ -377,7 +577,7 @@ mod tests {
             uvs: &[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], indices: &[0, 1, 2],
             base_color_png: &png, metallic_roughness_png: None, double_sided: false, colors: None,
         });
-        let ready = embed_load_ready_images(&glb, makepad_texcomp::uastc::Quality::Fast, 2).unwrap().expect("pattern converted");
+        let ready = embed_load_ready_images(&glb, makepad_texcomp::uastc::Quality::Fast, &makepad_texcomp::run_inline).unwrap().expect("pattern converted");
         let doc = makepad_gltf::parse_glb_bytes(&ready).unwrap().document;
         assert_eq!(doc.images_slice()[0].mime_type.as_deref(), Some("image/ktx2"));
     }

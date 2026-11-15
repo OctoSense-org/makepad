@@ -12,6 +12,7 @@ use {
         cx_2d::Cx2d,
         cx_draw::CxDraw,
         draw_list_2d::ManyInstances,
+        glyph_capture::CapturedGlyph,
         makepad_platform::*,
         makepad_platform::recording_buffer::RecordingBuffer,
         text::{
@@ -26,8 +27,8 @@ use {
             },
             line_break::{FollowingContext, PrecedingContext},
             loader::{FontDefinition, FontFamilyDefinition},
-            rasterizer::{AtlasKind, RasterizedGlyph},
-            shaper::ShapedText,
+            rasterizer::{AtlasKind, OutlineSdf, RasterizedGlyph},
+            shaper::{Direction, ShapedText},
             slug_atlas::SlugGlyphCacheResult,
             system_faces::{self, SystemFaceKey, SystemFaceState},
         },
@@ -41,6 +42,34 @@ use {
         rc::Rc,
     },
 };
+
+#[derive(Default)]
+struct StockTextShader {
+    generation: Option<u64>,
+    shader: Option<DrawShaderId>,
+}
+
+/// The shader compiled by the registered `DrawText` type default. Objects that
+/// only set values share it; objects with their own shader functions have another
+/// shader and stay in the pixels during capture, since a writer cannot paint them
+/// as flat text. Cached until a reload; made again after one. Where the script VM is
+/// held (a caller inside a script call) it answers what it had, or `None`: then no
+/// glyph is left out of the pixels, and the text is still captured.
+pub fn stock_text_shader(cx: &mut Cx) -> Option<DrawShaderId> {
+    let generation = cx.reload_generation;
+    let cached = cx.global::<StockTextShader>();
+    if cached.generation == Some(generation) {
+        return cached.shader;
+    }
+    let previous = cached.shader;
+    let Some(made) = cx.try_with_vm(|vm| DrawText::script_new_with_default(vm)) else {
+        log!("stock_text_shader: the script VM is held, answering the shader made before ({previous:?})");
+        return previous;
+    };
+    let shader = made.draw_vars.draw_shader_id;
+    *cx.global::<StockTextShader>() = StockTextShader { generation: Some(generation), shader };
+    shader
+}
 
 script_mod! {
     use mod.pod.*
@@ -87,6 +116,8 @@ script_mod! {
 
         pos: varying(vec2f)
         t: varying(vec2f)
+        t_min: varying(vec2f)
+        t_max: varying(vec2f)
         world: varying(vec4f)
 
         radius: uniform(float)
@@ -147,7 +178,7 @@ script_mod! {
             )
 
             self.pos = mix(p_normalized_raster, pos_slug, use_slug)
-            self.t = mix(self.t_min, self.t_max, p_normalized_raster.xy)
+            self.set_atlas_uvs(p_normalized_raster.xy)
             let final_pos = mix(p_clipped_raster, p_clipped_slug, use_slug)
             self.world = self.draw_list.view_transform * vec4(
                 final_pos.x,
@@ -163,20 +194,29 @@ script_mod! {
 
 
 
+        // The glyph's atlas texels as UVs of the atlas as it is now, so a draw recorded before
+        // the atlas grew still samples its glyph. `t`, `t_min` and `t_max` are UVs.
+        set_atlas_uvs: fn(p: vec2) {
+            let atlas_size = self.color_texture.size()
+            self.t_min = self.atlas_min / atlas_size
+            self.t_max = self.atlas_max / atlas_size
+            self.t = mix(self.t_min, self.t_max, p)
+        }
+
         slug_curve_offset: fn() -> float {
-            return self.t_min.x
+            return self.atlas_min.x
         }
 
         slug_curve_count: fn() -> float {
-            return self.t_min.y
+            return self.atlas_min.y
         }
 
         slug_band_offset: fn() -> float {
-            return self.t_max.x
+            return self.atlas_max.x
         }
 
         slug_band_count: fn() -> float {
-            return self.t_max.y
+            return self.atlas_max.y
         }
 
         slug_fill_flags: fn() -> float {
@@ -232,6 +272,9 @@ script_mod! {
         }
 
         alpha_at: fn(sample: vec2, px_x: float, px_y: float) -> float {
+            if self.slug_band_count() > 0.5 {
+                return self.alpha_at_bands(sample, px_x, px_y)
+            }
             return self.alpha_at_scan(sample, px_x, px_y)
         }
 
@@ -419,10 +462,12 @@ pub struct DrawText {
     pub sdf_sharpness: f32,
     #[live(0.03)]
     pub sdf_luma_bias: f32,
+    /// The glyph's atlas rectangle in texels (a slug glyph's curve and band offset and count),
+    /// so a recorded draw stays right when the atlas grows.
     #[live]
-    pub t_min: Vec2f,
+    pub atlas_min: Vec2f,
     #[live]
-    pub t_max: Vec2f,
+    pub atlas_max: Vec2f,
     #[live]
     pub atlas_plane: f32,
     /// The glyph's baseline below `rect_pos.y`: the vertex shader puts the baseline on a
@@ -483,10 +528,26 @@ fn note_glyph_uses(cx: &mut Cx2d) {
 /// for an atlas image. Also answers the slug generation a draw must upload (web), or 0.
 fn prepare_glyph(cx: &mut Cx2d, glyph: &LaidoutGlyph, dpxs_per_em: f32) -> (Option<PreparedGlyph>, u64) {
     let raster_image = glyph.font.has_glyph_raster_image(glyph.id, dpxs_per_em);
-    if !raster_image && cx.fonts.borrow().should_use_slug_glyph(dpxs_per_em) {
+    // `GlyphRendering::Hybrid`: a missing SDF doesn't hold the frame, its slug curves draw meanwhile
+    let sdf = if !raster_image && cx.fonts.borrow().should_use_hybrid_glyph(dpxs_per_em) {
+        Some(cx.fonts.borrow().rasterizer().borrow_mut().get_or_queue_glyph_outline_sdf(&glyph.font, glyph.id, dpxs_per_em))
+    } else {
+        None
+    };
+    if let Some(OutlineSdf::Ready(sdf_glyph)) = sdf {
+        return (Some(PreparedGlyph::Raster(sdf_glyph)), 0);
+    }
+    if !raster_image && (sdf.is_some() || cx.fonts.borrow().should_use_slug_glyph(dpxs_per_em)) {
         let lookup = cx.fonts.borrow_mut().get_or_cache_slug_glyph(glyph.font.as_ref(), glyph.id);
         match lookup {
-            SlugGlyphCacheResult::Ready(info) => return (Some(PreparedGlyph::Slug(info)), 0),
+            SlugGlyphCacheResult::Ready(info) => {
+                // this list redraws with the SDFs once they're all in
+                #[cfg(not(target_arch = "wasm32"))]
+                if let (Some(OutlineSdf::Pending), Some(list)) = (sdf, cx.draw_list_stack.last().copied()) {
+                    cx.hal_redraw_list_after_background_glyphs(list);
+                }
+                return (Some(PreparedGlyph::Slug(info)), 0);
+            }
             SlugGlyphCacheResult::NeedsUpload { generation, glyph: info } => return (Some(PreparedGlyph::Slug(info)), generation),
             SlugGlyphCacheResult::Empty => return (None, 0),
             SlugGlyphCacheResult::Unavailable => {
@@ -651,13 +712,32 @@ impl DrawText {
         glyph: PreparedGlyph,
         color: Vec4f,
     ) {
-        let slug = match glyph {
+        let glyph = match glyph {
+            // under `Hybrid` a kept SDF draws like laid-out text: its slug curves stand in while it's not held
+            #[cfg(not(target_arch = "wasm32"))]
+            PreparedGlyph::Raster(raster) if raster.atlas_kind == AtlasKind::Grayscale
+                && cx.fonts.borrow().should_use_hybrid_glyph(f32::from_bits(raster.source.dpxs_bits)) =>
+            {
+                let rasterizer = cx.fonts.borrow().rasterizer().clone();
+                let mut rasterizer = rasterizer.borrow_mut();
+                let sdf = rasterizer.client_mut().refresh_outline_sdf(raster);
+                if let OutlineSdf::Ready(sdf_glyph) = sdf {
+                    PreparedGlyph::Raster(sdf_glyph)
+                } else {
+                    let slug = rasterizer.client_mut().slug_stand_in(raster.source);
+                    if let (OutlineSdf::Pending, Some(list)) = (sdf, cx.draw_list_stack.last().copied()) {
+                        cx.hal_redraw_list_after_background_glyphs(list);
+                    }
+                    // curves on their way hold this frame, so it draws again with them
+                    slug.map_or(PreparedGlyph::Raster(RasterizedGlyph { atlas_kind: AtlasKind::Unresolved, ..raster }), PreparedGlyph::Slug)
+                }
+            }
             PreparedGlyph::Raster(raster) => {
                 return self.draw_rasterized_glyph_abs(cx, origin_in_lpxs, font_size_in_lpxs, raster, color);
             }
             // a kept glyph is looked up again (curves upgraded, taken back, or still on their
             // way when it was prepared), which also keeps it in use
-            PreparedGlyph::Slug(slug) => cx.fonts.borrow().rasterizer().borrow_mut().refresh_slug_glyph(slug),
+            PreparedGlyph::Slug(slug) => PreparedGlyph::Slug(cx.fonts.borrow().rasterizer().borrow_mut().refresh_slug_glyph(slug)),
         };
         let open = self.many_instances.take();
         let batch_was_open = open.is_some();
@@ -672,8 +752,13 @@ impl DrawText {
             }
         };
         self.color = color;
-        let aa_pad_in_lpxs = (self.get_aa_pad_px(cx.cx) / cx.current_dpi_factor() as f32).max(0.0);
-        self.draw_slug_glyph(origin_in_lpxs, font_size_in_lpxs, None, slug, aa_pad_in_lpxs, &mut instances.instances);
+        match glyph {
+            PreparedGlyph::Slug(slug) => {
+                let aa_pad_in_lpxs = (self.get_aa_pad_px(cx.cx) / cx.current_dpi_factor() as f32).max(0.0);
+                self.draw_slug_glyph(origin_in_lpxs, font_size_in_lpxs, None, slug, aa_pad_in_lpxs, &mut instances.instances);
+            }
+            PreparedGlyph::Raster(raster) => self.draw_rasterized_glyph(origin_in_lpxs, font_size_in_lpxs, None, raster, &mut instances.instances),
+        }
         if batch_was_open {
             self.many_instances = Some(instances);
         } else {
@@ -757,6 +842,11 @@ impl DrawText {
         self.draw_walk_keep(cx, walk, align, text).0
     }
 
+    /// Like [`Self::draw_walk`], but `wrap` decides whether the text wraps instead of the turtle's flow.
+    pub fn draw_walk_with_wrap(&mut self, cx: &mut Cx2d, walk: Walk, align: Align, wrap: bool, text: &str) -> Rect {
+        self.draw_walk_inner(cx, walk, align, wrap, text, None).0
+    }
+
     /// `draw_walk`, also handing back the laid-out text, for a widget that
     /// maps points to text and back (selection).
     pub fn draw_walk_keep(&mut self, cx: &mut Cx2d, walk: Walk, align: Align, text: &str) -> (Rect, Rc<LaidoutText>) {
@@ -774,6 +864,19 @@ impl DrawText {
         text: &str,
         restyle: Option<&dyn Fn(&LaidoutText) -> Option<LaidoutText>>,
     ) -> (Rect, Rc<LaidoutText>) {
+        let wrap = matches!(cx.turtle().layout().flow, Flow::Right { wrap: true, .. });
+        self.draw_walk_inner(cx, walk, align, wrap, text, restyle)
+    }
+
+    fn draw_walk_inner(
+        &mut self,
+        cx: &mut Cx2d,
+        walk: Walk,
+        align: Align,
+        wrap: bool,
+        text: &str,
+        restyle: Option<&dyn Fn(&LaidoutText) -> Option<LaidoutText>>,
+    ) -> (Rect, Rc<LaidoutText>) {
         let walk = cx.resolve_walk(walk, ResolveAt::BeforeBegin);
         let mut max_width_in_lpxs = self.max_layout_width_for_walk(cx, walk);
         if max_width_in_lpxs.is_none()
@@ -787,7 +890,6 @@ impl DrawText {
             max_width_in_lpxs =
                 self.fit_layout_width_for_walk(cx, walk, ellipsis_width_in_lpxs);
         }
-        let wrap = matches!(cx.turtle().layout().flow, Flow::Right { wrap: true, .. });
         let laid = self.layout(cx, 0.0, 0.0, max_width_in_lpxs, wrap, align, text);
         let laid = match restyle {
             Some(restyle) => restyle(&laid).map(Rc::new).unwrap_or(laid),
@@ -1480,7 +1582,7 @@ impl DrawText {
         // Under a `System` set the OS is asked first: while its font index is
         // still being built (Linux, started with the fonts, some ms) the
         // glyph waits for it instead of opening a bundled face it may not need.
-        if system_first && !crate::text::system_fonts::index_ready() {
+        if system_first && !cx.get_global::<Rc<RefCell<Fonts>>>().clone().borrow_mut().system_index_ready() {
             return laidout;
         }
         for system in [system_first, !system_first] {
@@ -1723,6 +1825,10 @@ impl DrawText {
         row: &LaidoutRow,
         out_instances: &mut RecordingBuffer,
     ) {
+        if cx.glyph_capture.is_some() {
+            self.draw_captured_row(cx, origin_in_lpxs, row, out_instances);
+            return;
+        }
         let aa_pad_in_lpxs = (self.get_aa_pad_px(cx.cx) / cx.current_dpi_factor() as f32).max(0.0);
         for glyph in &row.glyphs {
             self.draw_glyph(
@@ -1734,6 +1840,66 @@ impl DrawText {
             );
         }
         self.draw_debug_row_guides(cx, origin_in_lpxs, row);
+    }
+
+    // Out of line, so `draw_row` stays the same small loop when no capture is on.
+    #[cold]
+    #[inline(never)]
+    fn draw_captured_row(
+        &mut self,
+        cx: &mut Cx2d,
+        origin_in_lpxs: Point<f32>,
+        row: &LaidoutRow,
+        out_instances: &mut RecordingBuffer,
+    ) {
+        let Some(mut capture) = cx.glyph_capture.take() else {
+            return;
+        };
+        let plain = capture.is_plain(self.draw_vars.draw_shader_id);
+        let recorded = capture.begin_row(
+            cx,
+            rect(
+                origin_in_lpxs.x as f64,
+                (origin_in_lpxs.y - row.ascender_in_lpxs * self.font_scale) as f64,
+                (row.width_in_lpxs * self.font_scale) as f64,
+                // The descender is negative: below the baseline.
+                ((row.ascender_in_lpxs - row.descender_in_lpxs) * self.font_scale) as f64,
+            ),
+            &row.text,
+            plain,
+        );
+        let aa_pad_in_lpxs = (self.get_aa_pad_px(cx.cx) / cx.current_dpi_factor() as f32).max(0.0);
+        for (group, text, _) in row.glyph_clusters() {
+            for glyph in group {
+                let origin = origin_in_lpxs + Size::from(glyph.origin_in_lpxs) * self.font_scale;
+                let (face, embeddable) = capture.face(&glyph.font);
+                let skipped = plain && embeddable;
+                let color = glyph.color.map_or(self.color, |color| {
+                    vec4(color.r as f32, color.g as f32, color.b as f32, color.a as f32) / 255.0
+                });
+                if let Some(row) = recorded {
+                    capture.push_glyph(row, CapturedGlyph {
+                        face,
+                        id: glyph.id,
+                        x: origin.x + glyph.offset_in_lpxs() * self.font_scale,
+                        baseline: origin.y + self.temp_y_shift * glyph.font_size_in_lpxs,
+                        size: glyph.font_size_in_lpxs * self.font_scale,
+                        color: [color.x, color.y, color.z, color.w],
+                        text: text.clone(),
+                        rtl: glyph.direction == Direction::Rtl,
+                        in_pixels: !skipped,
+                    });
+                }
+                if skipped {
+                    // A glyph's colour remains the draw's colour for subsequent glyphs.
+                    self.color = color;
+                } else {
+                    self.draw_glyph(cx, origin, glyph, aa_pad_in_lpxs, out_instances);
+                }
+            }
+        }
+        self.draw_debug_row_guides(cx, origin_in_lpxs, row);
+        cx.glyph_capture = Some(capture);
     }
 
     fn resolve_glyph(&mut self, cx: &mut Cx2d, glyph: &LaidoutGlyph) -> Option<PreparedGlyph> {
@@ -1821,8 +1987,8 @@ impl DrawText {
         }
         self.texture_index = 3.0;
         self.atlas_plane = glyph.fill_flags as f32;
-        self.t_min = vec2(glyph.curve_offset as f32, glyph.curve_count as f32);
-        self.t_max = vec2(glyph.band_offset as f32, glyph.band_count as f32);
+        self.atlas_min = vec2(glyph.curve_offset as f32, glyph.curve_count as f32);
+        self.atlas_max = vec2(glyph.band_offset as f32, glyph.band_count as f32);
         let slice = self.draw_vars.as_slice();
 
         output.extend_from_slice(slice);
@@ -1838,13 +2004,6 @@ impl DrawText {
         glyph: RasterizedGlyph,
         output: &mut RecordingBuffer,
     ) {
-        fn tex_coord(point: Point<usize>, size: Size<usize>) -> Point<f32> {
-            Point::new(
-                point.x as f32 / size.width as f32,
-                point.y as f32 / size.height as f32,
-            )
-        }
-
         let texture_index = match glyph.atlas_kind {
             AtlasKind::Grayscale => 0.0,
             AtlasKind::Color => 1.0,
@@ -1853,16 +2012,12 @@ impl DrawText {
         };
 
         let atlas_image_bounds = glyph.atlas_image_bounds;
-        let atlas_size = glyph.atlas_size;
-        let (t_min, t_max) = if glyph.atlas_kind == AtlasKind::Unresolved {
+        let (atlas_min, atlas_max) = if glyph.atlas_kind == AtlasKind::Unresolved {
             // The image bounds below still describe the full glyph; the shader samples only
             // the reserved transparent texel, even before we know the host atlas dimensions.
-            (Point::new(0.0, 0.0), Point::new(0.0, 0.0))
+            (Point::new(0, 0), Point::new(0, 0))
         } else {
-            (
-                tex_coord(atlas_image_bounds.min(), atlas_size),
-                tex_coord(atlas_image_bounds.max(), atlas_size),
-            )
+            (atlas_image_bounds.min(), atlas_image_bounds.max())
         };
 
         let atlas_image_padding = glyph.atlas_image_padding;
@@ -1897,8 +2052,8 @@ impl DrawText {
         }
         self.texture_index = texture_index;
         self.atlas_plane = glyph.atlas_plane as f32;
-        self.t_min = vec2(t_min.x, t_min.y);
-        self.t_max = vec2(t_max.x, t_max.y);
+        self.atlas_min = vec2(atlas_min.x as f32, atlas_min.y as f32);
+        self.atlas_max = vec2(atlas_max.x as f32, atlas_max.y as f32);
         let slice = self.draw_vars.as_slice();
 
         output.extend_from_slice(slice);

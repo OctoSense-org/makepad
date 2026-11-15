@@ -55,6 +55,24 @@ pub(super) enum ModelLane {
     Splat = 9,
 }
 
+/// The lanes a load prepares (`Renderer::prepare_lane_variant`), in the order
+/// a world's first frame meets them: level slabs and terrain, placed models,
+/// foliage and its stand-ins, generated tiles, the streamed city, GPU-skinned
+/// characters, blended slabs. `true`: the lane also draws through its variant
+/// without `clip` (`lane_shaders`); the level draws take only theirs.
+const STAGED_LANES: [(ModelLane, bool); 10] = [
+    (ModelLane::Cube, false),
+    (ModelLane::Terrain, false),
+    (ModelLane::Diffuse, true),
+    (ModelLane::Pbr, true),
+    (ModelLane::Foliage, true),
+    (ModelLane::Impostor, true),
+    (ModelLane::Splat, true),
+    (ModelLane::City, true),
+    (ModelLane::SkinnedGpu, true),
+    (ModelLane::Alpha, false),
+];
+
 /// The optional features a lane's shader keeps.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug)]
 pub(crate) struct Features {
@@ -72,6 +90,8 @@ pub(crate) struct Features {
     pub cluster: bool,
     /// The lamps' shadow maps (`local_shadow_visibility`).
     pub local_shadows: bool,
+    /// Extra surface/specular outputs, installed only on opaque lit variants.
+    pub reflections: bool,
 }
 
 /// One variant: not built yet, unavailable (its layout differs from the
@@ -101,6 +121,7 @@ script_mod! {
     mod.draw.scene_variant = {
         clip: fn() {}
         gi_ambient: fn(wp: vec3, normal: vec3, fallback: vec3) -> vec3 { return fallback }
+        gi_specular_occlusion: fn(ambient: vec3, hemisphere: vec3) -> float { return 1.0 }
         gi_display: fn(color: vec4, wp: vec3, n: vec3) -> vec4 {
             if color.w < 0.999 { return color }
             return vec4(self.output_dither(color.xyz, wp), color.w)
@@ -114,6 +135,7 @@ script_mod! {
         csm_vis: fn(wp: vec3, n: vec3, ndl: float) -> float { return 1.0 }
         csm_debug_view: fn(color: vec4, wp: vec3, n: vec3) -> vec4 { return color }
         cluster_lights: fn(wp: vec3, normal: vec3, eye: vec3, albedo: vec3, roughness: float, metallic: float, pbr: float) -> vec3 { return vec3(0.0, 0.0, 0.0) }
+        cluster_lights_f0: fn(wp: vec3, normal: vec3, eye: vec3, albedo: vec3, roughness: float, metallic: float, pbr: float, f0: vec3) -> vec3 { return vec3(0.0, 0.0, 0.0) }
         local_shadow_visibility: fn(index: float, wp: vec3, normal: vec3, light_pos: vec3, radius: float) -> float { return 1.0 }
         // Clustered lights on: the per-draw light slots are not summed and a
         // lamp pool does not fill the sun's shadow (their cluster_on branch).
@@ -158,7 +180,49 @@ impl Renderer {
     pub(super) fn lane_features(&self) -> Features {
         let (gi, gi_debug) = self.gi.shader_features();
         let csm = self.gpu_baker.csm_binding().is_some_and(|(frame, _, _)| frame.on);
-        Features { clip: true, gi, gi_debug, csm, csm_debug: csm && self.shadow_debug, cluster: self.clustered.active(self.clustered_enabled), local_shadows: self.clustered.shadows_active(self.clustered_enabled) }
+        Features { clip: true, gi, gi_debug, csm, csm_debug: csm && self.shadow_debug, cluster: self.clustered.active(self.clustered_enabled), local_shadows: self.clustered.shadows_active(self.clustered_enabled), reflections: self.ssr.active() }
+    }
+
+    /// The feature sets a world's frames draw a lane with, most likely
+    /// first. They are this frame's, with the targets a world's first frame
+    /// allocates counted as there: the cascades in Realtime and the cluster
+    /// grid, which a load staged before any world drew sees off. The lamps'
+    /// shadows stay as this frame has them. In Realtime the cascades come
+    /// both on and off: they follow the sun's side of the horizon, which is
+    /// the world's and its hour's, and a day cycle crosses it in play.
+    pub(super) fn world_frame_features(&self) -> Vec<Features> {
+        let now = self.lane_features();
+        let cluster = self.clustered_enabled;
+        let world = Features { cluster, local_shadows: cluster && self.clustered.shadows.active(), ..now };
+        let off = Features { csm: false, csm_debug: false, ..world };
+        if self.gpu_baker.mode() == crate::gpu_lightmap::GpuLightmapMode::Realtime {
+            vec![Features { csm: true, csm_debug: self.shadow_debug, ..world }, off]
+        } else {
+            vec![off]
+        }
+    }
+
+    /// Build the next stock lane variant a world's frames draw through (one
+    /// per lane and `world_frame_features` set, with the one without `clip`
+    /// where the lane has it). A world's first frame built them otherwise,
+    /// 4-11 ms each, 40-70 ms of a cold launch's first frame; a host's load
+    /// prepares them while it stages. `Some(true)`: one was built;
+    /// `Some(false)`: the VM is busy; `None` once every one is built (they
+    /// are kept, so a later load finds them so).
+    pub fn prepare_lane_variant(&mut self, cx: &mut Cx) -> Option<bool> {
+        if std::env::var_os("MAKEPAD_SHADER_VARIANTS").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let opaque = !std::env::var_os("MAKEPAD_OPAQUE_VARIANT").is_some_and(|v| v == "0");
+        let unbuilt = |lv: &LaneVariants, key| matches!(lv.shaders.get(&key), None | Some(VariantShader::Unbuilt));
+        let (lane, features) = self.world_frame_features().into_iter()
+            .flat_map(|features| STAGED_LANES.into_iter().flat_map(move |(lane, without_clip)| {
+                let bare = (without_clip && opaque).then_some((lane, Features { clip: false, ..features }));
+                std::iter::once((lane, features)).chain(bare)
+            }))
+            .find(|key| unbuilt(&self.lane_variants, *key))?;
+        self.variant(cx, lane, features);
+        Some(!unbuilt(&self.lane_variants, (lane, features)))
     }
 
     /// The lane's shaders for this frame's features: the one it draws
@@ -241,9 +305,10 @@ pub(crate) fn variant_object(vm: &mut ScriptVm, base: ScriptObject, features: Fe
     let stubs = vm.value(draw, id!(scene_variant)).as_object()?;
     let obj = vm.heap_mut().new_with_proto_no_vec(base.into());
     // (switched off, the function it replaces, the stub it becomes)
-    let replace: [(bool, LiveId, LiveId); 13] = [
+    let replace: [(bool, LiveId, LiveId); 15] = [
         (!features.clip, id!(clip), id!(clip)),
         (!features.gi || !lit, id!(gi_ambient), id!(gi_ambient)),
+        (!features.gi || !lit, id!(gi_specular_occlusion), id!(gi_specular_occlusion)),
         (!features.gi, id!(gi_display), id!(gi_display)),
         (features.gi && !features.gi_debug, id!(gi_display), id!(gi_display_plain)),
         // The cascade debug view reads csm_vis: kept while it is on.
@@ -251,6 +316,7 @@ pub(crate) fn variant_object(vm: &mut ScriptVm, base: ScriptObject, features: Fe
         (!features.csm || (!lit && !features.csm_debug), id!(csm_vis_fast), id!(csm_vis)),
         (!features.csm_debug, id!(csm_debug_view), id!(csm_debug_view)),
         (!features.cluster || !lit, id!(cluster_lights), id!(cluster_lights)),
+        (!features.cluster || !lit, id!(cluster_lights_f0), id!(cluster_lights_f0)),
         (!features.local_shadows || !lit, id!(local_shadow_visibility), id!(local_shadow_visibility)),
         (features.cluster, id!(dl_sum), id!(dl_sum)),
         (features.cluster, id!(dl_sum_gated), id!(dl_sum)),
@@ -277,6 +343,16 @@ pub(crate) fn variant_object(vm: &mut ScriptVm, base: ScriptObject, features: Fe
         let f = f.filter(|f| vm.is_fn(*f))?;
         if !vm.set_value(obj, method, f).is_nil() {
             return None;
+        }
+        replaced = true;
+    }
+    // The only gate that installs PBR's extra fragment outputs. In particular,
+    // full/clip shaders (including blended and fur-shell draws) keep output 0.
+    if features.reflections && !features.clip && lit {
+        let reflection = vm.value(draw, id!(pbr_reflections)).as_object()?;
+        for field in [id!(fb1), id!(fb2), id!(ssr_surface), id!(ssr_coat), id!(ssr_finish), id!(clear_coat), id!(shade_mr_surface)] {
+            let value = vm.value(reflection, field);
+            if !vm.set_value(obj, field, value).is_nil() { return None; }
         }
         replaced = true;
     }
@@ -349,6 +425,9 @@ impl ModelLane {
 
 /// Build the variant of `lane` with `features`: (stock shader, variant).
 fn build(vm: &mut ScriptVm, lane: ModelLane, features: Features) -> Option<(DrawShaderId, DrawShaderId)> {
+    // City, foliage and GPU-skinned have independent finishes; they do not
+    // call shade_mr_surface and must not declare unwritten attachments.
+    let features = Features { reflections: features.reflections && matches!(lane, ModelLane::Pbr | ModelLane::Splat), ..features };
     let base = vm.heap().type_default_for_id(lane.type_id())?;
     let stock = lane.shader(vm, None)?;
     // Every feature on and `clip` kept: the stock shader itself.
@@ -396,6 +475,24 @@ mod tests {
     use super::*;
     use makepad_draw::makepad_platform::makepad_script::script_eval;
 
+    #[test]
+    fn pbr_extra_outputs_exist_only_in_the_reflections_variant() {
+        let source = include_str!("../shaders/pbr.rs");
+        let (before, reflection_and_stock) = source.split_once("mod.draw.pbr_reflections = {").unwrap();
+        let (reflection, stock) = reflection_and_stock.split_once("// Static props").unwrap();
+        for output in ["fragment_output(1, vec4f)", "fragment_output(2, vec4f)"] {
+            assert!(reflection.contains(output), "the reflections variant declares {output}");
+            assert!(!before.contains(output) && !stock.contains(output),
+                "stock/blended PBR must never declare {output}");
+        }
+        assert!(!stock.contains("self.ssr_"), "off keeps the stock shader unchanged");
+        let variants = include_str!("variants.rs");
+        let (_, gated) = variants.split_once("if features.reflections && !features.clip && lit {").unwrap();
+        let (gated, _) = gated.split_once("replaced.then_some(obj)").unwrap();
+        assert!(gated.contains("id!(fb1), id!(fb2)"),
+            "only an enabled, opaque, lit variant installs the extra outputs");
+    }
+
     /// A Cx whose VM has the renderer's shaders.
     fn shader_cx() -> Cx {
         let mut cx = Cx::new(Box::new(|_, _| {}));
@@ -419,15 +516,16 @@ mod tests {
         cx
     }
 
-    /// The painted-terrain and foliage lanes are built for a model that draws through them: with
-    /// none resident, nothing of theirs reaches the VM or the compiler.
+    /// The painted-terrain, foliage and stand-in lanes are built for a model that draws through
+    /// them: with none resident, nothing of theirs reaches the VM or the compiler.
     #[test]
     fn a_lane_without_a_model_builds_nothing() {
         let mut cx = shader_cx();
         let mut renderer = Renderer::default();
         renderer.prepare_splat_lane(&mut cx);
         renderer.prepare_foliage_lane(&mut cx);
-        assert!(!renderer.splat_ready && !renderer.foliage_ready);
+        renderer.prepare_impostor_lane(&mut cx);
+        assert!(!renderer.splat_ready && !renderer.foliage_ready && renderer.impostor_shader.is_none());
         assert!(renderer.splat_draw.is_none() && renderer.foliage_draw.is_none());
         assert!(renderer.lane_variants.shaders.is_empty());
     }
@@ -487,7 +585,7 @@ mod tests {
                 Features { clip: true, ..Default::default() },
                 Features { gi: true, ..Default::default() },
                 Features { csm: true, cluster: true, ..Default::default() },
-                Features { gi: true, gi_debug: true, csm: true, csm_debug: true, cluster: true, local_shadows: true, clip: false },
+                Features { gi: true, gi_debug: true, csm: true, csm_debug: true, cluster: true, local_shadows: true, clip: false, reflections: false },
             ] {
                 for lane in [ModelLane::Diffuse, ModelLane::Pbr, ModelLane::City, ModelLane::Foliage, ModelLane::Cube, ModelLane::Alpha, ModelLane::Terrain, ModelLane::SkinnedGpu, ModelLane::Splat] {
                     let name = lane.name();

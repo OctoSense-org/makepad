@@ -7,7 +7,9 @@ use std::collections::{BTreeSet,HashMap};
 pub struct GlbTransform {pub translation:[f32;3],pub rotation:[f32;4],pub scale:[f32;3]}
 impl Default for GlbTransform {fn default()->Self{Self{translation:[0.;3],rotation:[0.,0.,0.,1.],scale:[1.;3]}}}
 #[derive(Clone,Debug)]
-pub struct GlbAuthoringObject {pub name:String,pub parent:Option<usize>,pub transform:GlbTransform,pub primitives:Vec<usize>,pub extras:Option<JsonValue>,pub lods:Vec<usize>,pub lod_distances:Vec<f32>}
+pub struct GlbCollisionMesh {pub positions:Vec<[f32;3]>,pub indices:Vec<u32>}
+#[derive(Clone,Debug)]
+pub struct GlbAuthoringObject {pub name:String,pub parent:Option<usize>,pub transform:GlbTransform,pub primitives:Vec<usize>,pub extras:Option<JsonValue>,pub collision_mesh:Option<GlbCollisionMesh>,pub lods:Vec<usize>,pub lod_distances:Vec<f32>}
 #[derive(Clone,Debug)]
 pub enum GlbAttachment {Root,Object(usize),Joint(usize)}
 #[derive(Clone,Debug)]
@@ -45,7 +47,6 @@ fn target(a:&GlbAttachment,objects:&[usize],joints:&[usize],root:usize)->Result<
 /// into authored object nodes. Skinned geometry is already in bind space and
 /// retains its common skin mesh; object nodes still carry attached emitters.
 pub fn augment_glb_authoring(input:&[u8],authoring:&GlbAuthoring)->Result<Vec<u8>,GltfError>{
-    if authoring.objects.len()>256||authoring.lights.len()>32||authoring.sockets.len()>128{return Err(validation("authoring attachment budget"));}
     let mut rewrite=GlbRewrite::begin(input)?;
     let mut root_extensions=rewrite.document.extensions.clone().unwrap_or_else(||object([]));
     let mut nodes=rewrite.take_array("nodes")?;let mut scenes=rewrite.take_array("scenes")?;
@@ -75,27 +76,45 @@ pub fn augment_glb_authoring(input:&[u8],authoring:&GlbAuthoring)->Result<Vec<u8
         match mesh.get("primitives"){Some(JsonValue::Array(v))=>v.clone(),_=>return Err(validation("authoring mesh primitives"))}
     }else{Vec::new()};
     let object_nodes=(0..authoring.objects.len()).map(|i|nodes.len()+i).collect::<Vec<_>>();
-    let mut assigned=BTreeSet::new();
+    let mut assigned=BTreeSet::new();let mut shared_meshes=std::collections::BTreeMap::new();let mut object_meshes=Vec::new();
+    let lod_targets=authoring.objects.iter().flat_map(|o|o.lods.iter().copied()).collect::<BTreeSet<_>>();
     for (i,object_def) in authoring.objects.iter().enumerate(){
         let mut node=object([("name",string(&object_def.name))]);put_transform(fields(&mut node)?,&object_def.transform)?;
         if let Some(extras)=&object_def.extras {fields(&mut node)?.insert("extras".into(),extras.clone());}
-        if !object_def.primitives.is_empty(){
+        if let Some(collision)=&object_def.collision_mesh{
+            let extras=fields(&mut node)?.entry("extras".into()).or_insert_with(||object([]));let extras=fields(extras)?;
+            if extras.contains_key("MAKEPAD_collision"){return Err(validation("authoring collision declared twice"));}
+            let positions=&collision.positions;let indices=&collision.indices;
+            if positions.len()<3||positions.iter().flatten().any(|v|!v.is_finite())||indices.is_empty()||indices.len()%3!=0||indices.iter().any(|&i|i as usize>=positions.len()){return Err(validation("authoring collision mesh"));}
+            let (mut min,mut max)=([f32::INFINITY;3],[f32::NEG_INFINITY;3]);let mut bytes=Vec::with_capacity(positions.len()*12);
+            for position in positions{for a in 0..3{min[a]=min[a].min(position[a]);max[a]=max[a].max(position[a]);bytes.extend_from_slice(&position[a].to_le_bytes());}}
+            let p=rewrite.append_accessor(&mut views,&mut accessors,&bytes,5126,positions.len(),"VEC3",false,None,Some(floats(&min)?),Some(floats(&max)?));
+            bytes.clear();for i in indices{bytes.extend_from_slice(&i.to_le_bytes());}
+            let i=rewrite.append_accessor(&mut views,&mut accessors,&bytes,5125,indices.len(),"SCALAR",false,None,None,None);
+            extras.insert("MAKEPAD_collision".into(),object([("kind",string("mesh")),("positions",number(p)),("indices",number(i))]));
+        }
+        let mesh=if object_def.primitives.is_empty(){None}else if let Some(&mesh)=shared_meshes.get(&object_def.primitives){Some(mesh)}else{
             let mut primitives=Vec::new();for &p in &object_def.primitives{
-                if !assigned.insert(p){return Err(validation("primitive assigned to more than one authoring object"));}
+                if !assigned.insert(p){return Err(validation("overlapping primitive sets in authoring objects"));}
                 primitives.push(original_primitives.get(p).ok_or_else(||validation("authoring primitive out of range"))?.clone());
             }
             let mesh_id=meshes.len();meshes.push(object([("name",string(&object_def.name)),("primitives",JsonValue::Array(primitives))]));
-            if !skinned{fields(&mut node)?.insert("mesh".into(),number(mesh_id));}
-        }
+            shared_meshes.insert(object_def.primitives.clone(),mesh_id);Some(mesh_id)
+        };
+        if !skinned{if let Some(mesh)=mesh{fields(&mut node)?.insert("mesh".into(),number(mesh));}}
+        object_meshes.push(mesh);
         if let Some(parent)=object_def.parent {if parent>=authoring.objects.len()||parent==i{return Err(validation("object parent index"));}}
         nodes.push(node);
     }
     let mut geometry_nodes=object_nodes.clone();
     if skinned{
         for (i,definition) in authoring.objects.iter().enumerate(){
-            if definition.primitives.is_empty(){continue;}
-            let mesh=meshes.iter_mut().enumerate().skip(1).find_map(|(m,v)|fields(v).ok().and_then(|f|f.get("name")).is_some_and(|v|matches!(v,JsonValue::String(n)if n==&definition.name)).then_some(m)).ok_or_else(||validation("skin object mesh"))?;
-            let n=nodes.len();nodes.push(object([("name",string(&format!("{}__skin",definition.name))),("mesh",number(mesh)),("skin",number(0))]));geometry_nodes[i]=n;
+            if object_meshes[i].is_none()&&!lod_targets.contains(&i){continue;}
+            // Hidden empty levels still carry the owner's skin and bind-space
+            // transform. Repeats share its mesh index, without new geometry.
+            let mut node=object([("name",string(&format!("{}__skin",definition.name))),("skin",number(0))]);
+            if let Some(mesh)=object_meshes[i]{fields(&mut node)?.insert("mesh".into(),number(mesh));}
+            let n=nodes.len();nodes.push(node);geometry_nodes[i]=n;
         }
     }
     let mut lod_children=BTreeSet::new();

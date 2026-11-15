@@ -35,6 +35,9 @@ pub(crate) struct Picture {
     pub held: Box<dyn Send + Sync>,
     pub display_ns: u64,
     pub built_at: Instant,
+    /// When the app last asked for a pose before it drew this one (`hal_xr_remote_drawn`): a
+    /// pose that came before waited for the app until then.
+    pub asked: Option<Instant>,
     /// What the view centres on (m), for reprojection without per-pixel depth.
     pub focus_m: f32,
     pub rendered: Option<RenderedPose>,
@@ -55,9 +58,13 @@ pub(crate) struct Flow {
     pub(crate) decoded_tiles: AtomicU64,
     /// Pictures that never reach the headset (an encode that failed): out of flight.
     pub(crate) lost: AtomicU64,
-    /// This window's (the stats line).
+    /// This window's (the stats line): the headset's poses that came for the app, the frames
+    /// it built.
+    pub(crate) poses: AtomicU64,
     pub(crate) built: AtomicU64,
     pub(crate) skipped: AtomicU64,
+    /// Pictures with no eyes to be seen from (this window): [`picture_eyes`].
+    pub(crate) no_eyes: AtomicU64,
     /// The app asked for room and the headset had too many pictures in flight (this window).
     pub(crate) held: AtomicU64,
     /// Eye pictures the encoders finished (an access unit, a drop or an error; with the
@@ -66,6 +73,9 @@ pub(crate) struct Flow {
     /// Eye pictures the encoder dropped (it gave no access unit: VideoToolbox's real-time mode
     /// under load), this window: the headset never gets that picture whole.
     pub(crate) dropped: AtomicU64,
+    /// Per picture built this window: how long its pose waited for the app to ask for it (µs;
+    /// it came while the app still built the frame before).
+    pub(crate) app_wait_us: Mutex<Vec<u32>>,
 }
 
 impl Flow {
@@ -80,6 +90,45 @@ impl Flow {
         let done = self.decoded_tiles.load(Ordering::Acquire) / tiles.max(1) as u64 + self.lost.load(Ordering::Acquire);
         self.built_total.load(Ordering::Acquire).saturating_sub(done)
     }
+
+    /// A picture built that goes no further ([`picture_eyes`]): out of flight, and no encoder
+    /// waits for it.
+    fn no_eyes(&self, tiles: u32) {
+        self.no_eyes.fetch_add(1, Ordering::AcqRel);
+        self.lost.fetch_add(1, Ordering::AcqRel);
+        self.encoded_tiles.fetch_add(tiles as u64, Ordering::AcqRel);
+    }
+}
+
+/// A picture that goes no further: out of flight, its slot free, and then the sink woken. No
+/// encoder or headset will answer for this one, and the app's next pose waits on such an answer.
+fn let_go(flow: &Flow, tiles: u32, held: Box<dyn Send + Sync>, wake: impl FnOnce()) {
+    flow.no_eyes(tiles);
+    drop(held);
+    wake();
+}
+
+/// The pose a picture was drawn for, taken from those kept; the older ones were never drawn and
+/// go with it.
+fn take_pose_of(poses: &mut VecDeque<(u64, Arrived)>, display_ns: u64) -> Option<Arrived> {
+    let i = poses.iter().position(|(d, _)| *d == display_ns)?;
+    let pose = poses.remove(i).unwrap().1;
+    poses.drain(..i);
+    Some(pose)
+}
+
+/// What a picture is seen from: (pose sequence, eyes, its render time in µs from the pose's
+/// arrival). Its own render eyes, else those of the pose it was drawn for. None for a picture
+/// drawn again for a pose an earlier picture already took: its head would carry no eyes, and the
+/// headset showing one late (with its own eyes, not warped) has every frame refused for the
+/// empty pose, its frame loop then stalls and the app's poses and pictures slow to match.
+fn picture_eyes(rendered: Option<RenderedPose>, pose: Option<&Arrived>, built_at: Instant) -> Option<(u64, [XrRenderEye; 2], u32)> {
+    let (seq, eyes, at) = match (rendered, pose) {
+        (Some(r), _) => (r.seq, r.eyes, r.arrived),
+        (None, Some(a)) => (a.seq, a.eyes, a.at),
+        (None, None) => return None,
+    };
+    Some((seq, eyes, built_at.saturating_duration_since(at).as_micros() as u32))
 }
 
 /// The stream's rate (all tiles, kbit/s): the one rate controller of every Desk Link stream
@@ -129,7 +178,7 @@ impl Rate {
         let log = &self.shared.log;
         let before = self.current();
         let mut r = self.inner.lock().unwrap();
-        let link_queued = r.trip.queued(trip_ms, trip_min_ms);
+        let link_queued = LinkTrip::ours(r.trip.queued(trip_ms, trip_min_ms), sent_kbps, before);
         let cap = r.cap;
         // one fixed shape (a stream per eye): no encoder effort steps, no decode bands
         let s = Second { fps, pictures, sent_kbps, size, max_effort: effort::SHARP, link_queued, ..Second::default() };
@@ -244,23 +293,65 @@ impl Uplink {
     }
 }
 
+/// How long the headset's menu stays down to be a hold, not a press (ns).
+const MENU_HOLD_NS: u64 = 600_000_000;
+
+/// The headset's menu: the left controller's menu button, or a tracked left hand's menu gesture.
+#[derive(Default)]
+pub(crate) struct MenuPress {
+    /// When it went down (its pose's sample time), and whether the button was part of it.
+    down_at: Option<u64>,
+    button: bool,
+    /// Down [`MENU_HOLD_NS`]: a hold, until its release.
+    held: bool,
+}
+
+impl MenuPress {
+    /// One pose (`at`: its sample time): whether the menu is held now. The button's short press
+    /// turns the stream on and off at its release; a hold turns it on.
+    fn step(&mut self, shared: &ServerShared, at: u64, button: bool, gesture: bool) -> bool {
+        match (button || gesture, self.down_at) {
+            (true, None) => *self = MenuPress { down_at: Some(at), button, held: false },
+            (true, Some(from)) => {
+                self.button |= button;
+                if !self.held && at.saturating_sub(from) >= MENU_HOLD_NS {
+                    self.held = true;
+                    shared.set_streaming(true);
+                    (shared.log)("xr host: the headset's menu held");
+                }
+            }
+            (false, Some(from)) => {
+                // (a release seen only after the hold's time, a gap in the poses, is no press)
+                if self.button && !self.held && at.saturating_sub(from) < MENU_HOLD_NS {
+                    shared.set_streaming(!shared.streaming());
+                    (shared.log)(if shared.streaming() { "xr host: the headset's menu button resumed the stream" } else { "xr host: the headset's menu button paused the stream" });
+                }
+                *self = MenuPress::default();
+            }
+            (false, None) => {}
+        }
+        self.held
+    }
+}
+
 /// A pose from the headset: to the app's XR window, and kept to match its picture.
 fn take_pose(shared: &ServerShared, poses: &Mutex<VecDeque<(u64, Arrived)>>, seq: u64, sample_ns: u64, display_ns: u64, frame: &[u8]) -> bool {
-    // the left controller's menu button turns the stream on and off (unless the app took that
-    // over, `set_menu_toggles_streaming`): never seen by the app then
+    // the left controller's menu (unless the app took the button over,
+    // `set_menu_toggles_streaming`): its button never reaches the app; a short press turns the
+    // stream on and off, a hold reaches the app as HOLD_MENU on the left controller
     let mut masked = None;
     if shared.menu_toggles.load(Ordering::Acquire) {
-        use makepad_hal::{buffers::{read_items, Wire}, xr_controller, XrFrame};
+        use makepad_hal::{buffers::{read_items, Wire}, xr_controller, xr_hand, XrFrame};
         if let Some(mut f) = read_items::<XrFrame>(frame, 1).next() {
+            let gesture = f.hands[0].flags & xr_hand::MENU_PRESSED != 0;
             let left = &mut f.controllers[0];
-            let down = left.buttons & xr_controller::ACTIVE != 0 && left.buttons & xr_controller::CLICK_MENU != 0;
-            if down && !shared.menu_down.swap(true, Ordering::AcqRel) {
-                shared.set_streaming(!shared.streaming());
-            } else if !down {
-                shared.menu_down.store(false, Ordering::Release);
-            }
-            if left.buttons & xr_controller::CLICK_MENU != 0 {
+            let button = left.buttons & xr_controller::ACTIVE != 0 && left.buttons & xr_controller::CLICK_MENU != 0;
+            let held = shared.menu.lock().unwrap().step(shared, sample_ns, button, gesture);
+            if left.buttons & xr_controller::CLICK_MENU != 0 || held {
                 left.buttons &= !xr_controller::CLICK_MENU;
+                if held {
+                    left.buttons |= xr_controller::HOLD_MENU;
+                }
                 let mut bytes = Vec::with_capacity(frame.len());
                 f.write(&mut bytes);
                 masked = Some(bytes);
@@ -272,6 +363,7 @@ fn take_pose(shared: &ServerShared, poses: &Mutex<VecDeque<(u64, Arrived)>>, seq
         return true;
     }
     shared.pose_ns.store(makepad_hal::clock_ns(), Ordering::Release);
+    shared.note_pose();
     let frame = masked.as_deref().unwrap_or(frame);
     if shared.external.load(Ordering::Acquire) {
         let Some(frame) = makepad_hal::buffers::read_items::<makepad_hal::XrFrame>(frame, 1).next() else { return false };
@@ -377,7 +469,7 @@ impl Core {
                         log(&format!("xr host: eye {t}: encode: {e}"));
                         flow.lost.fetch_add(1, Ordering::AcqRel);
                         keyframe[t].store(true, Ordering::Release);
-                        shared.wake();
+                        shared.wake_sink();
                         return;
                     }
                 };
@@ -387,7 +479,7 @@ impl Core {
                 if packets.is_empty() {
                     flow.dropped.fetch_add(1, Ordering::AcqRel);
                     flow.decoded_tiles.fetch_add(1, Ordering::AcqRel);
-                    shared.wake();
+                    shared.wake_sink();
                     return;
                 }
                 // from the build: the wait for the frame's GPU work, the column's copy, its encode
@@ -403,7 +495,7 @@ impl Core {
                         return;
                     }
                 }
-                shared.wake();
+                shared.wake_sink();
             })
         };
         let encoders = Arc::new(TileEncoders::open("xr-host-encode", specs, sink)?);
@@ -430,31 +522,27 @@ impl Core {
         // the app's pictures: matched to their poses, fanned out to the eyes
         let (tx, rx) = sync_channel::<Picture>(4);
         {
-            let (poses, rate, ending, keyframe, log) = (poses.clone(), rate.clone(), ending.clone(), keyframe.clone(), log.clone());
+            let (poses, rate, ending, keyframe, log, flow) = (poses.clone(), rate.clone(), ending.clone(), keyframe.clone(), log.clone(), flow.clone());
             let dump = std::env::var_os("MAKEPAD_XR_REMOTE_DUMP");
+            let shared = shared.clone();
             std::thread::Builder::new()
                 .name("xr-host-pictures".into())
                 .spawn(move || {
                     let mut pts = 0i64;
                     while !ending.load(Ordering::Acquire) {
                         let Ok(p) = rx.recv_timeout(Duration::from_millis(100)) else { continue };
-                        let pose = {
-                            let mut poses = poses.lock().unwrap();
-                            let found = poses.iter().position(|(d, _)| *d == p.display_ns);
-                            found.map(|i| {
-                                let pose = poses.remove(i).unwrap().1;
-                                // older poses were never drawn: gone
-                                poses.drain(..i);
-                                pose
-                            })
-                        };
-                        let (seq, eyes, render_us) = match &pose {
-                            Some(a) => (a.seq, a.eyes, p.built_at.saturating_duration_since(a.at).as_micros() as u32),
-                            None => (0, [XrRenderEye::default(); 2], 0),
-                        };
-                        let (seq, eyes, render_us) = match p.rendered {
-                            Some(r) => (r.seq, r.eyes, p.built_at.saturating_duration_since(r.arrived).as_micros() as u32),
-                            None => (seq, eyes, render_us),
+                        let pose = take_pose_of(&mut poses.lock().unwrap(), p.display_ns);
+                        // of the render: the pose waiting for the app to ask for it
+                        if let (Some(a), Some(asked)) = (&pose, p.asked) {
+                            let mut waits = flow.app_wait_us.lock().unwrap();
+                            if waits.len() < 4096 {
+                                waits.push(asked.saturating_duration_since(a.at).as_micros() as u32);
+                            }
+                        }
+                        let Some((seq, eyes, render_us)) = picture_eyes(p.rendered, pose.as_ref(), p.built_at) else {
+                            // it and its hold on the slot go; the next pose draws what it showed
+                            let_go(&flow, tiles, p.held, || shared.wake_sink());
+                            continue;
                         };
                         if let Some(dir) = &dump {
                             dump_picture(dir, &p, size, &log);
@@ -493,10 +581,13 @@ impl Core {
         }
     }
 
-    /// The headset decoded one eye of a picture.
-    pub(crate) fn tile_decoded(&self) {
-        self.flow.decoded_tiles.fetch_add(1, Ordering::AcqRel);
-        self.shared.wake();
+    /// Eye pictures out of flight (decoded by the headset, or dropped on the way): their slots
+    /// free, the sink woken for them.
+    pub(crate) fn tiles_out(&self, n: u64) {
+        if n > 0 {
+            self.flow.decoded_tiles.fetch_add(n, Ordering::AcqRel);
+            self.shared.wake_sink();
+        }
     }
 
     pub(crate) fn stop(&self) {
@@ -521,3 +612,70 @@ pub fn picture_size(encoded: [u32; 2]) -> [u32; 2] {
     [encoded[0] * 2, encoded[1] * 3 / 2]
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eyes(w: f32) -> [XrRenderEye; 2] {
+        [XrRenderEye { orientation: [0.0, 0.0, 0.0, w], ..Default::default() }; 2]
+    }
+
+    fn poses(display_ns: &[u64]) -> VecDeque<(u64, Arrived)> {
+        display_ns.iter().map(|d| (*d, Arrived { at: Instant::now(), seq: *d + 1, eyes: eyes(1.0) })).collect()
+    }
+
+    #[test]
+    fn a_picture_takes_its_poses_eyes_and_the_older_poses_go() {
+        let mut kept = poses(&[10, 20, 30]);
+        let pose = take_pose_of(&mut kept, 20).unwrap();
+        assert_eq!(pose.seq, 21);
+        assert_eq!(kept.iter().map(|(d, _)| *d).collect::<Vec<_>>(), [30]);
+        let (seq, shown, _) = picture_eyes(None, Some(&pose), Instant::now()).unwrap();
+        assert_eq!(seq, 21);
+        assert_eq!(shown, eyes(1.0));
+    }
+
+    #[test]
+    fn a_picture_drawn_again_for_a_pose_already_taken_has_no_eyes_to_go_out_with() {
+        let mut kept = poses(&[10]);
+        assert!(take_pose_of(&mut kept, 10).is_some());
+        let again = take_pose_of(&mut kept, 10);
+        assert!(again.is_none());
+        assert!(picture_eyes(None, again.as_ref(), Instant::now()).is_none());
+    }
+
+    #[test]
+    fn a_picture_with_its_own_render_eyes_keeps_them() {
+        let rendered = RenderedPose { seq: 7, eyes: eyes(0.5), arrived: Instant::now() };
+        let (seq, shown, _) = picture_eyes(Some(rendered), None, Instant::now()).unwrap();
+        assert_eq!((seq, shown), (7, eyes(0.5)));
+    }
+
+    #[test]
+    fn a_picture_with_no_eyes_leaves_nothing_in_flight_or_waiting_for_an_encoder() {
+        let flow = Flow::default();
+        flow.built_total.fetch_add(1, Ordering::AcqRel);
+        assert_eq!((flow.in_flight(2), flow.backlog(2)), (1, 1));
+        flow.no_eyes(2);
+        assert_eq!((flow.in_flight(2), flow.backlog(2)), (0, 0));
+        assert_eq!(flow.no_eyes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_picture_with_no_eyes_frees_its_slot_and_then_wakes_the_app() {
+        struct Slot(Arc<AtomicBool>);
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let busy = Arc::new(AtomicBool::new(true));
+        let flow = Flow::default();
+        flow.built_total.fetch_add(1, Ordering::AcqRel);
+        let mut woken_with_a_free_slot = None;
+        let_go(&flow, 2, Box::new(Slot(busy.clone())), || woken_with_a_free_slot = Some(!busy.load(Ordering::Acquire)));
+        assert_eq!(woken_with_a_free_slot, Some(true), "nothing else wakes the app for this picture");
+        assert_eq!((flow.in_flight(2), flow.backlog(2)), (0, 0));
+    }
+}

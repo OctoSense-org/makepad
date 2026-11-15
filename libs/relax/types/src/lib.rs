@@ -3,33 +3,36 @@
 //! The layers below are re-exported, so every module of Relax is `crate::<module>` in each layer.
 
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
-// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// log in a full tmpfs /tmp aborted a fleet run inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! eprintln {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+    ($($t:tt)+) => { $crate::vfs::write_err(format_args!("{}\n", format_args!($($t)+))) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! eprint {
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!($($t)+)); }};
+    ($($t:tt)+) => { $crate::vfs::write_err(format_args!($($t)+)) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! println {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+    ($($t:tt)+) => { $crate::vfs::write_out(format_args!("{}\n", format_args!($($t)+))) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! print {
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!($($t)+)); }};
+    ($($t:tt)+) => { $crate::vfs::write_out(format_args!($($t)+)) };
 }
 
 pub use relax_front::*;
 
+/// The test binary's children (tests run alone in their own process), a few at once.
+#[cfg(test)]
+mod test_child;
 pub mod types;
 pub mod instance;
 pub mod consts;
@@ -41,6 +44,8 @@ pub mod layout;
 pub mod const_fold;
 pub mod cycle;
 pub mod borrowck;
+/// Per-owner body-check side effects, merged before the crate-wide passes read their sinks.
+pub mod body_facts;
 pub mod lint;
 pub mod lint_table;
 pub mod lint_levels;
@@ -106,6 +111,7 @@ include!(concat!(env!("OUT_DIR"), "/src_stamp.rs"));
 
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub unsafe fn reset_statics() {
+    body_facts::reset_statics();
     borrowck::reset_statics();
     layout::reset_statics();
     lint::reset_statics();

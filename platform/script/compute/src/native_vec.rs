@@ -65,7 +65,7 @@ pub fn host_lanes() -> u32 {
 /// (this host's lanes, whether MAKEPAD_KERNEL_LANES set them)
 fn host() -> (u32, bool) {
     static L: std::sync::OnceLock<(u32, bool)> = std::sync::OnceLock::new();
-    *L.get_or_init(|| match std::env::var("MAKEPAD_KERNEL_LANES").ok().as_deref() {
+    *L.get_or_init(|| match relax_api::env::var("MAKEPAD_KERNEL_LANES").ok().as_deref() {
         Some("4") => (4, true),
         Some("8") => (8, true),
         _ => (if cfg!(target_arch = "x86_64") { 8 } else { 4 }, false),
@@ -985,7 +985,10 @@ impl<'a> Vx<'a> {
                 Stmt::Def(v, Op::Load { region: r2, base, extent, off: Some(o) }) if *r2 == region && !self.uniform(*o) && !(region == Region::Shared && cfg!(target_arch = "aarch64") && *extent <= 16) => {
                     let (root, c) = self.root_of(*o);
                     if root == r && (*base as u64 + c as u64) < 1 << 30 && (region != Region::Shared || c < *extent) {
-                        ls.push((base + c, *v, id(st), (base + extent).saturating_sub(1)));
+                        // the table's last word from the true end: an extent near u32::MAX (an unbounded
+                        // table) wrapped base + extent to a small word before the saturation
+                        let last = (*base as u64 + *extent as u64).saturating_sub(1).min(u32::MAX as u64) as u32;
+                        ls.push((base + c, *v, id(st), last));
                     }
                 }
                 Stmt::Def(..) => {}

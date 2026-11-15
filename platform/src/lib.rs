@@ -74,6 +74,8 @@ pub mod draw_shader_layout;
 mod draw_vars;
 #[cfg(not(target_arch = "wasm32"))]
 mod frame_build;
+#[cfg(not(target_arch = "wasm32"))]
+mod draw_damage;
 pub mod shader_pack;
 pub mod collect;
 pub mod splash_blank;
@@ -113,6 +115,8 @@ pub mod perf_monitor;
 pub mod thread_counters;
 pub mod gpu_frame_timer;
 pub mod pass_load;
+#[cfg(not(target_arch = "wasm32"))]
+mod first_draw;
 pub mod gpu_admission;
 pub mod sploded;
 pub mod pick;
@@ -129,6 +133,7 @@ pub mod web_socket;
 pub mod audio_stream;
 
 pub mod file_dialogs;
+pub mod print;
 pub mod hosted_relay;
 
 mod media_api;
@@ -145,6 +150,9 @@ pub mod font_policy;
 #[macro_use]
 mod app_main;
 pub mod remote;
+// The remote's commands as the AI services' manifest describes them: native, as the remote
+// (makepad-remote) is; the web has neither.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod remote_schema;
 // the profiler stream of a native build (a `makepad run` app serves it from relax inspect)
 #[cfg(all(not(relax), any(target_os = "macos", target_os = "linux")))]
@@ -371,6 +379,7 @@ pub use {
             FileDialog, FileDialogAction, VirtualFile, VirtualFileLimits,
             DEFAULT_VIRTUAL_FILE_SIZE_LIMIT,
         },
+        print::{PrintId, PrintJob, PrintResult, PrintResultEvent},
         game_input::*,
         geometry::{CxGeometry, Geometry, GeometryId, IndexData, VertexData},
         draw_shader::{
@@ -412,7 +421,7 @@ pub use {
             StorageEstimate, StorageResponse, StorageResult, StorageStat, DEFAULT_STORAGE_VALUE_CAP,
             MAX_STORAGE_KEY_BYTES, MAX_STORAGE_LIST_LIMIT, MAX_STORAGE_NAMESPACE_BYTES,
         },
-        texture::{ReadbackTicket, ReadbackRequest, ReadbackError, TextureReadback, TEXTURE_READBACK_MAX_BYTES,
+        texture::{ReadbackTicket, ReadbackRequest, ReadbackError, TextureReadback, TEXTURE_READBACK_MAX_BYTES, STAGED_UPLOAD_BYTES,
             image_cache_use_mipmaps, Texture, TextureAnimation, TextureFormat, TextureId,
             TextureSize, TextureUpdated, TextureWrap, CompressedTextureFormat,
         },

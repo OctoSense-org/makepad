@@ -5,6 +5,56 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 
+/// Exec limits measured on this node, also published in its caps.
+pub fn exec_limits() -> Result<Option<super::ExecLimits>, String> {
+    extern "C" {
+        fn sysconf(name: i32) -> std::os::raw::c_long;
+    }
+    #[cfg(target_os = "macos")]
+    const SC_ARG_MAX: i32 = 1;
+    #[cfg(not(target_os = "macos"))]
+    const SC_ARG_MAX: i32 = 0;
+    // SAFETY: sysconf takes a constant selector and no pointers.
+    let max = unsafe { sysconf(SC_ARG_MAX) };
+    if max <= 0 { return Err("this box could not report its exec argument and env limit".into()); }
+    let max = max as usize;
+    #[cfg(target_os = "macos")]
+    let one: Option<usize> = None;
+    #[cfg(not(target_os = "macos"))]
+    let one = {
+        const SC_PAGESIZE: i32 = 30;
+        // SAFETY: Linux's page-size selector takes no pointers.
+        let page = unsafe { sysconf(SC_PAGESIZE) };
+        if page <= 0 { return Err("this box could not report its exec page-size limit".into()); }
+        Some(32 * page as usize)
+    };
+    Ok(Some(super::ExecLimits { total: max, per_string: one }))
+}
+
+/// Check an exec's words and explicit environment (the caller has cleared inheritance).
+pub fn exec_over(cmd: &Command) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let limits = match exec_limits() { Ok(Some(limits)) => limits, Ok(None) => return None, Err(e) => return Some(e) };
+    let pointer = std::mem::size_of::<*const u8>();
+    let check = |label: String, bytes: usize| limits.word_over(&label, bytes, pointer);
+    let program = Path::new(cmd.get_program()).file_name().unwrap_or(cmd.get_program()).to_string_lossy();
+    let mut total = 2 * pointer; // the argv and env pointer arrays' terminating NULLs
+    for (i, arg) in std::iter::once(cmd.get_program()).chain(cmd.get_args()).enumerate() {
+        let bytes = arg.as_bytes().len() + 1;
+        // (named by its start: its index is the wrapped command's, not the one the lane wrote)
+        let start: String = arg.to_string_lossy().chars().take(40).collect();
+        if let Some(over) = check(if i == 0 { format!("the program {program}") } else { format!("the argument `{start}...`") }, bytes) { return Some(over); }
+        total += bytes + pointer;
+    }
+    for (key, value) in cmd.get_envs() {
+        let Some(value) = value else { continue };
+        let bytes = key.as_bytes().len() + 1 + value.as_bytes().len() + 1;
+        if let Some(over) = check(format!("env value {}", key.to_string_lossy()), bytes) { return Some(over); }
+        total += bytes + pointer;
+    }
+    limits.total_over(total)
+}
+
 /// What keeps a run's processes together beyond its pid: nothing on Unix (the process group is
 /// named by the leader's pid).
 #[derive(Default)]
@@ -39,22 +89,25 @@ pub fn own_nice() -> i32 {
 }
 
 /// The argv a lease run executes: the scope (collected even on failure), nice and pinning wrappers, then `argv`.
-/// `share`: a shared lease's cost, whose cores become its scope's CPU weight (100 per core): its
+/// `weight`: a shared lease's scope CPU weight ([`crate::lease::Priority::cpu_weight`]): its
 /// share of the box under contention, the whole box when idle. Never a CPU quota: a quota of the
 /// lease's cores throttled a live Fab (measured at one core) to one CPU, and its pools and JIT
 /// sized themselves to that one CPU.
-/// `ram_max_gb`: the RAM the lease asked for itself (`--ram-gb`), the only hard memory cap; a
-/// measured ask only schedules, never kills a run that needs more than it measured.
-pub fn lease_argv(argv: Vec<String>, unit: Option<&str>, nice: i32, cpus: &str, share: Option<crate::lease::Cost>, ram_max_gb: Option<f64>) -> Vec<String> {
+/// `ram_max_gb`: the RAM the lease asked for itself (`--ram-gb`): past half again as much its
+/// scope is throttled (`MemoryHigh`: the kernel reclaims its pages and slows its allocations),
+/// never killed. A hard cap (`MemoryMax`) killed a hot bucket's JIT at 7.5 GB of its 5 GB ask, and
+/// systemd stopped the scope with it: the bucket had no verdict (11-13). A measured ask only
+/// schedules.
+pub fn lease_argv(argv: Vec<String>, unit: Option<&str>, nice: i32, cpus: &str, weight: Option<u32>, ram_max_gb: Option<f64>) -> Vec<String> {
     let mut full: Vec<String> = Vec::new();
     if let Some(u) = unit {
         // the command's words stay its own: left to expand, systemd takes `$$` for `$` and `${X}`
         // for its value before the shell they are written for sees them
         full.extend(["systemd-run", "--user", "--scope", "--collect", "--quiet", "--expand-environment=no"].map(String::from));
         full.push(format!("--unit={u}"));
-        if let Some(cost) = share.filter(|_| cfg!(target_os = "linux")) {
-            full.extend(["-p".into(), format!("CPUWeight={}", (cost.cores * 100.0).round().clamp(1.0, 10_000.0) as u32)]);
-            if let Some(gb) = ram_max_gb { full.extend(["-p".into(), format!("MemoryMax={}G", gb * 1.5)]); }
+        if let Some(weight) = weight.filter(|_| cfg!(target_os = "linux")) {
+            full.extend(["-p".into(), format!("CPUWeight={weight}")]);
+            if let Some(gb) = ram_max_gb { full.extend(["-p".into(), format!("MemoryHigh={}G", gb * 1.5)]); }
         }
         full.push("--".into());
     }
@@ -77,9 +130,20 @@ pub fn hub_program(program: &str, path: &std::ffi::OsStr) -> Result<std::path::P
         .ok_or_else(|| format!("{program}: not on the hub's PATH ({})", path.to_string_lossy()))
 }
 
+/// A run's scope (`unit`, Linux) takes CPU weight `weight` now: kept by systemd, a reload
+/// leaves it so.
+pub fn set_cpu_weight(unit: &str, weight: u32) -> Result<(), String> {
+    let out = Command::new(tool("systemctl")).args(["--user", "set-property", "--runtime", &format!("{unit}.scope"), &format!("CPUWeight={weight}")])
+        .stdin(std::process::Stdio::null()).output().map_err(|e| format!("systemctl: {e}"))?;
+    if out.status.success() { Ok(()) } else { Err(format!("systemctl set-property {unit}.scope CPUWeight={weight}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
+}
+
+/// Error windows are Windows' alone ([`crate::os`]'s Windows `quiet_errors`).
+pub fn quiet_errors() {}
+
 /// Clear failed transient units left by earlier hubs; an unloaded unit is harmless.
 pub fn reset_failed_units(pattern: &str) {
-    let _ = Command::new("systemctl").args(["--user", "reset-failed", pattern])
+    let _ = Command::new(tool("systemctl")).args(["--user", "reset-failed", pattern])
         .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
 }
 
@@ -104,7 +168,6 @@ if [ "$scoped" = 1 ] && [ -r /proc/self/cgroup ]; then
 fi
 record() {
     if [ -n "$group" ]; then
-        if [ -r "$group/memory.peak" ] && read -r peak < "$group/memory.peak"; then printf 'peak %s\n' "$peak"; fi
         if [ -r "$group/cpu.stat" ]; then
             while read -r key value; do
                 if [ "$key" = usage_usec ]; then printf 'cpu %s\n' "$value"; fi
@@ -130,11 +193,13 @@ exit "$?"
     full
 }
 
-/// Current scope high-water mark and cumulative CPU. The in-scope wrapper saves these again
-/// at exit because systemd removes an empty scope before its parent can read the cgroup.
+/// What a scoped run holds now that its class's RAM is measured by ([`parse_unreclaimable`]), and
+/// its cumulative CPU. The in-scope wrapper saves the CPU again at exit because systemd removes
+/// an empty scope before its parent can read the cgroup.
 pub fn scope_usage(pid: u32, start: u64, unit: Option<&str>, usage: &Path) -> (Option<u64>, Option<f64>) {
     let Some(group) = scope_dir(pid, start, unit, usage) else { return (None, None) };
-    let peak = std::fs::read_to_string(group.join("memory.peak")).ok().and_then(|s| s.trim().parse().ok());
+    let read = |f: &str| std::fs::read_to_string(group.join(f)).ok();
+    let peak = read("memory.current").and_then(|c| parse_unreclaimable(&c, &read("memory.stat").unwrap_or_default()));
     let cpu = std::fs::read_to_string(group.join("cpu.stat")).ok().and_then(|s| s.lines().find_map(|s| s.strip_prefix("usage_usec ").and_then(|s| s.parse::<f64>().ok()))).map(|us| us / 1_000_000.0);
     (peak, cpu)
 }
@@ -166,14 +231,16 @@ pub fn activity(pid: u32, start: u64, unit: Option<&str>, usage: &Path, _hold: &
 }
 
 /// One process's [`super::Activity`]: `stat`'s utime, stime, cutime and cstime (in the fixed
-/// 100 Hz of `/proc`), and `io`'s rchar and wchar.
+/// 100 Hz of `/proc`), and `io`'s read_bytes and write_bytes: storage I/O, as a scope's `io.stat`
+/// counts it. A socket's or a pipe's traffic is none (rchar and wchar count it): a test polling its
+/// parked app's remote every 50 ms moved 10-20 KB/s within its own processes and read as work (11-07).
 #[cfg(target_os = "linux")]
 fn proc_activity(pid: u32) -> Option<super::Activity> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let f: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
     // f[11..15] = fields 14-17
     let ticks: u64 = f.get(11..15)?.iter().filter_map(|t| t.parse::<u64>().ok()).sum();
-    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_default().lines().filter_map(|l| l.strip_prefix("rchar: ").or_else(|| l.strip_prefix("wchar: "))).filter_map(|n| n.trim().parse::<u64>().ok()).sum();
+    let io = std::fs::read_to_string(format!("/proc/{pid}/io")).unwrap_or_default().lines().filter_map(|l| l.strip_prefix("read_bytes: ").or_else(|| l.strip_prefix("write_bytes: "))).filter_map(|n| n.trim().parse::<u64>().ok()).sum();
     Some(super::Activity { cpu_us: ticks * 10_000, io_bytes: io })
 }
 
@@ -295,6 +362,9 @@ pub fn processes_view(pids: &[u32]) -> String {
     for &pid in pids.iter().filter(|p| !parents.contains(p)) {
         match stacks(pid) {
             Ok(frames) => out.push_str(&format!("stacks of {pid}:\n{frames}\n")),
+            // one gone meanwhile says nothing of the box: a poll loop's `sleep 0.1` ended under gdb
+            // and the hung stub after it went without its stacks (11-08)
+            Err(_) if !Path::new(&format!("/proc/{pid}")).exists() => {}
             // it is the box's answer, the same for the next one
             Err(why) => { out.push_str(&format!("stacks of {pid}: {why}\n")); break; }
         }
@@ -302,12 +372,46 @@ pub fn processes_view(pids: &[u32]) -> String {
     out
 }
 
+/// Where a stuck run of `pids` waits: the oldest of them that started none of the others (what the
+/// rest wait on), as the chain of commands that leads to it from the first of them, collapsed
+/// where a shell's subshell repeats it, with its pid and how long it has run, in s. A jitlegs
+/// leg's hung fixture stub slept under five shells, beside a poll loop's ever-new `sleep 0.1`
+/// (11-08). None: none of them lives.
+#[cfg(target_os = "linux")]
+pub fn stuck_in(pids: &[u32]) -> Option<(String, u32, u64)> {
+    // /proc's start times are in its fixed 100 Hz
+    let up_s: f64 = std::fs::read_to_string("/proc/uptime").ok()?.split_whitespace().next()?.parse().ok()?;
+    // pid -> (parent, start), of the live ones (a zombie does nothing)
+    let procs: std::collections::BTreeMap<u32, (u32, u64)> = pids.iter().filter_map(|&pid| {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let f: Vec<&str> = stat[stat.rfind(')')? + 2..].split_whitespace().collect();
+        if f.first() == Some(&"Z") { return None; }
+        Some((pid, (f.get(1)?.parse().ok()?, f.get(19)?.parse().ok()?)))
+    }).collect();
+    let (&leaf, &(_, start)) = procs.iter().filter(|(p, _)| !procs.values().any(|(parent, _)| parent == *p)).min_by_key(|(p, (_, start))| (*start, **p))?;
+    let mut chain: Vec<String> = Vec::new();
+    let mut at = Some(leaf);
+    for _ in 0..procs.len() {
+        let Some(p) = at else { break };
+        if let Some(label) = crate::top::label(p).filter(|l| chain.last() != Some(l)) { chain.push(label); }
+        at = procs.get(&p).map(|(parent, _)| *parent).filter(|parent| procs.contains_key(parent));
+    }
+    chain.reverse();
+    Some((chain.join(" > "), leaf, (up_s - start as f64 / 100.0).max(0.0) as u64))
+}
+
+/// (No process table read here.)
+#[cfg(not(target_os = "linux"))]
+pub fn stuck_in(_pids: &[u32]) -> Option<(String, u32, u64)> {
+    None
+}
+
 /// gdb's stacks of a process. Yama's default lets a process trace only its own descendants, so on
 /// such a box only the user's `sysctl kernel.yama.ptrace_scope=0` opens this (and nothing does for a
 /// process that is not dumpable).
 #[cfg(target_os = "linux")]
 fn stacks(pid: u32) -> Result<String, String> {
-    let o = std::process::Command::new("gdb").args(["-q", "-n", "-batch", "-p", &pid.to_string(), "-ex", "thread apply all bt 20"]).stdin(std::process::Stdio::null()).output().map_err(|e| format!("no gdb here: {e}"))?;
+    let o = std::process::Command::new(tool("gdb")).args(["-q", "-n", "-batch", "-p", &pid.to_string(), "-ex", "thread apply all bt 20"]).stdin(std::process::Stdio::null()).output().map_err(|e| format!("no gdb here: {e}"))?;
     let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
     let frames: Vec<&str> = text.lines().filter(|l| l.starts_with("Thread ") || l.starts_with('#')).collect();
     if !frames.is_empty() { return Ok(frames.join("\n")); }
@@ -367,6 +471,16 @@ pub fn scope_now(pid: u32, start: u64, unit: Option<&str>, usage: &Path) -> Opti
     Some(parse_held(&stat))
 }
 
+/// A cgroup's `memory.current` less the page cache the kernel reclaims first (`memory.stat`'s
+/// `inactive_file`), bytes: what a run's class asks for. Never `memory.peak`, which counts every
+/// file the run read: a third of a tests shard's scope was idle cache, and its class asked
+/// 27.7 GB and waited 15 min for a box with that free (11-10).
+pub fn parse_unreclaimable(current: &str, stat: &str) -> Option<u64> {
+    let current: u64 = current.trim().parse().ok()?;
+    let idle = stat.lines().find_map(|l| l.strip_prefix("inactive_file ")).and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+    Some(current.saturating_sub(idle))
+}
+
 /// `anon` + `shmem` of a cgroup's `memory.stat`.
 pub fn parse_held(stat: &str) -> u64 {
     stat.lines().filter_map(|l| l.split_once(' ')).filter(|(k, _)| matches!(*k, "anon" | "shmem")).filter_map(|(_, v)| v.trim().parse::<u64>().ok()).sum()
@@ -381,15 +495,13 @@ pub fn groups_held(groups: &[(u32, u64)]) -> Option<u64> {
     groups_rss(groups)
 }
 
-/// RSS in bytes across recorded process groups (ps reports KiB), in one process-table
-/// snapshot per lease. A departed leader can still have children; a reused pid is excluded.
+/// RSS in bytes across recorded process groups, in one read of the process table in place (no
+/// `ps` per sample). A departed leader can still have children; a reused pid is excluded.
 pub fn groups_rss(groups: &[(u32, u64)]) -> Option<u64> {
-    let groups: Vec<_> = groups.iter().filter(|(pid, start)| *pid != 0 && proc_start(*pid).is_none_or(|s| s == *start)).map(|(pid, _)| pid.to_string()).collect();
-    if groups.is_empty() { return None; }
-    let out = Command::new("ps").args(["-o", "rss=", "-g", &groups.join(",")]).output().ok()?;
-    if !out.status.success() { return None; }
-    let rss: Vec<u64> = String::from_utf8_lossy(&out.stdout).split_whitespace().map(str::parse).collect::<Result<_, _>>().ok()?;
-    (!rss.is_empty()).then(|| rss.iter().sum::<u64>() * 1024)
+    let leaders: Vec<u32> = groups.iter().filter(|(pid, start)| *pid != 0 && proc_start(*pid).is_none_or(|s| s == *start)).map(|(pid, _)| *pid).collect();
+    if leaders.is_empty() { return None; }
+    let rss: Vec<u64> = process_table(&leaders).into_iter().filter(|(_, (_, member))| *member).filter_map(|(pid, _)| crate::procinfo::proc(pid).map(|p| p.rss_bytes)).collect();
+    (!rss.is_empty()).then(|| rss.iter().sum())
 }
 
 /// Reap just this child, retaining user + system CPU including its waited-for descendants, and
@@ -397,6 +509,20 @@ pub fn groups_rss(groups: &[(u32, u64)]) -> Option<u64> {
 /// before anything looked at it. `Child::wait` discards rusage; a process-wide RUSAGE_CHILDREN
 /// delta would mix leases.
 pub fn wait_usage(child: &mut Child) -> std::io::Result<(ExitStatus, Option<f64>, Option<u64>)> {
+    loop {
+        if let Some(reaped) = wait4_usage(child, 0)? { return Ok(reaped); }
+    }
+}
+
+/// [`wait_usage`] without waiting: None while the child runs (`Child::try_wait` discards rusage too).
+pub fn try_wait_usage(child: &mut Child) -> std::io::Result<Option<(ExitStatus, Option<f64>, Option<u64>)>> {
+    const WNOHANG: i32 = 1;
+    wait4_usage(child, WNOHANG)
+}
+
+/// One `wait4` of the child with `options`: None when it has not ended (WNOHANG) or the wait was
+/// interrupted.
+fn wait4_usage(child: &mut Child, options: i32) -> std::io::Result<Option<(ExitStatus, Option<f64>, Option<u64>)>> {
     use std::os::raw::c_long;
     use std::os::unix::process::ExitStatusExt;
     #[repr(C)]
@@ -414,28 +540,51 @@ pub fn wait_usage(child: &mut Child) -> std::io::Result<(ExitStatus, Option<f64>
     extern "C" { fn wait4(pid: i32, status: *mut i32, options: i32, usage: *mut RUsage) -> i32; }
     let mut status = 0;
     let mut usage = RUsage::default();
-    loop {
-        if unsafe { wait4(child.id() as i32, &mut status, 0, &mut usage) } >= 0 {
+    match unsafe { wait4(child.id() as i32, &mut status, options, &mut usage) } {
+        0 => Ok(None),
+        n if n > 0 => {
             let cpu = (usage.user.sec + usage.system.sec) as f64 + (usage.user.usec + usage.system.usec) as f64 / 1_000_000.0;
             // ru_maxrss: bytes on macOS, KiB on Linux
             let maxrss = usage.rest[0].max(0) as u64 * if cfg!(target_os = "macos") { 1 } else { 1024 };
-            return Ok((ExitStatus::from_raw(status), Some(cpu), (maxrss > 0).then_some(maxrss)));
+            Ok(Some((ExitStatus::from_raw(status), Some(cpu), (maxrss > 0).then_some(maxrss))))
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted { return Err(e); }
+        _ => {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted { Ok(None) } else { Err(e) }
+        }
     }
 }
 
 /// Starts a lease run in its own session and process group (the group is what end signals; `exit`
-/// names the run's job on Windows).
+/// names the run's job on Windows). A run writes no core file: its soft core limit is 0, the hard
+/// one stays (a run that wants a core raises its own: `ulimit -c unlimited` in its command). Its
+/// crash says itself in the run's log, and systemd-coredump keeps one journal line of it ("Resource
+/// limits disable core dumping"), no core: a lane's native makepad that aborted every 30 s on a
+/// pool box kept systemd-coredump at about 0.8 of a core beside the leases there, and a game's
+/// 60-600 MB dumps once filled a node's disk in 90 s (11-13, 10-13).
 pub fn lease_spawn(cmd: &mut Command, _exit: Option<&Path>) -> std::io::Result<(Child, Hold)> {
     use std::os::unix::process::CommandExt;
+    #[repr(C)]
+    struct RLimit {
+        cur: u64,
+        max: u64,
+    }
     extern "C" {
         fn setsid() -> i32;
+        fn getrlimit(resource: i32, rlim: *mut RLimit) -> i32;
+        fn setrlimit(resource: i32, rlim: *const RLimit) -> i32;
     }
+    // (4 on Linux and macOS alike)
+    const RLIMIT_CORE: i32 = 4;
     unsafe {
         cmd.pre_exec(|| {
             setsid();
+            // (async-signal-safe: two plain syscalls on this process)
+            let mut core = RLimit { cur: 0, max: 0 };
+            if getrlimit(RLIMIT_CORE, &mut core) == 0 {
+                core.cur = 0;
+                setrlimit(RLIMIT_CORE, &core);
+            }
             Ok(())
         });
     }
@@ -460,6 +609,41 @@ pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// `name` as the one file a spawn starts: the first PATH directory that holds an executable `name`,
+/// looked up once per process and again when that file is gone; the bare name when none does (its
+/// spawn then searches and fails as before). A spawn by bare name tries each PATH directory in turn, and on macOS each miss is a
+/// process made and torn down: once the running binary's file has been replaced (a hub building its
+/// successor where it runs from), AppleSystemPolicy logs every miss as a refused process, three per
+/// git on a Mac with three PATH directories before /usr/bin.
+pub fn tool(name: &'static str) -> PathBuf {
+    static FOUND: std::sync::Mutex<Vec<(&'static str, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    tool_in(&mut FOUND.lock().unwrap_or_else(|e| e.into_inner()), &path, name)
+}
+
+/// [`tool`] over `found` (name, file): a found file still there is kept; one gone (an update moved
+/// it) is looked up again on `path`, not started to fail.
+fn tool_in(found: &mut Vec<(&'static str, PathBuf)>, path: &std::ffi::OsStr, name: &'static str) -> PathBuf {
+    if name.contains('/') {
+        return PathBuf::from(name);
+    }
+    if let Some((_, p)) = found.iter().find(|(n, _)| *n == name) {
+        if !p.is_absolute() || p.is_file() {
+            return p.clone();
+        }
+    }
+    let p = first_on(path, name).unwrap_or_else(|| PathBuf::from(name));
+    found.retain(|(n, _)| *n != name);
+    found.push((name, p.clone()));
+    p
+}
+
+/// The first absolute directory of `path` (a PATH value) that holds an executable file `name`.
+fn first_on(path: &std::ffi::OsStr, name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path).filter(|d| d.is_absolute()).map(|d| d.join(name)).find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
 /// `program` as a background build. On macOS at background QoS: efficiency cores and throttled
 /// I/O, a clamp cargo's rustc inherit and cannot lift, so a build never competes with the apps the
 /// person works in (nice only orders it behind them: after a landing a nice-10 build beside another
@@ -467,7 +651,7 @@ pub fn home_dir() -> PathBuf {
 /// longer. Elsewhere at nice 15.
 pub fn background(program: &std::ffi::OsStr) -> Command {
     let (low, words): (&str, &[&str]) = if cfg!(target_os = "macos") { ("/usr/sbin/taskpolicy", &["-c", "background"]) } else { ("nice", &["-n", "15"]) };
-    let mut cmd = Command::new(low);
+    let mut cmd = Command::new(tool(low));
     cmd.args(words).arg(program);
     cmd
 }
@@ -865,6 +1049,18 @@ fn safety_raised_limit_is_the_open_file_limit() {
     assert_eq!(actual, soft);
 }
 
+/// A scope's class RAM is what it holds less its idle page cache, from a tests shard's numbers
+/// (11.6 GB held, 3.5 GB of it idle cache); a cgroup without the stat line keeps it all.
+#[cfg(test)]
+#[test]
+fn a_scopes_class_ram_leaves_out_its_idle_page_cache() {
+    let mb = 1u64 << 20;
+    let stat = format!("anon {}\nfile {}\nkernel {}\nshmem {}\nactive_file {}\ninactive_file {}\n", 7953 * mb, 3798 * mb, 53 * mb, 89 * mb, 87 * mb, 3621 * mb);
+    assert_eq!(parse_unreclaimable(&format!("{}\n", 11888 * mb), &stat), Some(8267 * mb));
+    assert_eq!(parse_unreclaimable("4096\n", "anon 4096\n"), Some(4096), "no inactive_file: all of it");
+    assert_eq!(parse_unreclaimable("", &stat), None, "no memory.current: no measure");
+}
+
 /// A run's group and what descends from it count, by footprint; this process does not.
 #[cfg(all(test, target_os = "macos"))]
 #[test]
@@ -883,6 +1079,25 @@ fn groups_held_counts_a_groups_members_and_their_descendants() {
     let [run_held, other_held, reused, none] = looks;
     assert!(run_held.unwrap() > other_held.unwrap() && other_held.unwrap() > 0, "{looks:?}");
     assert_eq!((reused, none), (None, None), "{looks:?}");
+}
+
+/// A run dumps no core: its soft core limit is 0, and its hard one is the hub's, so a run that
+/// wants a core can raise its own.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn a_run_writes_no_core_file_unless_it_raises_its_own_limit() {
+    let mut sh = Command::new("sh");
+    sh.args(["-c", "ulimit -c; ulimit -H -c"]).stdout(std::process::Stdio::piped());
+    let (child, _hold) = lease_spawn(&mut sh, None).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let out = String::from_utf8_lossy(&out.stdout);
+    let hub = std::fs::read_to_string("/proc/self/limits").unwrap();
+    let hard = hub.lines().find_map(|l| l.strip_prefix("Max core file size")).unwrap().split_whitespace().nth(1).unwrap().to_string();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.first().copied(), Some("0"), "the run's soft core limit: {out}");
+    // (the shell says the kernel's limit in 1 KB blocks: `unlimited` or bytes / 1024)
+    let hard_kb = if hard == "unlimited" { hard } else { (hard.parse::<u64>().unwrap() / 1024).to_string() };
+    assert_eq!(lines.get(1).copied(), Some(hard_kb.as_str()), "the run's hard core limit is the hub's: {out}");
 }
 
 /// A descriptor the hub got from its parent without close-on-exec (the WM's GPU buffers) reaches
@@ -910,4 +1125,35 @@ fn a_run_gets_none_of_the_hubs_descriptors() {
     assert_eq!(in_run(), "free");
     drop(file);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A spawn starts one file: the first PATH directory with an executable of that name, git by its
+/// path (by its bare name, a Mac makes a refused process per PATH miss once the hub's binary is
+/// replaced), and the bare name when none holds it.
+#[cfg(test)]
+#[test]
+fn a_tool_is_one_file_from_the_first_path_directory_that_holds_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("devhub-tool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let dirs: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(|d| base.join(d)).collect();
+    std::fs::create_dir_all(dirs[0].join("x")).unwrap();
+    for (d, mode) in [(&dirs[1], 0o644), (&dirs[2], 0o755), (&dirs[3], 0o755)] {
+        let f = d.join("x");
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::write(&f, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let path = std::env::join_paths(&dirs).unwrap();
+    assert_eq!(first_on(&path, "x"), Some(dirs[2].join("x")), "a directory named x and a file without x bits are passed over");
+    assert_eq!(first_on(&path, "y"), None, "no directory holds y");
+    let git = crate::git_exec::command();
+    assert!(Path::new(git.get_program()).is_absolute(), "git starts by its path: {:?}", git.get_program());
+    assert_eq!(tool("devhub-no-such-tool"), PathBuf::from("devhub-no-such-tool"), "not found: the bare name");
+    let mut found = Vec::new();
+    assert_eq!(tool_in(&mut found, &path, "x"), dirs[2].join("x"));
+    std::fs::remove_file(dirs[2].join("x")).unwrap();
+    assert_eq!(tool_in(&mut found, &path, "x"), dirs[3].join("x"), "its file gone: looked up again, the next directory's");
+    assert_eq!(found.len(), 1, "one entry per name");
+    let _ = std::fs::remove_dir_all(&base);
 }

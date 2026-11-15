@@ -4,11 +4,11 @@ use crate::ops::{Deref, DerefMut};
 use crate::result::Result::{self, Err, Ok};
 
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
-#[cfg_attr(not(relax_check), lang = "Option")]
+#[lang = "Option"]
 pub enum Option<T> {
-    #[cfg_attr(not(relax_check), lang = "None")]
+    #[lang = "None"]
     None,
-    #[cfg_attr(not(relax_check), lang = "Some")]
+    #[lang = "Some"]
     Some(T),
 }
 
@@ -139,12 +139,6 @@ impl<T> Option<T> {
         match self {
             Some(t) => f(t),
             None => default(),
-        }
-    }
-    pub fn map_or_default<U: Default, F: FnOnce(T) -> U>(self, f: F) -> U {
-        match self {
-            Some(t) => f(t),
-            None => U::default(),
         }
     }
     pub const fn ok_or<E>(self, err: E) -> Result<T, E> {

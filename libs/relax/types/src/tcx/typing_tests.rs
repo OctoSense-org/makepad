@@ -396,3 +396,48 @@ fn round39_field_view_failed_instantiation_is_unknown() {
     assert_eq!(summary.len(), 1);
     assert!(matches!(&summary[0], crate::borrowck::field_views::Summary::Parts(parts) if parts.len() == 1 && parts[0].1));
 }
+
+/// A lowering cycle is reported once, by the check of the declaration that answers for it,
+/// whichever evaluation expanded the aliases first (tests/ui issue-34373: alias_tys kept
+/// another evaluation's expansion, which shows no cycle, and the E0391 was lost in some runs).
+#[test]
+fn lowering_cycles_are_reported_by_their_declaration_check() {
+    let (prog, tcx) = program(br#"#![no_std]
+        pub struct Foo<T = (DefaultFoo,)>(T);
+        type DefaultFoo = Foo;
+        type A = B;
+        type B = A;
+    "#);
+    // the losing order: another evaluation expands the aliases first, and alias_tys keeps them
+    let state = EvalState::new();
+    let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
+    for name in ["DefaultFoo", "B"] { tcx.alias_ty(&cx, &prog, named(&prog, name)); }
+    assert!(tcx.err_sink.lock().unwrap().is_empty(), "only a declaration check reports a cycle");
+    let errors: Vec<String> = ["Foo", "DefaultFoo", "A", "B"].iter()
+        .flat_map(|n| tcx.check_def_signature(&prog, named(&prog, n))).filter(|e| e.contains("E0391")).collect();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors[0].contains("cycle detected when computing the default of generic parameter `typing::Foo`"), "{errors:?}");
+    assert!(errors[1].contains("cycle detected when expanding type alias `typing::A`"), "{errors:?}");
+}
+
+#[test]
+fn opaque_auto_trait_cycle_is_one_error_whichever_body_is_checked_first() {
+    // (tests/ui impl-trait/auto-trait-leakage/auto-trait-leak.rs: each body asks whether the other's
+    // hidden type is Auto; the check that meets the cycle carries the E0391, named by the cycle's
+    // first opaque, so two threads checking the bodies at once report what one thread does)
+    let source = br#"#![no_std]
+        #![feature(auto_traits, negative_impls)]
+        auto trait Auto {}
+        struct No; impl !Auto for No {}
+        trait Tr {} impl Tr for No {}
+        fn need<T: Auto>(_: T) {}
+        fn cycle1() -> impl Tr { need(cycle2()); No }
+        fn cycle2() -> impl Tr { need(cycle1()); No }
+    "#;
+    for order in [["cycle1", "cycle2"], ["cycle2", "cycle1"]] {
+        let (prog, tcx) = program(source);
+        let errors: Vec<String> = order.iter().flat_map(|n| tcx.typeck(&prog, named(&prog, n)).errors.to_vec()).collect();
+        assert_eq!(errors.len(), 1, "{order:?}: {errors:?}");
+        assert!(errors[0].contains("E0391: cycle detected when computing type of opaque `typing::cycle1::{opaque#0}`"), "{order:?}: {errors:?}");
+    }
+}

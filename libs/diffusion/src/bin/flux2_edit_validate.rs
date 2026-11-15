@@ -24,7 +24,6 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 struct Npy {
-    shape: Vec<usize>,
     descr: String,
     data: Vec<u8>,
 }
@@ -60,10 +59,22 @@ fn load_npy(path: &Path) -> Result<Npy, String> {
         .split(',')
         .filter_map(|part| part.trim().parse::<usize>().ok())
         .collect();
+    let item = descr
+        .get(2..)
+        .and_then(|digits| digits.parse::<usize>().ok())
+        .ok_or_else(|| format!("{}: unknown descr {descr}", path.display()))?;
+    let data = &bytes[header_start + header_len..];
+    let expected = shape.iter().product::<usize>() * item;
+    if expected != data.len() {
+        return Err(format!(
+            "{}: shape {shape:?} of {descr} needs {expected} bytes, found {}",
+            path.display(),
+            data.len()
+        ));
+    }
     Ok(Npy {
-        shape,
         descr,
-        data: bytes[header_start + header_len..].to_vec(),
+        data: data.to_vec(),
     })
 }
 
@@ -178,6 +189,10 @@ fn parse_args() -> Result<(PathBuf, PathBuf, bool, bool), String> {
 }
 
 fn main() {
+    makepad_diffusion::backend::metal::run_model_worker("flux2_edit_validate", model_main)
+}
+
+fn model_main() {
     if let Err(err) = run() {
         eprintln!("flux2-edit-validate: {err}");
         std::process::exit(1);
@@ -512,8 +527,8 @@ fn run() -> Result<(), String> {
     const ORACLE_DECODE_MS: f64 = 5020.0;
     const ORACLE_E2E_MS: f64 = ORACLE_ENCODE_MS + 671.0 + ORACLE_DECODE_MS;
     rows.push(format!(
-        "warm_stage_ms        te={:.1} encode={:.1} denoise={:.1} decode={:.1} png={:.1} total={:.1}",
-        warm.te_ms, warm.encode_ms, warm.warm_ms, warm.decode_ms, warm.png_ms, warm.total_ms
+        "warm_stage_ms        te={:.1} encode={:.1} denoise={:.1} decode={:.1} total={:.1}",
+        warm.te_ms, warm.encode_ms, warm.warm_ms, warm.decode_ms, warm.total_ms
     ));
     {
         let ok = warm.decode_ms <= ORACLE_DECODE_MS;
@@ -549,7 +564,9 @@ fn run() -> Result<(), String> {
         println!("  {row}");
     }
     let out = dumps.join("native_decoded.png");
-    std::fs::write(&out, &result.png).ok();
+    if let Ok(png) = result.png() {
+        std::fs::write(&out, png).ok();
+    }
     println!("  wrote {}", out.display());
     if failed > 0 {
         return Err(format!("{failed} gate(s) failed"));

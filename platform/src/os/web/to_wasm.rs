@@ -20,6 +20,7 @@ use {
 pub struct WGpuInfo {
     pub min_uniform_vectors: u32,
     pub float_color_targets: bool,
+    pub max_texture_size: u32,
     pub vendor: String,
     pub renderer: String,
 }
@@ -126,6 +127,8 @@ pub struct ToWasmResizeWindow {
 #[derive(ToWasm)]
 pub struct ToWasmAnimationFrame {
     pub time: f64,
+    /// Whether this frame was asked for during the last one, so it comes a display frame after it.
+    pub in_a_row: bool,
 }
 
 #[derive(ToWasm)]
@@ -591,6 +594,15 @@ impl Into<TextInputEvent> for ToWasmTextInput {
 
 #[derive(ToWasm)]
 pub struct ToWasmTextCopy {}
+
+/// What a paste event's clipboard holds (empty: a flavour it lacks), sent ahead
+/// of the paste's text: the page reads the clipboard only there.
+#[derive(ToWasm)]
+pub struct ToWasmPasteFlavours {
+    pub text: String,
+    pub html: String,
+    pub markdown: String,
+}
 
 /// Finished frames' GPU times (timer queries, read a few frames late):
 /// the frame's start (ms, the page clock) and its GPU time (ms).

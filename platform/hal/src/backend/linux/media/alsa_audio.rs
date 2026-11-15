@@ -263,7 +263,7 @@ impl AlsaAudioAccess {
             let stopped = stop.clone();
             let failed = failed.clone();
             let change = self.change.clone();
-            // named: the device's real-time thread as tools see it (MAKEPAD_RUN_RT_THREADS)
+            // named: the device's real-time thread as tools see it (RELAX_RT_THREADS)
             let thread = std::thread::Builder::new().name("hal-alsa-audio".into()).spawn(move || {
                 let result = (|| {
                     let mut pcm = Pcm::new(
@@ -286,7 +286,7 @@ impl AlsaAudioAccess {
                             };
                             if n > 0 {
                                 planar.read(&pcm.samples[..n as usize * 2]);
-                                slot.call(id, pcm.rate, &mut planar);
+                                planar.call(&slot, id, pcm.rate);
                             } else if n == 0 || n == -11 {
                                 std::thread::sleep(std::time::Duration::from_millis(1));
                             } else if n < 0 {
@@ -295,7 +295,7 @@ impl AlsaAudioAccess {
                         } else {
                             planar.frames = pcm.frames;
                             planar.clear();
-                            slot.call(id, pcm.rate, &mut planar);
+                            planar.call(&slot, id, pcm.rate);
                             planar.write(&mut pcm.samples);
                             let mut offset = 0;
                             while offset < pcm.frames && !stopped.load(Ordering::Acquire) {

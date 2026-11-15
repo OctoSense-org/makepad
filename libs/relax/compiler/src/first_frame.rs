@@ -9,16 +9,22 @@ use std::time::Duration;
 
 pub(crate) static THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
-type Sample = (String, String, u64);
+/// A measured first frame: package, state (warm / cold), ms, and the codegen identity (hex) of
+/// the JIT build that ran it (`jit_id`)
+type Sample = (String, String, u64, String);
 
 fn samples(text: &str) -> Vec<Sample> {
     text.lines().filter_map(|line| {
         let mut words = line.split_whitespace();
-        let (package, state, ms) = (words.next()?, words.next()?, words.next()?);
+        let (package, state, ms, jit) = (words.next()?, words.next()?, words.next()?, words.next()?);
         if !matches!(state, "warm" | "cold") || words.next().is_some() { return None; }
-        Some((package.into(), state.into(), ms.parse().ok()?))
+        Some((package.into(), state.into(), ms.parse().ok()?, jit.into()))
     }).collect()
 }
+
+/// This JIT build: its codegen identity, what decides whether stored code links (codegen_id.rs).
+/// A warm start is one of a build that has code stored: another build's warm runs say nothing of it.
+fn jit_id() -> String { format!("{:032x}", crate::codegen_id::id()) }
 
 fn history() -> std::path::PathBuf { crate::gitstore::relax_home().join("first-frame.txt") }
 
@@ -41,17 +47,20 @@ fn remember(package: &str, state: &str, ms: u64) -> std::io::Result<()> {
     file.lock()?;
     let mut text = String::new();
     file.read_to_string(&mut text)?;
+    let jit = jit_id();
     let mut rows = samples(&text);
-    rows.push((package.into(), state.into(), ms));
+    rows.push((package.into(), state.into(), ms, jit.clone()));
     let mut counts = std::collections::HashMap::new();
     let mut keep = Vec::new();
+    // the last 9 of each package and state; warm runs of this build only
     for row in rows.into_iter().rev() {
+        if row.1 == "warm" && row.3 != jit { continue; }
         let n = counts.entry((row.0.clone(), row.1.clone())).or_insert(0);
         *n += 1;
         if *n <= 9 { keep.push(row); }
     }
     let mut text = String::new();
-    for (package, state, ms) in keep.into_iter().rev() { text.push_str(&format!("{package} {state} {ms}\n")); }
+    for (package, state, ms, jit) in keep.into_iter().rev() { text.push_str(&format!("{package} {state} {ms} {jit}\n")); }
     file.rewind()?;
     file.write_all(text.as_bytes())?;
     file.set_len(text.len() as u64)?;
@@ -61,11 +70,23 @@ fn remember(package: &str, state: &str, ms: u64) -> std::io::Result<()> {
 /// The deadline of a start in `state` (warm / cold): 3x the median of its measured first frames,
 /// at least the state's floor; and its basis in words.
 fn deadline(package: &str, state: &str) -> (u64, String) {
-    let floor = if state == "warm" { 30u64 } else { 180 };
-    let mut runs: Vec<_> = measured().unwrap_or_else(|e| {
-        eprintln!("makepad: cannot read first-frame history {}: {e}", history().display());
+    let rows = measured().unwrap_or_else(|e| {
+        eprintln!("relax: cannot read first-frame history {}: {e}", history().display());
         Vec::new()
-    }).into_iter().filter(|s| s.0 == package && s.1 == state).map(|s| s.2).collect();
+    });
+    deadline_of(&rows, package, state, &jit_id())
+}
+
+/// `deadline` over measured `rows` for the JIT build `jit`: a warm start counts this build's warm
+/// runs; with none (a new JIT build relaunched onto its stored code: what links, and what it
+/// compiles lazily, is unmeasured) it is judged as a cold start.
+fn deadline_of(rows: &[Sample], package: &str, state: &str, jit: &str) -> (u64, String) {
+    let mut runs: Vec<u64> = rows.iter().filter(|s| s.0 == package && s.1 == state && (state == "cold" || s.3 == jit)).map(|s| s.2).collect();
+    if state == "warm" && runs.is_empty() {
+        let (secs, basis) = deadline_of(rows, package, "cold", jit);
+        return (secs, format!("warm, but no measured warm start of this JIT build: {basis}"));
+    }
+    let floor = if state == "warm" { 30u64 } else { 180 };
     runs.sort_unstable();
     let median = if runs.is_empty() { None } else {
         let (a, b) = (runs[(runs.len() - 1) / 2], runs[runs.len() / 2]);
@@ -77,6 +98,19 @@ fn deadline(package: &str, state: &str) -> (u64, String) {
         None => format!("{state}: no measured runs, floor {floor} s"),
     };
     (secs, basis)
+}
+
+/// Past its deadline a start that is still compiling is not hung: the timeout is for hangs, not
+/// slow compiles (a relaunch onto a rebuilt JIT compiled lazily past a warm deadline and was
+/// killed, 11-07). Still compiling: a demand compile finished in the last 2 s, or one runs and
+/// began (or the last finished) less than a minute ago -- one compile running longer is a hang.
+fn still_compiling(running: bool, age_ns: u64) -> bool {
+    age_ns < if running { 60_000_000_000 } else { 2_000_000_000 }
+}
+
+fn compiling() -> bool {
+    let (running, age) = crate::jit::demand_compile_age();
+    still_compiling(running, age)
 }
 
 /// A start counted warm (its cache holds a startup manifest) that compiled most of its code
@@ -98,6 +132,8 @@ fn cold_like() -> bool {
 static MAIN_ENTERED_NS: OnceLock<u64> = OnceLock::new();
 /// When the program entered `app_main!`'s entry (ms since the process started).
 static APP_STARTED_MS: OnceLock<f64> = OnceLock::new();
+/// The app domain ended (`app_ended`).
+static APP_ENDED: AtomicBool = AtomicBool::new(false);
 
 /// The app domain's main starts now: the quiet of a program with no app counts from here, as the
 /// run's boot before it is no part of the program's own time.
@@ -113,21 +149,44 @@ pub(crate) fn app_started() {
     if let Some(t) = THREAD.get() { t.unpark(); }
 }
 
+/// The program presented its first frame (`relax_first_present`): it is an app.
+pub(crate) fn presented() {
+    if let Some(t) = THREAD.get() { t.unpark(); }
+}
+
+/// The app domain ended (domain.rs `end`: its main returned, it exited or it crashed): what it
+/// was is settled, and its run ends. The quiet after it is its exit's, never a batch program's:
+/// a short program whose exit ran past the quiet was taken for one, and the tier-up, lowering
+/// ahead and coherence check that wakes ran in its exit (rwbench: 1.8 s more, and 2075 compiles
+/// RELAX_WARM_STRICT counted as warm misses, 11-14).
+pub(crate) fn app_ended() {
+    APP_ENDED.store(true, Release);
+    if let Some(t) = THREAD.get() { t.unpark(); }
+}
+
+/// The run ends, or its app did: the watch has nothing left to decide.
+fn gone() -> bool {
+    crate::run_threads::ending() || APP_ENDED.load(Acquire)
+}
+
 /// Until the program shows what it is: an app (`app_started`, the first thing `app_main!`'s main
-/// reaches: lazy compiles on the way there keep the quiet from ending) or a batch program, whose
-/// main goes quiet without it. A batch program draws no frame: no deadline, no load screen. Should
-/// it start an app after all, the app has its deadline (and makes its own window).
+/// reaches: lazy compiles on the way there keep the quiet from ending; or a frame it presented) or
+/// a batch program, whose main goes quiet without either. A batch program draws no frame: no
+/// deadline, no load screen. Should it start an app after all, the app has its deadline (and makes
+/// its own window). A program that presented is never taken for one: an app whose own main skipped
+/// `app_started` lost the window it drew in when its compiles went quiet (an app, 11-06).
 fn watch_app() -> f64 {
     let mut batch = false;
     loop {
         if let Some(ms) = APP_STARTED_MS.get() { return *ms; }
-        if crate::run_threads::ending() { return 0.0; }
+        if crate::jit::presented() { return crate::clock::ms_since_process_start(); }
+        if gone() { return 0.0; }
         match MAIN_ENTERED_NS.get().filter(|_| !batch).map(|at| crate::jit::quiet_left(*at)) {
             None => std::thread::park(),
             Some(0) => {
                 batch = true;
                 if crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("makepad-run: main went quiet without an app: a batch program, no first frame");
+                    eprintln!("relax: main went quiet without an app: a batch program, no first frame");
                 }
                 crate::jit::batch_program();
                 crate::run::batch_program();
@@ -140,19 +199,19 @@ fn watch_app() -> f64 {
 /// The first frame's watch of a program that links the platform (`watch_app`).
 pub(crate) fn arm(package: &str) {
     let _kept = crate::zone_alloc::kept();
-    let state = if std::env::var("MAKEPAD_RUN_CACHE_STATE").as_deref() == Ok("warm") { "warm" } else { "cold" };
+    let state = if std::env::var("RELAX_CACHE_STATE").as_deref() == Ok("warm") { "warm" } else { "cold" };
     let package = package.to_string();
     if let Err(e) = crate::run_threads::spawn("first-frame-watch", move || {
         let _kept = crate::zone_alloc::kept();
         let _ = THREAD.set(std::thread::current());
         crate::run_threads::on_end(|| if let Some(t) = THREAD.get() { t.unpark(); });
         let started = watch_app();
-        if crate::run_threads::ending() { return; }
+        if gone() { return; }
         let (secs, basis) = deadline(&package, state);
-        if !crate::run::silent() { eprintln!("makepad: first-frame timeout {secs} s ({basis})"); }
+        if !crate::run::silent() { eprintln!("relax: first-frame timeout {secs} s ({basis})"); }
         watch(&package, state, started, secs, &basis);
     }) {
-        eprintln!("makepad: cannot arm first-frame timeout: {e}");
+        eprintln!("relax: cannot arm first-frame timeout: {e}");
         crate::run::failed_run(&format!("cannot arm the first-frame timeout: {e}"));
     }
 }
@@ -187,28 +246,37 @@ pub(crate) fn arm_window(package: &str) {
         let _ = WINDOW_THREAD.set(std::thread::current());
         watch_window(&package);
     }) {
-        eprintln!("makepad: cannot arm the boot window's first-frame timeout: {e}");
+        eprintln!("relax: cannot arm the boot window's first-frame timeout: {e}");
         crate::run::failed_run(&format!("cannot arm the boot window's first-frame timeout: {e}"));
     }
 }
 
 fn watch_window(package: &str) {
+    let mut said = false;
     let (secs, basis) = loop {
         if WINDOW_OPEN.load(Acquire) || crate::run_threads::ending() { return; }
         // a warm start that compiles most of its code fresh is judged as a cold one (`watch`)
         let state = if CACHE_STATE.load(Acquire) == 2 && !cold_like() { "warm" } else { "cold" };
         let (secs, basis) = deadline(package, state);
         let left = secs as f64 * 1000.0 - crate::clock::ms_since_process_start();
-        if left <= 0.0 { break (secs, basis); }
+        if left <= 0.0 {
+            if !compiling() { break (secs, basis); }
+            if !said {
+                said = true;
+                if !crate::run::silent() { eprintln!("relax: first-frame: {secs} s passed ({basis}) and the JIT is still compiling: no timeout while it compiles"); }
+            }
+            std::thread::park_timeout(Duration::from_millis(500));
+            continue;
+        }
         // woken by the window's open and the cache's classification; a warm start's
         // compile-or-link verdict is looked at again each second
         std::thread::park_timeout(Duration::from_secs_f64((left / 1000.0).min(1.0)));
     };
     if WINDOW_OPEN.load(Acquire) { return; }
     let s = snapshot::capture(&format!("first-frame timeout after {secs} s ({basis}): the boot window has not presented"));
-    eprintln!("makepad: first-frame timeout: {package}'s boot window presented no frame in {secs} s ({basis})");
-    eprintln!("makepad: likely cause: {}", s.cause);
-    eprintln!("makepad: report: {}", s.path.display());
+    eprintln!("relax: first-frame timeout: {package}'s boot window presented no frame in {secs} s ({basis})");
+    eprintln!("relax: likely cause: {}", s.cause);
+    eprintln!("relax: report: {}", s.path.display());
     let reason = format!("{} [report {}]", s.cause, s.path.display());
     persist("ff", Outcome::FirstFrameTimeout, package, &reason);
     crate::run::failed_run(&format!("first-frame timeout: {}", s.cause));
@@ -218,6 +286,7 @@ fn watch(package: &str, state: &str, started: f64, secs: u64, basis: &str) {
     let (mut state, mut secs, mut basis) = (state, secs, basis.to_string());
     let mut deadline_ms = started + secs as f64 * 1000.0;
     let mut wm = false;
+    let mut said = false;
     loop {
         if crate::run_threads::ending() { return; }
         if let Some(ms) = snapshot::first_present_ms().filter(|ms| *ms <= deadline_ms) {
@@ -228,7 +297,7 @@ fn watch(package: &str, state: &str, started: f64, secs: u64, basis: &str) {
                 // a warm start that compiled its code fresh is a cold start's sample
                 let state = if state == "warm" && cold_like() { "cold" } else { state };
                 if let Err(e) = remember(package, state, ms.round() as u64) {
-                    eprintln!("makepad: cannot write first-frame history {}: {e}", history().display());
+                    eprintln!("relax: cannot write first-frame history {}: {e}", history().display());
                 }
                 return;
             }
@@ -241,10 +310,19 @@ fn watch(package: &str, state: &str, started: f64, secs: u64, basis: &str) {
             deadline_ms = started + secs as f64 * 1000.0;
             left = deadline_ms - crate::clock::ms_since_process_start();
             if !crate::run::silent() {
-                eprintln!("makepad: first-frame: the warm start took cached code for {linked} slots and missed {miss} lookups (an edit reached most of the program, or its entries are gone): it starts cold, timeout {secs} s ({basis})");
+                eprintln!("relax: first-frame: the warm start took cached code for {linked} slots and missed {miss} lookups (an edit reached most of the program, or its entries are gone): it starts cold, timeout {secs} s ({basis})");
             }
         }
-        if left <= 0.0 { break; }
+        if left <= 0.0 {
+            if !compiling() { break; }
+            if !said {
+                said = true;
+                if !crate::run::silent() { eprintln!("relax: first-frame: {secs} s passed ({basis}) and the JIT is still compiling: no timeout while it compiles"); }
+            }
+            // (a first present from now on still counts: the deadline moves with the compiles)
+            deadline_ms = crate::clock::ms_since_process_start() + 500.0;
+            continue;
+        }
         if crate::jit::first_present_seen() {
             if !crate::run_threads::sleep(Duration::from_secs_f64((left / 1000.0).min(0.1))) { return; }
         } else {
@@ -252,18 +330,18 @@ fn watch(package: &str, state: &str, started: f64, secs: u64, basis: &str) {
         }
     }
     if snapshot::hal_shell().as_ref().is_some_and(snapshot::all_hidden) {
-        eprintln!("makepad: {package} hid its window before its first frame; no first-frame timeout");
+        eprintln!("relax: {package} hid its window before its first frame; no first-frame timeout");
         return;
     }
     let presented = crate::jit::first_present_seen();
     let s = snapshot::capture(&format!("first-frame timeout after {secs} s ({basis})"));
     if presented {
-        eprintln!("makepad: first-frame timeout: {package} drew, but no frame of it reached the WM in {secs} s ({basis})");
+        eprintln!("relax: first-frame timeout: {package} drew, but no frame of it reached the WM in {secs} s ({basis})");
     } else {
-        eprintln!("makepad: first-frame timeout: {package} drew no frame in {secs} s ({basis})");
+        eprintln!("relax: first-frame timeout: {package} drew no frame in {secs} s ({basis})");
     }
-    eprintln!("makepad: likely cause: {}", s.cause);
-    eprintln!("makepad: report: {}", s.path.display());
+    eprintln!("relax: likely cause: {}", s.cause);
+    eprintln!("relax: report: {}", s.path.display());
     let reason = format!("{} [report {}]", s.cause, s.path.display());
     persist("ff", Outcome::FirstFrameTimeout, package, &reason);
     // An app that drew keeps running: the WM link is the suspect and ending the app shows nothing.
@@ -279,7 +357,7 @@ fn persist(prefix: &str, outcome: Outcome, package: &str, reason: &str) {
         app: package.into(), node: String::new(), pid: std::process::id(), outcome, reason: reason.into(),
         failure: String::new(), units: Vec::new(), logs: Vec::new(),
     };
-    if let Err(e) = makepad_remote::hot::persist(&record) { eprintln!("makepad: cannot persist {}: {e}", outcome.name()); }
+    if let Err(e) = makepad_remote::hot::persist(&record) { eprintln!("relax: cannot persist {}: {e}", outcome.name()); }
 }
 
 pub(crate) fn no_window(package: &str, reason: &str) {
@@ -293,5 +371,73 @@ pub(crate) unsafe fn reset_statics() {
     reset(&THREAD, OnceLock::new());
     reset(&MAIN_ENTERED_NS, OnceLock::new());
     reset(&APP_STARTED_MS, OnceLock::new());
+    reset(&APP_ENDED, AtomicBool::new(false));
     reset(&CACHE_STATE, AtomicU8::new(0));
+}
+
+#[cfg(test)]
+mod tests {
+    /// A warm start's deadline counts this JIT build's warm runs only: a relaunch onto a rebuilt
+    /// JIT (whose warm runs are another build's) is judged as a cold start, as one with no warm
+    /// runs at all is; cold runs count whichever build measured them. A history row names its build.
+    #[test]
+    fn a_warm_start_of_a_new_jit_build_has_the_cold_deadline() {
+        let rows = super::samples("app warm 4000 aaaa\napp cold 70000 aaaa\napp warm 5000\nother warm 9000 bbbb\n");
+        assert_eq!(rows.len(), 3, "a row without its build is no sample");
+        // a new build: no warm run of its own -- the cold deadline (3x the cold median, above the floor)
+        let (secs, basis) = super::deadline_of(&rows, "app", "warm", "bbbb");
+        assert_eq!(secs, 210, "{basis}");
+        assert!(basis.starts_with("warm, but no measured warm start of this JIT build"), "{basis}");
+        // the build that measured it: the warm floor (3x 4 s is below it)
+        assert_eq!(super::deadline_of(&rows, "app", "warm", "aaaa").0, 30);
+        // cold runs count whichever build measured them
+        assert_eq!(super::deadline_of(&rows, "app", "cold", "bbbb").0, 210);
+        assert_eq!(super::deadline_of(&rows, "new", "warm", "aaaa").0, 180);
+    }
+
+    /// The timeout is for hangs: past its deadline a start whose demand compiles still make
+    /// progress (one finished in the last 2 s, or one runs that began under a minute ago) waits.
+    #[test]
+    fn a_start_still_compiling_is_not_hung() {
+        let s = 1_000_000_000u64;
+        assert!(super::still_compiling(false, s), "a compile finished a second ago");
+        assert!(!super::still_compiling(false, 3 * s), "quiet for 3 s: hung");
+        assert!(super::still_compiling(true, 30 * s), "a compile runs");
+        assert!(!super::still_compiling(true, 61 * s), "one compile running past a minute is a hang");
+    }
+
+    /// A batch program is one whose main goes quiet while it runs. Not one whose app ended: a
+    /// short program whose exit ran past the quiet was taken for one, and its tier-up, lowering
+    /// ahead and coherence check ran in the exit (rwbench, 1.8 s and 2075 compiles counted as warm
+    /// misses, 11-14). Not one that presented: an app whose own entry never says it is one (no
+    /// `app_main!`, so no `app_started`) is an app when its main goes quiet; an app wrote its entry
+    /// out by hand, and the run closed the window it drew in once its compiles went quiet (28-109 s
+    /// after each start, 11-06).
+    #[test]
+    fn only_a_running_program_that_never_presented_is_a_batch_program() {
+        isolated_test!(only_a_running_program_that_never_presented_is_a_batch_program);
+        let wait = |watch: &std::thread::JoinHandle<f64>| {
+            // (past the 2 s quiet: a watch that takes it for a batch program says so first)
+            let t0 = std::time::Instant::now();
+            while !watch.is_finished() && !crate::jit::past_startup_headless() && t0.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        super::main_entered();
+        assert!(super::APP_STARTED_MS.get().is_none(), "the entry never said it is an app");
+        // its main returned: the exit's quiet is no batch program's
+        super::app_ended();
+        let watch = std::thread::spawn(super::watch_app);
+        wait(&watch);
+        assert!(!crate::jit::past_startup_headless(), "the exit of a program whose app ended was taken for a batch program");
+        assert!(watch.is_finished(), "the app ended: the watch has nothing left to decide");
+        assert_eq!(watch.join().unwrap(), 0.0, "no start to time");
+        // it presented: the watch knows an app at once
+        crate::jit::FIRST_PRESENT.store(true, std::sync::atomic::Ordering::Release);
+        let watch = std::thread::spawn(super::watch_app);
+        wait(&watch);
+        assert!(watch.is_finished(), "it presented: the watch knows an app at once");
+        assert!(watch.join().unwrap() > 0.0, "an app's start");
+        assert!(!crate::jit::past_startup_headless(), "a program that presented was taken for a batch program");
+    }
 }

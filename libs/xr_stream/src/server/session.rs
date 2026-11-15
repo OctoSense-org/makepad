@@ -3,10 +3,11 @@
 //! poses, stats and reports in, the pictures out) and its per-window numbers.
 
 use super::pipeline::{Core, Out, Uplink};
-use super::{LiveHeadset, ServerShared};
+use super::{LiveHeadset, MicEvent, ServerShared};
 use crate::settings_types::HeadsetSettings;
 use makepad_desk_link::server::{fleet_identity, lan_address};
 use makepad_desk_link::xr::*;
+use makepad_desk_link::xr_capture::CaptureAssembler;
 use makepad_desk_link::xr_pair::{self, ServerPairing};
 use makepad_desk_link::{write_all, Inbox};
 use makepad_widgets::makepad_platform::makepad_hal::{self, xr_remote as hal};
@@ -15,7 +16,7 @@ use makepad_widgets::makepad_platform::makepad_network::tls::{self as net_tls, T
 use makepad_widgets::makepad_platform::video_file::{StreamVideoCodec, VideoStreamEncoder};
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::TryRecvError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -108,6 +109,12 @@ impl Host {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let shared_for_test = shared.clone();
+        // the headset on a loop (debug) is this server's one headset: no probe is answered and a
+        // real headset is refused while it runs (a paired headset on the LAN never joins a test)
+        let selftest = std::env::var("MAKEPAD_XR_REMOTE_SELFTEST").as_deref() == Ok("1");
+        if selftest {
+            self.busy.store(true, Ordering::Release);
+        }
         let (shared, stop2, port) = (shared.clone(), stop.clone(), self.port.clone());
         let (app, name, tls, verifier, pairing, world, busy) = (self.app.clone(), self.name.clone(), self.tls.clone(), self.verifier.clone(), self.pairing.clone(), self.world.clone(), self.busy.clone());
         std::thread::Builder::new()
@@ -133,8 +140,8 @@ impl Host {
                 port.store(bound, Ordering::Release);
                 log(&format!("xr host: {app} listens on port {bound} as {name} (the admin or a paired headset), instance {:016x}", pairing.lock().unwrap().instance));
                 // headsets find this server by their probe (answered while paired, or for the
-                // PIN typed here)
-                let responder = match xr_pair::identity("pairing headsets") {
+                // PIN typed here; never beside the headset on a loop)
+                let responder = if selftest { None } else { match xr_pair::identity("pairing headsets") {
                     Ok((me, fleet)) => match xr_pair::Responder::start(me, fleet, pairing.clone(), app.clone(), bound, log.clone()) {
                         Ok(r) => Some(r),
                         Err(e) => {
@@ -146,14 +153,14 @@ impl Host {
                         log(&format!("xr host: no pairing: {e}"));
                         None
                     }
-                };
+                } };
                 while !stop2.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((tcp, peer)) => {
                             if !lan_address(peer.ip()) {
                                 continue;
                             }
-                            let ctx = Session { peer, tls: tls.clone(), verifier: verifier.clone(), shared: shared.clone(), stop: stop2.clone(), busy: busy.clone(), server: name.clone(), world: world.clone(), pairing: pairing.clone() };
+                            let ctx = Session { peer, tls: tls.clone(), verifier: verifier.clone(), shared: shared.clone(), stop: stop2.clone(), busy: busy.clone(), server: name.clone(), world: world.clone(), pairing: pairing.clone(), pictures: AtomicU64::new(0), decoded: AtomicU64::new(0) };
                             let _ = std::thread::Builder::new().name("xr-host-session".into()).spawn(move || ctx.run(tcp));
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(50)),
@@ -170,13 +177,13 @@ impl Host {
             })
             .map_err(|e| e.to_string())?;
         // the headset on a loop (debug): a session of this listener's, ended by the off switch
-        if std::env::var("MAKEPAD_XR_REMOTE_SELFTEST").as_deref() == Ok("1") {
+        if selftest {
             // its eye size: `MAKEPAD_XR_REMOTE_SELFTEST_EYE=<w>x<h>` (a headset's: Quest 3 2016x2112)
             let eye = std::env::var("MAKEPAD_XR_REMOTE_SELFTEST_EYE").ok().and_then(|v| {
                 let (w, h) = v.split_once('x')?;
                 Some([w.trim().parse().ok()?, h.trim().parse().ok()?])
             });
-            super::debug::selftest(shared_for_test, eye.unwrap_or([1680, 1760]), stop.clone());
+            super::debug::selftest(shared_for_test, eye.unwrap_or([1680, 1760]), stop.clone(), self.busy.clone());
         }
         *listener = Some(Listener { stop });
         Ok(())
@@ -193,12 +200,17 @@ struct Session {
     busy: Arc<AtomicBool>,
     server: String,
     pairing: Arc<Mutex<ServerPairing>>,
+    /// The pictures written to the headset and those it reported decoded, for the line that says
+    /// how the session ended.
+    pictures: AtomicU64,
+    decoded: AtomicU64,
 }
 
 impl Session {
     fn run(self, tcp: TcpStream) {
+        let began = Instant::now();
         let why = self.serve(tcp).unwrap_or_else(|e| e);
-        (self.shared.log)(&format!("xr host: session {}: {why}", self.peer));
+        (self.shared.log)(&format!("xr host: session {}: {why} (lasted {:.1} s, {} pictures written, {} decoded by the headset)", self.peer, began.elapsed().as_secs_f64(), self.pictures.load(Ordering::Acquire), self.decoded.load(Ordering::Acquire)));
     }
 
     fn serve(&self, tcp: TcpStream) -> Result<String, String> {
@@ -266,6 +278,8 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     fn session(&self, stream: &mut makepad_widgets::makepad_platform::makepad_network::tls::TlsStream, mut inbox: Inbox, mut buf: Vec<u8>, name: &str, who: &str, instance: u64, paired: bool, eye: [u32; 2], refresh_mhz: u32, decodes: u32) -> Result<String, String> {
         let eye = [eye[0].clamp(64, 4096) & !3, eye[1].clamp(64, 4096) & !3];
+        // (before anything starts: a link without its own session id never runs)
+        let session = session_id(net_tls::os_random)?;
         // H.265 when both ends have it
         let codec = if decodes & codecs::HEVC != 0 && VideoStreamEncoder::caps().hevc { StreamVideoCodec::Hevc } else { StreamVideoCodec::H264 };
         let fps = (refresh_mhz / 1000).clamp(30, 120);
@@ -274,13 +288,20 @@ impl Session {
         // the app's XR display from now on (it presents on it at its next drawing)
         hal::hal_xr_remote_enable();
         hal::hal_xr_remote_attach(eye[0], eye[1], refresh_mhz);
-        let session = {
-            let mut b = [0u8; 8];
-            let _ = net_tls::os_random(&mut b);
-            u64::from_le_bytes(b)
-        };
+        // a session of its own: the headset's origin need not be the last session's
+        self.shared.new_space("the headset linked");
         let server_instance = self.pairing.lock().unwrap().instance;
         *self.shared.live_headset.lock().unwrap() = Some(LiveHeadset { instance, name: name.to_string(), session });
+        // a person uses the app through the headset while it is linked, however the session ends:
+        // a node's devhub keeps other work off the machine meanwhile (its frames share the GPU)
+        struct InUse;
+        impl Drop for InUse {
+            fn drop(&mut self) {
+                makepad_widgets::makepad_platform::restart::set_in_use("xr headset", None);
+            }
+        }
+        makepad_widgets::makepad_platform::restart::set_in_use("xr headset", Some(&format!("an XR headset ({name})")));
+        let _in_use = InUse;
         let welcome = XrServerMsg::Welcome { version: XR_VERSION, server: self.server.clone(), instance: server_instance, session, size: core.size, codec: core.codec, tiles: core.tiles as u8, encoder: core.description.clone(), eye: core.eye, fovea: core.fovea };
         write_all(stream, &welcome.encode()).map_err(|e| format!("write: {e}"))?;
         // the poses come as datagrams: a socket of the session's own, a key for it
@@ -292,8 +313,14 @@ impl Session {
         stream.set_write_timeout(Some(Duration::from_millis(5))).map_err(|e| e.to_string())?;
         self.shared.haptics.lock().unwrap().clear();
         self.shared.haptics_ok.store(decodes & codecs::HAPTICS != 0, Ordering::Release);
-        let why = self.pump(stream, &mut inbox, &mut buf, &core, (paired, instance));
+        self.shared.capture_ok.store(decodes & codecs::CAPTURE != 0, Ordering::Release);
+        self.shared.mic_ok.store(decodes & codecs::MIC != 0, Ordering::Release);
+        let why = self.pump(stream, &mut inbox, &mut buf, &core, (paired, instance), session);
+        self.decoded.store(core.flow.decoded_tiles.load(Ordering::Acquire) / core.tiles.max(1) as u64, Ordering::Release);
         self.shared.haptics_ok.store(false, Ordering::Release);
+        self.shared.capture_ok.store(false, Ordering::Release);
+        self.shared.mic_ok.store(false, Ordering::Release);
+        self.shared.mic_link_ended(session);
         *self.shared.live_headset.lock().unwrap() = None;
         self.shared.reports.lock().unwrap().clear();
         audio.stop();
@@ -308,7 +335,7 @@ impl Session {
 
     /// `paired`: whether the headset (its instance id) is the one paired here: when the desktop
     /// unpairs it, it is told and the link ends.
-    fn pump(&self, stream: &mut makepad_widgets::makepad_platform::makepad_network::tls::TlsStream, inbox: &mut Inbox, buf: &mut [u8], core: &Core, paired: (bool, u64)) -> String {
+    fn pump(&self, stream: &mut makepad_widgets::makepad_platform::makepad_network::tls::TlsStream, inbox: &mut Inbox, buf: &mut [u8], core: &Core, paired: (bool, u64), session: u64) -> String {
         let mut last_heard = Instant::now();
         let mut visible = true;
         let mut stats = PumpStats::new();
@@ -318,6 +345,9 @@ impl Session {
         let mut streaming_told: Option<bool> = None;
         let mut see_through_told: Option<bool> = None;
         let mut headset_told: Option<HeadsetSettings> = None;
+        let mut capture_told = None;
+        let mut mic_told = false;
+        let mut capture = CaptureAssembler::default();
         let mut flowing = false;
         loop {
             let sh = &self.shared;
@@ -335,9 +365,15 @@ impl Session {
                     return format!("write: {e}");
                 }
                 (self.shared.log)(&format!("xr host: stream {}", if on { "on" } else { "off" }));
-                // (on again: the decoder starts from a key picture)
-                if on && streaming_told.is_some() {
-                    core.keyframe();
+                if streaming_told.is_some() {
+                    // a paused headset drops the pictures that reach it, and one that resumes has
+                    // none of the old ones: those written and not reported are out of flight, or
+                    // each would hold its slot for good and the app build ever less
+                    core.tiles_out(stats.forget_unreported());
+                    // (on again: the decoder starts from a key picture)
+                    if on {
+                        core.keyframe();
+                    }
                 }
                 streaming_told = Some(on);
             }
@@ -348,6 +384,28 @@ impl Session {
                 }
                 (self.shared.log)(&format!("xr host: headset settings {headset:?}"));
                 headset_told = Some(headset);
+            }
+            // the app's ask of the cameras (only of a headset that captures)
+            let ask = sh.capture_ask_for(session);
+            if sh.capture_ok.load(Ordering::Acquire) && capture_told != Some(ask) {
+                let msg = match ask {
+                    Some(a) => XrServerMsg::Capture { on: true, step_deg: a.step_deg, step_m: a.step_m, preview_hz: a.preview_hz },
+                    None => XrServerMsg::Capture { on: false, step_deg: 0.0, step_m: 0.0, preview_hz: 0 },
+                };
+                if let Err(e) = write_all(stream, &msg.encode()) {
+                    return format!("write: {e}");
+                }
+                (self.shared.log)(&format!("xr host: capture {}", if ask.is_some() { "on" } else { "off" }));
+                capture_told = Some(ask);
+            }
+            // the app's ask of the microphone (only of a headset that has one)
+            let mic = sh.mic_asked(session);
+            if sh.mic_ok.load(Ordering::Acquire) && mic_told != mic {
+                if let Err(e) = write_all(stream, &XrServerMsg::Mic { on: mic }.encode()) {
+                    return format!("write: {e}");
+                }
+                (self.shared.log)(&format!("xr host: microphone {}", if mic { "on" } else { "off" }));
+                mic_told = mic;
             }
             // the app's controller buzzes (only to a headset that plays them)
             let haptics = std::mem::take(&mut *sh.haptics.lock().unwrap());
@@ -400,7 +458,8 @@ impl Session {
                         if let Err(e) = write_all(stream, &msg) {
                             return format!("write: {e}");
                         }
-                        stats.sent(&head, msg.len(), write_at.elapsed());
+                        core.tiles_out(stats.sent(&head, msg.len(), write_at.elapsed()));
+                        self.pictures.fetch_add(1, Ordering::AcqRel);
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return "the encoder stopped".into(),
@@ -443,8 +502,7 @@ impl Session {
                     }
                     XrClientMsg::Stats { seq, decode_us, .. } => {
                         stats.decode_us.push(decode_us);
-                        stats.reported(seq, decode_us);
-                        core.tile_decoded();
+                        core.tiles_out(stats.reported(seq, decode_us));
                     }
                     XrClientMsg::Ping { client_ns } => {
                         if let Err(e) = write_all(stream, &XrServerMsg::Pong { client_ns, server_ns: makepad_hal::clock_ns() }.encode()) {
@@ -458,6 +516,24 @@ impl Session {
                         (self.world)(voxel_size, chunk_edge, bricks);
                     }
                     XrClientMsg::Report { values } => self.shared.push_report(values),
+                    XrClientMsg::Capture { seq, part, parts, data } => {
+                        stats.capture_bytes += payload.len() as u64;
+                        match capture.push(seq, part, parts, &data) {
+                            Some(Ok(record)) => self.shared.capture_record(session, record),
+                            // (the error names the record's fault, never its contents)
+                            Some(Err(e)) => (self.shared.log)(&format!("xr host: capture: {e}")),
+                            None => {}
+                        }
+                    }
+                    XrClientMsg::Mic { state, text, pcm, .. } => {
+                        stats.mic_bytes += pcm.len() as u64;
+                        if !pcm.is_empty() {
+                            self.shared.mic_event(session, MicEvent::Pcm(pcm.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])).collect()));
+                        } else {
+                            self.shared.mic_event(session, MicEvent::State { state, text });
+                        }
+                    }
+                    XrClientMsg::Recenter => self.shared.new_space("the wearer recentered"),
                     XrClientMsg::Hello { .. } => return "a second hello".into(),
                 }
             }
@@ -474,16 +550,24 @@ pub(crate) struct PumpStats {
     pictures: u64,
     bytes: u64,
     stages_us: [Vec<u32>; 4],
+    /// Per picture: its pose's arrival to written to the socket (the stages' sum, µs).
+    desk_us: Vec<u32>,
     write_us: Vec<u32>,
     decode_us: Vec<u32>,
     /// Per tile: from its last byte written to the headset's report that it took it, less the
     /// headset's own time on it (the link's round trip with whatever queue it holds).
     trip_us: Vec<u32>,
-    /// The tiles written and not yet reported: (seq, when written).
+    /// The tiles written and not yet reported: (seq, when written). Kept across the windows: each
+    /// goes out of flight once, by its report, a later picture's, a pause or resume, or the
+    /// list's end.
     unreported: std::collections::VecDeque<(u64, Instant)>,
     /// Room-field bricks received, and their messages' bytes.
     bricks: u64,
     brick_bytes: u64,
+    /// Capture chunks' bytes received (the headset's cameras).
+    capture_bytes: u64,
+    /// Microphone sound bytes received (the wearer's voice: counted, never logged).
+    mic_bytes: u64,
     /// The rate controller's second (its own window inside this one).
     rate: RateWindow,
 }
@@ -502,6 +586,15 @@ impl RateWindow {
     }
 }
 
+/// A link's own session id, from the OS's random source. The capture ask is tied to it, so a
+/// link whose id cannot be drawn fails: ids that all came out the same would carry an ask
+/// across links.
+pub(super) fn session_id(random: impl FnOnce(&mut [u8]) -> std::io::Result<()>) -> Result<u64, String> {
+    let mut b = [0u8; 8];
+    random(&mut b).map_err(|e| format!("no session id (random source: {e})"))?;
+    Ok(u64::from_le_bytes(b))
+}
+
 fn median_ms(v: &mut [u32]) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -512,14 +605,17 @@ fn median_ms(v: &mut [u32]) -> f64 {
 
 impl PumpStats {
     pub(crate) fn new() -> Self {
-        PumpStats { at: Instant::now(), poses: 0, refused_poses: 0, pictures: 0, bytes: 0, stages_us: Default::default(), write_us: Vec::new(), decode_us: Vec::new(), trip_us: Vec::new(), unreported: Default::default(), bricks: 0, brick_bytes: 0, rate: RateWindow::new() }
+        PumpStats { at: Instant::now(), poses: 0, refused_poses: 0, pictures: 0, bytes: 0, stages_us: Default::default(), desk_us: Vec::new(), write_us: Vec::new(), decode_us: Vec::new(), trip_us: Vec::new(), unreported: Default::default(), bricks: 0, brick_bytes: 0, capture_bytes: 0, mic_bytes: 0, rate: RateWindow::new() }
     }
 
-    pub(crate) fn sent(&mut self, head: &VideoHead, bytes: usize, write: Duration) {
+    /// A tile written; the tiles out of flight with it: the oldest one unreported when it no
+    /// longer fits the list (its report, if one comes, finds nothing).
+    pub(crate) fn sent(&mut self, head: &VideoHead, bytes: usize, write: Duration) -> u64 {
         // a picture counted once, at its first tile; its stages are the slowest tile's
         if head.tile == 0 {
             self.pictures += 1;
             self.rate.pictures += 1;
+            self.desk_us.push(head.stages.iter().sum());
         }
         self.bytes += bytes as u64;
         self.rate.bytes += bytes as u64;
@@ -527,21 +623,28 @@ impl PumpStats {
             self.stages_us[i].push(*v);
         }
         self.write_us.push(write.as_micros() as u32);
-        if self.unreported.len() >= 64 {
-            self.unreported.pop_front();
-        }
+        let out = if self.unreported.len() >= 64 { self.unreported.pop_front().is_some() as u64 } else { 0 };
         self.unreported.push_back((head.seq, Instant::now()));
+        out
     }
 
-    /// The headset took a tile of picture `seq` (`decode_us` after it arrived).
-    fn reported(&mut self, seq: u64, decode_us: u32) {
-        let Some(at) = self.unreported.iter().position(|(s, _)| *s == seq) else { return };
+    /// The headset took a tile of picture `seq` (`decode_us` after it arrived): the tiles out of
+    /// flight with it, this one and those written before it and never reported (the headset
+    /// dropped them); none when it was out already (a pause or a later report took it).
+    pub(crate) fn reported(&mut self, seq: u64, decode_us: u32) -> u64 {
+        let Some(at) = self.unreported.iter().position(|(s, _)| *s == seq) else { return 0 };
         let (_, written) = self.unreported.remove(at).unwrap();
         // (older ones never reported: lost)
         self.unreported.drain(..at);
         let trip = (written.elapsed().as_micros() as u32).saturating_sub(decode_us);
         self.trip_us.push(trip);
         self.rate.trip_us.push(trip);
+        at as u64 + 1
+    }
+
+    /// The tiles written and never reported, forgotten (the stream paused or resumed): how many.
+    pub(crate) fn forget_unreported(&mut self) -> u64 {
+        self.unreported.drain(..).count() as u64
     }
 
     /// The rate controller's second, when one passed.
@@ -566,16 +669,18 @@ impl PumpStats {
         }
         let built = core.flow.built.swap(0, Ordering::AcqRel);
         let skipped = core.flow.skipped.swap(0, Ordering::AcqRel);
+        let no_eyes = core.flow.no_eyes.swap(0, Ordering::AcqRel);
         let kbps = core.rate.current();
         *sh.server_line.lock().unwrap() = format!("server {} Hz · built {:.0}/s · sent {:.1} of {:.0} Mbit/s · render {:.1} gpu {:.1} encode {:.1} ms",
             core.fps, built as f64 / secs, self.bytes as f64 * 8.0 / secs / 1e6, sh.bitrate_kbps.load(Ordering::Acquire) as f64 / 1000.0, median_ms(&mut self.stages_us[0].clone()), median_ms(&mut self.stages_us[1].clone()), median_ms(&mut self.stages_us[2].clone()));
         let [ref mut render, ref mut gpu, ref mut encode, ref mut send] = self.stages_us;
         log(&format!(
-            "xr host: poses {:.0}/s ({} no XR window) · built {:.0}/s ({} without a slot) · sent {:.0}/s {:.1} Mbit/s (rate {:.0}) · render {:.1} gpu {:.1} encode {:.1} send {:.1} (write {:.1}) ms · headset decode {:.1} ms · in flight {}",
+            "xr host: poses {:.0}/s ({} no XR window) · built {:.0}/s ({} without a slot, {} with no eyes) · sent {:.0}/s {:.1} Mbit/s (rate {:.0}) · render {:.1} gpu {:.1} encode {:.1} send {:.1} (write {:.1}) ms · headset decode {:.1} ms · in flight {}",
             self.poses as f64 / secs,
             self.refused_poses,
             built as f64 / secs,
             skipped,
+            no_eyes,
             self.pictures as f64 / secs,
             self.bytes as f64 * 8.0 / secs / 1e6,
             kbps as f64 / 1000.0,
@@ -590,7 +695,21 @@ impl PumpStats {
         if self.bricks > 0 {
             log(&format!("xr host: room field {} bricks ({:.1} KB/s) from the headset", self.bricks, self.brick_bytes as f64 / secs / 1000.0));
         }
+        if self.mic_bytes > 0 {
+            log(&format!("xr host: microphone {:.1} s of sound from the headset", self.mic_bytes as f64 / (2.0 * MIC_RATE as f64)));
+        }
+        if self.capture_bytes > 0 {
+            log(&format!("xr host: capture {:.1} MB/s from the headset", self.capture_bytes as f64 / secs / 1e6));
+        }
+        // pictures a frame or more later than the median (the ones a headset's lead misses): the
+        // host's (pose to written) and the link's (its round trip over the idle link's)
+        let period_us = 1e6 / core.fps.max(1) as f64;
+        let desk_median = median_ms(&mut self.desk_us) * 1000.0;
+        let host_late = self.desk_us.iter().filter(|d| **d as f64 > desk_median + period_us).count();
+        let trip_base_us = core.rate.base_ms() * 1000.0;
+        let link_late = self.trip_us.iter().filter(|t| **t as f64 > trip_base_us + period_us).count() / core.tiles.max(1) as usize;
         let held = core.flow.held.swap(0, Ordering::AcqRel);
+        let app_wait_ms = median_ms(&mut std::mem::take(&mut *core.flow.app_wait_us.lock().unwrap()));
         let dropped = core.flow.dropped.swap(0, Ordering::AcqRel);
         if dropped > 0 {
             log(&format!("xr host: the encoder dropped {dropped} eye pictures ({:.1}/s): those pictures never reach the headset whole", dropped as f64 / secs));
@@ -603,22 +722,27 @@ impl PumpStats {
             *stats = super::ServerStats {
                 window: stats.window + 1,
                 fps: core.fps,
+                poses_per_s: core.flow.poses.swap(0, Ordering::AcqRel) as f64 / secs,
                 built_per_s: built as f64 / secs,
                 sent_mbps: self.bytes as f64 * 8.0 / secs / 1e6,
                 rate_mbps: kbps as f64 / 1000.0,
                 cap_mbps: sh.bitrate_kbps.load(Ordering::Acquire) as f64 / 1000.0,
                 render_ms: median_ms(render),
+                app_wait_ms,
                 gpu_ms: median_ms(gpu),
                 encode_ms: median_ms(encode),
                 send_ms: median_ms(send),
                 trip_ms,
                 trip_base_ms: core.rate.base_ms(),
                 waited_per_s: held as f64 / secs,
+                host_late_per_s: host_late as f64 / secs,
+                link_late_per_s: link_late as f64 / secs,
             };
         }
-        let rate = std::mem::replace(&mut self.rate, RateWindow::new());
+        // the rate's window and the tiles in flight go on into the next window
+        let (rate, unreported) = (std::mem::replace(&mut self.rate, RateWindow::new()), std::mem::take(&mut self.unreported));
         *self = PumpStats::new();
-        self.rate = rate;
+        (self.rate, self.unreported) = (rate, unreported);
     }
 }
 

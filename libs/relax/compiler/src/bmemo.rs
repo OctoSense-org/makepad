@@ -18,7 +18,11 @@
 //! symbol), positions, layout facts, flags -- stays as it is. An inline candidate's patch flag (a
 //! live session's guard symbol, `Func::patch_flag`) and the flags of its unguarded copies
 //! (`Func::unguarded_flags`) are compared as they are too; the root's are not (its own code does
-//! not read them). A result naming a slot the input
+//! not read them). The copy versions the guards compare (`Func::copy_ver`, the root's and each
+//! deferred candidate's own: a word of the slot being built) are compared by the value the build
+//! read, and a hit's code and bodies name the instance's words instead. A counted build's code names
+//! the slot's own loop counter (`jit::loop_syms`): counted or not is a setting, and a hit's code
+//! names the instance's counter (before, it counted into the stored instance's). A result naming a slot the input
 //! does not name (none is known to exist) is not stored. Each slot keeps its own code copy, its
 //! own thunk and its own RIR: function pointers stay distinct, tier-ups, patches and the disk
 //! cache see an ordinary build.
@@ -88,6 +92,7 @@ impl Canon {
 fn hash_prep<H: std::hash::Hasher>(p: &Prep, c: &mut Canon, h: &mut H) {
     use std::hash::Hash;
     p.func.hash_body_mapped(h, &mut |s| c.add(s));
+    p.func.copy_ver.map(|x| x.1).hash(h);
     p.callees.len().hash(h);
     for (s, f, a) in &p.callees {
         (c.add(*s), a).hash(h);
@@ -119,7 +124,7 @@ pub(crate) struct SPrep {
 impl SPrep {
     pub(crate) fn of(p: &Prep) -> SPrep {
         SPrep {
-            func: p.func.clone(),
+            func: Func { lowering: None, ..p.func.clone() },
             callees: p.callees.clone(),
             facts: p.facts.clone(),
             cfg: p.cfg,
@@ -134,6 +139,7 @@ impl SPrep {
 fn same(p: &Prep, cp: &Canon, s: &SPrep, cs: &Canon) -> bool {
     let (mut mp, mut ms) = (cp.map(), cs.map());
     p.func.same_body_mapped(&mut mp, &s.func, &mut ms)
+        && p.func.copy_ver.map(|x| x.1) == s.func.copy_ver.map(|x| x.1)
         && p.callees.len() == s.callees.len()
         && p.callees.iter().zip(&s.callees).all(|(a, b)| mp(a.0) == ms(b.0) && a.2 == b.2 && a.1.patch_flag == b.1.patch_flag && a.1.unguarded_flags == b.1.unguarded_flags && a.1.same_body_mapped(&mut mp, &b.1, &mut ms))
         && p.facts.len() == s.facts.len()
@@ -146,10 +152,10 @@ fn same(p: &Prep, cp: &Canon, s: &SPrep, cs: &Canon) -> bool {
 }
 
 /// What the back end got: the preparation's hash and slot numbering, and the code generator's
-/// settings (fold, rotate, opt_regs, patch epoch).
+/// settings (fold, rotate, opt_regs, loop-counted, patch epoch).
 pub(crate) struct Key {
     hash: u64,
-    settings: (bool, bool, bool, u64),
+    settings: (bool, bool, bool, bool, u64),
     canon: Canon,
     /// the root's and the deferred candidates' names (index -> name): results are named by them
     names: Vec<(u32, String)>,
@@ -168,7 +174,7 @@ fn names(p: &Prep, ix: u32, c: &Canon, out: &mut Vec<(u32, String)>) {
 struct Entry {
     prep: SPrep,
     canon: Canon,
-    settings: (bool, bool, bool, u64),
+    settings: (bool, bool, bool, bool, u64),
     opt: Option<(Func, Vec<(u32, usize)>, u64)>,
     code: Vec<u8>,
     map: Vec<(u32, u64)>,
@@ -178,6 +184,8 @@ struct Entry {
     frame: (u32, u32),
     /// thread cpu the back end took (what a hit saves)
     cpu_ns: u64,
+    /// the loop counter symbol its code names (a counted build's: the root slot's own)
+    counter: Option<relax_backend::rir::Sym>,
 }
 
 pub(crate) static MEMO: std::sync::LazyLock<relax_session::sync::Mutex<Memo>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(Memo::default()));
@@ -202,7 +210,7 @@ pub(crate) static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// capture (they record what the back ends that run see).
 pub(crate) fn on(options: &crate::options::Options) -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENV.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP").is_none())
+    *ENV.get_or_init(|| std::env::var_os("RELAX_INTERP").is_none())
         && options.no_layout_fn.is_none()
         && options.layout_only.is_none()
         && options.unroll_only.is_none()
@@ -224,7 +232,7 @@ pub(crate) fn worthy(u: &Unit, id: u32) -> bool {
 }
 
 /// The key of a back end over `p` for slot `id`.
-pub(crate) fn key(id: u32, p: &Prep, settings: (bool, bool, bool, u64)) -> Key {
+pub(crate) fn key(id: u32, p: &Prep, settings: (bool, bool, bool, bool, u64)) -> Key {
     let t0 = cpu_ns();
     let mut canon = Canon::new(id);
     let mut h = crate::fxhash::FxHasher::default();
@@ -237,14 +245,44 @@ pub(crate) fn key(id: u32, p: &Prep, settings: (bool, bool, bool, u64)) -> Key {
     Key { hash, settings, canon, names: n }
 }
 
+/// The copy version words of a stored preparation (`s`: the root's, then each deferred
+/// candidate's, depth first) paired with those of the instance's (`p`) where they differ.
+fn word_pairs(p: &Prep, s: &SPrep, out: &mut Vec<(relax_backend::rir::Sym, relax_backend::rir::Sym)>) {
+    if let (Some(a), Some(b)) = (s.func.copy_ver, p.func.copy_ver) {
+        if a.0 != b.0 {
+            out.push((a.0, b.0));
+        }
+    }
+    for (x, y) in p.deferred.iter().zip(&s.deferred) {
+        word_pairs(&x.2, &y.2, out);
+    }
+}
+
+/// A body of a stored back end, naming the instance's copy version words (`word_pairs`).
+fn rename_words(f: &mut Func, words: &[(relax_backend::rir::Sym, relax_backend::rir::Sym)]) {
+    if words.is_empty() {
+        return;
+    }
+    let to = |s: relax_backend::rir::Sym| words.iter().find(|w| w.0 == s).map_or(s, |w| w.1);
+    for b in &mut f.blocks {
+        for i in &mut b.insts {
+            if let relax_backend::rir::Inst::Addr(_, s) = i {
+                *s = to(*s);
+            }
+        }
+    }
+    f.copy_ver = f.copy_ver.map(|(w, v)| (to(w), v));
+}
+
 /// What a hit hands the back end's caller (BackDone's parts), slots renamed to the instance's.
 pub(crate) type Hit = (Option<(Arc<Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<RelocAt>, u64, Vec<Deferred>, (u32, u32));
 
-pub(crate) fn lookup(k: &Key, p: &Prep) -> Option<Hit> {
+/// `counter`: the instance's own loop counter symbol (a counted build's).
+pub(crate) fn lookup(k: &Key, p: &Prep, counter: Option<relax_backend::rir::Sym>) -> Option<Hit> {
     let t0 = cpu_ns();
     let found: Vec<Arc<Entry>> = {
         let g = MEMO.lock().unwrap_or_else(|e| e.into_inner());
-        if g.epoch != k.settings.3 {
+        if g.epoch != k.settings.4 {
             return None;
         }
         let mut v = g.map.get(&k.hash).cloned().unwrap_or_default();
@@ -256,19 +294,32 @@ pub(crate) fn lookup(k: &Key, p: &Prep) -> Option<Hit> {
     let e = e?;
     let back = |s: &mut u32| *s = k.canon.order[*s as usize];
     let name = |ix: u32| k.names.iter().find(|x| x.0 == ix).map(|x| x.1.clone()).unwrap_or_default();
+    let mut words = Vec::new();
+    word_pairs(p, &e.prep, &mut words);
     let func = |f: &Func, ix: u32| {
         let mut f = f.clone();
         f.fn_slots_mut(&mut |s| back(s));
         f.nounwind_inputs.sort_unstable();
         f.name = name(ix);
+        rename_words(&mut f, &words);
         f
     };
     let inl = |v: &[(u32, usize)]| v.iter().map(|&(s, r)| (k.canon.order[s as usize], r)).collect::<Vec<_>>();
     let opt = e.opt.as_ref().map(|(f, i, ns)| (Arc::new(func(f, 0)), inl(i), *ns));
     let relocs = e.relocs.iter().map(|r| {
         let mut r = *r;
-        if let Reloc::Slot(s) | Reloc::Thunk(s) | Reloc::Call(s) = &mut r.target {
-            back(s);
+        match &mut r.target {
+            Reloc::Slot(s) | Reloc::Thunk(s) | Reloc::Call(s) => back(s),
+            Reloc::Sym(s) => {
+                if let Some(w) = words.iter().find(|w| w.0 == *s) {
+                    *s = w.1;
+                } else if let (Some(a), Some(b)) = (e.counter, counter) {
+                    if s.id == a.id {
+                        s.id = b.id;
+                    }
+                }
+            }
+            _ => {}
         }
         r
     }).collect();
@@ -282,7 +333,7 @@ pub(crate) fn lookup(k: &Key, p: &Prep) -> Option<Hit> {
 }
 
 /// Stores a back end's result under its key (not when it names a slot the input does not).
-pub(crate) fn store(k: Key, prep: SPrep, opt: &Option<(Arc<Func>, Vec<(u32, usize)>, u64)>, code: &[u8], map: &[(u32, u64)], relocs: &[RelocAt], cg_ns: u64, done: &[Deferred], frame: (u32, u32), cpu: u64) {
+pub(crate) fn store(k: Key, prep: SPrep, opt: &Option<(Arc<Func>, Vec<(u32, usize)>, u64)>, code: &[u8], map: &[(u32, u64)], relocs: &[RelocAt], cg_ns: u64, done: &[Deferred], frame: (u32, u32), cpu: u64, counter: Option<relax_backend::rir::Sym>) {
     STATS[1].fetch_add(1, Ordering::Relaxed);
     let c = &k.canon;
     let ok = std::cell::Cell::new(true);
@@ -291,7 +342,7 @@ pub(crate) fn store(k: Key, prep: SPrep, opt: &Option<(Arc<Func>, Vec<(u32, usiz
         None => ok.set(false),
     };
     let func = |f: &Func| {
-        let mut f = f.clone();
+        let mut f = Func { lowering: None, ..f.clone() };
         f.fn_slots_mut(&mut |s| to(s));
         f.name = String::new();
         f
@@ -321,15 +372,15 @@ pub(crate) fn store(k: Key, prep: SPrep, opt: &Option<(Arc<Func>, Vec<(u32, usiz
         STATS[2].fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let e = Arc::new(Entry { prep, canon: k.canon, settings: k.settings, opt, code: code.to_vec(), map: map.to_vec(), relocs, cg_ns, done, frame, cpu_ns: cpu });
+    let e = Arc::new(Entry { prep, canon: k.canon, settings: k.settings, opt, code: code.to_vec(), map: map.to_vec(), relocs, cg_ns, done, frame, cpu_ns: cpu, counter });
     let mut g = MEMO.lock().unwrap_or_else(|e| e.into_inner());
     let n = entry_bytes(&e);
-    if g.epoch != k.settings.3 {
+    if g.epoch != k.settings.4 {
         g.map = HashMap::new();
         g.old = HashMap::new();
         g.len = 0;
         g.bytes = 0;
-        g.epoch = k.settings.3;
+        g.epoch = k.settings.4;
     } else if g.bytes + n > MAX_BYTES / 2 {
         // the full generation becomes the old one, the old one goes
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -382,7 +433,7 @@ mod tests {
     #[test]
     fn same_body_up_to_slot_names_shares_the_result_renamed() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let settings = (true, true, false, 0xbeef);
+        let settings = (true, true, false, false, 0xbeef);
         // instance A: slot 3 calls 10 and 11; instance B: slot 4 calls 20 and 21 (same constants)
         let pa = prep(body("f<A>", 10, 11, 8), Some((11, body("g<A>", 30, 3, 1))));
         let pb = prep(body("f<B>", 20, 21, 8), Some((21, body("g<B>", 40, 4, 1))));
@@ -402,8 +453,8 @@ mod tests {
             RelocAt { at: 16, kind: RelocKind::Pool64, target: Reloc::Sym(Sym::new(7)) },
         ];
         let sa = SPrep::of(&pa);
-        store(ka, sa, &opt, &[1, 2, 3], &[(0, 9)], &relocs, 1, &[], (32, 8), 100);
-        let (o, code, map, r, _, done, frame) = lookup(&kb, &pb).expect("hit");
+        store(ka, sa, &opt, &[1, 2, 3], &[(0, 9)], &relocs, 1, &[], (32, 8), 100, None);
+        let (o, code, map, r, _, done, frame) = lookup(&kb, &pb, None).expect("hit");
         assert_eq!(code, vec![1, 2, 3]);
         assert_eq!(map, vec![(0, 9)]);
         assert_eq!(frame, (32, 8));
@@ -418,21 +469,21 @@ mod tests {
         assert!(f.same_body_mapped(&mut id, &body("f<B>", 20, 21, 8), &mut id2));
         assert_eq!(inl, vec![(21, 2)]);
         // the other constant does not hit; another patch epoch does not hit
-        assert!(lookup(&key(5, &pc, settings), &pc).is_none());
-        let ke = key(4, &pb, (true, true, false, 0xbef0));
-        assert!(lookup(&ke, &pb).is_none());
+        assert!(lookup(&key(5, &pc, settings), &pc, None).is_none());
+        let ke = key(4, &pb, (true, true, false, false, 0xbef0));
+        assert!(lookup(&ke, &pb, None).is_none());
     }
 
     #[test]
     fn a_result_naming_a_slot_the_input_does_not_is_not_stored() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let settings = (false, true, false, 0x1234);
+        let settings = (false, true, false, false, 0x1234);
         let pa = prep(body("h<A>", 10, 11, 4), None);
         let pb = prep(body("h<B>", 20, 21, 4), None);
         let ka = key(3, &pa, settings);
         let relocs = vec![RelocAt { at: 0, kind: RelocKind::X64Branch32, target: Reloc::Call(99) }];
-        store(ka, SPrep::of(&pa), &None, &[1], &[], &relocs, 1, &[], (0, 0), 1);
-        assert!(lookup(&key(4, &pb, settings), &pb).is_none());
+        store(ka, SPrep::of(&pa), &None, &[1], &[], &relocs, 1, &[], (0, 0), 1, None);
+        assert!(lookup(&key(4, &pb, settings), &pb, None).is_none());
     }
 }
 

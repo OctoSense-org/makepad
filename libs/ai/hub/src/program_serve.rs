@@ -19,7 +19,9 @@
 //!   waits for it, and the share comes down only [`SHARE_LINGER`] after the last session that
 //!   raised it (a study's solves one after another keep it up);
 //! - sends at most `wire::IN_FLIGHT` unacked versions of an output; a newer one replaces the
-//!   one waiting (a slow link skips versions, it never queues them);
+//!   one waiting (a slow link skips versions, it never queues them), and the values said while
+//!   one waits go with it, so an app sees what a program said in the order it said it, as an
+//!   in-process session gives it (a grown part's `settled` never comes before its last shape);
 //! - keeps a stream's inputs in the slots its opens name (`wire`'s `keep`), so a later open names
 //!   the ones it sent before by their hash, and the results its sessions remember there, so a
 //!   later session made from the same recalls them ([`Kept`]), at most [`KEPT_BYTES`] a stream;
@@ -365,11 +367,13 @@ struct Served {
     flow: Mutex<Flow>,
 }
 
-/// Per output (name, state): versions sent and not acked, and the newest one waiting.
+/// Per output (name, state): versions sent and not acked, and the newest one waiting; and the
+/// values said since an output began to wait (the newest per name).
 #[derive(Default)]
 struct Flow {
     in_flight: Vec<((String, bool), Vec<u64>)>,
     waiting: Vec<Output>,
+    said: Vec<(String, Value)>,
 }
 
 impl Flow {
@@ -383,8 +387,10 @@ impl Flow {
         }
     }
 
-    /// The outputs that may go now; the rest wait (the newest per name).
-    fn admit(&mut self, outputs: Vec<Output>, all: bool) -> Vec<Output> {
+    /// What of `u` may go now: the outputs within their flight, the rest waiting (the newest per
+    /// name), and its values once no output waits, which a value said after one waits for.
+    fn admit(&mut self, u: Updates, all: bool) -> Updates {
+        let Updates { outputs, values, progress, end } = u;
         for o in outputs {
             match self.waiting.iter_mut().find(|w| w.name == o.name && w.state == o.state) {
                 Some(w) => *w = o,
@@ -402,7 +408,14 @@ impl Flow {
                 self.waiting.push(o);
             }
         }
-        send
+        for (name, value) in values {
+            match self.said.iter_mut().find(|(n, _)| *n == name) {
+                Some(slot) => slot.1 = value,
+                None => self.said.push((name, value)),
+            }
+        }
+        let values = if all || self.waiting.is_empty() { std::mem::take(&mut self.said) } else { Vec::new() };
+        Updates { outputs: send, values, progress, end }
     }
 
     fn ack(&mut self, key: &(String, bool), version: u64) {
@@ -527,6 +540,22 @@ impl ProgramService {
         self.inner.sessions.lock().unwrap().get(&id).filter(|s| s.owner == owner).cloned()
     }
 
+    /// Every stream ends now, its sessions with it (a timed run holds the machine quiet: its
+    /// clients see their streams close and go to other nodes, or their own cores). Returns how
+    /// many streams there were.
+    pub fn end_all(&self) -> usize {
+        let streams: Vec<(u64, Push)> = self.inner.streams.lock().unwrap().drain().map(|(socket, (_, push))| (socket, push)).collect();
+        let ended: Vec<Arc<Served>> = self.inner.sessions.lock().unwrap().values().filter(|s| streams.iter().any(|(socket, _)| *socket == s.socket)).cloned().collect();
+        for s in ended {
+            s.session.cancel();
+        }
+        for (_, push) in &streams {
+            // (an empty frame closes the websocket)
+            let _ = push.tx.send(Vec::new());
+        }
+        streams.len()
+    }
+
     /// A stream closed: its sessions end.
     pub fn stream_closed(&self, socket: u64) {
         if self.inner.streams.lock().unwrap().remove(&socket).is_none() {
@@ -607,8 +636,7 @@ fn pump(served: &Served, push: &Push, id: u64, threads: usize) {
     loop {
         let u = served.session.wait();
         let ending = u.end.is_some();
-        let outputs = served.flow.lock().unwrap().admit(u.outputs, ending);
-        let update = Updates { outputs, ..u };
+        let update = served.flow.lock().unwrap().admit(u, ending);
         if !update.is_empty() {
             send(push, wire::UPDATE, id, wire::encode_update(&update, served.codec, threads));
         }
@@ -628,6 +656,18 @@ mod tests {
 
     fn words(n: usize) -> Arc<[u32]> {
         vec![7; n].into()
+    }
+
+    /// A machine held quiet ends every stream: each is closed (an empty frame) and none is left.
+    #[test]
+    fn a_quiet_ends_every_stream() {
+        let service = service();
+        let (tx, rx) = std::sync::mpsc::channel();
+        service.stream_open(9_000_001, "client-a", tx);
+        assert!(service.is_stream(9_000_001));
+        assert!(service.end_all() >= 1);
+        assert!(!service.is_stream(9_000_001));
+        assert_eq!(rx.try_recv().ok(), Some(Vec::new()), "its websocket is closed");
     }
 
     /// A slot keeps its last open's inputs: a later open names them by hash, what the slot held

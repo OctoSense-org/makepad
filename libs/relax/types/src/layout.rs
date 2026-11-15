@@ -5,8 +5,6 @@
 mod closure;
 pub use closure::ClosureStorage;
 
-use crate::next_solver::TraitRef;
-use crate::consts::GenericArg;
 use crate::program::Prim;
 use relax_backend::rir::{Cls, Mem};
 use crate::tcx::Tcx;
@@ -38,10 +36,6 @@ pub struct Layout {
     pub niche: Option<Niche>,
     /// no value of the type exists (`!`, empty enums, a field of such a type)
     pub uninhabited: bool,
-    /// Live sessions (M10): the offset of the hidden extension word of a live-editable struct
-    /// (a pointer to the fields edits added, null until one is used; hotreload.md section 13).
-    /// Fields in its extension block have offset u32::MAX in `fields`.
-    pub ext: Option<u32>,
 }
 
 /// A scalar of `bytes` at `off` whose valid values are `start..=end` (wrapping; rustc_abi
@@ -124,8 +118,9 @@ impl Niche {
         }
     }
 
+    /// A niche with invalid values left; a 16-byte one (u128 / i128 scalars and tags) too: its
+    /// tag is read and written as its two words (lower.rs emit_load_disc / emit_store_disc).
     fn some(self) -> Option<Niche> {
-        // (a 16-byte niche is a 128-bit scalar's: its tag is two words)
         if self.available() > 0 && self.bytes <= 16 {
             Some(self)
         } else {
@@ -183,7 +178,7 @@ impl LTable {
         use std::sync::atomic::{AtomicU32, Ordering};
         let i = t.0 as usize;
         let ci = i >> LCHUNK_BITS;
-        assert!(ci < LMAX_CHUNKS, "makepad: layout table full");
+        assert!(ci < LMAX_CHUNKS, "relax: layout table full");
         let mut c = self.chunks[ci].load(Ordering::Acquire);
         if c.is_null() {
             let fresh: Box<[AtomicU32]> = (0..LCHUNK).map(|_| AtomicU32::new(0)).collect();
@@ -255,6 +250,9 @@ pub struct Layouts {
     /// a field type that does not normalize stays as written (transmute's size skeletons erase
     /// parameters to `()`, so `PhantomData<<() as Tr>::Assoc>` need not project)
     lenient_fields: bool,
+    /// laid out apart from the running layouts (`probe`): a closure whose environment is not
+    /// known here is missing, not derived
+    probe: bool,
 }
 
 unsafe impl Send for Layouts {}
@@ -270,7 +268,7 @@ impl Drop for Layouts {
 }
 
 fn plain(size: u32, align: u32, leaves: Option<Vec<Leaf>>) -> Layout {
-    Layout { size, align, fields: Vec::new(), tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: None, uninhabited: false, ext: None }
+    Layout { size, align, fields: Vec::new(), tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: None, uninhabited: false }
 }
 
 fn scalar(size: u32, mem: Mem, cls: Cls) -> Layout {
@@ -346,6 +344,42 @@ fn fit_unsigned(x: u128) -> u32 {
     }
 }
 
+/// rustc_middle discr_range_of_repr for an enum without repr(int): the smallest integer of at
+/// least `at_least` bytes (4 for repr(C)) holding every discriminant in `min..=max`, unsigned
+/// when one fits. (bytes, signed)
+pub fn discr_int(min: i128, max: i128, at_least: u32) -> (u32, bool) {
+    let uf = fit_unsigned((min as u128).max(max as u128));
+    let sf = fit_signed(min).max(fit_signed(max));
+    if uf <= sf {
+        (uf.max(at_least), false)
+    } else {
+        (sf.max(at_least), true)
+    }
+}
+
+/// An enum tag's valid range: the smallest wrapping range at `bytes` that holds every tag of
+/// `tags` (taken at that width), the largest gap between them (the last of the largest, the tags
+/// in unsigned order) left out. Discriminants {0, 254} are 254..=0, and their Option's None is 1
+/// (rustc's). (start, end); no tags: 0..=0.
+pub fn tag_range(tags: &[u128], bytes: u32) -> (u128, u128) {
+    let wmask = if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
+    let mut ts: Vec<u128> = tags.iter().map(|&v| v & wmask).collect();
+    ts.sort();
+    ts.dedup();
+    if ts.is_empty() {
+        ts.push(0);
+    }
+    let mut gap_after = 0;
+    let mut widest = 0u128;
+    for k in 0..ts.len() {
+        let gap = ts[(k + 1) % ts.len()].wrapping_sub(ts[k]).wrapping_sub(1) & wmask;
+        if k == 0 || gap >= widest {
+            (gap_after, widest) = (k, gap);
+        }
+    }
+    (ts[(gap_after + 1) % ts.len()], ts[gap_after])
+}
+
 fn fit_signed(x: i128) -> u32 {
     if x >= i8::MIN as i128 && x <= i8::MAX as i128 {
         1
@@ -370,7 +404,7 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false }
+        Layouts { closure_storage: Default::default(), version_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default(), lenient_fields: false, probe: false }
     }
 
     /// Layouts of types whose parameters were erased (see `lenient_fields`).
@@ -444,7 +478,7 @@ impl Layouts {
         self.struct_layout(lcx, tcx, &storage.fields, Repr { pack: 0, align: 0, reorder: true }, kind)
     }
 
-    /// Memory report (MAKEPAD_RUN_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
+    /// Memory report (RELAX_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
     /// the shared layout entries with their vectors.
     pub fn mem_lines(&self) -> Vec<(String, u64)> {
         use std::sync::atomic::Ordering;
@@ -496,7 +530,7 @@ impl Layouts {
             at = Some(pool.next[i as usize]).filter(|n| *n != u32::MAX);
         }
         let i = self.ents.push(e) as u32;
-        assert!(i < SLOT_IDX, "makepad: layout entries full");
+        assert!(i < SLOT_IDX, "relax: layout entries full");
         let first = pool.head.insert(h, i);
         pool.next.push(first.unwrap_or(u32::MAX));
         i + 1
@@ -510,6 +544,48 @@ impl Layouts {
 
     fn table(&self) -> &LTable {
         unsafe { &*self.table.load(std::sync::atomic::Ordering::Acquire) }
+    }
+
+    /// Every type laid out since these Layouts were made, with its newest layout: the current
+    /// table's, else that of the last table `clear` retired that has it. What the values this
+    /// process made of a type were made with (a type laid out again after an edit only takes
+    /// layouts its running values can be read with).
+    pub fn laid_out(&self) -> Vec<(TyId, &'static Layout)> {
+        use std::sync::atomic::Ordering;
+        let retired = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen: Vec<u64> = Vec::new();
+        let mut out = Vec::new();
+        for table in std::iter::once(self.table()).chain(retired.iter().rev().map(|t| &**t)) {
+            for (ci, c) in table.chunks.iter().enumerate() {
+                let p = c.load(Ordering::Acquire);
+                if p.is_null() { continue; }
+                for k in 0..LCHUNK {
+                    let w = unsafe { &*p.add(k) }.load(Ordering::Acquire);
+                    if w & SLOT_IDX == 0 { continue; }
+                    let i = (ci << LCHUNK_BITS) | k;
+                    if seen.len() <= i / 64 { seen.resize(i / 64 + 1, 0); }
+                    if seen[i / 64] & (1 << (i % 64)) != 0 { continue; }
+                    seen[i / 64] |= 1 << (i % 64);
+                    out.push((TyId(i as u32), &self.entry(w).layout));
+                }
+            }
+        }
+        out
+    }
+
+    /// Layouts to lay types out again in, apart from these (an edit's candidate definitions: the
+    /// caller puts them in the Tcx, and these Layouts are left as they are): the provided crates'
+    /// opaque sizes and the closures' environments as these have them, no layouts. A closure
+    /// whose environment neither has is missing there (`LayoutCx::missing`). Its layouts live as
+    /// long as it does.
+    pub fn probe(&self) -> Layouts {
+        let mut p = Layouts::new();
+        p.opaque = self.opaque.clone();
+        p.lenient_fields = self.lenient_fields;
+        p.probe = true;
+        for (t, s) in self.closure_storage.snapshot() { p.closure_storage.insert(t, s); }
+        for (t, s) in self.version_storage.snapshot() { p.version_storage.insert(t, s); }
+        p
     }
 
     /// Forgets every cached layout (a type definition was re-collected). The old table stays
@@ -574,6 +650,7 @@ impl Layouts {
                     tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: *d, span: lcx.prog.files[def.file as usize].ast.item(def.item).lo },
                         format!("E0391: cycle detected when computing layout of `{}`", lcx.prog.def_path(*d)));
                 }
+                crate::cycle::note_stand_in();
                 return Box::leak(Box::new(plain(0, 1, None)));
             }
         };
@@ -600,39 +677,6 @@ impl Layouts {
                 Err(now) => cur = now,
             }
         }
-    }
-
-    /// Live sessions (M10, hotreload.md section 13): a struct in the application's scope that
-    /// edits may give fields in place -- named fields, no repr other than Rust's, not Copy (a
-    /// bitwise copy would share the extension block).
-    pub fn live_editable(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, t: TyId) -> bool {
-        if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
-            return false;
-        }
-        let prog = lcx.prog;
-        if !crate::borrowck::event::app_crate(prog, prog.def(d).krate) || adt.is_enum || adt.is_union {
-            return false;
-        }
-        if adt.repr_c || adt.repr_packed != 0 || adt.repr_align != 0 || adt.repr_int.is_some() || adt.no_niche || adt.valid_start.is_some() || adt.valid_end.is_some() {
-            return false;
-        }
-        if adt.variants.first().map_or(true, |v| v.shape != 2) {
-            return false;
-        }
-        match tcx.copy_trait {
-            Some(c) => !tcx.type_implements_trait(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply(),
-            None => false,
-        }
-    }
-
-    /// Live sessions (M10): an enum of the program's own crate with Rust's repr, which variants
-    /// may be added to in place (tagged layout, no niche).
-    pub fn live_editable_enum(&self, lcx: &LayoutCx<'_>, d: crate::program::DefId, adt: &crate::tcx::AdtT) -> bool {
-        if !LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed) || !adt.is_enum {
-            return false;
-        }
-        let prog = lcx.prog;
-        prog.def(d).krate == root_crate() && !adt.repr_c && adt.repr_int.is_none() && adt.repr_align == 0 && adt.repr_packed == 0 && !adt.no_niche
     }
 
     /// Is `t` 4 GiB or larger (its layout saturated)?
@@ -785,6 +829,10 @@ impl Layouts {
                 l
             }
             TyKind::Closure(file, ce, ..) => {
+                if self.probe && self.closure_storage.get(&t).is_none() && self.version_storage.get(&t).is_none() {
+                    lcx.missing.borrow_mut().push(t);
+                    return plain(0, 1, None);
+                }
                 let storage = self.closure_storage(lcx.prog, tcx, t);
                 let mut l = self.closure_storage_layout(lcx, tcx, t);
                 // a coroutine: its upvars and state word, then the saved locals of its suspension
@@ -862,19 +910,6 @@ impl Layouts {
                     for fi in 0..adt.variants[0].fields.len() {
                         fts.push(self.field_ty(lcx, tcx, d, 0, fi as u32, tcx.tys.list(args)));
                     }
-                    // a live-editable struct (M10): its first version's fields, then the hidden
-                    // extension word; the fields edits added live in the extension block
-                    if !adt.is_union && self.live_editable(lcx, tcx, d, &adt, t) {
-                        let n_base = (adt.ext_from as usize).min(fts.len());
-                        let mut l = self.struct_layout(lcx, tcx, &fts[..n_base], repr, Kind::AlwaysSized);
-                        let ext = self.rup(lcx, l.size, pb);
-                        l.align = l.align.max(pb);
-                        l.size = self.rup(lcx, ext + pb, l.align);
-                        l.ext = Some(ext);
-                        l.leaves = None;
-                        l.fields.resize(fts.len(), u32::MAX);
-                        return l;
-                    }
                     if adt.is_union {
                         let mut size = 0;
                         let mut align = 1;
@@ -895,7 +930,7 @@ impl Layouts {
                     // its sized instances may be reordered differently, so say so loudly
                     if kind == Kind::AlwaysSized && repr.reorder && fts.len() > 1 && self.is_unsized(lcx, tcx, fts[fts.len() - 1]) {
                         let name = lcx.prog.def_path(d);
-                        eprintln!("makepad: layout of `{}` with an unsized last field, but its definition requires that field sized (rustc: E0277); declare the parameter `?Sized`", name);
+                        eprintln!("relax: layout of `{}` with an unsized last field, but its definition requires that field sized (rustc: E0277); declare the parameter `?Sized`", name);
                     }
                     let mut l = self.struct_layout(lcx, tcx, &fts, repr, kind);
                     if adt.is_simd() {
@@ -912,9 +947,9 @@ impl Layouts {
                         // `rustc_layout_scalar_valid_range_*`: the range of the struct's scalar
                         if let Some(first) = l.leaves.as_ref().and_then(|v| v.first().copied()) {
                             if first.off == 0 && matches!(first.mem, Mem::Int(..)) {
-                                // a 128-bit scalar is two word leaves, but its valid range is over
-                                // all 16 bytes: `NonZero<u128>` excludes 0, not a zero low word
-                                let wide = fts.iter().any(|&f| matches!(tcx.tys.kind(f), TyKind::Int(p) if tcx.tys.int_info(*p).0 == 16));
+                                // a 128-bit integer is two word leaves but one 16-byte scalar, which
+                                // rustc's niche covers whole (Option<NonZero<u128>>: None is 0 in both words)
+                                let wide = matches!(fts.as_slice(), [f] if matches!(tcx.tys.kind(*f), TyKind::Int(p) if tcx.tys.int_info(*p).0 == 16));
                                 let bytes = match first.mem {
                                     _ if wide => 16,
                                     Mem::Int(b, _) => b as u32,
@@ -927,14 +962,9 @@ impl Layouts {
                     }
                     return l;
                 }
-                // a live-editable enum (M10): always tagged, no niche given to outer types, so a
-                // variant added at the end keeps every value's representation
-                if self.live_editable_enum(lcx, d, &adt) {
-                    let mut l = self.enum_layout(lcx, tcx, d, &adt, tcx.tys.list(args), repr, true);
-                    l.niche = None;
-                    return l;
-                }
-                self.enum_layout(lcx, tcx, d, &adt, tcx.tys.list(args), repr, false)
+                // live sessions too: an enum is laid out as rustc lays it (code sizes buffers by
+                // size_of and asserts it), and an edit its running values cannot take restarts
+                self.enum_layout(lcx, tcx, d, &adt, tcx.tys.list(args), repr)
             }
             TyKind::Foreign(_) => plain(0, 1, None),
             TyKind::Str => plain(0, 1, None),
@@ -969,7 +999,7 @@ impl Layouts {
         let (fl, ls) = self.field_ls(lcx, tcx, fts);
         let u = self.univariant(lcx, &fl, repr, kind);
         let leaves = self.leaves_of(&ls, &u.offsets);
-        Layout { size: u.size, align: u.align, fields: u.offsets, tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: u.niche, uninhabited: u.uninhabited, ext: None }
+        Layout { size: u.size, align: u.align, fields: u.offsets, tag: None, enc: TagEnc::Direct, variant_fields: Vec::new(), leaves, niche: u.niche, uninhabited: u.uninhabited }
     }
 
     fn leaves_of(&self, ls: &[&'static Layout], offsets: &[u32]) -> Option<Vec<Leaf>> {
@@ -1100,8 +1130,8 @@ impl Layouts {
 
     /// rustc_abi layout_of_struct_or_enum for enums: a single present variant is laid out like
     /// a struct; else the smaller of the niche-filling and the tagged layout (layout_of_enum).
-    fn enum_layout(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, args: &[TyId], repr: Repr, live: bool) -> Layout {
-        let inhibit = adt.repr_c || adt.repr_int.is_some() || live;
+    fn enum_layout(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, d: crate::program::DefId, adt: &crate::tcx::AdtT, args: &[TyId], repr: Repr) -> Layout {
+        let inhibit = adt.repr_c || adt.repr_int.is_some();
         let nv = adt.variants.len();
         let mut vfl: Vec<Vec<FieldL>> = Vec::new();
         let mut vls: Vec<Vec<&'static Layout>> = Vec::new();
@@ -1131,7 +1161,7 @@ impl Layouts {
             let leaves = self.leaves_of(&vls[v], &u.offsets);
             let mut vfs: Vec<Vec<u32>> = vfl.iter().map(|f| vec![0; f.len()]).collect();
             vfs[v] = u.offsets.clone();
-            return Layout { size: u.size, align: u.align, fields: Vec::new(), tag: None, enc: TagEnc::Single(v as u32), variant_fields: vfs, leaves, niche: u.niche, uninhabited: u.uninhabited, ext: None };
+            return Layout { size: u.size, align: u.align, fields: Vec::new(), tag: None, enc: TagEnc::Single(v as u32), variant_fields: vfs, leaves, niche: u.niche, uninhabited: u.uninhabited };
         }
         let niche_l = if inhibit { None } else { self.niche_filling(lcx, &vfl, &vls, repr) };
         let tagged = self.tagged(lcx, tcx, adt, &vfl, &vls, repr);
@@ -1203,58 +1233,24 @@ impl Layouts {
             leaves,
             niche: reserved.some(),
             uninhabited: us.iter().all(|u| u.uninhabited),
-            ext: None,
         })
     }
 
     fn tagged(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
         let nv = vfl.len();
-        // the discriminants of inhabited variants, and the largest gap between them (wrapping)
-        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.discriminant_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
+        // the tags of inhabited variants (their discriminants, or the tags a live edit kept)
+        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.tag_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
         ds.sort();
-        ds.dedup();
-        let discr_signed = match adt.repr_int {
-            Some(p) => tcx.tys.int_info(p).1,
-            None => true,
+        let (min, max) = (ds.first().copied().unwrap_or(0), ds.last().copied().unwrap_or(0));
+        // rustc_middle discr_range_of_repr; tags an in-place edit pinned keep the integer the
+        // running values hold them in
+        let (min_bytes, signed) = match (&adt.tag_pin, adt.repr_int) {
+            (Some(pin), _) => (pin.bytes, pin.signed),
+            (None, Some(p)) => tcx.tys.int_info(p),
+            (None, None) => discr_int(min, max, if adt.repr_c { 4 } else { 1 }),
         };
-        let discr_bytes = match adt.repr_int {
-            Some(p) => tcx.tys.int_info(p).0,
-            None => tcx.tys.ptr_bytes,
-        };
-        let dmax = if discr_bytes >= 16 { u128::MAX } else { (1u128 << (discr_bytes * 8)) - 1 };
-        let smax: u128 = if discr_bytes >= 16 { i128::MAX as u128 } else { (1u128 << (discr_bytes * 8 - 1)) - 1 };
-        let mut best: Option<(i128, i128, u128)> = None;
-        for k in 0..ds.len() {
-            let (s, e) = (ds[k], ds[(k + 1) % ds.len()]);
-            let dist = if s > e {
-                let d = s.wrapping_sub(e);
-                if discr_signed { smax.wrapping_sub(d as u128) } else { dmax.wrapping_sub(d as u128) }
-            } else {
-                e.wrapping_sub(s) as u128
-            };
-            // max_by_key: the last of the largest
-            if best.map_or(true, |b| dist >= b.2) {
-                best = Some((s, e, dist));
-            }
-        }
-        let (max, min) = best.map_or((0, 0), |b| (b.0, b.1));
-        // rustc_middle discr_range_of_repr
-        let (min_bytes, signed) = match adt.repr_int {
-            Some(p) => {
-                let (b, s) = tcx.tys.int_info(p);
-                (b, s)
-            }
-            None => {
-                let at_least = if adt.repr_c { 4 } else { 1 };
-                let uf = fit_unsigned((min as u128).max(max as u128));
-                let sf = fit_signed(min).max(fit_signed(max));
-                if uf <= sf {
-                    (uf.max(at_least), false)
-                } else {
-                    (sf.max(at_least), true)
-                }
-            }
-        };
+        let ts: Vec<u128> = ds.iter().map(|&v| v as u128).collect();
+        let (range_start, range_end) = tag_range(&ts, min_bytes);
         let mut prefix_align = min_bytes;
         if adt.repr_c {
             for fl in vfl {
@@ -1300,7 +1296,7 @@ impl Layouts {
             }
         }
         let mask = if ity >= 16 { u128::MAX } else { (1u128 << (ity * 8)) - 1 };
-        let tag_niche = Niche { off: 0, bytes: ity, start: (min as u128) & mask, end: (max as u128) & mask };
+        let tag_niche = Niche { off: 0, bytes: ity, start: range_start & mask, end: range_end & mask };
         let mem = Mem::Int(ity as u8, signed);
         let leaves = if ity != size { None } else if ity == 16 {
             // The scalar tag uses the same two-word ABI as i128/u128.
@@ -1317,7 +1313,6 @@ impl Layouts {
             leaves,
             niche: tag_niche.some(),
             uninhabited: us.iter().all(|u| u.uninhabited),
-            ext: None,
         }
     }
 
@@ -1396,6 +1391,7 @@ impl Layouts {
                     tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: *d, span: lcx.prog.files[def.file as usize].ast.item(def.item).lo },
                         format!("E0391: cycle detected when computing layout of `{}`", lcx.prog.def_path(*d)));
                 }
+                crate::cycle::note_stand_in();
                 return false;
             }
         };
@@ -1499,7 +1495,7 @@ pub fn root_crate() -> u32 {
     ROOT_CRATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// `makepad live`: the crate under test is the program's own crate (live_editable).
+/// `makepad live`: the crate under test is the program's own crate.
 pub fn set_root_crate(c: u32) {
     ROOT_CRATE.store(c, std::sync::atomic::Ordering::Relaxed);
 }

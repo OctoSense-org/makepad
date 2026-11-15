@@ -168,7 +168,7 @@ pub fn start_stdin_orphan_watchdog() {
                     "stdin-loop host is gone (reparented to init) — exiting orphaned app instance"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(0);
+                makepad_core_util::process_end::end(0);
             }
         })
         .ok();
@@ -190,7 +190,7 @@ fn watchdog_main(limits: MemoryLimits) {
                 "memory watchdog: stdin-loop host is gone (orphaned) — exiting to avoid a zombie app instance"
             );
             std::thread::sleep(std::time::Duration::from_millis(200));
-            std::process::exit(0);
+            makepad_core_util::process_end::end(0);
         }
         // Host-silence guard: parent may outlive us (studio spawns apps
         // directly), so also exit when the studio websocket goes quiet.
@@ -201,7 +201,7 @@ fn watchdog_main(limits: MemoryLimits) {
                 STDIN_HOST_SILENCE_LIMIT_S
             );
             std::thread::sleep(std::time::Duration::from_millis(200));
-            std::process::exit(0);
+            makepad_core_util::process_end::end(0);
         }
         let Some(footprint) = process_footprint_bytes() else {
             return;
@@ -311,5 +311,77 @@ pub fn process_footprint_bytes() -> Option<u64> {
     )))]
     {
         None
+    }
+}
+
+/// Bytes currently handed out by malloc, excluding free pages retained for reuse.
+/// A leak grows this value; retained free memory grows only the footprint.
+pub fn heap_in_use_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct MallocStatistics {
+            _blocks_in_use: u32,
+            size_in_use: usize,
+            _max_size_in_use: usize,
+            _size_allocated: usize,
+        }
+        extern "C" {
+            fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut MallocStatistics);
+        }
+        let mut stats = MallocStatistics::default();
+        // A null zone sums every zone.
+        unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
+        Some(stats.size_in_use as u64)
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        #[repr(C)]
+        struct Mallinfo2 {
+            _arena: usize,
+            _ordblks: usize,
+            _smblks: usize,
+            _hblks: usize,
+            hblkhd: usize,
+            _usmblks: usize,
+            _fsmblks: usize,
+            uordblks: usize,
+            _fordblks: usize,
+            _keepcost: usize,
+        }
+        extern "C" {
+            fn mallinfo2() -> Mallinfo2;
+        }
+        let m = unsafe { mallinfo2() };
+        Some((m.uordblks + m.hblkhd) as u64)
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        all(target_os = "linux", target_env = "gnu")
+    )))]
+    {
+        None
+    }
+}
+
+/// Give the allocator's free pages back to the system after a burst of work.
+/// Never call on the UI thread: this walks the allocator's arenas or zones.
+pub fn release_free_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        unsafe { malloc_trim(0) };
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
     }
 }

@@ -4,7 +4,7 @@ use crate::recording_buffer::{CpuReservation, RecordingBudget, RecordingBuffer};
 use crate::{
     cx::Cx,
     draw_pass::DrawPassId,
-    draw_shader::{CxDrawShader, CxDrawShaderMapping, CxDrawShaderOptions, DrawShaderId},
+    draw_shader::{CxDrawShader, CxDrawShaderMapping, CxDrawShaderOptions, DrawShaderBlendOp, DrawShaderColorFormat, DrawShaderId},
     draw_vars::{
         DrawVars, DRAW_CALL_TEXTURE_SLOTS, DRAW_CALL_UNIFORM_BUFFER_SLOTS,
     },
@@ -820,6 +820,10 @@ struct RetirementBatches<P: Send + 'static> {
     initialized: bool,
     returned_tx: crate::makepad_network::mpsc::SyncSender<Box<RetirementBatch<P>>>,
     returned_rx: crate::makepad_network::mpsc::Receiver<Box<RetirementBatch<P>>>,
+    /// The disposal jobs on workers, each carrying one of the sixteen envelopes: kept, not
+    /// detached, so whoever must see the disposal done can join them. Finished ones go at the
+    /// next poll.
+    in_flight: Vec<crate::thread::TaskHandle<()>>,
 }
 impl<P: Send + 'static> RetirementBatches<P> {
     fn new() -> Self {
@@ -830,9 +834,28 @@ impl<P: Send + 'static> RetirementBatches<P> {
             initialized: false,
             returned_tx,
             returned_rx,
+            in_flight: Vec::new(),
+        }
+    }
+    /// Waits for the workers this owner gave work to: the envelopes being prepared and every
+    /// disposal job. A join blocks only off the UI thread, so a helper thread joins.
+    #[cfg(test)]
+    fn join_workers(&mut self) {
+        fn joined<T: Send + 'static>(job: crate::thread::TaskHandle<T>) -> Result<T, crate::thread::TaskError> {
+            std::thread::spawn(move || job.join()).join().unwrap()
+        }
+        if let Some(job) = self.preparing.take() {
+            if let Ok(available) = joined(job) {
+                self.available = available;
+                self.initialized = true;
+            }
+        }
+        for job in std::mem::take(&mut self.in_flight) {
+            joined(job).unwrap();
         }
     }
     fn poll(&mut self, pool: &crate::thread::TaskPool) -> bool {
+        self.in_flight.retain(|job| !job.is_finished());
         if let Some(result) = self
             .preparing
             .as_mut()
@@ -927,6 +950,13 @@ impl CxDrawListPool {
         mut take_backend: impl FnMut(&mut CxDrawItem) -> P,
     ) -> bool {
         self.retire_free_items_with_ids(pool, frame, |_, _, os| take_backend(os))
+    }
+    /// Waits for the workers that retirement with backend payload `P` gave work to.
+    #[cfg(test)]
+    fn join_retirement_workers<P: Send + 'static>(&mut self) {
+        if let Some(batches) = self.4.get_mut(&std::any::TypeId::of::<P>()).and_then(|b| b.downcast_mut::<RetirementBatches<P>>()) {
+            batches.join_workers();
+        }
     }
     /// The HAL keeps backend allocations outside each draw item.
     /// Give it the exact physical item being retired, under the same reserved
@@ -1055,7 +1085,7 @@ impl CxDrawListPool {
                 let _ = returned.try_send(batch);
                 counter.fetch_sub(1, Ordering::AcqRel);
                 crate::thread::SignalToUI::set_internal_signal();
-            }) { handle.detach(); }
+            }) { batches.in_flight.push(handle); }
         }
         // Settlement includes rotating scans and completion/metadata debt,
         // not just the queue of freed CPU publications. Otherwise a view can
@@ -1389,8 +1419,12 @@ impl std::ops::IndexMut<DrawListId> for CxDrawListPool {
 pub struct DrawCallUniforms {
     #[live]
     pub zbias: f32,
+    /// 1: the call writes premultiplied colour (it blends over, `alpha_blend`); 0: its colour as
+    /// it is (no blending, a raw or max-blend shader; in an MSAA pass its alpha is coverage).
+    /// What a linear-light pass's output epilogue undoes before it decodes
+    /// (`DrawPassUniforms::linear_light`).
     #[live]
-    pub pad1: f32,
+    pub premultiplied: f32,
     #[live]
     pub pad2: f32,
     #[live]
@@ -1399,12 +1433,24 @@ pub struct DrawCallUniforms {
 
 crate::makepad_math::impl_gpu_pod!(DrawCallUniforms,
     zbias: f32,
-    pad1: f32,
+    premultiplied: f32,
     pad2: f32,
     pad3: f32,
 );
 
 impl DrawCallUniforms {
+    /// A call's block: its zbias comes with its paint order; `premultiplied` from how it blends.
+    pub fn for_call(mapping: &CxDrawShaderMapping, options: &CxDrawShaderOptions) -> Self {
+        let raw = matches!(mapping.color_format, DrawShaderColorFormat::Bgra8NoBlend | DrawShaderColorFormat::Rf16 | DrawShaderColorFormat::Ru8);
+        // The declared rule, which every backend applies to an 8-bit or RGBA16F target, except
+        // one edge: Metal blends only a shader that declares the default BGRA8 colour format, so a
+        // shader declaring a float format with `alpha_blend` on would decode as blended there
+        // while it writes raw. No shader is declared that way (the float-declared ones turn
+        // `alpha_blend` off).
+        let over = options.alpha_blend && !raw && mapping.blend_op == DrawShaderBlendOp::Over;
+        Self { premultiplied: if over { 1.0 } else { 0.0 }, ..Self::default() }
+    }
+
     // The array length is in f32 elements, not bytes, hence the >> 2.
     pub fn as_slice(&self) -> &[f32; std::mem::size_of::<DrawCallUniforms>() >> 2] {
         crate::makepad_math::bytemuck::cast_ref(self)
@@ -1787,7 +1833,7 @@ impl CxDrawCall {
         self.append_group_id = draw_vars.append_group_id;
         self.draw_shader_id = draw_vars.draw_shader_id.unwrap();
         self.total_instance_slots = mapping.instances.total_slots;
-        self.draw_call_uniforms = DrawCallUniforms::default();
+        self.draw_call_uniforms = DrawCallUniforms::for_call(mapping, &draw_vars.options);
         sized_dyn_uniforms(&mut self.dyn_uniforms, &draw_vars.dyn_uniforms, mapping.dyn_uniforms.total_slots);
         self.texture_slots.clone_from(&draw_vars.texture_slots);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1813,7 +1859,7 @@ impl CxDrawCall {
             append_group_id: draw_vars.append_group_id,
             draw_shader_id: draw_vars.draw_shader_id.unwrap(),
             total_instance_slots: mapping.instances.total_slots,
-            draw_call_uniforms: DrawCallUniforms::default(),
+            draw_call_uniforms: DrawCallUniforms::for_call(mapping, &draw_vars.options),
             dyn_uniforms: {
                 let mut u = Vec::new();
                 sized_dyn_uniforms(&mut u, &draw_vars.dyn_uniforms, mapping.dyn_uniforms.total_slots);
@@ -3420,7 +3466,7 @@ mod uniform_generation_tests {
         cx.draw_lists.1.copied(12, 12, std::time::Duration::ZERO);
         for frame in 0..20 {
             cx.draw_lists.retire_free_items(&pool, frame, |_| ());
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            cx.draw_lists.join_retirement_workers::<()>();
         }
         assert_eq!(cx.draw_lists.1.recordings.bytes(), bytes);
         let item = &mut cx.draw_lists[list.id()].draw_items[0];
@@ -3429,9 +3475,12 @@ mod uniform_generation_tests {
         item.retained_instance_id = publication.id();
         cx.draw_lists[list.id()].draw_items.record_consumption(0, 12);
         cx.draw_lists.1.copied(12, 12, std::time::Duration::ZERO);
-        for frame in 20..120 {
-            if !cx.draw_lists.retire_free_items(&pool, frame, |_| ()) { break; }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        // Each frame that leaves work pending gave it to workers: join them, then the next frame.
+        // (Bounded frames of sleep lost to a loaded box: the disposal job had not run yet.)
+        let mut frame = 20;
+        while cx.draw_lists.retire_free_items(&pool, frame, |_| ()) {
+            cx.draw_lists.join_retirement_workers::<()>();
+            frame += 1;
         }
         assert!(!cx.draw_lists.has_pending_instance_retirements());
         assert_eq!(cx.draw_lists.1.recordings.bytes(), 0, "storage actually freed, not just uncharged");

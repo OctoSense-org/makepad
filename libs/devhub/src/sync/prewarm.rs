@@ -117,6 +117,16 @@ mod board_tests {
     }
 }
 
+/// The leader (pid and process group) of this node's running pre-warm step, 0 while none runs:
+/// what runs under it is named the hub's pre-warm (`top`, a timed run's look at its box), not just
+/// `makepad run` of no lease (11-10).
+static STEP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The leader of the running pre-warm step ([`STEP`]).
+pub fn step_leader() -> Option<u32> {
+    Some(STEP.load(std::sync::atomic::Ordering::Acquire)).filter(|p| *p != 0)
+}
+
 #[cfg(feature = "checkout")]
 pub use node::*;
 
@@ -173,7 +183,7 @@ mod node {
             args.push(pkg);
             args.extend(extra.iter().copied());
             args.extend(["--", "--remote"]);
-            env.extend([("MAKEPAD_HIDE_WINDOWS", "1"), ("SANDBOX_MUTE", "1")].iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            env.extend([("MAKEPAD_HIDE_WINDOWS", "1"), ("MAKEPAD_MUTE", "1")].iter().map(|(k, v)| (k.to_string(), v.to_string())));
             steps.push(Step { app: id.to_string(), what: "present", program: cargo.clone(), dir, argv: jit(root, &args), env, report: Some(report) });
         }
         steps
@@ -276,6 +286,15 @@ mod node {
         }
         let (mut child, hold) = crate::os::lease_spawn(&mut cmd, None).map_err(|e| format!("{} {}: {e}", step.app, step.what))?;
         let pid = child.id();
+        // named the pre-warm's while it runs, whichever way the step ends
+        struct Named;
+        impl Drop for Named {
+            fn drop(&mut self) {
+                super::STEP.store(0, Ordering::Release);
+            }
+        }
+        super::STEP.store(pid, Ordering::Release);
+        let _named = Named;
         let t0 = Instant::now();
         let stop = |child: &mut std::process::Child| {
             // what it started ends by this stop, not by a crash: said before the TERM, while
@@ -449,7 +468,7 @@ mod node {
             assert_eq!(steps[0].dir, root.join("apps/commercial"));
             let calc = steps.last().unwrap();
             assert_eq!(calc.argv[head.len()..], ["run", "--report-to", &report, "makepad-app-calculator", "--no-default-features", "--features", "standalone", "--", "--remote"]);
-            assert!(calc.env.contains(&("MAKEPAD_HIDE_WINDOWS".into(), "1".into())) && calc.env.contains(&("SANDBOX_MUTE".into(), "1".into())));
+            assert!(calc.env.contains(&("MAKEPAD_HIDE_WINDOWS".into(), "1".into())) && calc.env.contains(&("MAKEPAD_MUTE".into(), "1".into())));
         }
 
         /// A present step's JIT, stopped once it presented, ended by that stop: the node's crash

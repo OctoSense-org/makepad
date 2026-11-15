@@ -254,13 +254,15 @@ pub(super) fn button(code: u32) -> u32 {
         0x110 | 1 => 1,
         0x111 | 3 => 2,
         0x112 | 2 => 4,
-        0x113 | 8 => 8,
-        0x114 | 9 => 16,
+        // most mice send their back/forward thumb buttons as BTN_SIDE/BTN_EXTRA (X11 buttons 8/9),
+        // but some send BTN_BACK (0x116)/BTN_FORWARD (0x115)
+        0x113 | 0x116 | 8 => 8,
+        0x114 | 0x115 | 9 => 16,
         _ => 0,
     }
 }
 
-pub(super) fn cursor_name(cursor: u32) -> &'static CStr {
+fn cursor_name(cursor: u32) -> &'static CStr {
     match cursor {
         2 => c"crosshair",
         3 => c"pointer",
@@ -289,6 +291,16 @@ pub(super) fn cursor_name(cursor: u32) -> &'static CStr {
     }
 }
 
+pub(super) fn cursor_names(cursor: u32) -> impl Iterator<Item = &'static CStr> {
+    // `closedhand` is the Qt/KDE name; `fleur` is a core X cursor, so on X11 it always loads.
+    let fallbacks: &[&CStr] = if cursor == crate::types::cursor::GRABBING {
+        &[c"closedhand", c"fleur"]
+    } else {
+        &[]
+    };
+    std::iter::once(cursor_name(cursor)).chain(fallbacks.iter().copied())
+}
+
 pub(super) const TEXT_MIMES: [&str; 4] = [
     "text/plain;charset=utf-8",
     "UTF8_STRING",
@@ -297,6 +309,8 @@ pub(super) const TEXT_MIMES: [&str; 4] = [
 ];
 pub(super) const URI_MIME: &str = "text/uri-list";
 pub(super) const PNG_MIME: &str = "image/png";
+pub(super) const HTML_MIME: &str = "text/html";
+pub(super) const MARKDOWN_MIME: &str = "text/markdown";
 
 pub(super) fn decode_clipboard(content: &mut ClipboardData, mime: &str, bytes: Vec<u8>) {
     if mime == PNG_MIME {
@@ -307,8 +321,13 @@ pub(super) fn decode_clipboard(content: &mut ClipboardData, mime: &str, bytes: V
                 content.files.push((uri.to_string(), path));
             }
         }
-    } else if TEXT_MIMES.contains(&mime) {
-        content.text = String::from_utf8_lossy(&bytes)
+    } else if TEXT_MIMES.contains(&mime) || mime == HTML_MIME || mime == MARKDOWN_MIME {
+        let text = match mime {
+            HTML_MIME => &mut content.html,
+            MARKDOWN_MIME => &mut content.markdown,
+            _ => &mut content.text,
+        };
+        *text = String::from_utf8_lossy(&bytes)
             .trim_end_matches('\0')
             .to_string();
     }

@@ -40,16 +40,16 @@ impl Fcx<'_> {
                     let mac = self.ast().row(row);
                     if mac.args != NO_MAC_ARGS {
                         let args = self.ast().mac_arg(mac.args);
-                        if args.pat.is_some_and(|pat| self.has_explicit_mut_ref(pat)) { roots.push(self.ast().list(args.exprs)[0]); }
-                        if let Some(asm) = args.asm {
-                            for op in self.ast().list(asm.ops) { if let Some(out) = op.output { roots.push(out); } }
+                        if args.pat.get().is_some_and(|pat| self.has_explicit_mut_ref(pat)) { roots.push(self.ast().list(args.exprs)[0]); }
+                        if let Some(asm) = args.asm.get() {
+                            for op in self.ast().list(asm.ops) { if let Some(out) = op.output.get() { roots.push(out); } }
                         }
                     }
                 }
                 _ => {}
             }
             match kind {
-                ExprKind::Block(block, _) | ExprKind::Unsafe(block) | ExprKind::Async(_, block)
+                ExprKind::Block(block, _) | ExprKind::Unsafe(block) | ExprKind::TryBlock(block) | ExprKind::Async(_, block)
                 | ExprKind::ConstBlock(block) | ExprKind::Loop(block, _) | ExprKind::If(_, block, _) => { blocks.insert(block.0); }
                 ExprKind::While(row) => { blocks.insert(self.ast().row(row).body.0); }
                 ExprKind::For(row) => { blocks.insert(self.ast().row(row).body.0); }
@@ -78,28 +78,34 @@ impl Fcx<'_> {
             for stmt in self.ast().stmts(block) {
                 if let Stmt::Let(row) = *stmt {
                     let decl = self.ast().row(row);
-                    if let Some(init) = decl.init { if self.has_explicit_mut_ref(decl.pat) { roots.push(init); } }
-                    if let Some(els) = decl.else_ { if blocks.insert(els.0) { pending.push(els); } }
+                    if let Some(init) = decl.init.get() { if self.has_explicit_mut_ref(decl.pat) { roots.push(init); } }
+                    if let Some(els) = decl.else_.get() { if blocks.insert(els.0) { pending.push(els); } }
                 }
             }
         }
         roots.sort_unstable_by_key(|expr| expr.0);
         roots.dedup();
         for root in roots { self.convert_place_to_mutable(root, false); }
-        for (call, recv, derefs) in receivers {
-            self.last_lo = self.ast().expr(call).lo;
-            let inside_union = self.convert_place_to_mutable(recv, false);
-            // the receiver's own autoderef steps live on the call node
-            for step in 0..derefs { self.convert_deref_step(call.0, false, step, inside_union); }
-        }
+        for (call, recv, derefs) in receivers { self.convert_call_receiver_to_mutable(call, recv, derefs); }
+    }
+
+    /// The receiver `recv` of a method or call `call` that borrows it mutably, with its `derefs`
+    /// autoderef steps: also for a closure call whose kind is known only after this pass ran
+    /// (call.rs DeferredCallResolution).
+    pub(super) fn convert_call_receiver_to_mutable(&mut self, call: ExprId, recv: ExprId, derefs: usize) {
+        if !self.keep_user_types || !self.b.errors.is_empty() { return; }
+        self.last_lo = self.ast().expr(call).lo;
+        let inside_union = self.convert_place_to_mutable(recv, false);
+        // the receiver's own autoderef steps live on the call node
+        for step in 0..derefs { self.convert_deref_step(call.0, false, step, inside_union); }
     }
 
     /// has a binding `ref mut x` (explicit: the implicit ones sit behind a reference).
     fn has_explicit_mut_ref(&self, pat: PatId) -> bool {
         match *self.ast().pat(pat) {
-            Pat::Ident { by_ref, mutbl, sub, .. } => by_ref && mutbl || sub.is_some_and(|pat| self.has_explicit_mut_ref(pat)),
+            Pat::Ident { by_ref, mutbl, sub, .. } => by_ref && mutbl || sub.get().is_some_and(|pat| self.has_explicit_mut_ref(pat)),
             Pat::Tuple(pats) | Pat::TupleStruct(_, pats) | Pat::Slice(pats) | Pat::Or(pats) => self.ast().list(pats).iter().any(|&pat| self.has_explicit_mut_ref(pat)),
-            Pat::Struct(_, fields, _) => self.ast().list(fields).iter().any(|field| self.has_explicit_mut_ref(field.pat)),
+            Pat::Struct(_, _, fields) => self.ast().list(fields).iter().any(|field| self.has_explicit_mut_ref(field.pat)),
             Pat::Ref(_, pat) | Pat::Paren(pat) | Pat::Box(pat) => self.has_explicit_mut_ref(pat),
             Pat::Wild | Pat::Rest | Pat::Lit(_) | Pat::Range(..) | Pat::Path(_) | Pat::Mac(_) => false,
         }

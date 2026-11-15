@@ -437,6 +437,15 @@ fn mark_live(base: &Path, file: &Path, stamp: bool) {
     }
 }
 
+/// Stamps the store at `path` (its generation 0 path, as `live` lists it) used by this run, as
+/// opening it would (mark_live), without reading it: a run that relies on what an earlier run
+/// read from it keeps it in use (check_reuse.rs Early).
+pub fn stamp_used(path: &Path) {
+    let base = base_path(path);
+    let file = current(&base);
+    if file.exists() { mark_live(&base, &file, true); }
+}
+
 /// The generation files this process opened (a stale generation it still reads is not deleted).
 static OPEN_FILES: relax_session::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = relax_session::sync::Mutex::new(None);
 
@@ -482,8 +491,11 @@ pub fn base_path(p: &Path) -> PathBuf {
 /// Highest generation seen per store (generation 0 path), and the folders listed for it.
 static GENS: relax_session::sync::Mutex<Option<(std::collections::HashMap<PathBuf, u32>, std::collections::HashSet<PathBuf>)>> = relax_session::sync::Mutex::new(None);
 
-/// Lists `dir` into GENS (each store's highest generation present).
+/// Lists `dir` into GENS (each store's highest generation present), in place of what was known of
+/// it: a generation deleted since (a cleared cache, a folder removed and made again) is gone from
+/// GENS too, so the store's next write is its lowest free generation, not one above the deleted.
 fn list_gens(dir: &Path, gens: &mut std::collections::HashMap<PathBuf, u32>) {
+    gens.retain(|k, _| k.parent() != Some(dir));
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = e.file_name();
         let Some(n) = n.to_str() else { continue };
@@ -777,14 +789,53 @@ pub fn append<T: Entry>(path: &Path, entries: Vec<T>, drop_all: bool) -> std::io
 /// `append`; `ordered`: with the write barrier before its commit (else as an exit commits).
 fn append_as<T: Entry>(path: &Path, entries: Vec<T>, drop_all: bool, ordered: bool) -> std::io::Result<()> {
     let base = base_path(path);
-    let r = append_inner(&base, entries, drop_all, ordered);
+    let r = append_inner(&base, entries, drop_all, ordered, None).map(|_| ());
     if r.is_ok() {
         mark_live(&base, &base, false);
     }
     r
 }
 
-fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, ordered: bool) -> std::io::Result<()> {
+/// The merge of a store's ledger under its lock (append_ledgered): its key, and what makes the
+/// ledger entry written with a batch from the one on disk (None: the batch is not written).
+pub type LedgerMerge<'a, T> = (u128, &'a mut dyn FnMut(Option<&[u8]>) -> Option<T>);
+
+/// `append` for a store whose ledger (the entry under `ledger_key`) is merged under the store's lock,
+/// so two processes never write a batch over a ledger they did not check (the shared code stores of
+/// Target B): `merge` gets the ledger payload on disk now (None: no store, or no ledger in it) and
+/// gives the ledger entry to commit with `entries`, or None: nothing is written and `entries` come
+/// back (Ok(Some)). Such a store is never replaced whole on a stale finding.
+pub fn append_ledgered<T: Entry>(path: &Path, entries: Vec<T>, ledger_key: u128, merge: &mut dyn FnMut(Option<&[u8]>) -> Option<T>) -> std::io::Result<Option<Vec<T>>> {
+    let base = base_path(path);
+    let r = append_inner(&base, entries, false, ordered(), Some((ledger_key, merge)));
+    if matches!(r, Ok(None)) {
+        mark_live(&base, &base, false);
+    }
+    r
+}
+
+/// The batch with the merged ledger entry in place of any it held, in key order; None: the merge
+/// refused it.
+fn with_ledger<T: Entry>(mut entries: Vec<T>, merge: &mut Option<LedgerMerge<'_, T>>, disk: Option<&[u8]>) -> Result<Vec<T>, Vec<T>> {
+    let Some((key, f)) = merge.as_mut() else { return Ok(entries) };
+    let Some(ledger) = f(disk) else { return Err(entries) };
+    let key = *key;
+    entries.retain(|e| e.key() != key);
+    entries.push(ledger);
+    entries.sort_by_key(|a| a.key());
+    Ok(entries)
+}
+
+/// Entry `e`'s payload read from the locked store file, its checksum verified; None: it does not match.
+fn read_payload(f: &mut std::fs::File, e: &Ix) -> std::io::Result<Option<Vec<u8>>> {
+    let mut b = vec![0u8; e.len as usize];
+    f.seek(SeekFrom::Start(e.off))?;
+    f.read_exact(&mut b)?;
+    Ok((sum64(&b) == e.sum).then_some(b))
+}
+
+/// Ok(None): written; Ok(Some): the ledger merge refused the batch, which comes back unwritten.
+fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, ordered: bool, mut merge: Option<LedgerMerge<'_, T>>) -> std::io::Result<Option<Vec<T>>> {
     // newest first within this batch: a stable sort keeps the first of equal keys
     entries.sort_by_key(|a| a.key());
     entries.dedup_by(|b, a| a.key() == b.key());
@@ -798,7 +849,10 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
         let (g, path) = current_gen(base);
         let f = match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(f) => f,
-            Err(_) => return rewrite(base, dir, Vec::new(), None, entries, ordered),
+            Err(_) => {
+                let entries = match with_ledger(entries, &mut merge, None) { Ok(e) => e, Err(e) => return Ok(Some(e)) };
+                return rewrite(base, dir, Vec::new(), None, entries, ordered).map(|_| None);
+            }
         };
         f.lock()?;
         if !gen_path(base, g + 1).exists() {
@@ -818,13 +872,34 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
         // not all reach the disk (they are written over)
         Ok(usable_slot(&mut f, &h, len).map(|(k, ix)| (h, k, ix)))
     })()?;
+    // a merged ledger: the one on disk now, under the lock (a payload that fails its checksum
+    // refuses the batch: the merge would drop what it held)
+    let entries = if merge.is_some() {
+        let lk = merge.as_ref().map_or(0, |m| m.0);
+        let disk = match &r {
+            Some((_, _, old)) => match old.iter().find(|e| { let k = e.key; k == lk }) {
+                Some(e) => match read_payload(&mut f, e)? {
+                    Some(b) => Some(b),
+                    None => { let _ = f.unlock(); return Ok(Some(entries)); }
+                },
+                None => None,
+            },
+            None => None,
+        };
+        match with_ledger(entries, &mut merge, disk.as_deref()) {
+            Ok(e) => e,
+            Err(e) => { let _ = f.unlock(); return Ok(Some(e)); }
+        }
+    } else {
+        entries
+    };
     let (h, k, mut old) = match r {
         Some(x) if !drop_all => x,
         // unreadable or stale: replaced whole
         _ => {
             let res = rewrite(path, dir, Vec::new(), None, entries, ordered);
             let _ = f.unlock();
-            return res;
+            return res.map(|_| None);
         }
     };
     let Slot { end, tail, .. } = h.slots[k as usize];
@@ -835,7 +910,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     if merged_n as u64 > h.cap as u64 {
         let res = rewrite(path, dir, old, Some(&f), entries, ordered);
         let _ = f.unlock();
-        return res;
+        return res.map(|_| None);
     }
     // A bounded buffer coalesces small fields; large code/image slices go straight to disk.
     let mut off = end;
@@ -854,7 +929,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     if dead * 4 > live && dead > 1 << 20 {
         let res = rewrite::<T>(path, dir, ix, Some(&f), Vec::new(), ordered);
         let _ = f.unlock();
-        return res;
+        return res.map(|_| None);
     }
     crate::memstat::print_tag("cache append", crate::memstat::Tag::CacheStore);
     let ib = encode_index(&ix);
@@ -872,18 +947,18 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool, orde
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&nh.bytes())?;
     let _ = f.unlock();
-    Ok(())
+    Ok(None)
 }
 
-/// MAKEPAD_RUN_PROFILE is set: the load timeline's spans for the image writes.
+/// RELAX_PROFILE is set: the load timeline's spans for the image writes.
 pub fn profiling() -> bool {
     static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *P.get_or_init(|| std::env::var_os("MAKEPAD_RUN_PROFILE").is_some())
+    *P.get_or_init(|| std::env::var_os("RELAX_PROFILE").is_some())
 }
 
 /// Makes the bytes written to `f` so far reach the disk before anything written after: an
 /// ordering barrier, not a durability flush. macOS: `F_BARRIERFSYNC` -- std's `sync_data` is
-/// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a cold Stage launch made ~3.7k
+/// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a large app's cold launch made ~3.7k
 /// of them); elsewhere (and where the barrier is refused) `sync_data`.
 fn order_writes(f: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_vendor = "apple")]
@@ -1208,6 +1283,41 @@ pub fn build_of(p: &Path) -> Option<u64> {
     r
 }
 
+/// The flights this process leads: (crate set, its lock file, the open lock).
+static FLIGHTS: std::sync::Mutex<Vec<(u128, PathBuf, std::fs::File)>> = std::sync::Mutex::new(Vec::new());
+
+/// A first load of crate set `identity` with the stores of `dir` (none of its graphs is
+/// stored): one run at a time makes it. The run that finds `<dir>/flight/<32 hex>` free leads:
+/// it holds the file locked until it has recorded the set ([`flight_landed`]) or exits (the OS
+/// drops the lock with the process, also on a crash). A run that finds it held waits for that,
+/// as long as the leader takes, and returns true: the leader's stores are there to restore from,
+/// where two runs started together each parsed and recorded the same crates (a leader that ended
+/// without recording leaves nothing to restore: the follower then loads on its own). false: this
+/// run leads (or no lock file can be made: it loads on its own).
+pub fn flight(dir: &Path, identity: u128) -> bool {
+    // a set this process leads already: no wait on itself
+    if FLIGHTS.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(id, ..)| *id == identity) { return false; }
+    let folder = dir.join("flight");
+    if std::fs::create_dir_all(&folder).is_err() { return false; }
+    let path = folder.join(format!("{identity:032x}"));
+    let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path) else { return false };
+    if f.try_lock().is_ok() {
+        // the file went between the open and the lock: its leader landed
+        if !still_at(&f, &path) { return true; }
+        FLIGHTS.lock().unwrap_or_else(|e| e.into_inner()).push((identity, path, f));
+        return false;
+    }
+    f.lock().is_ok()
+}
+
+/// This process recorded what its flights were for (or will not): their followers go on.
+pub fn flight_landed() {
+    for (_, path, f) in FLIGHTS.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        let _ = std::fs::remove_file(&path);
+        let _ = f.unlock();
+    }
+}
+
 /// Which builds run: every process holds a shared lock on `<cache dir>/live/<build hex>` from
 /// the first store it touches in that folder until it exits (the OS drops the lock with the
 /// process, also on a crash). retire_build takes a build's lock exclusively, so no process of
@@ -1378,6 +1488,26 @@ mod tests {
         let d = std::env::temp_dir().join(format!("rcs-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    /// A first load is led by one run: its flight file stays locked until the leader has recorded
+    /// the set (what another run's lock waits for), the leader does not wait on itself, and a
+    /// landing leaves no file, so the next run leads.
+    #[test]
+    fn a_flight_is_held_by_its_leader_until_it_lands() {
+        let d = tmpdir("flight");
+        let identity = 0x00f1_1957_u128 << 64 | std::process::id() as u128;
+        let file = d.join("flight").join(format!("{identity:032x}"));
+        assert!(!flight(&d, identity), "the first run leads");
+        let other = std::fs::OpenOptions::new().read(true).write(true).open(&file).unwrap();
+        assert!(other.try_lock().is_err(), "another run finds it held, and waits");
+        assert!(!flight(&d, identity), "the leader does not wait on itself");
+        flight_landed();
+        assert!(other.try_lock().is_ok(), "landed: the waiting run goes on");
+        assert!(!file.exists(), "a landed flight leaves no file");
+        assert!(!flight(&d, identity), "a run after the landing leads again");
+        flight_landed();
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

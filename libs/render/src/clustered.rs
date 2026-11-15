@@ -133,8 +133,6 @@ pub struct ClusteredLights {
     texture_height: usize,
     light_texel: usize,
     stats: ClusterStats,
-    last_overflow: (usize, usize),
-    last_overflow_log: f64,
     /// The texture holds an empty grid (no light in any cluster): a frame
     /// with no lights again has nothing new to pack or upload.
     uploaded_empty: bool,
@@ -175,8 +173,6 @@ impl Default for ClusteredLights {
             texture_height: 0,
             light_texel: 0,
             stats: ClusterStats::default(),
-            last_overflow: (0, 0),
-            last_overflow_log: -1.0,
             uploaded_empty: false,
             lin_ctl: [0.0, 1.0, 1.0, 1.0],
             fog_ctl: [0.0; 4],
@@ -190,10 +186,18 @@ impl Default for ClusteredLights {
 
 impl ClusteredLights {
     pub(crate) fn gi_light_ids(&self,center:Vec3f)->[f32;8] {
-        let mut ranked:Vec<_>=self.lights.iter().enumerate().filter(|(i,_)|self.shadows.records.get(*i).map_or(false,|r|r.count>0))
-            .map(|(i,l)|(l.color.x.max(l.color.y).max(l.color.z)/(1.0+(l.pos-center).length()),i)).collect();
-        ranked.sort_by(|a,b|b.0.total_cmp(&a.0));let mut out=[-1.0;8];
-        for (slot,(_,i)) in ranked.into_iter().take(8).enumerate(){out[slot]=i as f32;}out
+        // Stable top eight, matching the old descending stable sort without
+        // allocating or sorting all lights on every GI frame.
+        let mut ranked = [(f32::NEG_INFINITY, -1.0); 8];
+        for (i, l) in self.lights.iter().enumerate() {
+            if !self.shadows.records.get(i).is_some_and(|r| r.count > 0) { continue; }
+            let score = l.color.x.max(l.color.y).max(l.color.z) / (1.0 + (l.pos-center).length());
+            if let Some(slot) = ranked.iter().position(|&(s, id)| id < 0.0 || score.total_cmp(&s).is_gt()) {
+                ranked.copy_within(slot..7, slot+1);
+                ranked[slot] = (score, i as f32);
+            }
+        }
+        ranked.map(|(_, id)| id)
     }
     pub(crate) fn parent_shadows(&self,cx:&mut Cx,parent:DrawPassId){self.shadows.parent_to(cx,parent);}
     pub fn set_config(&mut self, config: ClusterConfig) {
@@ -291,13 +295,31 @@ impl ClusteredLights {
         let c = self.config;
         self.stats = ClusterStats::default();
         self.lights.clear();
-        // Deterministic global cap. Report it; never let generated content
-        // turn the per-frame upload or shader loop into an unbounded task.
+        let view = view
+            .filter(|(v, p)| v.v.iter().chain(p.v.iter()).all(|x| x.is_finite()))
+            .filter(|(_, p)| p.v[0].abs() > 1.0e-6 && p.v[5].abs() > 1.0e-6);
         for light in lights {
-            if valid_light(light) && self.lights.len() < c.max_lights {
+            if valid_light(light) {
                 self.lights.push(light.clone());
             } else {
                 self.stats.rejected_lights += 1;
+            }
+        }
+        if self.stats.rejected_lights > 0 && first_report(live_id!(clustered_invalid_lights).0) {
+            log!("clustered lighting: {} invalid lights omitted", self.stats.rejected_lights);
+        }
+        // Below the GPU bound no ranking or reordering is needed. Only an
+        // overflowing frame pays linear partial selection over valid lights.
+        if self.lights.len() > c.max_lights {
+            let omitted = self.lights.len() - c.max_lights;
+            let eye = view.map(|(v, _)| v.invert().transform_vec4(vec4(0.0, 0.0, 0.0, 1.0)).to_vec3f());
+            self.lights.select_nth_unstable_by(c.max_lights, |a, b| {
+                b.view_contribution(eye).total_cmp(&a.view_contribution(eye))
+            });
+            self.lights.truncate(c.max_lights);
+            self.stats.rejected_lights += omitted;
+            if first_report(live_id!(clustered_frame_light_budget).0) {
+                log!("{omitted} lights over the {}-light frame budget: the {} that count most for this view are drawn", c.max_lights, c.max_lights);
             }
         }
         self.stats.lights = self.lights.len();
@@ -307,9 +329,6 @@ impl ClusteredLights {
         self.indices.resize(c.count() * c.lights_per_cluster, 0);
         self.scores.resize(self.indices.len(), 0.0);
 
-        let view = view
-            .filter(|(v, p)| v.v.iter().chain(p.v.iter()).all(|x| x.is_finite()))
-            .filter(|(_, p)| p.v[0].abs() > 1.0e-6 && p.v[5].abs() > 1.0e-6);
         self.world_grid = view.is_none();
         self.stats.world_grid = self.world_grid;
         let mut box_bounds = Bounds::default();
@@ -508,6 +527,9 @@ impl ClusteredLights {
                 }
             }
         }
+        if self.stats.overflow_references > 0 && first_report(live_id!(clustered_cell_light_budget).0) {
+            log!("clustered lighting: {} light references over the {}-light cluster budget; the strongest contributions in each cluster are drawn", self.stats.overflow_references, c.lights_per_cluster);
+        }
         self.stats.occupied_clusters = self.counts.iter().filter(|&&n| n > 0).count();
         self.stats.references = self.counts.iter().sum();
         self.stats.max_lights_in_cluster = self.counts.iter().copied().max().unwrap_or(0);
@@ -608,16 +630,6 @@ impl ClusteredLights {
                 .put_back_vec_f32(cx, data, None);
         }
         self.stats.build_us = ((Cx::monotonic_now() - start) * 1_000_000.0) as u64;
-        let overflow = (self.stats.overflow_references, self.stats.rejected_lights);
-        if overflow != self.last_overflow && start - self.last_overflow_log >= 1.0 {
-            log!(
-                "clustered lighting: {} overflow references, {} rejected/capped lights",
-                overflow.0,
-                overflow.1
-            );
-            self.last_overflow = overflow;
-            self.last_overflow_log = start;
-        }
         self.stats
     }
 
@@ -937,7 +949,7 @@ script_mod! {
         mat_light: fn(radiance: vec3, l: vec3, n: vec3, v: vec3, brdf: vec3) -> vec3 {
             return radiance*brdf
         }
-        cluster_lights: fn(wp: vec3, normal: vec3, eye: vec3, albedo: vec3, roughness: float, metallic: float, pbr: float) -> vec3 {
+        cluster_lights_f0: fn(wp: vec3, normal: vec3, eye: vec3, albedo: vec3, roughness: float, metallic: float, pbr: float, f0: vec3) -> vec3 {
             if self.cluster_on < 0.5 { return vec3(0.0,0.0,0.0) }
             let p=vec4(wp.x,wp.y,wp.z,1.0)
             let w=dot(self.cluster_w,p)
@@ -964,9 +976,8 @@ script_mod! {
             // The BRDF's per-pixel half, hoisted out of the light loop.
             let view=normalize(eye-wp)
             let ndv=max(dot(n,view),0.0001)
-            let rough=clamp(roughness,0.045,1.0)
+            let rough=clamp(roughness,0.03,1.0)
             let metal=clamp(metallic,0.0,1.0)
-            let f0=mix(vec3(0.04,0.04,0.04),albedo,metal)
             let a2=rough*rough*rough*rough
             let k=(rough+1.0)*(rough+1.0)*0.125
             let pa=vec4(ndv,k,ndv/max(ndv*(1.0-k)+k,0.0001),mix(1.0,3.14159265,self.lin_ctl.x))
@@ -989,6 +1000,11 @@ script_mod! {
                 i=i+1.0
             }
             return total
+        }
+        // Ordinary callers retain their original roughness floor and F0.
+        cluster_lights: fn(wp: vec3, normal: vec3, eye: vec3, albedo: vec3, roughness: float, metallic: float, pbr: float) -> vec3 {
+            let metal = clamp(metallic, 0.0, 1.0)
+            return self.cluster_lights_f0(wp, normal, eye, albedo, max(roughness, 0.045), metal, pbr, mix(vec3(0.04, 0.04, 0.04), albedo, metal))
         }
         cluster_sum: fn(wp: vec3, normal: vec3) -> vec3 {
             return self.cluster_lights(wp,normal,vec3(0.0,0.0,0.0),vec3(1.0,1.0,1.0),1.0,0.0,0.0)
@@ -1103,6 +1119,35 @@ mod tests {
         assert_eq!(c.stats.max_lights_in_cluster, 8);
         assert!(contains(&c, vec3f(0.0, 0.0, -8.0), 19));
     }
+    #[test]
+    fn frame_budget_keeps_the_strongest_lights_for_the_view() {
+        let eye = vec3f(100.0, 0.0, 0.0);
+        let mut view = Mat4f::identity();
+        view.v[12] = -eye.x;
+        let lights = [
+            LmLight::omni(vec3f(0.0, 0.0, -2.0), vec3f(1.0, 1.0, 1.0), 200.0),
+            LmLight::omni(eye + vec3f(0.0, 0.0, -2.0), vec3f(2.0, 2.0, 2.0), 0.1),
+            LmLight::omni(eye + vec3f(0.0, 0.0, -1.0), vec3f(1.0, 1.0, 1.0), 20.0),
+            LmLight::omni(eye + vec3f(0.0, 0.0, -3.0), vec3f(1.0, 1.0, 1.0), 20.0),
+            LmLight::omni(eye + vec3f(0.0, 0.0, -4.0), vec3f(1.0, 1.0, 1.0), 20.0),
+            LmLight::omni(eye + vec3f(0.0, 0.0, -10.0), vec3f(100.0, 100.0, 100.0), 20.0),
+        ];
+        let mut c = ClusteredLights::default();
+        c.set_config(ClusterConfig { tiles_x: 1, tiles_y: 1, slices: 2, max_lights: 4, ..Default::default() });
+        c.build(&lights, Some((view, camera().unwrap().1)));
+        assert_eq!(c.stats.rejected_lights, 2);
+        assert_eq!(c.lights.len(), 4);
+        for light in &lights[2..] {
+            assert!(c.lights.iter().any(|kept| kept.pos == light.pos), "near or bright light kept: {:?}", light.pos);
+        }
+        c.set_config(ClusterConfig { max_lights: 1, ..c.config() });
+        c.build(&lights, None);
+        assert_eq!(c.lights[0].color, lights[5].color, "without a view intensity wins");
+        c.set_config(ClusterConfig { max_lights: 6, ..c.config() });
+        c.build(&lights, camera());
+        assert_eq!(c.lights.iter().map(|l| l.pos).collect::<Vec<_>>(), lights.iter().map(|l| l.pos).collect::<Vec<_>>(), "under budget preserves input order");
+    }
+
     #[test]
     fn empty_frame_removes_old_lights_and_packed_references_are_valid() {
         let mut c = ClusteredLights::default();

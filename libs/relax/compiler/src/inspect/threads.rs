@@ -80,7 +80,9 @@ impl Raw {
     }
 }
 
-pub use imp::{list, regs_now, tid_of_handle};
+pub use imp::{each_thread, list, regs_now, tid_of_handle};
+#[cfg(any(target_os = "linux", all(target_os = "android", target_arch = "aarch64")))]
+pub(crate) use imp::capture_taken;
 
 thread_local! {
     static SELF_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -96,6 +98,22 @@ pub fn self_os_id() -> u64 {
             c.get()
         })
         .unwrap_or_else(|_| imp::self_os_id())
+}
+
+/// What thread `id` of this process has spent runnable, waiting for a core, in ns: Linux's
+/// schedstat run_delay (/proc/self/task/<id>/schedstat, its second field; one small file). 0 once
+/// it ended, and where the OS keeps no runnable time per thread (macOS, Windows).
+pub fn waited_ns(id: u64) -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{id}/schedstat")).unwrap_or_default();
+        stat.split_whitespace().nth(1).and_then(|ns| ns.parse().ok()).unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = id;
+        0
+    }
 }
 
 /// Captures thread `t`'s stack (see the module comment). Never the calling thread: a thread that
@@ -121,17 +139,24 @@ pub fn hold_paused(tid: u64) -> Result<&'static HoldSlot, &'static str> {
 }
 
 /// Holds thread `tid` in its handler for good (a thread with a frame in code that never runs
-/// again: stale.rs `park_held`); a blocked thread is signalled too (it never returns from the
-/// handler, so an interrupted system call never comes back to its caller). Linux.
+/// again: stale.rs `park_held`); a blocked thread is signalled too (it leaves the handler only at
+/// the run's end, `release_held_for_good`, when no code of the run runs any more). Linux.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn hold_for_good(tid: u64) -> Result<&'static HoldSlot, &'static str> {
     imp::hold(tid, imp::HOLD_FOREVER)
 }
 
-/// A pause's hold of a thread becomes a hold for good (`release_hold` is never called for it).
+/// A pause's hold of a thread becomes a hold for good (no resume releases it: the run's end does).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn keep_held(s: &HoldSlot) {
     imp::keep(s)
+}
+
+/// The run's end, once its code is gone: every thread held for good leaves its handler (it faults
+/// out of that code at its next instruction there). Returns how many. Linux.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn release_held_for_good() -> usize {
+    imp::release_forever()
 }
 
 /// Whether thread `tid` stands still in its handler now (held by a pause or for good). Linux.
@@ -280,14 +305,9 @@ mod imp {
             // the handle the rest of Relax names threads by comes from libpthread
             let os_id = ident(port).0;
             let handle = unsafe { pthread_from_mach_thread_np(port) } as u64;
-            // thread_extended_info: user/system ns, cpu usage, policy, run state, flags,
-            // interruptible, cur/base/max priority, name[64]
-            let mut ext = [0u32; 28];
-            let mut n = 28u32;
             let (mut name, mut state, mut cpu_ns) = (String::new(), "?", 0u64);
-            if unsafe { thread_info(port, THREAD_EXTENDED_INFO, ext.as_mut_ptr(), &mut n) } == 0 {
-                let w = |k: usize| (ext[2 * k] as u64) | ((ext[2 * k + 1] as u64) << 32);
-                cpu_ns = w(0) + w(1);
+            if let Some(ext) = extended(port) {
+                cpu_ns = ext_cpu_ns(&ext);
                 state = match ext[6] {
                     1 => "running",
                     2 => "stopped",
@@ -296,9 +316,7 @@ mod imp {
                     5 => "halted",
                     _ => "?",
                 };
-                let bytes: Vec<u8> = ext[12..28].iter().flat_map(|w| w.to_ne_bytes()).collect();
-                let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-                name = String::from_utf8_lossy(&bytes[..len]).into_owned();
+                name = ext_name(&ext);
             }
             let stack = if handle != 0 {
                 let hi = unsafe { pthread_get_stackaddr_np(handle as usize) } as u64;
@@ -311,6 +329,45 @@ mod imp {
         }
         unsafe { vm_deallocate(task(), ports as usize, count as usize * 4) };
         out
+    }
+
+    /// thread_extended_info: user/system ns, cpu usage, policy, run state, flags, interruptible,
+    /// cur/base/max priority, name[64]
+    fn extended(port: Port) -> Option<[u32; 28]> {
+        let mut ext = [0u32; 28];
+        let mut n = 28u32;
+        (unsafe { thread_info(port, THREAD_EXTENDED_INFO, ext.as_mut_ptr(), &mut n) } == 0).then_some(ext)
+    }
+
+    fn ext_cpu_ns(ext: &[u32; 28]) -> u64 {
+        let w = |k: usize| (ext[2 * k] as u64) | ((ext[2 * k + 1] as u64) << 32);
+        w(0) + w(1)
+    }
+
+    fn ext_name(ext: &[u32; 28]) -> String {
+        let bytes: Vec<u8> = ext[12..28].iter().flat_map(|w| w.to_ne_bytes()).collect();
+        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..len]).into_owned()
+    }
+
+    /// Each thread of the task now, cheaply (`instrument::runtime_cpu_ns` reads them on every look
+    /// a test takes): its Mach thread id, and on demand its name and its CPU (ns; None once it
+    /// ended), each one thread_info.
+    pub fn each_thread(mut f: impl FnMut(u64, &dyn Fn() -> String, &dyn Fn() -> Option<u64>)) {
+        let mut ports: *mut Port = std::ptr::null_mut();
+        let mut count = 0u32;
+        if unsafe { task_threads(task(), &mut ports, &mut count) } != 0 {
+            return;
+        }
+        for i in 0..count as usize {
+            let port = unsafe { *ports.add(i) };
+            let id = ident(port).0;
+            if id != 0 {
+                f(id, &|| extended(port).map_or_else(String::new, |e| ext_name(&e)), &|| extended(port).map(|e| ext_cpu_ns(&e)));
+            }
+            unsafe { mach_port_deallocate(task(), port) };
+        }
+        unsafe { vm_deallocate(task(), ports as usize, count as usize * 4) };
     }
 
     impl Drop for Thread {
@@ -510,6 +567,59 @@ mod imp {
         out
     }
 
+    /// Each thread of the process now, cheaply (`instrument::runtime_cpu_ns` reads them on every
+    /// look a test takes): its tid from one read of /proc/self/task, and on demand its name
+    /// (`comm`) and its CPU (its thread CPU clock, ns; None once it ended). `list` reads three
+    /// files per thread, and a thread's `syscall` file waits for the thread to come off its CPU:
+    /// on a loaded box a look cost the app's UI thread milliseconds. The directory stays open
+    /// (rewound for each look: no path walk) and its entries are read in place, nothing allocated
+    /// per thread.
+    pub fn each_thread(mut f: impl FnMut(u64, &dyn Fn() -> String, &dyn Fn() -> Option<u64>)) {
+        extern "C" {
+            fn opendir(path: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+            fn readdir64(dir: *mut std::ffi::c_void) -> *const u8;
+            fn rewinddir(dir: *mut std::ffi::c_void);
+        }
+        // the open stream (its address; 0 until the first look); its lock keeps one walk at a time on it
+        static DIR: relax_session::sync::Mutex<usize> = relax_session::sync::Mutex::new(0);
+        let mut dir = DIR.lock().unwrap_or_else(|e| e.into_inner());
+        if *dir == 0 {
+            *dir = unsafe { opendir(c"/proc/self/task".as_ptr()) } as usize;
+            if *dir == 0 {
+                return;
+            }
+        } else {
+            unsafe { rewinddir(*dir as *mut std::ffi::c_void) };
+        }
+        loop {
+            let e = unsafe { readdir64(*dir as *mut std::ffi::c_void) };
+            if e.is_null() {
+                break;
+            }
+            // dirent64: ino (8), off (8), reclen (2), type (1), then the name, NUL-terminated
+            let name = unsafe { std::ffi::CStr::from_ptr(e.add(19).cast()) }.to_bytes();
+            let Some(tid) = (!name.is_empty() && name.iter().all(u8::is_ascii_digit)).then(|| name.iter().fold(0u64, |t, &b| t * 10 + (b - b'0') as u64)) else { continue };
+            f(tid, &|| std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default().trim_end().to_string(), &|| thread_clock_ns(tid));
+        }
+    }
+
+    /// Thread `tid`'s CPU time in ns, read from its CPU clock (the kernel's
+    /// MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED), the clock pthread_getcpuclockid names): one call,
+    /// no file. None once it ended.
+    fn thread_clock_ns(tid: u64) -> Option<u64> {
+        #[repr(C)]
+        struct Ts {
+            s: i64,
+            ns: i64,
+        }
+        extern "C" {
+            fn clock_gettime(id: i32, ts: *mut Ts) -> i32;
+        }
+        let id = ((!(tid as u32)) << 3) as i32 | 6;
+        let mut ts = Ts { s: 0, ns: 0 };
+        (unsafe { clock_gettime(id, &mut ts) } == 0).then(|| ts.s as u64 * 1_000_000_000 + ts.ns as u64)
+    }
+
     /// `/proc/self/task/<tid>/syscall`: "nr a1..a6 sp pc" while it blocks in a syscall
     fn read_syscall(tid: u64) -> Option<(i64, u64, u64, u64)> {
         let s = std::fs::read_to_string(format!("/proc/self/task/{}/syscall", tid)).ok()?;
@@ -525,7 +635,8 @@ mod imp {
     // ---- holds: a thread stands still in the capture signal's handler
     //
     // A slot per held thread. State: 0 free; 1 asked (signal sent); 5 the handler claimed it;
-    // 2 registers ready, the thread waits; 3 released by the inspector; 4 the handler left.
+    // 2 registers ready, the thread waits; 3 released by the inspector; 4 the handler left;
+    // 6 a pause's hold declined (the thread is inside the compiler's front end).
     // A capture uses a slot for the time of one walk; `pause` keeps slots until `resume`.
     const SLOTS: usize = 256;
     pub struct Slot {
@@ -535,7 +646,7 @@ mod imp {
         /// then the pthread handle
         regs: [AtomicU64; 9],
         /// HOLD_CAPTURE (one walk, at most 5 s), HOLD_PAUSE (until `resume`, at most 10 minutes),
-        /// HOLD_FOREVER (a thread that must never run on: stale.rs `park_held`)
+        /// HOLD_FOREVER (a thread that must not run on while its run does: stale.rs `park_held`)
         mode: AtomicU32,
     }
     static HOLDS: [Slot; SLOTS] = [const { Slot { state: AtomicU32::new(0), tid: AtomicI32::new(0), regs: [const { AtomicU64::new(0) }; 9], mode: AtomicU32::new(0) } }; SLOTS];
@@ -563,6 +674,14 @@ mod imp {
             let tid = syscall(SYS_GETTID) as i32;
             // the slot asked for this thread (a late signal of a capture that gave up finds none)
             let Some(slot) = HOLDS.iter().find(|h| h.tid.load(Acquire) == tid && h.state.compare_exchange(1, 5, AcqRel, Relaxed).is_ok()) else { return };
+            // A pause for a report or an inspection holds no thread inside the compiler's front
+            // end (instrument::pause_lets_front_readers_go): it runs on, and the pause's sweep
+            // holds it once it has left. (Atomics and a thread-local count: async-signal-safe.)
+            if slot.mode.load(Relaxed) == HOLD_PAUSE && crate::inspect::instrument::pause_lets_front_readers_go() && crate::jit::front_reads_held() > 0 {
+                slot.state.store(6, Release);
+                futex_wake(&slot.state);
+                return;
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 let gregs = uc.add(40) as *const u64;
@@ -627,6 +746,12 @@ mod imp {
         loop {
             match slot.state.load(Acquire) {
                 2 => return Ok(slot),
+                6 => {
+                    slot.tid.store(0, Relaxed);
+                    slot.mode.store(HOLD_CAPTURE, Relaxed);
+                    slot.state.store(0, Release);
+                    return Err("inside the compiler's front end (held once it has left)");
+                }
                 1 if t0.elapsed().as_millis() >= 250 => {
                     if slot.state.compare_exchange(1, 0, AcqRel, Relaxed).is_ok() {
                         slot.tid.store(0, Relaxed);
@@ -662,6 +787,17 @@ mod imp {
         slot.mode.store(HOLD_FOREVER, Relaxed);
     }
 
+    /// Lets every thread held for good go (`release_held_for_good`).
+    #[cfg(target_arch = "x86_64")]
+    pub fn release_forever() -> usize {
+        let mut n = 0;
+        for slot in HOLDS.iter().filter(|h| h.mode.load(Relaxed) == HOLD_FOREVER && h.state.load(Acquire) == 2) {
+            release(slot);
+            n += 1;
+        }
+        n
+    }
+
     /// The slot holding `tid` now (a paused thread), if any.
     pub fn held(tid: u64) -> Option<&'static Slot> {
         HOLDS.iter().find(|h| h.tid.load(Acquire) == tid as i32 && h.state.load(Acquire) == 2)
@@ -687,6 +823,15 @@ mod imp {
         raw.handle = r(8);
         raw.sp = regs.rsp;
         walk(raw, &mut regs);
+    }
+
+    /// The program took signal `sig` for its own action (os/progsig.rs): when that is the capture
+    /// signal, the capture moves to the next real-time signal nobody handles. Async-signal-safe.
+    pub fn capture_taken(sig: i32) {
+        if SIGNAL.load(Relaxed) == sig {
+            SIGNAL.store(0, Relaxed);
+            install();
+        }
     }
 
     /// Installs the capture signal's handler (once, on the inspect thread's start): the first
@@ -838,6 +983,59 @@ mod imp {
 mod x64_walk {
     use super::{Raw, MAX_FRAMES};
 
+    /// Why a walk ends at a frame whose return address is no code it can step (neither JIT code,
+    /// this compiler's or the runtime's that runs it, nor a module with unwind tables)
+    pub const NOT_CODE: &str = "its return address is in neither JIT code nor a module with unwind tables";
+
+    /// The runtime that runs this compiler, when one does (`cfg(relax)`: `makepad test` of
+    /// relax-compiler). Its JIT code is no unit of this compiler's and no module's, and every
+    /// program thread's frames are in it: the walk asks it what is its JIT code (stepped as JIT
+    /// code is, by frame records) and where its program stack switch returns (jit.rs
+    /// loader_symbol). A walk of the process's threads stopped at the first such frame, and every
+    /// layout patch of a unit this compiler ran there was a restart (the post-land tests bucket's
+    /// enum_reload_snapshots, 11-08).
+    pub(super) mod host {
+        #[cfg(relax)]
+        extern "C" {
+            fn __relax_host_jit_code(pc: u64) -> u32;
+            fn __relax_host_switch_return_pc() -> u64;
+        }
+
+        /// Whether `pc` is JIT code of the runtime that runs this compiler.
+        pub fn jit_code(pc: u64) -> bool {
+            #[cfg(relax)]
+            {
+                unsafe { __relax_host_jit_code(pc) != 0 }
+            }
+            #[cfg(not(relax))]
+            {
+                let _ = pc;
+                false
+            }
+        }
+
+        /// The return address of that runtime's program stack switch (0: none, or no such runtime).
+        pub fn switch_return_pc() -> u64 {
+            #[cfg(relax)]
+            {
+                unsafe { __relax_host_switch_return_pc() }
+            }
+            #[cfg(not(relax))]
+            {
+                0
+            }
+        }
+    }
+
+    /// Why a walk ends at a JIT frame whose frame pointer is no address of its stack (a garbage
+    /// rbp, as code without frame pointers leaves it, restored by a callee's unwind tables)
+    pub const FP_NOT_IN_STACK: &str = "it is JIT code and its frame pointer is not in its stack";
+
+    /// Why a walk ends at a frame of the runtime that runs this compiler when the frame pointer is
+    /// not known (a thread blocked in a syscall, walked from its sp and pc): that runtime's frame
+    /// sizes are its own, and no frame is taken from stack contents.
+    pub const HOST_NO_FP: &str = "it is JIT code of the runtime that runs this compiler, and its frame pointer is not known (a thread blocked in a syscall is walked from its sp and pc only)";
+
     /// Each step is proven or the walk ends there, saying why (`raw.stop`): a JIT frame by its
     /// frame record (JIT code keeps one in rbp; where rbp is not known, at its unwind info's
     /// distance above sp), a host frame by its module's unwind tables, the stack switch
@@ -852,16 +1050,17 @@ mod x64_walk {
         while raw.n < MAX_FRAMES && r.rip != 0 {
             // the lookup pc: a return address points past its call
             let look = if top { r.rip } else { r.rip.wrapping_sub(1) };
-            let jit = crate::jit::in_jit_code(look);
+            let own = crate::jit::in_jit_code(look);
+            let jit = own || host::jit_code(look);
             if !top && !jit && !cfi::covers(look) {
-                raw.stop = Some("its return address is in neither JIT code nor a module with unwind tables");
+                raw.stop = Some(NOT_CODE);
                 break;
             }
             raw.pcs[raw.n] = r.rip;
             raw.n += 1;
             // the stack switch's frame: it runs on the thread's own stack (its sp is in the
             // switch record on the segment), its callee on the segment
-            if !top && r.rip == crate::stack::switch_return_pc() {
+            if !top && (r.rip == crate::stack::switch_return_pc() || r.rip == host::switch_return_pc()) {
                 match read(r.rsp.wrapping_add(crate::stack::SWITCH_RECORD)) {
                     Some(own) => r.rsp = own,
                     None => {
@@ -881,6 +1080,10 @@ mod x64_walk {
                         raw.stop = Some("it is JIT code at no call (it makes the syscall itself) and its frame pointer is not known");
                         break;
                     }
+                    if !own {
+                        raw.stop = Some(HOST_NO_FP);
+                        break;
+                    }
                     match crate::jit::frame_pointer_at(r.rip, sp0) {
                         Ok(fp) => r.rbp = fp,
                         Err(why) => {
@@ -890,7 +1093,7 @@ mod x64_walk {
                     }
                 }
                 if r.rbp < sp0 || r.rbp - sp0 > 1 << 20 {
-                    raw.stop = Some("it is JIT code and its frame pointer is not in its stack");
+                    raw.stop = Some(FP_NOT_IN_STACK);
                     break;
                 }
                 let (Some(ra), Some(next)) = (read(r.rbp.wrapping_add(8)), read(r.rbp)) else {
@@ -1035,6 +1238,26 @@ mod imp {
         out
     }
 
+    /// Each thread of the process now (one snapshot), and on demand its name and its CPU.
+    pub fn each_thread(mut f: impl FnMut(u64, &dyn Fn() -> String, &dyn Fn() -> Option<u64>)) {
+        let Ok(snap) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }) else { return };
+        let pid = unsafe { GetCurrentProcessId() };
+        let mut e = THREADENTRY32::default();
+        e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut more = unsafe { Thread32First(snap, &mut e) }.is_ok();
+        while more {
+            if e.th32OwnerProcessID == pid {
+                let tid = e.th32ThreadID as u64;
+                f(tid, &|| name_and_cpu(tid).0, &|| Some(name_and_cpu(tid).1));
+            }
+            e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            more = unsafe { Thread32Next(snap, &mut e) }.is_ok();
+        }
+        unsafe {
+            let _ = CloseHandle(snap);
+        }
+    }
+
     /// The thread's description (SetThreadDescription; std names its threads with it) and its
     /// user + kernel CPU time.
     fn name_and_cpu(tid: u64) -> (String, u64) {
@@ -1121,6 +1344,7 @@ mod imp {
     pub fn list() -> Vec<Thread> {
         Vec::new()
     }
+    pub fn each_thread(_f: impl FnMut(u64, &dyn Fn() -> String, &dyn Fn() -> Option<u64>)) {}
     pub fn capture(_t: &Thread, _raw: &mut Raw) -> Result<(), &'static str> {
         Err("stack capture is not implemented on this target")
     }
@@ -1134,7 +1358,7 @@ mod imp {
 /// pointer is needed and says so (a libc built with them).
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 mod tests {
-    use super::{capture, imp::BLOCKED_NO_FP, list, Raw};
+    use super::{capture, imp::BLOCKED_NO_FP, list, x64_walk::{host, FP_NOT_IN_STACK, HOST_NO_FP}, Raw};
     use std::io::Write;
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Release}};
@@ -1213,9 +1437,25 @@ mod tests {
             super::super::symbols::host_symbol(if i == 0 { pc } else { pc - 1 }).map_or(format!("{pc:#x}"), |s| s.0)
         }).collect();
         assert!(!names.iter().any(|n| n.contains("fake_caller")), "a caller guessed from stack contents: {names:?}");
-        let reached = names.iter().any(|n| n.contains("park_in_poll"));
-        assert!(reached || raw.stop == Some(BLOCKED_NO_FP), "the walk neither reached park_in_poll nor said why it stopped: {names:?} {:?}", raw.stop);
-        assert!(raw.n >= 1);
+        // (by address too: under the JIT the walk names no JIT code)
+        let planted = fake_caller as extern "C" fn() -> u64 as usize as u64 + 4;
+        assert!(!raw.frames().contains(&planted), "a caller guessed from stack contents: {names:?}");
+        if cfg!(relax) {
+            // under the JIT, `park_in_poll` is JIT code of the runtime that runs this test, which
+            // the walk asks about: it steps libc's frames by their CFI, reaches `park_in_poll`, and
+            // ends there, saying why: the garbage rbp, when poll's unwind tables restore it (a poll
+            // that saves rbp), or no frame pointer at all (one that leaves it alone: a thread
+            // blocked in a syscall gives none)
+            let pcs = raw.frames();
+            assert!(raw.stop == Some(FP_NOT_IN_STACK) || raw.stop == Some(HOST_NO_FP), "{names:?} {:?}", raw.stop);
+            assert!(pcs.len() >= 2 && names[pcs.len() - 2].contains("poll"), "poll's frame comes before the last: {names:?}");
+            let last = pcs[pcs.len() - 1];
+            assert!(host::jit_code(last - 1) && last > park_in_poll as fn(i32, u64, &AtomicU64) as usize as u64, "the last frame is park_in_poll's, the runtime's JIT code: {names:?}");
+        } else {
+            let reached = names.iter().any(|n| n.contains("park_in_poll"));
+            assert!(reached || raw.stop == Some(BLOCKED_NO_FP), "the walk neither reached park_in_poll nor said why it stopped: {names:?} {:?}", raw.stop);
+            assert!(raw.n >= 1);
+        }
     }
 }
 

@@ -38,6 +38,13 @@ impl IrFnCompiler {
                 return;
             }
             let value = vm.bx.heap.scope_value(self.script_scope, name.into(), self.trap.pass());
+            // `mod(x, y)` is the modulo, as in script functions; `mod` itself
+            // stays the module root (`define_mod_call`).
+            if value == vm.bx.heap.modules.into() {
+                self.mes.push(IrMe::BuiltinCall { name: id!(mod), args: Vec::new() });
+                self.maybe_pop_to_me(vm, output, opargs);
+                return;
+            }
             if let Some(pod_ty) = vm.bx.heap.pod_type(value) {
                 self.handle_pod_type_call(vm, output, opargs, pod_ty, name);
                 return;
@@ -532,6 +539,9 @@ impl IrFnCompiler {
             }
             return;
         }
+        if name == id!(mod) || name == id!(modf) {
+            return self.lower_mod(vm, output, name, args);
+        }
         let builtins = vm.bx.code.builtins.pod.clone();
         if name == id!(instance_index) {
             if output.mode != ShaderMode::Vertex || !args.is_empty() {
@@ -640,6 +650,84 @@ impl IrFnCompiler {
         self.push(ShaderType::Pod(ret), e);
     }
 
+    /// `mod(x, y)`, the floored modulo of shading languages,
+    /// `x - y * floor(x / y)` (the result takes y's sign), and `modf(x, y)`,
+    /// the truncating remainder `x - y * trunc(x / y)` (x's sign), on floats
+    /// and float vectors (a scalar beside a vector applies to every lane),
+    /// as in script functions (`define_mod_call`, `x % y`). Both are lowered
+    /// to that arithmetic, so every backend computes the same thing (GLSL's
+    /// own `mod` floors, WGSL's `%`, HLSL's and Metal's `fmod` and SPIR-V's
+    /// OpFRem truncate); literals fold.
+    fn lower_mod(&mut self, vm: &mut ScriptVm, output: &mut ShaderOutput, name: LiveId, args: Vec<(ShaderType, ExprId)>) {
+        let pods = vm.bx.code.builtins.pod.clone();
+        let floored = name == id!(mod);
+        if args.len() != 2 {
+            let message = format!("{name}(x, y) takes two arguments, not {}", args.len());
+            output.push_error(message.clone());
+            script_err_shader!(self.trap, "{}", message);
+            return self.push(ShaderType::Error(NIL), NO_EXPR);
+        }
+        if args.iter().any(|(_, e)| *e == NO_EXPR) {
+            return self.push(ShaderType::Error(NIL), NO_EXPR);
+        }
+        for (ty, _) in &args {
+            let float = match ty {
+                ShaderType::AbstractInt | ShaderType::AbstractFloat => true,
+                ShaderType::Pod(pt) => crate::shader_lower_ops::is_float_pod(&pods, *pt),
+                _ => false,
+            };
+            if !float {
+                let message = format!("{name}(x, y) takes floats or float vectors; integers use %");
+                output.push_error(message.clone());
+                script_err_shader!(self.trap, "{}", message);
+                return self.push(ShaderType::Error(NIL), NO_EXPR);
+            }
+        }
+        let number = |l: Option<IrLit>| match l {
+            Some(IrLit::AbstractInt(i)) => Some(i as f32),
+            Some(IrLit::AbstractFloat(f)) => Some(f as f32),
+            _ => None,
+        };
+        if let (Some(x), Some(y)) = (number(self.lit_of(args[0].1)), number(self.lit_of(args[1].1))) {
+            // In f32, as the GPU computes it (shader_lower_ops' `fold`).
+            let q = if floored { (x / y).floor() } else { (x / y).trunc() };
+            let e = self.expr(ExprKind::Lit(IrLit::AbstractFloat((x - y * q) as f64)), TY_AFLOAT);
+            return self.push(ShaderType::AbstractFloat, e);
+        }
+        // Each operand is read twice: a plain read is repeated, anything
+        // else is computed once into a temporary.
+        let mut reads = Vec::new();
+        for (ty, e) in args {
+            let expr = &self.f.exprs[e as usize];
+            let (kind, ir_ty) = (expr.kind.clone(), expr.ty);
+            let kind = match kind {
+                ExprKind::Lit(_) | ExprKind::Local(_) | ExprKind::Param(_) | ExprKind::Global(_) => kind,
+                _ => {
+                    let tmp = self.f.local(id!(_mp_mod), 0, ir_ty, false, LocalKind::Temp);
+                    self.emit(Stmt::Local(tmp, e));
+                    ExprKind::Local(tmp)
+                }
+            };
+            reads.push((ty, kind, ir_ty));
+        }
+        let read = |this: &mut Self, i: usize| {
+            let (ty, kind, ir_ty) = reads[i].clone();
+            (ty, this.expr(kind, ir_ty))
+        };
+        let (x0, y0) = (read(self, 0), read(self, 1));
+        let (qt, q) = self.arithmetic(vm, output, BinOp::Div, false, x0, y0);
+        if q == NO_EXPR {
+            return self.push(ShaderType::Error(NIL), NO_EXPR);
+        }
+        let round = if floored { Builtin::Floor } else { Builtin::Trunc };
+        let whole = self.expr(ExprKind::Builtin(round, vec![q]), self.f.ty_of(q));
+        let y1 = read(self, 1);
+        let m = self.arithmetic(vm, output, BinOp::Mul, false, y1, (qt, whole));
+        let x1 = read(self, 0);
+        let (ty, e) = self.arithmetic(vm, output, BinOp::Sub, false, x1, m);
+        self.push(ty, e);
+    }
+
     fn handle_texture_builtin(&mut self, vm: &mut ScriptVm, output: &mut ShaderOutput, method_id: LiveId, tex_type: TextureType, tex: ExprId, args: Vec<(ShaderType, ExprId)>) {
         if let Some(ExprKind::Global(g)) = self.f.exprs.get(tex as usize).map(|e| &e.kind) {
             if let IrGlobalKind::StorageTexture(format) = output.compiled.ir.globals[*g as usize].kind {
@@ -731,7 +819,7 @@ impl IrFnCompiler {
                 let e = self.expr(ExprKind::TexSize(tex), v2);
                 self.push(ShaderType::Pod(pods.pod_vec2f), e);
             }
-            id!(sample) | id!(sample_lod) | id!(sample_nearest) | id!(sample_repeat) => {
+            id!(sample) | id!(sample_lod) | id!(sample_nearest) | id!(sample_repeat) | id!(sample_aniso_repeat) => {
                 let args_ok = if method_id == id!(sample_lod) {
                     exprs.len() == 2
                 } else if method_id == id!(sample_nearest) {
@@ -747,6 +835,8 @@ impl IrFnCompiler {
                     ShaderSampler { filter: SamplerFilter::Nearest, ..ShaderSampler::default() }
                 } else if method_id == id!(sample_repeat) {
                     ShaderSampler { address: SamplerAddress::Repeat, ..ShaderSampler::default() }
+                } else if method_id == id!(sample_aniso_repeat) {
+                    ShaderSampler { address: SamplerAddress::Repeat, anisotropy: 16, ..ShaderSampler::default() }
                 } else {
                     ShaderSampler::default()
                 };
@@ -775,13 +865,15 @@ impl IrFnCompiler {
             // `sample_grad_repeat`: the same with a repeating sampler (a
             // tiled texture read where implicit derivatives are not
             // defined: inside a branch that differs between pixels).
-            id!(sample_grad) | id!(sample_grad_repeat) => {
+            id!(sample_grad) | id!(sample_grad_repeat) | id!(sample_grad_aniso_repeat) => {
                 if exprs.len() != 3 || !matches!(tex_type, TextureType::Texture2d | TextureType::Texture2dArray) {
                     script_err_invalid_args!(self.trap, "texture.{:?}(coord, dx, dy) takes 3 args, on a 2D texture or 2D array (coord.z = layer)", method_id);
                     return self.push(ShaderType::Pod(pods.pod_vec4f), NO_EXPR);
                 }
                 let sampler = output.get_or_create_sampler(if method_id == id!(sample_grad_repeat) {
                     ShaderSampler { address: SamplerAddress::Repeat, ..ShaderSampler::default() }
+                } else if method_id == id!(sample_grad_aniso_repeat) {
+                    ShaderSampler { address: SamplerAddress::Repeat, anisotropy: 16, ..ShaderSampler::default() }
                 } else {
                     ShaderSampler::default()
                 });
@@ -832,7 +924,7 @@ impl IrFnCompiler {
                     method_id,
                     suggest_from_live_ids(
                         method_id,
-                        &[id!(sample), id!(sample_nearest), id!(sample_repeat), id!(sample_lod), id!(sample_grad), id!(sample_grad_repeat), id!(sample_video), id!(size)]
+                        &[id!(sample), id!(sample_nearest), id!(sample_repeat), id!(sample_aniso_repeat), id!(sample_lod), id!(sample_grad), id!(sample_grad_repeat), id!(sample_grad_aniso_repeat), id!(sample_video), id!(size)]
                     )
                 );
             }
@@ -1128,4 +1220,65 @@ fn is_compute_builtin(op: Builtin) -> bool {
             | Builtin::AtomicMin
             | Builtin::AtomicMax
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anisotropic_samples_opt_in_and_share_the_repeat_sampler() {
+        let mut host = ScriptVmHost::new(0i32, ());
+        let mut vm = ScriptVm { host: host.host_context(), bx: Box::new(ScriptVmBase::new()) };
+        vm.bx.captured_errors = Some(Vec::new());
+        let source = "use mod.pod.*\nuse mod.math.*\nuse mod.shader\n{
+            geom: shader.vertex_buffer(vec2f, nil)
+            vertex_pos: shader.vertex_position(vec4f)
+            tex: shader.texture_2d(float)
+            layers: shader.texture_2d_array(float)
+            pixel: shader.fragment_output(0, vec4f)
+            vertex: fn() { self.vertex_pos = vec4f(self.geom, 0.0, 1.0) }
+            fragment: fn() {
+                let uv = vec2(0.25, 0.5)
+                let layer = vec3(0.25, 0.5, 0.0)
+                let dx = vec2(0.125, 0.0)
+                let dy = vec2(0.0, 0.125)
+                self.pixel = self.tex.sample_repeat(uv)
+                    + self.tex.sample_grad_repeat(uv, dx, dy)
+                    + self.tex.sample_aniso_repeat(uv)
+                    + self.tex.sample_grad_aniso_repeat(uv, dx, dy)
+                    + self.layers.sample_repeat(layer)
+                    + self.layers.sample_grad_repeat(layer, dx, dy)
+                    + self.layers.sample_aniso_repeat(layer)
+                    + self.layers.sample_grad_aniso_repeat(layer, dx, dy)
+            }
+        }";
+        let shader = vm.eval(ScriptMod::new("", "", "anisotropic_samples", 0, 0, source, &[])).as_object().expect("shader object");
+        let output = crate::shader_ir_draw::compile_draw_shader_ir_with(&mut vm, shader, &Default::default());
+        let errors = vm.take_errors();
+        assert!(errors.is_empty(), "shader evaluation and lowering errors: {errors:?}");
+        assert!(!output.has_errors, "{}", output.error_report());
+        assert_eq!(output.samplers.len(), 2, "only anisotropy separates the samplers");
+        let mut counts = [0; 4];
+        for sample in output.ir.functions.iter().flat_map(|f| &f.exprs).filter_map(|e| {
+            if let ExprKind::Sample(s) = &e.kind { Some(s) } else { None }
+        }) {
+            let (index, anisotropy, grad) = match sample.method {
+                id!(sample_repeat) => (0, 1, false),
+                id!(sample_grad_repeat) => (1, 1, true),
+                id!(sample_aniso_repeat) => (2, 16, false),
+                id!(sample_grad_aniso_repeat) => (3, 16, true),
+                _ => panic!("unexpected texture method"),
+            };
+            counts[index] += 1;
+            assert_eq!(output.samplers[sample.sampler as usize], ShaderSampler {
+                filter: SamplerFilter::Linear, address: SamplerAddress::Repeat,
+                coord: SamplerCoord::Normalized, is_video: false, compare: false, anisotropy,
+            }, "sampler for {:?}", sample.method);
+            assert_eq!(matches!(sample.kind, SampleKind::Grad), grad, "gradient sampling for {:?}", sample.method);
+            assert_eq!(sample.dx != NO_EXPR && sample.dy != NO_EXPR, grad, "gradient operands for {:?}", sample.method);
+        }
+        assert_eq!(counts, [2; 4], "each method lowers on both 2D and array textures");
+        assert_eq!(ShaderSampler::video().anisotropy, 1, "video sampling remains isotropic");
+    }
 }

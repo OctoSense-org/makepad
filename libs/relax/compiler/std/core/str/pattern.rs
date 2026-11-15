@@ -1024,9 +1024,7 @@ impl<'a, F: FnMut(char) -> bool> Pattern<'a> for CharPred<F> {
     }
 }
 
-/// Closures and fns `FnMut(char) -> bool`. (Not in the rustc shim: there it would overlap
-/// with the `char`/`&str` impls, which only core itself may write.)
-#[cfg(not(relax_check))]
+/// Closures and fns `FnMut(char) -> bool`.
 impl<'a, F: FnMut(char) -> bool> Pattern<'a> for F {
     type Searcher = CharPredicateSearcher<'a, F>;
     fn into_searcher(self, haystack: &'a str) -> CharPredicateSearcher<'a, F> {
@@ -1041,7 +1039,7 @@ pub(crate) struct IsWhitespace;
 impl<'a> Pattern<'a> for IsWhitespace {
     type Searcher = CharPredicateSearcher<'a, fn(char) -> bool>;
     fn into_searcher(self, haystack: &'a str) -> CharPredicateSearcher<'a, fn(char) -> bool> {
-        let f: fn(char) -> bool = crate::char::is_whitespace;
+        let f: fn(char) -> bool = crate::char::methods::is_whitespace;
         CharPredicateSearcher::new(haystack, f)
     }
 }

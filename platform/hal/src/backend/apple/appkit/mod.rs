@@ -21,6 +21,7 @@
 mod app;
 pub(super) mod a11y;
 mod classes;
+mod close_why;
 mod clipboard;
 mod drag_out;
 mod ime;
@@ -32,7 +33,7 @@ mod test_resize;
 mod tray;
 mod window;
 
-pub use app::{host_dark, run_main_loop, stop_main_loop};
+pub use app::{end_unseen_activity, host_dark, resume_unseen_activity, run_main_loop, stop_main_loop};
 /// The exec restart's stacking handover (restack.rs).
 pub use restack::handover as restack_handover;
 /// `crate::set_menu_bar_app`.

@@ -26,6 +26,8 @@ struct Breakable {
     /// a `loop`/`while`/`for` takes unlabeled breaks; a labeled block only `break 'label`
     is_loop: bool,
     may_break: bool,
+    /// a `try` block: rustc's block whose `?`s break to it (no `break` names it)
+    is_try: bool,
 }
 
 struct Cx<'a> {
@@ -103,7 +105,7 @@ impl<'a> Cx<'a> {
         let blk = *self.ast.block(b);
         self.enter(blk.attrs);
         let prev = self.div;
-        self.breakables.push(Breakable { label: None, is_loop: false, may_break: false });
+        self.breakables.push(Breakable { label: None, is_loop: false, may_break: false, is_try: false });
         self.block_inner(b, None);
         let ctx = self.breakables.pop().unwrap();
         if ctx.may_break { self.div = prev; }
@@ -115,7 +117,7 @@ impl<'a> Cx<'a> {
         let stmts = self.ast.stmts(b);
         // the last expression statement without `;` is the tail expression
         let tail = match stmts.last() {
-            Some(Stmt::Expr(e, false)) => Some(*e),
+            Some(Stmt::Expr(false, e)) => Some(*e),
             _ => None,
         };
         let n = stmts.len() - usize::from(tail.is_some());
@@ -138,10 +140,10 @@ impl<'a> Cx<'a> {
                 let pos = self.stmt_pos_let(&l, b);
                 self.warn(pos, "statement");
                 let old = std::mem::replace(&mut self.div, Div::Maybe);
-                if let Some(x) = l.init {
+                if let Some(x) = l.init.get() {
                     self.expr(x);
                 }
-                if let Some(e) = l.else_ {
+                if let Some(e) = l.else_.get() {
                     let prev = self.div;
                     self.block(e);
                     self.div = prev;
@@ -149,7 +151,7 @@ impl<'a> Cx<'a> {
                 self.div = self.div.max(old);
                 self.leave(l.attrs);
             }
-            Stmt::Expr(e, _) => {
+            Stmt::Expr(_, e) => {
                 let attrs = ast.stmt_attrs(e);
                 self.enter(attrs);
                 self.expr_stmt(e);
@@ -173,8 +175,9 @@ impl<'a> Cx<'a> {
     fn pat_pos(&self, p: PatId) -> u32 {
         match *self.ast.pat(p) {
             Pat::Ident { name, .. } => name.lo,
-            Pat::Lit(e) | Pat::Range(Some(e), _, _) | Pat::Range(None, Some(e), _) => self.ast.expr(e).lo,
-            Pat::Path(ref path) | Pat::TupleStruct(ref path, _) | Pat::Struct(ref path, _, _) => path.lo,
+            Pat::Lit(e) => self.ast.expr(e).lo,
+            Pat::Range(a, b, _) if let Some(e) = a.get().or(b.get()) => self.ast.expr(e).lo,
+            Pat::Path(ref path) | Pat::TupleStruct(ref path, _) | Pat::Struct(_, ref path, _) => path.lo,
             Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.pat_pos(x),
             Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) => self.ast.list(ps).first().map_or(0, |x| self.pat_pos(*x)),
             _ => 0,
@@ -209,6 +212,8 @@ impl<'a> Cx<'a> {
         match ex.kind {
             ExprKind::Block(..) | ExprKind::Unsafe(..) | ExprKind::If(..) | ExprKind::Let(..) | ExprKind::Loop(..) | ExprKind::Match(..)
             | ExprKind::While(..) | ExprKind::For(..) | ExprKind::Cast(..) => {}
+            // a block (its `Try::from_output` tail call is skipped as try-block desugaring)
+            ExprKind::TryBlock(..) => {}
             // a destructuring assignment is lowered to a block (`{ let pat = rhs; .. }`)
             ExprKind::Assign(l, _) if self.is_destructuring(l) => {}
             ExprKind::Call(callee, _) => {
@@ -245,8 +250,14 @@ impl<'a> Cx<'a> {
         match ex.kind {
             ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Underscore | ExprKind::Paren(_) => {}
             ExprKind::Continue(_) => {}
-            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Box(x) | ExprKind::Try(x) | ExprKind::Await(x)
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Box(x) | ExprKind::Await(x)
             | ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::AddrOf(_, _, x) => self.expr(x),
+            ExprKind::Try(x) => {
+                self.expr(x);
+                // the desugared match checks its `break` arm as reachable (check_match resets the
+                // divergence for each arm): an enclosing `try` block may be left
+                if let Some(t) = self.breakables.iter_mut().rev().find(|b| b.is_try) { t.may_break = true; }
+            }
             ExprKind::Binary(op, a, b) => {
                 self.expr(a);
                 if matches!(op, BinOp::And | BinOp::Or) {
@@ -282,6 +293,16 @@ impl<'a> Cx<'a> {
                 }
             }
             ExprKind::Unsafe(b) => self.block(b),
+            ExprKind::TryBlock(b) => {
+                let blk = *self.ast.block(b);
+                self.enter(blk.attrs);
+                let prev = self.div;
+                self.breakables.push(Breakable { label: None, is_loop: false, may_break: false, is_try: true });
+                self.block_inner(b, None);
+                let ctx = self.breakables.pop().unwrap();
+                if ctx.may_break { self.div = prev; }
+                self.leave(blk.attrs);
+            }
             ExprKind::Async(_, b) => self.nested(|c| c.block(b)),
             ExprKind::ConstBlock(b) => self.nested(|c| c.block(b)),
             ExprKind::If(c, then, els) => self.if_expr(c, then, els),
@@ -295,7 +316,7 @@ impl<'a> Cx<'a> {
             ExprKind::While(row) => {
                 let w = *ast.row(row);
                 // loop { if cond { body } else { break } }
-                self.breakables.push(Breakable { label: w.label, is_loop: true, may_break: true });
+                self.breakables.push(Breakable { label: w.label.get(), is_loop: true, may_break: true, is_try: false });
                 self.if_expr_block(w.cond, w.body);
                 let ctx = self.breakables.pop().unwrap();
                 debug_assert!(ctx.may_break);
@@ -305,7 +326,7 @@ impl<'a> Cx<'a> {
                 let f = *ast.row(row);
                 self.expr(f.iter);
                 let after_iter = self.div;
-                self.breakables.push(Breakable { label: f.label, is_loop: true, may_break: true });
+                self.breakables.push(Breakable { label: f.label.get(), is_loop: true, may_break: true, is_try: false });
                 let saved = self.div;
                 self.div = Div::Maybe;
                 self.block(f.body);
@@ -314,7 +335,7 @@ impl<'a> Cx<'a> {
                 self.div = after_iter;
             }
             ExprKind::Loop(b, label) => {
-                self.breakables.push(Breakable { label: label.get(), is_loop: true, may_break: false });
+                self.breakables.push(Breakable { label: label.get(), is_loop: true, may_break: false, is_try: false });
                 self.block(b);
                 let ctx = self.breakables.pop().unwrap();
                 if ctx.may_break {
@@ -358,7 +379,7 @@ impl<'a> Cx<'a> {
                 if m.args == NO_MAC_ARGS { return; }
                 let args = *ast.mac_arg(m.args);
                 self.exprs(args.exprs);
-                if let Some(g) = args.guard { self.expr(g); }
+                if let Some(g) = args.guard.get() { self.expr(g); }
             }
         }
     }
@@ -393,7 +414,7 @@ impl<'a> Cx<'a> {
         let blk = *self.ast.block(b);
         self.enter(blk.attrs);
         let prev = self.div;
-        self.breakables.push(Breakable { label: Some(l), is_loop: false, may_break: false });
+        self.breakables.push(Breakable { label: Some(l), is_loop: false, may_break: false, is_try: false });
         self.block_inner(b, Some(l));
         let ctx = self.breakables.pop().unwrap();
         if ctx.may_break { self.div = prev; }
@@ -455,7 +476,7 @@ impl<'a> Cx<'a> {
         for a in arms {
             self.enter(a.attrs);
             self.div = Div::Maybe;
-            if let Some(g) = a.guard { self.expr(g); }
+            if let Some(g) = a.guard.get() { self.expr(g); }
             self.expr(a.body);
             all = all.min(self.div);
             self.leave(a.attrs);

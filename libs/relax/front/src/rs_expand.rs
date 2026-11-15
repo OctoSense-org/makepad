@@ -30,7 +30,8 @@ pub(crate) fn expand<'a>(src: &'a [u8], toks: impl Into<super::lazy_bodies::Toks
 ) -> Surface {
     let reuse = crate::parse_work::Session::new(Arc::default());
     let toks: super::lazy_bodies::Toks<'_> = toks.into();
-    outline(Parser::new(&ctx.cfg.session, src, toks, edition), ctx.clone(), table, reuse)
+    // the lints' records come from the parse (uses::unrecorded)
+    crate::macros::uses::unrecorded(|| outline(Parser::new(&ctx.cfg.session, src, toks, edition), ctx.clone(), table, reuse))
 }
 
 fn outline(mut p: Parser<'_>, ctx: std::rc::Rc<crate::builtins::FileCtx>, table: Arc<crate::macros::MacroTable>,
@@ -118,8 +119,11 @@ impl Parser<'_> {
                 if can_expand {
                     if self.session.runtime.profile { eprintln!("rs-outline-expand: {:?} macro {name:?}", self.bctx.as_ref().map(|c| &c.path)); }
                     let before = out.len();
-                    let result = self.expand_call(def.as_ref().unwrap(), range, self.toks.at(head).lo)
-                        .and_then(|at| self.in_expansion(at, |p| p.outline_items(T::Eof, out, unknown, eager_bodies)));
+                    // an item-position call: what it reads reaches other crates as the items it expands to
+                    self.item_macro = true;
+                    let at = self.expand_call(def.as_ref().unwrap(), range, self.toks.at(head).lo);
+                    self.item_macro = false;
+                    let result = at.and_then(|at| self.in_expansion(at, |p| p.outline_items(T::Eof, out, unknown, eager_bodies)));
                     if let Err(e) = result {
                         out.truncate(before);
                         out.extend_from_slice(&self.toks.range(start, after));

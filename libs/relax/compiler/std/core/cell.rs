@@ -6,8 +6,8 @@ use crate::ops::{Deref, DerefMut};
 
 /// The primitive for interior mutability (Relax knows it: no `noalias` on what it covers).
 #[repr(transparent)]
-#[cfg_attr(not(relax_check), rustc_layout_no_niche)]
-#[cfg_attr(not(relax_check), lang = "unsafe_cell")]
+#[rustc_layout_no_niche]
+#[lang = "unsafe_cell"]
 pub struct UnsafeCell<T: ?Sized> {
     value: T,
 }
@@ -31,16 +31,17 @@ impl<T: ?Sized> UnsafeCell<T> {
     pub const fn get_mut(&mut self) -> &mut T {
         &mut self.value
     }
+    // replace, as_ref_unchecked, as_mut_unchecked: const and stable since rustc 1.100.0 (unsafe_cell_access)
     #[rustc_should_not_be_called_on_const_items]
-    pub unsafe fn replace(&self, value: T) -> T where T: Sized {
-        crate::mem::replace(&mut *self.get(), value)
+    pub const unsafe fn replace(&self, value: T) -> T where T: Sized {
+        self.get().replace(value)
     }
     #[rustc_should_not_be_called_on_const_items]
-    pub unsafe fn as_ref_unchecked(&self) -> &T {
+    pub const unsafe fn as_ref_unchecked(&self) -> &T {
         &*self.get()
     }
     #[rustc_should_not_be_called_on_const_items]
-    pub unsafe fn as_mut_unchecked(&self) -> &mut T {
+    pub const unsafe fn as_mut_unchecked(&self) -> &mut T {
         &mut *self.get()
     }
     #[rustc_diagnostic_item = "unsafe_cell_raw_get"]
@@ -266,9 +267,7 @@ impl fmt::Display for BorrowMutError {
     }
 }
 
-#[cfg(not(relax_check))]
 impl crate::error::Error for BorrowError {}
-#[cfg(not(relax_check))]
 impl crate::error::Error for BorrowMutError {}
 
 #[inline(never)]
@@ -660,29 +659,5 @@ impl<T, F: FnOnce() -> T> Deref for LazyCell<T, F> {
     type Target = T;
     fn deref(&self) -> &T {
         LazyCell::force(self)
-    }
-}
-
-// core/src/cell/lazy.rs: `DerefMut for LazyCell` (stable 1.89) over `force_mut`. krilla pushes
-// into a lazily started PDF attribute list through it, from a closure that captures the cell.
-impl<T, F: FnOnce() -> T> LazyCell<T, F> {
-    pub fn force_mut(this: &mut LazyCell<T, F>) -> &mut T {
-        if this.cell.get().is_none() {
-            let value = match this.init.take() {
-                Some(f) => f(),
-                None => crate::panicking::panic_str("LazyCell instance has previously been poisoned"),
-            };
-            let _ = this.cell.set(value);
-        }
-        match this.cell.get_mut() {
-            Some(value) => value,
-            None => crate::panicking::panic_str("LazyCell instance has previously been poisoned"),
-        }
-    }
-}
-
-impl<T, F: FnOnce() -> T> DerefMut for LazyCell<T, F> {
-    fn deref_mut(&mut self) -> &mut T {
-        LazyCell::force_mut(self)
     }
 }

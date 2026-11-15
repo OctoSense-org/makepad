@@ -39,6 +39,10 @@ const AGENT: &str = "devhub-warm";
 struct Package {
     pkg: String,
     harness: Harness,
+    /// the features its target requires (the manifest's `required-features`, [`resolve`]):
+    /// selected without them it does not build (`--test effect_modules` without `scene3d`: every
+    /// warm run of it failed, 11-06)
+    features: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -72,7 +76,7 @@ impl Package {
             Some(t) if !t.is_empty() && !t.contains(':') => Harness::Test(t.to_string()),
             _ => return None,
         };
-        Some(Self { pkg: pkg.to_string(), harness })
+        Some(Self { pkg: pkg.to_string(), harness, features: Vec::new() })
     }
 
     fn label(&self) -> String {
@@ -87,17 +91,22 @@ impl Package {
     }
 
     fn select(&self) -> Vec<String> {
-        match &self.harness {
+        let mut select: Vec<String> = match &self.harness {
             Harness::Lib => vec!["--lib".into()],
             Harness::Bin(b) => vec!["--bin".into(), b.clone()],
             Harness::Test(t) => vec!["--test".into(), t.clone()],
             Harness::Tests => vec!["--tests".into()],
             Harness::All | Harness::Default => Vec::new(),
+        };
+        if !self.features.is_empty() {
+            select.extend(["--features".into(), self.features.join(",")]);
         }
+        select
     }
 
     fn argv(&self) -> Vec<String> {
-        let mut argv: Vec<_> = ["cargo", "run", "--profile", "host", "-q", "-p", "makepad-run", "--bin", "makepad", "--", "test", &self.pkg].into_iter().map(String::from).collect();
+        // the release profile, as `devhub test` runs the package (lease/client.rs)
+        let mut argv: Vec<_> = ["cargo", "run", "--profile", "host", "-q", "-p", "makepad-run", "--bin", "makepad", "--", "test", &self.pkg, "--release"].into_iter().map(String::from).collect();
         argv.extend(self.select());
         argv.extend(["--".into(), "--list".into()]);
         argv
@@ -112,26 +121,39 @@ impl Package {
     }
 }
 
-fn resolve(repo: &Path, rev: &str, packages: &[Package]) -> (Vec<Package>, String) {
+fn resolve(repo: &Path, rev: &str, packages: &[Package], overlay: bool) -> (Vec<Package>, String) {
     if packages.is_empty() { return (Vec::new(), String::new()); }
     let tree = crate::lease::Pin::of_rev(rev).ok_or_else(|| "missing commit pair".to_string()).and_then(|pin| {
-        super::ci::Tree::at(repo, &Pair::new(&pin.makepad, pin.commercial.as_deref().unwrap_or("")))
+        super::ci::Tree::at(repo, &pin.pair())
     });
-    let tree = match tree {
-        Ok(tree) => tree,
-        Err(e) => return (Vec::new(), format!("targets unknown at {rev}: {e}")),
-    };
-    let dirs = super::ci::package_dirs(&tree);
+    match tree {
+        Ok(tree) => resolve_in(&tree, packages, overlay),
+        Err(e) => (Vec::new(), format!("targets unknown at {rev}: {e}")),
+    }
+}
+
+/// The packages' targets as `tree` has them, each with the features its target requires; the
+/// note names those it dropped (no such package or target).
+/// The packages a warm run builds at `tree`, with their targets' required features. `overlay`: a
+/// JIT overlay run, which leaves out a package whose tests run in the lane's tree (its test-tree:
+/// no run of them ever reads an overlay, and one fails there; relax-compiler's build script runs
+/// cargo metadata on the checkout, 11-13).
+fn resolve_in(tree: &super::ci::Tree, packages: &[Package], overlay: bool) -> (Vec<Package>, String) {
+    let dirs = super::ci::package_dirs(tree);
     let (mut kept, mut dropped) = (Vec::new(), Vec::new());
     let mut seen = BTreeSet::new();
     for package in packages {
         let krate = dirs.get(&package.pkg).and_then(|dir| {
-            super::ci::krate(&tree, &if dir.is_empty() { "Cargo.toml".into() } else { format!("{dir}/Cargo.toml") })
+            super::ci::krate(tree, &if dir.is_empty() { "Cargo.toml".into() } else { format!("{dir}/Cargo.toml") })
         });
         let Some(k) = krate else {
             dropped.push(format!("{} (no such package)", package.label()));
             continue;
         };
+        if let Some(why) = k.test_tree.as_deref().filter(|_| overlay) {
+            dropped.push(format!("{} (runs in the lane's tree: {why})", package.label()));
+            continue;
+        }
         let harness = match &package.harness {
             Harness::All | Harness::Tests => Ok(package.harness.clone()),
             Harness::Lib if k.lib => Ok(Harness::Lib),
@@ -147,7 +169,13 @@ fn resolve(repo: &Path, rev: &str, packages: &[Package]) -> (Vec<Package>, Strin
         };
         match harness {
             Ok(harness) => {
-                let package = Package { pkg: package.pkg.clone(), harness };
+                let target = match &harness {
+                    Harness::Bin(b) => Some(format!("bin:{b}")),
+                    Harness::Test(t) => Some(format!("test:{t}")),
+                    _ => None,
+                };
+                let features = target.and_then(|t| k.required.get(&t).cloned()).unwrap_or_default();
+                let package = Package { pkg: package.pkg.clone(), harness, features };
                 if seen.insert(package.clone()) { kept.push(package); }
             }
             Err(e) => dropped.push(format!("{} ({e})", package.label())),
@@ -483,7 +511,7 @@ fn same_group(a: &Caps, b: &Caps) -> bool { a.os == b.os && a.arch == b.arch }
 /// work goes to the pool boxes (the scheduler's pool_takes), and a spare there held a bench box
 /// for nothing.
 fn spare_ok(n: &NodeView, l: &LaneActivity, group: &Caps, pool_in_group: bool) -> bool {
-    n.up && n.dev && !n.role().users() && !(pool_in_group && n.role() == Role::Bench) && !l.boxes.contains(&n.name) && n.caps.as_ref().is_some_and(|c| same_group(c, group) && c.hub_proto >= if l.src == Src::Tree { 7 } else { 5 })
+    n.up && n.dev && !n.role().users() && !(pool_in_group && n.role() == Role::Bench) && !l.boxes.contains(&n.name) && n.caps.as_ref().is_some_and(|c| same_group(c, group) && c.has(if l.src == Src::Tree { "warm-trees" } else { "jit-inputs" }))
 }
 
 /// The group (OS, arch) has an up pool box.
@@ -493,6 +521,21 @@ fn pool_in_group(nodes: &[NodeView], group: &Caps) -> bool {
 
 fn native_room(c: &Caps, activity: &Activity) -> bool {
     c.native.len() < c.native_trees as usize || c.native.iter().any(|lane| !activity.active.contains(lane))
+}
+
+/// Of `free` (boxes the scheduler could start a spare's queued leg on now), those the lane's
+/// spare may take ([`spare_ok`], RAM and a native slot as its first pick asks).
+fn free_spares(nodes: &[NodeView], free: &[String], l: &LaneActivity, group: &Caps, native: bool, activity: &Activity) -> Vec<String> {
+    let pooled = pool_in_group(nodes, group);
+    nodes.iter().filter(|n| free.contains(&n.name) && spare_ok(n, l, group, pooled) && n.caps.as_ref().is_some_and(|c| c.ram_avail_gb >= 8.0 && (!native || native_room(c, activity)))).map(|n| n.name.clone()).collect()
+}
+
+/// A spare's leg that has waited to start at its box (`running`, holding no lease yet) past what
+/// it saves there, `value_ms` (a JIT build on that box: the most the lane's next lease there
+/// spends building it): its lane's next lease builds anyway. Three lanes' warm legs waited up to
+/// 10 min at a box behind its tests shard while two others sat at 1-3% CPU (11-09).
+fn waited_out(s: &Spare, running: bool, now: u64, value_ms: u64) -> bool {
+    running && s.progress.lease.is_none() && s.progress.state == "waiting" && now.saturating_sub(s.progress.started_ms) > value_ms
 }
 
 /// Only agent lanes receive spares, excluding devhub's own job lanes.
@@ -519,11 +562,31 @@ fn spare_tick(ctx: &Arc<Ctx>, nodes: &[NodeView], compilers: &[String], activity
     let mut spares = SPARES.lock().unwrap();
     let mut release = Vec::new();
     let mut runs = Vec::new();
+    // a spare whose leg waits in the queue at its box while boxes it may warm could start it now
+    // moves to them: never a fixed full box (a lane's warm waited 4 min at a full box, its every
+    // ask saying four others could start it, 11-07)
+    let moves: BTreeMap<String, Vec<String>> = spares.lanes.iter().filter(|(lane, s)| spares.running.contains_key(*lane) && s.progress.lease.is_none() && s.progress.state == "waiting").filter_map(|(lane, s)| {
+        let (l, group) = needing.get(lane)?;
+        let free = ctx.leases.starts_elsewhere(&format!("{WARM_LANE_PREFIX}{lane}"));
+        let free = free_spares(nodes, &free, l, group, s.native, activity);
+        (!free.is_empty()).then(|| (lane.clone(), free))
+    }).collect();
+    // one with nowhere to move gives up once it waited past what it saves ([`waited_out`])
+    let waited: BTreeMap<String, u64> = spares.lanes.iter().filter(|(lane, _)| !moves.contains_key(*lane)).filter_map(|(lane, s)| {
+        let value = ctx.leases.jit_build_ms(&s.node);
+        waited_out(s, spares.running.contains_key(lane), now, value).then(|| (lane.clone(), value))
+    }).collect();
     let remove: Vec<_> = spares.lanes.iter().filter(|(lane, s)| {
-        !needing.get(lane).is_some_and(|(l, group)| s.native == (l.src == Src::Tree) && nodes.iter().any(|n| n.name == s.node && spare_ok(n, l, group, pool_in_group(nodes, group))))
+        moves.contains_key(*lane) || waited.contains_key(*lane) || !needing.get(lane).is_some_and(|(l, group)| s.native == (l.src == Src::Tree) && nodes.iter().any(|n| n.name == s.node && spare_ok(n, l, group, pool_in_group(nodes, group))))
     }).map(|(lane, _)| lane.clone()).collect();
     for lane in remove {
         let s = spares.lanes.remove(&lane).unwrap();
+        if let Some(free) = moves.get(&lane) {
+            ctx.store.event("warm", Sev::Info, format!("warm {lane}: its leg waited at {}, which has no room, while {} could start it: it moves", s.node, free.join(" ")), None);
+        }
+        if let Some(value) = waited.get(&lane) {
+            ctx.store.event("warm", Sev::Info, format!("warm {lane}: its leg waited {} s at {}, past what it saves there (a JIT build there, {} s), and no box it may warm could start it: dropped (the lane's next lease builds anyway)", now.saturating_sub(s.progress.started_ms) / 1000, s.node, value / 1000), None);
+        }
         // Serialize this with finish's note_warm: an old completion cannot restore the mark.
         if !s.native { ctx.leases.forget_warm(&lane, &s.node); }
         if let Some(id) = s.progress.lease { release.push(id); }
@@ -535,7 +598,8 @@ fn spare_tick(ctx: &Arc<Ctx>, nodes: &[NodeView], compilers: &[String], activity
         let native = l.src == Src::Tree;
         if !spares.lanes.contains_key(lane) {
             let pooled = pool_in_group(nodes, group);
-            let candidate = nodes.iter().filter(|n| spare_ok(n, l, group, pooled) && n.caps.as_ref().is_some_and(|c| c.ram_avail_gb >= 8.0 && (!native || native_room(c, activity)))).min_by(|a, b| {
+            let moving = moves.get(lane.as_str());
+            let candidate = nodes.iter().filter(|n| spare_ok(n, l, group, pooled) && n.caps.as_ref().is_some_and(|c| c.ram_avail_gb >= 8.0 && (!native || native_room(c, activity))) && moving.is_none_or(|free| free.contains(&n.name))).min_by(|a, b| {
                 let (ac, bc) = (a.caps.as_ref().unwrap(), b.caps.as_ref().unwrap());
                 assigned.get(&a.name).copied().unwrap_or(0).cmp(&assigned.get(&b.name).copied().unwrap_or(0))
                     .then_with(|| ac.cpu_pct.unwrap_or(100.0).total_cmp(&bc.cpu_pct.unwrap_or(100.0)))
@@ -652,7 +716,7 @@ fn run_leg(ctx: &Ctx, run: &Run) {
         };
         if run.borrow().native {
             let r = run.borrow().clone();
-            let (packages, note) = resolve(&ctx.repo, &r.key.rev, &r.key.packages);
+            let (packages, note) = resolve(&ctx.repo, &r.key.rev, &r.key.packages, false);
             dropped = note;
             if !dropped.is_empty() { let _ = writeln!(log, "{dropped}"); }
             return native_leg(&r, &spec_of(&r), &packages, &mut log);
@@ -702,7 +766,6 @@ fn run_leg(ctx: &Ctx, run: &Run) {
                 // took a build's 12 GB default (three pool boxes' prebuilds waited 23 min an hour
                 // on RAM, holding their box meanwhile, 11-03)
                 r.class = WARM_CLASS.into();
-                if prebuild { r.priority = crate::lease::Priority::Interactive; }
                 if run.borrow().os == "macos" { r.needs.push(("os".into(), "macos".into())); }
             }, &mut on_wait, &give_up, &mut follow);
             if prebuild {
@@ -743,7 +806,7 @@ fn run_leg(ctx: &Ctx, run: &Run) {
             }
             let r = run.borrow().clone();
             if !set(&r, |p| { p.state = "held".into(); p.note.clear(); p.lease = Some(held.id.clone()); p.listed.clear(); }) { return Ok(String::new()); }
-            let (packages, note) = resolve(&ctx.repo, &r.key.rev, &r.key.packages);
+            let (packages, note) = resolve(&ctx.repo, &r.key.rev, &r.key.packages, true);
             dropped = note;
             if !dropped.is_empty() { let _ = writeln!(log, "{dropped}"); }
             let mut failures = Vec::new();
@@ -986,7 +1049,38 @@ pub fn render(v: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Key, Listed, Node, Package, Plan, Progress};
+    use super::{Key, Listed, Node, Package, Plan, Progress, Role, Src};
+
+    /// A warm replay builds a target with the features it requires (`required-features`): a
+    /// test target selected without them is an error (makepad-motion's `effect_modules` needs
+    /// `scene3d`: every warm run of it failed, 11-06). A target that needs none, and the
+    /// all-targets selections cargo skips such a target in, get no `--features`. A package whose
+    /// tests run in the lane's tree (test-tree) is built by a native warm run alone: in an overlay
+    /// relax-compiler's build script ran cargo metadata on a root only the JIT reads (11-13).
+    #[test]
+    fn a_warm_target_builds_with_the_features_it_requires() {
+        let manifest = "[package]\nname = \"motion\"\n\n[features]\nscene3d = []\n\n[[test]]\nname = \"effect_modules\"\nrequired-features = [\"scene3d\"]\n\n[[bin]]\nname = \"viewer\"\nrequired-features = [\"scene3d\", \"gpu\"]\n";
+        let tree = super::super::ci::Tree::mem(vec![
+            ("Cargo.toml", "[workspace]\nmembers = [\"motion\", \"stamped\"]\n"),
+            ("motion/Cargo.toml", manifest),
+            ("motion/src/lib.rs", ""),
+            ("motion/tests/effect_modules.rs", ""),
+            ("motion/tests/plain.rs", ""),
+            ("stamped/Cargo.toml", "[package]\nname = \"stamped\"\n[package.metadata.makepad]\ntest-tree = \"its build script runs cargo on the checkout\"\n"),
+            ("stamped/src/lib.rs", ""),
+        ]);
+        let mut asked: Vec<Package> = ["test:motion:effect_modules", "test:motion:plain", "test:motion:bin:viewer", "test:motion:lib"].iter().map(|c| Package::from_class(c).unwrap()).collect();
+        let stamped = Package::from_class("test:stamped:lib").unwrap();
+        asked.push(stamped.clone());
+        let (natively, note) = super::resolve_in(&tree, &asked, false);
+        assert!(natively.contains(&stamped) && note.is_empty(), "a native warm run builds it: {note}");
+        let (packages, note) = super::resolve_in(&tree, &asked, true);
+        assert_eq!(note, "dropped stamped:lib (runs in the lane's tree: its build script runs cargo on the checkout)", "an overlay one leaves it out");
+        let argv: Vec<String> = packages.iter().map(|p| p.argv()[11..].join(" ")).collect();
+        assert_eq!(argv, ["motion --release --test effect_modules --features scene3d -- --list", "motion --release --test plain -- --list", "motion --release --bin viewer --features scene3d,gpu -- --list", "motion --release --lib -- --list"]);
+        let native = packages.iter().find(|p| p.label() == "motion:effect_modules").unwrap().native_argv("linux");
+        assert!(native.ends_with(&["--test".to_string(), "effect_modules".into(), "--features".into(), "scene3d".into()]), "{native:?}");
+    }
 
     /// Every dev box that lacks the new JIT builds it, the lane-active ones first; one that has it,
     /// one with another compiler, a box down or with dev off is left alone.
@@ -1024,6 +1118,38 @@ mod tests {
         // a failure before any JIT was named never clears
         let mut p = Progress { state: "failed".into(), ..Progress::waiting("", 1) };
         assert!(!p.clear_if_stored(&[String::new()], 5));
+    }
+
+    /// A spare's leg queued at a full box moves only to a box the scheduler could start it on now
+    /// that its spare may take: never one of the lane's own boxes, a bench box beside pool ones, a
+    /// box short of RAM or another OS.
+    #[test]
+    fn a_spare_moves_only_to_a_free_box_it_may_warm() {
+        use crate::lease::sched::NodeView;
+        let node = |name: &str, os: &str, role: Role, ram: f64| NodeView {
+            name: name.into(), up: true, dev: true,
+            caps: Some(crate::lease::Caps { os: os.into(), arch: "x86_64".into(), features: crate::lease::FEATURES.iter().map(|f| f.to_string()).collect(), ram_avail_gb: ram, role: Some(role), ..Default::default() }),
+            ..Default::default()
+        };
+        let nodes = [node("full", "linux", Role::Pool, 16.0), node("own", "linux", Role::Pool, 16.0), node("free", "linux", Role::Pool, 16.0), node("bench", "linux", Role::Bench, 16.0), node("short", "linux", Role::Pool, 4.0), node("mac", "macos", Role::Pool, 16.0)];
+        let l = super::LaneActivity { boxes: ["own".to_string()].into(), src: Src::Overlay, newest_ms: 1, node: "own".into(), rev: "work@x".into(), hint: Vec::new(), packages: Vec::new(), native_packages: Vec::new() };
+        let group = nodes[0].caps.clone().unwrap();
+        let free: Vec<String> = ["own", "free", "bench", "short", "mac"].iter().map(|n| n.to_string()).collect();
+        assert_eq!(super::free_spares(&nodes, &free, &l, &group, false, &super::Activity::default()), vec!["free".to_string()]);
+        assert!(super::free_spares(&nodes, &[], &l, &group, false, &super::Activity::default()).is_empty(), "no box could start it: it stays");
+    }
+
+    /// A spare's leg that waited to start past what it saves at its box gives up: not before, not
+    /// once it holds its lease, and not while no leg runs (its next warm's wait).
+    #[test]
+    fn a_spares_leg_gives_up_past_what_it_saves() {
+        let spare = |state: &str, lease: Option<&str>| super::Spare { node: "a".into(), native: true, generation: 1, warmed: None, progress: Progress { state: state.into(), lease: lease.map(str::to_string), ..Progress::waiting("", 1_000) } };
+        let waiting = spare("waiting", None);
+        assert!(!super::waited_out(&waiting, true, 91_000, 90_000), "90 s: what a build there takes");
+        assert!(super::waited_out(&waiting, true, 91_001, 90_000));
+        assert!(!super::waited_out(&waiting, false, 900_000, 90_000), "no leg runs: its next warm waits its turn");
+        assert!(!super::waited_out(&spare("held", Some("L1")), true, 900_000, 90_000), "started: it builds");
+        assert!(!super::waited_out(&spare("syncing", Some("L1")), true, 900_000, 90_000));
     }
 
     fn plan(nodes: Vec<Node>) -> Plan {

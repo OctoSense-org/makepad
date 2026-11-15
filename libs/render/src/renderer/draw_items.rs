@@ -154,6 +154,13 @@ pub(super) struct SdfMeta {
 /// SDF shadow edge softness, sprite units: the base half-width at the feet
 /// and the extra per unit of source height (contact hardening — the tip of
 /// a shadow is cast by the head and blurs wider than the feet's contact).
+/// The paint lane's map slot: a terrain tile's weight map, or a worn road
+/// part's band map (material_surface.rs `SplatBand`). It is the PBR lane's
+/// occlusion slot, which the paint lane never reads as occlusion
+/// (occlusion_strength stays 0); shaders/splat.rs reads it only through
+/// the weight lookup and `splat_band_texel`.
+const SPLAT_MAP_SLOT: LiveId = live_id!(occlusion_map);
+
 pub(super) const SDF_SOFT_BASE: f32 = 0.05;
 pub(super) const SDF_SOFT_HARDEN: f32 = 0.10;
 
@@ -452,21 +459,35 @@ impl ModelDraw<'_> {
             self.base().draw_vars.set_uniform(cx, live_id!(morph_ctl), &[0.0, 0.0, 0.0, 0.0]);
         }
         self.base().tex_mag = vec2f(if m.mag_nearest { 1.0 } else { 0.0 }, 0.0);
+        let msdf = m.surface.as_ref().and_then(|s| s.definition.msdf);
+        let base = self.base();
+        // Read the bound texture when it has an allocation; on the first
+        // upload the shader obtains the same dimensions with texture.size().
+        let size = base.draw_vars.texture_slots[0].as_ref().and_then(|t|t.allocated_size(cx)).unwrap_or((0, 0));
+        let (fill, border, ctl, cells, ink_alpha) = if let Some(text) = msdf {
+            base.tex_mag.x = if text.plate_cells.is_some() { 4.0 } else { 3.0 };
+            (text.fill, text.border, [text.border_width, text.range, size.0 as f32, size.1 as f32], text.plate_cells.unwrap_or([0.0; 4]), m.surface.as_ref().unwrap().definition.base_alpha)
+        } else { ([0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4], 1.0) };
+        base.draw_vars.set_uniform(cx, live_id!(msdf_fill), &fill);
+        base.draw_vars.set_uniform(cx, live_id!(msdf_border), &border);
+        base.draw_vars.set_uniform(cx, live_id!(msdf_ctl), &ctl);
+        base.draw_vars.set_uniform(cx, live_id!(msdf_plate_cells), &cells);
+        base.draw_vars.set_uniform(cx, live_id!(msdf_ink_alpha), &[ink_alpha]);
         if let Some(d) = self.pbr() {
             let surface_on = if m.surface.is_some() { 1.0 } else { 0.0 };
             let (mut material_alpha, mut alpha_mode, mut alpha_cutoff) = (1.0f32, 0.0f32, 0.5f32);
             let (mut normal_scale, mut occlusion_strength) = (0.0f32, 0.0f32);
             let (mut emissive, mut double_sided, mut triplanar) = (vec3f(0.0, 0.0, 0.0), 0.0f32, 0.0f32);
+            let mut crown = 0.0f32;
             d.skinned.draw_vars.options.alpha_blend=false;d.skinned.draw_vars.options.depth_write=true;d.skinned.draw_vars.options.backface_culling=true;
             if let Some(surface)=&m.surface {
                 let definition=&surface.definition;
                 fur = crate::material_surface::fur_params(definition.fur);
-                material_alpha=definition.base_alpha;alpha_mode=definition.alpha_mode as f32;alpha_cutoff=definition.alpha_cutoff;
+                material_alpha=if definition.msdf.is_some(){1.0}else{definition.base_alpha};alpha_mode=definition.alpha_mode as f32;alpha_cutoff=definition.alpha_cutoff;
                 triplanar=definition.triplanar;
+                crown=if definition.crown{1.0}else{0.0};
                 // Race paint in the spare tex_mag lane (shaders.rs DrawSceneSkinned).
                 d.skinned.tex_mag.y=definition.packed_shading();
-                // A number plate: tex_mag.x = 2 selects the per-copy digit remap.
-                if definition.plate { d.skinned.tex_mag.x = 2.0; }
                 normal_scale=definition.normal_scale;occlusion_strength=definition.occlusion_strength;
                 emissive=vec3f(definition.emissive[0],definition.emissive[1],definition.emissive[2]);double_sided=if definition.double_sided{1.0}else{0.0};
                 d.skinned.draw_vars.options.alpha_blend=definition.alpha_mode==2;d.skinned.draw_vars.options.depth_write=definition.alpha_mode!=2;d.skinned.draw_vars.options.backface_culling=!definition.double_sided;
@@ -484,6 +505,9 @@ impl ModelDraw<'_> {
             vars.set_uniform(cx, live_id!(emissive), &[emissive.x, emissive.y, emissive.z]);
             vars.set_uniform(cx, live_id!(double_sided), &[double_sided]);
             vars.set_uniform(cx, live_id!(triplanar), &[triplanar]);
+            // A crown layer keeps its normals and reads its vertex colour as
+            // occlusion (shaders/foliage.rs); the other lanes have no `crown`.
+            vars.set_uniform(cx, live_id!(crown), &[crown]);
             if let Some(id)=d.skinned.draw_vars.draw_shader_id {
                 for (name,texture) in [(live_id!(normal_map),m.surface.as_ref().map(|s|&s.normal)),(live_id!(occlusion_map),m.surface.as_ref().map(|s|&s.occlusion)),(live_id!(emissive_map),m.surface.as_ref().map(|s|&s.emissive))] {
                     if let Some(slot)=cx.draw_shaders[id.index].mapping.textures.iter().position(|t|t.id==name).filter(|slot|*slot<d.skinned.draw_vars.texture_slots.len()){d.skinned.draw_vars.set_texture(slot,texture.unwrap_or(&m.orm));}
@@ -514,8 +538,22 @@ impl ModelDraw<'_> {
             for (i, id) in [live_id!(splat_l0), live_id!(splat_l1), live_id!(splat_l2), live_id!(splat_l3), live_id!(splat_l4), live_id!(splat_l5), live_id!(splat_l6), live_id!(splat_l7)].into_iter().enumerate() {
                 vars.set_uniform(cx, id, &p.params[i]);
             }
+            // One uniform branch skips relief work for the entire draw.
+            vars.set_uniform(cx, live_id!(splat_relief_on), &[if p.surface.iter().any(|p| p[0] > 0.0) { 1.0 } else { 0.0 }]);
+            for (i, id) in [live_id!(splat_s0), live_id!(splat_s1), live_id!(splat_s2), live_id!(splat_s3), live_id!(splat_s4), live_id!(splat_s5), live_id!(splat_s6), live_id!(splat_s7)].into_iter().enumerate() {
+                vars.set_uniform(cx, id, &p.surface[i]);
+            }
+            for (i, id) in [live_id!(splat_m0), live_id!(splat_m1), live_id!(splat_m2), live_id!(splat_m3), live_id!(splat_m4), live_id!(splat_m5), live_id!(splat_m6), live_id!(splat_m7)].into_iter().enumerate() {
+                vars.set_uniform(cx, id, &p.macro_variation[i]);
+            }
+            vars.set_uniform(cx, live_id!(splat_hex_a), &p.stochastic[0]);
+            vars.set_uniform(cx, live_id!(splat_hex_b), &p.stochastic[1]);
+            // A worn road part's band (zero: none, the masks are skipped).
+            vars.set_uniform(cx, live_id!(splat_band), &p.band[0]);
+            vars.set_uniform(cx, live_id!(splat_band_map), &p.band[1]);
+            vars.set_uniform(cx, live_id!(splat_wear), &p.band[2]);
             if let Some(id) = vars.draw_shader_id {
-                for (name, texture) in [(live_id!(normal_map), &p.normal), (live_id!(occlusion_map), &p.weights)] {
+                for (name, texture) in [(live_id!(normal_map), &p.normal), (SPLAT_MAP_SLOT, &p.weights)] {
                     if let Some(slot) = cx.draw_shaders[id.index].mapping.textures.iter().position(|t| t.id == name).filter(|slot| *slot < vars.texture_slots.len()) {
                         vars.set_texture(slot, texture);
                     }

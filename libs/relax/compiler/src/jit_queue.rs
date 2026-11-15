@@ -104,11 +104,14 @@ pub(super) struct Queue {
     timer: Option<std::thread::ThreadId>,
     /// AHEAD_INBOX's other buffer (its entries move in without a new allocation per move)
     inbox: Vec<(Arc<FrontShared>, AheadWork, u64)>,
+    /// the run quits (`quit`): no check or lowering ahead, O2 or speculative build nobody waits for
+    /// is queued
+    quitting: bool,
 }
 impl Queue {
     fn new() -> Self {
         Self { entries: Vec::new(), running: Vec::new(), serial: 0, waiters: HashMap::default(), plan: std::array::from_fn(|_| std::array::from_fn(|_| BTreeSet::new())), indices: HashMap::default(), by_slot: HashMap::default(), refresh_cursor: 0, ahead_class: budget::BACKGROUND, ahead_len: 0,
-            tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new() }
+            tick_at: Instant::now(), tick_queued: false, timer: None, inbox: Vec::new(), quitting: false }
     }
     /// Queues `job`; returns whether it can start now.
     pub(super) fn push(&mut self, job: Job, at: u64) -> bool {
@@ -119,6 +122,8 @@ impl Queue {
         let now = HeatNow::take();
         let slot = job.slot();
         let wanted = slot.and_then(|slot| self.wanted(slot));
+        // the run quits: a compile nobody waits for is speculative (`quit`)
+        if wanted.is_none() && self.quitting && quit_drops(job.tier()) { return false; }
         let promoted = wanted.is_some();
         let class = if job.tier() == 0 { budget::BACKGROUND } else { job_class(&job, &now) };
         let class = wanted.map_or(class, |w| w.min(self.bucket_class(job.tier(), class)));
@@ -167,21 +172,41 @@ impl Queue {
         self.sync_ahead();
         if self.entries.is_empty() { return; }
         self.refresh_cursor %= self.entries.len();
-        let entry = &mut self.entries[self.refresh_cursor];
+        let i = self.refresh_cursor;
         self.refresh_cursor += 1;
-        if entry.job.tier() == 0 { return; }
-        self.plan[entry.job.tier()][entry.class as usize].remove(&order(entry.key, entry.serial));
+        self.rekey(i, now);
+    }
+    /// Entry `i`'s class and key sampled again, its place in the plan with them. True: either moved.
+    fn rekey(&mut self, i: usize, now: &HeatNow) -> bool {
+        let entry = &mut self.entries[i];
+        if entry.job.tier() == 0 { return false; }
         let class = if entry.promoted { entry.class } else { job_class(&entry.job, now) };
+        let key = key(entry, now);
+        if class == entry.class && key == entry.key { return false; }
+        self.plan[entry.job.tier()][entry.class as usize].remove(&order(entry.key, entry.serial));
         if class != entry.class {
             budget::queued(entry.class, budget::JIT, -1);
             budget::queued(class, budget::JIT, 1);
             entry.class = class;
         }
-        entry.key = key(entry, now);
+        entry.key = key;
         self.plan[entry.job.tier()][entry.class as usize].insert(order(entry.key, entry.serial));
+        true
     }
+    /// The entry to start now. An O3 entry's heat is live (its slot's record is charged until the
+    /// build), so the one chosen has its key read again: moved since its last sample (code that
+    /// stopped running, or got hotter), it goes to its place and the pick runs again. Each entry
+    /// moves at most once per pick (its key is then current).
     fn head(&mut self, now: &HeatNow, takes: Takes) -> Option<usize> {
         self.refresh(now);
+        // (a key read twice at one `now` is the same unless the program charged the record in
+        // between: the walk ends after one pass over the entries whatever happens)
+        for _ in 0..self.entries.len() {
+            let i = self.first_for(takes)?;
+            if !matches!(self.entries[i].job, Job::O3(_)) || !self.rekey(i, now) {
+                return Some(i);
+            }
+        }
         self.first_for(takes)
     }
     /// The entry to start now, in rank order (head without its heat sample): the first class whose
@@ -358,7 +383,7 @@ fn key(e: &Entry, now: &HeatNow) -> i64 {
     if matches!(e.job, Job::Check(..)) { return if crate::check::check_waited() { CHECK_WAITED_KEY } else { i64::MIN }; }
     let (heat, ui) = match &e.job {
         Job::O2(u, id, _) => now.heat(*u, *id),
-        Job::O3(t) => now.heat(0, t.0),
+        Job::O3(t) => now.tier_heat(t),
         _ => (0, false),
     };
     // log2 heat buckets, with one doubling per four seconds of age. Adding the
@@ -385,6 +410,12 @@ static QUEUE: OnceLock<relax_session::sync::Mutex<Queue>> = OnceLock::new();
 const TIERS: usize = 6;
 static COUNTS: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
 static RUNNING: [AtomicUsize; TIERS] = [const { AtomicUsize::new(0) }; TIERS];
+const TIER_NAMES: [&str; TIERS] = ["ahead", "O2", "O3", "spec", "tick", "check"];
+/// What the jobs of each tier took so far, the CPU of the threads running them (makepad inspect `jit spent`).
+static JOB_CPU: [AtomicU64; TIERS] = [const { AtomicU64::new(0) }; TIERS];
+static JOB_RUNS: [AtomicU64; TIERS] = [const { AtomicU64::new(0) }; TIERS];
+/// The same per slot for its O2 and O3 jobs: O2 ns, O2 jobs, O3 ns, O3 jobs.
+static SLOT_CPU: relax_session::sync::Mutex<Option<HashMap<u32, [u64; 4]>>> = relax_session::sync::Mutex::new(None);
 /// A worker's park state, on its own cache line (each worker writes its flag at every job).
 #[repr(align(64))]
 /// `idle`: the worker runs at the OS's idle policy (idle_tiers): it takes tier-ups only.
@@ -431,13 +462,52 @@ impl Takes {
     }
 }
 static THREADS: OnceLock<Vec<Sleeper>> = OnceLock::new();
-static START: std::sync::Once = std::sync::Once::new();
 static NEXT_WORKER: AtomicUsize = AtomicUsize::new(0);
 /// The workers leave at their next pick (`stop_workers`).
 static WORKERS_STOP: AtomicBool = AtomicBool::new(false);
-/// Drains started and drains that came back.
-static DRAINS: AtomicUsize = AtomicUsize::new(0);
+/// The workers' drains (`start`), and the drains that came back.
+static DRAINS: Drains = Drains::new();
 static DRAINS_BACK: AtomicUsize = AtomicUsize::new(0);
+/// The drains the first start asks the pool for, one per core. One the pool cannot start (no idle
+/// worker, and the OS refused a thread: a limit on the process's memory counts each worker's stack)
+/// leaves the workers the start has, which take every job; with none the start fails, and the
+/// next one asks again. A failed start leaves nothing a later one trips over: a Once its refused
+/// thread poisoned once failed every later push ("Once instance has previously been poisoned",
+/// on whichever thread pushed next).
+struct Drains {
+    /// the drains are started (the fast path of every push)
+    started: AtomicBool,
+    /// held by the start that starts them
+    starting: relax_session::sync::Mutex<()>,
+    /// drains started: `stop_workers` waits for as many to come back
+    count: AtomicUsize,
+}
+#[derive(Debug, PartialEq)]
+enum Started { Already, All, Short(usize, String) }
+impl Drains {
+    const fn new() -> Drains {
+        Drains { started: AtomicBool::new(false), starting: relax_session::sync::Mutex::new(()), count: AtomicUsize::new(0) }
+    }
+    /// `init` once, then `drain` until `want` drains run. Err: not one started (the OS's answer).
+    fn start(&self, want: usize, init: impl FnOnce(), mut drain: impl FnMut() -> std::io::Result<()>) -> std::io::Result<Started> {
+        if self.started.load(Ordering::Acquire) { return Ok(Started::Already); }
+        let _starting = self.starting.lock().unwrap_or_else(|e| e.into_inner());
+        if self.started.load(Ordering::Acquire) { return Ok(Started::Already); }
+        init();
+        while self.count.load(Ordering::SeqCst) < want {
+            // counted before it starts: stop_workers never sees a running drain uncounted
+            self.count.fetch_add(1, Ordering::SeqCst);
+            if let Err(e) = drain() {
+                let have = self.count.fetch_sub(1, Ordering::SeqCst) - 1;
+                if have == 0 { return Err(e); }
+                self.started.store(true, Ordering::Release);
+                return Ok(Started::Short(have, e.to_string()));
+            }
+        }
+        self.started.store(true, Ordering::Release);
+        Ok(Started::All)
+    }
+}
 struct CompilerSource;
 static SOURCE: CompilerSource = CompilerSource;
 pub(super) fn queue() -> &'static relax_session::sync::Mutex<Queue> {
@@ -466,28 +536,56 @@ fn lock() -> QueueGuard {
     QueueGuard { guard, acquired: Instant::now() }
 }
 pub(super) fn start() {
-    START.call_once(|| {
+    if DRAINS.started.load(Ordering::Acquire) { return; }
+    let _kept = crate::zone_alloc::kept();
+    let want = budget::cores() as usize;
+    let init = || {
         crate::pool::thread_start(ensure_altstack);
-        let _kept = crate::zone_alloc::kept();
-        THREADS.get_or_init(|| (0..budget::cores()).map(|_| Sleeper { thread: OnceLock::new(), waiting: AtomicBool::new(false), idle: AtomicBool::new(false) }).collect());
-        DRAINS.store(budget::cores() as usize, Ordering::SeqCst);
-        for _ in 0..budget::cores() { crate::pool::drain(&SOURCE); }
-    });
+        THREADS.get_or_init(|| (0..want).map(|_| Sleeper { thread: OnceLock::new(), waiting: AtomicBool::new(false), idle: AtomicBool::new(false) }).collect());
+    };
+    match DRAINS.start(want, init, || crate::pool::drain(&SOURCE)) {
+        Ok(Started::Already | Started::All) => {}
+        Ok(Started::Short(have, e)) => eprintln!("relax: the JIT compiles on {have} of its {want} workers: the OS refused another thread ({e})"),
+        Err(e) => panic!("failed to start JIT pool worker: {e}"),
+    }
+}
+/// A lifecycle test measures retained process heap after its initial setup.
+/// A pool thread allocates runtime state before entering the drain: merely spawning
+/// the drains does not establish that those one-off allocations have happened.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn warm_workers_for_test() {
+    start();
+    let count = DRAINS.count.load(Ordering::Acquire);
+    while THREADS.get().unwrap().iter().take(count).any(|worker| worker.thread.get().is_none()) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 /// The workers leave at their next pick, a job in hand ending first (what compiles was told to stop
-/// by then: `jit::stop_compiling`). False: some were still in a job when `give_up` ran out.
-pub(super) fn stop_workers(give_up: std::time::Duration) -> bool {
+/// by then: `jit::stop_compiling`). Returns once every one has: a job reads the run's unit and the
+/// statics the run's end puts back, so the end never goes on past one. While a job runs on, every
+/// `report` says which.
+pub(super) fn stop_workers(report: std::time::Duration) {
     WORKERS_STOP.store(true, Ordering::SeqCst);
     let t = Instant::now();
-    while DRAINS_BACK.load(Ordering::SeqCst) < DRAINS.load(Ordering::SeqCst) {
-        if t.elapsed() >= give_up {
-            return false;
+    let mut said = std::time::Duration::ZERO;
+    while DRAINS_BACK.load(Ordering::SeqCst) < DRAINS.count.load(Ordering::SeqCst) {
+        if t.elapsed() >= said + report {
+            said = t.elapsed();
+            let jobs: Vec<String> = {
+                let _kept = crate::zone_alloc::kept();
+                lock().running.iter().map(|r| match r.slot {
+                    Some((_, slot)) => format!("{} of slot #{slot}", TIER_LABELS[r.tier]),
+                    None => TIER_LABELS[r.tier].to_string(),
+                }).collect()
+            };
+            eprintln!("relax: a run's end waits {:.0} s for its compile workers, {} still in a job: {}", said.as_secs_f64(), DRAINS.count.load(Ordering::SeqCst) - DRAINS_BACK.load(Ordering::SeqCst), jobs.join(", "));
         }
         wake_all();
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    true
 }
+/// The jobs of each tier (`Job::tier`), as `Job::label` names them.
+const TIER_LABELS: [&str; TIERS] = ["JIT ahead", "JIT O2", "JIT O3", "JIT spec", "JIT tick", "JIT check"];
 /// Callable from a hot stub: no queue lock, allocation or compiler work. Wakes the first parked
 /// worker: the work stays on the few workers it needs (a startup's checks ahead on as many as its
 /// width), each on its core with its caches warm, not spread over every worker in turn.
@@ -522,6 +620,35 @@ pub(super) fn wake_all() {
 /// This process is a plain fork's child (jit::fork_child): it has no workers, and a parent's worker
 /// may have held the queue's lock or inbox at the fork, held for good there: nothing is queued.
 static FORKED: AtomicBool = AtomicBool::new(false);
+/// The run quits (`quit`): ahead work found from now on is not queued (Queue::quitting decides,
+/// under the lock; this spares the inbox and the workers' wake).
+static QUITTING: AtomicBool = AtomicBool::new(false);
+/// A queued job of `tier` the quit drops: checks and lowering ahead, O2 and speculative builds.
+fn quit_drops(tier: usize) -> bool {
+    matches!(tier, 0 | 1 | 3)
+}
+/// The run quits (run.rs quit_mark): the compiles queued and not started -- checks and lowering
+/// ahead, O2 and speculative builds -- are dropped, unless a thread waits for one: they are
+/// speculative, and the next launch asks again. None is queued from now on. The O3 tier-ups were
+/// stopped (TIER_STOP) and stay queued, for the exit to record their verdicts
+/// (record_queued_at_exit); the checks beside the program and the tick go on. In batches, the
+/// queue's lock held for one at a time (a lazy compile of the app's shutdown may queue behind
+/// it). Returns how many were dropped.
+pub(super) fn quit() -> usize {
+    QUITTING.store(true, Ordering::SeqCst);
+    if FORKED.load(Ordering::Relaxed) { return 0; }
+    let _kept = crate::zone_alloc::kept();
+    let serials = lock().quit();
+    let mut dropped = 0;
+    for batch in serials.chunks(QUIT_DROP_BATCH) {
+        // (the entries go after the lock is given back)
+        let gone = lock().quit_drop(batch);
+        dropped += gone.len();
+    }
+    dropped
+}
+/// `quit`'s entries dropped per hold of the queue's lock.
+const QUIT_DROP_BATCH: usize = 1024;
 #[cfg(unix)]
 pub(super) fn fork_child() {
     FORKED.store(true, Ordering::SeqCst);
@@ -548,7 +675,7 @@ pub(super) fn ahead_found(front: &Arc<FrontShared>, work: Vec<AheadWork>) {
 /// Ahead work made since the queue's lock was last taken: whoever takes it next moves it in
 /// (`lock`). The owner makes a slot for each callee of a lazy compile, and the checks ahead find
 /// work in every body: each queued under the queue's lock, which a worker holds for every pick,
-/// met it on one push in seven (15k sleeps of the owner through a cold Fab start, the thread the
+/// met it on one push in seven (15k sleeps of the owner through a large app's cold start, the thread the
 /// UI waits behind; 130k of the workers').
 static AHEAD_INBOX: relax_session::sync::Mutex<Vec<(Arc<FrontShared>, AheadWork, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 static AHEAD_PENDING: AtomicBool = AtomicBool::new(false);
@@ -556,7 +683,8 @@ static AHEAD_PENDING: AtomicBool = AtomicBool::new(false);
 /// width (STARTUP_AHEAD; a running check takes the next itself when it ends). Ahead work blocked
 /// otherwise starts when the startup's phases change (they wake the workers).
 fn push_ahead(front: &Arc<FrontShared>, work: impl Iterator<Item = AheadWork>) {
-    if FORKED.load(Ordering::Relaxed) { return; }
+    // (the run quits: nothing is checked or lowered ahead any more, `quit`)
+    if FORKED.load(Ordering::Relaxed) || QUITTING.load(Ordering::Relaxed) { return; }
     // A producer can finish discovering work after the settle rebuild retired its front.
     if !front.alive.load(Ordering::Acquire) { return; }
     let at = wall_ns();
@@ -594,6 +722,34 @@ pub(super) fn tiers_where(keep: impl Fn(&TierEntry) -> bool) -> Vec<TierEntry> {
     drain_tier_inbox();
     lock().entries.iter().filter_map(|e| if let Job::O3(t) = e.job { keep(&t).then_some(t) } else { None }).collect()
 }
+fn note_job(tier: usize, slot: Option<u32>, ns: u64) {
+    JOB_CPU[tier].fetch_add(ns, Ordering::Relaxed);
+    JOB_RUNS[tier].fetch_add(1, Ordering::Relaxed);
+    if let (true, Some(slot)) = (is_tier_up(tier), slot) {
+        let at = (tier - 1) * 2;
+        crate::zone_alloc::kept_with(|| {
+            let mut g = SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner());
+            let row = g.get_or_insert_with(Default::default).entry(slot).or_default();
+            row[at] += ns;
+            row[at + 1] += 1;
+        });
+    }
+}
+/// What the jobs took by tier, then the `n` slots whose O2 and O3 jobs took the most.
+pub(super) fn spent(n: usize) -> Vec<String> {
+    let mut rows = vec![TIER_NAMES.iter().enumerate()
+        .map(|(i, name)| format!("{name} {:.1} s x{}", JOB_CPU[i].load(Ordering::Relaxed) as f64 / 1e9, JOB_RUNS[i].load(Ordering::Relaxed)))
+        .collect::<Vec<_>>().join(", ")];
+    let g = SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slots: Vec<(&u32, &[u64; 4])> = g.iter().flatten().collect();
+    slots.sort_by_key(|(id, r)| (std::cmp::Reverse(r[0] + r[2]), **id));
+    rows.push(format!("{} slots had an O2 or O3 job", slots.len()));
+    rows.extend(slots.into_iter().take(n).map(|(id, r)| {
+        let name = slot_name(*id).unwrap_or_default();
+        format!("S{id} O2 {:.1} ms x{} O3 {:.1} ms x{} {name}", r[0] as f64 / 1e6, r[1], r[2] as f64 / 1e6, r[3])
+    }));
+    rows
+}
 pub(super) fn retire_front(front: &Arc<FrontShared>) {
     front.alive.store(false, Ordering::SeqCst);
     retain(|job| !matches!(job, Job::Ahead(f, _) if Arc::ptr_eq(f, front)));
@@ -607,6 +763,20 @@ pub(super) fn retain(mut keep: impl FnMut(&Job) -> bool) {
     }
 }
 impl Queue {
+    /// The run quits (`quit`): nothing it drops is queued from now on; the queued entries it drops.
+    fn quit(&mut self) -> Vec<u64> {
+        self.quitting = true;
+        self.entries.iter().filter(|e| quit_drops(e.job.tier()) && !e.promoted).map(|e| e.serial).collect()
+    }
+    /// `serials`' entries out of the queue, but one a worker took since or a thread came to wait for.
+    fn quit_drop(&mut self, serials: &[u64]) -> Vec<Entry> {
+        let mut gone = Vec::with_capacity(serials.len());
+        for serial in serials {
+            let Some(&i) = self.indices.get(serial) else { continue };
+            if !self.entries[i].promoted { gone.push(self.remove(i)); }
+        }
+        gone
+    }
     /// Promotes slot `id`'s queued and running jobs to their waiters' class; returns whether a
     /// queued one can start now.
     fn promote(&mut self, unit: usize, id: u32) -> bool {
@@ -753,6 +923,7 @@ fn worker_loop(index: usize) {
             worker.waiting.store(true, Ordering::SeqCst);
             // Atomics-only producers publish to the existing tier-record inbox.
             drain_tier_inbox();
+            prioritize_hot_verdicts();
             // one queue lock per pick, idle or not: the tick's timer is taken and given back
             // under it too
             let next = {
@@ -824,11 +995,13 @@ fn worker_loop(index: usize) {
                         TIER_ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(tier.0);
                         Some(TierActive(tier.0))
                     } else { None };
+                    let (slot, cpu) = (entry.slot.map(|s| s.1), cpu_ns());
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(entry.job)));
+                    note_job(tier, slot, cpu_ns().saturating_sub(cpu));
                     drop(active);
                     if let Err(payload) = result {
                         let (message, bail) = panic_payload(&*payload);
-                        if !bail { eprintln!("makepad: JIT job panicked: {message}"); }
+                        if !bail { eprintln!("relax: JIT job panicked: {message}"); }
                     }
                     held = Some(permit);
                     finished = Some((serial, tier));
@@ -896,7 +1069,7 @@ pub(super) fn view(n: usize) -> Vec<String> {
         let e = &q.entries[i];
         let (heat, ui) = match &e.job {
             Job::O2(unit, id, _) => now.heat(*unit, *id),
-            Job::O3(t) => now.heat(0, t.0),
+            Job::O3(t) => now.tier_heat(t),
             _ => (0, false),
         };
         let why = match &e.job {
@@ -915,6 +1088,28 @@ pub(super) fn view(n: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_jobs_cpu_goes_to_its_tier_and_slot() {
+        // (the counts are process-wide and other tests add to theirs: it checks what its own jobs
+        // added, so it holds beside them and when a warm test process runs it again)
+        let slot = u32::MAX - 11;
+        let of_slot = || SLOT_CPU.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&slot).copied()).unwrap_or_default();
+        let tiers = || [1, 2].map(|t| (JOB_CPU[t].load(Ordering::Relaxed), JOB_RUNS[t].load(Ordering::Relaxed)));
+        let (slot0, tiers0) = (of_slot(), tiers());
+        note_job(2, Some(slot), 5_000_000);
+        note_job(2, Some(slot), 5_000_000);
+        note_job(1, Some(slot), 1_000_000);
+        let (slot1, tiers1) = (of_slot(), tiers());
+        assert_eq!([0, 1, 2, 3].map(|i| slot1[i] - slot0[i]), [1_000_000, 1, 10_000_000, 2], "the slot's O2 and O3 time and runs");
+        for (t, (ns, runs)) in [(0, (1_000_000, 1)), (1, (10_000_000, 2))] {
+            assert!(tiers1[t].0 - tiers0[t].0 >= ns && tiers1[t].1 - tiers0[t].1 >= runs, "tier {} totals hold the jobs", t + 1);
+        }
+        let rows = spent(usize::MAX);
+        assert!(rows[0].contains("O3 "), "by tier first: {}", rows[0]);
+        let row = format!("S{slot} O2 {:.1} ms x{} O3 {:.1} ms x{}", slot1[0] as f64 / 1e6, slot1[1], slot1[2] as f64 / 1e6, slot1[3]);
+        assert!(rows.iter().any(|r| r.starts_with(&row)), "{row} in {rows:?}");
+    }
 
     #[test]
     fn admission_order_and_waiter_promotion() {
@@ -974,6 +1169,50 @@ mod tests {
         assert_eq!(q.ahead_len, 0, "removals balance bucket accounting");
     }
 
+    /// A drain the OS refuses a thread (a memory limit on the process: a tests/ui check under the
+    /// sweep's data limit) leaves the workers started, and no later start fails for it; a start
+    /// that got none, or panicked, is asked again by the next.
+    #[test]
+    fn a_refused_worker_thread_poisons_no_later_start() {
+        let refused = || std::io::Error::from_raw_os_error(11);
+        let d = Drains::new();
+        let mut asked = 0;
+        let got = d.start(4, || {}, || { asked += 1; if asked <= 2 { Ok(()) } else { Err(refused()) } }).unwrap();
+        assert!(matches!(got, Started::Short(2, _)), "the two drains that started work: {got:?}");
+        assert_eq!(d.count.load(Ordering::SeqCst), 2, "stop_workers waits for the two, not four");
+        assert_eq!(d.start(4, || panic!("init again"), || panic!("asked again")).unwrap(), Started::Already, "the next push finds them started");
+
+        let d = Drains::new();
+        assert!(d.start(4, || {}, || Err(refused())).is_err(), "no drain at all: the start fails");
+        assert_eq!(d.count.load(Ordering::SeqCst), 0);
+        assert_eq!(d.start(4, || {}, || Ok(())).unwrap(), Started::All, "the next start asks again, and gets them");
+        assert_eq!(d.count.load(Ordering::SeqCst), 4);
+
+        let d = Drains::new();
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| d.start(4, || panic!("a panic in the first start"), || Ok(()))));
+        assert!(first.is_err());
+        assert_eq!(d.start(4, || {}, || Ok(())).unwrap(), Started::All, "a start after a panicked one runs, poisoned by nothing");
+        assert_eq!(d.count.load(Ordering::SeqCst), 4);
+    }
+
+    /// A run's end waits out a worker still in a job however long the job takes: the job reads
+    /// the unit and the statics the end puts back next (a prefront still lowering after a 10 s
+    /// give-up read a Tcx the reset had freed: a fault outside JIT code, the app gone, 11-08).
+    #[test]
+    fn a_runs_end_waits_out_a_worker_in_a_job() {
+        isolated_test!(a_runs_end_waits_out_a_worker_in_a_job);
+        // a drain that is in its job until `back` comes
+        DRAINS.count.fetch_add(1, Ordering::SeqCst);
+        let t = Instant::now();
+        let back = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            DRAINS_BACK.fetch_add(1, Ordering::SeqCst);
+        });
+        stop_workers(std::time::Duration::from_millis(50));
+        assert!(t.elapsed() >= std::time::Duration::from_millis(400), "the end went on while the job ran ({:?})", t.elapsed());
+        back.join().unwrap();
+    }
+
     /// While a real-time thread is live, a worker at the idle policy starts tier-ups only, and one
     /// that may not go there any more everything else (idle_tiers).
     #[test]
@@ -989,6 +1228,42 @@ mod tests {
         q.remove(other);
         assert!(q.head(&now, Takes::NoTierUps).is_none(), "the tier-up waits for an idle worker");
         assert!(q.first().is_some(), "which some worker may start: one of the other kind is woken");
+    }
+
+    /// At the quit the compiles queued and not started go, but one a thread waits for; the O3
+    /// tier-ups stay queued (stopped: the exit records their verdicts), and nothing new nobody
+    /// waits for is queued after it.
+    #[test]
+    fn a_quit_drops_the_queued_compiles_nobody_waits_for() {
+        let mut q = Queue::new();
+        let front = Arc::new(FrontShared::new(&Arc::new(crate::Session::default())));
+        front.alive.store(true, Ordering::Release);
+        q.push(Job::Ahead(front.clone(), AheadWork::Slot(30)), 1);
+        q.push(Job::O2(1, 31, O2Kind::Normal), 2);
+        q.push(Job::Spec(1, 32), 3);
+        q.push(Job::O2(1, 33, O2Kind::Normal), 4);
+        q.push(Job::O3((34, 0, 0, 0)), 5);
+        q.push(Job::Tick, 6);
+        q.waiters.insert((1, 33), [1, 0]);
+        q.promote(1, 33);
+        let serials = q.quit();
+        // (a worker takes one of them before its batch is dropped)
+        let taken = q.indices[&serials[0]];
+        q.remove(taken);
+        let gone = q.quit_drop(&serials);
+        assert_eq!(gone.len(), 2, "the queued checks ahead, O2 and speculative builds nobody waits for are dropped, once");
+        let left: Vec<usize> = q.entries.iter().map(|e| e.job.tier()).collect();
+        assert_eq!(left.len(), 3, "the waited-for O2 build, the O3 tier-up and the tick stay: {left:?}");
+        assert!(q.entries.iter().any(|e| e.job.slot() == Some((1, 33))), "a compile a thread waits for stays queued");
+        assert!(q.entries.iter().any(|e| matches!(e.job, Job::O3(..))), "a queued O3 tier-up stays for the exit's verdicts");
+        assert_eq!(q.ahead_len, 0, "the dropped check ahead leaves the bucket accounting balanced");
+        q.push(Job::O2(1, 35, O2Kind::Normal), 7);
+        q.push(Job::Spec(1, 36), 8);
+        q.push(Job::Ahead(front, AheadWork::Slot(37)), 9);
+        assert_eq!(q.entries.len(), 3, "after the quit nothing nobody waits for is queued");
+        q.waiters.insert((1, 38), [1, 0]);
+        q.push(Job::O2(1, 38, O2Kind::Normal), 10);
+        assert_eq!(q.entries.len(), 4, "a compile a thread waits for is still queued");
     }
 }
 
@@ -1007,9 +1282,19 @@ pub(super) fn cleanup_ahead() {
     let Some(front) = front else { return };
     let q = lock();
     if q.entries.iter().any(|e| e.job.tier() == 0) || q.running.iter().any(|r| r.tier == 0) { return; }
-    let keys = std::mem::take(&mut *front.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
-    let unused: Vec<_> = keys.iter().filter_map(|key| front.ahead.remove(key)).collect();
-    let lowered = std::mem::take(&mut *front.lowered.lock().unwrap_or_else(|e| e.into_inner()));
+    // (not what a background build checked and lowered for its own take: its bodies are published
+    // under the claim lock, its lowerings under the map's)
+    let (keys, unused) = {
+        let _claim = front.inprog.lock().unwrap_or_else(|e| e.into_inner());
+        if fronts_held() { return; }
+        let keys = std::mem::take(&mut *front.ahead_post.lock().unwrap_or_else(|e| e.into_inner()));
+        let unused: Vec<_> = keys.iter().filter_map(|key| front.ahead.remove(key)).collect();
+        (keys, unused)
+    };
+    let lowered = {
+        let mut lowered = front.lowered.lock().unwrap_or_else(|e| e.into_inner());
+        if fronts_held() { Default::default() } else { std::mem::take(&mut *lowered) }
+    };
     drop(q);
     lowered_end();
     if !keys.is_empty() {
@@ -1025,15 +1310,18 @@ pub(crate) unsafe fn reset_statics() {
     reset(&QUEUE, OnceLock::new());
     reset(&COUNTS, [const { AtomicUsize::new(0) }; TIERS]);
     reset(&RUNNING, [const { AtomicUsize::new(0) }; TIERS]);
+    reset(&JOB_CPU, [const { AtomicU64::new(0) }; TIERS]);
+    reset(&JOB_RUNS, [const { AtomicU64::new(0) }; TIERS]);
+    reset(&SLOT_CPU, relax_session::sync::Mutex::new(None));
     reset(&THREADS, OnceLock::new());
-    reset(&START, std::sync::Once::new());
     reset(&NEXT_WORKER, AtomicUsize::new(0));
     reset(&IDLE_WORKERS, AtomicUsize::new(0));
     reset(&WORKERS_STOP, AtomicBool::new(false));
-    reset(&DRAINS, AtomicUsize::new(0));
+    reset(&DRAINS, Drains::new());
     reset(&DRAINS_BACK, AtomicUsize::new(0));
     reset(&LOCK_MAX_NS, AtomicU64::new(0));
     reset(&AHEAD_INBOX, relax_session::sync::Mutex::new(Vec::new()));
     reset(&AHEAD_PENDING, AtomicBool::new(false));
     reset(&LOOKS_GONE, AtomicBool::new(false));
+    reset(&QUITTING, AtomicBool::new(false));
 }

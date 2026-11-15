@@ -1,7 +1,7 @@
-//! Provided crates (local/plans/loader-core.md section 8): a crate rustc built into the binary
+//! Provided crates: a crate rustc built into the binary
 //! that runs Relax (the `makepad` loader builds makepad-script into itself). Relax still loads
 //! its source (types, signatures, generic and inline bodies) but binds the fns the crate marks
-//! `#[relax_api]` (makepad-relax-api) to the compiled code: each gets a bridge body
+//! `#[relax_api]` (relax-api) to the compiled code: each gets a bridge body
 //! (lower::bridge_func) with Relax's own ABI that packs its arguments into one uniform C call,
 //! `extern "C" fn(args: *const *mut u8, ret: *mut u8) -> u32`, of the wrapper the attribute
 //! generated into the crate. Callers, fn pointers and vtables need nothing else: the slot is an
@@ -29,7 +29,8 @@ use std::collections::HashMap;
 use relax_session::sync::Mutex;
 
 /// A generated shim: arguments moved out of `args[i]`, the result written to `ret`; 0 = returned,
-/// 1 = panicked (the message is then read with the crate's LastPanicFn).
+/// 1 = panicked (the message is then read with the crate's LastPanicFn), 2 = the calling thread's
+/// own panic unwound through it (relax_api::CallerPanic: the caller goes on with it).
 pub type ShimFn = unsafe extern "C" fn(*const *mut u8, *mut u8) -> u32;
 /// Writes the text of the last panic a shim caught on this thread: (ptr, len), valid until the
 /// thread's next shim call.
@@ -72,11 +73,15 @@ pub struct ProvidedCrate {
     pub binding: u64,
     /// Per-file and feature/version identity embedded by the loader build.
     pub manifest: &'static [u8],
+    /// the crate's `#[relax_api]` entries as the loader's linker laid them down (its
+    /// `relax_api::entries()`, in their order): the program's `relax_api` table takes these where
+    /// rustc's link would put the crate's own (sections.rs lay_out)
+    pub table: Vec<&'static relax_api::Entry>,
 }
 
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
-        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest }
+        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), per_side: self.per_side.clone(), last_panic: self.last_panic, source: self.source, binding: self.binding, manifest: self.manifest, table: self.table.clone() }
     }
 }
 
@@ -88,7 +93,8 @@ pub(crate) fn registered(name: &str) -> bool {
 }
 
 /// Registers a provided crate (before `cli_main`): its `#[relax_api]` entries as the loader read
-/// them from its own binary (makepad_relax_api::entries), and the panic-text accessor.
+/// them from its own binary (relax_api::entries; `table`: all of them, as laid down), and the
+/// panic-text accessor.
 pub fn register(
     name: &str,
     shims: HashMap<String, Shim>,
@@ -98,10 +104,11 @@ pub fn register(
     last_panic: LastPanicFn,
     source: u64,
     manifest: &'static [u8],
+    table: Vec<&'static relax_api::Entry>,
 ) {
     let name = name.replace('-', "_");
     let binding = binding_identity(&name, &shims, &types, &layouts, &per_side);
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, per_side, last_panic, source, binding, manifest });
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, per_side, last_panic, source, binding, manifest, table });
 }
 
 /// The identity of what JIT code depends on in a provided crate beyond its source text (which
@@ -188,7 +195,10 @@ impl From<String> for SourceCheckError {
 
 fn check_manifest(name: &str, source: u64, manifest: &[u8], current: &crate::srchash::Manifest, pkgs: &[crate::srchash::SrcPkg]) -> Result<(), SourceCheckError> {
     if crate::srchash::manifest_hash(current) == source { return Ok(()); }
-    let built = crate::srchash::decode_manifest(manifest)?;
+    // what the program's graph builds of the closure (srchash reached_by): a dependency that only
+    // the loader's host-shims brings in is no change
+    let built = crate::srchash::reached_by(&crate::srchash::decode_manifest(manifest)?, current);
+    if crate::srchash::diff_entries(&built, current).next().is_none() { return Ok(()); }
     let mut files = std::collections::BTreeSet::new();
     for (package, path) in crate::srchash::diff_entries(&built, current) {
         let package = package.strip_prefix("host:").unwrap_or(package);
@@ -239,6 +249,27 @@ mod source_tests {
         features.insert(("fixture_dep@1".into(), "\0features".into()), "enabled".into());
         assert_eq!(check_manifest("fixture", source, &encoded, &features, &pkgs), Err(SourceCheckError::Changed(ProvidedChange { crate_name: "fixture".into(), files: vec!["fixture/Cargo.toml".into()] })));
         assert!(matches!(check_manifest("fixture", source, &[1], &current, &pkgs), Err(SourceCheckError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_dependency_only_the_loaders_shims_bring_in_is_no_change() {
+        use crate::srchash::closure_manifest;
+        // relax-api's relax-api-phase: optional behind host-shims (the loader's build enables
+        // it, a program never does) and a dependency on Apple's targets only
+        let pkg = |name: &str, features: &[&str], deps: Vec<usize>| SrcPkg { name: name.into(), version: "1".into(), dir: format!("/.cargo/registry/{name}"),
+            features: features.iter().map(|f| f.to_string()).collect(), deps, proc_macro: false };
+        let built = closure_manifest(&[pkg("fixture", &["host-shims"], vec![1]), pkg("fixture-phase", &[], vec![])], 0);
+        let (source, encoded) = (manifest_hash(&built), encode_manifest(&built));
+        let check = |pkgs: &[SrcPkg]| check_manifest("fixture", source, &encoded, &closure_manifest(pkgs, 0), pkgs);
+        assert_eq!(check(&[pkg("fixture", &[], vec![])]), Ok(()), "Linux: the program's graph builds the crate without the dependency");
+        assert_eq!(check(&[pkg("fixture", &[], vec![1]), pkg("fixture-phase", &[], vec![])]), Ok(()), "Apple: both graphs have it");
+        // what the program builds still counts
+        let changed = |result: Result<(), SourceCheckError>| matches!(result, Err(SourceCheckError::Changed(_)));
+        assert!(changed(check(&[pkg("fixture", &[], vec![1]), pkg("fixture-other", &[], vec![])])), "a dependency only the program has");
+        let mut moved = [pkg("fixture", &[], vec![1]), pkg("fixture-phase", &[], vec![])];
+        moved[1].version = "2".into();
+        assert!(changed(check(&moved)), "another version of the dependency");
+        assert!(changed(check(&[pkg("fixture", &["other"], vec![])])), "a feature the identity keeps");
     }
 }
 
@@ -481,8 +512,12 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
             // free). Such a box is no handle: the type holding it stays opaque (TYPES), dropped
             // and cloned by the crate.
             if tcx.adts.get(d).is_some_and(|a| a.is_box()) {
-                return tcx.tys.list(*a).len() <= 2
-                    && tcx.tys.list(*a).first().is_some_and(|x| match tcx.tys.kind(*x) {
+                // only a Box in the global allocator: rustc's side frees any other through an
+                // allocator value Relax would have laid out
+                let args = tcx.tys.list(*a);
+                return args.len() <= 2
+                    && args.get(1).is_none_or(|al| is_global_alloc(tcx, *al))
+                    && args.first().is_some_and(|x| match tcx.tys.kind(*x) {
                         TyKind::Str => true,
                         TyKind::Slice(e) => tr(*e) || own_pub(*e),
                         TyKind::Dyn(..) => false,
@@ -563,7 +598,8 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
             }
         }
         TyKind::Adt(d, a, _) => {
-            if tcx.adts.get(d).is_some_and(|a| a.is_box()) {
+            // (Global, a container's allocator: zero-sized and the same on both sides)
+            if tcx.adts.get(d).is_some_and(|a| a.is_box()) || is_global_alloc(tcx, t) {
                 return;
             }
             if prog.def(*d).krate != krate || !a.is_empty() {
@@ -579,7 +615,12 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
     }
 }
 
-/// The key an op is registered under, as `#[relax_api]` records it (makepad-relax-api's
+/// `alloc::alloc::Global` (lang `global_alloc_ty`): the allocator of a Box or Vec that crosses.
+pub(crate) fn is_global_alloc(tcx: &Tcx, t: TyId) -> bool {
+    matches!(tcx.tys.kind(t), TyKind::Adt(d, ..) if tcx.lang_items.get(LangItem::GlobalAlloc) == Some(*d))
+}
+
+/// The key an op is registered under, as `#[relax_api]` records it (relax-api's
 /// key_code): a trait impl's method `<T as Trait>::m`, an inherent method `<T>::m` (T as
 /// `type_name` prints it), a free fn its path -- [`norm`]ed.
 pub fn key(prog: &Program, tcx: &Tcx, d: DefId) -> String {
@@ -874,12 +915,15 @@ fn std_vec_same(prog: &Program, tcx: &Tcx, probe: &crate::layout::Layouts) -> Op
     let TyKind::Adt(vd, va, _) = tcx.tys.kind(vt) else { return None };
     let (vd, va) = (*vd, *va);
     let vadt = tcx.adts.get(&vd)?;
-    if tcx.tys.list(va).len() != 1 || vadt.variants.len() != 1 {
+    // Vec<u8, Global>: the element and the global allocator (zero-sized; rustc's RawVec holds it
+    // after the words, Relax's Vec after its three words too)
+    let vargs = tcx.tys.list(va);
+    if vargs.len() != 2 || !is_global_alloc(tcx, vargs[1]) || vadt.variants.len() != 1 {
         return None;
     }
     let pb = std::mem::size_of::<usize>() as u32;
     let (ls, lv) = (probe.of(&lcx, tcx, st), probe.of(&lcx, tcx, vt));
-    if ls.size != 3 * pb || ls.fields.as_slice() != [0] || lv.size != 3 * pb || lv.ext.is_some() || ls.ext.is_some() {
+    if ls.size != 3 * pb || ls.fields.as_slice() != [0] || lv.size != 3 * pb {
         return None;
     }
     let mut ours = [usize::MAX; 3];
@@ -941,7 +985,6 @@ pub fn same_layout_handles(prog: &Program, tcx: &Tcx, cands: &[(DefId, u32, u32,
                 && offs.len() == adt.variants[0].fields.len()
                 && l.size == *size
                 && l.align == *align
-                && l.ext.is_none()
                 && offs.len() == l.fields.len()
                 && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64)
         })
@@ -991,9 +1034,13 @@ fn same_bytes(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, ok: &dyn Fn(DefId)
         if let Some(std) = std_same {
             let args = tcx.tys.list(*a);
             let same = |x: TyId| same_bytes(prog, tcx, krate, x, ok, std_same, opaque, depth + 1);
-            // String, Vec<T> of such T
+            // String, Vec<T> of such T in the global allocator (another allocator is laid out
+            // by each side's own rules: rustc keeps it in its RawVec)
             let vec_like = |x: TyId| match tcx.tys.kind(x) {
-                TyKind::Adt(xd, xa, _) => tcx.lang_items.get(LangItem::String) == Some(*xd) || (*xd == std.vec && tcx.tys.list(*xa).first().is_some_and(|e| same(*e))),
+                TyKind::Adt(xd, xa, _) => tcx.lang_items.get(LangItem::String) == Some(*xd) || (*xd == std.vec && match tcx.tys.list(*xa) {
+                    [e, al] => same(*e) && is_global_alloc(tcx, *al),
+                    _ => false,
+                }),
                 _ => false,
             };
             if vec_like(t) {

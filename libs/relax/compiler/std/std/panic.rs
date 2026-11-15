@@ -76,13 +76,13 @@ type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
 static HOOK: RwLock<Option<Hook>> = RwLock::new(None);
 
 fn trampoline(message: &str, location: &Location<'_>) {
-    #[cfg(not(any(relax_web, relax_shim)))]
+    #[cfg(not(relax_web))]
     {
         let payload = take_payload();
         run_hook(&*payload, message, location);
         store_payload(payload);
     }
-    #[cfg(any(relax_web, relax_shim))]
+    #[cfg(relax_web)]
     run_hook(&String::from(message), message, location);
 }
 
@@ -179,7 +179,7 @@ pub(crate) fn record_payload(message: fmt::Arguments<'_>) {
     });
 }
 
-fn clear_payload() {
+pub(crate) fn clear_payload() {
     let _ = PAYLOAD.try_with(|c| {
         if let Some(p) = c.take() {
             drop(unsafe { Box::from_raw(p.as_ptr()) });
@@ -211,6 +211,18 @@ pub(crate) fn prepare_payload() {
 
 /// Runs `f`; Err(payload) if it panicked, with real std's payload (see record_payload).
 pub fn catch_unwind<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, Box<dyn Any + Send + 'static>> {
+    // the panic this catches is the program's to handle: the runtime's report says `(caught)`
+    #[cfg(not(relax_web))]
+    {
+        extern "C" { fn __relax_catch_caught(); }
+        unsafe { __relax_catch_caught() };
+    }
+    catch_boundary(f)
+}
+
+/// catch_unwind for std's own boundaries, where a panic ends what runs (the test harness: it
+/// fails the test): the runtime's report of it is no `(caught)` one.
+pub(crate) fn catch_boundary<F: FnOnce() -> R + UnwindSafe, R>(f: F) -> Result<R, Box<dyn Any + Send + 'static>> {
     let mut slot: (Option<F>, Option<R>) = (Some(f), None);
     prepare_payload();
     let panicked = sys::rt::catch_panic(run_slot::<F, R>, &mut slot as *mut (Option<F>, Option<R>) as *mut u8);

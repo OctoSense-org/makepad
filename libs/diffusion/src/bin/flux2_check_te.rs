@@ -23,7 +23,7 @@ use std::process::ExitCode;
 
 use makepad_diffusion::flux2::{Flux2TextEncoderWeights, Mistral3TextConfig, FLUX2_SYSTEM_MESSAGE};
 use makepad_diffusion::flux2_text::{
-    flux2_text_encode_tapped, flux2_text_release, round_to_bf16, Flux2TextEncoderPrepared,
+    flux2_text_encode_tapped, round_to_bf16, Flux2TextEncoderPrepared,
 };
 use makepad_diffusion::flux2_tokenizer::{
     Flux2Tokenizer, Flux2TokenizedPrompt, FLUX2_MAX_SEQUENCE_LENGTH,
@@ -429,7 +429,9 @@ fn run() -> Result<Vec<Gate>, String> {
         exact: false,
     });
 
-    let evicted = flux2_text_release().map_err(|e| format!("release: {e}"))?;
+    let evicted = prepared
+        .release_device()
+        .map_err(|e| format!("release: {e}"))?;
     println!("released {evicted} cached weights");
 
     if strict {
@@ -452,6 +454,10 @@ fn run() -> Result<Vec<Gate>, String> {
 }
 
 fn main() -> ExitCode {
+    makepad_diffusion::backend::metal::run_model_worker("flux2_check_te", model_main)
+}
+
+fn model_main() -> ExitCode {
     match run() {
         Ok(gates) => {
             println!("flux2-check-te: {} stages compared", gates.len());

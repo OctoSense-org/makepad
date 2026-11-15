@@ -79,10 +79,14 @@ extern "C" {
     pub fn rename(old: *const c_char, new: *const c_char) -> c_int;
     pub fn symlink(target: *const c_char, link: *const c_char) -> c_int;
     pub fn link(old: *const c_char, new: *const c_char) -> c_int;
+    pub fn linkat(olddirfd: c_int, old: *const c_char, newdirfd: c_int, new: *const c_char, flags: c_int) -> c_int;
     pub fn readlink(path: *const c_char, buf: *mut c_char, size: size_t) -> ssize_t;
     pub fn realpath(path: *const c_char, resolved: *mut c_char) -> *mut c_char;
     pub fn chmod(path: *const c_char, mode: mode_t) -> c_int;
     pub fn fchmod(fd: c_int, mode: mode_t) -> c_int;
+    pub fn chown(path: *const c_char, owner: uid_t, group: gid_t) -> c_int;
+    pub fn lchown(path: *const c_char, owner: uid_t, group: gid_t) -> c_int;
+    pub fn fchown(fd: c_int, owner: uid_t, group: gid_t) -> c_int;
     pub fn access(path: *const c_char, mode: c_int) -> c_int;
     pub fn opendir(path: *const c_char) -> *mut c_void;
     pub fn closedir(dir: *mut c_void) -> c_int;

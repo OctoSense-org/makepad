@@ -1,4 +1,4 @@
-//! A git repository as ONE file (local/plans/run-from-git.md): what `makepad run <git url>` reads its
+//! A git repository as ONE file: what `makepad run <git url>` reads its
 //! sources from, without a working tree, a .git folder, packs or loose objects on disk.
 //!
 //! ```text
@@ -410,12 +410,25 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     Ok(n)
 }
 
+/// A read that meets an append's lock waits for it: Windows keeps every other handle from reading
+/// a range another holds locked (ERROR_LOCK_VIOLATION, where POSIX locks are advisory), and a lease
+/// that read its JIT's sources while another fed the box's store failed at once with it (11-06).
 #[cfg(windows)]
 fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
     use std::os::windows::fs::FileExt;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
     let mut n = 0;
     while n < buf.len() {
-        let k = f.seek_read(&mut buf[n..], off + n as u64)?;
+        let k = match f.seek_read(&mut buf[n..], off + n as u64) {
+            Ok(k) => k,
+            Err(e) if e.raw_os_error() == Some(ERROR_LOCK_VIOLATION) => {
+                f.lock_shared()?;
+                let read = f.seek_read(&mut buf[n..], off + n as u64);
+                let _ = f.unlock();
+                read?
+            }
+            Err(e) => return Err(e),
+        };
         if k == 0 {
             break;
         }
@@ -534,7 +547,7 @@ pub fn append(path: &Path, add: Append, keep: &dyn Fn(&[Ref]) -> Vec<Ref>) -> Re
         file.seek(SeekFrom::Start(0)).map_err(err)?;
         file.read_exact(&mut head).map_err(err)?;
         if &head[..8] != MAGIC {
-            return Err(format!("{}: not a makepad run git store", path.display()));
+            return Err(format!("{}: not a Relax git store", path.display()));
         }
         match Store::last_trailer(&file, 0, len, &|_| true).map_err(err)? {
             Some((e, i, _)) => (e, i),
@@ -675,15 +688,14 @@ pub fn compact(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
-/// The store file of a repository URL in `cache`: `git-<name>-<hash8>.store`.
-/// makepad run's own folder: $MAKEPAD_RUN_HOME, else ~/.makepad-run (%USERPROFILE%\.makepad-run);
+/// makepad run's own folder: $RELAX_HOME, else ~/.relax (%USERPROFILE%\.relax);
 /// its stores are in `cache/` there.
 pub fn relax_home() -> PathBuf {
-    if let Some(h) = std::env::var_os("MAKEPAD_RUN_HOME").filter(|h| !h.is_empty()) {
+    if let Some(h) = std::env::var_os("RELAX_HOME").filter(|h| !h.is_empty()) {
         return PathBuf::from(h);
     }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| ".".into());
-    home.join(".makepad-run")
+    home.join(".relax")
 }
 
 /// One file of `url`'s repository at `commit`, from its store (None: no store, the commit is
@@ -695,11 +707,14 @@ pub fn store_file(url: &str, commit: &Oid, path: &str) -> Option<Vec<u8>> {
     s.object(&e.oid).ok()?.map(|(_, d)| d)
 }
 
+/// The store file of a repository URL in `cache`: `git-<name>-<sha1 of the URL>.store`. The
+/// whole hash: with part of it a URL made to share another's name (2^32 tries for 8 hex digits)
+/// shared its store, and its fetches answered for the other URL.
 pub fn store_path(cache: &Path, url: &str) -> PathBuf {
     let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("repo");
     let name: String = last.trim_end_matches(".git").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect();
     let h = sha1(url.trim_end_matches('/').as_bytes());
-    cache.join(format!("git-{}-{}.store", if name.is_empty() { "repo" } else { &name }, &hex(&h)[..8]))
+    cache.join(format!("git-{}-{}.store", if name.is_empty() { "repo" } else { &name }, hex(&h)))
 }
 
 /// BTreeMap of a path table's folders (for read_dir/is_dir): each folder -> its direct children.
@@ -728,6 +743,26 @@ pub fn folders(entries: &[Entry]) -> BTreeMap<String, Vec<(String, bool)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reader of a store that an append holds locked waits for the append (Windows refuses the
+    /// read of a locked range outright; elsewhere the lock is advisory and the read goes on).
+    #[test]
+    fn a_read_waits_for_an_append_that_holds_the_store() {
+        let path = std::env::temp_dir().join(format!("relax-gitstore-locked-{}", std::process::id()));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let writer = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        writer.lock().unwrap();
+        let reader = File::open(&path).unwrap();
+        let held = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            writer.unlock().unwrap();
+        });
+        let mut buf = [0u8; 4];
+        assert_eq!(read_at(&reader, &mut buf, 3).unwrap(), 4);
+        assert_eq!(&buf, b"3456");
+        held.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
     use std::sync::Arc;
 
     fn obj(kind: &str, data: &[u8]) -> Oid {

@@ -1,6 +1,7 @@
 //! Realm lifecycle, stage/quality, effects, placed models and custom materials.
 
 use super::*;
+use super::draw_models::LayerPhase;
 
 impl Renderer {
     /// Begin rendering a different realm into this view.
@@ -11,9 +12,13 @@ impl Renderer {
     /// at the successful world-replacement boundary, before submitting the
     /// new realm's first frame. It invalidates every cache derived from the
     /// old world while retaining uploaded asset geometry/textures, shader
-    /// and pass pools, stage policy, bake settings, shadow budget, and the
-    /// adaptive-quality history owned by this device.
+    /// and pass pools, stage policy, bake settings, shadow budget, the
+    /// local shadow atlas (its cache is keyed on content, below), the
+    /// adaptive-quality history owned by this device, and the grass field
+    /// (the host's to replace or remove with [`Self::set_grass`]).
     pub fn enter_realm(&mut self) {
+        self.volume_fog.reset();
+        self.ssr.reset();
         self.custom_draws.clear();
         // The stock IBL program went with them: a build of it that failed
         // may be made again (renderer/stock_ibl.rs).
@@ -35,7 +40,9 @@ impl Renderer {
         self.placed_prefix = None;
         self.csm_static_casters.clear();
         self.csm_static_blocks.clear();
-        self.grass = None;
+        // The grass stays: the host replaces or removes it (set_grass), so a
+        // level re-evaluated in place keeps drawing its field instead of
+        // showing none until the same field is prepared again.
         self.world_attachments.clear();
         self.view_models.clear();
         self.placed_scene_signature = None;
@@ -67,15 +74,18 @@ impl Renderer {
         self.lamp_cache.clear();
         self.lamp_cache_rev = None;
         self.light_grid = LightGrid::default();
+        // The local shadow atlas stays. A face is kept only for the same
+        // light in the same tile with the same camera, the same static
+        // casters (geometry ids and transforms) and the same movers inside,
+        // so a new world's faces miss by themselves and a restart of the same
+        // one finds its static faces; the atlas targets, pass and depth
+        // shaders are the device's. Rebuilding them cost every new world's
+        // first frame 1-2 ms.
         let cluster_config = self.clustered.config();
-        let shadow_config = self.clustered.shadows.config();
-        let soft_filter = self.clustered.shadows.soft_filter;
-        let shadow_source_radius = self.clustered.shadows.source_radius;
+        let shadows = std::mem::take(&mut self.clustered.shadows);
         self.clustered = crate::clustered::ClusteredLights::default();
         self.clustered.set_config(cluster_config);
-        self.clustered.shadows.set_config(shadow_config);
-        self.clustered.shadows.soft_filter=soft_filter;
-        self.clustered.shadows.source_radius=shadow_source_radius;
+        self.clustered.shadows = shadows;
         self.clustered_frames = 0;
         self.light_rank.clear();
         self.gi.reset();
@@ -400,6 +410,7 @@ impl Renderer {
                     min,
                     max,
                     cutout: masked(material).then(|| texture.clone()),
+                    msdf: material.surface.as_ref().and_then(|s|s.definition.msdf.map(|text|(text, s.definition.base_alpha, inst.color_adjust.w))),
                     band,
                 });
             }
@@ -532,11 +543,15 @@ impl Renderer {
     /// every view; a fork kept across frames mirrors it again each frame.
     pub fn fork_scene_for_review(&self) -> Self {
         let mut review = Self::default();
+        // The review draws the same scene: its uploads follow the host's plan too.
+        review.texture_first_level = self.texture_first_level.clone();
         review.static_models = self.static_models.clone();
         review.model_casts_shadow = self.model_casts_shadow.clone();
         review.model_anim_state = self.model_anim_state.clone();
         review.ao_textures = self.ao_textures.clone();
         review.model_pack = self.model_pack.clone();
+        review.model_lod_chains = self.model_lod_chains.clone();
+        review.model_lod_chains_dirty = self.model_lod_chains_dirty;
         review.skin_rig_geometries = self.skin_rig_geometries.clone();
         review.skin_material_draws = self.skin_material_draws.clone();
         review.skin_lods = self.skin_lods.clone();
@@ -547,6 +562,30 @@ impl Renderer {
         review.host_lights = self.host_lights.clone();
         review.host_asset_lights = self.host_asset_lights.clone();
         review.sky_time = self.sky_time;
+        review.wind = self.wind;
+        review.wind_clock = self.wind_clock;
+        review.sky_clock = self.sky_clock;
+        review.sky_hour = self.sky_hour;
+        review.set_hdr_output(self.hdr_output);
+        review.set_camera_relative(self.camera_relative());
+        review.set_graphics_tier(self.graphics_tier);
+        let csm = self.csm_config();
+        review.set_csm_config(csm.tile_resolution, csm.far_range);
+        review.set_cluster_config(self.clustered.config());
+        review.set_local_shadow_config(self.clustered.shadows.config());
+        review.pbr_materials_enabled = self.pbr_materials_enabled;
+        review.lightmap_enabled = self.lightmap_enabled;
+        review.display_transform = self.display_transform;
+        review.output_dither = self.output_dither;
+        review.fxaa = self.fxaa;
+        review.bloom = self.bloom;
+        review.auto_exposure = self.auto_exposure;
+        review.grade = self.grade;
+        review.clustered.shadows.soft_filter = self.clustered.shadows.soft_filter;
+        review.clustered.shadows.source_radius = self.clustered.shadows.source_radius;
+        review.star_texture = self.star_texture.clone();
+        review.star_map_loaded = self.star_map_loaded;
+        review.mirror_stream_from(self);
         review.set_gpu_lightmap_mode(crate::GpuLightmapMode::Realtime);
         review.set_clustered_lighting(true);
         review.set_gi_mode(crate::GiMode::Off);
@@ -558,6 +597,80 @@ impl Renderer {
     /// review pass, then restore them before encoding the player's pass.
     pub fn swap_review_materials(&mut self, other: &mut Self) {
         std::mem::swap(&mut self.custom_draws, &mut other.custom_draws);
+        // UploadedSurface already shares its albedo/normal arrays and
+        // weight map. The missing state was the prepared material lane:
+        // a fresh fork can fall back while its pipeline is compiling.
+        std::mem::swap(&mut self.pbr_draw, &mut other.pbr_draw);
+        std::mem::swap(&mut self.splat_draw, &mut other.splat_draw);
+        std::mem::swap(&mut self.foliage_draw, &mut other.foliage_draw);
+        std::mem::swap(&mut self.lane_variants, &mut other.lane_variants);
+        std::mem::swap(&mut self.grass, &mut other.grass);
+        std::mem::swap(&mut self.grass_draw, &mut other.grass_draw);
+    }
+
+    /// Lend the live probe field during a secondary scene draw. Call again
+    /// immediately afterwards. No relighting, recentering or voxel work is
+    /// allowed while borrowed; the secondary camera keeps its own SSAO.
+    pub fn swap_review_gi(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.gi, &mut other.gi);
+        self.review_gi = !self.review_gi;
+    }
+
+    /// Whether resident specialized material lanes could actually draw.
+    pub fn review_materials_ready(&self) -> bool {
+        if !self.pbr_materials_enabled { return true; }
+        let used: std::collections::HashSet<&str> = self.placed_models.iter().chain(&self.world_attachments)
+            .map(|m| m.model.as_str()).collect();
+        self.static_models.iter().filter(|(id, _)| used.contains(id.as_str())).all(|(_, model)| {
+            std::iter::once(model).chain(model.lods.iter().map(|(_, m)| m)).all(|m| {
+                let layers = || std::iter::once(&m.material).chain(m.extra_draws.iter().map(|l| &l.4));
+                (!m.wants_pbr || self.pbr_ready)
+                    && (self.splat_ready || !layers().any(|m| m.surface.as_ref().is_some_and(|s| s.splat.is_some())))
+                    // A model with a far stand-in draws its own layers at
+                    // every distance until the stand-in's shader exists: a
+                    // picture taken then shows the mesh where the stand-in
+                    // belongs, and the stand-in pops in a frame later.
+                    && (self.impostor_shader.is_some() || !layers().any(|m| m.surface.as_ref().is_some_and(|s| s.definition.impostor > 0.0)))
+            })
+        })
+    }
+
+    /// Current poses and resolved lights for another camera. Called only
+    /// when that camera renders, after the source scene has resolved them.
+    pub fn mirror_review_frame_from(&mut self, live: &Self) {
+        self.set_models(live.placed_models.clone());
+        self.set_world_attachments(live.world_attachments.clone());
+        self.model_anim_state = live.model_anim_state.clone();
+        self.sky_time = live.sky_time;
+        self.wind = live.wind;
+        self.wind_clock = live.wind_clock;
+        self.sky_clock = live.sky_clock;
+        self.sky_hour = live.sky_hour;
+        self.review_lights = Some(live.frame_lights.clone());
+        self.trample.mirror_from(&live.trample);
+        self.grade = live.grade;
+        self.bloom = live.bloom;
+        self.fxaa = live.fxaa;
+    }
+
+    /// Refresh uploads that completed between an on-demand camera's warmup
+    /// and capture. Geometry/texture handles remain shared; never decode a
+    /// second copy or keep a replaced generated surface in the fork.
+    pub fn mirror_review_assets_from(&mut self, live: &Self) {
+        let same = self.static_models.len() == live.static_models.len()
+            && self.static_models.iter().zip(&live.static_models).all(|((id, a), (other, b))| {
+                id == other && a.geometry.geometry_id() == b.geometry.geometry_id()
+                    && a.texture.texture_id() == b.texture.texture_id() && a.lods.len() == b.lods.len()
+            });
+        if same { return; }
+        self.static_models.clone_from(&live.static_models);
+        self.model_casts_shadow.clone_from(&live.model_casts_shadow);
+        self.ao_textures.clone_from(&live.ao_textures);
+        self.model_pack.clone_from(&live.model_pack);
+        self.model_lod_chains.clone_from(&live.model_lod_chains);
+        self.model_lod_chains_dirty = live.model_lod_chains_dirty;
+        self.models_rev = self.models_rev.wrapping_add(1);
+        self.rebuild_csm_static_casters();
     }
 
     pub fn review_models_ready(&self) -> bool {
@@ -584,6 +697,46 @@ impl Renderer {
     pub fn install_custom_material(&mut self, name: String, material: CustomMaterial) -> bool {
         if !material.draw.draw_vars.can_instance() { return false; }
         self.custom_draws.insert(name, Box::new(material));
+        true
+    }
+
+    /// Build `material`'s shader variants for the `set`th feature set a
+    /// world's frames draw it with (renderer/variants.rs) before it
+    /// is installed; false past the last set. Its first draw builds them
+    /// otherwise, a 10-15 ms step for a lit material in the first frame
+    /// that shows it. A host's load prepares one set per staging step, so
+    /// that frame only draws.
+    pub fn prepare_custom_material(&self, cx: &mut Cx, material: &mut CustomMaterial, set: usize) -> bool {
+        let Some(features) = self.world_frame_features().get(set).copied() else { return false };
+        material.shaders(cx, features);
+        true
+    }
+
+    /// Make the light map's draws (its 18 depth, gather, filter and encode
+    /// shaders) before a world's first frame needs them: that frame made
+    /// them otherwise, about 22 ms of a cold launch's first world frame. A
+    /// host's load makes them while it stages. True when they were made by
+    /// this call; false when they are there already or the VM is busy (a
+    /// world's first frame makes them then).
+    pub fn prepare_lightmap_draws(&mut self, cx: &mut Cx) -> bool {
+        !self.gpu_baker.has_draws() && self.gpu_baker.ensure_draws(cx)
+    }
+
+    /// Make the post chain's and the screen AO's draws, and with `lamp_shadows` (the world
+    /// has shadowed lamps) the lamp shadows' depth draws, before a world's first frame needs
+    /// them: that frame made them otherwise, 13 shaders and about 7 ms of a cold launch's
+    /// first world frame. Their passes and targets wait for that frame. False when they are
+    /// there already.
+    pub fn prepare_post_draws(&mut self, cx: &mut Cx, lamp_shadows: bool) -> bool {
+        let lamp_shadows = lamp_shadows && self.clustered_enabled;
+        if self.post.draws_ready() && self.gi.screen_ao_draws_ready() && (!lamp_shadows || self.clustered.shadows.draws_ready()) {
+            return false;
+        }
+        self.post.prepare_draws(cx);
+        self.gi.prepare_screen_ao_draws(cx);
+        if lamp_shadows {
+            self.clustered.shadows.prepare_draws(cx);
+        }
         true
     }
 
@@ -629,27 +782,29 @@ impl Renderer {
     /// list, taking only the models with a wind layer. Until its pipeline
     /// exists (Metal compiles asynchronously) they stay on the PBR lane.
     pub(super) fn draw_foliage_models(
-        &mut self, cx: &mut Cx3d, eye: Vec3f, instances: &[ModelInstance],
+        &mut self, cx: &mut Cx3d, eye: Vec3f, lod_scale: f32, instances: &[ModelInstance],
         lane: WorldModelLane, fog: (Vec3f, f32), sun: &SunLight,
         frustum: Option<&Frustum>, stats: &mut RenderStats,
     ) {
         if !self.foliage_ready { return; }
         let Some(mut draw) = self.foliage_draw.take() else { return };
-        self.draw_models_inner(cx, ModelDraw::Foliage(&mut draw), eye, instances, lane, fog, sun, frustum, stats);
+        self.draw_models_inner(cx, ModelDraw::Foliage(&mut draw), LayerPhase::Opaque, eye, lod_scale, instances, lane, fog, sun, frustum, stats);
         self.foliage_draw = Some(draw);
     }
 
     /// The terrain paint pass (shaders/splat.rs): the same instance list,
     /// taking only the models with a painted layer. Until its pipeline
-    /// exists they stay on the PBR lane (their main layer).
+    /// exists they stay on the PBR lane (their main layer). `focal_px`: the
+    /// view's, for the grass's far carpet (`set_grass_carpet`).
     pub(super) fn draw_splat_models(
-        &mut self, cx: &mut Cx3d, eye: Vec3f, instances: &[ModelInstance],
+        &mut self, cx: &mut Cx3d, eye: Vec3f, lod_scale: f32, instances: &[ModelInstance],
         lane: WorldModelLane, fog: (Vec3f, f32), sun: &SunLight,
-        frustum: Option<&Frustum>, stats: &mut RenderStats,
+        frustum: Option<&Frustum>, focal_px: f32, stats: &mut RenderStats,
     ) {
         if !self.splat_ready { return; }
         let Some(mut draw) = self.splat_draw.take() else { return };
-        self.draw_models_inner(cx, ModelDraw::Splat(&mut draw), eye, instances, lane, fog, sun, frustum, stats);
+        self.set_grass_carpet(cx.cx, &mut draw, focal_px);
+        self.draw_models_inner(cx, ModelDraw::Splat(&mut draw), LayerPhase::Opaque, eye, lod_scale, instances, lane, fog, sun, frustum, stats);
         self.splat_draw = Some(draw);
     }
 
@@ -709,8 +864,23 @@ impl Renderer {
         self.foliage_ready = shader.is_some_and(|id| cx.draw_shader_ready(id, hdr));
     }
 
+    /// Decide once per frame, before any model pass, whether far stand-ins
+    /// draw this frame. Their shader is built as soon as a resident model has
+    /// a stand-in (its follow-up installed), in parallel with the other
+    /// lanes, not at a stand-in's first draw; until its pipeline exists every
+    /// model draws its own layers at every distance, and a review waits for
+    /// it (`review_materials_ready`).
+    pub(super) fn prepare_impostor_lane(&mut self, cx: &mut Cx) {
+        self.impostor_shader = None;
+        if !self.pbr_materials_enabled || !self.a_resident_layer(|s| s.definition.impostor > 0.0) {
+            return;
+        }
+        let hdr = self.hdr_output;
+        self.impostor_shader = self.lane_shaders(cx, super::variants::ModelLane::Impostor, None).0.filter(|id| cx.draw_shader_ready(*id, hdr));
+    }
+
     pub(super) fn draw_custom_models(
-        &mut self, cx: &mut Cx3d, eye: Vec3f, instances: &[ModelInstance],
+        &mut self, cx: &mut Cx3d, eye: Vec3f, lod_scale: f32, instances: &[ModelInstance],
         lane: WorldModelLane, fog: (Vec3f, f32), sun: &SunLight,
         frustum: Option<&Frustum>, stats: &mut RenderStats,
     ) {
@@ -724,15 +894,16 @@ impl Renderer {
         // While the frame does not route (no environment) nothing is
         // scanned.
         let stock_ibl_on = self.stock_ibl_active() && self.lists_a_stock_ibl_model(instances);
-        // Blended programs after every opaque one (they neither write depth
-        // nor hide what is behind them), each group in name order.
+        // Keep opaque programs before blended ones, each group in name
+        // order; their deferred layers replay the same program order.
         let mut names: Vec<(bool, String)> = self.custom_draws.iter().filter(|(name, _)| {
             (stock_ibl_on && name.as_str() == stock_ibl::STOCK_IBL_MATERIAL)
                 || instances.iter().any(|i| i.custom_material.as_ref().is_some_and(|m| &m.name == *name))
         }).map(|(name, m)| {
-            // The stock IBL program stands in for the PBR lane: opaque models, their blended
-            // layers drawn inside it, before every blended program. set_material leaves the
-            // last layer's blend state on its draw, so that state must not sort it.
+            // The stock IBL program stands in for the PBR lane: its opaque layers draw
+            // here, and its blended layers are deferred until after the opaque world.
+            // set_material leaves the last layer's blend state on its draw, so that
+            // state must not sort the program.
             let blended = m.draw.draw_vars.options.alpha_blend && name.as_str() != stock_ibl::STOCK_IBL_MATERIAL;
             (blended, name.clone())
         }).collect();
@@ -740,7 +911,7 @@ impl Renderer {
         let names = names.into_iter().map(|(_, name)| name);
         for name in names {
             let Some(mut draw) = self.custom_draws.remove(&name) else { continue; };
-            self.draw_models_inner(cx, ModelDraw::Custom(&name, &mut draw), eye,
+            self.draw_models_inner(cx, ModelDraw::Custom(&name, &mut draw), LayerPhase::Opaque, eye, lod_scale,
                 instances, lane, fog, sun, frustum, stats);
             self.custom_draws.insert(name, draw);
         }

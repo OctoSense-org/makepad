@@ -10,12 +10,12 @@ use crate::regalloc::{for_defs, for_uses, reachable, term_uses, uses_defs};
 use crate::rir::*;
 use crate::stats::{opt_off, pass_clock, pass_time};
 
-/// MAKEPAD_RUN_OPT=-ifconv: no if-conversion (bisection).
+/// RELAX_OPT=-ifconv: no if-conversion (bisection).
 pub fn if_conv_on(options: &relax_session::Options) -> bool {
     !options.opt.iter().any(|p| p == "-ifconv")
 }
 
-/// MAKEPAD_RUN_OPT=-thread: no jump threading over known values (bisection).
+/// RELAX_OPT=-thread: no jump threading over known values (bisection).
 pub fn thread_on(options: &relax_session::Options) -> bool {
     !options.opt.iter().any(|p| p == "-thread")
 }
@@ -76,6 +76,11 @@ pub fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
         Inst::TlsAddr(d, off) => Inst::TlsAddr(m(*d), *off),
         Inst::TlsStatic(d, off) => Inst::TlsStatic(m(*d), *off),
         Inst::Sel(d, c, a, b) => Inst::Sel(m(*d), m(*c), m(*a), m(*b)),
+        Inst::SelCmp(d, c, a, b) => {
+            let mut c = *c;
+            c.vregs_mut(|v| *v = m(*v));
+            Inst::SelCmp(m(*d), c, m(*a), m(*b))
+        }
         Inst::VSel(d, k, a, b) => Inst::VSel(m(*d), m(*k), m(*a), m(*b)),
         Inst::VFma(np, na, keep, w, d, a, b, c) => Inst::VFma(*np, *na, *keep, *w, m(*d), m(*a), m(*b), m(*c)),
         Inst::VSplat(d, a) => Inst::VSplat(m(*d), m(*a)),
@@ -165,21 +170,26 @@ pub fn rotl(bits: u8, a: u64, b: u64) -> u64 {
     if k == 0 { x } else { ((x << k) | (x >> (w - k))) & mask }
 }
 
-/// IOp::Crc32B/H/W/X (the semantics every backend implements): the low `bits` (8, 16, 32 or 64)
-/// of `data` folded bit by bit, least significant first, into the 32-bit crc in the low bits of
-/// `crc` with the reflected IEEE polynomial (0xEDB88320); no inversions. The result is the u32.
-pub fn crc32(bits: u8, crc: u64, data: u64) -> u64 {
+/// IOp::Crc32B/H/W/X and Crc32CB/H/W/X (the semantics every backend implements): the low `bits`
+/// (8, 16, 32 or 64) of `data` folded bit by bit, least significant first, into the 32-bit crc in
+/// the low bits of `crc` with the reflected IEEE polynomial (0xEDB88320), or Castagnoli's
+/// (0x82F63B78) for `castagnoli`; no inversions. The result is the u32.
+pub fn crc32(bits: u8, castagnoli: bool, crc: u64, data: u64) -> u64 {
+    let poly = if castagnoli { 0x82F6_3B78 } else { 0xEDB8_8320u32 };
     let mut r = crc as u32;
     for i in 0..bits.min(64) as u32 {
         r ^= ((data >> i) & 1) as u32;
-        r = (r >> 1) ^ (0xEDB8_8320 & 0u32.wrapping_sub(r & 1));
+        r = (r >> 1) ^ (poly & 0u32.wrapping_sub(r & 1));
     }
     r as u64
 }
 
 pub fn fold_ibin(op: IOp, it: IntTy, a: i64, b: i64) -> Option<i64> {
     let r = match op {
-        IOp::Crc32B | IOp::Crc32H | IOp::Crc32W | IOp::Crc32X => crc32(op.crc32_bits()?, a as u64, b as u64) as i64,
+        IOp::Crc32B | IOp::Crc32H | IOp::Crc32W | IOp::Crc32X | IOp::Crc32CB | IOp::Crc32CH | IOp::Crc32CW | IOp::Crc32CX => {
+            let (bits, castagnoli) = op.crc32()?;
+            crc32(bits, castagnoli, a as u64, b as u64) as i64
+        }
         IOp::Add => a.wrapping_add(b),
         IOp::Sub => a.wrapping_sub(b),
         IOp::Mul => a.wrapping_mul(b),
@@ -262,6 +272,13 @@ pub fn fval(bits: u64, w: bool) -> f64 {
 }
 
 pub fn fold_fbin(op: FOp, w: bool, a: u64, b: u64) -> u64 {
+    // min/max of equal operands (`0.0` and `-0.0`): what the back end's instruction gives, never
+    // the choice of the compiler that built this one -- x64's general form gives b (minsd a, b:
+    // x64.rs), AArch64's fminnm orders -0.0 below 0.0 -- so a folded min/max answers as the
+    // same one run does (Rust leaves the sign unspecified; the tiers must not differ)
+    if matches!(op, FOp::Min | FOp::Max) && fval(a, w) == fval(b, w) {
+        return if cfg!(target_arch = "aarch64") { if op == FOp::Min { a | b } else { a & b } } else { b };
+    }
     // select forms return an operand's exact bits
     if op == FOp::MinLt || op == FOp::MaxGt {
         let (x, y) = (fval(a, w), fval(b, w));
@@ -454,7 +471,7 @@ pub fn const_inst(d: VReg, k: K) -> Inst {
 /// bits) the count of a 64-bit shift (the hardware reads the count's low 6 bits). The backends then skip the
 /// result's re-extension (movzx / sxtw after every u8 / i32 operation): the bit reader's
 /// `bits_left -= n` (u8, stored back as a byte) and its `entry as u8` (a shift count).
-/// MAKEPAD_RUN_OPT=-lowbits: none (bisection).
+/// RELAX_OPT=-lowbits: none (bisection).
 pub fn low_bits_only(options: &relax_session::Options, f: &Func) -> Vec<bool> {
     let nv = f.vregs.len();
     if crate::stats::opt_off(options, "-lowbits") {
@@ -538,7 +555,7 @@ pub fn cast_is_move(z: u8, it: IntTy) -> bool {
 /// upper bits as they were). A cast of such a value to a wider type is a plain move: zero- and
 /// sign-extension of a value whose upper bits are zero are the value itself (Paeth's
 /// `i32::from(u8)` was ldrb + sxtw per pixel byte).
-/// MAKEPAD_RUN_OPT=-zeroabove: none (bisection).
+/// RELAX_OPT=-zeroabove: none (bisection).
 pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> Vec<u8> {
     let nv = f.vregs.len();
     if crate::stats::opt_off(options, "-zeroabove") {
@@ -590,7 +607,7 @@ pub fn zero_above(options: &relax_session::Options, f: &Func, low: &[bool]) -> V
             }
         }
     }
-    // MAKEPAD_RUN_OPT=-zeromulti: single-definition values only, no copies (bisection)
+    // RELAX_OPT=-zeromulti: single-definition values only, no copies (bisection)
     let single = crate::stats::opt_off(options, "-zeromulti");
     let mut ndef = vec![0u32; if single { nv } else { 0 }];
     if single {
@@ -709,7 +726,7 @@ pub static T: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::n
 pub fn trace_opt(f: &Func, tag: &str) {
     let t = T.get_or_init(|| {
         let _k = relax_session::phase::kept();
-        std::env::var("MAKEPAD_RUN_TRACE_OPT").ok().map(|s| &*Box::leak(s.into_boxed_str()))
+        std::env::var("RELAX_TRACE_OPT").ok().map(|s| &*Box::leak(s.into_boxed_str()))
     });
     if let Some(t) = t {
         if f.name.contains(*t) {
@@ -3138,9 +3155,9 @@ pub fn thread_known(f: &mut Func) -> bool {
             continue;
         }
         {
-            // MAKEPAD_RUN_THREAD_MAX=n: only the first n threads of the process (bisection)
+            // RELAX_THREAD_MAX=n: only the first n threads of the process (bisection)
             static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-            let m = *MAX.get_or_init(|| std::env::var("MAKEPAD_RUN_THREAD_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
+            let m = *MAX.get_or_init(|| std::env::var("RELAX_THREAD_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
             if m != u64::MAX {
                 let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if k >= m {
@@ -5364,7 +5381,7 @@ pub fn local_cse(options: &relax_session::Options, f: &mut Func) -> bool {
     if !cse_can_change(f) {
         return false;
     }
-    // MAKEPAD_RUN_OPT=-cseevict: a full table takes nothing new (bisection)
+    // RELAX_OPT=-cseevict: a full table takes nothing new (bisection)
     let keep_full = crate::stats::opt_off(options, "-cseevict");
     let n = f.blocks.len();
     let nv = f.vregs.len();
@@ -5908,7 +5925,7 @@ pub fn load_key_size(k0: u64) -> i64 {
 /// result of an instruction with the same key and result class above it in the dominator tree
 /// (simplify's copy propagation then removes the copy). Constants stay: they are rematerialised
 /// and sunk to their uses. For generated code with long runs of repeated pure values: a Splash
-/// kernel's lane extracts, which LICM gathers in the element loop's preheader (Stage's largest x4
+/// kernel's lane extracts, which LICM gathers in the element loop's preheader (an app's largest x4
 /// kernel extracted each lane of one product 216 times, all live through its 14k blocks).
 /// Vector ops (VX, VX3, VFma, VSel, VShuffle) are numbered too, their constant operands by value
 /// (each use has its own constant: a table's byte indices `h * splat(0x04040404) + splat(..)` of
@@ -6162,7 +6179,7 @@ pub fn sroa(f: &mut Func) -> bool {
 
 pub fn sroa_with(f: &mut Func, tile: bool) -> bool {
     static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let mut stats = STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_SROA_STATS").map_or(false, |v| v == "1"))
+    let mut stats = STATS.get_or_init(|| std::env::var("RELAX_SROA_STATS").map_or(false, |v| v == "1"))
         .then(|| SroaStats { candidates: f.slots.len(), ..SroaStats::default() });
     let changed = sroa_inner(f, stats.as_mut(), tile);
     if let Some(s) = stats {
@@ -6171,6 +6188,10 @@ pub fn sroa_with(f: &mut Func, tile: bool) -> bool {
     }
     changed
 }
+
+/// The escape call sites an escaped slot may have and still be promoted (each last-use site
+/// costs a reachability walk).
+const SROA_ESC_SITES: u32 = 12;
 
 pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -> bool {
     let nv = f.vregs.len();
@@ -6253,6 +6274,20 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
         }
     }
     let at = |v: VReg| addr[v.0 as usize];
+    // A guarded inline copy's slow call (a live session) runs only after a patch of its callee:
+    // a slot it gets at offset 0 and keeps no pointer to (its result buffer by construction,
+    // `Func::sret`) is written back and read again around that call alone (a reload site, below),
+    // at any loop depth.
+    let guard_nocap = |bi: usize, k: usize, sl: u32| -> bool {
+        f.guard_call(bi, k)
+            && match &f.blocks[bi].insts[k] {
+                Inst::Call(c, args, _) => args.iter().enumerate().all(|(j, a)| {
+                    let sret = j == 0 && matches!(c, Callee::Fn(id) | Callee::CFn(id, _) if f.sret_callees.contains(id));
+                    at(*a).0 != sl || (at(*a).1 == 0 && (sret || sroa_nocapture(c, j)))
+                }),
+                _ => false,
+            }
+    };
     // a slot qualifies when its addresses are only bases, copy operands or derivations
     let mut ok = vec![true; ns];
     // slots whose address is passed to calls that are their last uses (an iterator handed
@@ -6331,14 +6366,38 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             sroa_reject_slot(&mut ok, at(*u).0 as usize, SroaReject::Escape, &mut stats);
         }
     }
+    // escaped slots in copies that are promoted anyway (below): the slow call reads or writes
+    // bytes no access names, so they count as copied in and out whole
+    let mut copied_esc = vec![false; ns];
     if esc.iter().any(|x| *x) {
+        // An escaped slot stays out of copies (a copy is no access the last-use test below sees),
+        // unless every escape is a guarded copy's slow call that keeps no pointer to it: those are
+        // reload sites, after which the slot's cells are its value again.
+        let mut guard_only = vec![true; ns];
+        let mut nsites = vec![0u32; ns];
+        for &(bi, k) in &rel {
+            if let Inst::Call(_, args, _) = &f.blocks[bi as usize].insts[k as usize] {
+                for (j, a) in args.iter().enumerate() {
+                    let sl = at(*a).0;
+                    if sl != u32::MAX && !args[..j].iter().any(|b| at(*b).0 == sl) {
+                        nsites[sl as usize] += 1;
+                        guard_only[sl as usize] &= guard_nocap(bi as usize, k as usize, sl);
+                    }
+                }
+            }
+        }
         for &(bi, k) in &rel {
             {
                 let i = &f.blocks[bi as usize].insts[k as usize];
                 if let Inst::Copy(d, s2, _) = i {
                     for v in [*d, *s2] {
-                        if at(v).0 != u32::MAX && esc[at(v).0 as usize] {
-                            sroa_reject_slot(&mut ok, at(v).0 as usize, SroaReject::Escape, &mut stats);
+                        let sl = at(v).0;
+                        if sl != u32::MAX && esc[sl as usize] {
+                            if guard_only[sl as usize] && nsites[sl as usize] <= SROA_ESC_SITES {
+                                copied_esc[sl as usize] = true;
+                            } else {
+                                sroa_reject_slot(&mut ok, sl as usize, SroaReject::Escape, &mut stats);
+                            }
                         }
                     }
                 }
@@ -6473,6 +6532,16 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                     }
                     _ => {}
                 }
+            }
+        }
+        // (the escaped slots in copies: their whole bytes, both ways, so the group is tiled and
+        // every byte the slow call reads or writes has a cell its flush and reload move)
+        for sl in 0..ns {
+            if copied_esc[sl] && ok[sl] {
+                let (g, lo) = (root[sl] as usize, delta[sl]);
+                copies.push((g as u32, lo, lo + f.slots[sl].size as i64, 0, false));
+                has_in[g] = true;
+                has_out[g] = true;
             }
         }
         cells.sort_unstable_by_key(|c| (c.0, c.1, mem_key(c.2)));
@@ -6700,7 +6769,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
             }
             // few escape sites only (each last-use site costs a reachability walk; no-capture
             // sites are cheap: a Vec's push loop has a few grow calls)
-            if sites[sl].len() > 12 {
+            if sites[sl].len() > SROA_ESC_SITES as usize {
                 sroa_reject_slot(&mut ok, sl, SroaReject::Escape, &mut stats);
                 continue;
             }
@@ -6714,18 +6783,13 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 // ... and only when the call runs less often than the slot's accesses: a flush and
                 // reload per call in the slot's own loop costs more than the memory traffic it
                 // saves (bench_rt sort_ints / shape got slower with calls inside the hot loop)
-                // A guarded inline copy's slow call (a live session) runs only after a patch of its
-                // callee: its flush and reload cost the path the copy runs nothing, at any depth,
-                // and its result buffer is no capture by construction (`Func::sret`).
-                let guard = f.guard_call(bi, k);
-                let nocap = (guard || depth[bi] < acc_depth[sl])
-                    && match &f.blocks[bi].insts[k] {
-                        Inst::Call(c, args, _) => args.iter().enumerate().all(|(j, a)| {
-                            let sret = guard && j == 0 && matches!(c, Callee::Fn(id) | Callee::CFn(id, _) if f.sret_callees.contains(id));
-                            at(*a).0 != sl as u32 || (at(*a).1 == 0 && (sret || sroa_nocapture(c, j)))
-                        }),
-                        _ => false,
-                    };
+                // (a guarded copy's slow call: `guard_nocap`)
+                let nocap = guard_nocap(bi, k, sl as u32)
+                    || depth[bi] < acc_depth[sl]
+                        && match &f.blocks[bi].insts[k] {
+                            Inst::Call(c, args, _) => args.iter().enumerate().all(|(j, a)| at(*a).0 != sl as u32 || (at(*a).1 == 0 && sroa_nocapture(c, j))),
+                            _ => false,
+                        };
                 if nocap {
                     reload_sites.push((bi as u32, k as u32, sl as u32));
                     continue;
@@ -6861,6 +6925,24 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
     };
     // invoked reload sites: the reloads go on both edges (blocks made below)
     let mut edge_reloads: Vec<(usize, u32, VReg)> = Vec::new();
+    // (block, instruction, slot): a guarded copy's slow call handed the slot as its result buffer
+    // alone (`Slot::ret`: it writes all of it). The cells' values before it are dead, so they are
+    // not flushed: a flush keeps them live around the loop the copy runs in, which the copy's own
+    // path pays for (a popped Option's tag stored, copied and reloaded each iteration)
+    let ret_sites: Vec<(u32, u32, u32)> = reload_sites
+        .iter()
+        .copied()
+        .filter(|&(bi, k, sl)| {
+            f.slots[sl as usize].ret
+                && f.guard_call(bi as usize, k as usize)
+                && match &f.blocks[bi as usize].insts[k as usize] {
+                    Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), args, _) => {
+                        f.sret_callees.contains(id) && args.first().map(|a| at(*a)) == Some((sl, 0)) && !args[1..].iter().any(|a| at(*a).0 == sl)
+                    }
+                    _ => false,
+                }
+        })
+        .collect();
     // temporaries of sub-cell accesses (vregs nv0.., added after the rewrite)
     let nv0 = f.vregs.len() as u32;
     let mut sub_tmps: Vec<Cls> = Vec::new();
@@ -6989,7 +7071,7 @@ pub fn sroa_inner(f: &mut Func, mut stats: Option<&mut SroaStats>, tile: bool) -
                 Inst::Call(_, args, _) if !esc_addr.is_empty() => {
                     // an escaped slot's last use: the slot gets its cells' values first
                     for &(sl, a) in &esc_addr {
-                        if !args.iter().any(|x| at(*x).0 == sl) {
+                        if !args.iter().any(|x| at(*x).0 == sl) || ret_sites.contains(&(bi as u32, k as u32, sl)) {
                             continue;
                         }
                         let g = root[sl as usize] as usize;
@@ -7143,7 +7225,7 @@ pub fn natural_loops(f: &Func) -> (Vec<Vec<u32>>, Vec<(u32, Vec<bool>)>) {
 /// with a and c invariant, b not, and t1 read only by t2 becomes `t1 = a + c; t2 = t1 + b`, so the
 /// invariant half hoists (a 2-D index `row + x + k`: `row + k` once per row). Integer adds wrap in
 /// their type, so the regrouping is exact. Runs at the start of licm. Returns whether any changed.
-/// MAKEPAD_RUN_OPT=-reassoc: off (bisection).
+/// RELAX_OPT=-reassoc: off (bisection).
 pub fn reassociate_invariants(options: &relax_session::Options, f: &mut Func) -> bool {
     if crate::stats::opt_off(options, "-reassoc") {
         return false;
@@ -7845,37 +7927,65 @@ pub fn expand_small_copies(f: &mut Func) {
     }
 }
 
-/// Late: `c ? 1 : 0` / `c ? 0 : 1` of a compare result c (0 / 1) is c / c ^ 1 (setcc instead of
+/// Late: `c ? 1 : 0` / `c ? 0 : 1` of a compare result c (0 / 1) is c / !c (setcc instead of
 /// two constants and a cmov: `count += is_less as usize` after an Ordering became a select).
-/// Runs after the last simplify, whose Ordering / phi folds read selects of constants.
+/// !c is the opposite compare made again when each of its operands has one definition, which runs
+/// before the compare on every path (they hold the same values here: `setge` instead of
+/// `setl; xor 1`), else c ^ 1. Runs after the last simplify, whose Ordering / phi folds read
+/// selects of constants.
 pub fn bool_selects(f: &mut Func) {
     let nv = f.vregs.len();
     let mut ndef = vec![0u32; nv];
     let mut k01: Vec<Option<i64>> = vec![None; nv];
-    let mut is_cmp = vec![false; nv];
+    let mut cmp: Vec<Option<Cmp>> = vec![None; nv];
+    let mut def_at = vec![(u32::MAX, 0usize); nv];
     for p in &f.params {
         ndef[p.0 as usize] += 1;
     }
-    for b in &f.blocks {
-        for i in &b.insts {
-            for_defs(i, |d| ndef[d.0 as usize] += 1);
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k);
+            });
             match *i {
                 Inst::Iconst(d, k @ (0 | 1)) => k01[d.0 as usize] = Some(k),
-                Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) => is_cmp[d.0 as usize] = true,
-                _ => {}
+                _ => {
+                    if let Some((d, c)) = Cmp::of(i) {
+                        cmp[d.0 as usize] = Some(c);
+                    }
+                }
             }
         }
     }
     let one = |v: VReg, ndef: &[u32]| ndef[v.0 as usize] == 1;
+    let negs = f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(*i, Inst::Sel(_, c, x, y) if cmp[c.0 as usize].is_some() && k01[x.0 as usize] == Some(0) && k01[y.0 as usize] == Some(1))));
+    let dom = negs.then(|| crate::dom::Dom::new(f));
+    let held = |cc: Cmp, at: (u32, usize)| {
+        let mut h = dom.is_some();
+        cc.uses(|o| {
+            let d = def_at[o.0 as usize];
+            h &= one(o, &ndef) && (d.0 == u32::MAX || dom.as_ref().is_some_and(|dm| dm.before(d, at)));
+        });
+        h
+    };
+    let vregs = &f.vregs;
     for b in f.blocks.iter_mut() {
         for i in b.insts.iter_mut() {
             if let Inst::Sel(d, c, x, y) = *i {
-                if !one(c, &ndef) || !is_cmp[c.0 as usize] || !one(x, &ndef) || !one(y, &ndef) || f.vregs[d.0 as usize] != Cls::I {
+                let Some(cc) = cmp[c.0 as usize] else { continue };
+                if !one(c, &ndef) || !one(x, &ndef) || !one(y, &ndef) || vregs[d.0 as usize] != Cls::I {
                     continue;
                 }
+                let held = k01[x.0 as usize] == Some(0) && held(cc, def_at[c.0 as usize]);
                 match (k01[x.0 as usize], k01[y.0 as usize]) {
                     (Some(1), Some(0)) => *i = Inst::Mov(d, c),
-                    (Some(0), Some(1)) => *i = Inst::IBinI(IOp::Xor, U64, d, c, 1),
+                    (Some(0), Some(1)) => {
+                        *i = match cc.not() {
+                            Some(n) if held => n.inst(d),
+                            _ => Inst::IBinI(IOp::Xor, U64, d, c, 1),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -8503,7 +8613,7 @@ pub fn set_sroa_nocapture(q: Option<Box<dyn Fn(&Callee, usize) -> bool>>) {
 /// division's `b == -1`, hoisted out of a loop, `&` the `a == MIN` of its block): the branch
 /// tests the flag first and the block's compare moves to the new block, which runs only when
 /// the flag does not decide (`test; jne` instead of `cmp; sete; movzx; and; test; jne`).
-/// MAKEPAD_RUN_OPT=-splitbr off. Returns whether anything changed.
+/// RELAX_OPT=-splitbr off. Returns whether anything changed.
 pub fn split_branch_conditions(options: &relax_session::Options, f: &mut Func) -> bool {
     if crate::stats::opt_off(options, "-splitbr") {
         return false;

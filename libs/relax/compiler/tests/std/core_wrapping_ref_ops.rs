@@ -2,8 +2,7 @@
 // `&a op &b` (stable since 1.14), `a op= &b` (1.22), `a op= int` and `a op= &int` (1.60), the
 // shifts by `&usize` (1.39), `-&a`, `!&a`, unary minus on the unsigned types, and `/=`, `%=`.
 // ring 0.17's SHA-1 adds a `&Wrapping<u32>` it gets from a slice iterator (src/digest/sha1.rs:
-// `let T = rotl(a, 5) + f(b, c, d) + e + k + W_t;`); the std here had only the by-value impls
-// ("cannot add `&Wrapping<u32>` to `Wrapping<u32>`").
+// `let T = rotl(a, 5) + f(b, c, d) + e + k + W_t;`).
 use std::num::Wrapping;
 
 type W32 = Wrapping<u32>;
@@ -64,7 +63,7 @@ macro_rules! binop_forms {
             let mut x = a;
             x $op_assign &b;
             assert_eq!(x, want);
-            // `x op= int` by value, as an operator and through the trait method
+            // `x op= int` by value, as the operator and through the trait method
             let mut x = a;
             $tra::<$t>::$ma(&mut x, b.0);
             assert_eq!(x, want);

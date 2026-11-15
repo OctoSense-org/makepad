@@ -265,7 +265,7 @@ struct Raw {
     keys: Vec<Name>,
     /// loud macros invoked in its text whose expansion it does not have (deps.rs file_nodes)
     invoked: Vec<Name>,
-    /// where (diagnostics: MAKEPAD_RUN_DEPS_DUMP)
+    /// where (diagnostics: RELAX_DEPS_DUMP)
     invoked_at: Vec<u32>,
     always: bool,
     /// a macro item left unexpanded: coarse whatever it invokes
@@ -443,7 +443,7 @@ fn reached(pf: &ParsedFile) -> Vec<(u32, Option<u32>)> {
             ItemKind::Trait(r) => ast.list(ast.row(*r).items),
             ItemKind::Impl(r) => ast.list(ast.row(*r).items),
             ItemKind::ForeignMod(r) => ast.list(ast.row(*r).items),
-            ItemKind::Mod(Some(items)) => ast.list(*items),
+            ItemKind::Mod(crate::ast::Opt::Some(items)) => ast.list(*items),
             _ => &[],
         };
         for k in kids.iter().rev() { stack.push((k.0, Some(i))); }
@@ -564,7 +564,7 @@ fn ty_names(pf: &ParsedFile, t: crate::ast::TyId, params: &[&str], out: &mut Vec
                         },
                         crate::ast::GenericArgs::Paren(l, r) => {
                             for t in ast.list(*l) { ty_names(pf, *t, params, out, depth + 1); }
-                            if let Some(r) = r { ty_names(pf, *r, params, out, depth + 1); }
+                            if let Some(r) = &r.get() { ty_names(pf, *r, params, out, depth + 1); }
                         }
                     }
                 }
@@ -603,7 +603,7 @@ fn use_names(pf: &ParsedFile, t: &UseTree, last: Option<&str>, out: &mut Vec<Nam
         }
         UseTree::Name(seg, rename) => {
             let w = pf.text(seg.name);
-            let bound = match rename {
+            let bound = match &rename.get() {
                 Some(r) => pf.text(*r),
                 None if w == "self" => last.unwrap_or(w),
                 None => w,
@@ -705,7 +705,7 @@ fn file_nodes(pf: &ParsedFile, dg: &super::items::FileDigest, path: &str) -> Vec
     let ident = |i: u32| -> u128 {
         let mut h = Sip128::new();
         h.str("dep-ident");
-        h.str(path);
+        h.str(&crate::dirs::anchored(path));
         let mut at = parent_of.get(&i).copied().flatten();
         let mut depth = 0;
         while let Some(p) = at {
@@ -784,7 +784,7 @@ fn file_nodes(pf: &ParsedFile, dg: &super::items::FileDigest, path: &str) -> Vec
         };
         let header = parent.filter(|&p| matches!(kind_of(p), ItemKind::Impl(_) | ItemKind::ForeignMod(_)));
         match &it.kind {
-            ItemKind::Mod(Some(kids)) => { header_only(&mut cut, ast.list(*kids), false); own(&mut keys); }
+            ItemKind::Mod(crate::ast::Opt::Some(kids)) => { header_only(&mut cut, ast.list(*kids), false); own(&mut keys); }
             ItemKind::ForeignMod(r) => header_only(&mut cut, ast.list(ast.row(*r).items), false),
             ItemKind::Impl(r) => {
                 let im = ast.row(*r);
@@ -798,7 +798,7 @@ fn file_nodes(pf: &ParsedFile, dg: &super::items::FileDigest, path: &str) -> Vec
                     }
                     let params: Vec<&str> = ast.list(im.generics.params).iter().map(|g| pf.text(g.name)).collect();
                     named_head = ty_names(pf, im.self_ty, &params, &mut keys, 0);
-                    trait_name = im.trait_.as_ref().and_then(|p| ast.segs(p.segs).last()).map(|s| pf.text(s.name)).filter(|t| !t.is_empty()).map(|t| name_of(t.as_bytes()));
+                    trait_name = im.trait_.get().as_ref().and_then(|p| ast.segs(p.segs).last()).map(|s| pf.text(s.name)).filter(|t| !t.is_empty()).map(|t| name_of(t.as_bytes()));
                 }
             }
             ItemKind::Trait(r) => {
@@ -825,7 +825,7 @@ fn file_nodes(pf: &ParsedFile, dg: &super::items::FileDigest, path: &str) -> Vec
             }
             ItemKind::ExternCrate(alias) => {
                 skip.clear();
-                match alias { Some(a) => keys.push(name_of(pf.text(*a).as_bytes())), None => own(&mut keys) }
+                match &alias.get() { Some(a) => keys.push(name_of(pf.text(*a).as_bytes())), None => own(&mut keys) }
             }
             ItemKind::Mac(_) => { always = true; mac = true; }
             ItemKind::MacroRules(_) => { own(&mut keys); rules = true; }
@@ -848,6 +848,157 @@ fn file_nodes(pf: &ParsedFile, dg: &super::items::FileDigest, path: &str) -> Vec
     out
 }
 
+/// The skipped bodies of files `files` that hold a fn body in the interface (an `impl Trait`
+/// return, async, const, items inside) the load skipped and that invokes a macro, parsed: the
+/// expansions' names belong to the node; without them it would be coarse -- and whether it is must
+/// not depend on what ran before the nodes were made.
+pub(crate) fn parse_interface_parts(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], files: &[usize], digests: &[Option<std::sync::Arc<super::items::FileDigest>>]) {
+    for &f in files {
+        let (Some(pf), Some(Some(dg))) = (parsed.get(f), digests.get(f)) else { continue };
+        if pf.part.get().is_some() { continue; }
+        let needs = pf.ast.items.iter().enumerate().any(|(i, it)| {
+            matches!(it.kind, ItemKind::Fn(sig, body, _) if body.is_none() && pf.ast.fn_sig(sig).lazy_body.is_some())
+                && dg.body_span(crate::ast::ItemId(i as u32)).is_none()
+                && { let (mut n, mut inv) = (Vec::new(), Vec::new()); scan(&pf.src, &[(it.lo, it.hi)], &[], &mut n, &mut inv); inv.iter().any(|&m| m & QUIET_BIT == 0 || late_builtin(m)) }
+        });
+        if needs {
+            if let Some(&c) = prog.file_crate.get(f) { let _ = pf.part(&prog.crates[c as usize].cfg); }
+        }
+    }
+}
+
+/// The names of the macros and the type aliases defined outside the sysroot.
+pub(crate) struct UserNames {
+    /// `macro_rules!` anywhere in a file, a proc-macro crate's root fns: a quiet macro of such a
+    /// name may expand to anything
+    pub macros: std::collections::HashSet<Name>,
+    /// a trait impl for an alias applies to the type it names
+    pub aliases: std::collections::HashSet<Name>,
+}
+
+pub(crate) fn user_names(prog: &Program) -> UserNames {
+    let std_dir = crate::std_dir();
+    let user: Vec<bool> = (0..prog.crates.len()).map(|c| !sysroot(prog, c, &std_dir)).collect();
+    let mut out = UserNames { macros: Default::default(), aliases: Default::default() };
+    for (f, pf) in prog.files.iter().enumerate() {
+        let Some(&c) = prog.file_crate.get(f) else { continue };
+        if !user.get(c as usize).copied().unwrap_or(false) { continue; }
+        let proc_root = prog.crates[c as usize].proc_macro && f < prog.boot_files;
+        for (i, it) in pf.ast.items.iter().enumerate() {
+            let set = match it.kind {
+                ItemKind::MacroRules(_) => &mut out.macros,
+                ItemKind::Fn(..) if proc_root && pf.ast.root_items.iter().any(|r| r.0 as usize == i) => &mut out.macros,
+                ItemKind::TypeAlias(_) => &mut out.aliases,
+                _ => continue,
+            };
+            let n = pf.text(it.name);
+            if !n.is_empty() { set.insert(name_of(n.as_bytes())); }
+        }
+    }
+    out
+}
+
+/// A node of the item graph as a check's verdict reuse compares two interfaces of a crate by it
+/// (check_reuse.rs): the crates above see a change of the crate only through the names its changed
+/// nodes are found under, except through the nodes flagged here.
+pub(crate) struct CheckNode {
+    /// its piece with its identity (file_nodes)
+    pub piece: u128,
+    /// the names it is found under (file_nodes; a trait impl: the names of its self type), and an
+    /// inherent impl's or extern block's header under its items' names (they depend on it)
+    pub keys: Vec<Name>,
+    /// the names its piece writes
+    pub names: Vec<Name>,
+    /// a trait impl: its trait's name first, then its items' names and the names in its trait's
+    /// generic arguments. An impl that applies to types its self type does not name (`named_head`
+    /// false, or an alias: check_reuse.rs Dirty) is found under these too: `5u8.hi()` asks a
+    /// blanket impl of `hi`'s trait, `x.into()` asks `From<X> for u32` through core's blanket impl
+    pub wide: Vec<Name>,
+    /// a trait impl whose self type's head is a named path (file_nodes)
+    pub named_head: bool,
+    /// a trait definition (its keys: its name and its items' names)
+    pub trait_def: bool,
+    /// reached by every node of the crates that can see it: an always node (inner attributes, glob
+    /// and `as _` imports, an item macro outside a module), or one whose text defines an impl, a
+    /// macro or an extern block that no name finds (in a fn body or a constant's initializer). An
+    /// item macro of a module is not: the load expands it into a file of its own (a fragment, whose
+    /// nodes stand for its expansion)
+    pub always: bool,
+    /// it invokes a macro whose expansion it does not have (a loud one, or a quiet one of a name a
+    /// user macro has: `user_names`): what it names is not known
+    pub coarse: bool,
+}
+
+/// One file's nodes as a check's verdict reuse compares them (CheckNode).
+pub(crate) fn check_nodes(pf: &ParsedFile, dg: &super::items::FileDigest, path: &str, user_macros: &std::collections::HashSet<Name>) -> Vec<CheckNode> {
+    let ast = &pf.ast;
+    let raws = file_nodes(pf, dg, path);
+    // the items of the modules (an item macro there is expanded into a fragment)
+    let mut in_module = vec![false; ast.items.len()];
+    for (i, parent) in reached(pf) {
+        let module = parent.is_none_or(|p| matches!(ast.item(crate::ast::ItemId(p)).kind, ItemKind::Mod(_)));
+        if let Some(m) = in_module.get_mut(i as usize) { *m = module; }
+    }
+    // where the global items no name finds were written: an impl, a macro definition or item
+    // macro, an extern block or crate outside the modules, impls and traits (file_nodes' nodes)
+    let mut reached_items = vec![false; ast.items.len()];
+    for (i, _) in reached(pf) { if let Some(r) = reached_items.get_mut(i as usize) { *r = true; } }
+    let mut hidden: Vec<u32> = ast.items.iter().enumerate()
+        .filter(|(i, it)| !reached_items[*i] && matches!(it.kind, ItemKind::Impl(_) | ItemKind::MacroRules(_) | ItemKind::Mac(_) | ItemKind::ForeignMod(_) | ItemKind::ExternCrate(_)))
+        .map(|(_, it)| pf.call_site(it.lo)).collect();
+    hidden.sort_unstable();
+    let mut header_keys: HashMap<u32, Vec<Name>> = HashMap::new();
+    for r in &raws {
+        if let Some(h) = r.header { header_keys.entry(h).or_default().extend_from_slice(&r.keys); }
+    }
+    raws.into_iter().map(|r| {
+        let item = r.items.first().copied();
+        let mut keys = r.keys;
+        let mut wide = Vec::new();
+        if let Some(t) = r.trait_name {
+            for &k in r.items.iter().skip(1) {
+                let n = pf.text(ast.item(crate::ast::ItemId(k)).name);
+                if !n.is_empty() { wide.push(name_of(n.as_bytes())); }
+            }
+            if let Some(ItemKind::Impl(row)) = item.map(|i| &ast.item(crate::ast::ItemId(i)).kind) {
+                let im = ast.row(*row);
+                let params: Vec<&str> = ast.list(im.generics.params).iter().map(|g| pf.text(g.name)).collect();
+                for s in im.trait_.get().as_ref().map_or(&[][..], |p| ast.segs(p.segs)) {
+                    match ast.gargs(s.args()) {
+                        Some(crate::ast::GenericArgs::Angle(l)) => for g in ast.list(*l) {
+                            match g {
+                                crate::ast::GenericArg::Type(t) | crate::ast::GenericArg::Binding(_, _, t) => { ty_names(pf, *t, &params, &mut wide, 0); }
+                                _ => {}
+                            }
+                        },
+                        Some(crate::ast::GenericArgs::Paren(l, ret)) => {
+                            for t in ast.list(*l) { ty_names(pf, *t, &params, &mut wide, 0); }
+                            if let Some(t) = &ret.get() { ty_names(pf, *t, &params, &mut wide, 0); }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            wide.sort_unstable();
+            wide.dedup();
+            wide.retain(|&n| n != t);
+            wide.insert(0, t);
+        }
+        let trait_def = item.is_some_and(|i| matches!(ast.item(crate::ast::ItemId(i)).kind, ItemKind::Trait(_)));
+        if let Some(v) = item.and_then(|i| header_keys.get(&i)) { keys.extend_from_slice(v); }
+        keys.sort_unstable();
+        keys.dedup();
+        let global = item.is_some_and(|i| {
+            let (lo, hi) = full_span(pf, i);
+            let k = hidden.partition_point(|&p| p < lo);
+            hidden.get(k).is_some_and(|&p| p < hi)
+        });
+        let module_mac = r.mac && item.is_some_and(|i| in_module.get(i as usize).copied().unwrap_or(false));
+        let coarse = (r.mac && !module_mac) || (!r.rules && r.invoked.iter().any(|&m| m & QUIET_BIT == 0 || user_macros.contains(&(m & !QUIET_BIT))));
+        CheckNode { piece: r.piece, keys, names: r.names, wide, named_head: r.named_head, trait_def, always: (r.always && !module_mac) || global, coarse }
+    }).collect()
+}
+
 fn kind_code(k: &ItemKind) -> u32 {
     match k {
         ItemKind::Use(_) => 1, ItemKind::ExternCrate(_) => 2, ItemKind::Fn(..) => 3, ItemKind::Struct(_) => 4,
@@ -857,13 +1008,19 @@ fn kind_code(k: &ItemKind) -> u32 {
     }
 }
 
+/// The files a graph is of: the boot files, then `added` (the files of modules live edits added,
+/// by the index each was loaded at: Program::edit_added_files; after every boot file).
+fn text_files<'a>(prog: &'a Program, added: &'a [u32]) -> impl Iterator<Item = usize> + 'a {
+    (0..prog.boot_files.min(prog.files.len())).chain(added.iter().map(|&f| f as usize).filter(|&f| f >= prog.boot_files && f < prog.files.len()))
+}
+
 impl Deps {
     /// Per crate: what its rows are built from, besides the crates it can see (CrateRow without its
     /// own lists and always hash).
-    fn crate_inputs(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], iface: &[u128], atomic: &[bool]) -> Vec<CrateRow> {
+    fn crate_inputs(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], added: &[u32], iface: &[u128], atomic: &[bool]) -> Vec<CrateRow> {
         let mut files: Vec<Sip128> = (0..prog.crates.len()).map(|_| { let mut h = Sip128::new(); h.str("deps-crate-files"); h }).collect();
         let mut place = vec![0u32; prog.crates.len()];
-        for f in 0..prog.boot_files.min(prog.files.len()) {
+        for f in text_files(prog, added) {
             if prog.front_macro_fragments.contains(&f) { continue; }
             let Some(&c) = prog.file_crate.get(f) else { continue };
             let Some(h) = files.get_mut(c as usize) else { continue };
@@ -871,7 +1028,7 @@ impl Deps {
             // order (an edited crate restored after the kept ones), the places with the crate only
             h.u32(place[c as usize]);
             place[c as usize] += 1;
-            h.str(prog.file_paths.get(f).map_or("", |p| p.as_str()));
+            h.str(&crate::dirs::anchored(prog.file_paths.get(f).map_or("", |p| p.as_str())));
             h.u32(parsed[f].ast.items.len() as u32);
         }
         files.into_iter().enumerate().map(|(c, files)| {
@@ -879,7 +1036,7 @@ impl Deps {
             let mut ident = Sip128::new();
             ident.str("crate-ident");
             ident.str(prog.syms.str(ci.name));
-            ident.str(prog.mods.get(ci.root_mod as usize).and_then(|m| prog.file_paths.get(m.file as usize)).map_or("", |p| p.as_str()));
+            ident.str(&crate::dirs::anchored(prog.mods.get(ci.root_mod as usize).and_then(|m| prog.file_paths.get(m.file as usize)).map_or("", |p| p.as_str())));
             ident.u8(ci.cfg.holds("test") as u8);
             CrateRow { ident: h2(ident.finish128()), files: h2(files.finish128()),
                 iface: h2(iface.get(c).copied().unwrap_or(0)), always: [0; 2], always_at: [0; 2], aliases_at: [0; 2], macros_at: [0; 2],
@@ -887,11 +1044,17 @@ impl Deps {
         }).collect()
     }
 
-    /// Per boot file: its crate, NONE for one not in the graph (Deps::files).
-    fn file_crates(prog: &Program) -> Vec<u32> {
-        (0..prog.boot_files.min(prog.files.len()))
+    /// Per file up to the last of the graph's (`text_files`): its crate, NONE for one not in the
+    /// graph (Deps::files).
+    fn file_crates(prog: &Program, added: &[u32]) -> Vec<u32> {
+        let mut out: Vec<u32> = (0..prog.boot_files.min(prog.files.len()))
             .map(|f| if prog.front_macro_fragments.contains(&f) { NONE } else { prog.file_crate.get(f).copied().unwrap_or(NONE) })
-            .collect()
+            .collect();
+        for f in text_files(prog, added).skip(out.len()) {
+            if out.len() <= f { out.resize(f + 1, NONE); }
+            if !prog.front_macro_fragments.contains(&f) { out[f] = prog.file_crate.get(f).copied().unwrap_or(NONE); }
+        }
+        out
     }
 
     /// Per crate of this program: its index in `prev` (NONE: it had none), by identity -- a load
@@ -914,13 +1077,14 @@ impl Deps {
     }
 
     /// The crates whose rows a build over `prev` takes over (`build`): their files need no digests.
-    pub(crate) fn clean_crates(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], iface: &[u128], prev: Option<&Deps>) -> Vec<bool> {
+    pub(crate) fn clean_crates(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], added: &[u32], iface: &[u128], prev: Option<&Deps>) -> Vec<bool> {
         let atomic = atomic_crates(prog, iface.len());
-        Self::clean_with(prev, &Self::crate_inputs(prog, parsed, iface, &atomic), &universes(prog))
+        Self::clean_with(prev, &Self::crate_inputs(prog, parsed, added, iface, &atomic), &universes(prog))
     }
 
-    /// Builds the graph of the program's boot files, `parsed` per boot file (`prog.files`, or the
-    /// versions a live edit made current); `iface`: the crates' interface fingerprints
+    /// Builds the graph of the program's boot files and `added` (the files of modules live edits
+    /// added: `text_files`), `parsed` per file (`prog.files`, or the versions a live edit made
+    /// current); `iface`: the crates' interface fingerprints
     /// (what coarse nodes and sysroot crates are keyed by), `valid` what
     /// it is built from (Deps::valid). Over `prev` (the graph a start before this one stored), the
     /// rows of every crate that is clean (`clean_crates`) are taken over and only the other crates'
@@ -928,15 +1092,15 @@ impl Deps {
     /// closures and components are known. The result is the graph a build from scratch makes (the
     /// component ids aside). None: over `prev`, the names that decide clean crates' nodes (the
     /// program's alias and macro names) changed -- build without it.
-    pub(crate) fn build(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], digests: &[Option<std::sync::Arc<super::items::FileDigest>>], iface: &[u128], valid: u128, prev: Option<&Deps>) -> Option<Deps> {
+    pub(crate) fn build(prog: &Program, parsed: &[std::sync::Arc<ParsedFile>], added: &[u32], digests: &[Option<std::sync::Arc<super::items::FileDigest>>], iface: &[u128], valid: u128, prev: Option<&Deps>) -> Option<Deps> {
         let t0 = std::time::Instant::now();
         let n_crates = prog.crates.len();
         let atomic = atomic_crates(prog, iface.len());
         let universe = universes(prog);
-        let mut crates = Self::crate_inputs(prog, parsed, iface, &atomic);
+        let mut crates = Self::crate_inputs(prog, parsed, added, iface, &atomic);
         let clean = Self::clean_with(prev, &crates, &universe);
         let prev = prev.filter(|_| clean.iter().any(|&c| c));
-        let file_crate = Self::file_crates(prog);
+        let file_crate = Self::file_crates(prog, added);
         // `prev`'s numbering to this program's: crates by identity (`at`: ours to its; `cur`: its
         // to ours, clean crates only), a clean crate's files by their places among its own
         let at: Vec<u32> = prev.map_or_else(|| vec![NONE; n_crates], |p| Self::prev_crates(p, &crates));
@@ -956,28 +1120,13 @@ impl Deps {
                 }).collect()
             }
         };
-        // the files walked: boot files of the crates in the graph that are not clean
-        let files: Vec<usize> = (0..prog.boot_files.min(prog.files.len()))
+        // the files walked: the graph's files of the crates in it that are not clean
+        let files: Vec<usize> = text_files(prog, added)
             .filter(|&f| !prog.front_macro_fragments.contains(&f))
             .filter(|&f| prog.file_crate.get(f).is_some_and(|&c| !atomic.get(c as usize).copied().unwrap_or(true) && !clean[c as usize]))
             .filter(|&f| digests.get(f).is_some_and(|d| d.is_some()))
             .collect();
-        // a fn body in the interface (an `impl Trait` return, async, const, items inside) that the
-        // load skipped and that invokes a macro: its file's skipped bodies are parsed now (the
-        // expansions' names belong to the node; without them it would be coarse -- and whether it
-        // is must not depend on what ran before the graph was built)
-        for &f in &files {
-            let (Some(pf), Some(Some(dg))) = (parsed.get(f), digests.get(f)) else { continue };
-            if pf.part.get().is_some() { continue; }
-            let needs = pf.ast.items.iter().enumerate().any(|(i, it)| {
-                matches!(it.kind, ItemKind::Fn(sig, None, _) if pf.ast.fn_sig(sig).lazy_body.is_some())
-                    && dg.body_span(crate::ast::ItemId(i as u32)).is_none()
-                    && { let (mut n, mut inv) = (Vec::new(), Vec::new()); scan(&pf.src, &[(it.lo, it.hi)], &[], &mut n, &mut inv); inv.iter().any(|&m| m & QUIET_BIT == 0 || late_builtin(m)) }
-            });
-            if needs {
-                if let Some(&c) = prog.file_crate.get(f) { let _ = pf.part(&prog.crates[c as usize].cfg); }
-            }
-        }
+        parse_interface_parts(prog, parsed, &files, digests);
         struct Shared<'a>(&'a [std::sync::Arc<ParsedFile>]);
         unsafe impl Sync for Shared<'_> {}
         let pfs = Shared(parsed);
@@ -1319,9 +1468,9 @@ impl Deps {
             lists.extend_from_slice(&own_macros[c]);
             crates[c].macros_at = at(&lists, s);
         }
-        // MAKEPAD_RUN_DEPS_DUMP=<file>: every item node walked (crate, file:offset, piece, closure,
+        // RELAX_DEPS_DUMP=<file>: every item node walked (crate, file:offset, piece, closure,
         // coarse and the macros that made it so): which piece an edit changed, and what reaches it
-        if let Ok(path) = std::env::var("MAKEPAD_RUN_DEPS_DUMP") {
+        if let Ok(path) = std::env::var("RELAX_DEPS_DUMP") {
             let mut out = String::new();
             for id in 0..n_items {
                 let f = node_file[id] as usize;
@@ -1435,7 +1584,7 @@ impl Deps {
     pub(crate) fn crate_count(&self) -> usize { self.crates.rows().len() }
     /// Whether a graph can be built over it (its component ids leave room for the new ones).
     pub(crate) fn ids_left(&self) -> bool { self.comp_end < 1 << 30 }
-    /// Whether the graph holds the same closures as `other` (MAKEPAD_RUN_DEPS_VERIFY: a graph built
+    /// Whether the graph holds the same closures as `other` (RELAX_DEPS_VERIFY: a graph built
     /// over a stored one against one built from scratch; component ids are not compared).
     pub(crate) fn same_closures(&self, other: &Deps) -> Result<(), String> {
         let (a, b) = (self.nodes.rows(), other.nodes.rows());
@@ -1467,7 +1616,7 @@ impl Deps {
         h.u32(prog.files.len() as u32);
         h.u32(prog.boot_files as u32);
         for (i, p) in prog.file_paths.iter().enumerate().take(prog.boot_files.min(prog.files.len())) {
-            h.str(p);
+            h.str(&crate::dirs::anchored(p));
             h.u32(prog.file_crate.get(i).copied().unwrap_or(u32::MAX));
             h.u32(prog.files.get(i).map_or(0, |f| f.ast.items.len() as u32));
         }
@@ -1497,6 +1646,12 @@ impl Deps {
         None
     }
 
+    /// Whether the graph's nodes are of file version `f`: a boot file, or the version a re-key
+    /// walked in its place (not one an edit made after it).
+    pub(crate) fn has_file(&self, prog: &Program, f: u32) -> bool {
+        self.file_versions.contains_key(&f) || (f as usize) < prog.boot_files
+    }
+
     /// Whether `d`'s crate is in the graph.
     pub(crate) fn in_graph(&self, prog: &Program, d: DefId) -> bool {
         !self.atomic.get(prog.def(d).krate as usize).copied().unwrap_or(true)
@@ -1524,10 +1679,22 @@ impl Deps {
     }
 }
 
-/// Whether `m` (a `scan` invocation entry) is a quiet built-in that reads an outside late input.
+/// Whether `m` (a `scan` invocation entry) is a built-in that reads an outside late input: its
+/// expansion's text goes into the key of the body that invokes it (`include!`'s file is no source
+/// of the program: a body's key named only the names of its text, so an edit of the file kept it).
+/// (A name's own top bit is the quiet mark's: `include_bytes`' has it, and compared whole it never
+/// matched, so a body's include_bytes! left its file out of the key.)
 pub(crate) fn late_builtin(m: Name) -> bool {
     let raw = m & !QUIET_BIT;
-    raw == name_of(b"include_str") || raw == name_of(b"include_bytes") || raw == name_of(b"env") || raw == name_of(b"option_env")
+    [&b"include"[..], b"include_str", b"include_bytes", b"env", b"option_env"].iter().any(|w| raw == name_of(w) & !QUIET_BIT)
+}
+
+/// Whether `text` invokes `include!` (as `scan` records invocations).
+pub(crate) fn invokes_include(text: &[u8]) -> bool {
+    let include = name_of(b"include") & !QUIET_BIT;
+    let mut invoked = Vec::new();
+    scan(text, &[(0, text.len() as u32)], &[], &mut Vec::new(), &mut invoked);
+    invoked.iter().any(|&m| m & !QUIET_BIT == include)
 }
 
 /// The expansion text digest and the names of the expansion text produced by macro invocations
@@ -1579,4 +1746,24 @@ pub(super) fn region_closure(regions: &[(u32, u32, u32)], seeds: &[(u32, u32)]) 
         }
     }
     out
+}
+
+#[cfg(test)]
+mod late_input_tests {
+    use super::*;
+
+    /// The built-ins that read an outside input are found in a body as `scan` records their calls
+    /// (quiet or not), include! among them: their expansions' text goes into the body's key.
+    #[test]
+    fn a_bodys_late_builtins_are_found_as_scan_records_them() {
+        let calls = [("include!(\"v.rs\")", true), ("include_str!(\"v.txt\")", true), ("include_bytes!(\"v.bin\")", true),
+            ("env!(\"V\")", true), ("option_env!(\"V\")", true), ("concat!(\"a\")", false), ("stringify!(a)", false), ("m!(a)", false)];
+        for (call, late) in calls {
+            let src = format!("fn f() {{ {call}; }}");
+            let (mut names, mut invoked) = (Vec::new(), Vec::new());
+            scan(src.as_bytes(), &[(0, src.len() as u32)], &[], &mut names, &mut invoked);
+            assert_eq!(invoked.len(), 1, "{call}: {invoked:?}");
+            assert_eq!(late_builtin(invoked[0]), late, "{call}");
+        }
+    }
 }

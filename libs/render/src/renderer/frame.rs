@@ -3,6 +3,7 @@
 
 use super::ibl::EnvScope;
 use super::*;
+use super::draw_models::LayerPhase;
 
 /// HDR lane: the analytic dome's radiance relative to the lit world. The
 /// Preetham luminance at the legacy 0.1 exposure sits near a sunlit white
@@ -222,9 +223,15 @@ impl Renderer {
         // bound, the scene's. First, after a live edit, what the renderer
         // derived from the shaders' defaults is derived again (variants.rs).
         self.follow_reload(cx.cx);
+        self.restore_textures(cx.cx);
         self.resolve_ibl_for(cx.cx, &world.environment, scope);
         self.prepare_stock_ibl(cx.cx);
         self.push_item_instances(cx.cx, world);
+        // The trampled-grass field once per host update, for the scene's
+        // own draw (an aux draw's camera never moves it).
+        if matches!(scope, EnvScope::Scene) {
+            self.record_trample(cx);
+        }
         let stats = self.draw_scene_inner(cx, draw_list, draws, world, scene_state, skinned, models_draw);
         self.pop_item_instances();
         stats
@@ -241,12 +248,29 @@ impl Renderer {
         skinned: Option<SkinnedBatch>,
         mut models_draw: Option<&mut DrawSceneSkinned>,
     ) -> RenderStats {
+        self.blended_models.clear();
         let mut stats = RenderStats::default();
         // The placed list's static blocks for this frame (draw_models.rs):
         // the cascades' mover collection and the model lanes' cull read them.
         self.apply_model_lod_chains();
         self.placed_blocks.refresh(&self.static_models, &self.placed_models, self.placed_scene_signature);
         let camera_pos = scene_state.camera_pos;
+        // Target pixels, including this pass's DPI or offscreen render scale.
+        // XR records one model list for both eyes; like eye_pos below, use
+        // the left eye, with the runtime's actual projection and target size.
+        let pass_id = cx.current_pass_id();
+        let lod_scale = if matches!(cx.passes[pass_id].parent, CxDrawPassParent::Xr) {
+            cx.cx.xr_pass_eyes().map_or(1.0, |([(_, projection), _], size)| {
+                crate::lod_view::lod_projection_scale(&projection, size.y as f32)
+            })
+        } else {
+            // The recording stack may carry display DPI; the pass's own DPI
+            // is the raster density (also handles hosts changing it after begin).
+            let view_height_px = cx.passes[pass_id].dpi_factor.and_then(|dpi| {
+                cx.cx.get_pass_rect(pass_id, dpi).map(|rect| Cx::pass_pixel_size(rect.size, dpi).1 as f32)
+            }).unwrap_or(0.0);
+            crate::lod_view::lod_projection_scale(&scene_state.projection, view_height_px)
+        } * self.lod_bias;
         // The stage the scene draw list carries (identity on an MR box stage, whose stage
         // rides in the XR eye views instead: shaders then see world coordinates).
         let stage_matrix = self.draw_stage_matrix();
@@ -282,8 +306,9 @@ impl Renderer {
         let frustum = frustum_val.as_ref();
         // Where the eye really is in the world: the game camera, except on an MR box stage,
         // whose eye is the headset's, through the stage (far off at a small scale). Levels of
-        // detail, impostors and grass are picked, and shading views from, there; shadows,
-        // lights and streaming stay centred on the game camera (the followed subject).
+        // detail, impostors and grass are picked, and shading views from, there; shadow
+        // scheduling, lights and streaming stay centred on the game camera (the followed
+        // subject), while caster LODs share the drawn models' eye and scale.
         // (The left eye's view of the world: its view in the room times the stage.)
         let eye_view = match (self.stage.mode, cx.cx.xr_eye_matrices()) {
             (StageMode::MrBox, Some([(view, _), _])) => Some(Mat4f::mul(&view, &self.stage.matrix())),
@@ -365,6 +390,9 @@ impl Renderer {
         // and its Sun and Sky replace the rig's key and fill.
         let sun = crate::world_lights::apply_world_sun(world, sun);
         crate::world_lights::append_world_lights(world, &mut self.frame_lights);
+        if let Some(lights) = &self.review_lights { self.frame_lights.clone_from(lights); }
+        self.prepare_volume_fog_lighting(cx.current_pass_id(), sun, camera_pos);
+        self.prepare_ssr_camera(cx.current_pass_id(), camera_pos);
         self.clustered.lin_ctl = self.lin_ctl();
         let local_shadows = self.clustered_enabled && self.frame_lights.iter().any(|l| l.shadows);
         // Character palettes pack BEFORE the cascades encode: the skinned
@@ -375,7 +403,7 @@ impl Renderer {
         }
         let mut lm_movers = if tiers.csm || local_shadows {
             self.ensure_entity_caster_geometries(cx.cx);
-            self.collect_lm_movers(world, camera_pos, skinned.as_ref().map(|b| b.items.as_slice()))
+            self.collect_lm_movers(world, eye_pos, lod_scale, skinned.as_ref().map(|b| b.items.as_slice()))
         } else {
             Vec::new()
         };
@@ -449,8 +477,8 @@ impl Renderer {
             self.clustered.render_shadows(cx.cx, camera_pos, &statics, &lm_movers);
             stats.clustered = self.clustered.stats();
         }
-        self.gi.flush_retired(cx.cx);
-        if self.gi.mode()!=crate::GiMode::Off && self.clustered_enabled && cx.gpu_info().float_color_targets {
+        if !self.review_gi { self.gi.flush_retired(cx.cx); }
+        if !self.review_gi && self.gi.mode()!=crate::GiMode::Off && self.clustered_enabled && cx.gpu_info().float_color_targets {
             self.run_fast_gi(cx, world, camera_pos, &scene_state, skinned.as_ref().map(|b| b.items.as_slice()), &sun, &mut stats);
         }
         draw_list.begin_always(cx);
@@ -569,6 +597,8 @@ impl Renderer {
         // HDR lane: per-pixel exponential height fog (clustered.rs
         // scene_fog) with the game's density at the base height.
         // A world's linear or exp2 fog is fogged with distance as it says.
+        let volume_fog_on = self.volume_fog_active_for(cx.current_pass_id());
+        let fog_density = if volume_fog_on { 0.0 } else { fog_density };
         let fog_on = self.hdr_output && fog_density > 0.0;
         self.clustered.fog_ctl = match (fog_on, &world.environment.fog) {
             (false, _) => [0.0; 4],
@@ -598,6 +628,10 @@ impl Renderer {
             }
             None => (fog_color, fog_density),
         };
+        // One fog model in this frame, including material families that
+        // otherwise pick the underwater analytic override above.
+        let fog_density = if volume_fog_on { 0.0 } else { fog_density };
+        if volume_fog_on { self.clustered.fog_ctl = [0.0; 4]; }
         self.clustered.uw = if shows_environment {
             super::water::water_column(world.water.as_deref(), camera_pos, world.water_time, &sun)
         } else {
@@ -1422,6 +1456,7 @@ impl Renderer {
                 frustum,
                 &mut stats,
                 eye_pos,
+                lod_scale,
             );
         }
 
@@ -1587,12 +1622,19 @@ impl Renderer {
                 self.model_ground.push(receiver.sample(x, z).0);
             }
             let instances = std::mem::take(&mut self.placed_models);
+            // The view's focal length in pixels: the grass's density (and its
+            // far carpet on the terrain) follows the image.
+            let focal_px = 0.5 * scene_state.projection.v[5].abs()
+                * (scene_state.viewport_rect.size.y * cx.current_dpi_factor()).max(1.0) as f32;
             self.prepare_foliage_lane(cx.cx);
             self.prepare_splat_lane(cx.cx);
+            self.prepare_impostor_lane(cx.cx);
             self.draw_models_inner(
                 cx,
                 ModelDraw::Diffuse(draw),
+                LayerPhase::Opaque,
                 eye_pos,
+                lod_scale,
                 &instances,
                 WorldModelLane::Placed,
                 (fog_color, fog_density),
@@ -1603,6 +1645,7 @@ impl Renderer {
             self.draw_pbr_models(
                 cx,
                 eye_pos,
+                lod_scale,
                 &instances,
                 WorldModelLane::Placed,
                 (fog_color, fog_density),
@@ -1610,22 +1653,22 @@ impl Renderer {
                 frustum,
                 &mut stats,
             );
-            self.draw_splat_models(cx, eye_pos, &instances, WorldModelLane::Placed,
+            self.draw_splat_models(cx, eye_pos, lod_scale, &instances, WorldModelLane::Placed,
+                (fog_color, fog_density), &sun, frustum, focal_px, &mut stats);
+            self.draw_foliage_models(cx, eye_pos, lod_scale, &instances, WorldModelLane::Placed,
                 (fog_color, fog_density), &sun, frustum, &mut stats);
-            self.draw_foliage_models(cx, eye_pos, &instances, WorldModelLane::Placed,
-                (fog_color, fog_density), &sun, frustum, &mut stats);
-            self.draw_custom_models(cx, eye_pos, &instances, WorldModelLane::Placed,
+            self.draw_custom_models(cx, eye_pos, lod_scale, &instances, WorldModelLane::Placed,
                 (fog_color, fog_density), &sun, frustum, &mut stats);
             self.placed_models = instances;
             let owner = cx.enter_draw_name("stream");
             self.draw_stream(cx, draw, camera_pos, (fog_color, fog_density), &sun);
             cx.exit_draw_label(owner);
             let owner = cx.enter_draw_name("grass");
-            self.draw_grass(cx, eye_pos, (fog_color, fog_density), &sun, frustum, &mut stats);
+            self.draw_grass(cx, eye_pos, focal_px, (fog_color, fog_density), &sun, frustum, &mut stats);
             cx.exit_draw_label(owner);
 
-            // Actor-attached props share the world material/depth pass, but
-            // this is their ONLY renderer traversal. In particular they
+            // Actor-attached props share the world material/depth pass;
+            // their blended layers join the deferred model stage. They
             // were absent from the lightmap/CSM mover and shadow-building
             // stages above. A receiver sample gives their shader the same
             // projected baked-shadow lookup as other moving geometry
@@ -1650,7 +1693,9 @@ impl Renderer {
             self.draw_models_inner(
                 cx,
                 ModelDraw::Diffuse(draw),
+                LayerPhase::Opaque,
                 eye_pos,
+                lod_scale,
                 &attachments,
                 WorldModelLane::Attachment,
                 (fog_color, fog_density),
@@ -1661,6 +1706,7 @@ impl Renderer {
             self.draw_pbr_models(
                 cx,
                 eye_pos,
+                lod_scale,
                 &attachments,
                 WorldModelLane::Attachment,
                 (fog_color, fog_density),
@@ -1668,7 +1714,7 @@ impl Renderer {
                 frustum,
                 &mut stats,
             );
-            self.draw_custom_models(cx, eye_pos, &attachments, WorldModelLane::Attachment,
+            self.draw_custom_models(cx, eye_pos, lod_scale, &attachments, WorldModelLane::Attachment,
                 (fog_color, fog_density), &sun, frustum, &mut stats);
             self.world_attachments = attachments;
         }
@@ -1873,6 +1919,14 @@ impl Renderer {
                 if let Some(mi) = draw_alpha.cube.cube.many_instances.take() {
                     cx.end_many_instances(mi);
                 }
+            }
+        }
+
+        if !self.blended_models.is_empty() {
+            if let Some(draw) = models_draw.as_deref_mut() {
+                let owner = cx.enter_draw_name("blended models");
+                self.draw_blended_models(cx, draw, eye_pos, lod_scale, (fog_color, fog_density), &sun, frustum, &mut stats);
+                cx.exit_draw_label(owner);
             }
         }
 

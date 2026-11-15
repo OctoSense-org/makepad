@@ -18,7 +18,7 @@ impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Arc<U>> for Arc
 impl<T: ?Sized + Unsize<U>, U: ?Sized> crate::ops::CoerceUnsized<Weak<U>> for Weak<T> {}
 unsafe impl<T: ?Sized> PinSafePointer for Arc<T> {}
 use crate::ptr;
-use crate::rc::{alloc_block, free_block, header_of, is_dangling, value_offset, Header, DANGLING};
+use crate::rc::{alloc_block, free_block_of, header_of, is_dangling, Header, DANGLING};
 
 const RELAXED: u8 = 0;
 const RELEASE: u8 = 1;
@@ -90,6 +90,28 @@ impl<T> Arc<T> {
         }
     }
 
+    /// rustc 1.100.0 (smart_pointer_map): `f` of the value, in the same allocation when this is the only
+    /// reference and `U` fits it exactly
+    pub fn map<U>(this: Self, f: impl FnOnce(&T) -> U) -> Arc<U> {
+        if crate::mem::size_of::<T>() == crate::mem::size_of::<U>()
+            && crate::mem::align_of::<T>() == crate::mem::align_of::<U>()
+            && Arc::is_unique(&this)
+        {
+            unsafe {
+                let ptr = Arc::into_raw(this);
+                let value = ptr::read(ptr);
+                let mut allocation = Arc::from_raw(ptr as *const crate::mem::MaybeUninit<U>);
+                Arc::get_mut_unchecked(&mut allocation).write(f(&value));
+                allocation.assume_init()
+            }
+        } else {
+            let output = f(&*this);
+            let ptr = Arc::into_raw(this);
+            unsafe { Arc::decrement_strong_count(ptr) }
+            Arc::new(output)
+        }
+    }
+
     pub fn into_inner(this: Arc<T>) -> Option<T> {
         let this = crate::mem::ManuallyDrop::new(this);
         let old = unsafe { ia::atomic_fetch_sub(strong_ptr(header_of(this.ptr.as_ptr())), 1usize, RELEASE) };
@@ -138,7 +160,7 @@ impl<T: ?Sized + crate::clone_uninit::CloneToUninit> Arc<T> {
                 let size = crate::intrinsics_mem::size_of_val(&*p);
                 let align = crate::intrinsics_mem::align_of_val(&*p);
                 let (nh, np) = alloc_block(size, align, 1, 1);
-                let guard = crate::rc::FreeBlockGuard(nh);
+                let guard = crate::rc::FreeBlockGuard(nh, size, align);
                 (*p).clone_to_uninit(np);
                 crate::mem::forget(guard);
                 *this = Arc::from_parts(crate::clone_uninit::with_addr(p, np));
@@ -194,6 +216,14 @@ impl<T: ?Sized> Arc<T> {
 
     pub fn strong_count(this: &Arc<T>) -> usize {
         unsafe { ia::atomic_load(strong_ptr(header_of(this.ptr.as_ptr())) as *const usize, ACQUIRE) }
+    }
+
+    /// The only Arc, and no Weak exists (alloc's private `is_unique`).
+    fn is_unique(this: &Arc<T>) -> bool {
+        unsafe {
+            ia::atomic_load(weak_ptr(header_of(this.ptr.as_ptr())) as *const usize, ACQUIRE) == 1
+                && ia::atomic_load(strong_ptr(header_of(this.ptr.as_ptr())) as *const usize, ACQUIRE) == 1
+        }
     }
 
     /// Mutable access when this is the only Arc and no Weak exists.
@@ -590,7 +620,7 @@ unsafe impl<#[may_dangle] T: ?Sized> Drop for Weak<T> {
         if old == 1 {
             unsafe {
                 ia::atomic_fence(ACQUIRE);
-                free_block(header_of(self.ptr.as_ptr()));
+                free_block_of(self.ptr.as_ptr());
             }
         }
     }

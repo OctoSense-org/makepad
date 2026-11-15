@@ -3,7 +3,7 @@
 //! what needs a device to the backend's [`Gpu`] hooks. The headless backend implements the hooks
 //! without a device; the Metal backend implements them with one.
 
-use crate::buffers::{pack_domains, read_items, read_strs, CmdView, PipelineBlob};
+use crate::buffers::{pack_domains, read_items, read_rects, read_strs, CmdView, PipelineBlob};
 use crate::cmds::HalCmd;
 use crate::ledger::{Kind, LedgerEntry};
 use crate::session::*;
@@ -55,7 +55,8 @@ pub enum OsCmd {
     ImeShow { id: Id, area: [f32; 4], config: u32 },
     ImeHide { id: Id },
     ImeSync { id: Id, selection: [u32; 2], composition: [u32; 2], text: String },
-    ClipSet { text: String },
+    /// The flavours a copy writes (`clipboard::ClipboardData`: text, HTML, Markdown).
+    ClipSet { data: crate::clipboard::ClipboardData },
     ClipRead { req: u64, primary: bool },
     SelectionSet { text: String },
     /// `items`: (`input::drag_item` kind, string); `image`: an RGBA8 drag image.
@@ -76,10 +77,12 @@ pub enum OsCmd {
     /// `HalCmd::XrHaptic`.
     XrHaptic { id: Id, hand: u32, amplitude: f32, duration_us: u32 },
     FileDialog { req: u32, kind: u32, title: String, location: String, filename: String, filters: Vec<String> },
+    PrintPdf { req: u32, title: String, pdf: std::sync::Arc<[u8]> },
     ShareText { text: String },
     ClipboardActions { id: Id, show: bool, area: [f32; 4], selection: bool },
     AppIcon { w: u32, h: u32, rgba: Vec<u8> },
-    DragReply { id: Id, to: u32, answer: u32 },
+    /// `HalCmd::DragReply`.
+    DragReply { id: Id, to: u32, answer: u32, fullscreen: bool },
     FrameRequest { id: Id },
     MobileUi { op: u32, value: u32 },
     NativeAppearance { value: u32 },
@@ -170,7 +173,6 @@ pub trait Gpu {
     fn completes_inline(&self) -> bool {
         false
     }
-    fn pick(&mut self, s: &mut Session, window: Id, req: u32, pos: [f32; 2]);
     /// Frame capture ([`crate::framecap`]): a copy of the texture's storage as everything submitted
     /// so far leaves it, before the frame that follows. Every mip level of every layer, tightly
     /// packed rows (whole 4x4 blocks for block formats), level-major then layer. `done` runs once
@@ -185,7 +187,7 @@ pub trait Gpu {
         None
     }
     fn window_copy(&mut self, s: &mut Session, _window: Id, _texture: Id, req: u32) {
-        s.events.readback(req, readback::NO_RASTER, [0; 4], &[]);
+        s.events.readback(req, readback::NO_RASTER, [0; 4], None);
     }
     fn snapshot(&mut self, s: &mut Session, window: Id, req: u32);
     fn window_closed(&mut self, sid: u32, id: Id);
@@ -202,6 +204,18 @@ pub trait Gpu {
     /// (`target::BADGES | target::OVERLAY`) and the borrower's frames stay in the retained image.
     /// A backend with neither has no panels: the borrower keeps the window and its input.
     fn overlays(&self) -> bool { false }
+    /// The backend composes session 0's window layers (`window_overlay` with a layer texture)
+    /// itself. Otherwise the executor composes them as it does panels, through the window's
+    /// badge layer, and before each of session 0's frames of the window after a new borrower
+    /// frame has the backend copy that frame into the layer's texture (`layer_copy`).
+    fn layers(&self) -> bool { false }
+    /// A composed window layer's texture `layer` (session 0's) takes the newest frame the
+    /// borrower of session 0's window `window` drew (its retained image under the badge layer,
+    /// or the frame that went to the window system before the layer came on), over the area both
+    /// have; the rest keeps what it had. Recorded ahead of session 0's next frame, which samples it.
+    /// False: that frame is still with the window system, which gives it back within a frame of
+    /// its own; the executor asks again before session 0's next frame.
+    fn layer_copy(&mut self, _s: &mut Session, _window: Id, _layer: Id, _now: u64) -> bool { true }
     /// Mobile shells lend their permanent host window even without an explicit adopt flag.
     fn auto_adopt(&self) -> bool { false }
     /// The backend composes session 0's badge layers (`target::BADGES`) into the frames its
@@ -255,6 +269,86 @@ pub fn clamped_pass(s: &mut Session, target: Id, size: [u32; 2], fits: [u32; 2],
     eprintln!("[hal] pass {size:?} at dpi {dpi} is larger than its attachments {fits:?} (target {target:?}); drawn clipped to them");
 }
 
+/// Whether a pass's depth must be stored: something can read it later. A depth texture that is
+/// not sampled (no `usage::SAMPLED`), that this pass clears (or does not care about) rather than
+/// loads, and that no later pass of the submit loads, is read by nobody: it stays in tile memory
+/// (store DontCare), the w x h x 4 bytes are never written out.
+pub fn depth_kept(s: &Session, sid: u32, pass: &Pass, view: &CmdView, depth: Id) -> bool {
+    let sampled = s.textures.get(sid, depth).map_or(true, |e| e.val.usage & usage::SAMPLED != 0);
+    if sampled || pass.load[4] == pass_load::LOAD {
+        return true;
+    }
+    let at = view.passes.iter().position(|p| std::ptr::eq(p, pass)).unwrap_or(0);
+    view.passes[at + 1..].iter().any(|p| p.depth == depth && p.load[4] == pass_load::LOAD)
+}
+
+/// Whether an MSAA pass's multisampled images ([`Pass::samples`]) must hold its samples past its
+/// end: the pass loads an attachment (it continues what they hold), or a later MSAA pass of the
+/// submit loads one of its attachments (it continues them). Otherwise they live for the pass
+/// alone: transient, never stored (on a tile GPU they stay in tile memory unless the pass's
+/// geometry makes it spill them, so their storage is one a mid-pass flush can write), and
+/// its end resolves them. A backend that cuts the pass into several render passes (a split
+/// frame of the GPU profiler) keeps them too.
+pub fn twins_kept(pass: &Pass, view: &CmdView) -> bool {
+    /// A pass's colour attachments: its colour targets, or (none named) the window's own in slot 0.
+    fn colours(p: &Pass) -> impl Iterator<Item = usize> + '_ {
+        let window = p.color.iter().all(|c| c.is_none());
+        (0..4).filter(move |i| !p.color[*i].is_none() || (window && *i == 0))
+    }
+    let loads = |p: &Pass, of: &Pass| {
+        colours(p).any(|i| p.load[i] == pass_load::LOAD && colours(of).any(|k| of.color[k] == p.color[i]))
+            || (p.load[4] == pass_load::LOAD && !p.depth.is_none() && p.depth == of.depth)
+    };
+    if loads(pass, pass) {
+        return true;
+    }
+    let at = view.passes.iter().position(|p| std::ptr::eq(p, pass)).unwrap_or(0);
+    view.passes[at + 1..].iter().any(|p| p.samples > 1 && loads(p, pass))
+}
+
+/// One view of a pass ([`Pass::view_rects`]): where it draws (x, y, w, h in target pixels) and
+/// its block of the pass's uniforms (a byte range of [`Pass::uniforms`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PassView {
+    pub rect: [f32; 4],
+    pub block: std::ops::Range<usize>,
+}
+
+/// A pass's views: its `view_rects`, each with its block of the uniforms, or without rects the
+/// one view of its viewport with all of them. A pass whose rects break the rules of
+/// [`Pass::view_rects`] is refused, saying why: the backends draw nothing of it.
+pub fn pass_views(pass: &Pass, arena: &[u8]) -> Result<Vec<PassView>, &'static str> {
+    let n = pass.view_rects.len as usize;
+    let len = pass.uniforms.len();
+    if n == 0 {
+        return Ok(vec![PassView { rect: pass.viewport, block: 0..len }]);
+    }
+    if pass.views >= 2 {
+        return Err("view rects in a multiview pass");
+    }
+    if pass.damage.len != 0 {
+        return Err("view rects in a pass with damage");
+    }
+    if len % n != 0 {
+        return Err("the pass uniforms do not split into a block per view rect");
+    }
+    let v = pass.viewport;
+    let size = len / n;
+    let mut views = Vec::with_capacity(n);
+    for (i, r) in read_rects(arena, pass.view_rects).enumerate() {
+        let inside = r.iter().all(|x| x.is_finite()) && r[2] > 0.0 && r[3] > 0.0
+            && r[0] >= v[0] && r[1] >= v[1] && r[0] + r[2] <= v[0] + v[2] && r[1] + r[3] <= v[1] + v[3];
+        if !inside {
+            return Err("a view rect outside the pass viewport");
+        }
+        views.push(PassView { rect: r, block: i * size..(i + 1) * size });
+    }
+    if views.len() != n {
+        return Err("view rects past the end of the arena");
+    }
+    Ok(views)
+}
+
 /// Session 0's badge `id` moved to `geom` (`None`: it closes): where its window routes the
 /// pointer to it, when it takes input.
 fn badge_moved(world: &mut World, id: Id, geom: Option<[f32; 4]>) {
@@ -271,7 +365,7 @@ fn badge_moved(world: &mut World, id: Id, geom: Option<[f32; 4]>) {
     }
 }
 
-/// A frame's compute passes used the buffers and storage textures they bind: the ledger's last use
+/// A frame's compute passes used the buffers and the storage and sampled textures they bind: the ledger's last use
 /// (the backends mark what draws bind), so a resource only kernels read or write is not reported
 /// as never used.
 fn touch_compute(s: &mut Session, packet: u32, view: &CmdView, frame: u64, now: u64) {
@@ -288,7 +382,8 @@ fn touch_compute(s: &mut Session, packet: u32, view: &CmdView, frame: u64, now: 
             for id in buffers.into_iter().chain(Some(d.indirect_buffer).filter(|i| !i.is_none())) {
                 s.ledger.touch(Kind::Buffer, id.index, id.gen, frame, now);
             }
-            for id in crate::compute::ids(view.arena, d.textures).unwrap_or_default() {
+            let sampled = crate::compute::ids(view.arena, d.sampled).unwrap_or_default();
+            for id in crate::compute::ids(view.arena, d.textures).unwrap_or_default().into_iter().chain(sampled) {
                 s.ledger.touch(Kind::Texture, id.index, id.gen, frame, now);
             }
         }
@@ -302,21 +397,18 @@ fn touch_compute(s: &mut Session, packet: u32, view: &CmdView, frame: u64, now: 
 /// the `FrameDone` is held until that frame completes so completion serials never advance
 /// out of order ahead of in-flight GPU work.
 fn drop_frame(world: &mut World, sid: u32, target: Id, packet: u32, view: &CmdView, now: u64) {
-    let Some(frame) = view.frames.get(packet as usize).map(|p| p.frame).filter(|&f| f != 0) else { return };
-    if let Some(s) = world.session_mut(sid) {
-        if s.last_frame_done < s.frame {
-            s.dropped_frames.push((s.frame, target, frame, now));
-            return;
-        }
-        s.last_frame_done = s.last_frame_done.max(frame);
-    }
-    world.to_session(sid, |q| q.frame_done(target, frame, 0, now, 0.0, 0.0));
+    let Some(frame) = view.frames.get(packet as usize).map(|p| p.frame) else { return };
+    world.retire_frame(sid, target, frame, now);
 }
 
 /// Session 0's badge layer frame for its window `window`: kept on the window (one without draws
-/// ends the layer), then composed over the window's retained image and presented.
+/// ends the layer), then composed over the window's retained image and presented; or, while
+/// the borrower's frame of the beat it is for is coming (`World::badge_rides`), shown with that
+/// frame (it rides). A riding frame is done (`FrameDone`) once it showed or a newer one
+/// replaced it.
 #[allow(clippy::too_many_arguments)]
 fn badge_frame(gpu: &mut dyn Gpu, world: &mut World, sid: u32, window: Id, kind: u32, packet: u32, view: &CmdView, now: u64) {
+    let beat_rides = world.badge_rides(window);
     let Some(s) = world.session_mut(sid) else { return };
     let own = s.windows.get(sid, window).is_ok_and(|w| w.val.kind & 0xff != window_kind::BADGE && !w.val.is_hosted() && w.val.embedded.is_none());
     if sid != HOST || !gpu.badges() || kind & !target::FLAGS != target::WINDOW || kind & (target::PICK | target::CAPTURE) != 0 || !own {
@@ -338,10 +430,28 @@ fn badge_frame(gpu: &mut dyn Gpu, world: &mut World, sid: u32, window: Id, kind:
     // under a composed panel the badges are kept for later but not drawn: the panel covers the
     // window, and a badge frame presenting would show the app's retained frame between its frames
     let covered = w.val.overlay.as_ref().is_some_and(|o| o.composed);
+    let serial = kept.view().frames[0].frame;
+    // the borrower's frame of the beat this one is for is coming (`World::badge_rides`): the
+    // layer shows with that frame instead of presenting the window a second time in the refresh
+    // (a frame a snapshot reads back presents itself)
+    let rides = !ends && !covered && kind & target::SNAPSHOT == 0 && beat_rides;
+    let replaced = if rides {
+        let since = w.val.ride.map_or(w.val.beats, |(_, since)| since);
+        w.val.ride.replace((serial, since))
+    } else {
+        if !covered { w.val.shown_beat = Some(w.val.beats); }
+        w.val.ride.take()
+    };
     w.val.badges = Some(kept.clone());
     sync_layer(gpu, world, window);
+    // a riding frame this one replaces never showed: it is done
+    if let Some((frame, _)) = replaced {
+        world.retire_frame(HOST, window, frame, now);
+    }
+    if rides {
+        return;
+    }
     let Some(s) = world.session_mut(HOST) else { return };
-    let serial = kept.view().frames[0].frame;
     let prev_frame = s.frame;
     // a last frame without draws shows the window without its layer, then the layer goes
     let submitted = !covered && gpu.frame(s, HOST, window, kind, 0, &kept.view(), now).is_some();
@@ -382,12 +492,55 @@ pub(crate) fn sync_layer(gpu: &mut dyn Gpu, world: &mut World, window: Id) {
 /// panel went away and the window shows the panel's last frame until the app's next one.
 fn redraw_borrower(world: &mut World, window: Id) {
     let Some(lent) = world.lent_to(window) else { return };
-    let alias = world.session(lent).and_then(|s| {
-        s.windows.keys_of(lent).into_iter().find(|id| s.windows.get(lent, *id).is_ok_and(|e| e.val.alias_of == Some(window)))
-    });
-    if let Some(alias) = alias {
+    if let Some(alias) = alias_of(world, lent, window) {
         world.to_session(lent, |q| q.redraw(alias, false));
     }
+}
+
+/// Borrower `lent`'s id of session 0's window `window`.
+fn alias_of(world: &World, lent: u32, window: Id) -> Option<Id> {
+    let s = world.session(lent)?;
+    s.windows.keys_of(lent).into_iter().find(|id| s.windows.get(lent, *id).is_ok_and(|e| e.val.alias_of == Some(window)))
+}
+
+/// A `FrameRequest` of session 0 for its lent window `hid`, or of the borrower for its alias:
+/// noted, so the beat reaches each side that asked (`World::lent_beat`). A riding badge frame
+/// whose borrower frame will not come presents now: the borrower asks again without having drawn
+/// with its beat (it went unused), or session 0 asks two beats after the ride began while the
+/// borrower draws with none. The borrower's ask wakes session 0 when it asks beats too: its next
+/// badge frame may ride the borrower's next frame (`World::badge_rides`). Returns the borrower
+/// and its alias, by which the backend is asked for the window's beat.
+fn lent_beat_request(gpu: &mut dyn Gpu, world: &mut World, sid: u32, hid: Id, now: u64) -> Option<(u32, Id)> {
+    let lent = world.lent_to(hid).filter(|&lent| sid == HOST || sid == lent)?;
+    let alias = alias_of(world, lent, hid)?;
+    let w = world.session_mut(HOST)?.windows.get_mut(HOST, hid).ok()?;
+    let drawing = w.val.borrower_beat.is_some_and(|b| b + 1 >= w.val.beats);
+    let (missed, wake) = if sid == HOST {
+        w.val.beat_asked |= BEAT_HOST;
+        (w.val.ride.is_some_and(|(_, since)| w.val.beats >= since + 2) && !drawing, false)
+    } else {
+        let first = w.val.beat_asked & BEAT_BORROWER == 0;
+        w.val.beat_asked |= BEAT_BORROWER;
+        (w.val.borrower_beat.take().is_some() && w.val.ride.is_some(), first && w.val.beat_asked & BEAT_HOST != 0)
+    };
+    if missed {
+        present_ride(gpu, world, hid, now);
+    }
+    if wake {
+        // session 0 draws its next badge frame now, to ride the borrower's frame of the beat
+        world.to_session(HOST, |q| q.wake());
+    }
+    Some((lent, alias))
+}
+
+/// Session 0's riding badge frame of `window` presents on its own: the borrower frame it waited
+/// for did not come.
+fn present_ride(gpu: &mut dyn Gpu, world: &mut World, window: Id, now: u64) {
+    let Some(w) = world.session_mut(HOST).and_then(|s| s.windows.get_mut(HOST, window).ok()) else { return };
+    let Some((frame, _)) = w.val.ride.take() else { return };
+    w.val.shown_beat = Some(w.val.beats);
+    replay_badges(gpu, world, window, now);
+    world.retire_frame(HOST, window, frame, now);
 }
 
 /// Session 0's host window `window` shows a new frame: its badge layer is drawn over it.
@@ -540,6 +693,29 @@ pub fn device_reset(b: &mut dyn DeviceReset, world: &mut World) -> bool {
         eprintln!("[hal] device reset: {e}; trying again");
         return false;
     }
+    make_objects_again(b, world);
+    b.rebuild_pipelines(world);
+    restored(b, world, None);
+    true
+}
+
+/// Android's GLES fallback: `gpu` makes every texture and buffer again and takes the lent windows.
+/// Sessions hear `BackendChanged`, so they make their pipelines in its dialect, then `DeviceReset`.
+pub fn backend_changed(gpu: &mut dyn Gpu, world: &mut World, info: HalInfo) {
+    make_objects_again(gpu, world);
+    for sid in world.session_ids() {
+        let Some(s) = world.session_mut(sid) else { continue };
+        s.pipelines_pending = 0;
+        let lent: Vec<(Id, Id)> = s.windows.keys_of(sid).into_iter()
+            .filter_map(|id| Some((id, s.windows.get(sid, id).ok()?.val.alias_of?))).collect();
+        for (id, host) in lent { gpu.window_lent(sid, id, host, true); }
+    }
+    restored(gpu, world, Some(info));
+}
+
+/// Every texture and buffer gets new storage under its id (contents are the app's to upload
+/// again), shared textures answer with their new handle and imported ones as not imported.
+fn make_objects_again(b: &mut dyn Gpu, world: &mut World) {
     for sid in world.session_ids() {
         let Some(s) = world.session_mut(sid) else { continue };
         for id in s.textures.keys_of(sid) {
@@ -572,7 +748,11 @@ pub fn device_reset(b: &mut dyn DeviceReset, world: &mut World) -> bool {
             }
         }
     }
-    b.rebuild_pipelines(world);
+}
+
+/// The font atlases come back from the font service's own copy and every session hears
+/// `DeviceReset`, after `BackendChanged` when the device is another backend's (`info`).
+fn restored(b: &mut dyn Gpu, world: &mut World, info: Option<HalInfo>) {
     if let Some(mut fonts) = world.fonts.take() {
         fonts.device_reset(b, world);
         world.fonts = Some(fonts);
@@ -594,10 +774,12 @@ pub fn device_reset(b: &mut dyn DeviceReset, world: &mut World) -> bool {
             for (d_target, d_frame, d_now) in pending {
                 q.frame_done(d_target, d_frame, 0, d_now, 0.0, 0.0);
             }
+            if let Some(info) = info {
+                q.backend_changed(&HalInfo { session: sid, ..info }.to_bytes());
+            }
             q.device_reset(generation);
         });
     }
-    true
 }
 
 /// Frees a session's table entries and ledger rows (device objects are the backend's).
@@ -893,10 +1075,10 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                 s.bad();
                 return;
             }
-            // an opaque panel the backend does not compose itself: the executor composes it
-            // through the window's layer, or, without one, there is no panel (the app keeps the
-            // window and its input; nothing would show what the input went to)
-            let composed = layer.is_none() && !gpu.overlays();
+            // a panel or window layer the backend does not compose itself: the executor composes
+            // it through the window's badge layer, or, without one, there is none (the app keeps
+            // the window and its input; nothing would show what the input went to)
+            let composed = if layer.is_none() { !gpu.overlays() } else { !gpu.layers() };
             if on && composed && !gpu.badges() {
                 s.stats.overlay_unsupported += 1;
                 return;
@@ -907,7 +1089,8 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                 return;
             }
             let was_composed = w.val.overlay.as_ref().is_some_and(|o| o.composed);
-            w.val.overlay = next.map(|(rect, layer)| WindowOverlay { rect, frame: None, layer, input, composed: on && composed });
+            // (a new layer takes the app's newest frame before its first frame)
+            w.val.overlay = next.map(|(rect, layer)| WindowOverlay { rect, frame: None, layer, input, composed: on && composed, fresh: true });
             gpu.window_overlay(s, id, on.then_some(rect), layer, now);
             if was_composed || composed {
                 sync_layer(gpu, world, id);
@@ -972,6 +1155,19 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             // image (it is opaque: nothing of the app shows) and presented; the borrower's frames
             // under it only render into the retained image
             if overlay && covered { kind |= target::BADGES; }
+            // a composed window layer samples the borrower's newest frame: copied into its
+            // texture first, once per borrower frame (a frame the window system still has: at
+            // the next frame)
+            let fresh_layer = if overlay && covered {
+                s.windows.get(sid, target).ok().and_then(|w| w.val.overlay.as_ref())
+                    .filter(|o| o.fresh && !o.layer.is_none()).map(|o| o.layer)
+            } else {
+                None
+            };
+            if let Some(layer) = fresh_layer {
+                let taken = gpu.layer_copy(s, target, layer, now);
+                if let Some(o) = s.windows.get_mut(sid, target).ok().and_then(|w| w.val.overlay.as_mut()) { o.fresh = !taken; }
+            }
             // Adoption may race the owner's last draw. Once the borrower encodes
             // a window frame, only it may replace that image. Uploads remain valid.
             if sid == HOST && kind & !target::FLAGS == target::WINDOW
@@ -1072,11 +1268,23 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             if let Some(id) = host {
                 if let Some(w) = world.session_mut(HOST).and_then(|s| s.windows.get_mut(HOST, id).ok()) {
                     w.val.borrower_frame = true;
+                    w.val.borrower_beat = None;
+                    if let Some(o) = w.val.overlay.as_mut() { o.fresh = true; }
                 }
             }
-            // the window's badge layer over the frame it now shows
+            // the window's badge layer over the frame it now shows (a riding badge frame showed
+            // with it)
             if submitted.window && kind & target::PICK == 0 && (host.is_some() || sid == HOST) {
-                replay_badges(gpu, world, host.unwrap_or(target), now);
+                let window = host.unwrap_or(target);
+                replay_badges(gpu, world, window, now);
+                let ride = world.session_mut(HOST).and_then(|s| s.windows.get_mut(HOST, window).ok()).and_then(|w| {
+                    let ride = w.val.ride.take();
+                    if ride.is_some() { w.val.shown_beat = Some(w.val.beats); }
+                    ride
+                });
+                if let Some((frame, _)) = ride {
+                    world.retire_frame(HOST, window, frame, now);
+                }
             }
             if gpu.completes_inline() {
                 if submitted.window && !overlay {
@@ -1355,9 +1563,10 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             let text = String::from_utf8_lossy(text).into_owned();
             os_cmd(gpu, sid, OsCmd::SelectionSet { text });
         }
-        HalCmd::ClipSet { text } => {
-            s.clipboard = String::from_utf8_lossy(text).into_owned();
-            os_cmd(gpu, sid, OsCmd::ClipSet { text: s.clipboard.clone() });
+        HalCmd::ClipSet { data } => {
+            let data = crate::clipboard::ClipboardData::read(data).unwrap_or_default();
+            s.clipboard = data.text.clone();
+            os_cmd(gpu, sid, OsCmd::ClipSet { data });
         }
         HalCmd::ClipRead { req, primary } => {
             if !os_cmd(gpu, sid, OsCmd::ClipRead { req, primary }) {
@@ -1427,6 +1636,13 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             let _ = on;
             s.bad();
         }
+        HalCmd::PrintPdf { req, title, pdf } => {
+            let title = s.string(title).unwrap_or("").to_string();
+            let pdf = std::sync::Arc::from(pdf);
+            if !os_cmd(gpu, sid, OsCmd::PrintPdf { req, title, pdf }) {
+                s.events.print_result(req, print_status::UNSUPPORTED, &[]);
+            }
+        }
         HalCmd::FileDialog { req, kind, title, location, filename, count, filters } => {
             let filters = read_strs(filters, count);
             let title = s.string(title).unwrap_or("").to_string();
@@ -1444,9 +1660,15 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                 let now = world.now();
                 world.request_embedded_frame(sid, id, now);
             }
-            Ok(_) => {
-                if !os_cmd(gpu, sid, OsCmd::FrameRequest { id }) {
-                    s.events.frame_ready(id, 0);
+            Ok(e) => {
+                // a lent window's beat is asked for by the borrower's alias, the window's owner
+                // with the backend, whichever side asked (`lent_beat_request`)
+                let lent = if sid == HOST { (e.lent_to != 0).then_some(id) } else { e.val.alias_of };
+                let (owner, wid) = lent.and_then(|hid| lent_beat_request(gpu, world, sid, hid, now)).unwrap_or((sid, id));
+                if !os_cmd(gpu, owner, OsCmd::FrameRequest { id: wid }) {
+                    if let Some(s) = world.session_mut(sid) {
+                        s.events.frame_ready(id, 0);
+                    }
                 }
             }
             Err(_) => s.stale(),
@@ -1496,7 +1718,7 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                 gpu.texture_readback(s, id, req, rect);
             } else {
                 s.stale();
-                s.events.readback(req, readback::STALE, rect, &[]);
+                s.events.readback(req, readback::STALE, rect, None);
             }
         }
         HalCmd::TextureShare { id } => match s.textures.get(sid, id) {
@@ -1688,24 +1910,18 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             Err(_) => s.stale(),
         },
 
-        HalCmd::Pick { window, req, pos } => {
-            if s.windows.get(sid, window).is_err() {
-                s.stale();
-            }
-            gpu.pick(s, window, req, pos);
-        }
         HalCmd::Snapshot { window, req } => match s.windows.get(sid, window) {
             Ok(_) => gpu.snapshot(s, window, req),
             Err(_) => {
                 s.stale();
-                s.events.readback(req, readback::STALE, [0; 4], &[]);
+                s.events.readback(req, readback::STALE, [0; 4], None);
             }
         },
         HalCmd::WindowCopy { window, texture, req } => {
             if s.windows.get(sid, window).is_ok() && s.textures.get(sid, texture).is_ok() {
                 gpu.window_copy(s, window, texture, req);
             } else {
-                s.events.readback(req, readback::STALE, [0; 4], &[]);
+                s.events.readback(req, readback::STALE, [0; 4], None);
             }
         }
         HalCmd::A11yUpdate { id, bytes } => {
@@ -1734,7 +1950,7 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             s.marks.push((now, t));
         }
         HalCmd::Budget { what, value } => s.budgets.push((what, value)),
-        HalCmd::DragReply { window, to, answer } => os_window(gpu, s, window, OsCmd::DragReply { id: window, to, answer }),
+        HalCmd::DragReply { window, to, answer, fullscreen } => os_window(gpu, s, window, OsCmd::DragReply { id: window, to, answer, fullscreen }),
 
         // ---- media
         HalCmd::VideoPrepare { .. } | HalCmd::VideoControl { .. } | HalCmd::AudioUse { .. } | HalCmd::AudioEntry { .. } | HalCmd::Midi { .. } | HalCmd::GameOut { .. } | HalCmd::Location { .. } | HalCmd::Permission { .. } | HalCmd::NativeLayerCreate { .. } | HalCmd::NativeLayerOp { .. } | HalCmd::NativeLayerDestroy { .. } | HalCmd::VideoInput { .. } => {

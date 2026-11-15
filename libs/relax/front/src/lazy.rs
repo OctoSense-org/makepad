@@ -75,6 +75,8 @@ pub struct PendingPlan {
     carried: bool,
     /// planned again for its outline (outline_macros), when `plan` is a restored one
     outlined: std::sync::OnceLock<Plan>,
+    /// the planning thread panicked (`complete`): no plan comes from it, and its waiters fail
+    failed: std::sync::atomic::AtomicBool,
 }
 impl PendingPlan {
     /// The plan an earlier load of these crates recorded (`image`), taken as it is: an edited start
@@ -82,7 +84,7 @@ impl PendingPlan {
     /// the edit (a full selection is always a sound one), so nothing is planned. Its parts stay
     /// the stored ones (the next plan validates them by their own inputs).
     pub fn carried(crates: &[PreCrate], contexts: Vec<Arc<crate::source_context::Context>>, image: Arc<DemandImage>) -> Self {
-        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts: None, carried: true, outlined: std::sync::OnceLock::new() };
+        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts: None, carried: true, outlined: std::sync::OnceLock::new(), failed: Default::default() };
         let plan = Plan::build(&pending.pending_crates, pending.pending_contexts.clone(), Some(image), &pending.early, None);
         let _ = pending.plan.set(plan);
         pending
@@ -91,11 +93,19 @@ impl PendingPlan {
     pub fn new(crates: &[PreCrate], contexts: Vec<Arc<crate::source_context::Context>>, images: Option<&dyn crate::crate_image::CrateImages>, parallel: bool) -> Self {
         let image = if crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) { None }
             else { images.and_then(|images| images.demand_image(crates, recipe_identity(crates))) };
+        // an edited start whose stored plan selected everything: that plan, not a new closure
+        // over every crate (nor its parts encoded again)
+        if image.is_none() && !crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) {
+            if let Some(stored) = images.and_then(|images| images.carried_demand_image(crates)) {
+                if trace() { eprintln!("boot-trace: demand plan carried: its inputs changed, it selected every file"); }
+                return Self::carried(crates, contexts, stored);
+            }
+        }
         let parts = if image.is_none() && crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy)
             && !crates.iter().any(|c| c.cfg.session.runtime.lazy_verify) {
             images.and_then(|i| i.demand_parts(crates, recipe_identity(crates)))
         } else { None };
-        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts, carried: false, outlined: std::sync::OnceLock::new() };
+        let pending = Self { pending_crates: crates.to_vec(), pending_contexts: contexts, plan: std::sync::OnceLock::new(), early: EarlyCrates::default(), parts, carried: false, outlined: std::sync::OnceLock::new(), failed: Default::default() };
         // The crates selected in full (Plan::build) are known before planning.
         pending.early.publish(selected_prefix(crates, pending.parts.as_ref()));
         if image.is_some() || !parallel {
@@ -104,11 +114,31 @@ impl PendingPlan {
         }
         pending
     }
+    /// Plans on this thread (the pool's planning thread). A panic here is the plan's failure:
+    /// its waiters are woken and fail (`failed`), none waits for a plan nobody makes.
     pub fn complete(&self) {
+        struct Failing<'a>(&'a PendingPlan);
+        impl Drop for Failing<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.failed.store(true, std::sync::atomic::Ordering::Release);
+                    self.0.early.wake_all();
+                }
+            }
+        }
+        let _failing = Failing(self);
         let _reads = self.pending_contexts.first().map(|c| c.bind_source_reads());
         let _ = std::ops::Deref::deref(self);
         self.early.wake_all();
+        // The allocator's free pages go back to the system now that the plan is ready: on a large
+        // app's cold load about 0.6 GB is free then (parse and planning churn) and still resident,
+        // under the load's peak. On this thread, whose work is done.
+        let (r0, t) = (if trace() { crate::memstat::resident() } else { 0 }, std::time::Instant::now());
+        crate::memstat::trim();
+        if trace() { eprintln!("boot-trace: plan ready, heap trimmed: rss {} -> {} MB in {:.1} ms", r0 >> 20, crate::memstat::resident() >> 20, t.elapsed().as_secs_f64() * 1e3); }
     }
+    /// The planning thread panicked (`complete`).
+    pub fn failed(&self) -> bool { self.failed.load(std::sync::atomic::Ordering::Acquire) }
     pub fn ready(&self) -> Option<&Plan> { self.plan.get() }
     /// The macro definitions the outline of crate `ci` found, its expansions' included (what
     /// the raw scan a crate's files parse against lacks). Waits for the plan. A restored plan
@@ -140,6 +170,7 @@ impl PendingPlan {
     pub fn wait_progress(&self, seen: usize) {
         let mut g = self.early.wake.0.lock().unwrap_or_else(|e| e.into_inner());
         while self.ready().is_none() && self.early_prefix() <= seen {
+            if self.failed() { panic!("the demand plan failed on its thread: the selection past its first {seen} crates never comes"); }
             // (re-checked now and then: a plan made by another dereference wakes nobody)
             g = self.early.wake.1.wait_timeout(g, std::time::Duration::from_millis(20)).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -151,7 +182,7 @@ impl PendingPlan {
         let _ = self.early.notify.set(Box::new(notify));
     }
     pub fn skips(&self, root: &str, test: bool, path: &str) -> bool {
-        // MAKEPAD_RUN_LAZY_DEFER=<path suffix>,..: these files are skipped whatever the
+        // RELAX_LAZY_DEFER=<path suffix>,..: these files are skipped whatever the
         // closure says; the post-boot loader brings them in when code needs them (its test)
         if self.pending_crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy) && forced_deferral(path) {
             return true;
@@ -223,7 +254,7 @@ impl Plan {
         }
         let saved = &saved;
         let mut reused_outline = BTreeSet::new();
-        let verify_restore = std::env::var_os("MAKEPAD_RUN_DEMAND_RESTORE_CHECK").is_some_and(|v| v == "1");
+        let verify_restore = std::env::var_os("RELAX_DEMAND_RESTORE_CHECK").is_some_and(|v| v == "1");
         let mut restored_surfaces = BTreeSet::new();
         let mut demands = BTreeSet::new();
         let mut origins = BTreeMap::<String, (String, String)>::new();
@@ -252,6 +283,11 @@ impl Plan {
         let lazy_from = eager_prefix(crates);
         let eager_prefix = selected_prefix(crates, stored);
         early.publish(eager_prefix);
+        // The last crate is selected whole when it is built with cfg(test) (its own items are all
+        // demanded, below): the load takes it in full now instead of waiting for the closure
+        // (the plan's eager prefix, part of its image, stays as computed)
+        if rust_lazy && crates.last().is_some_and(|c| c.cfg.set.iter().any(|x| x == "test")) { early.publish(crates.len()); }
+        let by_name = crate_indices_by_name(crates);
         let mut prepared_files = Vec::new();
         let mut unindexed_files = Vec::new();
         let queue = OutlineQueue::default();
@@ -296,18 +332,29 @@ impl Plan {
                         let _reads = contexts[job.ci].bind_source_reads();
                         let (path, module, scan) = job.inputs[i].lock().unwrap().take().expect("each input is expanded once");
                         let _profile = crate::load_profile::span(profile, "rust-demand-outline-worker", &path);
-                        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&c.name, &path, &module, &c.cfg));
-                        let surface = {
+                        let expanded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(test)]
+                            if failure_tests::OUTLINE_PANICS.lock().unwrap().iter().any(|p| path.ends_with(p.as_str())) {
+                                panic!("test: the outline expansion of {path} panics");
+                            }
+                            let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&c.name, &path, &module, &c.cfg));
                             let src = &scan.src[..];
                             let mut toks = crate::parser::lazy_bodies::Toks::from(&scan.toks[..]);
                             if !toks.last().is_some_and(|t| t.kind == T::Eof) {
                                 toks.push(Tok { kind: T::Eof, lo: src.len() as u32, hi: src.len() as u32 });
                             }
-                            Some(crate::parser::rs_expand::expand(src, toks, c.edition, ctx, job.base.clone()))
-                        };
-                        let surface = surface.map(|surface| OutlineIndexes::new(surface, &scan.src, profile, &path));
+                            let surface = crate::parser::rs_expand::expand(src, toks, c.edition, ctx, job.base.clone());
+                            Some(OutlineIndexes::new(surface, &scan.src, profile, &path))
+                        }));
                         drop(scan);
-                        job.ready.0.lock().unwrap().insert((path.clone(), module.clone()), surface);
+                        match expanded {
+                            Ok(surface) => { job.ready.0.lock().unwrap_or_else(|e| e.into_inner()).surfaces.insert((path.clone(), module.clone()), surface); }
+                            Err(panic) => {
+                                job.ready.0.lock().unwrap_or_else(|e| e.into_inner()).failed.get_or_insert(path.clone());
+                                job.ready.1.notify_all();
+                                std::panic::resume_unwind(panic);
+                            }
+                        }
                         job.ready.1.notify_all();
                     }
                 });
@@ -427,10 +474,15 @@ impl Plan {
                     let take = |key: (String, String)| {
                         if !expected.contains(&key) { return None; }
                         let _profile = crate::load_profile::span(profile, "rust-demand-outline-wait", &key.0);
-                        let mut map = job.ready.0.lock().unwrap();
+                        let mut map = job.ready.0.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(surface) = map.remove(&key) { return surface; }
-                            map = crate::pool::wait(&job.ready.1, &job.ready.0, map).unwrap();
+                            if let Some(surface) = map.surfaces.remove(&key) { return surface; }
+                            if let Some(file) = map.failed.clone() {
+                                // (not under the lock: the job's other workers still hand theirs in)
+                                drop(map);
+                                panic!("the demand plan's outline expansion of {file} (crate {}) panicked on its worker: the plan cannot complete", c.name);
+                            }
+                            map = crate::pool::wait(&job.ready.1, &job.ready.0, map).unwrap_or_else(|e| e.into_inner());
                         }
                     };
                     let mut directories = BTreeMap::new();
@@ -479,6 +531,12 @@ impl Plan {
                                 for (name, reason) in &surface.unknown { eprintln!("rs-outline-fallback: {path:?} {name:?} {reason:?}"); }
                             }
                             expansion_failures.insert((*ci, path.clone(), module.clone()), !surface.unknown.is_empty());
+                            // An unknown expansion forces its file's crate and every crate it depends on
+                            // whole (the closure's inputs, below): when that takes in the last crate, the
+                            // one the closure selects among, the load takes it in full now
+                            if !surface.unknown.is_empty() && crates.last().is_some_and(|last| forced_crates(crates, &by_name, *ci).iter().any(|&k| crates[k].name == last.name)) {
+                                early.publish(crates.len());
+                            }
                             for def in &surface.used.local {
                                 if !table.defs.get(&def.name).is_some_and(|defs| defs.iter().any(|d| d.def_file == def.def_file && d.def_pos == def.def_pos)) { parts[*ci].macros.note_definition(&c.name, def); Arc::make_mut(&mut table).push(def.clone()); }
                             }
@@ -502,7 +560,7 @@ impl Plan {
                         }
                         {
                             let _profile = crate::load_profile::span(profile, "rust-demand-outline-names", path);
-                            names.add(*ci, module, &scan.src, &scan.toks, &scan.uses, &scan.mods);
+                            names.add(*ci, module, &scan.src, &scan.toks, &scan.uses, &scan.mods, &scan.inner_macro_use);
                         }
                         scans.push(entry);
                     }
@@ -575,6 +633,14 @@ impl Plan {
                         (part.namespace, part.input_id) = names.snapshot(*ci);
                         part.namespace_id = crate::crate_image::file_hash("", &part.namespace);
                     }
+                } else if rust_lazy && by_name[c.name.as_str()].last() != Some(&*ci) {
+                    // A package's library and binary share a name, so the recording cannot tell
+                    // their tables apart in the final names: a crate whose name a later crate also
+                    // has takes its namespace now, its projection after its prepare. (The last one's
+                    // is the final names' projection, as every other crate's: the recording takes it.)
+                    // Its id stays 0: the recording seals it (recorded_parts).
+                    let _snapshot = crate::load_profile::span(profile, "rust-demand-namespace-shared", &c.name);
+                    (part.namespace, part.input_id) = names.snapshot(*ci);
                 }
                 part.macros.finish_capture(&table, &c.name);
                 part.files = prepared_files[files_start..].to_vec();
@@ -656,16 +722,9 @@ impl Plan {
                     crate::why::event("rs-eager", &file.path, 0, "", Some(crate::why::Cause::new(&file.path, 1, "outline-fallback", why)));
                     if profile { eprintln!("rs-eager: {:?} {why}; dependencies={dependencies}", file.path); }
                     if dependencies {
-                        let mut todo = vec![file.ci];
-                        let mut seen = BTreeSet::new();
-                        while let Some(ci) = todo.pop() {
-                            if !seen.insert(ci) { continue; }
+                        for ci in forced_crates(crates, &by_name, file.ci) {
                             forced.insert(crates[ci].name.clone());
                             force_origin.entry(crates[ci].name.clone()).or_insert((file.path.clone(), why.into()));
-                            todo.extend(crates[ci].image_deps.iter().copied());
-                            for (_, name) in &crates[ci].deps {
-                                todo.extend(crates.iter().enumerate().filter(|(_, c)| c.name == *name).map(|(i, _)| i));
-                            }
                         }
                     }
                 }
@@ -841,9 +900,13 @@ impl Plan {
         let mut hash = crate::sip::Sip128::new();
         hash.str("source-demand-v24-impl-declarations");
         hash.u128(graph);
-        for (p, h) in &inputs { hash.str(p); hash.u128(*h); }
-        for (p, exists) in &plan.probes { hash.str(p); hash.u8(*exists as u8); }
-        for (c, kind, name, content) in &late_inputs { hash.str(c); hash.u8(*kind); hash.str(name); hash.u128(*content); }
+        for (p, h) in &inputs { hash.str(&crate::dirs::anchored(p)); hash.u128(*h); }
+        for (p, exists) in &plan.probes { hash.str(&crate::dirs::anchored(p)); hash.u8(*exists as u8); }
+        for (c, kind, name, content) in &late_inputs {
+            hash.str(c); hash.u8(*kind);
+            if crate::sip::late_base(*kind) == crate::sip::LATE_FILE { hash.str(&crate::dirs::anchored(name)); } else { hash.str(name); }
+            hash.u128(*content);
+        }
         let fingerprint = hash.finish128();
         drop(inputs_profile);
         // The closure is certified. Transient glob lookup results are not part
@@ -854,6 +917,8 @@ impl Plan {
             for (ci, part) in parts.iter_mut().enumerate() {
                 let _profile = crate::load_profile::span(profile, "rust-demand-certify-part", &crates[ci].root);
                 let mut own = part.scans.iter().filter_map(|(p, _, hash, ..)| hash.map(|h| (p.clone(), h))).collect::<BTreeMap<_, _>>();
+                // the files the scanned ones `include!` are inputs too (relax issue 173)
+                own.extend(part.scans.iter().filter_map(|(_, _, _, scan, ..)| scan.as_ref()).flat_map(|s| s.included.iter().cloned()));
                 let mut probes = part.scans.iter().filter_map(|(_, _, _, scan, ..)| scan.as_ref())
                     .flat_map(|s| s.probes.iter().cloned()).collect::<BTreeSet<_>>();
                 // Retain validated schema reads even when restored outlines did
@@ -915,11 +980,11 @@ impl Plan {
             eprintln!("source-lazy: language={extension} indexed={indexed} reached={reached} deferred={}", indexed - reached);
         }
     }
-    /// MAKEPAD_RUN_DEMAND_DUMP=<file>: the plan's observable result (per-crate selection
+    /// RELAX_DEMAND_DUMP=<file>: the plan's observable result (per-crate selection
     /// identity and deferred list, reached/indexed counts), to diff an incremental
-    /// plan against one built from scratch (MAKEPAD_RUN_LAZY_VERIFY=1) for the same sources.
+    /// plan against one built from scratch (RELAX_LAZY_VERIFY=1) for the same sources.
     fn dump(&self) {
-        let Some(path) = std::env::var_os("MAKEPAD_RUN_DEMAND_DUMP") else { return; };
+        let Some(path) = std::env::var_os("RELAX_DEMAND_DUMP") else { return; };
         use std::fmt::Write as _;
         let mut out = String::new();
         let _ = writeln!(out, "reached={} indexed={}", self.reached.len(), self.indexed.len());
@@ -948,7 +1013,7 @@ impl Plan {
                 hash.str("source-demand-crate-v1");
                 hash
             });
-            hash.str(&key.1);
+            hash.str(&crate::dirs::anchored(&key.1));
             hash.u8(self.reached.contains(key) as u8);
         }
         self.selection = hashes.into_iter().map(|h| h.map_or(0, |h| h.finish128())).collect();
@@ -982,7 +1047,7 @@ impl Plan {
                     lo, hi, ..crate::pm_tokens::Span::DUMMY
                 }).map_err(|e| e.to_string())?;
                 let eager = crate::rs_index::of_tokens(&stream);
-                if outline.index != eager { return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: Rust outline differs: {path}")); }
+                if outline.index != eager { return Err(format!("RELAX_LAZY_VERIFY: Rust outline differs: {path}")); }
             }
         }
         Ok(())
@@ -998,6 +1063,28 @@ pub(super) fn dependency_identities(crates: &[usize], identities: &[u128]) -> Ve
     let mut v: Vec<u128> = crates.iter().map(|&d| identities[d]).collect();
     v.sort_unstable();
     v
+}
+
+/// `crates`' load-order indices by crate name (a library and its binary share one).
+fn crate_indices_by_name(crates: &[PreCrate]) -> BTreeMap<&str, Vec<usize>> {
+    let mut by_name = BTreeMap::<&str, Vec<usize>>::new();
+    for (ci, c) in crates.iter().enumerate() { by_name.entry(c.name.as_str()).or_default().push(ci); }
+    by_name
+}
+
+/// The crates an unindexed expansion in crate `ci` forces whole: `ci` and every crate it depends
+/// on, by image dependency and by name (`by_name`: crate_indices_by_name).
+fn forced_crates(crates: &[PreCrate], by_name: &BTreeMap<&str, Vec<usize>>, ci: usize) -> BTreeSet<usize> {
+    let mut todo = vec![ci];
+    let mut seen = BTreeSet::new();
+    while let Some(ci) = todo.pop() {
+        if !seen.insert(ci) { continue; }
+        todo.extend(crates[ci].image_deps.iter().copied());
+        for (_, name) in &crates[ci].deps {
+            todo.extend(by_name.get(name.as_str()).into_iter().flatten().copied());
+        }
+    }
+    seen
 }
 
 fn eager_prefix(crates: &[PreCrate]) -> usize {
@@ -1068,14 +1155,22 @@ struct OutlineJob {
     /// publication then owns the scan alone (Arc::make_mut, no copy).
     inputs: Vec<relax_session::sync::Mutex<Option<(String, String, Arc<Scanned>)>>>,
     next: std::sync::atomic::AtomicUsize,
-    ready: (relax_session::sync::Mutex<BTreeMap<(String, String), Option<OutlineIndexes>>>, relax_session::sync::Condvar),
+    ready: (relax_session::sync::Mutex<OutlineReady>, relax_session::sync::Condvar),
+}
+/// An outline job's expanded files, and the file whose expansion panicked on its worker: that
+/// worker is gone with the job's inputs it would have expanded, so no surface of the job is
+/// awaited any more (publication fails at once instead of waiting for work nobody owns).
+#[derive(Default)]
+struct OutlineReady {
+    surfaces: BTreeMap<(String, String), Option<OutlineIndexes>>,
+    failed: Option<String>,
 }
 impl OutlineJob {
     fn new(ci: usize, base: Arc<crate::macros::MacroTable>, scans: &[part::Scan]) -> Arc<Self> {
         let inputs = scans.iter().filter_map(|(path, module, _, scan, ..)| scan.as_ref().map(|scan|
             relax_session::sync::Mutex::new(Some((path.clone(), module.clone(), scan.clone()))))).collect();
         Arc::new(Self { ci, base, inputs, next: std::sync::atomic::AtomicUsize::new(0),
-            ready: (relax_session::sync::Mutex::new(BTreeMap::new()), relax_session::sync::Condvar::new()) })
+            ready: (relax_session::sync::Mutex::new(OutlineReady::default()), relax_session::sync::Condvar::new()) })
     }
 }
 
@@ -1118,14 +1213,14 @@ impl Drop for OutlineFinish<'_> {
 fn crate_modules(c: &PreCrate, scans: &[part::Scan]) -> crate::macros::CrateMods {
     let mut modules = crate::macros::CrateMods { root: c.name.clone(), src: c.root.clone(), ..Default::default() };
     modules.externs.extend(c.deps.iter().cloned());
-    for (path, module, _, scan, _, _) in scans {
+    for (path, _, _, scan, _, _) in scans {
         let Some(scan) = scan else { continue; };
         if path == &c.root && scan.recursion_limit.is_some() {
             modules.recursion_limit = scan.recursion_limit;
         }
         modules.mods.extend(scan.mods.iter().cloned());
         modules.items.extend(scan.mod_items.iter().cloned());
-        if scan.inner_macro_use { modules.inner_macro_use.insert(module.clone()); }
+        modules.inner_macro_use.extend(scan.inner_macro_use.iter().cloned());
         for u in &scan.uses { modules.add_use(u.clone()); }
     }
     modules
@@ -1221,7 +1316,7 @@ fn discover_crate(c: &PreCrate, ci: usize, context: &crate::source_context::Cont
             todo.extend(scan.children.iter().rev().cloned());
             {
                 let _profile = crate::load_profile::span(profile, "rust-demand-names", &path);
-                if !rust_lazy { local_names.add(ci, &module, &scan.src, &scan.toks, &scan.uses, &scan.mods); }
+                if !rust_lazy { local_names.add(ci, &module, &scan.src, &scan.toks, &scan.uses, &scan.mods, &scan.inner_macro_use); }
             }
             // These token walks belong to the file worker;
             // only their stable publication needs the merge.
@@ -1391,7 +1486,7 @@ pub fn recipe_identity(crates: &[PreCrate]) -> u128 {
     hash.str("source-demand-v24-impl-declarations");
     hash.u128(crate::macro_reg::outline_identity());
     for c in crates {
-        hash.str(&c.name); hash.str(&c.root); hash.u32(c.edition as u32);
+        hash.str(&c.name); hash.str(&crate::dirs::anchored(&c.root)); hash.u32(c.edition as u32);
         hash.u128(c.cfg.session.options.fingerprint()); hash.u8(c.proc_macro as u8);
         let mut cfg = c.cfg.set.clone(); cfg.sort();
         for value in cfg { hash.str(&value); }
@@ -1644,6 +1739,49 @@ fn rust_eager_reason(src: &[u8], tokens: &[Tok], names: &Names, ci: usize, modul
 
 fn forced_deferral(path: &str) -> bool {
     static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| std::env::var("MAKEPAD_RUN_LAZY_DEFER").map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default())
+    LIST.get_or_init(|| std::env::var("RELAX_LAZY_DEFER").map(|v| v.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect()).unwrap_or_default())
         .iter().any(|suffix| path.ends_with(suffix.as_str()))
+}
+
+#[cfg(test)]
+pub(crate) mod failure_tests {
+    /// Files whose outline expansion panics on its worker (path suffixes; a test's own files).
+    pub(crate) static OUTLINE_PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// An outline worker that panics takes the job's inputs it would have expanded with it: the
+    /// plan, and the load waiting for its crate (Pool::take_ahead), fail at once with the reason
+    /// instead of waiting for surfaces nobody makes (relax-front's own deferred load test hung
+    /// 545 s, every thread idle, after its expansion ended that way under the JIT).
+    #[test]
+    fn a_panicked_outline_worker_fails_the_load_at_once() {
+        let dir = std::env::temp_dir().join(format!("relax-outline-panic-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), "pub mod later;\npub fn f() -> u32 { later::g() + 1 }\n").unwrap();
+        std::fs::write(dir.join("later.rs"), "pub fn g() -> u32 { 2 }\n").unwrap();
+        let root = dir.join("lib.rs").to_string_lossy().into_owned();
+        OUTLINE_PANICS.lock().unwrap().push(dir.join("later.rs").to_string_lossy().into_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let load_root = root.clone();
+        std::thread::spawn(move || {
+            let r = std::panic::catch_unwind(move || {
+                let mut session = crate::Session::default();
+                session.options.rs_lazy = true;
+                let session = std::sync::Arc::new(session);
+                let cfg = crate::cfg::CfgSet::host(&session, &[]);
+                let mut p = crate::program::Program::new(&session);
+                p.preload(vec![crate::preload::PreCrate {
+                    name: "outline_panic".into(), root: load_root.clone(), edition: 2021, cfg: cfg.clone(), deps: Vec::new(),
+                    proc_macro: false, image_deps: Vec::new(), image_dep_names: Vec::new(),
+                }]);
+                let _ = p.load_crate("outline_panic", &load_root, 2021, cfg, Vec::new());
+            });
+            let _ = tx.send(r.err().map(|e| e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()));
+        });
+        // (the bound only turns a hang into a failure; a working load fails in milliseconds)
+        let got = rx.recv_timeout(std::time::Duration::from_secs(120)).expect("the load still waits for an outline worker that panicked");
+        let why = got.expect("the load completed although its outline expansion panicked");
+        assert!(why.contains("panicked"), "{why}");
+        OUTLINE_PANICS.lock().unwrap().retain(|p| !p.starts_with(&*dir.to_string_lossy()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

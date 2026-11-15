@@ -43,6 +43,11 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
         "the shell backend, WM connection and windows, without asking the shell thread",
     ),
     (
+        "hal lose",
+        "",
+        "the GPU device is taken for lost, as a driver reset would: every session hears DeviceLost, then DeviceReset on a new device (refused by a backend that cannot replace one)",
+    ),
+    (
         "gpu diff",
         "<a> <b|now>",
         "byte growth by owner and new/freed handles",
@@ -119,6 +124,18 @@ fn gpu(out: &mut Out) {
     ));
 }
 
+/// `hal lose`: what a driver reset does to every session (tests of the recovery path).
+fn lose(out: &mut Out) {
+    let Some(info) = crate::Hal::global().backend_info() else {
+        return out.err("GPU backend is not initialized");
+    };
+    if info.flags & crate::info_flags::DEVICE_RESET == 0 {
+        return out.err("this backend cannot replace a lost device");
+    }
+    crate::Hal::global().simulate_device_loss();
+    out.line("{\"lost\":true}");
+}
+
 /// True when this is a GPU or HAL command. The endpoint thread reads the native ledger directly.
 pub fn dispatch(req: &Req, out: &mut Out) -> bool {
     if crate::framecap::dispatch(req, out) {
@@ -135,7 +152,8 @@ pub fn dispatch(req: &Req, out: &mut Out) -> bool {
             Some("pump") => pump(out),
             Some("pace") => pace(out),
             Some("shell") => out.line(&crate::backend::shell::line()),
-            _ => out.err("hal pump|pace|shell"),
+            Some("lose") => lose(out),
+            _ => out.err("hal pump|pace|shell|lose"),
         }
         return true;
     }
@@ -361,7 +379,7 @@ mod parameter_tests {
 
     fn run(line: &str) -> String {
         let mut bytes = Vec::new();
-        assert!(dispatch(&Req::parse(line), &mut Out::new(&mut bytes, usize::MAX)));
+        assert!(dispatch(&Req::parse(line), &mut Out::new(&mut bytes)));
         String::from_utf8(bytes).unwrap()
     }
 
@@ -377,7 +395,7 @@ mod parameter_tests {
     #[test]
     fn hal_rejects_unknown_parameters() {
         assert!(run("hal pace timeout=1").contains("unknown parameter"));
-        let ok = run("hal pace full=1");
+        let ok = run("hal pace");
         assert!(!ok.contains("\"err\""), "{ok}");
     }
 
@@ -385,7 +403,7 @@ mod parameter_tests {
     fn cap_rejects_unknown_parameters() {
         let error = run("cap grab timeout_ms=1");
         assert!(error.contains("unknown parameter") && error.contains("timeout,"), "{error}");
-        let ok = run("cap list full=1");
+        let ok = run("cap list");
         assert!(!ok.contains("\"err\""), "{ok}");
         assert!(run("cap tex X0 mip=1").contains("unknown parameter"));
     }

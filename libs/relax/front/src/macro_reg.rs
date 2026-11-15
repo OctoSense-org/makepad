@@ -56,8 +56,8 @@ pub struct UnitInfo {
     pub deps: Vec<(usize, String)>,
     pub proc_macro: bool,
     pub harness: bool,
-    /// a registry/git package (CrateUnit::registry): third-party, sandboxed under a strict
-    /// proc-macro policy (pmhost::Policy)
+    /// a registry/git package (CrateUnit::registry): third-party, its macros confined under
+    /// sandbox::Policy::Sandboxed
     pub registry: bool,
     pub cfgs: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -90,41 +90,54 @@ pub struct Reg {
     /// Application dependency edges for caller-side macro lookup. `units` keeps
     /// the distinct host graph used to compile and execute the macros themselves.
     pub target_deps: std::collections::HashMap<usize, Vec<(usize, String)>>,
-    /// crate name -> the units its unit(s) reach through `deps` (transitively; memoised)
-    pub reach: std::collections::HashMap<String, Vec<bool>>,
+    /// (crate name, host side) -> the units its unit(s) reach through their caller edges
+    /// (transitively; memoised)
+    pub reach: std::collections::HashMap<(String, bool), Vec<bool>>,
     /// root file of a proc-macro crate's dependency -> the `macro_rules!` definitions of its
     /// files (memoised for one scan round: every proc-macro crate asks syn's again)
     pub dep_macro_defs: std::collections::HashMap<String, std::sync::Arc<Vec<crate::macros::MacroDef>>>,
 }
 
 impl Reg {
-    fn caller_deps(&self, unit: usize) -> &[(usize, String)] {
+    /// The dependency edges of `unit` as a caller there sees them: the program's (target)
+    /// edges, or on the host side (a crate of the macro world) the unit's own. Cargo builds a
+    /// crate a proc macro uses as a host unit with that side's features and dependencies
+    /// (cargo reference features.md#feature-resolver-version-2), so a macro crate one side
+    /// imports can be missing from the other.
+    fn caller_deps(&self, unit: usize, host: bool) -> &[(usize, String)] {
+        if host {
+            return &self.units[unit].deps;
+        }
         self.target_deps.get(&unit).map_or(&self.units[unit].deps, Vec::as_slice)
     }
 }
 
-/// The units in the dependency closure of the unit(s) named `krate`, themselves included. A
-/// name no unit has (core, alloc, std, proc_macro: never cargo units) reaches nothing.
-fn reach<'a>(reg: &'a mut Reg, krate: &str) -> &'a [bool] {
-    if !reg.reach.contains_key(krate) {
+/// The units in the dependency closure of the unit(s) named `krate` on one side, themselves
+/// included. A name no unit has (core, alloc, std, proc_macro: never cargo units) reaches nothing.
+fn reach<'a>(reg: &'a mut Reg, krate: &str, host: bool) -> &'a [bool] {
+    let key = (krate.to_string(), host);
+    if !reg.reach.contains_key(&key) {
         let mut seen = vec![false; reg.units.len()];
         let mut stack: Vec<usize> = (0..reg.units.len()).filter(|&i| reg.units[i].name == krate).collect();
         while let Some(i) = stack.pop() {
             if std::mem::replace(&mut seen[i], true) {
                 continue;
             }
-            stack.extend(reg.caller_deps(i).iter().map(|d| d.0));
+            stack.extend(reg.caller_deps(i, host).iter().map(|d| d.0));
         }
-        reg.reach.insert(krate.to_string(), seen);
+        reg.reach.insert(key.clone(), seen);
     }
-    &reg.reach[krate]
+    &reg.reach[&key]
 }
 
 /// Resolves proc-macro `name` of `kind` as crate `krate` sees it:
 /// Tier 1: direct proc-macro dependency of `krate`
 /// Tier 2: 1-hop library wrapper dependency of `krate` (`krate -> wrapper -> proc_macro`)
 /// Tier 3: transitive dependency closure of `krate`
+/// A crate the macro world builds (`world_builder`) is the host side of its package and sees the
+/// macros of its host dependencies, those the proc macro's features turn on.
 fn resolve_entry(reg: &mut Reg, krate: &str, name: &str, kind: Kind) -> Option<Entry> {
+    let host = world_builder();
     let hits: Vec<Entry> = match kind {
         Kind::Derive => reg.derives.iter().filter(|(n, _)| n == name).map(|x| x.1.clone()).collect(),
         _ => reg.macros.iter().filter(|(n, e)| n == name && e.kind == kind).map(|x| x.1.clone()).collect(),
@@ -142,13 +155,13 @@ fn resolve_entry(reg: &mut Reg, krate: &str, name: &str, kind: Kind) -> Option<E
         // sysroot crate absent from this graph has no proc-macro dependencies.
         return if krate.is_empty() && kind != Kind::Attr { hits.into_iter().next() } else { None };
     }
-    if let Some(e) = hits.iter().find(|e| u_idxs.contains(&e.unit) || u_idxs.iter().any(|&u| reg.caller_deps(u).iter().any(|&(d, _)| d == e.unit))) {
+    if let Some(e) = hits.iter().find(|e| u_idxs.contains(&e.unit) || u_idxs.iter().any(|&u| reg.caller_deps(u, host).iter().any(|&(d, _)| d == e.unit))) {
         return Some(e.clone());
     }
-    if let Some(e) = hits.iter().find(|e| u_idxs.iter().any(|&u| reg.caller_deps(u).iter().any(|&(d, _)| reg.caller_deps(d).iter().any(|&(dd, _)| dd == e.unit)))) {
+    if let Some(e) = hits.iter().find(|e| u_idxs.iter().any(|&u| reg.caller_deps(u, host).iter().any(|&(d, _)| reg.caller_deps(d, host).iter().any(|&(dd, _)| dd == e.unit)))) {
         return Some(e.clone());
     }
-    let rc = reach(reg, krate);
+    let rc = reach(reg, krate, host);
     hits.into_iter().find(|e| rc[e.unit])
 }
 
@@ -176,6 +189,16 @@ pub(crate) fn proc_macro_names() -> Vec<String> {
         names.sort_unstable();
         names.dedup();
         names
+    })
+}
+
+/// Every proc macro this crate itself exports, in the order `exported_proc_macro` searches them.
+pub(crate) fn exported_proc_macros(krate: &str) -> Vec<(String, Entry)> {
+    if in_world() { return Vec::new(); }
+    REG.with(|r| {
+        let r = r.borrow();
+        let Some(r) = r.as_ref() else { return Vec::new() };
+        r.derives.iter().chain(&r.macros).filter(|(_, e)| r.units[e.unit].name == krate).cloned().collect()
     })
 }
 
@@ -333,7 +356,13 @@ pub fn call_krate_env(key: &str) -> Option<String> {
             _ => None,
         }
     });
-    own.or_else(|| crate::crates::config_env_value(key))
+    own.or_else(|| {
+        // cargo's `[env]`: a checkout's configuration, in no key; noted as the crate's late input
+        // (present or absent: another checkout may set it), checked by its stores' ledgers
+        let v = crate::crates::config_env_value(key);
+        crate::sip::note_late_input(&krate, crate::sip::LATE_CONFIG_ENV, key, v.as_deref().map(|x| x.as_bytes()));
+        v
+    })
 }
 
 /// The registry and the stats are process-wide: files parse on worker threads too.
@@ -390,6 +419,14 @@ pub fn bang_index(name: &str) -> Option<usize> {
     REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().position(|(n, e)| n == name && e.kind == Kind::Bang)))
 }
 
+/// Index of the function-like proc macro whose entry point is `entry`.
+pub fn bang_index_of(entry: &Entry) -> Option<usize> {
+    if in_world() {
+        return None;
+    }
+    REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.iter().position(|(_, e)| e.kind == Kind::Bang && e.unit == entry.unit && e.fname == entry.fname)))
+}
+
 /// Index of function-like proc macro `name` as crate `krate` sees it (`resolve_entry`).
 pub fn bang_index_for(krate: &str, name: &str) -> Option<usize> {
     if in_world() {
@@ -408,25 +445,35 @@ pub fn bang_name(i: usize) -> Option<String> {
 }
 
 /// Hosted proc macros re-run on every edited input unless their package is a
-/// pure token transformation: makepad's shader derives (makepad_shader_derive +
-/// derive_impl + micro_proc_macro read no filesystem, environment, clock or
-/// process state; audited 2026-10-09), or the runner certifies the entry as a
-/// token transform. Their expansion is a function of the item's tokens and
-/// spans, which the reuse key covers.
-const PURE_DERIVE_UNITS: &[&str] = &["makepad_shader_derive"];
+/// pure token transformation the host binary vouches for (`set_pure_crates`), or
+/// the runner certifies the entry as a token transform. Their expansion is a
+/// function of the item's tokens and spans, which the reuse key covers.
+static PURE_CRATES: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+
+/// The proc-macro crates the host binary has audited as pure token transforms (they read no
+/// filesystem, environment, clock or process state), once, before any crate graph loads
+/// (relax_runner Host.pure_macro_crates). A crate never certifies itself. None (the bare
+/// runner): every hosted macro re-runs on each edited input, slower, never stale.
+pub fn set_pure_crates(crates: &'static [&'static str]) {
+    let _ = PURE_CRATES.set(crates);
+}
+
+fn pure_crate(name: &str) -> bool {
+    PURE_CRATES.get().is_some_and(|c| c.contains(&name))
+}
 pub fn reusable_bang(i: usize) -> bool {
     let entry = REG.with(|r| r.borrow().as_ref().and_then(|r| r.macros.get(i).map(|(_, e)| e.clone())));
     entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
 }
 pub fn reusable_derive(name: &str) -> bool {
     let (entry, pure) = REG.with(|r| r.borrow().as_ref().and_then(|r| r.derives.iter().find(|(n, _)| n == name)
-        .map(|(_, e)| (Some(e.clone()), PURE_DERIVE_UNITS.contains(&r.units[e.unit].name.as_str())))).unwrap_or((None, false)));
+        .map(|(_, e)| (Some(e.clone()), pure_crate(&r.units[e.unit].name)))).unwrap_or((None, false)));
     pure || entry.as_ref().is_some_and(|e| RUNNER.get().is_some_and(|r| r.reusable(e)))
 }
 
 /// Is the resolved attribute a pure token transform (derive rule)?
 pub fn reusable_attr(entry: &Entry) -> bool {
-    let pure = REG.with(|r| r.borrow().as_ref().is_some_and(|r| PURE_DERIVE_UNITS.contains(&r.units[entry.unit].name.as_str())));
+    let pure = REG.with(|r| r.borrow().as_ref().is_some_and(|r| pure_crate(&r.units[entry.unit].name)));
     pure || RUNNER.get().is_some_and(|r| r.reusable(entry))
 }
 
@@ -437,6 +484,7 @@ pub fn run_bang_in(sess: &std::sync::Arc<crate::Session>, krate: &str, i: usize,
         return Err("a proc macro used while the macro world itself is being built".to_string());
     }
     let _krate = with_call_krate(krate);
+    let _outside = crate::parse_work::outside();
     match RUNNER.get() {
         Some(r) if declaring() => r.declare(sess, &e, None, &input, call_span),
         Some(r) => r.call(sess, &e, &input, call_span),
@@ -529,7 +577,7 @@ fn merged_host_units_keep_features_and_dependencies() {
         pkg_id: format!("path+file://{dir}/{name}#0.1.0"),
         name: name.to_string(), kind: vec![kind.to_string()],
         src_path: format!("{dir}/{name}/src/lib.rs"), edition: "2021".to_string(),
-        host, mode: "build".to_string(), harness: false, sysroot: false, features: features.iter().map(|s| s.to_string()).collect(),
+        host, checks: None, mode: "build".to_string(), harness: false, sysroot: false, features: features.iter().map(|s| s.to_string()).collect(),
         deps: deps.iter().map(|(d, n)| (*d, n.to_string())).collect(),
     };
     let units = Units { units: vec![
@@ -539,8 +587,8 @@ fn merged_host_units_keep_features_and_dependencies() {
         unit("target_helper", "lib", false, &[], &[]),
         unit("shared", "lib", true, &["full", "visit"], &[(5, "host_helper")]),
         unit("host_helper", "lib", true, &["walk"], &[]),
-    ], roots: vec![0], bins: Vec::new() };
-    let mut g = crate::unitgraph::load(&units, false).unwrap();
+    ], roots: vec![0], bins: Vec::new(), script: None };
+    let mut g = crate::unitgraph::load(&units, false, false).unwrap();
     let sess = &std::sync::Arc::new(crate::Session::default());
     let saved = REG.with(|r| r.borrow_mut().take());
     register_and_strip(sess, &mut g.crates, &dir, false).unwrap();
@@ -551,7 +599,7 @@ fn merged_host_units_keep_features_and_dependencies() {
     let helper = g.crates.iter().find(|u| u.name == "host_helper").unwrap();
     assert_eq!(helper.src_path, format!("{dir}/proc_macro/empty.rs"));
     // Re-registering the original graph matches the host feature set, not the app's.
-    let again = crate::unitgraph::load(&units, false).unwrap();
+    let again = crate::unitgraph::load(&units, false, false).unwrap();
     register(sess, &again.crates, &dir, true).unwrap();
     REG.with(|r| {
         let r = r.borrow();
@@ -571,6 +619,32 @@ fn merged_host_units_keep_features_and_dependencies() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A crate a proc macro and the program both use, with different features, sees on the
+/// program's side the macros of its target dependencies and in the macro world those of its host
+/// dependencies (relax issue 53: the host side's derive was looked up among the target side's).
+#[cfg(test)]
+#[test]
+fn a_macro_world_crate_resolves_macros_through_its_host_dependencies() {
+    let unit = |name: &str, proc_macro, deps: &[usize]| UnitInfo {
+        name: name.to_string(), src_path: format!("{name}/src/lib.rs"), edition: 2021, features: Vec::new(),
+        deps: deps.iter().map(|&d| (d, String::new())).collect(), proc_macro, harness: false, registry: false,
+        cfgs: Vec::new(), env: Vec::new(),
+    };
+    // host edges: shared -> wrapper -> inner -> the derive crate (beyond tiers 1 and 2: the
+    // dependency closure); the program's shared depends on nothing
+    let mut reg = Reg { units: vec![unit("shared", false, &[1]), unit("wrapper", false, &[2]), unit("inner", false, &[3]), unit("rate_derive", true, &[])], ..Default::default() };
+    reg.target_deps.insert(0, Vec::new());
+    reg.derives.push(("Rate".to_string(), Entry { unit: 3, fname: "derive_rate".to_string(), kind: Kind::Derive }));
+    let saved = REG.with(|r| r.borrow_mut().replace(reg));
+    let program = derive_entry("shared", "Rate").map(|e| e.unit);
+    set_world_builder(true);
+    let world = derive_entry("shared", "Rate").map(|e| e.unit);
+    set_world_builder(false);
+    REG.with(|r| *r.borrow_mut() = saved);
+    assert_eq!(program, None, "the program's shared has no derive crate in reach");
+    assert_eq!(world, Some(3), "the macro world's shared reaches the derive through its host dependencies");
+}
+
 /// phf_codegen in a build script: the crate and what only it reaches (phf_generator) are the
 /// host's, while `rand`, which the app has too, stays the app's with the app's features.
 #[cfg(test)]
@@ -585,7 +659,7 @@ fn a_crate_only_a_build_script_links_is_no_root_of_the_app() {
         pkg_id: format!("path+file://{dir}/{name}#0.1.0"),
         name: name.to_string(), kind: vec![kind.to_string()],
         src_path: format!("{dir}/{name}/{file}"), edition: "2021".to_string(),
-        host, mode: mode.to_string(), harness: false, sysroot: false, features: features.iter().map(|s| s.to_string()).collect(),
+        host, checks: None, mode: mode.to_string(), harness: false, sysroot: false, features: features.iter().map(|s| s.to_string()).collect(),
         deps: deps.iter().map(|(d, n)| (*d, n.to_string())).collect(),
     };
     let units = Units { units: vec![
@@ -596,8 +670,8 @@ fn a_crate_only_a_build_script_links_is_no_root_of_the_app() {
         unit("codegen", "lib", "build", "src/lib.rs", true, &[], &[(5, "generator")]),
         unit("generator", "lib", "build", "src/lib.rs", true, &[], &[(6, "rand")]),
         unit("rand", "lib", "build", "src/lib.rs", true, &["small_rng", "std"], &[]),
-    ], roots: vec![0], bins: Vec::new() };
-    let mut g = crate::unitgraph::load(&units, false).unwrap();
+    ], roots: vec![0], bins: Vec::new(), script: None };
+    let mut g = crate::unitgraph::load(&units, false, false).unwrap();
     let sess = &std::sync::Arc::new(crate::Session::default());
     let saved = REG.with(|r| r.borrow_mut().take());
     register_and_strip(sess, &mut g.crates, &dir, false).unwrap();
@@ -628,7 +702,9 @@ fn a_crate_only_a_build_script_links_is_no_root_of_the_app() {
 
 /// Updates registered units with build-script `cfgs` and `env` outputs (`run.rs` after
 /// `run_build_scripts`), and re-scans proc-macro units whose `cfgs` changed.
-pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], cfgs: &[Vec<String>], env: &[Vec<(String, String)>]) {
+/// `host_checks`: per crate, the cfgs its profile's checks set on its host side (`makepad test`'s
+/// profile, build-override and all: run.rs), for every unit of the macro world.
+pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], cfgs: &[Vec<String>], env: &[Vec<(String, String)>], host_checks: &[Vec<String>]) {
     REG.with(|r| {
         let mut b = r.borrow_mut();
         let Some(reg) = b.as_mut() else { return };
@@ -641,8 +717,14 @@ pub fn set_build_outputs(sess: &std::sync::Arc<crate::Session>, units: &[CrateUn
                 if u.name == c.name && u.harness == c.harness {
                     let host_outputs = c.host.as_ref().and_then(|h| h.build_outputs.as_ref());
                     if let Some(cs) = host_outputs.map(|o| &o.0).or_else(|| cfgs.get(ci)) {
-                        if u.cfgs != *cs {
-                            u.cfgs = cs.clone();
+                        let mut cs = cs.clone();
+                        for c in host_checks.get(ci).into_iter().flatten() {
+                            if !cs.contains(c) {
+                                cs.push(c.clone());
+                            }
+                        }
+                        if u.cfgs != cs {
+                            u.cfgs = cs;
                             if u.proc_macro {
                                 rescan.push((ui, u.src_path.clone(), u.edition));
                             }
@@ -787,11 +869,11 @@ pub fn outline_identity() -> u128 {
     )).unwrap_or_default());
     let mut hash = crate::sip::Sip128::new();
     for (name, entry, source) in entries {
-        hash.str(&name); hash.str(&source); hash.str(&entry.fname); hash.u8(entry.kind as u8);
+        hash.str(&name); hash.str(&crate::dirs::anchored(&source)); hash.str(&entry.fname); hash.u8(entry.kind as u8);
         hash.u8(RUNNER.get().is_some_and(|r| r.native(&entry)) as u8);
     }
     for (source, name, attributes) in helpers {
-        hash.str(&source); hash.str(&name); hash.u32(attributes.len() as u32);
+        hash.str(&crate::dirs::anchored(&source)); hash.str(&name); hash.u32(attributes.len() as u32);
         for attribute in attributes { hash.str(&attribute); }
     }
     hash.finish128()
@@ -819,6 +901,7 @@ pub fn run_attr(sess: &std::sync::Arc<crate::Session>, krate: &str, e: &Entry, a
         return Err("an attribute macro used while the macro world itself is being built".to_string());
     }
     let _krate = with_call_krate(krate);
+    let _outside = crate::parse_work::outside();
     match RUNNER.get() {
         Some(r) if declaring() => r.declare(sess, e, Some(attr), item, call_span),
         Some(r) => r.call_attr(sess, e, attr, item, call_span),
@@ -1021,6 +1104,18 @@ fn scan_tokens_for_entries(
                             b"proc_macro_derive" => Kind::Derive,
                             b"proc_macro" => Kind::Bang,
                             b"proc_macro_attribute" => Kind::Attr,
+                            // proc-macro-hack 0.5 (src/lib.rs expand_export): `#[proc_macro_hack] pub fn name`
+                            // becomes `#[proc_macro_derive(_proc_macro_hack_name)] pub fn
+                            // _proc_macro_hack_name`, an entry point this scan of the source cannot
+                            // read; the declaration crate imports it by that name
+                            // (unic-langid-macros: `unic_langid_macros_impl::_proc_macro_hack_langid`).
+                            b"proc_macro_hack" => {
+                                let name = format!("_proc_macro_hack_{}", String::from_utf8_lossy(text(i + 1)).trim_start_matches("r#"));
+                                if !reg.derives.iter().any(|(n, ex)| n == &name && ex.unit == unit) {
+                                    reg.derives.push((name.clone(), Entry { unit, fname: name, kind: Kind::Derive }));
+                                }
+                                continue;
+                            }
                             _ => continue,
                         };
                         let mut name = String::new();
@@ -1135,6 +1230,7 @@ pub(crate) fn run_derive_entry(sess: &std::sync::Arc<crate::Session>, krate: &st
     let native = RUNNER.get().map_or(false, |r| r.native(e));
     let _profile = crate::load_profile::span(sess.runtime.profile, if native { "derive-native" } else { "derive-jit" }, name);
     let _krate = with_call_krate(krate);
+    let _outside = crate::parse_work::outside();
     match RUNNER.get() {
         Some(r) if declaring() => r.declare(sess, e, None, item, call_span),
         Some(r) => r.call(sess, e, item, call_span),

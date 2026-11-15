@@ -5,13 +5,18 @@
 //! follow=1` streams them (one line each), and `makepad run --agent` prints them on stderr too.
 //! Repeats of the same event (kind + key) within 30 s are counted, not sent again.
 //!
-//! Panic parking: a panic in JIT code on a program thread waits at the panic point (its stack
-//! intact for `stacks`) while a watcher is attached or under `--agent`, until a client resumes it
-//! or the wait times out; then it unwinds as usual. With nobody watching, the first panic at a site
-//! parks briefly (MAKEPAD_RUN_PANIC_PARK seconds, default 2) and says how to attach.
+//! Panic parking: a panic in JIT code on a program thread parks with its stack intact for up to
+//! 600 s when someone can decide it: an inspect watcher, `--agent`, devhub, the visible Run panel
+//! in a live session, or an interactive terminal. Otherwise it parks briefly
+//! (RELAX_PANIC_PARK seconds, default 2), once per site. Someone attaching extends a short
+//! park to 600 s from its start; a long park never shortens. Resuming or timing out unwinds as
+//! usual. `--unattended` never parks. Every park always prints one line, even under --quiet or
+//! --silent, naming who can decide, the limit, how to inspect it and how --unattended avoids it;
+//! an extension prints one more line naming who attached and the new limit.
 
 use super::{json_str, now_ms, Out, Req};
 use std::collections::VecDeque;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
 use relax_session::sync::{Condvar, Mutex};
 
@@ -32,6 +37,8 @@ static NEW: Condvar = Condvar::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 /// sessions in `watch` / `events follow=1` now
 pub static WATCHERS: AtomicU32 = AtomicU32::new(0);
+/// `observe` followers (devhub): can decide a park without arming costly detectors.
+static OBSERVERS: AtomicU32 = AtomicU32::new(0);
 static RUN_STATE_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static RUN_STATE_OBSERVER: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
@@ -80,18 +87,25 @@ fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::
     }
     let seq = SEQ.fetch_add(1, SeqCst) + 1;
     let verified = crate::reload::observations_verified();
+    // a test that crashes or parks this process on purpose says why (RELAX_EXPECTED_CRASH): its
+    // panic is the test's, and whoever follows the run (devhub) does not stop for it
+    let expected = match std::env::var("RELAX_EXPECTED_CRASH") {
+        Ok(why) if kind == "panic" => format!(",\"expected\":{}", json_str(if why.is_empty() { "yes" } else { &why })),
+        _ => String::new(),
+    };
     let json = format!(
-        "{{\"event\":\"{}\",\"seq\":{},\"pid\":{},\"app\":{},\"at_ms\":{},\"verified\":{},{}}}",
+        "{{\"event\":\"{}\",\"seq\":{},\"pid\":{},\"app\":{},\"at_ms\":{},\"verified\":{},{}{}}}",
         kind,
         seq,
         std::process::id(),
         json_str(&super::APP.lock().unwrap_or_else(|e| e.into_inner())),
         now_ms(),
         verified,
-        fields
+        fields,
+        expected
     );
     if super::AGENT.load(Relaxed) {
-        eprintln!("makepad-run event: {}", json);
+        eprintln!("relax event: {}", json);
     }
     if let Some(w) = super::WATCH.get() {
         crate::zone_alloc::kept_with(|| w.emit(&json));
@@ -136,9 +150,19 @@ pub fn remote_watcher_closed() {
     retry_update();
 }
 
+pub fn observer_opened() {
+    OBSERVERS.fetch_add(1, SeqCst);
+    retry_update();
+}
+
+pub fn observer_closed() {
+    OBSERVERS.fetch_sub(1, SeqCst);
+    retry_update();
+}
+
 /// Retry boundaries are worth setting while someone may resume a panic with `retry`.
 fn retry_update() {
-    MAKEPAD_RUN_RETRY_ON.store(watched() || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
+    RELAX_RETRY_ON.store(watched() || OBSERVERS.load(Relaxed) > 0 || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
 }
 
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
@@ -156,7 +180,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
     // A run that does not watch its sources never emits a patch event: say so now, not after
     // the caller's timeout.
     if on.as_ref().is_some_and(|v| v.iter().any(|k| k.starts_with("patch"))) && !crate::layout::LIVE_SESSION.load(Relaxed) {
-        out.line("{\"err\":\"not a live session: this run does not watch its sources, so no edit patches in (a run from a store is live with MAKEPAD_RUN_STORE_LIVE=1 and an edits folder)\"}");
+        out.line("{\"err\":\"not a live session: this run does not watch its sources, so no edit patches in (a run from a store is live with RELAX_STORE_LIVE=1 and an edits folder)\"}");
         return;
     }
     let parked_since = PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| p.seq).min().map_or(u64::MAX, |s| s - 1);
@@ -195,8 +219,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
 }
 
 /// `events [since=<seq>] [follow=1] [on=..]`: the kept events after `since` (default: the last
-/// 20, the newest of them when the reply limit cuts it), then with follow=1 each new one as it
-/// comes, until the client goes away.
+/// 20), then with follow=1 each new one as it comes, until the client goes away.
 pub fn cmd_events(req: &Req, out: &mut Out) {
     let on = kinds(req);
     let follow = req.get("follow") == Some("1");
@@ -204,24 +227,15 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
     let mut since = asked.unwrap_or_else(|| SEQ.load(SeqCst).saturating_sub(20));
     out.measured("events", "event queue", &[]);
     if follow {
-        // a stream is unbounded by design
-        out.limit = usize::MAX;
         WATCHERS.fetch_add(1, SeqCst);
         super::timeline::set_frame_watch(true);
         retry_update();
     }
     loop {
-        let mut batch: Vec<(u64, std::sync::Arc<str>)> = {
+        let batch: Vec<(u64, std::sync::Arc<str>)> = {
             let q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
             q.iter().filter(|e| e.seq > since && wanted(&on, e.kind)).map(|e| (e.seq, e.json.clone())).collect()
         };
-        if asked.is_none() {
-            // The recent events end at the newest: a few hitch lines filled the reply before, and
-            // devhub took a 30 s old verdict for the edit it had just shipped (11-04).
-            let mut room = out.remaining();
-            let fit = batch.iter().rev().take_while(|(_, j)| room.checked_sub(j.len() + 1).map(|r| room = r).is_some()).count();
-            batch.drain(..batch.len() - fit);
-        }
         for (seq, j) in &batch {
             out.line(j);
             since = *seq;
@@ -272,6 +286,9 @@ enum ParkKind {
     /// a call of code that did not compile (park_compile_error): a live patch that fixes it
     /// resumes the call; only `stop`
     CompileError,
+    /// a call whose code a live update could not build (park_update_failed): it waits for the
+    /// person; only `restart` / `stop`
+    UpdateFailed,
 }
 
 /// Parked panic `id`'s (the newest with None) register block at its innermost frame's call
@@ -302,7 +319,7 @@ pub fn parked_frames(id: Option<u64>) -> Option<(u64, Option<crate::domain::Doma
 
 /// boundaries may be set (makepad checks it through `relax_retry_on`): on while watched
 #[no_mangle]
-pub static MAKEPAD_RUN_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static RELAX_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// retry boundaries open on this thread (their unit names, innermost last)
@@ -337,8 +354,35 @@ static PANIC_IDS: AtomicU64 = AtomicU64::new(0);
 /// sites that parked already with nobody watching (the next panic there does not wait again)
 static SITES_SEEN: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 
+/// The run is one no one attends (`makepad run --unattended`): no panic parks, not even briefly.
+static UNATTENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this run as one no one attends ([`UNATTENDED`]).
+pub fn unattended() {
+    UNATTENDED.store(true, Relaxed);
+}
+
 fn park_secs_unwatched() -> u64 {
-    std::env::var("MAKEPAD_RUN_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+    std::env::var("RELAX_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+}
+
+/// Who can decide a panic now, including a person reading an interactive terminal.
+fn decider(domain: Option<crate::domain::DomainId>) -> Option<&'static str> {
+    if WATCHERS.load(SeqCst) > 0 {
+        Some("an inspect watcher")
+    } else if super::AGENT.load(Relaxed) {
+        Some("an agent")
+    } else if OBSERVERS.load(SeqCst) > 0 {
+        Some("devhub")
+    } else if RUN_STATE_AVAILABLE.load(SeqCst) && domain.is_some()
+        && domain == crate::run::app_domain() && crate::run::live_session()
+    {
+        Some("the Run panel")
+    } else if std::io::stdin().is_terminal() && crate::tui::stderr_is_terminal() {
+        Some("this terminal")
+    } else {
+        None
+    }
 }
 
 /// A panic is about to unwind on this (program) thread: park it if someone may want to look
@@ -356,6 +400,19 @@ pub fn panic_parked(os_id: u64) -> bool {
     PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.os_id == os_id)
 }
 
+/// A quit was asked for (a signal, the app's own quit): nothing parked waits for a decision any
+/// more, whatever its domain -- each ends as its domain's stop ends it (`release_domain`), a stale
+/// access's report resumes the program it paused -- and a program paused for an inspection goes
+/// on: the quit waits for the app's main to return, and a paused main never did (a quit waited
+/// forever behind a stale report's pause that named no domain, 11-08).
+pub fn quit_releases() {
+    for p in PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let _ = p.decision.compare_exchange(0, 1, SeqCst, SeqCst);
+    }
+    RESUME.notify_all();
+    super::instrument::quit_resumes();
+}
+
 /// A domain is stopping: let its parked panics unwind so its ordinary cleanup can run.
 pub fn release_domain(domain: crate::domain::DomainId) {
     for p in PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.domain == Some(domain)) {
@@ -367,7 +424,7 @@ pub fn release_domain(domain: crate::domain::DomainId) {
 pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let unwinds = !regs.is_null();
     let _k = crate::zone_alloc::kept();
-    if !super::STARTED.load(Relaxed) || super::TEST_RUN.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
+    if !super::STARTED.load(Relaxed) || super::TEST_RUN.load(Relaxed) || UNATTENDED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() || super::eval::in_eval() {
         return;
     }
     let domain = crate::domain::current_app_domain();
@@ -390,10 +447,8 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
         // reported as the JIT's failure (a restarted run's): the call unwinds, no program panic parks
         return;
     }
-    // the run window shows the app's parked panic (resume, restart) in a live session; a run that
-    // is none (a test's child) ends as its panic ends it
-    let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed)
-        || (RUN_STATE_AVAILABLE.load(SeqCst) && domain.is_some() && domain == crate::run::app_domain() && crate::run::live_session());
+    let deciding = decider(domain);
+    let mut watched = deciding.is_some();
     let key = format!("{}|{}|{}", info.site, info.location, info.message);
     super::flightrec::panic(&super::short(&info.message, 120), if info.location.is_empty() { "?" } else { &info.location });
     if !watched {
@@ -414,7 +469,7 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let fr: Vec<String> = frames.iter().map(super::frame_json).collect();
     let me = crate::os::thread::current();
     let thread = if me == crate::jit::MAIN_TID.load(Relaxed) { "main".to_string() } else { crate::os::thread::name(me) };
-    let wait_s = if watched { 600 } else { park_secs_unwatched() };
+    let mut wait_s = if watched { 600 } else { park_secs_unwatched() };
     let primary = domain.is_some() && domain == crate::run::app_domain();
     let boundary = innermost_boundary();
     // a restartable frame (`restartable <fn>`) on the stack: restart / return are offered
@@ -458,18 +513,31 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event, what: (thread.clone(), info.message.clone(), location.clone()), frames: info.frames.iter().copied().take(64).collect(), regs: if unwinds { unsafe { std::slice::from_raw_parts(regs, crate::jit::REG_WORDS) }.to_vec() } else { Vec::new() }, kind: ParkKind::Panic });
     list.push(p.clone());
     parked_changed();
-    // said watched or not: what reads the app's output (a CI smoke) is no watcher of the event stream
-    eprintln!(
-        "makepad: panic parked on thread {} ({}) for {} s -- attach: makepad inspect {} panics (resume P{} panic)",
-        thread,
-        super::short(&info.message, 120),
-        wait_s,
-        std::process::id(),
-        id
-    );
+    // Unconditional: --quiet/--silent do not filter stderr, and the session-log tee forwards
+    // every complete line to its saved real stderr even when the progress bar is disabled.
+    let tool = crate::tool_name();
+    let pid = std::process::id();
+    let thread_line = thread.replace(['\n', '\r'], " ");
+    let message = super::short(&info.message, 120).replace(['\n', '\r'], " ");
+    if let Some(who) = deciding {
+        eprintln!("relax: panic parked on thread {thread_line} ({message}) for {wait_s} s ({who} can decide): {tool} inspect {pid} panics, then resume P{id} panic; rerun with --unattended to never park");
+    } else {
+        eprintln!("relax: panic parked on thread {thread_line} ({message}) for {wait_s} s (nothing attached): {tool} inspect {pid} panics within that time, or rerun with --unattended");
+    }
     let t0 = std::time::Instant::now();
-    while p.decision.load(SeqCst) == 0 && t0.elapsed().as_secs() < wait_s && !crate::run_threads::run_ending() {
-        // an unwatched park ends early once nobody could still attach in time
+    loop {
+        // Check before expiry so an attachment during the last wait can still decide. Once
+        // someone could decide, detaching never shortens the park or clears the watched state.
+        if !watched {
+            if let Some(who) = decider(domain) {
+                watched = true;
+                wait_s = 600;
+                eprintln!("relax: panic P{id} on thread {thread_line}: {who} attached; park extended to {wait_s} s from its start");
+            }
+        }
+        if p.decision.load(SeqCst) != 0 || t0.elapsed().as_secs() >= wait_s || crate::run_threads::run_ending() {
+            break;
+        }
         list = RESUME.wait_timeout(list, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
     }
     list.retain(|x| x.id != id);
@@ -491,9 +559,16 @@ pub fn on_panic(info: &crate::jit::PanicInfo, regs: *const u64) {
     }
 }
 
-/// Somebody could answer a parked stop now: the Run panel, an inspect watcher, an agent.
+/// Somebody could answer a parked stop now: the Run panel, an inspect watcher, an agent, devhub.
+/// A terminal alone cannot justify a stale access's park, which has no timeout. A test run's stop
+/// is the test's, as its panics are (`makepad test`: a fixture that asserts its child dies parked
+/// under devhub's observer and paused the whole job, J13263, 11-13), and an unattended run has
+/// nobody by definition: both end with the report.
 pub fn can_decide() -> bool {
-    super::STARTED.load(Relaxed) && (WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed) || RUN_STATE_AVAILABLE.load(SeqCst))
+    super::STARTED.load(Relaxed)
+        && !super::TEST_RUN.load(Relaxed)
+        && !UNATTENDED.load(Relaxed)
+        && (WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed) || OBSERVERS.load(SeqCst) > 0 || RUN_STATE_AVAILABLE.load(SeqCst))
 }
 
 /// What the user decided for a parked stale access.
@@ -503,14 +578,50 @@ pub enum StaleDecision {
     Stop,
     /// the run starts again with its command line
     Restart,
+    /// the run ends meanwhile (a restart or stop taken elsewhere: the ring, the WM's toast): no
+    /// second restart
+    Ending,
 }
 
 /// A stale access (stale.rs), parked on behalf of thread `os_id` (it waits in its fault handler
 /// for good): listed and announced as a parked panic -- `panics`, `watch`, the Run panel -- with the
 /// choices `restart` (the process starts again) and `stop`. Waits for the decision without a
 /// timeout.
-
 pub fn park_stale(os_id: u64, domain: Option<crate::domain::DomainId>, message: &str, frames: &[u64]) -> StaleDecision {
+    let (id, decision) = park_for_restart(ParkKind::Stale, "stale access", os_id, domain, message, frames,
+        |id| format!("relax: stale access parked as P{} -- {tool} inspect {} panics; resume P{} restart | stop", id, std::process::id(), id, tool = crate::tool_name()));
+    let d = match decision { 3 => StaleDecision::Restart, 5 => StaleDecision::Stop, _ => StaleDecision::Ending };
+    super::flightrec::panic_decided(id, match d { StaleDecision::Stop => "stale: stop", StaleDecision::Restart => "stale: restart", StaleDecision::Ending => "stale: the run ended" });
+    d
+}
+
+/// How a call parked at a failed live update ended (park_update_failed).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UpdateParked {
+    /// the person chose to restart: the next run starts with the update
+    Restart,
+    /// the person stopped the app
+    Stop,
+    /// the run ends meanwhile (a restart taken elsewhere: the ring, the WM's toast)
+    Ending,
+}
+
+/// A program thread's call whose code the live update could not build (an internal compiler error
+/// at the call after live edits, jit.rs ice_at_call): the thread waits at the call -- the window
+/// and the app's state stay -- listed and announced as a parked panic (`panics`, `watch`, the
+/// paused view) with `message` saying so, and the choices `restart` and `stop`. No timeout: the app
+/// is never restarted by itself.
+pub fn park_update_failed(message: &str, frames: &[u64]) -> UpdateParked {
+    let (id, decision) = park_for_restart(ParkKind::UpdateFailed, "update failed", super::threads::self_os_id(), crate::domain::current_app_domain(), message, frames,
+        |id| format!("relax: {} -- parked as P{} (the app holds still, its state kept): {tool} inspect {} panics; resume P{} restart | stop", super::short(message, 200), id, std::process::id(), id, tool = crate::tool_name()));
+    let d = match decision { 3 => UpdateParked::Restart, 5 => UpdateParked::Stop, _ => UpdateParked::Ending };
+    super::flightrec::panic_decided(id, match d { UpdateParked::Restart => "update failed: restart", UpdateParked::Stop => "update failed: stop", UpdateParked::Ending => "update failed: the run ended" });
+    d
+}
+
+/// A thread that cannot go on, parked on behalf of thread `os_id` until the person decides (no
+/// timeout): `restart` (3) or `stop` (5); 0 when the run ends first. `kind` names it in the event.
+fn park_for_restart(kind: ParkKind, label: &str, os_id: u64, domain: Option<crate::domain::DomainId>, message: &str, frames: &[u64], announce: impl FnOnce(u64) -> String) -> (u64, u32) {
     let _k = crate::zone_alloc::kept();
     let id = PANIC_IDS.fetch_add(1, SeqCst) + 1;
     let top: Vec<u64> = frames.iter().copied().take(12).collect();
@@ -519,10 +630,13 @@ pub fn park_stale(os_id: u64, domain: Option<crate::domain::DomainId>, message: 
     let sym = super::symbolise_within(&[as_raw], &mut partial, 500).pop().unwrap_or_default();
     let location = sym.first().map(|f| f.at.clone()).unwrap_or_default();
     let fr: Vec<String> = sym.iter().map(super::frame_json).collect();
-    let thread = super::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string());
+    // (the UI thread is "main", as a parked panic names it: the paused view leads with its choices)
+    let main = os_id == super::threads::self_os_id() && crate::os::thread::current() == crate::jit::MAIN_TID.load(Relaxed);
+    let thread = if main { "main".to_string() } else { super::threads::list().into_iter().find(|t| t.os_id == os_id).map(|t| t.name.clone()).unwrap_or_else(|| os_id.to_string()) };
     let fields = format!(
-        "\"id\":\"P{}\",\"kind\":\"stale access\",\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}],\"parked_s\":null{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} stop\"]",
+        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}],\"parked_s\":null{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} stop\"]",
         id,
+        json_str(label),
         json_str(&super::short(message, 400)),
         json_str(&location),
         json_str(&thread),
@@ -533,20 +647,17 @@ pub fn park_stale(os_id: u64, domain: Option<crate::domain::DomainId>, message: 
     );
     let mut list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     let (seq, event) = emit_record("panic", &format!("P{}", id), &fields);
-    let p = std::sync::Arc::new(Parked { id, seq, os_id, domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event, what: (thread, message.to_string(), location), frames: frames.iter().copied().take(64).collect(), regs: Vec::new(), kind: ParkKind::Stale });
+    let p = std::sync::Arc::new(Parked { id, seq, os_id, domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event, what: (thread, message.to_string(), location), frames: frames.iter().copied().take(64).collect(), regs: Vec::new(), kind });
     list.push(p.clone());
     parked_changed();
-    eprintln!("makepad: stale access parked as P{} -- makepad inspect {} panics; resume P{} restart | stop", id, std::process::id(), id);
+    eprintln!("{}", announce(id));
     while p.decision.load(SeqCst) == 0 && !crate::run_threads::run_ending() {
         list = RESUME.wait_timeout(list, std::time::Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
     }
     list.retain(|x| x.id != id);
     drop(list);
     parked_changed();
-    let decision = p.decision.load(SeqCst);
-    let d = if decision == 5 { StaleDecision::Stop } else { StaleDecision::Restart };
-    super::flightrec::panic_decided(id, match d { StaleDecision::Stop => "stale: stop", StaleDecision::Restart => "stale: restart" });
-    d
+    (id, p.decision.load(SeqCst))
 }
 
 /// How a call parked at a compile error ended.
@@ -590,7 +701,10 @@ pub fn park_compile_error(message: &str, location: &str, frames: &[u64], mut reb
     list.push(p.clone());
     parked_changed();
     super::flightrec::panic(&super::short(message, 120), if location.is_empty() { "?" } else { location });
-    eprintln!("makepad: compile error parked on thread {} at its call of code that did not compile: edit the code (a live edit that makes it compile resumes the call), or stop: makepad inspect {} panics (resume P{} stop)", thread, std::process::id(), id);
+    // Unconditional, like a panic's park line: a run nobody attends (a script, CI) learns here why it
+    // waits and that --unattended ends it at the error instead.
+    let tool = crate::tool_name();
+    eprintln!("relax: compile error parked on thread {} at its call of code that did not compile: edit the code (a live edit that makes it compile resumes the call), or stop: {tool} inspect {} panics (resume P{} stop); rerun with --unattended to end the run at a compile error instead", thread, std::process::id(), id);
     let mut epoch = crate::jit::patch_epoch();
     let end = loop {
         match p.decision.load(SeqCst) {
@@ -684,10 +798,11 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
     let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     match list.iter().find(|p| p.id == id) {
         Some(p) if p.kind == ParkKind::Stale && decision != 3 && decision != 5 => out.err(&format!("P{} is a stale access: its thread cannot go on (resume P{} restart | stop)", id, id)),
+        Some(p) if p.kind == ParkKind::UpdateFailed && decision != 3 && decision != 5 => out.err(&format!("P{} is a call the live update could not build: its thread cannot go on (resume P{} restart | stop)", id, id)),
         Some(p) if p.kind == ParkKind::CompileError && decision != 5 => out.err(&format!("P{} is a call of code that did not compile: a live edit that fixes it resumes it (resume P{} stop ends the run)", id, id)),
         Some(p) if p.kind == ParkKind::Panic && decision == 5 => out.err(&format!("P{} is a panic: stop is for stale accesses and compile errors", id)),
-        Some(p) if p.kind == ParkKind::Stale && decision == 3 => {
-            // the watcher it parked for starts the next run (stale.rs restart_run)
+        Some(p) if matches!(p.kind, ParkKind::Stale | ParkKind::UpdateFailed) && decision == 3 => {
+            // the thread it parked for starts the next run (stale.rs restart_run, jit.rs ice_at_call)
             p.decision.store(3, SeqCst);
             RESUME.notify_all();
             out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"restart\",\"window_kept\":{},\"state_kept\":false}}", id, crate::run::hosted_run()));
@@ -700,7 +815,7 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     if let Err(e) = crate::reload::restart_run(&why) {
                         crate::hot_failure::restart_failed(&e);
-                        eprintln!("makepad: {why}: {e}");
+                        eprintln!("relax: {why}: {e}");
                     }
                 });
                 match spawned {
@@ -735,8 +850,9 @@ pub fn start() {
     { let _k = crate::zone_alloc::kept();
     let _ = crate::run_threads::spawn("run-inspect-watch", || {
         super::heap::exclude_this_thread();
-        let hang_ms: u64 = std::env::var("MAKEPAD_RUN_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let hang_ms: u64 = std::env::var("RELAX_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
         let mut last_cycle: Vec<u64> = Vec::new();
+        let mut last_rows: Vec<(u64, u64, u64)> = Vec::new();
         let mut base_rss = 0u64;
         let mut tick = 0u64;
         let (mut marked_main, mut marked_present) = (false, false);
@@ -769,15 +885,20 @@ pub fn start() {
             }
             // a cycle among registry waits (thread -> holder handle)
             let cycle = super::hang::registry_cycle(&waits);
-            if !cycle.is_empty() && cycle == last_cycle {
+            // each cycle thread's row: a deadlock is the same waits in both looks, not a new short
+            // wait each time that happens to close a cycle again
+            let rows: Vec<(u64, u64, u64)> = cycle.iter().filter_map(|h| waits.iter().find(|w| w.thread == *h).map(|w| (w.thread, w.object, w.since_ns))).collect();
+            if !cycle.is_empty() && cycle == last_cycle && rows == last_rows {
                 let mut list = super::threads::list();
                 super::name_handles(&mut list);
                 let names: Vec<String> = cycle.iter().map(|h| json_str(&super::thread_label(*h, &list))).collect();
+                let what: Vec<String> = cycle.iter().filter_map(|h| waits.iter().find(|w| w.thread == *h)).map(|w| json_str(&format!("{} waits: {}", super::thread_label(w.thread, &list), super::wait_text(w, &list)))).collect();
                 let mut key = cycle.clone();
                 key.sort_unstable();
-                emit("deadlock", &format!("{:?}", key), &format!("\"cycle\":[{}],\"more\":[\"why-hung\"]", names.join(",")));
+                emit("deadlock", &format!("{:?}", key), &format!("\"cycle\":[{}],\"waits\":[{}],\"more\":[\"why-hung\"]", names.join(","), what.join(",")));
             }
             last_cycle = cycle;
+            last_rows = rows;
             super::heap::expire();
             // the memory timeline and its phase markers
             let rss = crate::memstat::resident();
@@ -811,17 +932,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_recent_events_end_at_the_newest_when_the_reply_is_cut() {
-        // twelve 3 KB events: the 16 KB reply holds about five
+    fn the_recent_events_end_at_the_newest_and_arrive_whole() {
+        // twelve 3 KB events: more than the 16 KB a reply was once cut at (it kept the oldest,
+        // and devhub took a 30 s old verdict for the edit it had just shipped, 11-04)
         let pad = "x".repeat(3 << 10);
         let seqs: Vec<u64> = (0..12).map(|n| emit("cuttest", &format!("cut{n}"), &format!("\"pad\":\"{pad}\""))).collect();
-        let mut buf = Vec::new();
-        cmd_events(&Req::parse("events on=cuttest"), &mut Out::new(&mut buf, 16 << 10));
-        let text = String::from_utf8(buf).unwrap();
-        let shown: Vec<u64> = text.lines().filter_map(|l| l.split("\"seq\":").nth(1)?.split(',').next()?.parse().ok()).collect();
-        assert!(!shown.is_empty() && shown.len() < seqs.len(), "{shown:?}");
-        assert_eq!(shown.last(), seqs.last(), "the newest event was cut from the reply");
-        assert!(shown.windows(2).all(|w| w[0] < w[1]), "{shown:?}");
+        let shown = |line: &str| -> Vec<u64> {
+            let mut buf = Vec::new();
+            cmd_events(&Req::parse(line), &mut Out::new(&mut buf));
+            let text = String::from_utf8(buf).unwrap();
+            text.lines().filter_map(|l| l.split("\"seq\":").nth(1)?.split(',').next()?.parse().ok()).collect()
+        };
+        let recent = shown("events on=cuttest");
+        assert_eq!(recent.last(), seqs.last(), "the recent events end at the newest");
+        assert!(recent.windows(2).all(|w| w[0] < w[1]), "{recent:?}");
+        assert_eq!(shown(&format!("events on=cuttest since={}", seqs[0] - 1)), seqs, "every event arrives");
+    }
+
+    /// A call the live update could not build (an internal compiler error at a call after a live
+    /// edit) in an app the person runs: recorded and offered, no restart started, and the call
+    /// parks for the person -- listed with its message and the choices restart and stop, with no
+    /// timeout -- until they choose. (A landing restarted the person's running app in place.)
+    #[test]
+    fn a_call_the_update_could_not_build_parks_for_the_person() {
+        isolated_test!(a_call_the_update_could_not_build_parks_for_the_person);
+        let home = std::env::temp_dir().join(format!("relax-update-failed-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("MAKEPAD_HOME", &home);
+        std::env::set_var("RELAX_LIVE_LOG", home.join("live.jsonl"));
+        crate::hot_failure::enable();
+        crate::hot_failure::edit_ran_for_test();
+        let ice = "internal compiler error compiling `f` (slot 7) on its first call: test".to_string();
+        assert!(crate::reload::update_failed_at_call(&ice), "after a live edit the update failed in the call");
+        assert!(crate::reload::restart_pending().contains(&ice), "the restart is offered: {:?}", crate::reload::restart_pending());
+        assert!(!crate::reload::RESTART_CONFIRMED.load(SeqCst), "nobody chose a restart: none is under way");
+        assert!(!crate::run_threads::ending(), "the run goes on");
+        let why = "The live update failed in this call: test".to_string();
+        let caller = std::thread::spawn(move || park_update_failed(&why, &[]));
+        let t0 = std::time::Instant::now();
+        while parked_now().is_empty() && t0.elapsed().as_secs() < 10 { std::thread::sleep(std::time::Duration::from_millis(10)); }
+        let (id, event) = { let list = PARKED.lock().unwrap(); let p = list.first().expect("the call parked"); (p.id, p.event.clone()) };
+        for part in ["\"kind\":\"update failed\"", "\"message\":\"The live update failed in this call: test\"", "\"parked_s\":null", &format!("\"resume P{id} restart\""), &format!("\"resume P{id} stop\"")] {
+            assert!(event.contains(part), "{part} in {event}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!caller.is_finished(), "it waits for the person's choice");
+        let resume = |words: &str| { let mut buf = Vec::new(); cmd_resume(&Req::parse(words), &mut Out::new(&mut buf)); String::from_utf8(buf).unwrap() };
+        assert!(resume(&format!("resume P{id} panic")).contains("could not build"), "its thread cannot go on: no unwind into the app");
+        assert!(resume(&format!("resume P{id} restart")).contains("\"as\":\"restart\""));
+        assert_eq!(caller.join().unwrap(), UpdateParked::Restart, "the restart is its thread's to start");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A stale access parked while its run ends (a restart or stop taken elsewhere, its domain
+    /// stopping) starts no restart of its own: the run's end is its outcome. (The ending run got a
+    /// second restart from the stale watcher.)
+    #[test]
+    fn a_stale_access_parked_as_its_run_ends_starts_no_second_restart() {
+        isolated_test!(a_stale_access_parked_as_its_run_ends_starts_no_second_restart);
+        let home = std::env::temp_dir().join(format!("relax-stale-ending-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("MAKEPAD_HOME", &home);
+        let parked = || { let t0 = std::time::Instant::now(); while parked_now().is_empty() && t0.elapsed().as_secs() < 10 { std::thread::sleep(std::time::Duration::from_millis(10)); } !parked_now().is_empty() };
+        let caller = std::thread::spawn(|| park_stale(1, None, "stale access: test", &[]));
+        assert!(parked(), "the stale access parked");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!caller.is_finished(), "it waits for the person's choice");
+        crate::run_threads::run_ends();
+        RESUME.notify_all();
+        assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "the run ends: no restart");
+        assert!(parked_now().is_empty(), "the ended park leaves the list");
+        crate::run_threads::begin_run();
+        let domain: crate::domain::DomainId = 9;
+        let caller = std::thread::spawn(move || park_stale(1, Some(domain), "stale access: test", &[]));
+        assert!(parked(), "the stale access parked");
+        release_domain(domain);
+        assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "its domain stops: no restart");
+        // a quit ends one of no domain too, and a program paused for its report goes on: the quit
+        // waits for the app's main (a park that named no domain outlived its domain's stop, and
+        // the quit waited for the paused main forever, 11-08)
+        let caller = std::thread::spawn(|| park_stale(1, None, "stale access: test", &[]));
+        assert!(parked(), "the stale access parked");
+        crate::inspect::instrument::pause_program();
+        assert!(crate::inspect::instrument::paused(), "paused for the report");
+        quit_releases();
+        assert_eq!(caller.join().unwrap(), StaleDecision::Ending, "a quit: no restart");
+        assert!(!crate::inspect::instrument::paused(), "a quit resumes the paused program");
+        assert!(parked_now().is_empty(), "nothing stays parked at a quit");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

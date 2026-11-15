@@ -4,7 +4,8 @@
 //! the resolved paths, method calls, field reads, patterns, types it mentions); the signatures'
 //! and fields' references are read from the syntax (`TypeWalker`). `finish` then runs rustc's
 //! worklist: seeds are `main`, the effectively public items (`#[allow(dead_code)]` items,
-//! `#[no_mangle]` / `#[used]` / lang items, `const _`, a test build's `#[test]` fns), and
+//! `#[no_mangle]` / `#[used]` / lang items, `const _`, a test build's `#[test]` fns, what a
+//! `global_asm!`'s operands name), and
 //! whatever a live item mentions is live; trait impls and their items are live when the trait
 //! (item) and the implementing type are. What stays dead is reported per module as rustc's
 //! `check_mod_deathness` does, grouped by parent and lint level.
@@ -13,7 +14,9 @@
 
 use crate::ast::*;
 use crate::ast_visit::{self, Visitor};
+use crate::body_facts::{read_u8, read_u32, FactCodec, FactDecodec};
 use crate::lint::{self, Level, Lint};
+use crate::lint_imports::Judge;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::typeck::{Body, Res};
@@ -27,8 +30,9 @@ pub const DEAD_CODE_PUB_IN_BINARY: Lint = lint::lint("dead_code_pub_in_binary");
 /// A field of a struct, union or enum variant: (ADT, variant index, field index).
 type FieldKey = (DefId, u32, u32);
 
-#[derive(Clone, Copy, Debug)]
-enum Ref {
+/// A live definition or field read, kept in order for the dead-code worklist and stored facts.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum Ref {
     /// `check_def_id`: the definition is live and explored
     Use(DefId),
     /// a field that is read
@@ -37,23 +41,98 @@ enum Ref {
 
 /// What one body owner references, and the diagnostics it emits when it is live.
 #[derive(Default)]
-struct BodyInfo {
+pub(crate) struct BodyInfo {
     refs: Vec<Ref>,
     /// (position, message, attributes in scope): `useless assignment ... to itself`
     notes: Vec<(u32, String, Vec<Attr>)>,
 }
 
-/// Positions (file, site) of the names patterns bind (they are definitions, not uses).
-static BINDING_SITES: Mutex<Option<HashSet<(u32, u32)>>> = Mutex::new(None);
+/// Keeps the private reference representation behind the body-facts storage boundary.
+impl BodyInfo {
+    /// Drops refs the crate's dead-code pass cannot use; notes retain positions and cannot be stored.
+    pub(crate) fn stored(&self, prog: &Program, krate: u32) -> Option<BodyInfo> {
+        if !self.notes.is_empty() { return None; }
+        let refs = self.refs.iter().copied().filter(|r| {
+            let d = match *r { Ref::Use(d) | Ref::Field((d, _, _)) => d };
+            prog.def(d).krate == krate
+        }).collect();
+        Some(BodyInfo { refs, notes: Vec::new() })
+    }
 
-pub fn is_binding_site(file: u32, pos: u32) -> bool {
-    BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(file, pos)))
+    /// Writes ordered, position-free refs using the table's stable definition indices.
+    pub(crate) fn encode(&self, c: &mut dyn FactCodec, out: &mut Vec<u8>) -> Option<()> {
+        out.extend_from_slice(&u32::try_from(self.refs.len()).ok()?.to_le_bytes());
+        for r in &self.refs {
+            match *r {
+                Ref::Use(d) => {
+                    out.push(0);
+                    out.extend_from_slice(&c.def(d)?.to_le_bytes());
+                }
+                Ref::Field((d, variant, field)) => {
+                    out.push(1);
+                    out.extend_from_slice(&c.def(d)?.to_le_bytes());
+                    out.extend_from_slice(&variant.to_le_bytes());
+                    out.extend_from_slice(&field.to_le_bytes());
+                }
+            }
+        }
+        Some(())
+    }
+
+    /// Rebuilds refs without exposing their representation, rejecting truncated or unknown tags.
+    pub(crate) fn decode(bytes: &mut &[u8], d: &mut dyn FactDecodec) -> Option<BodyInfo> {
+        let mut refs = Vec::new();
+        for _ in 0..read_u32(bytes)? {
+            refs.push(match read_u8(bytes)? {
+                0 => Ref::Use(d.def(read_u32(bytes)?)?),
+                1 => Ref::Field((d.def(read_u32(bytes)?)?, read_u32(bytes)?, read_u32(bytes)?)),
+                _ => return None,
+            });
+        }
+        Some(BodyInfo { refs, notes: Vec::new() })
+    }
+
+    /// Compares stored references without requiring equality on position-bearing syntax attributes.
+    pub(crate) fn same_stored(&self, other: &BodyInfo) -> bool {
+        self.refs == other.refs && self.notes.is_empty() && other.notes.is_empty()
+    }
 }
 
+/// Stored references as a set: one entry per holder (an empty one kept), its refs sorted and each
+/// once. The dead-code pass's live set does not rest on their order or repetition.
+pub(crate) fn canonical_refs(refs: &[(DefId, BodyInfo)]) -> Vec<(DefId, BodyInfo)> {
+    let mut by: std::collections::BTreeMap<DefId, Vec<Ref>> = std::collections::BTreeMap::new();
+    for (holder, info) in refs { by.entry(*holder).or_default().extend_from_slice(&info.refs); }
+    by.into_iter().map(|(holder, mut refs)| {
+        refs.sort_unstable();
+        refs.dedup();
+        (holder, BodyInfo { refs, notes: Vec::new() })
+    }).collect()
+}
+
+/// Canonical refs (`canonical_refs`) as (holder, reference) pairs, sorted: the holders with no
+/// reference as (holder, None).
+pub(crate) fn ref_pairs(refs: &[(DefId, BodyInfo)]) -> Vec<(DefId, Option<Ref>)> {
+    refs.iter().flat_map(|(holder, info)| {
+        let none = info.refs.is_empty().then_some((*holder, None));
+        none.into_iter().chain(info.refs.iter().map(|r| (*holder, Some(*r))))
+    }).collect()
+}
+
+/// A reference as a difference report names it.
+pub(crate) fn describe_ref(prog: &Program, r: Option<Ref>) -> String {
+    match r {
+        None => "no reference".to_string(),
+        Some(Ref::Use(d)) => format!("`{}`", prog.def_path(d)),
+        Some(Ref::Field((d, variant, field))) => format!("field {field} of variant {variant} of `{}`", prog.def_path(d)),
+    }
+}
+
+/// Each body owner's references, from a check's `reset` to its `finish` (None otherwise: a body
+/// linted outside a check -- a live save's -- adds nothing).
 static BODY_REFS: Mutex<Option<HashMap<DefId, BodyInfo>>> = Mutex::new(None);
 
 pub fn reset() {
-    *BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashSet::new());
     crate::lint_imports::reset();
     *BODY_REFS.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashMap::new());
 }
@@ -117,7 +196,7 @@ impl<'a> TypeWalker<'a> {
             Ty::Fn(f) => {
                 let f = *ast.fn_ptr(f);
                 for &x in ast.list(f.params) { self.ty(x); }
-                if let Some(r) = f.ret { self.ty(r); }
+                if let Some(r) = f.ret.get() { self.ty(r); }
             }
             Ty::ImplTrait(b) | Ty::DynTrait(b, _) => self.bounds(b),
             Ty::ImplicitSelf => {
@@ -160,7 +239,7 @@ impl<'a> TypeWalker<'a> {
             }
             Some(GenericArgs::Paren(inputs, out)) => {
                 for &t in ast.list(*inputs) { self.ty(t); }
-                if let Some(t) = out { self.ty(*t); }
+                if let Some(t) = &out.get() { self.ty(*t); }
             }
             None => {}
         }
@@ -172,11 +251,11 @@ impl<'a> TypeWalker<'a> {
             match p.kind {
                 GenericParamKind::Type(b, def) => {
                     self.bounds(b);
-                    if let Some(t) = def { self.ty(t); }
+                    if let Some(t) = def.get() { self.ty(t); }
                 }
                 GenericParamKind::Const(t, def) => {
                     self.ty(t);
-                    if let Some(e) = def { self.const_expr(e); }
+                    if let Some(e) = def.get() { self.const_expr(e); }
                 }
                 GenericParamKind::Lifetime(_) => {}
             }
@@ -195,7 +274,7 @@ impl<'a> TypeWalker<'a> {
         for s in ast.segs(p.segs) { self.generic_args(s.args()); }
         if let Some(q) = ast.qself(p) {
             self.ty(q.ty);
-            if let Some(tp) = q.trait_path { self.path(&tp, true); }
+            if let Some(tp) = q.trait_path.get() { self.path(&tp, true); }
         }
     }
 
@@ -228,7 +307,7 @@ impl<'a> TypeWalker<'a> {
         if segs.is_empty() { return; }
         // `<T as Trait>::Assoc`: the trait (above) and the associated item it names
         if let Some(q) = ast.qself(p) {
-            if let Some(tp) = q.trait_path {
+            if let Some(tp) = q.trait_path.get() {
                 if let Some(t) = self.resolve_path_def(&tp, true) {
                     self.use_def(t);
                     if let Some(last) = segs.last() {
@@ -329,12 +408,12 @@ fn item_refs_in(prog: &Program, d: DefId, pub_only: bool) -> Vec<Ref> {
             let sig = *ast.fn_sig(sig);
             for p in ast.list(sig.params) { w.ty(p.ty); }
             // `self` / `&self`: its type is `Self`
-            match sig.self_param {
+            match sig.self_param.get() {
                 Some(SelfParam::Typed(_, t)) => w.ty(t),
                 Some(_) => { if let Some(s) = w.self_def { w.use_def(s); } }
                 None => {}
             }
-            if let Some(r) = sig.ret { w.ty(r); }
+            if let Some(r) = sig.ret.get() { w.ty(r); }
         }
         ItemKind::Struct(r) => {
             let s = *ast.row(r);
@@ -344,13 +423,13 @@ fn item_refs_in(prog: &Program, d: DefId, pub_only: bool) -> Vec<Ref> {
         ItemKind::Enum(r) => {
             for v in ast.list(ast.row(r).variants) {
                 if let VariantData::Struct(l) | VariantData::Tuple(l) = v.data { fields(&mut w, ast, l, false); }
-                if let Some(e) = v.disc { w.const_expr(e); }
+                if let Some(e) = v.disc.get() { w.const_expr(e); }
             }
         }
         ItemKind::TypeAlias(r) => {
             let a = *ast.row(r);
             w.bounds(a.bounds);
-            if let Some(t) = a.ty { w.ty(t); }
+            if let Some(t) = a.ty.get() { w.ty(t); }
         }
         ItemKind::Trait(r) => {
             let t = *ast.row(r);
@@ -358,13 +437,13 @@ fn item_refs_in(prog: &Program, d: DefId, pub_only: bool) -> Vec<Ref> {
         }
         ItemKind::Impl(r) => {
             let i = *ast.row(r);
-            if let Some(tp) = i.trait_ {
+            if let Some(tp) = i.trait_.get() {
                 w.path(&tp, true);
                 // the associated types of a trait impl are part of what the impl exposes
                 // (`Index::Output`, `IntoIterator::IntoIter`)
                 for &it in ast.list(i.items) {
                     if let ItemKind::TypeAlias(r) = ast.item(it).kind {
-                        if let Some(t) = ast.row(r).ty { w.ty(t); }
+                        if let Some(t) = ast.row(r).ty.get() { w.ty(t); }
                     }
                 }
             }
@@ -384,7 +463,7 @@ fn fields(w: &mut TypeWalker, ast: &Ast, l: List<FieldDef>, pub_only: bool) {
     for f in ast.list(l) {
         if pub_only && !matches!(f.vis, Vis::Pub) { continue; }
         w.ty(f.ty);
-        if let Some(e) = f.default { w.const_expr(e); }
+        if let Some(e) = f.default.get() { w.const_expr(e); }
     }
 }
 
@@ -443,11 +522,17 @@ pub fn collect_body(prog: &Program, tcx: &Tcx, body: &Body) {
     };
     let mut out = std::mem::take(&mut b.out);
     out.append(&mut b.tw.out);
-    let mut notes = std::mem::take(&mut b.notes);
+    let mut info = BodyInfo { refs: out, notes: std::mem::take(&mut b.notes) };
+    if !crate::body_facts::record(|f| f.refs.push((holder, std::mem::take(&mut info)))) { merge_refs(holder, info); }
+}
+
+/// Appends a body's references and notes to its holder before the dead-code pass reads them.
+pub(crate) fn merge_refs(holder: DefId, mut other: BodyInfo) {
     let mut g = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner());
-    let info = g.get_or_insert_with(HashMap::new).entry(holder).or_default();
-    info.refs.append(&mut out);
-    info.notes.append(&mut notes);
+    let Some(g) = g.as_mut() else { return };
+    let info = g.entry(holder).or_default();
+    info.refs.append(&mut other.refs);
+    info.notes.append(&mut other.notes);
 }
 
 struct BodyRefs<'a> {
@@ -562,7 +647,7 @@ impl<'a> BodyRefs<'a> {
         let (adt, vi) = self.variant_of(d);
         self.use_def(adt);
         match *ast.pat(p) {
-            Pat::Struct(_, fs, _) => {
+            Pat::Struct(_, _, fs) => {
                 let Some(a) = self.tcx.adts.get(&adt) else { return };
                 let Some(var) = a.variants.get(vi as usize) else { return };
                 for f in ast.list(fs) {
@@ -593,7 +678,7 @@ impl<'a> BodyRefs<'a> {
         let ast = self.ast;
         match *ast.pat(p) {
             Pat::Or(_) => {}
-            Pat::Struct(_, fs, _) => {
+            Pat::Struct(_, _, fs) => {
                 if let Some(Res::Def(d)) = self.body.pat_res.get(&p.0) { if self.prog.def(*d).kind == DefKind::Variant { out.push(*d); } }
                 for f in ast.list(fs) { self.necessary_variants(f.pat, out); }
             }
@@ -603,7 +688,9 @@ impl<'a> BodyRefs<'a> {
             }
             Pat::Path(_) | Pat::Ident { .. } => {
                 if let Some(Res::Def(d)) = self.body.pat_res.get(&p.0) { if self.prog.def(*d).kind == DefKind::Variant { out.push(*d); } }
-                if let Pat::Ident { sub: Some(s), .. } = *ast.pat(p) { self.necessary_variants(s, out); }
+                if let Pat::Ident { sub, .. } = *ast.pat(p) {
+                    if let Some(s) = sub.get() { self.necessary_variants(s, out); }
+                }
             }
             Pat::Tuple(ps) | Pat::Slice(ps) => for &x in ast.list(ps) { self.necessary_variants(x, out) },
             Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.necessary_variants(x, out),
@@ -657,7 +744,7 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
 
     fn stmt(&mut self, s: &Stmt, b: BlockId) {
         if let Stmt::Let(r) = *s {
-            if let Some(t) = self.ast.row(r).ty { self.tw.ty(t); }
+            if let Some(t) = self.ast.row(r).ty.get() { self.tw.ty(t); }
         }
         let _ = b;
         ast_visit::walk_stmt(self, s);
@@ -676,7 +763,7 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
         let ast = self.ast;
         let was = std::mem::replace(&mut self.in_pat, true);
         match *ast.pat(p) {
-            Pat::Struct(path, ..) | Pat::TupleStruct(path, _) => {
+            Pat::Struct(_, path, ..) | Pat::TupleStruct(path, _) => {
                 self.tw.path_args(&path);
                 self.tw.alias_uses(&path);
                 if let Some(Res::Def(d)) = self.body.pat_res.get(&p.0).copied() { self.handle_res(d); }
@@ -693,12 +780,7 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
                     self.handle_res(d);
                 }
             }
-            Pat::Ident { name, .. } => {
-                // (a binding a macro made has no place of its own: it maps to the call)
-                if self.body.pat_local.get(&p.0).is_some() && self.body.pat_res.get(&p.0).is_none() && name.lo < self.prog.files[self.body.file as usize].src_len {
-                    let site = self.prog.files[self.body.file as usize].diagnostic_pos(name.lo);
-                    BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert((self.body.file, site));
-                }
+            Pat::Ident { .. } => {
                 if let Some(Res::Def(d)) = self.body.pat_res.get(&p.0).copied() {
                     let pi = self.body.pat_ix(p);
                     if pi < self.body.pat_ty.len() {
@@ -752,8 +834,8 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
             ExprKind::Cast(_, t) => self.tw.ty(t),
             ExprKind::Closure(row) => {
                 let c = *ast.row(row);
-                for p in ast.list(c.params) { if let Some(t) = p.ty { self.tw.ty(t); } }
-                if let Some(t) = c.ret { self.tw.ty(t); }
+                for p in ast.list(c.params) { if let Some(t) = p.ty.get() { self.tw.ty(t); } }
+                if let Some(t) = c.ret.get() { self.tw.ty(t); }
             }
             ExprKind::Repeat(_, n) => self.tw.const_expr(n),
             ExprKind::Assign(l, r) => {
@@ -789,7 +871,7 @@ pub fn module_items(prog: &Program, m: u32) -> (u32, Vec<ItemId>) {
     let d = prog.def(md.def);
     let ast = &prog.files[d.file as usize].ast;
     match ast.item(d.item).kind {
-        ItemKind::Mod(Some(l)) => (d.file, ast.list(l).to_vec()),
+        ItemKind::Mod(crate::ast::Opt::Some(l)) => (d.file, ast.list(l).to_vec()),
         _ => (md.file, prog.files[md.file as usize].ast.root_items.iter().copied().collect()),
     }
 }
@@ -799,7 +881,7 @@ fn use_leaves(ast: &Ast, t: &UseTree, prefix: &mut Vec<PathSeg>, out: &mut Vec<(
         UseTree::Name(seg, rename) => {
             let mut p = prefix.clone();
             p.push(seg);
-            out.push((p, rename, false));
+            out.push((p, rename.get(), false));
         }
         UseTree::Path(seg, child) => {
             prefix.push(seg);
@@ -867,7 +949,7 @@ impl Reach {
                 None => return false,
             };
             if !self_reach { return true; }
-            let trait_reach = match imp.trait_ {
+            let trait_reach = match imp.trait_.get() {
                 None => None,
                 Some(_) => Some(tcx.impl_trait.get(&d).map_or(true, |&t| !local(t) || defs.contains(&t))),
             };
@@ -1208,14 +1290,18 @@ impl<'a> Dead<'a> {
     }
 }
 
-/// MAKEPAD_RUN_CHECK_TIMES: finish's parts of 50 ms or more, summed over the crates
-struct PartTimes {
+/// RELAX_CHECK_TIMES: a pass's parts of 50 ms or more, summed over the crates
+pub(crate) struct PartTimes {
+    pass: &'static str,
     on: bool,
     t: std::time::Instant,
     parts: Vec<(&'static str, std::time::Duration)>,
 }
 impl PartTimes {
-    fn mark(&mut self, part: &'static str) {
+    pub(crate) fn new(pass: &'static str) -> Self {
+        PartTimes { pass, on: std::env::var_os("RELAX_CHECK_TIMES").is_some(), t: std::time::Instant::now(), parts: Vec::new() }
+    }
+    pub(crate) fn mark(&mut self, part: &'static str) {
         if !self.on { return; }
         let dt = self.t.elapsed();
         match self.parts.iter_mut().find(|p| p.0 == part) {
@@ -1224,9 +1310,18 @@ impl PartTimes {
         }
         self.t = std::time::Instant::now();
     }
-    fn report(&self, crates: usize) {
+    /// `other`'s parts summed into these (a worker's).
+    pub(crate) fn add(&mut self, other: PartTimes) {
+        for (part, dt) in other.parts {
+            match self.parts.iter_mut().find(|p| p.0 == part) {
+                Some(p) => p.1 += dt,
+                None => self.parts.push((part, dt)),
+            }
+        }
+    }
+    pub(crate) fn report(&self, crates: usize) {
         for &(part, dt) in &self.parts {
-            if dt.as_millis() >= 50 { eprintln!("makepad check: lint_dead::finish {} {:.2} s ({} crates)", part, dt.as_secs_f64(), crates); }
+            if dt.as_millis() >= 50 { eprintln!("relax check: {} {} {:.2} s ({} crates)", self.pass, part, dt.as_secs_f64(), crates); }
         }
     }
 }
@@ -1250,12 +1345,71 @@ pub struct CrateItems<'p> {
 /// required analyses passed, so rustc's misc_checking_3 runs (dead code and the late lints);
 /// without it only the unused imports are reported (rustc's resolver and check_unused_traits
 /// report them before the analyses can fail). `erroneous`: the imports (by index) the check
-/// reported an error of that never bind in rustc, besides the ones still open.
-pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, erroneous: &[usize]) {
-    if !lint::enabled() { return; }
-    let mut pt = PartTimes { on: std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some(), t: std::time::Instant::now(), parts: Vec::new() };
+/// reported an error of that never bind in rustc, besides the ones still open. `replayed`: the
+/// crates with bodies replayed from stored verdicts, whose import reports wait while one is a
+/// candidate (lint_imports::Judge): those crates come back, for `finish_imports`.
+pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, erroneous: &[usize], replayed: &[bool]) -> Vec<Deferred> {
+    if !lint::enabled() { return Vec::new(); }
+    let mut pt = PartTimes::new("lint_dead::finish");
     let refs = BODY_REFS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut traits = crate::lint_imports::take_method_traits();
+    let mut children: HashMap<DefId, Vec<DefId>> = HashMap::new();
+    let crates = crate_items(prog, own, erroneous, Some(&mut children));
+    pt.mark("children");
+    // the crates on the pool, the biggest first
+    let traits: Vec<HashSet<DefId>> = crates.iter().map(|c| traits.remove(&c.krate).unwrap_or_default()).collect();
+    let mut order: Vec<usize> = (0..crates.len()).collect();
+    order.sort_by_key(|&i| (std::cmp::Reverse(crates[i].defs.len()), i));
+    let parts = crate::lint::par_each(&order, |&i| {
+        let mut pt = PartTimes::new("lint_dead::finish");
+        let c = &crates[i];
+        let judge = if replayed.get(c.krate as usize).copied().unwrap_or(false) { Judge::Defer } else { Judge::Report };
+        let candidates = finish_crate(&CrateCx { prog, tcx, c, root, refs: &refs, children: &children }, &traits[i], late, judge, &mut pt);
+        (pt, (judge == Judge::Defer && !candidates.is_empty()).then_some((i, candidates)))
+    });
+    let mut deferred = Vec::new();
+    for (p, d) in parts {
+        pt.add(p);
+        if let Some((i, candidates)) = d { deferred.push(Deferred { krate: crates[i].krate, traits: traits[i].clone(), candidates }); }
+    }
+    pt.report(crates.len());
+    deferred.sort_by_key(|d| d.krate);
+    deferred
+}
+
+/// A crate whose import reports `finish` held back: the method traits its bodies used, and the
+/// candidates ("path:line:col: message") its replayed bodies' stored uses left.
+pub struct Deferred {
+    pub krate: u32,
+    traits: HashSet<DefId>,
+    pub candidates: Vec<String>,
+}
+
+/// The import reports of the crates `finish` deferred, their replayed bodies checked since:
+/// `facts` (the bodies' facts) published, the candidates the check of those bodies cleared.
+pub fn finish_imports(prog: &Program, tcx: &Tcx, deferred: Vec<Deferred>, erroneous: &[usize], facts: Vec<(DefId, crate::body_facts::BodyFacts)>) -> Vec<String> {
+    // (`finish` took the method traits: the facts' are collected anew)
+    crate::lint_imports::reset();
+    crate::body_facts::publish(prog, facts);
+    if deferred.is_empty() || !lint::enabled() { return Vec::new(); }
+    let mut more = crate::lint_imports::take_method_traits();
+    let mut own = vec![false; prog.crates.len()];
+    for d in &deferred { own[d.krate as usize] = true; }
+    let mut cleared = Vec::new();
+    // (both in crate order)
+    for (c, d) in crate_items(prog, &own, erroneous, None).iter().zip(deferred) {
+        let mut traits = d.traits;
+        traits.extend(more.remove(&c.krate).unwrap_or_default());
+        let reach = Reach::compute(prog, tcx, c);
+        let now = crate::lint_imports::check(prog, tcx, c, &reach, &traits, Judge::Recheck);
+        cleared.extend(d.candidates.into_iter().filter(|x| !now.contains(x)));
+    }
+    cleared
+}
+
+/// The items of each crate `own` names, in crate order, with its imports and the ones still open
+/// (`erroneous` besides); `children`: each definition's, filled when given.
+fn crate_items<'p>(prog: &'p Program, own: &[bool], erroneous: &[usize], mut children: Option<&mut HashMap<DefId, Vec<DefId>>>) -> Vec<CrateItems<'p>> {
     let n = prog.crates.len();
     let is_own = |k: u32| own.get(k as usize).copied().unwrap_or(false);
     let mut crates: Vec<CrateItems> = (0..n as u32).filter(|&k| is_own(k)).map(|k| {
@@ -1265,10 +1419,11 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, er
     }).collect();
     let mut slot = vec![usize::MAX; n];
     for (i, c) in crates.iter().enumerate() { slot[c.krate as usize] = i; }
-    let mut children: HashMap<DefId, Vec<DefId>> = HashMap::new();
     for i in 0..prog.defs.len() {
         let def = &prog.defs[i];
-        if def.parent != NO_DEF { children.entry(def.parent).or_default().push(DefId(i as u32)); }
+        if let Some(ch) = children.as_deref_mut() {
+            if def.parent != NO_DEF { ch.entry(def.parent).or_default().push(DefId(i as u32)); }
+        }
         if is_own(def.krate) { crates[slot[def.krate as usize]].defs.push(DefId(i as u32)); }
     }
     for (m, md) in prog.mods.iter().enumerate() {
@@ -1282,27 +1437,34 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32, late: bool, er
         c.imports.push(im);
         if open.contains(&i) { c.unresolved.push(im); }
     }
-    pt.mark("children");
-    for c in &crates {
-        let t = traits.remove(&c.krate).unwrap_or_default();
-        finish_crate(prog, tcx, c, root, &refs, &children, &t, late, &mut pt);
-    }
-    pt.report(crates.len());
+    crates
 }
 
-/// One checked crate's dead code and reachability lints (`late`), and its unused imports.
-#[allow(clippy::too_many_arguments)]
-fn finish_crate(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, traits: &HashSet<DefId>, late: bool, pt: &mut PartTimes) {
+/// The shared read-only context for one checked crate's lints.
+struct CrateCx<'a> {
+    prog: &'a Program,
+    tcx: &'a Tcx,
+    c: &'a CrateItems<'a>,
+    root: u32,
+    refs: &'a HashMap<DefId, BodyInfo>,
+    children: &'a HashMap<DefId, Vec<DefId>>,
+}
+
+/// One checked crate's dead code and reachability lints (`late`), and its unused imports as
+/// `judge` says: the candidates judged.
+fn finish_crate(cx: &CrateCx<'_>, traits: &HashSet<DefId>, late: bool, judge: Judge, pt: &mut PartTimes) -> Vec<String> {
+    let CrateCx { prog, tcx, c, .. } = *cx;
     let reach = Reach::compute(prog, tcx, c);
     pt.mark("Reach::compute");
-    if late { late_lints(prog, tcx, c, root, refs, children, &reach, pt); }
-    crate::lint_imports::check(prog, tcx, c, &reach, traits);
+    if late { late_lints(cx, &reach, pt); }
+    let candidates = crate::lint_imports::check(prog, tcx, c, &reach, traits, judge);
     pt.mark("lint_imports::check");
+    candidates
 }
 
 /// misc_checking_3 of one checked crate: dead code, then the late lints of its items.
-#[allow(clippy::too_many_arguments)]
-fn late_lints(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashMap<DefId, BodyInfo>, children: &HashMap<DefId, Vec<DefId>>, reach: &Reach, pt: &mut PartTimes) {
+fn late_lints(cx: &CrateCx<'_>, reach: &Reach, pt: &mut PartTimes) {
+    let CrateCx { prog, tcx, c, root, refs, children } = *cx;
     let own = &c.own[..];
     let mut s = Dead { prog, tcx, own, refs, live: HashSet::new(), live_log: Vec::new(), live_fields: HashSet::new(), worklist: Vec::new(), scanned: HashSet::new(), propagated: false, ignored_derived: HashMap::new(), children };
     // seeds
@@ -1310,13 +1472,32 @@ fn late_lints(prog: &Program, tcx: &Tcx, c: &CrateItems, root: u32, refs: &HashM
     let mut unsolved: Vec<DefId> = Vec::new();
     // rustc_passes dead.rs create_and_seed_worklist: a binary's `main` is live. Cargo checks each
     // target as a crate of its own, so every binary of the check seeds its entry: a package's
-    // `src/bin/*.rs` and `[[bin]]` targets beside the one the check is rooted at.
+    // `src/bin/*.rs` and `[[bin]]` targets beside the one the check is rooted at. A binary built
+    // with `--test` too: libtest's harness marks its own `main` #[allow(dead_code)]
+    // (rustc_builtin_macros test_harness.rs EntryPointCleaner), and dead.rs seeds what it allows.
     let main = prog.syms.intern_late("main");
     let ci = &prog.crates[c.krate as usize];
-    let executable = if c.krate == root { is_executable(prog, root) } else { ci.is_bin && !ci.harness && is_executable(prog, c.krate) };
+    let executable = if c.krate == root { is_executable(prog, root) } else { ci.is_bin && is_executable(prog, c.krate) };
     if executable {
         if let Some(m) = prog.lookup_in_container(prog.mods[ci.root_mod as usize].def, main, false) {
             if prog.def(m).kind == DefKind::Fn { s.worklist.push(Work { id: m, propagated: false, own: false }); }
+        }
+    }
+    // dead.rs: a `global_asm!` is live (DefKind::GlobalAsm seeds the worklist), and so is what
+    // its operands name: a `sym` operand's fn or static, a `const` operand's constants
+    for &(file, iid, module) in &prog.global_asms {
+        if prog.mods[module as usize].krate != c.krate { continue; }
+        let ast = &prog.files[file as usize].ast;
+        let ItemKind::Mac(m) = &ast.item(iid).kind else { continue };
+        let m = ast.row(*m);
+        if m.args == NO_MAC_ARGS { continue; }
+        let Some(spec) = ast.mac_arg(m.args).asm.get() else { continue };
+        let mut w = TypeWalker { prog, file, ast, module, params: HashSet::new(), self_def: None, out: Vec::new() };
+        for op in ast.list(spec.ops) {
+            if let Some(x) = op.input.get() { w.const_expr(x); }
+        }
+        for r in w.out {
+            if let Ref::Use(d) = r { s.worklist.push(Work { id: d, propagated: false, own: false }); }
         }
     }
     for &d in reach.defs.iter() {
@@ -1641,7 +1822,7 @@ fn field_ast(prog: &Program, adt: DefId, vi: usize, fi: usize) -> (Vec<Attr>, u3
     match list {
         Some(l) => {
             let f = ast.list(l)[fi];
-            (ast.list(f.attrs).to_vec(), f.name.map_or(f.ty_span.0, |n| n.lo))
+            (ast.list(f.attrs).to_vec(), f.name.get().map_or(f.ty_span.0, |n| n.lo))
         }
         None => (Vec::new(), ast.item(def.item).name.lo),
     }
@@ -1670,6 +1851,5 @@ fn unnameable_types(prog: &Program, own: &[bool], reach: &Reach) {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
-    reset(&BINDING_SITES, Mutex::new(None));
     reset(&BODY_REFS, Mutex::new(None));
 }

@@ -23,7 +23,9 @@
 //!   dev-dependencies are not part of a build;
 //! - targets: `[lib]` (name, path, proc-macro, crate-type, edition), `[[bin]]` plus discovered
 //!   bins (src/main.rs, src/bin/*.rs, src/bin/*/main.rs) unless `autobins = false`, bins whose
-//!   `required-features` are off are skipped; build scripts (`build = ..` or build.rs): a compile
+//!   `required-features` are off are skipped; `[[example]]` plus discovered examples
+//!   (examples/*.rs, examples/*/main.rs) unless `autoexamples = false`, one of which `--example`
+//!   runs as a bin with the package's dev-dependencies (as `cargo run --example` builds it); build scripts (`build = ..` or build.rs): a compile
 //!   unit on the host side (deps = build-dependencies) and a run unit that the lib depends on
 //!   (deps = the compile unit and the run units of dependencies with `links`).
 //! - registry packages neither vendored nor in $CARGO_HOME: fetched from crates.io (registry.rs:
@@ -38,7 +40,7 @@
 //!   checked out). The commit: Cargo.lock's `git+<url>?<ref>#<commit>` source when it lists the
 //!   source (the lockfile wins); else the pin Relax recorded in `<relax dir>/git.lock` (the user's
 //!   Cargo.lock is never written); else the commit the remote's ref names now, recorded there.
-//!   Offline (Cargo's env/config, --offline/--frozen, MAKEPAD_RUN_OFFLINE or no answer), a pinned
+//!   Offline (Cargo's env/config, --offline/--frozen, RELAX_OFFLINE or no answer), a pinned
 //!   commit must be local; an unpinned ref uses the store's newest fetch of it. The package is
 //!   found in the repository as cargo does it: every Cargo.toml of the tree (not under hidden
 //!   folders, a package's `target` folder or a nested repository), the root first, the first
@@ -69,6 +71,10 @@ struct Dep {
     platform: Option<String>,
     /// a path package directory, or None for a registry or git package
     path: Option<String>,
+    /// `path` is the manifest's own `path` key (not the root workspace's [patch] or
+    /// [workspace.dependencies]): what a third-party manifest names is no path package of the
+    /// person's (`Graph::follow`)
+    own_path: bool,
     /// a git package's source
     git: Option<GitSrc>,
     /// the version requirement (`version = ..`; "*" when none)
@@ -204,7 +210,7 @@ fn git_src(st: &TomlTable, at: &str, key: &str) -> Result<Option<GitSrc>, String
         return Err(format!("{}: dependency ({}) specification is ambiguous. Only one of `branch`, `tag` or `rev` is allowed.", at, key));
     }
     if crate::git::fetch::check_url(&url).is_err() {
-        return Err(format!("{}: `{}` is a git dependency on {}: makepad run fetches git repositories over https only", at, key, url));
+        return Err(format!("{}: `{}` is a git dependency on {}: Relax fetches git repositories over https only", at, key, url));
     }
     Ok(Some(GitSrc { url, reference: refs.pop().unwrap_or(GitRef::DefaultBranch) }))
 }
@@ -229,6 +235,8 @@ struct Manifest {
     bins: Vec<Target>,
     /// integration test targets: `[[test]]` plus discovered tests/*.rs, tests/*/main.rs
     tests: Vec<Target>,
+    /// examples: `[[example]]` plus discovered examples/*.rs, examples/*/main.rs
+    examples: Vec<Target>,
     features: BTreeMap<String, Vec<String>>,
     deps: Vec<Dep>,
     /// the keys of a registry package's dev-dependencies, which are not read (never built): a
@@ -264,6 +272,9 @@ impl Manifest {
     }
     fn has_dep(&self, key: &str) -> bool {
         self.deps.iter().any(|d| d.key == key)
+    }
+    fn optional_deps(&self) -> BTreeSet<String> {
+        self.deps.iter().filter(|d| d.optional).map(|d| d.key.clone()).collect()
     }
     fn implicit_features(&self) -> BTreeSet<String> {
         let hidden: BTreeSet<&str> = self.features.values().flatten().filter_map(|v| v.strip_prefix("dep:")).collect();
@@ -484,7 +495,7 @@ impl Workspace {
     /// Is `dir` a member? Cargo's members are the listed ones plus every path dependency of a
     /// member that lies inside the workspace root and is not excluded, transitively, through any
     /// dependency table (normal, dev, build, `[target.*]`; `workspace = true` entries by the
-    /// workspace's own path): apps/commercial names Stage's and Sandbox's crates that way.
+    /// workspace's own path): apps/commercial names two apps' crates that way.
     fn has_member(&self, dir: &str) -> bool {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut todo = self.member_dirs();
@@ -645,7 +656,7 @@ impl Resolver {
     fn inherits_from(&mut self, dir: &str, source: &Source) -> Result<std::rc::Rc<Workspace>, String> {
         if let Source::Git(_) = source {
             let ceiling = self.git.borrow().mounts.iter().find(|m| dir == m.1 || dir.starts_with(&format!("{}/", m.1))).map(|m| m.1.clone());
-            let root = find_inherit_root(dir, ceiling.as_deref())?;
+            let root = find_root_in(dir, ceiling.as_deref())?;
             if let Some(w) = self.owners.get(&root) {
                 return Ok(w.clone());
             }
@@ -653,13 +664,12 @@ impl Resolver {
             self.owners.insert(root, w.clone());
             return Ok(w);
         }
-        if *source == Source::Registry {
+        if *source == Source::Registry || (dir == self.ws.root || dir.starts_with(&format!("{}/", self.ws.root))) && !self.ws.excluded(dir) {
             return Ok(self.ws.clone());
         }
-        // cargo walks up from the package itself: a nearer `[workspace]` wins over the graph's
-        // own, even inside the graph's folder (a checkout of another repository placed or
-        // symlinked under it, as `.sources/makepad`)
-        let root = find_inherit_root(dir, None)?;
+        // a workspace already found that holds `dir` (cargo's ws_roots shortcut)
+        if let Some(w) = self.owners.values().find(|w| dir.starts_with(&format!("{}/", w.root)) && !w.excluded(dir)) { return Ok(w.clone()); }
+        let root = find_root(dir)?;
         if root == self.ws.root { return Ok(self.ws.clone()); }
         if let Some(w) = self.owners.get(&root) { return Ok(w.clone()); }
         let w = std::rc::Rc::new(Workspace::load(&root)?);
@@ -816,6 +826,52 @@ impl Resolver {
                 }
             }
         }
+        // [[example]] + discovered examples (cargo's target discovery: examples/*.rs and
+        // examples/*/main.rs unless `autoexamples = false`, as for tests). A `crate-type` other
+        // than `bin` is a library example: no program to run.
+        let mut examples: Vec<Target> = Vec::new();
+        let explicit_examples = t.get("example").and_then(|b| b.as_array_of_tables()).map(|v| v.to_vec()).unwrap_or_default();
+        for et in &explicit_examples {
+            let Some(ename) = s(et, "name") else { continue };
+            let path = match s(et, "path") {
+                Some(p) => join(&dir, &p),
+                None => {
+                    let cands = [format!("{}/examples/{}.rs", dir, ename), format!("{}/examples/{}/main.rs", dir, ename)];
+                    match cands.iter().find(|c| crate::vfs::is_file(c)) {
+                        Some(p) => p.clone(),
+                        None => continue,
+                    }
+                }
+            };
+            let types = strs(et, "crate-type");
+            let kind = if types.is_empty() || types.iter().any(|t| t == "bin") { vec!["example".to_string()] } else { types };
+            examples.push(Target { name: ename, path, edition: s(et, "edition").unwrap_or_else(|| edition.clone()), kind, required_features: strs(et, "required-features"), harness: b(et, "harness").unwrap_or(true), test: b(et, "test").unwrap_or(false), doctest: false });
+        }
+        let autoexamples = match b(pkg, "autoexamples") {
+            Some(v) => v,
+            None => edition != "2015" || explicit_examples.is_empty(),
+        };
+        if autoexamples {
+            let mut found: Vec<(String, String)> = Vec::new();
+            if let Ok(rd) = crate::vfs::read_dir(format!("{}/examples", dir)) {
+                for (n, is_dir) in rd {
+                    if is_dir {
+                        let p = format!("{}/examples/{}/main.rs", dir, n);
+                        if crate::vfs::is_file(&p) {
+                            found.push((n, p));
+                        }
+                    } else if let Some(stem) = n.strip_suffix(".rs") {
+                        found.push((stem.to_string(), format!("{}/examples/{}", dir, n)));
+                    }
+                }
+            }
+            found.sort();
+            for (n, p) in found {
+                if !examples.iter().any(|x| x.name == n || x.path == p) {
+                    examples.push(Target { name: n, path: p, edition: edition.clone(), kind: vec!["example".to_string()], required_features: Vec::new(), harness: true, test: false, doctest: false });
+                }
+            }
+        }
         // [features]
         let mut features = BTreeMap::new();
         if let Some(f) = table(&t, "features") {
@@ -862,6 +918,7 @@ impl Resolver {
                 let package = s(&st, "package").unwrap_or_else(|| key.clone());
                 let mut git = git_src(&st, &format!("{}/Cargo.toml", dir), key)?;
                 let mut path = s(&st, "path").map(|p| join(&base_dir, &p));
+                let own_path = path.is_some() && !from_ws;
                 // the root workspace's [patch] of the dependency's source (crates-io or its repository)
                 if path.is_none() && (git.is_some() || !st.contains_key("registry")) {
                     let src = git.as_ref().map_or_else(|| "crates-io".to_string(), |g| canonical_url(&g.url));
@@ -883,6 +940,7 @@ impl Resolver {
                     default_features: b(&st, "default-features").or_else(|| b(&st, "default_features")).unwrap_or(true),
                     features: strs(&st, "features"),
                     platform: platform.clone(),
+                    own_path,
                     path,
                     git,
                     req: s(&st, "version").unwrap_or_else(|| "*".to_string()),
@@ -916,7 +974,7 @@ impl Resolver {
             }
         }
         let i = self.manifests.len();
-        self.manifests.push(Manifest { dir: dir.clone(), name, version, edition, links, build, lib, bins, tests, features, deps, dev_keys, proc_macro, source });
+        self.manifests.push(Manifest { dir: dir.clone(), name, version, edition, links, build, lib, bins, tests, examples, features, deps, dev_keys, proc_macro, source });
         self.by_dir.insert(dir, i);
         Ok(i)
     }
@@ -1050,7 +1108,7 @@ impl Resolver {
             let mut g = self.git.borrow_mut();
             let pins = g.pins.get_or_insert_with(BTreeMap::new);
             pins.insert(src.id(), crate::gitstore::hex(commit));
-            let mut text = String::from("# makepad run's pins of git dependencies Cargo.lock does not list: <source id>\t<commit>\n");
+            let mut text = String::from("# Relax's pins of git dependencies Cargo.lock does not list: <source id>\t<commit>\n");
             for (id, c) in pins.iter() {
                 text.push_str(&format!("{}\t{}\n", id, c));
             }
@@ -1138,12 +1196,12 @@ impl Resolver {
 /// (cargo test's order: the lib's unit tests, the bins' unit tests, then the test targets by name).
 /// The package's lib path, bins and integration tests: (name, path, harness) each. Missing
 /// required features skip implicit targets and reject explicitly named targets before any run.
-pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str, flags: &[String], bin_names: &[String], test_names: &[String]) -> Result<(Option<LibTarget>, Vec<(String, String, bool)>, Vec<(String, String, bool)>), String> {
+pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &str, flags: &[String], bin_names: &[String], test_names: &[String], example_names: &[String]) -> Result<TestTargets, String> {
     let o = parse_flags(flags)?;
     let mut r = Resolver::new(sess, dir)?;
     let i = r.find_member(package)?;
     let m = &r.manifests[i];
-    let features = enabled_features(&m.features, &m.implicit_features(), &o).map_err(|e| format!("package `{package}`: {e}"))?;
+    let features = enabled_features(&m.features, &m.implicit_features(), &m.optional_deps(), &o).map_err(|e| format!("package `{package}`: {e}"))?;
     let enabled = |targets: &[Target], names: &[String]| -> Result<Vec<(String, String, bool)>, String> {
         let mut out = Vec::new();
         for t in targets {
@@ -1157,7 +1215,34 @@ pub fn test_targets(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &
     };
     let bins = enabled(&m.bins, bin_names)?;
     let tests = enabled(&m.tests, test_names)?;
-    Ok((m.lib.as_ref().map(|l| LibTarget { path: l.path.clone(), test: l.test, doctest: l.doctest }), bins, tests))
+    let examples = enabled(&m.examples, example_names)?;
+    let every = |targets: &[Target]| -> Result<Vec<(String, String, bool)>, String> {
+        let mut out = Vec::new();
+        for t in targets {
+            if t.enabled(&features, false)? {
+                out.push((t.name.clone(), t.path.clone(), t.harness));
+            }
+        }
+        out.sort();
+        Ok(out)
+    };
+    let all_bins = every(&m.bins)?;
+    let all_examples = every(&m.examples)?;
+    Ok(TestTargets { lib: m.lib.as_ref().map(|l| LibTarget { path: l.path.clone(), test: l.test, doctest: l.doctest }), bins, tests, examples, all_bins, all_examples })
+}
+
+/// A package's targets as `cargo test` selects them (`test_targets`): the lib, and (name, source
+/// path, harness) of each bin, integration test and example with `test = true` or named.
+pub struct TestTargets {
+    pub lib: Option<LibTarget>,
+    pub bins: Vec<(String, String, bool)>,
+    pub tests: Vec<(String, String, bool)>,
+    pub examples: Vec<(String, String, bool)>,
+    /// every bin whose required features are on, `test = false` ones too: what cargo builds
+    /// beside an integration test (its CARGO_BIN_EXE_<name>)
+    pub all_bins: Vec<(String, String, bool)>,
+    /// every example whose required features are on (`--examples`, cargo's "all example targets")
+    pub all_examples: Vec<(String, String, bool)>,
 }
 
 /// The package's lib as `cargo test` sees it.
@@ -1176,16 +1261,19 @@ pub fn package_dir(sess: &std::sync::Arc<crate::Session>, dir: &str, package: &s
     Ok(r.manifests[i].dir.clone())
 }
 
-/// What a package asks of its run's environment: its manifest's
-/// `[package.metadata.makepad.run-env]` table of `NAME = "value"` lines. The loader applies it to every run of the package, from a
-/// checkout or from the stores; a variable the environment already sets wins.
-pub fn run_env(manifest: &str) -> Vec<(String, String)> {
+/// What a package asks of its program's environment: its manifest's
+/// `[package.metadata.relax.run-env]` table of `NAME = "value"` lines. The loader gives it to the
+/// program of every run of the package, from a checkout or from the stores, and to the program
+/// alone (progenv `set_run_env`); a variable the environment already sets wins. A name that
+/// steers Relax or the tools it runs (`run_env_refused`) is an error naming it: a package does
+/// not grant itself `--allow-c` or load a library into the loader.
+pub fn run_env(manifest: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut inside = false;
     for line in manifest.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') {
-            inside = line == "[package.metadata.makepad.run-env]";
+            inside = line == "[package.metadata.relax.run-env]";
             continue;
         }
         if !inside {
@@ -1195,12 +1283,49 @@ pub fn run_env(manifest: &str) -> Vec<(String, String)> {
             let (k, v) = (k.trim(), v.trim());
             if let Some(v) = v.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
                 if !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    if run_env_refused(k) {
+                        return Err(format!("[package.metadata.relax.run-env] sets {k}, which a package may not set: Relax's own settings (RELAX_*, such as RELAX_ALLOW_C: `--allow-c` is the person's) and the names the loader, the C toolchain and cargo read (LD_*, DYLD_*, CC, CXX, AR, LINKER, C/CXX/CPP/LD FLAGS, RUSTC*, RUSTFLAGS, CARGO*)"));
+                    }
                     out.push((k.to_string(), v.to_string()));
                 }
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// The names a package's run-env may not set: Relax's own (`RELAX_*`: its options, such as
+/// `RELAX_ALLOW_C`, and its run's facts), the dynamic loader's (`LD_*`, `DYLD_*`), the C
+/// toolchain's (`CC`, `CXX`, `AR`, `LINKER`, the C flags, and their per-target forms such as
+/// `CC_<target>` and `TARGET_CC`), cargo's and rustc's (`CARGO*`, `RUSTC*`, `RUSTFLAGS`,
+/// `RUSTDOC*`). Without case: a
+/// Windows name has none.
+pub fn run_env_refused(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    let tool = |t: &str| n == t || n.starts_with(&format!("{t}_")) || n.ends_with(&format!("_{t}"));
+    ["RELAX_", "LD_", "DYLD_", "RUSTC", "RUSTFLAGS", "RUSTDOC", "CARGO"].iter().any(|p| n.starts_with(p))
+        || ["CC", "CXX", "AR", "LINKER", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"].iter().any(|t| tool(t))
+}
+
+/// What a confined build script's `rustc-env` says of a refused name (`script_env_refused`).
+pub const SCRIPT_ENV_PRINCIPLE: &str = "a third-party build script sets variables for the program, never for Relax, makepad, the loader or the tools they start";
+
+/// The names a confined build script's `rustc-env` may not set. The value lands in the host
+/// process, which the program shares with Relax, makepad, the dynamic loader and every tool they
+/// start (a rebuild's scripts, a self-exec run, git, ssh, a linker): a third-party script sets
+/// variables for the program, never for them (SCRIPT_ENV_PRINCIPLE). So every name that steers
+/// one of them is refused: `run_env_refused`'s, the program search (`PATH`, the Windows loader's
+/// too), the loader's (`LD_*`, `DYLD_*`), Relax's and makepad's (`RELAX_*`, `MAKEPAD_*`), cargo's,
+/// rustc's and rustup's (`CARGO*`, `RUSTC*`, `RUSTFLAGS`, `RUSTDOCFLAGS`, `RUSTUP_*`), git's and
+/// ssh's (`GIT_*`, `SSH_*`), the home and temp folders (`HOME`, `TMPDIR`, `TMP`, `TEMP`,
+/// `XDG_*`), the shell (`SHELL`) and the network's route (`HTTP_PROXY`, `HTTPS_PROXY`,
+/// `ALL_PROXY`, `NO_PROXY`). Without case: a Windows name has none, and the proxies are read in
+/// either.
+pub fn script_env_refused(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    run_env_refused(name)
+        || ["LD_", "DYLD_", "RELAX_", "MAKEPAD_", "CARGO", "RUSTC", "RUSTUP_", "GIT_", "SSH_", "XDG_"].iter().any(|p| n.starts_with(p))
+        || ["PATH", "RUSTFLAGS", "RUSTDOCFLAGS", "HOME", "TMPDIR", "TMP", "TEMP", "SHELL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"].contains(&n.as_str())
 }
 
 /// The folders of a repository's tree (a commit's path table) whose Cargo.toml cargo's package
@@ -1292,7 +1417,7 @@ fn vendor_dir(dir: &str) -> Result<Option<(Vendor, String)>, String> {
     }
     match s(src, "directory") {
         Some(p) => Ok(Some((Vendor::Dir(join(d, &p)), config))),
-        None => Err(format!("{}/.cargo: [source.{}] is neither a `directory` nor a `git` source: makepad run reads vendored crates and git repositories only", d, with)),
+        None => Err(format!("{}/.cargo: [source.{}] is neither a `directory` nor a `git` source: Relax reads vendored crates and git repositories only", d, with)),
     }
 }
 
@@ -1323,14 +1448,14 @@ pub fn target_dir(dir: &str) -> Result<String, String> {
 }
 
 pub fn find_root(dir: &str) -> Result<String, String> {
-    find_root_in(dir, None, true)
+    find_root_in(dir, None)
 }
 
 /// The cargo config files for a start folder, in cargo's order (GlobalContext::walk_tree): the
 /// `.cargo/config` (else `.cargo/config.toml`) of `dir` and of every folder above it, then
 /// $CARGO_HOME's when none of those is it. Each with the folder its relative paths resolve
 /// against: the one holding that `.cargo` (the folder above CARGO_HOME for its config).
-fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
+pub fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
     let in_dir = |d: &str| ["config", "config.toml"].iter().map(|f| format!("{}/{}", d, f)).find(|p| crate::vfs::is_file(p));
     let mut files: Vec<(String, String)> = Vec::new();
     let mut cur = Some(normalize(dir));
@@ -1354,8 +1479,11 @@ fn cargo_config_files(dir: &str) -> Vec<(String, String)> {
 /// field, and a string in one file against a table in another is an error. A `relative` value is
 /// joined to the folder of the file its `value` comes from (Path::join: unnormalized, an absolute
 /// value stands). An entry applies when it is `force`d or the process environment lacks the
-/// variable. CARGO_HOME, RUSTUP_HOME and RUSTUP_TOOLCHAIN may not be set there.
-pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
+/// variable. CARGO_HOME, RUSTUP_HOME and RUSTUP_TOOLCHAIN may not be set there. Nor are Relax's
+/// own names (`RELAX_*`, progenv `reserved`): a repository's configuration does not set what a
+/// Relax host or a build script's host reads, such as its trust settings; each is left out and
+/// named in the second list (`<file>: [env] `<name>``), for the run to say so.
+pub fn cargo_env(dir: &str) -> Result<(Vec<(String, String)>, Vec<String>), String> {
     // a plain string, or the table's (value and its file's folder, force, relative)
     enum Entry { Plain(String), Options(Option<(String, String)>, Option<bool>, Option<bool>) }
     let mut env: BTreeMap<String, (Entry, String)> = BTreeMap::new();
@@ -1394,10 +1522,14 @@ pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
             }
         }
     }
-    let mut out = Vec::new();
+    let (mut out, mut ignored) = (Vec::new(), Vec::new());
     for (k, (e, path)) in env {
         if ["CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"].contains(&k.as_str()) {
             return Err(format!("{}: setting the `{}` environment variable is not supported in the `[env]` configuration table", path, k));
+        }
+        if crate::progenv::reserved(k.as_bytes()) {
+            ignored.push(format!("{}: [env] `{}`", path, k));
+            continue;
         }
         let (value, force) = match e {
             Entry::Plain(value) => (value, false),
@@ -1409,7 +1541,280 @@ pub fn cargo_env(dir: &str) -> Result<Vec<(String, String)>, String> {
         };
         if force || std::env::var_os(&k).is_none() { out.push((k, value)); }
     }
-    Ok(out)
+    Ok((out, ignored))
+}
+
+/// What a cargo profile sets that changes what a program's code does: `debug-assertions`
+/// (cfg(debug_assertions): `debug_assert!`, and the items and tests under the cfg) and
+/// `overflow-checks` (cfg(overflow_checks), and the overflow panics of arithmetic, shifts and
+/// negation). rustc sets each cfg when its check is on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProfileChecks {
+    pub debug_assertions: bool,
+    pub overflow_checks: bool,
+}
+
+impl ProfileChecks {
+    /// The cfg names these settings turn on (rustc_session config.rs default_configuration).
+    pub fn cfgs(self) -> impl Iterator<Item = &'static str> {
+        [(self.debug_assertions, "debug_assertions"), (self.overflow_checks, "overflow_checks")].into_iter().filter_map(|(on, name)| on.then_some(name))
+    }
+}
+
+/// What a package's build script is told of the profile it builds for, as cargo tells it
+/// (custom_build.rs): PROFILE (`release` when the profile is `release` or inherits it, else
+/// `debug`), OPT_LEVEL and DEBUG (whether debug info is on) as the package's profile sets them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ScriptProfile {
+    pub release: bool,
+    /// `0`-`3`, `s` or `z`
+    pub opt_level: char,
+    pub debuginfo: bool,
+}
+
+impl ScriptProfile {
+    /// A `relax run`'s: it builds as the release profile does (no debug assertions or overflow
+    /// checks), whatever `cargo run`'s dev profile would.
+    pub const RUN: ScriptProfile = ScriptProfile { release: true, opt_level: '3', debuginfo: false };
+
+    pub fn env(self) -> [(&'static str, String); 3] {
+        [("PROFILE", if self.release { "release" } else { "debug" }.to_string()), ("OPT_LEVEL", self.opt_level.to_string()), ("DEBUG", self.debuginfo.to_string())]
+    }
+}
+
+/// The settings as one profile table, or one package's override in it, sets them.
+#[derive(Clone, Copy, Default, Debug)]
+struct ChecksSet {
+    debug_assertions: Option<bool>,
+    overflow_checks: Option<bool>,
+    opt_level: Option<char>,
+    debuginfo: Option<bool>,
+}
+
+impl ChecksSet {
+    /// `self`, with what it leaves unset taken from `lower`.
+    fn over(self, lower: ChecksSet) -> ChecksSet {
+        ChecksSet {
+            debug_assertions: self.debug_assertions.or(lower.debug_assertions),
+            overflow_checks: self.overflow_checks.or(lower.overflow_checks),
+            opt_level: self.opt_level.or(lower.opt_level),
+            debuginfo: self.debuginfo.or(lower.debuginfo),
+        }
+    }
+
+    fn is_empty(self) -> bool {
+        self.debug_assertions.is_none() && self.overflow_checks.is_none() && self.opt_level.is_none() && self.debuginfo.is_none()
+    }
+
+    fn apply(self, to: ProfileChecks) -> ProfileChecks {
+        ProfileChecks { debug_assertions: self.debug_assertions.unwrap_or(to.debug_assertions), overflow_checks: self.overflow_checks.unwrap_or(to.overflow_checks) }
+    }
+
+    fn apply_script(self, to: ScriptProfile) -> ScriptProfile {
+        ScriptProfile { release: to.release, opt_level: self.opt_level.unwrap_or(to.opt_level), debuginfo: self.debuginfo.unwrap_or(to.debuginfo) }
+    }
+
+    /// The settings of a profile's table (or a package's table in it) in the file `path`.
+    fn read(t: &TomlTable, path: &str, what: &str) -> Result<ChecksSet, String> {
+        let flag = |k: &str| match t.get(k) {
+            None => Ok(None),
+            Some(Toml::Bool(x, _)) => Ok(Some(*x)),
+            Some(_) => Err(format!("{path}: {what} `{k}` is not a boolean")),
+        };
+        let opt_level = match t.get("opt-level") {
+            None => None,
+            Some(Toml::Num(n, _)) if n.fract() == 0.0 && (0.0..=3.0).contains(n) => Some(char::from(b'0' + *n as u8)),
+            Some(Toml::Str(v, _)) => Some(opt_level(v).ok_or_else(|| format!("{path}: {what} `opt-level` `{v}` is none of 0-3, s, z"))?),
+            Some(_) => return Err(format!("{path}: {what} `opt-level` is none of 0-3, s, z")),
+        };
+        let debuginfo = match t.get("debug") {
+            None => None,
+            Some(Toml::Bool(x, _)) => Some(*x),
+            Some(Toml::Num(n, _)) if n.fract() == 0.0 && (0.0..=2.0).contains(n) => Some(*n != 0.0),
+            Some(Toml::Str(v, _)) => Some(debuginfo(v).ok_or_else(|| format!("{path}: {what} `debug` `{v}` is no debug info level"))?),
+            Some(_) => return Err(format!("{path}: {what} `debug` is no debug info level")),
+        };
+        Ok(ChecksSet { debug_assertions: flag("debug-assertions")?, overflow_checks: flag("overflow-checks")?, opt_level, debuginfo })
+    }
+}
+
+/// A profile's `opt-level` as written (`3`, `"s"`).
+fn opt_level(v: &str) -> Option<char> {
+    matches!(v, "0" | "1" | "2" | "3" | "s" | "z").then(|| v.chars().next()).flatten()
+}
+
+/// Whether a profile's `debug` as written turns debug info on (cargo DebugInfo::is_turned_on).
+fn debuginfo(v: &str) -> Option<bool> {
+    match v {
+        "false" | "0" | "none" => Some(false),
+        "true" | "1" | "2" | "line-directives-only" | "line-tables-only" | "limited" | "full" => Some(true),
+        _ => None,
+    }
+}
+
+/// A cargo profile's checks for the packages of a workspace, as cargo resolves the profile
+/// (core/profiles.rs): the root profile's own values (dev: both checks on; release: both off),
+/// under each profile of the `inherits` chain up to the named one (`test` and `doc` inherit
+/// `dev`, `bench` `release`, another profile names its parent), the profile nearer the named one
+/// first. A profile's value is CARGO_PROFILE_<NAME>_<KEY>'s, else the first cargo config file's
+/// `[profile.<name>]` that sets it (the nearest first), else the workspace root manifest's. A
+/// host unit (a build script, a proc macro and what they depend on) then takes the chain's
+/// `build-override` (CARGO_PROFILE_<NAME>_BUILD_OVERRIDE_<KEY> first), a package the chain's
+/// `package."*"` overrides when it is no workspace member, then its own `package.<name>` (or
+/// `<name>@<version>`) ones.
+pub struct Profile {
+    root: String,
+    checks: ProfileChecks,
+    script: ScriptProfile,
+    build: ChecksSet,
+    any: ChecksSet,
+    /// (package name, version or any, overrides)
+    named: Vec<(String, Option<String>, ChecksSet)>,
+    /// the workspace, for whether a package is a member (`package."*"`): read when first asked
+    ws: std::cell::OnceCell<Option<Workspace>>,
+}
+
+/// The profile `name` of the workspace that the start folder `dir` belongs to (find_root).
+pub fn profile(dir: &str, name: &str) -> Result<Profile, String> {
+    let root = find_root(dir)?;
+    let manifest = format!("{}/Cargo.toml", root);
+    // the `[profile]` tables, the highest precedence first: the config files', then the manifest's
+    let mut files: Vec<(String, TomlTable)> = Vec::new();
+    for (_, path) in cargo_config_files(dir) {
+        if let Some(p) = table(&read_toml(&path)?, "profile") {
+            files.push((path, p.clone()));
+        }
+    }
+    if let Some(p) = table(&read_toml(&manifest)?, "profile") {
+        files.push((manifest, p.clone()));
+    }
+    let env = |p: &str, key: &str| {
+        let var = format!("CARGO_PROFILE_{}_{}", p.to_uppercase().replace('-', "_"), key);
+        std::env::var(&var).ok().map(|v| (var, v))
+    };
+    let env_flag = |p: &str, key: &str| match env(p, key) {
+        None => Ok(None),
+        Some((_, v)) if v == "true" => Ok(Some(true)),
+        Some((_, v)) if v == "false" => Ok(Some(false)),
+        Some((var, v)) => Err(format!("{var}: `{v}` is not a boolean")),
+    };
+    // the inherits chain, the named profile first
+    let env_value = |p: &str, key: &str, value: fn(&str) -> Option<char>| match env(p, key) {
+        None => Ok(None),
+        Some((var, v)) => value(&v).map(Some).ok_or_else(|| format!("{var}: `{v}` is none of 0-3, s, z")),
+    };
+    let env_debug = |p: &str, key: &str| match env(p, key) {
+        None => Ok(None),
+        Some((var, v)) => debuginfo(&v).map(Some).ok_or_else(|| format!("{var}: `{v}` is no debug info level")),
+    };
+    let mut chain = vec![name.to_string()];
+    loop {
+        let p = chain[chain.len() - 1].clone();
+        if p == "dev" || p == "release" {
+            break;
+        }
+        let set = env(&p, "INHERITS").map(|(_, v)| v).or_else(|| files.iter().find_map(|(_, t)| table(t, &p).and_then(|t| s(t, "inherits"))));
+        let parent = match (set, p.as_str()) {
+            (Some(parent), _) => parent,
+            (None, "test" | "doc") => "dev".to_string(),
+            (None, "bench") => "release".to_string(),
+            (None, _) if files.iter().any(|(_, t)| t.contains_key(&p)) => {
+                return Err(format!("profile `{p}` is missing an `inherits` directive (`inherits` is required for all profiles except `dev` or `release`)"));
+            }
+            (None, _) => return Err(format!("profile `{p}` is not defined")),
+        };
+        if chain.contains(&parent) {
+            return Err(format!("profile inheritance loop detected with profile `{p}` inheriting `{parent}`"));
+        }
+        chain.push(parent);
+    }
+    let on = chain[chain.len() - 1] == "dev";
+    let (mut level, mut build, mut any) = (ChecksSet::default(), ChecksSet::default(), ChecksSet::default());
+    let mut named: Vec<(String, Option<String>, ChecksSet)> = Vec::new();
+    for p in &chain {
+        let mut here = ChecksSet { debug_assertions: env_flag(p, "DEBUG_ASSERTIONS")?, overflow_checks: env_flag(p, "OVERFLOW_CHECKS")?, opt_level: env_value(p, "OPT_LEVEL", opt_level)?, debuginfo: env_debug(p, "DEBUG")? };
+        let mut host = ChecksSet {
+            debug_assertions: env_flag(p, "BUILD_OVERRIDE_DEBUG_ASSERTIONS")?,
+            overflow_checks: env_flag(p, "BUILD_OVERRIDE_OVERFLOW_CHECKS")?,
+            opt_level: env_value(p, "BUILD_OVERRIDE_OPT_LEVEL", opt_level)?,
+            debuginfo: env_debug(p, "BUILD_OVERRIDE_DEBUG")?,
+        };
+        for (path, t) in &files {
+            let Some(pt) = table(t, p) else { continue };
+            here = here.over(ChecksSet::read(pt, path, &format!("[profile.{p}]"))?);
+            if let Some(b) = table(pt, "build-override") {
+                host = host.over(ChecksSet::read(b, path, &format!("[profile.{p}.build-override]"))?);
+            }
+            for (spec, v) in table(pt, "package").into_iter().flatten() {
+                let Some(v) = v.as_table() else { continue };
+                let set = ChecksSet::read(v, path, &format!("[profile.{p}.package.\"{spec}\"]"))?;
+                if spec == "*" {
+                    any = any.over(set);
+                    continue;
+                }
+                // `<name>`, `<name>@<version>`, or a source URL's `#<name>@<version>`
+                let spec = spec.rsplit('#').next().unwrap_or(spec);
+                let (n, v) = match spec.split_once('@') {
+                    Some((n, v)) => (n.to_string(), Some(v.to_string())),
+                    None => (spec.to_string(), None),
+                };
+                match named.iter_mut().find(|x| x.0 == n && x.1 == v) {
+                    Some(x) => x.2 = x.2.over(set),
+                    None => named.push((n, v, set)),
+                }
+            }
+        }
+        level = level.over(here);
+        build = build.over(host);
+    }
+    // dev: no optimisation, debug info; release: opt-level 3, none. A host unit's build-override
+    // defaults to opt-level 0 and no debug info (cargo profiles.rs default_build_override)
+    let script = level.apply_script(if on { ScriptProfile { release: false, opt_level: '0', debuginfo: true } } else { ScriptProfile::RUN });
+    let build = build.over(ChecksSet { opt_level: Some('0'), debuginfo: Some(false), ..ChecksSet::default() });
+    Ok(Profile { root, checks: level.apply(ProfileChecks { debug_assertions: on, overflow_checks: on }), script, build, any, named, ws: std::cell::OnceCell::new() })
+}
+
+impl Profile {
+    /// The checks of the package `name` `version` in the folder `dir`; `registry`: a registry or
+    /// git package (never a member); `host`: its unit for the host (build-override).
+    pub fn checks(&self, dir: &str, name: &str, version: &str, registry: bool, host: bool) -> ProfileChecks {
+        let mut c = self.checks;
+        if host {
+            c = self.build.apply(c);
+        }
+        if (self.any.debug_assertions.is_some() || self.any.overflow_checks.is_some()) && (registry || !self.member(dir)) {
+            c = self.any.apply(c);
+        }
+        for (n, v, set) in &self.named {
+            if n == name && v.as_deref().is_none_or(|v| v == version) {
+                c = set.apply(c);
+            }
+        }
+        c
+    }
+
+    /// What the build script of the package `name` `version` in `dir` is told of the profile
+    /// (`registry` and `host` as for `checks`: a host unit's profile is its build-override's).
+    pub fn script(&self, dir: &str, name: &str, version: &str, registry: bool, host: bool) -> ScriptProfile {
+        let mut s = self.script;
+        if host {
+            s = self.build.apply_script(s);
+        }
+        if !self.any.is_empty() && (registry || !self.member(dir)) {
+            s = self.any.apply_script(s);
+        }
+        for (n, v, set) in &self.named {
+            if n == name && v.as_deref().is_none_or(|v| v == version) {
+                s = set.apply_script(s);
+            }
+        }
+        s
+    }
+
+    fn member(&self, dir: &str) -> bool {
+        let dir = normalize(dir);
+        self.ws.get_or_init(|| Workspace::load(&self.root).ok()).as_ref().is_some_and(|ws| ws.has_member(&dir) && !ws.excluded(&dir))
+    }
 }
 
 /// What `file!()` names a source file relative to, as cargo decides it (`path_args`): a file of a
@@ -1442,18 +1847,8 @@ impl FileRoot {
     }
 }
 
-/// The workspace a dependency at `dir` inherits `workspace = true` fields from, as cargo's
-/// find_workspace_root has it: the nearest `[workspace]` at or above its manifest that does not
-/// exclude it, listed in `members` or not (makepad's libs/micro_proc_macro is no member of the
-/// makepad workspace, yet takes `relax-lex` from its `[workspace.dependencies]`). `find_root`
-/// keeps a start folder outside every workspace's members standalone instead.
-fn find_inherit_root(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
-    find_root_in(dir, ceiling, false)
-}
-
-/// `find_root` looking no higher than `ceiling` (a mounted repository's root); `members_only`:
-/// a workspace that does not list the package is passed over (see `find_inherit_root`).
-fn find_root_in(dir: &str, ceiling: Option<&str>, members_only: bool) -> Result<String, String> {
+/// `find_root` looking no higher than `ceiling` (a mounted repository's root).
+fn find_root_in(dir: &str, ceiling: Option<&str>) -> Result<String, String> {
     let up = |d: &str| if ceiling == Some(d) { None } else { parent(d) };
     let start = normalize(dir);
     let mut cur = Some(start.clone());
@@ -1470,19 +1865,21 @@ fn find_root_in(dir: &str, ceiling: Option<&str>, members_only: bool) -> Result<
     while let Some(d) = cur {
         let path = format!("{}/Cargo.toml", d);
         if crate::vfs::is_file(&path) {
-            if let Ok(t) = read_toml(&path) {
-                if t.contains_key("workspace") {
-                    if d == current {
+            // a manifest on the way up that does not parse is the answer, as cargo's workspace
+            // search reads each one (find_workspace_root_with_loader): skipped, its members were
+            // resolved as standalone packages and named a missing [workspace.dependencies] entry
+            let t = read_toml(&path)?;
+            if t.contains_key("workspace") {
+                if d == current {
+                    return Ok(d);
+                }
+                if let Ok(ws) = Workspace::load(&d) {
+                    if !ws.excluded(&current) && ws.has_member(&current) {
                         return Ok(d);
                     }
-                    if let Ok(ws) = Workspace::load(&d) {
-                        if !ws.excluded(&current) && (!members_only || ws.has_member(&current)) {
-                            return Ok(d);
-                        }
-                    }
-                    // a workspace that does not hold this package: keep looking above (cargo
-                    // would refuse; a standalone package is what is meant)
                 }
+                // a workspace that does not hold this package: keep looking above (cargo
+                // would refuse; a standalone package is what is meant)
             }
         }
         cur = up(&d);
@@ -1597,9 +1994,10 @@ fn feature_requests(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSe
 }
 
 /// Package-local feature closure for target selection, without resolving or fetching dependencies.
-/// Dependency features are not local features; a strong `dep/feature` can enable an implicit
-/// optional-dependency feature, while `dep:dep` and `dep?/feature` cannot.
-fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSet<String>, o: &Options) -> Result<BTreeSet<String>, String> {
+/// Dependency features are not local features; a strong `dep/feature` on an optional dependency
+/// (a key of `optional`) enables the feature named `dep` when there is one, the implicit one or an
+/// explicit `dep = ["dep:dep"]` (as Feat::run), while `dep:dep` and `dep?/feature` do not.
+fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSet<String>, optional: &BTreeSet<String>, o: &Options) -> Result<BTreeSet<String>, String> {
     let mut enabled = BTreeSet::new();
     let mut work = feature_requests(features, implicit, o);
     while let Some(req) = work.pop() {
@@ -1615,7 +2013,7 @@ fn enabled_features(features: &BTreeMap<String, Vec<String>>, implicit: &BTreeSe
                     return Err(format!("has no feature `{f}`"));
                 }
             }
-            Req::DepFeature(d, _, false) if implicit.contains(&d) => work.push(Req::Feature(d)),
+            Req::DepFeature(d, _, false) if implicit.contains(&d) || (optional.contains(&d) && features.contains_key(&d)) => work.push(Req::Feature(d)),
             _ => {}
         }
     }
@@ -1628,6 +2026,8 @@ pub struct Options {
     pub all_features: bool,
     pub features: Vec<String>,
     pub bin: Option<String>,
+    /// `--example <name>`: that example is the program (a bin built with the dev-dependencies)
+    pub example: Option<String>,
     /// `--lib`, `--bins`, `--bin <name>`, `--tests`, `--test <name>` (cargo test's target
     /// selection): the graph of the package's test harness. The lib's unit tests are a program of
     /// their own (the lib is cfg(test) there and plain beside the bins' unit tests and the
@@ -1712,17 +2112,22 @@ pub enum TestSel {
     Lib,
     /// these bin targets built with `--test` and these integration test targets, beside the plain
     /// lib: one graph, as `cargo test` builds them in one go with one feature resolution (`makepad
-    /// test` runs each target out of it in a process of its own, run.rs `--subject`). None: no
-    /// target of that kind; empty: all of them.
-    Targets { bins: Option<Vec<String>>, tests: Option<Vec<String>> },
+    /// test` runs each target out of it in a process of its own, run.rs `--subject`), and these
+    /// examples built with `--test` (`--examples`; cargo tests an example with `test = true` by
+    /// default). None: no target of that kind; empty: all of them.
+    Targets { bins: Option<Vec<String>>, tests: Option<Vec<String>>, examples: Option<Vec<String>> },
 }
 
 pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
-    let mut o = Options { offline: false, no_default_features: false, all_features: false, features: Vec::new(), bin: None, test: None, check: None };
+    let mut o = Options { offline: false, no_default_features: false, all_features: false, features: Vec::new(), bin: None, example: None, test: None, check: None };
     let mut lib = false;
     let mut bins = false;
     let mut bin_names: Vec<String> = Vec::new();
     let mut tests: Option<Vec<String>> = None;
+    // `--examples` (with the names that follow it as `--example <name>`, as `makepad test` writes
+    // a test graph): examples built with `--test`; `--example <name>` alone: the one example run
+    let mut examples = false;
+    let mut example_names: Vec<String> = Vec::new();
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
@@ -1739,6 +2144,8 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
             }
             "--bins" => bins = true,
             "--bin" => bin_names.push(value(&mut i)?),
+            "--example" => example_names.push(value(&mut i)?),
+            "--examples" => examples = true,
             "--lib" => lib = true,
             "--tests" => {
                 tests.get_or_insert_with(Vec::new);
@@ -1754,14 +2161,26 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
                     o.features.extend(v.split(|c: char| c == ',' || c.is_whitespace()).filter(|x| !x.is_empty()).map(str::to_string));
                 } else if let Some(v) = f.strip_prefix("--bin=") {
                     bin_names.push(v.to_string());
+                } else if let Some(v) = f.strip_prefix("--example=") {
+                    example_names.push(v.to_string());
                 } else if let Some(v) = f.strip_prefix("--test=") {
                     tests.get_or_insert_with(Vec::new).push(v.to_string());
                 } else {
-                    return Err(format!("unit graph: flag `{}` is not supported by makepad run's resolver", f));
+                    return Err(format!("unit graph: flag `{}` is not supported by Relax's resolver", f));
                 }
             }
         }
         i += 1;
+    }
+    let examples = if examples {
+        Some(example_names)
+    } else {
+        o.example = example_names.into_iter().last();
+        None
+    };
+    // (cargo run takes one target: a bin or an example)
+    if o.example.is_some() && (bins || !bin_names.is_empty() || lib || tests.is_some()) {
+        return Err("unit graph: `--example` runs one example; it takes no other target flag (--bin, --bins, --lib, --tests, --test)".to_string());
     }
     let bins = if bins {
         Some(bin_names)
@@ -1769,10 +2188,10 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
         o.bin = bin_names.into_iter().last();
         None
     };
-    o.test = match (lib, bins, tests) {
-        (true, None, None) => Some(TestSel::Lib),
-        (false, None, None) => None,
-        (false, bins, tests) => Some(TestSel::Targets { bins, tests }),
+    o.test = match (lib, bins, tests, examples) {
+        (true, None, None, None) => Some(TestSel::Lib),
+        (false, None, None, None) => None,
+        (false, bins, tests, examples) => Some(TestSel::Targets { bins, tests, examples }),
         _ => return Err("unit graph: the lib's unit tests (--lib) are a test program of their own; select them alone".to_string()),
     };
     Ok(o)
@@ -1829,7 +2248,22 @@ impl<'a> Feat<'a> {
                 return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): it {}", m.name, m.version, c, relax_session::options::C_GATE));
             }
         }
-        let (dir, source) = self.r.dep_dir(d)?;
+        let (dir, mut source) = self.r.dep_dir(d)?;
+        // a path dependency a third-party manifest names is third-party too: a registry package's
+        // in its vendored folder is a registry package (its build script and macros confined as
+        // its owner's are); one anywhere else, or a git package's outside its repository (a mount
+        // keeps the ones inside git: dep_dir), would make a folder of this machine the person's
+        // own package, unconfined, so it is an error
+        let owner = &self.r.manifests[k.0];
+        if d.own_path && source == Source::Path && owner.source != Source::Path {
+            let vendored = matches!(&self.r.vendor, Some((Vendor::Dir(v), _)) if dir.starts_with(&format!("{}/", v)));
+            if owner.source != Source::Registry || !vendored {
+                return Err(format!("{} package `{}` {} names the path dependency `{}` ({}), outside its {}: a third-party package's path dependency is never a package of the person's",
+                    if owner.source == Source::Registry { "registry" } else { "git" }, owner.name, owner.version, d.key, dir,
+                    if owner.source == Source::Registry { "vendored folder" } else { "repository" }));
+            }
+            source = Source::Registry;
+        }
         let t = self.r.load(&dir, source)?;
         if self.r.manifests[t].name != d.package {
             return Err(format!("{}/Cargo.toml: dependency `{}` names package `{}`, but {} holds `{}`", self.r.manifests[k.0].dir, d.key, d.package, dir, self.r.manifests[t].name));
@@ -1878,8 +2312,8 @@ impl<'a> Feat<'a> {
             let m = &self.r.manifests[k.0];
             let mname = m.name.clone();
             let fvals = if let Req::Feature(f) = &req { m.features.get(f).cloned() } else { None };
-            let (opt, syntax, has) = match &req {
-                Req::Feature(x) | Req::Dep(x) | Req::DepFeature(x, _, _) => (m.is_optional_dep(x), m.dep_syntax(x), m.has_dep(x)),
+            let (opt, syntax, has, named) = match &req {
+                Req::Feature(x) | Req::Dep(x) | Req::DepFeature(x, _, _) => (m.is_optional_dep(x), m.dep_syntax(x), m.has_dep(x), m.features.contains_key(x)),
             };
             match req {
                 Req::Feature(f) => {
@@ -1912,7 +2346,12 @@ impl<'a> Feat<'a> {
                         return Err(format!("package `{}`: feature value `{}/{}` names no dependency", mname, d, f));
                     }
                     if !weak && opt {
-                        if !syntax {
+                        // cargo features.rs activate_dep_feature: a strong `x/f` turns optional
+                        // dependency x on and, for compatibility, the feature named x when the
+                        // package has one: an explicit `x = ["dep:x"]` (num-rational's `num-bigint`,
+                        // which its `num-bigint-std = ["num-bigint/std"]` turns on) or the implicit
+                        // one no `dep:x` hides (cargo#10788)
+                        if named || !syntax {
                             self.work.push((k, Req::Feature(d.clone())));
                         }
                         self.switch_dep(k, &d)?;
@@ -1941,6 +2380,10 @@ pub struct GraphUnit {
     pub edition: String,
     /// a host-side unit (build-dependency / proc-macro side)
     pub host: bool,
+    /// the profile's checks the unit is built with, when its graph names them (`profile`'s
+    /// `debug_assertions` and `overflow_checks`: a build script's run, which its parent gives its
+    /// host checks, front unitgraph.rs script_units); else the run's profile decides (run.rs)
+    pub checks: Option<ProfileChecks>,
     /// build | run-custom-build
     pub mode: String,
     /// built with rustc's `--test`: libtest's generated main replaces the crate's own
@@ -1960,6 +2403,21 @@ pub struct Units {
     pub roots: Vec<usize>,
     /// binary target names of the root package when building integration tests (`CARGO_BIN_EXE_<name>`)
     pub bins: Vec<String>,
+    /// a build script's units: its parent confined its run, with these folders (`relax_script`)
+    pub script: Option<ScriptFolders>,
+}
+
+/// The folders of a confined build script's run, as its parent names them (relax-front
+/// unitgraph.rs `script_units`): a store's or a folder mount's path stays virtual. OUT_DIR, the
+/// one it writes, is its environment's.
+#[derive(Clone, Debug, Default)]
+pub struct ScriptFolders {
+    /// its package's source root, which it reads
+    pub read: Vec<String>,
+    /// folders it never reaches (the run's target folder, Relax's dir)
+    pub excluded: Vec<String>,
+    /// its current folder at the start (its package's)
+    pub cwd: String,
 }
 
 impl Units {
@@ -1983,6 +2441,10 @@ impl Units {
                     src_path: s(t.and_then(|t| t.get("src_path"))),
                     edition: s(t.and_then(|t| t.get("edition"))),
                     host: matches!(u.get("relax_host"), Some(crate::json::Json::Bool(true))),
+                    checks: u.get("profile").and_then(|p| match (p.get("debug_assertions"), p.get("overflow_checks")) {
+                        (Some(crate::json::Json::Bool(d)), Some(crate::json::Json::Bool(o))) => Some(ProfileChecks { debug_assertions: *d, overflow_checks: *o }),
+                        _ => None,
+                    }),
                     mode: s(u.get("mode")),
                     harness: u.get("mode").is_some_and(|m| m.str() == "test"),
                     sysroot: false,
@@ -2003,7 +2465,8 @@ impl Units {
             pending.extend(units[i].deps.iter().map(|d| d.0));
         }
         let roots = j.get("roots").map(|r| r.arr().iter().map(|x| x.num() as usize).collect()).unwrap_or_default();
-        Ok(Units { units, roots, bins: Vec::new() })
+        let script = j.get("relax_script").map(|r| ScriptFolders { read: list(r.get("read")), excluded: list(r.get("excluded")), cwd: s(r.get("cwd")) });
+        Ok(Units { units, roots, bins: Vec::new(), script })
     }
 }
 
@@ -2032,7 +2495,7 @@ pub fn package_meta_env(dir: &str) -> Vec<(String, String)> {
         if let Some(Toml::Table(x)) = &v {
             if b(x, "workspace") == Some(true) {
                 let w = ws.get_or_insert_with(|| {
-                    find_inherit_root(dir, None).ok().and_then(|r| read_toml(&format!("{}/Cargo.toml", r)).ok()).and_then(|t| table(&t, "workspace").and_then(|w| table(w, "package")).cloned()).unwrap_or_default()
+                    find_root(dir).ok().and_then(|r| read_toml(&format!("{}/Cargo.toml", r)).ok()).and_then(|t| table(&t, "workspace").and_then(|w| table(w, "package")).cloned()).unwrap_or_default()
                 });
                 v = w.get(key).cloned();
             }
@@ -2046,6 +2509,16 @@ pub fn package_meta_env(dir: &str) -> Vec<(String, String)> {
         out.push((env.to_string(), text));
     }
     out
+}
+
+/// The package's `links` value: cargo gives it to the package's build script alone, as
+/// CARGO_MANIFEST_LINKS (custom_build.rs; its crates and targets do not see it).
+pub fn package_links(dir: &str) -> Option<String> {
+    let t = read_toml(&format!("{}/Cargo.toml", dir)).ok()?;
+    match table(&t, "package")?.get("links")? {
+        Toml::Str(l, _) => Some(l.clone()),
+        _ => None,
+    }
 }
 
 /// The cargo metadata subset used by build scripts, from the same manifests and VFS as the
@@ -2268,7 +2741,7 @@ fn graph_of(sess: &std::sync::Arc<crate::Session>, workspace: &str, package: &st
     let root = r.find_member(package)?;
     let rk = (root, false);
     // (the dev-dependencies are resolved for a graph with a target built with `--test`)
-    let dev = o.test.is_some() || o.check.as_ref().is_some_and(CheckSel::tests_anything);
+    let dev = o.test.is_some() || o.example.is_some() || o.check.as_ref().is_some_and(CheckSel::tests_anything);
     let mut f = Feat { r: &mut r, dev_of: dev.then_some(rk).into_iter().collect(), all_platforms: false, nodes: HashMap::new(), work: Vec::new(), order: Vec::new() };
     f.activate(rk)?;
     let m = &f.r.manifests[root];
@@ -2288,6 +2761,10 @@ enum UKind {
     BinTest(usize),
     /// the root's integration test target
     Test(usize),
+    /// the root's example (`--example`): a bin with the dev-dependencies
+    Example(usize),
+    /// the root's example built with `--test` (its unit tests; `makepad test --examples`)
+    ExampleTest(usize),
     BuildCompile,
     BuildRun,
 }
@@ -2338,7 +2815,31 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
     let rm = &r.manifests[root];
     match &o.test {
         Some(TestSel::Lib) if rm.lib.is_none() => return Err(format!("no library targets found in package `{}`", rm.name)),
-        Some(TestSel::Targets { bins, tests }) => {
+        Some(TestSel::Targets { bins, tests, examples }) => {
+            if let Some(names) = examples {
+                if rm.examples.is_empty() {
+                    return Err(format!("no example targets found in package `{}`", rm.name));
+                }
+                for n in names {
+                    if !rm.examples.iter().any(|t| &t.name == n) {
+                        return Err(format!("no example target named `{}` in package `{}`", n, rm.name));
+                    }
+                }
+                for (ei, et) in rm.examples.iter().enumerate() {
+                    if !names.is_empty() && !names.contains(&et.name) {
+                        continue;
+                    }
+                    if !et.enabled(&rn.features, !names.is_empty())? {
+                        continue;
+                    }
+                    // as the bins: `--examples` builds the harness ones; `makepad test` names
+                    // the targets it runs, `harness = false` ones included
+                    if !et.harness && names.is_empty() {
+                        continue;
+                    }
+                    roots.push(add((root, false), UKind::ExampleTest(ei), &mut units));
+                }
+            }
             if let Some(names) = bins {
                 if rm.bins.is_empty() {
                     return Err(format!("no bin targets found in package `{}`", rm.name));
@@ -2429,8 +2930,22 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             }
         }
     }
+    if let Some(e) = &o.example {
+        let rm = &r.manifests[root];
+        let Some(ei) = rm.examples.iter().position(|t| &t.name == e) else {
+            let names: Vec<&str> = rm.examples.iter().map(|t| t.name.as_str()).collect();
+            return Err(if names.is_empty() { format!("no example targets found in package `{}`", rm.name) }
+                else { format!("no example target named `{}` in package `{}` (available: {})", e, rm.name, names.join(", ")) });
+        };
+        let et = &rm.examples[ei];
+        if et.kind.iter().all(|k| k != "example") {
+            return Err(format!("example target `{}` is a library and cannot be executed", e));
+        }
+        et.enabled(&rn.features, true)?;
+        roots.push(add((root, false), UKind::Example(ei), &mut units));
+    }
     for (bi, bt) in r.manifests[root].bins.iter().enumerate() {
-        if check.is_some() {
+        if check.is_some() || o.example.is_some() {
             break;
         }
         if !bt.enabled(&rn.features, o.test.is_none() && o.bin.as_ref() == Some(&bt.name))? {
@@ -2472,6 +2987,10 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 let b = &m.bins[*bi];
                 (b.kind.clone(), b.name.clone(), b.path.clone(), b.edition.clone(), if matches!(u, UKind::BinTest(_)) { "test" } else { "build" })
             }
+            UKind::Example(ei) | UKind::ExampleTest(ei) => {
+                let e = &m.examples[*ei];
+                (e.kind.clone(), e.name.clone(), e.path.clone(), e.edition.clone(), if matches!(u, UKind::ExampleTest(_)) { "test" } else { "build" })
+            }
             UKind::BuildCompile | UKind::BuildRun => {
                 let p = m.build.clone().unwrap();
                 let stem = p.rsplit('/').next().unwrap_or("build.rs").trim_end_matches(".rs").to_string();
@@ -2481,8 +3000,9 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
         };
         // dependencies
         let mut deps: Vec<(usize, String)> = Vec::new();
-        // dev-dependencies: only the test targets' (the plain lib of a test graph has none)
-        let dev = matches!(u, UKind::LibTest | UKind::BinTest(_) | UKind::Test(_));
+        // dev-dependencies: only the test targets' and an example's (the plain lib of a test
+        // graph has none)
+        let dev = matches!(u, UKind::LibTest | UKind::BinTest(_) | UKind::Test(_) | UKind::Example(_) | UKind::ExampleTest(_));
         let normal_edges = |deps: &mut Vec<(usize, String)>, build: bool| {
             for (di, tk) in &node.edges {
                 let d = &m.deps[*di];
@@ -2504,7 +3024,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                     deps.push((bi, "build_script_build".to_string()));
                 }
             }
-            UKind::Bin(_) | UKind::BinTest(_) | UKind::Test(_) => {
+            UKind::Bin(_) | UKind::BinTest(_) | UKind::Test(_) | UKind::Example(_) | UKind::ExampleTest(_) => {
                 if let Some(&li) = index.get(&(*k, UKind::Lib)) {
                     deps.push((li, lib_name(k.0)));
                 }
@@ -2518,9 +3038,10 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if let Some(&ci) = index.get(&(*k, UKind::BuildCompile)) {
                     deps.push((ci, "build_script_build".to_string()));
                 }
-                // the run units of dependencies with `links` (their DEP_* variables)
+                // the run units of the normal dependencies with `links` (their DEP_* variables;
+                // cargo connects no build- or dev-dependency's script to this one)
                 for (di, tk) in &node.edges {
-                    if m.deps[*di].build || r.manifests[tk.0].links.is_none() {
+                    if m.deps[*di].build || m.deps[*di].dev || r.manifests[tk.0].links.is_none() {
                         continue;
                     }
                     if let Some(&ri) = index.get(&(*tk, UKind::BuildRun)) {
@@ -2540,10 +3061,12 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             src_path: if cfg!(windows) { path.replace('/', "\\") } else { path },
             edition,
             host,
+            checks: None,
             mode: mode.to_string(),
             harness: match u {
                 UKind::LibTest | UKind::BinTest(_) => true,
                 UKind::Test(ti) => m.tests[*ti].harness,
+                UKind::ExampleTest(ei) => m.examples[*ei].harness,
                 _ => false,
             },
             sysroot: false,
@@ -2551,7 +3074,7 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
             deps,
         });
     }
-    if std::env::var("MAKEPAD_RUN_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "units")) {
+    if std::env::var("RELAX_TRACE").is_ok_and(|v| v.split(',').any(|x| x == "units")) {
         for (i, u) in out.iter().enumerate() {
             let (k, _) = &units[i];
             let m = &r.manifests[k.0];
@@ -2560,12 +3083,36 @@ fn emit(r: &Resolver, nodes: &HashMap<(usize, bool), Node>, order: &[(usize, boo
                 if u.host { "host" } else { "target" }, u.name, u.mode, u.features.join(","), deps.join(","));
         }
     }
-    Ok(Units { units: out, roots, bins })
+    Ok(Units { units: out, roots, bins, script: None })
 }
 
 #[cfg(test)]
 mod root_tests {
     use super::*;
+
+    /// A strong `x/f` on an optional dependency enables the package's feature `x` when it has one,
+    /// an explicit `x = ["dep:x"]` included (num-rational's `num-bigint-std = ["num-bigint/std"]`
+    /// beside `num-bigint = ["dep:num-bigint"]`; relax issue 63, from makepad/relax#66).
+    #[test]
+    fn a_strong_dependency_feature_enables_an_explicit_feature_of_that_name() {
+        let manifest = parse_toml(r#"
+[dependencies]
+extra = { version = "1", optional = true }
+[features]
+extra = ["dep:extra"]
+fast = ["extra/boost"]
+weak = ["extra?/boost"]
+"#).unwrap().root;
+        let definitions = table(&manifest, "features").unwrap();
+        let features = definitions.keys().map(|k| (k.clone(), strs(definitions, k))).collect();
+        let optional = BTreeSet::from(["extra".to_string()]);
+        let enabled = |feature: &str| {
+            let flags: Vec<String> = ["--features", feature].iter().map(|f| f.to_string()).collect();
+            enabled_features(&features, &BTreeSet::new(), &optional, &parse_flags(&flags).unwrap()).unwrap()
+        };
+        assert!(enabled("fast").contains("extra"), "a strong `extra/boost` enables the explicit feature `extra`");
+        assert!(!enabled("weak").contains("extra"), "a weak `extra?/boost` does not");
+    }
 
     #[test]
     fn required_features_follow_package_feature_flags() {
@@ -2587,6 +3134,7 @@ required-features = ["b", "manual"]
         let definitions = table(&manifest, "features").unwrap();
         let features = definitions.keys().map(|k| (k.clone(), strs(definitions, k))).collect();
         let implicit = BTreeSet::from(["optional".to_string()]);
+        let optional = BTreeSet::from(["optional".to_string(), "hidden".to_string()]);
         let target = &manifest.get("test").unwrap().as_array_of_tables().unwrap()[0];
         let target = Target {
             name: s(target, "name").unwrap(), path: String::new(), edition: "2021".into(),
@@ -2594,7 +3142,7 @@ required-features = ["b", "manual"]
         };
         let enabled = |flags: &[&str]| {
             let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
-            enabled_features(&features, &implicit, &parse_flags(&flags).unwrap()).unwrap()
+            enabled_features(&features, &implicit, &optional, &parse_flags(&flags).unwrap()).unwrap()
         };
         assert_eq!(enabled(&[]), BTreeSet::from(["default".into(), "a".into(), "b".into()]));
         assert!(enabled(&["--no-default-features"]).is_empty());
@@ -2710,7 +3258,7 @@ required-features = ["b", "manual"]
     /// and the integration tests, a `test = false` bin left out -- beside the plain lib they link,
     /// with the dev-dependencies; `--lib` and `--bins` are the plain targets, without them. A
     /// `makepad check --tests` had checked the integration tests only, and so reported none of
-    /// the bins' unit tests' lints (`unused_mut` in fab's sla.rs tests, cargo check's 11-05).
+    /// the bins' unit tests' lints (`unused_mut` in a binary's unit tests, cargo check's 11-05).
     #[test]
     fn check_target_flags_are_cargo_checks() {
         let sess = &std::sync::Arc::new(crate::Session::default());
@@ -2757,6 +3305,54 @@ required-features = ["b", "manual"]
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `--example <name>` (cargo run --example): the example is the root, a bin that links the
+    /// package's lib and its dev-dependencies (the plain lib has none); explicit `[[example]]`
+    /// targets and discovered examples/*.rs, examples/*/main.rs; a library example, an unknown
+    /// name and another target flag beside it are errors.
+    #[test]
+    fn an_example_runs_as_a_bin_with_the_dev_dependencies() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let root = tree("examples", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[[example]]\nname = \"named\"\npath = \"demo/named.rs\"\n[[example]]\nname = \"plugin\"\ncrate-type = [\"cdylib\"]\n[dev-dependencies]\nhelper = { path = \"../helper\" }\n"),
+            ("app/src/lib.rs", ""),
+            ("app/src/main.rs", "fn main() {}\n"),
+            ("app/examples/smoke.rs", "fn main() {}\n"),
+            ("app/examples/multi/main.rs", "fn main() {}\n"),
+            ("app/examples/plugin.rs", ""),
+            ("app/demo/named.rs", "fn main() {}\n"),
+            ("helper/Cargo.toml", "[package]\nname = \"helper\"\nversion = \"0.1.0\"\n"),
+            ("helper/src/lib.rs", ""),
+        ]);
+        let graph = |flags: &[&str]| unit_graph(sess, &root, "app", &flags.iter().map(|f| f.to_string()).collect::<Vec<_>>());
+        for (name, path) in [("smoke", "examples/smoke.rs"), ("multi", "examples/multi/main.rs"), ("named", "demo/named.rs")] {
+            for flags in [vec!["--example", name], vec![]] {
+                let flags: Vec<String> = if flags.is_empty() { vec![format!("--example={name}")] } else { flags.iter().map(|f| f.to_string()).collect() };
+                let g = unit_graph(sess, &root, "app", &flags).unwrap_or_else(|e| panic!("{flags:?}: {e}"));
+                let ex: Vec<usize> = g.roots.iter().copied().filter(|&i| g.units[i].kind.iter().any(|k| k == "example")).collect();
+                assert_eq!(ex.len(), 1, "{flags:?}: one example root");
+                let u = &g.units[ex[0]];
+                assert_eq!((u.name.as_str(), u.mode.as_str()), (name, "build"));
+                assert!(u.src_path.replace('\\', "/").ends_with(path), "{}", u.src_path);
+                // no bin of the package is a root
+                assert!(!g.roots.iter().any(|&i| g.units[i].kind.iter().any(|k| k == "bin")), "{flags:?}");
+                let lib = g.units.iter().position(|x| x.name == "app" && x.kind.iter().any(|k| k == "lib")).expect("the lib");
+                let helper = g.units.iter().position(|x| x.name == "helper").expect("the dev-dependency");
+                assert!(u.deps.iter().any(|(d, _)| *d == lib) && u.deps.iter().any(|(d, _)| *d == helper), "{name} links the lib and the dev-dependency");
+                assert!(!g.units[lib].deps.iter().any(|(d, _)| *d == helper), "the plain lib has no dev-dependency");
+            }
+        }
+        // a plain run: the bin, without the dev-dependencies
+        let g = graph(&[]).unwrap();
+        assert!(!g.units.iter().any(|u| u.name == "helper" || u.kind.iter().any(|k| k == "example")));
+        let e = |flags: &[&str]| graph(flags).err().unwrap_or_else(|| panic!("{flags:?}: no error"));
+        assert!(e(&["--example", "plugin"]).contains("is a library and cannot be executed"));
+        let unknown = e(&["--example", "nope"]);
+        assert!(unknown.contains("no example target named `nope`") && unknown.contains("smoke"), "{unknown}");
+        assert!(e(&["--example", "smoke", "--bin", "app"]).contains("takes no other target flag"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A registry package's feature value `x/f` naming one of its dev-dependencies (vsss-rs 6.0.1:
     /// `alloc = ["rand/alloc"]` with rand a dev-dependency): cargo accepts it and enables nothing
     /// (cargo core/resolver/features.rs activate_dep_feature: no activated dependency `x`).
@@ -2783,6 +3379,45 @@ required-features = ["b", "manual"]
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A path dependency a third-party manifest names is third-party too. A vendored registry
+    /// package's, inside the vendored folder, is a registry package (its pkg_id is what makes a
+    /// unit third-party: its build script and macros run confined under `makepad run`); one
+    /// outside it is an error. It was a path package, the person's own: a vendored tree (the
+    /// repository's content) ran a build script of its choosing unconfined.
+    #[test]
+    fn a_third_party_manifests_path_dependency_is_no_path_package() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let vend = |dep: &str| format!("[package]\nname = \"vend\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[dependencies]\n{dep}\n");
+        let pkg = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"1.0.0\"\nedition = \"2021\"\n");
+        let checksum = "{\"files\":{},\"package\":null}";
+        let (vend_inner, inner, outer) = (vend("inner = { path = \"../inner\" }"), pkg("inner"), pkg("outer"));
+        let root = tree("third-party-path", &[
+            ("Cargo.toml", "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n"),
+            (".cargo/config.toml", "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n"),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nvend = \"1\"\n"),
+            ("app/src/lib.rs", ""),
+            ("vendor/vend/Cargo.toml", vend_inner.as_str()),
+            ("vendor/vend/.cargo-checksum.json", checksum),
+            ("vendor/vend/src/lib.rs", ""),
+            ("vendor/inner/Cargo.toml", inner.as_str()),
+            ("vendor/inner/build.rs", "fn main() {}\n"),
+            ("vendor/inner/.cargo-checksum.json", checksum),
+            ("vendor/inner/src/lib.rs", ""),
+            ("outer/Cargo.toml", outer.as_str()),
+            ("outer/build.rs", "fn main() {}\n"),
+            ("outer/src/lib.rs", ""),
+        ]);
+        let g = unit_graph(sess, &root, "app", &[]).unwrap_or_else(|e| panic!("{e}"));
+        let ids: Vec<&str> = g.units.iter().map(|u| u.pkg_id.as_str()).collect();
+        let inner: Vec<&&str> = ids.iter().filter(|id| id.contains("inner")).collect();
+        assert!(inner.len() >= 2 && inner.iter().all(|id| id.starts_with("registry+")), "the vendored path dependency, its lib and its build script, is a registry package: {ids:?}");
+        assert!(ids.iter().any(|id| id.starts_with("path+") && id.contains("/app#")), "the member stays the person's: {ids:?}");
+        let _ = std::fs::write(format!("{root}/vendor/vend/Cargo.toml"), vend("outer = { path = \"../../outer\" }"));
+        let e = unit_graph(sess, &root, "app", &[]).err().unwrap_or_else(|| panic!("a vendored package's path dependency outside the vendored folder resolved"));
+        assert!(e.contains("registry package `vend` 1.0.0 names the path dependency `outer`") && e.contains("outside its vendored folder"), "{e}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A member manifest that does not parse is the answer when no member is the package: its
     /// file, line, column and message, not "not a member of the workspace". Another broken member
     /// does not hide a package that loads.
@@ -2791,17 +3426,48 @@ required-features = ["b", "manual"]
         let sess = &std::sync::Arc::new(crate::Session::default());
         let root = tree("broken-member", &[
             ("Cargo.toml", "[workspace]\nmembers = [\"slice\", \"other\"]\n"),
-            ("slice/Cargo.toml", "[package]\nname = \"fab-slice\"\nversion = \"0.1.0\"\n\n[dev-dependencies]\nsdf = { path = \"../other\" }\nsdf = { path = \"../other\" }\n"),
+            ("slice/Cargo.toml", "[package]\nname = \"tool-a\"\nversion = \"0.1.0\"\n\n[dev-dependencies]\nsdf = { path = \"../other\" }\nsdf = { path = \"../other\" }\n"),
             ("slice/src/lib.rs", ""),
             ("other/Cargo.toml", "[package]\nname = \"other\"\nversion = \"0.1.0\"\n"),
             ("other/src/lib.rs", ""),
         ]);
         let mut r = Resolver::new(sess, &root).unwrap();
-        let e = r.find_member("fab-slice").err().unwrap();
+        let e = r.find_member("tool-a").err().unwrap();
         let path = format!("{}/slice/Cargo.toml", normalize(&root));
         assert!(e.starts_with(&format!("{path}:7:1: duplicate key `sdf`\n")), "{e}");
         assert!(!e.contains("not a member"), "{e}");
         assert!(r.find_member("other").is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// TOML 1.1 inline tables in a manifest (relax issue 36): a [workspace.dependencies] entry
+    /// over several lines, with a comment and a trailing comma, is inherited by its member, from
+    /// the workspace itself and through another workspace's path dependency. A workspace
+    /// manifest that does not parse is named by its file, line and column, not as a missing entry.
+    #[test]
+    fn multiline_inline_tables_and_a_workspace_manifest_that_does_not_parse() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let ws = "[workspace]\nresolver = \"3\"\nmembers = [\"member\", \"helper\"]\n\n[workspace.dependencies]\nhelper = {\n    path = \"helper\", # the local copy\n    version = \"0.1.0\",\n}\n";
+        let root = tree("multiline-inline", &[
+            ("dependency/Cargo.toml", ws),
+            ("dependency/member/Cargo.toml", "[package]\nname = \"member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nhelper = { workspace = true }\n"),
+            ("dependency/member/src/lib.rs", ""),
+            ("dependency/helper/Cargo.toml", "[package]\nname = \"helper\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+            ("dependency/helper/src/lib.rs", ""),
+            ("user/Cargo.toml", "[package]\nname = \"user\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nmember = {\n    path = \"../dependency/member\",\n}\n\n[workspace]\n"),
+            ("user/src/lib.rs", ""),
+        ]);
+        assert!(units(sess, &format!("{root}/dependency"), "member").iter().any(|n| n == "helper"), "the member inherits the entry");
+        let through = units(sess, &format!("{root}/user"), "user");
+        assert!(through.iter().any(|n| n == "member") && through.iter().any(|n| n == "helper"), "a path dependency on the member: {through:?}");
+        // two commas in the entry: the workspace's manifest is the error, from either side
+        let broken = ws.replace("\"helper\", #", "\"helper\",, #");
+        std::fs::write(format!("{root}/dependency/Cargo.toml"), &broken).unwrap();
+        let path = format!("{}/dependency/Cargo.toml", normalize(&root));
+        for (dir, pkg) in [("dependency", "member"), ("user", "user")] {
+            let e = unit_graph(sess, &format!("{root}/{dir}"), pkg, &[]).err().unwrap_or_else(|| panic!("{pkg}: resolved a workspace that does not parse"));
+            assert!(e.contains(&format!("{path}:7:21: ")) && !e.contains("no such entry"), "{pkg}: {e}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2823,7 +3489,7 @@ required-features = ["b", "manual"]
                 ("solo/Cargo.toml", "[package]\nname = \"solo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
                 ("solo/src/main.rs", "fn main() {}\n"),
                 // a members package naming a crate only as a never-built path dependency (apps/commercial
-                // and Sandbox): cargo makes that crate a member, so the workspace's inherited deps apply
+                // and an app): cargo makes that crate a member, so the workspace's inherited deps apply
                 ("hub/Cargo.toml", "[package]\nname = \"hub\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[target.'cfg(any())'.dependencies]\ngame = { path = \"game\" }\n"),
                 ("hub/src/lib.rs", ""),
                 ("hub/game/Cargo.toml", "[package]\nname = \"game\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nlib = { workspace = true }\n"),
@@ -2843,9 +3509,6 @@ required-features = ["b", "manual"]
         assert!(b.iter().any(|n| n == "bench") && b.iter().any(|n| n == "lib"));
         // a package without a workspace table that no workspace above holds
         assert_eq!(find_root(&format!("{root}/solo")).unwrap(), normalize(&format!("{root}/solo")));
-        // ...is still that workspace's for what it inherits, as cargo has it; an excluded one is not
-        assert_eq!(find_inherit_root(&format!("{root}/solo"), None).unwrap(), normalize(&root));
-        assert_eq!(find_inherit_root(&format!("{root}/bench"), None).unwrap(), normalize(&format!("{root}/bench")));
         assert!(units(sess, &format!("{root}/solo"), "solo").iter().any(|n| n == "solo"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2887,7 +3550,7 @@ fn file_macro_paths_as_cargo_names_them() {
     std::fs::write(ws.join("Cargo.toml"), "workspace.members = [\"m\"]\nworkspace.resolver = \"2\"\n\n[workspace.dependencies]\n").unwrap();
     std::fs::write(ws.join("m/Cargo.toml"), "[package]\nname = \"m\"\nversion = \"0.1.0\"\n").unwrap();
     let ws = normalize(&ws.display().to_string());
-    let registry = format!("{}/target/makepad-run/registry", ws);
+    let registry = format!("{}/target/relax/registry", ws);
     let r = FileRoot { root: find_root(&format!("{}/m", ws)).unwrap(), not_path: vec![registry.clone()] };
     assert_eq!(r.relative(&format!("{}/m/src/main.rs", ws)).as_deref(), Some("m/src/main.rs"));
     assert_eq!(r.relative(&format!("{}/src/foo-1.0.0-0123456789abcdef/src/lib.rs", registry)), None);
@@ -2921,9 +3584,17 @@ fn unit_graph_host_side_follows_proc_macro_and_build_script_edges() {
 #[cfg(test)]
 #[test]
 fn run_env_reads_the_packages_table() {
-    let m = "[package]\nname = \"makepad-amp\"\n\n[package.metadata.makepad.run-env]\n# why\nMAKEPAD_LOG = \"0\"\nbad key = \"x\"\n\n[dependencies]\nX = \"1\"\n";
-    assert_eq!(run_env(m), vec![("MAKEPAD_LOG".to_string(), "0".to_string())]);
-    assert!(run_env("[package]\nname = \"a\"\n").is_empty());
+    let m = "[package]\nname = \"makepad-amp\"\n\n[package.metadata.relax.run-env]\n# why\nMAKEPAD_LOG = \"0\"\nbad key = \"x\"\n\n[dependencies]\nX = \"1\"\n";
+    assert_eq!(run_env(m), Ok(vec![("MAKEPAD_LOG".to_string(), "0".to_string())]));
+    assert_eq!(run_env("[package]\nname = \"a\"\n"), Ok(Vec::new()));
+    // a package grants itself nothing of Relax's or its tools': the run stops, naming the key
+    for key in ["RELAX_ALLOW_C", "relax_allow_c", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CC", "CC_x86_64_unknown_linux_gnu", "TARGET_CC", "CXX", "AR", "LINKER", "CFLAGS", "RUSTC_WRAPPER", "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_HOME", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"] {
+        let refused = run_env(&format!("[package.metadata.relax.run-env]\nMAKEPAD_LOG = \"0\"\n{key} = \"1\"\n"));
+        assert!(refused.as_ref().is_err_and(|e| e.contains(&format!("sets {key},"))), "run-env must refuse {key}: {refused:?}");
+    }
+    for key in ["MAKEPAD_LOG", "APP_MODE", "PATH", "ACCOUNT", "SCALE", "RUST_LOG"] {
+        assert!(run_env(&format!("[package.metadata.relax.run-env]\n{key} = \"1\"\n")).is_ok(), "run-env takes {key}");
+    }
 }
 
 #[cfg(test)]
@@ -2949,18 +3620,35 @@ test = false
 name = "quiet_test"
 path = "tests/quiet_test.rs"
 test = false
+[[example]]
+name = "shown"
+test = true
 "#).unwrap();
-    for f in ["src/lib.rs", "src/quiet_bin.rs", "tests/quiet_test.rs", "tests/loud.rs"] { std::fs::write(root.join(f), "").unwrap(); }
+    std::fs::create_dir_all(root.join("examples")).unwrap();
+    for f in ["src/lib.rs", "src/quiet_bin.rs", "tests/quiet_test.rs", "tests/loud.rs", "examples/shown.rs", "examples/plain.rs"] { std::fs::write(root.join(f), "").unwrap(); }
     let sess = std::sync::Arc::new(crate::Session::default());
     let dir = root.to_str().unwrap();
     let names = |t: &[(String, String, bool)]| t.iter().map(|t| t.0.clone()).collect::<Vec<_>>();
-    let (lib, bins, tests) = test_targets(&sess, dir, "quiet", &[], &[], &[]).unwrap();
-    let lib = lib.unwrap();
+    let t = test_targets(&sess, dir, "quiet", &[], &[], &[], &[]).unwrap();
+    let lib = t.lib.unwrap();
     assert!(!lib.test && !lib.doctest);
-    assert!(bins.is_empty(), "{bins:?}");
-    assert_eq!(names(&tests), ["loud"]);
-    let (_, bins, tests) = test_targets(&sess, dir, "quiet", &[], &["quiet_bin".to_string()], &["quiet_test".to_string()]).unwrap();
-    assert_eq!(names(&bins), ["quiet_bin"]);
-    assert_eq!(names(&tests), ["loud", "quiet_test"]);
+    assert!(t.bins.is_empty(), "{:?}", t.bins);
+    assert_eq!(names(&t.tests), ["loud"]);
+    // an example runs its tests when it says `test = true` (relax issue 120: none ran), the
+    // discovered one only when named
+    assert_eq!(names(&t.examples), ["shown"], "examples by default");
+    let t = test_targets(&sess, dir, "quiet", &[], &["quiet_bin".to_string()], &["quiet_test".to_string()], &["plain".to_string()]).unwrap();
+    assert_eq!(names(&t.bins), ["quiet_bin"]);
+    assert_eq!(names(&t.tests), ["loud", "quiet_test"]);
+    assert_eq!(names(&t.examples), ["plain", "shown"], "a named example");
+    assert_eq!(names(&t.all_examples), ["plain", "shown"], "--examples");
+    // `--examples` with the names makepad test lists is a test graph's selection; `--example`
+    // alone is the example `makepad run` runs
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let o = parse_flags(&s(&["--examples", "--example", "shown", "--test", "loud"])).unwrap();
+    assert_eq!(o.test, Some(TestSel::Targets { bins: None, tests: Some(s(&["loud"])), examples: Some(s(&["shown"])) }));
+    assert_eq!(o.example, None);
+    let o = parse_flags(&s(&["--example", "plain"])).unwrap();
+    assert_eq!((o.test, o.example.as_deref()), (None, Some("plain")));
     let _ = std::fs::remove_dir_all(&root);
 }

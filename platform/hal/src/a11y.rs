@@ -36,6 +36,23 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 /// `act` also performs one action through the OS API. Each adapter registers it when it starts.
 pub type OsSelfCheck = fn(window_key: u64, act: bool) -> String;
 
+/// The person's native input to this process, counted: the platform advances it at each input
+/// (its remote activity ledger), and a check of a sequence (an act's, `if_user_seq`) reads it on
+/// its own thread, never through the UI thread: it waits for nothing while the app is busy.
+static USER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// The person's native input so far (`USER_SEQ`). An op: the count lives with the HAL's code.
+#[relax_api::relax_api]
+pub fn user_seq() -> u64 {
+    USER_SEQ.load(Ordering::Acquire)
+}
+
+/// The person gave this process native input (`USER_SEQ`). An op, as `user_seq`.
+#[relax_api::relax_api]
+pub fn note_user_input() {
+    USER_SEQ.fetch_add(1, Ordering::Release);
+}
+
 fn os_selfcheck() -> &'static OnceLock<OsSelfCheck> {
     static CHECK: OnceLock<OsSelfCheck> = OnceLock::new();
     &CHECK
@@ -48,7 +65,7 @@ pub fn set_os_selfcheck(f: OsSelfCheck) {
 fn consumer_bits() -> &'static AtomicU32 {
     static BITS: OnceLock<AtomicU32> = OnceLock::new();
     BITS.get_or_init(|| {
-        AtomicU32::new(if std::env::var("MAKEPAD_A11Y").as_deref() == Ok("1") {
+        AtomicU32::new(if relax_api::env::var("MAKEPAD_A11Y").as_deref() == Ok("1") {
             consumer::TEST
         } else {
             0
@@ -284,14 +301,18 @@ impl remote::Backend for Native {
         let req = inject_action(window, request);
         wait_done(req, timeout).map(ActionResult::from_u8).ok_or_else(|| format!("action {req} timed out; inspect before retrying"))
     }
+    fn wait_action(&self, req: u64, timeout: Duration) -> Result<Option<ActionResult>,String> {
+        if !lock(&completions().0).requests.contains_key(&req) { return Err(format!("action {req}: no such pending action")); }
+        Ok(wait_done(req, timeout).map(ActionResult::from_u8))
+    }
     fn present(&self, window: u64, timeout: Duration) -> Result<(), String> {
         let query = format!("a11y_present {}", window as u32);
         let reply = Hal::global().query((window >> 32) as u32, query.as_bytes(), timeout).ok_or("presentation timed out; action may already be applied")?;
         if reply == b"ok" { Ok(()) } else { Err(String::from_utf8_lossy(&reply).into_owned()) }
     }
     fn type_text(&self, window: u64, text: &str) -> Result<(), String> {
-        let reply = Hal::global().query((window >> 32) as u32, format!("a11y_type\n{text}").as_bytes(), Duration::from_secs(5)).ok_or("text input timed out")?;
-        if reply == b"ok" { Ok(()) } else { Err(String::from_utf8_lossy(&reply).into_owned()) }
+        Hal::global().post((window >> 32) as u32, format!("a11y_type\n{text}").as_bytes());
+        Ok(())
     }
 
     fn os_selfcheck(&self, window: u64, act: bool) -> Result<String, String> {
@@ -299,9 +320,8 @@ impl remote::Backend for Native {
         Ok(check(window, act))
     }
 
-    fn user_seq(&self, window: u64) -> Result<u64, String> {
-        let reply = Hal::global().query((window >> 32) as u32, b"a11y_user_seq", Duration::from_secs(5)).ok_or("activity query timed out")?;
-        String::from_utf8_lossy(&reply).parse().map_err(|_| "invalid activity counter".into())
+    fn user_seq(&self, _window: u64) -> Result<u64, String> {
+        Ok(user_seq())
     }
 
     fn pointer(&self, window: u64, event: remote::PointerEvent, x: f64, y: f64, button: u32, mods: u32) -> Result<(), String> {
@@ -326,23 +346,19 @@ impl remote::Backend for Native {
 pub type UiWrite = extern "C" fn(ctx: *mut u8, bytes: *const u8, len: usize);
 
 /// Optional host routing, called on the consumer worker before the local mirrors: the request
-/// in its wire form (`Req::to_wire`), the bytes its reply may still take, and where the reply's
-/// lines go; returns [`UI_ANSWERED`] | [`UI_TRUNCATED`]. A C entry, so a router that `makepad run`
-/// JIT-compiles (the WM's) is called by the HAL's own code: make one with [`serve_ui_route`].
-/// The callback must release its own registry locks before waiting or dispatching.
+/// in its wire form (`Req::to_wire`) and where the reply's lines go; returns whether it answered.
+/// A C entry, so a router that `makepad run` JIT-compiles (the WM's) is called by the HAL's own
+/// code: make one with [`serve_ui_route`]. The callback must release its own registry locks
+/// before waiting or dispatching.
 #[cfg(not(target_arch = "wasm32"))]
-pub type UiRouter = extern "C" fn(req: *const u8, len: usize, limit: usize, ctx: *mut u8, write: UiWrite) -> u32;
-#[cfg(not(target_arch = "wasm32"))]
-pub const UI_ANSWERED: u32 = 1;
-#[cfg(not(target_arch = "wasm32"))]
-pub const UI_TRUNCATED: u32 = 2;
+pub type UiRouter = extern "C" fn(req: *const u8, len: usize, ctx: *mut u8, write: UiWrite) -> bool;
 
 #[cfg(not(target_arch = "wasm32"))]
 static UI_ROUTERS: Mutex<Vec<UiRouter>> = Mutex::new(Vec::new());
 
 /// Adds a host router (once per entry). An op: the routers live with the HAL's code.
 #[cfg(not(target_arch = "wasm32"))]
-#[makepad_relax_api::relax_api]
+#[relax_api::relax_api]
 pub fn register_ui_router(router: UiRouter) {
     let mut routers = lock(&UI_ROUTERS);
     if !routers.iter().any(|existing| *existing as usize == router as usize) {
@@ -376,36 +392,34 @@ impl std::io::Write for UiWriter {
 
 /// Runs `route` (a router of the caller's side) on a request that came across the C boundary, the
 /// body of a [`UiRouter`] entry:
-/// `extern "C" fn r(q: *const u8, n: usize, l: usize, c: *mut u8, w: UiWrite) -> u32 { unsafe { serve_ui_route(dispatch, q, n, l, c, w) } }`.
+/// `extern "C" fn r(q: *const u8, n: usize, c: *mut u8, w: UiWrite) -> bool { unsafe { serve_ui_route(dispatch, q, n, c, w) } }`.
 ///
 /// # Safety
 /// The arguments are what the HAL passes a [`UiRouter`].
 #[cfg(not(target_arch = "wasm32"))]
-pub unsafe fn serve_ui_route(route: fn(&makepad_remote::Req, &mut makepad_remote::Out) -> bool, req: *const u8, len: usize, limit: usize, ctx: *mut u8, write: UiWrite) -> u32 {
-    let Some(req) = makepad_remote::Req::from_wire(unsafe { std::slice::from_raw_parts(req, len) }) else { return 0 };
+pub unsafe fn serve_ui_route(route: fn(&makepad_remote::Req, &mut makepad_remote::Out) -> bool, req: *const u8, len: usize, ctx: *mut u8, write: UiWrite) -> bool {
+    let Some(req) = makepad_remote::Req::from_wire(unsafe { std::slice::from_raw_parts(req, len) }) else { return false };
     let mut w = UiWriter { ctx, write };
-    let mut out = makepad_remote::Out::new(&mut w, limit);
-    let answered = route(&req, &mut out);
-    answered as u32 * UI_ANSWERED | out.truncated as u32 * UI_TRUNCATED
+    let mut out = makepad_remote::Out::new(&mut w);
+    route(&req, &mut out)
 }
 
 /// `ui` requests: the host routers, then the local mirrors (`local`: the local mirrors only). An
 /// op: routers, mirrors and snapshots live with the HAL's code; the request crosses in its wire
 /// form and the reply comes back through `write`.
 #[cfg(not(target_arch = "wasm32"))]
-#[makepad_relax_api::relax_api]
-pub fn dispatch_ui(local: bool, req: *const u8, len: usize, limit: usize, ctx: *mut u8, write: UiWrite) -> u32 {
-    let Some(req) = makepad_remote::Req::from_wire(unsafe { std::slice::from_raw_parts(req, len) }) else { return 0 };
+#[relax_api::relax_api]
+pub fn dispatch_ui(local: bool, req: *const u8, len: usize, ctx: *mut u8, write: UiWrite) -> bool {
+    let Some(req) = makepad_remote::Req::from_wire(unsafe { std::slice::from_raw_parts(req, len) }) else { return false };
     let mut w = UiWriter { ctx, write };
-    let mut out = makepad_remote::Out::new(&mut w, limit);
+    let mut out = makepad_remote::Out::new(&mut w);
     // Validate before a host router can fan out or forward the request.
     if req.cmd == "ui" {
         if let Some(params) = makepad_remote::params::ui(req.pos.first().map_or("", String::as_str)) {
-            if let Err(e) = req.validate_params(params) { out.err(&e); return UI_ANSWERED; }
+            if let Err(e) = req.validate_params(params) { out.err(&e); return true; }
         }
     }
-    let answered = if local { dispatch_mirrors(&req, &mut out) } else { dispatch_routed(&req, &mut out) };
-    answered as u32 * UI_ANSWERED | out.truncated as u32 * UI_TRUNCATED
+    if local { dispatch_mirrors(&req, &mut out) } else { dispatch_routed(&req, &mut out) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -414,15 +428,14 @@ fn dispatch_routed(req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> 
     if !routers.is_empty() {
         let wire = req.to_wire();
         for route in routers {
-            let mut r = 0;
-            let (remaining, reply) = (out.remaining(), out as *mut makepad_remote::Out as *mut u8);
-            if !makepad_relax_api::app_call(|| r = route(wire.as_ptr(), wire.len(), remaining, reply, relay_to_out)) {
+            let mut answered = false;
+            let reply = out as *mut makepad_remote::Out as *mut u8;
+            if !relax_api::app_call(|| answered = route(wire.as_ptr(), wire.len(), reply, relay_to_out)) {
                 // its code's run has ended
                 lock(&UI_ROUTERS).retain(|existing| *existing as usize != route as usize);
                 continue;
             }
-            out.truncated |= r & UI_TRUNCATED != 0;
-            if r & UI_ANSWERED != 0 {
+            if answered {
                 return true;
             }
         }
@@ -438,9 +451,7 @@ fn dispatch_routed(req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> 
 #[cfg(not(target_arch = "wasm32"))]
 fn dispatch_across(local: bool, req: &makepad_remote::Req, out: &mut makepad_remote::Out) -> bool {
     let wire = req.to_wire();
-    let r = dispatch_ui(local, wire.as_ptr(), wire.len(), out.remaining(), out as *mut makepad_remote::Out as *mut u8, relay_to_out);
-    out.truncated |= r & UI_TRUNCATED != 0;
-    r & UI_ANSWERED != 0
+    dispatch_ui(local, wire.as_ptr(), wire.len(), out as *mut makepad_remote::Out as *mut u8, relay_to_out)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

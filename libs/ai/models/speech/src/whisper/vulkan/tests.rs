@@ -159,10 +159,10 @@ fn matrices_match_cpu() {
         let bias = tensor(&[n], 43);
         for half in [false, true] {
             let w = raw(&weights, &[k, n], half);
-            let want = cpu(|| Tensor::linear_raw(&x, &w, &bias));
+            let want = cpu(|| Tensor::linear_raw(&x, &w, &bias, None));
             let got = try_matmul_nt_ggml_bytes_add_bias(&x.data, &w.data, w.ggml_type, m, k, n, &bias.data).unwrap();
             close(&format!("matrix {m}x{k}x{n} half={half}"), &got, &want.data, 3e-5);
-            let want = cpu(|| Tensor::matmul_raw(&x, &w));
+            let want = cpu(|| Tensor::matmul_raw(&x, &w, None));
             let got = try_matmul_nt_ggml_bytes(&x.data, &w.data, w.ggml_type, m, k, n).unwrap();
             close("matrix without bias", &got, &want.data, 3e-5);
         }
@@ -213,7 +213,7 @@ fn convolutions_match_cpu() {
         let weights = if let Some(ty) = ty { quantized(&data, &[3, ic, oc], ty) }
             else { raw(&data, &[3, ic, oc], true) };
         let bias = tensor(&[oc], 43);
-        let want = cpu(|| Tensor::transpose_2d(&Tensor::conv1d_raw(&x, &weights, &bias, stride)));
+        let want = cpu(|| Tensor::transpose_2d(&Tensor::conv1d_raw(&x, &weights, &bias, stride, None)));
         let ow = want.shape[0];
         let want = if ty.is_some() {
             let mut cols = Tensor { data: vec![0.0; ow * ic * 3], shape: vec![ow, ic * 3] };
@@ -228,7 +228,7 @@ fn convolutions_match_cpu() {
                 }
             }
             let w = RawTensor { data: weights.data.to_vec().into(), shape: vec![ic * 3, oc], ggml_type: weights.ggml_type };
-            cpu(|| Tensor::linear_raw(&rounded_activations(&cols), &raw(&w.to_f32().data, &[ic * 3, oc], false), &bias))
+            cpu(|| Tensor::linear_raw(&rounded_activations(&cols), &raw(&w.to_f32().data, &[ic * 3, oc], false), &bias, None))
         } else { want };
         for time_major in [false, true] {
             let input = if time_major { Tensor::transpose_2d(&x) } else { x.clone() };
@@ -374,7 +374,7 @@ fn fused_encoder_decoder_and_cache_match_cpu() {
         (61, Some(GGML_TYPE_Q5_K)), (71, Some(GGML_TYPE_Q4_K))] {
         let model = model_with_quant(seed, ty);
         let mel = values(8 * 74, seed);
-        let want = cpu(|| encoder::encode(&model, &mel, 37));
+        let want = cpu(|| encoder::encode(&model, &mel, 37, &|| false).unwrap());
         let encoded = try_encode(&model, &mel, 37).unwrap();
         close_stack("complete encoder", &encoded, &want.data, ty.is_some());
         let input = Tensor { data: encoded, shape: vec![37, 128] };
@@ -464,7 +464,7 @@ fn int8_encoder_weights_keep_float_gemv_and_decoder() {
         assert!(weights.conv1.w.int8.is_none() && weights.conv2.w.int8.is_none() && weights.logits.int8.is_none());
         for rows in [1, 4] {
             let input = tensor(&[rows, 128], 19);
-            let want = cpu(|| Tensor::linear_raw(&input, &model.encoder_layers[0].attn_q_w, &model.encoder_layers[0].attn_q_b));
+            let want = cpu(|| Tensor::linear_raw(&input, &model.encoder_layers[0].attn_q_w, &model.encoder_layers[0].attn_q_b, Some(&model.weights_owner)));
             let mut plan = Layout::default();
             let x = plan.take(input.data.len())?;
             let dst = plan.take(input.data.len())?;

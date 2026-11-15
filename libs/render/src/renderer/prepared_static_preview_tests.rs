@@ -16,6 +16,109 @@ fn triangle() -> StaticModel {
 }
 
 #[test]
+fn texture_book_separates_shared_lod_atlas_from_geometry() {
+    let png = Cx::encode_rgba_as_png(2, 2, &[180; 16]).unwrap();
+    let prepare = || {
+        let mut model = triangle();
+        model.texture_png = Some(png.clone());
+        let mut prepared = PreparedStaticPreview::prepare(model).unwrap();
+        // Distinct allocations prove that content keys, rather than Arc identity, deduplicate levels.
+        prepared.main.texture = std::sync::Arc::new((*prepared.main.texture).clone());
+        prepared
+    };
+    let mut prepared = prepare();
+    let atlas = prepared.main.texture.clone();
+    let lods = vec![(10.0, prepare()), (20.0, prepare())];
+    prepared = prepared.with_lods(lods).unwrap();
+    // A second binding of this key must retain the first slot in the census.
+    prepared.main.detail = atlas.clone();
+    let geometry = (3 * crate::model::MODEL_VERTEX_FLOATS + 3) * 4;
+    assert_eq!(prepared.level_geometry_bytes(), vec![geometry; 3], "LOD geometry contains no texture bytes");
+    let charges = prepared.texture_charges();
+    let atlas_rows: Vec<_> = charges.iter().filter(|t| t.key == atlas.hash).collect();
+    assert_eq!(atlas_rows.len(), 1, "all three levels charge the atlas once");
+    assert_eq!((atlas_rows[0].slot, atlas_rows[0].width, atlas_rows[0].height, atlas_rows[0].layers, atlas_rows[0].mips, atlas_rows[0].bytes),
+        (TextureSlot::Base, 2, 2, 1, 2, 20), "the first binding and whole mip chain are reported");
+    let mut classification = (*atlas_rows[0]).clone();
+    classification.width = crate::material_surface::COMPRESS_MIN_TEXELS;
+    classification.height = 1;
+    assert!(classification.rgba_compressible(), "the upload threshold includes its boundary");
+    classification.width -= 1;
+    assert!(!classification.rgba_compressible(), "smaller images stay out of compressible RGBA");
+    classification.width += 1;
+    classification.compressed = Some(crate::material_surface::GpuCompressedFormat::Bc7);
+    assert!(!classification.rgba_compressible(), "compressed bytes cannot also be compressible RGBA");
+    let keys = prepared.level_texture_keys();
+    assert_eq!(keys.len(), 3, "one key list per distance level");
+    for level in keys {
+        assert_eq!(level.iter().filter(|&&key| key == atlas.hash).count(), 1, "each level binds the atlas exactly once");
+    }
+    assert_eq!(prepared.upload_bytes(), 3 * geometry + 20 + 4 + 4, "atlas and two default maps each upload once");
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let mut renderer = Renderer::default();
+    let _uploaded = renderer.upload_static_preview(&mut cx, prepared);
+    assert_eq!(renderer.cached_texture_keys().collect::<std::collections::HashSet<_>>(),
+        charges.iter().map(|t| t.key).collect(), "charge keys match upload cache keys");
+    // A host that plans the atlas from level 1 gets only that level on the GPU, copied in the frame.
+    let copied = crate::material_surface::upload_ui_stats()[3];
+    let mut planned = Renderer::default();
+    let key = atlas.hash;
+    planned.set_texture_first_level(Some(std::rc::Rc::new(move |k| usize::from(k == key))));
+    let _uploaded = planned.upload_static_preview(&mut cx, prepare());
+    assert!(matches!(planned.texture_cache[&key].get_format(&mut cx), TextureFormat::VecMipBGRAu8_32 { width: 1, height: 1, max_level: Some(0), .. }),
+        "the atlas uploads from level 1: one texel, one level");
+    assert!(crate::material_surface::upload_ui_stats()[3] >= copied + 4, "the kept level is copied in the upload's frame");
+}
+
+#[test]
+fn splat_charges_follow_array_order_and_upload_format() {
+    use crate::material_surface::{PreparedSurface, SplatLayer, SplatSurface, splat_array_key};
+    let layer = |color| SplatLayer {
+        albedo_png: None, color, normal_png: None, scale: 1.0, roughness: 0.5,
+        metallic: 0.0, bump: 0.0, relief: 0.0, wet: 0.0, puddles: 0.0,
+        macro_variation: [0.0; 4], stochastic: false,
+    };
+    let mut surface = PreparedSurface::prepare(crate::material_surface::MaterialSurface {
+        splat: Some(std::sync::Arc::new(SplatSurface {
+            layers: vec![layer([1.0, 0.0, 0.0]), layer([0.0, 1.0, 0.0])],
+            weights_png: Cx::encode_rgba_as_png(1, 1, &[255, 0, 0, 0]).unwrap(),
+            origin: [0.0; 2], cell: 1.0, width: 1.0, rows: 1.0, band: None,
+        })), ..Default::default()
+    }, &mut 4096).unwrap();
+    // Compressed layers need no transcoding here: the test checks the array upload contract.
+    let splat = surface.splat.as_mut().unwrap();
+    for layer in &mut splat.albedo {
+        let layer = std::sync::Arc::make_mut(layer);
+        layer.data.make_mut().clear();
+        layer.compressed = Some((crate::material_surface::GpuCompressedFormat::Bc7, vec![0; 16].into()));
+    }
+    splat.gather_arrays();
+    let first_key = splat_array_key(&splat.albedo);
+    let mut reversed = surface.clone();
+    reversed.splat.as_mut().unwrap().albedo.reverse();
+    reversed.splat.as_mut().unwrap().gather_arrays();
+    let second_key = splat_array_key(&reversed.splat.as_ref().unwrap().albedo);
+    assert_ne!(first_key, second_key, "layer order identifies a distinct array");
+    let mut prepared = PreparedStaticPreview::prepare(triangle()).unwrap();
+    prepared.main.surface = Some(surface);
+    let mut other = prepared.main.clone();
+    other.surface = Some(reversed);
+    prepared.extra.push(other);
+    let charges = prepared.texture_charges();
+    let arrays: Vec<_> = charges.iter().filter(|t| t.slot == TextureSlot::SplatAlbedo).collect();
+    assert_eq!(arrays.len(), 2, "the two bindings hold two arrays");
+    for array in arrays {
+        assert_eq!((array.bytes, array.layers, array.mips, array.compressed),
+            (32, 2, 1, Some(crate::material_surface::GpuCompressedFormat::Bc7)), "array metadata describes the uploaded blocks");
+    }
+    let mut cx = Cx::new(Box::new(|_, _| {}));
+    let mut renderer = Renderer::default();
+    let _uploaded = renderer.upload_static_preview(&mut cx, prepared);
+    assert_eq!(renderer.cached_texture_keys().collect::<std::collections::HashSet<_>>(),
+        charges.iter().map(|t| t.key).collect(), "splat layers charge only their arrays and weights");
+}
+
+#[test]
 fn generated_png_limits_are_checked_before_pixel_decode() {
     let png = Cx::encode_rgba_as_png(4, 4, &[255; 64]).unwrap();
     assert!(decode_generated_png(&png, 2, 1024).is_err());
@@ -104,7 +207,7 @@ fn morph_shadow_casters_share_visible_weights_and_exclude_rest_duplicates() {
     renderer.set_world_attachments(vec![instance]);
     renderer.set_model_clip(ModelTarget::Instance(0),Some("pulse".into()),0.75,false).unwrap();
     renderer.set_model_clip_weighted(ModelTarget::Attachment(0),Some("pulse".into()),1.,false,0.5).unwrap();
-    let movers=renderer.collect_lm_movers(&World::default(),vec3f(0.,0.,0.),None);
+    let movers=renderer.collect_lm_movers(&World::default(),vec3f(0.,0.,0.),1.,None);
     assert_eq!(movers.len(),2);
     assert_eq!(movers[0].morph.as_ref().unwrap().weights[0].x,0.75);
     assert_eq!(movers[1].morph.as_ref().unwrap().weights[0].x,0.625);
@@ -123,9 +226,9 @@ fn entity_casters_keep_their_primitive_shape(){
     let body=|id:u64,shape:Shape|Entity{id,shape,kind:BodyKind::Rigid,half:vec3f(0.5,0.5,0.5),scale:vec3f(1.,1.,1.),..Default::default()};
     world.entities=vec![body(1,Shape::Sphere),body(2,Shape::Box),body(3,Shape::Cylinder)];
     // No geometry resident yet: nothing is drawn as the wrong shape.
-    assert!(renderer.collect_lm_movers(&world,vec3f(0.,0.,0.),None).is_empty());
+    assert!(renderer.collect_lm_movers(&world,vec3f(0.,0.,0.),1.,None).is_empty());
     renderer.ensure_entity_caster_geometries(&mut cx);
-    let movers=renderer.collect_lm_movers(&world,vec3f(0.,0.,0.),None);
+    let movers=renderer.collect_lm_movers(&world,vec3f(0.,0.,0.),1.,None);
     assert_eq!(movers.len(),3);
     let id=|shape:Shape|renderer.shadow_shape_geometries[shape.index()].as_ref().unwrap().geometry_id();
     assert_eq!(movers[0].geometry,id(Shape::Sphere));

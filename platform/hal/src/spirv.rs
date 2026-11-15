@@ -18,6 +18,11 @@ pub struct SpirvPipeline {
     /// format's Y'CbCr conversion).
     pub textures: Vec<u32>,
     pub samplers: Vec<SpirvSampler>,
+    /// Which textures each sampler reads, sampler by sampler (bit i: texture i). A sampler
+    /// without an entry, or with all bits, may read any of them. A draw that binds a texture
+    /// whose format the device cannot filter reads it through a blend-free twin of each sampler
+    /// that reads it.
+    pub sampler_textures: Vec<u32>,
     /// The multiview stages (`view_index` picks each view's pass matrices; the bindings are the
     /// ones above, the depth binding a depth array): what a draw into a `Pass` with `views: 2`
     /// runs. Empty when the shader has none: such draws are left out of multiview passes.
@@ -33,6 +38,8 @@ pub struct SpirvSampler {
     pub address: u32,
     pub compare: bool,
     pub pixel: bool,
+    /// The requested anisotropy; 1 leaves anisotropic filtering off.
+    pub anisotropy: u32,
 }
 
 impl SpirvPipeline {
@@ -42,7 +49,8 @@ impl SpirvPipeline {
             self.pick_binding, self.pick_texture_base, self.textures.len() as u32, self.samplers.len() as u32,
             self.xr_vertex.len() as u32, self.xr_fragment.len() as u32];
         words.extend_from_slice(&self.textures);
-        for s in &self.samplers { words.extend([s.filter, s.address, u32::from(s.compare), u32::from(s.pixel)]); }
+        for s in &self.samplers { words.extend([s.filter, s.address, u32::from(s.compare), u32::from(s.pixel), s.anisotropy]); }
+        words.extend((0..self.samplers.len()).map(|i| self.sampler_textures.get(i).copied().unwrap_or(u32::MAX)));
         words.extend_from_slice(&self.vertex);
         words.extend_from_slice(&self.fragment);
         words.extend_from_slice(&self.xr_vertex);
@@ -56,7 +64,7 @@ impl SpirvPipeline {
         if words.len() < HEADER || words[0] != MAGIC { return Err("invalid HAL SPIR-V payload header".into()); }
         let (nv, nf, nt, ns) = (words[1] as usize, words[2] as usize, words[9] as usize, words[10] as usize);
         let (nxv, nxf) = (words[11] as usize, words[12] as usize);
-        let end = ns.checked_mul(4).and_then(|n| n.checked_add(HEADER)).and_then(|n| n.checked_add(nt))
+        let end = ns.checked_mul(6).and_then(|n| n.checked_add(HEADER)).and_then(|n| n.checked_add(nt))
             .and_then(|n| n.checked_add(nv)).and_then(|n| n.checked_add(nf)).and_then(|n| n.checked_add(nxv)).and_then(|n| n.checked_add(nxf));
         if end != Some(words.len()) || nv < 5 || nf < 5 || (nxv == 0) != (nxf == 0) || (nxv != 0 && (nxv < 5 || nxf < 5)) {
             return Err("invalid HAL SPIR-V payload lengths".into());
@@ -64,11 +72,12 @@ impl SpirvPipeline {
         let textures = words[HEADER..HEADER + nt].to_vec();
         if textures.iter().any(|t| *t > 6) { return Err("invalid SPIR-V texture shape".into()); }
         let mut samplers = Vec::with_capacity(ns);
-        for s in words[HEADER + nt..HEADER + nt + ns * 4].chunks_exact(4) {
-            if s[0] > 1 || s[1] > 3 || s[2] > 1 || s[3] > 1 { return Err("invalid SPIR-V sampler".into()); }
-            samplers.push(SpirvSampler { filter: s[0], address: s[1], compare: s[2] != 0, pixel: s[3] != 0 });
+        for s in words[HEADER + nt..HEADER + nt + ns * 5].chunks_exact(5) {
+            if s[0] > 1 || s[1] > 3 || s[2] > 1 || s[3] > 1 || s[4] == 0 { return Err("invalid SPIR-V sampler".into()); }
+            samplers.push(SpirvSampler { filter: s[0], address: s[1], compare: s[2] != 0, pixel: s[3] != 0, anisotropy: s[4] });
         }
-        let mut at = HEADER + nt + ns * 4;
+        let sampler_textures = words[HEADER + nt + ns * 5..HEADER + nt + ns * 6].to_vec();
+        let mut at = HEADER + nt + ns * 6;
         let mut take = |n: usize| { let stage = words[at..at + n].to_vec(); at += n; stage };
         let (vertex, fragment, xr_vertex, xr_fragment) = (take(nv), take(nf), take(nxv), take(nxf));
         for stage in [&vertex, &fragment, &xr_vertex, &xr_fragment] {
@@ -81,13 +90,13 @@ impl SpirvPipeline {
                 at += count;
             }
         }
-        Ok(Self { vertex, fragment, textures, samplers, texture_base: words[3], sampler_base: words[4],
+        Ok(Self { vertex, fragment, textures, samplers, sampler_textures, texture_base: words[3], sampler_base: words[4],
             depth_binding: words[5], instance_binding: words[6], pick_binding: words[7], pick_texture_base: words[8], xr_vertex, xr_fragment })
     }
 }
 
-/// The payload's header: magic (v2: with the multiview stages) and 12 counts/bindings.
-const MAGIC: u32 = 0x48564b32;
+/// The payload's header: magic (v4: with each sampler's textures) and 12 counts/bindings.
+const MAGIC: u32 = 0x48564b34;
 const HEADER: usize = 13;
 
 #[cfg(test)]
@@ -103,13 +112,18 @@ mod tests {
             vertex: stage.clone(), fragment: stage, texture_base: 2, sampler_base: 20, depth_binding: 0,
             instance_binding: 1, pick_binding: u32::MAX, pick_texture_base: 40,
             textures: (0..12).map(|i| i % 3).collect(),
-            samplers: vec![SpirvSampler { filter: 1, address: 0, compare: false, pixel: false }],
+            samplers: vec![
+                SpirvSampler { filter: 1, address: 0, compare: false, pixel: false, anisotropy: 1 },
+                SpirvSampler { filter: 1, address: 0, compare: false, pixel: false, anisotropy: 16 },
+            ],
+            sampler_textures: vec![0b101, 1 << 11],
             xr_vertex: Vec::new(), xr_fragment: Vec::new(),
         };
         let back = SpirvPipeline::decode(&p.encode()).expect("twelve textures decode");
         assert_eq!(back.textures, p.textures);
         assert_eq!(back.texture_base, 2);
         assert!(back.xr_vertex.is_empty());
+        assert_eq!(back, p, "sampler anisotropy, each sampler's textures and subsequent stages survive the wire format");
     }
 
     #[test]
@@ -119,7 +133,7 @@ mod tests {
         let p = SpirvPipeline {
             vertex: stage.clone(), fragment: stage, texture_base: 0, sampler_base: 1, depth_binding: 2,
             instance_binding: 3, pick_binding: u32::MAX, pick_texture_base: u32::MAX, textures: vec![0], samplers: Vec::new(),
-            xr_vertex: xr.clone(), xr_fragment: xr.clone(),
+            sampler_textures: Vec::new(), xr_vertex: xr.clone(), xr_fragment: xr.clone(),
         };
         let back = SpirvPipeline::decode(&p.encode()).expect("multiview stages decode");
         assert_eq!(back.xr_vertex, xr);

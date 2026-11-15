@@ -4,7 +4,7 @@
 //! it), so a host never starts a binary older than its sources; an installation (no
 //! checkout) starts the built binary, building it first when allowed.
 
-use crate::{build_argv, built_binary, has_sources, run_argv, AppEntry, AppTarget, MAKEPAD_RUN};
+use crate::{build_argv_features, built_binary, has_sources, run_argv_features, AppEntry, AppTarget, MAKEPAD_RUN};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
@@ -199,7 +199,7 @@ impl AppLaunch {
     }
 
     /// The arguments of the started process: the app's (`--stdin-loop`, registry, host), or the
-    /// tool's `run <package>` with the app's after `--`.
+    /// tool's `run <package> --bin <bin>` with the app's after `--`.
     fn process_args(&self) -> Vec<String> {
         let app_args = self.app.args.iter().map(|arg| arg.to_string()).chain(self.extra.iter().cloned());
         match self.runner {
@@ -209,7 +209,9 @@ impl AppLaunch {
                 // the way a native child is, over the host's wire
                 let hosted = (!cfg!(target_os = "linux")).then(|| "--stdin-loop".to_string());
                 let app_args: Vec<String> = hosted.into_iter().chain(app_args).collect();
-                let mut args = vec!["run".to_string(), self.app.package.to_string()];
+                // the app's own binary, as a native launch's `cargo run --bin` names it (a
+                // package may hold several)
+                let mut args = vec!["run".to_string(), self.app.package.to_string(), "--bin".to_string(), self.app.bin.to_string()];
                 if !app_args.is_empty() {
                     args.push("--".to_string());
                     args.extend(app_args);
@@ -219,24 +221,30 @@ impl AppLaunch {
         }
     }
 
+    /// The cargo features its build adds: the app's own (`AppEntry::build_features`); the JIT
+    /// tool's build none.
+    fn features(&self) -> String {
+        if self.runner == Runner::Native { self.app.build_features() } else { String::new() }
+    }
+
     fn command(&self) -> Result<Command, String> {
         let target = Self::target_of(self.app, self.runner);
-        // a host that runs under the JIT loader starts JIT apps with that loader (`$MAKEPAD_RUN_LOADER
+        // a host that runs under the JIT loader starts JIT apps with that loader (`$RELAX_LOADER
         // run ...`, the runner's convention), never a cargo build of another one: a CI tree's cargo
         // (no CARGO_TARGET_DIR once scrubbed) built a whole host makepad on every launch
-        let loader = (self.run && self.runner == Runner::Jit).then(|| std::env::var_os("MAKEPAD_RUN_LOADER").map(PathBuf::from)).flatten().filter(|l| l.is_file());
+        let loader = (self.run && self.runner == Runner::Jit).then(|| std::env::var_os("RELAX_LOADER").map(PathBuf::from)).flatten().filter(|l| l.is_file());
         let (program, args) = if let Some(loader) = &loader {
             self.root.as_deref().ok_or("no checkout to run from")?;
             (loader.clone(), self.process_args())
         } else if self.run {
             let root = self.root.as_deref().ok_or("no checkout to run from")?;
-            run_argv(&target, root, &self.process_args())
+            run_argv_features(&target, root, &self.features(), &self.process_args())
         } else if self.building {
             let root = self.root.as_deref().ok_or("no checkout to build from")?;
             if !has_sources(&target, root) {
                 return Err(format!("sources not found: {}", target.dir));
             }
-            build_argv(&target, root)
+            build_argv_features(&target, root, &self.features())
         } else if self.runner == Runner::Native {
             launch_argv(self.app, self.root.as_deref(), &self.extra)?
         } else {
@@ -261,7 +269,7 @@ impl AppLaunch {
             // only after a sync of landed work, never what a lane or an edit writes there
             // (relax's `DockGate`).
             if let (Runner::Jit, Some(revision)) = (self.runner, self.root.as_ref().map(|r| r.join(crate::machine::FLEET_REVISION)).filter(|r| r.is_file())) {
-                command.env("MAKEPAD_RUN_DOCK_REVISION", revision);
+                command.env("RELAX_DOCK_REVISION", revision);
             }
         }
         if let Some(root) = &self.root {
@@ -435,17 +443,17 @@ mod tests {
         seen.expect("start spawned")
     }
 
-    /// Under the JIT a checkout launch is `run <package>` with the app's arguments after `--` (on
+    /// Under the JIT a checkout launch is `run <package> --bin <bin>` with the app's arguments after `--` (on
     /// Linux no `--stdin-loop`: the HAL finds the WM by its socket), given to the loader this host
-    /// runs under (`MAKEPAD_RUN_LOADER`), else to `cargo run` of the makepad tool.
+    /// runs under (`RELAX_LOADER`), else to `cargo run` of the makepad tool.
     #[test]
     fn a_jit_launch_runs_the_package_under_the_makepad_tool() {
         let root = crate::checkout_at_or_above(Path::new(env!("CARGO_MANIFEST_DIR"))).expect("tests run in a checkout");
         let (args, kind) = started("terminal", Runner::Jit, &root);
         assert_eq!(kind, LaunchKind::Run);
         let hosted: &[&str] = if cfg!(target_os = "linux") { &[] } else { &["--stdin-loop"] };
-        let run = [&["run", "makepad-app-terminal", "--"], hosted, &["--x"]].concat();
-        if std::env::var_os("MAKEPAD_RUN_LOADER").is_some_and(|l| Path::new(&l).is_file()) {
+        let run = [&["run", "makepad-app-terminal", "--bin", "makepad-app-terminal", "--"], hosted, &["--x"]].concat();
+        if std::env::var_os("RELAX_LOADER").is_some_and(|l| Path::new(&l).is_file()) {
             assert_eq!(args, run);
         } else {
             let tail: Vec<&str> = args.iter().map(String::as_str).skip_while(|a| *a != "-p").collect();
@@ -457,7 +465,7 @@ mod tests {
     }
 
     /// A JIT launch from a checkout devhub syncs (it holds `FLEET-REVISION.txt`) carries the dock
-    /// gate (`MAKEPAD_RUN_DOCK_REVISION`: only a sync of landed work changes that app's code); a
+    /// gate (`RELAX_DOCK_REVISION`: only a sync of landed work changes that app's code); a
     /// launch from any other tree (a lane's) does not.
     #[test]
     fn a_launch_from_the_synced_checkout_is_gated_on_its_revision() {
@@ -469,7 +477,7 @@ mod tests {
             let mut env = None;
             let entry = crate::find("calculator").unwrap();
             let _ = AppLaunch::start::<()>(entry, Runner::Jit, Some(root.to_path_buf()), Vec::new(), BuildPolicy::IfMissing, false, |cmd, _| {
-                env = cmd.get_envs().find(|(k, _)| *k == "MAKEPAD_RUN_DOCK_REVISION").and_then(|(_, v)| v.map(|v| v.to_os_string()));
+                env = cmd.get_envs().find(|(k, _)| *k == "RELAX_DOCK_REVISION").and_then(|(_, v)| v.map(|v| v.to_os_string()));
                 Err("captured".into())
             });
             env
@@ -500,17 +508,17 @@ mod tests {
             // what this machine sets for the app at run time is not a build input, nor is the
             // dock gate a JIT launch from a devhub-synced checkout carries (read by the running JIT)
             let mut machine: Vec<String> = crate::machine::launch_env(id, runner == Runner::Jit).into_iter().map(|(k, _)| k).collect();
-            machine.push("MAKEPAD_RUN_DOCK_REVISION".to_string());
+            machine.push("RELAX_DOCK_REVISION".to_string());
             let envs = |c: &Command| {
                 let mut v: Vec<_> = c.get_envs().filter(|(k, _)| !machine.iter().any(|m| k.to_str() == Some(m.as_str()))).map(|(k, v)| (k.to_os_string(), v.map(|v| v.to_os_string()))).collect();
                 v.sort();
                 v
             };
             let (run_args, build_args) = (args(&run), args(&build));
-            let loader = std::env::var_os("MAKEPAD_RUN_LOADER").map(PathBuf::from).filter(|p| p.is_file());
+            let loader = std::env::var_os("RELAX_LOADER").map(PathBuf::from).filter(|p| p.is_file());
             if let Some(loader) = loader.filter(|_| runner == Runner::Jit) {
                 assert_eq!(run.get_program(), loader.as_os_str());
-                let mut expected_args = vec!["run".to_string(), entry.package.to_string()];
+                let mut expected_args = vec!["run".to_string(), entry.package.to_string(), "--bin".to_string(), entry.bin.to_string()];
                 let mut app_args = Vec::new();
                 if !cfg!(target_os = "linux") { app_args.push("--stdin-loop".to_string()); }
                 app_args.extend(entry.args.iter().map(|arg| arg.to_string()));
@@ -519,7 +527,7 @@ mod tests {
                     expected_args.extend(app_args);
                 }
                 assert_eq!(run_args, expected_args, "{id}");
-                let (program, expected_args) = build_argv(&MAKEPAD_RUN, &root);
+                let (program, expected_args) = crate::build_argv(&MAKEPAD_RUN, &root);
                 assert_eq!(build.get_program(), program.as_os_str());
                 assert_eq!(build_args, expected_args, "{id}");
                 let mut expected = Command::new(&loader);

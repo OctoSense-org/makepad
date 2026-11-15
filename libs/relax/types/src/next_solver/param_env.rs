@@ -101,7 +101,7 @@ pub(crate) fn param_env(tcx: &Tcx, prog: &Program, def: DefId) -> ParamEnv {
     if prog.def(def).kind == DefKind::AssocFn && prog.def(prog.def(def).parent).kind == DefKind::Trait {
         let d = prog.def(def);
         let ast = &prog.files[d.file as usize].ast;
-        if matches!(ast.item(d.item).kind, crate::ast::ItemKind::Fn(_, Some(_), _)) || prog.fn_body(d.file, d.item).ok().flatten().is_some() {
+        if matches!(ast.item(d.item).kind, crate::ast::ItemKind::Fn(_, body, _) if body.is_some()) || prog.fn_body(d.file, d.item).ok().flatten().is_some() {
             if let Some(sig) = tcx.fn_sig(prog, def) {
                 if !add_default_body_rpitit_clauses(prog, tcx, def, &sig, &mut clauses) {
                     infcx.errors.report(infcx.cause, "invalid return-position impl Trait in default trait body".into());
@@ -216,7 +216,7 @@ pub fn normalize_param_env_or_error(tcx: &Tcx, prog: &Program, env: ParamEnv, ca
     let mut clauses = Vec::new();
     let mut seen = crate::fxhash::HashSet::default();
     for p in &*env.clauses {
-        for p in tcx.supertraits(prog, p.clone()) { if seen.insert(p.clone()) { clauses.push(p); } }
+        for p in tcx.elaborate(prog, p.clone()) { if seen.insert(p.clone()) { clauses.push(p); } }
     }
     struct HasAliases(bool);
     impl TypeFolder for HasAliases {

@@ -8,7 +8,7 @@
 //! the TEB's bounds, which GetCurrentThreadStackLimits reads). Another thread, or a thread that is
 //! not on a program stack, gets the OS answer.
 //!
-//! Thread names (pthread_setname_np, Linux): a thread that names itself as MAKEPAD_RUN_RT_THREADS
+//! Thread names (pthread_setname_np, Linux): a thread that names itself as RELAX_RT_THREADS
 //! lists is a live real-time thread for the JIT's queue (jit::realtime_live).
 //!
 //! Heap (glibc mallinfo2): a program thread that runs in a domain allocates in that domain's heap
@@ -29,7 +29,7 @@ extern "C" {
     fn libc_pthread_setname_np(t: usize, name: *const std::ffi::c_char) -> i32;
 }
 
-/// pthread_setname_np: a thread that takes a name MAKEPAD_RUN_RT_THREADS lists is a live real-time
+/// pthread_setname_np: a thread that takes a name RELAX_RT_THREADS lists is a live real-time
 /// thread (jit::realtime_live: the tier-up builds go below it from now on).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub extern "C" fn pthread_setname_np(t: usize, name: *const std::ffi::c_char) -> i32 {
@@ -207,9 +207,12 @@ mod tests {
 
     /// Off a domain, mallinfo2 leaves out what the loader's allocator holds in the system heap:
     /// a loader block allocated meanwhile does not show, as the program did not allocate it.
+    /// (In a process of its own: the system-held count is the process's, and the suite's other
+    /// threads freeing meanwhile took it below the 1 MiB block, one whole-suite run in eight.)
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn mallinfo2_leaves_out_the_loaders_blocks() {
+        isolated_test!(mallinfo2_leaves_out_the_loaders_blocks);
         let m = super::Mallinfo2 { uordblks: 1000, hblkhd: 500, fordblks: 7, ..Default::default() };
         let p = super::program_mallinfo2(m, 1200);
         assert_eq!((p.uordblks, p.hblkhd, p.fordblks), (0, 300, 7));

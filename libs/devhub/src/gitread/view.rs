@@ -49,6 +49,16 @@ fn queries(common: &Path) -> Option<Arc<Mutex<Queries>>> {
     drop(q);
     Some(query)
 }
+/// Where a commit that does not read should be, for its error to say what was missing: the
+/// reader that read it, its loose file, the pack directory's indexes, the store itself, as they
+/// are on a second look (a flaky test's commit "did not read" with no path in its error, 11-03..07).
+pub(crate) fn store_state(common: &Path, oid: &ObjectId) -> String {
+    let objects = common.join("objects");
+    let (dir, file) = oid.loose_path_components();
+    if !objects.is_dir() { return format!(" (through the shared reader of {}; {} is gone)", common.display(), objects.display()); }
+    let packs = std::fs::read_dir(objects.join("pack")).map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "idx")).count());
+    format!(" (through the shared reader of {}; now loose {}: {}; packs: {})", common.display(), objects.join(&dir).join(&file).display(), if objects.join(&dir).join(&file).exists() { "present" } else { "absent" }, packs.map_or_else(|e| e.to_string(), |n| n.to_string()))
+}
 struct View {
     repo: Arc<Mutex<Repository>>,
     query: Arc<Mutex<Queries>>,
@@ -150,7 +160,7 @@ impl Pass {
         let Some(oid) = self.oid(&p, name) else { return format!("no ref {name}") };
         let read = self.view(&p).map(|v| v.repo.lock().unwrap_or_else(|e| e.into_inner()).read_commit(&oid).map(|_| ()));
         match read {
-            Some(Err(e)) => format!("its commit {} does not read: {e}", oid.to_hex()),
+            Some(Err(e)) => format!("its commit {} does not read: {e}{}", oid.to_hex(), store_state(&p.common_dir, &oid)),
             _ => format!("{name} read on a second look ({})", oid.to_hex()),
         }
     }

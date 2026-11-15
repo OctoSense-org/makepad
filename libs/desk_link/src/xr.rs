@@ -13,7 +13,7 @@
 //! Headset → desktop: `Hello` (eye size, refresh, the decoder's codecs), then one `Pose` per
 //! display frame (the `XrFrame` the app draws with: head, both eyes, controllers, hands; a
 //! sequence number and the headset's sample and display times), `State` (visible / focused),
-//! `Stats` (decode and motion-to-photon per shown picture), `Ping`, `Keyframe`.
+//! `Stats` (decode and motion-to-photon per shown picture), `Ping`, `Keyframe`, `Recenter`.
 //! Desktop → headset: `Welcome` (the picture size, codec and tiles), then per rendered frame one
 //! `Video` per tile (the pose's sequence number, the eyes the picture was rendered with, the
 //! server-side stage durations, one Annex-B access unit), `Pong`, `Bye`, `Note`.
@@ -188,7 +188,28 @@ pub mod codecs {
     /// Not a codec: the headset plays `XrServerMsg::Haptic` (a headset without it is never
     /// sent one, so older headsets keep linking).
     pub const HAPTICS: u32 = 1 << 16;
+    /// Not a codec: the headset sends its cameras' pictures when asked
+    /// (`XrServerMsg::Capture`; a headset without it is never asked).
+    pub const CAPTURE: u32 = 1 << 17;
+    /// Not a codec: the headset sends its microphone when asked (`XrServerMsg::Mic`; a
+    /// headset without it is never asked).
+    pub const MIC: u32 = 1 << 18;
 }
+
+/// `XrClientMsg::Mic::state`: what the headset's microphone is doing.
+pub mod mic_state {
+    /// Not capturing (the answer to an off, or the link's first word).
+    pub const OFF: u8 = 0;
+    /// Asked; waiting for the wearer's permission or the device.
+    pub const STARTING: u8 = 1;
+    /// Capturing: PCM follows.
+    pub const LISTENING: u8 = 2;
+    /// It cannot capture: the text says why.
+    pub const FAILED: u8 = 3;
+}
+
+/// The sample rate of `XrClientMsg::Mic` audio (mono, signed 16-bit little endian).
+pub const MIC_RATE: u32 = 16_000;
 /// `Video::codec`.
 pub const CODEC_H264: u8 = 0;
 pub const CODEC_HEVC: u8 = 1;
@@ -213,6 +234,18 @@ pub enum XrClientMsg {
     /// The headset's numbers of its last second ([`report`] names them), for the server's
     /// stats panel.
     Report { values: Vec<f32> },
+    /// Chunk `part` of `parts` of capture record `seq` (`crate::xr_capture`: what the cameras
+    /// see, while the server asks with `XrServerMsg::Capture`). Sent in the link's gaps, like
+    /// `World`.
+    Capture { seq: u32, part: u32, parts: u32, data: Vec<u8> },
+    /// The headset's microphone, while the server asks (`XrServerMsg::Mic`): its `state`
+    /// ([`mic_state`]) with a `text` that says why when it failed, and the next `pcm` (mono,
+    /// [`MIC_RATE`], 16-bit little endian; empty on a state change). `seq` counts the messages
+    /// of one ask. Sent in the link's gaps, like `Capture`.
+    Mic { seq: u32, state: u8, text: String, pcm: Vec<u8> },
+    /// The wearer recentered: the headset's tracking space moved (its origin, its forward), and
+    /// the poses from here on are in the moved space.
+    Recenter,
 }
 
 /// `XrClientMsg::Report`: what each value is (index) and its label.
@@ -351,6 +384,15 @@ pub enum XrServerMsg {
     /// A short buzz on a controller (`hand` 0 left, 1 right; `amplitude` 0..1), the app's
     /// `Cx::xr_haptic`. Only to a headset whose `Hello::codecs` has [`codecs::HAPTICS`].
     Haptic { hand: u8, amplitude: f32, duration_us: u32 },
+    /// Capture the cameras (`crate::xr_capture`) or stop: a keyframe each time the head turned
+    /// `step_deg` or moved `step_m` since the last, and a preview of `preview_hz` pictures a
+    /// second (0: none). Only to a headset whose `Hello::codecs` has [`codecs::CAPTURE`];
+    /// off until asked, and off again when the link ends.
+    Capture { on: bool, step_deg: f32, step_m: f32, preview_hz: u8 },
+    /// The microphone on or off: while on, the headset sends what its wearer says
+    /// (`XrClientMsg::Mic`). Only to a headset whose `Hello::codecs` has [`codecs::MIC`]; off
+    /// until asked, and off again when the link ends.
+    Mic { on: bool },
 }
 
 /// `Video::stages`: the desktop's durations of a picture (µs).
@@ -374,6 +416,9 @@ mod tag {
     pub const KEYFRAME: u8 = 6;
     pub const WORLD: u8 = 7;
     pub const REPORT: u8 = 8;
+    pub const CAPTURE_C: u8 = 9;
+    pub const MIC_C: u8 = 10;
+    pub const RECENTER: u8 = 11;
     pub const WELCOME: u8 = 100;
     pub const REFUSED: u8 = 101;
     pub const VIDEO: u8 = 102;
@@ -388,6 +433,8 @@ mod tag {
     pub const UNPAIRED: u8 = 111;
     pub const HEADSET: u8 = 112;
     pub const HAPTIC: u8 = 113;
+    pub const CAPTURE_S: u8 = 114;
+    pub const MIC_S: u8 = 115;
 }
 
 fn bad(ty: u8, side: &str) -> io::Error {
@@ -440,6 +487,17 @@ impl XrClientMsg {
                 }
                 o.done()
             }
+            XrClientMsg::Capture { seq, part, parts, data } => {
+                let mut o = Out::new(CAPTURE_C);
+                o.u32(*seq).u32(*part).u32(*parts).bytes(data);
+                o.done()
+            }
+            XrClientMsg::Mic { seq, state, text, pcm } => {
+                let mut o = Out::new(MIC_C);
+                o.u32(*seq).u8(*state).str(text).bytes(pcm);
+                o.done()
+            }
+            XrClientMsg::Recenter => Out::new(RECENTER).done(),
         }
     }
 
@@ -469,6 +527,9 @@ impl XrClientMsg {
                 }
                 XrClientMsg::World { voxel_size, chunk_edge, bricks }
             }
+            CAPTURE_C => XrClientMsg::Capture { seq: r.u32()?, part: r.u32()?, parts: r.u32()?, data: r.bytes()?.to_vec() },
+            MIC_C => XrClientMsg::Mic { seq: r.u32()?, state: r.u8()?, text: r.str()?, pcm: r.bytes()?.to_vec() },
+            RECENTER => XrClientMsg::Recenter,
             _ => return Err(bad(ty, "client")),
         })
     }
@@ -545,6 +606,16 @@ impl XrServerMsg {
                 o.u8(*hand).f32(*amplitude).u32(*duration_us);
                 o.done()
             }
+            XrServerMsg::Capture { on, step_deg, step_m, preview_hz } => {
+                let mut o = Out::new(CAPTURE_S);
+                o.u8(*on as u8).f32(*step_deg).f32(*step_m).u8(*preview_hz);
+                o.done()
+            }
+            XrServerMsg::Mic { on } => {
+                let mut o = Out::new(MIC_S);
+                o.u8(*on as u8);
+                o.done()
+            }
         }
     }
 
@@ -588,6 +659,8 @@ impl XrServerMsg {
             UNPAIRED => XrServerMsg::Unpaired,
             HEADSET => XrServerMsg::Headset { foveation: r.u8()?, eye_min_pct: r.u8()?, eye_max_pct: r.u8()?, multimodal: r.u8()? != 0, occlusion: r.u8()? != 0, ahead: r.u8()? },
             HAPTIC => XrServerMsg::Haptic { hand: r.u8()?, amplitude: r.f32()?, duration_us: r.u32()? },
+            CAPTURE_S => XrServerMsg::Capture { on: r.bool()?, step_deg: r.f32()?, step_m: r.f32()?, preview_hz: r.u8()? },
+            MIC_S => XrServerMsg::Mic { on: r.bool()? },
             _ => return Err(bad(ty, "server")),
         })
     }
@@ -720,6 +793,44 @@ pub mod pose_datagram {
     }
 }
 
+/// The bytes of low-priority messages queued and not written yet; a sender waits on it for
+/// the link to take them (the link's thread tells each write, and its end).
+#[cfg(any(feature = "server", test))]
+#[derive(Default)]
+pub(crate) struct BulkGauge {
+    /// (bytes, the link ended)
+    state: std::sync::Mutex<(usize, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(any(feature = "server", test))]
+impl BulkGauge {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (usize, bool)> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn add(&self, n: usize) {
+        self.lock().0 += n;
+    }
+    pub(crate) fn written(&self, n: usize) {
+        let mut s = self.lock();
+        s.0 = s.0.saturating_sub(n);
+        self.changed.notify_all();
+    }
+    pub(crate) fn end(&self) {
+        *self.lock() = (0, true);
+        self.changed.notify_all();
+    }
+    pub(crate) fn pending(&self) -> usize {
+        self.lock().0
+    }
+    pub(crate) fn wait_below(&self, max: usize) {
+        let mut s = self.lock();
+        while s.0 > max && !s.1 {
+            s = self.changed.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 #[cfg(feature = "server")]
 pub mod link {
     //! The headset's end: a TLS connection to an XR server on its own thread (TLS contexts are not
@@ -727,19 +838,25 @@ pub mod link {
     use super::*;
     use crate::{write_all, Inbox};
     use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     pub struct XrLink {
         tx: Sender<Vec<u8>>,
-        /// Low-priority messages (the room field): written only when nothing else waits.
+        /// Low-priority messages (the room field, the capture): written only when nothing else
+        /// waits, and their bytes not written yet.
         bulk: Sender<Vec<u8>>,
+        bulk_bytes: Arc<BulkGauge>,
         /// Behind a lock so a link can be shared (one reader in practice).
         rx: std::sync::Mutex<Receiver<XrServerMsg>>,
         closed: Arc<AtomicBool>,
         reason: Arc<std::sync::Mutex<String>>,
+        /// Messages the link's thread passed on and the reader has not taken: a link that ended
+        /// is not [`XrLink::closed`] before the reader has them (a `Refresh` and the `Bye`
+        /// behind it come in one read).
+        queued: Arc<AtomicUsize>,
     }
 
     /// What the headset says of itself in its `Hello`.
@@ -769,16 +886,21 @@ pub mod link {
             let closed = Arc::new(AtomicBool::new(false));
             let reason = Arc::new(std::sync::Mutex::new(String::new()));
             let (closed2, reason2) = (closed.clone(), reason.clone());
+            let queued = Arc::new(AtomicUsize::new(0));
+            let queued2 = queued.clone();
+            let bulk_bytes = Arc::new(BulkGauge::default());
+            let bulk_bytes2 = bulk_bytes.clone();
             std::thread::Builder::new()
                 .name("xr-link".into())
                 .spawn(move || {
-                    let why = run(&mut stream, out_rx, bulk_rx, in_tx, &wake);
+                    let why = run(&mut stream, out_rx, bulk_rx, &bulk_bytes2, in_tx, &queued2, &wake);
                     *reason2.lock().unwrap() = why;
                     closed2.store(true, Ordering::Release);
+                    bulk_bytes2.end();
                     wake();
                 })
                 .map_err(|e| e.to_string())?;
-            Ok(XrLink { tx, bulk, rx: std::sync::Mutex::new(rx), closed, reason })
+            Ok(XrLink { tx, bulk, bulk_bytes, rx: std::sync::Mutex::new(rx), closed, reason, queued })
         }
 
         /// Queues a message (never waits; a closed link drops it).
@@ -790,25 +912,60 @@ pub mod link {
         /// link's loop and only when no other message waits (a pose is never behind it). Keep
         /// each one small (tens of KB) so a pose waits at most one such write.
         pub fn send_bulk(&self, msg: &XrClientMsg) {
-            let _ = self.bulk.send(msg.encode());
+            let bytes = msg.encode();
+            self.bulk_bytes.add(bytes.len());
+            if self.bulk.send(bytes).is_err() {
+                // (a closed link: nothing will write it)
+                self.bulk_bytes.end();
+            }
+        }
+
+        /// The bytes of low-priority messages queued and not written yet (a sender of big
+        /// payloads keeps it bounded: the link's gaps are only so wide).
+        pub fn bulk_pending(&self) -> usize {
+            self.bulk_bytes.pending()
+        }
+
+        /// Waits (a sender's thread; never the UI's) until at most `max` bytes of low-priority
+        /// messages are queued, or the link ended.
+        pub fn wait_bulk_below(&self, max: usize) {
+            self.bulk_bytes.wait_below(max);
         }
 
         pub fn try_recv(&self) -> Option<XrServerMsg> {
-            self.rx.lock().unwrap().try_recv().ok()
+            let msg = self.rx.lock().unwrap().try_recv().ok();
+            self.taken(msg)
         }
 
         /// The next message, waiting up to `timeout` (a worker thread's loop; never the UI's).
         pub fn recv_timeout(&self, timeout: Duration) -> Option<XrServerMsg> {
-            self.rx.lock().unwrap().recv_timeout(timeout).ok()
+            let msg = self.rx.lock().unwrap().recv_timeout(timeout).ok();
+            self.taken(msg)
         }
 
-        /// Why the link ended, once it did.
+        fn taken(&self, msg: Option<XrServerMsg>) -> Option<XrServerMsg> {
+            if msg.is_some() {
+                self.queued.fetch_sub(1, Ordering::AcqRel);
+            }
+            msg
+        }
+
+        /// Why the link ended, once it did and the reader has every message it passed on (the
+        /// server's last words, a `Refresh` before its `Bye`, are not lost to the end).
         pub fn closed(&self) -> Option<String> {
-            self.closed.load(Ordering::Acquire).then(|| self.reason.lock().unwrap().clone())
+            (self.closed.load(Ordering::Acquire) && self.queued.load(Ordering::Acquire) == 0).then(|| self.reason.lock().unwrap().clone())
+        }
+
+        /// A link over channels the test fills itself (no connection).
+        #[cfg(test)]
+        pub(crate) fn over_channels(rx: Receiver<XrServerMsg>, queued: Arc<AtomicUsize>, why: &str) -> XrLink {
+            let (tx, _) = channel();
+            let (bulk, _) = channel();
+            XrLink { tx, bulk, bulk_bytes: Arc::new(BulkGauge::default()), rx: std::sync::Mutex::new(rx), closed: Arc::new(AtomicBool::new(true)), reason: Arc::new(std::sync::Mutex::new(why.to_string())), queued }
         }
     }
 
-    fn run(stream: &mut makepad_network::SocketStream, out: Receiver<Vec<u8>>, bulk: Receiver<Vec<u8>>, inbox_tx: Sender<XrServerMsg>, wake: &Arc<dyn Fn() + Send + Sync>) -> String {
+    fn run(stream: &mut makepad_network::SocketStream, out: Receiver<Vec<u8>>, bulk: Receiver<Vec<u8>>, bulk_bytes: &BulkGauge, inbox_tx: Sender<XrServerMsg>, queued: &AtomicUsize, wake: &Arc<dyn Fn() + Send + Sync>) -> String {
         let mut inbox = Inbox::default();
         let mut buf = vec![0u8; 1 << 20];
         let mut last_heard = Instant::now();
@@ -826,7 +983,9 @@ pub mod link {
             }
             // one low-priority message in the gap (the next turn writes the poses first)
             if let Ok(bytes) = bulk.try_recv() {
-                if let Err(e) = write_all(stream, &bytes) {
+                let written = write_all(stream, &bytes);
+                bulk_bytes.written(bytes.len());
+                if let Err(e) = written {
                     return format!("write: {e}");
                 }
             }
@@ -851,7 +1010,10 @@ pub mod link {
                                     XrServerMsg::Bye { reason } | XrServerMsg::Refused { reason } => reason.clone(),
                                     _ => String::new(),
                                 };
-                                let _ = inbox_tx.send(msg);
+                                queued.fetch_add(1, Ordering::AcqRel);
+                                if inbox_tx.send(msg).is_err() {
+                                    queued.fetch_sub(1, Ordering::AcqRel);
+                                }
                                 wake();
                                 if end {
                                     return why;
@@ -874,6 +1036,42 @@ pub mod link {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn a_link_that_ended_still_hands_over_the_servers_last_words_first() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // the server's Refresh and Bye came in one read, the link's thread ended behind them
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queued = std::sync::Arc::new(AtomicUsize::new(0));
+        for m in [XrServerMsg::Refresh { mhz: 72_000 }, XrServerMsg::Bye { reason: "the display rate goes from 90 to 72 Hz".into() }] {
+            queued.fetch_add(1, Ordering::AcqRel);
+            tx.send(m).unwrap();
+        }
+        let link = link::XrLink::over_channels(rx, queued, "the display rate goes from 90 to 72 Hz");
+        assert_eq!(link.closed(), None, "the reader has two messages to take first");
+        assert!(matches!(link.try_recv(), Some(XrServerMsg::Refresh { mhz: 72_000 })));
+        assert_eq!(link.closed(), None);
+        assert!(matches!(link.try_recv(), Some(XrServerMsg::Bye { .. })));
+        assert_eq!(link.closed().as_deref(), Some("the display rate goes from 90 to 72 Hz"));
+    }
+
+    #[test]
+    fn bulk_gauge_wakes_a_waiting_sender() {
+        // a sender waits until the link took enough, or the link ended; never polls
+        let g = std::sync::Arc::new(BulkGauge::default());
+        g.add(100);
+        let waiter = { let g = g.clone(); std::thread::spawn(move || { g.wait_below(50); g.pending() }) };
+        g.written(30);
+        g.written(30);
+        assert_eq!(waiter.join().unwrap(), 40);
+        g.add(100);
+        let waiter = { let g = g.clone(); std::thread::spawn(move || g.wait_below(0)) };
+        g.end();
+        waiter.join().unwrap();
+        assert_eq!(g.pending(), 0);
+        g.wait_below(0);
+    }
     use crate::Inbox;
 
     #[test]
@@ -925,6 +1123,9 @@ mod tests {
             XrClientMsg::Ping { client_ns: 5 },
             XrClientMsg::Keyframe,
             XrClientMsg::World { voxel_size: 0.02, chunk_edge: 4, bricks: vec![WorldBrick { key: [1, -2, 3], version: 7, payload: vec![1, 2, 3] }, WorldBrick { key: [0, 0, 0], version: 1, payload: Vec::new() }] },
+            XrClientMsg::Capture { seq: 3, part: 1, parts: 2, data: vec![9, 8, 7] },
+            XrClientMsg::Mic { seq: 4, state: mic_state::FAILED, text: "no microphone".into(), pcm: vec![1, 0, 255, 127] },
+            XrClientMsg::Recenter,
         ];
         for m in client {
             let mut inbox = Inbox::default();
@@ -933,7 +1134,7 @@ mod tests {
             assert_eq!(XrClientMsg::decode(ty, &p).unwrap(), m);
         }
         let server = [
-            XrServerMsg::Welcome { version: XR_VERSION, server: "166".into(), instance: 7, session: 9, size: [2560, 1824], codec: CODEC_HEVC, tiles: 2, encoder: "nvidia".into(), eye: [2016, 2112], fovea: Fovea::DEFAULT },
+            XrServerMsg::Welcome { version: XR_VERSION, server: "89".into(), instance: 7, session: 9, size: [2560, 1824], codec: CODEC_HEVC, tiles: 2, encoder: "nvidia".into(), eye: [2016, 2112], fovea: Fovea::DEFAULT },
             XrServerMsg::Refused { reason: "busy".into() },
             XrServerMsg::Video {
                 seq: 9,
@@ -957,6 +1158,8 @@ mod tests {
             XrServerMsg::Unpaired,
             XrServerMsg::Headset { foveation: 2, eye_min_pct: 70, eye_max_pct: 100, multimodal: true, occlusion: true, ahead: 4 },
             XrServerMsg::Haptic { hand: 1, amplitude: 0.85, duration_us: 35_000 },
+            XrServerMsg::Capture { on: true, step_deg: 12.0, step_m: 0.04, preview_hz: 5 },
+            XrServerMsg::Mic { on: true },
         ];
         for m in server {
             let mut inbox = Inbox::default();

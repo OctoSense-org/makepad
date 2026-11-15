@@ -487,10 +487,27 @@ fn touch_dragging_a_nested_scroll_view_with_nothing_to_scroll_drags_the_page(app
 }
 
 #[makepad_test]
-fn touch_dragging_a_multiline_input_never_drags_the_page(app: TestApp) {
+fn touch_dragging_a_multiline_input_drags_the_page_only_when_its_text_cant_scroll_that_way(app: TestApp) {
     let page = reveal_carousel(&app);
     app.locator(Selector::id("short_notes")).touch_drag_by_and_hold(0.0, -60.0);
-    assert_eq!(offsets(&app, ["page"]), [page]);
+    let [page_after] = offsets(&app, ["page"]);
+    assert!(page_after > page + 40.0, "the page followed the finger ({page} -> {page_after})");
+
+    // The notes start out scrolled to the top, so a drag down moves the page.
+    app.locator(Selector::id("notes")).touch_drag_by_and_hold(0.0, 60.0);
+    let [page_down] = offsets(&app, ["page"]);
+    assert!(page_down < page_after - 40.0, "the page followed the finger ({page_after} -> {page_down})");
+
+    // A drag up scrolls the notes instead, so the next drag down scrolls them back.
+    app.locator(Selector::id("notes")).touch_drag_by_and_hold(0.0, -60.0);
+    assert_eq!(offsets(&app, ["page"]), [page_down]);
+    app.locator(Selector::id("notes")).touch_drag_by_and_hold(0.0, 60.0);
+    assert_eq!(offsets(&app, ["page"]), [page_down]);
+
+    // That put them back at the top, so the page gets the next one.
+    app.locator(Selector::id("notes")).touch_drag_by_and_hold(0.0, 60.0);
+    let [page_last] = offsets(&app, ["page"]);
+    assert!(page_last < page_down - 40.0, "the page followed the finger ({page_down} -> {page_last})");
 }
 
 fn open_code_modal(app: &TestApp) {
@@ -583,11 +600,35 @@ fn touch_dragging_sideways_from_a_button_leaves_its_page_alone(app: TestApp) {
     assert_eq!(offsets(&app, ["tap_page"]), [page]);
 }
 
+/// A mouse press a button took becomes the page's once it drags the page's way past the tap slop,
+/// as a touch does: the page scrolls and the release clicks nothing.
 #[makepad_test]
-fn mouse_dragging_from_a_button_leaves_its_page_alone(app: TestApp) {
+fn mouse_dragging_from_a_button_scrolls_its_page_and_never_clicks_it(app: TestApp) {
     let [page] = offsets(&app, ["tap_page"]);
+    app.locator(Selector::id("tap_button")).drag_by(0.0, 0.0);
+    wait_for(&app, "tap_clicks", 1.0);
+
     app.locator(Selector::id("tap_button")).drag_by(0.0, -60.0);
-    assert_eq!(offsets(&app, ["tap_page"]), [page]);
+    let [clicks, page_after] = offsets(&app, ["tap_clicks", "tap_page"]);
+    assert_eq!(clicks, 1.0);
+    assert!(page_after >= page + 40.0, "the page followed the mouse ({page} -> {page_after})");
+}
+
+/// A mouse drag a control gives a meaning of its own stays the control's: one on a reorder list's
+/// grip carries the row, one over a selectable list's text selects it, and the page around them
+/// takes neither over, as it would a drag that starts on a button.
+#[makepad_test]
+fn a_mouse_drag_on_a_grip_or_selectable_text_never_scrolls_its_page(app: TestApp) {
+    let [page, reorders] = offsets(&app, ["drag_page", "reorders"]);
+    app.locator(Selector::all().text_exact("Grip 3")).drag_by_and_hold(0.0, -70.0);
+    let [page_after, reorders_after] = offsets(&app, ["drag_page", "reorders"]);
+    assert_eq!(reorders_after, reorders + 1.0, "the drag on the grip moved its row");
+    assert_eq!(page_after, page, "the drag on the grip left the page alone");
+
+    app.locator(Selector::all().text_exact("Sel 1")).drag_by_and_hold(0.0, -40.0);
+    let [page_after, selected] = offsets(&app, ["drag_page", "selected"]);
+    assert!(selected > 0.0, "the drag over the list's text selected some of it");
+    assert_eq!(page_after, page, "the selecting drag left the page alone");
 }
 
 #[makepad_test]

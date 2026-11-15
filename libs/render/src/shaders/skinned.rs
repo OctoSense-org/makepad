@@ -6,12 +6,73 @@ script_mod! {
     use mod.prelude.widgets_internal.*
     use mod.widgets.*
     use mod.geom
+    use mod.shared.*
+
+    // Shared by static/CPU-skinned models and the GPU skin lane. All text
+    // state is per material; no fields are added to the instance stream.
+    mod.draw.SceneMsdfText = {
+        msdf_fill: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        msdf_border: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        // Border thickness, encoded distance range (texels), texture size.
+        msdf_ctl: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        msdf_plate_cells: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        msdf_ink_alpha: uniform(1.0)
+        msdf_texel: fn(uv: vec2, ink_color: vec3, number: float, plate: float) -> vec4 {
+            var top_uv = uv
+            if plate > 0.5 { top_uv = vec2(uv.x, uv.y * 0.5) }
+            // Derivatives before digit remapping: adjacent digits must
+            // not select a coarse mip at the atlas discontinuity.
+            let dx = dFdx(top_uv)
+            let dy = dFdy(top_uv)
+            var ink_uv = top_uv
+            var ink_dx = dx
+            var ink_dy = dy
+            if plate > 0.5 {
+                let cells = self.msdf_plate_cells
+                let cell = (top_uv.x - cells.x) / cells.y
+                let n = max(0.0 - number - 1.0, 0.0)
+                if cell >= 0.0 && cell < 3.0 && number < -0.5 {
+                    let k = floor(cell)
+                    let digit = floor(n / pow(10.0, 2.0 - k)) - floor(n / pow(10.0, 3.0 - k)) * 10.0
+                    ink_uv = vec2(cells.z + cells.w * (digit + fract(cell)), 0.5 + top_uv.y)
+                    ink_dx = vec2(dx.x * cells.w / cells.y, dx.y)
+                    ink_dy = vec2(dy.x * cells.w / cells.y, dy.y)
+                }
+            }
+            let sample = self.tex.sample_grad(ink_uv, ink_dx, ink_dy)
+            // Badge geometry always comes from the top, including under
+            // remapped digits. It is independent of the RGB lettering.
+            var badge = sample.w
+            if plate > 0.5 { badge = self.tex.sample_grad(top_uv, dx, dy).w }
+            let d = max(min(sample.x, sample.y), min(max(sample.x, sample.y), sample.z))
+            let range = self.msdf_ctl.y
+            var tsz = self.msdf_ctl.zw
+            if tsz.x < 1.0 { tsz = self.tex.size() }
+            let footprint = max(abs(ink_dx) + abs(ink_dy), vec2(0.000001, 0.000001))
+            let screen_range = max(0.5 * dot(vec2(range, range) / tsz, vec2(1.0, 1.0) / footprint), 1.0)
+            let sd = (d - 0.5) * range
+            let w = max(abs(dFdx(sd)) + abs(dFdy(sd)), range / screen_range)
+            let ink = clamp(sd / max(w, 0.00001) + 0.5, 0.0, 1.0) * self.msdf_ink_alpha
+            let shape_sd = (badge - 0.5) * range
+            let shape_w = max(abs(dFdx(shape_sd)) + abs(dFdy(shape_sd)), range / screen_range)
+            let shape = clamp(shape_sd / max(shape_w, 0.00001) + 0.5, 0.0, 1.0)
+            let inner = clamp((shape_sd - self.msdf_ctl.x) / max(shape_w, 0.00001) + 0.5, 0.0, 1.0)
+            let ring = max(shape - inner, 0.0)
+            let bg = mix(self.msdf_fill, self.msdf_border, ring * self.msdf_border.w)
+            let rgb = mix(bg.xyz, ink_color, ink)
+            // base_texel's callers consume encoded colour, and apply
+            // their existing scene transfer and MASK coverage once.
+            return vec4(linear_to_srgb(rgb), max(max(shape * self.msdf_fill.w, ring * self.msdf_border.w), ink))
+        }
+    }
 
     // Skinned character mesh: PbrVertex stream (CPU-skinned per frame, uv in
     // ny_nz_uv.zw), textured, lit and fogged like the terrain.
     mod.draw.DrawSceneSkinned = mod.std.set_type_default() do #(DrawSceneSkinned::script_shader(vm)){
         ..mod.draw.SceneFurSurface,
+        ..mod.draw.SceneMsdfText,
         ..mod.draw.SceneColorAdjust,
+        ..mod.draw.SceneWind,
         alpha_blend: false
         // Imported model layers may be deliberate sheets (roof soffits,
         // glazing, CAD faces). The shadow depth path is already two-sided;
@@ -152,7 +213,7 @@ script_mod! {
         //       nothing); gba = a model-space offset added to the vertex
         //   texels 1..3 (stride 4 only): the rows of a model-space rotation
         //       applied before the offset (rigid moves: a live mechanism),
-        //       and to the normal
+        //       and to the normal; texel 2 `a` over 0.5: casts no shadow
         // `elem_ctl` = (map width, map height, texels per element, enable).
         // The host writes both with `DrawVars::set_texture(6, ..)` /
         // `set_uniform(live_id!(elem_ctl), ..)` on its own draw struct.
@@ -163,6 +224,13 @@ script_mod! {
         // a fragment where dot(xyz, p) + w < 0 is cut away. The zero plane
         // (the default) keeps everything.
         host_clip: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        // A box the model lanes keep (`Renderer::set_host_box`): a fragment past 1 on any of its
+        // three rows, abs(dot(row, (p, 1))), is cut. All zero: nothing reads past 1. An element
+        // whose lookup says so (stride 4, texel 3 `a` below zero) stays whole: what stands around
+        // the box, not in it.
+        host_box0: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        host_box1: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        host_box2: uniform(vec4(0.0, 0.0, 0.0, 0.0))
         // ---- screen-space AO (ssao.rs) — slot 7, OFF by default ----
         // A host that runs `SsaoPass` hands its blurred output to
         // `Renderer::set_ssao`, which binds it here for BOTH model lanes.
@@ -192,8 +260,24 @@ script_mod! {
         display: uniform(vec4(0.0, 0.0, 0.0, 0.0))
         v_csm: varying(vec4f)
         v_csm_n: varying(vec3f),
+        // The model's far stand-in (impostor.rs): xyz its centre in model
+        // space, w 1 when this layer is the model's own and the stand-in
+        // casts for it in the outer cascades (draw_models.rs). v_csm_own is
+        // how far that centre lies past this point along the sun's depth
+        // axis, in world units (every cascade shares the axis; one float, so
+        // the varyings keep their room).
+        csm_own: uniform(vec4(0.0, 0.0, 0.0, 0.0))
+        v_csm_own: varying(float),
 
         ..mod.draw.SunCascades,
+
+        // The stand-in casts at its centre's depth (lm_depth.rs
+        // DrawLmSunDepthImpostor), in every cascade past the first: this
+        // layer compares no deeper than two texels before it there.
+        csm_own_limit: fn(ci: float) -> float {
+            if self.csm_own.w < 0.5 || ci < 0.5 { return 2.0 }
+            return self.csm_proj(ci, self.v_csm.xyz).z + (self.v_csm_own - 2.0 * self.csm_pick(self.csm_texel, ci)) * self.csm_pick(self.csm_zw, ci)
+        }
 
         // One dynamic light at world point `wp`, world normal `n`.
         // Attenuation (1 - d/r)^2; the spot factor mirrors lightmap.rs's
@@ -374,27 +458,42 @@ script_mod! {
 
         // Foliage wind (a layer with makepadShading.wind). A swaying layer
         // never morphs, so it rides the morph lanes: morph_ctl.w = -1 turns
-        // it on (morph_delta only reads w > 0.5) and morph_weights0 = (sway
-        // metres at the top, 1 / model height, wind clock s, leaf flutter).
-        // No new instance lane: the model stream is at the vertex-attribute
-        // limit. One world-space breeze for the whole forest: a slow sway
-        // plus a faster gust, both phased by the copy's position so
-        // neighbours never move in lockstep, bending more toward the top
-        // (flex = height^2), and a flutter on the leaves. The bend is taken
-        // into model space through the copy's own axes, so a yawed or
-        // scaled tree leans the same way as its neighbours.
+        // it on (morph_delta only reads w > 0.5); morph_weights0 = (sway
+        // metres at the top in a 6 m/s wind, 1 / model height, 0, leaf
+        // flutter metres), morph_weights1 and 2 = the world wind's state and
+        // scroll (SceneWind). No new instance lane: the model stream is at
+        // the vertex-attribute limit.
+        //
+        // The trunk leans with the wind where the copy stands, so a gust
+        // reaches each tree as it crosses the forest, and sways about that
+        // lean (more along the wind than across it); branches bob on a phase
+        // of their own, more toward their tips; leaves flutter along their
+        // card normal. All of it grows toward the top (flex = height^2) and
+        // with the local wind. The bend is taken into model space through
+        // the copy's own axes, so a yawed or scaled tree leans the same way
+        // as its neighbours.
         wind_bend: fn(pos: vec3) -> vec3 {
             let ax = (self.transform * vec4(1.0, 0.0, 0.0, 0.0)).xyz
             let ay = (self.transform * vec4(0.0, 1.0, 0.0, 0.0)).xyz
             let az = (self.transform * vec4(0.0, 0.0, 1.0, 0.0)).xyz
             let origin = (self.transform * vec4(0.0, 0.0, 0.0, 1.0)).xyz
-            let phase = origin.x * 0.11 + origin.z * 0.07
             let w = self.morph_weights0
-            let t = w.z
+            let clock = self.morph_weights1.w
+            let f = self.wind_push(self.scene_wind(origin.xz, self.morph_weights1, self.morph_weights2).xy)
+            let fl = length(f)
+            let fd = f / max(fl, 0.0001)
+            // Neighbours never sway in lockstep: a phase from where the copy
+            // stands (smooth, so a carried copy never jumps).
+            let phase = fract(origin.x * 0.071 + origin.z * 0.113)
             let h = clamp(pos.y * w.y, 0.0, 1.4)
-            let sway = (sin(t * 0.83 + phase) * 0.7 + sin(t * 2.1 + phase * 1.9) * 0.3 + 0.35) * h * h
-            let flutter = sin(t * 6.3 + dot(pos, vec3(3.7, 2.3, 4.1)) + phase) * w.w * h
-            let wd = vec3(0.8, 0.0, 0.6) * (sway * w.x)
+            let along = self.wind_wave(clock, 103.0, phase)
+            let across = self.wind_wave(clock, 79.0, phase + 0.37)
+            let lean = (f * (1.0 + 0.35 * along) + vec2(0.0 - fd.y, fd.x) * (0.15 * fl * across)) * (w.x * h * h)
+            let reach = clamp(length(pos.xz) * w.y * 2.0, 0.0, 1.0)
+            let bob = self.wind_wave(clock, 241.0, phase + dot(pos, vec3(0.19, 0.13, 0.17))) * (0.2 * fl * reach * h * w.x)
+            let wd = vec3(lean.x + fd.x * bob * 0.4, bob, lean.y + fd.y * bob * 0.4)
+            let flutter = self.wind_wave(clock, 523.0, phase + dot(pos, vec3(0.61, 0.37, 0.67))) * (w.w * fl * h)
+            let card = self.oct_decode(unpack2f16(self.geom.nrm))
             // Stepped-through grass and flowers lean away from the feet.
             var pd = vec3(0.0, 0.0, 0.0)
             if self.occ_eye.w > 0.0 {
@@ -405,7 +504,7 @@ script_mod! {
             }
             let s2 = max(dot(ax, ax), 0.000001)
             let bend = vec3(dot(ax, wd + pd), dot(ay, wd + pd), dot(az, wd + pd)) / s2
-            return pos + bend + vec3(flutter * 0.6, flutter * 0.4, flutter * 0.5) - vec3(0.0, abs(sway * w.x) * 0.12, 0.0)
+            return pos + bend + card * flutter - vec3(0.0, length(lean) * 0.12, 0.0)
         }
 
         vertex: fn() {
@@ -508,6 +607,8 @@ script_mod! {
             self.v_lmg = vec4(lg_uv.x, lg_uv.y, lg_in, dl_wp.y)
             self.v_csm = vec4(dl_wp.x, dl_wp.y, dl_wp.z, dp)
             self.v_csm_n = dl_n
+            let own_wp = (self.transform * vec4(self.csm_own.x, self.csm_own.y, self.csm_own.z, 1.0)).xyz
+            self.v_csm_own = dot(self.csm_rz0.xyz, own_wp - dl_wp) / max(self.csm_zw.x, 0.000001)
             self.v_uv = unpack2f16(self.geom.uv)
             // RGB is the material tint. Instance tint/hue is applied once the
             // complete texture × vertex albedo exists in the pixel stage.
@@ -547,24 +648,8 @@ script_mod! {
         // branch, so the sampler's own derivatives stay well defined.
         base_texel: fn() -> vec4 {
             var suv = self.v_uv
-            if self.tex_mag.x > 1.5 {
-                // A number plate (libs/model stencil_plate): the top half is
-                // a 7-glyph plate (6-dot glyph pitch from dot 2 of 45), the
-                // last three glyphs left blank for the number; the bottom
-                // half is "0123456789" on the same plate (from dot 2 of 63).
-                // Each copy's number rides color_adjust_ctl.w = -(1 + n); a
-                // blank glyph cell reads its digit from the strip.
-                let pu = clamp(self.v_uv.x, 0.0, 0.9999)
-                let pv = clamp(self.v_uv.y, 0.0, 0.9999)
-                suv = vec2(pu, pv * 0.5)
-                let cell = (pu * 45.0 - 1.5) / 6.0
-                let n = max(0.0 - self.color_adjust_ctl.w - 1.0, 0.0)
-                if cell >= 4.0 && cell < 7.0 && self.color_adjust_ctl.w < -0.5 {
-                    let k = floor(cell) - 4.0
-                    let digit = floor(n / pow(10.0, 2.0 - k)) - floor(n / pow(10.0, 3.0 - k)) * 10.0
-                    suv = vec2((1.5 + 6.0 * digit + 6.0 * fract(cell)) / 63.0, 0.5 + pv * 0.5)
-                }
-                return self.tex.sample(suv)
+            if self.tex_mag.x > 2.5 {
+                return self.msdf_texel(self.v_uv, srgb_to_linear(self.v_tint.xyz), self.color_adjust_ctl.w, self.tex_mag.x - 3.0)
             }
             if self.tex_mag.x > 0.5 {
                 let tsz = self.tex.size()
@@ -584,6 +669,10 @@ script_mod! {
         // complementary pixels.
         host_cut: fn() {
             if dot(self.host_clip.xyz, self.v_csm.xyz) + self.host_clip.w < 0.0 { self.clip() }
+            let p = vec4(self.v_csm.xyz, 1.0)
+            if max(max(abs(dot(self.host_box0, p)), abs(dot(self.host_box1, p))), abs(dot(self.host_box2, p))) > 1.0 {
+                if self.v_paint.w < 0.0 || self.paint_texel(self.v_paint.w * self.elem_ctl.z + 3.0).w > 0.0 - 0.5 { self.clip() }
+            }
         }
         door_window: fn() {
             if self.color_adjust_ctl.w > 0.5 {
@@ -628,13 +717,15 @@ script_mod! {
             let tex = self.base_texel()
             // BUILD punch-through: palette 255 / magenta is the overlay key.
             let magenta = (tex.x > 0.75) && (tex.z > 0.75) && (tex.y < 0.22)
-            if tex.w < 0.5 || magenta {
+            if tex.w < 0.5 || (magenta && self.tex_mag.x < 2.5) {
                 self.clip()
             }
             let base = self.to_scene(vec3(tex.x, tex.y, tex.z))
+            var material_tint = self.to_scene(self.v_tint.xyz)
+            if self.tex_mag.x > 2.5 { material_tint = vec3(1.0, 1.0, 1.0) }
             var albedo = self.color_adjust(
                 // the vertex tint is encoded like a texel: both scene-referred lanes decode it
-                base * self.to_scene(self.v_tint.xyz),
+                base * material_tint,
                 self.tint,
                 self.color_adjust_ctl
             )

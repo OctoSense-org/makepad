@@ -1,3 +1,10 @@
+use std::borrow::Cow;
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use imp::{tensor_f32_weight, tensor_test_error_and_guard,
+    tensor_test_drop_owner_locked, tensor_test_legacy_matmuls};
+#[cfg(target_os = "macos")]
+pub(crate) use imp::{TensorBuffer, tensor_thread_guard, tensor_available, tensor_profile, tensor_cow_record, tensor_buffer, tensor_host_written, tensor_flush_until, tensor_pool_clear, tensor_alloc_bytes, tensor_evict_owner, tensor_evict_keys, tensor_resident_weights, shape4_from_row_major, tensor_binary, tensor_unary, tensor_norm, tensor_matmul, tensor_named_weight, tensor_attention, tensor_im2col, tensor_copy_strided};
+
 /// Missing-kernel fallbacks fire per matmul; print each distinct message once.
 #[cfg(target_os = "macos")]
 fn log_metal_error_once(msg: impl std::fmt::Display) {
@@ -14,10 +21,43 @@ fn log_metal_error_once(msg: impl std::fmt::Display) {
     }
 }
 
+/// Run a tool's model work off the process main thread, preserving its stack size.
+pub fn run_model_worker<F, T>(name: &str, f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let builder = std::thread::Builder::new().name(name.to_owned());
+    #[cfg(target_os = "macos")]
+    let builder = {
+        unsafe extern "C" {
+            fn pthread_self() -> *mut std::ffi::c_void;
+            fn pthread_get_stacksize_np(thread: *mut std::ffi::c_void) -> usize;
+        }
+        // Called by the tool's main: retain the stack its model work had there.
+        builder.stack_size(unsafe { pthread_get_stacksize_np(pthread_self()) })
+    };
+    match builder.spawn(f).expect("start model worker").join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
 pub fn is_available() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// This process's device allocations and the advisory working-set size, in bytes.
+/// Reads device properties without initializing a tensor runtime.
+pub fn device_memory() -> Result<(u64, u64), String> {
+    imp::device_memory()
+}
+
+pub fn device_name() -> Option<String> {
+    imp::device_name()
+}
+
+use makepad_ai_loader::{F32Weight, WeightKey, WeightOwner};
 use crate::gpu_types::GpuTensor;
 use makepad_ai_loader::prof;
 
@@ -43,26 +83,6 @@ pub fn try_matmul_nt_f32(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) ->
     out
 }
 
-pub fn try_matmul_nt_f32_bytes(
-    a: &[f32],
-    bt_bytes: &[u8],
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Option<Vec<f32>> {
-    imp::try_matmul_nt_f32_bytes(a, bt_bytes, m, k, n)
-}
-
-pub fn try_matmul_nt_f16_bytes(
-    a: &[f32],
-    bt_f16_bytes: &[u8],
-    m: usize,
-    k: usize,
-    n: usize,
-) -> Option<Vec<f32>> {
-    imp::try_matmul_nt_f16_bytes(a, bt_f16_bytes, m, k, n)
-}
-
 pub fn try_matmul_nt_ggml_bytes(
     a: &[f32],
     bt_bytes: &[u8],
@@ -83,22 +103,56 @@ pub fn try_matmul_nt_ggml_bytes(
     out
 }
 
-pub fn try_matmul_nt_ggml_bytes_keyed<F>(
+pub fn try_matmul_nt_f32_weight(a: &[f32], w: &F32Weight, m: usize, k: usize, n: usize) -> Option<Vec<f32>> {
+    let t = std::time::Instant::now();
+    let out = imp::try_matmul_nt_f32_weight(a, w, m, k, n);
+    if let Some(v) = &out {
+        prof_rec(prof::CAT_MATMUL_UNCACHED, t, a.len() + v.len());
+    }
+    out
+}
+
+/// `C[m, n] = W[m, k] * Bt[n, k]^T`, with a resident left operand.
+pub fn try_matmul_nt_f32_weight_left(w: &F32Weight, bt: &[f32], m: usize, k: usize, n: usize) -> Option<Vec<f32>> {
+    let t = std::time::Instant::now();
+    let out = imp::try_matmul_nt_f32_weight_left(w, bt, m, k, n);
+    if let Some(v) = &out {
+        prof_rec(prof::CAT_MATMUL_UNCACHED, t, bt.len() + v.len());
+    }
+    out
+}
+
+pub fn try_matmul_nt_f32_weight_multi(
+    a: &[f32],
+    m: usize,
+    k: usize,
+    weights: &[&F32Weight],
+) -> Option<Vec<Vec<f32>>> {
+    let t = std::time::Instant::now();
+    let out = imp::try_matmul_nt_f32_weight_multi(a, m, k, weights);
+    if let Some(vs) = &out {
+        let n_out: usize = vs.iter().map(|v| v.len()).sum();
+        prof_rec(prof::CAT_MATMUL_UNCACHED, t, a.len() + n_out);
+    }
+    out
+}
+
+pub fn try_matmul_nt_ggml_bytes_keyed<'a, F>(
     a: &[f32],
     bt_ggml_type: u32,
     m: usize,
     k: usize,
     n: usize,
-    namespace: &str,
+    owner: &WeightOwner,
     cache_key: &str,
     load: F,
 ) -> Option<Vec<f32>>
 where
-    F: FnOnce() -> Result<Vec<u8>, String>,
+    F: FnOnce() -> Result<Cow<'a, [u8]>, String>,
 {
     let t = std::time::Instant::now();
     let out = imp::try_matmul_nt_ggml_bytes_keyed(
-        a, bt_ggml_type, m, k, n, namespace, cache_key, load,
+        a, bt_ggml_type, m, k, n, owner, cache_key, load,
     );
     if let Some(v) = &out {
         prof_rec(prof::CAT_MATMUL_UNCACHED, t, a.len() + v.len());
@@ -106,34 +160,17 @@ where
     out
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct MatmulNtGgmlBytesMatrix<'a> {
-    pub bt_bytes: &'a [u8],
-    pub bt_ggml_type: u32,
-    pub n: usize,
-}
-
-pub fn try_matmul_nt_ggml_bytes_multi(
-    a: &[f32],
-    m: usize,
-    k: usize,
-    matrices: &[MatmulNtGgmlBytesMatrix<'_>],
-) -> Option<Vec<Vec<f32>>> {
-    imp::try_matmul_nt_ggml_bytes_multi(a, m, k, matrices)
-}
-
 /// Same kernels as [`try_matmul_nt_ggml_bytes_keyed`], one activation upload,
-/// one wait. Weights live in the named cache — do not use the uncached multi
-/// path for AR (it re-uploads W whenever the host pointer moves).
+/// one wait. Each weight lives in the named cache under its namespace and key.
 #[derive(Clone, Copy, Debug)]
 pub struct MatmulNtGgmlBytesKeyedMatrix<'a> {
     pub bt_ggml_type: u32,
     pub n: usize,
-    pub namespace: &'a str,
+    pub owner: &'a WeightOwner,
     pub cache_key: &'a str,
 }
 
-pub fn try_matmul_nt_ggml_bytes_keyed_multi<F>(
+pub fn try_matmul_nt_ggml_bytes_keyed_multi<'a, F>(
     a: &[f32],
     m: usize,
     k: usize,
@@ -141,7 +178,7 @@ pub fn try_matmul_nt_ggml_bytes_keyed_multi<F>(
     load: F,
 ) -> Option<Vec<Vec<f32>>>
 where
-    F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+    F: FnMut(&WeightOwner, &str) -> Result<Cow<'a, [u8]>, String>,
 {
     let t = std::time::Instant::now();
     let out = imp::try_matmul_nt_ggml_bytes_keyed_multi(a, m, k, matrices, load);
@@ -152,17 +189,32 @@ where
     out
 }
 
+/// The AR residual stream between `try_ar_*` calls, owned by the caller (one per decode
+/// step or prefill). Dropping it releases the device buffer.
+pub struct ArResidual(imp::ArResidual);
+impl ArResidual {
+    pub fn new() -> Self {
+        Self(imp::ArResidual::default())
+    }
+}
+impl Default for ArResidual {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Upload (optional) hidden, RMS + QKV (+ optional Q/K RMS) on GPU.
 /// Returns host q,k,v. `qk_norm` is `(q_norm, k_norm, q_key, k_key)`;
 /// pass `None` for stacks without per-head Q/K norms (Music3 RVQ).
 pub fn try_ar_pre_attn<F>(
+    resid: &mut ArResidual,
     hidden: Option<&[f32]>,
     m: usize,
     hidden_w: usize,
     head_dim: usize,
     in_norm: &[f32],
-    qk_norm: Option<(&[f32], &[f32], &str, &str)>,
-    in_norm_key: &str,
+    qk_norm: Option<(&[f32], &[f32], &WeightKey, &WeightKey)>,
+    in_norm_key: &WeightKey,
     eps: f32,
     q: MatmulNtGgmlBytesKeyedMatrix<'_>,
     k: MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -170,9 +222,10 @@ pub fn try_ar_pre_attn<F>(
     load: F,
 ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)>
 where
-    F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+    F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
 {
     imp::try_ar_pre_attn(
+        &mut resid.0,
         hidden,
         m,
         hidden_w,
@@ -190,11 +243,12 @@ where
 
 /// o_proj + residual + RMS + up/gate + SiLU*mul + down + residual. Hidden stays on GPU.
 pub fn try_ar_post_attn<F>(
+    resid: &mut ArResidual,
     attn: &[f32],
     m: usize,
     hidden_w: usize,
     post_norm: &[f32],
-    post_norm_key: &str,
+    post_norm_key: &WeightKey,
     eps: f32,
     o: MatmulNtGgmlBytesKeyedMatrix<'_>,
     up: MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -203,9 +257,10 @@ pub fn try_ar_post_attn<F>(
     load: F,
 ) -> Option<()>
 where
-    F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+    F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
 {
     imp::try_ar_post_attn(
+        &mut resid.0,
         attn,
         m,
         hidden_w,
@@ -221,20 +276,17 @@ where
 }
 
 pub fn try_ar_final_rms(
+    resid: &mut ArResidual,
     m: usize,
     hidden_w: usize,
     gamma: &[f32],
-    gamma_key: &str,
+    gamma_key: &WeightKey,
     eps: f32,
 ) -> Option<Vec<f32>> {
-    imp::try_ar_final_rms(m, hidden_w, gamma, gamma_key, eps)
+    imp::try_ar_final_rms(&mut resid.0, m, hidden_w, gamma, gamma_key, eps)
 }
 
-pub fn ar_resident_clear() {
-    imp::ar_resident_clear();
-}
-
-/// Drop all recycled transient buffers (keeps act/weight caches). Call at a
+/// Drop all recycled transient buffers in the tensor runtime (keeps weights). Call at a
 /// phase edge when the previous phase used much larger shapes (e.g. after
 /// prefill, before decode) so the pool's retained giants don't sit wired
 /// through a long small-shape loop.
@@ -249,15 +301,15 @@ pub fn try_dit_ffn_resident<F>(
     ff_dim: usize,
     ff_in_b: &[f32],
     ff_out_b: &[f32],
-    ff_in_b_key: &str,
-    ff_out_b_key: &str,
+    ff_in_b_key: &WeightKey,
+    ff_out_b_key: &WeightKey,
     swap: bool,
     ff_in: MatmulNtGgmlBytesKeyedMatrix<'_>,
     ff_out: MatmulNtGgmlBytesKeyedMatrix<'_>,
     load: F,
 ) -> Option<Vec<f32>>
 where
-    F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+    F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
 {
     imp::try_dit_ffn_resident(
         normed,
@@ -272,36 +324,6 @@ where
         ff_in,
         ff_out,
         load,
-    )
-}
-
-pub fn try_matmul_nt_ggml_bytes_add_bias(
-    a: &[f32],
-    bt_bytes: &[u8],
-    bt_ggml_type: u32,
-    m: usize,
-    k: usize,
-    n: usize,
-    bias: &[f32],
-) -> Option<Vec<f32>> {
-    imp::try_matmul_nt_ggml_bytes_add_bias(a, bt_bytes, bt_ggml_type, m, k, n, bias)
-}
-
-pub fn try_vision_mlp_bf16_fused(
-    x: &[f32],
-    gate_up_weight_bytes: &[u8],
-    down_weight_bytes: &[u8],
-    rows: usize,
-    hidden_size: usize,
-    intermediate_size: usize,
-) -> Option<Vec<f32>> {
-    imp::try_vision_mlp_bf16_fused(
-        x,
-        gate_up_weight_bytes,
-        down_weight_bytes,
-        rows,
-        hidden_size,
-        intermediate_size,
     )
 }
 
@@ -327,16 +349,13 @@ pub fn try_flash_attn_f32_packed(
     out
 }
 
-pub fn clear_decoder_kv_cache() {
-    imp::clear_decoder_kv_cache();
-}
-
 #[allow(clippy::too_many_arguments)]
 /// One linear of a device-resident two-way decoder layer: an f32 `[n, k]`
 /// weight tensor (cached on the device under its content identity) and an
 /// optional `[1, n]` bias.
 #[derive(Clone, Copy)]
 pub struct DecLinearRef<'a> {
+    pub owner: &'a WeightOwner,
     pub weight: &'a GpuTensor,
     pub bias: Option<&'a GpuTensor>,
 }
@@ -443,34 +462,6 @@ pub fn try_vit_backbone_resident_f32(
     imp::try_vit_backbone_resident_f32(
         x, seq_len, n_state, n_head, rot_half, cos, sin, layers, final_norm_w, final_norm_b, eps,
     )
-}
-
-pub fn try_flash_attn_f32_self_kv_cache(
-    layer: usize,
-    q: &[f32],
-    k_all: &[f32],
-    v_all: &[f32],
-    n_kv: usize,
-    n_head: usize,
-    d: usize,
-    scale: f32,
-) -> Option<Vec<f32>> {
-    imp::try_flash_attn_f32_self_kv_cache(layer, q, k_all, v_all, n_kv, n_head, d, scale)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn try_flash_attn_f32_cross_kv_cache(
-    layer: usize,
-    q: &[f32],
-    k_cross: &[f32],
-    v_cross: &[f32],
-    n_q: usize,
-    n_kv: usize,
-    n_head: usize,
-    d: usize,
-    scale: f32,
-) -> Option<Vec<f32>> {
-    imp::try_flash_attn_f32_cross_kv_cache(layer, q, k_cross, v_cross, n_q, n_kv, n_head, d, scale)
 }
 
 pub fn try_add_f32(a: &[f32], a_shape: &[usize], b: &[f32], b_shape: &[usize]) -> Option<Vec<f32>> {
@@ -580,17 +571,6 @@ pub fn try_get_rows_ggml_bytes(
     imp::try_get_rows_ggml_bytes(src, src_ggml_type, n_cols, n_rows, row_indices)
 }
 
-pub fn try_im2col_1d_f32(
-    input: &[f32],
-    ic: usize,
-    iw: usize,
-    kw: usize,
-    stride: usize,
-    pad: usize,
-) -> Option<Vec<f32>> {
-    imp::try_im2col_1d_f32(input, ic, iw, kw, stride, pad)
-}
-
 /// Planar ([c][y][x]) stride-1 "same" conv2d for the diffusion VAE lazy path.
 /// `weights` is [out_c][in_c][kh][kw], `bias` is per out channel.
 #[allow(clippy::too_many_arguments)]
@@ -669,10 +649,9 @@ pub fn try_silu_f32(a: &[f32]) -> Option<Vec<f32>> {
     )
 ))]
 mod tests {
-    use super::{
-        try_add_f32, try_attention_softmax_weighted_sum_f32, try_gelu_f32, try_mul_f32,
-        try_rms_norm_f32, try_rms_norm_mul_f32,
-    };
+    use super::{try_add_f32, try_gelu_f32, try_mul_f32, try_rms_norm_f32, try_rms_norm_mul_f32};
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+    use super::try_attention_softmax_weighted_sum_f32;
 
     // The non-macOS path currently routes through CUDA kernels that do not
     // match the CPU reference bit-for-bit on these tiny synthetic cases.
@@ -702,6 +681,65 @@ mod tests {
             .collect::<Vec<_>>();
         let actual = try_add_f32(&a, &[2, 3], &b, &[2, 3]).expect("a working device backend is required");
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn conv2d_planar_matches_cpu_when_backend_available() {
+        let (ic, oc, width, height) = (3, 4, 7, 5);
+        let input: Vec<f32> = (0..ic * width * height)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0).collect();
+        let weights: Vec<f32> = (0..oc * ic * 9)
+            .map(|i| ((i * 11 % 19) as f32 - 9.0) / 32.0).collect();
+        let bias = [0.125, -0.25, 0.375, -0.5];
+        for (case, kernel, pad, budget) in [
+            ("3x3 padded", 3, 1, 256 * 1024 * 1024),
+            ("1x1 unpadded without bias", 1, 0, 256 * 1024 * 1024),
+            ("3x3 smaller output", 3, 0, 256 * 1024 * 1024),
+            ("3x3 two-row bands", 3, 1, 2 * width * ic * 9 * 4),
+        ] {
+            let ow = width + 2 * pad - kernel + 1;
+            let oh = height + 2 * pad - kernel + 1;
+            let weights = &weights[..oc * ic * kernel * kernel];
+            let bias: &[f32] = if kernel == 1 { &[] } else { &bias };
+            let mut expected = vec![0.0f32; oc * oh * ow];
+            for c in 0..oc {
+                for y in 0..oh {
+                    for x in 0..ow {
+                        let mut sum = 0.0f32;
+                        for i in 0..ic {
+                            for ky in 0..kernel {
+                                for kx in 0..kernel {
+                                    let iy = (y + ky) as isize - pad as isize;
+                                    let ix = (x + kx) as isize - pad as isize;
+                                    if iy >= 0 && iy < height as isize && ix >= 0 && ix < width as isize {
+                                        sum += input[(i * height + iy as usize) * width + ix as usize]
+                                            * weights[((c * ic + i) * kernel + ky) * kernel + kx];
+                                    }
+                                }
+                            }
+                        }
+                        expected[(c * oh + y) * ow + x] = sum + bias.get(c).copied().unwrap_or(0.0);
+                    }
+                }
+            }
+            let actual = super::imp::try_conv2d_planar_f32_with_budget(
+                &input, width, height, ic, weights, bias, oc,
+                kernel, kernel, pad, pad, budget,
+            ).unwrap_or_else(|| panic!("{case}: a working Metal backend is required"));
+            assert_eq!(actual.len(), expected.len(), "{case}: output length");
+            for (i, (&a, &e)) in actual.iter().zip(&expected).enumerate() {
+                assert!((a - e).abs() <= 1.0e-5 * e.abs().max(f32::EPSILON),
+                    "{case}: element {i}: actual={a} expected={e}");
+            }
+            if case == "3x3 smaller output" {
+                let x = crate::gpu_tensor::upload(&input, ic, width * height).unwrap();
+                let out = crate::gpu_tensor::conv2d_planar(
+                    &x, width, height, weights, bias, oc, kernel, kernel, pad, pad,
+                ).expect("3x3 smaller output: tensor convolution");
+                assert_eq!((out.rows(), out.cols()), (oc, oh * ow), "{case}: tensor shape");
+            }
+        }
     }
 
     #[test]
@@ -762,6 +800,8 @@ mod tests {
         assert_close(&actual, &expected, RMS_NORM_TOLERANCE);
     }
 
+    // Only the CUDA backend implements this helper; on macOS it returns `None` and callers take their host path.
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
     #[test]
     fn attention_softmax_weighted_sum_matches_cpu_when_backend_available() {
         let logits = vec![
@@ -778,6 +818,7 @@ mod tests {
         assert_close(&actual, &expected, RMS_NORM_TOLERANCE);
     }
 
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
     fn cpu_attention_softmax_weighted_sum(
         logits: &[f32],
         values: &[f32],
@@ -817,6 +858,19 @@ mod tests {
 
 #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
 mod imp {
+    pub(super) fn device_memory() -> Result<(u64, u64), String> {
+        Err("no Metal device".to_string())
+    }
+
+    pub(super) fn device_name() -> Option<String> {
+        None
+    }
+
+    #[derive(Default)]
+    pub(super) struct ArResidual;
+
+    use makepad_ai_loader::{F32Weight, WeightKey, WeightOwner};
+    use super::Cow;
     use makepad_ai_cuda as cuda;
     use std::cell::RefCell;
     use std::mem::size_of;
@@ -903,6 +957,40 @@ mod imp {
         })
     }
 
+    pub(super) fn try_matmul_nt_f32_weight(
+        a: &[f32], w: &F32Weight, m: usize, k: usize, n: usize,
+    ) -> Option<Vec<f32>> {
+        try_matmul_nt_f32(a, w.as_slice(), m, k, n)
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight_left(
+        w: &F32Weight, bt: &[f32], m: usize, k: usize, n: usize,
+    ) -> Option<Vec<f32>> {
+        try_matmul_nt_f32(w.as_slice(), bt, m, k, n)
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight_multi(
+        a: &[f32],
+        m: usize,
+        k: usize,
+        weights: &[&F32Weight],
+    ) -> Option<Vec<Vec<f32>>> {
+        if weights.is_empty() {
+            return Some(Vec::new());
+        }
+        if a.len() != m.checked_mul(k)?
+            || m == 0
+            || k == 0
+            || weights.iter().any(|w| w.len() % k != 0 || w.len() / k == 0)
+        {
+            return None;
+        }
+        weights
+            .iter()
+            .map(|w| try_matmul_nt_f32(a, w.as_slice(), m, k, w.len() / k))
+            .collect()
+    }
+
     pub(super) fn try_matmul_nt_f32(
         a: &[f32],
         bt: &[f32],
@@ -929,26 +1017,6 @@ mod imp {
         })
     }
 
-    pub(super) fn try_matmul_nt_f32_bytes(
-        _a: &[f32],
-        _bt_bytes: &[u8],
-        _m: usize,
-        _k: usize,
-        _n: usize,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_f16_bytes(
-        _a: &[f32],
-        _bt_f16_bytes: &[u8],
-        _m: usize,
-        _k: usize,
-        _n: usize,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
     pub(super) fn try_matmul_nt_ggml_bytes(
         _a: &[f32],
         _bt_bytes: &[u8],
@@ -960,32 +1028,23 @@ mod imp {
         None
     }
 
-    pub(super) fn try_matmul_nt_ggml_bytes_keyed<F>(
+    pub(super) fn try_matmul_nt_ggml_bytes_keyed<'a, F>(
         _a: &[f32],
         _bt_ggml_type: u32,
         _m: usize,
         _k: usize,
         _n: usize,
-        _namespace: &str,
+        _owner: &WeightOwner,
         _cache_key: &str,
         _load: F,
     ) -> Option<Vec<f32>>
     where
-        F: FnOnce() -> Result<Vec<u8>, String>,
+        F: FnOnce() -> Result<Cow<'a, [u8]>, String>,
     {
         None
     }
 
-    pub(super) fn try_matmul_nt_ggml_bytes_multi(
-        _a: &[f32],
-        _m: usize,
-        _k: usize,
-        _matrices: &[super::MatmulNtGgmlBytesMatrix<'_>],
-    ) -> Option<Vec<Vec<f32>>> {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_ggml_bytes_keyed_multi<F>(
+    pub(super) fn try_matmul_nt_ggml_bytes_keyed_multi<'a, F>(
         _a: &[f32],
         _m: usize,
         _k: usize,
@@ -993,19 +1052,20 @@ mod imp {
         _load: F,
     ) -> Option<Vec<Vec<f32>>>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Cow<'a, [u8]>, String>,
     {
         None
     }
 
     pub(super) fn try_ar_pre_attn<F>(
+        _resid: &mut ArResidual,
         _hidden: Option<&[f32]>,
         _m: usize,
         _hidden_w: usize,
         _head_dim: usize,
         _in_norm: &[f32],
-        _qk_norm: Option<(&[f32], &[f32], &str, &str)>,
-        _in_norm_key: &str,
+        _qk_norm: Option<(&[f32], &[f32], &WeightKey, &WeightKey)>,
+        _in_norm_key: &WeightKey,
         _eps: f32,
         _q: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _k: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -1013,17 +1073,18 @@ mod imp {
         _load: F,
     ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
         None
     }
 
     pub(super) fn try_ar_post_attn<F>(
+        _resid: &mut ArResidual,
         _attn: &[f32],
         _m: usize,
         _hidden_w: usize,
         _post_norm: &[f32],
-        _post_norm_key: &str,
+        _post_norm_key: &WeightKey,
         _eps: f32,
         _o: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _up: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -1032,22 +1093,21 @@ mod imp {
         _load: F,
     ) -> Option<()>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
         None
     }
 
     pub(super) fn try_ar_final_rms(
+        _resid: &mut ArResidual,
         _m: usize,
         _hidden_w: usize,
         _gamma: &[f32],
-        _gamma_key: &str,
+        _gamma_key: &WeightKey,
         _eps: f32,
     ) -> Option<Vec<f32>> {
         None
     }
-
-    pub(super) fn ar_resident_clear() {}
 
     pub(super) fn transient_pool_clear() {}
 
@@ -1058,39 +1118,16 @@ mod imp {
         _ff_dim: usize,
         _ff_in_b: &[f32],
         _ff_out_b: &[f32],
-        _ff_in_b_key: &str,
-        _ff_out_b_key: &str,
+        _ff_in_b_key: &WeightKey,
+        _ff_out_b_key: &WeightKey,
         _swap: bool,
         _ff_in: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _ff_out: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _load: F,
     ) -> Option<Vec<f32>>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_ggml_bytes_add_bias(
-        _a: &[f32],
-        _bt_bytes: &[u8],
-        _bt_ggml_type: u32,
-        _m: usize,
-        _k: usize,
-        _n: usize,
-        _bias: &[f32],
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    pub(super) fn try_vision_mlp_bf16_fused(
-        _x: &[f32],
-        _gate_up_weight_bytes: &[u8],
-        _down_weight_bytes: &[u8],
-        _rows: usize,
-        _hidden_size: usize,
-        _intermediate_size: usize,
-    ) -> Option<Vec<f32>> {
         None
     }
 
@@ -1109,8 +1146,6 @@ mod imp {
         // scale. It requires n_q == n_kv (self attention), which it checks.
         cuda::try_flash_attn_f32_packed(q, k, v, n_q, n_kv, n_head, d, scale)
     }
-
-    pub(super) fn clear_decoder_kv_cache() {}
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
@@ -1142,34 +1177,6 @@ mod imp {
         _ctx_dim: usize,
         _layer: &super::TwoWayLayerRef<'_>,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
-        None
-    }
-
-    pub(super) fn try_flash_attn_f32_self_kv_cache(
-        _layer: usize,
-        _q: &[f32],
-        _k_all: &[f32],
-        _v_all: &[f32],
-        _n_kv: usize,
-        _n_head: usize,
-        _d: usize,
-        _scale: f32,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_flash_attn_f32_cross_kv_cache(
-        _layer: usize,
-        _q: &[f32],
-        _k_cross: &[f32],
-        _v_cross: &[f32],
-        _n_q: usize,
-        _n_kv: usize,
-        _n_head: usize,
-        _d: usize,
-        _scale: f32,
-    ) -> Option<Vec<f32>> {
         None
     }
 
@@ -1378,17 +1385,6 @@ mod imp {
         None
     }
 
-    pub(super) fn try_im2col_1d_f32(
-        _input: &[f32],
-        _ic: usize,
-        _iw: usize,
-        _kw: usize,
-        _stride: usize,
-        _pad: usize,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_conv2d_planar_f32(
         input: &[f32],
@@ -1502,6 +1498,24 @@ mod imp {
 )))]
 #[allow(unused_variables)]
 mod imp {
+    // No bounce calls the CUDA crate here, but the dependency stays: its build script's links
+    // metadata (DEP_MAKEPAD_AI_CUDA_KERNELS) is what tells build.rs whether kernels exist.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use makepad_ai_cuda as _;
+
+    pub(super) fn device_memory() -> Result<(u64, u64), String> {
+        Err("no Metal device".to_string())
+    }
+
+    pub(super) fn device_name() -> Option<String> {
+        None
+    }
+
+    #[derive(Default)]
+    pub(super) struct ArResidual;
+
+    use makepad_ai_loader::{F32Weight, WeightKey, WeightOwner};
+    use super::Cow;
     pub(super) fn try_matmul_nn_f32(
         a: &[f32],
         b: &[f32],
@@ -1512,32 +1526,33 @@ mod imp {
         None
     }
 
+    pub(super) fn try_matmul_nt_f32_weight(
+        a: &[f32], w: &F32Weight, m: usize, k: usize, n: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight_left(
+        w: &F32Weight, bt: &[f32], m: usize, k: usize, n: usize,
+    ) -> Option<Vec<f32>> {
+        None
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight_multi(
+        a: &[f32],
+        m: usize,
+        k: usize,
+        weights: &[&F32Weight],
+    ) -> Option<Vec<Vec<f32>>> {
+        None
+    }
+
     pub(super) fn try_matmul_nt_f32(
         a: &[f32],
         bt: &[f32],
         m: usize,
         k: usize,
         n: usize,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_f32_bytes(
-        _a: &[f32],
-        _bt_bytes: &[u8],
-        _m: usize,
-        _k: usize,
-        _n: usize,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_f16_bytes(
-        _a: &[f32],
-        _bt_f16_bytes: &[u8],
-        _m: usize,
-        _k: usize,
-        _n: usize,
     ) -> Option<Vec<f32>> {
         None
     }
@@ -1553,32 +1568,23 @@ mod imp {
         None
     }
 
-    pub(super) fn try_matmul_nt_ggml_bytes_keyed<F>(
+    pub(super) fn try_matmul_nt_ggml_bytes_keyed<'a, F>(
         _a: &[f32],
         _bt_ggml_type: u32,
         _m: usize,
         _k: usize,
         _n: usize,
-        _namespace: &str,
+        _owner: &WeightOwner,
         _cache_key: &str,
         _load: F,
     ) -> Option<Vec<f32>>
     where
-        F: FnOnce() -> Result<Vec<u8>, String>,
+        F: FnOnce() -> Result<Cow<'a, [u8]>, String>,
     {
         None
     }
 
-    pub(super) fn try_matmul_nt_ggml_bytes_multi(
-        _a: &[f32],
-        _m: usize,
-        _k: usize,
-        _matrices: &[super::MatmulNtGgmlBytesMatrix<'_>],
-    ) -> Option<Vec<Vec<f32>>> {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_ggml_bytes_keyed_multi<F>(
+    pub(super) fn try_matmul_nt_ggml_bytes_keyed_multi<'a, F>(
         _a: &[f32],
         _m: usize,
         _k: usize,
@@ -1586,19 +1592,20 @@ mod imp {
         _load: F,
     ) -> Option<Vec<Vec<f32>>>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Cow<'a, [u8]>, String>,
     {
         None
     }
 
     pub(super) fn try_ar_pre_attn<F>(
+        _resid: &mut ArResidual,
         _hidden: Option<&[f32]>,
         _m: usize,
         _hidden_w: usize,
         _head_dim: usize,
         _in_norm: &[f32],
-        _qk_norm: Option<(&[f32], &[f32], &str, &str)>,
-        _in_norm_key: &str,
+        _qk_norm: Option<(&[f32], &[f32], &WeightKey, &WeightKey)>,
+        _in_norm_key: &WeightKey,
         _eps: f32,
         _q: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _k: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -1606,17 +1613,18 @@ mod imp {
         _load: F,
     ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
         None
     }
 
     pub(super) fn try_ar_post_attn<F>(
+        _resid: &mut ArResidual,
         _attn: &[f32],
         _m: usize,
         _hidden_w: usize,
         _post_norm: &[f32],
-        _post_norm_key: &str,
+        _post_norm_key: &WeightKey,
         _eps: f32,
         _o: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _up: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -1625,22 +1633,21 @@ mod imp {
         _load: F,
     ) -> Option<()>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
         None
     }
 
     pub(super) fn try_ar_final_rms(
+        _resid: &mut ArResidual,
         _m: usize,
         _hidden_w: usize,
         _gamma: &[f32],
-        _gamma_key: &str,
+        _gamma_key: &WeightKey,
         _eps: f32,
     ) -> Option<Vec<f32>> {
         None
     }
-
-    pub(super) fn ar_resident_clear() {}
 
     pub(super) fn transient_pool_clear() {}
 
@@ -1651,39 +1658,16 @@ mod imp {
         _ff_dim: usize,
         _ff_in_b: &[f32],
         _ff_out_b: &[f32],
-        _ff_in_b_key: &str,
-        _ff_out_b_key: &str,
+        _ff_in_b_key: &WeightKey,
+        _ff_out_b_key: &WeightKey,
         _swap: bool,
         _ff_in: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _ff_out: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         _load: F,
     ) -> Option<Vec<f32>>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
-        None
-    }
-
-    pub(super) fn try_matmul_nt_ggml_bytes_add_bias(
-        _a: &[f32],
-        _bt_bytes: &[u8],
-        _bt_ggml_type: u32,
-        _m: usize,
-        _k: usize,
-        _n: usize,
-        _bias: &[f32],
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    pub(super) fn try_vision_mlp_bf16_fused(
-        _x: &[f32],
-        _gate_up_weight_bytes: &[u8],
-        _down_weight_bytes: &[u8],
-        _rows: usize,
-        _hidden_size: usize,
-        _intermediate_size: usize,
-    ) -> Option<Vec<f32>> {
         None
     }
 
@@ -1699,8 +1683,6 @@ mod imp {
     ) -> Option<Vec<f32>> {
         None
     }
-
-    pub(super) fn clear_decoder_kv_cache() {}
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_vit_backbone_resident_f32(
@@ -1731,33 +1713,6 @@ mod imp {
         _ctx_dim: usize,
         _layer: &super::TwoWayLayerRef<'_>,
     ) -> Option<(Vec<f32>, Vec<f32>)> {
-        None
-    }
-
-    pub(super) fn try_flash_attn_f32_self_kv_cache(
-        _layer: usize,
-        _q: &[f32],
-        _k_all: &[f32],
-        _v_all: &[f32],
-        _n_kv: usize,
-        _n_head: usize,
-        _d: usize,
-        _scale: f32,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
-    pub(super) fn try_flash_attn_f32_cross_kv_cache(
-        _layer: usize,
-        _q: &[f32],
-        _k_cross: &[f32],
-        _v_cross: &[f32],
-        _n_q: usize,
-        _n_kv: usize,
-        _n_head: usize,
-        _d: usize,
-        _scale: f32,
-    ) -> Option<Vec<f32>> {
         None
     }
 
@@ -1833,17 +1788,6 @@ mod imp {
         None
     }
 
-    pub(super) fn try_im2col_1d_f32(
-        _input: &[f32],
-        _ic: usize,
-        _iw: usize,
-        _kw: usize,
-        _stride: usize,
-        _pad: usize,
-    ) -> Option<Vec<f32>> {
-        None
-    }
-
     pub(super) fn try_conv2d_planar_f32(
         input: &[f32],
         width: usize,
@@ -1881,8 +1825,33 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
+    pub(super) fn device_memory() -> Result<(u64, u64), String> {
+        let _pool = AutoreleasePool::new();
+        let device = MetalContext::create_device().ok_or_else(|| "no Metal device".to_string())?;
+        unsafe {
+            let current: u64 = msg_send![device.as_id(), currentAllocatedSize];
+            let recommended: u64 = msg_send![device.as_id(), recommendedMaxWorkingSetSize];
+            Ok((current, recommended))
+        }
+    }
+
+    pub(super) fn device_name() -> Option<String> {
+        let _pool = AutoreleasePool::new();
+        let device = MetalContext::create_device()?;
+        let name: ObjcId = unsafe { msg_send![device.as_id(), name] };
+        (!name.is_null()).then(|| nsstring_to_string(name))
+    }
+
+    #[derive(Default)]
+    pub(super) struct ArResidual {
+        h: Option<Arc<TensorBuffer>>,
+        elems: usize,
+    }
+
+    use makepad_ai_loader::{F32Weight, WeightKey, WeightOwner, WeightOwnerTrace};
+    use super::Cow;
     use makepad_ai_loader::quant::{
-        block_elements, block_size, f32_to_f16, ggml_type_name, GGML_TYPE_BF16, GGML_TYPE_F16,
+        block_elements, block_size, ggml_type_name, GGML_TYPE_BF16, GGML_TYPE_F16,
         GGML_TYPE_F32, GGML_TYPE_I32, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
         GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
         GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
@@ -1895,6 +1864,12 @@ mod imp {
     use std::ptr::NonNull;
     use std::thread;
     use std::time::Duration;
+
+    #[link(name = "System")]
+    unsafe extern "C" {
+        // Referenced by name from `objc_block!`.
+        static _NSConcreteStackBlock: [*const c_void; 32];
+    }
 
     const LOG_METAL_PIPELINES: bool = false;
     const DISABLE_GGML_METAL_BF16: bool = false;
@@ -1940,15 +1915,8 @@ mod imp {
     const METAL_INIT_ATTEMPTS: usize = 12;
     const METAL_INIT_RETRY_DELAY_MS: u64 = 100;
     const SCRATCH_FLASH_OUT: u8 = 4;
-    const SCRATCH_FLASH_MASK: u8 = 5;
     const SCRATCH_ENC_NORM0: u8 = 10;
     const SCRATCH_ENC_NORM1: u8 = 11;
-    const SCRATCH_DEC_NORM0: u8 = 12;
-    const SCRATCH_DEC_NORM1: u8 = 13;
-    #[allow(dead_code)]
-    const SCRATCH_ENC_FLASH_K_F16: u8 = 14;
-    #[allow(dead_code)]
-    const SCRATCH_ENC_FLASH_V_F16: u8 = 15;
 
     const N_R0_Q4_0: i32 = 4;
     const N_SG_Q4_0: i32 = 2;
@@ -2373,13 +2341,25 @@ mod imp {
     }
 
     #[derive(Copy, Clone)]
-    struct Shape4 {
+    pub(crate) struct Shape4 {
         ne: [i32; 4],
         nb: [u64; 4],
         numel: usize,
     }
 
     struct StrongId(NonNull<Object>);
+
+    // Metal objects are thread-safe; the tensor mutex serialises encoding.
+    unsafe impl Send for StrongId {}
+    // Shared handles expose only Metal's thread-safe retain and object methods.
+    unsafe impl Sync for StrongId {}
+
+    impl Clone for StrongId {
+        fn clone(&self) -> Self {
+            unsafe { let _: () = msg_send![self.as_id(), retain]; }
+            Self(self.0)
+        }
+    }
 
     impl StrongId {
         unsafe fn from_owned(id: ObjcId) -> Option<Self> {
@@ -2636,7 +2616,7 @@ mod imp {
         }
     }
 
-    fn shape4_from_row_major(shape: &[usize], elem_bytes: u64) -> Result<Shape4, String> {
+    pub(crate) fn shape4_from_row_major(shape: &[usize], elem_bytes: u64) -> Result<Shape4, String> {
         if shape.is_empty() {
             return Err("shape must be non-empty".to_string());
         }
@@ -2735,36 +2715,6 @@ mod imp {
         let words =
             (pad_to(dk, 128) + 4 * ncpsg + 2 * pad_to(dv, 128)).saturating_mul(nsg.max(1) as usize);
         pad_to(words.saturating_mul(std::mem::size_of::<f32>() / 2), 16)
-    }
-
-    fn matmul_cache_tag(bt_ggml_type: u32) -> u8 {
-        match bt_ggml_type {
-            GGML_TYPE_F32 => 2u8,
-            GGML_TYPE_F16 => 3u8,
-            GGML_TYPE_BF16 => 9u8,
-            GGML_TYPE_Q4_0 => 4u8,
-            GGML_TYPE_Q4_1 => 5u8,
-            GGML_TYPE_Q5_0 => 6u8,
-            GGML_TYPE_Q5_1 => 7u8,
-            GGML_TYPE_Q8_0 => 8u8,
-            GGML_TYPE_Q2_K => 10u8,
-            GGML_TYPE_Q3_K => 11u8,
-            GGML_TYPE_Q4_K => 12u8,
-            GGML_TYPE_Q5_K => 13u8,
-            GGML_TYPE_Q6_K => 14u8,
-            _ => 0u8,
-        }
-    }
-
-    fn matmul_batch_tag(bt_ggml_type: u32, index: usize) -> Result<u8, String> {
-        let base = matmul_cache_tag(bt_ggml_type);
-        let slot = u8::try_from(index).map_err(|_| format!("matmul batch index too large: {}", index))?;
-        if slot >= 8 {
-            return Err(format!("matmul batch supports at most 8 outputs, got {}", index + 1));
-        }
-        Ok(128u8
-            .wrapping_add(base.wrapping_mul(8))
-            .wrapping_add(slot))
     }
 
     fn flash_attn_ext_extra_pad_bytes(
@@ -2890,31 +2840,13 @@ mod imp {
         )
     }
 
+    #[derive(Clone)]
     struct PipelineState {
         obj: StrongId,
         smem: usize,
         nsg: i32,
         nr0: i32,
         nr1: i32,
-    }
-
-    struct DecoderKvLayer {
-        k: StrongId,
-        v: StrongId,
-        n_state: usize,
-        cap_rows: usize,
-        len_rows: usize,
-    }
-
-    struct CrossKvLayer {
-        k: StrongId,
-        v: StrongId,
-        n_state: usize,
-        n_rows: usize,
-        src_k_ptr: usize,
-        src_v_ptr: usize,
-        src_k_len: usize,
-        src_v_len: usize,
     }
 
     struct ScratchBuffer {
@@ -2934,17 +2866,19 @@ mod imp {
     const POOL_CAP_BYTES: usize = 1280 * 1024 * 1024;
 
     struct MetalContext {
+        tensor_mode: bool,
+        tensor_prepare: bool,
+        tensor_batch: u64,
+        tensor_dispatches: usize,
+        tensor_bindings: HashMap<usize, std::sync::Arc<TensorBuffer>>,
         device: StrongId,
         command_queue: StrongId,
         library: StrongId,
         pipeline_cache: HashMap<String, PipelineState>,
         cached_weight_buffers: HashMap<BufferKey, StrongId>,
         named_weight_buffers: HashMap<(String, String), StrongId>,
-        act_buffers: HashMap<String, (StrongId, usize)>,
         scratch_buffers: HashMap<u8, ScratchBuffer>,
         matmul_out_buffers: HashMap<u8, ScratchBuffer>,
-        decoder_kv_layers: HashMap<usize, DecoderKvLayer>,
-        cross_kv_layers: HashMap<usize, CrossKvLayer>,
         batch_depth: usize,
         batch_command_buffer: Option<StrongId>,
         batch_encoder: Option<StrongId>,
@@ -3021,17 +2955,19 @@ mod imp {
                 };
 
                 return Ok(Self {
+                    tensor_mode: false,
+                    tensor_prepare: false,
+                    tensor_batch: 0,
+                    tensor_dispatches: 0,
+                    tensor_bindings: HashMap::new(),
                     device,
                     command_queue,
                     library,
                     pipeline_cache: HashMap::new(),
                     cached_weight_buffers: HashMap::new(),
                     named_weight_buffers: HashMap::new(),
-                    act_buffers: HashMap::new(),
                     scratch_buffers: HashMap::new(),
                     matmul_out_buffers: HashMap::new(),
-                    decoder_kv_layers: HashMap::new(),
-                    cross_kv_layers: HashMap::new(),
                     batch_depth: 0,
                     batch_command_buffer: None,
                     batch_encoder: None,
@@ -3242,17 +3178,25 @@ mod imp {
             }
         }
 
-        fn pool_clear(&mut self) {
-            self.pool_free.clear();
-            self.pool_in_flight.clear();
-        }
-
         fn get_or_create_scratch_buffer(
             &mut self,
             kind: u8,
             need_bytes: usize,
         ) -> Result<ObjcId, String> {
             let need_bytes = need_bytes.max(1);
+            if self.tensor_mode {
+                if let Some(entry) = self.scratch_buffers.get(&kind) {
+                    if entry.cap_bytes >= need_bytes { return Ok(entry.buf.as_id()); }
+                }
+                if !self.tensor_prepare { return Err("unprepared tensor scratch".into()); }
+                let buffer = tensor_buffer(need_bytes, false)?;
+                let id = buffer.id();
+                self.scratch_buffers.insert(kind, ScratchBuffer {
+                    buf: buffer.object()?.clone(), cap_bytes: buffer.capacity, is_private: false,
+                });
+                self.tensor_bindings.insert(id as usize, buffer);
+                return Ok(id);
+            }
             let is_private = matches!(
                 kind,
                 SCRATCH_FLASH_PAD
@@ -3261,8 +3205,6 @@ mod imp {
                     | SCRATCH_FLASH_OUT
                     | SCRATCH_ENC_NORM0
                     | SCRATCH_ENC_NORM1
-                    | SCRATCH_DEC_NORM0
-                    | SCRATCH_DEC_NORM1
             );
             if let Some(entry) = self.scratch_buffers.get(&kind) {
                 if entry.cap_bytes >= need_bytes && entry.is_private == is_private {
@@ -3317,77 +3259,6 @@ mod imp {
         fn buffer_length_bytes(&self, buffer: ObjcId) -> Result<usize, String> {
             let len_u64: u64 = unsafe { msg_send![buffer, length] };
             usize::try_from(len_u64).map_err(|_| format!("buffer length too large: {}", len_u64))
-        }
-
-        fn zero_buffer_range(
-            &self,
-            buffer: ObjcId,
-            offset_bytes: usize,
-            len_bytes: usize,
-        ) -> Result<(), String> {
-            if len_bytes == 0 {
-                return Ok(());
-            }
-            let buf_len = self.buffer_length_bytes(buffer)?;
-            let end = offset_bytes
-                .checked_add(len_bytes)
-                .ok_or_else(|| "overflow computing zero range end".to_string())?;
-            if end > buf_len {
-                return Err(format!(
-                    "zero range out of bounds: offset={}, len={}, buffer_len={}",
-                    offset_bytes, len_bytes, buf_len
-                ));
-            }
-            let ptr: *mut u8 = unsafe { msg_send![buffer, contents] };
-            if ptr.is_null() {
-                return Err("buffer contents returned null".to_string());
-            }
-            unsafe {
-                std::ptr::write_bytes(ptr.add(offset_bytes), 0u8, len_bytes);
-            }
-            Ok(())
-        }
-
-        fn prepare_decoder_self_mask_f16(
-            &mut self,
-            n_valid: usize,
-            n_total: usize,
-        ) -> Result<ObjcId, String> {
-            if n_total == 0 || n_valid > n_total {
-                return Err(format!(
-                    "invalid decoder self mask sizes: n_valid={}, n_total={}",
-                    n_valid, n_total
-                ));
-            }
-
-            let mask_bytes = n_total
-                .checked_mul(std::mem::size_of::<u16>())
-                .ok_or_else(|| "overflow computing decoder self mask bytes".to_string())?;
-            let mask_id = self.get_or_create_scratch_buffer(SCRATCH_FLASH_MASK, mask_bytes)?;
-            let mask_cap = self.buffer_length_bytes(mask_id)?;
-            if mask_bytes > mask_cap {
-                return Err(format!(
-                    "decoder self mask write exceeds buffer: need={}, cap={}",
-                    mask_bytes, mask_cap
-                ));
-            }
-            let ptr: *mut u16 = unsafe { msg_send![mask_id, contents] };
-            if ptr.is_null() {
-                return Err("decoder self mask buffer contents returned null".to_string());
-            }
-
-            let neg_inf_h = f32_to_f16(f32::NEG_INFINITY);
-            unsafe {
-                let dst = std::slice::from_raw_parts_mut(ptr, n_total);
-                for v in dst.iter_mut().take(n_valid) {
-                    *v = 0;
-                }
-                for v in dst.iter_mut().skip(n_valid) {
-                    *v = neg_inf_h;
-                }
-            }
-
-            Ok(mask_id)
         }
 
         fn copy_f32_buffer_contents(
@@ -3490,22 +3361,6 @@ mod imp {
             self.copy_f32_buffer_contents_readable(buffer, elems)
         }
 
-        #[allow(dead_code)]
-        fn read_f32_buffers3(
-            &self,
-            b0: ObjcId,
-            b1: ObjcId,
-            b2: ObjcId,
-            elems: usize,
-        ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
-            self.wait_queue_idle()?;
-            let o0 = self.copy_f32_buffer_contents_readable(b0, elems)?;
-            let o1 = self.copy_f32_buffer_contents_readable(b1, elems)?;
-            let o2 = self.copy_f32_buffer_contents_readable(b2, elems)?;
-            Ok((o0, o1, o2))
-        }
-
-        #[allow(dead_code)]
         fn get_or_create_cached_f32_buffer(
             &mut self,
             data: &[f32],
@@ -3534,211 +3389,11 @@ mod imp {
 
         fn get_or_create_named_weight_buffer(
             &mut self,
-            namespace: &str,
+            owner: &WeightOwner,
             cache_key: &str,
             load: impl FnOnce() -> Result<Vec<u8>, String>,
         ) -> Result<ObjcId, String> {
-            let key = (namespace.to_string(), cache_key.to_string());
-            if !self.named_weight_buffers.contains_key(&key) {
-                let bytes = load()?;
-                let buf = self.new_buffer_with_bytes(&bytes)?;
-                self.named_weight_buffers.insert(key.clone(), buf);
-            }
-            Ok(self.named_weight_buffers.get(&key).unwrap().as_id())
-        }
-
-        fn clear_decoder_kv_cache(&mut self) {
-            self.decoder_kv_layers.clear();
-            self.cross_kv_layers.clear();
-        }
-
-        fn ensure_decoder_kv_layer(
-            &mut self,
-            layer: usize,
-            n_state: usize,
-            need_rows: usize,
-        ) -> Result<(ObjcId, ObjcId), String> {
-            let need_rows = need_rows.max(1);
-
-            if let Some(entry) = self.decoder_kv_layers.get(&layer) {
-                if entry.n_state == n_state && entry.cap_rows >= need_rows {
-                    return Ok((entry.k.as_id(), entry.v.as_id()));
-                }
-            }
-
-            let row_bytes = n_state
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "overflow computing decoder kv row bytes".to_string())?;
-
-            let old = self.decoder_kv_layers.remove(&layer);
-            let cap_rows = if let Some(ref old) = old {
-                if old.n_state == n_state {
-                    old.cap_rows.saturating_mul(2).max(need_rows).max(32)
-                } else {
-                    need_rows.max(32)
-                }
-            } else {
-                need_rows.max(32)
-            };
-            let total_bytes = cap_rows
-                .checked_mul(row_bytes)
-                .ok_or_else(|| "overflow computing decoder kv bytes".to_string())?;
-
-            let new_k = self.new_buffer_with_length(total_bytes)?;
-            let new_v = self.new_buffer_with_length(total_bytes)?;
-
-            let mut len_rows = 0usize;
-            if let Some(old) = old {
-                if old.n_state == n_state && old.len_rows > 0 {
-                    let copy_rows = old.len_rows.min(cap_rows);
-                    let copy_bytes = copy_rows
-                        .checked_mul(row_bytes)
-                        .ok_or_else(|| "overflow computing decoder kv copy bytes".to_string())?;
-                    let old_k_ptr: *const u8 = unsafe { msg_send![old.k.as_id(), contents] };
-                    let old_v_ptr: *const u8 = unsafe { msg_send![old.v.as_id(), contents] };
-                    let new_k_ptr: *mut u8 = unsafe { msg_send![new_k.as_id(), contents] };
-                    let new_v_ptr: *mut u8 = unsafe { msg_send![new_v.as_id(), contents] };
-                    if old_k_ptr.is_null()
-                        || old_v_ptr.is_null()
-                        || new_k_ptr.is_null()
-                        || new_v_ptr.is_null()
-                    {
-                        return Err("decoder kv buffer contents returned null".to_string());
-                    }
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(old_k_ptr, new_k_ptr, copy_bytes);
-                        std::ptr::copy_nonoverlapping(old_v_ptr, new_v_ptr, copy_bytes);
-                    }
-                    len_rows = copy_rows;
-                }
-            }
-
-            self.decoder_kv_layers.insert(
-                layer,
-                DecoderKvLayer {
-                    k: new_k,
-                    v: new_v,
-                    n_state,
-                    cap_rows,
-                    len_rows,
-                },
-            );
-            let entry = self
-                .decoder_kv_layers
-                .get(&layer)
-                .ok_or_else(|| "decoder kv layer insertion failed".to_string())?;
-            Ok((entry.k.as_id(), entry.v.as_id()))
-        }
-
-        fn ensure_cross_kv_layer(
-            &mut self,
-            layer: usize,
-            n_state: usize,
-            n_rows: usize,
-            k_cross: &[f32],
-            v_cross: &[f32],
-        ) -> Result<(ObjcId, ObjcId), String> {
-            if n_state == 0 || n_rows == 0 {
-                return Err(format!(
-                    "invalid cross kv dimensions: n_state={}, n_rows={}",
-                    n_state, n_rows
-                ));
-            }
-            if k_cross.len() != v_cross.len() {
-                return Err(format!(
-                    "cross kv k/v len mismatch: k={}, v={}",
-                    k_cross.len(),
-                    v_cross.len(),
-                ));
-            }
-            if k_cross.len() % n_state != 0 {
-                return Err(format!(
-                    "cross kv len not divisible by n_state: len={}, n_state={}",
-                    k_cross.len(),
-                    n_state
-                ));
-            }
-
-            let src_rows = k_cross.len() / n_state;
-            if src_rows == 0 {
-                return Err("cross kv has zero rows".to_string());
-            }
-            if src_rows > n_rows {
-                return Err(format!(
-                    "cross kv source rows exceed requested rows: src_rows={}, n_rows={}",
-                    src_rows, n_rows
-                ));
-            }
-
-            let src_k_ptr = k_cross.as_ptr() as usize;
-            let src_v_ptr = v_cross.as_ptr() as usize;
-            let src_k_len = k_cross.len();
-            let src_v_len = v_cross.len();
-
-            if let Some(entry) = self.cross_kv_layers.get(&layer) {
-                if entry.n_state == n_state
-                    && entry.n_rows == n_rows
-                    && entry.src_k_ptr == src_k_ptr
-                    && entry.src_v_ptr == src_v_ptr
-                    && entry.src_k_len == src_k_len
-                    && entry.src_v_len == src_v_len
-                {
-                    return Ok((entry.k.as_id(), entry.v.as_id()));
-                }
-            }
-
-            let row_bytes = n_state
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "overflow computing cross kv row bytes".to_string())?;
-            let total_bytes = n_rows
-                .checked_mul(row_bytes)
-                .ok_or_else(|| "overflow computing cross kv total bytes".to_string())?;
-            let copy_bytes = src_rows
-                .checked_mul(row_bytes)
-                .ok_or_else(|| "overflow computing cross kv copy bytes".to_string())?;
-
-            let (k_buf, v_buf) = if src_rows == n_rows {
-                (
-                    self.new_buffer_with_bytes(f32_slice_as_bytes(k_cross))?,
-                    self.new_buffer_with_bytes(f32_slice_as_bytes(v_cross))?,
-                )
-            } else {
-                let k_buf = self.new_buffer_with_length(total_bytes)?;
-                let v_buf = self.new_buffer_with_length(total_bytes)?;
-
-                let dst_k: *mut u8 = unsafe { msg_send![k_buf.as_id(), contents] };
-                let dst_v: *mut u8 = unsafe { msg_send![v_buf.as_id(), contents] };
-                if dst_k.is_null() || dst_v.is_null() {
-                    return Err("cross kv buffer contents returned null".to_string());
-                }
-                unsafe {
-                    std::ptr::write_bytes(dst_k, 0u8, total_bytes);
-                    std::ptr::write_bytes(dst_v, 0u8, total_bytes);
-                    std::ptr::copy_nonoverlapping(k_cross.as_ptr() as *const u8, dst_k, copy_bytes);
-                    std::ptr::copy_nonoverlapping(v_cross.as_ptr() as *const u8, dst_v, copy_bytes);
-                }
-
-                (k_buf, v_buf)
-            };
-            self.cross_kv_layers.insert(
-                layer,
-                CrossKvLayer {
-                    k: k_buf,
-                    v: v_buf,
-                    n_state,
-                    n_rows,
-                    src_k_ptr,
-                    src_v_ptr,
-                    src_k_len,
-                    src_v_len,
-                },
-            );
-
-            let entry = self
-                .cross_kv_layers
-                .get(&layer)
-                .ok_or_else(|| "cross kv layer insertion failed".to_string())?;
-            Ok((entry.k.as_id(), entry.v.as_id()))
+            Ok(tensor_named_weight(owner, cache_key, || load().map(Cow::Owned))?.id())
         }
 
         fn compile_pipeline(
@@ -3838,6 +3493,19 @@ mod imp {
             nr1: i32,
             nsg: i32,
         ) -> Result<(ObjcId, usize, i32, i32, i32), String> {
+            if self.tensor_mode && !self.pipeline_cache.contains_key(&cache_name) {
+                if !self.tensor_prepare {
+                    return Err(format!("unprepared tensor pipeline: {cache_name}"));
+                }
+                let cached = tensor_locked(|state| Ok(state.context.pipeline_cache.get(&cache_name).cloned()))?;
+                let pipeline = if let Some(pipeline) = cached { pipeline } else {
+                    let obj = self.compile_pipeline(base_name, constants)?;
+                    let candidate = PipelineState { obj, smem, nr0, nr1, nsg };
+                    tensor_locked(|state| Ok(state.context.pipeline_cache.entry(cache_name.clone())
+                        .or_insert_with(|| candidate.clone()).clone()))?
+                };
+                self.pipeline_cache.insert(cache_name.clone(), pipeline);
+            }
             if !self.pipeline_cache.contains_key(&cache_name) {
                 if LOG_METAL_PIPELINES {
                     eprintln!("[ggml][metal] compile_pipeline base={}", base_name);
@@ -3855,7 +3523,7 @@ mod imp {
                 );
             }
 
-            let p = self.pipeline_cache.get(&cache_name).unwrap();
+            let p = self.pipeline_cache.get(&cache_name).ok_or_else(|| "pipeline missing".to_string())?;
             Ok((p.obj.as_id(), p.smem, p.nr0, p.nr1, p.nsg))
         }
 
@@ -4001,6 +3669,7 @@ mod imp {
             &mut self,
             handles: Option<(StrongId, StrongId)>,
         ) -> Result<(), String> {
+            if self.tensor_mode && !self.tensor_prepare { self.tensor_dispatches += 1; }
             let Some((command_buffer, encoder)) = handles else {
                 return Ok(());
             };
@@ -4032,6 +3701,27 @@ mod imp {
             ne0: i32,
             ne1: i32,
         ) -> Result<(), String> {
+            self.dispatch_mul_mv_ext_offsets(src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01, nb10, nb11, ne0, ne1, [0, 0, 0])
+        }
+
+        fn dispatch_mul_mv_ext_offsets(
+            &mut self,
+            src0: Src0Type,
+            src0_id: ObjcId,
+            src1_id: ObjcId,
+            dst_id: ObjcId,
+            ne00: i32,
+            ne01: i32,
+            ne10: i32,
+            ne11: i32,
+            nb00: u64,
+            nb01: u64,
+            nb10: u64,
+            nb11: u64,
+            ne0: i32,
+            ne1: i32,
+                    offsets: [usize; 3],
+) -> Result<(), String> {
             let nsg = 2i32;
             let nxpsg = if ne00 % 256 == 0 && ne11 < 3 {
                 16i32
@@ -4105,6 +3795,9 @@ mod imp {
                 r3: 1,
             };
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -4114,9 +3807,9 @@ mod imp {
                     length: std::mem::size_of::<KArgsMulMvExt>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 3u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, dst_id, offsets[2], 3)?;
 
                 let tgs = MTLSize {
                     width: ((ne01 + r0ptg - 1) / r0ptg) as u64,
@@ -4153,6 +3846,25 @@ mod imp {
             ne0: i32,
             ne1: i32,
         ) -> Result<(), String> {
+            self.dispatch_mul_mm_offsets(src0, src0_id, src1_id, dst_id, ne00, ne01, nb01, ne12, nb10, nb11, ne0, ne1, [0, 0, 0])
+        }
+
+        fn dispatch_mul_mm_offsets(
+            &mut self,
+            src0: Src0Type,
+            src0_id: ObjcId,
+            src1_id: ObjcId,
+            dst_id: ObjcId,
+            ne00: i32,
+            ne01: i32,
+            nb01: u64,
+            ne12: i32,
+            nb10: u64,
+            nb11: u64,
+            ne0: i32,
+            ne1: i32,
+                    offsets: [usize; 3],
+) -> Result<(), String> {
             let bc_inp = ne00 % 32 != 0;
             let bc_out = ne0 % 64 != 0 || ne1 % 32 != 0;
 
@@ -4214,6 +3926,9 @@ mod imp {
                 r3: 1,
             };
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -4223,9 +3938,9 @@ mod imp {
                     length: std::mem::size_of::<KArgsMulMm>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 3u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, dst_id, offsets[2], 3)?;
                 let _: () = msg_send![
                     encoder,
                     setThreadgroupMemoryLength: pipeline_smem as u64
@@ -4269,6 +3984,27 @@ mod imp {
             ne0: i32,
             ne1: i32,
         ) -> Result<(), String> {
+            self.dispatch_mul_mv_offsets(src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01, nb10, nb11, ne0, ne1, [0, 0, 0])
+        }
+
+        fn dispatch_mul_mv_offsets(
+            &mut self,
+            src0: Src0Type,
+            src0_id: ObjcId,
+            src1_id: ObjcId,
+            dst_id: ObjcId,
+            ne00: i32,
+            ne01: i32,
+            ne10: i32,
+            ne11: i32,
+            nb00: u64,
+            nb01: u64,
+            nb10: u64,
+            nb11: u64,
+            ne0: i32,
+            ne1: i32,
+                    offsets: [usize; 3],
+) -> Result<(), String> {
             let (nsg, nr0, nr1, smem, suffix) = match src0 {
                 Src0Type::F32 | Src0Type::F16 | Src0Type::BF16 => {
                     if ne00 < 32 {
@@ -4345,6 +4081,9 @@ mod imp {
                 r3: 1,
             };
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -4354,9 +4093,9 @@ mod imp {
                     length: std::mem::size_of::<KArgsMulMv>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 3u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, dst_id, offsets[2], 3)?;
 
                 if smem > 0 {
                     let _: () = msg_send![
@@ -4403,7 +4142,18 @@ mod imp {
             dst_id: ObjcId,
             shape: &Shape4,
         ) -> Result<(), String> {
-            let is_c4 = shape.ne[0] % 4 == 0;
+            self.dispatch_unary_f32_offsets(op_num, src0_id, dst_id, shape, [0, 0])
+        }
+
+        fn dispatch_unary_f32_offsets(
+            &mut self,
+            op_num: i16,
+            src0_id: ObjcId,
+            dst_id: ObjcId,
+            shape: &Shape4,
+                    offsets: [usize; 2],
+) -> Result<(), String> {
+            let is_c4 = offsets.iter().all(|offset| offset % 16 == 0) && shape.ne[0] % 4 == 0;
             let is_cnt = shape.numel < 32768;
 
             let base = if is_c4 {
@@ -4457,6 +4207,9 @@ mod imp {
                 args.ne0 /= 4;
             }
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -4466,8 +4219,8 @@ mod imp {
                     length: std::mem::size_of::<KArgsUnary>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 2u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, dst_id, offsets[1], 2)?;
 
                 if is_cnt {
                     let n = if is_c4 { shape.numel / 4 } else { shape.numel };
@@ -4811,6 +4564,20 @@ mod imp {
             k: usize,
             n: usize,
         ) -> Result<(), String> {
+            self.matmul_nt_into_buffer_offsets(src0_ggml_type, src0_id, src1_id, dst_id, m, k, n, [0, 0, 0])
+        }
+
+        fn matmul_nt_into_buffer_offsets(
+            &mut self,
+            src0_ggml_type: u32,
+            src0_id: ObjcId,
+            src1_id: ObjcId,
+            dst_id: ObjcId,
+            m: usize,
+            k: usize,
+            n: usize,
+                    offsets: [usize; 3],
+) -> Result<(), String> {
             let src0 = src0_type_from_ggml(src0_ggml_type).ok_or_else(|| {
                 format!("unsupported src0 ggml_type for metal matmul: {}", src0_ggml_type)
             })?;
@@ -4827,40 +4594,34 @@ mod imp {
                 .checked_mul(4)
                 .ok_or_else(|| "overflow computing nb11".to_string())?;
             if can_use_mul_mv_ext(src0, ne00, ne11) {
-                self.dispatch_mul_mv_ext(
+                self.dispatch_mul_mv_ext_offsets(
                     src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01, nb10,
-                    nb11, ne0, ne1,
-                )
+                    nb11, ne0, ne1, [offsets[0], offsets[1], offsets[2]])
             } else if ne00 >= 64 && ne11 > 8 {
-                match self.dispatch_mul_mm(
-                    src0, src0_id, src1_id, dst_id, ne00, ne01, nb01, 1, nb10, nb11, ne0, ne1,
-                ) {
+                match self.dispatch_mul_mm_offsets(
+                    src0, src0_id, src1_id, dst_id, ne00, ne01, nb01, 1, nb10, nb11, ne0, ne1, [offsets[0], offsets[1], offsets[2]]) {
                     Ok(()) => Ok(()),
                     Err(e) => {
+                        if self.tensor_mode { return Err(e); }
                         super::log_metal_error_once(format!(
                             "[ggml][metal] mul_mm failed for type {:?}, falling back to mul_mv: {}",
                             src0, e
                         ));
-                        self.dispatch_mul_mv(
+                        self.dispatch_mul_mv_offsets(
                             src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01,
-                            nb10, nb11, ne0, ne1,
-                        )
+                            nb10, nb11, ne0, ne1, [offsets[0], offsets[1], offsets[2]])
                     }
                 }
             } else {
-                self.dispatch_mul_mv(
+                self.dispatch_mul_mv_offsets(
                     src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01, nb10,
-                    nb11, ne0, ne1,
-                )
+                    nb11, ne0, ne1, [offsets[0], offsets[1], offsets[2]])
             }
         }
 
         /// The f32 contents of a host-backed tensor as little-endian bytes.
         fn tensor_f32_bytes(t: &crate::gpu_types::GpuTensor) -> Result<Vec<u8>, String> {
-            let data = t
-                .data
-                .try_borrow()
-                .map_err(|_| "metal GpuTensor already borrowed".to_string())?;
+            let data = crate::gpu_tensor::data(t)?;
             let mut bytes = Vec::with_capacity(data.len() * 4);
             for value in data.iter() {
                 bytes.extend_from_slice(&value.to_le_bytes());
@@ -4897,7 +4658,7 @@ mod imp {
             let k = lin.weight.cols;
             let weight = lin.weight;
             let w_id = self.get_or_create_named_weight_buffer(
-                "two_way",
+                lin.owner,
                 &format!("w{}", weight.id.get()),
                 || Self::tensor_f32_bytes(weight),
             )?;
@@ -4911,7 +4672,7 @@ mod imp {
                     ));
                 }
                 let b_id = self.get_or_create_named_weight_buffer(
-                    "two_way",
+                    lin.owner,
                     &format!("b{}", bias.id.get()),
                     || Self::tensor_f32_bytes(bias),
                 )?;
@@ -5120,87 +4881,6 @@ mod imp {
             result
         }
 
-        fn dispatch_cpy_f32_to_f16(
-            &mut self,
-            src_id: ObjcId,
-            dst_id: ObjcId,
-            ne00: usize,
-            ne01: usize,
-            nb00: u64,
-            nb01: u64,
-            nb0: u64,
-            nb1: u64,
-        ) -> Result<(), String> {
-            let base = "kernel_cpy_f32_f16";
-            let (pipeline, _smem, _nr0, _nr1, _nsg) =
-                self.get_or_compile_cached_pipeline(base.to_string(), base, &[], 0, 0, 0, 0)?;
-
-            let ne00_i64 = i64::try_from(ne00).map_err(|_| format!("ne00 too large: {}", ne00))?;
-            let ne01_i64 = i64::try_from(ne01).map_err(|_| format!("ne01 too large: {}", ne01))?;
-            let nb02 = nb01
-                .checked_mul(ne01 as u64)
-                .ok_or_else(|| "overflow computing cpy nb02".to_string())?;
-            let nb2 = nb1
-                .checked_mul(ne01 as u64)
-                .ok_or_else(|| "overflow computing cpy nb2".to_string())?;
-            let args = KArgsCpy {
-                nk0: ne00_i64,
-                ne00: ne00_i64,
-                ne01: ne01_i64,
-                ne02: 1,
-                ne03: 1,
-                nb00,
-                nb01,
-                nb02,
-                nb03: nb02,
-                ne0: ne00_i64,
-                ne1: ne01_i64,
-                ne2: 1,
-                ne3: 1,
-                nb0,
-                nb1,
-                nb2,
-                nb3: nb2,
-            };
-
-            let max_threads = Self::pipeline_max_threads(pipeline).max(1);
-            let nth = std::cmp::min(ne00.max(1) as u64, max_threads).max(1);
-            let nw0 = ((ne00.max(1) as u64) + nth - 1) / nth;
-
-            let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
-            unsafe {
-                let _: () = msg_send![encoder, setComputePipelineState: pipeline];
-                let _: () = msg_send![
-                    encoder,
-                    setBytes: &args as *const KArgsCpy as *const c_void
-                    length: std::mem::size_of::<KArgsCpy>() as u64
-                    atIndex: 0u64
-                ];
-                let _: () = msg_send![encoder, setBuffer: src_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 2u64];
-
-                let tgs = MTLSize {
-                    width: nw0
-                        .checked_mul(ne01 as u64)
-                        .ok_or_else(|| "overflow computing cpy threadgroups width".to_string())?,
-                    height: 1,
-                    depth: 1,
-                };
-                let tpg = MTLSize {
-                    width: nth,
-                    height: 1,
-                    depth: 1,
-                };
-                let _: () = msg_send![
-                    encoder,
-                    dispatchThreadgroups: tgs
-                    threadsPerThreadgroup: tpg
-                ];
-            }
-
-            self.end_command_encoder(encoder_handles)
-        }
-
         fn dispatch_bin_f32(
             &mut self,
             op_num: i16,
@@ -5210,6 +4890,19 @@ mod imp {
             src0_shape: &Shape4,
             src1_shape: &Shape4,
         ) -> Result<(), String> {
+            self.dispatch_bin_f32_offsets(op_num, src0_id, src1_id, dst_id, src0_shape, src1_shape, [0, 0, 0])
+        }
+
+        fn dispatch_bin_f32_offsets(
+            &mut self,
+            op_num: i16,
+            src0_id: ObjcId,
+            src1_id: ObjcId,
+            dst_id: ObjcId,
+            src0_shape: &Shape4,
+            src1_shape: &Shape4,
+                    offsets: [usize; 3],
+) -> Result<(), String> {
             for d in 0..4 {
                 let b = src1_shape.ne[d];
                 let a = src0_shape.ne[d];
@@ -5221,7 +4914,7 @@ mod imp {
                 }
             }
 
-            let is_c4 = src0_shape.ne[0] % 4 == 0 && src1_shape.ne[0] % 4 == 0;
+            let is_c4 = offsets.iter().all(|offset| offset % 16 == 0) && src0_shape.ne[0] % 4 == 0 && src1_shape.ne[0] % 4 == 0;
             let is_rb = nrows(src1_shape) == 1 && src0_shape.numel < 65536;
 
             let base = if is_c4 {
@@ -5284,6 +4977,9 @@ mod imp {
                 args.ne0 /= 4;
             }
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5293,9 +4989,9 @@ mod imp {
                     length: std::mem::size_of::<KArgsBin>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 3u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, dst_id, offsets[2], 3)?;
 
                 if is_rb {
                     let n = if is_c4 {
@@ -5346,65 +5042,6 @@ mod imp {
             self.end_command_encoder(encoder_handles)
         }
 
-        fn dispatch_geglu_strided_rows_f32(
-            &mut self,
-            src_id: ObjcId,
-            dst_id: ObjcId,
-            row_count: usize,
-            row_width: usize,
-            input_row_stride: usize,
-            input_split_offset: usize,
-        ) -> Result<(), String> {
-            #[repr(C)]
-            struct MlxGegluStridedRowsArgsCompat {
-                n: u32,
-                row_width: u32,
-                input_row_stride: u32,
-                input_split_offset: u32,
-            }
-
-            let n = row_count
-                .checked_mul(row_width)
-                .ok_or_else(|| "overflow computing fused vision geglu size".to_string())?;
-            let base = "kernel_mlx_geglu_strided_rows_f32";
-            let (pipeline, _smem, _nr0, _nr1, _nsg) =
-                self.get_or_compile_cached_pipeline(base.to_string(), base, &[], 0, 0, 0, 0)?;
-            let args = MlxGegluStridedRowsArgsCompat {
-                n: n as u32,
-                row_width: row_width as u32,
-                input_row_stride: input_row_stride as u32,
-                input_split_offset: input_split_offset as u32,
-            };
-            let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
-            unsafe {
-                let _: () = msg_send![encoder, setComputePipelineState: pipeline];
-                let _: () = msg_send![
-                    encoder,
-                    setBytes: &args as *const MlxGegluStridedRowsArgsCompat as *const c_void
-                    length: std::mem::size_of::<MlxGegluStridedRowsArgsCompat>() as u64
-                    atIndex: 0u64
-                ];
-                let _: () = msg_send![encoder, setBuffer: src_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 2u64];
-                let tgs = MTLSize {
-                    width: (n as u64).div_ceil(256),
-                    height: 1,
-                    depth: 1,
-                };
-                let tpg = MTLSize {
-                    width: 256,
-                    height: 1,
-                    depth: 1,
-                };
-                let _: () = msg_send![
-                    encoder,
-                    dispatchThreadgroups: tgs
-                    threadsPerThreadgroup: tpg
-                ];
-            }
-            self.end_command_encoder(encoder_handles)
-        }
-
         fn dispatch_swiglu_packed(
             &mut self,
             src_id: ObjcId,
@@ -5449,6 +5086,7 @@ mod imp {
             let base = "kernel_swiglu_f32";
             let (pipeline, _smem, _nr0, _nr1, _nsg) =
                 self.get_or_compile_cached_pipeline(base.to_string(), base, &[], 0, 0, 0, 0)?;
+            if self.tensor_prepare { return Ok(()); }
             let nth = (ff_dim as u64 / 2).max(1).min(256);
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
@@ -5459,9 +5097,9 @@ mod imp {
                     length: std::mem::size_of::<KArgsGluCompat>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 3u64];
+                self.bind_buffer(encoder, src_id, 0, 1)?;
+                self.bind_buffer(encoder, src_id, 0, 2)?;
+                self.bind_buffer(encoder, dst_id, 0, 3)?;
                 let tgs = MTLSize {
                     width: rows.max(1) as u64,
                     height: 1,
@@ -5494,11 +5132,27 @@ mod imp {
             eps: f32,
             n_fuse: i32,
         ) -> Result<(), String> {
+            self.dispatch_norm_f32_offsets(src0_id, src1_0_id, src1_1_id, dst_id, src0_shape, src1_0_shape, src1_1_shape, eps, n_fuse, [0, 0, 0, 0])
+        }
+
+        fn dispatch_norm_f32_offsets(
+            &mut self,
+            src0_id: ObjcId,
+            src1_0_id: ObjcId,
+            src1_1_id: ObjcId,
+            dst_id: ObjcId,
+            src0_shape: &Shape4,
+            src1_0_shape: &Shape4,
+            src1_1_shape: &Shape4,
+            eps: f32,
+            n_fuse: i32,
+                    offsets: [usize; 4],
+) -> Result<(), String> {
             if src0_shape.ne[0] <= 0 {
                 return Err("norm ne0 must be positive".to_string());
             }
 
-            let is_c4 = src0_shape.ne[0] % 4 == 0;
+            let is_c4 = offsets.iter().all(|offset| offset % 16 == 0) && src0_shape.ne[0] % 4 == 0;
             let suffix = if is_c4 { "_4" } else { "" };
             let base = match n_fuse {
                 1 => format!("kernel_norm_f32{}", suffix),
@@ -5538,6 +5192,9 @@ mod imp {
             nth = std::cmp::min(nth, nth_max);
             nth = std::cmp::min(nth, args.ne00_t.max(1) as u64);
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5547,10 +5204,10 @@ mod imp {
                     length: std::mem::size_of::<KArgsNorm>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_0_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: src1_1_id offset: 0u64 atIndex: 3u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 4u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_0_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, src1_1_id, offsets[2], 3)?;
+                self.bind_buffer(encoder, dst_id, offsets[3], 4)?;
                 let _: () = msg_send![
                     encoder,
                     setThreadgroupMemoryLength: pipeline_smem as u64
@@ -5577,8 +5234,7 @@ mod imp {
             self.end_command_encoder(encoder_handles)
         }
 
-        #[allow(clippy::too_many_arguments)]
-        fn dispatch_rms_norm_f32(
+        fn dispatch_rms_norm_f32_offsets(
             &mut self,
             src0_id: ObjcId,
             src1_0_id: ObjcId,
@@ -5589,12 +5245,13 @@ mod imp {
             src1_1_shape: &Shape4,
             eps: f32,
             n_fuse: i32,
+            offsets: [usize; 4],
         ) -> Result<(), String> {
             if src0_shape.ne[0] <= 0 {
                 return Err("rms_norm ne0 must be positive".to_string());
             }
 
-            let is_c4 = src0_shape.ne[0] % 4 == 0;
+            let is_c4 = offsets.iter().all(|offset| offset % 16 == 0) && src0_shape.ne[0] % 4 == 0;
             let suffix = if is_c4 { "_4" } else { "" };
             let base = match n_fuse {
                 1 => format!("kernel_rms_norm_f32{}", suffix),
@@ -5634,6 +5291,7 @@ mod imp {
             nth = std::cmp::min(nth, nth_max);
             nth = std::cmp::min(nth, args.ne00_t.max(1) as u64);
 
+            if self.tensor_prepare { return Ok(()); }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5643,10 +5301,10 @@ mod imp {
                     length: std::mem::size_of::<KArgsNorm>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_0_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: src1_1_id offset: 0u64 atIndex: 3u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 4u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_0_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, src1_1_id, offsets[2], 3)?;
+                self.bind_buffer(encoder, dst_id, offsets[3], 4)?;
                 let _: () = msg_send![
                     encoder,
                     setThreadgroupMemoryLength: pipeline_smem as u64
@@ -5682,6 +5340,7 @@ mod imp {
             src1_shape: &Shape4,
             dst_id: ObjcId,
             dst_shape: &Shape4,
+            offsets: [usize; 3],
         ) -> Result<(), String> {
             let base = format!("kernel_get_rows_{}", ggml_type_name(src0_ggml_type));
             let (pipeline, _smem, _nr0, _nr1, _nsg) =
@@ -5717,6 +5376,9 @@ mod imp {
             );
             let nw0 = ((args.ne00t.max(1) as u64) + nth - 1) / nth;
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5726,9 +5388,9 @@ mod imp {
                     length: std::mem::size_of::<KArgsGetRows>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src0_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: src1_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 3u64];
+                self.bind_buffer(encoder, src0_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, src1_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, dst_id, offsets[2], 3)?;
 
                 let tgs = MTLSize {
                     width: nw0 * (src1_shape.ne[0] as u64),
@@ -5750,64 +5412,60 @@ mod imp {
             self.end_command_encoder(encoder_handles)
         }
 
-        fn dispatch_im2col_1d_f32(
+        fn dispatch_im2col_2d_f32_offsets(
             &mut self,
             src_id: ObjcId,
+            src_offset: usize,
             dst_id: ObjcId,
             ic: usize,
             iw: usize,
+            ih: usize,
+            channel_stride: usize,
             kw: usize,
-            stride: usize,
-            pad: usize,
+            kh: usize,
+            pad_x: usize,
+            pad_y: usize,
             ow: usize,
-        ) -> Result<(), String> {
+            oh: usize,
+                    offsets: [usize; 2],
+) -> Result<(), String> {
             let base = "kernel_im2col_f32";
             let (pipeline, _smem, _nr0, _nr1, _nsg) =
                 self.get_or_compile_cached_pipeline(base.to_string(), base, &[], 0, 0, 0, 0)?;
-
-            let ic_i32 = i32::try_from(ic).map_err(|_| format!("ic too large: {}", ic))?;
-            let iw_i32 = i32::try_from(iw).map_err(|_| format!("iw too large: {}", iw))?;
-            let kw_i32 = i32::try_from(kw).map_err(|_| format!("kw too large: {}", kw))?;
-            let ow_i32 = i32::try_from(ow).map_err(|_| format!("ow too large: {}", ow))?;
-            let stride_i32 =
-                i32::try_from(stride).map_err(|_| format!("stride too large: {}", stride))?;
-            let pad_i32 = i32::try_from(pad).map_err(|_| format!("pad too large: {}", pad))?;
-
-            let chw = ic
-                .checked_mul(kw)
+            let dim = |v: usize| i32::try_from(v)
+                .map_err(|_| format!("im2col dimension too large: {v}"));
+            let khw = kh.checked_mul(kw)
+                .ok_or_else(|| "overflow computing im2col kernel size".to_string())?;
+            let chw = ic.checked_mul(khw)
                 .ok_or_else(|| "overflow computing im2col CHW".to_string())?;
-            let ofs0 = ic
-                .checked_mul(iw)
-                .ok_or_else(|| "overflow computing im2col ofs0".to_string())?;
-
+            let ofs0 = ic.checked_mul(channel_stride)
+                .ok_or_else(|| "overflow computing im2col batch stride".to_string())?;
             let args = KArgsIm2Col {
                 ofs0: ofs0 as u64,
-                ofs1: iw as u64,
-                iw: iw_i32,
-                ih: 1,
-                chw: i32::try_from(chw).map_err(|_| format!("CHW too large: {}", chw))?,
-                s0: stride_i32,
+                ofs1: channel_stride as u64,
+                iw: dim(iw)?,
+                ih: dim(ih)?,
+                chw: dim(chw)?,
+                s0: 1,
                 s1: 1,
-                p0: pad_i32,
-                p1: 0,
+                p0: dim(pad_x)?,
+                p1: dim(pad_y)?,
                 d0: 1,
                 d1: 1,
                 n: 1,
-                kh: 1,
-                kw: kw_i32,
-                khw: kw_i32,
+                kh: dim(kh)?,
+                kw: dim(kw)?,
+                khw: dim(khw)?,
             };
-
             let max_threads = Self::pipeline_max_threads(pipeline);
-            let khkw = kw_i32 as u64;
-            if khkw == 0 || khkw > max_threads {
+            if khw == 0 || khw as u64 > max_threads {
                 return Err(format!(
-                    "invalid im2col thread shape: kh*kw={} max={}",
-                    khkw, max_threads
+                    "invalid im2col thread shape: kh*kw={khw} max={max_threads}"
                 ));
             }
-            let ntptg0 = (max_threads / khkw).min(1).max(1);
-
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5817,31 +5475,19 @@ mod imp {
                     length: std::mem::size_of::<KArgsIm2Col>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: src_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 2u64];
-
-                let tgs = MTLSize {
-                    width: ic_i32 as u64,
-                    height: 1,
-                    depth: ow_i32 as u64,
-                };
-                let tpg = MTLSize {
-                    width: ntptg0,
-                    height: 1,
-                    depth: kw_i32 as u64,
-                };
-                let _: () = msg_send![
-                    encoder,
-                    dispatchThreadgroups: tgs
-                    threadsPerThreadgroup: tpg
-                ];
+                self.bind_buffer(encoder, src_id, offsets[0] + src_offset, 1)?;
+                self.bind_buffer(encoder, dst_id, offsets[1], 2)?;
+                let tgs = MTLSize { width: ic as u64, height: oh as u64, depth: ow as u64 };
+                let tpg = MTLSize { width: 1, height: kh as u64, depth: kw as u64 };
+                let _: () = msg_send![encoder, dispatchThreadgroups: tgs threadsPerThreadgroup: tpg];
             }
-
             self.end_command_encoder(encoder_handles)
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn dispatch_flash_attn_ext_pad(
+
+
+        fn dispatch_flash_attn_ext_pad_offsets(
             &mut self,
             k_id: ObjcId,
             v_id: ObjcId,
@@ -5864,7 +5510,8 @@ mod imp {
             nb31: u64,
             nb32: u64,
             nb33: u64,
-        ) -> Result<(), String> {
+                    offsets: [usize; 4],
+) -> Result<(), String> {
             let base = "kernel_flash_attn_ext_pad";
             let name = format!("{}_mask={}_ncpsg={}", base, has_mask as i32, ncpsg);
             let constants = [
@@ -5898,6 +5545,9 @@ mod imp {
                 nb33,
             };
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5907,10 +5557,10 @@ mod imp {
                     length: std::mem::size_of::<KArgsFlashAttnExtPad>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: k_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: v_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: mask_id offset: 0u64 atIndex: 3u64];
-                let _: () = msg_send![encoder, setBuffer: pad_id offset: 0u64 atIndex: 4u64];
+                self.bind_buffer(encoder, k_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, v_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, mask_id, offsets[2], 3)?;
+                self.bind_buffer(encoder, pad_id, offsets[3], 4)?;
 
                 let tgs = MTLSize {
                     width: ncpsg as u64,
@@ -5933,7 +5583,9 @@ mod imp {
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn dispatch_flash_attn_ext_blk(
+
+
+        fn dispatch_flash_attn_ext_blk_offsets(
             &mut self,
             mask_id: ObjcId,
             blk_id: ObjcId,
@@ -5947,7 +5599,8 @@ mod imp {
             nb33: u64,
             nqptg: i32,
             ncpsg: i32,
-        ) -> Result<(), String> {
+                    offsets: [usize; 2],
+) -> Result<(), String> {
             let base = "kernel_flash_attn_ext_blk";
             let name = format!("{}_nqptg={}_ncpsg={}", base, nqptg, ncpsg);
             let constants = [
@@ -5976,6 +5629,9 @@ mod imp {
                 nb33,
             };
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -5985,8 +5641,8 @@ mod imp {
                     length: std::mem::size_of::<KArgsFlashAttnExtBlk>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: mask_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: blk_id offset: 0u64 atIndex: 2u64];
+                self.bind_buffer(encoder, mask_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, blk_id, offsets[1], 2)?;
 
                 let nblk1 = ((ne01 + nqptg - 1) / nqptg) as u64;
                 let nblk0 = ((ne30 + ncpsg - 1) / ncpsg) as u64;
@@ -6031,6 +5687,31 @@ mod imp {
             max_bias: f32,
             logit_softcap: f32,
         ) -> Result<(), String> {
+            self.dispatch_flash_attn_ext_f32_offsets(q_id, k_id, v_id, mask_id, sinks_id, pad_id, blk_id, dst_id, n_q, n_kv, n_head, d, kv_type, scale, has_mask, has_sinks, max_bias, logit_softcap, [0, 0, 0, 0, 0, 0, 0, 0])
+        }
+
+        fn dispatch_flash_attn_ext_f32_offsets(
+            &mut self,
+            q_id: ObjcId,
+            k_id: ObjcId,
+            v_id: ObjcId,
+            mask_id: ObjcId,
+            sinks_id: ObjcId,
+            pad_id: ObjcId,
+            blk_id: ObjcId,
+            dst_id: ObjcId,
+            n_q: usize,
+            n_kv: usize,
+            n_head: usize,
+            d: usize,
+            kv_type: Src0Type,
+            scale: f32,
+            has_mask: bool,
+            has_sinks: bool,
+            max_bias: f32,
+            logit_softcap: f32,
+                    offsets: [usize; 8],
+) -> Result<(), String> {
             if !flash_attn_supported_head_dim(d) {
                 return Err(format!(
                     "unsupported flash-attn head dim for kv kernel: {}",
@@ -6115,15 +5796,13 @@ mod imp {
                 .map_err(|_| "overflow computing flash ns20".to_string())?;
 
             if has_kvpad {
-                self.dispatch_flash_attn_ext_pad(
+                self.dispatch_flash_attn_ext_pad_offsets(
                     k_id, v_id, mask_id, pad_id, has_mask, ncpsg, ne11, ne02, 1, nb11, nb12, nb13,
-                    nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,
-                )?;
+                    nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, [offsets[1], offsets[2], offsets[3], offsets[5]])?;
             }
             if has_mask {
-                self.dispatch_flash_attn_ext_blk(
-                    mask_id, blk_id, n_q, n_kv, ne31, ne32, ne33, nb31, nb32, nb33, nqptg, ncpsg,
-                )?;
+                self.dispatch_flash_attn_ext_blk_offsets(
+                    mask_id, blk_id, n_q, n_kv, ne31, ne32, ne33, nb31, nb32, nb33, nqptg, ncpsg, [offsets[3], offsets[6]])?;
             }
 
             let base = format!(
@@ -6223,6 +5902,9 @@ mod imp {
                 logit_softcap,
             };
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -6232,14 +5914,14 @@ mod imp {
                     length: std::mem::size_of::<KArgsFlashAttnExt>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: q_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: k_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: v_id offset: 0u64 atIndex: 3u64];
-                let _: () = msg_send![encoder, setBuffer: mask_id offset: 0u64 atIndex: 4u64];
-                let _: () = msg_send![encoder, setBuffer: sinks_id offset: 0u64 atIndex: 5u64];
-                let _: () = msg_send![encoder, setBuffer: pad_id offset: 0u64 atIndex: 6u64];
-                let _: () = msg_send![encoder, setBuffer: blk_id offset: 0u64 atIndex: 7u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 8u64];
+                self.bind_buffer(encoder, q_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, k_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, v_id, offsets[2], 3)?;
+                self.bind_buffer(encoder, mask_id, offsets[3], 4)?;
+                self.bind_buffer(encoder, sinks_id, offsets[4], 5)?;
+                self.bind_buffer(encoder, pad_id, offsets[5], 6)?;
+                self.bind_buffer(encoder, blk_id, offsets[6], 7)?;
+                self.bind_buffer(encoder, dst_id, offsets[7], 8)?;
                 let _: () = msg_send![
                     encoder,
                     setThreadgroupMemoryLength: pipeline_smem as u64
@@ -6266,14 +5948,17 @@ mod imp {
             self.end_command_encoder(encoder_handles)
         }
 
-        fn dispatch_flash_attn_ext_vec_reduce_f32(
+
+
+        fn dispatch_flash_attn_ext_vec_reduce_f32_offsets(
             &mut self,
             tmp_id: ObjcId,
             dst_id: ObjcId,
             nrows: usize,
             d: usize,
             nwg: i32,
-        ) -> Result<(), String> {
+                    offsets: [usize; 2],
+) -> Result<(), String> {
             let base = "kernel_flash_attn_ext_vec_reduce";
             let name = format!("{}_dv={}_nwg={}", base, d, nwg);
             let d_i32 =
@@ -6306,6 +5991,9 @@ mod imp {
                 ));
             }
 
+            if self.tensor_prepare {
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -6315,8 +6003,8 @@ mod imp {
                     length: std::mem::size_of::<KArgsFlashAttnExtVecReduce>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: tmp_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: dst_id offset: 0u64 atIndex: 2u64];
+                self.bind_buffer(encoder, tmp_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, dst_id, offsets[1], 2)?;
 
                 let tgs = MTLSize {
                     width: nrows as u64,
@@ -6359,6 +6047,31 @@ mod imp {
             max_bias: f32,
             logit_softcap: f32,
         ) -> Result<(), String> {
+            self.dispatch_flash_attn_ext_vec_f32_offsets(q_id, k_id, v_id, mask_id, sinks_id, pad_id, tmp_id, dst_id, n_q, n_kv, n_head, d, kv_type, scale, has_mask, has_sinks, max_bias, logit_softcap, [0, 0, 0, 0, 0, 0, 0, 0])
+        }
+
+        fn dispatch_flash_attn_ext_vec_f32_offsets(
+            &mut self,
+            q_id: ObjcId,
+            k_id: ObjcId,
+            v_id: ObjcId,
+            mask_id: ObjcId,
+            sinks_id: ObjcId,
+            pad_id: ObjcId,
+            tmp_id: Option<ObjcId>,
+            dst_id: ObjcId,
+            n_q: usize,
+            n_kv: usize,
+            n_head: usize,
+            d: usize,
+            kv_type: Src0Type,
+            scale: f32,
+            has_mask: bool,
+            has_sinks: bool,
+            max_bias: f32,
+            logit_softcap: f32,
+                    offsets: [usize; 8],
+) -> Result<(), String> {
             if d % 32 != 0 {
                 return Err(format!(
                     "flash-attn vec requires head dim divisible by 32, got {}",
@@ -6454,10 +6167,9 @@ mod imp {
                 .map_err(|_| "overflow computing flash vec ns20".to_string())?;
 
             if has_kvpad {
-                self.dispatch_flash_attn_ext_pad(
+                self.dispatch_flash_attn_ext_pad_offsets(
                     k_id, v_id, mask_id, pad_id, has_mask, ncpsg, ne11, ne02, 1, nb11, nb12, nb13,
-                    nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33,
-                )?;
+                    nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33, [offsets[1], offsets[2], offsets[3], offsets[5]])?;
             }
 
             let base = format!(
@@ -6578,6 +6290,14 @@ mod imp {
                     .ok_or_else(|| "flash-attn vec requires tmp buffer when nwg > 1".to_string())?
             };
 
+            if self.tensor_prepare {
+                if nwg > 1 {
+                    self.dispatch_flash_attn_ext_vec_reduce_f32_offsets(
+                        out_id, dst_id, nrows, d, nwg, [offsets[6], offsets[7]],
+                    )?;
+                }
+                return Ok(());
+            }
             let (_command_buffer, encoder, encoder_handles) = self.begin_command_encoder()?;
             unsafe {
                 let _: () = msg_send![encoder, setComputePipelineState: pipeline];
@@ -6587,13 +6307,13 @@ mod imp {
                     length: std::mem::size_of::<KArgsFlashAttnExtVec>() as u64
                     atIndex: 0u64
                 ];
-                let _: () = msg_send![encoder, setBuffer: q_id offset: 0u64 atIndex: 1u64];
-                let _: () = msg_send![encoder, setBuffer: k_id offset: 0u64 atIndex: 2u64];
-                let _: () = msg_send![encoder, setBuffer: v_id offset: 0u64 atIndex: 3u64];
-                let _: () = msg_send![encoder, setBuffer: mask_id offset: 0u64 atIndex: 4u64];
-                let _: () = msg_send![encoder, setBuffer: sinks_id offset: 0u64 atIndex: 5u64];
-                let _: () = msg_send![encoder, setBuffer: pad_id offset: 0u64 atIndex: 6u64];
-                let _: () = msg_send![encoder, setBuffer: out_id offset: 0u64 atIndex: 7u64];
+                self.bind_buffer(encoder, q_id, offsets[0], 1)?;
+                self.bind_buffer(encoder, k_id, offsets[1], 2)?;
+                self.bind_buffer(encoder, v_id, offsets[2], 3)?;
+                self.bind_buffer(encoder, mask_id, offsets[3], 4)?;
+                self.bind_buffer(encoder, sinks_id, offsets[4], 5)?;
+                self.bind_buffer(encoder, pad_id, offsets[5], 6)?;
+                self.bind_buffer(encoder, out_id, if nwg == 1 { offsets[7] } else { offsets[6] }, 7)?;
 
                 let _: () = msg_send![
                     encoder,
@@ -6623,300 +6343,10 @@ mod imp {
             if nwg > 1 {
                 let tmp_id = tmp_id
                     .ok_or_else(|| "flash-attn vec requires tmp buffer when nwg > 1".to_string())?;
-                self.dispatch_flash_attn_ext_vec_reduce_f32(tmp_id, dst_id, nrows, d, nwg)?;
+                self.dispatch_flash_attn_ext_vec_reduce_f32_offsets(tmp_id, dst_id, nrows, d, nwg, [offsets[6], offsets[7]])?;
             }
 
             Ok(())
-        }
-
-        fn flash_attn_f32_packed(
-            &mut self,
-            q: &[f32],
-            k: &[f32],
-            v: &[f32],
-            n_q: usize,
-            n_kv: usize,
-            n_head: usize,
-            d: usize,
-            scale: f32,
-        ) -> Result<Vec<f32>, String> {
-            if n_q == 0 || n_kv == 0 || n_head == 0 || d == 0 {
-                return Ok(Vec::new());
-            }
-
-            let q_need = n_q
-                .checked_mul(n_head)
-                .and_then(|v| v.checked_mul(d))
-                .ok_or_else(|| "overflow computing flash q size".to_string())?;
-            if q.len() != q_need {
-                return Err(format!(
-                    "flash q len mismatch: got {}, expected {}",
-                    q.len(),
-                    q_need
-                ));
-            }
-
-            let kv_need = n_kv
-                .checked_mul(n_head)
-                .and_then(|v| v.checked_mul(d))
-                .ok_or_else(|| "overflow computing flash kv size".to_string())?;
-            if k.len() != kv_need {
-                return Err(format!(
-                    "flash k len mismatch: got {}, expected {}",
-                    k.len(),
-                    kv_need
-                ));
-            }
-            if v.len() != kv_need {
-                return Err(format!(
-                    "flash v len mismatch: got {}, expected {}",
-                    v.len(),
-                    kv_need
-                ));
-            }
-
-            let out_elems = n_q
-                .checked_mul(n_head)
-                .and_then(|v| v.checked_mul(d))
-                .ok_or_else(|| "overflow computing flash output size".to_string())?;
-            let out_bytes = out_elems
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "overflow computing flash output bytes".to_string())?;
-
-            let q_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    q.as_ptr() as *const u8,
-                    q.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let k_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    k.as_ptr() as *const u8,
-                    k.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let v_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    v.as_ptr() as *const u8,
-                    v.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let q_buf = self.new_buffer_with_bytes(q_bytes)?;
-            let k_buf = self.new_buffer_with_bytes(k_bytes)?;
-            let v_buf = self.new_buffer_with_bytes(v_bytes)?;
-            let dst_id = self.get_or_create_scratch_buffer(SCRATCH_FLASH_OUT, out_bytes)?;
-
-            let params = FlashAttnExtParams::default();
-            let kv_type = Src0Type::F32;
-            let kv_elem_bytes = flash_attn_kv_elem_bytes(kv_type)?;
-            let use_vec = flash_attn_use_vec(n_q, d);
-            let pad_bytes = flash_attn_ext_extra_pad_bytes(
-                n_q,
-                n_kv,
-                n_head,
-                d,
-                kv_elem_bytes,
-                params.has_mask,
-                use_vec,
-            )?;
-            let pad_id = self.get_or_create_scratch_buffer(SCRATCH_FLASH_PAD, pad_bytes)?;
-
-            if use_vec {
-                let tmp_bytes = flash_attn_ext_extra_tmp_bytes(n_q, n_head, d, 32)?;
-                let tmp_id = self.get_or_create_scratch_buffer(SCRATCH_FLASH_TMP, tmp_bytes)?;
-
-                self.dispatch_flash_attn_ext_vec_f32(
-                    q_buf.as_id(),
-                    k_buf.as_id(),
-                    v_buf.as_id(),
-                    q_buf.as_id(), // unused when has_mask=false
-                    q_buf.as_id(), // unused when has_sinks=false
-                    pad_id,
-                    Some(tmp_id),
-                    dst_id,
-                    n_q,
-                    n_kv,
-                    n_head,
-                    d,
-                    kv_type,
-                    scale,
-                    params.has_mask,
-                    params.has_sinks,
-                    params.max_bias,
-                    params.logit_softcap,
-                )?;
-            } else {
-                let blk_bytes = flash_attn_ext_extra_blk_bytes(n_q, n_kv, params.has_mask, false)?;
-                let blk_id = self.get_or_create_scratch_buffer(SCRATCH_FLASH_BLK, blk_bytes)?;
-
-                self.dispatch_flash_attn_ext_f32(
-                    q_buf.as_id(),
-                    k_buf.as_id(),
-                    v_buf.as_id(),
-                    q_buf.as_id(), // unused when has_mask=false
-                    q_buf.as_id(), // unused when has_sinks=false
-                    pad_id,
-                    blk_id,
-                    dst_id,
-                    n_q,
-                    n_kv,
-                    n_head,
-                    d,
-                    kv_type,
-                    scale,
-                    params.has_mask,
-                    params.has_sinks,
-                    params.max_bias,
-                    params.logit_softcap,
-                )?;
-            }
-
-            self.read_f32_buffer(dst_id, out_elems)
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn flash_attn_f32_self_kv_cache(
-            &mut self,
-            layer: usize,
-            q: &[f32],
-            k_all: &[f32],
-            v_all: &[f32],
-            n_kv: usize,
-            n_head: usize,
-            d: usize,
-            scale: f32,
-        ) -> Result<Vec<f32>, String> {
-            if n_kv == 0 || n_head == 0 || d == 0 {
-                return Ok(Vec::new());
-            }
-            let n_state = n_head
-                .checked_mul(d)
-                .ok_or_else(|| "overflow computing n_state".to_string())?;
-            let kv_need = n_kv
-                .checked_mul(n_state)
-                .ok_or_else(|| "overflow computing decoder self kv size".to_string())?;
-            if q.len() != n_state || k_all.len() != kv_need || v_all.len() != kv_need {
-                return Err(format!(
-                    "decoder self kv len mismatch: q={}, k_all={}, v_all={}, expected q={}, kv={}",
-                    q.len(),
-                    k_all.len(),
-                    v_all.len(),
-                    n_state,
-                    kv_need
-                ));
-            }
-
-            // Mirror whisper.cpp Metal path: self-KV cache length is padded to 32.
-            let n_kv_flash = pad_to(n_kv, 32);
-            let (k_id, v_id) = self.ensure_decoder_kv_layer(layer, n_state, n_kv_flash)?;
-            let row_bytes = n_state
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "overflow computing decoder kv row bytes".to_string())?;
-            let start_row = self
-                .decoder_kv_layers
-                .get(&layer)
-                .map(|e| e.len_rows.min(n_kv))
-                .unwrap_or(0);
-            if start_row < n_kv {
-                let copy_rows = n_kv - start_row;
-                let copy_bytes = copy_rows
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| "overflow computing decoder kv copy bytes".to_string())?;
-                let offset = start_row
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| "overflow computing decoder kv copy offset".to_string())?;
-                let src_k = f32_slice_as_bytes(&k_all[start_row * n_state..n_kv * n_state]);
-                let src_v = f32_slice_as_bytes(&v_all[start_row * n_state..n_kv * n_state]);
-                let dst_k: *mut u8 = unsafe { msg_send![k_id, contents] };
-                let dst_v: *mut u8 = unsafe { msg_send![v_id, contents] };
-                if dst_k.is_null() || dst_v.is_null() {
-                    return Err("decoder kv buffer contents returned null".to_string());
-                }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src_k.as_ptr(), dst_k.add(offset), copy_bytes);
-                    std::ptr::copy_nonoverlapping(src_v.as_ptr(), dst_v.add(offset), copy_bytes);
-                }
-                if let Some(entry) = self.decoder_kv_layers.get_mut(&layer) {
-                    entry.len_rows = n_kv;
-                }
-            }
-
-            if n_kv < n_kv_flash {
-                let tail_off = n_kv
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| "overflow computing decoder kv tail offset".to_string())?;
-                let tail_len = (n_kv_flash - n_kv)
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| "overflow computing decoder kv tail bytes".to_string())?;
-                self.zero_buffer_range(k_id, tail_off, tail_len)?;
-                self.zero_buffer_range(v_id, tail_off, tail_len)?;
-            }
-
-            let mask_id = self.prepare_decoder_self_mask_f16(n_kv, n_kv_flash)?;
-            let q_buf = self.new_buffer_with_bytes(f32_slice_as_bytes(q))?;
-            let out_buf = self.flash_attn_f32_from_buffers_with_params(
-                q_buf.as_id(),
-                k_id,
-                v_id,
-                1,
-                n_kv_flash,
-                n_head,
-                d,
-                scale,
-                FlashAttnExtParams {
-                    has_mask: true,
-                    ..FlashAttnExtParams::default()
-                },
-                Some(mask_id),
-            )?;
-            self.read_f32_buffer(out_buf.as_id(), n_state)
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn flash_attn_f32_cross_kv_cache(
-            &mut self,
-            layer: usize,
-            q: &[f32],
-            k_cross: &[f32],
-            v_cross: &[f32],
-            n_q: usize,
-            n_kv: usize,
-            n_head: usize,
-            d: usize,
-            scale: f32,
-        ) -> Result<Vec<f32>, String> {
-            if n_q == 0 || n_kv == 0 || n_head == 0 || d == 0 {
-                return Ok(Vec::new());
-            }
-            let n_state = n_head
-                .checked_mul(d)
-                .ok_or_else(|| "overflow computing n_state".to_string())?;
-            let q_need = n_q
-                .checked_mul(n_state)
-                .ok_or_else(|| "overflow computing cross q size".to_string())?;
-            if q.len() != q_need {
-                return Err(format!(
-                    "cross q len mismatch: got {}, expected {}",
-                    q.len(),
-                    q_need
-                ));
-            }
-
-            let (k_id, v_id) =
-                self.ensure_cross_kv_layer(layer, n_state, n_kv, k_cross, v_cross)?;
-            let q_buf = self.new_buffer_with_bytes(f32_slice_as_bytes(q))?;
-            let out_buf = self.flash_attn_f32_from_buffers(
-                q_buf.as_id(),
-                k_id,
-                v_id,
-                n_q,
-                n_kv,
-                n_head,
-                d,
-                scale,
-            )?;
-            self.read_f32_buffer(out_buf.as_id(), q_need)
         }
 
         fn flash_attn_f32_from_buffers(
@@ -7073,50 +6503,6 @@ mod imp {
         }
 
         #[allow(dead_code)]
-        fn encoder_flash_kv_f16_buffer(
-            &mut self,
-            src_f32_id: ObjcId,
-            seq_len: usize,
-            n_kv_flash: usize,
-            n_state: usize,
-            scratch_kind: u8,
-        ) -> Result<ObjcId, String> {
-            let row_bytes_f32 = n_state
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "overflow computing encoder f32 row bytes".to_string())?;
-            let row_bytes_f16 = n_state
-                .checked_mul(std::mem::size_of::<u16>())
-                .ok_or_else(|| "overflow computing encoder f16 row bytes".to_string())?;
-            let total_bytes = n_kv_flash
-                .checked_mul(row_bytes_f16)
-                .ok_or_else(|| "overflow computing encoder f16 kv bytes".to_string())?;
-            let dst_id = self.get_or_create_scratch_buffer(scratch_kind, total_bytes)?;
-
-            self.dispatch_cpy_f32_to_f16(
-                src_f32_id,
-                dst_id,
-                n_state,
-                seq_len,
-                std::mem::size_of::<f32>() as u64,
-                row_bytes_f32 as u64,
-                std::mem::size_of::<u16>() as u64,
-                row_bytes_f16 as u64,
-            )?;
-
-            if seq_len < n_kv_flash {
-                let tail_off = seq_len
-                    .checked_mul(row_bytes_f16)
-                    .ok_or_else(|| "overflow computing encoder kv tail offset".to_string())?;
-                let tail_bytes = (n_kv_flash - seq_len)
-                    .checked_mul(row_bytes_f16)
-                    .ok_or_else(|| "overflow computing encoder kv tail bytes".to_string())?;
-                self.zero_buffer_range(dst_id, tail_off, tail_bytes)?;
-            }
-
-            Ok(dst_id)
-        }
-
-        #[allow(dead_code)]
         #[allow(clippy::too_many_arguments)]
         fn linear_from_src_buffer(
             &mut self,
@@ -7162,1060 +6548,6 @@ mod imp {
             }
 
             Ok(dst)
-        }
-
-        #[allow(dead_code)]
-        #[allow(clippy::too_many_arguments)]
-        fn encoder_attn_block_f32(
-            &mut self,
-            x: &[f32],
-            seq_len: usize,
-            n_state: usize,
-            n_head: usize,
-            ln_w: &[f32],
-            ln_b: &[f32],
-            q_w_bytes: &[u8],
-            q_w_ggml_type: u32,
-            q_b: &[f32],
-            k_w_bytes: &[u8],
-            k_w_ggml_type: u32,
-            v_w_bytes: &[u8],
-            v_w_ggml_type: u32,
-            v_b: &[f32],
-            out_w_bytes: &[u8],
-            out_w_ggml_type: u32,
-            out_b: &[f32],
-        ) -> Result<Vec<f32>, String> {
-            if n_state == 0 || seq_len == 0 || n_head == 0 || n_state % n_head != 0 {
-                return Err(format!(
-                    "invalid attn dimensions: seq_len={}, n_state={}, n_head={}",
-                    seq_len, n_state, n_head
-                ));
-            }
-            let x_need = seq_len
-                .checked_mul(n_state)
-                .ok_or_else(|| "overflow computing x size".to_string())?;
-            if x.len() != x_need {
-                return Err(format!(
-                    "x len mismatch: got {}, expected {}",
-                    x.len(),
-                    x_need
-                ));
-            }
-            if ln_w.len() != n_state || ln_b.len() != n_state {
-                return Err("layernorm affine size mismatch".to_string());
-            }
-            if q_b.len() != n_state || v_b.len() != n_state || out_b.len() != n_state {
-                return Err("attention bias size mismatch".to_string());
-            }
-
-            let x_buf = self.new_buffer_with_bytes(f32_slice_as_bytes(x))?;
-            let x_shape = shape4_from_row_major(&[seq_len, n_state], 4)?;
-            let ln_shape = shape4_from_row_major(&[n_state], 4)?;
-            let ln_w_id = self.get_or_create_cached_f32_buffer(ln_w, 110)?;
-            let ln_b_id = self.get_or_create_cached_f32_buffer(ln_b, 111)?;
-
-            let norm_buf = self.new_buffer_with_length(x_need * std::mem::size_of::<f32>())?;
-            self.dispatch_norm_f32(
-                x_buf.as_id(),
-                ln_w_id,
-                ln_b_id,
-                norm_buf.as_id(),
-                &x_shape,
-                &ln_shape,
-                &ln_shape,
-                1e-5f32,
-                3,
-            )?;
-
-            let q_buf = self.linear_from_src_buffer(
-                norm_buf.as_id(),
-                seq_len,
-                n_state,
-                q_w_bytes,
-                q_w_ggml_type,
-                n_state,
-                Some(q_b),
-                112,
-                113,
-            )?;
-            let k_buf = self.linear_from_src_buffer(
-                norm_buf.as_id(),
-                seq_len,
-                n_state,
-                k_w_bytes,
-                k_w_ggml_type,
-                n_state,
-                None,
-                114,
-                0,
-            )?;
-            let v_buf = self.linear_from_src_buffer(
-                norm_buf.as_id(),
-                seq_len,
-                n_state,
-                v_w_bytes,
-                v_w_ggml_type,
-                n_state,
-                Some(v_b),
-                115,
-                116,
-            )?;
-
-            let d = n_state / n_head;
-            let scale = 1.0f32 / (d as f32).sqrt();
-            let attn_buf = self.flash_attn_f32_from_buffers(
-                q_buf.as_id(),
-                k_buf.as_id(),
-                v_buf.as_id(),
-                seq_len,
-                seq_len,
-                n_head,
-                d,
-                scale,
-            )?;
-
-            let proj_buf = self.linear_from_src_buffer(
-                attn_buf.as_id(),
-                seq_len,
-                n_state,
-                out_w_bytes,
-                out_w_ggml_type,
-                n_state,
-                Some(out_b),
-                117,
-                118,
-            )?;
-
-            self.dispatch_bin_f32(
-                0,
-                proj_buf.as_id(),
-                x_buf.as_id(),
-                proj_buf.as_id(),
-                &x_shape,
-                &x_shape,
-            )?;
-
-            self.read_f32_buffer(proj_buf.as_id(), x_need)
-        }
-
-        #[allow(dead_code)]
-        #[allow(clippy::too_many_arguments)]
-        fn encoder_ffn_block_f32(
-            &mut self,
-            x: &[f32],
-            seq_len: usize,
-            n_state: usize,
-            ln_w: &[f32],
-            ln_b: &[f32],
-            w0_bytes: &[u8],
-            w0_ggml_type: u32,
-            b0: &[f32],
-            w1_bytes: &[u8],
-            w1_ggml_type: u32,
-            b1: &[f32],
-        ) -> Result<Vec<f32>, String> {
-            if n_state == 0 || seq_len == 0 {
-                return Err(format!(
-                    "invalid ffn dimensions: seq_len={}, n_state={}",
-                    seq_len, n_state
-                ));
-            }
-            let x_need = seq_len
-                .checked_mul(n_state)
-                .ok_or_else(|| "overflow computing x size".to_string())?;
-            if x.len() != x_need {
-                return Err(format!(
-                    "x len mismatch: got {}, expected {}",
-                    x.len(),
-                    x_need
-                ));
-            }
-            if ln_w.len() != n_state || ln_b.len() != n_state {
-                return Err("layernorm affine size mismatch".to_string());
-            }
-            let n_ff = b0.len();
-            if n_ff == 0 || b1.len() != n_state {
-                return Err("ffn bias size mismatch".to_string());
-            }
-
-            let x_buf = self.new_buffer_with_bytes(f32_slice_as_bytes(x))?;
-            let x_shape = shape4_from_row_major(&[seq_len, n_state], 4)?;
-            let ln_shape = shape4_from_row_major(&[n_state], 4)?;
-            let ln_w_id = self.get_or_create_cached_f32_buffer(ln_w, 120)?;
-            let ln_b_id = self.get_or_create_cached_f32_buffer(ln_b, 121)?;
-
-            let norm_buf = self.new_buffer_with_length(x_need * std::mem::size_of::<f32>())?;
-            self.dispatch_norm_f32(
-                x_buf.as_id(),
-                ln_w_id,
-                ln_b_id,
-                norm_buf.as_id(),
-                &x_shape,
-                &ln_shape,
-                &ln_shape,
-                1e-5f32,
-                3,
-            )?;
-
-            let ff0_buf = self.linear_from_src_buffer(
-                norm_buf.as_id(),
-                seq_len,
-                n_state,
-                w0_bytes,
-                w0_ggml_type,
-                n_ff,
-                Some(b0),
-                122,
-                123,
-            )?;
-
-            let ff0_shape = shape4_from_row_major(&[seq_len, n_ff], 4)?;
-            self.dispatch_unary_f32(
-                OP_UNARY_NUM_GELU,
-                ff0_buf.as_id(),
-                ff0_buf.as_id(),
-                &ff0_shape,
-            )?;
-
-            let ff1_buf = self.linear_from_src_buffer(
-                ff0_buf.as_id(),
-                seq_len,
-                n_ff,
-                w1_bytes,
-                w1_ggml_type,
-                n_state,
-                Some(b1),
-                124,
-                125,
-            )?;
-
-            self.dispatch_bin_f32(
-                0,
-                ff1_buf.as_id(),
-                x_buf.as_id(),
-                ff1_buf.as_id(),
-                &x_shape,
-                &x_shape,
-            )?;
-
-            self.read_f32_buffer(ff1_buf.as_id(), x_need)
-        }
-
-        #[allow(dead_code)]
-        #[allow(clippy::too_many_arguments)]
-        fn encoder_layer_from_buffer_f32(
-            &mut self,
-            x_id: ObjcId,
-            seq_len: usize,
-            n_state: usize,
-            n_head: usize,
-            attn_ln_w: &[f32],
-            attn_ln_b: &[f32],
-            q_w_bytes: &[u8],
-            q_w_ggml_type: u32,
-            q_b: &[f32],
-            k_w_bytes: &[u8],
-            k_w_ggml_type: u32,
-            v_w_bytes: &[u8],
-            v_w_ggml_type: u32,
-            v_b: &[f32],
-            out_w_bytes: &[u8],
-            out_w_ggml_type: u32,
-            out_b: &[f32],
-            mlp_ln_w: &[f32],
-            mlp_ln_b: &[f32],
-            w0_bytes: &[u8],
-            w0_ggml_type: u32,
-            b0: &[f32],
-            w1_bytes: &[u8],
-            w1_ggml_type: u32,
-            b1: &[f32],
-            tag_base: u8,
-        ) -> Result<StrongId, String> {
-            if n_state == 0 || seq_len == 0 || n_head == 0 || n_state % n_head != 0 {
-                return Err(format!(
-                    "invalid encoder layer dimensions: seq_len={}, n_state={}, n_head={}",
-                    seq_len, n_state, n_head
-                ));
-            }
-            if attn_ln_w.len() != n_state
-                || attn_ln_b.len() != n_state
-                || mlp_ln_w.len() != n_state
-                || mlp_ln_b.len() != n_state
-            {
-                return Err("layernorm affine size mismatch".to_string());
-            }
-            if q_b.len() != n_state || v_b.len() != n_state || out_b.len() != n_state {
-                return Err("attention bias size mismatch".to_string());
-            }
-            let n_ff = b0.len();
-            if n_ff == 0 || b1.len() != n_state {
-                return Err("ffn bias size mismatch".to_string());
-            }
-
-            let x_shape = shape4_from_row_major(&[seq_len, n_state], 4)?;
-            let ln_shape = shape4_from_row_major(&[n_state], 4)?;
-
-            // Attention sub-block
-            let attn_ln_w_id =
-                self.get_or_create_cached_f32_buffer(attn_ln_w, tag_base.wrapping_add(0))?;
-            let attn_ln_b_id =
-                self.get_or_create_cached_f32_buffer(attn_ln_b, tag_base.wrapping_add(1))?;
-            let norm_bytes = x_shape
-                .numel
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "overflow computing encoder norm buffer bytes".to_string())?;
-            let norm0_id = self.get_or_create_scratch_buffer(SCRATCH_ENC_NORM0, norm_bytes)?;
-            self.dispatch_norm_f32(
-                x_id,
-                attn_ln_w_id,
-                attn_ln_b_id,
-                norm0_id,
-                &x_shape,
-                &ln_shape,
-                &ln_shape,
-                1e-5f32,
-                3,
-            )?;
-
-            let q_buf = self.linear_from_src_buffer(
-                norm0_id,
-                seq_len,
-                n_state,
-                q_w_bytes,
-                q_w_ggml_type,
-                n_state,
-                Some(q_b),
-                tag_base.wrapping_add(2),
-                tag_base.wrapping_add(3),
-            )?;
-
-            // Match whisper.cpp encoder flash-attn usage: keep KV rows padded.
-            let n_kv_flash = pad_to(seq_len, 256);
-
-            let k_buf_f32 = self.linear_from_src_buffer(
-                norm0_id,
-                seq_len,
-                n_state,
-                k_w_bytes,
-                k_w_ggml_type,
-                n_state,
-                None,
-                tag_base.wrapping_add(4),
-                0,
-            )?;
-            let v_buf_f32 = self.linear_from_src_buffer(
-                norm0_id,
-                seq_len,
-                n_state,
-                v_w_bytes,
-                v_w_ggml_type,
-                n_state,
-                Some(v_b),
-                tag_base.wrapping_add(5),
-                tag_base.wrapping_add(6),
-            )?;
-            let k_buf_f16 = self.encoder_flash_kv_f16_buffer(
-                k_buf_f32.as_id(),
-                seq_len,
-                n_kv_flash,
-                n_state,
-                SCRATCH_ENC_FLASH_K_F16,
-            )?;
-            let v_buf_f16 = self.encoder_flash_kv_f16_buffer(
-                v_buf_f32.as_id(),
-                seq_len,
-                n_kv_flash,
-                n_state,
-                SCRATCH_ENC_FLASH_V_F16,
-            )?;
-
-            let d = n_state / n_head;
-            let scale = 1.0f32 / (d as f32).sqrt();
-            let attn_buf = self.flash_attn_f32_from_buffers_with_params_typed(
-                q_buf.as_id(),
-                k_buf_f16,
-                v_buf_f16,
-                seq_len,
-                n_kv_flash,
-                n_head,
-                d,
-                scale,
-                FlashAttnExtParams::default(),
-                None,
-                Src0Type::F16,
-            )?;
-            let attn_res_buf = self.linear_from_src_buffer(
-                attn_buf.as_id(),
-                seq_len,
-                n_state,
-                out_w_bytes,
-                out_w_ggml_type,
-                n_state,
-                Some(out_b),
-                tag_base.wrapping_add(7),
-                tag_base.wrapping_add(8),
-            )?;
-            self.dispatch_bin_f32(
-                0,
-                attn_res_buf.as_id(),
-                x_id,
-                attn_res_buf.as_id(),
-                &x_shape,
-                &x_shape,
-            )?;
-
-            // FFN sub-block
-            let mlp_ln_w_id =
-                self.get_or_create_cached_f32_buffer(mlp_ln_w, tag_base.wrapping_add(9))?;
-            let mlp_ln_b_id =
-                self.get_or_create_cached_f32_buffer(mlp_ln_b, tag_base.wrapping_add(10))?;
-            let norm1_id = self.get_or_create_scratch_buffer(SCRATCH_ENC_NORM1, norm_bytes)?;
-            self.dispatch_norm_f32(
-                attn_res_buf.as_id(),
-                mlp_ln_w_id,
-                mlp_ln_b_id,
-                norm1_id,
-                &x_shape,
-                &ln_shape,
-                &ln_shape,
-                1e-5f32,
-                3,
-            )?;
-
-            let ff0_buf = self.linear_from_src_buffer(
-                norm1_id,
-                seq_len,
-                n_state,
-                w0_bytes,
-                w0_ggml_type,
-                n_ff,
-                Some(b0),
-                tag_base.wrapping_add(11),
-                tag_base.wrapping_add(12),
-            )?;
-            let ff0_shape = shape4_from_row_major(&[seq_len, n_ff], 4)?;
-            self.dispatch_unary_f32(
-                OP_UNARY_NUM_GELU,
-                ff0_buf.as_id(),
-                ff0_buf.as_id(),
-                &ff0_shape,
-            )?;
-            let ff1_buf = self.linear_from_src_buffer(
-                ff0_buf.as_id(),
-                seq_len,
-                n_ff,
-                w1_bytes,
-                w1_ggml_type,
-                n_state,
-                Some(b1),
-                tag_base.wrapping_add(13),
-                tag_base.wrapping_add(14),
-            )?;
-            self.dispatch_bin_f32(
-                0,
-                ff1_buf.as_id(),
-                attn_res_buf.as_id(),
-                ff1_buf.as_id(),
-                &x_shape,
-                &x_shape,
-            )?;
-
-            Ok(ff1_buf)
-        }
-
-        #[allow(dead_code)]
-        #[allow(clippy::too_many_arguments)]
-        fn encoder_layer_f32(
-            &mut self,
-            x: &[f32],
-            seq_len: usize,
-            n_state: usize,
-            n_head: usize,
-            attn_ln_w: &[f32],
-            attn_ln_b: &[f32],
-            q_w_bytes: &[u8],
-            q_w_ggml_type: u32,
-            q_b: &[f32],
-            k_w_bytes: &[u8],
-            k_w_ggml_type: u32,
-            v_w_bytes: &[u8],
-            v_w_ggml_type: u32,
-            v_b: &[f32],
-            out_w_bytes: &[u8],
-            out_w_ggml_type: u32,
-            out_b: &[f32],
-            mlp_ln_w: &[f32],
-            mlp_ln_b: &[f32],
-            w0_bytes: &[u8],
-            w0_ggml_type: u32,
-            b0: &[f32],
-            w1_bytes: &[u8],
-            w1_ggml_type: u32,
-            b1: &[f32],
-        ) -> Result<Vec<f32>, String> {
-            let x_need = seq_len
-                .checked_mul(n_state)
-                .ok_or_else(|| "overflow computing x size".to_string())?;
-            if x.len() != x_need {
-                return Err(format!(
-                    "x len mismatch: got {}, expected {}",
-                    x.len(),
-                    x_need
-                ));
-            }
-            let x_buf = self.new_buffer_with_bytes(f32_slice_as_bytes(x))?;
-
-            let ff1_buf = self.encoder_layer_from_buffer_f32(
-                x_buf.as_id(),
-                seq_len,
-                n_state,
-                n_head,
-                attn_ln_w,
-                attn_ln_b,
-                q_w_bytes,
-                q_w_ggml_type,
-                q_b,
-                k_w_bytes,
-                k_w_ggml_type,
-                v_w_bytes,
-                v_w_ggml_type,
-                v_b,
-                out_w_bytes,
-                out_w_ggml_type,
-                out_b,
-                mlp_ln_w,
-                mlp_ln_b,
-                w0_bytes,
-                w0_ggml_type,
-                b0,
-                w1_bytes,
-                w1_ggml_type,
-                b1,
-                130,
-            )?;
-            self.read_f32_buffer(ff1_buf.as_id(), x_need)
-        }
-
-        #[allow(dead_code)]
-        #[allow(clippy::too_many_arguments)]
-        fn decoder_self_qkv_step_f32(
-            &mut self,
-            x: &[f32],
-            n_state: usize,
-            attn_ln_w: &[f32],
-            attn_ln_b: &[f32],
-            q_w_bytes: &[u8],
-            q_w_ggml_type: u32,
-            q_b: &[f32],
-            k_w_bytes: &[u8],
-            k_w_ggml_type: u32,
-            v_w_bytes: &[u8],
-            v_w_ggml_type: u32,
-            v_b: &[f32],
-        ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
-            if n_state == 0 {
-                return Err("decoder qkv: n_state is zero".to_string());
-            }
-            if x.len() != n_state
-                || attn_ln_w.len() != n_state
-                || attn_ln_b.len() != n_state
-                || q_b.len() != n_state
-                || v_b.len() != n_state
-            {
-                return Err("decoder qkv: input/affine size mismatch".to_string());
-            }
-
-            let x_shape = shape4_from_row_major(&[1, n_state], 4)?;
-            let ln_shape = shape4_from_row_major(&[n_state], 4)?;
-
-            let (q_buf, k_buf, v_buf) = self.with_batch(|ctx| {
-                let x_buf = ctx.new_buffer_with_bytes(f32_slice_as_bytes(x))?;
-
-                let ln_w_id = ctx.get_or_create_cached_f32_buffer(attn_ln_w, 240)?;
-                let ln_b_id = ctx.get_or_create_cached_f32_buffer(attn_ln_b, 241)?;
-                let norm_bytes = n_state
-                    .checked_mul(std::mem::size_of::<f32>())
-                    .ok_or_else(|| "overflow computing decoder qkv norm bytes".to_string())?;
-                let norm_id = ctx.get_or_create_scratch_buffer(SCRATCH_DEC_NORM0, norm_bytes)?;
-                ctx.dispatch_norm_f32(
-                    x_buf.as_id(),
-                    ln_w_id,
-                    ln_b_id,
-                    norm_id,
-                    &x_shape,
-                    &ln_shape,
-                    &ln_shape,
-                    1e-5f32,
-                    3,
-                )?;
-
-                let q_buf = ctx.linear_from_src_buffer(
-                    norm_id,
-                    1,
-                    n_state,
-                    q_w_bytes,
-                    q_w_ggml_type,
-                    n_state,
-                    Some(q_b),
-                    242,
-                    243,
-                )?;
-                let k_buf = ctx.linear_from_src_buffer(
-                    norm_id,
-                    1,
-                    n_state,
-                    k_w_bytes,
-                    k_w_ggml_type,
-                    n_state,
-                    None,
-                    244,
-                    0,
-                )?;
-                let v_buf = ctx.linear_from_src_buffer(
-                    norm_id,
-                    1,
-                    n_state,
-                    v_w_bytes,
-                    v_w_ggml_type,
-                    n_state,
-                    Some(v_b),
-                    245,
-                    246,
-                )?;
-
-                Ok((q_buf, k_buf, v_buf))
-            })?;
-
-            self.read_f32_buffers3(q_buf.as_id(), k_buf.as_id(), v_buf.as_id(), n_state)
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn bin_f32(
-            &mut self,
-            op_num: i16,
-            a: &[f32],
-            a_shape: &[usize],
-            b: &[f32],
-            b_shape: &[usize],
-        ) -> Result<Vec<f32>, String> {
-            let a_s = shape4_from_row_major(a_shape, 4)?;
-            let b_s = shape4_from_row_major(b_shape, 4)?;
-            if a.len() != a_s.numel {
-                return Err(format!(
-                    "lhs len mismatch: got {}, expected {}",
-                    a.len(),
-                    a_s.numel
-                ));
-            }
-            if b.len() != b_s.numel {
-                return Err(format!(
-                    "rhs len mismatch: got {}, expected {}",
-                    b.len(),
-                    b_s.numel
-                ));
-            }
-
-            let a_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    a.as_ptr() as *const u8,
-                    a.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let b_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    b.as_ptr() as *const u8,
-                    b.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let a_buf = self.new_buffer_with_bytes(a_bytes)?;
-            let b_buf = self.new_buffer_with_bytes(b_bytes)?;
-            let dst_buf = self.new_buffer_with_length(a_s.numel * std::mem::size_of::<f32>())?;
-
-            self.dispatch_bin_f32(
-                op_num,
-                a_buf.as_id(),
-                b_buf.as_id(),
-                dst_buf.as_id(),
-                &a_s,
-                &b_s,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), a_s.numel)
-        }
-
-        fn unary_gelu_f32(&mut self, a: &[f32], shape: &[usize]) -> Result<Vec<f32>, String> {
-            let s = shape4_from_row_major(shape, 4)?;
-            if a.len() != s.numel {
-                return Err(format!(
-                    "unary len mismatch: got {}, expected {}",
-                    a.len(),
-                    s.numel
-                ));
-            }
-
-            let a_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    a.as_ptr() as *const u8,
-                    a.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let a_buf = self.new_buffer_with_bytes(a_bytes)?;
-            let dst_buf = self.new_buffer_with_length(s.numel * std::mem::size_of::<f32>())?;
-            self.dispatch_unary_f32(OP_UNARY_NUM_GELU, a_buf.as_id(), dst_buf.as_id(), &s)?;
-            self.read_f32_buffer(dst_buf.as_id(), s.numel)
-        }
-
-        fn norm_f32(&mut self, x: &[f32], x_shape: &[usize], eps: f32) -> Result<Vec<f32>, String> {
-            let s = shape4_from_row_major(x_shape, 4)?;
-            if x.len() != s.numel {
-                return Err(format!(
-                    "norm len mismatch: got {}, expected {}",
-                    x.len(),
-                    s.numel
-                ));
-            }
-
-            let x_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    x.as_ptr() as *const u8,
-                    x.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let x_buf = self.new_buffer_with_bytes(x_bytes)?;
-            let dst_buf = self.new_buffer_with_length(s.numel * std::mem::size_of::<f32>())?;
-            self.dispatch_norm_f32(
-                x_buf.as_id(),
-                x_buf.as_id(),
-                x_buf.as_id(),
-                dst_buf.as_id(),
-                &s,
-                &s,
-                &s,
-                eps,
-                1,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), s.numel)
-        }
-
-        fn rms_norm_f32(
-            &mut self,
-            x: &[f32],
-            x_shape: &[usize],
-            eps: f32,
-        ) -> Result<Vec<f32>, String> {
-            let s = shape4_from_row_major(x_shape, 4)?;
-            if x.len() != s.numel {
-                return Err(format!(
-                    "rms_norm len mismatch: got {}, expected {}",
-                    x.len(),
-                    s.numel
-                ));
-            }
-
-            let x_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    x.as_ptr() as *const u8,
-                    x.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let x_buf = self.new_buffer_with_bytes(x_bytes)?;
-            let dst_buf = self.new_buffer_with_length(s.numel * std::mem::size_of::<f32>())?;
-            self.dispatch_rms_norm_f32(
-                x_buf.as_id(),
-                x_buf.as_id(),
-                x_buf.as_id(),
-                dst_buf.as_id(),
-                &s,
-                &s,
-                &s,
-                eps,
-                1,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), s.numel)
-        }
-
-        fn rms_norm_mul_f32(
-            &mut self,
-            x: &[f32],
-            x_shape: &[usize],
-            mul: &[f32],
-            mul_shape: &[usize],
-            eps: f32,
-        ) -> Result<Vec<f32>, String> {
-            let x_s = shape4_from_row_major(x_shape, 4)?;
-            let m_s = shape4_from_row_major(mul_shape, 4)?;
-
-            if x.len() != x_s.numel {
-                return Err(format!(
-                    "rms_norm src len mismatch: got {}, expected {}",
-                    x.len(),
-                    x_s.numel
-                ));
-            }
-            if mul.len() != m_s.numel {
-                return Err(format!(
-                    "rms_norm mul len mismatch: got {}, expected {}",
-                    mul.len(),
-                    m_s.numel
-                ));
-            }
-
-            if m_s.ne[0] != x_s.ne[0] {
-                return Err(format!(
-                    "rms_norm fuse ne0 mismatch: x={} mul={}",
-                    x_s.ne[0], m_s.ne[0]
-                ));
-            }
-            for d in 1..4 {
-                if m_s.ne[d] != 1 && m_s.ne[d] != x_s.ne[d] {
-                    return Err("rms_norm fuse broadcast mismatch".to_string());
-                }
-            }
-
-            let x_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    x.as_ptr() as *const u8,
-                    x.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let mul_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    mul.as_ptr() as *const u8,
-                    mul.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let x_buf = self.new_buffer_with_bytes(x_bytes)?;
-            let mul_buf = self.new_buffer_with_bytes(mul_bytes)?;
-            let dst_buf = self.new_buffer_with_length(x_s.numel * std::mem::size_of::<f32>())?;
-
-            self.dispatch_rms_norm_f32(
-                x_buf.as_id(),
-                mul_buf.as_id(),
-                x_buf.as_id(),
-                dst_buf.as_id(),
-                &x_s,
-                &m_s,
-                &x_s,
-                eps,
-                2,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), x_s.numel)
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn norm_mul_add_f32(
-            &mut self,
-            x: &[f32],
-            x_shape: &[usize],
-            mul: &[f32],
-            mul_shape: &[usize],
-            add: &[f32],
-            add_shape: &[usize],
-            eps: f32,
-        ) -> Result<Vec<f32>, String> {
-            let x_s = shape4_from_row_major(x_shape, 4)?;
-            let m_s = shape4_from_row_major(mul_shape, 4)?;
-            let a_s = shape4_from_row_major(add_shape, 4)?;
-
-            if x.len() != x_s.numel {
-                return Err(format!(
-                    "norm src len mismatch: got {}, expected {}",
-                    x.len(),
-                    x_s.numel
-                ));
-            }
-            if mul.len() != m_s.numel {
-                return Err(format!(
-                    "norm mul len mismatch: got {}, expected {}",
-                    mul.len(),
-                    m_s.numel
-                ));
-            }
-            if add.len() != a_s.numel {
-                return Err(format!(
-                    "norm add len mismatch: got {}, expected {}",
-                    add.len(),
-                    a_s.numel
-                ));
-            }
-
-            if m_s.ne[0] != x_s.ne[0] || a_s.ne[0] != x_s.ne[0] {
-                return Err(format!(
-                    "norm fuse ne0 mismatch: x={} mul={} add={}",
-                    x_s.ne[0], m_s.ne[0], a_s.ne[0]
-                ));
-            }
-            for d in 1..4 {
-                if (m_s.ne[d] != 1 && m_s.ne[d] != x_s.ne[d])
-                    || (a_s.ne[d] != 1 && a_s.ne[d] != x_s.ne[d])
-                {
-                    return Err("norm fuse broadcast mismatch".to_string());
-                }
-            }
-
-            let x_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    x.as_ptr() as *const u8,
-                    x.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let mul_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    mul.as_ptr() as *const u8,
-                    mul.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let add_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    add.as_ptr() as *const u8,
-                    add.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let x_buf = self.new_buffer_with_bytes(x_bytes)?;
-            let mul_buf = self.new_buffer_with_bytes(mul_bytes)?;
-            let add_buf = self.new_buffer_with_bytes(add_bytes)?;
-            let dst_buf = self.new_buffer_with_length(x_s.numel * std::mem::size_of::<f32>())?;
-
-            self.dispatch_norm_f32(
-                x_buf.as_id(),
-                mul_buf.as_id(),
-                add_buf.as_id(),
-                dst_buf.as_id(),
-                &x_s,
-                &m_s,
-                &a_s,
-                eps,
-                3,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), x_s.numel)
-        }
-
-        fn get_rows_ggml_bytes(
-            &mut self,
-            src: &[u8],
-            src_ggml_type: u32,
-            n_cols: usize,
-            n_rows: usize,
-            row_indices: &[i32],
-        ) -> Result<Vec<f32>, String> {
-            if row_indices.is_empty() {
-                return Ok(Vec::new());
-            }
-
-            let src_ty = src0_type_from_ggml(src_ggml_type)
-                .ok_or_else(|| format!("unsupported ggml type for get_rows: {}", src_ggml_type))?;
-            let (row_bytes, elem_or_block) = src0_layout_bytes_per_row(src_ty, n_cols)?;
-            let expected_src = n_rows
-                .checked_mul(row_bytes)
-                .ok_or_else(|| "overflow computing get_rows source bytes".to_string())?;
-            if src.len() != expected_src {
-                return Err(format!(
-                    "get_rows source len mismatch: got {}, expected {}",
-                    src.len(),
-                    expected_src
-                ));
-            }
-
-            for &row in row_indices {
-                let row_ok = usize::try_from(row).ok().is_some_and(|row| row < n_rows);
-                if !row_ok {
-                    return Err(format!(
-                        "get_rows row index {} is out of range {}",
-                        row, n_rows
-                    ));
-                }
-            }
-
-            let src_shape = shape4_from_row_major(&[n_rows, n_cols], elem_or_block)?;
-            let idx_shape =
-                shape4_from_row_major(&[row_indices.len()], std::mem::size_of::<i32>() as u64)?;
-            let dst_shape = shape4_from_row_major(&[row_indices.len(), n_cols], 4)?;
-
-            let idx_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    row_indices.as_ptr() as *const u8,
-                    row_indices.len() * std::mem::size_of::<i32>(),
-                )
-            };
-
-            let src_buf = self.new_buffer_with_bytes(src)?;
-            let idx_buf = self.new_buffer_with_bytes(idx_bytes)?;
-            let dst_buf =
-                self.new_buffer_with_length(dst_shape.numel * std::mem::size_of::<f32>())?;
-            self.dispatch_get_rows_ggml(
-                src_ggml_type,
-                src_buf.as_id(),
-                &src_shape,
-                idx_buf.as_id(),
-                &idx_shape,
-                dst_buf.as_id(),
-                &dst_shape,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), dst_shape.numel)
-        }
-
-        fn im2col_1d_f32(
-            &mut self,
-            input: &[f32],
-            ic: usize,
-            iw: usize,
-            kw: usize,
-            stride: usize,
-            pad: usize,
-        ) -> Result<Vec<f32>, String> {
-            if kw == 0 || stride == 0 {
-                return Err("im2col requires kw>0 and stride>0".to_string());
-            }
-            let expect = ic
-                .checked_mul(iw)
-                .ok_or_else(|| "overflow computing input size".to_string())?;
-            if input.len() != expect {
-                return Err(format!(
-                    "im2col input len mismatch: got {}, expected {}",
-                    input.len(),
-                    expect
-                ));
-            }
-            let num = iw
-                .checked_add(pad.saturating_mul(2))
-                .ok_or_else(|| "overflow computing im2col output numerator".to_string())?;
-            if num < kw {
-                return Ok(Vec::new());
-            }
-            let ow = (num - kw) / stride + 1;
-            let chw = ic
-                .checked_mul(kw)
-                .ok_or_else(|| "overflow computing im2col CHW".to_string())?;
-            let out_elems = ow
-                .checked_mul(chw)
-                .ok_or_else(|| "overflow computing im2col output size".to_string())?;
-
-            let input_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    input.as_ptr() as *const u8,
-                    input.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let src_buf = self.new_buffer_with_bytes(input_bytes)?;
-            let dst_buf = self.new_buffer_with_length(out_elems * std::mem::size_of::<f32>())?;
-            self.dispatch_im2col_1d_f32(
-                src_buf.as_id(),
-                dst_buf.as_id(),
-                ic,
-                iw,
-                kw,
-                stride,
-                pad,
-                ow,
-            )?;
-            self.read_f32_buffer(dst_buf.as_id(), out_elems)
         }
 
         fn matmul_nt_ggml_from_src1_buffer(
@@ -8336,6 +6668,7 @@ mod imp {
             }
         }
 
+        #[cfg(test)]
         fn matmul_nt_ggml_bytes_impl(
             &mut self,
             a: &[f32],
@@ -8377,900 +6710,1542 @@ mod imp {
             Ok((dst_buffer, m, n))
         }
 
-        fn matmul_nn_f32(
-            &mut self,
-            a: &[f32],
-            b: &[f32],
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<Vec<f32>, String> {
-            let mk = m
-                .checked_mul(k)
-                .ok_or_else(|| "overflow computing m*k".to_string())?;
-            let kn = k
-                .checked_mul(n)
-                .ok_or_else(|| "overflow computing k*n".to_string())?;
-            if a.len() != mk {
-                return Err(format!(
-                    "lhs len mismatch: got {}, expected {}",
-                    a.len(),
-                    mk
-                ));
-            }
-            if b.len() != kn {
-                return Err(format!(
-                    "rhs len mismatch: got {}, expected {}",
-                    b.len(),
-                    kn
-                ));
-            }
 
-            let mut bt = vec![0.0f32; n * k];
+    }
+
+    use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicU64, Ordering}, mpsc};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+    extern "C" { fn pthread_main_np() -> i32; }
+
+    pub(crate) fn tensor_thread_guard() -> Result<(), String> {
+        tensor_thread_guard_for(unsafe { pthread_main_np() } != 0)
+    }
+
+    fn tensor_thread_guard_for(main: bool) -> Result<(), String> {
+        if main { Err("Metal tensor operations are forbidden on the process main/UI thread".into()) }
+        else { Ok(()) }
+    }
+
+    struct ReturnedBuffer {
+        object: StrongId,
+        capacity: usize,
+        last_batch: u64,
+        writer_batch: u64,
+        recycle: bool,
+    }
+
+    pub(crate) struct TensorBuffer {
+        object: Option<StrongId>,
+        capacity: usize,
+        last_batch: AtomicU64,
+        writer_batch: AtomicU64,
+        returns: mpsc::Sender<ReturnedBuffer>,
+        recycle: bool,
+    }
+
+    impl TensorBuffer {
+        fn object(&self) -> Result<&StrongId, String> {
+            self.object.as_ref().ok_or_else(|| "released tensor buffer".into())
+        }
+        fn id(&self) -> ObjcId { self.object.as_ref().map_or(nil, StrongId::as_id) }
+        #[cfg(test)]
+        pub(crate) fn test_identity(&self) -> usize { self.id() as usize }
+        pub(crate) fn last_batch(&self) -> u64 { self.last_batch.load(Ordering::Acquire) }
+        pub(crate) fn contents(&self) -> Result<*mut f32, String> {
+            let ptr: *mut f32 = unsafe { msg_send![self.id(), contents] };
+            if ptr.is_null() { Err("shared tensor buffer has no contents".into()) } else { Ok(ptr) }
+        }
+    }
+
+    impl Drop for TensorBuffer {
+        fn drop(&mut self) {
+            if let Some(object) = self.object.take() {
+                // No context lock, including when an op unwinds while holding it.
+                let _ = self.returns.send(ReturnedBuffer {
+                    object, capacity: self.capacity, last_batch: self.last_batch(),
+                    writer_batch: self.writer_batch.load(Ordering::Acquire), recycle: self.recycle,
+                });
+            }
+        }
+    }
+
+    const SLICE_NS: f64 = 4_000_000.0;
+
+    #[derive(Clone, Copy)]
+    struct TensorCost {
+        ns_per_mac: f64,
+        ns_per_byte: f64,
+        ns_per_dispatch: f64,
+        ns_per_commit: f64,
+    }
+
+    fn estimate_ns(cost: &TensorCost, macs: u64, bytes: u64, dispatches: usize) -> f64 {
+        macs as f64 * cost.ns_per_mac + bytes as f64 * cost.ns_per_byte
+            + dispatches as f64 * cost.ns_per_dispatch
+    }
+
+    fn should_commit(open_ns: f64, gpu_idle: bool, cost: &TensorCost) -> bool {
+        open_ns >= SLICE_NS || (gpu_idle && open_ns >= cost.ns_per_commit)
+    }
+
+    fn row_chunks(
+        rows: usize, est_ns: f64, align: usize, min_rows: usize,
+    ) -> Vec<std::ops::Range<usize>> {
+        if est_ns <= SLICE_NS || rows <= min_rows {
+            return vec![0..rows];
+        }
+        let chunks = (est_ns / SLICE_NS).ceil() as usize;
+        let chunk_rows = rows.div_ceil(chunks).max(min_rows).div_ceil(align) * align;
+        let mut ranges = Vec::new();
+        let mut start = 0;
+        while start < rows {
+            let mut end = start.saturating_add(chunk_rows).min(rows);
+            if rows - end < min_rows {
+                end = rows;
+            }
+            ranges.push(start..end);
+            start = end;
+        }
+        ranges
+    }
+
+    fn back_pressure_target(
+        mine: &VecDeque<u64>, open_batch: u64, completed: u64,
+    ) -> Option<u64> {
+        let mut unfinished = mine.iter().copied()
+            .filter(|number| *number > completed && *number != open_batch);
+        let oldest = unfinished.next()?;
+        if unfinished.nth(1).is_some() { Some(oldest) } else { None }
+    }
+
+    fn measure_tensor_gpu_ns(
+        context: &mut MetalContext,
+        dispatch: impl Fn(&mut MetalContext) -> Result<(), String>,
+    ) -> Result<f64, String> {
+        // Three runs, the fastest kept: the first lets the GPU clocks ramp up.
+        let mut fastest = f64::INFINITY;
+        for _ in 0..3 {
+            context.with_batch(|ctx| dispatch(ctx))?;
+            context.wait_queue_idle()?;
+            let command = context.last_command_buffer.as_ref()
+                .ok_or("tensor calibration command buffer missing")?;
+            let start: f64 = unsafe { msg_send![command.as_id(), GPUStartTime] };
+            let end: f64 = unsafe { msg_send![command.as_id(), GPUEndTime] };
+            if !start.is_finite() || !end.is_finite() || end <= start {
+                return Err("tensor calibration GPU timestamps invalid".into());
+            }
+            fastest = fastest.min((end - start) * 1e9);
+        }
+        Ok(fastest)
+    }
+
+    fn measure_tensor_cost(context: &mut MetalContext) -> Result<TensorCost, String> {
+        let elements = 8 * 1024 * 1024;
+        let a = context.new_buffer_with_length(elements * 4)?;
+        let b = context.new_buffer_with_length(elements * 4)?;
+        let out = context.new_buffer_with_length(elements * 4)?;
+        for buffer in [&a, &b] {
+            let contents: *mut u8 = unsafe { msg_send![buffer.as_id(), contents] };
+            if contents.is_null() {
+                return Err("tensor calibration buffer contents unavailable".into());
+            }
+            unsafe { std::ptr::write_bytes(contents, 0, elements * 4); }
+        }
+        // Long enough (4.3 G multiply-adds, a few ms) to measure the GPU at its working clocks.
+        let ns_per_mac = measure_tensor_gpu_ns(context, |ctx| {
+            ctx.matmul_nt_into_buffer_offsets(
+                GGML_TYPE_F32, a.as_id(), b.as_id(), out.as_id(),
+                1024, 2048, 2048, [0; 3])
+        })? / (1024.0 * 2048.0 * 2048.0);
+        let shape = shape4_from_row_major(&[elements], 4)?;
+        let ns_per_byte = measure_tensor_gpu_ns(context, |ctx| {
+            ctx.dispatch_bin_f32_offsets(
+                0, a.as_id(), b.as_id(), out.as_id(), &shape, &shape, [0; 3])
+        })? / (3 * elements * 4) as f64;
+        let shape = shape4_from_row_major(&[1024], 4)?;
+        let dispatch_ns = measure_tensor_gpu_ns(context, |ctx| {
+            for _ in 0..256 {
+                ctx.dispatch_bin_f32_offsets(
+                    0, a.as_id(), b.as_id(), out.as_id(), &shape, &shape, [0; 3])?;
+            }
+            Ok(())
+        })?;
+        let ns_per_dispatch =
+            ((dispatch_ns - (256 * 3 * 1024 * 4) as f64 * ns_per_byte) / 256.0).max(0.0);
+        let mut ns_per_commit = f64::INFINITY;
+        for _ in 0..2 {
+            let mut commands = Vec::new();
+            for _ in 0..32 {
+                let command: ObjcId = unsafe {
+                    msg_send![context.command_queue.as_id(), commandBuffer]
+                };
+                commands.push(unsafe { StrongId::from_unowned(command) }
+                    .ok_or("tensor calibration commandBuffer returned nil")?);
+            }
+            let start = std::time::Instant::now();
+            for command in &commands {
+                unsafe { let _: () = msg_send![command.as_id(), commit]; }
+            }
+            ns_per_commit = ns_per_commit.min(start.elapsed().as_nanos() as f64 / 32.0);
+            context.wait_queue_idle()?; // One queue: this waits for all 32.
+            drop(commands);
+        }
+        if !ns_per_commit.is_finite() || ns_per_commit <= 0.0 {
+            return Err("tensor calibration commit timing invalid".into());
+        }
+        context.last_command_buffer.take();
+        eprintln!(
+            "[metal] tensor slices: {:.0} GMAC/s, {:.0} GB/s, {:.1} us/dispatch, {:.1} us/commit, slice {} ms",
+            1.0 / ns_per_mac, 1.0 / ns_per_byte, ns_per_dispatch / 1000.0,
+            ns_per_commit / 1000.0, SLICE_NS / 1_000_000.0);
+        Ok(TensorCost { ns_per_mac, ns_per_byte, ns_per_dispatch, ns_per_commit })
+    }
+
+    struct TensorState {
+        context: MetalContext,
+        lock_phases: TensorLockPhases,
+        returns: mpsc::Receiver<ReturnedBuffer>,
+        free: Vec<ReturnedBuffer>,
+        deferred_drop: Vec<StrongId>,
+        dead_owners: makepad_ai_loader::DeadOwnerInbox,
+        in_flight: VecDeque<(u64, StrongId)>,
+        next_batch: u64,
+        open_batch: u64,
+        open_ns: f64,
+        thread_batches: HashMap<std::thread::ThreadId, VecDeque<u64>>,
+        completed_batch: u64,
+        failed: BTreeSet<u64>,
+        failed_oom: BTreeSet<u64>,
+        failure_floor: Option<u64>,
+        #[cfg(test)]
+        injected_failure: Option<(u64, bool)>,
+        live_writers: BTreeMap<u64, usize>,
+    }
+
+    struct TensorRuntime {
+        state: Mutex<TensorState>,
+        /// Measured once at init; read without the lock.
+        cost: TensorCost,
+        device: StrongId,
+        library: StrongId,
+        queue: StrongId,
+        returns: mpsc::Sender<ReturnedBuffer>,
+    }
+
+    static TENSOR_CONTEXT: OnceLock<Result<TensorRuntime, String>> = OnceLock::new();
+    static TENSOR_LOCK_HIGH_WATER_NS: AtomicU64 = AtomicU64::new(0);
+    #[derive(Clone, Copy, Default, Debug)]
+    struct TensorLockPhases {
+        open_ns: u64,
+        encode_ns: u64,
+        commit_ns: u64,
+        dispatches: usize,
+    }
+    #[derive(Clone, Copy)]
+    struct TensorLockMaximum {
+        ns: u64,
+        dispatches: usize,
+    }
+    struct TensorLockSite {
+        first_sequence: u64,
+        first: TensorLockMaximum,
+        later: TensorLockMaximum,
+        calls: u64,
+    }
+    static TENSOR_LOCK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static TENSOR_LOCK_SITES: Mutex<BTreeMap<(&'static std::panic::Location<'static>, &'static str), TensorLockSite>> = Mutex::new(BTreeMap::new());
+    static TENSOR_COW_COPIES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn tensor_available() -> bool {
+        !matches!(TENSOR_CONTEXT.get(), Some(Err(_)))
+    }
+
+    pub(crate) fn tensor_profile() -> (u64, u64) {
+        let records: Vec<_> = {
+            let sites = TENSOR_LOCK_SITES.lock().unwrap_or_else(|e| e.into_inner());
+            sites.iter().map(|((location, phase), site)|
+                (*location, *phase, site.first, site.later, site.calls)).collect()
+        };
+        for (location, phase, first, later, calls) in records {
+            eprintln!("tensor lock: site={location}, phase={phase}, calls={calls}, first_ns={}, first_dispatches={}, later_max_ns={}, later_dispatches={}",
+                first.ns, first.dispatches, later.ns, later.dispatches);
+        }
+        (TENSOR_LOCK_HIGH_WATER_NS.load(Ordering::Relaxed), TENSOR_COW_COPIES.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn tensor_cow_record() { TENSOR_COW_COPIES.fetch_add(1, Ordering::Relaxed); }
+
+    fn tensor_runtime() -> Result<&'static TensorRuntime, String> {
+        tensor_thread_guard()?;
+        TENSOR_CONTEXT.get_or_init(|| {
+            // OnceLock serialises initialisation, before any context mutex exists.
+            let _pool = AutoreleasePool::new();
+            let mut context = MetalContext::new()?;
+            // Pay the driver's first command-buffer, encoder and commit setup
+            // before creating the mutex used for tensor bookkeeping.
+            context.begin_batch()?;
+            context.end_batch()?;
+            context.wait_queue_idle()?;
+            context.last_command_buffer.take();
+            let cost = measure_tensor_cost(&mut context)?;
+            let (returns, receiver) = mpsc::channel();
+            Ok(TensorRuntime {
+                device: context.device.clone(), library: context.library.clone(),
+                queue: context.command_queue.clone(), returns, cost,
+                state: Mutex::new(TensorState {
+                    context, lock_phases: TensorLockPhases::default(), returns: receiver, free: Vec::new(), deferred_drop: Vec::new(), dead_owners: makepad_ai_loader::DeadOwnerInbox::register(), in_flight: VecDeque::new(),
+                    next_batch: 1, open_batch: 0, open_ns: 0.0,
+                    thread_batches: HashMap::new(), completed_batch: 0,
+                    failed: BTreeSet::new(), failed_oom: BTreeSet::new(), failure_floor: None,
+                    #[cfg(test)]
+                    injected_failure: None,
+                    live_writers: BTreeMap::new(),
+                }),
+            })
+        }).as_ref().map_err(Clone::clone)
+    }
+
+    #[track_caller]
+    fn tensor_locked<T>(f: impl FnOnce(&mut TensorState) -> Result<T, String>) -> Result<T, String> {
+        tensor_locked_in(tensor_runtime()?, f)
+    }
+
+    #[track_caller]
+    fn tensor_locked_in<T>(runtime: &TensorRuntime, f: impl FnOnce(&mut TensorState) -> Result<T, String>) -> Result<T, String> {
+        tensor_thread_guard()?;
+        let _pool = AutoreleasePool::new();
+        let mut state = match runtime.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let mut state = poisoned.into_inner();
+                let open = state.open_batch;
+                if open != 0 { state.record_failure(open, false); }
+                runtime.state.clear_poison();
+                state
+            }
+        };
+        let start = std::time::Instant::now();
+        let sequence = TENSOR_LOCK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        state.lock_phases = TensorLockPhases::default();
+        let result = f(&mut state);
+        // Release what this call retired before unlocking: the next lock holder (a pool clear)
+        // then finds every buffer and command the runtime let go of already released, none of
+        // them still in another thread's hands.
+        state.deferred_drop.clear();
+        let phases = state.lock_phases;
+        let elapsed = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        drop(state);
+        let location = std::panic::Location::caller();
+        {
+            let mut sites = TENSOR_LOCK_SITES.lock().unwrap_or_else(|e| e.into_inner());
+            for (phase, ns) in [("hold", elapsed), ("open", phases.open_ns),
+                ("encode", phases.encode_ns), ("commit", phases.commit_ns)] {
+                if phase != "hold" && ns == 0 { continue; }
+                let sample = TensorLockMaximum { ns, dispatches: phases.dispatches };
+                match sites.entry((location, phase)) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(TensorLockSite { first_sequence: sequence, first: sample,
+                            later: TensorLockMaximum { ns: 0, dispatches: 0 }, calls: 1 });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let site = entry.get_mut();
+                        // Recording happens after unlocking; another thread may record first.
+                        let later = if sequence < site.first_sequence {
+                            site.first_sequence = sequence;
+                            std::mem::replace(&mut site.first, sample)
+                        } else { sample };
+                        if later.ns > site.later.ns { site.later = later; }
+                        site.calls += 1;
+                    }
+                }
+            }
+        }
+        TENSOR_LOCK_HIGH_WATER_NS.fetch_max(elapsed, Ordering::Relaxed);
+        result
+    }
+
+    impl TensorState {
+        fn record_failure(&mut self, number: u64, oom: bool) {
+            if oom { self.failed_oom.insert(number); }
+            if self.failed.insert(number) {
+                self.failure_floor = Some(self.failure_floor.map_or(number, |old| old.min(number)));
+            }
+        }
+        fn remove_writer(&mut self, batch: u64) {
+            if let Some(count) = self.live_writers.get_mut(&batch) {
+                *count -= 1;
+                if *count == 0 { self.live_writers.remove(&batch); }
+            }
+        }
+        fn drain_returns(&mut self) {
+            self.dead_owners.take(|owner| {
+                let keys: Vec<_> = self.context.named_weight_buffers.keys()
+                    .filter(|(ns, _)| ns.starts_with(owner)).cloned().collect();
+                for key in keys {
+                    if let Some(buffer) = self.context.named_weight_buffers.remove(&key) {
+                        self.deferred_drop.push(buffer);
+                    }
+                }
+            });
+            while let Ok(mut buffer) = self.returns.try_recv() {
+                self.remove_writer(buffer.writer_batch);
+                buffer.writer_batch = 0;
+                if buffer.recycle { self.free.push(buffer); }
+                else { self.deferred_drop.push(buffer.object); }
+            }
+            if let Some(first) = self.failure_floor {
+                if self.live_writers.range(first..).next().is_none() { self.failure_floor = None; }
+            }
+        }
+        fn check_writer(&self, writer: u64) -> Result<(), String> {
+            if writer != 0 {
+                if let Some(first) = self.failure_floor {
+                    if writer >= first {
+                        let suffix = if self.failed_oom.contains(&first) { " (out of memory)" } else { "" };
+                        return Err(format!("Metal tensor writer batch {writer} depends on failed batch {first}{suffix}"));
+                    }
+                }
+            }
+            Ok(())
+        }
+        fn set_writer(&mut self, buffer: &TensorBuffer, batch: u64) {
+            let old = buffer.writer_batch.swap(batch, Ordering::AcqRel);
+            self.remove_writer(old);
+            if batch != 0 { *self.live_writers.entry(batch).or_default() += 1; }
+        }
+        fn prune_thread_batches(&mut self) {
+            let completed = self.completed_batch;
+            self.thread_batches.retain(|_, mine| {
+                while mine.front().is_some_and(|number| *number <= completed) {
+                    mine.pop_front();
+                }
+                !mine.is_empty()
+            });
+        }
+        fn back_pressure_command(&self, thread: std::thread::ThreadId) -> Option<(u64, StrongId)> {
+            let mine = self.thread_batches.get(&thread)?;
+            let target = back_pressure_target(mine, self.open_batch, self.completed_batch)?;
+            self.in_flight.iter().find(|(number, _)| *number == target)
+                .map(|(number, command)| (*number, command.clone()))
+        }
+        /// Records a finished command's failure and queues it on `deferred_drop`: it and the
+        /// buffers it retains are released before this lock is.
+        fn retire(&mut self, number: u64, command: StrongId, status: u64) {
+            let failed = status == 5;
+            let oom = failed && command_out_of_memory(&command);
+            #[cfg(test)]
+            let (failed, oom) = match self.injected_failure {
+                Some((batch, injected_oom)) if batch == number => (true, oom || injected_oom),
+                _ => (failed, oom),
+            };
+            if failed { self.record_failure(number, oom); }
+            self.deferred_drop.push(command);
+        }
+        fn reap(&mut self) {
+            while let Some(status) = self.in_flight.front().map(|(_, command)| command_status(command)) {
+                if status < 4 { break; }
+                let Some((number, command)) = self.in_flight.pop_front() else { break };
+                self.completed_batch = self.completed_batch.max(number);
+                self.retire(number, command, status);
+            }
+            self.prune_thread_batches();
+        }
+        /// Every finished command, wherever it sits: Metal can finish a later batch while an
+        /// earlier one still runs, and `reap` stops at the first unfinished one.
+        /// `completed_batch` stays the in-order watermark.
+        fn retire_finished(&mut self) {
+            self.reap();
+            let mut index = 0;
+            while index < self.in_flight.len() {
+                let status = command_status(&self.in_flight[index].1);
+                if status < 4 { index += 1; continue; }
+                if let Some((number, command)) = self.in_flight.remove(index) {
+                    self.retire(number, command, status);
+                }
+            }
+        }
+        fn commit(&mut self) -> Result<(), String> {
+            let start = std::time::Instant::now();
+            self.reap();
+            if self.open_batch == 0 { return Ok(()); }
+            let number = self.open_batch;
+            let result = self.context.end_batch();
+            self.lock_phases.commit_ns += start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            result?;
+            let command = self.context.last_command_buffer.take()
+                .ok_or_else(|| "committed tensor batch missing".to_string())?;
+            self.in_flight.push_back((number, command));
+            self.open_batch = 0;
+            self.open_ns = 0.0;
+            Ok(())
+        }
+    }
+
+    pub(crate) fn tensor_alloc_bytes(bytes: usize) -> usize {
+        bytes.max(4)
+    }
+
+    pub(crate) fn tensor_buffer(bytes: usize, host: bool) -> Result<Arc<TensorBuffer>, String> {
+        let runtime = tensor_runtime()?;
+        let bytes = tensor_alloc_bytes(bytes);
+        let mut discarded = Vec::new();
+        let pooled = tensor_locked(|state| {
+            state.drain_returns();
+            let index = state.free.iter().position(|b| b.capacity == bytes
+                && (!host || b.last_batch <= state.completed_batch));
+            let buffer = index.map(|i| state.free.swap_remove(i));
+            let mut retained: usize = state.free.iter().map(|b| b.capacity).sum();
+            while retained > POOL_CAP_BYTES {
+                if let Some(buffer) = state.free.pop() {
+                    retained -= buffer.capacity;
+                    discarded.push(buffer);
+                } else { break; }
+            }
+            Ok(buffer)
+        })?;
+        drop(discarded);
+        let (object, last_batch) = if let Some(buffer) = pooled {
+            (buffer.object, buffer.last_batch)
+        } else {
+            let _pool = AutoreleasePool::new();
+            let object = unsafe {
+                let id: ObjcId = msg_send![runtime.device.as_id(), newBufferWithLength: bytes as u64 options: MTL_RESOURCE_STORAGE_MODE_SHARED];
+                StrongId::from_owned(id)
+            }.ok_or_else(|| format!("Metal tensor allocation failed for {bytes} bytes (out of memory)"))?;
+            (object, 0)
+        };
+        Ok(Arc::new(TensorBuffer {
+            object: Some(object), capacity: bytes, last_batch: AtomicU64::new(last_batch),
+            writer_batch: AtomicU64::new(0), returns: runtime.returns.clone(), recycle: true,
+        }))
+    }
+
+    pub(crate) fn tensor_host_written(buffer: &TensorBuffer) -> Result<(), String> {
+        tensor_locked(|state| { state.set_writer(buffer, 0); Ok(()) })
+    }
+
+    pub(crate) fn tensor_flush_until(number: u64) -> Result<(), String> {
+        if number == 0 { return tensor_thread_guard(); }
+        tensor_flush_in(tensor_runtime()?, number)
+    }
+
+    fn tensor_flush_in(runtime: &TensorRuntime, number: u64) -> Result<(), String> {
+        let commands = tensor_locked_in(runtime, |state| {
+            state.drain_returns();
+            if number != 0 && state.open_batch != 0 && state.open_batch <= number {
+                state.commit()?;
+            }
+            state.reap();
+            Ok(state.in_flight.iter().take_while(|(batch, _)| *batch <= number)
+                .map(|(batch, command)| (*batch, command.clone())).collect::<Vec<_>>())
+        })?;
+        wait_committed(runtime, commands)?;
+        tensor_locked_in(runtime, |state| state.check_writer(number))
+    }
+
+    fn command_status(command: &StrongId) -> u64 {
+        unsafe { msg_send![command.as_id(), status] }
+    }
+
+    fn command_out_of_memory(command: &StrongId) -> bool {
+        unsafe {
+            let error: ObjcId = msg_send![command.as_id(), error];
+            if error == nil { return false; }
+            let code: isize = msg_send![error, code];
+            code == 8 // MTLCommandBufferErrorOutOfMemory
+        }
+    }
+
+    fn wait_committed(runtime: &TensorRuntime, commands: Vec<(u64, StrongId)>) -> Result<(), String> {
+        for (batch, command) in commands {
+            let _pool = AutoreleasePool::new();
+            unsafe { let _: () = msg_send![command.as_id(), waitUntilCompleted]; }
+            let status: u64 = unsafe { msg_send![command.as_id(), status] };
+            let oom = status == 5 && command_out_of_memory(&command);
+            tensor_locked_in(runtime, |state| {
+                let failed = status == 5;
+                #[cfg(test)]
+                let (failed, oom) = match state.injected_failure {
+                    Some((number, injected_oom)) if number == batch => (true, oom || injected_oom),
+                    _ => (failed, oom),
+                };
+                if failed { state.record_failure(batch, oom); }
+                state.completed_batch = state.completed_batch.max(batch);
+                state.prune_thread_batches();
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tensor_pool_clear() -> Result<(), String> {
+        tensor_pool_clear_in(tensor_runtime()?)
+    }
+
+    fn tensor_pool_clear_in(runtime: &TensorRuntime) -> Result<(), String> {
+        let buffers = tensor_locked_in(runtime, |state| {
+            state.drain_returns();
+            // Finished commands still retain every buffer they used (the last batch stays in
+            // `in_flight` until the next commit, and a later batch can finish before an earlier
+            // one): retire them all so their buffers come back now.
+            state.retire_finished();
+            Ok(std::mem::take(&mut state.free))
+        })?;
+        drop(buffers); // Unfinished commands retain their resources; clearing never waits.
+        Ok(())
+    }
+
+    pub(crate) fn tensor_evict_owner(owner: &WeightOwner) -> Result<usize, String> {
+        let buffers = tensor_locked(|state| {
+            state.drain_returns();
+            let keys: Vec<_> = state.context.named_weight_buffers.keys()
+                .filter(|(namespace, _)| namespace.starts_with(owner.namespace())).cloned().collect();
+            Ok(keys.into_iter().filter_map(|key| state.context.named_weight_buffers.remove(&key)).collect::<Vec<_>>())
+        })?;
+        let bytes = buffers.iter().map(|buffer| unsafe {
+            let bytes: u64 = msg_send![buffer.as_id(), length]; bytes as usize
+        }).sum();
+        drop(buffers);
+        Ok(bytes)
+    }
+
+    pub(crate) fn tensor_evict_keys(prefix: &WeightKey) -> Result<usize, String> {
+        let buffers = tensor_locked(|state| {
+            state.drain_returns();
+            let keys: Vec<_> = state.context.named_weight_buffers.keys()
+                .filter(|(namespace, key)| format!("{namespace}::{key}").starts_with(prefix.as_str())).cloned().collect();
+            Ok(keys.into_iter().filter_map(|key| state.context.named_weight_buffers.remove(&key)).collect::<Vec<_>>())
+        })?;
+        let bytes = buffers.iter().map(|buffer| unsafe {
+            let bytes: u64 = msg_send![buffer.as_id(), length]; bytes as usize
+        }).sum();
+        drop(buffers);
+        Ok(bytes)
+    }
+
+    impl MetalContext {
+        /// A per-operation preparation record. It shares the process device,
+        /// queue and pipelines; it never opens or commits its own tensor batch.
+        fn tensor_preparation() -> Result<Self, String> {
+            let runtime = tensor_runtime()?;
+            Ok(Self {
+                tensor_mode: true, tensor_prepare: true, tensor_batch: 0, tensor_dispatches: 0, tensor_bindings: HashMap::new(),
+                device: runtime.device.clone(), command_queue: runtime.queue.clone(), library: runtime.library.clone(),
+                pipeline_cache: HashMap::new(), cached_weight_buffers: HashMap::new(), named_weight_buffers: HashMap::new(),
+                scratch_buffers: HashMap::new(), matmul_out_buffers: HashMap::new(),
+                batch_depth: 0,
+                batch_command_buffer: None, batch_encoder: None, last_command_buffer: None,
+                pool_free: Vec::new(), pool_in_flight: Vec::new(),
+            })
+        }
+
+        fn bind_buffer(&self, encoder: ObjcId, buffer: ObjcId, offset: usize, index: u64) -> Result<(), String> {
+            if self.tensor_mode {
+                let handle = self.tensor_bindings.get(&(buffer as usize))
+                    .ok_or_else(|| "tensor dispatch bound an unregistered buffer".to_string())?;
+                handle.last_batch.fetch_max(self.tensor_batch, Ordering::Release);
+            }
+            unsafe { let _: () = msg_send![encoder, setBuffer: buffer offset: offset as u64 atIndex: index]; }
+            Ok(())
+        }
+    }
+
+    #[track_caller]
+    fn tensor_encode(
+        macs: u64, buffers: &[&Arc<TensorBuffer>], output: &Arc<TensorBuffer>,
+        dispatch: impl Fn(&mut MetalContext) -> Result<(), String>,
+    ) -> Result<u64, String> {
+        tensor_encode_group(macs, buffers, &[output], dispatch)
+    }
+
+    #[track_caller]
+    fn tensor_encode_group(
+        macs: u64, inputs: &[&Arc<TensorBuffer>], outputs: &[&Arc<TensorBuffer>],
+        dispatch: impl Fn(&mut MetalContext) -> Result<(), String>,
+    ) -> Result<u64, String> {
+        let _pool = AutoreleasePool::new();
+        let runtime = tensor_runtime()?;
+        let thread = std::thread::current().id();
+        let bytes = inputs.iter().chain(outputs).map(|buffer| buffer.capacity as u64).sum();
+        let mut prepared = MetalContext::tensor_preparation()?;
+        for buffer in inputs.iter().chain(outputs).copied() {
+            prepared.tensor_bindings.insert(buffer.id() as usize, buffer.clone());
+        }
+        dispatch(&mut prepared)?; // Compile and allocate, without the encoding lock.
+        prepared.tensor_prepare = false;
+        let result = tensor_locked_in(runtime, |state| {
+            state.drain_returns();
+            for buffer in inputs { state.check_writer(buffer.writer_batch.load(Ordering::Acquire))?; }
+            if state.open_batch == 0 {
+                let start = std::time::Instant::now();
+                let result = state.context.begin_batch();
+                state.lock_phases.open_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                result?;
+                state.open_batch = state.next_batch;
+                state.next_batch += 1;
+            }
+            let number = state.open_batch;
+            prepared.batch_depth = 1;
+            prepared.batch_command_buffer = state.context.batch_command_buffer.clone();
+            prepared.batch_encoder = state.context.batch_encoder.clone();
+            prepared.tensor_batch = number;
+            for output in outputs { state.set_writer(output, number); }
+            let start = std::time::Instant::now();
+            let encoded = dispatch(&mut prepared);
+            state.lock_phases.encode_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            state.lock_phases.dispatches = prepared.tensor_dispatches;
+            if let Err(error) = encoded {
+                state.record_failure(number, false);
+                return Err(error);
+            }
+            let mine = state.thread_batches.entry(thread).or_default();
+            if mine.back() != Some(&number) { mine.push_back(number); }
+            state.open_ns += estimate_ns(&runtime.cost, macs, bytes, prepared.tensor_dispatches);
+            state.reap();
+            if should_commit(state.open_ns, state.in_flight.is_empty(), &runtime.cost) {
+                state.commit()?;
+            }
+            Ok((number, state.back_pressure_command(thread)))
+        });
+        let (number, mut waiting) = result?;
+        while let Some(command) = waiting {
+            wait_committed(runtime, vec![command])?;
+            waiting = tensor_locked_in(runtime, |state| {
+                state.reap();
+                state.check_writer(number)?;
+                Ok(state.back_pressure_command(thread))
+            })?;
+        }
+        Ok(number)
+    }
+
+    /// Copy a logical 4-D tensor into fresh pool storage. Dimensions are in
+    /// ggml order (innermost first); offsets and strides are bytes.
+    pub(crate) fn tensor_copy_strided(
+        src: &Arc<TensorBuffer>, src_offset: usize, src_ne: [usize; 4], src_nb: [usize; 4],
+        dst: &Arc<TensorBuffer>, dst_offset: usize, dst_ne: [usize; 4], dst_nb: [usize; 4],
+    ) -> Result<u64, String> {
+        let overflow = || "metal strided copy extent overflow".to_string();
+        let count = |ne: [usize; 4]| ne.into_iter().try_fold(1usize, |n, d| n.checked_mul(d).ok_or_else(overflow));
+        let elements = count(src_ne)?;
+        if elements != count(dst_ne)? || dst_nb[0] != 4
+            || (elements != 0 && dst_ne[0] % src_ne[0] != 0) {
+            return Err("metal strided copy requires matching extents and contiguous destination rows".into());
+        }
+        for (buffer, offset, ne, nb) in [(src, src_offset, src_ne, src_nb), (dst, dst_offset, dst_ne, dst_nb)] {
+            if offset % 4 != 0 || nb.into_iter().any(|stride| stride % 4 != 0) {
+                return Err("metal strided copy requires f32 alignment".into());
+            }
+            let end = if elements == 0 { offset } else {
+                ne.into_iter().zip(nb).try_fold(offset, |end, (size, stride)| {
+                    (size - 1).checked_mul(stride).and_then(|n| end.checked_add(n)).ok_or_else(overflow)
+                })?.checked_add(4).ok_or_else(overflow)?
+            };
+            if end > buffer.capacity { return Err("metal strided copy outside buffer".into()); }
+        }
+        if elements == 0 { tensor_thread_guard()?; return Ok(0); }
+        // The kernel's grid coordinates and row index use 32-bit integers.
+        for size in src_ne.into_iter().chain(dst_ne) {
+            i32::try_from(size).map_err(|_| overflow())?;
+        }
+        i64::try_from(elements).map_err(|_| overflow())?;
+        let args = KArgsCpy {
+            nk0: src_ne[0] as i64,
+            ne00: src_ne[0] as i64, ne01: src_ne[1] as i64,
+            ne02: src_ne[2] as i64, ne03: src_ne[3] as i64,
+            nb00: src_nb[0] as u64, nb01: src_nb[1] as u64,
+            nb02: src_nb[2] as u64, nb03: src_nb[3] as u64,
+            ne0: dst_ne[0] as i64, ne1: dst_ne[1] as i64,
+            ne2: dst_ne[2] as i64, ne3: dst_ne[3] as i64,
+            nb0: dst_nb[0] as u64, nb1: dst_nb[1] as u64,
+            nb2: dst_nb[2] as u64, nb3: dst_nb[3] as u64,
+        };
+        tensor_encode(0, &[src], dst, |ctx| {
+            // This scalar kernel also handles offsets not divisible by 16.
+            // It never makes float4 loads, even for aligned tensors.
+            let base = "kernel_cpy_f32_f32";
+            let (pipeline, _, _, _, _) = ctx.get_or_compile_cached_pipeline(
+                base.to_string(), base, &[], 0, 0, 0, 0)?;
+            let nth = (src_ne[0] as u64).min(MetalContext::pipeline_max_threads(pipeline).max(1));
+            let groups = (src_ne[0] as u64).div_ceil(nth)
+                .checked_mul(src_ne[1] as u64).ok_or_else(overflow)?;
+            u32::try_from(groups).map_err(|_| overflow())?;
+            if ctx.tensor_prepare { return Ok(()); }
+            let (_, encoder, handles) = ctx.begin_command_encoder()?;
+            unsafe {
+                let _: () = msg_send![encoder, setComputePipelineState: pipeline];
+                let _: () = msg_send![encoder, setBytes: &args as *const KArgsCpy as *const c_void
+                    length: std::mem::size_of::<KArgsCpy>() as u64 atIndex: 0u64];
+                ctx.bind_buffer(encoder, src.id(), src_offset, 1)?;
+                ctx.bind_buffer(encoder, dst.id(), dst_offset, 2)?;
+                let grid = MTLSize { width: groups, height: src_ne[2] as u64, depth: src_ne[3] as u64 };
+                let threads = MTLSize { width: nth, height: 1, depth: 1 };
+                let _: () = msg_send![encoder, dispatchThreadgroups: grid threadsPerThreadgroup: threads];
+            }
+            ctx.end_command_encoder(handles)
+        })
+    }
+
+    pub(crate) fn tensor_binary(
+        a: &Arc<TensorBuffer>, a_offset: usize, a_shape: &Shape4,
+        b: &Arc<TensorBuffer>, b_offset: usize, b_shape: &Shape4,
+        out: &Arc<TensorBuffer>, multiply: bool,
+    ) -> Result<u64, String> {
+        tensor_encode(0, &[a, b], out, |ctx| ctx.dispatch_bin_f32_offsets(
+            if multiply { 2 } else { 0 }, a.id(), b.id(), out.id(), a_shape, b_shape, [a_offset, b_offset, 0]))
+    }
+
+    pub(crate) fn tensor_unary(
+        x: &Arc<TensorBuffer>, offset: usize, shape: &Shape4, out: &Arc<TensorBuffer>, op: i16,
+    ) -> Result<u64, String> {
+        tensor_encode(0, &[x], out, |ctx| ctx.dispatch_unary_f32_offsets(op, x.id(), out.id(), shape, [offset, 0]))
+    }
+
+    fn check_norm_affine(x: &Shape4, affine: &Shape4) -> Result<(), String> {
+        if affine.ne[0] != x.ne[0] {
+            return Err("norm fuse ne0 mismatch".into());
+        }
+        for d in 1..4 {
+            if affine.ne[d] != 1 && affine.ne[d] != x.ne[d] {
+                return Err("norm fuse broadcast mismatch".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tensor_norm(
+        x: &Arc<TensorBuffer>, offset: usize, shape: &Shape4,
+        mul: &Arc<TensorBuffer>, mul_offset: usize, mul_shape: &Shape4,
+        add: &Arc<TensorBuffer>, add_offset: usize, add_shape: &Shape4,
+        out: &Arc<TensorBuffer>, eps: f32, n_fuse: i32,
+    ) -> Result<u64, String> {
+        if n_fuse >= 2 { check_norm_affine(shape, mul_shape)?; }
+        if n_fuse >= 3 { check_norm_affine(shape, add_shape)?; }
+        tensor_encode(0, &[x, mul, add], out, |ctx| ctx.dispatch_norm_f32_offsets(
+            x.id(), mul.id(), add.id(), out.id(), shape, mul_shape, add_shape, eps, n_fuse,
+            [offset, mul_offset, add_offset, 0]))
+    }
+
+    pub(crate) fn tensor_rms_norm(
+        x: &Arc<TensorBuffer>, offset: usize, shape: &Shape4,
+        mul: &Arc<TensorBuffer>, mul_offset: usize, mul_shape: &Shape4,
+        add: &Arc<TensorBuffer>, add_offset: usize, add_shape: &Shape4,
+        out: &Arc<TensorBuffer>, eps: f32, n_fuse: i32,
+    ) -> Result<u64, String> {
+        if n_fuse >= 2 { check_norm_affine(shape, mul_shape)?; }
+        if n_fuse >= 3 { check_norm_affine(shape, add_shape)?; }
+        tensor_encode(0, &[x, mul, add], out, |ctx| ctx.dispatch_rms_norm_f32_offsets(
+            x.id(), mul.id(), add.id(), out.id(), shape, mul_shape, add_shape, eps, n_fuse,
+            [offset, mul_offset, add_offset, 0]))
+    }
+
+    fn get_rows_shapes(
+        src_ggml_type: u32,
+        n_cols: usize,
+        n_rows: usize,
+        n_indices: usize,
+    ) -> Result<(Shape4, Shape4, Shape4), String> {
+        let src_ty = src0_type_from_ggml(src_ggml_type)
+            .ok_or_else(|| format!("unsupported ggml type for get_rows: {}", src_ggml_type))?;
+        let (row_bytes, elem_or_block) = src0_layout_bytes_per_row(src_ty, n_cols)?;
+        let source_bytes = n_rows
+            .checked_mul(row_bytes)
+            .ok_or_else(|| "overflow computing get_rows source bytes".to_string())?;
+        let mut src_shape = shape4_from_row_major(&[n_rows, n_cols], elem_or_block)?;
+        // Quantized rows contain blocks, not one block per logical element.
+        src_shape.nb[1] = row_bytes as u64;
+        src_shape.nb[2] = source_bytes as u64;
+        src_shape.nb[3] = src_shape.nb[2];
+        let idx_shape = shape4_from_row_major(&[n_indices], std::mem::size_of::<i32>() as u64)?;
+        let dst_shape = shape4_from_row_major(&[n_indices, n_cols], 4)?;
+        Ok((src_shape, idx_shape, dst_shape))
+    }
+
+    pub(crate) fn tensor_get_rows(
+        src: &Arc<TensorBuffer>,
+        src_offset: usize,
+        src_ggml_type: u32,
+        n_cols: usize,
+        n_rows: usize,
+        rows: &Arc<TensorBuffer>,
+        rows_offset: usize,
+        n_indices: usize,
+        out: &Arc<TensorBuffer>,
+    ) -> Result<u64, String> {
+        let (src_shape, idx_shape, dst_shape) =
+            get_rows_shapes(src_ggml_type, n_cols, n_rows, n_indices)?;
+        tensor_encode(0, &[src, rows], out, |ctx| {
+            ctx.dispatch_get_rows_ggml(
+                src_ggml_type, src.id(), &src_shape, rows.id(), &idx_shape,
+                out.id(), &dst_shape, [src_offset, rows_offset, 0],
+            )
+        })
+    }
+
+    fn tensor_upload_bytes(values: &[u8]) -> Result<Arc<TensorBuffer>, String> {
+        let buffer = tensor_buffer(values.len(), true)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr(), buffer.contents()?.cast::<u8>(), values.len(),
+            );
+        }
+        Ok(buffer)
+    }
+
+    fn tensor_upload_f32(values: &[f32], shape: &Shape4) -> Result<Arc<TensorBuffer>, String> {
+        if values.len() != shape.numel { return Err("metal upload size mismatch".into()); }
+        let bytes = shape.numel.checked_mul(4).ok_or("metal upload extent overflow")?;
+        let buffer = tensor_buffer(bytes, true)?;
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.contents()?, values.len()); }
+        Ok(buffer)
+    }
+
+    fn tensor_host_result(shape: &Shape4, dispatch: impl FnOnce(&Arc<TensorBuffer>) -> Result<u64, String>) -> Result<Vec<f32>, String> {
+        let bytes = shape.numel.checked_mul(4).ok_or("metal output extent overflow")?;
+        let output = tensor_buffer(bytes, false)?;
+        tensor_flush_until(dispatch(&output)?)?;
+        Ok(unsafe { std::slice::from_raw_parts(output.contents()?, shape.numel) }.to_vec())
+    }
+
+    fn tensor_try<T>(operation: impl FnOnce() -> Result<T, String>) -> Option<T> {
+        match operation() {
+            Ok(value) => Some(value),
+            Err(error) => {
+                super::log_metal_error_once(format!("[ggml][metal] compute failed: {error}"));
+                None
+            }
+        }
+    }
+
+    fn tensor_host_binary(a: &[f32], a_shape: &[usize], b: &[f32], b_shape: &[usize], multiply: bool) -> Option<Vec<f32>> {
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(a_shape, 4)?;
+            let b_shape = shape4_from_row_major(b_shape, 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let b = tensor_upload_f32(b, &b_shape)?;
+            tensor_host_result(&a_shape, |out| tensor_binary(&a, 0, &a_shape, &b, 0, &b_shape, out, multiply))
+        })
+    }
+
+    pub(crate) fn tensor_matmul(
+        x: &Arc<TensorBuffer>, x_offset: usize, w: &Arc<TensorBuffer>, w_offset: usize,
+        out: &Arc<TensorBuffer>, m: usize, k: usize, n: usize, ty: u32,
+    ) -> Result<u64, String> {
+        let macs = m as u64 * k as u64 * n as u64;
+        let bytes = x.capacity as u64 + w.capacity as u64 + out.capacity as u64;
+        let est = estimate_ns(&tensor_runtime()?.cost, macs, bytes, 1);
+        let rows = if m > 8 && k >= 64 {
+            row_chunks(m, est, 32, 32)
+        } else { vec![0..m] };
+        tensor_matmul_rows(x, x_offset, w, w_offset, out, m, k, n, ty, &rows)
+    }
+
+    fn tensor_matmul_rows(
+        x: &Arc<TensorBuffer>, x_offset: usize, w: &Arc<TensorBuffer>, w_offset: usize,
+        out: &Arc<TensorBuffer>, m: usize, k: usize, n: usize, ty: u32,
+        rows: &[std::ops::Range<usize>],
+    ) -> Result<u64, String> {
+        let src0 = src0_type_from_ggml(ty).ok_or_else(|| "unsupported tensor weight type".to_string())?;
+        let (row, _) = src0_layout_bytes_per_row(src0, k)?;
+        let fits = |offset: usize, rows: usize, bytes: usize, cap: usize| {
+            rows.checked_mul(bytes).and_then(|n| n.checked_add(offset)).is_some_and(|end| end <= cap)
+        };
+        if !fits(w_offset, n, row, w.capacity) || !fits(x_offset, m, k.checked_mul(4).ok_or("tensor matmul overflow")?, x.capacity)
+            || !fits(0, m, n.checked_mul(4).ok_or("tensor matmul overflow")?, out.capacity) {
+            return Err("tensor matmul buffer extent mismatch".into());
+        }
+        let mut batch = 0;
+        for r in rows {
+            batch = tensor_encode(r.len() as u64 * k as u64 * n as u64, &[x, w], out,
+                |ctx| ctx.matmul_nt_into_buffer_offsets(
+                    ty, w.id(), x.id(), out.id(), r.len(), k, n,
+                    [w_offset, x_offset + r.start * k * 4, r.start * n * 4]))?;
+        }
+        Ok(batch)
+    }
+
+    pub(crate) fn tensor_named_weight<'a>(owner: &WeightOwner, key: &str, load: impl FnOnce() -> Result<Cow<'a, [u8]>, String>) -> Result<Arc<TensorBuffer>, String> {
+        tensor_named_weight_buffer((owner.namespace().to_owned(), key.to_owned()), load)
+    }
+
+    pub(crate) fn tensor_keyed_weight<'a>(key: &WeightKey, load: impl FnOnce() -> Result<Cow<'a, [u8]>, String>) -> Result<Arc<TensorBuffer>, String> {
+        tensor_named_weight_buffer((key.as_str().to_owned(), "act-norm".to_owned()), load)
+    }
+
+    fn tensor_named_weight_buffer<'a>(key: (String, String), load: impl FnOnce() -> Result<Cow<'a, [u8]>, String>) -> Result<Arc<TensorBuffer>, String> {
+        tensor_cached_weight_buffer(key, |device| {
+            let bytes = load()?;
+            unsafe {
+                let obj: ObjcId = msg_send![device, newBufferWithBytes: bytes.as_ptr() as *const c_void length: bytes.len() as u64 options: MTL_RESOURCE_STORAGE_MODE_SHARED];
+                StrongId::from_owned(obj)
+            }.ok_or_else(|| "named tensor weight allocation failed (out of memory)".to_string())
+        })
+    }
+
+    pub(crate) fn tensor_f32_weight(w: &F32Weight) -> Result<Arc<TensorBuffer>, String> {
+        let key = (w.owner().namespace().to_owned(), w.name().to_owned());
+        tensor_cached_weight_buffer(key, |device| {
+            let storage = Arc::clone(w.storage());
+            let bytes = storage.page_bytes();
+            // Metal copies the block and holds its Arc until the buffer's
+            // last reference (including in-flight commands) is released.
+            unsafe {
+                let deallocator = makepad_objc_sys::objc_block!(move |_pointer: *mut c_void, _length: u64| {
+                    let _ = &storage;
+                });
+                let obj: ObjcId = msg_send![device, newBufferWithBytesNoCopy: w.storage().as_ptr() as *mut c_void length: bytes as u64 options: MTL_RESOURCE_STORAGE_MODE_SHARED deallocator: &deallocator];
+                StrongId::from_owned(obj)
+            }.ok_or_else(|| format!("f32 weight no-copy buffer failed for {bytes} bytes (out of memory)"))
+        })
+    }
+
+    fn tensor_cached_weight_buffer(
+        key: (String, String),
+        create: impl FnOnce(ObjcId) -> Result<StrongId, String>,
+    ) -> Result<Arc<TensorBuffer>, String> {
+        let runtime = tensor_runtime()?;
+        let existing = tensor_locked(|state| {
+            state.drain_returns();
+            Ok(state.context.named_weight_buffers.get(&key).cloned())
+        })?;
+        let object = if let Some(buffer) = existing { buffer } else {
+            let _pool = AutoreleasePool::new();
+            let candidate = create(runtime.device.as_id())?;
+            tensor_locked(|state| {
+                state.dead_owners.holds(&key.0);
+                Ok(state.context.named_weight_buffers.entry(key)
+                    .or_insert_with(|| candidate.clone()).clone())
+            })?
+        };
+        let capacity: u64 = unsafe { msg_send![object.as_id(), length] };
+        Ok(Arc::new(TensorBuffer { object: Some(object), capacity: capacity as usize,
+            last_batch: AtomicU64::new(0), writer_batch: AtomicU64::new(0), returns: runtime.returns.clone(), recycle: false }))
+    }
+
+    pub(crate) fn tensor_attention(
+        q: &Arc<TensorBuffer>, qo: usize, k: &Arc<TensorBuffer>, ko: usize,
+        v: &Arc<TensorBuffer>, vo: usize, out: &Arc<TensorBuffer>,
+        nq: usize, nk: usize, heads: usize, d: usize, scale: f32,
+    ) -> Result<u64, String> {
+        let rows = if !flash_attn_use_vec(nq, d) {
+            let macs = 2 * nq as u64 * nk as u64 * heads as u64 * d as u64;
+            let bytes = q.capacity as u64 + k.capacity as u64
+                + v.capacity as u64 + out.capacity as u64;
+            let dispatches = 1 + usize::from(nk % OP_FLASH_ATTN_EXT_NCPSG as usize != 0);
+            let est = estimate_ns(&tensor_runtime()?.cost, macs, bytes, dispatches);
+            // Chunks hold whole query tiles: a partial tile costs a full one in every chunk.
+            row_chunks(nq, est, OP_FLASH_ATTN_EXT_NQPSG as usize, 20)
+        } else { vec![0..nq] };
+        tensor_attention_rows(q, qo, k, ko, v, vo, out, nq, nk, heads, d, scale, &rows)
+    }
+
+    fn tensor_attention_rows(
+        q: &Arc<TensorBuffer>, qo: usize, k: &Arc<TensorBuffer>, ko: usize,
+        v: &Arc<TensorBuffer>, vo: usize, out: &Arc<TensorBuffer>,
+        nq: usize, nk: usize, heads: usize, d: usize, scale: f32,
+        rows: &[std::ops::Range<usize>],
+    ) -> Result<u64, String> {
+        let vector = flash_attn_use_vec(nq, d);
+        let mut batch = 0;
+        for r in rows {
+            let nq = r.len();
+            let q_offset = qo + r.start * heads * d * 4;
+            let out_offset = r.start * heads * d * 4;
+            batch = tensor_encode(2 * nq as u64 * nk as u64 * heads as u64 * d as u64,
+                &[q, k, v], out, |ctx| {
+                let pad = ctx.get_or_create_scratch_buffer(SCRATCH_FLASH_PAD,
+                    flash_attn_ext_extra_pad_bytes(nq, nk, heads, d, 4, false, vector)?)?;
+                if vector {
+                    let tmp = ctx.get_or_create_scratch_buffer(SCRATCH_FLASH_TMP,
+                        flash_attn_ext_extra_tmp_bytes(nq, heads, d, 32)?)?;
+                    ctx.dispatch_flash_attn_ext_vec_f32_offsets(
+                        q.id(), k.id(), v.id(), q.id(), q.id(), pad, Some(tmp), out.id(),
+                        nq, nk, heads, d, Src0Type::F32, scale, false, false, 0.0, 0.0,
+                        [q_offset, ko, vo, q_offset, q_offset, 0, 0, out_offset])
+                } else {
+                    let blk = ctx.get_or_create_scratch_buffer(SCRATCH_FLASH_BLK,
+                        flash_attn_ext_extra_blk_bytes(nq, nk, false, false)?)?;
+                    ctx.dispatch_flash_attn_ext_f32_offsets(
+                        q.id(), k.id(), v.id(), q.id(), q.id(), pad, blk, out.id(),
+                        nq, nk, heads, d, Src0Type::F32, scale, false, false, 0.0, 0.0,
+                        [q_offset, ko, vo, q_offset, q_offset, 0, 0, out_offset])
+                }
+            })?;
+        }
+        Ok(batch)
+    }
+
+    pub(crate) fn tensor_im2col(
+        x: &Arc<TensorBuffer>, offset: usize, out: &Arc<TensorBuffer>,
+        ic: usize, iw: usize, ih: usize, stride: usize, kw: usize, kh: usize,
+        px: usize, py: usize, ow: usize, oh: usize,
+    ) -> Result<u64, String> {
+        tensor_encode(0, &[x], out, |ctx| ctx.dispatch_im2col_2d_f32_offsets(
+            x.id(), 0, out.id(), ic, iw, ih, stride, kw, kh, px, py, ow, oh, [offset, 0]))
+    }
+
+    pub(crate) fn tensor_resident_weights(owner: &WeightOwnerTrace) -> Result<(usize, usize), String> {
+        tensor_locked(|state| {
+            state.drain_returns();
+            Ok(state.context.named_weight_buffers.iter()
+                .filter(|((namespace, _), _)| namespace.starts_with(owner.namespace()))
+                .fold((0, 0), |(count, bytes), (_, buffer)| {
+                    let length: u64 = unsafe { msg_send![buffer.as_id(), length] };
+                    (count + 1, bytes + length as usize)
+                }))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tensor_test_drop_owner_locked(owner: makepad_ai_loader::WeightOwner) -> Result<(), String> {
+        tensor_locked(move |_| { drop(owner); Ok(()) })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tensor_test_legacy_matmuls(a: &[f32], weights: &[(u32, Vec<u8>)],
+        m: usize, k: usize, n: usize) -> Result<Vec<Vec<f32>>, String> {
+        let _pool = AutoreleasePool::new();
+        let mut legacy = MetalContext::new()?;
+        weights.iter().map(|(ty, bytes)| {
+            let (dst, mr, nr) = legacy.matmul_nt_ggml_bytes_impl(a, bytes, *ty, m, k, n, None)?;
+            legacy.read_f32_buffer(dst.as_id(), mr * nr)
+        }).collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tensor_test_error_and_guard() -> Result<(), String> {
+        assert!(tensor_thread_guard_for(true).unwrap_err().contains("main/UI"), "main-thread refusal");
+        assert!(tensor_thread_guard_for(false).is_ok(), "worker allowed");
+        let buffer = tensor_buffer(16, false)?;
+        let result: Result<(), String> = tensor_locked(move |_| {
+            drop(buffer);
+            Err("injected op error".into())
+        });
+        assert!(result.is_err(), "drop under encoding lock returns normally");
+        tensor_pool_clear()?;
+        // Isolate injected failures from other tests, but exercise the same
+        // commit/wait/read gate and return-channel accounting used in production.
+        let (sender, returns) = mpsc::channel();
+        let cost = tensor_runtime()?.cost;
+        let mut context = MetalContext::tensor_preparation()?;
+        context.tensor_mode = false;
+        context.tensor_prepare = false;
+        let first_object = context.new_buffer_with_length(16)?;
+        let second_object = context.new_buffer_with_length(16)?;
+        let first = Arc::new(TensorBuffer { object: Some(first_object), capacity: 16,
+            last_batch: AtomicU64::new(1), writer_batch: AtomicU64::new(1), returns: sender.clone(), recycle: true });
+        let second = Arc::new(TensorBuffer { object: Some(second_object), capacity: 16,
+            last_batch: AtomicU64::new(2), writer_batch: AtomicU64::new(2), returns: sender.clone(), recycle: true });
+        let runtime = Arc::new(TensorRuntime {
+            device: context.device.clone(), queue: context.command_queue.clone(), library: context.library.clone(), returns: sender, cost,
+            state: Mutex::new(TensorState {
+                context, lock_phases: TensorLockPhases::default(), returns, free: Vec::new(), deferred_drop: Vec::new(), dead_owners: makepad_ai_loader::DeadOwnerInbox::register(),
+                in_flight: VecDeque::new(), next_batch: 3, open_batch: 0,
+                open_ns: 0.0, thread_batches: HashMap::new(),
+                completed_batch: 0, failed: BTreeSet::new(), failed_oom: BTreeSet::new(), failure_floor: None, injected_failure: Some((1, false)),
+                live_writers: BTreeMap::from([(1, 1), (2, 1)]),
+            }),
+        });
+        tensor_locked_in(&runtime, |state| {
+            state.context.begin_batch()?;
+            state.open_batch = 1;
+            Ok(())
+        })?;
+        let error = tensor_flush_in(&runtime, 1).unwrap_err();
+        assert!(error.contains("failed batch 1"), "failed producer read rejected on A: {error}");
+        assert!(!error.contains("out of memory"), "plain failure is not OOM: {error}");
+        assert!(tensor_flush_in(&runtime, 0).is_ok(), "host weights survive failed batch");
+        let other = runtime.clone();
+        std::thread::spawn(move || {
+            assert!(tensor_flush_in(&other, 2).is_err(), "dependent batch read rejected on B");
+            drop(second);
+        }).join().unwrap();
+        drop(first);
+        tensor_locked_in(&runtime, |state| {
+            state.drain_returns();
+            state.context.begin_batch()?;
+            state.open_batch = 3;
+            Ok(())
+        })?;
+        let other = runtime.clone();
+        std::thread::spawn(move || tensor_pool_clear_in(&other)).join().unwrap()?;
+        assert_eq!(tensor_locked_in(&runtime, |state| Ok(state.open_batch))?, 3,
+            "pool clear on B neither commits nor waits for A's open batch");
+        assert!(tensor_flush_in(&runtime, 3).is_ok(), "next job commits and reads after failed outputs drop");
+        tensor_locked_in(&runtime, |state| {
+            state.record_failure(1, false);
+            state.check_writer(3)
+        })?;
+        tensor_locked_in(&runtime, |state| {
+            state.injected_failure = Some((4, true));
+            state.live_writers.insert(4, 1);
+            state.context.begin_batch()?;
+            state.open_batch = 4;
+            Ok(())
+        })?;
+        let error = tensor_flush_in(&runtime, 4).unwrap_err();
+        assert!(error.contains("out of memory"), "OOM failure keeps its classification: {error}");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tensor_slice_tests {
+        use super::*;
+
+        #[test]
+        fn row_plans_cover_and_preserve_kernel_rows() {
+            assert_eq!(row_chunks(300, SLICE_NS, 32, 32), vec![0..300]);
+            assert_eq!(row_chunks(300, 3.5 * SLICE_NS, 32, 32),
+                vec![0..96, 96..192, 192..300], "short tail merges");
+            assert_eq!(row_chunks(100, 9.0 * SLICE_NS, 1, 20),
+                vec![0..20, 20..40, 40..60, 60..80, 80..100],
+                "minimum rows preserve non-vector attention");
+            for (rows, slices, align, min_rows) in [
+                (300, 3.5, 32, 32), (100, 9.0, 1, 20),
+                (320, 4.0, 32, 32), (33, 20.0, 32, 32),
+                (101, 3.0, 1, 20), (101, 3.0, 8, 20), (8220, 36.0, 8, 20),
+            ] {
+                let plan = row_chunks(rows, slices * SLICE_NS, align, min_rows);
+                let mut end = 0;
+                for (index, range) in plan.iter().enumerate() {
+                    assert_eq!(range.start, end, "contiguous ordered cover");
+                    assert_eq!(range.start % align, 0, "aligned start");
+                    assert!(range.len() >= min_rows, "minimum kernel rows");
+                    if index + 1 < plan.len() {
+                        assert_eq!(range.len() % align, 0, "aligned non-tail size");
+                    }
+                    end = range.end;
+                }
+                assert_eq!(end, rows, "exact final extent");
+            }
+        }
+
+        #[test]
+        fn commit_and_back_pressure_rules() {
+            let cost = TensorCost {
+                ns_per_mac: 2.0, ns_per_byte: 3.0,
+                ns_per_dispatch: 5.0, ns_per_commit: 1000.0,
+            };
+            assert_eq!(estimate_ns(&cost, 7, 11, 13), 112.0);
+            assert!(!should_commit(999.0, true, &cost), "idle commit floor");
+            assert!(should_commit(1000.0, true, &cost), "idle starts work");
+            assert!(!should_commit(1000.0, false, &cost), "busy accumulates");
+            assert!(!should_commit(SLICE_NS - 1.0, false, &cost));
+            assert!(should_commit(SLICE_NS, false, &cost), "slice boundary");
+            assert!(should_commit(SLICE_NS + 1.0, true, &cost));
+            for (mine, open, completed, expected) in [
+                (vec![], 0, 0, None),
+                (vec![1, 2], 0, 0, None),
+                (vec![1, 2, 3], 3, 0, None),
+                (vec![1, 2, 3], 0, 0, Some(1)),
+                (vec![1, 2, 3, 4], 4, 1, None),
+                (vec![1, 2, 3, 4, 5], 5, 1, Some(2)),
+                (vec![1, 3, 7], 0, 7, None),
+            ] {
+                assert_eq!(back_pressure_target(&VecDeque::from(mine), open, completed),
+                    expected, "only committed unfinished batches count");
+            }
+        }
+
+        fn next_random(state: &mut u32) -> u32 {
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            *state
+        }
+
+        fn random_input(state: &mut u32, elements: usize) -> Vec<f32> {
+            (0..elements).map(|_| next_random(state) as i32 as f32 / i32::MAX as f32)
+                .collect()
+        }
+
+        fn output_bits(buffer: &TensorBuffer, elements: usize, batch: u64) -> Vec<u32> {
+            tensor_flush_until(batch).unwrap();
+            unsafe { std::slice::from_raw_parts(buffer.contents().unwrap(), elements) }
+                .iter().map(|value| value.to_bits()).collect()
+        }
+
+        #[test]
+        fn matmul_row_slices_preserve_f32_and_q8_bits() {
+            crate::run_model_worker("matmul-slices-test", || {
+                let (m, k, n) = (300, 256, 512);
+                let mut seed = 0x6d2b79f5;
+                let x = random_input(&mut seed, m * k);
+                let shape = shape4_from_row_major(&[m, k], 4).unwrap();
+                let x = tensor_upload_f32(&x, &shape).unwrap();
+                let weights = random_input(&mut seed, n * k);
+                let f32_bytes: Vec<_> = weights.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let mut q8_bytes = Vec::new();
+                for _ in 0..n * k / 32 {
+                    q8_bytes.extend(makepad_ai_loader::quant::f32_to_f16(0.03125).to_le_bytes());
+                    q8_bytes.extend((0..32).map(|_| next_random(&mut seed) as u8));
+                }
+                for (ty, bytes) in [(GGML_TYPE_F32, f32_bytes), (GGML_TYPE_Q8_0, q8_bytes)] {
+                    let w = tensor_buffer(bytes.len(), true).unwrap();
+                    unsafe { std::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(), w.contents().unwrap().cast::<u8>(), bytes.len()); }
+                    let whole = tensor_buffer(m * n * 4, false).unwrap();
+                    let split = tensor_buffer(m * n * 4, false).unwrap();
+                    let whole_batch = tensor_matmul_rows(
+                        &x, 0, &w, 0, &whole, m, k, n, ty, &[0..m]).unwrap();
+                    let split_batch = tensor_matmul_rows(
+                        &x, 0, &w, 0, &split, m, k, n, ty,
+                        &[0..96, 96..192, 192..300]).unwrap();
+                    assert_eq!(output_bits(&whole, m * n, whole_batch),
+                        output_bits(&split, m * n, split_batch),
+                        "GEMM row slices preserve every bit for type {ty}");
+                }
+            });
+        }
+
+        #[test]
+        fn attention_row_slices_preserve_bits() {
+            crate::run_model_worker("attention-slices-test", || {
+                let (nq, nk, heads, d) = (100, 64, 2, 64);
+                let mut seed = 0xa341316c;
+                let q_shape = shape4_from_row_major(&[nq, heads, d], 4).unwrap();
+                let kv_shape = shape4_from_row_major(&[nk, heads, d], 4).unwrap();
+                let q = tensor_upload_f32(&random_input(&mut seed, q_shape.numel), &q_shape).unwrap();
+                let k = tensor_upload_f32(&random_input(&mut seed, kv_shape.numel), &kv_shape).unwrap();
+                let v = tensor_upload_f32(&random_input(&mut seed, kv_shape.numel), &kv_shape).unwrap();
+                let whole = tensor_buffer(q_shape.numel * 4, false).unwrap();
+                let split = tensor_buffer(q_shape.numel * 4, false).unwrap();
+                let scale = 1.0 / (d as f32).sqrt();
+                let whole_batch = tensor_attention_rows(
+                    &q, 0, &k, 0, &v, 0, &whole, nq, nk, heads, d, scale, &[0..nq]).unwrap();
+                let split_batch = tensor_attention_rows(
+                    &q, 0, &k, 0, &v, 0, &split, nq, nk, heads, d, scale,
+                    &[0..34, 34..68, 68..100]).unwrap();
+                assert_eq!(output_bits(&whole, q_shape.numel, whole_batch),
+                    output_bits(&split, q_shape.numel, split_batch),
+                    "attention row slices preserve every bit");
+            });
+        }
+    }
+
+    #[test]
+    fn host_matmul_wrappers_preserve_kernel_bits() {
+        let _pool = AutoreleasePool::new();
+        let mut legacy = MetalContext::new().expect("a working Metal backend is required");
+        // mul_mv_ext requires k divisible by 128 and 2..=8 input rows.
+        // mul_mm uses k >= 64 and m > 8; the odd short row uses mul_mv.
+        for (m, k, n, kernel) in [
+            (3, 128, 5, "mul_mv_ext"),
+            (9, 65, 7, "mul_mm"),
+            (5, 7, 3, "mul_mv"),
+        ] {
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| (i as i32 % 23 - 11) as f32 * 0.0317)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| (i as i32 % 19 - 9) as f32 * 0.0731)
+                .collect();
+            let mut bt = vec![0.0; n * k];
             for i in 0..k {
                 for j in 0..n {
                     bt[j * k + i] = b[i * n + j];
                 }
             }
-
-            let bt_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    bt.as_ptr() as *const u8,
-                    bt.len() * std::mem::size_of::<f32>(),
-                )
-            };
-
-            let (dst, mr, nr) =
-                self.matmul_nt_ggml_bytes_impl(a, bt_bytes, GGML_TYPE_F32, m, k, n, None)?;
-            self.read_f32_buffer(dst.as_id(), mr * nr)
-        }
-
-        fn matmul_nt_f32(
-            &mut self,
-            a: &[f32],
-            bt: &[f32],
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<Vec<f32>, String> {
-            let bt_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    bt.as_ptr() as *const u8,
-                    bt.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            // Raw f32 RHS buffers are often transient activation vectors.
-            // Pointer-based caching is unsafe here because allocators can reuse the same address
-            // for different contents across layers or heads.
-            let (dst, mr, nr) =
-                self.matmul_nt_ggml_bytes_impl(a, bt_bytes, GGML_TYPE_F32, m, k, n, None)?;
-            self.read_f32_buffer(dst.as_id(), mr * nr)
-        }
-
-        fn matmul_nt_f32_bytes(
-            &mut self,
-            a: &[f32],
-            bt_bytes: &[u8],
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<Vec<f32>, String> {
-            let (dst, mr, nr) =
-                self.matmul_nt_ggml_bytes_impl(a, bt_bytes, GGML_TYPE_F32, m, k, n, None)?;
-            self.read_f32_buffer(dst.as_id(), mr * nr)
-        }
-
-        fn matmul_nt_f16_bytes(
-            &mut self,
-            a: &[f32],
-            bt_f16_bytes: &[u8],
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<Vec<f32>, String> {
-            let (dst, mr, nr) =
-                self.matmul_nt_ggml_bytes_impl(a, bt_f16_bytes, GGML_TYPE_F16, m, k, n, None)?;
-            self.read_f32_buffer(dst.as_id(), mr * nr)
-        }
-
-        fn matmul_nt_ggml_bytes(
-            &mut self,
-            a: &[f32],
-            bt_bytes: &[u8],
-            bt_ggml_type: u32,
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<Vec<f32>, String> {
-            let tag = matmul_cache_tag(bt_ggml_type);
-            let (dst, mr, nr) =
-                self.matmul_nt_ggml_bytes_impl(a, bt_bytes, bt_ggml_type, m, k, n, Some(tag))?;
-            self.read_f32_buffer(dst.as_id(), mr * nr)
-        }
-
-        fn matmul_nt_ggml_from_resident_src(
-            &mut self,
-            src0_id: ObjcId,
-            src1_id: ObjcId,
-            bt_ggml_type: u32,
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<StrongId, String> {
-            let mn = m
-                .checked_mul(n)
-                .ok_or_else(|| "matmul overflow computing m*n".to_string())?;
-            let dst_bytes = mn
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "matmul overflow computing dst bytes".to_string())?;
-            let dst_buffer = self.pool_take(dst_bytes)?;
-            if m == 0 || k == 0 || n == 0 {
-                return Ok(dst_buffer);
-            }
-            self.matmul_nt_ggml_resident_into(
-                src0_id,
-                src1_id,
-                dst_buffer.as_id(),
-                bt_ggml_type,
-                m,
-                k,
-                n,
-            )?;
-            Ok(dst_buffer)
-        }
-
-        /// Same dispatch as [`Self::matmul_nt_ggml_from_resident_src`] but the
-        /// caller owns the destination buffer (act pool / recycled transient).
-        fn matmul_nt_ggml_resident_into(
-            &mut self,
-            src0_id: ObjcId,
-            src1_id: ObjcId,
-            dst_id: ObjcId,
-            bt_ggml_type: u32,
-            m: usize,
-            k: usize,
-            n: usize,
-        ) -> Result<(), String> {
-            if m == 0 || k == 0 || n == 0 {
-                return Ok(());
-            }
-            let src0 = src0_type_from_ggml(bt_ggml_type).ok_or_else(|| {
-                format!(
-                    "unsupported src0 ggml_type for metal matmul: {}",
-                    bt_ggml_type
-                )
-            })?;
-            let (src0_row_bytes, nb00) = src0_layout_bytes_per_row(src0, k)?;
-            let ne00 = i32::try_from(k).map_err(|_| format!("k too large: {}", k))?;
-            let ne01 = i32::try_from(n).map_err(|_| format!("n too large: {}", n))?;
-            let ne10 = ne00;
-            let ne11 = i32::try_from(m).map_err(|_| format!("m too large: {}", m))?;
-            let ne0 = ne01;
-            let ne1 = ne11;
-            let nb01 = src0_row_bytes as u64;
-            let nb10 = 4u64;
-            let nb11 = (k as u64)
-                .checked_mul(4)
-                .ok_or_else(|| "overflow computing nb11".to_string())?;
-            let used_mul_mv_ext = can_use_mul_mv_ext(src0, ne00, ne11);
-            let used_mul_mm = ne00 >= 64 && ne11 > 8;
-            if used_mul_mv_ext {
-                self.dispatch_mul_mv_ext(
-                    src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01, nb10,
-                    nb11, ne0, ne1,
-                )?;
-            } else if used_mul_mm {
-                if let Err(e) = self.dispatch_mul_mm(
-                    src0, src0_id, src1_id, dst_id, ne00, ne01, nb01, 1, nb10, nb11, ne0, ne1,
-                ) {
-                    super::log_metal_error_once(format!(
-                        "[ggml][metal] mul_mm failed for type {:?}, falling back to mul_mv: {}",
-                        src0, e
-                    ));
-                    self.dispatch_mul_mv(
-                        src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01,
-                        nb10, nb11, ne0, ne1,
-                    )?;
-                }
-            } else {
-                self.dispatch_mul_mv(
-                    src0, src0_id, src1_id, dst_id, ne00, ne01, ne10, ne11, nb00, nb01, nb10,
-                    nb11, ne0, ne1,
-                )?;
-            }
-            Ok(())
-        }
-
-        fn matmul_nt_ggml_bytes_keyed<F>(
-            &mut self,
-            a: &[f32],
-            bt_ggml_type: u32,
-            m: usize,
-            k: usize,
-            n: usize,
-            namespace: &str,
-            cache_key: &str,
-            load: F,
-        ) -> Result<Vec<f32>, String>
-        where
-            F: FnOnce() -> Result<Vec<u8>, String>,
-        {
-            let src0_id = self.get_or_create_named_weight_buffer(namespace, cache_key, load)?;
-            let mk = m
-                .checked_mul(k)
-                .ok_or_else(|| "matmul overflow computing m*k".to_string())?;
-            if a.len() != mk {
-                return Err(format!(
-                    "lhs len mismatch: got {}, expected {}",
-                    a.len(),
-                    mk
-                ));
-            }
-            let a_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    a.as_ptr() as *const u8,
-                    a.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let src1_buffer = self.pool_take_filled(a_bytes)?;
-            let dst = self.matmul_nt_ggml_from_resident_src(
-                src0_id,
-                src1_buffer.as_id(),
-                bt_ggml_type,
-                m,
-                k,
-                n,
-            )?;
-            let out = self.read_f32_buffer(dst.as_id(), m * n)?;
-            self.pool_give(src1_buffer);
-            self.pool_give(dst);
-            self.pool_recycle();
-            Ok(out)
-        }
-
-        fn matmul_nt_ggml_bytes_keyed_multi<F>(
-            &mut self,
-            a: &[f32],
-            m: usize,
-            k: usize,
-            matrices: &[super::MatmulNtGgmlBytesKeyedMatrix<'_>],
-            mut load: F,
-        ) -> Result<Vec<Vec<f32>>, String>
-        where
-            F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
-        {
-            if matrices.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mk = m
-                .checked_mul(k)
-                .ok_or_else(|| "matmul overflow computing m*k".to_string())?;
-            if a.len() != mk {
-                return Err(format!(
-                    "lhs len mismatch: got {}, expected {}",
-                    a.len(),
-                    mk
-                ));
-            }
-            let a_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    a.as_ptr() as *const u8,
-                    a.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let src1_buffer = self.pool_take_filled(a_bytes)?;
-            let outputs = self.with_batch(|this| {
-                let mut outputs = Vec::with_capacity(matrices.len());
-                for matrix in matrices {
-                    let src0_id = this.get_or_create_named_weight_buffer(
-                        matrix.namespace,
-                        matrix.cache_key,
-                        || load(matrix.namespace, matrix.cache_key),
-                    )?;
-                    let dst = this.matmul_nt_ggml_from_resident_src(
-                        src0_id,
-                        src1_buffer.as_id(),
-                        matrix.bt_ggml_type,
-                        m,
-                        k,
-                        matrix.n,
-                    )?;
-                    outputs.push((dst, matrix.n));
-                }
-                Ok(outputs)
-            })?;
-            self.wait_queue_idle()?;
-            let mut result = Vec::with_capacity(outputs.len());
-            for (buffer, n_out) in outputs {
-                result.push(self.copy_f32_buffer_contents_readable(buffer.as_id(), m * n_out)?);
-                self.pool_give(buffer);
-            }
-            self.pool_give(src1_buffer);
-            self.pool_recycle();
-            Ok(result)
-        }
-
-        fn act_buf(&mut self, name: &str, elems: usize) -> Result<ObjcId, String> {
-            let bytes = elems
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "act buffer overflow".to_string())?;
-            if let Some((buf, cap)) = self.act_buffers.get(name) {
-                if *cap >= bytes {
-                    return Ok(buf.as_id());
+            let (dst, mr, nr) = legacy
+                .matmul_nt_ggml_bytes_impl(&a, f32_slice_as_bytes(&bt), GGML_TYPE_F32, m, k, n, None)
+                .expect("legacy matmul");
+            let expected = legacy.read_f32_buffer(dst.as_id(), mr * nr).unwrap();
+            for (layout, actual) in [
+                ("NT", super::try_matmul_nt_f32(&a, &bt, m, k, n)),
+                ("NN", super::try_matmul_nn_f32(&a, &b, m, k, n)),
+            ] {
+                let actual = actual.expect("tensor matmul");
+                assert_eq!(actual.len(), expected.len(), "{layout} {kernel} shape");
+                for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(actual.to_bits(), expected.to_bits(),
+                        "{layout} {kernel} m={m} k={k} n={n} index={i}: actual={actual} expected={expected} abs_diff={}",
+                        (actual - expected).abs());
                 }
             }
-            let buf = self.new_buffer_with_length(bytes.max(4))?;
-            let id = buf.as_id();
-            self.act_buffers.insert(name.to_string(), (buf, bytes));
-            Ok(id)
         }
-
-        fn act_write(&mut self, name: &str, data: &[f32]) -> Result<ObjcId, String> {
-            let id = self.act_buf(name, data.len())?;
-            let ptr: *mut c_void = unsafe { msg_send![id, contents] };
-            if ptr.is_null() {
-                return Err(format!("act {name} contents null"));
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut f32, data.len());
-            }
-            Ok(id)
+        assert!(super::try_matmul_nt_f32(&[1.0; 6], &[1.0; 5], 2, 3, 2).is_none());
+        assert!(super::try_matmul_nn_f32(&[1.0; 6], &[1.0; 5], 2, 3, 2).is_none());
+        assert!(super::try_matmul_nt_f32(&[1.0; 5], &[1.0; 6], 2, 3, 2).is_none());
+        assert!(super::try_matmul_nn_f32(&[1.0; 5], &[1.0; 6], 2, 3, 2).is_none());
+        // An empty product declines the device, as the legacy path did (no zero-byte buffers).
+        for (m, k, n) in [(0, 7, 3), (3, 0, 5), (3, 7, 0)] {
+            let a = vec![1.0; m * k];
+            let b = vec![1.0; k * n];
+            assert!(super::try_matmul_nt_f32(&a, &b, m, k, n).is_none(), "NT m={m} k={k} n={n}");
+            assert!(super::try_matmul_nn_f32(&a, &b, m, k, n).is_none(), "NN m={m} k={k} n={n}");
         }
+    }
 
-        fn act_read(&self, name: &str, elems: usize) -> Result<Vec<f32>, String> {
-            let (buf, cap) = self
-                .act_buffers
-                .get(name)
-                .ok_or_else(|| format!("act {name} missing"))?;
-            let need = elems
-                .checked_mul(std::mem::size_of::<f32>())
-                .ok_or_else(|| "act read overflow".to_string())?;
-            if need > *cap {
-                return Err(format!("act {name} read {need} > cap {cap}"));
-            }
-            self.copy_f32_buffer_contents_readable(buf.as_id(), elems)
+    #[test]
+    fn host_elementwise_wrappers_preserve_kernel_bits() {
+        fn bits(values: &[f32]) -> Vec<u32> {
+            values.iter().map(|value| value.to_bits()).collect()
         }
-
-        fn act_norm_gamma(&mut self, key: &str, gamma: &[f32]) -> Result<ObjcId, String> {
+        fn legacy_buffer(ctx: &MetalContext, values: &[f32]) -> StrongId {
             let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    gamma.as_ptr() as *const u8,
-                    gamma.len() * std::mem::size_of::<f32>(),
-                )
+                std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4)
             };
-            self.get_or_create_named_weight_buffer("music3-act-norm", key, || Ok(bytes.to_vec()))
+            ctx.new_buffer_with_bytes(bytes).expect("legacy upload")
         }
 
-        fn act_rms_norm_mul(
-            &mut self,
-            src: ObjcId,
-            dst: ObjcId,
-            gamma: ObjcId,
-            rows: usize,
-            width: usize,
-            eps: f32,
-        ) -> Result<(), String> {
-            let x_s = shape4_from_row_major(&[rows, width], 4)?;
-            let m_s = shape4_from_row_major(&[width], 4)?;
-            self.dispatch_rms_norm_f32(src, gamma, src, dst, &x_s, &m_s, &x_s, eps, 2)
-        }
-
-        fn act_add_inplace(
-            &mut self,
-            a: ObjcId,
-            b: ObjcId,
-            dst: ObjcId,
-            elems: usize,
-        ) -> Result<(), String> {
-            let s = shape4_from_row_major(&[elems], 4)?;
-            self.dispatch_bin_f32(0, a, b, dst, &s, &s)
-        }
-
-        fn act_silu(&mut self, src: ObjcId, dst: ObjcId, elems: usize) -> Result<(), String> {
-            let s = shape4_from_row_major(&[elems], 4)?;
-            self.dispatch_unary_f32(OP_UNARY_NUM_SILU, src, dst, &s)
-        }
-
-        fn act_mul(&mut self, a: ObjcId, b: ObjcId, dst: ObjcId, elems: usize) -> Result<(), String> {
-            let s = shape4_from_row_major(&[elems], 4)?;
-            self.dispatch_bin_f32(2, a, b, dst, &s, &s)
-        }
-
-        fn act_linear_keyed<F>(
-            &mut self,
-            src1: ObjcId,
-            dst_name: &str,
-            bt_ggml_type: u32,
-            m: usize,
-            k: usize,
-            n: usize,
-            namespace: &str,
-            cache_key: &str,
-            load: F,
-        ) -> Result<ObjcId, String>
-        where
-            F: FnOnce() -> Result<Vec<u8>, String>,
-        {
-            let src0 = self.get_or_create_named_weight_buffer(namespace, cache_key, load)?;
-            let elems = m
-                .checked_mul(n)
-                .ok_or_else(|| "act linear overflow".to_string())?;
-            let dst = self.act_buf(dst_name, elems)?;
-            self.matmul_nt_ggml_resident_into(src0, src1, dst, bt_ggml_type, m, k, n)?;
-            Ok(dst)
-        }
-
-        fn ar_pre_attn<F>(
-            &mut self,
-            hidden: Option<&[f32]>,
-            m: usize,
-            hidden_w: usize,
-            head_dim: usize,
-            in_norm: &[f32],
-            qk_norm: Option<(&[f32], &[f32], &str, &str)>,
-            in_norm_key: &str,
-            eps: f32,
-            q: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            k: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            v: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            mut load: F,
-        ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String>
-        where
-            F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
-        {
-            let h_elems = m * hidden_w;
-            if let Some(h) = hidden {
-                if h.len() != h_elems {
-                    return Err("ar hidden len".to_string());
+        let _pool = AutoreleasePool::new();
+        let mut legacy = MetalContext::new().expect("a working Metal backend is required");
+        // Ranks 1-4, independent affine broadcasting, odd scalar rows and a
+        // vector row. The reference uses the old upload/dispatch/read sequence.
+        for dims in [vec![5], vec![3, 5], vec![3, 3, 5], vec![3, 3, 3, 5], vec![3, 8]] {
+            let shape = shape4_from_row_major(&dims, 4).unwrap();
+            let width = *dims.last().unwrap();
+            let mut mul_dims = dims.clone();
+            if mul_dims.len() > 1 { mul_dims[0] = 1; }
+            let mut add_dims = dims.clone();
+            if add_dims.len() > 2 { add_dims[1] = 1; }
+            let ms = shape4_from_row_major(&mul_dims, 4).unwrap();
+            let ads = shape4_from_row_major(&add_dims, 4).unwrap();
+            let x: Vec<f32> = (0..shape.numel).map(|i| (i as i32 % 13 - 6) as f32 * 0.125).collect();
+            let mul: Vec<f32> = (0..ms.numel).map(|i| 0.5 + (i % 7) as f32 * 0.25).collect();
+            let add: Vec<f32> = (0..ads.numel).map(|i| (i as i32 % 5 - 2) as f32 * 0.25).collect();
+            let xb = legacy_buffer(&legacy, &x);
+            let mb = legacy_buffer(&legacy, &mul);
+            let ab = legacy_buffer(&legacy, &add);
+            let dst = legacy.new_buffer_with_length(x.len() * 4).unwrap();
+            let eps = 1e-5;
+            for op in 0..7 {
+                let actual = match op {
+                    0 | 1 => {
+                        legacy.dispatch_bin_f32(if op == 0 { 0 } else { 2 }, xb.as_id(), mb.as_id(), dst.as_id(), &shape, &ms).unwrap();
+                        if op == 0 { try_add_f32(&x, &dims, &mul, &mul_dims) }
+                        else { try_mul_f32(&x, &dims, &mul, &mul_dims) }
+                    }
+                    2 => {
+                        legacy.dispatch_unary_f32(OP_UNARY_NUM_GELU, xb.as_id(), dst.as_id(), &shape).unwrap();
+                        try_gelu_f32(&x, &dims)
+                    }
+                    3 => {
+                        legacy.dispatch_norm_f32(xb.as_id(), xb.as_id(), xb.as_id(), dst.as_id(), &shape, &shape, &shape, eps, 1).unwrap();
+                        try_layer_norm_f32(&x, &dims, eps)
+                    }
+                    4 => {
+                        legacy.dispatch_rms_norm_f32_offsets(xb.as_id(), xb.as_id(), xb.as_id(), dst.as_id(), &shape, &shape, &shape, eps, 1, [0; 4]).unwrap();
+                        try_rms_norm_f32(&x, &dims, eps)
+                    }
+                    5 => {
+                        legacy.dispatch_rms_norm_f32_offsets(xb.as_id(), mb.as_id(), xb.as_id(), dst.as_id(), &shape, &ms, &shape, eps, 2, [0; 4]).unwrap();
+                        try_rms_norm_mul_f32(&x, &dims, &mul, &mul_dims, eps)
+                    }
+                    _ => {
+                        legacy.dispatch_norm_f32(xb.as_id(), mb.as_id(), ab.as_id(), dst.as_id(), &shape, &ms, &ads, eps, 3).unwrap();
+                        try_layer_norm_mul_add_f32(&x, &dims, &mul, &mul_dims, &add, &add_dims, eps)
+                    }
+                }.expect("host wrapper must run the device operation");
+                let expected = legacy.read_f32_buffer(dst.as_id(), x.len()).unwrap();
+                assert_eq!(bits(&actual), bits(&expected), "wrapper op {op}, shape {dims:?}");
+                if op <= 1 {
+                    let host: Vec<f32> = x.iter().enumerate().map(|(i, value)| {
+                        if op == 0 { value + mul[i % mul.len()] } else { value * mul[i % mul.len()] }
+                    }).collect();
+                    assert_eq!(bits(&actual), bits(&host), "binary host reference op {op}, shape {dims:?}");
                 }
-                self.act_write("h", h)?;
-            }
-            let q_elems = m * q.n;
-            let k_elems = m * k.n;
-            let v_elems = m * v.n;
-            self.with_batch(|this| {
-                let h = this.act_buf("h", h_elems)?;
-                let n1 = this.act_buf("n1", h_elems)?;
-                let gamma = this.act_norm_gamma(in_norm_key, in_norm)?;
-                this.act_rms_norm_mul(h, n1, gamma, m, hidden_w, eps)?;
-                this.act_linear_keyed(
-                    n1,
-                    "q",
-                    q.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    q.n,
-                    q.namespace,
-                    q.cache_key,
-                    || load(q.namespace, q.cache_key),
-                )?;
-                this.act_linear_keyed(
-                    n1,
-                    "k",
-                    k.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    k.n,
-                    k.namespace,
-                    k.cache_key,
-                    || load(k.namespace, k.cache_key),
-                )?;
-                this.act_linear_keyed(
-                    n1,
-                    "v",
-                    v.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    v.n,
-                    v.namespace,
-                    v.cache_key,
-                    || load(v.namespace, v.cache_key),
-                )?;
-                if let Some((q_norm, k_norm, q_norm_key, k_norm_key)) = qk_norm {
-                    let q_id = this.act_buf("q", q_elems)?;
-                    let k_id = this.act_buf("k", k_elems)?;
-                    let qn = this.act_buf("qn", q_elems)?;
-                    let kn = this.act_buf("kn", k_elems)?;
-                    let qg = this.act_norm_gamma(q_norm_key, q_norm)?;
-                    let kg = this.act_norm_gamma(k_norm_key, k_norm)?;
-                    this.act_rms_norm_mul(q_id, qn, qg, q_elems / head_dim, head_dim, eps)?;
-                    this.act_rms_norm_mul(k_id, kn, kg, k_elems / head_dim, head_dim, eps)?;
+
+                if width == 5 && dims.len() == 4 {
+                    // The host APIs have no offset. Exercise the tensor entries
+                    // with a 4-byte prefix, preserving the scalar kernel choice.
+                    let padded = |values: &[f32]| {
+                        let mut values = values.to_vec();
+                        values.insert(0, -123.0);
+                        let ps = shape4_from_row_major(&[values.len()], 4).unwrap();
+                        tensor_upload_f32(&values, &ps).unwrap()
+                    };
+                    let tx = padded(&x);
+                    let tm = padded(&mul);
+                    let ta = padded(&add);
+                    let offset_result = tensor_host_result(&shape, |out| match op {
+                        0 | 1 => tensor_binary(&tx, 4, &shape, &tm, 4, &ms, out, op == 1),
+                        2 => tensor_unary(&tx, 4, &shape, out, OP_UNARY_NUM_GELU),
+                        3 => tensor_norm(&tx, 4, &shape, &tx, 4, &shape, &tx, 4, &shape, out, eps, 1),
+                        4 => tensor_rms_norm(&tx, 4, &shape, &tx, 4, &shape, &tx, 4, &shape, out, eps, 1),
+                        5 => tensor_rms_norm(&tx, 4, &shape, &tm, 4, &ms, &tx, 4, &shape, out, eps, 2),
+                        _ => tensor_norm(&tx, 4, &shape, &tm, 4, &ms, &ta, 4, &ads, out, eps, 3),
+                    }).unwrap();
+                    assert_eq!(bits(&offset_result), bits(&expected), "unaligned tensor op {op}");
                 }
-                Ok(())
-            })?;
-            self.wait_queue_idle()?;
-            let (q_src, k_src) = if qk_norm.is_some() {
-                ("qn", "kn")
-            } else {
-                ("q", "k")
-            };
-            let qv = self.act_read(q_src, q_elems)?;
-            let kv = self.act_read(k_src, k_elems)?;
-            let vv = self.act_read("v", v_elems)?;
-            Ok((qv, kv, vv))
+            }
+        }
+        assert!(try_silu_f32(&[0.25, -0.5, 1.0]).is_none(), "macOS SiLU shim stays unsupported");
+        assert!(try_add_f32(&[1.0; 15], &[3, 5], &[1.0; 3], &[3]).is_none(), "binary rejects incompatible broadcast");
+        assert!(try_gelu_f32(&[1.0; 5], &[3, 5]).is_none(), "unary rejects wrong length");
+        assert!(try_rms_norm_mul_f32(&[1.0; 15], &[3, 5], &[1.0; 3], &[3], 1e-5).is_none(), "RMS rejects wrong affine width");
+        assert!(try_layer_norm_mul_add_f32(&[1.0; 15], &[3, 5], &[1.0; 10], &[2, 5], &[0.0; 5], &[5], 1e-5).is_none(), "norm rejects incompatible affine broadcast");
+    }
+
+    #[test]
+    fn host_get_rows_matches_cpu_bits() {
+        use makepad_ai_loader::quant::{
+            f32_to_f16, get_rows_ggml_bytes_cpu, quantize_f32_to_q8_0,
+        };
+
+        fn bits(values: &[f32]) -> Vec<u32> {
+            values.iter().map(|value| value.to_bits()).collect()
         }
 
-        fn ar_post_attn<F>(
-            &mut self,
-            attn: &[f32],
-            m: usize,
-            hidden_w: usize,
-            post_norm: &[f32],
-            post_norm_key: &str,
-            eps: f32,
-            o: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            up: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            gate: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            down: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            mut load: F,
-        ) -> Result<(), String>
-        where
-            F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
-        {
-            let h_elems = m * hidden_w;
-            let ff_elems = m * up.n;
-            if attn.len() != h_elems {
-                return Err("ar attn len".to_string());
-            }
-            self.act_write("attn", attn)?;
-            self.with_batch(|this| {
-                let attn_id = this.act_buf("attn", h_elems)?;
-                this.act_linear_keyed(
-                    attn_id,
-                    "o",
-                    o.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    o.n,
-                    o.namespace,
-                    o.cache_key,
-                    || load(o.namespace, o.cache_key),
-                )?;
-                let h = this.act_buf("h", h_elems)?;
-                let o_id = this.act_buf("o", h_elems)?;
-                let h2 = this.act_buf("h2", h_elems)?;
-                this.act_add_inplace(h, o_id, h2, h_elems)?;
-                let n2 = this.act_buf("n2", h_elems)?;
-                let pg = this.act_norm_gamma(post_norm_key, post_norm)?;
-                this.act_rms_norm_mul(h2, n2, pg, m, hidden_w, eps)?;
-                this.act_linear_keyed(
-                    n2,
-                    "up",
-                    up.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    up.n,
-                    up.namespace,
-                    up.cache_key,
-                    || load(up.namespace, up.cache_key),
-                )?;
-                this.act_linear_keyed(
-                    n2,
-                    "gate",
-                    gate.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    gate.n,
-                    gate.namespace,
-                    gate.cache_key,
-                    || load(gate.namespace, gate.cache_key),
-                )?;
-                let up_id = this.act_buf("up", ff_elems)?;
-                let gate_id = this.act_buf("gate", ff_elems)?;
-                let gs = this.act_buf("gs", ff_elems)?;
-                let ff = this.act_buf("ff", ff_elems)?;
-                this.act_silu(gate_id, gs, ff_elems)?;
-                this.act_mul(up_id, gs, ff, ff_elems)?;
-                this.act_linear_keyed(
-                    ff,
-                    "down",
-                    down.bt_ggml_type,
-                    m,
-                    up.n,
-                    down.n,
-                    down.namespace,
-                    down.cache_key,
-                    || load(down.namespace, down.cache_key),
-                )?;
-                let down_id = this.act_buf("down", h_elems)?;
-                let h3 = this.act_buf("h", h_elems)?;
-                this.act_add_inplace(h2, down_id, h3, h_elems)?;
-                Ok(())
-            })?;
-            Ok(())
-        }
-
-        fn ar_final_rms(
-            &mut self,
-            m: usize,
-            hidden_w: usize,
-            gamma: &[f32],
-            gamma_key: &str,
-            eps: f32,
-        ) -> Result<Vec<f32>, String> {
-            let h_elems = m * hidden_w;
-            self.with_batch(|this| {
-                let h = this.act_buf("h", h_elems)?;
-                let out = this.act_buf("hout", h_elems)?;
-                let g = this.act_norm_gamma(gamma_key, gamma)?;
-                this.act_rms_norm_mul(h, out, g, m, hidden_w, eps)?;
-                Ok(())
-            })?;
-            self.wait_queue_idle()?;
-            self.act_read("hout", h_elems)
-        }
-
-        fn ar_clear_acts(&mut self) {
-            self.act_buffers.clear();
-            self.pool_clear();
-        }
-
-        fn dit_ffn_resident<F>(
-            &mut self,
-            normed: &[f32],
-            m: usize,
-            hidden_w: usize,
-            ff_dim: usize,
-            ff_in_b: &[f32],
-            ff_out_b: &[f32],
-            ff_in_b_key: &str,
-            ff_out_b_key: &str,
-            swap: bool,
-            ff_in: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            ff_out: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
-            mut load: F,
-        ) -> Result<Vec<f32>, String>
-        where
-            F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
-        {
-            if normed.len() != m * hidden_w {
-                return Err("dit ffn normed len".to_string());
-            }
-            if ff_in.n != ff_dim * 2 || ff_out.n != hidden_w {
-                return Err("dit ffn weight n".to_string());
-            }
-            self.act_write("dn", normed)?;
-            self.with_batch(|this| {
-                let dn = this.act_buf("dn", m * hidden_w)?;
-                this.act_linear_keyed(
-                    dn,
-                    "ffin",
-                    ff_in.bt_ggml_type,
-                    m,
-                    hidden_w,
-                    ff_in.n,
-                    ff_in.namespace,
-                    ff_in.cache_key,
-                    || load(ff_in.namespace, ff_in.cache_key),
-                )?;
-                let ffin = this.act_buf("ffin", m * ff_in.n)?;
-                let in_b = this.act_norm_gamma(ff_in_b_key, ff_in_b)?;
-                let ffinb = this.act_buf("ffinb", m * ff_in.n)?;
-                let x_s = shape4_from_row_major(&[m, ff_in.n], 4)?;
-                let b_s = shape4_from_row_major(&[ff_in.n], 4)?;
-                this.dispatch_bin_f32(0, ffin, in_b, ffinb, &x_s, &b_s)?;
-                let gated = this.act_buf("gated", m * ff_dim)?;
-                this.dispatch_swiglu_packed(ffinb, gated, m, ff_dim, swap)?;
-                this.act_linear_keyed(
-                    gated,
-                    "ffout",
-                    ff_out.bt_ggml_type,
-                    m,
-                    ff_dim,
-                    ff_out.n,
-                    ff_out.namespace,
-                    ff_out.cache_key,
-                    || load(ff_out.namespace, ff_out.cache_key),
-                )?;
-                let ffout = this.act_buf("ffout", m * hidden_w)?;
-                let out_b = this.act_norm_gamma(ff_out_b_key, ff_out_b)?;
-                let y = this.act_buf("ffy", m * hidden_w)?;
-                let y_s = shape4_from_row_major(&[m, hidden_w], 4)?;
-                let ob_s = shape4_from_row_major(&[hidden_w], 4)?;
-                this.dispatch_bin_f32(0, ffout, out_b, y, &y_s, &ob_s)?;
-                Ok(())
-            })?;
-            self.wait_queue_idle()?;
-            self.act_read("ffy", m * hidden_w)
-        }
-
-        fn matmul_nt_ggml_bytes_multi(
-            &mut self,
-            a: &[f32],
-            m: usize,
-            k: usize,
-            matrices: &[super::MatmulNtGgmlBytesMatrix<'_>],
-        ) -> Result<Vec<Vec<f32>>, String> {
-            if matrices.is_empty() {
-                return Ok(Vec::new());
-            }
-            let mk = m
-                .checked_mul(k)
-                .ok_or_else(|| "matmul overflow computing m*k".to_string())?;
-            if a.len() != mk {
-                return Err(format!(
-                    "lhs len mismatch: got {}, expected {}",
-                    a.len(),
-                    mk
-                ));
-            }
-
-            let a_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    a.as_ptr() as *const u8,
-                    a.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let src1_buffer = self.new_buffer_with_bytes(a_bytes)?;
-            let outputs = self.with_batch(|this| {
-                let mut outputs = Vec::with_capacity(matrices.len());
-                for (index, matrix) in matrices.iter().enumerate() {
-                    let tag = matmul_batch_tag(matrix.bt_ggml_type, index)?;
-                    let dst = this.matmul_nt_ggml_from_src1_buffer(
-                        src1_buffer.as_id(),
-                        matrix.bt_bytes,
-                        matrix.bt_ggml_type,
-                        m,
-                        k,
-                        matrix.n,
-                        Some(tag),
-                    )?;
-                    outputs.push((dst, matrix.n));
+        let indices = [2i32, 0, 2, 1];
+        let n_rows = 3;
+        for (ty, n_cols) in [
+            (GGML_TYPE_F32, 5),
+            (GGML_TYPE_F16, 5),
+            (GGML_TYPE_BF16, 5),
+            (GGML_TYPE_Q8_0, 32),
+            (GGML_TYPE_Q8_0, 64),
+            (GGML_TYPE_Q4_0, 32),
+            (GGML_TYPE_Q4_0, 64),
+        ] {
+            let values: Vec<f32> = (0..n_rows * n_cols)
+                .map(|i| (i as i32 % 29 - 14) as f32 * 0.125)
+                .collect();
+            let src: Vec<u8> = match ty {
+                GGML_TYPE_F32 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                GGML_TYPE_F16 => values.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes()).collect(),
+                GGML_TYPE_BF16 => values.iter()
+                    .flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect(),
+                GGML_TYPE_Q8_0 => quantize_f32_to_q8_0(&values),
+                GGML_TYPE_Q4_0 => {
+                    // No Q4_0 quantizer in the loader. Use deterministic blocks
+                    // with distinct scales and both positive and negative nibbles.
+                    let mut bytes = Vec::new();
+                    for block in 0..n_rows * n_cols / 32 {
+                        bytes.extend_from_slice(&f32_to_f16((block + 1) as f32 * 0.125).to_le_bytes());
+                        bytes.extend((0..16).map(|i| ((i + block * 3) % 16) as u8 | (((15 - i + block * 5) % 16) as u8) << 4));
+                    }
+                    bytes
                 }
-                Ok(outputs)
-            })?;
-            self.wait_queue_idle()?;
-            let mut result = Vec::with_capacity(outputs.len());
-            for (buffer, n_out) in outputs {
-                result.push(self.copy_f32_buffer_contents_readable(buffer.as_id(), m * n_out)?);
-            }
-            Ok(result)
-        }
-
-        fn vision_mlp_bf16_fused(
-            &mut self,
-            x: &[f32],
-            gate_up_weight_bytes: &[u8],
-            down_weight_bytes: &[u8],
-            rows: usize,
-            hidden_size: usize,
-            intermediate_size: usize,
-        ) -> Result<Vec<f32>, String> {
-            let expected_x = rows
-                .checked_mul(hidden_size)
-                .ok_or_else(|| "overflow computing fused vision mlp input size".to_string())?;
-            if x.len() != expected_x {
-                return Err(format!(
-                    "fused vision mlp input len mismatch: got {}, expected {}",
-                    x.len(),
-                    expected_x
-                ));
-            }
-            let expected_gate_up_bytes = (intermediate_size * 2)
-                .checked_mul(hidden_size)
-                .and_then(|elems| elems.checked_mul(std::mem::size_of::<u16>()))
-                .ok_or_else(|| "overflow computing fused vision mlp gate_up bytes".to_string())?;
-            if gate_up_weight_bytes.len() != expected_gate_up_bytes {
-                return Err(format!(
-                    "fused vision mlp gate_up len mismatch: got {}, expected {}",
-                    gate_up_weight_bytes.len(),
-                    expected_gate_up_bytes
-                ));
-            }
-            let expected_down_bytes = hidden_size
-                .checked_mul(intermediate_size)
-                .and_then(|elems| elems.checked_mul(std::mem::size_of::<u16>()))
-                .ok_or_else(|| "overflow computing fused vision mlp down bytes".to_string())?;
-            if down_weight_bytes.len() != expected_down_bytes {
-                return Err(format!(
-                    "fused vision mlp down len mismatch: got {}, expected {}",
-                    down_weight_bytes.len(),
-                    expected_down_bytes
-                ));
-            }
-
-            let x_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    x.as_ptr() as *const u8,
-                    x.len() * std::mem::size_of::<f32>(),
-                )
+                _ => unreachable!(),
             };
-            let src1_buffer = self.new_buffer_with_bytes(x_bytes)?;
-            let geglu_bytes = rows
-                .checked_mul(intermediate_size)
-                .and_then(|elems| elems.checked_mul(std::mem::size_of::<f32>()))
-                .ok_or_else(|| "overflow computing fused vision mlp geglu bytes".to_string())?;
+            let expected = get_rows_ggml_bytes_cpu(&src, ty, n_cols, n_rows, &indices)
+                .expect("CPU get-rows reference");
+            let actual = try_get_rows_ggml_bytes(&src, ty, n_cols, n_rows, &indices)
+                .expect("host wrapper must run Metal get-rows");
+            assert_eq!(bits(&actual), bits(&expected), "get-rows wrapper type {ty}, columns {n_cols}");
 
-            let down_buffer = self.with_batch(|this| {
-                let gate_up_buffer = this.matmul_nt_ggml_from_src1_buffer(
-                    src1_buffer.as_id(),
-                    gate_up_weight_bytes,
-                    GGML_TYPE_BF16,
-                    rows,
-                    hidden_size,
-                    intermediate_size * 2,
-                    Some(31u8),
-                )?;
-                let geglu_buffer = this.get_or_create_matmul_out_buffer(32u8, geglu_bytes)?;
-                this.dispatch_geglu_strided_rows_f32(
-                    gate_up_buffer.as_id(),
-                    geglu_buffer,
-                    rows,
-                    intermediate_size,
-                    intermediate_size * 2,
-                    intermediate_size,
-                )?;
-                this.matmul_nt_ggml_from_src1_buffer(
-                    geglu_buffer,
-                    down_weight_bytes,
-                    GGML_TYPE_BF16,
-                    rows,
-                    intermediate_size,
-                    hidden_size,
-                    Some(33u8),
-                )
-            })?;
-            self.read_f32_buffer(down_buffer.as_id(), rows * hidden_size)
+            let mut padded_src = vec![0xa5; 4];
+            padded_src.extend_from_slice(&src);
+            let mut padded_rows = (-1i32).to_le_bytes().to_vec();
+            padded_rows.extend(indices.iter().flat_map(|row| row.to_le_bytes()));
+            let src_buffer = tensor_upload_bytes(&padded_src).unwrap();
+            let rows_buffer = tensor_upload_bytes(&padded_rows).unwrap();
+            let shape = shape4_from_row_major(&[indices.len(), n_cols], 4).unwrap();
+            let offset_result = tensor_host_result(&shape, |out| {
+                tensor_get_rows(&src_buffer, 4, ty, n_cols, n_rows,
+                    &rows_buffer, 4, indices.len(), out)
+            }).unwrap();
+            assert_eq!(bits(&offset_result), bits(&expected), "get-rows offsets type {ty}, columns {n_cols}");
+            assert!(try_get_rows_ggml_bytes(&src, ty, n_cols, n_rows, &[3]).is_none(), "get-rows rejects upper row bound for type {ty}");
+            assert!(try_get_rows_ggml_bytes(&src, ty, n_cols, n_rows, &[-1]).is_none(), "get-rows rejects negative row for type {ty}");
+            assert!(try_get_rows_ggml_bytes(&src[..src.len() - 1], ty, n_cols, n_rows, &indices).is_none(), "get-rows rejects wrong source length for type {ty}");
+            assert_eq!(try_get_rows_ggml_bytes(&src, ty, n_cols, n_rows, &[]), Some(Vec::new()), "get-rows accepts empty indices for type {ty}");
         }
-
-        fn matmul_nt_ggml_bytes_add_bias(
-            &mut self,
-            a: &[f32],
-            bt_bytes: &[u8],
-            bt_ggml_type: u32,
-            m: usize,
-            k: usize,
-            n: usize,
-            bias: &[f32],
-        ) -> Result<Vec<f32>, String> {
-            if bias.len() != n {
-                return Err(format!(
-                    "bias len mismatch for matmul+add: got {}, expected {}",
-                    bias.len(),
-                    n
-                ));
-            }
-
-            let tag = match bt_ggml_type {
-                GGML_TYPE_F32 => 2u8,
-                GGML_TYPE_F16 => 3u8,
-                GGML_TYPE_BF16 => 9u8,
-                GGML_TYPE_Q4_0 => 4u8,
-                GGML_TYPE_Q4_1 => 5u8,
-                GGML_TYPE_Q5_0 => 6u8,
-                GGML_TYPE_Q5_1 => 7u8,
-                GGML_TYPE_Q8_0 => 8u8,
-                GGML_TYPE_Q2_K => 10u8,
-                GGML_TYPE_Q3_K => 11u8,
-                GGML_TYPE_Q4_K => 12u8,
-                GGML_TYPE_Q5_K => 13u8,
-                GGML_TYPE_Q6_K => 14u8,
-                _ => 0u8,
-            };
-
-            let (dst, mr, nr) =
-                self.matmul_nt_ggml_bytes_impl(a, bt_bytes, bt_ggml_type, m, k, n, Some(tag))?;
-
-            let bias_shape = shape4_from_row_major(&[n], 4)?;
-            let dst_shape = shape4_from_row_major(&[m, n], 4)?;
-            let bias_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    bias.as_ptr() as *const u8,
-                    bias.len() * std::mem::size_of::<f32>(),
-                )
-            };
-            let bias_buf = self.new_buffer_with_bytes(bias_bytes)?;
-            self.dispatch_bin_f32(
-                0,
-                dst.as_id(),
-                bias_buf.as_id(),
-                dst.as_id(),
-                &dst_shape,
-                &bias_shape,
-            )?;
-
-            self.read_f32_buffer(dst.as_id(), mr * nr)
-        }
+        assert_eq!(try_get_rows_ggml_bytes(&[], u32::MAX, 0, 0, &[]), Some(Vec::new()), "empty indices return before validation");
+        assert!(try_get_rows_ggml_bytes(&[0; 4], u32::MAX, 1, 1, &[0]).is_none(), "get-rows rejects unsupported types");
+        assert!(try_get_rows_ggml_bytes(&[0; 34], GGML_TYPE_Q8_0, 31, 1, &[0]).is_none(), "get-rows rejects incomplete quantized blocks");
     }
 
     fn with_context<T>(f: impl FnOnce(&mut MetalContext) -> Result<T, String>) -> Option<T> {
@@ -9321,7 +8296,89 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.matmul_nn_f32(a, b, m, k, n))
+        if a.len() != m.checked_mul(k)? || b.len() != k.checked_mul(n)? {
+            return None;
+        }
+        let mut bt = vec![0.0f32; n * k];
+        for i in 0..k {
+            for j in 0..n {
+                bt[j * k + i] = b[i * n + j];
+            }
+        }
+        try_matmul_nt_f32(a, &bt, m, k, n)
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight(
+        a: &[f32], w: &F32Weight, m: usize, k: usize, n: usize,
+    ) -> Option<Vec<f32>> {
+        if a.len() != m.checked_mul(k)? || w.len() != n.checked_mul(k)?
+            || m == 0 || k == 0 || n == 0 {
+            return None;
+        }
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(&[m, k], 4)?;
+            let out_shape = shape4_from_row_major(&[m, n], 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let weight = tensor_f32_weight(w)?;
+            tensor_host_result(&out_shape, |out| {
+                tensor_matmul(&a, 0, &weight, 0, out, m, k, n, GGML_TYPE_F32)
+            })
+        })
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight_left(
+        w: &F32Weight, bt: &[f32], m: usize, k: usize, n: usize,
+    ) -> Option<Vec<f32>> {
+        if w.len() != m.checked_mul(k)? || bt.len() != n.checked_mul(k)?
+            || m == 0 || k == 0 || n == 0 {
+            return None;
+        }
+        tensor_try(|| {
+            let bt_shape = shape4_from_row_major(&[n, k], 4)?;
+            let out_shape = shape4_from_row_major(&[m, n], 4)?;
+            let weight = tensor_f32_weight(w)?;
+            let bt = tensor_upload_f32(bt, &bt_shape)?;
+            tensor_host_result(&out_shape, |out| {
+                tensor_matmul(&weight, 0, &bt, 0, out, m, k, n, GGML_TYPE_F32)
+            })
+        })
+    }
+
+    pub(super) fn try_matmul_nt_f32_weight_multi(
+        a: &[f32],
+        m: usize,
+        k: usize,
+        weights: &[&F32Weight],
+    ) -> Option<Vec<Vec<f32>>> {
+        if weights.is_empty() {
+            return Some(Vec::new());
+        }
+        if a.len() != m.checked_mul(k)?
+            || m == 0
+            || k == 0
+            || weights.iter().any(|w| w.len() % k != 0 || w.len() / k == 0)
+        {
+            return None;
+        }
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(&[m, k], 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let mut outputs = Vec::with_capacity(weights.len());
+            let mut last_batch = 0;
+            for w in weights {
+                let n = w.len() / k;
+                let weight = tensor_f32_weight(w)?;
+                let shape = shape4_from_row_major(&[m, n], 4)?;
+                let bytes = shape.numel.checked_mul(4).ok_or("metal output extent overflow")?;
+                let out = tensor_buffer(bytes, false)?;
+                last_batch = tensor_matmul(&a, 0, &weight, 0, &out, m, k, n, GGML_TYPE_F32)?;
+                outputs.push((out, shape.numel));
+            }
+            tensor_flush_until(last_batch)?;
+            outputs.into_iter().map(|(out, numel)| {
+                Ok(unsafe { std::slice::from_raw_parts(out.contents()?, numel) }.to_vec())
+            }).collect()
+        })
     }
 
     pub(super) fn try_matmul_nt_f32(
@@ -9331,27 +8388,26 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.matmul_nt_f32(a, bt, m, k, n))
-    }
-
-    pub(super) fn try_matmul_nt_f32_bytes(
-        a: &[f32],
-        bt_bytes: &[u8],
-        m: usize,
-        k: usize,
-        n: usize,
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.matmul_nt_f32_bytes(a, bt_bytes, m, k, n))
-    }
-
-    pub(super) fn try_matmul_nt_f16_bytes(
-        a: &[f32],
-        bt_f16_bytes: &[u8],
-        m: usize,
-        k: usize,
-        n: usize,
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.matmul_nt_f16_bytes(a, bt_f16_bytes, m, k, n))
+        if a.len() != m.checked_mul(k)? {
+            return None;
+        }
+        // Legacy Metal allocations reject zero-byte input or output buffers.
+        if m == 0 || k == 0 || n == 0 {
+            return None;
+        }
+        if bt.len() != n.checked_mul(k)? {
+            return None;
+        }
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(&[m, k], 4)?;
+            let bt_shape = shape4_from_row_major(&[n, k], 4)?;
+            let out_shape = shape4_from_row_major(&[m, n], 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let bt = tensor_upload_f32(bt, &bt_shape)?;
+            tensor_host_result(&out_shape, |out| {
+                tensor_matmul(&a, 0, &bt, 0, out, m, k, n, GGML_TYPE_F32)
+            })
+        })
     }
 
     pub(super) fn try_matmul_nt_ggml_bytes(
@@ -9362,37 +8418,50 @@ mod imp {
         k: usize,
         n: usize,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.matmul_nt_ggml_bytes(a, bt_bytes, bt_ggml_type, m, k, n))
+        if a.len() != m.checked_mul(k)? || m == 0 || k == 0 || n == 0 {
+            return None;
+        }
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(&[m, k], 4)?;
+            let out_shape = shape4_from_row_major(&[m, n], 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let weight = tensor_upload_bytes(bt_bytes)?;
+            tensor_host_result(&out_shape, |out| {
+                tensor_matmul(&a, 0, &weight, 0, out, m, k, n, bt_ggml_type)
+            })
+        })
     }
 
-    pub(super) fn try_matmul_nt_ggml_bytes_keyed<F>(
+    pub(super) fn try_matmul_nt_ggml_bytes_keyed<'a, F>(
         a: &[f32],
         bt_ggml_type: u32,
         m: usize,
         k: usize,
         n: usize,
-        namespace: &str,
+        owner: &WeightOwner,
         cache_key: &str,
         load: F,
     ) -> Option<Vec<f32>>
     where
-        F: FnOnce() -> Result<Vec<u8>, String>,
+        F: FnOnce() -> Result<Cow<'a, [u8]>, String>,
     {
-        with_context(|ctx| {
-            ctx.matmul_nt_ggml_bytes_keyed(a, bt_ggml_type, m, k, n, namespace, cache_key, load)
+        if a.len() != m.checked_mul(k)? || m == 0 || k == 0 || n == 0 {
+            return None;
+        }
+        // A type no kernel multiplies is declined before its bytes are copied into the store.
+        src0_type_from_ggml(bt_ggml_type)?;
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(&[m, k], 4)?;
+            let out_shape = shape4_from_row_major(&[m, n], 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let weight = tensor_named_weight(owner, cache_key, load)?;
+            tensor_host_result(&out_shape, |out| {
+                tensor_matmul(&a, 0, &weight, 0, out, m, k, n, bt_ggml_type)
+            })
         })
     }
 
-    pub(super) fn try_matmul_nt_ggml_bytes_multi(
-        a: &[f32],
-        m: usize,
-        k: usize,
-        matrices: &[super::MatmulNtGgmlBytesMatrix<'_>],
-    ) -> Option<Vec<Vec<f32>>> {
-        with_context(|ctx| ctx.matmul_nt_ggml_bytes_multi(a, m, k, matrices))
-    }
-
-    pub(super) fn try_matmul_nt_ggml_bytes_keyed_multi<F>(
+    pub(super) fn try_matmul_nt_ggml_bytes_keyed_multi<'a, F>(
         a: &[f32],
         m: usize,
         k: usize,
@@ -9400,19 +8469,47 @@ mod imp {
         load: F,
     ) -> Option<Vec<Vec<f32>>>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Cow<'a, [u8]>, String>,
     {
-        with_context(|ctx| ctx.matmul_nt_ggml_bytes_keyed_multi(a, m, k, matrices, load))
+        if matrices.is_empty() { return Some(Vec::new()); }
+        if a.len() != m.checked_mul(k)? || m == 0 || k == 0 || matrices.iter().any(|matrix| matrix.n == 0) {
+            return None;
+        }
+        // A type no kernel multiplies is declined before any bytes are copied into the store.
+        if matrices.iter().any(|matrix| src0_type_from_ggml(matrix.bt_ggml_type).is_none()) {
+            return None;
+        }
+        let mut load = load;
+        tensor_try(|| {
+            let a_shape = shape4_from_row_major(&[m, k], 4)?;
+            let a = tensor_upload_f32(a, &a_shape)?;
+            let mut outputs = Vec::with_capacity(matrices.len());
+            let mut last_batch = 0;
+            for matrix in matrices {
+                let weight = tensor_named_weight(matrix.owner, matrix.cache_key,
+                    || load(matrix.owner, matrix.cache_key))?;
+                let shape = shape4_from_row_major(&[m, matrix.n], 4)?;
+                let bytes = shape.numel.checked_mul(4).ok_or("metal output extent overflow")?;
+                let out = tensor_buffer(bytes, false)?;
+                last_batch = tensor_matmul(&a, 0, &weight, 0, &out, m, k, matrix.n, matrix.bt_ggml_type)?;
+                outputs.push((out, shape.numel));
+            }
+            tensor_flush_until(last_batch)?;
+            outputs.into_iter().map(|(out, numel)| {
+                Ok(unsafe { std::slice::from_raw_parts(out.contents()?, numel) }.to_vec())
+            }).collect()
+        })
     }
 
     pub(super) fn try_ar_pre_attn<F>(
+        resid: &mut ArResidual,
         hidden: Option<&[f32]>,
         m: usize,
         hidden_w: usize,
         head_dim: usize,
         in_norm: &[f32],
-        qk_norm: Option<(&[f32], &[f32], &str, &str)>,
-        in_norm_key: &str,
+        qk_norm: Option<(&[f32], &[f32], &WeightKey, &WeightKey)>,
+        in_norm_key: &WeightKey,
         eps: f32,
         q: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         k: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -9420,32 +8517,73 @@ mod imp {
         load: F,
     ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
-        with_context(|ctx| {
-            ctx.ar_pre_attn(
-                hidden,
-                m,
-                hidden_w,
-                head_dim,
-                in_norm,
-                qk_norm,
-                in_norm_key,
-                eps,
-                q,
-                k,
-                v,
-                load,
-            )
+        let mut load = load;
+        tensor_try(|| {
+            let x_s = shape4_from_row_major(&[m, hidden_w], 4)?;
+            let g_s = shape4_from_row_major(&[hidden_w], 4)?;
+            if let Some(hidden) = hidden {
+                if hidden.len() != x_s.numel { return Err("ar hidden len".into()); }
+                resid.h = Some(tensor_upload_f32(hidden, &x_s)?);
+                resid.elems = x_s.numel;
+            }
+            let h = resid.h.as_ref().filter(|_| resid.elems == x_s.numel).ok_or("ar residual missing")?;
+            let q_s = shape4_from_row_major(&[m, q.n], 4)?;
+            let k_s = shape4_from_row_major(&[m, k.n], 4)?;
+            let v_s = shape4_from_row_major(&[m, v.n], 4)?;
+            let g = tensor_keyed_weight(in_norm_key, || Ok(Cow::Owned(in_norm.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+            let qw = tensor_named_weight(q.owner, q.cache_key, || load(q.owner, q.cache_key).map(Cow::Owned))?;
+            let kw = tensor_named_weight(k.owner, k.cache_key, || load(k.owner, k.cache_key).map(Cow::Owned))?;
+            let vw = tensor_named_weight(v.owner, v.cache_key, || load(v.owner, v.cache_key).map(Cow::Owned))?;
+            let qk = if let Some((q_norm, k_norm, q_key, k_key)) = qk_norm {
+                let qg = tensor_keyed_weight(q_key, || Ok(Cow::Owned(q_norm.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+                let kg = tensor_keyed_weight(k_key, || Ok(Cow::Owned(k_norm.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+                let qs = shape4_from_row_major(&[q_s.numel / head_dim, head_dim], 4)?;
+                let ks = shape4_from_row_major(&[k_s.numel / head_dim, head_dim], 4)?;
+                let gs = shape4_from_row_major(&[head_dim], 4)?;
+                Some((qg, kg, qs, ks, gs))
+            } else { None };
+            let n1 = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let qo = tensor_buffer((q_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let ko = tensor_buffer((k_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let vo = tensor_buffer((v_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let normalized = if qk.is_some() {
+                Some((tensor_buffer(q_s.numel.checked_mul(4).ok_or("metal output extent overflow")?, false)?,
+                      tensor_buffer(k_s.numel.checked_mul(4).ok_or("metal output extent overflow")?, false)?))
+            } else { None };
+            let mut inputs = vec![h, &g, &qw, &kw, &vw];
+            let mut outputs = vec![&n1, &qo, &ko, &vo];
+            if let Some((qg, kg, _, _, _)) = &qk { inputs.extend([qg, kg]); }
+            if let Some((qn, kn)) = &normalized { outputs.extend([qn, kn]); }
+            let batch = tensor_encode_group(
+                m as u64 * hidden_w as u64 * (q.n as u64 + k.n as u64 + v.n as u64),
+                &inputs, &outputs, |ctx| {
+                ctx.dispatch_rms_norm_f32_offsets(h.id(), g.id(), h.id(), n1.id(), &x_s, &g_s, &x_s, eps, 2, [0; 4])?;
+                ctx.matmul_nt_into_buffer_offsets(q.bt_ggml_type, qw.id(), n1.id(), qo.id(), m, hidden_w, q.n, [0; 3])?;
+                ctx.matmul_nt_into_buffer_offsets(k.bt_ggml_type, kw.id(), n1.id(), ko.id(), m, hidden_w, k.n, [0; 3])?;
+                ctx.matmul_nt_into_buffer_offsets(v.bt_ggml_type, vw.id(), n1.id(), vo.id(), m, hidden_w, v.n, [0; 3])?;
+                if let (Some((qg, kg, qs, ks, gs)), Some((qn, kn))) = (&qk, &normalized) {
+                    ctx.dispatch_rms_norm_f32_offsets(qo.id(), qg.id(), qo.id(), qn.id(), qs, gs, qs, eps, 2, [0; 4])?;
+                    ctx.dispatch_rms_norm_f32_offsets(ko.id(), kg.id(), ko.id(), kn.id(), ks, gs, ks, eps, 2, [0; 4])?;
+                }
+                Ok(())
+            })?;
+            tensor_flush_until(batch)?;
+            let (q_src, k_src) = normalized.as_ref().map(|(q, k)| (q, k)).unwrap_or((&qo, &ko));
+            Ok((unsafe { std::slice::from_raw_parts(q_src.contents()?, q_s.numel) }.to_vec(),
+                unsafe { std::slice::from_raw_parts(k_src.contents()?, k_s.numel) }.to_vec(),
+                unsafe { std::slice::from_raw_parts(vo.contents()?, v_s.numel) }.to_vec()))
         })
     }
 
     pub(super) fn try_ar_post_attn<F>(
+        resid: &mut ArResidual,
         attn: &[f32],
         m: usize,
         hidden_w: usize,
         post_norm: &[f32],
-        post_norm_key: &str,
+        post_norm_key: &WeightKey,
         eps: f32,
         o: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         up: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
@@ -9454,47 +8592,83 @@ mod imp {
         load: F,
     ) -> Option<()>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
-        with_context(|ctx| {
-            ctx.ar_post_attn(
-                attn,
-                m,
-                hidden_w,
-                post_norm,
-                post_norm_key,
-                eps,
-                o,
-                up,
-                gate,
-                down,
-                load,
-            )
+        let mut load = load;
+        tensor_try(|| {
+            let x_s = shape4_from_row_major(&[m, hidden_w], 4)?;
+            let g_s = shape4_from_row_major(&[hidden_w], 4)?;
+            let h_s = shape4_from_row_major(&[x_s.numel], 4)?;
+            let up_s = shape4_from_row_major(&[m, up.n], 4)?;
+            let ff_s = shape4_from_row_major(&[up_s.numel], 4)?;
+            let o_s = shape4_from_row_major(&[m, o.n], 4)?;
+            let gate_s = shape4_from_row_major(&[m, gate.n], 4)?;
+            let down_s = shape4_from_row_major(&[m, down.n], 4)?;
+            if attn.len() != x_s.numel { return Err("ar attn len".into()); }
+            let h = resid.h.as_ref().filter(|_| resid.elems == x_s.numel).ok_or("ar residual missing")?;
+            let attn = tensor_upload_f32(attn, &x_s)?;
+            let g = tensor_keyed_weight(post_norm_key, || Ok(Cow::Owned(post_norm.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+            let ow = tensor_named_weight(o.owner, o.cache_key, || load(o.owner, o.cache_key).map(Cow::Owned))?;
+            let uw = tensor_named_weight(up.owner, up.cache_key, || load(up.owner, up.cache_key).map(Cow::Owned))?;
+            let gw = tensor_named_weight(gate.owner, gate.cache_key, || load(gate.owner, gate.cache_key).map(Cow::Owned))?;
+            let dw = tensor_named_weight(down.owner, down.cache_key, || load(down.owner, down.cache_key).map(Cow::Owned))?;
+            let oo = tensor_buffer((o_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let h2 = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let n2 = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let uo = tensor_buffer((up_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let go = tensor_buffer((gate_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let gs = tensor_buffer((up_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let ff = tensor_buffer((up_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let d = tensor_buffer((down_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let h3 = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            tensor_encode_group(m as u64 * (
+                hidden_w as u64 * o.n as u64 + hidden_w as u64 * up.n as u64
+                + hidden_w as u64 * gate.n as u64 + up.n as u64 * down.n as u64),
+                &[h, &attn, &g, &ow, &uw, &gw, &dw],
+                &[&oo, &h2, &n2, &uo, &go, &gs, &ff, &d, &h3], |ctx| {
+                ctx.matmul_nt_into_buffer_offsets(o.bt_ggml_type, ow.id(), attn.id(), oo.id(), m, hidden_w, o.n, [0; 3])?;
+                ctx.dispatch_bin_f32_offsets(0, h.id(), oo.id(), h2.id(), &h_s, &h_s, [0; 3])?;
+                ctx.dispatch_rms_norm_f32_offsets(h2.id(), g.id(), h2.id(), n2.id(), &x_s, &g_s, &x_s, eps, 2, [0; 4])?;
+                ctx.matmul_nt_into_buffer_offsets(up.bt_ggml_type, uw.id(), n2.id(), uo.id(), m, hidden_w, up.n, [0; 3])?;
+                ctx.matmul_nt_into_buffer_offsets(gate.bt_ggml_type, gw.id(), n2.id(), go.id(), m, hidden_w, gate.n, [0; 3])?;
+                ctx.dispatch_unary_f32_offsets(OP_UNARY_NUM_SILU, go.id(), gs.id(), &ff_s, [0; 2])?;
+                ctx.dispatch_bin_f32_offsets(2, uo.id(), gs.id(), ff.id(), &ff_s, &ff_s, [0; 3])?;
+                ctx.matmul_nt_into_buffer_offsets(down.bt_ggml_type, dw.id(), ff.id(), d.id(), m, up.n, down.n, [0; 3])?;
+                ctx.dispatch_bin_f32_offsets(0, h2.id(), d.id(), h3.id(), &h_s, &h_s, [0; 3])?;
+                Ok(())
+            })?;
+            resid.h = Some(h3);
+            Ok(())
         })
     }
 
     pub(super) fn try_ar_final_rms(
+        resid: &mut ArResidual,
         m: usize,
         hidden_w: usize,
         gamma: &[f32],
-        gamma_key: &str,
+        gamma_key: &WeightKey,
         eps: f32,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.ar_final_rms(m, hidden_w, gamma, gamma_key, eps))
-    }
-
-    pub(super) fn ar_resident_clear() {
-        let _ = with_context(|ctx| {
-            ctx.ar_clear_acts();
-            Ok(())
-        });
+        tensor_try(|| {
+            let x_s = shape4_from_row_major(&[m, hidden_w], 4)?;
+            let g_s = shape4_from_row_major(&[hidden_w], 4)?;
+            let h = resid.h.as_ref().filter(|_| resid.elems == x_s.numel).ok_or("ar residual missing")?;
+            let g = tensor_keyed_weight(gamma_key, || Ok(Cow::Owned(gamma.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+            let out = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let batch = tensor_encode_group(0, &[h, &g], &[&out], |ctx| {
+                ctx.dispatch_rms_norm_f32_offsets(h.id(), g.id(), h.id(), out.id(), &x_s, &g_s, &x_s, eps, 2, [0; 4])?;
+                Ok(())
+            })?;
+            tensor_flush_until(batch)?;
+            Ok(unsafe { std::slice::from_raw_parts(out.contents()?, x_s.numel) }.to_vec())
+        })
     }
 
     pub(super) fn transient_pool_clear() {
-        let _ = with_context(|ctx| {
-            ctx.pool_clear();
-            Ok(())
-        });
+        if let Err(error) = tensor_pool_clear() {
+            super::log_metal_error_once(format!("[ggml][metal] transient pool clear failed: {error}"));
+        }
     }
 
     pub(super) fn try_dit_ffn_resident<F>(
@@ -9504,65 +8678,47 @@ mod imp {
         ff_dim: usize,
         ff_in_b: &[f32],
         ff_out_b: &[f32],
-        ff_in_b_key: &str,
-        ff_out_b_key: &str,
+        ff_in_b_key: &WeightKey,
+        ff_out_b_key: &WeightKey,
         swap: bool,
         ff_in: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         ff_out: super::MatmulNtGgmlBytesKeyedMatrix<'_>,
         load: F,
     ) -> Option<Vec<f32>>
     where
-        F: FnMut(&str, &str) -> Result<Vec<u8>, String>,
+        F: FnMut(&WeightOwner, &str) -> Result<Vec<u8>, String>,
     {
-        with_context(|ctx| {
-            ctx.dit_ffn_resident(
-                normed,
-                m,
-                hidden_w,
-                ff_dim,
-                ff_in_b,
-                ff_out_b,
-                ff_in_b_key,
-                ff_out_b_key,
-                swap,
-                ff_in,
-                ff_out,
-                load,
-            )
-        })
-    }
-
-    pub(super) fn try_matmul_nt_ggml_bytes_add_bias(
-        a: &[f32],
-        bt_bytes: &[u8],
-        bt_ggml_type: u32,
-        m: usize,
-        k: usize,
-        n: usize,
-        bias: &[f32],
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.matmul_nt_ggml_bytes_add_bias(a, bt_bytes, bt_ggml_type, m, k, n, bias)
-        })
-    }
-
-    pub(super) fn try_vision_mlp_bf16_fused(
-        x: &[f32],
-        gate_up_weight_bytes: &[u8],
-        down_weight_bytes: &[u8],
-        rows: usize,
-        hidden_size: usize,
-        intermediate_size: usize,
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.vision_mlp_bf16_fused(
-                x,
-                gate_up_weight_bytes,
-                down_weight_bytes,
-                rows,
-                hidden_size,
-                intermediate_size,
-            )
+        let mut load = load;
+        tensor_try(|| {
+            if normed.len() != m * hidden_w { return Err("dit ffn normed len".into()); }
+            if ff_in.n != ff_dim * 2 || ff_out.n != hidden_w { return Err("dit ffn weight n".into()); }
+            let y_s = shape4_from_row_major(&[m, hidden_w], 4)?;
+            let x_s = shape4_from_row_major(&[m, ff_in.n], 4)?;
+            let b_s = shape4_from_row_major(&[ff_in.n], 4)?;
+            let ob_s = shape4_from_row_major(&[hidden_w], 4)?;
+            let gated_s = shape4_from_row_major(&[m, ff_dim], 4)?;
+            let dn = tensor_upload_f32(normed, &y_s)?;
+            let iw = tensor_named_weight(ff_in.owner, ff_in.cache_key, || load(ff_in.owner, ff_in.cache_key).map(Cow::Owned))?;
+            let ow = tensor_named_weight(ff_out.owner, ff_out.cache_key, || load(ff_out.owner, ff_out.cache_key).map(Cow::Owned))?;
+            let ib = tensor_keyed_weight(ff_in_b_key, || Ok(Cow::Owned(ff_in_b.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+            let ob = tensor_keyed_weight(ff_out_b_key, || Ok(Cow::Owned(ff_out_b.iter().flat_map(|v| v.to_le_bytes()).collect())))?;
+            let ffin = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let ffinb = tensor_buffer((x_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let gated = tensor_buffer((gated_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let ffout = tensor_buffer((y_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let y = tensor_buffer((y_s.numel).checked_mul(4).ok_or("metal output extent overflow")?, false)?;
+            let batch = tensor_encode_group(
+                m as u64 * (hidden_w as u64 * ff_in.n as u64 + ff_dim as u64 * ff_out.n as u64),
+                &[&dn, &iw, &ow, &ib, &ob], &[&ffin, &ffinb, &gated, &ffout, &y], |ctx| {
+                ctx.matmul_nt_into_buffer_offsets(ff_in.bt_ggml_type, iw.id(), dn.id(), ffin.id(), m, hidden_w, ff_in.n, [0; 3])?;
+                ctx.dispatch_bin_f32_offsets(0, ffin.id(), ib.id(), ffinb.id(), &x_s, &b_s, [0; 3])?;
+                ctx.dispatch_swiglu_packed(ffinb.id(), gated.id(), m, ff_dim, swap)?;
+                ctx.matmul_nt_into_buffer_offsets(ff_out.bt_ggml_type, ow.id(), gated.id(), ffout.id(), m, ff_dim, ff_out.n, [0; 3])?;
+                ctx.dispatch_bin_f32_offsets(0, ffout.id(), ob.id(), y.id(), &y_s, &ob_s, [0; 3])?;
+                Ok(())
+            })?;
+            tensor_flush_until(batch)?;
+            Ok(unsafe { std::slice::from_raw_parts(y.contents()?, y_s.numel) }.to_vec())
         })
     }
 
@@ -9576,14 +8732,21 @@ mod imp {
         d: usize,
         scale: f32,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.flash_attn_f32_packed(q, k, v, n_q, n_kv, n_head, d, scale))
-    }
-
-    pub(super) fn clear_decoder_kv_cache() {
-        let _ = with_context(|ctx| {
-            ctx.clear_decoder_kv_cache();
-            Ok(())
-        });
+        if n_q == 0 || n_kv == 0 || n_head == 0 || d == 0 {
+            return Some(Vec::new());
+        }
+        let width = n_head.checked_mul(d)?;
+        if q.len() != n_q.checked_mul(width)? || k.len() != n_kv.checked_mul(width)? || v.len() != k.len() {
+            return None;
+        }
+        tensor_try(|| {
+            let q_shape = shape4_from_row_major(&[n_q, width], 4)?;
+            let kv_shape = shape4_from_row_major(&[n_kv, width], 4)?;
+            let q = tensor_upload_f32(q, &q_shape)?;
+            let k = tensor_upload_f32(k, &kv_shape)?;
+            let v = tensor_upload_f32(v, &kv_shape)?;
+            tensor_host_result(&q_shape, |out| tensor_attention(&q, 0, &k, 0, &v, 0, out, n_q, n_kv, n_head, d, scale))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -9628,47 +8791,13 @@ mod imp {
         })
     }
 
-    pub(super) fn try_flash_attn_f32_self_kv_cache(
-        layer: usize,
-        q: &[f32],
-        k_all: &[f32],
-        v_all: &[f32],
-        n_kv: usize,
-        n_head: usize,
-        d: usize,
-        scale: f32,
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.flash_attn_f32_self_kv_cache(layer, q, k_all, v_all, n_kv, n_head, d, scale)
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_flash_attn_f32_cross_kv_cache(
-        layer: usize,
-        q: &[f32],
-        k_cross: &[f32],
-        v_cross: &[f32],
-        n_q: usize,
-        n_kv: usize,
-        n_head: usize,
-        d: usize,
-        scale: f32,
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.flash_attn_f32_cross_kv_cache(
-                layer, q, k_cross, v_cross, n_q, n_kv, n_head, d, scale,
-            )
-        })
-    }
-
     pub(super) fn try_add_f32(
         a: &[f32],
         a_shape: &[usize],
         b: &[f32],
         b_shape: &[usize],
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.bin_f32(0, a, a_shape, b, b_shape))
+        tensor_host_binary(a, a_shape, b, b_shape, false)
     }
 
     pub(super) fn try_mul_f32(
@@ -9677,19 +8806,33 @@ mod imp {
         b: &[f32],
         b_shape: &[usize],
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.bin_f32(2, a, a_shape, b, b_shape))
+        tensor_host_binary(a, a_shape, b, b_shape, true)
     }
 
     pub(super) fn try_gelu_f32(a: &[f32], shape: &[usize]) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.unary_gelu_f32(a, shape))
+        tensor_try(|| {
+            let shape = shape4_from_row_major(shape, 4)?;
+            let input = tensor_upload_f32(a, &shape)?;
+            tensor_host_result(&shape, |out| tensor_unary(&input, 0, &shape, out, OP_UNARY_NUM_GELU))
+        })
     }
 
     pub(super) fn try_layer_norm_f32(x: &[f32], shape: &[usize], eps: f32) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.norm_f32(x, shape, eps))
+        tensor_try(|| {
+            let shape = shape4_from_row_major(shape, 4)?;
+            let input = tensor_upload_f32(x, &shape)?;
+            tensor_host_result(&shape, |out| tensor_norm(&input, 0, &shape, &input, 0, &shape,
+                &input, 0, &shape, out, eps, 1))
+        })
     }
 
     pub(super) fn try_rms_norm_f32(x: &[f32], shape: &[usize], eps: f32) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.rms_norm_f32(x, shape, eps))
+        tensor_try(|| {
+            let shape = shape4_from_row_major(shape, 4)?;
+            let input = tensor_upload_f32(x, &shape)?;
+            tensor_host_result(&shape, |out| tensor_rms_norm(&input, 0, &shape, &input, 0, &shape,
+                &input, 0, &shape, out, eps, 1))
+        })
     }
 
     pub(super) fn try_rms_norm_mul_f32(
@@ -9699,7 +8842,14 @@ mod imp {
         mul_shape: &[usize],
         eps: f32,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.rms_norm_mul_f32(x, x_shape, mul, mul_shape, eps))
+        tensor_try(|| {
+            let shape = shape4_from_row_major(x_shape, 4)?;
+            let mul_shape = shape4_from_row_major(mul_shape, 4)?;
+            let input = tensor_upload_f32(x, &shape)?;
+            let mul = tensor_upload_f32(mul, &mul_shape)?;
+            tensor_host_result(&shape, |out| tensor_rms_norm(&input, 0, &shape, &mul, 0, &mul_shape,
+                &input, 0, &shape, out, eps, 2))
+        })
     }
 
     pub(super) fn try_attention_softmax_weighted_sum_f32(
@@ -9721,7 +8871,16 @@ mod imp {
         add_shape: &[usize],
         eps: f32,
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.norm_mul_add_f32(x, x_shape, mul, mul_shape, add, add_shape, eps))
+        tensor_try(|| {
+            let shape = shape4_from_row_major(x_shape, 4)?;
+            let mul_shape = shape4_from_row_major(mul_shape, 4)?;
+            let add_shape = shape4_from_row_major(add_shape, 4)?;
+            let input = tensor_upload_f32(x, &shape)?;
+            let mul = tensor_upload_f32(mul, &mul_shape)?;
+            let add = tensor_upload_f32(add, &add_shape)?;
+            tensor_host_result(&shape, |out| tensor_norm(&input, 0, &shape, &mul, 0, &mul_shape,
+                &add, 0, &add_shape, out, eps, 3))
+        })
     }
 
     pub(super) fn try_get_rows_ggml_bytes(
@@ -9731,39 +8890,94 @@ mod imp {
         n_rows: usize,
         row_indices: &[i32],
     ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.get_rows_ggml_bytes(src, src_ggml_type, n_cols, n_rows, row_indices))
+        tensor_try(|| {
+            if row_indices.is_empty() {
+                return Ok(Vec::new());
+            }
+            let (src_shape, _, dst_shape) =
+                get_rows_shapes(src_ggml_type, n_cols, n_rows, row_indices.len())?;
+            let expected_src = src_shape.nb[2] as usize;
+            if src.len() != expected_src {
+                return Err(format!(
+                    "get_rows source len mismatch: got {}, expected {}",
+                    src.len(), expected_src,
+                ));
+            }
+            for &row in row_indices {
+                let row_ok = usize::try_from(row).ok().is_some_and(|row| row < n_rows);
+                if !row_ok {
+                    return Err(format!(
+                        "get_rows row index {} is out of range {}", row, n_rows,
+                    ));
+                }
+            }
+            // Validate the output allocation before uploading either input.
+            dst_shape.numel.checked_mul(4).ok_or("metal output extent overflow")?;
+            let idx_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    row_indices.as_ptr().cast::<u8>(), std::mem::size_of_val(row_indices),
+                )
+            };
+            let src = tensor_upload_bytes(src)?;
+            let rows = tensor_upload_bytes(idx_bytes)?;
+            tensor_host_result(&dst_shape, |out| {
+                tensor_get_rows(&src, 0, src_ggml_type, n_cols, n_rows,
+                    &rows, 0, row_indices.len(), out)
+            })
+        })
     }
 
-    pub(super) fn try_im2col_1d_f32(
-        input: &[f32],
-        ic: usize,
-        iw: usize,
-        kw: usize,
-        stride: usize,
-        pad: usize,
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| ctx.im2col_1d_f32(input, ic, iw, kw, stride, pad))
-    }
-
-    // The diffusion VAE runs through the compiled graph path on macOS, so
-    // these planar helpers only have CUDA implementations today.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn try_conv2d_planar_f32(
-        _input: &[f32],
-        _width: usize,
-        _height: usize,
-        _in_channels: usize,
-        _weights: &[f32],
-        _bias: &[f32],
-        _out_channels: usize,
-        _kw: usize,
-        _kh: usize,
-        _pad_x: usize,
-        _pad_y: usize,
+        input: &[f32],
+        width: usize,
+        height: usize,
+        in_channels: usize,
+        weights: &[f32],
+        bias: &[f32],
+        out_channels: usize,
+        kw: usize,
+        kh: usize,
+        pad_x: usize,
+        pad_y: usize,
     ) -> Option<Vec<f32>> {
-        None
+        try_conv2d_planar_f32_with_budget(
+            input, width, height, in_channels, weights, bias, out_channels,
+            kw, kh, pad_x, pad_y, 256 * 1024 * 1024,
+        )
     }
 
+    pub(super) fn try_conv2d_planar_f32_with_budget(
+        input: &[f32],
+        width: usize,
+        height: usize,
+        in_channels: usize,
+        weights: &[f32],
+        bias: &[f32],
+        out_channels: usize,
+        kw: usize,
+        kh: usize,
+        pad_x: usize,
+        pad_y: usize,
+        im2col_budget_bytes: usize,
+    ) -> Option<Vec<f32>> {
+        tensor_try(|| {
+            if width == 0 || height == 0 || in_channels == 0 || out_channels == 0 || kw == 0 || kh == 0 {
+                return Err("conv2d requires non-empty extents".into());
+            }
+            let plane = width.checked_mul(height).ok_or("conv2d extent overflow")?;
+            if input.len() != in_channels.checked_mul(plane).ok_or("conv2d extent overflow")? {
+                return Err("conv2d input shape mismatch".into());
+            }
+            let x = crate::gpu_tensor::upload(input, in_channels, plane)?;
+            let out = crate::gpu_tensor::conv2d_planar_banded(
+                &x, width, height, weights, bias, out_channels, kw, kh, pad_x, pad_y, im2col_budget_bytes,
+            )?;
+            crate::gpu_tensor::download(&out)
+        })
+    }
+
+    // The diffusion VAE uses the compiled graph path on macOS; these remaining
+    // planar group-norm and silu helpers still only have CUDA implementations.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_group_norm_planar_f32(
         _input: &[f32],
@@ -9782,173 +8996,4 @@ mod imp {
         None
     }
 
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_encoder_attn_block_f32(
-        x: &[f32],
-        seq_len: usize,
-        n_state: usize,
-        n_head: usize,
-        ln_w: &[f32],
-        ln_b: &[f32],
-        q_w_bytes: &[u8],
-        q_w_ggml_type: u32,
-        q_b: &[f32],
-        k_w_bytes: &[u8],
-        k_w_ggml_type: u32,
-        v_w_bytes: &[u8],
-        v_w_ggml_type: u32,
-        v_b: &[f32],
-        out_w_bytes: &[u8],
-        out_w_ggml_type: u32,
-        out_b: &[f32],
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.encoder_attn_block_f32(
-                x,
-                seq_len,
-                n_state,
-                n_head,
-                ln_w,
-                ln_b,
-                q_w_bytes,
-                q_w_ggml_type,
-                q_b,
-                k_w_bytes,
-                k_w_ggml_type,
-                v_w_bytes,
-                v_w_ggml_type,
-                v_b,
-                out_w_bytes,
-                out_w_ggml_type,
-                out_b,
-            )
-        })
-    }
-
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_encoder_ffn_block_f32(
-        x: &[f32],
-        seq_len: usize,
-        n_state: usize,
-        ln_w: &[f32],
-        ln_b: &[f32],
-        w0_bytes: &[u8],
-        w0_ggml_type: u32,
-        b0: &[f32],
-        w1_bytes: &[u8],
-        w1_ggml_type: u32,
-        b1: &[f32],
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.encoder_ffn_block_f32(
-                x,
-                seq_len,
-                n_state,
-                ln_w,
-                ln_b,
-                w0_bytes,
-                w0_ggml_type,
-                b0,
-                w1_bytes,
-                w1_ggml_type,
-                b1,
-            )
-        })
-    }
-
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_encoder_layer_f32(
-        x: &[f32],
-        seq_len: usize,
-        n_state: usize,
-        n_head: usize,
-        attn_ln_w: &[f32],
-        attn_ln_b: &[f32],
-        q_w_bytes: &[u8],
-        q_w_ggml_type: u32,
-        q_b: &[f32],
-        k_w_bytes: &[u8],
-        k_w_ggml_type: u32,
-        v_w_bytes: &[u8],
-        v_w_ggml_type: u32,
-        v_b: &[f32],
-        out_w_bytes: &[u8],
-        out_w_ggml_type: u32,
-        out_b: &[f32],
-        mlp_ln_w: &[f32],
-        mlp_ln_b: &[f32],
-        w0_bytes: &[u8],
-        w0_ggml_type: u32,
-        b0: &[f32],
-        w1_bytes: &[u8],
-        w1_ggml_type: u32,
-        b1: &[f32],
-    ) -> Option<Vec<f32>> {
-        with_context(|ctx| {
-            ctx.encoder_layer_f32(
-                x,
-                seq_len,
-                n_state,
-                n_head,
-                attn_ln_w,
-                attn_ln_b,
-                q_w_bytes,
-                q_w_ggml_type,
-                q_b,
-                k_w_bytes,
-                k_w_ggml_type,
-                v_w_bytes,
-                v_w_ggml_type,
-                v_b,
-                out_w_bytes,
-                out_w_ggml_type,
-                out_b,
-                mlp_ln_w,
-                mlp_ln_b,
-                w0_bytes,
-                w0_ggml_type,
-                b0,
-                w1_bytes,
-                w1_ggml_type,
-                b1,
-            )
-        })
-    }
-
-    #[allow(dead_code)]
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn try_decoder_self_qkv_step_f32(
-        x: &[f32],
-        n_state: usize,
-        attn_ln_w: &[f32],
-        attn_ln_b: &[f32],
-        q_w_bytes: &[u8],
-        q_w_ggml_type: u32,
-        q_b: &[f32],
-        k_w_bytes: &[u8],
-        k_w_ggml_type: u32,
-        v_w_bytes: &[u8],
-        v_w_ggml_type: u32,
-        v_b: &[f32],
-    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-        with_context(|ctx| {
-            ctx.decoder_self_qkv_step_f32(
-                x,
-                n_state,
-                attn_ln_w,
-                attn_ln_b,
-                q_w_bytes,
-                q_w_ggml_type,
-                q_b,
-                k_w_bytes,
-                k_w_ggml_type,
-                v_w_bytes,
-                v_w_ggml_type,
-                v_b,
-            )
-        })
-    }
 }

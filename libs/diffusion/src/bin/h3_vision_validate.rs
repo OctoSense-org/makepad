@@ -17,7 +17,7 @@
 
 use makepad_diffusion::h3::H3ShardedWeights;
 use makepad_diffusion::h3_text::{
-    h3_fl2va_mrope_positions, h3_text_encode_fl2va_taps, h3_text_encoder_evict,
+    h3_fl2va_mrope_positions, h3_text_encode_fl2va_taps,
     h3_vision_encode_with_taps, h3_vision_preprocess, h3_vision_rope_angles,
     H3TextEncoderPrepared, H3VisionPrepared, H3_IMAGE_PAD_TOKEN,
 };
@@ -197,6 +197,10 @@ impl Gates {
 }
 
 fn main() {
+    makepad_diffusion::backend::metal::run_model_worker("h3_vision_validate", model_main)
+}
+
+fn model_main() {
     let args: Vec<String> = std::env::args().collect();
     let mut opts: HashMap<String, String> = HashMap::new();
     let mut key: Option<String> = None;
@@ -474,7 +478,11 @@ fn run(dump: &Path, models: &Path, stage: &str, gates: &mut Gates) -> Result<(),
                 "te.prompt_embeds",
                 compare("te.prompt_embeds", &hidden, &reference),
             );
-            let freed = h3_text_encoder_evict().map_err(|err| err.to_string())?;
+            let ns = weights.owner().trace();
+            let (freed, _) = makepad_diffusion::backend::gpu_weight_cache_resident(&ns)?;
+            drop(prepared);
+            drop(weights);
+            makepad_diffusion::backend::gpu_weight_cache_resident(&ns)?;
             println!("te cache evicted: {freed} buffers");
         }
     }

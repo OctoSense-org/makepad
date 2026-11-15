@@ -166,15 +166,22 @@ impl Types {
     }
 
     /// The settle rebuild (relax-compiler settle_rebuild.rs): `self` was restored from an image of
-    /// `live` encoded while compiles ran, so it holds the rows up to that encode's count. With
-    /// every type check held off (a front write), the rows interned since are copied as they are (same ids)
-    /// and the small tables -- regions, constants, the list arena, the intern tables -- are copied
-    /// whole, so the restored interner equals the live one. Nothing of `live`'s heap is shared
-    /// (it is dropped after the rebuild).
+    /// `live` encoded while compiles ran, so it holds the rows, regions and lists up to that
+    /// encode's counts (append-only arenas: `live` holds the same ones below them). With every type
+    /// check held off (a front write), what `live` interned since is copied past those counts at
+    /// the same ids and positions, and claimed in the intern tables in id and position order, as
+    /// interning claims them; the constants are copied whole (small). The restored interner then
+    /// equals the live one. Nothing of `live`'s heap is shared (it is dropped after the rebuild).
     /// None: `self` holds rows `live` does not.
     pub fn top_up_from(&mut self, live: &Types) -> Option<()> {
         let (n0, n1) = (self.len(), live.len());
         if n0 > n1 { return None; }
+        // `self` is as restore_collected made it: the settle thread's alone from the restore to
+        // here, and nothing interns into it (the restore maps the image, the cache open only reads
+        // the program), so its arenas end at the image's counts and every entry of `live` past
+        // them is new. (The rows' copy from `n0` has always rested on this.)
+        debug_assert!(self.image.as_ref().map_or(0, |i| i.len()) == n0 && self.lists.end() == self.lists.mapped.len()
+            && self.regions.unindexed.load(Ordering::Acquire), "the restored interner was used before its top-up");
         let layout = std::alloc::Layout::array::<Entry>(CHUNK).ok()?;
         for i in n0..n1 {
             let row = *live.entry(TyId(i as u32));
@@ -186,16 +193,23 @@ impl Types {
             unsafe { c.add(i & (CHUNK - 1)).write(row) };
         }
         *self.len.get_mut() = n1 as u32;
-        self.index = index::Index::copy_of(&live.index);
-        let kinds: Vec<RegionKind> = live.regions.kinds.iter().copied().collect();
-        let args: Vec<std::sync::Arc<[RegionId]>> = live.regions.args.iter().map(|a| std::sync::Arc::from(&a[..])).collect();
-        self.regions = Regions::restored(kinds, args);
+        {
+            let mut g = self.index.lock();
+            for i in n0..n1 {
+                let h = self.entry(TyId(i as u32)).hash;
+                self.index.claim(&mut g, h, Self::slot(h, i), || (0..=i).map(|j| {
+                    let h = self.entry(TyId(j as u32)).hash;
+                    (h, Self::slot(h, j))
+                }));
+            }
+        }
+        self.regions.top_up_from(&live.regions);
         // (through the codec: a constant's value tree is a fresh allocation)
         let mut w = Vec::new();
         live.consts.put(&mut w);
         self.consts = Codec::get(&mut Decode::new(&w))?;
         *self.free_regions.get_mut() = live.free_regions.load(Ordering::Relaxed);
-        self.lists = list::Lists::copy_of(&live.lists);
+        self.lists.top_up_from(&live.lists);
         Some(())
     }
 
@@ -207,7 +221,8 @@ impl Types {
     pub fn collected_writer(&self) -> Option<crate::image::Writer<'_>> {
         self.collected_writer_with(&|| false)
     }
-    /// collected_writer, asking `stop` every arena chunk of rows (None: it said yes)
+    /// collected_writer, asking `stop` every arena chunk of rows and through the intern tables
+    /// (None: it said yes)
     pub fn collected_writer_with(&self, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'_>> {
         let (n, table) = {
             let _g = self.index.lock();
@@ -222,6 +237,7 @@ impl Types {
         for t in [self.unit, self.bool_, self.char_, self.str_, self.never, self.error,
             self.i32_, self.i64_, self.u8_, self.u32_, self.u64_, self.usize_, self.isize_,
             self.f32_, self.f64_, self.str_ref] { t.put(&mut meta); }
+        if stop() { return None; }
         let mapped_rows = self.image.as_ref().map_or(&[][..], |image| image.rows);
         // the rows past the mapped ones, as the arena chunks hold them (no copy): a row below
         // `n` is written before `len` publishes it and never changes, and a chunk is freed only
@@ -240,12 +256,11 @@ impl Types {
             if stop() { return None; }
             i = end;
         }
-        let slots = table.snapshot(|s| (s & ID_MASK) as usize <= n);
-        if stop() { return None; }
+        let slots = table.snapshot(|s| (s & ID_MASK) as usize <= n, stop)?;
         // the list table after the rows taken above: every list they name is below its end
-        let (list_end, list_slots) = self.lists.image_slots();
+        let (list_end, list_slots) = self.lists.image_slots(stop)?;
         let mapped_words = self.lists.mapped;
-        let words = self.lists.tail_word_bytes(mapped_words.len(), list_end);
+        let words = self.lists.tail_word_bytes(mapped_words.len(), list_end, stop)?;
         let mut image = crate::image::Writer::default();
         image.add_bytes(0, meta); image.add_parts(1, mapped_rows, runs);
         image.add_mapped_prefix(2, mapped_words, words);
@@ -319,6 +334,8 @@ impl Types {
         *t.chunks[0].get_mut() = std::ptr::null_mut();
         t.image = Some(MappedTypes { rows });
         *t.len.get_mut() = n as u32;
+        // `new`'s pre-interned variables are the image's first rows and regions (same build)
+        if !t.preinterned_hold() { return None; }
         Some(t)
     }
 }

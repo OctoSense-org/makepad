@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """The live driver inside `makepad run` (a working tree runs live, reload.rs start_watcher), end to end.
 
-usage: run.py --makepad <makepad binary> [--warm]   (MAKEPAD_RUN_STD in the environment)
+usage: run.py --makepad <relax or makepad binary> [--warm]   (run_all.py runs it)
 
 Copies pkg/ to a temporary dir, runs it (a working tree: live) and edits src/helper.rs while it runs:
   1. body edit: value() returns 2                  -> stdout shows 2, stderr "patched"
   2. type error in value()                          -> stderr "NOT applied" + the error; output stays 2
-  3. struct field added to Conf (a Copy struct)     -> a Restart rung: the program restarts in place on
-                                                     its own (no rebuild): a state-preserving restart,
-                                                     the program gets its tick count back and runs the
-                                                     new code (value 1 + extra 5 = 6)
+  3. struct field added to Conf (a static holds    -> a Restart rung: the restart is offered and the
+     a value of it)                                  program keeps running; taken as a person takes it
+                                                     (`inspect <pid> session relaunch`), it restarts in
+                                                     place: a state-preserving restart, the program
+                                                     gets its tick count back and runs the new code
+                                                     (value 1 + extra 5 = 6)
   4. the struct back + value() returns 999          -> the program sees 999 and exits
 Each step waits up to 20 s. Prints PASS/FAIL per step; exit 1 on any FAIL.
 """
-import os, shutil, subprocess, sys, tempfile, threading, time
+import os, re, shutil, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 relax = os.path.abspath(sys.argv[sys.argv.index("--makepad") + 1])
@@ -22,19 +24,19 @@ pkg = os.path.join(tmp, "pkg")
 shutil.copytree(os.path.join(HERE, "pkg"), pkg)
 helper = os.path.join(pkg, "src", "helper.rs")
 base = open(helper).read()
-# the live driver writes this file once it watches the sources (MAKEPAD_RUN_LIVE_READY)
+# the live driver writes this file once it watches the sources (RELAX_LIVE_READY)
 ready = os.path.join(tmp, "live-ready")
 # --warm: a live session from a warm cache. A first live run (one tick, no edit) fills a fresh
 # cache; the edits below then run on a program restored from it (collected graph), not parsed.
 warm = "--warm" in sys.argv
 if warm:
-    env = dict(os.environ, MAKEPAD_RUN_LIVE_READY=ready, MAKEPAD_RUN_CACHE_DIR=os.path.join(tmp, "cache"), MAKEPAD_RUN_TARGET_DIR=os.path.join(tmp, "target"))
+    env = dict(os.environ, RELAX_LIVE_READY=ready, RELAX_CACHE_DIR=os.path.join(tmp, "cache"), RELAX_TARGET_DIR=os.path.join(tmp, "target"))
     fill = subprocess.run([relax, "run", "--quiet", "relax-live-app"], cwd=pkg, env=dict(env, LIVE_APP_TICKS="1"), capture_output=True, text=True, timeout=600)
     print("%s warm-up run fills the cache (exit %d)" % ("PASS" if fill.returncode == 0 else "FAIL", fill.returncode))
     if fill.returncode != 0:
         print(fill.stderr[-3000:]); sys.exit(1)
 else:
-    env = dict(os.environ, MAKEPAD_RUN_LIVE_READY=ready, MAKEPAD_RUN_CACHE="0")
+    env = dict(os.environ, RELAX_LIVE_READY=ready, RELAX_CACHE="0")
 if os.path.exists(ready):
     os.remove(ready)  # written by the runs before this one
 p = subprocess.Popen([relax, "run", "--verbose" if warm else "--quiet", "relax-live-app"], cwd=pkg, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -75,7 +77,7 @@ def step(name, ok):
 
 step("starts", wait(lambda: last_value() == 1 and os.path.exists(ready), 120))
 if warm:
-    step("live start restored the collected graph", wait(lambda: any(l.startswith("makepad-run collected: restored") for l in err)))
+    step("live start restored the collected graph", wait(lambda: any(l.startswith("relax collected: restored") for l in err)))
 t = time.time()
 save(base.replace("conf().base\n", "conf().base + 1\n"))
 ok = wait(lambda: last_value() == 2)
@@ -89,11 +91,16 @@ n_err = len(err)
 n_before = max((int(l.split()[2]) for l in out if l.startswith("out tick ")), default=0)
 layout = base.replace("    pub base: u64,\n", "    pub base: u64,\n    pub extra: u8,\n").replace("Conf { base: 1 }", "Conf { base: 1, extra: 5 }").replace("conf().base\n", "conf().base + conf().extra as u64\n")
 save(layout)
-restarting = wait(lambda: any("restarting in place" in l for l in err[n_err:]))
-step("layout edit restarts the program in place on its own (no `session relaunch`)", restarting)
-ok = wait(lambda: last_value() == 6, 300)
+offered = wait(lambda: any("a restart applies it; offered" in l for l in err[n_err:]))
+time.sleep(0.3)
+step("layout edit takes the restart rung: offered, the program keeps running the previous code", offered and last_value() == 2)
+pid = next((m[1] for m in (re.search(r"-remote: pid (\d+)", l) for l in err) if m), str(p.pid))
+asked = subprocess.run([relax, "inspect", pid, "session", "relaunch"], cwd=pkg, env=env, capture_output=True, text=True, timeout=60)
+ok = wait(lambda: last_value() == 6, 60)
 restored = [int(l.split()[2]) for l in out if l.startswith("out restored ")]
-step("layout edit: state-preserving restart (restored tick %s, before %d), new code runs" % (restored[-1] if restored else None, n_before), ok and bool(restored) and restored[-1] >= n_before)
+step("the offered restart (session relaunch): state-preserving (restored tick %s, before %d), new code runs" % (restored[-1] if restored else None, n_before), asked.returncode == 0 and ok and bool(restored) and restored[-1] >= n_before)
+if asked.returncode != 0:
+    print("session relaunch: exit %d: %s" % (asked.returncode, (asked.stdout + asked.stderr).strip()[-600:]))
 save(layout.replace("conf().base + conf().extra as u64\n", "999\n"))
 ok = wait(lambda: p.poll() is not None)
 step("final edit applies, program exits", ok and last_value() == 999)

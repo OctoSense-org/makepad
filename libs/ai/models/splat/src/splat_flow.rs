@@ -22,13 +22,14 @@
 //! is computed once per condition and reused across every sampler step —
 //! algebraically identical to the reference, which recomputes it each call.
 
+use crate::backend::WeightOwner;
 use crate::splat::{
     pcd_position_embed, pcd_position_embed_v1_freqs, timestep_embedding, SplatWeights,
     FLOW_BLOCKS, FLOW_CAM_CHANNELS, FLOW_COND2_CHANNELS, FLOW_COND_CHANNELS, FLOW_FFN,
     FLOW_FINAL_NORM_EPS, FLOW_HEADS, FLOW_HEAD_DIM, FLOW_IN_CHANNELS, FLOW_MODEL_CHANNELS,
     FLOW_MOD_COLS, FLOW_NORM_EPS, FLOW_OUT_CHANNELS, FLOW_Q_TOKENS, FLOW_REFINER_BLOCKS,
     FLOW_SOBOL_SEED, POS_EMBED_MAX_RES, REPO_FREQ_0, REPO_FREQ_1, REPO_FREQ_2, REPO_HIDDEN,
-    REPO_PAIRS, SPLAT_FLOW_NAMESPACE, T_FREQ_DIM,
+    REPO_PAIRS, SplatModel, T_FREQ_DIM,
 };
 use crate::splat_ops::{
     add, attention, concat_rows, gated_residual_mod, gelu_tanh, host_linear, host_silu, layer_norm,
@@ -37,6 +38,7 @@ use crate::splat_ops::{
 };
 use crate::splat_rand::sobol_draw;
 use crate::{emit_progress, DiffusionError, ProgressHook, Result};
+use std::sync::Arc;
 
 /// Sizes a flow block and its rope layer are built at. Fixed to
 /// [`Dims::FLOW`] in production; the tests instantiate tiny ones so the whole
@@ -194,6 +196,7 @@ fn splat_repo_tables(
 
 /// One `UnifiedTransformerBlock`.
 struct FlowBlock {
+    owner: Arc<WeightOwner>,
     dims: Dims,
     /// Checkpoint prefix, reused as the device weight-cache key for the
     /// per-head RMS gammas (the shared kernel caches them by name).
@@ -212,7 +215,13 @@ struct FlowBlock {
 }
 
 impl FlowBlock {
-    fn load(device: Device, weights: &SplatWeights, prefix: &str, modulated: bool) -> Result<Self> {
+    fn load(
+        device: Device,
+        owner: &Arc<WeightOwner>,
+        weights: &Arc<SplatWeights>,
+        prefix: &str,
+        modulated: bool,
+    ) -> Result<Self> {
         let dims = Dims::FLOW;
         let c = dims.channels;
         let (shift_table, norm1, norm2) = if modulated {
@@ -237,40 +246,49 @@ impl FlowBlock {
         Ok(Self {
             dims,
             name: prefix.to_string(),
+            owner: Arc::clone(owner),
             shift_table,
             norm1,
             norm2,
-            qkv: Lin::new(
+            qkv: Lin::new_f16(
                 device,
-                &weights.f32_shaped(&format!("{prefix}.attn.qkv.weight"), &[3 * c, c])?,
+                weights,
+                &format!("{prefix}.attn.qkv.weight"),
                 3 * c,
                 c,
                 Some(&weights.f32_shaped(&format!("{prefix}.attn.qkv.bias"), &[3 * c])?),
+                owner,
             )?,
             q_norm: weights
                 .f32_shaped(&format!("{prefix}.attn.q_norm.gamma"), &[FLOW_HEADS, FLOW_HEAD_DIM])?,
             k_norm: weights
                 .f32_shaped(&format!("{prefix}.attn.k_norm.gamma"), &[FLOW_HEADS, FLOW_HEAD_DIM])?,
-            out: Lin::new(
+            out: Lin::new_f16(
                 device,
-                &weights.f32_shaped(&format!("{prefix}.attn.out.weight"), &[c, c])?,
+                weights,
+                &format!("{prefix}.attn.out.weight"),
                 c,
                 c,
                 Some(&weights.f32_shaped(&format!("{prefix}.attn.out.bias"), &[c])?),
+                owner,
             )?,
-            mlp0: Lin::new(
+            mlp0: Lin::new_f16(
                 device,
-                &weights.f32_shaped(&format!("{prefix}.mlp.mlp.0.weight"), &[FLOW_FFN, c])?,
+                weights,
+                &format!("{prefix}.mlp.mlp.0.weight"),
                 FLOW_FFN,
                 c,
                 Some(&weights.f32_shaped(&format!("{prefix}.mlp.mlp.0.bias"), &[FLOW_FFN])?),
+                owner,
             )?,
-            mlp2: Lin::new(
+            mlp2: Lin::new_f16(
                 device,
-                &weights.f32_shaped(&format!("{prefix}.mlp.mlp.2.weight"), &[c, FLOW_FFN])?,
+                weights,
+                &format!("{prefix}.mlp.mlp.2.weight"),
                 c,
                 FLOW_FFN,
                 Some(&weights.f32_shaped(&format!("{prefix}.mlp.mlp.2.bias"), &[c])?),
+                owner,
             )?,
         })
     }
@@ -305,7 +323,7 @@ impl FlowBlock {
             heads,
             head_dim,
             &self.q_norm,
-            SPLAT_FLOW_NAMESPACE,
+            &self.owner,
             &format!("{}.attn.q_norm", self.name),
         )?;
         let k = rms_norm_per_head(
@@ -313,7 +331,7 @@ impl FlowBlock {
             heads,
             head_dim,
             &self.k_norm,
-            SPLAT_FLOW_NAMESPACE,
+            &self.owner,
             &format!("{}.attn.k_norm", self.name),
         )?;
         let attn = attention(&q, &k, &v, heads, scale)?;
@@ -384,21 +402,27 @@ pub struct SplatFlow {
 impl SplatFlow {
     pub fn prepare(
         device: Device,
+        model: SplatModel,
         weights: &SplatWeights,
         mut progress: Option<ProgressHook>,
     ) -> Result<Self> {
-        Self::prepare_sized(device, weights, FLOW_Q_TOKENS, &mut progress)
+        Self::prepare_sized(device, model, weights, FLOW_Q_TOKENS, &mut progress)
     }
 
     /// [`Self::prepare`] with an explicit latent token count so a tiny
     /// synthetic config can be built in tests.
     pub fn prepare_sized(
         device: Device,
+        model: SplatModel,
         weights: &SplatWeights,
         q_tokens: usize,
         progress: &mut Option<ProgressHook>,
     ) -> Result<Self> {
+        let owner = Arc::new(WeightOwner::new("splat-flow"));
         let c = FLOW_MODEL_CHANNELS;
+        // The blocks' f16 linears keep the file to read a weight again after
+        // a cache eviction.
+        let source = Arc::new(weights.clone());
         let total = FLOW_REFINER_BLOCKS * 2 + FLOW_BLOCKS;
         let mut done = 0usize;
         let tick = |progress: &mut Option<ProgressHook>, done: &mut usize| -> Result<()> {
@@ -418,7 +442,8 @@ impl SplatFlow {
         for i in 0..FLOW_REFINER_BLOCKS {
             noise_refiner.push(FlowBlock::load(
                 device,
-                weights,
+                &owner,
+                &source,
                 &format!("noise_refiner.{i}"),
                 true,
             )?);
@@ -434,7 +459,8 @@ impl SplatFlow {
         for i in 0..FLOW_REFINER_BLOCKS {
             context_refiner.push(FlowBlock::load(
                 device,
-                weights,
+                &owner,
+                &source,
                 &format!("context_refiner.{i}"),
                 false,
             )?);
@@ -448,13 +474,17 @@ impl SplatFlow {
         let mut blocks = Vec::with_capacity(FLOW_BLOCKS);
         let mut repo = Vec::with_capacity(FLOW_BLOCKS);
         for i in 0..FLOW_BLOCKS {
-            blocks.push(FlowBlock::load(device, weights, &format!("blocks.{i}"), true)?);
+            blocks.push(FlowBlock::load(device, &owner, &source, &format!("blocks.{i}"), true)?);
             repo.push(RepoLayer::load(device, weights, &format!("repo_layers.{i}"))?);
             tick(progress, &mut done)?;
         }
 
-        // The Sobol anchors and their embedding are model constants.
-        let anchors = sobol_draw(3, q_tokens, FLOW_SOBOL_SEED);
+        // The anchors and their embedding are model constants.
+        let anchors = if model.pos_pe_in_checkpoint() {
+            weights.f32_shaped("pos_pe", &[1, q_tokens, 3])?
+        } else {
+            sobol_draw(3, q_tokens, FLOW_SOBOL_SEED)
+        };
         let freqs = pcd_position_embed_v1_freqs(c, 3, POS_EMBED_MAX_RES);
         let pos = pcd_position_embed(&anchors, 3, &freqs, 2.0 * std::f32::consts::PI, c);
 
@@ -680,7 +710,7 @@ fn host_final_affine(values: &mut [f32], c: usize, shift: &[f32], scale: &[f32])
 }
 
 /// Every tensor name the flow model reads, with its shape.
-pub fn flow_expected_tensors() -> Vec<(String, Vec<usize>)> {
+pub fn flow_expected_tensors(model: SplatModel) -> Vec<(String, Vec<usize>)> {
     let c = FLOW_MODEL_CHANNELS;
     let mut out = vec![
         ("input_layer.weight".to_string(), vec![c, FLOW_IN_CHANNELS]),
@@ -762,6 +792,9 @@ pub fn flow_expected_tensors() -> Vec<(String, Vec<usize>)> {
     for i in 0..FLOW_BLOCKS {
         repo(format!("repo_layers.{i}"));
     }
+    if model.pos_pe_in_checkpoint() {
+        out.push(("pos_pe".to_string(), vec![1, FLOW_Q_TOKENS, 3]));
+    }
     out
 }
 
@@ -813,6 +846,7 @@ impl FlowBlock {
         Ok(Self {
             dims,
             name,
+            owner: Arc::new(WeightOwner::new("splat-flow")),
             shift_table: modulated.then(|| vec![0.0f32; dims.mod_cols()]),
             norm1: (!modulated).then(|| (vec![1.0; c], vec![0.0; c])),
             norm2: (!modulated).then(|| (vec![1.0; c], vec![0.0; c])),
@@ -890,7 +924,7 @@ mod tests {
 
     #[test]
     fn state_dict_contract_matches_the_released_checkpoint_shape() {
-        let expected = flow_expected_tensors();
+        let expected = flow_expected_tensors(SplatModel::TripoSplat);
         // 21 top-level + 28 modulated blocks + 8 per repo layer.
         let names: Vec<&str> = expected.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"blocks.23.attn.qkv.weight"));
@@ -907,6 +941,10 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), names.len(), "duplicate tensor name");
+        let idol = flow_expected_tensors(SplatModel::Idol);
+        assert_eq!(idol.len(), 560);
+        assert_eq!(&idol[..expected.len()], expected.as_slice());
+        assert_eq!(idol.last(), Some(&("pos_pe".to_string(), vec![1, 8192, 3])));
     }
 
     #[test]

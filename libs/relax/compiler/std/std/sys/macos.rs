@@ -19,6 +19,8 @@ pub const O_NONBLOCK: c_int = 0x4;
 pub const O_APPEND: c_int = 0x8;
 pub const O_NOFOLLOW: c_int = 0x100;
 pub const O_CREAT: c_int = 0x200;
+/// sys/fcntl.h: the current directory, for the *at calls.
+pub const AT_FDCWD: c_int = -2;
 pub const O_TRUNC: c_int = 0x400;
 pub const O_EXCL: c_int = 0x800;
 pub const O_DIRECTORY: c_int = 0x100000;
@@ -109,11 +111,14 @@ pub struct stat_t {
 }
 
 impl stat_t {
-    /// A stat of a file Relax's VFS serves (git runs): its type bits and size only.
-    pub fn synthetic(mode: u32, size: i64) -> stat_t {
+    /// A stat of a file Relax's VFS serves (git runs): its type bits, size and modification time
+    /// (ns since the Unix epoch).
+    pub fn synthetic(mode: u32, size: i64, mtime_ns: u64) -> stat_t {
         let mut st = stat_t::zeroed();
         st.st_mode = mode as u16;
         st.st_size = size;
+        st.st_mtime = (mtime_ns / 1_000_000_000) as _;
+        st.st_mtime_nsec = (mtime_ns % 1_000_000_000) as _;
         st
     }
     pub fn zeroed() -> stat_t {
@@ -161,7 +166,6 @@ extern "C" {
     pub fn stat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn lstat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn fstat(fd: c_int, buf: *mut stat_t) -> c_int;
-    pub fn mkstemp(template: *mut c_char) -> c_int;
     pub fn readdir(dir: *mut c_void) -> *mut dirent_t;
     fn pthread_setname_np(name: *const c_char) -> c_int;
     fn _NSGetEnviron() -> *mut *const *const c_char;
@@ -222,7 +226,7 @@ pub fn fill_random(buf: &mut [u8]) {
 // <os/os_sync_wait_on_address.h> (macOS 14.4+) is used when the running macOS has it; it is
 // looked up with dlsym (no link-time dependency, so the binary still loads on older macOS).
 // Otherwise __ulock_wait/__ulock_wake. The choice is made once and cached;
-// MAKEPAD_RUN_FORCE_ULOCK=1 forces the fallback (testing only).
+// RELAX_FORCE_ULOCK=1 forces the fallback (testing only).
 
 type OsSyncWait = unsafe extern "C" fn(*mut c_void, u64, usize, u32) -> c_int;
 type OsSyncWaitTimeout = unsafe extern "C" fn(*mut c_void, u64, usize, u32, u32, u64) -> c_int;
@@ -248,7 +252,7 @@ fn lookup(name: &[u8]) -> usize {
 
 fn force_ulock() -> bool {
     unsafe {
-        let v = super::getenv(b"MAKEPAD_RUN_FORCE_ULOCK\0".as_ptr() as *const c_char);
+        let v = super::getenv(b"RELAX_FORCE_ULOCK\0".as_ptr() as *const c_char);
         !v.is_null() && *v == b'1' as c_char && *v.add(1) == 0
     }
 }

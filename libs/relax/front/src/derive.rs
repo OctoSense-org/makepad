@@ -66,11 +66,6 @@ pub fn default_const_name(ty: &str, variant: Option<&str>, field: &str) -> Strin
     }
 }
 
-/// Only plain structs take `#[rust(expr)]` defaults (enum variants' fields never grow live).
-fn variant_is_none_live(groups: &[(Option<String>, Vec<FieldDef>)]) -> bool {
-    groups.len() == 1 && groups[0].0.is_none()
-}
-
 impl<'a> Parser<'a> {
 
 
@@ -97,38 +92,16 @@ impl<'a> Parser<'a> {
         }
         let name = String::from_utf8_lossy(self.bytes(it.name.lo, it.name.hi)).trim_start_matches("r#").to_string();
         let mut g = Gen::new(self.edition);
-        // live sessions (M10): a struct field's `#[rust(expr)]` initial value (makepad's) is its
-        // default too, for running values when an edit adds the field (lower.rs ext_project)
-        let live = variant_is_none_live(&groups) && self.session.options.live;
         for (variant, fields) in &groups {
             for f in fields {
-                let Some(fname) = f.name else { continue };
-                // the initial value's tokens: a byte span of the item's tokens, or the attribute's token range
-                let init = match f.default {
-                    Some(e) => {
-                        let ex = self.ast.expr(e);
-                        (ex.lo, ex.hi, None)
-                    }
-                    None if live => match self.rust_attr_expr(self.ast.list(f.attrs)) {
-                        Some(r) => (0, 0, Some(r)),
-                        None => continue,
-                    },
-                    None => continue,
-                };
+                let (Some(fname), Some(e)) = (f.name.get(), f.default.get()) else { continue };
+                let ex = self.ast.expr(e);
+                let (lo, hi) = (ex.lo, ex.hi);
                 let fname = String::from_utf8_lossy(self.bytes(fname.lo, fname.hi)).trim_start_matches("r#").to_string();
-                // a `#[rust(expr)]` initial value is a run-time expression, not a constant of the
-                // program: marked, so the const checker leaves it alone (a real default field
-                // value is an anonymous const like any other)
-                if f.default.is_none() {
-                    tg!(&mut g; #[relax_live_default]);
-                }
                 tg!(&mut g; #[allow(non_upper_case_globals)] const #word(&default_const_name(&name, variant.as_deref(), &fname)) :);
                 self.copy_bytes(&mut g, tok_lo, f.ty_span.0, f.ty_span.1);
                 tg!(&mut g; =);
-                match init.2 {
-                    None => self.copy_bytes(&mut g, tok_lo, init.0, init.1),
-                    Some((a, b)) => self.copy_toks(&mut g, a, b),
-                }
+                self.copy_bytes(&mut g, tok_lo, lo, hi);
                 tg!(&mut g; ;);
             }
         }
@@ -141,22 +114,6 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// The tokens of a field attribute `#[rust(expr)]` (makepad's initial value): their range.
-    fn rust_attr_expr(&self, attrs: &[Attr]) -> Option<(usize, usize)> {
-        for a in attrs {
-            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            if hi < lo + 3 || self.tok_text(self.toks.at(lo)) != b"rust" || self.tok_text(self.toks.at(lo + 1)) != b"(" {
-                continue;
-            }
-            let (s, e) = (self.toks.at(lo + 2).lo, self.toks.at(hi - 2).hi);
-            if self.tok_text(self.toks.at(hi - 1)) != b")" || e <= s {
-                continue;
-            }
-            return Some((lo + 2, hi - 1));
-        }
-        None
-    }
-
     /// Token `i` as the source spelled it (split generic delimiters are restored).
     fn copy_tok(&self, g: &mut Gen, i: usize) {
         let t = self.toks.at(i);
@@ -164,34 +121,14 @@ impl<'a> Parser<'a> {
             g.punct(T::Gt);
             g.punct(T::Gt);
         } else {
-            // The parser splits a compound token in place (`break_and_eat`): `<-25` lexes as
-            // `<-` `25`, and reading the generic arguments leaves the buffer with a `-` token that
-            // begins one byte after the previous token ends, the `<` being the byte in the gap.
-            // The same holds for `<<`, `<=`, `<<=`, `&&`, `&=`, `||`, `|=` and `+=`. A copied
-            // field type must give that byte back, or `X<-25, 25>` comes out as `X -25, 25>`.
-            if let Some(k) = self.split_before(i) {
-                g.punct(k);
+            // `Foo<-1>` is lexed with `<-`, `<<T as A>::B as C>::D` with `<<`. Parsing
+            // consumes the first `<` and leaves the rest in place (`-`, `<`), just as `>>`
+            // leaves `>`: the copy puts the `<` back.
+            let prev_hi = if i > 0 { self.toks.at(i - 1).hi } else { 0 };
+            if matches!(t.kind, T::Minus | T::Lt) && t.lo > prev_hi && self.bytes(t.lo - 1, t.lo) == b"<" {
+                g.punct(T::Lt);
             }
             g.put(t.kind, &String::from_utf8_lossy(self.tok_text(t)));
-        }
-    }
-
-    /// The first half of a compound token the parser split at `i`, if any: see `copy_tok`.
-    fn split_before(&self, i: usize) -> Option<T> {
-        if i == 0 {
-            return None;
-        }
-        let t = self.toks.at(i);
-        let prev_hi = self.toks.at(i - 1).hi;
-        if t.lo != prev_hi + 1 {
-            return None;
-        }
-        match (self.bytes(t.lo - 1, t.lo), t.kind) {
-            (b"<", T::Minus | T::Lt | T::Eq | T::Le) => Some(T::Lt),
-            (b"&", T::And | T::Eq) => Some(T::And),
-            (b"|", T::Or | T::Eq) => Some(T::Or),
-            (b"+", T::Eq) => Some(T::Plus),
-            _ => None,
         }
     }
 
@@ -352,7 +289,7 @@ impl<'a> Parser<'a> {
                     while gparams.iter().any(|g| g.1 == h) {
                         h.push('_');
                     }
-                    gen_hash(&mut body, &name, is_enum, &shapes, &h, packed)
+                    gen_hash(&mut body, &name, is_enum, &shapes, &h, &disc_ty, packed)
                 }
                 "PartialOrd" => gen_ord(&mut body, &name, is_enum, &shapes, true, &disc_ty, packed),
                 _ => gen_ord(&mut body, &name, is_enum, &shapes, false, &disc_ty, packed),
@@ -851,22 +788,25 @@ fn gen_default(g: &mut Gen, ty: &str, is_enum: bool, shapes: &[Shape]) -> bool {
     true
 }
 
-fn gen_hash(g: &mut Gen, _ty: &str, is_enum: bool, shapes: &[Shape], h: &str, packed: bool) {
+fn gen_hash(g: &mut Gen, _ty: &str, is_enum: bool, shapes: &[Shape], h: &str, disc_ty: &str, packed: bool) {
     tg!(g; fn hash < #word(h) : #core() :: hash :: Hasher > (& self , state : & mut #word(h)));
     g.open_brace();
     if is_enum && shapes.is_empty() {
         tg!(g; match * self { });
     } else {
+        if is_enum && shapes.len() > 1 {
+            // deriving/hash.rs: the discriminant's value (explicit `= n` included) as the
+            // discriminant type (`#[repr(u8)]` ..), then the variant's fields
+            tg!(g; let __sd = unsafe { #core() :: intrinsics_mem :: discriminant_value (self) } as #word(disc_ty) ;);
+            tg!(g; #core() :: hash :: Hash :: hash (& __sd , state) ;);
+        }
         tg!(g; match self);
         g.open_brace();
-        for (vi, s) in shapes.iter().enumerate() {
+        for s in shapes {
             if packed { tg!(g; _); } else { pat(g, s, "__s"); }
             tg!(g; =>);
             g.open_brace();
             if packed { packed_fields(g, s, "__s", "self"); }
-            if is_enum && shapes.len() > 1 {
-                tg!(g; #core() :: hash :: Hash :: hash (& (#int(format!("{}isize", vi))), state) ;);
-            }
             for i in 0..s.fields.len() {
                 tg!(g; #core() :: hash :: Hash :: hash (#word(&format!("__s{}", i)), state) ;);
             }
@@ -1002,7 +942,7 @@ impl Parser<'_> {
                 let f = self.ast.fn_ptr(f);
                 let len = bound.len(); bound.extend_from_slice(self.ast.list(f.hrtb));
                 for &t in self.ast.list(f.params) { self.find_type_parameters(t, names, bound, out); }
-                if let Some(t) = f.ret { self.find_type_parameters(t, names, bound, out); }
+                if let Some(t) = f.ret.get() { self.find_type_parameters(t, names, bound, out); }
                 bound.truncate(len);
             }
             Ty::ImplTrait(bs) | Ty::DynTrait(bs, _) => self.find_bounds_type_parameters(bs, names, bound, out),
@@ -1021,7 +961,7 @@ impl Parser<'_> {
             },
             Some(GenericArgs::Paren(ts, ret)) => {
                 for &t in self.ast.list(*ts) { self.find_type_parameters(t, names, bound, out); }
-                if let Some(t) = ret { self.find_type_parameters(*t, names, bound, out); }
+                if let Some(t) = &ret.get() { self.find_type_parameters(*t, names, bound, out); }
             }
             None => {}
         }
@@ -1184,7 +1124,7 @@ impl Parser<'_> {
         for (name, data, fields) in self.deriving_fields(it) {
             let mut values = Vec::new(); let mut pattern = Vec::new();
             for (i, f) in fields.iter().enumerate() {
-                let n = f.name.map_or(i.to_string(), |n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
+                let n = f.name.get().map_or(i.to_string(), |n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
                 let mut value = Gen::new(self.edition);
                 if let VariantData::Struct(_) = data {
                     value.word(&n);
@@ -1265,7 +1205,7 @@ impl Parser<'_> {
             for scalar in [true, false] {
                 for (i, f) in fields.iter().enumerate() {
                     if self.maybe_scalar(f.ty) != scalar { continue; }
-                    let n = f.name.map_or(i.to_string(), |n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
+                    let n = f.name.get().map_or(i.to_string(), |n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
                     if checks > 0 {
                         check.punct(T::AndAnd);
                     }
@@ -1382,7 +1322,10 @@ mod tests {
         for d in &p.defs {
             if d.kind != DefKind::AssocFn || p.syms.str(d.name) != "clone" { continue; }
             let f = &p.files[d.file as usize];
-            let ItemKind::Fn(_, Some(b), _) = f.ast.item(d.item).kind else { panic!("derive body absent") };
+            let b = match f.ast.item(d.item).kind {
+                ItemKind::Fn(_, body, _) if let Some(b) = body.get() => b,
+                _ => panic!("derive body absent"),
+            };
             let block = f.ast.block(b);
             clone_bodies.push(String::from_utf8_lossy(f.bytes(block.lo, block.hi)).replace(' ', ""));
         }

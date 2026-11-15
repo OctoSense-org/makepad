@@ -3,7 +3,6 @@
 //! indirection (E0072, rustc_ty_utils representability.rs).
 
 use crate::ast;
-use crate::mir::transform::const_check::is_live_default;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
@@ -50,7 +49,6 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         let d = DefId(i as u32);
         let def = prog.def(d);
         if !own.get(def.krate as usize).copied().unwrap_or(false) || def.parent == NO_DEF { continue; }
-        if is_live_default(prog, d) { continue; }
         if !matches!(prog.def(def.parent).kind, DefKind::Mod | DefKind::Trait) { continue; }
         // only items the module's source declares (not the compiler's own definitions)
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
@@ -91,6 +89,7 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
 /// source order, is reported; a macro the definition of which another crate wrote is not ours.
 pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
     let mut errors = Vec::new();
+    let scope = relax_front::macros::MacroScope::new(prog.macros.clone());
     for (name, defs) in prog.macros.defs.iter() {
         let mut seen: Vec<(u32, u32, u32)> = Vec::new(); // (krate, file, pos)
         let mut mine: Vec<&crate::macros::MacroDef> = defs.iter().map(|d| &**d).filter(|d| d.exported && d.builtin == 0 && !d.def_file.is_empty()).collect();
@@ -116,9 +115,18 @@ pub fn duplicate_exported_macros(prog: &Program, own: &[bool]) -> Vec<String> {
             let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
             if !own.get(krate as usize).copied().unwrap_or(false) || d.def_pos >= prog.files[file].src_len { continue; }
             let root = prog.crates[krate as usize].root_mod;
+            let krate_name = prog.syms.str(prog.crates[krate as usize].name);
+            let module_name = prog.def_path(prog.mods[root as usize].def);
             let clash = prog.imports_iter().any(|im| im.module == root && !im.glob && !im.ext && im.bind == sym && sym.is_some()
                 && im.segs.len() > 1 && im.segs.last().map(|s| s.1) == sym
-                && (crate::program::BUILTIN_MACROS.contains(&name.as_str()) || relax_front::builtins::is_macro_name(name)));
+                // A value named `column` does not import the built-in `column!`.
+                // Resolve the import's macro path, including public re-exports,
+                // rather than inferring its namespace from the final spelling.
+                && scope.builtin_macro(krate_name, &module_name, &{
+                    let mut path: Vec<_> = im.segs.iter().map(|s| prog.syms.str(s.1).to_string()).collect();
+                    if im.global { path.insert(0, String::new()); }
+                    path
+                }).is_some());
             if clash {
                 errors.push(prog.record_error(file as u32, d.def_pos, "resolve", format!(
                     "E0255: the name `{}` is defined multiple times -- note: `{}` must be defined only once in the macro namespace of this module", name, name)));
@@ -156,6 +164,12 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
     let mut errors = Vec::new();
     // (a definition an expansion wrote has no visibility the AST states: its checks are skipped)
     let written = |d: DefId| { let def = prog.def(d); def.item.0 != u32::MAX && prog.files.get(def.file as usize).is_some_and(|f| f.ast.items.get(def.item.0 as usize).is_some_and(|it| it.lo < f.src_len)) };
+    // the associated types of each impl, in definition order
+    let mut assoc_tys: std::collections::HashMap<DefId, Vec<DefId>> = std::collections::HashMap::new();
+    for j in 0..prog.defs.len() {
+        let adef = prog.def(DefId(j as u32));
+        if adef.kind == DefKind::AssocTy && adef.parent != NO_DEF { assoc_tys.entry(adef.parent).or_default().push(DefId(j as u32)); }
+    }
     for i in 0..prog.defs.len() {
         let imp = DefId(i as u32);
         let idef = prog.def(imp);
@@ -178,10 +192,8 @@ pub fn private_assoc_types(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<Strin
             }
         }
         if !known { continue; }
-        for j in 0..prog.defs.len() {
-            let ad = DefId(j as u32);
+        for &ad in assoc_tys.get(&imp).into_iter().flatten() {
             let adef = prog.def(ad);
-            if adef.kind != DefKind::AssocTy || adef.parent != imp { continue; }
             let Ok(t) = tcx.type_of(prog, ad) else { continue };
             let mut used = Vec::new();
             adts(prog, tcx, t, &mut used, 0);
@@ -216,7 +228,7 @@ pub fn impl_trait_path_privacy(prog: &Program, tcx: &Tcx, own: &[bool]) -> Vec<S
         if def.kind != DefKind::Impl || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
         let ast = &prog.files[def.file as usize].ast;
         let Some(imp) = ast.as_impl(&ast.item(def.item).kind) else { continue };
-        let Some(p) = imp.trait_ else { continue };
+        let Some(p) = imp.trait_.get() else { continue };
         if p.segs.len() < 2 || !p.no_qself() || p.lo >= prog.files[def.file as usize].src_len { continue; }
         let segs = crate::program::path_segs(prog, def.file, &p);
         let module = tcx.item_module(prog, d);
@@ -703,7 +715,7 @@ pub fn generic_param_rules(prog: &Program, d: DefId) -> Vec<String> {
             errors.push(prog.record_error(def.file, item.lo, "parse", "functions cannot be both `const` and `async`".to_string()));
         }
     }
-    let has_default = |p: &crate::ast::GenericParam| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)));
+    let has_default = |p: &crate::ast::GenericParam| matches!(p.kind, GenericParamKind::Type(_, d) if d.is_some()) || matches!(p.kind, GenericParamKind::Const(_, d) if d.is_some());
     if matches!(item.kind, ItemKind::Fn(..) | ItemKind::Impl(..)) {
         for p in params {
             if has_default(p) {
@@ -764,7 +776,7 @@ pub fn entry_point(prog: &Program, root: u32) -> Vec<String> {
     if sig.asyncness {
         return err("E0752: `main` function is not allowed to be `async`");
     }
-    let rust_abi = match sig.abi {
+    let rust_abi = match sig.abi.get() {
         None => true,
         Some(None) => false,
         Some(Some(name)) => prog.files[def.file as usize].text(name) == "\"Rust\"",
@@ -863,7 +875,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             if !prog.active(file, &attrs) { continue; }
             match item.kind {
                 ItemKind::ForeignMod(_) => blocks.push(item),
-                ItemKind::Mod(Some(l)) => stack.extend(ast.list(l).iter().copied()),
+                ItemKind::Mod(crate::ast::Opt::Some(l)) => stack.extend(ast.list(l).iter().copied()),
                 _ => {}
             }
         }
@@ -880,7 +892,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             let fm = ast.row(r);
             let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
             // rustc_ast_lowering lower_abi: the block's ABI string names an ABI
-            if let Some(a) = fm.abi {
+            if let Some(a) = fm.abi.get() {
                 let text = pf.text(a);
                 if !crate::types::Abi::is_rustc_name(&crate::lit::unescape_str(text)) {
                     errors.push(prog.record_error(file, a.lo, "typeck", format!("E0703: invalid ABI: found `{}`", crate::lit::unescape_str(text))));
@@ -937,7 +949,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                                 }
                                 if t == b"kind" && crate::cfg::tok_str(sp, i + 2) == b"\"framework\"" {
                                     let target = &prog.session.options.target;
-                                    let apple = if target.is_empty() { cfg!(target_vendor = "apple") } else { target.contains("apple") };
+                                    let apple = target.contains("apple");
                                     if !apple {
                                         errors.push(prog.record_error(file, sp.tok(lo).lo, "typeck", "E0455: link kind `framework` is only supported on Apple targets".to_string()));
                                     }
@@ -1006,7 +1018,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                 }
                 {
                     // `#[track_caller]` on an item of a block whose ABI is not "Rust" (E0737)
-                    let abi = fm.abi.map_or("C".to_string(), |a| crate::lit::unescape_str(pf.text(a)));
+                    let abi = fm.abi.get().map_or("C".to_string(), |a| crate::lit::unescape_str(pf.text(a)));
                     let sp = prog.src(file);
                     for a in ast.list(ast.item(it).attrs) {
                         let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
@@ -1022,7 +1034,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                     }
                     // check_abi: a C-variadic foreign function has a C-like calling convention
                     if sig.variadic {
-                        let abi = fm.abi.map_or(&b"\"C\""[..], |a| pf.bytes(a.lo, a.hi));
+                        let abi = fm.abi.get().map_or(&b"\"C\""[..], |a| pf.bytes(a.lo, a.hi));
                         let abi = abi.strip_prefix(b"\"").and_then(|a| a.strip_suffix(b"\"")).unwrap_or(abi);
                         if !matches!(abi, b"C" | b"C-unwind" | b"cdecl" | b"cdecl-unwind" | b"system" | b"system-unwind" | b"aapcs" | b"aapcs-unwind" | b"win64" | b"win64-unwind" | b"sysv64" | b"sysv64-unwind" | b"efiapi") {
                             errors.push(prog.record_error(file, ast.item(it).lo, "typeck", format!("E0045: C-variadic functions with the \"{}\" calling convention are not supported", String::from_utf8_lossy(abi))));
@@ -1033,7 +1045,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                         errors.push(prog.record_error(file, g.name.lo, "typeck", format!("E0044: foreign items may not have {} parameters", what)));
                     }
                     for prm in ast.list(sig.params) {
-                        if !matches!(ast.pat(prm.pat), crate::ast::Pat::Wild | crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub: None, .. }) {
+                        if !matches!(ast.pat(prm.pat), crate::ast::Pat::Wild) && !matches!(ast.pat(prm.pat), crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub, .. } if sub.is_none()) {
                             errors.push(prog.record_error(file, ast.item(it).lo, "typeck", "E0130: patterns aren't allowed in foreign function declarations".to_string()));
                         }
                     }
@@ -1169,10 +1181,9 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
         // check_attr.rs check_instruction_set: `arm::*` instruction sets are for the arm targets
         if from_source && name == b"instruction_set" && hi > first + 2 && crate::cfg::tok_str(p, first + 1) == b"(" && crate::cfg::tok_str(p, first + 2) == b"arm" {
             let target = &prog.session.options.target;
-            let arch = if target.is_empty() { std::env::consts::ARCH } else { target.split('-').next().unwrap_or("") };
+            let arch = target.split('-').next().unwrap_or("");
             if !arch.starts_with("arm") && arch != "thumbv7em" {
-                let triple = if target.is_empty() { format!("{}-unknown-{}-gnu", arch, std::env::consts::OS) } else { target.clone() };
-                errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("target `{}` does not support `#[instruction_set(arm::*)]`", triple)));
+                errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("target `{}` does not support `#[instruction_set(arm::*)]`", target)));
             }
         }
         if from_source && name == b"export_name" && hi > first + 2 && crate::cfg::tok_str(p, first + 1) == b"=" {
@@ -1190,7 +1201,7 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
         }
         if from_source && name == b"track_caller" {
             if let crate::ast::ItemKind::Fn(sig, _, _) = ast.item(def.item).kind {
-                let abi = match ast.fn_sig(sig).abi { None => None, Some(None) => Some("C".to_string()), Some(Some(a)) => Some(crate::lit::unescape_str(pf.text(a))) };
+                let abi = match ast.fn_sig(sig).abi.get() { None => None, Some(None) => Some("C".to_string()), Some(Some(a)) => Some(crate::lit::unescape_str(pf.text(a))) };
                 if abi.is_some_and(|a| a != "Rust") {
                     errors.push(prog.record_error(def.file, pos, "typeck", "E0737: `#[track_caller]` can only be used with the Rust ABI".to_string()));
                 }
@@ -1445,7 +1456,7 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
             }
         };
         match ast.ty(t) {
-            Ty::Ref(lt, _, x) => (match lt { None => refs_too, Some(l) => text(*l) == "'_" }) || anon(ast, text, *x, refs_too, depth + 1),
+            Ty::Ref(_, lt, x) => (match &lt.get() { None => refs_too, Some(l) => text(*l) == "'_" }) || anon(ast, text, *x, refs_too, depth + 1),
             Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => anon(ast, text, *x, refs_too, depth + 1),
             Ty::Tuple(l) => ast.list(*l).iter().any(|x| anon(ast, text, *x, refs_too, depth + 1)),
             Ty::Path(p) => ast.segs(p.segs).iter().any(|s| args(s.args(), depth)),
@@ -1457,7 +1468,7 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
     // a lifetime is in scope: one the impl declares (`impl<'a>`), or an anonymous one its header names
     let declared = iast.list(im.generics.params).iter().any(|p| matches!(p.kind, crate::ast::GenericParamKind::Lifetime(_)));
     let header = declared || anon(iast, &itext, im.self_ty, false, 0)
-        || im.trait_.as_ref().is_some_and(|p| iast.segs(p.segs).iter().any(|s| match iast.gargs(s.args()) {
+        || im.trait_.get().as_ref().is_some_and(|p| iast.segs(p.segs).iter().any(|s| match iast.gargs(s.args()) {
             Some(GenericArgs::Angle(v)) => iast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(l) if itext(*l) == "'_")),
             _ => false,
         }));
@@ -1503,7 +1514,7 @@ pub(crate) fn attribute_target(prog: &Program, d: DefId) -> Option<(&'static str
     let item = ast.item(def.item);
     Some(match def.kind {
         K::Fn | K::AssocFn => {
-            let body = matches!(item.kind, ItemKind::Fn(_, Some(_), _));
+            let body = matches!(item.kind, ItemKind::Fn(_, body, _) if body.is_some());
             let in_trait = def.kind == K::AssocFn && prog.def(def.parent).kind == K::Trait;
             ("functions", true, in_trait && !body, false)
         }
@@ -1534,7 +1545,7 @@ pub fn duplicate_symbols(prog: &Program, own: &[bool]) -> Vec<String> {
     for i in 0..prog.defs.len() {
         let d = DefId(i as u32);
         let def = prog.def(d);
-        if !own.get(def.krate as usize).copied().unwrap_or(false) || is_live_default(prog, d) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static) { continue; }
+        if !own.get(def.krate as usize).copied().unwrap_or(false) || !matches!(def.kind, K::Fn | K::AssocFn | K::Static) { continue; }
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         // (an inherent method's symbol clash is left to a build: the check-pass test
         // lint/non-snake-case/non-snake-ffi-issue-31924 has one)
@@ -1670,7 +1681,7 @@ pub fn precise_capture_params(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String
     let pf = &prog.files[def.file as usize];
     let ast = &pf.ast;
     let ItemKind::Fn(sig, _, _) = ast.item(def.item).kind else { return Vec::new() };
-    let Some(ret) = ast.fn_sig(sig).ret else { return Vec::new() };
+    let Some(ret) = ast.fn_sig(sig).ret.get() else { return Vec::new() };
     // the `use<..>` lists of the opaque types written in the return type
     fn walk(ast: &crate::ast::Ast, t: crate::ast::TyId, out: &mut Vec<(crate::ast::GenericArgsId, crate::ast::TyId)>, depth: u32) {
         if depth > 16 { return; }
@@ -1861,8 +1872,12 @@ pub fn global_allocators_and_lang_items(prog: &Program, own: &[bool], binaries: 
 }
 
 /// rustc_ast_passes feature_gate `gate_all`: syntax the parser recorded (ParseSess::gated_spans)
-/// whose feature the crate does not enable is E0658. Text a macro expanded is not judged.
+/// whose feature the crate does not enable is E0658. The crate's own text is judged: the file's,
+/// and the body of a `macro_rules!` defined in it (reported at the token in the definition, as
+/// rustc does); what a built-in macro or another crate's macro produced is not (it may carry
+/// `allow_internal_unstable`).
 pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
+    use crate::parser::ExpnKind;
     let mut errors = Vec::new();
     for (f, pf) in prog.files.iter().enumerate() {
         if pf.ast.gated_syntax.is_empty() { continue; }
@@ -1870,7 +1885,7 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
         if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
         let features = prog.crates[krate as usize].features(prog);
         for &(feature, pos) in &pf.ast.gated_syntax {
-            if pos >= pf.src_len || features.has(feature) { continue; }
+            if features.has(feature) || !matches!(pf.expansion_kind(pos), ExpnKind::Root | ExpnKind::LocalRules) { continue; }
             let msg = match feature {
                 "stmt_expr_attributes" => "attributes on expressions are experimental",
                 "coroutines" => "coroutine syntax is experimental",
@@ -1879,7 +1894,7 @@ pub fn gated_syntax(prog: &Program, own: &[bool]) -> Vec<String> {
                 "default_field_values" => "default values on fields are experimental",
                 _ => continue,
             };
-            errors.push(prog.record_error(f as u32, pos, "typeck", format!("E0658: {msg}")));
+            errors.push(prog.record_error(f as u32, pf.lint_pos(pos), "typeck", format!("E0658: {msg}")));
         }
     }
     errors

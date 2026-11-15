@@ -6,7 +6,7 @@ use crate::makepad_draw::text::{
     selection::{Cursor, Selection},
     shaper::ShapedText,
 };
-use crate::text_input::{mark_band_rect, DrawTextMark, TextMark, TextMarkKind, TextMarkSet};
+use crate::text_input::{mark_band_rect, DrawTextMark, DrawTextMatch, TextMark, TextMarkKind, TextMarkSet};
 use crate::{
     animator::*, html::{FollowingRoomFinder, PendingFollowingRoom, PendingTextAfterRun}, makepad_derive_widget::*,
     makepad_draw::shader::draw_text::TextOverflow, makepad_draw::turtle::{RowAlign, RowAlignRole}, makepad_draw::*,
@@ -398,6 +398,62 @@ pub enum SelectionSegment {
     },
 }
 
+/// A tracked run or object in an aligned table cell: its segment, and an
+/// aligned area at its first row with that row's draw-time position.
+/// Whole cells shown selected (see [`TextFlow::set_cell_selection`]): in
+/// the `table`th table the flow draws (from zero), its `rows` (zero the
+/// header) and `columns`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellSelection {
+    pub table: usize,
+    pub rows: std::ops::Range<usize>,
+    pub columns: std::ops::Range<usize>,
+}
+
+struct CellAnchor {
+    segment: usize,
+    area: Area,
+    drawn: DVec2,
+}
+
+/// The run's layout with its rows where they were drawn. A row after the first starts on the
+/// turtle's next line, below anything taller than the text on the first row's line (a picture,
+/// a display formula), where the layout put it at the text's own pitch. The selection, the
+/// caret and the page-break bands read the run's rows, so they take these. `row_tops` holds
+/// each row's drawn top; a run drawn as one walk moves no row.
+fn rows_as_drawn(text: Rc<LaidoutText>, row_tops: &[f64], font_scale: f32) -> Rc<LaidoutText> {
+    if text.rows.len() < 2 || row_tops.len() != text.rows.len() || font_scale <= 0.0 {
+        return text;
+    }
+    let top = |row: &LaidoutRow| f64::from((row.origin_in_lpxs.y - row.ascender_in_lpxs) * font_scale);
+    let first = row_tops[0] - top(&text.rows[0]);
+    let moved: Vec<f32> = text
+        .rows
+        .iter()
+        .zip(row_tops)
+        .map(|(row, drawn)| ((drawn - first - top(row)) / f64::from(font_scale)) as f32)
+        .collect();
+    if moved.iter().all(|dy| dy.abs() < 0.01) {
+        return text;
+    }
+    let mut text = (*text).clone();
+    for (row, dy) in text.rows.iter_mut().zip(&moved) {
+        row.origin_in_lpxs.y += dy;
+    }
+    text.size_in_lpxs.height += moved.last().copied().unwrap_or(0.0);
+    Rc::new(text)
+}
+
+/// Notes a run's first row as an aligned area, which the cell's alignment
+/// moves with the run's text.
+fn anchor_run(cx: &mut Cx2d, anchor: &mut Option<(Area, DVec2)>, rect: Rect) {
+    if anchor.is_none() {
+        let mut area = Area::Empty;
+        cx.add_aligned_rect_area(&mut area, rect);
+        *anchor = Some((area, rect.pos));
+    }
+}
+
 /// Tracks all segments during drawing for selection support
 #[derive(Default)]
 pub struct SelectionTracker {
@@ -454,6 +510,11 @@ impl SelectionTracker {
 
     pub fn push_newline(&mut self) {
         self.text.push('\n');
+    }
+
+    /// Separates a table row's cells in the text, as copying a table gives them.
+    pub fn push_cell_break(&mut self) {
+        self.text.push('\t');
     }
 
     pub fn total_len(&self) -> usize {
@@ -535,7 +596,7 @@ impl SelectionTracker {
 
     /// Find the nearest character index when point is outside all segments
     fn nearest_index(&self, cx: &Cx, point: DVec2, live: DVec2) -> Option<usize> {
-        let mut best: Option<(usize, f64)> = None;
+        let mut best: Option<(usize, (f64, f64))> = None;
 
         for segment in &self.segments {
             match segment {
@@ -599,7 +660,10 @@ impl SelectionTracker {
         best.map(|(idx, _)| idx)
     }
 
-    fn point_to_rect_distance(point: DVec2, rect: Rect) -> f64 {
+    /// How far `point` is from `rect`, vertically then horizontally: the
+    /// nearest text is on the nearest line, then the nearest along it (a
+    /// point right of a table cell's text finds that cell's row).
+    fn point_to_rect_distance(point: DVec2, rect: Rect) -> (f64, f64) {
         let dx = if point.x < rect.pos.x {
             rect.pos.x - point.x
         } else if point.x > rect.pos.x + rect.size.x {
@@ -614,7 +678,7 @@ impl SelectionTracker {
         } else {
             0.0
         };
-        (dx * dx + dy * dy).sqrt()
+        (dy, dx)
     }
 
     /// Screen-space bands for one mark: one per row the mark touches, each
@@ -748,6 +812,81 @@ impl SelectionTracker {
         }
 
         rects
+    }
+
+    /// The caret's line box at flat index `index`, zero wide, in draw-time
+    /// coordinates. On the boundary between two runs the left run's end is
+    /// taken; where a wrap separates them, `prefer_next_row` takes the next
+    /// run's start instead, as a cursor at a wrapped row's end does.
+    pub fn caret_rect(&self, index: usize, prefer_next_row: bool) -> Option<Rect> {
+        let mut left: Option<Rect> = None;
+        for segment in &self.segments {
+            let rect = match segment {
+                SelectionSegment::Text {
+                    laidout_text,
+                    origin,
+                    font_scale,
+                    text_start,
+                } => {
+                    let end = text_start + laidout_text.text.len();
+                    if index < *text_start || index > end || laidout_text.rows.is_empty() {
+                        continue;
+                    }
+                    let cursor = Cursor {
+                        index: index - text_start,
+                        prefer_next_row,
+                    };
+                    let position = laidout_text.cursor_to_position(cursor);
+                    let row = &laidout_text.rows[position.row_index];
+                    let scale = *font_scale as f64;
+                    let rect = Rect {
+                        pos: *origin
+                            + dvec2(
+                                position.x_in_lpxs as f64 * scale,
+                                (row.origin_in_lpxs.y - row.ascender_in_lpxs) as f64 * scale,
+                            ),
+                        size: dvec2(
+                            0.0,
+                            (row.ascender_in_lpxs - row.descender_in_lpxs) as f64 * scale,
+                        ),
+                    };
+                    if index < end {
+                        return Some(match left {
+                            Some(left) if !prefer_next_row || rect.pos.y <= left.pos.y + 0.5 => left,
+                            _ => rect,
+                        });
+                    }
+                    rect
+                }
+                SelectionSegment::Gap { rect, text_start } => {
+                    let end = text_start + '\u{FFFC}'.len_utf8();
+                    if index == *text_start {
+                        Rect { pos: rect.pos, size: dvec2(0.0, rect.size.y) }
+                    } else if index == end {
+                        Rect {
+                            pos: rect.pos + dvec2(rect.size.x, 0.0),
+                            size: dvec2(0.0, rect.size.y),
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+                SelectionSegment::WidgetText { .. } => continue,
+            };
+            match left {
+                // Two runs meet at `index`: the left one, unless a wrap
+                // between them and the caret prefers the next row.
+                Some(previous) => {
+                    return Some(if prefer_next_row && rect.pos.y > previous.pos.y + 0.5 {
+                        rect
+                    } else {
+                        previous
+                    });
+                }
+                None => left = Some(rect),
+            }
+        }
+        left
     }
 }
 
@@ -891,6 +1030,10 @@ pub struct TextFlow {
     /// Where the last run ended and how it was laid out, while `max_lines` is set.
     #[rust]
     last_run_end: Option<(DVec2, Rc<LaidoutText>)>,
+    /// The empty space after our content on its last line, which is absolute while we draw
+    /// and relative to our area once we've ended.
+    #[rust]
+    last_line_free_space: Option<Rect>,
 
     #[rust]
     pub areas_tracker: RectAreasTracker,
@@ -927,11 +1070,19 @@ pub struct TextFlow {
     table_cell_layout: Layout,
     #[rust]
     pub table_num_columns: usize,
-    /// Horizontal text alignment applied by the layouter within the
-    /// currently active table cell. Set by `begin_table_cell`, cleared
+    /// Horizontal alignment of the currently active table cell, which its
+    /// turtle applies to each of its rows. Set by `begin_table_cell`, cleared
     /// by `end_table_cell`. Outside a cell it is always 0.0 (left).
     #[rust]
     pub cell_text_align_x: f64,
+    /// The tracked runs of the aligned cell being drawn, with where each
+    /// was drawn, until the cell aligns them.
+    #[rust]
+    cell_anchors: Vec<CellAnchor>,
+    /// The table rows drawn (top and bottom, draw-time), while the flow
+    /// tracks its text: a page break does not cut them.
+    #[rust]
+    table_rows: Vec<std::ops::Range<f64>>,
     #[rust]
     pub in_table_header: bool,
     #[rust]
@@ -940,6 +1091,16 @@ pub struct TextFlow {
     pub table_row_is_header: bool,
     #[rust]
     table_is_first_row: bool,
+    /// The cells shown selected, the tables begun in this draw, the row of
+    /// the open table (zero the header), and the selected cells' rects.
+    #[rust]
+    cell_selection: Option<CellSelection>,
+    #[rust]
+    tables_begun: usize,
+    #[rust]
+    table_row: usize,
+    #[rust]
+    cell_washes: Vec<Rect>,
     /// The row each table we're in has open, whose cells all start on its first line.
     #[rust]
     open_table_rows: SmallVec<[Option<TableRowLines>; 2]>,
@@ -977,6 +1138,10 @@ pub struct TextFlow {
     #[live]
     pub draw_selection: DrawColor,
 
+    /// The wash under found text (a [`TextMarkKind::Match`] mark).
+    #[live]
+    pub draw_match: DrawTextMatch,
+
     #[live]
     pub draw_mark: DrawTextMark,
 
@@ -988,6 +1153,13 @@ pub struct TextFlow {
     /// Enable text selection
     #[live(false)]
     pub selectable: bool,
+
+    /// The host owns the selection: the flow tracks its text and draws the
+    /// selection the host sets ([`TextFlow::set_selection`]) as `selectable`
+    /// does, but takes no presses or key focus for it. For an editor that
+    /// hit-tests the flow and keeps its own caret.
+    #[live(false)]
+    pub host_selection: bool,
 
     /// Selection anchor (start) character index
     #[rust]
@@ -1237,6 +1409,9 @@ impl TextFlow {
     /// Counts a drawn inline widget as content on its line. If it drew nothing, the block
     /// start (and pending margin) that `begin_inline_content` used up are put back.
     pub(crate) fn end_inline_widget(&mut self, cx: &Cx2d, block_start_state: (bool, f64)) {
+        if cx.turtle().pos() != self.inline_content_start_pos {
+            self.track_last_line_end(cx);
+        }
         if !self.collapse_block_margins {
             return;
         }
@@ -1586,7 +1761,7 @@ impl Widget for TextFlow {
                 }
             }
             Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                cx.set_key_focus(self.area);
+                cx.set_key_focus_from_user(self.area);
                 if fe.device.is_touch() {
                     cx.hide_clipboard_actions();
                 }
@@ -1600,6 +1775,10 @@ impl Widget for TextFlow {
                         None
                     };
                     self.is_selecting = true;
+                    // A mouse drag selects text, so no scroller around us takes it over. A touch drag still scrolls.
+                    if !fe.device.is_touch() {
+                        cx.claim_finger_drag(fe.digit_id);
+                    }
                     self.redraw(cx);
                 }
             }
@@ -1679,6 +1858,7 @@ impl TextFlow {
         self.skipped_block_depth = 0;
         self.last_row_y = f64::NAN;
         self.last_run_end = None;
+        self.last_line_free_space = None;
         self.is_holding_inline_content = false;
         self.is_wrap_off_for_inline_content = false;
         self.overrun_start_x = None;
@@ -1721,7 +1901,11 @@ impl TextFlow {
         self.table_row_is_header = false;
         self.table_is_first_row = false;
         self.open_table_rows.clear();
+        self.tables_begun = 0;
+        self.cell_washes.clear();
         self.cell_text_align_x = 0.0;
+        self.cell_anchors.clear();
+        self.table_rows.clear();
         self.pending_block_margin = 0.0;
         self.is_at_block_start = true;
     }
@@ -1964,14 +2148,19 @@ impl TextFlow {
     pub fn end(&mut self, cx: &mut Cx2d) {
         self.draw_text.end_deferred_slug_flush(cx);
 
-        // Draw selection highlight before finishing the turtle, then the
-        // marks over it: a mark under a selected word must stay visible.
+        // Draw found text and the selection before finishing the turtle,
+        // then the other marks over them: a mark under a selected word must
+        // stay visible.
+        self.draw_found_rects(cx);
         self.draw_selection_rects(cx);
         self.draw_mark_rects(cx);
 
         cx.end_turtle_with_area(&mut self.area);
         self.drawn_pos = self.area.rect(cx).pos;
         self.items.as_mut().unwrap().retain_visible();
+        if let Some(free_space) = &mut self.last_line_free_space {
+            free_space.pos -= self.drawn_pos;
+        }
 
         // The wipe: text drawn while it runs gets its edge, and it asks for
         // frames until it is done. A finished wipe leaves the text alone.
@@ -1979,6 +2168,23 @@ impl TextFlow {
             self.draw_text.set_total_chars(cx, self.wipe.front());
             self.next_frame = cx.new_next_frame();
         }
+    }
+
+    /// Returns the empty space after our content on its last line (relative to our area), where a widget drawn
+    /// after us can sit, or `None` if the content ends in a box like a quote or a code block.
+    pub fn last_line_free_space(&self) -> Option<Rect> {
+        self.last_line_free_space
+    }
+
+    /// Notes that our content so far ends where the turtle is.
+    fn track_last_line_end(&mut self, cx: &Cx2d) {
+        let turtle = cx.turtle();
+        let pos = turtle.pos();
+        let inner = turtle.inner_rect();
+        self.last_line_free_space = Some(Rect {
+            pos,
+            size: dvec2(inner.pos.x + inner.size.x - pos.x, turtle.row_height()),
+        });
     }
 
     /// Streamed text: new chars wipe in. Call before drawing.
@@ -2011,7 +2217,7 @@ impl TextFlow {
     /// after the glyphs are placed, and neither can do that from the drawn
     /// glyphs alone. A flow with neither pays for none of it.
     fn tracks_text(&self) -> bool {
-        self.selectable || !self.marks.is_empty()
+        self.selectable || self.host_selection || !self.marks.is_empty()
     }
 
     /// Mark a stretch of this flow's text as wrong, doubtful or noteworthy,
@@ -2057,6 +2263,9 @@ impl TextFlow {
         }
         let band_height = self.draw_mark.band_height();
         for mark in self.marks.as_slice() {
+            if mark.kind == TextMarkKind::Match {
+                continue;
+            }
             self.draw_mark.mark_kind = mark.kind;
             for rect in self.selection_tracker.mark_rects(*mark, band_height) {
                 self.draw_mark.draw_abs(cx, rect);
@@ -2064,10 +2273,34 @@ impl TextFlow {
         }
     }
 
+    /// Wash the text of every Match mark, the rows it covers full height.
+    ///
+    /// The wash's layer opens here, after the flow's blocks: a table header's
+    /// or a code block's own background, drawn between the glyphs, would
+    /// cover a layer opened before them. It washes over the text as the
+    /// flow's selection does. A flow with no match opens none.
+    fn draw_found_rects(&mut self, cx: &mut Cx2d) {
+        if !self.marks.as_slice().iter().any(|mark| mark.kind == TextMarkKind::Match) {
+            return;
+        }
+        self.draw_match.new_draw_call(cx);
+        for mark in self.marks.as_slice() {
+            if mark.kind == TextMarkKind::Match {
+                for rect in self.selection_tracker.selection_rects(mark.start, mark.end) {
+                    self.draw_match.draw_abs(cx, rect);
+                }
+            }
+        }
+    }
+
     /// Draw selection highlight rectangles
     fn draw_selection_rects(&mut self, cx: &mut Cx2d) {
-        if !self.selectable {
+        if !self.selectable && !self.host_selection {
             return;
+        }
+        for index in 0..self.cell_washes.len() {
+            let rect = self.cell_washes[index];
+            self.draw_selection.draw_abs(cx, rect);
         }
 
         let start = self.selection_anchor.min(self.selection_cursor);
@@ -2171,11 +2404,18 @@ impl TextFlow {
     /// Set selection range (for external control, e.g., cross-TextFlow selection).
     /// Propagates sub-ranges to child WidgetText widgets so they draw their own selection.
     pub fn set_selection(&mut self, anchor: usize, cursor: usize) {
-        if self.selectable {
+        if self.selectable || self.host_selection {
             self.selection_anchor = anchor;
             self.selection_cursor = cursor;
             self.propagate_selection_to_children();
         }
+    }
+
+    /// Shows whole cells of a table selected, washed as a selection is (a
+    /// host that selects cells sets no text selection over them); None
+    /// shows none. It holds until changed.
+    pub fn set_cell_selection(&mut self, cells: Option<CellSelection>) {
+        self.cell_selection = cells;
     }
 
     /// Propagate the current selection range to child widgets (e.g., CodeView).
@@ -2215,6 +2455,113 @@ impl TextFlow {
             .chars()
             .filter(|c| *c != '\u{FFFC}')
             .collect()
+    }
+
+    /// The caret's line box at flat index `index` of this flow's text, zero
+    /// wide, in the coordinates the flow was drawn at (see
+    /// [`SelectionTracker::caret_rect`]). Needs the flow to track its text.
+    pub fn caret_rect(&self, index: usize, prefer_next_row: bool) -> Option<Rect> {
+        self.selection_tracker.caret_rect(index, prefer_next_row)
+    }
+
+    /// The boxes flat range `start..end` of this flow's text fills, one per
+    /// row it touches, in the coordinates the flow was drawn at (see
+    /// [`SelectionTracker::selection_rects`]). Needs the flow to track its text.
+    pub fn selection_rects(&self, start: usize, end: usize) -> Vec<Rect> {
+        self.selection_tracker.selection_rects(start, end)
+    }
+
+    /// How far the flow moved since it was drawn (a scroll that did not
+    /// redraw it); add it to a draw-time rect to get where it is now.
+    pub fn drawn_shift(&self, cx: &Cx) -> DVec2 {
+        self.shift(cx)
+    }
+
+    /// Takes a line of text's height where the next run would start and
+    /// returns that place as a zero-wide rect, in draw-time coordinates: where
+    /// a caret stands on a line with no text (an empty paragraph or item).
+    pub fn draw_caret_anchor(&mut self, cx: &mut Cx2d) -> Rect {
+        self.flush_block_margin(cx);
+        let (height_in_lpxs, _) = self.get_line_height_and_baseline_in_lpxs(cx);
+        let height = height_in_lpxs as f64 * self.draw_text.font_scale as f64;
+        let pos = cx.turtle().pos();
+        self.make_line_as_tall_as_text(cx);
+        Rect {
+            pos,
+            size: dvec2(0.0, height),
+        }
+    }
+
+    /// Holds a place in the flow's text where it drew nothing (an empty
+    /// table cell): an object character a caret stands before and after, at
+    /// where the next run would start, which a press near it finds.
+    pub fn draw_caret_place(&mut self, cx: &mut Cx2d) {
+        let rect = self.draw_caret_anchor(cx);
+        self.track_object(cx, rect);
+    }
+
+    /// Holds one object character in the flow's text for something drawn in
+    /// place of text (a picture): a caret stands before and after it, a press
+    /// on `rect` finds it, and a selection over it covers `rect`. `rect` is
+    /// where it was drawn, in this draw's coordinates.
+    pub fn track_object(&mut self, cx: &mut Cx2d, rect: Rect) {
+        if self.tracks_text() {
+            self.selection_tracker.push_gap(rect);
+            // In an aligned cell the cell's end moves it as far as it
+            // aligned what it holds.
+            if self.cell_text_align_x != 0.0 {
+                let mut area = Area::Empty;
+                cx.add_aligned_rect_area(&mut area, rect);
+                let segment = self.selection_tracker.segments.len() - 1;
+                self.cell_anchors.push(CellAnchor { segment, area, drawn: rect.pos });
+            }
+        }
+    }
+
+    /// The object (`track_object`, or a held place) drawn under `abs`: where
+    /// it stands in the flow's text. Only a press on the object itself finds
+    /// it, never one merely nearest to it.
+    pub fn object_at(&self, cx: &Cx, abs: DVec2) -> Option<usize> {
+        let point = abs - self.shift(cx);
+        self.selection_tracker.segments.iter().find_map(|segment| match segment {
+            SelectionSegment::Gap { rect, text_start } if rect.contains(point) => Some(*text_start),
+            _ => None,
+        })
+    }
+
+    /// Bands across what the flow drew last that a page break must not cut:
+    /// each line of text, each object in the text (a picture, a widget, a
+    /// held place) and each table row, from the flow's top, in no particular
+    /// order. Empty unless the flow tracks its text.
+    pub fn break_hints(&self, cx: &Cx) -> Vec<std::ops::Range<f64>> {
+        let top = self.drawn_pos.y;
+        let mut bands = Vec::new();
+        for segment in &self.selection_tracker.segments {
+            match segment {
+                SelectionSegment::Text { laidout_text, origin, font_scale, .. } => {
+                    let scale = *font_scale as f64;
+                    for row in &laidout_text.rows {
+                        let y = origin.y + (row.origin_in_lpxs.y - row.ascender_in_lpxs) as f64 * scale - top;
+                        bands.push(y..y + (row.ascender_in_lpxs - row.descender_in_lpxs) as f64 * scale);
+                    }
+                }
+                SelectionSegment::Gap { rect, .. } => bands.push(rect.pos.y - top..rect.pos.y + rect.size.y - top),
+                SelectionSegment::WidgetText { area, .. } => {
+                    // Where the widget is now, less how far the flow moved.
+                    let rect = area.rect(cx);
+                    let y = rect.pos.y - self.shift(cx).y - top;
+                    bands.push(y..y + rect.size.y);
+                }
+            }
+        }
+        bands.extend(self.table_rows.iter().map(|row| row.start - top..row.end - top));
+        bands
+    }
+
+    /// The text the flow tracks, as drawn (its flat indices index it), for a
+    /// host that steps a caret through it. Empty unless the flow tracks text.
+    pub fn tracked_text(&self) -> &str {
+        &self.selection_tracker.text
     }
 
     /// Get the total text length
@@ -2264,6 +2611,7 @@ impl TextFlow {
         self.draw_block.draw_vars.area = area;
         self.draw_block.end(cx);
         self.end_block_box(cx, self.code_walk);
+        self.last_line_free_space = None;
         if self.tracks_text() {
             self.selection_tracker.push_newline();
         }
@@ -2480,6 +2828,7 @@ impl TextFlow {
         let walk = self.begin_block_box(cx, self.sep_walk);
         self.draw_block.draw_walk(cx, walk);
         self.end_block_box(cx, self.sep_walk);
+        self.last_line_free_space = None;
     }
 
     pub fn begin_quote(&mut self, cx: &mut Cx2d) {
@@ -2506,12 +2855,15 @@ impl TextFlow {
         self.draw_block.draw_vars.area = area;
         self.draw_block.end(cx);
         self.end_block_box(cx, self.quote_walk);
+        self.last_line_free_space = None;
         if self.tracks_text() {
             self.selection_tracker.push_newline();
         }
     }
 
     pub fn begin_table(&mut self, cx: &mut Cx2d, num_columns: usize) {
+        self.tables_begun += 1;
+        self.table_row = 0;
         if self.skip_block_if_cut() {
             return;
         }
@@ -2535,6 +2887,7 @@ impl TextFlow {
         self.table_num_columns = 0;
         self.in_table_header = false;
         self.end_block_box(cx, self.table_walk);
+        self.last_line_free_space = None;
         if self.tracks_text() {
             self.selection_tracker.push_newline();
         }
@@ -2555,6 +2908,10 @@ impl TextFlow {
         }
         self.table_row_is_header = is_header;
         self.table_row_cell_rects.clear();
+        // Rows after the first start a line of the text.
+        if !self.table_is_first_row && self.tracks_text() {
+            self.selection_tracker.push_newline();
+        }
         if let Some(row) = self.open_table_rows.last_mut() {
             *row = Some(TableRowLines { start_lines_drawn: self.lines_drawn, max_lines_drawn: self.lines_drawn });
         }
@@ -2585,15 +2942,28 @@ impl TextFlow {
         if let Some(row) = self.open_table_rows.last_mut().and_then(Option::take) {
             self.lines_drawn = row.max_lines_drawn;
         }
-        let row_rect = cx.turtle().rect();
-        if self.table_row_is_header {
+        // The rules take the finished row's height: before the row ends a
+        // fitted turtle's height is NaN, and rules drawn with it never show.
+        let ended = if self.table_row_is_header {
             self.draw_block.end(cx);
+            self.draw_block.draw_vars.area.rect(cx)
         } else {
-            cx.end_turtle();
+            cx.end_turtle()
+        };
+        self.draw_row_cell_borders(cx, ended);
+        if let Some(selection) = &self.cell_selection {
+            if selection.table + 1 == self.tables_begun && selection.rows.contains(&self.table_row) {
+                for (column, cell) in self.table_row_cell_rects.iter().enumerate() {
+                    if selection.columns.contains(&column) {
+                        self.cell_washes.push(Rect { pos: dvec2(cell.pos.x, ended.pos.y), size: dvec2(cell.size.x, ended.size.y) });
+                    }
+                }
+            }
         }
-        self.draw_row_cell_borders(cx, row_rect);
+        self.table_row += 1;
         if self.tracks_text() {
             self.selection_tracker.push_newline();
+            self.table_rows.push(ended.pos.y..ended.pos.y + ended.size.y);
         }
     }
 
@@ -2659,6 +3029,11 @@ impl TextFlow {
         if !is_in_drawn_row && self.skip_block_if_cut() {
             return;
         }
+        // Cells stay apart in the text, so the end of one and the start of
+        // the next are different places.
+        if !self.table_row_cell_rects.is_empty() && self.tracks_text() {
+            self.selection_tracker.push_cell_break();
+        }
         let cell_width = if self.table_num_columns > 0 {
             cx.turtle().inner_width() / self.table_num_columns as f64
         } else {
@@ -2689,6 +3064,16 @@ impl TextFlow {
             return;
         }
         let cell_rect = cx.end_turtle();
+        // The cell aligned its rows as it ended: its runs' text positions,
+        // recorded as they were drawn, move with them.
+        for CellAnchor { segment, area, drawn } in self.cell_anchors.drain(..) {
+            let moved = area.rect(cx).pos - drawn;
+            match self.selection_tracker.segments.get_mut(segment) {
+                Some(SelectionSegment::Text { origin, .. }) => *origin += moved,
+                Some(SelectionSegment::Gap { rect, .. }) => rect.pos += moved,
+                _ => {}
+            }
+        }
         self.table_row_cell_rects.push(cell_rect);
         if let Some(Some(row)) = self.open_table_rows.last_mut() {
             row.max_lines_drawn = row.max_lines_drawn.max(self.lines_drawn);
@@ -2901,10 +3286,21 @@ impl TextFlow {
     }
 
     pub fn draw_text(&mut self, cx: &mut Cx2d, text: &str) {
+        self.draw_text_range(cx, text);
+    }
+
+    /// Draws a run of text as [`Self::draw_text`] does, and returns the part
+    /// of `text` the flow drew and added to its text (a line's leading white
+    /// space and a run's trailing line breaks are not content), or `None`
+    /// when it drew nothing. A host that maps the flow's text back to where
+    /// the run came from records this, not the text it passed.
+    pub fn draw_text_range(&mut self, cx: &mut Cx2d, text: &str) -> Option<std::ops::Range<usize>> {
+        let whole = text;
+        let mut drawn = None;
         if let Some(DrawState::Drawing) = self.draw_state.get() {
             // If we've already exceeded max_lines, skip all further text.
             if self.content_truncated {
-                return;
+                return None;
             }
 
             let is_at_line_start = self.first_thing_on_a_line || (self.collapse_block_margins && self.is_at_block_start);
@@ -2916,6 +3312,8 @@ impl TextFlow {
             } else {
                 text.trim_start()
             });
+            let drawn_start = text.as_ptr() as usize - whole.as_ptr() as usize;
+            let drawn_range = drawn_start..drawn_start + text.len();
             // Whitespace that starts a line or follows a list item's marker isn't content,
             // and neither is a run that was empty or only a line break.
             if text.is_empty() {
@@ -2923,12 +3321,12 @@ impl TextFlow {
                 if !is_at_line_start {
                     self.make_line_as_tall_as_text(cx);
                 }
-                return;
+                return None;
             }
             // A run that would start a new line past the budget is dropped before its margin applies.
             if self.collapse_block_margins && self.max_lines > 0 && self.lines_drawn >= self.max_lines && self.is_at_new_line_start(cx) {
                 self.content_truncated = true;
-                return;
+                return None;
             }
             if let Some(pending) = self.pending_text_after_run.take() {
                 pending.resolve(cx, self);
@@ -2978,10 +3376,6 @@ impl TextFlow {
             self.draw_text.text_style.font_size = *font_size as _;
             self.draw_text.color = font_color;
             self.draw_text.temp_y_shift = top_drop + y_shift_scale + baseline_shift;
-            self.draw_text.layout_align = Align {
-                x: self.cell_text_align_x,
-                y: 0.0,
-            };
 
             // Widget-level max_lines: compute how many layouter rows this run is allowed. A "continuation"
             // run starts mid-line or on a row something already charged, so its first row shares that line.
@@ -3006,7 +3400,7 @@ impl TextFlow {
                 if remaining_new_lines == 0 && !is_continuation {
                     // No visual lines left and this run would start a new one.
                     self.content_truncated = true;
-                    return;
+                    return None;
                 }
                 // Continuation runs get +1 because their first row doesn't
                 // consume a new visual line (it shares the current one).
@@ -3024,6 +3418,9 @@ impl TextFlow {
 
             // A code box's right margin sits between its text and the text glued to it.
             self.draw_text.trailing_glue_width_in_lpxs = self.add_code_margin_end(self.trailing_glue_width_in_lpxs);
+            // A run in an aligned cell notes where it was drawn; the cell's
+            // end moves its tracked position as far as it aligned it.
+            let anchored = self.cell_text_align_x != 0.0 && self.tracks_text();
             let dt = &mut self.draw_text;
             dt.line_break_before = self.line_break_before;
             dt.line_break_after = self.line_break_after;
@@ -3036,6 +3433,9 @@ impl TextFlow {
             let mut layout_origin = dvec2(cx.turtle().inner_rect().pos.x, cx.turtle().pos().y);
             // While we hold inline content, where the run starts and the edge it's laid out against.
             let mut held_run_bounds = self.is_holding_inline_content.then(|| (cx.turtle().pos(), Self::get_row_end(cx)));
+            let mut anchor = None;
+            // Where each of the run's rows was drawn (its top).
+            let mut row_tops: Vec<f64> = Vec::new();
             let laidout_text = if self.inline_code.value() > 0 {
                 let db = &mut self.draw_block;
                 db.block_type = FlowBlockType::InlineCode;
@@ -3218,6 +3618,10 @@ impl TextFlow {
                 let laidout_text = self.pending_following_room.and_then(|pending| self.lay_out_run(cx, text, pending));
                 let (dt, db, areas_tracker) = (&mut self.draw_text, &mut self.draw_block, &mut self.areas_tracker);
                 let result = dt.draw_laidout_resumable_with_background(cx, text, laidout_text, |cx, mut rect, _| {
+                    row_tops.push(rect.pos.y);
+                    if anchored {
+                        anchor_run(cx, &mut anchor, rect);
+                    }
                     let text_rect = rect;
                     rect.pos -= self.inline_code_padding.left_top();
                     rect.size += self.inline_code_padding.size();
@@ -3263,6 +3667,10 @@ impl TextFlow {
                     db.line_color = font_color;
                     db.block_type = FlowBlockType::Strikethrough;
                     dt.draw_laidout_resumable_with(cx, text, laidout_text, |cx, rect, _| {
+                        row_tops.push(rect.pos.y);
+                        if anchored {
+                            anchor_run(cx, &mut anchor, rect);
+                        }
                         db.draw_abs(cx, rect);
                         areas_tracker.track_rect(cx, rect);
                     })
@@ -3270,15 +3678,24 @@ impl TextFlow {
                     db.line_color = font_color;
                     db.block_type = FlowBlockType::Underline;
                     dt.draw_laidout_resumable_with(cx, text, laidout_text, |cx, rect, _| {
+                        row_tops.push(rect.pos.y);
+                        if anchored {
+                            anchor_run(cx, &mut anchor, rect);
+                        }
                         db.draw_abs(cx, rect);
                         areas_tracker.track_rect(cx, rect);
                     })
                 } else {
                     dt.draw_laidout_resumable_with(cx, text, laidout_text, |cx, rect, _| {
+                        row_tops.push(rect.pos.y);
+                        if anchored {
+                            anchor_run(cx, &mut anchor, rect);
+                        }
                         areas_tracker.track_rect(cx, rect);
                     })
                 }
             };
+            let laidout_text = rows_as_drawn(laidout_text, &row_tops, self.draw_text.font_scale);
             if let Some((run_start, row_end)) = held_run_bounds.filter(|_| self.overrun_start_x.is_none()) {
                 let last_row = laidout_text.rows.last().unwrap();
                 let end_in_lpxs = last_row.origin_in_lpxs.x + last_row.width_without_hanging_in_lpxs();
@@ -3294,6 +3711,10 @@ impl TextFlow {
             if self.tracks_text() {
                 self.selection_tracker
                     .push_text(laidout_text.clone(), layout_origin, self.draw_text.font_scale, text);
+                if let Some((area, drawn)) = anchor {
+                    let segment = self.selection_tracker.segments.len() - 1;
+                    self.cell_anchors.push(CellAnchor { segment, area, drawn });
+                }
             }
             self.line_break_before = laidout_text.line_break_before_next_run;
             self.is_start_reserved = laidout_text.is_trailing_glue_reserved;
@@ -3325,8 +3746,11 @@ impl TextFlow {
             // whether it is joining this same visual line or one that inline
             // content opened in between.
             self.last_row_y = cx.turtle().pos().y;
+            self.track_last_line_end(cx);
+            drawn = Some(drawn_range);
         }
         self.first_thing_on_a_line = false;
+        drawn
     }
 
     /// Lays out a run of `text` where the turtle is, since what follows it at `pending` may need room on its last row.
@@ -3528,8 +3952,9 @@ impl Widget for TextFlowLink {
             let area = self.drawn_areas[i];
             match event.hits(cx, area) {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
-                    if self.grab_key_focus {
-                        cx.set_key_focus(self.area());
+                    // A touch waits until it's a tap, so a drag that scrolls from here keeps the keyboard up.
+                    if self.grab_key_focus && !fe.device.is_touch() {
+                        cx.set_key_focus_from_user(self.area());
                     }
                     self.animator_play(cx, ids!(hover.down));
                     if self.click_on_down {
@@ -3550,6 +3975,9 @@ impl Widget for TextFlowLink {
                     self.animator_play(cx, ids!(hover.off));
                 }
                 Hit::FingerUp(fe) if fe.is_primary_hit() => {
+                    if self.grab_key_focus && fe.device.is_touch() && fe.is_over && fe.was_tap() {
+                        cx.set_key_focus_from_user(self.area());
+                    }
                     if fe.is_over {
                         if !self.click_on_down {
                             cx.widget_action_with_data(

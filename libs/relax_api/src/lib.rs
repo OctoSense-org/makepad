@@ -17,13 +17,17 @@
 //!   only that side's code makes and reads, laid out by that side's std). Without it, JIT code
 //!   that reaches a provided crate's static of a type not the same bytes on both sides is refused:
 //!   rustc's one copy cannot be read with Relax's layouts.
+//! - `run`, beside any of these: the ops allocate in the program's heap ([`run_op`]), so the
+//!   program's end takes what they made. A crate whose objects are the program's (a script VM)
+//!   says it on every attribute. Without it an op allocates in the host's heap ([`host_op`]).
 //!
 //! In a normal build the attribute leaves the item as it is. With the crate's `host-shims`
 //! feature (only the `makepad` loader build enables it) it also emits, next to the item, an extern "C"
-//! wrapper and one [`Entry`] in the `relax_api` link section; [`entries`] reads them all back.
+//! wrapper and one [`Entry`] in the `relax_api` link section; [`entries`] reads them all back. The
+//! loader is not built for the web (its `platforms`), so the feature is never on for wasm32.
 //! Nothing generated is checked in.
 
-pub use makepad_relax_api_macro::relax_api;
+pub use relax_api_macro::relax_api;
 
 static APP_CALL: std::sync::OnceLock<fn(unsafe extern "C" fn(*mut u8), *mut u8) -> bool> = std::sync::OnceLock::new();
 
@@ -52,11 +56,11 @@ pub fn app_call<F: FnOnce()>(f: F) -> bool {
 }
 
 /// An op of a crate whose objects are the program's: what it allocates goes with the program's heap
-/// (`makepad_alloc_phase::run`). Only generated wrappers call this.
+/// (`relax_api_phase::run`). Only generated wrappers call this.
 #[cfg(feature = "host-shims")]
 #[inline(always)]
 pub fn run_op() -> impl Sized {
-    makepad_alloc_phase::run()
+    relax_api_phase::run()
 }
 #[cfg(not(feature = "host-shims"))]
 #[inline(always)]
@@ -67,18 +71,52 @@ pub fn run_op() {}
 #[cfg(feature = "host-shims")]
 #[inline(always)]
 pub fn host_op() -> impl Sized {
-    makepad_alloc_phase::kept()
+    relax_api_phase::kept()
 }
 #[cfg(not(feature = "host-shims"))]
 #[inline(always)]
 pub fn host_op() {}
+
+/// The program's environment, for a provided crate's code. Under the loader a provided crate's
+/// bound ops run rustc's code in the loader's process, where `std::env` is the host's environment;
+/// the program's own (a package's run-env, the program's writes) is the loader's to answer. Read a
+/// setting that only tunes or reports the program's own run (a log, a trace, a tuning knob) here;
+/// one that decides what the process loads, runs or opens, a choice of the person's invocation, or
+/// a variable a C library reads too stays a `std::env` read.
+pub mod env {
+    use std::ffi::{OsStr, OsString};
+
+    static PROGRAM_READ: std::sync::OnceLock<fn(&OsStr) -> Option<OsString>> = std::sync::OnceLock::new();
+
+    /// The loader's read of the program's environment (relax-base progenv `program_var_os`), once per
+    /// process. Without one, and in JIT-compiled code, the program's environment is `std::env`.
+    pub fn set_program_read(read: fn(&OsStr) -> Option<OsString>) {
+        let _ = PROGRAM_READ.set(read);
+    }
+
+    /// `std::env::var_os` of the program's environment.
+    pub fn var_os<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
+        match PROGRAM_READ.get() {
+            Some(read) => read(key.as_ref()),
+            None => std::env::var_os(key),
+        }
+    }
+
+    /// `std::env::var` of the program's environment.
+    pub fn var<K: AsRef<OsStr>>(key: K) -> Result<String, std::env::VarError> {
+        match var_os(key) {
+            Some(v) => v.into_string().map_err(std::env::VarError::NotUnicode),
+            None => Err(std::env::VarError::NotPresent),
+        }
+    }
+}
 
 /// The locks a provided crate's process-lifetime data uses. On macOS std's lock allocates a block
 /// at its first use, on whatever thread and in whatever phase that is: in an op, that block would
 /// be the run's and go with it, and the lock with it. These keep their state inline.
 pub mod sync {
     #[cfg(target_vendor = "apple")]
-    pub use makepad_alloc_phase::sync::{Condvar, Mutex, MutexGuard};
+    pub use relax_api_phase::sync::{Condvar, Mutex, MutexGuard};
     #[cfg(not(target_vendor = "apple"))]
     pub use std::sync::{Condvar, Mutex, MutexGuard};
 }
@@ -89,7 +127,7 @@ pub mod sync {
 #[inline(always)]
 pub fn process_heap<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(feature = "host-shims")]
-    let _kept = makepad_alloc_phase::kept();
+    let _kept = relax_api_phase::kept();
     f()
 }
 
@@ -167,9 +205,35 @@ pub unsafe fn string_from_words(w: Words) -> String {
 
 thread_local! { static LAST_PANIC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 
-/// A wrapper's caught panic: its text is kept for [`last_panic`]; returns 1.
+/// The payload of a panic of the caller's side (Relax-compiled code) on its way through rustc's
+/// frames, which run their cleanups as for any panic: the caller's own payload stays on its
+/// side. A wrapper that catches it returns 2, and the caller's side goes on with its panic.
+/// Dropped anywhere else (a catch_unwind of rustc's ended the panic), it calls `end`, which
+/// ends the panic on the caller's side.
+#[doc(hidden)]
+pub struct CallerPanic {
+    pub end: Option<extern "C" fn()>,
+}
+
+impl Drop for CallerPanic {
+    fn drop(&mut self) {
+        if let Some(end) = self.end.take() {
+            end();
+        }
+    }
+}
+
+/// A wrapper's caught panic: its text is kept for [`last_panic`]; returns 1. A panic of the
+/// caller's side ([`CallerPanic`]) returns 2: it is the caller's to go on with.
 #[doc(hidden)]
 pub fn caught(p: Box<dyn std::any::Any + Send>) -> u32 {
+    let p = match p.downcast::<CallerPanic>() {
+        Ok(mut c) => {
+            c.end = None;
+            return 2;
+        }
+        Err(p) => p,
+    };
     let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
     LAST_PANIC.with(|l| *l.borrow_mut() = msg);
     1
@@ -261,11 +325,7 @@ mod section {
 }
 
 #[cfg(all(feature = "host-shims", target_arch = "wasm32"))]
-mod section {
-    pub fn entries() -> &'static [super::Entry] {
-        &[]
-    }
-}
+compile_error!("relax-api's host-shims is the `makepad` loader's, which wasm32 does not run: no table is laid down or read there");
 
 #[allow(dead_code)]
 const fn anchor() -> Entry {
@@ -281,8 +341,6 @@ fn platform() -> &'static str {
         "apple"
     } else if cfg!(windows) {
         "windows"
-    } else if cfg!(target_arch = "wasm32") {
-        "wasm32"
     } else {
         "elf"
     }

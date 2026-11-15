@@ -134,8 +134,9 @@ fn a_kept_run_draws_every_glyph() {
 /// No frame shows a glyph blank, and a draw list that is not redrawn keeps its
 /// words. `churn` animates 760 frames of glyphs it already holds (past the
 /// 600-frame idle sweep, nothing asks for glyphs so nothing redraws the `still`
-/// row's own list), then 240 frames of fresh glyph/size pairs into a 1024x1024 host
-/// atlas (evicting and reusing slots). Every sampled frame: each churn cell has ink, and
+/// row's own list), then fresh glyph/size pairs into a 1024x1024 host atlas (evicting and
+/// reusing slots): at least 240 frames, and until this has sampled ten of them and presses
+/// `churn` again (however slow the box). Every sampled frame: each churn cell has ink, and
 /// the still row is pixel-identical to how it looked before the churn.
 #[test]
 fn no_frame_shows_a_blank_glyph_and_a_retained_list_keeps_its_words() {
@@ -193,6 +194,10 @@ fn no_frame_shows_a_blank_glyph_and_a_retained_list_keeps_its_words() {
             if status == "churn fresh" {
                 let shot = app.screenshot();
                 sampled += 1;
+                if sampled == 10 {
+                    // enough frames seen: the churn ends once it has drawn its fresh frames
+                    app.locator(Selector::id("churn")).click();
+                }
                 let cells: Vec<usize> = (0..8)
                     .map(|k| ink(&shot, (8 + k * 64, churn_y, 56, 66)))
                     .collect();
@@ -228,7 +233,7 @@ fn no_frame_shows_a_blank_glyph_and_a_retained_list_keeps_its_words() {
 /// A draw list recorded once and painted from its kept instances ever after (never redrawn,
 /// not even on a full redraw, as a render target's passes are) keeps its words while the churn
 /// fills a small curve store with fresh glyphs in three faces: its glyphs stay in use and are
-/// touched at every sweep, so the store takes back unused glyphs first. Before (149, the Relax
+/// touched at every sweep, so the store takes back unused glyphs first. Before (on a Linux node, the Relax
 /// deck title): they were let go as unused, their curves given to another glyph ("Re ax").
 #[test]
 fn a_kept_draw_list_keeps_its_words() {
@@ -280,6 +285,10 @@ fn a_kept_draw_list_keeps_its_words() {
             if status == "churn fresh" || status.starts_with("churn done") {
                 let shot = app.screenshot();
                 sampled += 1;
+                if sampled == 5 {
+                    // enough frames seen: the churn ends once it has drawn its fresh frames
+                    app.locator(Selector::id("churn")).click();
+                }
                 let now = rows(&shot);
                 let diff = now.iter().zip(&before).filter(|(a, b)| a.abs_diff(**b) > 48).count();
                 if diff > 8 {

@@ -7,7 +7,7 @@ use crate::frame::FrameReader;
 use crate::hosts::{Host, Hosts, Via};
 use crate::hub::Hub;
 use crate::relay;
-use crate::tests::{pair, shared};
+use crate::tests::{pair, pair_served, shared};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ fn ledger_dir(test: &str) -> std::path::PathBuf {
 fn relay_endpoint() -> Endpoint {
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    relay::endpoint(relay::Config { name: "d".into(), launch: vec!["/bin/sleep".into()], env: vec![("SANDBOX_MUTE".into(), "1".into())], ledger: ledger_dir(&format!("shared{n}")) })
+    relay::endpoint(relay::Config { name: "d".into(), launch: vec!["sleep".into()], env: vec![("MAKEPAD_MUTE".into(), "1".into())], ledger: ledger_dir(&format!("shared{n}")) })
 }
 
 /// A relay on an existing ledger (what a restarted relay does).
@@ -112,6 +112,36 @@ fn cmd_goes_to_the_endpoint() {
     }
 }
 
+/// Requests in a row on one routed channel ([`crate::hub::Asking`]) take one route for all of
+/// them, which ends with the channel: a route for each took two threads in the hub, and a master
+/// following its runs' logs spawned 1.4k threads in 25 s (11-06).
+#[test]
+fn requests_in_a_row_on_one_channel_take_one_route() {
+    let (_, _) = shared();
+    let hub = Hub::new(&hosts());
+    let _relay_conn = link(&hub, &relay_endpoint());
+    let c = client(&hub);
+    let me = std::process::id();
+    let asking = crate::hub::Asking::on(c.open("route", &format!("d:{me} cmd ")).unwrap());
+    for _ in 0..5 {
+        let mut reply = Vec::new();
+        assert_eq!(asking.ask("ping", &mut |l| reply.push(l.to_string())), Ok(false));
+        assert!(reply.len() == 1 && reply[0].starts_with("{\"pong\":1"), "{reply:?}");
+        assert_eq!(hub.routes(), 1);
+    }
+    // a reply far past the 16 KiB it was once cut at comes through the hub whole, the line a
+    // message boundary cut inside a character joined again
+    let mut big = Vec::new();
+    assert_eq!(asking.ask("big", &mut |l| big.push(l.to_string())), Ok(false));
+    assert!(big == crate::tests::big_lines(), "the big reply arrives whole through the hub");
+    drop(asking);
+    let t = std::time::Instant::now();
+    while hub.routes() > 0 {
+        assert!(t.elapsed() < WAIT, "the route outlived its channel");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// An app's AI tools through the hub, as `devhub inspect <node>/<pid> call ..` and `live act`
 /// ask them (both sent `call` to `cmd`, which knows no such command, 11-05).
 #[test]
@@ -163,7 +193,10 @@ fn requests_to_an_unreachable_fleet_host_leave_no_route_threads() {
     // the request line arrives while the dial is still failing: the route ends without an
     // upstream, and its client -> upstream thread must end with it
     let hub = Hub::new(&Hosts::default());
-    hub.set_fleet(std::sync::Arc::new(|_addr: &str| {
+    let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = dials.clone();
+    hub.set_fleet(std::sync::Arc::new(move |_addr: &str| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(50));
         Err(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "down"))
     }));
@@ -171,7 +204,9 @@ fn requests_to_an_unreachable_fleet_host_leave_no_route_threads() {
     let c = client(&hub);
     for _ in 0..10 {
         let ch = c.open("route", "gone peers").unwrap();
-        ch.send(b"peers".to_vec()).unwrap();
+        // while the host's redial pauses the hub may answer before the request goes: the
+        // channel is closed then, and its close says why
+        let _ = ch.send(b"peers".to_vec());
         match ch.recv_timeout(WAIT) {
             Ok(Event::Closed(_, why)) => assert!(why.contains("down"), "{why}"),
             other => panic!("{other:?}"),
@@ -182,6 +217,9 @@ fn requests_to_an_unreachable_fleet_host_leave_no_route_threads() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(hub.routes(), 0, "route threads left behind");
+    // a down host is dialled again only after a pause: ten requests in a row are not ten dials
+    let n = dials.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(n < 5, "{n} dials for 10 requests to a down host");
 }
 
 #[test]
@@ -334,9 +372,9 @@ fn dial_in_binds_the_key_to_its_host_and_reads_keys_live() {
 
 #[test]
 fn hosts_registry_round_trips() {
-    let text = "[host.149]\nvia = \"ssh\"\nssh = \"arch@10.77.0.73\"\nmakepad = \"/opt/makepad\"\n\n[host.phone]\nvia = \"dial\"\nkey = \"ab\"\nfingerprint = \"cd\"\n";
+    let text = "[host.89]\nvia = \"ssh\"\nssh = \"arch@10.77.0.73\"\nmakepad = \"/opt/makepad\"\n\n[host.phone]\nvia = \"dial\"\nkey = \"ab\"\nfingerprint = \"cd\"\n";
     let h = Hosts::parse(text).unwrap();
-    assert_eq!(h.names(), vec!["149", "phone"]);
+    assert_eq!(h.names(), vec!["89", "phone"]);
     assert_eq!(Hosts::parse(&h.to_text()).unwrap(), h);
     assert!(Hosts::parse("[host.x]\nvia = \"carrier-pigeon\"\n").unwrap_err().contains("via must be"));
     assert!(Hosts::parse("[host.x]\nvia = \"ssh\"\n").unwrap_err().contains("needs ssh"));
@@ -371,7 +409,7 @@ fn the_ledger_lets_a_restarted_relay_kill_and_drops_stale_entries() {
     let dir = ledger_dir("restart");
     // the first relay launches a session, then goes away
     let hub1 = Hub::new(&hosts());
-    let first = link(&hub1, &relay_on(&dir, vec!["/bin/sleep".into()], vec![]));
+    let first = link(&hub1, &relay_on(&dir, vec!["sleep".into()], vec![]));
     let c1 = client(&hub1);
     let ch1 = c1.open("route", "d session").unwrap();
     let pid: u32 = field(&ask(&ch1, "launch 30")[0], "launched").parse().unwrap();
@@ -382,7 +420,7 @@ fn the_ledger_lets_a_restarted_relay_kill_and_drops_stale_entries() {
     std::fs::write(dir.join(format!("{}.json", std::process::id())), format!("{{\"pid\":{},\"start\":1,\"app\":\"x\",\"args\":\"\",\"cwd\":\"\",\"env_keys\":\"\",\"log\":\"/dev/null\"}}", std::process::id())).unwrap();
     // a new relay on the same ledger knows the session
     let hub2 = Hub::new(&hosts());
-    let _second = link(&hub2, &relay_on(&dir, vec!["/bin/sleep".into()], vec![]));
+    let _second = link(&hub2, &relay_on(&dir, vec!["sleep".into()], vec![]));
     let c2 = client(&hub2);
     let ch2 = c2.open("route", "d session").unwrap();
     let listed = ask(&ch2, "launched");
@@ -400,7 +438,7 @@ fn the_ledger_lets_a_restarted_relay_kill_and_drops_stale_entries() {
 fn relaunch_starts_the_same_app_again() {
     let dir = ledger_dir("relaunch");
     let hub = Hub::new(&hosts());
-    let _l = link(&hub, &relay_on(&dir, vec!["/bin/sleep".into()], vec![]));
+    let _l = link(&hub, &relay_on(&dir, vec!["sleep".into()], vec![]));
     let c = client(&hub);
     let ch = c.open("route", "d session").unwrap();
     let old: u32 = field(&ask(&ch, "launch 30")[0], "launched").parse().unwrap();
@@ -422,7 +460,7 @@ fn relaunch_starts_the_same_app_again() {
 fn launches_get_the_relays_env() {
     let dir = ledger_dir("env");
     let hub = Hub::new(&hosts());
-    let _l = link(&hub, &relay_on(&dir, vec!["/usr/bin/env".into()], vec![("T3B_PROBE".into(), "from-hosts-toml".into())]));
+    let _l = link(&hub, &relay_on(&dir, vec!["env".into()], vec![("T3B_PROBE".into(), "from-hosts-toml".into())]));
     let c = client(&hub);
     let ch = c.open("route", "d session").unwrap();
     let l = ask(&ch, "launch printenv T3B_PROBE");
@@ -452,20 +490,33 @@ fn host_env_round_trips_in_hosts_toml() {
 fn closed_clients_are_let_go() {
     let hub = Hub::new(&hosts());
     let ep = hub.client_endpoint();
-    for _ in 0..5 {
-        let c = pair(&ep);
+    for n in 0..5 {
+        // the hub kept the served side when it was accepted, and lets go of the closed one
+        // before it
+        let (c, served) = pair_served(&ep);
+        assert_eq!(hub.kept_clients(), (1, 1), "client {n}");
         c.close("done");
-        c.wait_closed();
+        served.wait_closed();
+        assert_eq!(hub.kept_clients(), (1, 0), "client {n} closed");
     }
-    let t = std::time::Instant::now();
-    // the server side sees each close a moment later
-    while t.elapsed() < WAIT && hub.kept_clients().1 > 0 {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let _live = pair(&ep);
-    let t = std::time::Instant::now();
-    while t.elapsed() < WAIT && hub.kept_clients().1 == 0 {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let (_live, _served) = pair_served(&ep);
     assert_eq!(hub.kept_clients(), (1, 1));
+}
+
+/// The hub's socket, pid file and log are in this user's own socket dir, never at fixed names in
+/// the shared temp dir; and a client refuses a socket another user's process serves (checked
+/// where the system serves one anyone may connect to: macOS's mDNSResponder, Linux's D-Bus).
+#[test]
+fn the_hubs_files_are_this_users_and_a_client_refuses_another_users_socket() {
+    let own = crate::carrier::unix::socket_dir();
+    for p in [crate::hub::socket_path(), crate::hub::pid_path(), crate::hub::log_path()] {
+        assert_eq!(p.parent(), Some(own.as_path()), "{} is not in this user's own socket dir", p.display());
+    }
+    for sys in ["/var/run/mDNSResponder", "/run/dbus/system_bus_socket"] {
+        let path = std::path::Path::new(sys);
+        if UnixStream::connect(path).is_ok() {
+            let e = crate::carrier::unix::dial(path).err().expect("a client dialled another user's socket");
+            assert!(e.to_string().contains("another user"), "{sys}: {e}");
+        }
+    }
 }

@@ -9,7 +9,7 @@ use {
         display_context::DisplayContext,
         draw_list::CxDrawListPool,
         draw_matrix::CxDrawMatrixPool,
-        draw_pass::CxDrawPassPool,
+        draw_pass::{CxDrawPassPool, TimeFpsClock},
         draw_shader::CxDrawShaders,
         event::{
             CancelScope, CancelScopeKind, CxCancelScopes, CxDragDrop, CxFingers, CxKeyboard, DrawEvent, Event,
@@ -26,7 +26,7 @@ use {
         texture::{CxTexturePool, Texture, TextureFormat, TextureUpdated},
         thread::{SignalToUI, ToUIReceiver},
         uniform_buffer::CxUniformBufferPool,
-        window::CxWindowPool,
+        window::{CxWindowPool, WindowId},
     },
     makepad_futures::{
         executor,
@@ -83,11 +83,13 @@ pub struct Cx {
     /// Studio instead; this is where that arrives, and it is what
     /// `game_input_states` reads while `in_makepad_studio` is set.
     pub(crate) game_input_remote: Vec<crate::event::game_input::GameInputState>,
-    /// Keeps the frame loop running. Which passes repaint is up to each pass's `repaint_next`.
+    /// Keeps the frame loop running. Which passes repaint is up to each pass's `repaint_next`,
+    /// and a `time_fps` shader slow enough to skip frames waits for `Cx::time_repaint_at` instead.
     pub demo_time_repaint: bool,
     /// `draw_pass.time` counts from here, which `Cx::pass_time` moves while no pass owes a time frame.
     pub(crate) pass_time_origin: f64,
     pub(crate) pass_time_rebase: bool,
+    pub(crate) time_fps_clock: TimeFpsClock,
     pub(crate) mouse_cursor: crate::cursor::MouseCursor,
     pub(crate) gpu_info: GpuInfo,
     pub(crate) gpu_admission: crate::gpu_admission::GpuLedger,
@@ -122,9 +124,13 @@ pub struct Cx {
     pub draw_shaders: CxDrawShaders,
 
     pub new_draw_event: DrawEvent,
-    /// Run on every Event::Signal before the app sees it: subsystems above the platform
-    /// (the text system's glyph workers) react to their workers' signals.
+    /// Run on every Event::Signal before the app sees it, and on a beat woken by a hook's own
+    /// signal alone (`SignalToUI::set_for_hooks`, no Event::Signal then): subsystems above the
+    /// platform (the text system's glyph workers, an XR frame sink) react to their workers' signals.
     pub signal_hooks: Vec<fn(&mut Cx)>,
+    /// Run on every event before the app sees it, after the signal hooks: subsystems above the
+    /// platform with timers of their own, or that react to the app going to the background.
+    pub event_hooks: Vec<fn(&mut Cx, &Event)>,
 
     pub redraw_id: u64,
     /// The drawing being recorded (`Cx::drawing_id`): one per draw event, and
@@ -157,6 +163,10 @@ pub struct Cx {
     pub(crate) cancel_scopes: CxCancelScopes,
     pub fingers: CxFingers,
     pub(crate) ime_area: Area,
+    /// The innermost view being drawn that moves its content out from under the soft keyboard
+    /// (like `KeyboardView`), by its widget uid, or 0 outside of all of them.
+    pub ime_scope: u64,
+    pub(crate) ime_area_scope: u64,
     pub keyboard_shift: f64,
     pub(crate) drag_drop: CxDragDrop,
     pub(crate) file_dialogs: FileDialogState,
@@ -167,16 +177,31 @@ pub struct Cx {
     pub(crate) pending_camera_playbacks: Vec<PendingCameraPlayback>,
 
     pub(crate) new_next_frames: HashSet<NextFrame>,
+    /// The textures whose uploads are staged ([`crate::Texture::set_staged_upload`]): each
+    /// frame's backend sends what they wait to upload, drawn or not.
+    pub(crate) staged_textures: Vec<crate::texture::TextureId>,
     /// Frame requests made so far (`Cx::frame_requests`).
     pub(crate) frame_requests: u64,
     /// An `Event::XrUpdate` is being handled: what is redrawn now is drawn for a remote
     /// headset's frame, and paints no window (`Cx::compute_pass_repaint_order`).
     pub(crate) in_xr_update: bool,
+    /// An XR frame came (`Event::XrUpdate`) and no drawing has started since.
+    pub(crate) xr_frame_due: bool,
+    /// The drawing under way is the first since an XR frame came (`Cx::drawing_xr_frame`).
+    pub(crate) drawing_xr_frame: bool,
     /// Something other than a remote headset's frame redrew since the windows last painted (or
     /// a grab waits for them): with an offscreen XR display the windows paint only then.
     pub(crate) window_redrawn: bool,
+    /// A remote request (a `/step` frame, a grab) asked for a window's frame and no beat has drawn
+    /// since: under the virtual clock the app draws for such a request (`app_draws_now`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) remote_present_owed: bool,
     /// Repaints that painted a window, since the start (`Cx::window_paints`).
     pub(crate) window_paints: u64,
+    /// This run painted no window yet: what came before, and its one event if none comes
+    /// (`first_draw`).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) first_draw: crate::first_draw::FirstDrawWatch,
     /// A child its host says nothing shows of (`HostedVisible`: a hosted process over its
     /// socket, a HAL domain as an app message from its parent): next-frame callbacks and draws
     /// wait until it is shown again (`hosted_frames_held`).
@@ -207,6 +232,8 @@ pub struct Cx {
 
     pub(crate) self_ref: Option<Rc<RefCell<Cx>>>,
     pub(crate) in_draw_event: bool,
+    /// Whether a `CxDraw` is walking the widgets, which ends before the actions it emitted get handled.
+    pub is_in_draw_walk: bool,
 
     /// Display context for the main window, used by AdaptiveView
     pub display_context: DisplayContext,
@@ -277,6 +304,8 @@ pub struct Cx {
     /// The exploded z-layer inspection view. Inert while off.
     pub sploded: SplodedView,
     pub(crate) pick: crate::pick::CxPick,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) draw_damage: crate::draw_damage::CxDrawDamage,
     /// How many `WidgetRef` draw scopes deep the current draw is — the turtle
     /// nesting AS COMPONENTS SEE IT. Maintained by `WidgetRef::draw_walk` and
     /// its siblings, stamped onto every draw call at creation, and used as the
@@ -343,7 +372,8 @@ pub struct Cx {
     /// Selects a cancel scope from the currently active widget hierarchy. The lookup
     /// returns the newest matching scope for a widget UID. Called only for a new
     /// Escape/Back press; widgets install this without a platform dependency on them.
-    pub cancel_scope_resolver: Option<fn(&Cx, &dyn Fn(u64) -> Option<u64>) -> Option<u64>>,
+    /// For a swipe, it also gets the window the swipe starts in.
+    pub cancel_scope_resolver: Option<fn(&Cx, Option<WindowId>, &dyn Fn(u64) -> Option<u64>) -> Option<u64>>,
     /// The tweaker overlay's remote dispatcher (widgets/families/tweaker/src/tweaker.rs).
     /// Registered by the widgets crate at startup, exactly like the widget
     /// tree callbacks above; the /tweak routes in remote.rs delegate here so
@@ -940,7 +970,7 @@ impl Cx {
         self.cancel_scopes.has_press_owner()
     }
 
-    /// Whether a back swipe by a touch starting in the event being delivered belongs to `scope`, a scope
+    /// Whether a back swipe by a touch or trackpad gesture starting in the event being delivered belongs to `scope`, a scope
     /// from [`Self::begin_widget_back_swipe_scope()`] that Back would go to right now. Only meaningful during that event.
     pub fn owns_back_swipe(&self, scope: &CancelScope) -> bool {
         self.cancel_scopes.owns_back_swipe(scope)
@@ -1015,6 +1045,7 @@ impl Cx {
             demo_time_repaint: false,
             pass_time_origin: 0.0,
             pass_time_rebase: true,
+            time_fps_clock: TimeFpsClock::default(),
             mouse_cursor: Default::default(),
             null_texture,
             null_cube_texture,
@@ -1028,6 +1059,7 @@ impl Cx {
             in_makepad_studio: false,
             game_input_remote: Vec::new(),
             in_draw_event: false,
+            is_in_draw_walk: false,
             os_type: OsType::Unknown,
             gpu_info: Default::default(),
             gpu_admission: Default::default(),
@@ -1051,6 +1083,7 @@ impl Cx {
 
             new_draw_event: Default::default(),
             signal_hooks: Vec::new(),
+            event_hooks: Vec::new(),
             new_actions: Default::default(),
 
             redraw_id: 1,
@@ -1072,16 +1105,25 @@ impl Cx {
             drag_drop: Default::default(),
             file_dialogs: Default::default(),
             ime_area: Default::default(),
+            ime_scope: 0,
+            ime_area_scope: 0,
             keyboard_shift: 0.0,
             platform_ops: Default::default(),
             trays: Vec::new(),
             pending_camera_playbacks: Vec::new(),
             studio_http: "".to_string(),
             new_next_frames: Default::default(),
+            staged_textures: Vec::new(),
             frame_requests: 0,
             in_xr_update: false,
+            xr_frame_due: false,
+            drawing_xr_frame: false,
             window_redrawn: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            remote_present_owed: false,
             window_paints: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            first_draw: Default::default(),
             hosted_hidden: false,
 
             post_draw_hook: None,
@@ -1128,6 +1170,8 @@ impl Cx {
             perf_monitor: Default::default(),
             sploded: Default::default(),
             pick: Default::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            draw_damage: Default::default(),
             nesting_depth: 0,
             nesting_depth_max: 0,
 
@@ -1198,7 +1242,7 @@ pub fn startup_trace_enabled() -> bool {
 
 fn startup_t0() -> f64 {
     *STARTUP_T0.get_or_init(|| {
-        std::env::var("MAKEPAD_RUN_STARTUP_T0")
+        std::env::var("RELAX_STARTUP_T0")
             .or_else(|_| std::env::var("MAKEPAD_STARTUP_T0"))
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
@@ -1315,6 +1359,21 @@ mod memory_budget_tests {
 }
 
 impl Cx {
+    /// How many live patches (`std::relax::patched`) this context has taken in: it moves when
+    /// one lands, before the redraw that shows it. An app that keeps what its code made beyond
+    /// the designs the platform runs again (a cache of results) makes it again when this moves.
+    /// 0 outside Relax.
+    pub fn live_patches(&self) -> u64 {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.live_patches
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            0
+        }
+    }
+
     /// True while the platform is still compiling draw shaders it was handed
     /// and is therefore dropping (WebGL) their draw calls. Native backends
     /// build pipelines inside the paint that first uses them and never
@@ -1423,12 +1482,12 @@ pub fn first_present_seen() -> bool {
 pub fn launched_hidden_until_first_present() -> bool {
     static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *WANTED.get_or_init(|| {
-        std::env::var_os("MAKEPAD_RUN_REPORT_TO").is_some()
+        std::env::var_os("RELAX_REPORT_TO").is_some()
             && std::env::var_os("MAKEPAD_HIDE_WINDOWS").is_none()
     })
 }
 
-/// Also tells a launcher (MAKEPAD_RUN_REPORT_TO, see `report_first_present`).
+/// Also tells a launcher (RELAX_REPORT_TO, see `report_first_present`).
 pub fn startup_trace_first_present() {
     static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
     if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -1449,16 +1508,16 @@ pub fn startup_trace_first_present() {
 /// Relax runs the app in its own process and publishes this metadata before calling main.
 /// Cargo/rustc launches have no package marker and keep their existing stderr behavior.
 fn print_first_present(presented_at: f64) {
-    let Ok(package) = std::env::var("MAKEPAD_RUN_PACKAGE") else { return };
+    let Ok(package) = std::env::var("RELAX_PACKAGE") else { return };
     // Relax's boot progress line already printed its "ready" summary instead of this line
-    if std::env::var_os("MAKEPAD_RUN_PROGRESS").is_some() {
+    if std::env::var_os("RELAX_PROGRESS").is_some() {
         return;
     }
     // Capture the time in the hook, before report I/O or lazy compilation of the formatter.
     let present_ms = (presented_at - startup_t0()).max(0.0) * 1000.0;
-    let main_ms = std::env::var("MAKEPAD_RUN_MAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
-    let cache = std::env::var("MAKEPAD_RUN_CACHE_STATE").unwrap_or_else(|_| "off".to_string());
-    let ahead = std::env::var("MAKEPAD_RUN_AHEAD").unwrap_or_else(|_| "balanced".to_string());
+    let main_ms = std::env::var("RELAX_MAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let cache = std::env::var("RELAX_CACHE_STATE").unwrap_or_else(|_| "off".to_string());
+    let ahead = std::env::var("RELAX_AHEAD").unwrap_or_else(|_| "balanced".to_string());
     #[cfg(not(target_arch = "wasm32"))]
     let hold = first_frame_hold::summary();
     #[cfg(target_arch = "wasm32")]
@@ -1480,7 +1539,7 @@ fn first_present_line(package: &str, present_ms: f64, main_ms: f64, cache: &str,
     line
 }
 
-/// A launcher that started this app with MAKEPAD_RUN_REPORT_TO=<path> (the runner app, through
+/// A launcher that started this app with RELAX_REPORT_TO=<path> (the runner app, through
 /// `makepad run --report-to`, or a native build it opened) learns that the first frame is on
 /// glass and which process to follow and stop: the lines `pid <pid> 0` and `present` appended to
 /// <path>, in the loader's progress format (the launcher times it on receipt). The launcher
@@ -1488,7 +1547,7 @@ fn first_present_line(package: &str, present_ms: f64, main_ms: f64, cache: &str,
 /// single O_APPEND write.
 fn report_first_present() {
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(path) = std::env::var_os("MAKEPAD_RUN_REPORT_TO") {
+    if let Some(path) = std::env::var_os("RELAX_REPORT_TO") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(path) {
             let _ = f.write_all(format!("pid\t{}\t0\npresent\n", std::process::id()).as_bytes());

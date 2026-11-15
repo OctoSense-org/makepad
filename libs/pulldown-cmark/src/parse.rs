@@ -210,6 +210,9 @@ pub struct Parser<'input, F = DefaultBrokenLinkCallback> {
     // To prevent this, track how much it's expanded and limit it.
     link_ref_expansion_limit: usize,
 
+    /// Every `[^label]` is a footnote reference, defined or not.
+    footnote_labels_assumed: bool,
+
     // used by inline passes. store them here for reuse
     inline_stack: InlineStack,
     link_stack: LinkStack,
@@ -283,6 +286,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
             html_scan_guard,
             // always allow 100KiB
             link_ref_expansion_limit: text.len().max(100_000),
+            footnote_labels_assumed: false,
             code_delims: CodeDelims::new(),
             math_delims: MathDelims::new(),
         }
@@ -292,6 +296,30 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
     /// to the internal map of reference definitions.
     pub fn reference_definitions(&self) -> &RefDefs<'_> {
         &self.allocs.refdefs
+    }
+
+    /// Declares footnote labels defined outside the text being parsed, so a
+    /// reference to one of them is a `FootnoteReference` under the GFM rule
+    /// (which otherwise leaves a reference to an undefined label as text).
+    /// For a host that parses a slice of a larger document. Labels the text
+    /// defines itself are kept as they are.
+    pub fn declare_footnote_labels<'l>(&mut self, labels: impl IntoIterator<Item = &'l str>) {
+        for label in labels {
+            let key: FootnoteLabel<'input> = UniCase::new(CowStr::from(label.to_string()));
+            self.allocs
+                .footdefs
+                .0
+                .entry(key)
+                .or_insert(FootnoteDef { use_count: 0 });
+        }
+    }
+
+    /// Treats every footnote label as defined: each `[^label]` is a
+    /// `FootnoteReference`, while definitions keep the GFM syntax. For a host
+    /// that collects the references of a slice before it knows which labels
+    /// the larger document defines. Block structure is the same either way.
+    pub fn assume_footnote_labels_defined(&mut self) {
+        self.footnote_labels_assumed = true;
     }
 
     /// Use a link label to fetch a type, url, and title.
@@ -745,6 +773,7 @@ impl<'input, F: BrokenLinkCallback<'input>> Parser<'input, F> {
                                     def.use_count += 1;
                                 }
                                 if !self.options.has_gfm_footnotes()
+                                    || self.footnote_labels_assumed
                                     || self.allocs.footdefs.contains(&self.allocs.cows[footref.0])
                                 {
                                     // If this came from a MaybeImage, then the `!` prefix
@@ -2244,6 +2273,44 @@ mod test {
         opts.insert(Options::ENABLE_TASKLISTS);
 
         Parser::new_ext(text, opts)
+    }
+
+    #[test]
+    fn inline_math_pandoc_dollar_rules() {
+        fn math_events(text: &str) -> (Vec<Event<'_>>, bool) {
+            let mut math = Vec::new();
+            let mut text_dollar = false;
+            for event in Parser::new_ext(text, Options::ENABLE_MATH) {
+                match event {
+                    Event::InlineMath(_) | Event::DisplayMath(_) => math.push(event),
+                    Event::Text(text) => text_dollar |= text.contains('$'),
+                    _ => {}
+                }
+            }
+            (math, text_dollar)
+        }
+
+        for (input, math, text_dollar) in [
+            ("$x$5", vec![], true),
+            ("$x$ 5", vec![Event::InlineMath("x".into())], false),
+            ("$$5$$", vec![Event::DisplayMath("5".into())], false),
+            ("$5 and $10", vec![], true),
+            (
+                "$5 and 10$",
+                vec![Event::InlineMath("5 and 10".into())],
+                false,
+            ),
+            ("$2x+1$", vec![Event::InlineMath("2x+1".into())], false),
+            (r"\$x$", vec![], true),
+            ("`$x$`", vec![], false),
+            (
+                "$a$, $b$",
+                vec![Event::InlineMath("a".into()), Event::InlineMath("b".into())],
+                false,
+            ),
+        ] {
+            assert_eq!(math_events(input), (math, text_dollar), "case {input:?}");
+        }
     }
 
     #[test]

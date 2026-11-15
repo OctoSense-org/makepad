@@ -23,7 +23,7 @@ pub mod main_lag;
 pub mod headless;
 #[cfg(target_os = "linux")]
 pub mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod gl;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod vulkan;
@@ -33,6 +33,14 @@ pub mod apple;
 pub mod windows;
 
 use crate::buffers::CmdView;
+
+/// Native window-system work stays outside the GPU core (Vulkan's and GLES's).
+#[cfg(target_os = "android")]
+pub trait Shell: Send {
+    fn command(&mut self, session: u32, cmd: exec::OsCmd) -> bool;
+    fn lent(&mut self, session: u32, alias: crate::types::Id, host: crate::types::Id, attach: bool);
+    fn auto_adopt(&self) -> bool { false }
+}
 
 /// Makes one session's pump look: what a GPU completion calls for the session that owns it
 /// (the pump that steps drains every completion; others' pumps sleep on).
@@ -52,17 +60,17 @@ use crate::types::{HalInfo, Id};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn log_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_HAL_LOG").is_some())
+    *ON.get_or_init(|| relax_api::env::var_os("MAKEPAD_HAL_LOG").is_some())
 }
 
 /// When a device loss is simulated (HAL clock ns): `MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_MS` after
 /// now (the backend is being made). With `MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_APP` only the
 /// process whose executable has that name simulates it: one hosted app under a host that
 /// passes its environment on (the host's own device stays).
-#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android", target_vendor = "apple"))]
 pub(crate) fn simulated_loss_at() -> Option<u64> {
-    let ms = std::env::var("MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_MS").ok()?.parse::<u64>().ok()?;
-    if let Ok(app) = std::env::var("MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_APP") {
+    let ms = relax_api::env::var("MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_MS").ok()?.parse::<u64>().ok()?;
+    if let Ok(app) = relax_api::env::var("MAKEPAD_HAL_SIMULATE_DEVICE_LOSS_APP") {
         let exe = std::env::current_exe().ok()?;
         if exe.file_stem().is_none_or(|stem| stem != app.as_str()) { return None; }
     }
@@ -125,6 +133,9 @@ pub trait Backend: Send {
     /// driver's exit handlers, which fault a thread still inside it. The last call a backend
     /// gets; no wait with a time limit (a thread that is gone is the only proof).
     fn before_exit(&mut self) {}
+    /// The HAL drops this backend for another one while the process goes on (Android moves to
+    /// GLES): like [`Backend::before_exit`], and what it still owed its sessions is delivered.
+    fn retire(&mut self, _world: &mut World) { self.before_exit(); }
     /// Tests and automation: the next step handles the device as lost (removed by the OS) and
     /// replaces it as a real loss does (`exec::device_reset`). Backends without a device reset
     /// ignore it.

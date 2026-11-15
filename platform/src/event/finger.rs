@@ -192,6 +192,15 @@ impl CxScrollLatch {
         self.owners[axis_slot(axis)]
     }
 
+    /// Whether `e` starts a new trackpad gesture, rather than being a wheel, momentum or more of a gesture.
+    pub(crate) fn starts_finger_gesture(&self, e: &ScrollEvent) -> bool {
+        match e.phase {
+            ScrollPhase::Began => true,
+            ScrollPhase::Changed => self.gesture != ScrollGesture::Fingers,
+            _ => false,
+        }
+    }
+
     /// Ends the gesture, so the next scroll event starts a new one.
     pub(crate) fn reset(&mut self) {
         self.gesture = ScrollGesture::Idle;
@@ -681,6 +690,9 @@ pub struct CxFingers {
     scroll_drag_locks: Vec<(DigitId, ScrollDirection)>,
     /// The presses something outside a drag scroller already held when it got them, which it never joins.
     presses_held_outside: Vec<(DigitId, Area)>,
+    /// The presses that leave the key focus where it is, see [`Self::mark_press_as_keeping_key_focus`].
+    presses_keeping_key_focus: Vec<DigitId>,
+    is_touching: bool,
     is_mouse_drag_scrolling_disabled: bool,
 }
 
@@ -923,6 +935,8 @@ impl CxFingers {
         let before = self.cancelled.len();
         self.move_to_cancelled(|v| v.digit_id == digit_id && !v.owner && Some(v.area) != partner);
         if self.cancelled.len() > before {
+            // It's a drag now, not a tap, so it only keeps the key focus if the scroller marks it again.
+            self.unmark_press_as_keeping_key_focus(digit_id);
             let abs = self.captures.iter().find(|v| v.digit_id == digit_id).map(|v| v.abs_start).unwrap_or_default();
             self.queue_cancel(digit_id, abs);
         }
@@ -1107,7 +1121,11 @@ impl CxFingers {
     /// other element may take a hover, focus or press-like state from that
     /// pointer on the way. A reorder carry, a scroll grab, or any other
     /// gesture that would start from the same press stands down while
-    /// another control holds the mouse. The one exception is drag and drop:
+    /// another control holds the mouse. A drag scroller may still take a
+    /// press over from a widget inside it that claimed no drag of its own,
+    /// like a button, once the press turns into a drag its way (see
+    /// [`Self::is_mouse_held_outside_drag_scroller`]); a continuously dragged
+    /// control claims its drag and stays locked. The one exception is drag and drop:
     /// there the source does NOT lock the pointer, because a global drag
     /// state must let other components light their drag-over states and
     /// accept the drop on release.
@@ -1144,6 +1162,20 @@ impl CxFingers {
         })
     }
 
+    /// Like [`Self::is_mouse_held_outside_scrollers`], for a drag scroller that holds the press together with
+    /// widgets inside it (see [`Self::can_take_over_press`]): those took the press before `area` did, so their
+    /// captures, ahead of its own, are inside it. A capture taken after `area`'s still counts.
+    pub fn is_mouse_held_outside_drag_scroller(&self, area: Area) -> bool {
+        let digit_id: DigitId = live_id!(mouse).into();
+        let own = self.captures.iter().position(|c| c.digit_id == digit_id && same_owner(area, c.area));
+        self.captures.iter().enumerate().any(|(i, c)| {
+            c.digit_id == digit_id
+                && own.is_none_or(|own| i > own)
+                && !same_owner(area, c.area)
+                && !self.is_scroll_drag_holder(digit_id, c.area)
+        })
+    }
+
     pub(crate) fn release_digit(&mut self, digit_id: DigitId) {
         self.cancelled.retain(|v| v.digit_id != digit_id);
         self.taken_away.retain(|d| *d != digit_id);
@@ -1159,6 +1191,7 @@ impl CxFingers {
         self.scroll_drag_holders.retain(|(id, _)| *id != digit_id);
         self.scroll_drag_locks.retain(|(id, _)| *id != digit_id);
         self.presses_held_outside.retain(|(id, _)| *id != digit_id);
+        self.presses_keeping_key_focus.retain(|id| *id != digit_id);
     }
 
     /// See [`Cx::set_mouse_drag_scrolling`].
@@ -1228,12 +1261,42 @@ impl CxFingers {
             .any(|capture| capture.digit_id == digit_id && !self.is_scroll_drag_holder(digit_id, capture.area))
     }
 
+    /// Whether `digit_id`'s press was marked as held by something outside `area`, see [`Self::mark_press_as_held_outside`].
+    pub fn is_press_held_outside(&self, digit_id: DigitId, area: Area) -> bool {
+        self.presses_held_outside.contains(&(digit_id, area))
+    }
+
     /// Marks `digit_id`'s press as already held by something outside `area` (like an overlay drawn
     /// over it), so `area` never joins it. Call it before passing the press to what's inside `area`.
     pub fn mark_press_as_held_outside(&mut self, digit_id: DigitId, area: Area) {
         if !self.presses_held_outside.contains(&(digit_id, area)) {
             self.presses_held_outside.push((digit_id, area));
         }
+    }
+
+    /// Marks `digit_id`'s press as leaving the key focus where it is, so a focused text input stays focused
+    /// (and keeps its soft keyboard up) even though the press ends outside of it. Call it before the press ends,
+    /// e.g., on `Hit::FingerDown`.
+    pub fn mark_press_as_keeping_key_focus(&mut self, digit_id: DigitId) {
+        if !self.presses_keeping_key_focus.contains(&digit_id) {
+            self.presses_keeping_key_focus.push(digit_id);
+        }
+    }
+
+    /// Undoes [`Self::mark_press_as_keeping_key_focus`], e.g., once a press that might have been a tap turns into a drag.
+    pub fn unmark_press_as_keeping_key_focus(&mut self, digit_id: DigitId) {
+        self.presses_keeping_key_focus.retain(|id| *id != digit_id);
+    }
+
+    /// Whether `digit_id`'s press leaves the key focus where it is, see [`Self::mark_press_as_keeping_key_focus`].
+    pub fn is_press_keeping_key_focus(&self, digit_id: DigitId) -> bool {
+        self.presses_keeping_key_focus.contains(&digit_id)
+    }
+
+    /// Whether a widget holds the press of a finger on the screen,
+    /// counting a finger being lifted until its touch update is done.
+    pub fn is_touch_press_held(&self) -> bool {
+        self.is_touching && !self.captures.is_empty()
     }
 
     /// Whether two scrollers took `digit_id`'s drag, one along each axis.
@@ -1307,9 +1370,13 @@ impl CxFingers {
     }
 
     pub(crate) fn process_touch_update_start(&mut self, time: f64, touches: &[TouchPoint]) {
+        if !touches.is_empty() {
+            self.is_touching = true;
+        }
         for touch in touches {
             if let TouchState::Start = touch.state {
                 self.process_tap_count(touch.abs, time);
+                self.tap.digit_id = live_id_num!(touch, touch.uid).into();
             }
         }
     }
@@ -1322,6 +1389,10 @@ impl CxFingers {
     /// after each dispatch, and on a cancel whether or not anything is left
     /// to dispatch to.
     pub fn process_touch_update_end(&mut self, touches: &[TouchPoint]) {
+        // Only clears it, since a host's synthetic touches skip the start above and would defer a hide nothing ever flushes.
+        self.is_touching &= touches
+            .iter()
+            .any(|touch| !matches!(touch.state, TouchState::Stop | TouchState::Cancel));
         for touch in touches {
             let digit_id = live_id_num!(touch, touch.uid).into();
             match touch.state {
@@ -1332,6 +1403,11 @@ impl CxFingers {
                 TouchState::Start | TouchState::Move | TouchState::Stable => {
                     self.cycle_hover_area(digit_id);
                 }
+            }
+            // A press that moved too far to be a tap doesn't count towards a double tap, like on Android and iOS,
+            // so swiping twice from the same spot doesn't make the second swipe a double tap.
+            if digit_id == self.tap.digit_id && touch.abs.distance(&self.tap.last_pos) >= TAP_COUNT_DISTANCE {
+                self.tap.last_time = f64::NEG_INFINITY;
             }
         }
         self.switch_captures();
@@ -2546,7 +2622,9 @@ impl Event {
                         is_sweep: false,
                         cancelled: capture.cancelled,
                     });
-                    if is_over {
+                    // A `capture_overload` parent (e.g., PortalList) gets this release after the pressed item,
+                    // so only the first capture takes the hover, else the item never gets its hover-out.
+                    if is_over && cx.fingers.find_digit_capture(digit_id).is_some_and(|c| c.area == area) {
                         cx.fingers.new_hover_area(digit_id, area);
                     }
                     return event;

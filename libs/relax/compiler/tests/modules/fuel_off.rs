@@ -1,4 +1,4 @@
-// RELAX_SANDBOX_FUEL=0 leaves the meter out of a twin's code: a call spends no fuel and no
+// --allow-unmetered-modules leaves the meter out of a twin's code: a call spends no fuel and no
 // budget ends it (a host that bounds its modules by deadline alone). By default the same call
 // ends on its budget.
 use std::relax::{Budget, BudgetError, Module};

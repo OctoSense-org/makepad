@@ -1,6 +1,19 @@
 use crate::{context::invalid, *};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DerivedTriangle {
+    pub corners: [DerivedCorner; 3],
+    pub material: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DerivedCorner {
+    pub vertex: VertexId,
+    pub uv: [f64; 2],
+    pub normal: [f64; 3],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mesh {
     pub(crate) vertices: Vec<Vertex>,
@@ -89,11 +102,6 @@ impl Mesh {
         }
         for p in polygons {
             ctx.checkpoint(p.vertices.len() as u64)?;
-            ctx.limit(
-                "face corners",
-                p.vertices.len() as u64,
-                ctx.limits.max_face_corners as u64,
-            )?;
             if p.vertices.len() < 3 {
                 return Err(invalid("a face needs at least three corners"));
             }
@@ -118,6 +126,56 @@ impl Mesh {
         Ok(m)
     }
 
+    /// A mesh of `triangles` over vertices of `self`: each kept vertex keeps its
+    /// VertexId, position and weights; each corner gets the explicit UV and
+    /// normal given; no edge data or UV pins. For derived geometry (LOD levels)
+    /// that must keep skin and IDs.
+    pub fn derive_triangles(
+        &self,
+        triangles: &[DerivedTriangle],
+        ctx: &mut Context<'_>,
+    ) -> Result<Mesh> {
+        ctx.checkpoint(0)?;
+        let corner_count = triangles
+            .len()
+            .checked_mul(3)
+            .ok_or_else(|| invalid("derived corner count overflow"))?;
+        ctx.counts(0, triangles.len(), corner_count, 0)?;
+        let mut kept = BTreeSet::new();
+        let mut weights = 0usize;
+        for triangle in triangles {
+            ctx.checkpoint(1)?;
+            for corner in &triangle.corners {
+                let vertex = self
+                    .vertex(corner.vertex)
+                    .ok_or_else(|| invalid("derived triangle refers to missing vertex"))?;
+                if kept.insert(vertex.id) {
+                    weights = weights.saturating_add(vertex.weights.len());
+                }
+            }
+        }
+        ctx.counts(kept.len(), triangles.len(), corner_count, 0)?;
+        ctx.bytes(
+            storage_estimate(kept.len(), triangles.len(), corner_count, 0, weights)
+                .saturating_add(kept.len().saturating_mul(64)),
+        )?;
+        let mut derived = Self::new();
+        derived.next_id = self.next_id;
+        for vertex in &self.vertices {
+            ctx.checkpoint(1)?;
+            if kept.contains(&vertex.id) {
+                derived.vertices.push(vertex.clone());
+            }
+        }
+        for triangle in triangles {
+            ctx.checkpoint(1)?;
+            let corners = triangle.corners.map(|c| (c.vertex, c.uv, Some(c.normal)));
+            derived.push_face(&corners, triangle.material)?;
+        }
+        derived.check_structure(ctx)?;
+        Ok(derived)
+    }
+
     /// Bulk import avoids one whole-mesh transaction per vertex. Each weight
     /// vector is normalized and sorted; empty weights mean unbound. UVs remain
     /// per polygon corner. No input is installed on failure.
@@ -135,11 +193,6 @@ impl Mesh {
         let mut total = 0usize;
         for w in weights {
             ctx.checkpoint(1)?;
-            ctx.limit(
-                "weights per vertex",
-                w.len() as u64,
-                ctx.limits.max_weights_per_vertex as u64,
-            )?;
             total = total.saturating_add(w.len());
         }
         let mut mesh = Self::from_polygons(positions, polygons, ctx)?;
@@ -236,7 +289,6 @@ impl Mesh {
                 a.edges.entry(edge).or_default();
             }
         }
-        ctx.limit("edges", a.edges.len() as u64, ctx.limits.max_edges as u64)?;
         for &edge in a.edges.keys() {
             ctx.checkpoint(1)?;
             a.vertex_edges
@@ -262,7 +314,6 @@ impl Mesh {
             .iter()
             .map(|f| f.corner_count as usize - 2)
             .sum::<usize>();
-        ctx.limit("triangles", nt as u64, ctx.limits.max_triangles as u64)?;
         let weights = self
             .corners
             .iter()
@@ -416,11 +467,6 @@ impl Mesh {
             if f.first_corner as usize != offset || f.corner_count < 3 {
                 return Err(MeshError::CorruptData("invalid face corner range"));
             }
-            ctx.limit(
-                "face corners",
-                f.corner_count as u64,
-                ctx.limits.max_face_corners as u64,
-            )?;
             offset = offset
                 .checked_add(f.corner_count as usize)
                 .ok_or(MeshError::CorruptData("corner range overflow"))?;
@@ -473,16 +519,6 @@ impl Mesh {
                 return Err(MeshError::CorruptData("redundant default edge record"));
             }
         }
-        ctx.limit(
-            "edges",
-            used_edges.len().saturating_add(
-                self.edge_data
-                    .iter()
-                    .filter(|(e, d)| d.loose && !used_edges.contains(e))
-                    .count(),
-            ) as u64,
-            ctx.limits.max_edges as u64,
-        )?;
         Ok(())
     }
 }
@@ -521,11 +557,8 @@ pub(crate) fn check_edge_attributes(a: EdgeAttributes) -> Result<()> {
     }
 }
 pub(crate) fn check_weights(weights: &[JointWeight], ctx: &mut Context<'_>) -> Result<()> {
-    ctx.limit(
-        "weights per vertex",
-        weights.len() as u64,
-        ctx.limits.max_weights_per_vertex as u64,
-    )?;
+    // The mesh source stores each weight count in a u32.
+    ctx.limit("mesh source weight count", weights.len() as u64, u32::MAX as u64)?;
     let mut prev = None;
     let mut sum = 0.;
     for w in weights {

@@ -12,12 +12,12 @@ C=$(mktemp -d)
 chmod 700 "$C"
 bad=""
 k=0
-for run in "a" "b" "c MAKEPAD_RUN_PRELINK=0" "d" "b"; do
+for run in "a" "b" "c RELAX_PRELINK=0" "d" "b"; do
   k=$((k + 1))
   set -- $run
   arg=$1
   shift
-  (cd "$H" && env "$@" MAKEPAD_RUN_CACHE_DIR="$C/cache" MAKEPAD_RUN_TARGET_DIR="$C/target" MAKEPAD_RUN_STD="$H/../../std" "$R" run cache-warm-coroutine-arg -- "$arg") > "$C/run$k.log" 2>&1
+  (cd "$H" && env "$@" RELAX_CACHE_DIR="$C/cache" RELAX_TARGET_DIR="$C/target" RELAX_STD="$H/../../std" "$R" run cache-warm-coroutine-arg -- "$arg") > "$C/run$k.log" 2>&1
   rc=$?
   if [ $rc != 0 ] || ! grep -q "^cache_warm_coroutine_arg result 21$" "$C/run$k.log"; then
     bad="$bad run$k($run) exit $rc: $(grep -m1 -E "segfault|panicked|error|result" "$C/run$k.log" | cut -c1-200);"

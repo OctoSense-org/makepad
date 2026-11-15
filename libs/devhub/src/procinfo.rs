@@ -50,8 +50,10 @@ pub fn in_use() -> Option<u64> {
 
 /// Whether a process has ended, reaping it if it is this process's own child (a child of an
 /// earlier image of this process after an exec is a zombie until then, and `alive` calls a zombie
-/// alive): None while it runs; `Some(code)`, its exit code when it can be known (None: a signal).
-/// One that is gone and was not a child counts as a clean exit.
+/// alive): None while it runs; `Some(code)`, its exit code when it can be known (None: a signal,
+/// or not known). One that is gone and was never this process's child has no exit this process
+/// could know: it was taken for a clean exit, and a bucket gate the restarted master adopted,
+/// killed by the Mac's reboot (11-06), read as exit 0, and a failed run of the landings.
 pub fn exited(pid: u32) -> Option<Option<i32>> {
     // (`waitpid(0)` would reap any child of the group)
     if pid == 0 {
@@ -85,7 +87,7 @@ pub fn exited(pid: u32) -> Option<Option<i32>> {
     if gone {
         INHERITED.lock().unwrap().retain(|p| *p != pid);
     }
-    gone.then_some(Some(0))
+    gone.then_some(None)
 }
 
 /// Children of an earlier image of this process (an exec restart keeps the pid and its children,
@@ -104,14 +106,8 @@ pub fn reap_inherited() {
     #[cfg(unix)]
     {
         let me = std::process::id();
-        let Ok(child) = std::process::Command::new("ps").args(["-axo", "pid=,ppid="]).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn() else { return };
-        let ps = child.id();
-        let Ok(out) = child.wait_with_output() else { return };
-        let pids: Vec<u32> = String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| {
-            let mut w = l.split_whitespace();
-            let (pid, ppid) = (w.next()?.parse::<u32>().ok()?, w.next()?.parse::<u32>().ok()?);
-            (ppid == me && pid != ps).then_some(pid)
-        }).collect();
+        // (the process table read in place, before this image starts a child: every child now is one)
+        let pids: Vec<u32> = makepad_remote::procs::list_processes().map(|all| all.into_iter().filter(|p| p.ppid == me).map(|p| p.pid).collect()).unwrap_or_default();
         if pids.is_empty() {
             return;
         }

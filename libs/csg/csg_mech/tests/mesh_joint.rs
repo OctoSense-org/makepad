@@ -1,7 +1,8 @@
 use makepad_csg_math::Vec3d;
-use makepad_csg_mech::check::{closer_than, min_gap, risk, sweep_limit, Risk};
+use makepad_csg_mech::check::{closer_than, min_gap, risk, sweep_limit, Risk, Sweep};
+use makepad_csg_mech::mesh_pieces;
 use makepad_csg_sdf::mesh_field::{MeshData, MeshField};
-use makepad_csg_sdf::Sdf3;
+use makepad_csg_sdf::{Hints, Sdf3};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -15,9 +16,9 @@ impl Sdf3 for Counted {
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.field.distance(p)
     }
-    fn distance_bounded(&self, p: Vec3d, lower: f64, upper: f64, hint: Option<(Vec3d, f64)>) -> f64 {
+    fn distance_bounded(&self, p: Vec3d, lower: f64, upper: f64, hints: &mut Hints) -> f64 {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.field.distance_bounded(p, lower, upper, hint)
+        self.field.distance_bounded(p, lower, upper, hints)
     }
 }
 
@@ -79,7 +80,8 @@ fn mesh_pin_and_knuckles() {
     let (lo, hi) = ([-1.0; 3], [1.0; 3]);
     let start = Instant::now();
     let gap = min_gap(&a, &b, lo, hi, 0.02);
-    println!("min_gap: {:.9} mm, {} cells, {} field calls, {:.3} ms", gap.gap, gap.evals, counts(), start.elapsed().as_secs_f64() * 1000.0);
+    let found = if gap.gap < 0.0 { format!("overlap at least {:.9} mm", -gap.gap) } else { format!("{:.9} mm", gap.gap) };
+    println!("min_gap: {found}, {} cells, {} field calls, {:.3} ms", gap.evals, counts(), start.elapsed().as_secs_f64() * 1000.0);
     assert!((gap.gap - 0.2).abs() < 0.036, "{gap:?}");
     for contact in [0.05, 0.25] {
         let start = Instant::now();
@@ -88,8 +90,52 @@ fn mesh_pin_and_knuckles() {
         assert_eq!(hit, contact > 0.2);
     }
     let start = Instant::now();
-    let limit = sweep_limit(&a, &b, [0.0; 3], [0.0, 0.0, 1.0], 1.0, lo, hi, 0.05, std::f64::consts::PI);
+    let limit = sweep_limit(&a, &b, Sweep { pivot: [0.0; 3], axis: [0.0, 0.0, 1.0], dir: 1.0, lo, hi, contact: 0.05, max: std::f64::consts::PI, turn: (0, 1), slide: false });
     println!("sweep_limit: {:.9} rad, {} field calls, {:.3} ms", limit, counts(), start.elapsed().as_secs_f64() * 1000.0);
     assert_eq!(limit, std::f64::consts::PI, "a clear hinge rotates through 180 degrees");
     assert_eq!(risk(gap.gap, 0.2, &[0.0; 4], 0.2).0, Risk::Low);
+}
+
+type Mesh = (Vec<[f64; 3]>, Vec<[u32; 3]>);
+
+// A box as a triangle soup (each triangle with corners of its own), facing out or, as a hollow, in.
+fn cuboid(m: &mut Mesh, lo: [f64; 3], hi: [f64; 3], out: bool) {
+    const FACES: [[[usize; 3]; 4]; 6] = [
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],
+        [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]],
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],
+        [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]],
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],
+        [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]],
+    ];
+    for f in FACES {
+        for t in [[f[0], f[1], f[2]], [f[0], f[2], f[3]]] {
+            for c in if out { t } else { [t[0], t[2], t[1]] } {
+                m.0.push(std::array::from_fn(|k| if c[k] == 0 { lo[k] } else { hi[k] }));
+            }
+            let n = m.0.len() as u32;
+            m.1.push([n - 3, n - 2, n - 1]);
+        }
+    }
+}
+
+#[test]
+fn a_mesh_splits_into_the_pieces_that_print_apart() {
+    // the slicer's closing heals gaps under twice its 0.049 mm radius
+    const FUSED: f64 = 0.098;
+    let pieces = |boxes: &[([f64; 3], [f64; 3], bool)]| {
+        let mut m = (Vec::new(), Vec::new());
+        for &(lo, hi, out) in boxes {
+            cuboid(&mut m, lo, hi, out);
+        }
+        mesh_pieces(&m.0, &m.1, FUSED).into_iter().map(|(v, t)| (v.len(), t.len())).collect::<Vec<_>>()
+    };
+    let cube = |x: f64| ([x, 0.0, 0.0], [x + 5.0, 5.0, 5.0], true);
+    assert_eq!(pieces(&[cube(0.0)]), vec![(36, 12)], "one shell: the mesh as it is");
+    assert_eq!(pieces(&[cube(0.0), cube(10.0)]), vec![(8, 12), (8, 12)], "cubes 5 mm apart are two pieces, each welded");
+    assert_eq!(pieces(&[cube(0.0), cube(5.2)]), vec![(8, 12), (8, 12)], "cubes 0.2 mm apart print apart");
+    assert_eq!(pieces(&[cube(0.0), cube(5.05)]), vec![(72, 24)], "cubes 0.05 mm apart print fused: one piece");
+    assert_eq!(pieces(&[cube(0.0), cube(3.0)]), vec![(72, 24)], "overlapping cubes are one piece");
+    let hollow = [([0.0; 3], [20.0; 3], true), ([2.0; 3], [18.0; 3], false), ([6.0; 3], [14.0; 3], true)];
+    assert_eq!(pieces(&hollow), vec![(16, 24), (8, 12)], "a cube shut in a hollow box is a piece; the hollow stays with its box");
 }

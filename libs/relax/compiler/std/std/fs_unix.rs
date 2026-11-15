@@ -20,11 +20,11 @@ use crate::time::SystemTime;
 
 use super::vfs;
 
-/// The stat of a virtual entry (a regular file of its size, or a folder).
+/// The stat of a virtual entry (a regular file of its size and time, or a folder).
 pub(crate) fn vfs_stat(k: &vfs::Kind) -> stat_t {
     match k {
-        vfs::Kind::File(n) => stat_t::synthetic(sys::S_IFREG | 0o644, *n as i64),
-        _ => stat_t::synthetic(sys::S_IFDIR | 0o755, 0),
+        vfs::Kind::File(s) => stat_t::synthetic(sys::S_IFREG | 0o644, s.len as i64, s.mtime_ns),
+        _ => stat_t::synthetic(sys::S_IFDIR | 0o755, 0, 0),
     }
 }
 
@@ -100,25 +100,20 @@ fn needs_write() -> io::Error {
 
 pub struct File {
     fd: OwnedFd,
-    virtual_len: Option<u64>,
+    /// A virtual file's stat (its bytes are a private copy in `fd`).
+    virtual_stat: Option<vfs::Stat>,
 }
 
+extern "C" {
+    /// An anonymous file of this process, close-on-exec, made by the host (compiler jit.rs
+    /// `relax_anon_fd`; a confined build script's broker makes it there): -1 and errno on failure.
+    fn __relax_anon_fd() -> c_int;
+}
+
+/// A virtual file's private copy: an anonymous file, which names nothing on any disk.
 fn virtual_fd() -> io::Result<OwnedFd> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        let fd = cvt_r(|| unsafe { sys::os::memfd_create(b"relax-vfs\0".as_ptr() as *const c_char, sys::os::MFD_CLOEXEC) })?;
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        let path = crate::env::temp_dir().join("relax-vfs-XXXXXX");
-        let mut name = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| NUL_ERR)?.into_bytes_with_nul();
-        let fd = cvt(unsafe { sys::os::mkstemp(name.as_mut_ptr() as *mut c_char) })?;
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        cvt_r(|| unsafe { sys::unlink(name.as_ptr() as *const c_char) })?;
-        cvt_r(|| unsafe { sys::fcntl(fd.as_raw_fd(), sys::F_SETFD, sys::FD_CLOEXEC) })?;
-        Ok(fd)
-    }
+    let fd = cvt_r(|| unsafe { __relax_anon_fd() })?;
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// A folder fd that names no folder: a fresh empty folder in the temp folder, removed once it is
@@ -195,14 +190,15 @@ impl OpenOptions {
                 let disk = vfs::edit_target(&*abs, how).unwrap_or_else(|| Err(vfs::read_only()))?;
                 return run_path_with_cstr(&disk, &|c| self.open_c(c));
             }
+            vfs::note(&abs, b'f');
             return match k {
-                vfs::Kind::File(_) => {
+                vfs::Kind::File(stat) => {
                     let data = vfs::read(&*abs)?;
-                    let mut file = File { fd: virtual_fd()?, virtual_len: None };
+                    let mut file = File { fd: virtual_fd()?, virtual_stat: None };
                     cvt_r(|| unsafe { sys::fchmod(file.raw(), 0o644 as sys::mode_t) })?;
                     file.write_all(&data)?;
                     file.seek(SeekFrom::Start(0))?;
-                    file.virtual_len = Some(data.len() as u64);
+                    file.virtual_stat = Some(vfs::Stat { len: data.len() as u64, mtime_ns: stat.mtime_ns });
                     Ok(file)
                 }
                 // open(2) of a folder for reading succeeds on the disk (its reads fail EISDIR; a
@@ -215,10 +211,13 @@ impl OpenOptions {
                             return Ok(file);
                         }
                     }
-                    Ok(File { fd: virtual_dir_fd()?, virtual_len: None })
+                    Ok(File { fd: virtual_dir_fd()?, virtual_stat: None })
                 }
                 vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             };
+        }
+        if self.read {
+            vfs::note(path.as_ref(), b'f');
         }
         run_path_with_cstr(path.as_ref(), &|c| self.open_c(c))
     }
@@ -250,7 +249,7 @@ impl OpenOptions {
             }
             (_, true) => {
                 if self.truncate && !self.create_new {
-                    return Err(needs_write());
+                    return Err(io::Error::from_string(io::ErrorKind::InvalidInput, String::from("append and truncate cannot both be enabled")));
                 }
             }
         }
@@ -267,7 +266,7 @@ impl OpenOptions {
         let flags = sys::os::O_CLOEXEC | self.access_mode()? | self.creation_mode()? | (self.custom_flags & !3);
         let mode = self.mode;
         let fd = cvt_r(|| unsafe { sys::open(path.as_ptr(), flags, mode as core::ffi::c_uint) })?;
-        Ok(File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, virtual_len: None })
+        Ok(File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, virtual_stat: None })
     }
 }
 
@@ -327,7 +326,7 @@ impl File {
         self.sync_all()
     }
     pub fn set_len(&self, size: u64) -> io::Result<()> {
-        if self.virtual_len.is_some() {
+        if self.virtual_stat.is_some() {
             return Err(vfs::read_only());
         }
         if size > i64::MAX as u64 {
@@ -337,31 +336,24 @@ impl File {
         Ok(())
     }
     pub fn metadata(&self) -> io::Result<Metadata> {
-        if let Some(len) = self.virtual_len {
-            return Ok(Metadata { st: vfs_stat(&vfs::Kind::File(len)) });
+        if let Some(stat) = self.virtual_stat {
+            return Ok(Metadata { st: vfs_stat(&vfs::Kind::File(stat)) });
         }
         let mut st = stat_t::zeroed();
         cvt(unsafe { sys::os::fstat(self.raw(), &mut st as *mut stat_t) })?;
         Ok(Metadata { st })
     }
     pub fn try_clone(&self) -> io::Result<File> {
-        Ok(File { fd: self.fd.try_clone()?, virtual_len: self.virtual_len })
+        Ok(File { fd: self.fd.try_clone()?, virtual_stat: self.virtual_stat })
     }
     pub fn set_permissions(&self, perm: Permissions) -> io::Result<()> {
         cvt_r(|| unsafe { sys::fchmod(self.raw(), perm.mode as sys::mode_t) })?;
         Ok(())
     }
-    /// real std sys/fs/unix.rs set_times: futimens with UTIME_OMIT for a time left unset
+    /// real std sys/fs/unix.rs set_times: fsetattrlist on Apple targets (which sets the creation
+    /// time too), elsewhere futimens with UTIME_OMIT for a time left unset
     pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
-        let ts = |t: Option<SystemTime>| match t {
-            Some(t) => {
-                let (secs, nanos) = t.unix_parts();
-                FutimensSpec { sec: secs, nsec: nanos as i64 }
-            }
-            None => FutimensSpec { sec: 0, nsec: UTIME_OMIT },
-        };
-        let spec = [ts(times.accessed), ts(times.modified)];
-        cvt(unsafe { futimens(self.raw(), spec.as_ptr()) })?;
+        cvt(set_fd_times(self.raw(), &times))?;
         Ok(())
     }
     pub fn set_modified(&self, time: SystemTime) -> io::Result<()> {
@@ -407,7 +399,7 @@ impl File {
         }
     }
     fn write_raw(&self, buf: &[u8]) -> io::Result<usize> {
-        if self.virtual_len.is_some() {
+        if self.virtual_stat.is_some() {
             return Err(vfs::read_only());
         }
         let len = if buf.len() > crate::os::unix::fs::READ_LIMIT { crate::os::unix::fs::READ_LIMIT } else { buf.len() };
@@ -526,7 +518,7 @@ impl AsFd for File {
 }
 impl FromRawFd for File {
     unsafe fn from_raw_fd(fd: RawFd) -> File {
-        File { fd: OwnedFd::from_raw_fd(fd), virtual_len: None }
+        File { fd: OwnedFd::from_raw_fd(fd), virtual_stat: None }
     }
 }
 impl IntoRawFd for File {
@@ -541,7 +533,7 @@ impl From<File> for OwnedFd {
 }
 impl From<OwnedFd> for File {
     fn from(fd: OwnedFd) -> File {
-        File { fd, virtual_len: None }
+        File { fd, virtual_stat: None }
     }
 }
 impl crate::io::IsTerminal for File {
@@ -617,11 +609,14 @@ impl fmt::Debug for Metadata {
     }
 }
 
-/// Times to set on a file (File::set_times).
+/// Times to set on a file (File::set_times); the creation time is set through
+/// std::os::darwin::fs::FileTimesExt.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FileTimes {
     accessed: Option<SystemTime>,
     modified: Option<SystemTime>,
+    #[cfg(target_vendor = "apple")]
+    pub(crate) created: Option<SystemTime>,
 }
 
 impl FileTimes {
@@ -638,10 +633,23 @@ impl FileTimes {
     }
 }
 
+/// struct timespec
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct FutimensSpec {
     sec: i64,
     nsec: i64,
+}
+
+/// real std's file_time_to_timespec: an unset time is UTIME_OMIT (futimens leaves it as it is)
+fn file_time_to_timespec(time: Option<SystemTime>) -> FutimensSpec {
+    match time {
+        Some(t) => {
+            let (secs, nanos) = t.unix_parts();
+            FutimensSpec { sec: secs, nsec: nanos as i64 }
+        }
+        None => FutimensSpec { sec: 0, nsec: UTIME_OMIT },
+    }
 }
 
 #[cfg(target_vendor = "apple")]
@@ -649,8 +657,88 @@ const UTIME_OMIT: i64 = -2;
 #[cfg(not(target_vendor = "apple"))]
 const UTIME_OMIT: i64 = (1 << 30) - 2;
 
+#[cfg(not(target_vendor = "apple"))]
 extern "C" {
     fn futimens(fd: c_int, times: *const FutimensSpec) -> c_int;
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn set_fd_times(fd: c_int, times: &FileTimes) -> c_int {
+    let spec = [file_time_to_timespec(times.accessed), file_time_to_timespec(times.modified)];
+    unsafe { futimens(fd, spec.as_ptr()) }
+}
+
+#[cfg(target_vendor = "apple")]
+fn set_fd_times(fd: c_int, times: &FileTimes) -> c_int {
+    let ta = TimesAttrlist::from_times(times);
+    unsafe { fsetattrlist(fd, ta.attrlist(), ta.times_buf(), ta.times_buf_size(), 0) }
+}
+
+/// struct attrlist (sys/attr.h)
+#[cfg(target_vendor = "apple")]
+#[repr(C)]
+struct Attrlist {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+#[cfg(target_vendor = "apple")]
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+#[cfg(target_vendor = "apple")]
+const ATTR_CMN_CRTIME: u32 = 0x0000_0200;
+#[cfg(target_vendor = "apple")]
+const ATTR_CMN_MODTIME: u32 = 0x0000_0400;
+#[cfg(target_vendor = "apple")]
+const ATTR_CMN_ACCTIME: u32 = 0x0000_1000;
+
+#[cfg(target_vendor = "apple")]
+extern "C" {
+    fn fsetattrlist(fd: c_int, attr_list: *mut c_void, attr_buf: *mut c_void, attr_buf_size: usize, options: u32) -> c_int;
+}
+
+/// real std sys/fs/unix.rs TimesAttrlist: the times that are set, in the attribute order
+/// fsetattrlist reads them (creation, modification, access)
+#[cfg(target_vendor = "apple")]
+struct TimesAttrlist {
+    buf: [FutimensSpec; 3],
+    attrlist: Attrlist,
+    num_times: usize,
+}
+
+#[cfg(target_vendor = "apple")]
+impl TimesAttrlist {
+    fn from_times(times: &FileTimes) -> Self {
+        let mut this = TimesAttrlist {
+            buf: [FutimensSpec { sec: 0, nsec: 0 }; 3],
+            attrlist: Attrlist { bitmapcount: ATTR_BIT_MAP_COUNT, reserved: 0, commonattr: 0, volattr: 0, dirattr: 0, fileattr: 0, forkattr: 0 },
+            num_times: 0,
+        };
+        for (time, attr) in [(times.created, ATTR_CMN_CRTIME), (times.modified, ATTR_CMN_MODTIME), (times.accessed, ATTR_CMN_ACCTIME)] {
+            if time.is_some() {
+                this.buf[this.num_times] = file_time_to_timespec(time);
+                this.num_times += 1;
+                this.attrlist.commonattr |= attr;
+            }
+        }
+        this
+    }
+
+    fn attrlist(&self) -> *mut c_void {
+        (&raw const self.attrlist).cast::<c_void>().cast_mut()
+    }
+
+    fn times_buf(&self) -> *mut c_void {
+        self.buf.as_ptr().cast::<c_void>().cast_mut()
+    }
+
+    fn times_buf_size(&self) -> usize {
+        self.num_times * core::mem::size_of::<FutimensSpec>()
+    }
 }
 
 impl FileType {
@@ -908,6 +996,7 @@ impl Default for DirBuilder {
 
 pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return vfs::read(&*abs);
     }
     let mut file = File::open(path.as_ref())?;
@@ -918,6 +1007,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 
 pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     if let Some((abs, vfs::Kind::File(_))) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'f');
         return String::from_utf8(vfs::read(&*abs)?).map_err(|_| io::Error::INVALID_UTF8);
     }
     let mut file = File::open(path.as_ref())?;
@@ -931,12 +1021,14 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> io::Result
 }
 
 pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
-    if let Some((_, k)) = vfs::kind(path.as_ref()) {
+    if let Some((abs, k)) = vfs::kind(path.as_ref()) {
+        vfs::note(&abs, b'p');
         return match k {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             k => Ok(Metadata { st: vfs_stat(&k) }),
         };
     }
+    vfs::note(path.as_ref(), b'p');
     run_path_with_cstr(path.as_ref(), &|c| {
         let mut st = stat_t::zeroed();
         cvt(unsafe { sys::os::stat(c.as_ptr(), &mut st as *mut stat_t) })?;
@@ -948,6 +1040,7 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     if vfs::kind(path.as_ref()).is_some() {
         return metadata(path);
     }
+    vfs::note(path.as_ref(), b'p');
     run_path_with_cstr(path.as_ref(), &|c| {
         let mut st = stat_t::zeroed();
         cvt(unsafe { sys::os::lstat(c.as_ptr(), &mut st as *mut stat_t) })?;
@@ -999,10 +1092,16 @@ pub fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<()> 
     })
 }
 
+/// As real std: linkat with flags 0, so a symlink `original` is linked itself, never followed
+/// (POSIX leaves that open for link(), and macOS's link() follows it). Android keeps link(),
+/// which never follows one there, as real std does.
 pub fn hard_link<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
     run_path_with_cstr(original.as_ref(), &|a| {
         run_path_with_cstr(link.as_ref(), &|b| {
+            #[cfg(target_os = "android")]
             cvt(unsafe { sys::link(a.as_ptr(), b.as_ptr()) })?;
+            #[cfg(not(target_os = "android"))]
+            cvt(unsafe { sys::linkat(sys::os::AT_FDCWD, a.as_ptr(), sys::os::AT_FDCWD, b.as_ptr(), 0) })?;
             Ok(())
         })
     })
@@ -1087,6 +1186,7 @@ fn remove_dir_all_recursive(path: &Path) -> io::Result<()> {
 pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
     let path = path.as_ref();
     if let Some((abs, k)) = vfs::kind(path) {
+        vfs::note(&abs, b'd');
         return match k {
             vfs::Kind::Dir => {
                 let mut virt = vfs::list(&*abs)?;
@@ -1098,6 +1198,7 @@ pub fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
             vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
         };
     }
+    vfs::note(path, b'd');
     run_path_with_cstr(path, &|c| {
         let dir = unsafe { sys::opendir(c.as_ptr()) };
         if dir.is_null() {
@@ -1161,6 +1262,26 @@ pub fn set_permissions<P: AsRef<Path>>(path: P, perm: Permissions) -> io::Result
         cvt_r(|| unsafe { sys::chmod(c.as_ptr(), perm.mode as sys::mode_t) })?;
         Ok(())
     })
+}
+
+// chown(2), lchown(2) and fchown(2), as real std's sys fs: `u32::MAX` (-1) leaves that id as it is.
+pub(crate) fn chown_raw(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    run_path_with_cstr(path, &|c| {
+        cvt(unsafe { sys::chown(c.as_ptr(), uid as sys::uid_t, gid as sys::gid_t) })?;
+        Ok(())
+    })
+}
+
+pub(crate) fn lchown_raw(path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+    run_path_with_cstr(path, &|c| {
+        cvt(unsafe { sys::lchown(c.as_ptr(), uid as sys::uid_t, gid as sys::gid_t) })?;
+        Ok(())
+    })
+}
+
+pub(crate) fn fchown_raw(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
+    cvt(unsafe { sys::fchown(fd, uid as sys::uid_t, gid as sys::gid_t) })?;
+    Ok(())
 }
 
 /// Deprecated alias of `os::unix::fs::symlink` (rustc library/std/src/fs.rs `soft_link`).

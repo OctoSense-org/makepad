@@ -23,7 +23,19 @@ use std::collections::BTreeMap;
 /// Matches `geom.GameMeshVertexAo` — a separate POD from GameMeshVertex so
 /// the shadow mesh, which shares that layout and has no AO, does not pay four
 /// bytes a vertex for a lane it never reads.
+///
+/// The last float, the AO lane ([`AO_LANE`], `geom.ao_uv`), carries one of:
+/// the AO-atlas chart (unorm16 x 2, [`pack_ao_uv`]; the lightmap reuses it),
+/// a morph source index (a model with morph targets), a CAD element index
+/// (the skinned lane's `elem_ctl`, a host's opt-in), or, on a primitive whose
+/// paint material carries a band (a worn road part: `makepadSplat.band`),
+/// its band coordinates from TEXCOORD_1 (unorm16 x 2, read only by the paint
+/// lane: shaders/splat.rs `splat_band_coords`). A band never takes the lane
+/// from an atlas or morphs: such a model keeps its AO and draws without the
+/// band ([`PrimSpan::band`]).
 pub const MODEL_VERTEX_FLOATS: usize = 7;
+/// The AO lane's float in a packed vertex ([`MODEL_VERTEX_FLOATS`]).
+pub const AO_LANE: usize = 6;
 
 /// A loaded prop: packed vertices ready for upload, plus where its texture
 /// lives relative to the GLB.
@@ -1192,6 +1204,9 @@ impl StaticModel {
         let mut raw_alpha: Vec<f32> = Vec::new();
         let mut raw_source:Vec<usize>=Vec::new();
         let mut raw_uv: Vec<[f32; 2]> = Vec::new();
+        // Per vertex: a worn road primitive's band coordinates (0 elsewhere).
+        let mut raw_band: Vec<[f32; 2]> = Vec::new();
+        let mut band_lane_reported = false;
         // (image, detail_image, detail_scale, v0, v1, i0, i1)
         let mut prim_spans: Vec<PrimSpan> = Vec::new();
 
@@ -1256,6 +1271,17 @@ impl StaticModel {
                     .map(|a| acc.read_f32(a))
                     .transpose()?
                     .map(|(v, _)| v);
+                // A worn road part's band coordinates ride the AO lane, when
+                // the model leaves it free (see MODEL_VERTEX_FLOATS).
+                let prim_band = prim.get("material").and_then(Val::usize).is_some_and(|i| gltf_material_has_band(&json, i));
+                if prim_band && (ao_atlas.is_some() || has_morphs) && !band_lane_reported {
+                    band_lane_reported = true;
+                    makepad_draw::log!("model: a worn road primitive's band left off: the model's AO lane carries {}", if has_morphs { "morph indices" } else { "its AO atlas" });
+                }
+                let prim_band = prim_band && ao_atlas.is_none() && !has_morphs;
+                let band_uv = if prim_band {
+                    attrs.get("TEXCOORD_1").and_then(Val::usize).map(|a| acc.read_f32(a)).transpose()?.map(|(v, _)| v)
+                } else { None };
                 // COLOR_0 vertex colors (e.g. trellis-generated meshes carry
                 // their PBR base color here): multiplied into the material
                 // tint per vertex, exactly like the shader multiplies tint
@@ -1342,6 +1368,7 @@ impl StaticModel {
                     let surface=prim.get("material").and_then(Val::usize).is_some_and(|i|gltf_material_is_surface(&json,i));
                     raw_alpha.push(if surface { vcolor.as_ref().and_then(|(values,lanes)|(*lanes==4).then(||values.get(i*lanes+3).copied()).flatten()).unwrap_or(1.0) }else{1.0});
                     raw_uv.push([g(&uv, 2, 0, 0.0), g(&uv, 2, 1, 0.0)]);
+                    raw_band.push([g(&band_uv, 2, 0, 0.0), g(&band_uv, 2, 1, 0.0)]);
                     vertices.extend_from_slice(&[
                         p.x,
                         p.y,
@@ -1384,6 +1411,7 @@ impl StaticModel {
                     parts.push((pmin, pmax));
                     prim_spans.push(PrimSpan {
                         material: prim.get("material").and_then(Val::usize),
+                        band: band_uv.is_some(),
                         image: prim_image,
                         detail_image,
                         detail_scale,
@@ -1478,7 +1506,11 @@ impl StaticModel {
             max.z = max.z.max(s.max.z);
         }
         if vertices.is_empty() && anim_parts.is_empty() && driven_parts.is_empty() && sky.is_none() {
-            return Err("no mesh primitives found".into());
+            // A distance variant can intentionally drop every visible owner.
+            let empty_lod = node_vals.iter().enumerate().any(|(i,n)| active_nodes[i]
+                && n.get("mesh").is_none() && n.get("extensions").and_then(|e|e.get("MSFT_lod")).is_some());
+            if !empty_lod || node_vals.iter().enumerate().any(|(i,n)| active_nodes[i] && n.get("mesh").is_some()) { return Err("no mesh primitives found".into()); }
+            min = vec3f(0.,0.,0.); max = min;
         }
 
         // Bake self-occlusion into the colour's alpha lane. This is the whole
@@ -1530,7 +1562,8 @@ impl StaticModel {
                 raw_tint = tint;
                 (baked.ao_uv, baked.vertex_ao, baked.ground)
             }
-            None => (vec![[0.0, 0.0]; raw_pos.len()], vec![1.0; raw_pos.len()], None),
+            // No atlas: the lane is neutral, or a worn road part's band.
+            None => (raw_band.clone(), vec![1.0; raw_pos.len()], None),
         };
 
         vertices.clear();
@@ -1642,6 +1675,10 @@ impl StaticModel {
 #[derive(Clone)]
 struct PrimSpan {
     material: Option<usize>,
+    /// Its vertices carry their band coordinates in the AO lane (a worn
+    /// road part on a model whose lane is free): its paint keeps its band.
+    /// Otherwise a band its material declares is left off.
+    band: bool,
     image: usize,
     detail_image: Option<usize>,
     detail_scale: [f32; 2],
@@ -1659,6 +1696,11 @@ struct PrimSpan {
     liquid: bool,
 }
 
+/// Does material `index` paint a worn road part (`makepadSplat.band`)?
+fn gltf_material_has_band(json:&Val,index:usize)->bool {
+    json.get("materials").and_then(|m|m.idx(index)).and_then(|m|m.get("extras")).and_then(|e|e.get("makepadSplat")).and_then(|s|s.get("band")).is_some()
+}
+
 pub(crate) fn gltf_material_is_surface(json:&Val,index:usize)->bool {
     let Some(material)=json.get("materials").and_then(|m|m.idx(index))else{return false};
     material.get("normalTexture").is_some()||material.get("occlusionTexture").is_some()
@@ -1666,7 +1708,7 @@ pub(crate) fn gltf_material_is_surface(json:&Val,index:usize)->bool {
         ||material.get("emissiveFactor").is_some_and(|v|v.arr().iter().any(|v|v.f64().unwrap_or(0.0)>0.0))
         ||matches!(material.get("alphaMode").and_then(Val::str),Some("MASK"|"BLEND"))
         ||matches!(material.get("doubleSided"),Some(Val::Bool(true)))
-        ||material.get("extras").is_some_and(|e|e.get("makepadMips").is_some()||matches!(e.get("makepadSurface"),Some(Val::Bool(true))))
+        ||material.get("extras").is_some_and(|e|e.get("makepadMips").is_some()||e.get("makepadShading").and_then(|s|s.get("msdf")).and_then(Val::f64).is_some_and(|v|v>0.5)||matches!(e.get("makepadSurface"),Some(Val::Bool(true))))
 }
 
 /// Does material `index`'s base-colour texture sample with `magFilter:
@@ -1706,14 +1748,37 @@ pub(crate) fn gltf_material_surface(json:&Val,bin:&[u8],index:usize)->Option<cra
     });
     let shading=material.get("extras").and_then(|e|e.get("makepadShading"));
     let term=|key:&str|value(shading,key,0.0).clamp(0.0,1.0);
+    let impostor=value(shading,"impostor",0.0).max(0.0);
+    let occlusion_png=image("occlusionTexture");
+    // Every stand-in the bake writes carries its depth atlas in the occlusion
+    // slot (impostor.rs `ImpostorBake::depth`); one without draws at the front
+    // of its bounds (the white fallback reads as the nearest depth).
+    if impostor>0.0&&occlusion_png.is_none(){makepad_draw::log!("model: a far stand-in without its depth atlas (a bake bug): it draws at the front of its bounds");}
     Some(crate::material_surface::MaterialSurface {
         wind:term("wind"),clearcoat:term("clearcoat"),flake:term("flake"),rim:term("rim"),
-        impostor:value(shading,"impostor",0.0).max(0.0),
+        crown:value(shading,"crown",0.0)>0.5,
+        impostor,
         plate:value(shading,"plate",0.0)>0.5,
+        msdf:shading.filter(|s|value(Some(s),"msdf",0.0)>0.5).and_then(|s| {
+            let rgba = |key: &str| -> Option<[f32; 4]> {
+                let a = s.get(key)?;
+                let mut c = [0.0; 4];
+                for (i, v) in c.iter_mut().enumerate() {
+                    *v = a.idx(i)?.f64()? as f32;
+                    if !v.is_finite() { return None; }
+                }
+                Some(c)
+            };
+            let range = value(Some(s), "msdf_range", 0.0);
+            let border_width = value(Some(s), "msdf_border_width", 0.0);
+            if !range.is_finite() || range <= 0.0 || !border_width.is_finite() || border_width < 0.0 { return None; }
+            let plate_cells = rgba("msdf_plate_cells").filter(|c| c[1] > 0.0 && c[3] > 0.0);
+            Some(crate::material_surface::MsdfText { fill: rgba("msdf_fill")?, border: rgba("msdf_border")?, border_width, range, plate_cells })
+        }),
         lamp:shading.and_then(|s|s.get("lamp")).and_then(Val::str).and_then(makepad_gltf::GlbLamp::from_name),
         fur,
         normal_png:image("normalTexture"),normal_scale:value(material.get("normalTexture"),"scale",1.0),
-        occlusion_png:image("occlusionTexture"),occlusion_strength:value(material.get("occlusionTexture"),"strength",1.0),
+        occlusion_png,occlusion_strength:value(material.get("occlusionTexture"),"strength",1.0),
         emissive_png:image("emissiveTexture"),emissive,
         alpha_mode:match material.get("alphaMode").and_then(Val::str){Some("MASK")=>1,Some("BLEND")=>2,_=>0},
         alpha_cutoff:value(Some(material),"alphaCutoff",0.5),base_alpha:alpha,
@@ -1729,19 +1794,40 @@ pub(crate) fn gltf_material_surface(json:&Val,bin:&[u8],index:usize)->Option<cra
 /// A generated terrain tile's paint (gen level glb.rs `splat_material`):
 /// `weights` (a texture index), `map` [x, z, cell, width, rows] and per
 /// layer its `albedo` (or flat sRGB `color`), `normal` and `bump`, `scale`
-/// (1/metres), `roughness`, `metallic`.
+/// (1/metres), `roughness`, `metallic`, and `macro` [brightness, hue,
+/// roughness, size metres] (world macro variation; absent = none), plus
+/// `tiling` ("stochastic" for hex-tiled reads; absent or "repeat" = repeat).
+/// A worn road part adds `band` (gen level glb.rs): its band map (`map`, a
+/// texture index), the spans its TEXCOORD_1 decodes over (`lateral`,
+/// `span` past `base`), the map's layout (`cell` metres per texel, `row`,
+/// `rows`), the carriageway's `half` width, a closed road's `length` (0:
+/// open) and the `wear` amounts (line, seams, repairs, edges).
 fn gltf_splat(json:&Val,bin:&[u8],splat:&Val)->Option<crate::material_surface::SplatSurface> {
     let texture=|v:Option<&Val>|v.and_then(Val::usize).and_then(|i|json.get("textures")?.idx(i)?.get("source")?.usize()).and_then(|i|gltf_embedded_png(json,bin,i));
     let num=|v:&Val,key:&str,default:f32|v.get(key).and_then(Val::f64).map_or(default,|f|f as f32);
-    let map=splat.get("map")?;
-    let m=|i:usize|map.idx(i).and_then(Val::f64).map(|v|v as f32);
+    let m=|i:usize,default:f32|splat.get("map").and_then(|map|map.idx(i)).and_then(Val::f64).map_or(default,|v|v as f32);
     let layers=splat.get("layers")?.arr().iter().map(|l|crate::material_surface::SplatLayer{
         albedo_png:texture(l.get("albedo")),
         color:std::array::from_fn(|i|l.get("color").and_then(|c|c.idx(i)).and_then(Val::f64).unwrap_or(0.5) as f32),
         normal_png:texture(l.get("normal")),
         scale:num(l,"scale",1.0),roughness:num(l,"roughness",0.9),metallic:num(l,"metallic",0.0),bump:num(l,"bump",0.0),
+        relief:num(l,"relief",0.0).clamp(0.0,0.12),
+        wet:num(l,"wet",0.0).clamp(0.0,1.0),puddles:num(l,"puddles",0.0).clamp(0.0,1.0),
+        macro_variation:{
+            let v=|i:usize|l.get("macro").and_then(|m|m.idx(i)).and_then(Val::f64).map_or(0.0,|v|v as f32);
+            if v(3)>0.0 {[v(0).clamp(0.0,1.0),v(1).clamp(0.0,1.0),v(2).clamp(0.0,1.0),v(3)]} else {[0.0;4]}
+        },
+        stochastic:l.get("tiling").and_then(Val::str)==Some("stochastic"),
     }).collect::<Vec<_>>();
-    Some(crate::material_surface::SplatSurface{layers,weights_png:texture(splat.get("weights"))?,origin:[m(0)?,m(1)?],cell:m(2)?,width:m(3)?,rows:m(4)?})
+    // A worn road part: its band (the map rides the weight slot: a single
+    // mesh surface reads no weights).
+    let band=splat.get("band").map(|b|crate::material_surface::SplatBand{
+        base:num(b,"base",0.0),span:num(b,"span",0.0),lateral:num(b,"lateral",0.0),cell:num(b,"cell",1.0).max(1e-3),
+        row:num(b,"row",1.0).max(2.0),rows:num(b,"rows",1.0).max(1.0),half:num(b,"half",0.0),length:num(b,"length",0.0),
+        wear:std::array::from_fn(|i|b.get("wear").and_then(|w|w.idx(i)).and_then(Val::f64).map_or(0.0,|v|(v as f32).clamp(0.0,1.0))),
+    });
+    let weights=band.as_ref().map_or(splat.get("weights"),|_|splat.get("band").and_then(|b|b.get("map")));
+    Some(crate::material_surface::SplatSurface{layers,weights_png:texture(weights).unwrap_or_default(),origin:[m(0,0.0),m(1,0.0)],cell:m(2,1.0),width:m(3,1.0),rows:m(4,1.0),band})
 }
 
 impl PrimSpan {
@@ -1749,7 +1835,10 @@ impl PrimSpan {
     /// chunk once (see [`PbrMaterial`]).
     fn pbr(&self, json: &Val, bin: &[u8]) -> PbrMaterial {
         PbrMaterial {
-            surface: self.material.and_then(|i|gltf_material_surface(json,bin,i)).map(std::sync::Arc::new),
+            surface: self.material.and_then(|i|gltf_material_surface(json,bin,i)).map(|mut surface| {
+                if !self.band { surface.drop_band(); }
+                std::sync::Arc::new(surface)
+            }),
             metallic: self.metallic,
             roughness: self.roughness,
             orm_png: self.orm_image.and_then(|i| gltf_embedded_png(json, bin, i)),
@@ -2373,6 +2462,7 @@ fn pack_node_stream(
             let (metallic, roughness, orm_image) = gltf_prim_pbr(json, prim);
             out.spans.push(PrimSpan {
                 material: prim.get("material").and_then(Val::usize),
+                band: false,
                 image: gltf_prim_image_index(json, prim),
                 detail_image,
                 detail_scale,
@@ -2622,6 +2712,18 @@ fn build_driven_parts(
             pack_node_stream(json, acc, node, &local, mirrored, &mut stream)?;
         }
         if !stream.is_drawable() {
+            // A distance level that hides the part's geometry (an LOD owner
+            // without its mesh) leaves it out of this level only: its pivot
+            // and drive stay with the full-detail model, which the owning
+            // object queries and poses. Anything else is an authoring error.
+            let hidden = node_vals.iter().enumerate().any(|(node_index, node)| {
+                owner_of.get(node_index).copied().flatten() == Some(part_index)
+                    && node.get("mesh").is_none()
+                    && node.get("extensions").and_then(|e| e.get("MSFT_lod")).is_some()
+            });
+            if hidden {
+                continue;
+            }
             return Err(format!(
                 "driven part {} has no drawable geometry",
                 def.connection
@@ -2923,7 +3025,7 @@ fn plain_surface_signature(json: &Val, bin: &[u8], index: usize) -> Option<Vec<u
     let textured = material.get("pbrMetallicRoughness").is_some_and(|p| p.get("baseColorTexture").is_some() || p.get("metallicRoughnessTexture").is_some())
         || material.get("extras").is_some_and(|e| e.get("makepadMips").is_some());
     // A lamp keeps its own layer too: its emission changes per copy.
-    if textured || s.fur.is_some() || s.normal_png.is_some() || s.occlusion_png.is_some() || s.emissive_png.is_some() || s.impostor > 0.0 || s.plate || s.lamp.is_some() {
+    if textured || s.fur.is_some() || s.normal_png.is_some() || s.occlusion_png.is_some() || s.emissive_png.is_some() || s.impostor > 0.0 || s.plate || s.msdf.is_some() || s.lamp.is_some() {
         return None;
     }
     let factor = |key: &str| material.get("pbrMetallicRoughness").and_then(|p| p.get(key)).and_then(Val::f64).unwrap_or(1.0) as f32;
@@ -2931,7 +3033,7 @@ fn plain_surface_signature(json: &Val, bin: &[u8], index: usize) -> Option<Vec<u
     Some(vec![
         s.emissive[0].to_bits(), s.emissive[1].to_bits(), s.emissive[2].to_bits(), s.alpha_mode as u32, s.alpha_cutoff.to_bits(),
         s.base_alpha.to_bits(), s.double_sided as u32, s.triplanar.to_bits(), s.wind.to_bits(), s.clearcoat.to_bits(),
-        s.flake.to_bits(), s.rim.to_bits(), metallic.to_bits(), roughness.to_bits(),
+        s.flake.to_bits(), s.rim.to_bits(), s.crown as u32, metallic.to_bits(), roughness.to_bits(),
     ])
 }
 
@@ -3372,6 +3474,72 @@ mod sidecar_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn crown_extras_keep_normal_modes_separate_when_layers_merge() {
+        let positions = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let bin: Vec<u8> = positions.into_iter().flat_map(f32::to_le_bytes).collect();
+        let json = r#"{"asset":{"version":"2.0"},
+            "nodes":[{"mesh":0}],
+            "meshes":[{"primitives":[
+                {"attributes":{"POSITION":0},"material":0},
+                {"attributes":{"POSITION":0},"material":1},
+                {"attributes":{"POSITION":0},"material":2}]}],
+            "materials":[
+                {"extras":{"makepadSurface":true}},
+                {"extras":{"makepadSurface":true,"makepadShading":{"crown":0.5}}},
+                {"extras":{"makepadSurface":true,"makepadShading":{"crown":1.0}}}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3"}],
+            "bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],
+            "buffers":[{"byteLength":36}]}"#;
+        let parsed = JsonParser::parse(json.as_bytes()).unwrap();
+        for (index, crown) in [(0, false), (1, false), (2, true)] {
+            assert_eq!(gltf_material_surface(&parsed, &bin, index).unwrap().crown, crown, "crown is enabled only above 0.5 on material {index}");
+        }
+        let model = StaticModel::parse_glb(&glb_from(json.into(), bin)).unwrap();
+        assert_eq!(model.draw_layers.len(), 2, "crown and card normals must keep separate draws");
+        for crown in [false, true] {
+            let layer = model.draw_layers.iter().find(|l| l.pbr.surface.as_ref().unwrap().crown == crown).unwrap();
+            assert_eq!(layer.indices.len(), if crown { 3 } else { 6 }, "only matching normal modes merge");
+        }
+    }
+
+    #[test]
+    fn msdf_extras_roundtrip_colours_and_plate_geometry() {
+        let shading = makepad_gltf::GlbShading {
+            msdf: 1.0, plate: 1.0, msdf_fill: [0.25, 0.5, 0.75, 0.5],
+            msdf_border: [0.75, 0.125, 0.25, 1.0], msdf_border_width: 3.0, msdf_range: 8.0,
+            msdf_plate_cells: Some([0.5, 0.1, 0.0, 0.1]), ..Default::default()
+        };
+        let material = makepad_gltf::GlbPbrMaterial {
+            fur: None, shading: Some(shading), base_color: [0.1, 0.1, 0.1, 1.0], metallic: 0.0, roughness: 0.6,
+            normal_scale: 1.0, occlusion_strength: 1.0, emissive: [0.0; 3], emissive_strength: 1.0,
+            alpha_mode: "MASK".into(), alpha_cutoff: 0.5, double_sided: false,
+            base_color_texture: None, metallic_roughness_texture: None, normal_texture: None,
+            occlusion_texture: None, emissive_texture: None,
+        };
+        let mesh = makepad_gltf::write_glb_mesh(&[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], &[0, 1, 2]);
+        let glb = makepad_gltf::augment_glb_pbr(&mesh, &[material], &[makepad_gltf::GlbPbrPrimitive {
+            mesh: 0, primitive: 0, material: 0, colors: Vec::new(), tangents: Vec::new(),
+        }]).unwrap();
+        let len = u32::from_le_bytes(glb[12..16].try_into().unwrap()) as usize;
+        let json = JsonParser::parse(&glb[20..20 + len]).unwrap();
+        let index = json.get("meshes").unwrap().idx(0).unwrap().get("primitives").unwrap().idx(0).unwrap().get("material").unwrap().usize().unwrap();
+        let surface = gltf_material_surface(&json, &[], index).unwrap();
+        let msdf = surface.msdf.unwrap();
+        assert_eq!(msdf.fill, shading.msdf_fill.map(|v|v as f32));
+        assert_eq!(msdf.border, shading.msdf_border.map(|v|v as f32));
+        assert_eq!((msdf.border_width, msdf.range), (3.0, 8.0));
+        assert_eq!(msdf.plate_cells, shading.msdf_plate_cells.map(|c|c.map(|v|v as f32)));
+        assert!(matches!(surface.base_semantic(), crate::material_surface::PixelSemantic::Data));
+        assert_eq!((surface.alpha_mode, surface.alpha_cutoff), (1, 0.5));
+        for (mode, expected) in [("OPAQUE", 0), ("MASK", 1), ("BLEND", 2)] {
+            let json = JsonParser::parse(format!(r#"{{"materials":[{{"alphaMode":"{mode}","extras":{{"makepadSurface":true}}}}]}}"#).as_bytes()).unwrap();
+            let old = gltf_material_surface(&json, &[], 0).unwrap();
+            assert!(old.msdf.is_none());
+            assert_eq!(old.alpha_mode, expected);
+        }
+    }
 
     #[test]
     fn driven_wheel_visual_metadata_is_optional_and_validated() {
@@ -3841,6 +4009,25 @@ pub(crate) mod tests {
             assert!(m.anim_parts.is_empty());
             assert_eq!(m.vertex_count(), 3);
         }
+    }
+
+    #[test]
+    fn splat_surface_parameters_parse_with_legacy_defaults() {
+        let json = JsonParser::parse(br#"{"layers":[{"relief":0.04,"wet":0.6,"puddles":0.25}]}"#).unwrap();
+        let splat = gltf_splat(&json, &[], &json).unwrap();
+        assert_eq!((splat.layers[0].relief, splat.layers[0].wet, splat.layers[0].puddles), (0.04, 0.6, 0.25));
+        assert_eq!((splat.width, splat.rows), (1.0, 1.0), "a single surface needs no weight grid");
+        let old = JsonParser::parse(br#"{"layers":[{}]}"#).unwrap();
+        let old = gltf_splat(&old, &[], &old).unwrap();
+        assert_eq!((old.layers[0].relief, old.layers[0].wet, old.layers[0].puddles), (0.0, 0.0, 0.0));
+        assert_eq!(old.layers[0].macro_variation, [0.0; 4], "no macro variation unless a layer asks");
+        assert!(!old.layers[0].stochastic, "legacy layers keep repeat tiling");
+        let varied = JsonParser::parse(br#"{"layers":[{"macro":[0.2,0.05,0.1,14]}]}"#).unwrap();
+        assert_eq!(gltf_splat(&varied, &[], &varied).unwrap().layers[0].macro_variation, [0.2, 0.05, 0.1, 14.0]);
+        let tiling = JsonParser::parse(br#"{"layers":[{"tiling":"stochastic"},{"tiling":"repeat"}]}"#).unwrap();
+        let tiling = gltf_splat(&tiling, &[], &tiling).unwrap();
+        assert!(tiling.layers[0].stochastic, "stochastic tiling enables hex-tiled reads");
+        assert!(!tiling.layers[1].stochastic, "explicit repeat keeps ordinary tiling");
     }
 
     #[test]

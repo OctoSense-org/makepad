@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""A failed hot load ends in a warm restart and a ledger report, never a parked panic; the restarted
-run takes the next edit, a panic of the program's there is the program's, and an error of the JIT's
-there is the JIT's.
+"""A failed hot load parks its call and offers a warm restart, never restarting the app by itself
+(reload.rs recover_hot_failure); taken as a person takes it (`session relaunch`), the restart brings
+the app's state back with a ledger report, and nothing stays parked; the restarted run takes the
+next edit, a panic of the program's there is the program's, and an error of the JIT's there is the
+JIT's.
 
 usage: hot_fail.py [case ...]   (run from the workspace root; the JIT runs through `cargo run
-  --profile host`; MAKEPAD_RUN_STD in the environment, default libs/relax/compiler/std; every case
+  --profile host`; RELAX_STD in the environment, default libs/relax/compiler/std; every case
   when none is named)
 
 Copies hot_fail/ to a temporary dir and runs it once per case. Once it ticks, tick.rs is edited so
 that a worker thread calls a fn never built before. In a process an edit ran in, that build fails:
-  - error, program-panic, jit-error: with an internal compiler error (MAKEPAD_RUN_TEST_HOT_BUILD_ERROR):
+  - error, program-panic, jit-error: with an internal compiler error (RELAX_TEST_HOT_BUILD_ERROR):
     the call would park at a compile error;
-  - panic: the compiler panics in the call (MAKEPAD_RUN_TEST_HOT_COMPILE_PANIC): the call gets a stub
+  - panic: the compiler panics in the call (RELAX_TEST_HOT_COMPILE_PANIC): the call gets a stub
     that panics. Its builds fail too, so that nothing builds it ahead of the call.
 Then, in the restarted run (a terminal program: it never presents a frame):
   - error, panic: the next edit;
   - program-panic: a thread of the program's panics ("panic-now");
-  - jit-error: that build fails again with no edit in the run (MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR);
+  - jit-error: that build fails again with no edit in the run (RELAX_TEST_REPLACEMENT_BUILD_ERROR);
     the worker calls the fn again every tick, so calls meet the error after the run reported it too.
-Each passes when:
+In every case the fixture waits for the offer and takes it (`session relaunch`). Each passes when:
   - the app's state came back ("out restored <tick>" at or past the tick before the edit) and, but
     for jit-error, the edit runs (value=2);
   - the ledger (the hot outbox under MAKEPAD_HOME) holds the failure and its restart, one load;
@@ -29,7 +31,7 @@ Each passes when:
   - jit-error: the error is the JIT's: a restart_failed record of the same load, the run's JIT error
     verdict line and exit code, a `jiterror` in the flight recorder, and no panic said or parked (the
     calls after the report included);
-  - nothing else parks and no panic waits for anyone;
+  - nothing parks but the failed call before the restart, and no panic waits for anyone;
   - the restarted run answers `inspect` at its pid, the first run's (exec keeps it);
   - the run's exit code (7, or the JIT error's) reaches whoever started it, in the working directory
     it was started in.
@@ -49,7 +51,10 @@ BAD = ("parked", "paused on a panic", "stale access", "FATAL", "Segmentation")
 JIT_ERROR_EXIT = 86
 JIT_ERROR_LINE = "verdict: jit-error (not your change) record="
 OWN_PANIC = "hot_fail: the program's own panic"
-os.environ.setdefault("MAKEPAD_RUN_STD", os.path.abspath("libs/relax/compiler/std"))
+# the failed load's call, parked for the person until the restart (reload.rs update_failed_at_call)
+PARKED_CALL = "The live update failed in this call"
+OFFERED = "a restart applies it; offered"
+os.environ.setdefault("RELAX_STD", os.path.abspath("libs/relax/compiler/std"))
 
 
 def case(name, hooks, after):
@@ -58,9 +63,9 @@ def case(name, hooks, after):
     shutil.copytree(os.path.join(HERE, "hot_fail"), pkg)
     home = os.path.join(tmp, "home")
     ready = os.path.join(tmp, "ready")
-    env = dict(os.environ, MAKEPAD_RUN_LIVE_READY=ready, MAKEPAD_RUN_HOME=home, MAKEPAD_HOME=os.path.join(tmp, "makepad"),
-               MAKEPAD_RUN_CACHE_DIR=os.path.join(home, "cache"), MAKEPAD_RUN_TARGET_DIR=os.path.join(home, "target"),
-               MAKEPAD_RUN_LIVE_TRACE="1", **{hook: "hot_fail_target" for hook in hooks})
+    env = dict(os.environ, RELAX_LIVE_READY=ready, RELAX_HOME=home, MAKEPAD_HOME=os.path.join(tmp, "makepad"),
+               RELAX_CACHE_DIR=os.path.join(home, "cache"), RELAX_TARGET_DIR=os.path.join(home, "target"),
+               RELAX_LIVE_TRACE="1", **{hook: "hot_fail_target" for hook in hooks})
     p = subprocess.Popen(JIT + ["run", "--ahead=minimal", "relax-hot-fail"], cwd=pkg, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     out, err = [], []
     def pump(f, acc):
@@ -124,7 +129,7 @@ def case(name, hooks, after):
     restored = lambda: []
     before = -1
     exit_code = 7
-    allowed = None
+    allowed = [PARKED_CALL]
     try:
         if not wait(lambda: os.path.exists(ready) and len(ticks()) >= 20 and any("watcher gate open" in l for l in err)):
             fails.append("no-start")
@@ -134,7 +139,16 @@ def case(name, hooks, after):
             edit("pub fn value() -> u64 {\n    1\n}", "pub fn value() -> u64 {\n    hot_fail_target()\n}")
             restored = lambda: [int(l.split()[2]) for l in out[n_out:] if l.startswith("out restored ")]
             applied = lambda: any("value=2" in l for l in ticks(n_out))
-            if after == "jit-error":
+            # the failed load offers the restart; the person takes it
+            if not wait(lambda: any(OFFERED in l for l in err)):
+                fails.append("no-restart-offered(%s; %s)" % (outcomes(), ended()))
+            else:
+                took = subprocess.run([MAKEPAD, "inspect", str(pids()[-1]), "session", "relaunch"], cwd=pkg, env=env, capture_output=True, text=True)
+                if "relaunch: queued" not in took.stdout + took.stderr:
+                    fails.append("relaunch-not-taken: " + (took.stdout + took.stderr)[:200])
+            if fails:
+                pass
+            elif after == "jit-error":
                 # the restarted run's own build of the target fails: its call never returns a value
                 wait(lambda: restored() and "restart_failed" in outcomes())
                 if not restored():
@@ -172,7 +186,7 @@ def case(name, hooks, after):
                     fails.append("later-edit-restarted-%s" % pids())
             if not fails and after == "program-panic":
                 # the program's own panic after the restore: the program's, as in any run
-                allowed = OWN_PANIC
+                allowed.append(OWN_PANIC)
                 e_panic = len(err)
                 open(os.path.join(pkg, "panic-now"), "w").close()
                 wait(lambda: any(OWN_PANIC in l for l in err[e_panic:]))
@@ -204,7 +218,7 @@ def case(name, hooks, after):
             if not fails and after == "jit-error":
                 failed = [r for r in ledger() if r.get("outcome") == "restart_failed"]
                 record = failed[0].get("id", "?")
-                if "MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR" not in failed[0].get("reason", ""):
+                if "RELAX_TEST_REPLACEMENT_BUILD_ERROR" not in failed[0].get("reason", ""):
                     fails.append("jit-error-record-of-another-error: " + failed[0].get("reason", "")[:200])
                 wait(lambda: any(JIT_ERROR_LINE + record in l for l in err))
                 if not any(JIT_ERROR_LINE + record in l for l in err):
@@ -231,7 +245,7 @@ def case(name, hooks, after):
                 open(os.path.join(pkg, "exit-now"), "w").close()
                 if p.wait() != exit_code:
                     fails.append("exit-code-%d" % p.returncode)
-        wrong = next((l for l in err if any(b in l for b in BAD) and not (allowed and allowed in l)), None)
+        wrong = next((l for l in err if any(b in l for b in BAD) and not any(a in l for a in allowed)), None)
         if wrong:
             fails.append("bad-line: " + wrong[:200])
     finally:
@@ -246,7 +260,7 @@ def case(name, hooks, after):
     shutil.rmtree(tmp, ignore_errors=True)
     return True
 
-ERROR, PANIC, AGAIN = "MAKEPAD_RUN_TEST_HOT_BUILD_ERROR", "MAKEPAD_RUN_TEST_HOT_COMPILE_PANIC", "MAKEPAD_RUN_TEST_REPLACEMENT_BUILD_ERROR"
+ERROR, PANIC, AGAIN = "RELAX_TEST_HOT_BUILD_ERROR", "RELAX_TEST_HOT_COMPILE_PANIC", "RELAX_TEST_REPLACEMENT_BUILD_ERROR"
 CASES = [("error", [ERROR], "edit"), ("panic", [ERROR, PANIC], "edit"),
          ("program-panic", [ERROR], "program-panic"), ("jit-error", [ERROR, AGAIN], "jit-error")]
 asked = sys.argv[1:]

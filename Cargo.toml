@@ -1,4 +1,5 @@
 workspace.members = [
+    "tools/arch_installer",
     "tools/ci_merge",
     "tools/private_check",
     "tools/uv_unwrap_corpus",
@@ -10,7 +11,6 @@ workspace.members = [
     "apps/wm-all",
     "apps/wm-phone",
     "apps/desklink",
-    "apps/xr_remote",
     "apps/xr_bridge",
     "libs/xr_runtime",
     "tools/xr_proton",
@@ -26,6 +26,7 @@ workspace.members = [
     "apps/clock",
     "apps/weather",
     "apps/translator",
+    "apps/party",
     "apps/mail",
     "apps/notes",
     "apps/calendar",
@@ -50,6 +51,8 @@ workspace.members = [
     "libs/relax_api/phase",
     "libs/civil_time",
     "libs/wm_api",
+    "libs/qr",
+    "libs/webrtc",
     "libs/shell_kit",
     "libs/app_module",
     "libs/app_registry",
@@ -129,14 +132,19 @@ workspace.members = [
     "libs/web_pack",
     "libs/web_manifest",
     "libs/font_subset",
+    "libs/pdf_write",
+    "libs/markdown_edit",
     "libs/kinetic_type",
     "libs/raytrace",
     "libs/scene",
     "libs/soft_body",
+    "libs/dynamics",
     "libs/show_control",
     "libs/bounded_http",
     # zero-dependency shared primitives (SHA-256, reuse-address UDP bind)
     "libs/core_util",
+    # pictures decoded to RGBA with no platform (the app's and headless tools' one decoder)
+    "libs/image_decode",
     "libs/strict_json",
     "libs/cell_width",
     "libs/source_slice",
@@ -176,6 +184,8 @@ workspace.members = [
     "examples/pdf",
     "examples/shader",
     "examples/frame_probe",
+    "examples/camera_probe",
+    "examples/xr_capture_probe",
     "examples/fractal_zoom",
     "examples/material_lab",
     "examples/raytrace",
@@ -199,6 +209,7 @@ workspace.members = [
     "examples/cad",
     "examples/box3d",
     "examples/hello_world",
+    "examples/hello_3d",
     "examples/render_to_texture",
     "examples/depth_mix",
     "examples/sdf_atlas",
@@ -248,6 +259,7 @@ workspace.members = [
     "libs/value_pickers",
     "libs/editor_panel",
     "libs/flow",
+    "libs/lock_free",
     # === own MP3 / Ogg Vorbis decoders ===
     "libs/audio_decode",
     # === own Ogg Vorbis encoder (stem side-channels) ===
@@ -295,6 +307,7 @@ workspace.members = [
     # and its host crates; Relax's Rust JIT library crates live in libs/relax ===
     "tools/run",
     "tools/run/runner",
+    "tools/run/native_macros",
     "tools/run/boot",
     "tools/run/fixture/diffpkg",
     "tools/run/fixture/diffpkg/tables",
@@ -316,6 +329,7 @@ workspace.members = [
     "libs/relax/types",
     "tools/run/fixture",
     "tools/run/fixture/park_view",
+    "tools/run/fixture/tray_app",
     "tools/run/fixture/script_ops",
     "libs/relax/lex",
     "libs/system_speech",
@@ -328,7 +342,7 @@ workspace.members = [
     "platform/script/test",
     "platform/script/audio_aot",
     "platform/hal",
-    "platform/cpu_budget",
+    "libs/cpu_budget",
     "platform/script/compute",
     "platform/script/imports",
     "platform/script/compute_sched",
@@ -341,6 +355,7 @@ workspace.members = [
     "widgets/families/tweaker",
     "widgets/families/data",
     "widgets/families/rich_text",
+    "widgets/families/markdown_editor",
     "widgets/families/menus",
     "widgets/families/extras",
     "widgets/families/maps",
@@ -483,9 +498,9 @@ unicode-segmentation = { path = "libs/unicode/unicode-segmentation" }
 # Paths of Relax's JIT libraries (libs/relax), the host crates (tools/run), and their makepad dependencies:
 # members say `name = { workspace = true }`.
 [workspace.dependencies]
-makepad-cpu-budget = { path = "platform/cpu_budget", version = "1.0.0" }
+makepad-cpu-budget = { path = "libs/cpu_budget", version = "1.0.0" }
 relax-lex = { path = "libs/relax/lex", version = "0.1.0" }
-makepad-relax = { path = "libs/relax/attr", version = "1.0.0" }
+relax-attr = { path = "libs/relax/attr", version = "1.0.0" }
 relax-base = { path = "libs/relax/base", version = "0.1.0" }
 relax-backend = { path = "libs/relax/backend", version = "0.1.0" }
 relax-codegen = { path = "libs/relax/codegen", version = "0.1.0" }
@@ -503,8 +518,8 @@ makepad-strict-json = { path = "libs/strict_json", version = "0.1.0" }
 makepad-gpu-trace = { path = "libs/gpu_trace", version = "1.0.0" }
 makepad-prof-stream = { path = "libs/prof_stream", version = "1.0.0" }
 makepad-prof-view = { path = "libs/prof_view", version = "0.1.0" }
-makepad-relax-api = { path = "libs/relax_api", version = "1.0.0" }
-makepad-relax-api-macro-impl = { path = "libs/relax_api/macro_impl", version = "1.0.0" }
+relax-api = { path = "libs/relax_api", version = "1.0.0" }
+relax-api-macro-impl = { path = "libs/relax_api/macro_impl", version = "1.0.0" }
 makepad-live-id-macros-impl = { path = "libs/live_id/id_macros_impl", version = "1.0.0" }
 makepad-derive-widget-impl = { path = "widgets/derive_widget_impl", version = "1.0.0" }
 makepad-micro-serde-derive-impl = { path = "libs/micro_serde/derive_impl", version = "1.0.0" }
@@ -583,6 +598,12 @@ opt-level = 1
 [profile.release.package.makepad-stitch]
 incremental = false
 
+# The dynamics engine's step in one codegen unit (measured 2026-11-09 on a Linux pool box, same
+# code back to back): chain +12%, hinge chain +5%, humanoid +6%, limited hinge chain +15% steps/s;
+# the crate's own release build goes from 8.5 s to 19 s.
+[profile.release.package.makepad-dynamics]
+codegen-units = 1
+
 #[profile.dev.package.makepad-live-tokenizer]
 #opt-level = 3
 #[profile.dev.package.makepad-live-compiler]
@@ -637,4 +658,6 @@ incremental = false
 [profile.release.package.relax-session]
 incremental = false
 [profile.release.package.relax-native-macros]
+incremental = false
+[profile.release.package.makepad-run-native-macros]
 incremental = false

@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 /// How long the run's own threads get to see the end. A compile between two of its points is what
 /// takes the time.
 const THREADS_GRACE: Duration = Duration::from_secs(10);
+/// How often the end says which compile jobs it still waits for (it waits them out: they read the
+/// unit and the statics it puts back).
+const WORKERS_REPORT: Duration = Duration::from_secs(5);
 /// How long the program's threads get.
 const PROGRAM_GRACE: Duration = Duration::from_secs(5);
 
@@ -51,7 +54,8 @@ pub fn started_in_place() -> bool {
 }
 
 /// # Safety
-/// `up` is the running unit; nothing of the run is called after this.
+/// `up` is the running unit, or null for a run whose boot ended without one (its build failed);
+/// nothing of the run is called after this.
 pub unsafe fn end(up: *mut Unit, grace: Duration) -> Ended {
     let t = Instant::now();
     let mut ms = [0.0; 5];
@@ -80,10 +84,7 @@ pub unsafe fn end(up: *mut Unit, grace: Duration) -> Ended {
     crate::run::end_console();
     crate::jit::stop_compiling();
     let stayed = crate::run_threads::end_all(THREADS_GRACE);
-    let workers_stopped = crate::jit::stop_queue_workers(THREADS_GRACE);
-    if !workers_stopped {
-        eprintln!("makepad-run: a run's end: compile workers were still in a job after {THREADS_GRACE:?}");
-    }
+    crate::jit::stop_queue_workers(WORKERS_REPORT);
     crate::pool::retire_idle();
     makepad_cpu_budget::end_run();
     ms[2] = mark();
@@ -92,9 +93,9 @@ pub unsafe fn end(up: *mut Unit, grace: Duration) -> Ended {
     crate::pmhost::free_world();
     let up = crate::run::take_run_unit();
     if !up.is_null() {
-        let no_thread_in_it = stayed.is_empty() && workers_stopped;
+        let no_thread_in_it = stayed.is_empty();
         if !no_thread_in_it {
-            eprintln!("makepad-run: a run's end: its unit stays in memory, threads that did not end may read it: {stayed:?}");
+            eprintln!("relax: a run's end: its unit stays in memory, threads that did not end may read it: {stayed:?}");
         }
         crate::jit::end_unit(up, no_thread_in_it);
     }
@@ -155,22 +156,48 @@ pub fn restart(why: String, state: Option<&[u8]>) -> Result<(), String> {
         }
     };
     let spawned = std::thread::Builder::new().name("run-restart".into()).spawn(move || {
-        eprintln!("makepad live: restarting ({why})");
+        eprintln!("relax live: restarting ({why})");
         let t = Instant::now();
+        let mut next = next;
+        if wait_boot() {
+            eprintln!("relax live: the run's boot is over after {:.0} ms: the restart ends the run now", t.elapsed().as_secs_f64() * 1e3);
+            // its program barely began: the state it was started with is the next run's, when
+            // this restart has none of its own
+            crate::reload::carry_restore(&mut next);
+        }
         crate::reload::restart_begins();
         let up = crate::run::running_unit();
         let ended = unsafe { end(up, PROGRAM_GRACE) };
-        eprintln!("makepad-run: {} ; run's threads stayed: {:?}; {:.0} ms in all: end {:.0}, cache {:.0}, threads {:.0}, unit {:.0}, statics {:.0}", ended.program.line(), ended.stayed, t.elapsed().as_secs_f64() * 1e3, ended.ms[0], ended.ms[1], ended.ms[2], ended.ms[3], ended.ms[4]);
+        eprintln!("relax: {} ; run's threads stayed: {:?}; {:.0} ms in all: end {:.0}, cache {:.0}, threads {:.0}, unit {:.0}, statics {:.0}", ended.program.line(), ended.stayed, t.elapsed().as_secs_f64() * 1e3, ended.ms[0], ended.ms[1], ended.ms[2], ended.ms[3], ended.ms[4]);
         // what the next run reads (run_input)
         *HANDED.lock().unwrap_or_else(|e| e.into_inner()) = Some(next);
+        // the next run's boot is due before another restart can be asked for
+        crate::run::boot_begins();
         RESTARTING.store(false, Ordering::Release);
         crate::run::host_next_run();
     });
     if let Err(e) = spawned {
-        eprintln!("makepad-run: the restart's thread did not start: {e}");
+        eprintln!("relax: the restart's thread did not start: {e}");
         std::process::abort();
     }
     Ok(())
+}
+
+/// How often a restart looks whether the run's boot is over (`wait_boot`).
+const BOOT_LOOK: Duration = Duration::from_millis(2);
+
+/// A restart's end waits for the run's boot (`run::booting`): until the boot hands the run to its
+/// program, or returns without one, there is no program to end and the boot still builds the unit
+/// the end takes away. True: it waited.
+fn wait_boot() -> bool {
+    if !crate::run::booting() {
+        return false;
+    }
+    eprintln!("relax live: the restart waits for the run's boot: its program has not started yet");
+    while crate::run::booting() {
+        std::thread::sleep(BOOT_LOOK);
+    }
+    true
 }
 
 /// A thread of the program in a host call, the restart it waits for asked: it leaves the run when
@@ -182,7 +209,7 @@ pub(crate) fn leave() -> ! {
     unsafe { crate::jit::leave_ended_run() }
 }
 
-/// `MAKEPAD_RUN_LEFTOVERS=<file>` (Linux): what a run's end left in the process's statics. Their bytes
+/// `RELAX_LEFTOVERS=<file>` (Linux): what a run's end left in the process's statics. Their bytes
 /// when `cmd_run` starts are the process's own; after each run's end every symbol whose bytes differ
 /// goes in the file. tools/run/fixture/restart_in_place.py holds them against the statics a process
 /// keeps on purpose: anything else is the next run seeing the last one.
@@ -199,7 +226,7 @@ pub mod leftovers {
     }
     /// The process's statics as they start.
     pub fn mark() {
-        if std::env::var_os("MAKEPAD_RUN_LEFTOVERS").is_none() {
+        if std::env::var_os("RELAX_LEFTOVERS").is_none() {
             return;
         }
         ON.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -252,7 +279,7 @@ pub mod leftovers {
     }
     /// The symbols that differ from `mark` and were not restored, in the file: `name size`.
     pub fn report() {
-        let Some(path) = std::env::var_os("MAKEPAD_RUN_LEFTOVERS") else { return };
+        let Some(path) = std::env::var_os("RELAX_LEFTOVERS") else { return };
         let start = START.lock().unwrap_or_else(|e| e.into_inner());
         let Some(start) = start.as_ref() else { return };
         let Ok(elf) = std::fs::read("/proc/self/exe") else { return };
@@ -295,7 +322,7 @@ pub mod leftovers {
     }
 }
 
-/// `MAKEPAD_RUN_LEFTOVERS` on macOS: a heap that went stays unmapped, and no static may point there
+/// `RELAX_LEFTOVERS` on macOS: a heap that went stays unmapped, and no static may point there
 /// (the check above, without the symbols' before and after). What it finds goes to stderr.
 #[cfg(target_vendor = "apple")]
 pub mod leftovers {
@@ -304,7 +331,7 @@ pub mod leftovers {
     static ON: AtomicBool = AtomicBool::new(false);
     static GONE: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
     pub fn mark() {
-        ON.store(std::env::var_os("MAKEPAD_RUN_LEFTOVERS").is_some(), Ordering::SeqCst);
+        ON.store(std::env::var_os("RELAX_LEFTOVERS").is_some(), Ordering::SeqCst);
     }
     pub(crate) fn heap_gone(base: usize, size: usize) {
         if !ON.load(Ordering::SeqCst) {
@@ -342,12 +369,35 @@ pub mod leftovers {
                         // (heaps sit low here, so two small u32s read as an address: pointers are aligned)
                         if w & 7 == 0 && gone.iter().any(|&(b, n)| w.wrapping_sub(b) < n) {
                             // the unslid address: `nm` names it
-                            eprintln!("makepad-run: -> a heap that went: {:#x} -> {w:#x}", (at as isize - slide) as usize);
+                            eprintln!("relax: -> a heap that went: {:#x} -> {w:#x}", (at as isize - slide) as usize);
                         }
                     }
                 }
                 c = c.add(size);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A restart asked while the run boots (its program not started, its unit maybe not in yet)
+    /// ends the run only once the boot is over: before, there is nothing to end, and the boot still
+    /// builds what the end takes away (a relaunch 3 s into a restarted run killed it, 11-07). A boot
+    /// that panics is over too: the host shows its panic, and the restart goes on.
+    #[test]
+    fn a_restart_waits_out_the_runs_boot() {
+        assert!(!super::wait_boot(), "no boot: the end goes on at once");
+        let boot = crate::run::Boot::on();
+        let restart = std::thread::spawn(super::wait_boot);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!restart.is_finished(), "the end waits while the run boots");
+        drop(boot);
+        assert!(restart.join().unwrap(), "the boot is over: the end goes on, and it waited");
+        let panicked = std::panic::catch_unwind(|| {
+            let _boot = crate::run::Boot::on();
+            panic!("the boot's own panic");
+        });
+        assert!(panicked.is_err() && !crate::run::booting(), "a boot that panicked is over");
     }
 }

@@ -12,10 +12,10 @@ default-run = "relax-provided-fixture"
 host-shims = []
 
 [dependencies]
-makepad-relax-api = { workspace = true }
+relax-api = { workspace = true }
 
 [dev-dependencies]
-makepad-relax-api = { workspace = true, features = ["host-shims"] }
+relax-api = { workspace = true, features = ["host-shims"] }
 
 [lib]
 path = "src/lib.rs"
@@ -30,6 +30,13 @@ path = "src/main.rs"
 name = "relax-provided-fixture-guard"
 path = "src/guard.rs"
 
+# `makepad run relax-provided-fixture-arc-guard` must stop with "`shared_registry_retain` calls
+# `..increment_strong_count` in JIT-compiled code" (provided_script.sh); under rustc it prints
+# "strong 2". The panic a with_vm trampoline boxes is JIT code's own type and stays allowed (vm_call).
+[[bin]]
+name = "relax-provided-fixture-arc-guard"
+path = "src/arc_guard.rs"
+
 # statics of the lib reached from JIT-compiled code: a per-side one works, rustc's one copy is
 # refused (provided_static.sh)
 [[bin]]
@@ -40,6 +47,12 @@ path = "src/provided_static.rs"
 [[bin]]
 name = "relax-unwind-probe"
 path = "src/unwind_probe.rs"
+
+# a JIT panic through the lib's rustc frames: rustc's drop guard runs and rustc's catch_unwind
+# catches it; prints what its rustc build prints (unwind_through.sh)
+[[bin]]
+name = "relax-unwind-through"
+path = "src/unwind_through.rs"
 
 # a native panic in a lazy compile reaches the program as a panic of the call (compile_panic.sh)
 [[bin]]

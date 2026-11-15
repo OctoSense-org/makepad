@@ -55,7 +55,7 @@ pub enum Loc {
     None,
 }
 
-/// Set by drivers that compare builds (MAKEPAD_RUN_CODE_SIG): backends then report `alloc_sig`.
+/// Set by drivers that compare builds (RELAX_CODE_SIG): backends then report `alloc_sig`.
 pub static SIG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Hash of an allocation (every vreg's location, frame, saves): address-independent, so
@@ -141,8 +141,8 @@ pub enum Remat {
     Const(i64),
     /// the address of stack slot n
     Slot(u32),
-    /// a V128 constant: every lane `bits` (`Inst::VConst`): one movi / literal load at a use beats a
-    /// spill store at the definition and a reload at each use
+    /// a vector constant: every lane `bits` (`Inst::VConst`, V128 or V256): one movi / literal load
+    /// at a use beats a spill store at the definition and a reload at each use
     VConst(u32),
     /// a scalar float constant (`Inst::Fconst`: bits, f64?) where the target loads one in a single
     /// instruction at a use (`RegConfig::fconst_remat`; arm64: fmov #imm or a literal load)
@@ -266,6 +266,12 @@ pub fn uses_defs(i: &Inst, uses: &mut Vec<VReg>, defs: &mut Vec<VReg>) {
             uses.push(*b);
             defs.push(*d);
         }
+        Inst::SelCmp(d, c, a, b) => {
+            c.uses(|u| uses.push(u));
+            uses.push(*a);
+            uses.push(*b);
+            defs.push(*d);
+        }
         Inst::FMulAdd(_, _, _, d, a, b, c) => {
             uses.push(*a);
             uses.push(*b);
@@ -369,6 +375,11 @@ pub fn for_uses(i: &Inst, mut uses: impl FnMut(VReg)) {
             uses(*a);
             uses(*b);
         }
+        Inst::SelCmp(d, c, a, b) => {
+            c.uses(&mut uses);
+            uses(*a);
+            uses(*b);
+        }
         Inst::FMulAdd(_, _, _, d, a, b, c) => {
             uses(*a);
             uses(*b);
@@ -438,6 +449,7 @@ pub fn for_defs(i: &Inst, mut defs: impl FnMut(VReg)) {
         | Inst::VFma(_, _, _, _, d, _, _, _)
         | Inst::VInsert(d, _, _, _)
         | Inst::Sel(d, _, _, _)
+        | Inst::SelCmp(d, _, _, _)
         | Inst::FMulAdd(_, _, _, d, _, _, _)
         | Inst::AtomicLoad(_, _, d, _)
         | Inst::AtomicRmw(_, _, _, d, _, _)
@@ -449,6 +461,7 @@ pub fn term_uses(t: &Term, uses: &mut Vec<VReg>) {
     uses.clear();
     match t {
         Term::Branch(c, _, _) | Term::Switch(c, _) => uses.push(*c),
+        Term::BranchCmp(c, _, _) => c.uses(|u| uses.push(u)),
         Term::Ret(v) => uses.extend_from_slice(v),
         _ => {}
     }
@@ -927,7 +940,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     // (x64/arm64 base_disp fold the chain down to the first base with a location), so every base
     // of the chain must be live at the use: `v = w + 16, w = self + 0x2938` read v in a loop where
     // the split parked `self` in a copy (a hole) while w stayed live past the loop: the load used
-    // `self`'s register, which the loop counter had taken (Sandbox race x64 fault at 0x2948).
+    // `self`'s register, which the loop counter had taken (a game x64 fault at 0x2948).
     if remat.iter().any(|r| matches!(r, Remat::Offset(..))) {
         let mut ok = vec![true; nv as usize];
         let live_at = |b: u32, p: u32| ranges.of(b).iter().any(|&(a, z)| a <= p && p <= z);
@@ -1262,10 +1275,15 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
         if chosen.is_none() {
             if let Some(m) = unit_members(v) {
-                // dissolve: the root and its members take their turns now, heaviest first
+                // dissolve: the root and its members take their turns now, heaviest first, each its own
+                // unit again (a member's partners are then found where they are placed: a loop piece and
+                // its step's temporary share a register after their spilled original left the unit)
                 let mut parts: Vec<u32> = m.clone();
                 parts.push(v);
                 dissolved[v as usize].set(true);
+                for &u in &parts {
+                    parent[u as usize] = u;
+                }
                 parts.sort_by(|a, b| prio(refs[*b as usize], lens[*b as usize]).partial_cmp(&prio(refs[*a as usize], lens[*a as usize])).unwrap_or(std::cmp::Ordering::Equal));
                 let parts: Vec<u32> = parts.into_iter().filter(|u| !ranges.of(*u).is_empty()).collect();
                 order.splice(oi..oi, parts);
@@ -1313,7 +1331,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             }
         }
     }
-    // MAKEPAD_RUN_RA_TRACE=<fn suffix>: why each value spilled (weight, length, unit) and which
+    // RELAX_RA_TRACE=<fn suffix>: why each value spilled (weight, length, unit) and which
     // allocated values hold each register over its ranges
     if trace_on(f) {
         for v in 0..nv as usize {
@@ -1435,7 +1453,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     }
     // spill slots shared by live range: values that are never live at once take one slot.
     // Every spilled value had a slot of its own, so baseline frames carried one 8-byte cell per
-    // spill (Scope's recursive type parser: ~800 bytes of parse_type's frame)
+    // spill (a large app's recursive type parser: ~800 bytes of parse_type's frame)
     if slot_share_on(options) {
         spill_bytes = pack_spill_slots(f, &reach, &block_start, &mut loc, &ranges, &start);
     }
@@ -1482,7 +1500,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     // the register of each value's region
     let mut region_reg: HashMap<u32, u8> = HashMap::new();
     if thorough && windows_on(options) && !crate::stats::opt_off(options, "-regionwin") {
-        // MAKEPAD_RUN_OPT=-defregion: regions leave out blocks that redefine the value;
+        // RELAX_OPT=-defregion: regions leave out blocks that redefine the value;
         // -edgeload: entry loads stay at the region block's start
         let (dr, el) = (!crate::stats::opt_off(options, "-defregion"), !crate::stats::opt_off(options, "-edgeload"));
         region_windows_alloc(f, &reach, &tab, &block_start, &block_end, &ranges, &wts, &loc, &remat, &call_pos, cfg, &used_callee_int, &mut occ, pos_words, &mut region_windows, &mut chained, &mut in_region, &mut region_reg, dr, el);
@@ -1507,7 +1525,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
             cfg.float_windows
                 && matches!(
                     i,
-                    Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) | Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::VX(..) | Inst::Sel(..) | Inst::Conv(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::Mov(..)
+                    Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) | Inst::Store(..) | Inst::StoreX(..) | Inst::VStore(..) | Inst::VStoreX(..) | Inst::VX(..) | Inst::Sel(..) | Inst::SelCmp(..) | Inst::Conv(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::Mov(..)
                 )
         };
         let fwin = |v: usize| f.vregs[v] != Cls::I && (matches!(loc[v], Loc::Stack(_)) || (loc[v] == Loc::None && matches!(remat[v], Remat::FConst(..) | Remat::VConst(_))));
@@ -1653,7 +1671,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
                 // free over the defining instruction's operands and the one before it too (deferred
                 // fused compares read at the next instruction); saturating: the entry block's second
                 // instruction has a = 4 (a - 5 wrapped to u32::MAX and indexed far past the bit set:
-                // Stage's kernels, compute's x64 fuzzers)
+                // an app's kernels, compute's x64 fuzzers)
                 let a0 = if di > 0 { a.saturating_sub(5) } else { a - 1 };
                 for &c in &regs {
                     let o = &mut occ[c as usize];
@@ -1703,11 +1721,11 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
         }
     }
     // a value whose every read is served by its def window (a short temporary that spilled: def +
-    // a few uses in one block) needs no store home either. MAKEPAD_RUN_OPT=-defstore: only region
+    // a few uses in one block) needs no store home either. RELAX_OPT=-defstore: only region
     // values' stores are checked
     let defstore = !crate::stats::opt_off(options, "-defstore");
     windows.extend(region_windows);
-    // MAKEPAD_RUN_OPT=-exitstore: region values' stores stay at their definitions
+    // RELAX_OPT=-exitstore: region values' stores stay at their definitions
     let (store_skip, exit_stores) = if thorough && windows_on(options) && (!in_region.is_empty() || (defstore && !def_wins.is_empty())) && !crate::stats::opt_off(options, "-storeskip") {
         let sink = (!crate::stats::opt_off(options, "-exitstore")).then_some(SinkStores { ranges: &ranges, region_reg: &region_reg, wts: &wts });
         dead_spill_stores(f, &reach, &tab, &block_start, &block_end, &loc, &in_region, &windows, &chained, if defstore { &def_wins } else { &[] }, &use_count, cfg.defers, sink)
@@ -1722,7 +1740,7 @@ fn allocate_low(options: &relax_session::Options, f: &Func, cfg: &RegConfig, tho
     Alloc { loc, used_callee_int, used_callee_flt, spill_bytes, block_start, block_end, saves, start, end, uses: use_count, remat, windows, chained, save_skip, restore_skip, store_skip, exit_stores }
 }
 
-/// MAKEPAD_RUN_RA_TRACE=<fn name suffix>: the allocation as the emitter reads it (locations,
+/// RELAX_RA_TRACE=<fn name suffix>: the allocation as the emitter reads it (locations,
 /// call saves and their skips, windows), one line each -- for reading a miscompile
 /// next to its machine code.
 pub fn trace_alloc(f: &Func, al: &Alloc) {
@@ -1761,7 +1779,7 @@ pub fn trace_alloc(f: &Func, al: &Alloc) {
     eprint!("{}", o);
 }
 
-/// Whether the allocation checker runs (`+checkra` in the options or MAKEPAD_RUN_OPT): then every
+/// Whether the allocation checker runs (`+checkra` in the options or RELAX_OPT): then every
 /// finding fails the function's compile (`check_or_fail`) -- the checker is a gate, not a log.
 pub fn check_on(options: &relax_session::Options) -> bool {
     crate::stats::opt_off(options, "+checkra") || crate::stats::opt_env_off("+checkra")
@@ -1778,7 +1796,7 @@ pub fn check_or_fail(options: &relax_session::Options, f: &Func, cfg: &RegConfig
     Err(format!("{}: the register allocation check failed ({} findings):\n{}", f.name, bad.len(), bad.join("\n")))
 }
 
-/// MAKEPAD_RUN_OPT=+checkra: symbolic check of an allocation, as the emitter carries it out. A
+/// RELAX_OPT=+checkra: symbolic check of an allocation, as the emitter carries it out. A
 /// forward dataflow over which values each register (integer r0..r31, float / vector f0..f31) and
 /// each stack slot (spill homes, call save slots) holds, meeting by intersection:
 /// - a definition sets its register, or its home slot -- unless Alloc::store_skip drops that
@@ -1998,6 +2016,23 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
                 }
             }
         };
+        // The emitters read the terminator's operands at the position of the block's last
+        // instruction, after it ran, and x64 those of a compare fused into the branch at the
+        // position of the instruction before it, after that one ran (copy_reuse): a copy register
+        // serving a read at that position must hold the value then too
+        let (_, ne) = branch_compare(b, &al.uses);
+        let fused = n >= 2 && ne + 1 == n;
+        let late_read = |reported: &mut std::collections::HashSet<(u32, u32)>, dd: &[u64], u: u32, q: u32, st: &St, out: &mut Vec<String>| {
+            let Some((v, Loc::Stack(_))) = home_of(u) else { return };
+            if in_win(v, q).is_some() {
+                return;
+            }
+            let Some(&r) = copy_reg.get(&(q, v)) else { return };
+            let ri = if is_int(v) { r as usize } else { 32 + r as usize };
+            if !st.reg[ri].contains(&v) && dd[v as usize / 64] & (1 << (v % 64)) != 0 && reported.insert((q, v)) {
+                out.push(format!("ra-check {}: branch read of v{} (via v{}) through the copy register at {} (b{}) reads {} holding {:?}", f.name, v, u, q, bi, name(ri), st.reg[ri]));
+            }
+        };
         // exit stores: the region's register -> the home slot, at the block's start (before
         // anything else) and before its terminator
         let exit_store = |st: &mut St, reported: &mut std::collections::HashSet<(u32, u32)>, out: &mut Vec<String>, dd: &[u64], p: u32| {
@@ -2030,11 +2065,19 @@ pub fn check_alloc(options: &relax_session::Options, f: &Func, cfg: &RegConfig, 
                 term_uses(&b.term, &mut tu);
                 for &u in &tu {
                     report(&mut reported, &dd, u.0, p, "terminator read", &st, &mut out);
+                    if n > 0 && !fused {
+                        late_read(&mut reported, &dd, u.0, bs + 2 * (n - 1) as u32 + 1, &st, &mut out);
+                    }
                 }
                 break;
             }
             let i = &b.insts[ii];
             uses_defs(i, &mut us, &mut ds);
+            if fused && ii + 1 == n {
+                for u in &us {
+                    late_read(&mut reported, &dd, u.0, p - 2, &st, &mut out);
+                }
+            }
             // a move between values sharing a slot (pieces of one split value) emits nothing: no
             // read, no store -- d is in the slot only when its source is
             let slot_mov = matches!(*i, Inst::Mov(d, s2) if matches!(al.loc[d.0 as usize], Loc::Stack(_)) && al.loc[d.0 as usize] == al.loc[s2.0 as usize]);
@@ -2490,7 +2533,7 @@ fn dead_spill_stores(
     let mut ev: Vec<Vec<(u32, bool, usize, u32)>> = vec![Vec::new(); nb];
     // (a select reads its condition and integer operands through the windows too: x64 cmov_sel,
     // arm64 csel)
-    let simple = |i: &Inst| matches!(i, Inst::IBin(..) | Inst::IBinI(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) | Inst::Conv(..) | Inst::Mov(..) | Inst::Sel(..));
+    let simple = |i: &Inst| matches!(i, Inst::IBin(..) | Inst::IBinI(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) | Inst::Conv(..) | Inst::Mov(..) | Inst::Sel(..) | Inst::SelCmp(..));
     // An instruction the emitter defers into the next one (RegConfig::defers) reads its operands at
     // the next instruction's position -- from a window only if that window still holds them there,
     // else from the slot -- and its own result is never written (no write event: it kills no earlier
@@ -2677,7 +2720,7 @@ fn dead_spill_stores(
                 }
             }
             if at_end {
-                if !matches!(f.blocks[bu].term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
+                if !matches!(f.blocks[bu].term, Term::Jump(_) | Term::Branch(..) | Term::BranchCmp(..) | Term::Switch(..)) {
                     kept = Some((b, u32::MAX, u32::MAX));
                     break 'walk;
                 }
@@ -2915,7 +2958,7 @@ fn region_windows_alloc(
                     }
                     let pu = p as usize;
                     let from = block_end[pu].saturating_sub(5).max(block_start[pu]);
-                    let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..));
+                    let term_ok = matches!(f.blocks[pu].term, Term::Jump(_) | Term::Branch(..) | Term::BranchCmp(..) | Term::Switch(..));
                     if p == b || !reach[pu] || !term_ok || depth[pu] > depth[bu] || (!o.is_empty() && bits_any(o, from, block_end[pu])) {
                         return None;
                     }
@@ -3165,6 +3208,10 @@ fn allocate_baseline(options: &relax_session::Options, f: &Func, cfg: &RegConfig
                 use_count[c.0 as usize] += 1;
                 touch(&mut start, &mut end, c.0, p);
             }
+            Term::BranchCmp(c, _, _) => c.uses(|u| {
+                use_count[u.0 as usize] += 1;
+                touch(&mut start, &mut end, u.0, p);
+            }),
             Term::Ret(vs) => {
                 for v in vs {
                     use_count[v.0 as usize] += 1;
@@ -3447,6 +3494,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                     argret[v.0 as usize] = true;
                 }),
                 Term::Branch(c, _, _) | Term::Switch(c, _) => nonbase[c.0 as usize] = true,
+                Term::BranchCmp(c, _, _) => c.uses(|u| nonbase[u.0 as usize] = true),
                 _ => {}
             }
         }
@@ -3481,7 +3529,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
             // one definition, or every definition the same constant (built on several paths)
             let same_const = matches!(i, Remat::Const(_)) && kdefs[d].2 && kdefs[d].1 == ndef[d];
             let cls_ok = match i {
-                Remat::VConst(_) => f.vregs[d] == Cls::V128,
+                Remat::VConst(_) => matches!(f.vregs[d], Cls::V128 | Cls::V256),
                 Remat::FConst(_, w) => f.vregs[d] == if w { Cls::F64 } else { Cls::F32 },
                 _ => f.vregs[d] == Cls::I,
             };
@@ -3687,6 +3735,17 @@ fn affinities(f: &Func, reach: &[bool], block_start: &[u32], ranges: &Ranges, wt
                 // dies here, addend first
                 Inst::FMulAdd(_, _, _, d, a, b2, c) => {
                     if let Some(s2) = [*c, *a, *b2].into_iter().find(|s2| *s2 != *d && dies_at(ranges, s2.0, p)) {
+                        edges.push((d.0, s2.0, w));
+                        edges.push((s2.0, d.0, w));
+                    }
+                    continue;
+                }
+                // a select writes its result over either input (x64: cmov over the second, or over the
+                // first on the inverse condition; a float select's first move; arm64 csel has its own
+                // destination): the result prefers the input that dies here, and no copy comes first.
+                // The first input first: x64's SSE min / max (`minsd d, b`) writes in place only over it
+                Inst::Sel(d, _, a, b2) | Inst::SelCmp(d, _, a, b2) => {
+                    if let Some(s2) = [*a, *b2].into_iter().find(|s2| *s2 != *d && f.vregs[s2.0 as usize] == f.vregs[d.0 as usize] && dies_at(ranges, s2.0, p)) {
                         edges.push((d.0, s2.0, w));
                         edges.push((s2.0, d.0, w));
                     }
@@ -4034,12 +4093,12 @@ fn build_ranges(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], bloc
 
 // ------------------------------------------------------------ live-range splitting at loops
 
-/// MAKEPAD_RUN_NO_THROUGH=1: no passed-through loop pieces (split_loops)
+/// RELAX_NO_THROUGH=1: no passed-through loop pieces (split_loops)
 fn through_on(options: &relax_session::Options) -> bool {
     !options.no_through
 }
 
-/// MAKEPAD_RUN_NO_WINDOWS=1: no spill windows (Alloc::windows)
+/// RELAX_NO_WINDOWS=1: no spill windows (Alloc::windows)
 fn windows_on(options: &relax_session::Options) -> bool {
     !options.no_windows
 }
@@ -4139,7 +4198,7 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
 /// call -- an Rc drop_slow, a Vec grow inlined into the loop -- needs a callee-saved register for
 /// the whole loop or spills: x64 has five.) Returns the rewritten copy, or None.
 fn trace_on(f: &Func) -> bool {
-    match std::env::var("MAKEPAD_RUN_RA_TRACE") {
+    match std::env::var("RELAX_RA_TRACE") {
         Ok(w) => f.name.ends_with(w.as_str()),
         Err(_) => false,
     }
@@ -4293,7 +4352,7 @@ fn split_cold_calls(f: &Func, freq: &[f32], cand: &[bool]) -> Option<Func> {
             changed = true;
         }
         // a copy pair per value per cold call: a big loop with many cold calls made
-        // thousands (Stage's video_edit store worker: 10.6k vregs -> 69k after both splits,
+        // thousands (an app's video editing store worker: 10.6k vregs -> 69k after both splits,
         // 7.4 s of allocation, 1.8 MB of code): past half again the function's values the
         // split costs more than its spills, and the first allocation stands
         if g.vregs.len() - nv0 > SPLIT_GROWTH_MAX(nv0) / 2 {
@@ -4374,7 +4433,7 @@ fn allocate_split_loops_inner(options: &relax_session::Options, f: &Func, al: Al
         }
         al2 = allocate_low(options, &g, cfg, true, gfreq, Some(&through), Some(&origin));
     }
-    if let Ok(w) = std::env::var("MAKEPAD_RUN_RA_TRACE") {
+    if let Ok(w) = std::env::var("RELAX_RA_TRACE") {
         if f.name.ends_with(w.as_str()) {
             let n1 = al.loc.iter().filter(|l| matches!(l, Loc::Stack(_))).count();
             let n2 = al2.loc.iter().filter(|l| matches!(l, Loc::Stack(_))).count();
@@ -4480,6 +4539,7 @@ fn live_in_sets(f: &Func, reach: &[bool]) -> LiveSets {
 pub fn term_vregs_mut(t: &mut Term, mut fv: impl FnMut(&mut VReg)) {
     match t {
         Term::Branch(c, _, _) | Term::Switch(c, _) => fv(c),
+        Term::BranchCmp(c, _, _) => c.vregs_mut(fv),
         Term::Ret(vs) => vs.iter_mut().for_each(fv),
         _ => {}
     }
@@ -4816,7 +4876,7 @@ fn split_loops(f: &mut Func, spilled: &[bool], inreg: Option<&[bool]>, hot: Opti
             // retarget only this edge (an Invoke's normal edge or a branch arm)
             match &mut f.blocks[from as usize].term {
                 Term::Jump(t) => *t = nbk,
-                Term::Branch(_, t, e2) => {
+                Term::Branch(_, t, e2) | Term::BranchCmp(_, t, e2) => {
                     if *t == to {
                         *t = nbk;
                     }
@@ -5014,7 +5074,7 @@ fn pack_spill_slots(f: &Func, reach: &[bool], block_start: &[u32], loc: &mut [Lo
     bytes
 }
 
-/// MAKEPAD_RUN_NO_SLOT_SHARE=1: every spilled value keeps a slot of its own
+/// RELAX_NO_SLOT_SHARE=1: every spilled value keeps a slot of its own
 fn slot_share_on(options: &relax_session::Options) -> bool {
     !options.no_slot_share
 }
@@ -5315,7 +5375,7 @@ pub fn share_index_bases(f: &Func) -> Option<Func> {
 /// block -- neither redefined since, no call between, and the register one still read later in the
 /// block (so its register holds it there) -- reads the register instead of loading the slot.
 /// `mov r14, [rbp-0x70]` then `cmp r10, [rbp-0x70]` (html's position after its copy) becomes
-/// `cmp r14, ...`. Keyed by (use position, vreg). MAKEPAD_RUN_OPT=-copyreuse: none (bisection).
+/// `cmp r14, ...`. Keyed by (use position, vreg). RELAX_OPT=-copyreuse: none (bisection).
 pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> HashMap<(u32, u32), u8> {
     let mut out = HashMap::new();
     if crate::stats::opt_off(options, "-copyreuse") {
@@ -5326,7 +5386,7 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
     let mut tu = Vec::new();
     // (block, use position, spilled vreg, register copy, its register): reads after the copy's
     // last read in the block, served when the copy is live out (html's `pos` copy at the loop latch:
-    // `mov r13, [rbp-0x70]; mov r10, [rbp-0x70]; cmp r10, [rbp-0x30]`). MAKEPAD_RUN_OPT=-copyliveout
+    // `mov r13, [rbp-0x70]; mov r10, [rbp-0x70]; cmp r10, [rbp-0x30]`). RELAX_OPT=-copyliveout
     let mut pending: Vec<(u32, u32, u32, u32, u8)> = Vec::new();
     let no_live_out = crate::stats::opt_off(options, "-copyliveout");
     for (bi, b) in f.blocks.iter().enumerate() {
@@ -5372,6 +5432,24 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
                 (None, None) => Some(false),
             }
         };
+        // The emitters make the terminator's reads at the position of the block's last
+        // instruction, after it ran, and x64 makes those of a compare fused into the branch
+        // (branch_compare) at the position of the instruction before it, after that one ran: an
+        // entry there serves them too, so the copy must still hold the value then -- neither u
+        // nor c written from its instruction on, c read after it (or live out). `i = t; len = t;
+        // t = t + 1; branch t < n` with t spilled and i in a register: the step read t through
+        // i's register, and so did the branch, after the step: the old count (the loop ran once
+        // more and wrote one element past its buffer).
+        let n = b.insts.len();
+        let tail = |ii: usize| ii + 1 == n || (ii + 2 == n && branch_compare(b, &al.uses).1 + 1 == n);
+        let read_after = |c: u32, ii: usize| reads.get(&c).and_then(|r| r.last()).is_some_and(|&k| k > ii);
+        let kept_to_end = |ii: usize, u: u32, c: u32| {
+            b.insts[ii..].iter().all(|x| {
+                let mut w = false;
+                for_defs(x, |d| w |= d.0 == u || d.0 == c);
+                !w
+            })
+        };
         // spilled vreg -> (its register copy, that register)
         let mut have: Vec<(u32, u32, u8)> = Vec::new();
         for (ii, i) in b.insts.iter().enumerate() {
@@ -5379,13 +5457,23 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
             if !have.is_empty() {
                 for u in &us {
                     if let Some(&(_, c, r)) = have.iter().find(|h| h.0 == u.0) {
+                        let p = al.inst_pos(bi, ii);
                         match holds(c, ii) {
+                            Some(_) if tail(ii) => {
+                                if kept_to_end(ii, u.0, c) {
+                                    if read_after(c, ii) {
+                                        out.insert((p, u.0), r);
+                                    } else if !no_live_out {
+                                        pending.push((bi as u32, p, u.0, c, r));
+                                    }
+                                }
+                            }
                             Some(true) => {
-                                out.insert((al.inst_pos(bi, ii), u.0), r);
+                                out.insert((p, u.0), r);
                             }
                             // not read again in the block: its register still holds it when the
                             // copy is live out of the block (not redefined since: `have` drops it)
-                            Some(false) if !no_live_out => pending.push((bi as u32, al.inst_pos(bi, ii), u.0, c, r)),
+                            Some(false) if !no_live_out => pending.push((bi as u32, p, u.0, c, r)),
                             _ => {}
                         }
                     }
@@ -5424,7 +5512,7 @@ pub fn copy_reuse(options: &relax_session::Options, f: &Func, al: &Alloc) -> Has
 /// where `i` still holds the same value, so the allocator joins them (`equal_copies`) and the copy
 /// `mov old, i` per iteration is gone (LLVM: one induction variable, its increment at the latch).
 /// A step is `i = i +- k` in place or `t = i +- k; i = t` (t read only by that move).
-/// MAKEPAD_RUN_OPT=-sinkinc off.
+/// RELAX_OPT=-sinkinc off.
 pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Func> {
     if crate::stats::opt_off(options, "-sinkinc") {
         return None;
@@ -5530,7 +5618,7 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
                 // one way on: the successor entered only from here, the others side exits where v is dead
                 let succ: Vec<u32> = match &blk.term {
                     Term::Jump(t) => vec![*t],
-                    Term::Branch(_, t, e) | Term::Invoke(t, e) if t != e => vec![*t, *e],
+                    Term::Branch(_, t, e) | Term::BranchCmp(_, t, e) | Term::Invoke(t, e) if t != e => vec![*t, *e],
                     _ => break end,
                 };
                 let on: Vec<u32> = succ.iter().copied().filter(|&s| s as usize != bi && preds[s as usize].len() == 1 && preds[s as usize][0] == c).collect();
@@ -5564,91 +5652,6 @@ pub fn sink_increments(options: &relax_session::Options, f: &Func) -> Option<Fun
                 tb.pos.insert(at + j, p);
             }
         }
-    }
-    g
-}
-
-/// A compare whose one use is its block's branch moves to the end of the block (with the pure
-/// instruction right before it that computes its one-use operand, `t = x & K`), so the emitters
-/// fuse it into cmp + jcc / b.cond instead of materialising it (`setne; movzx; test; jne` when a
-/// constant or a copy sat between them: `while let Some(ix) = cur`). Not past a call (its
-/// operands would cross it). MAKEPAD_RUN_OPT=-sinkbr off.
-pub fn sink_branch_compares(options: &relax_session::Options, f: &Func) -> Option<Func> {
-    if crate::stats::opt_off(options, "-sinkbr") {
-        return None;
-    }
-    let nv = f.vregs.len();
-    let mut uses = vec![0u32; nv];
-    let mut tu: Vec<VReg> = Vec::new();
-    for b in &f.blocks {
-        for i in &b.insts {
-            for_uses(i, |u| uses[u.0 as usize] += 1);
-        }
-        tu.clear();
-        term_uses(&b.term, &mut tu);
-        for u in &tu {
-            uses[u.0 as usize] += 1;
-        }
-    }
-    let mut g: Option<Func> = None;
-    let mut reads: Vec<VReg> = Vec::new();
-    let mut writes: Vec<VReg> = Vec::new();
-    for bi in 0..f.blocks.len() {
-        let b = &f.blocks[bi];
-        let Term::Branch(c, _, _) = b.term else { continue };
-        let n = b.insts.len();
-        if n < 2 || uses[c.0 as usize] != 1 {
-            continue;
-        }
-        let Some(j) = (0..n).rev().find(|&k| {
-            let mut d = false;
-            for_defs(&b.insts[k], |x| d |= x == c);
-            d
-        }) else {
-            continue;
-        };
-        if j + 1 == n {
-            continue;
-        }
-        let ops = match b.insts[j] {
-            Inst::ICmp(_, _, _, x, y) | Inst::FCmp(_, _, _, x, y) => [x, y],
-            Inst::ICmpI(_, _, _, x, _) => [x, x],
-            _ => continue,
-        };
-        // the pure one-use operand computed right before it travels along
-        let mut lo = j;
-        if j > 0 {
-            if let Inst::IBinI(_, _, d, _, _) | Inst::IBin(_, _, d, _, _) | Inst::Conv(Conv::IntToInt(_), d, _) = b.insts[j - 1] {
-                if ops.contains(&d) && uses[d.0 as usize] == 1 {
-                    lo = j - 1;
-                }
-            }
-        }
-        reads.clear();
-        writes.clear();
-        for k in lo..=j {
-            for_uses(&b.insts[k], |u| reads.push(u));
-            for_defs(&b.insts[k], |d| writes.push(d));
-        }
-        let blocked = (j + 1..n).any(|k| {
-            let i = &b.insts[k];
-            if matches!(i, Inst::Call(..)) {
-                return true;
-            }
-            let mut bad = false;
-            for_defs(i, |d| bad |= reads.contains(&d) || writes.contains(&d));
-            for_uses(i, |u| bad |= writes.contains(&u));
-            bad
-        });
-        if blocked {
-            continue;
-        }
-        let gf = g.get_or_insert_with(|| f.clone());
-        let blk = &mut gf.blocks[bi];
-        let moved: Vec<Inst> = blk.insts.drain(lo..=j).collect();
-        let mpos: Vec<u64> = blk.pos.drain(lo..=j).collect();
-        blk.insts.extend(moved);
-        blk.pos.extend(mpos);
     }
     g
 }
@@ -5724,60 +5727,295 @@ pub fn pair_selects(f: &Func) -> Option<Func> {
     g
 }
 
-pub fn sink_compares(f: &Func) -> Option<Func> {
-    let mut g: Option<Func> = None;
-    for bi in 0..f.blocks.len() {
-        let n = f.blocks[bi].insts.len();
-        let mut i = 0;
-        while i < n {
-            let b = g.as_ref().map_or(&f.blocks[bi], |x| &x.blocks[bi]);
-            let c = match b.insts[i] {
-                Inst::Sel(_, c, _, _) => c,
-                _ => {
-                    i += 1;
-                    continue;
+/// The compare a block's branch reads and how many of its instructions come before it: the
+/// terminator's own (`Term::BranchCmp`), or a compare used only by the `Branch` right after it
+/// (the tiers that run no `compares_into_readers` lower `if a < b` so), which the emitters fuse
+/// the same way and never emit as an instruction.
+pub fn branch_compare(b: &Block, uses: &[u32]) -> (Option<Cmp>, usize) {
+    let n = b.insts.len();
+    match b.term {
+        Term::BranchCmp(c, ..) => (Some(c), n),
+        Term::Branch(c, ..) if n > 0 && uses[c.0 as usize] == 1 => match Cmp::of(&b.insts[n - 1]) {
+            Some((d, cmp)) if d == c => (Some(cmp), n - 1),
+            _ => (None, n),
+        },
+        _ => (None, n),
+    }
+}
+
+/// Branches and selects read their compare in place (`Term::BranchCmp`, `Inst::SelCmp`): the
+/// condition is the flags of a compare made right at the reader (`cmp; jcc`, `cmp; cmov`) and never
+/// lives in a register: no setcc, zero extension and test (LLVM's CodeGenPrepare sinks compares
+/// into the blocks of their users for the same reason). A reader's condition is the compare that
+/// made it, in its block or one that runs before it on every path (CSE: `x.max(y)` beside
+/// `x.min(y)`; LICM: a loop's `tag == k`), through copies and `c ^ 1` (the opposite compare). A
+/// block that only branches on a bool its predecessor has just made is skipped: `v = a < b; jump B`
+/// with `B: branch v` becomes `branch a < b` (a constant bool: a jump). Compares, copies and
+/// constants left without readers go; a pure operand made only for the branch moves next to it
+/// (`t = x & K`: test x, K), not past a call (its operands would cross it).
+///
+/// RIR is not SSA: a compare's operands must hold at the reader the values they had at the compare.
+/// In one block nothing between the two writes them; across blocks each has one definition, which
+/// runs before the compare on every path (then no path from the compare to the reader passes it).
+/// `sel_ok`: the backend's select takes that compare for that data class. RELAX_OPT=-cmpread.
+pub fn compares_into_readers(options: &relax_session::Options, f: &Func, sel_ok: fn(&Cmp, Cls) -> bool) -> Option<Func> {
+    if crate::stats::opt_off(options, "-cmpread") {
+        return None;
+    }
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let mut ndef = vec![0u32; nv];
+    let mut def_at = vec![(u32::MAX, 0usize); nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut readers = false;
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (k, i) in b.insts.iter().enumerate() {
+            for_defs(i, |d| {
+                ndef[d.0 as usize] += 1;
+                def_at[d.0 as usize] = (bi as u32, k);
+            });
+            readers |= matches!(i, Inst::Sel(..));
+        }
+        readers |= matches!(b.term, Term::Branch(..));
+    }
+    if !readers {
+        return None;
+    }
+    let reach = reachable(f);
+    let dom = crate::dom::Dom::new(f);
+    // where the value of v read at `at` was written: the last write before it in its block, else
+    // its one definition when that runs before `at` on every path
+    let def_of = |v: VReg, at: (u32, usize)| -> Option<(u32, usize)> {
+        let insts = &f.blocks[at.0 as usize].insts;
+        for j in (0..at.1.min(insts.len())).rev() {
+            let mut w = false;
+            for_defs(&insts[j], |d| w |= d == v);
+            if w {
+                return Some((at.0, j));
+            }
+        }
+        let d = def_at[v.0 as usize];
+        (ndef[v.0 as usize] == 1 && d.0 != u32::MAX && d.0 != at.0 && dom.before(d, at)).then_some(d)
+    };
+    // the compare whose result v (written at d) holds, and where it is made: through copies and `^ 1`
+    // (the values on the way: `chain`)
+    let source = |v: VReg, d: (u32, usize), chain: &mut Vec<VReg>| -> Option<(Cmp, (u32, usize))> {
+        let (mut v, mut d, mut neg) = (v, d, false);
+        loop {
+            chain.push(v);
+            let i = &f.blocks[d.0 as usize].insts[d.1];
+            if let Some((_, c)) = Cmp::of(i) {
+                return if neg { c.not().map(|c| (c, d)) } else { Some((c, d)) };
+            }
+            let s = match *i {
+                Inst::IBinI(IOp::Xor, _, r, s, 1) if r == v && s != v => {
+                    neg = !neg;
+                    s
                 }
+                Inst::Mov(r, s) if r == v && s != v => s,
+                _ => return None,
             };
-            // the compare defining c earlier in this block
-            let j = match (0..i).rev().find(|k| {
-                let mut d = false;
-                for_defs(&b.insts[*k], |x| d |= x == c);
+            d = def_of(s, d)?;
+            v = s;
+        }
+    };
+    // per vreg: its last write in the block being walked (stamped with the block)
+    let mut last = vec![(u32::MAX, 0usize); nv];
+    // the compare a reader at (bi, at) of c takes, with its operands holding their values there
+    let read = |last: &[(u32, usize)], c: VReg, bi: u32, at: usize, chain: &mut Vec<VReg>| -> Option<Cmp> {
+        let d = match last[c.0 as usize] {
+            (b, j) if b == bi => (bi, j),
+            _ => {
+                let d = def_at[c.0 as usize];
+                if ndef[c.0 as usize] != 1 || d.0 == u32::MAX || d.0 == bi || !dom.before(d, (bi, at)) {
+                    return None;
+                }
                 d
-            }) {
-                Some(j) if j + 1 < i => j,
-                _ => {
-                    i += 1;
-                    continue;
-                }
+            }
+        };
+        let n0 = chain.len();
+        let Some((cmp, p)) = source(c, d, chain) else {
+            chain.truncate(n0);
+            return None;
+        };
+        let mut ok = true;
+        cmp.uses(|o| {
+            let od = def_at[o.0 as usize];
+            ok &= if p.0 == bi {
+                !matches!(last[o.0 as usize], (b, j) if b == bi && j >= p.1)
+            } else {
+                ndef[o.0 as usize] == 1 && (od.0 == u32::MAX || dom.before(od, p))
             };
-            let ops: Vec<VReg> = match b.insts[j] {
-                Inst::ICmp(_, _, d, x, y) if d == c => vec![x, y],
-                Inst::ICmpI(_, _, d, x, _) if d == c => vec![x],
-                _ => {
-                    i += 1;
-                    continue;
+        });
+        if !ok {
+            chain.truncate(n0);
+        }
+        ok.then_some(cmp)
+    };
+    // the values the converted readers' conditions came through (their writes may die)
+    let mut chain: Vec<VReg> = Vec::new();
+    let mut sels: Vec<(usize, usize, Inst)> = Vec::new();
+    let mut terms: Vec<(usize, Term, Option<u64>)> = Vec::new();
+    for bi in 0..nb {
+        if !reach[bi] {
+            continue;
+        }
+        let b = &f.blocks[bi];
+        for (k, i) in b.insts.iter().enumerate() {
+            if let Inst::Sel(d, c, x, y) = *i {
+                let n0 = chain.len();
+                match read(&last, c, bi as u32, k, &mut chain) {
+                    Some(cmp) if sel_ok(&cmp, f.vregs[d.0 as usize]) => sels.push((bi, k, Inst::SelCmp(d, cmp, x, y))),
+                    _ => chain.truncate(n0),
                 }
+            }
+            for_defs(i, |d| last[d.0 as usize] = (bi as u32, k));
+        }
+        let n = b.insts.len();
+        match b.term {
+            Term::Branch(c, t, e) => {
+                if let Some(cmp) = read(&last, c, bi as u32, n, &mut chain) {
+                    terms.push((bi, Term::BranchCmp(cmp, t, e), None));
+                }
+            }
+            // a jump to a block that only branches on a bool written here
+            Term::Jump(j) if j != 0 && j as usize != bi => {
+                let jb = &f.blocks[j as usize];
+                if let (true, Term::Branch(v, t, e)) = (jb.insts.is_empty(), &jb.term) {
+                    let (v, t, e) = (*v, *t, *e);
+                    if let (true, (b2, k)) = (t != e, last[v.0 as usize]) {
+                        if b2 == bi as u32 {
+                            if let Inst::Iconst(_, x) = b.insts[k] {
+                                terms.push((bi, Term::Jump(if x != 0 { t } else { e }), Some(jb.term_pos)));
+                                chain.push(v);
+                            } else if let Some(cmp) = read(&last, v, bi as u32, n, &mut chain) {
+                                terms.push((bi, Term::BranchCmp(cmp, t, e), Some(jb.term_pos)));
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if sels.is_empty() && terms.is_empty() {
+        return None;
+    }
+    let mut g = f.clone();
+    for (bi, k, i) in sels {
+        g.blocks[bi].insts[k] = i;
+    }
+    for (bi, t, pos) in terms {
+        g.blocks[bi].term = t;
+        if let Some(p) = pos {
+            g.blocks[bi].term_pos = p;
+        }
+    }
+    // a skipped block nothing enters any more reads bools whose writes go below
+    let reach2 = reachable(&g);
+    for bi in 0..nb {
+        if reach[bi] && !reach2[bi] {
+            let blk = &mut g.blocks[bi];
+            blk.insts.clear();
+            blk.pos.clear();
+            blk.term = Term::Unreachable;
+        }
+    }
+    // the writes of those values that nothing reads any more go, and then those of what they read
+    let mut uses = vec![0u32; nv];
+    let mut tu: Vec<VReg> = Vec::new();
+    let mut on_chain = vec![false; nv];
+    for v in &chain {
+        on_chain[v.0 as usize] = true;
+    }
+    let mut writes: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, b) in g.blocks.iter().enumerate() {
+        if !reach2[bi] {
+            continue;
+        }
+        for (k, i) in b.insts.iter().enumerate() {
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+            for_defs(i, |d| {
+                if on_chain[d.0 as usize] {
+                    writes.entry(d.0).or_default().push((bi, k));
+                }
+            });
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    let pure = |i: &Inst| matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..) | Inst::IBinI(IOp::Xor, _, _, _, 1) | Inst::Mov(..) | Inst::Iconst(..));
+    let mut gone = vec![false; nv];
+    let mut drop_at: Vec<(usize, usize)> = Vec::new();
+    while let Some(v) = chain.pop() {
+        let vi = v.0 as usize;
+        if gone[vi] || uses[vi] != 0 {
+            continue;
+        }
+        let Some(ws) = writes.get(&v.0) else { continue };
+        if !ws.iter().all(|&(bi, k)| pure(&g.blocks[bi].insts[k])) {
+            continue;
+        }
+        gone[vi] = true;
+        for &(bi, k) in ws {
+            drop_at.push((bi, k));
+            for_uses(&g.blocks[bi].insts[k], |u| {
+                uses[u.0 as usize] -= 1;
+                if on_chain[u.0 as usize] {
+                    chain.push(u);
+                }
+            });
+        }
+    }
+    drop_at.sort_unstable();
+    for &(bi, k) in drop_at.iter().rev() {
+        g.blocks[bi].insts.remove(k);
+        g.blocks[bi].pos.remove(k);
+    }
+    // a pure operand made only for the branch, earlier in its block, moves next to it
+    let mut reads: Vec<VReg> = Vec::new();
+    for bi in 0..nb {
+        let Term::BranchCmp(cmp, ..) = g.blocks[bi].term else { continue };
+        let mut ops: Vec<VReg> = Vec::new();
+        cmp.uses(|o| ops.push(o));
+        for o in ops {
+            let blk = &g.blocks[bi];
+            let n = blk.insts.len();
+            if uses[o.0 as usize] != 1 {
+                continue;
+            }
+            let Some(j) = (0..n).rev().find(|&k| {
+                let mut w = false;
+                for_defs(&blk.insts[k], |d| w |= d == o);
+                w
+            }) else {
+                continue;
             };
-            let blocked = (j + 1..i).any(|k| {
-                let mut bad = false;
-                for_uses(&b.insts[k], |u| bad |= u == c);
-                for_defs(&b.insts[k], |d| bad |= d == c || ops.contains(&d));
+            if j + 1 == n || !matches!(blk.insts[j], Inst::IBinI(..) | Inst::IBin(..) | Inst::Conv(Conv::IntToInt(_), ..)) {
+                continue;
+            }
+            reads.clear();
+            for_uses(&blk.insts[j], |u| reads.push(u));
+            let blocked = blk.insts[j + 1..].iter().any(|i| {
+                let mut bad = matches!(i, Inst::Call(..));
+                for_defs(i, |d| bad |= d == o || reads.contains(&d));
                 bad
             });
             if blocked {
-                i += 1;
                 continue;
             }
-            let gf = g.get_or_insert_with(|| f.clone());
-            let blk = &mut gf.blocks[bi];
-            let inst = blk.insts.remove(j);
+            let blk = &mut g.blocks[bi];
+            let i = blk.insts.remove(j);
             let p = blk.pos.remove(j);
-            blk.insts.insert(i - 1, inst);
-            blk.pos.insert(i - 1, p);
-            i += 1;
+            blk.insts.push(i);
+            blk.pos.push(p);
         }
     }
-    g
+    Some(g)
 }
 
 /// The blocks whose start reads the running thread's domain base for a function that names domain

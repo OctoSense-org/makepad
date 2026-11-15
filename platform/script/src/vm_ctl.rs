@@ -12,8 +12,8 @@
 //!
 //! Natively each is `#[inline]` and the mode is a constant at every call, so a call costs what
 //! the method it replaces did.
-use makepad_relax_api::relax_api;
-use makepad_relax::relax;
+use relax_api::relax_api;
+use relax_attr::relax;
 
 use crate::function::NativeId;
 use crate::heap::*;
@@ -31,7 +31,7 @@ use crate::vm_api::ScriptTextOut;
 use std::rc::Rc;
 
 /// The VM's parts as borrows (see [`ScriptVmBase::parts`]).
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptVmParts<'a> {
     pub heap: &'a ScriptHeap,
@@ -43,7 +43,7 @@ pub struct ScriptVmParts<'a> {
 
 /// [`ScriptVmParts`] with the heap mutable: a heap call that reports at the thread's trap
 /// borrows both at once.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptVmPartsMut<'a> {
     pub heap: &'a mut ScriptHeap,
@@ -75,6 +75,10 @@ pub const STAT_HAS_CAPTURED_ERRORS: u32 = 12;
 pub const STAT_HAS_LET_HOOK: u32 = 13;
 /// Whether a capture is on (`take_errors` has a list to take).
 pub const STAT_CAPTURING: u32 = 14;
+/// Whether the current thread's sliced run yielded ([`crate::vm::ScriptRunBudget::slice`]).
+pub const STAT_RUN_YIELDED: u32 = 15;
+/// Whether a native running now may pause its thread: it was called by the outermost run.
+pub const STAT_CAN_PAUSE: u32 = 16;
 
 // ---- vm_ctl
 
@@ -123,7 +127,7 @@ pub const CTL_NATIVE_STRING_PREFLIGHT: u32 = 23;
 /// `text`: a host native's text, stored (charged on its real length under a budget) into `value`.
 pub const CTL_STORE_NATIVE_STRING: u32 = 24;
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptCtlReq<'a> {
     pub op: u32,
@@ -187,10 +191,12 @@ pub const ERR_PUSH_DIAGNOSTIC: u32 = 10;
 /// `size: [1, 2, 3]` for a vec3): into the active capture (once), where a host refuses the
 /// evaluation on it; logged once per site when nothing captures; counted like ERR_PUSH_DIAGNOSTIC.
 pub const ERR_PUSH_DIAGNOSTIC_ERROR: u32 = 11;
+/// Drains the parser's warnings captured since [`ERR_CAPTURE`] into `push`.
+pub const ERR_TAKE_WARNINGS: u32 = 12;
 
 pub type ScriptErrorPush = unsafe extern "C-unwind" fn(*mut u8, *const ScriptErrorRecord);
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptErrorsReq<'a> {
     pub op: u32,
@@ -224,7 +230,7 @@ pub const BODY_VALIDATE: u32 = 3;
 /// `body`, `scope`, `rooted`: the body's initial scope becomes `scope`, a GC root or not.
 pub const BODY_SET_SCOPE: u32 = 4;
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptBodyReq<'a> {
     pub op: u32,
@@ -279,7 +285,7 @@ pub const REG_FN: u32 = 13;
 
 /// A native as `{data, call, drop}`: what the four native kinds share. Made by
 /// `into_raw`, which gives up the native's ownership; the op rebuilds the kind it registers.
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ScriptNativeRaw {
@@ -297,7 +303,7 @@ impl ScriptNativeRaw {
     }
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[repr(C)]
 pub struct ScriptRegReq<'a> {
     pub kind: u32,
@@ -338,11 +344,11 @@ impl<'a> ScriptRegReq<'a> {
     }
 }
 
-#[relax_api]
+#[relax_api(run)]
 impl ScriptVmBase {
     /// The heap, the code, the current thread and its trap.
     #[inline]
-    #[relax_api]
+    #[relax_api(run)]
     pub fn parts(&self) -> ScriptVmParts<'_> {
         let thread = self.threads.cur_ref();
         ScriptVmParts { heap: &self.heap, code: &self.code, thread, trap: &thread.trap, pod: &self.code.builtins.pod }
@@ -350,7 +356,7 @@ impl ScriptVmBase {
 
     /// [`Self::parts`] with the heap mutable.
     #[inline]
-    #[relax_api]
+    #[relax_api(run)]
     pub fn parts_mut(&mut self) -> ScriptVmPartsMut<'_> {
         let thread = self.threads.cur_ref();
         ScriptVmPartsMut { heap: &mut self.heap, code: &self.code, thread, trap: &thread.trap, pod: &self.code.builtins.pod }
@@ -358,7 +364,7 @@ impl ScriptVmBase {
 
     /// Reads a number of the VM by `req.op` (STAT_*).
     #[inline]
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_stat(&self, req: &mut ScriptCtlReq) -> u64 {
         match req.op {
             STAT_RELOAD => self.is_reload as u64,
@@ -385,13 +391,15 @@ impl ScriptVmBase {
             STAT_HAS_CAPTURED_ERRORS => self.captured_errors.as_ref().is_some_and(|e| !e.is_empty()) as u64,
             STAT_HAS_LET_HOOK => self.let_hook.is_some() as u64,
             STAT_CAPTURING => self.captured_errors.is_some() as u64,
+            STAT_RUN_YIELDED => self.threads.cur_ref().yielded as u64,
+            STAT_CAN_PAUSE => (self.run_depth == 1) as u64,
             op => panic!("vm_stat: unknown op {op}"),
         }
     }
 
     /// Sets a number of the VM or acts on it by `req.op` (CTL_*).
     #[inline]
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_ctl(&mut self, req: &mut ScriptCtlReq) -> u64 {
         match req.op {
             CTL_GC => {
@@ -554,7 +562,7 @@ impl ScriptVmBase {
     }
 
     /// Captures, takes, drains and formats errors by `req.op` (ERR_*).
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_errors(&mut self, req: &mut ScriptErrorsReq) {
         match req.op {
             ERR_PUSH_CAPTURED => {
@@ -574,7 +582,15 @@ impl ScriptVmBase {
                     trap.push_err(ScriptValue::script_err_type_mismatch(trap.ip), req.text, file!(), line!());
                 }
             }
-            ERR_CAPTURE => self.captured_errors = Some(Vec::new()),
+            ERR_CAPTURE => {
+                self.captured_errors = Some(Vec::new());
+                self.captured_warnings.clear();
+            }
+            ERR_TAKE_WARNINGS => {
+                for record in std::mem::take(&mut self.captured_warnings) {
+                    unsafe { (req.push)(req.ctx, &record) };
+                }
+            }
             ERR_CAPTURE_NESTED => {
                 let prev = self.captured_errors.replace(Vec::new());
                 self.captured_stash.push(prev);
@@ -640,7 +656,7 @@ impl ScriptVmBase {
     }
 
     /// Acts on the body table by `req.op` (BODY_*).
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_body(&mut self, req: &mut ScriptBodyReq) -> bool {
         match req.op {
             BODY_SET_SHOWN => {
@@ -678,7 +694,7 @@ impl ScriptVmBase {
 
     /// Registers natives, handle types, globals and hooks by `req.kind` (REG_*). The answer is
     /// the kind's: a number for the kinds that make one, else 0.
-    #[relax_api]
+    #[relax_api(run)]
     pub fn vm_register(&mut self, req: &ScriptRegReq) -> u64 {
         // SAFETY (all `from_raw`): the request's native was made by `into_raw` of the kind
         // registered and its ownership passes to the table.

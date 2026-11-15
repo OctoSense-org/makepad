@@ -79,6 +79,9 @@ pub struct AppEntry {
     /// Runs on a phone: starts, draws and is usable by touch at phone size (checked on the Pixel).
     /// The phone WM's home, drawer and app lists offer only these; the desktop ignores it.
     pub mobile: bool,
+    /// A row of this machine's own apps (`machine::local_apps_path`), not the shared table:
+    /// every launch of it builds with its `features` (added to the package's defaults).
+    pub local: bool,
 }
 
 mod table;
@@ -92,6 +95,12 @@ impl AppEntry {
     /// What the checkout helpers need to know about it.
     pub fn target(&self) -> AppTarget<'static> {
         AppTarget { id: self.id, package: self.package, dir: self.dir, bin: self.bin, manifest: self.manifest, profile: "release" }
+    }
+
+    /// The cargo features a build of its own binary adds to the package's defaults: a machine's
+    /// own app's (`local`), none for the shared table's.
+    pub fn build_features(&self) -> String {
+        if self.local { self.features.join(",") } else { String::new() }
     }
 }
 
@@ -268,19 +277,29 @@ pub fn built_binary(app: &AppTarget, root: Option<&Path>) -> Option<PathBuf> {
     Some(checkout_binary(app, root, target_dir.as_deref())).filter(|path| path.is_file())
 }
 
-/// The cargo to launch with: the one running us, else the rustup default
-/// (a Dock/GUI-launched process has no `~/.cargo/bin` on PATH), else PATH's.
+/// The cargo to launch with: the one the environment names. The one running us (`CARGO`),
+/// else the first on PATH (a terminal's, or the toolchain a devhub run puts there: rustup's
+/// proxy refuses on a box with no default toolchain), else rustup's in `~/.cargo/bin` (only
+/// where PATH has none: a Dock/GUI-launched process), else a bare `cargo`.
 pub fn cargo_bin() -> PathBuf {
-    if let Ok(cargo) = std::env::var("CARGO") {
+    cargo_in(std::env::var_os("CARGO"), std::env::var_os("PATH"), std::env::var_os("HOME"))
+}
+
+/// [`cargo_bin`] of the given `CARGO`, `PATH` and `HOME`.
+fn cargo_in(cargo: Option<std::ffi::OsString>, path: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(cargo) = cargo.filter(|c| !c.is_empty()) {
         return PathBuf::from(cargo);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let rustup = PathBuf::from(home).join(".cargo/bin/cargo");
-        if rustup.exists() {
-            return rustup;
-        }
-    }
-    PathBuf::from("cargo")
+    let exe = format!("cargo{}", std::env::consts::EXE_SUFFIX);
+    let rustup = home.filter(|h| !h.is_empty()).map(|h| PathBuf::from(h).join(".cargo").join("bin"));
+    let path = path.unwrap_or_default();
+    // (an empty PATH entry is the cwd: never a launcher's cargo)
+    std::env::split_paths(&path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .chain(rustup)
+        .map(|dir| dir.join(&exe))
+        .find(|cargo| cargo.is_file())
+        .unwrap_or_else(|| PathBuf::from("cargo"))
 }
 
 /// The build of `app` in the checkout at `root`: `cargo build --release`
@@ -418,12 +437,35 @@ pub fn is_available(entry: &AppEntry) -> bool {
 
 /// The command that builds `entry`: `build_argv` in the checkout root with
 /// the launchers' cargo environment (`cargo_command`), so a build from a tool
-/// (Stage's app runs) leaves what the WM, Code and DECK find fresh. None
-/// outside a checkout.
-pub fn build_command(entry: &AppEntry) -> Option<Command> {
-    let root = repo_root()?;
-    let (program, args) = build_argv(&entry.target(), &root);
-    Some(cargo_command(&program, &args, &root))
+/// (Stage's app runs) leaves what the WM, Code and DECK find fresh. Err
+/// outside a checkout, and in one cargo cannot read ([`on_disk`]).
+pub fn build_command(entry: &AppEntry) -> Result<Command, String> {
+    let root = repo_root().ok_or("no Makepad checkout to build in")?;
+    on_disk(&root)?;
+    let (program, args) = build_argv_features(&entry.target(), &root, &entry.build_features());
+    Ok(cargo_command(&program, &args, &root))
+}
+
+/// Err when `root` lies in the JIT's virtual source tree (its mount table, RELAX_VFS: a
+/// devhub overlay run, or a run of a git repository). The JIT process reads its files, but cargo
+/// runs as a process of its own and finds only the disk, where that tree is not: under an overlay
+/// an app run's build failed with "manifest path `<work>/dev/src/Cargo.toml` does not exist"
+/// (11-08).
+pub fn on_disk(root: &Path) -> Result<(), String> {
+    match virtual_mount(root, &std::env::var("RELAX_VFS").unwrap_or_default()) {
+        Some(at) => Err(format!(
+            "{} is in the JIT's virtual source tree (mounted at {at}): only the JIT process reads it, so cargo finds no checkout there. \
+             Build from a checkout on disk: in devhub, the lane's tree (`devhub test <lane> <package> --tree`, \
+             or `[package.metadata.makepad] test-tree = \"<why>\"` in the package's Cargo.toml)",
+            root.display()
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The mount of a mount table (`root\tstore\tcommit..` per line) that `path` lies in.
+fn virtual_mount<'a>(path: &Path, mounts: &'a str) -> Option<&'a str> {
+    mounts.lines().filter_map(|line| line.split('\t').next()).find(|at| !at.is_empty() && path.starts_with(at))
 }
 
 #[cfg(test)]
@@ -448,6 +490,19 @@ mod tests {
         #[cfg(target_os = "linux")]
         assert_eq!(runs_binary(std::process::id(), &std::env::current_exe().unwrap()), Some(true));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A root in the JIT's virtual source tree is no checkout cargo can build in: an overlay's
+    /// root, a nested repository mounted in it and any folder under them. A folder beside them
+    /// is the disk's.
+    #[test]
+    fn a_root_in_the_jits_virtual_tree_is_no_checkout_for_cargo() {
+        let mounts = "/w/dev/src\t/w/dev/stores/makepad\tab12\n/w/dev/src/apps/x\t/w/dev/stores/x\tcd34\t0+10\n";
+        assert_eq!(virtual_mount(Path::new("/w/dev/src"), mounts), Some("/w/dev/src"));
+        assert_eq!(virtual_mount(Path::new("/w/dev/src/apps/x/libs/y"), mounts), Some("/w/dev/src"));
+        assert_eq!(virtual_mount(Path::new("/w/dev/srcs"), mounts), None, "a folder whose name starts like the root's");
+        assert_eq!(virtual_mount(Path::new("/w/tree"), mounts), None);
+        assert_eq!(virtual_mount(Path::new("/w/dev/src"), ""), None, "no mounts: every folder is the disk's");
     }
 
     /// The checkout these tests were compiled in.
@@ -562,6 +617,28 @@ mod tests {
         let root = std::env::temp_dir().join(format!("app-registry-absent-{}", std::process::id()));
         assert!(!has_sources(&find("stage").unwrap().target(), &root));
         assert!(!has_sources(&find("scope").unwrap().target(), &root));
+    }
+
+    /// A launcher builds with the cargo its environment names: a devhub run's toolchain on
+    /// PATH, not rustup's proxy in `~/.cargo/bin`, which refuses on a box with no default
+    /// toolchain (11-13: no hosted app of a WM started on a node ever built).
+    #[test]
+    fn the_cargo_is_cargo_then_path_then_rustups() {
+        let dir = std::env::temp_dir().join(format!("app-registry-cargo-{}", std::process::id()));
+        let exe = format!("cargo{}", std::env::consts::EXE_SUFFIX);
+        let (toolchain, home) = (dir.join("toolchain"), dir.join("home"));
+        let rustup = home.join(".cargo").join("bin");
+        for bin in [&toolchain, &rustup] {
+            std::fs::create_dir_all(bin).unwrap();
+            std::fs::write(bin.join(&exe), b"").unwrap();
+        }
+        let os = |p: &Path| Some(p.as_os_str().to_os_string());
+        let path = std::env::join_paths([dir.join("empty"), toolchain.clone()]).unwrap();
+        assert_eq!(cargo_in(None, Some(path.clone()), os(&home)), toolchain.join(&exe), "PATH's cargo goes ahead of ~/.cargo/bin");
+        assert_eq!(cargo_in(os(Path::new("/given/cargo")), Some(path), os(&home)), PathBuf::from("/given/cargo"), "CARGO goes first");
+        assert_eq!(cargo_in(None, os(&dir.join("empty")), os(&home)), rustup.join(&exe), "~/.cargo/bin only where PATH has no cargo");
+        assert_eq!(cargo_in(Some("".into()), None, None), PathBuf::from("cargo"), "nothing named: a bare cargo");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

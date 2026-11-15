@@ -459,6 +459,8 @@ pub struct LmLight {
     /// Request a budgeted realtime shadow. Unallocated requests are omitted
     /// rather than silently lighting through walls.
     pub shadows: bool,
+    /// Participates in the optional volume-fog march.
+    pub volumetric: bool,
     /// A rectangular area light (clustered lighting only): `pos` is the
     /// rectangle's centre and `dir` the side it emits from. The atlas bake
     /// and the per-vertex lamp slots treat it as a point at its centre.
@@ -496,9 +498,20 @@ impl Default for LmLight {
 }
 
 impl LmLight {
+    /// Contribution near the view: inverse-square intensity, with a soft
+    /// penalty beyond the light's reach. No eye (XR world grid) ranks by intensity.
+    pub(crate) fn view_contribution(&self, eye: Option<Vec3f>) -> f32 {
+        let intensity = self.color.x.max(self.color.y).max(self.color.z).max(0.0);
+        let Some(eye) = eye else { return intensity };
+        let d2 = (self.pos - eye).length_squared();
+        let r2 = self.radius * self.radius;
+        let reach = r2 / d2.max(r2).max(f32::MIN_POSITIVE);
+        intensity * reach / d2.max(0.0001)
+    }
+
     /// An omnidirectional light.
     pub fn omni(pos: Vec3f, color: Vec3f, radius: f32) -> Self {
-        LmLight { pos, color, radius, dir: Vec3f { x: 0.0, y: -1.0, z: 0.0 }, spot: 0.0, cone: None, shadows: false, area: None }
+        LmLight { pos, color, radius, dir: Vec3f { x: 0.0, y: -1.0, z: 0.0 }, spot: 0.0, cone: None, shadows: false, volumetric: false, area: None }
     }
 }
 
@@ -1158,10 +1171,12 @@ mod tests {
             "a sun_filled declaration appeared or vanished"
         );
         // DrawSceneCube, DrawSceneSkinned, DrawScenePbr (inherited),
-        // DrawSceneSkinnedGpu and DrawSceneTerrain each call it once.
+        // DrawSceneSkinnedGpu and DrawSceneTerrain each call it once; so does
+        // the reflections variant of the PBR composite (`pbr_reflections`),
+        // which shades the same surface while writing the reflection targets.
         assert_eq!(
             src.matches("self.sun_filled(").count(),
-            5,
+            6,
             "a composite stopped filling the sun shadow, or gained a call"
         );
     }

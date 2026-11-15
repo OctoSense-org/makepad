@@ -89,6 +89,13 @@ impl Cx {
         self.hal.focused.filter(|w| self.windows.is_valid(*w)).or_else(|| self.windows.id_iter().find(|w| self.hal.window_ready(*w)))
     }
 
+    #[cfg(target_os = "android")]
+    pub(super) fn hal_send_pending_ime_hide(&mut self) {
+        self.hal.pending_ime_hide = false;
+        let w = self.hal_target_window();
+        self.hal.frames.w.ime_hide(w);
+    }
+
     /// Layout points of `window_id` (when it exists) in native window points.
     fn hal_native_points(&self, window_id: Option<WindowId>, p: crate::makepad_math::Vec2d) -> crate::makepad_math::Vec2d {
         match window_id {
@@ -158,7 +165,13 @@ impl Cx {
         let title = window.create_title.clone();
         let visuals = window.window_visuals();
         let kind = kind | exact | macos_window_style(&window.macos);
-        let fullscreen = window.is_fullscreen;
+        let state = if window.is_fullscreen {
+            Some(window_state::FULLSCREEN)
+        } else if window.create_maximized {
+            Some(window_state::MAXIMIZE)
+        } else {
+            None
+        };
         // a dropdown never takes the host's window (`makepad run`'s load screen): the app's
         // first regular window does
         let adopt = kind & 0xff != window_kind::DROPDOWN && !std::mem::replace(&mut self.hal.window_created, true);
@@ -172,8 +185,8 @@ impl Cx {
         if cfg!(target_os = "macos") {
             fb.w.window_dpi_override(id, window.dpi_override.and_then(crate::window::CxWindow::valid_dpi_factor).unwrap_or(0.0));
         }
-        if fullscreen {
-            fb.w.window_state(id, window_state::FULLSCREEN);
+        if let Some(state) = state {
+            fb.w.window_state(id, state);
         }
         fb.w.window_visuals(id, visuals.transparent as u32 | (visuals.backdrop as u32) << 8, [visuals.backdrop_intensity, 0.0, 0.0, 0.0]);
         self.hal.windows.insert(window_id.0, super::HalWindow::default());
@@ -237,10 +250,26 @@ impl Cx {
         fb.w.file_dialog(req, kind as u32 | (settings.multiple as u32) << 8, title, location, filename, strs.len() as u32, &bytes);
     }
 
+    fn hal_print_pdf(&mut self, id: crate::print::PrintId, job: crate::print::PrintJob) {
+        // Reuse wire ids only after the preceding request has completed.
+        loop {
+            self.hal.next_print = self.hal.next_print.wrapping_add(1);
+            if !self.hal.prints.contains_key(&self.hal.next_print) {
+                break;
+            }
+        }
+        let req = self.hal.next_print;
+        self.hal.prints.insert(req, id);
+        let fb = &mut self.hal.frames;
+        let title = fb.intern(&job.title);
+        fb.w.print_pdf(req, title, &job.pdf);
+    }
+
     /// Drains the platform ops into HAL commands. False when the app asked to quit.
     pub(crate) fn hal_handle_platform_ops(&mut self) -> bool {
         let _phase = crate::thread::ui_phase(crate::thread::UiPhase::PlatformOps);
         self.native_layer_retire();
+        let mut tray_shown = false;
         while let Some(op) = self.platform_ops.pop_front() {
             match op {
                 CxOsOp::SetOwnChrome(own) => {
@@ -266,7 +295,10 @@ impl Cx {
                 CxOsOp::RelaunchDomain(domain) => self.hal.frames.w.domain_relaunch(domain),
                 CxOsOp::ListDomains(request) => self.hal.frames.w.domain_list(request),
 
-                CxOsOp::CreateWindow(window_id) => self.hal_create_window(window_id, None),
+                CxOsOp::CreateWindow(window_id) => {
+                    self.windows[window_id].shown = true;
+                    self.hal_create_window(window_id, None)
+                }
                 CxOsOp::CreatePopupWindow { window_id, parent_window_id, position, size, grab_keyboard } => {
                     let window = &mut self.windows[window_id];
                     window.is_popup = true;
@@ -301,17 +333,17 @@ impl Cx {
                         self.hal.close_pending = Some(std::time::Instant::now());
                     }
                 }
-                CxOsOp::MinimizeWindow(w) if self.hal_hosted_extra_window(w) => Self::send_hosted_window(crate::ime::HostedWindow::new(w.id(), crate::ime::hosted_window_op::MINIMIZE)),
-                CxOsOp::MaximizeWindow(w) if self.hal_hosted_extra_window(w) => Self::send_hosted_window(crate::ime::HostedWindow::new(w.id(), crate::ime::hosted_window_op::MAXIMIZE)),
-                CxOsOp::FullscreenWindow(w) if self.hal_hosted_extra_window(w) => Self::send_hosted_window(crate::ime::HostedWindow::new(w.id(), crate::ime::hosted_window_op::FULLSCREEN)),
+                CxOsOp::MinimizeWindow(w) if self.hal_hosted_extra_window(w) => Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::new(w.id(), makepad_hal::window_controls::hosted_window_op::MINIMIZE)),
+                CxOsOp::MaximizeWindow(w) if self.hal_hosted_extra_window(w) => Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::new(w.id(), makepad_hal::window_controls::hosted_window_op::MAXIMIZE)),
+                CxOsOp::FullscreenWindow(w) if self.hal_hosted_extra_window(w) => Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::new(w.id(), makepad_hal::window_controls::hosted_window_op::FULLSCREEN)),
                 CxOsOp::Deminiaturize(w) | CxOsOp::RestoreWindow(w) | CxOsOp::NormalizeWindow(w) if self.hal_hosted_extra_window(w) => {
-                    Self::send_hosted_window(crate::ime::HostedWindow::new(w.id(), crate::ime::hosted_window_op::RESTORE))
+                    Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::new(w.id(), makepad_hal::window_controls::hosted_window_op::RESTORE))
                 }
                 CxOsOp::SetWindowTitle(w, title) if self.hal_hosted_extra_window(w) => {
-                    Self::send_hosted_window(crate::ime::HostedWindow::title(w.id(), &title))
+                    Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::title(w.id(), &title))
                 }
                 CxOsOp::RepositionWindow(w, pos) if self.hal_hosted_extra_window(w) => {
-                    Self::send_hosted_window(crate::ime::HostedWindow { x: pos.x, y: pos.y, ..crate::ime::HostedWindow::new(w.id(), crate::ime::hosted_window_op::MOVE) })
+                    Self::send_hosted_window(makepad_hal::window_controls::HostedWindow { x: pos.x, y: pos.y, ..makepad_hal::window_controls::HostedWindow::new(w.id(), makepad_hal::window_controls::hosted_window_op::MOVE) })
                 }
                 CxOsOp::RepositionWindow(window_id, pos) => {
                     let s = self.windows[window_id].window_geom.inner_size;
@@ -367,8 +399,12 @@ impl Cx {
                 }
                 CxOsOp::MaximizeWindow(w) => self.hal.frames.w.window_state(hal_window_id(w), window_state::MAXIMIZE),
                 CxOsOp::FullscreenWindow(w) => self.hal.frames.w.window_state(hal_window_id(w), window_state::FULLSCREEN),
-                CxOsOp::HideWindow(w) => self.hal.frames.w.window_state(hal_window_id(w), window_state::HIDE),
+                CxOsOp::HideWindow(w) => {
+                    self.windows[w].shown = false;
+                    self.hal.frames.w.window_state(hal_window_id(w), window_state::HIDE)
+                }
                 CxOsOp::ShowWindowAtTray(w, tray, size) => {
+                    self.windows[w].shown = true;
                     // A hosted app (the makepad WM adopted it): the WM places the window under its
                     // tray item (`dropdown.rs`), the size is the app's own layout points.
                     if self.hal.hosted.is_some() {
@@ -381,6 +417,7 @@ impl Cx {
                     self.hal.frames.w.window_at_tray(hal_window_id(w), tray.0, size.x as f32, size.y as f32);
                 }
                 CxOsOp::ShowWindow(w) => {
+                    self.windows[w].shown = true;
                     self.hal.frames.w.window_state(hal_window_id(w), window_state::SHOW);
                     if self.hal.hosted.is_none() { self.hal.frames.w.activate_app(); }
                 }
@@ -403,7 +440,7 @@ impl Cx {
                 CxOsOp::SetTopmost(w, on) if self.hal.hosted.is_some() => {
                     self.windows[w].window_geom.is_topmost = on;
                     if self.windows[w].is_created {
-                        Self::send_hosted_window(crate::ime::HostedWindow::topmost(w.id(), on));
+                        Self::send_hosted_window(makepad_hal::window_controls::HostedWindow::topmost(w.id(), on));
                     }
                 }
                 CxOsOp::SetTopmost(w, on) => self.hal.frames.w.window_topmost(hal_window_id(w), on),
@@ -437,14 +474,34 @@ impl Cx {
                     self.hal.frames.w.pointer_lock(w, pointer::REPIN)
                 }
                 CxOsOp::ShowTextIME(area, cursor_rect, config) => {
+                    // An input asking for the keyboard right after a hide (e.g., it just took
+                    // focus from another input) keeps the keyboard up.
+                    #[cfg(target_os = "android")]
+                    { self.hal.pending_ime_hide = false; }
+                    let config = ime_config(&config);
+                    // The backend forgets its last show the moment the keyboard closes, so a repeat
+                    // drawn before we've heard about that close would bring the keyboard back.
+                    #[cfg(target_os = "android")]
+                    if !self.hal_is_embedded() && self.hal.ime_shown.replace(config) == Some(config) {
+                        continue;
+                    }
                     // both corners of the caret line (area-relative layout points) in native points
                     let window_id = self.get_window_id_of(&area).unwrap_or(crate::window::CxWindowPool::id_zero());
                     let area_pos = area.clipped_rect(self).pos;
                     let tl = self.windows[window_id].layout_vec2d_to_native_points(area_pos + cursor_rect.pos);
                     let br = self.windows[window_id].layout_vec2d_to_native_points(area_pos + cursor_rect.pos + cursor_rect.size);
-                    self.hal.frames.w.ime_show(hal_window_id(window_id), [tl.x as f32, tl.y as f32, (br.x - tl.x) as f32, (br.y - tl.y) as f32], ime_config(&config));
+                    self.hal.frames.w.ime_show(hal_window_id(window_id), [tl.x as f32, tl.y as f32, (br.x - tl.x) as f32, (br.y - tl.y) as f32], config);
                 }
                 CxOsOp::HideTextIME => {
+                    #[cfg(target_os = "android")]
+                    { self.hal.ime_shown = None; }
+                    // On Android a hide waits until after the next draw, but only the non-hosted
+                    // beat in `hal_run` sends it, so a hosted or embedded session hides right away.
+                    #[cfg(target_os = "android")]
+                    if self.hal.hosted.is_none() && !self.hal.externally_driven {
+                        self.hal.pending_ime_hide = true;
+                        continue;
+                    }
                     let w = self.hal_target_window();
                     self.hal.frames.w.ime_hide(w)
                 }
@@ -537,12 +594,8 @@ impl Cx {
                     fb.w.menu_set(items.len() as u32, &bytes);
                 }
                 CxOsOp::SetTray(tray) => {
-                    // A tray app shows itself with its tray: before it made a window, the first tray
-                    // the desktop shows is its first present (the launcher, the JIT's startup and its
-                    // first-frame deadline wait for one). A window app's stays its first frame.
-                    if self.trays.contains(&tray.id) && !self.windows.id_iter().any(|w| self.windows[w].is_created) {
-                        crate::startup_trace_first_present();
-                    }
+                    // (a tray the desktop shows: below)
+                    tray_shown |= self.trays.contains(&tray.id);
                     // A hosted app's tray is its host's to show (the makepad WM's tray area).
                     if self.hal.hosted.is_some() {
                         Self::send_studio_message(crate::studio::AppToStudio::Relay(crate::studio::ChildRelay::SetTray(crate::tray::relay_tray(&tray))));
@@ -600,13 +653,7 @@ impl Cx {
                     let w = self.hal_target_window();
                     self.hal.frames.w.clipboard_actions(w, false, [0.0; 4], false)
                 }
-                CxOsOp::CopyToClipboard(content) => {
-                    if self.hal.hosted.is_some() {
-                        Self::send_studio_message(crate::studio::AppToStudio::SetClipboard(content));
-                    } else {
-                        self.hal.frames.w.clip_set(content.as_bytes());
-                    }
-                }
+                CxOsOp::CopyToClipboard(write) => self.hal_clipboard_write(write),
                 CxOsOp::ShareText(text) => self.hal.frames.w.share_text(text.as_bytes()),
                 // a hosted child's selection is its host's primary selection
                 CxOsOp::SetPrimarySelection(text) => {
@@ -647,6 +694,7 @@ impl Cx {
 
                 // the rest arrive as their own HAL modules (HAL.md phases 1b / 4 / 5)
                 CxOsOp::SelectFileDialog(settings) => self.hal_file_dialog(DialogKind::SelectFile, settings),
+                CxOsOp::PrintPdf(id, job) => self.hal_print_pdf(id, job),
                 CxOsOp::SaveFileDialog(settings) => self.hal_file_dialog(DialogKind::SaveFile, settings),
                 CxOsOp::SelectFolderDialog(settings) => self.hal_file_dialog(DialogKind::SelectFolder, settings),
                 CxOsOp::SaveFolderDialog(settings) => self.hal_file_dialog(DialogKind::SaveFolder, settings),
@@ -695,6 +743,13 @@ impl Cx {
                 | CxOsOp::XrAdvertiseAnchor(_)
                 | CxOsOp::XrDiscoverAnchor(_) => self.hal.frames.gap("XR render scale and anchors are not on the HAL yet"),
             }
+        }
+        // A tray app shows itself with its tray: when these ops made no window, the first tray the
+        // desktop shows is its first present (the launcher, the JIT's startup and its first-frame
+        // deadline wait for one; `makepad run`'s load screen closes with it). A window app's stays
+        // its first frame, also when its window comes in the same ops as its tray, after it.
+        if tray_shown && !self.windows.id_iter().any(|w| self.windows[w].is_created) {
+            crate::startup_trace_first_present();
         }
         // A zoom queued layout geometry while handling these ops. Deliver it before the
         // next event; AppKit's moved buttons follow through the ordered Chrome/Geom pipe.
@@ -756,5 +811,46 @@ fn cursor_index(c: MouseCursor) -> u32 {
         MouseCursor::NwseResize => cursor::NWSE_RESIZE,
         MouseCursor::ColResize => cursor::COL_RESIZE,
         MouseCursor::RowResize => cursor::ROW_RESIZE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{cx::Cx, event::Event, makepad_math::dvec2, restart::RestartState, window::WindowHandle};
+    use makepad_hal::{window_state, HalCmd};
+
+    /// A restart in place reopens a window as the window system showed it, through the restart
+    /// text the next run reads: a maximized window maximized (it came back as a plain window at
+    /// its maximized frame), a fullscreen one fullscreen, a plain one with no state.
+    #[test]
+    fn a_restart_reopens_a_window_as_it_was_shown() {
+        for (shown, sent) in [
+            (window_state::MAXIMIZE, vec![window_state::MAXIMIZE]),
+            (window_state::FULLSCREEN, vec![window_state::FULLSCREEN]),
+            (window_state::RESTORE, vec![]),
+        ] {
+            let kept = {
+                let mut old = Cx::new(Box::new(|_: &mut Cx, _: &Event| {}));
+                let window = WindowHandle::new(&mut old);
+                old.windows[window.window_id()].is_created = true;
+                old.hal_window_geom(window.window_id(), dvec2(0.0, 25.0), dvec2(1512.0, 900.0), 1.0, shown);
+                RestartState { windows: old.restart_window_frames(), ..Default::default() }.to_text()
+            };
+            let restored = RestartState::from_text(&kept).expect("the kept state reads back");
+            let mut cx = Cx::new(Box::new(|_: &mut Cx, _: &Event| {}));
+            let window = WindowHandle::new(&mut cx);
+            cx.restart_apply_window_frames(&restored.windows);
+            cx.hal_create_window(window.window_id(), None);
+            let w = &cx.hal.frames.w;
+            let states: Vec<u32> = w
+                .cmds()
+                .iter()
+                .filter_map(|c| match c.decode(w.arena()) {
+                    Some(HalCmd::WindowState { state, .. }) => Some(state),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(states, sent, "a window shown in state {shown} reopens with these window states");
+        }
     }
 }

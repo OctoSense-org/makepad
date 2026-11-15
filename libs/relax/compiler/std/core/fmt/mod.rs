@@ -10,8 +10,10 @@
 mod builders;
 mod float;
 mod num;
+mod num_buffer;
 
 pub use builders::{DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple};
+pub use num_buffer::{NumBuffer, NumBufferTrait};
 
 use crate::cell::{Cell, Ref, RefCell, RefMut, UnsafeCell};
 use crate::marker::PhantomData;
@@ -108,7 +110,7 @@ pub mod rt {
 
     /// A type-erased argument: a pointer to the value and its formatting function.
     #[derive(Copy, Clone)]
-    #[cfg_attr(not(relax_check), lang = "format_argument")]
+    #[lang = "format_argument"]
     pub struct Argument<'a> {
         value: *const u8,
         formatter: fn(*const u8, &mut Formatter<'_>) -> Result,
@@ -168,7 +170,7 @@ pub mod rt {
 
 /// A precompiled format string and its arguments.
 #[derive(Copy, Clone)]
-#[cfg_attr(not(relax_check), lang = "format_arguments")]
+#[lang = "format_arguments"]
 pub struct Arguments<'a> {
     pieces: &'a [&'static str],
     /// None = every argument formatted with the default spec, in order
@@ -649,6 +651,26 @@ pub trait UpperExp: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
 
+/// A value whose Debug and Display call `f` with the formatter (real core's `fmt::from_fn`).
+pub fn from_fn<F: Fn(&mut Formatter<'_>) -> Result>(f: F) -> FromFn<F> {
+    FromFn(f)
+}
+
+/// What `from_fn` returns. As in real core: no bound on the struct, Debug and Display only.
+pub struct FromFn<F>(F);
+
+impl<F: Fn(&mut Formatter<'_>) -> Result> Debug for FromFn<F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        (self.0)(f)
+    }
+}
+
+impl<F: Fn(&mut Formatter<'_>) -> Result> Display for FromFn<F> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        (self.0)(f)
+    }
+}
+
 // References forward to the referent.
 impl<'a, T: crate::marker::PointeeSized + Debug> Debug for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
@@ -783,13 +805,11 @@ impl Debug for () {
     }
 }
 
-#[cfg(not(relax_check))]
 impl Debug for ! {
     fn fmt(&self, _f: &mut Formatter<'_>) -> Result {
         *self
     }
 }
-#[cfg(not(relax_check))]
 impl Display for ! {
     fn fmt(&self, _f: &mut Formatter<'_>) -> Result {
         *self

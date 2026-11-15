@@ -1,7 +1,8 @@
 //! Integer formatting: Display (decimal), Debug ({:x?}/{:X?} aware), LowerHex, UpperHex,
-//! Octal, Binary, LowerExp, UpperExp for every integer type, through Formatter::pad_integral
-//! as in real core. Shared non-generic helpers here; the per-type impls are generated
-//! (num/impls.rs, by check/src/gen_fmt.rs).
+//! Octal, Binary, LowerExp and UpperExp for every integer type, through Formatter::pad_integral as
+//! in real core.
+//! Shared non-generic helpers here; the per-type impls are generated (num/impls.rs, by
+//! gen/src/gen_fmt.rs).
 
 mod impls;
 
@@ -23,17 +24,17 @@ const DECIMAL_PAIRS: &[u8; 200] = b"\
       8081828384858687888990919293949596979899";
 
 /// Port of real core's `_fmt_inner` (library/core/src/fmt/num.rs): four decimals per step from the pair
-/// table, then two, then the last one, right-aligned in `buf`; returns the first written index.
+/// table, then two, then the last one, right-aligned below `out + end`; returns the first written
+/// index (the caller's buffer holds every decimal of `$T` below `end`).
 /// `$Unsigned` arithmetic: u32 for values that fit (real core formats u8..u32 at their width), else u64.
 /// Unchecked accesses where real core states the bounds (`assert_unchecked(offset >= 4)`, the pair
 /// indices below 100 from `% 1_00_00 / 100` and `% 100`, which its optimiser proves).
 macro_rules! dec_inner {
     ($name:ident, $T:ty) => {
-        fn $name(n: $T, buf: &mut [u8; 20]) -> usize {
-            let mut offset = buf.len();
+        unsafe fn $name(n: $T, out: *mut u8, end: usize) -> usize {
+            let mut offset = end;
             let mut remain = n;
             let pairs = DECIMAL_PAIRS.as_ptr();
-            let out = buf.as_mut_ptr();
             while remain > 999 {
                 offset -= 4;
                 let quad = remain % 1_00_00;
@@ -75,13 +76,25 @@ dec_inner!(dec_u64, u64);
 /// Decimal digits of `n` with the sign decided by `is_nonnegative`.
 pub(crate) fn fmt_u64(n: u64, is_nonnegative: bool, f: &mut Formatter<'_>) -> Result {
     let mut buf = [0u8; 20];
-    let i = if n <= u32::MAX as u64 { dec_u32(n as u32, &mut buf) } else { dec_u64(n, &mut buf) };
+    let out = buf.as_mut_ptr();
+    let i = unsafe { if n <= u32::MAX as u64 { dec_u32(n as u32, out, 20) } else { dec_u64(n, out, 20) } };
     f.pad_integral(is_nonnegative, "", ascii(&buf[i..]))
+}
+
+/// The decimals of a u64, at u32 width when they fit, below `out + end` (20 bytes there).
+unsafe fn dec_any_u64(n: u64, out: *mut u8, end: usize) -> usize {
+    if n <= u32::MAX as u64 { dec_u32(n as u32, out, end) } else { dec_u64(n, out, end) }
 }
 
 pub(crate) fn fmt_u128(n: u128, is_nonnegative: bool, f: &mut Formatter<'_>) -> Result {
     let mut buf = [0u8; 40];
-    let mut i = buf.len();
+    let i = unsafe { dec_u128(n, buf.as_mut_ptr(), buf.len()) };
+    f.pad_integral(is_nonnegative, "", ascii(&buf[i..]))
+}
+
+/// The decimals of a u128 below `out + end` (39 bytes there); the first written index.
+unsafe fn dec_u128(n: u128, out: *mut u8, end: usize) -> usize {
+    let mut i = end;
     let mut n = n;
     // 19-digit chunks through u64 arithmetic
     while n >= 10_000_000_000_000_000_000u128 {
@@ -90,7 +103,7 @@ pub(crate) fn fmt_u128(n: u128, is_nonnegative: bool, f: &mut Formatter<'_>) -> 
         let mut k = 0;
         while k < 19 {
             i -= 1;
-            buf[i] = b'0' + (low % 10) as u8;
+            *out.add(i) = b'0' + (low % 10) as u8;
             low /= 10;
             k += 1;
         }
@@ -98,13 +111,13 @@ pub(crate) fn fmt_u128(n: u128, is_nonnegative: bool, f: &mut Formatter<'_>) -> 
     let mut n = n as u64;
     loop {
         i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
+        *out.add(i) = b'0' + (n % 10) as u8;
         n /= 10;
         if n == 0 {
             break;
         }
     }
-    f.pad_integral(is_nonnegative, "", ascii(&buf[i..]))
+    i
 }
 
 fn prefix(shift: u32) -> &'static str {
@@ -158,30 +171,39 @@ pub(crate) fn fmt_radix_u128(x: u128, shift: u32, upper: bool, f: &mut Formatter
     f.pad_integral(true, prefix(shift), ascii(&buf[i..]))
 }
 
-/// Port of real core's `impl_Exp` (library/core/src/fmt/num.rs): `n` as a coefficient in [1, 10)
-/// and its power of ten, `1.234e3`. Without a precision the trailing zeros are dropped; a
-/// precision below the digit count rounds the coefficient half to even, one above it appends
-/// zeros. `$LEN`: the type's decimal digits, the point and `e99`.
+/// Port of real core's `impl_Exp!` formatter (library/core/src/fmt/num.rs): LowerExp/UpperExp of
+/// the magnitude `n`, through u64 for the integers up to 64 bits and u128 for i128/u128, as real
+/// core does on 64-bit targets. `$LEN` is real core's MAX_TEXT_LEN: the decimals of `$T::MAX`, the
+/// dot and "e99".
 macro_rules! exp_inner {
     ($name:ident, $T:ty, $LEN:expr) => {
-        pub(crate) fn $name(n: $T, is_nonnegative: bool, upper: bool, f: &mut Formatter<'_>) -> Result {
+        pub(crate) fn $name(n: $T, is_nonnegative: bool, letter_e: u8, f: &mut Formatter<'_>) -> Result {
+            // Print the integer as a coefficient in range (-10, 10).
             let mut exp = n.checked_ilog10().unwrap_or(0) as usize;
-            // the digits as an integer, coef_prec of them after the point
-            let mut coef = n;
+            // Precision is counted as the number of digits in the fraction.
             let mut coef_prec = exp;
-            let more_prec = match f.precision {
+            // Keep the digits as an integer (paired with its coef_prec count).
+            let mut coef = n;
+
+            // A Formatter may set the precision to a fixed number of decimals.
+            let more_prec = match f.precision() {
                 None => {
+                    // Omit any and all trailing zeroes.
                     while coef_prec != 0 && coef % 10 == 0 {
                         coef /= 10;
                         coef_prec -= 1;
                     }
                     0
                 }
+                // Count the number of additional zeroes needed.
                 Some(fmt_prec) if fmt_prec >= coef_prec => fmt_prec - coef_prec,
                 Some(fmt_prec) => {
-                    // fewer than exp digits to drop: the power of ten stays below n
-                    let scale = (10 as $T).pow((coef_prec - fmt_prec) as u32);
+                    // Scale the coefficient/precision pair down to fmt_prec decimals: any
+                    // precision below coef_prec gives a power of ten below the coefficient.
+                    let less_prec = coef_prec - fmt_prec;
+                    let scale = (10 as $T).pow(less_prec as u32);
                     let floor = coef / scale;
+                    // Round half to even, as documented.
                     let over = coef % scale;
                     let half = scale / 2;
                     let round_up = if over < half {
@@ -189,11 +211,14 @@ macro_rules! exp_inner {
                     } else if over > half {
                         1
                     } else {
-                        floor & 1
+                        floor & 1 // round odd up to even
                     };
+                    // Adding one to a scale down of at least 10 won't overflow.
                     coef = floor + round_up;
                     coef_prec = fmt_prec;
-                    // 9.95 to one decimal is 10.0: drop that zero for one more power of ten
+
+                    // The round up may make the coefficient reach 10 (anything in [9.95, 10)
+                    // becomes 10.0 at precision 1): drop one trailing zero, one power higher.
                     if round_up != 0 && coef.checked_ilog10().unwrap_or(0) as usize > coef_prec {
                         coef /= 10;
                         exp += 1;
@@ -201,46 +226,105 @@ macro_rules! exp_inner {
                     0
                 }
             };
+
             let mut buf = [0u8; $LEN];
-            let coef_len = if coef_prec == 0 && more_prec == 0 {
-                1
+            // Encode the coefficient in buf[..coef_len].
+            let (lead_dec, coef_len) = if coef_prec == 0 && more_prec == 0 {
+                (coef, 1usize) // single digit; no fraction
             } else {
                 buf[1] = b'.';
-                let mut i = 2 + coef_prec;
-                while i > 2 {
-                    i -= 1;
-                    buf[i] = b'0' + (coef % 10) as u8;
-                    coef /= 10;
+                let start = 2;
+                let end = start + coef_prec;
+                // Consume the least-significant decimals, two at a time from the pair table.
+                let mut remain = coef;
+                let mut i = end;
+                while i >= start + 2 {
+                    i -= 2;
+                    let pair = (remain % 100) as usize;
+                    remain /= 100;
+                    buf[i] = DECIMAL_PAIRS[pair * 2];
+                    buf[i + 1] = DECIMAL_PAIRS[pair * 2 + 1];
                 }
-                2 + coef_prec
+                // An odd number of digits leaves one digit remaining.
+                if coef_prec & 1 != 0 {
+                    buf[start] = b'0' + (remain % 10) as u8;
+                    remain /= 10;
+                }
+                (remain, end)
             };
-            buf[0] = b'0' + coef as u8;
-            buf[coef_len] = if upper { b'E' } else { b'e' };
+            buf[0] = b'0' + lead_dec as u8;
+
+            // Encode the scale factor in buf[coef_len..text_len]; no integer reaches e100.
+            buf[coef_len] = letter_e;
             let text_len = if exp < 10 {
                 buf[coef_len + 1] = b'0' + exp as u8;
                 coef_len + 2
             } else {
-                buf[coef_len + 1] = b'0' + (exp / 10) as u8;
-                buf[coef_len + 2] = b'0' + (exp % 10) as u8;
+                buf[coef_len + 1] = DECIMAL_PAIRS[exp * 2];
+                buf[coef_len + 2] = DECIMAL_PAIRS[exp * 2 + 1];
                 coef_len + 3
             };
+            let text = &buf[..text_len];
+
             if more_prec == 0 {
-                return f.pad_integral(is_nonnegative, "", ascii(&buf[..text_len]));
-            }
-            let sign = if !is_nonnegative {
-                "-"
-            } else if f.sign_plus() {
-                "+"
+                f.pad_integral(is_nonnegative, "", ascii(text))
             } else {
-                ""
-            };
-            let mut out = Formatted::new(sign);
-            out.push(Part::Copy(&buf[..coef_len]));
-            out.push(Part::Zero(more_prec));
-            out.push(Part::Copy(&buf[coef_len..text_len]));
-            pad_formatted_parts(f, &out)
+                let sign = if !is_nonnegative {
+                    "-"
+                } else if f.sign_plus() {
+                    "+"
+                } else {
+                    ""
+                };
+                let mut formatted = Formatted::new(sign);
+                formatted.push(Part::Copy(&text[..coef_len]));
+                formatted.push(Part::Zero(more_prec));
+                formatted.push(Part::Copy(&text[coef_len..]));
+                pad_formatted_parts(f, &formatted)
+            }
         }
     };
 }
-exp_inner!(fmt_exp_u64, u64, 24);
-exp_inner!(fmt_exp_u128, u128, 43);
+exp_inner!(exp_u64, u64, 24);
+exp_inner!(exp_u128, u128, 43);
+
+/// `format_into` (library/core/src/fmt/num.rs @1.100.0, int_format_into, stable since 1.98): an
+/// integer's decimals written into a NumBuffer, without a Formatter. The digits are right-aligned
+/// at the buffer's end (`_fmt_inner`), a negative value's `-` before them; the str is that tail.
+macro_rules! format_into {
+    ($dec:ident; $($Signed:ident $Unsigned:ident $Wide:ty),*) => {
+        $(
+            impl $Signed {
+                pub fn format_into(self, buf: &mut super::NumBuffer<Self>) -> &str {
+                    let digits = buf.buf.as_mut();
+                    let (out, end) = (digits.as_mut_ptr() as *mut u8, digits.len());
+                    // SAFETY: the buffer holds every decimal of the type and a sign (num_buffer.rs)
+                    unsafe {
+                        let mut offset = $dec(self.unsigned_abs() as $Wide, out, end);
+                        // Only difference between signed and unsigned are these 4 lines.
+                        if self < 0 {
+                            offset -= 1;
+                            *out.add(offset) = b'-';
+                        }
+                        crate::intrinsics_mem::str_from_raw(out.add(offset) as *const u8, end - offset)
+                    }
+                }
+            }
+
+            impl $Unsigned {
+                pub fn format_into(self, buf: &mut super::NumBuffer<Self>) -> &str {
+                    let digits = buf.buf.as_mut();
+                    let (out, end) = (digits.as_mut_ptr() as *mut u8, digits.len());
+                    // SAFETY: the buffer holds every decimal of the type (num_buffer.rs)
+                    unsafe {
+                        let offset = $dec(self as $Wide, out, end);
+                        crate::intrinsics_mem::str_from_raw(out.add(offset) as *const u8, end - offset)
+                    }
+                }
+            }
+        )*
+    };
+}
+format_into!(dec_u32; i8 u8 u32, i16 u16 u32, i32 u32 u32);
+format_into!(dec_any_u64; i64 u64 u64, isize usize u64);
+format_into!(dec_u128; i128 u128 u128);

@@ -52,7 +52,7 @@ fn id() -> String {
 fn record(a: &Attempt, outcome: Outcome, reason: String, failure: String, logs: Vec<String>) -> Record {
     let mut all_logs = if outcome.failure() { (*a.logs).clone() } else { Vec::new() };
     all_logs.extend(logs);
-    Record { id: id(), load: a.id.clone(), at_ms: now(), app: std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_default(), node: String::new(), pid: std::process::id(),
+    Record { id: id(), load: a.id.clone(), at_ms: now(), app: std::env::var("RELAX_PACKAGE").unwrap_or_default(), node: String::new(), pid: std::process::id(),
         outcome, reason, failure, units: if outcome.failure() { (*a.units).clone() } else { Vec::new() }, logs: all_logs }
 }
 
@@ -159,6 +159,9 @@ pub fn checker_panic(body: &str, message: &str) {
 pub fn recovering() -> bool { ACTIVE.load(Ordering::Acquire) }
 /// Whether a live edit was attempted in this process.
 pub(crate) fn edit_ran() -> bool { state().current.is_some() }
+/// A live edit was attempted in this process (tests of what follows one).
+#[cfg(test)]
+pub(crate) fn edit_ran_for_test() { let old = state().current.replace(empty_attempt()); drop(old); }
 pub(crate) fn enable() { REPORTING.store(true, Ordering::Release); }
 pub fn has_error() -> bool { ERROR.load(Ordering::Acquire) }
 /// Whether this run is a restart's replacement whose restore has not completed (`restored`).
@@ -284,7 +287,7 @@ fn flush() -> bool {
     let mut records = std::mem::take(&mut state().pending);
     while let Some(r) = records.front() {
         if let Err(e) = makepad_remote::hot::persist(r) {
-            eprintln!("makepad hot: record {} pending: {e}", r.id);
+            eprintln!("relax hot: record {} pending: {e}", r.id);
             let mut s = state();
             records.append(&mut s.pending);
             s.pending = records;
@@ -324,7 +327,7 @@ pub(crate) fn hand_over() -> Result<Option<std::path::PathBuf>, String> {
 #[cfg(windows)]
 pub(crate) fn next_run_failed(path: &std::path::Path, why: &str) {
     let Some(r) = std::fs::read_to_string(path).ok().and_then(|s| Record::parse(&s)) else {
-        eprintln!("makepad hot: cannot read the recovery record {}", path.display());
+        eprintln!("relax hot: cannot read the recovery record {}", path.display());
         return;
     };
     let _ = std::fs::remove_file(path);
@@ -333,15 +336,21 @@ pub(crate) fn next_run_failed(path: &std::path::Path, why: &str) {
     done.app = r.app;
     eprintln!("{}", Verdict::JitError { record: done.id.clone() }.line());
     if let Err(e) = makepad_remote::hot::persist(&done) {
-        eprintln!("makepad hot: record {} not written: {e}", done.id);
+        eprintln!("relax hot: record {} not written: {e}", done.id);
     }
 }
 
+/// This run read its recovery record (`restore`): the run's start and its watcher's both ask, and
+/// the first read removes the file (a run started in place keeps its hand-over: the second read
+/// found no file and said "cannot restore the pending recovery record").
+static RESTORE_READ: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn restore() {
     let _kept = crate::zone_alloc::kept();
-    let Some(path) = crate::run_end::run_input("MAKEPAD_JIT_RECOVERY") else { return };
+    let Some(path) = crate::run_end::run_input("RELAX_JIT_RECOVERY") else { return };
+    if RESTORE_READ.swap(true, Ordering::AcqRel) { return; }
     // (a process's first run: the programs it starts do not take its recovery for theirs)
-    if !crate::run_end::started_in_place() { std::env::remove_var("MAKEPAD_JIT_RECOVERY"); }
+    if !crate::run_end::started_in_place() { std::env::remove_var("RELAX_JIT_RECOVERY"); }
     match std::fs::read_to_string(&path).ok().and_then(|s| Record::parse(&s)) {
         Some(r) => {
             state().recovery = Some(Recovery { attempt: Attempt { id: r.load, units: Arc::new(r.units), logs: Arc::new(r.logs) }, failure: r.failure });
@@ -349,7 +358,7 @@ pub(crate) fn restore() {
             REPLACEMENT.store(true, Ordering::Release);
             let _ = std::fs::remove_file(path);
         }
-        None => eprintln!("makepad hot: cannot restore the pending recovery record"),
+        None => eprintln!("relax hot: cannot restore the pending recovery record"),
     }
 }
 
@@ -358,4 +367,5 @@ pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
     reset(&STATE, std::sync::OnceLock::new());
     reset(&RECORDED, AtomicU64::new(0));
+    reset(&RESTORE_READ, AtomicBool::new(false));
 }

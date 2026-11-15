@@ -42,6 +42,13 @@ pub struct OnceState {
     set_state_to: Cell<State>,
 }
 
+// rustc 1.100.0 (once_default)
+impl Default for Once {
+    fn default() -> Once {
+        Once::new()
+    }
+}
+
 impl OnceState {
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -463,23 +470,6 @@ impl<T, F: FnOnce() -> T> Deref for LazyLock<T, F> {
     type Target = T;
     fn deref(&self) -> &T {
         LazyLock::force(self)
-    }
-}
-
-// std/src/sync/lazy_lock.rs: `DerefMut for LazyLock` (stable 1.89) over `force_mut`.
-impl<T, F: FnOnce() -> T> LazyLock<T, F> {
-    pub fn force_mut(this: &mut LazyLock<T, F>) -> &mut T {
-        LazyLock::force(this);
-        match this.value.get_mut().as_mut() {
-            Some(v) => v,
-            None => panic!("LazyLock instance has previously been poisoned"),
-        }
-    }
-}
-
-impl<T, F: FnOnce() -> T> core::ops::DerefMut for LazyLock<T, F> {
-    fn deref_mut(&mut self) -> &mut T {
-        LazyLock::force_mut(self)
     }
 }
 

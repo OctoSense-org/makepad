@@ -364,7 +364,7 @@ pub fn serve(sched: &Mutex<Sched>, ledger: &Path, line: &str, now: u64, out: &mu
         rows.extend(s.recent_ended(usize::MAX).iter().filter(|l| l.ended_ms.unwrap_or(0) >= since).map(row));
         // the scheduler holds the leases that ended since the master started, up to a bound:
         // what ended before that is in the ledger only
-        (s.node_view(), rows, s.pressure_since(since), s.ended_from_ms)
+        (s.node_view(now), rows, s.pressure_since(since), s.ended_from_ms)
     };
     if since < kept_from {
         let have: HashSet<String> = rows.iter().map(|r| r.id.clone()).collect();
@@ -437,7 +437,7 @@ mod tests {
     fn caps(name: &str) -> Caps {
         Caps {
             node: name.into(),
-            hub_proto: crate::lease::HUB_PROTO,
+            features: crate::lease::FEATURES.iter().map(|f| f.to_string()).collect(),
             native_trees: crate::lease::caps::NATIVE_TREES,
             arch: "x86_64".into(),
             os: "linux".into(),
@@ -463,9 +463,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("devhub-panel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let ledger = dir.join("leases.jsonl");
-        // an older lease only the ledger still has, twice (its later line wins), and one before the window
+        // an older lease only the ledger still has, twice (its later line wins), and one before the
+        // window (its times 9 s and 8 s before its end: no end before 9 s, where u64 would wrap)
         let line = |id: &str, ended: u64, how: &str| format!("{{\"id\":\"{id}\",\"lane\":\"lane-a\",\"kind\":\"build\",\"node\":\"node-b\",\"asked_ms\":{},\"granted_ms\":{},\"ended_ms\":{ended},\"how\":\"{how}\",\"cost\":\"large\",\"cost_source\":\"kind\",\"measured_ms\":null,\"alloc\":{{\"cores\":6,\"ram_gb\":10,\"gpus\":0}},\"phases\":[{{\"phase\":\"queued\",\"blocker\":\"budget cores\",\"boxes\":[],\"start_ms\":{},\"end_ms\":{}}}],\"req\":{{\"agent\":\"AGENT-A\",\"class\":\"build cargo\"}}}}\n", ended - 9000, ended - 8000, ended - 9000, ended - 8000);
-        std::fs::write(&ledger, [line("L1", 1_000, "released"), line("L2", 50_000, "expired"), line("L2", 51_000, "released")].concat()).unwrap();
+        std::fs::write(&ledger, [line("L1", 10_000, "released"), line("L2", 50_000, "expired"), line("L2", 51_000, "released")].concat()).unwrap();
         let sched = Mutex::new(Sched::new("mac", 1));
         {
             let mut s = sched.lock().unwrap();

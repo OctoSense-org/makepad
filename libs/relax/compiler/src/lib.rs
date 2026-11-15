@@ -5,10 +5,11 @@
 //!   makepad parse <units.json> [threads]   parse the crate graph, time it, write the census
 //!   makepad file <path> [edition]          parse one file, report errors
 //!   makepad clean [-p <package>]           remove the workspace's <target>/relax (or one app's files)
+//!   makepad clean --shared-code            remove the shared code stores of builds not running
 //!   makepad run [opts] <package> [cargo flags] [-- args]   boot a cargo package from source (run.rs)
 
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
-// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// log in a full tmpfs /tmp aborted a fleet run inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
 #[cfg(not(test))]
 #[allow(unused_macros)]
@@ -23,7 +24,7 @@ macro_rules! eprintln {
 #[allow(unused_macros)]
 macro_rules! stderr_line {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all(::std::fmt::format(format_args!("{}\n", format_args!($($t)+))).as_bytes()); }};
+    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_all($crate::vfs::shown(&::std::fmt::format(format_args!("{}\n", format_args!($($t)+)))).as_bytes()); }};
 }
 #[cfg(test)]
 macro_rules! stderr_line {
@@ -32,18 +33,18 @@ macro_rules! stderr_line {
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! eprint {
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stderr().write_fmt(format_args!($($t)+)); }};
+    ($($t:tt)+) => { $crate::vfs::write_err(format_args!($($t)+)) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! println {
     () => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_all(b"\n"); }};
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!("{}\n", format_args!($($t)+))); }};
+    ($($t:tt)+) => { $crate::vfs::write_out(format_args!("{}\n", format_args!($($t)+))) };
 }
 #[cfg(not(test))]
 #[allow(unused_macros)]
 macro_rules! print {
-    ($($t:tt)+) => {{ use ::std::io::Write as _; let _ = ::std::io::stdout().write_fmt(format_args!($($t)+)); }};
+    ($($t:tt)+) => { $crate::vfs::write_out(format_args!($($t)+)) };
 }
 
 /// First statement of a test that builds, runs or drops a JIT unit: the test runs alone in a
@@ -54,6 +55,10 @@ macro_rules! print {
 /// sharing a process saw each other's units: a lazily compiled slot of one test was built in
 /// another's unit (the parallel suite aborted: "failed to initiate panic" / "free(): invalid
 /// pointer"), and every test after the first dropped unit found the cache stopped.
+///
+/// The process sizes its CPU budget from MAKEPAD_CPU_CORES (a gate's share of its lease,
+/// land_gate.sh step_testrun). A test whose checks need a budget of a certain shape gives its
+/// own process the cores it needs with `isolated_test!(name, cores = N)`, not the share it ran in.
 #[cfg(test)]
 macro_rules! isolated_test {
     ($name:ident) => {
@@ -61,40 +66,140 @@ macro_rules! isolated_test {
             return;
         }
     };
+    ($name:ident, cores = $cores:expr) => {
+        if !$crate::test_child::run_alone_with_cores(module_path!(), stringify!($name), Some($cores)) {
+            return;
+        }
+    };
 }
 
 #[cfg(test)]
 mod test_child {
+    use std::process::{Command, ExitStatus, Output};
+    use std::sync::{Condvar, Mutex};
+
     const CHILD: &str = "RELAX_TEST_CHILD";
+
+    /// Children of this test binary at once. Under the JIT each is a whole run of the binary, its
+    /// program loaded: 1.1 to 1.5 GB. The suite's threads started one each, up to 30 processes at
+    /// once (38 GB summed, 11-08); a slot per child keeps them to this.
+    const SLOTS: usize = 3;
+
+    static FREE: Mutex<usize> = Mutex::new(SLOTS);
+    static FREED: Condvar = Condvar::new();
+
+    /// A slot, held while its child runs.
+    pub struct Slot(());
+
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            *FREE.lock().unwrap() += 1;
+            FREED.notify_one();
+        }
+    }
+
+    /// A slot for a child of this test binary (`current_exe()`), once one is free.
+    pub fn slot() -> Slot {
+        let mut free = FREE.lock().unwrap();
+        while *free == 0 {
+            free = FREED.wait(free).unwrap();
+        }
+        *free -= 1;
+        Slot(())
+    }
+
+    /// `command` (a child of this test binary) run to its end in a slot, its output kept.
+    pub fn output(command: &mut Command) -> Output {
+        let _slot = slot();
+        command.output().unwrap()
+    }
+
+    /// `command` (a child of this test binary) run to its end in a slot.
+    pub fn status(command: &mut Command) -> ExitStatus {
+        let _slot = slot();
+        command.status().unwrap()
+    }
 
     /// True in the child (run the test body); in the parent, runs the child and returns false
     /// once it passed (a failure panics with the child's output).
     pub fn run_alone(module: &str, name: &str) -> bool {
+        run_alone_with_cores(module, name, None)
+    }
+
+    /// `run_alone`, with an optional CPU budget for the child instead of its parent's share.
+    pub fn run_alone_with_cores(module: &str, name: &str, cores: Option<usize>) -> bool {
         let module = module.split_once("::").map_or("", |(_, rest)| rest);
         let test = if module.is_empty() { name.to_string() } else { format!("{module}::{name}") };
         if std::env::var(CHILD).is_ok_and(|t| t == test) {
             return true;
         }
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &test, "--include-ignored", "--test-threads=1", "--nocapture"])
-            .env(CHILD, &test)
-            .output()
-            .unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", &test, "--include-ignored", "--test-threads=1", "--nocapture"])
+            .env(CHILD, &test);
+        if let Some(cores) = cores {
+            command.env("MAKEPAD_CPU_CORES", cores.to_string());
+        }
+        let output = output(&mut command);
         let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-        assert!(output.status.success() && all.contains("test result: ok. 1 passed"), "{test} in its own process:\n{all}");
+        if !(output.status.success() && all.contains("test result: ok. 1 passed")) {
+            panic!("{test} in its own process: {}\n{all}", child_cause(&all, &test, output.status));
+        }
         false
+    }
+
+    /// A failed child's cause for the panic's first line, the line a bucket's summary shows: the
+    /// message its test thread panicked with and where; else that of the first panic the JIT
+    /// reported uncaught (`report: {..}`, under the JIT a panic's only line at times), else the
+    /// first other thread's; or how the child ended without one.
+    fn child_cause(all: &str, test: &str, status: ExitStatus) -> String {
+        let lines: Vec<&str> = all.lines().collect();
+        let panics = || lines.windows(2).filter_map(|w| {
+            let (who, at) = w[0].strip_prefix("thread '")?.split_once(" panicked at ")?;
+            Some((who.split_once('\'').map_or(who, |(name, _)| name), format!("{} (panicked at {})", w[1].trim(), at.trim_end_matches(':'))))
+        });
+        let reported = || lines.iter().find_map(|line| {
+            let report = line.trim_start().strip_prefix("report: {\"kind\":\"panic\"")?;
+            Some(format!("{} (panicked at {})", json_field(report, "message")?, json_field(report, "location")?))
+        });
+        match panics().find(|(who, _)| *who == test).map(|(_, cause)| cause).or_else(reported).or_else(|| panics().next().map(|(_, cause)| cause)) {
+            Some(cause) => cause,
+            None if status.success() => "it ran no test".to_string(),
+            None => format!("it ended with {status} and no panic"),
+        }
+    }
+
+    /// The first line of the string field `key` of one JSON object's text, its escapes read (a
+    /// report's message).
+    fn json_field(object: &str, key: &str) -> Option<String> {
+        let mut chars = object.split_once(&format!("\"{key}\":\""))?.1.chars();
+        let mut out = String::new();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => return Some(out),
+                '\\' => match chars.next()? {
+                    'n' => return Some(out),
+                    'u' => out.push(char::from_u32(u32::from_str_radix(&chars.by_ref().take(4).collect::<String>(), 16).ok()?).unwrap_or('?')),
+                    e => out.push(e),
+                },
+                c => out.push(c),
+            }
+        }
+        None
     }
 }
 
 pub mod front;
 pub mod global_asm;
+pub mod selfexe;
 pub mod live;
 pub mod reload;
 pub mod modules;
 pub mod sandbox;
+pub mod tool;
 pub mod stale;
 pub mod invalid;
 pub mod domain;
+mod sections;
 pub(crate) mod domain_res;
 pub(crate) mod domain_threads;
 pub mod jit;
@@ -128,6 +233,9 @@ mod test_pkg;
 pub mod tui;
 pub mod check;
 mod check_order;
+mod check_reuse;
+/// Body verdicts: a body whose stored verdict stands is replayed, not checked.
+mod check_bodies;
 mod typeck_bg;
 mod gandalf_out;
 pub mod serve;
@@ -154,7 +262,7 @@ pub mod memreport;
 pub mod registry_net;
 
 /// The system allocator (Relax's own malloc zone once a program swaps the default zone:
-/// zone_alloc.rs), with per-subsystem accounting when MAKEPAD_RUN_MEM_REPORT is set (memstat.rs).
+/// zone_alloc.rs), with per-subsystem accounting when RELAX_MEM_REPORT is set (memstat.rs).
 #[global_allocator]
 static GLOBAL_ALLOC: memstat::Counting = memstat::Counting;
 
@@ -167,7 +275,7 @@ pub use jit::PROVENANCE;
 
 /// The same, as a marker other binaries find in this one's bytes (provenance_of).
 #[used]
-static PROVENANCE_MARK: &str = concat!("<<RELAX-PROVENANCE:", env!("MAKEPAD_RUN_PROVENANCE"), ">>");
+static PROVENANCE_MARK: &str = concat!("<<RELAX-PROVENANCE:", env!("RELAX_PROVENANCE"), ">>");
 
 /// The compiler stamp a binary file carries (its PROVENANCE_MARK), if any.
 pub fn provenance_of(path: &std::path::Path) -> Option<String> {
@@ -182,56 +290,63 @@ pub fn provenance_of(path: &std::path::Path) -> Option<String> {
 /// script's RUSTC is Relax itself; asked `--version`, it answers this (relax_as_rustc).
 pub const RUSTC_VERSION: &str = "1.98.0";
 
-/// MAKEPAD_RUN_AS_RUSTC=1: a build script's RUSTC is Relax itself. `--version` / `-vV` / `-V` answer
-/// as a rustc of RUSTC_VERSION would (build scripts such as libc's read the minor version);
-/// `--print` requests about the target (cargo's target-info probe, which `cargo metadata
-/// --filter-platform` runs) answer from Relax's own target model (print_as_rustc). Returns whether
-/// it answered.
+/// RELAX_AS_RUSTC=1: a build script's RUSTC is Relax itself, as a process (a script whose own
+/// spawn of RUSTC the host answers in-process, tool.rs, never starts one). Returns whether it
+/// answered (`rustc_answer`); a failed answer exits with its status.
 pub fn relax_as_rustc() -> bool {
     let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
-    if std::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_none() && !native::is_target_rustc_probe(&args) {
+    if std::env::var_os("RELAX_AS_RUSTC").is_none() && !native::is_target_rustc_probe(&args) {
         return false;
     }
     // the script's own run (and a nested script's) is a Relax command, not a RUSTC question
     if args.first().is_some_and(|a| a == "run") {
         return false;
     }
-    let sess = &session_from_env(&args);
-    match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["--version"] | ["-V"] => println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE),
-        ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => {
-            println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE);
-            println!("binary: rustc");
-            println!("commit-hash: unknown");
-            println!("commit-date: unknown");
-            println!("host: {}", crate::cfg::CfgSet::machine(sess, &[]).triple());
-            println!("release: {}", RUSTC_VERSION);
-        }
-        _ => {
-            // probes pipe a program in (cargo's target info, rustix, autocfg): read it all, as rustc
-            // would, so the writer never sees a broken pipe
-            let mut input = Vec::new();
-            if args.iter().any(|a| a == "-") {
-                let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut input);
-            }
-            match print_as_rustc(sess, &args, &input) {
-                Ok(out) => {
-                    use std::io::Write;
-                    let mut o = std::io::stdout().lock();
-                    let _ = o.write_all(out.as_bytes());
-                    let _ = o.flush();
-                }
-                Err(e) => {
-                    // anything else asked of RUSTC (a compile probe: autocfg, rustc_version's
-                    // `--emit`): Relax is not rustc. Fail the probe as a missing rustc would (the
-                    // script decides); never run the script's program again.
-                    eprintln!("makepad: not rustc: a build script asked RUSTC {:?}: {}", args, e);
-                    std::process::exit(1);
-                }
-            }
-        }
+    // probes pipe a program in (cargo's target info, rustix, autocfg): read it all, as rustc
+    // would, so the writer never sees a broken pipe
+    let mut input = Vec::new();
+    if args.iter().any(|a| a == "-") {
+        let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut input);
+    }
+    let (status, out, err) = rustc_answer(&args, &input);
+    {
+        use std::io::Write;
+        let mut o = std::io::stdout().lock();
+        let _ = o.write_all(&out);
+        let _ = o.flush();
+        let _ = std::io::stderr().write_all(&err);
+    }
+    if status != 0 {
+        std::process::exit(status);
     }
     true
+}
+
+/// What Relax answers as a build script's RUSTC, asked `args` (after the program) with `input` on
+/// its stdin: the exit status, stdout and stderr. `--version` / `-vV` / `-V` answer as a rustc of
+/// RUSTC_VERSION would (build scripts such as libc's read the minor version); `--print` requests
+/// about the target (cargo's target-info probe, which `cargo metadata --filter-platform` runs)
+/// answer from Relax's own target model (print_as_rustc). Anything else asked of RUSTC (a compile
+/// probe: autocfg, rustc_version's `--emit`) fails with status 1, as a missing rustc would: Relax
+/// is not rustc, and the script decides.
+pub fn rustc_answer(args: &[String], input: &[u8]) -> (i32, Vec<u8>, Vec<u8>) {
+    // the session of this process's own options: a question's words are rustc's, never Relax's
+    // (a script's `$RUSTC --allow-c` sets nothing of the run's)
+    let sess = &session_from_env(&[]);
+    let out = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["--version"] | ["-V"] => format!("rustc {} (Relax {})\n", RUSTC_VERSION, PROVENANCE),
+        ["-vV"] | ["--version", "--verbose"] | ["--verbose", "--version"] | ["-V", "--verbose"] | ["--verbose", "-V"] => format!(
+            "rustc {v} (Relax {p})\nbinary: rustc\ncommit-hash: unknown\ncommit-date: unknown\nhost: {h}\nrelease: {v}\n",
+            v = RUSTC_VERSION,
+            p = PROVENANCE,
+            h = crate::cfg::CfgSet::machine(sess, &[]).triple()
+        ),
+        _ => match print_as_rustc(sess, args, input) {
+            Ok(out) => out,
+            Err(e) => return (1, Vec::new(), format!("relax: not rustc: a build script asked RUSTC {:?}: {}\n", args, e).into_bytes()),
+        },
+    };
+    (0, out.into_bytes(), Vec::new())
 }
 
 /// The `--print` requests of a rustc command line, answered for Relax's target model the way
@@ -372,25 +487,64 @@ pub fn print_as_rustc(sess: &std::sync::Arc<crate::Session>, args: &[String], in
     Ok(out)
 }
 
+/// rustup's homes named in this process's environment, as rustup's cargo names them for the
+/// programs it runs (rustup Toolchain::set_env: CARGO_HOME and RUSTUP_HOME): a program that runs a
+/// child with another HOME (a test starting its CARGO_BIN_EXE_* binary in a scratch home) has that
+/// child's Relax find the same toolchain and registry, as the binary cargo built needs neither
+/// (relax issue 129: the child's cargo said rustup could not choose a version). Only where rustup
+/// is in use (RUSTUP_HOME set, or ~/.rustup there); a variable already set keeps its folder, made
+/// absolute as rustup makes it (the child may start in another folder).
+fn keep_toolchain_homes() {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let home = set(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(std::path::PathBuf::from);
+    let Some(rustup) = set("RUSTUP_HOME").map(std::path::PathBuf::from).or_else(|| home.as_ref().map(|h| h.join(".rustup")).filter(|d| d.is_dir())) else {
+        return;
+    };
+    let absolute = |p: std::path::PathBuf| std::path::absolute(&p).unwrap_or(p);
+    std::env::set_var("RUSTUP_HOME", absolute(rustup));
+    if let Some(cargo) = set("CARGO_HOME").map(std::path::PathBuf::from).or_else(|| home.map(|h| h.join(".cargo"))) {
+        std::env::set_var("CARGO_HOME", absolute(cargo));
+    }
+}
+
+/// A `makepad run` host's start (Policy::Sandboxed): the grants come from its command line alone
+/// (options.rs GRANTS), so their environment names leave this process before its options are read,
+/// each one that was set said in one line; its children never inherit them. Whatever set them (the
+/// person's shell, a launcher, a build environment a parent handed: progenv `init_handed`, which
+/// ran before) grants nothing. So does an ambient self-exec line (RELAX_SELF_EXEC, words std's
+/// spawn of this program runs), which this run states again when it makes its own executable.
+fn drop_ambient_grants() {
+    for (word, name) in crate::options::GRANTS {
+        if std::env::var_os(name).is_some() {
+            std::env::remove_var(name);
+            let word = if word.ends_with('=') { format!("{word}<n>") } else { word.to_string() };
+            eprintln!("{}: {name} in the environment is ignored; pass {word}", crate::tool_name());
+        }
+    }
+    std::env::remove_var("RELAX_SELF_EXEC");
+}
+
 /// Construct the invocation inputs before parsing; CLI overrides replace environment values.
 /// rustc: compiler/rustc_session/src/config.rs:2428, session.rs:90-93.
 pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     crate::pool::thread_start(crate::jit::ensure_altstack);
+    keep_toolchain_homes();
+    if crate::sandbox::policy() == crate::sandbox::Policy::Sandboxed {
+        drop_ambient_grants();
+    }
     let mut options = crate::options::Options::from_env();
-    // `--no-asm` / `--allow-c` anywhere before `--`, for every command (run, test, check, the
-    // relax runner): the environment carries them to the processes this one starts (build
-    // scripts, test harnesses); cli_main drops them from the arguments
+    let mut runtime = crate::options::RuntimeOptions::from_env();
+    // `--no-asm` and the grants (`--allow-*`) anywhere before `--`, for every command (run, test,
+    // check, the relax runner); cli_main drops them from the arguments. `--no-asm` reaches the
+    // processes this one starts through the environment; a grant never does: a child that is this
+    // run again has it on its command line, which its parent Relax writes (options.rs GRANTS)
     for a in args.iter().take_while(|a| a.as_str() != "--") {
-        match a.as_str() {
-            "--no-asm" => {
-                options.no_asm = true;
-                std::env::set_var("MAKEPAD_RUN_NO_ASM", "1");
-            }
-            "--allow-c" => {
-                options.allow_c = true;
-                std::env::set_var("MAKEPAD_RUN_ALLOW_C", "1");
-            }
-            _ => {}
+        if a == "--no-asm" {
+            options.no_asm = true;
+            std::env::set_var("RELAX_NO_ASM", "1");
+        } else if let Err(e) = crate::options::apply_grant(a, &mut options, &mut runtime) {
+            eprintln!("{}: {e}", crate::tool_name());
+            std::process::exit(2);
         }
     }
     options.live |= args.get(1).map(String::as_str) == Some("live");
@@ -402,26 +556,42 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
         options.cpu = relax_backend::x64::detect_cpu(&options);
     }
     options.spec_hot = Some(options.spec_hot.unwrap_or_else(crate::jit::on_battery));
-    let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
-    session.options.target = match session.options.check_target {
-        crate::options::CheckTarget::WindowsX64 => "x86_64-pc-windows-gnu",
-        crate::options::CheckTarget::MacosArm64 => "aarch64-apple-darwin",
-        crate::options::CheckTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
-        crate::options::CheckTarget::AndroidArm64 => "aarch64-linux-android",
-        crate::options::CheckTarget::IosArm64 => "aarch64-apple-ios",
-        crate::options::CheckTarget::Web(w) => crate::options::CheckTarget::web_triple(w),
-        _ if cfg!(target_os = "android") => "aarch64-linux-android",
-        _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
-        _ if cfg!(target_os = "ios") => "aarch64-apple-ios",
-        _ if cfg!(windows) => "x86_64-pc-windows-gnu",
-        _ => "x86_64-unknown-linux-gnu",
-    }.to_string();
+    let mut session = crate::Session { options, runtime };
+    session.options.target = session.options.check_target.triple().to_string();
     std::sync::Arc::new(session)
+}
+
+/// A `makepad run` host (Sandboxed) takes the grants from its words before `--` alone: their
+/// environment names, and an ambient self-exec line, leave the process before its options are
+/// read. Bare relax (Open) reads the names as well.
+#[cfg(test)]
+#[test]
+fn a_sandboxed_host_takes_its_grants_from_its_words_and_bare_relax_from_its_environment_too() {
+    isolated_test!(a_sandboxed_host_takes_its_grants_from_its_words_and_bare_relax_from_its_environment_too);
+    use relax_base::compile_time::{replace_policy_in_test, Policy};
+    let named = [("RELAX_ALLOW_C", "1"), ("RELAX_MODULES_TRUSTED", "1"), ("RELAX_SANDBOX_NOCHECK", "1"), ("RELAX_SANDBOX_FUEL", "0"), ("RELAX_MODULE_FUEL", "7")];
+    for (name, value) in named {
+        std::env::set_var(name, value);
+    }
+    let words = |args: &[&str]| {
+        let s = session_from_env(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        crate::options::grant_words(&s.options, &s.runtime)
+    };
+    // (this test plays both entry points)
+    unsafe { replace_policy_in_test(Policy::Open) };
+    let all = ["--allow-c", "--allow-host-modules", "--allow-unchecked-modules", "--allow-unmetered-modules", "--allow-module-fuel=7"];
+    assert_eq!(words(&["relax", "run"]), all, "bare relax reads the grants' names");
+    std::env::set_var("RELAX_SELF_EXEC", "/forged\u{1f}run\u{1f}--allow-host-modules\u{1f}--");
+    unsafe { replace_policy_in_test(Policy::Sandboxed) };
+    assert_eq!(words(&["makepad", "run", "--allow-c", "--allow-module-fuel=5", "p", "--", "--allow-host-modules"]), ["--allow-c", "--allow-module-fuel=5"], "a Sandboxed host's grants are its words before `--`");
+    for name in named.map(|(n, _)| n).into_iter().chain(["RELAX_SELF_EXEC"]) {
+        assert_eq!(std::env::var_os(name), None, "a Sandboxed host drops {name} from its environment");
+    }
 }
 
 pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     registry_net::install();
-    if std::env::var_os("MAKEPAD_RUN_CODE_SIG").is_some() {
+    if std::env::var_os("RELAX_CODE_SIG").is_some() {
         relax_backend::regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // a program's own arguments after `--` may be any bytes (`makepad run p -- $'\xff'`): Relax
@@ -432,14 +602,14 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     let mut k = 0;
     args.retain(|a| {
         k += 1;
-        !(k <= end && (a == "--no-asm" || a == "--allow-c"))
+        !(k <= end && (a == "--no-asm" || crate::options::is_grant_word(a)))
     });
     if args.get(1).map(String::as_str) == Some("--version") {
-        println!("makepad run {}", PROVENANCE);
+        println!("Relax {}", PROVENANCE);
         std::process::exit(0);
     }
     if args.len() < 3 && !matches!(args.get(1).map(String::as_str), Some("serve" | "clean")) {
-        eprintln!("makepad: {} needs an argument; run `makepad help {}`", args.get(1).map_or("this command", String::as_str), args.get(1).map_or("", String::as_str));
+        eprintln!("relax: {} needs an argument; run `{tool} help {}`", args.get(1).map_or("this command", String::as_str), args.get(1).map_or("", String::as_str), tool = crate::tool_name());
         std::process::exit(2);
     }
     match args[1].as_str() {
@@ -485,7 +655,8 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             os::proc::exit(run::cmd_run(sess, &a));
         }
         "serve" => os::proc::exit(serve_rpc::cmd_serve(sess, &args[2..])),
-        // `makepad clean [-p <package>]`: remove the workspace's <target>/relax (clean.rs)
+        // `makepad clean [-p <package> | --shared-code]`: remove the workspace's <target>/relax, or
+        // the shared code stores (clean.rs)
         "clean" => std::process::exit(clean::cmd_clean(&args[2..])),
         "schema" | "hover" | "definition" => os::proc::exit(serve_rpc::query(sess, &args[1], &args[2..])),
         // `makepad fix --to-strict [--units u.json] <package>`: check in relaxed mode (all features
@@ -503,7 +674,7 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
         // lib and integration tests, each a harness program (run.rs `--harness`)
         "test" if args[2..].iter().take_while(|a| a.as_str() != "--").any(|a| a == "--live")
             || !args[2..].iter().any(|a| a.ends_with(".rs")) => {
-            let code = test_pkg::cmd_test_package(&args[2..]);
+            let code = test_pkg::cmd_test_package(&args[2..], &crate::options::grant_words(&sess.options, &sess.runtime));
             os::proc::exit(code);
         }
         "test" => {
@@ -777,12 +948,12 @@ fn census_report(crates: &[crates::CrateUnit], per: &[census::Census], total: &c
 
 pub mod std_source;
 
-/// std sources: $MAKEPAD_RUN_STD, else <repo>/libs/relax/compiler/std next to the binary's
+/// std sources: $RELAX_STD, else <repo>/libs/relax/compiler/std next to the binary's
 /// target dir (<worktree>/<target>/release/makepad; a pool node's layout keeps the sources under
 /// <dir>/src), else the source tree this binary was built from (a CARGO_TARGET_DIR outside the
-/// checkout). None found: the build tree's path, and a hint to set MAKEPAD_RUN_STD, said once.
+/// checkout). None found: the build tree's path, and a hint to set RELAX_STD, said once.
 pub fn std_dir() -> String {
-    if let Ok(d) = std::env::var("MAKEPAD_RUN_STD") {
+    if let Ok(d) = std::env::var("RELAX_STD") {
         return d;
     }
     let candidates = std_candidates(None);
@@ -790,7 +961,7 @@ pub fn std_dir() -> String {
         return c.clone();
     }
     static HINT: std::sync::Once = std::sync::Once::new();
-    HINT.call_once(|| eprintln!("makepad-run: no std sources found (looked in {}): set MAKEPAD_RUN_STD=<makepad checkout>/libs/relax/compiler/std", candidates.join(", ")));
+    HINT.call_once(|| eprintln!("relax: no std sources found (looked in {}): set RELAX_STD=<checkout>/libs/relax/compiler/std", candidates.join(", ")));
     concat!(env!("CARGO_MANIFEST_DIR"), "/std").to_string()
 }
 
@@ -799,7 +970,8 @@ pub fn std_dir() -> String {
 /// under <dir>/src, and the tree the binary was built from. The workspace's tree comes first: a
 /// lease's binary matches the lease's tree, and the tree beside it may have moved on since.
 pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
-    let mut d = std::env::current_exe().unwrap_or_default();
+    // the loader's own path, not a run's link of it (selfexe.rs)
+    let mut d = crate::dirs::loader_exe().unwrap_or_default();
     for _ in 0..3 {
         d.pop();
     }
@@ -820,7 +992,9 @@ pub fn std_candidates(workspace: Option<&str>) -> Vec<String> {
 fn a_workspace_inside_a_checkout_takes_that_checkouts_std_before_the_one_beside_the_binary() {
     let v = std_candidates(Some("/t/lane/apps/commercial"));
     let at = |c: &str| v.iter().position(|x| x == c);
-    let mut beside = std::env::current_exe().unwrap();
+    // the binary is the loader, as std_candidates takes it: under the JIT this test's own
+    // executable (current_exe) is its run's link of the loader, in the run's folder
+    let mut beside = crate::dirs::loader_exe().unwrap();
     for _ in 0..3 {
         beside.pop();
     }
@@ -949,7 +1123,15 @@ fn load_std_crates_inner(sess: &std::sync::Arc<crate::Session>, prog: &mut progr
     Ok((core, deps))
 }
 
+/// One file's crate with Relax's std; `test`: built `--test`. Its cfg is a release build's, as
+/// `makepad test <file.rs>` builds it (`rustc -O --test`).
 pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool) -> Result<(program::Program, u32, u32), Vec<String>> {
+    load_with_std_checks(sess, root, name, test, crate::resolve::ProfileChecks { debug_assertions: false, overflow_checks: false })
+}
+
+/// `load_with_std` with the file's crate under a cargo profile's checks: its cfg has them, as
+/// run.rs gives a test's crates the profile's (`makepad test <package>`); Relax's std keeps its own.
+pub fn load_with_std_checks(sess: &std::sync::Arc<crate::Session>, root: &str, name: &str, test: bool, checks: crate::resolve::ProfileChecks) -> Result<(program::Program, u32, u32), Vec<String>> {
     pmhost::install();
     let mut prog = program::Program::new(sess);
     prog.std_simd = std_simd_wanted([root]);
@@ -958,6 +1140,7 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
     if test {
         cfgset.set.push("test".to_string());
     }
+    cfgset.set.extend(checks.cfgs().map(str::to_string));
     // a single file is edition 2021 unless its header says otherwise (`//@ edition: 2024`,
     // the compiletest directive; rustc takes it as --edition)
     let edition = crate::vfs::read_to_string(root).ok().and_then(|src| {
@@ -1009,6 +1192,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     jit::set_program_args(pa);
     let t0 = Instant::now();
     let path = workspace_file_path(root);
+    // the `unused_imports` / `unused_macros` lints of the check below need the load's import and
+    // macro uses, as the package form records them (run.rs test_lints): without them every
+    // import of the file was reported unused
+    relax_types::macros::uses::record(true);
+    relax_front::program::set_record_import_uses(true);
     let (mut prog, core, krate) = match load_with_std(sess, &path, "test_crate", true) {
         Ok(x) => x,
         Err(e) => {
@@ -1049,7 +1237,10 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         for error in enum_errors { eprintln!("error: {}", error); }
         return 1;
     }
-    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true);
+    let check_errors = run::check_test_subjects(&mut u, krate, &[krate], true, false);
+    // (what the tests' own code resolves and expands from now on is no lint's input)
+    relax_types::macros::uses::record(false);
+    relax_front::program::set_record_import_uses(false);
     if check_errors > 0 {
         eprintln!("error: could not compile `{root}` (test) due to {check_errors} previous error{}: no test ran", if check_errors == 1 { "" } else { "s" });
         return 101;
@@ -1071,6 +1262,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         }
     }
     let total_runs = runs.len();
+    // the platform's start code runs the program's constructors before the harness (sections.rs)
+    if let Err(e) = unsafe { crate::sections::run_constructors(&mut *u, krate, None) } {
+        eprintln!("error: {e}");
+        return 101;
+    }
     for (ri, d) in runs.into_iter().enumerate() {
         let last_round = ri + tests.len() >= total_runs;
         let name = u.prog.def_path(d);
@@ -1089,15 +1285,28 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         let r = if runtime.test_domains <= 1 {
             // the program's main on a program stack (large, lazily committed, guarded)
             let mut r = None;
-            crate::stack::on_program_stack(jit::program_stack_changed, || r = Some(unsafe { jit::call_jit(up, entry, 0) }));
+            crate::stack::on_program_stack(jit::program_stack_changed, || {
+                let _program = crate::os::program_thread();
+                r = Some(unsafe { jit::call_jit(up, entry, 0) })
+            });
             r.expect("program main returned")
         } else {
             // the same test at the same time in N domains of this unit (domain 0 + N-1 new
             // blocks), each on its own thread: a static shared between them fails its asserts
             let bases: Vec<u64> = std::iter::once(u.syms.dom0()).chain((1..runtime.test_domains).map(|_| crate::owner::call(crate::owner::Class::Program, || crate::domain::create(&u)))).collect();
+            // a new domain's statics are their initial images: its constructors run in it too
+            for &b in &bases[1..] {
+                if let Err(e) = unsafe { crate::sections::run_constructors(up, krate, Some(b)) } {
+                    eprintln!("error: {e}");
+                    return 101;
+                }
+            }
             let upa = up as usize;
             let rs: Vec<_> = std::thread::scope(|sc| {
-                let hs: Vec<_> = bases.iter().map(|&b| sc.spawn(move || unsafe { jit::call_jit_in(upa as *mut jit::Unit, b, entry, 0) })).collect();
+                let hs: Vec<_> = bases.iter().map(|&b| sc.spawn(move || {
+                    let _program = crate::os::program_thread();
+                    unsafe { jit::call_jit_in(upa as *mut jit::Unit, b, entry, 0) }
+                })).collect();
                 hs.into_iter().map(|h| h.join().expect("domain test thread")).collect()
             });
             for &b in &bases[1..] {
@@ -1145,7 +1354,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             rules.push_str(&format!("{} {}  ", n, u.stats.inline_rules[i]));
         }
         println!("inlined call sites by rule: {}", rules);
-        if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() {
+        if std::env::var("RELAX_PASS_TIMES").is_ok() {
             let mut passes = String::new();
             for i in 0..relax_backend::stats::PASS_NAMES.len() {
                 passes.push_str(&format!("{} {:.2}  ", relax_backend::stats::PASS_NAMES[i], relax_backend::stats::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
@@ -1292,24 +1501,30 @@ mod reload_items_tests;
 #[cfg(test)]
 mod value_tests;
 
+#[cfg(all(test, any(target_os = "linux", target_vendor = "apple")))]
+mod progsig_tests;
+
 #[cfg(test)]
 mod check_lint_tests;
+
+#[cfg(test)]
+mod check_reuse_tests;
 
 #[cfg(test)]
 #[test]
 fn round18_rpit_diagnostic() {
     // `makepad test` is process-global (it installs the runtime and exits): run it in a child of
     // this test binary, as lazy_reload_tests does, instead of naming a built makepad binary.
-    const CHILD: &str = "MAKEPAD_RUN_ROUND18_RPIT_CHILD";
+    const CHILD: &str = "RELAX_ROUND18_RPIT_CHILD";
     let dir = env!("CARGO_MANIFEST_DIR");
     if std::env::var_os(CHILD).is_some() {
         let sess = session_from_env(&[]);
         os::proc::exit(cmd_test(&sess, &[format!("{dir}/tests/rpit.rs")]));
     }
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = crate::test_child::output(std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "round18_rpit_diagnostic", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1").env("MAKEPAD_RUN_STD", format!("{dir}/std")).env("MAKEPAD_RUN_CACHE", "off")
-        .env("MAKEPAD_HIDE_WINDOWS", "1").env("SANDBOX_MUTE", "1").output().unwrap();
+        .env(CHILD, "1").env("RELAX_STD", format!("{dir}/std")).env("RELAX_CACHE", "off")
+        .env("MAKEPAD_HIDE_WINDOWS", "1").env("MAKEPAD_MUTE", "1"));
     let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     eprintln!("{all}");
     assert!(output.status.success());
@@ -1330,7 +1545,6 @@ pub unsafe fn reset_statics() {
     inspect::reset_statics();
     invalid::reset_statics();
     jit::reset_statics();
-    lower::reset_statics();
     mainprof::reset_statics();
     modules::reset_statics();
     native_macros::reset_statics();
@@ -1342,6 +1556,7 @@ pub unsafe fn reset_statics() {
     reload::reset_statics();
     run::reset_statics();
     sandbox::reset_statics();
+    selfexe::reset_statics();
     stale::reset_statics();
     store::reset_statics();
     syms::reset_statics();

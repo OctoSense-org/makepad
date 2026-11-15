@@ -8,7 +8,9 @@ pub use crate::gpu as cuda;
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub use makepad_ai_cuda::llm_ops;
 pub use makepad_ai_loader::prof;
+pub use makepad_ai_loader::{F32Weight, WeightKey, WeightOwner, WeightOwnerTrace};
 pub use makepad_ai_metal::{BackendCapabilities, BackendInfo, BackendKind};
+pub use makepad_ai_metal::{device_memory, device_name};
 
 pub mod metal {
     pub use makepad_ai_llm::metal_compiled::*;
@@ -18,7 +20,8 @@ pub mod metal {
 pub use metal::{
     try_add_f32, try_attention_softmax_weighted_sum_f32, try_conv2d_planar_f32,
     try_flash_attn_f32_packed, try_gelu_f32, try_group_norm_planar_f32,
-    try_layer_norm_mul_add_f32, try_matmul_nn_f32, try_matmul_nt_f32, try_mul_f32,
+    try_layer_norm_mul_add_f32, try_matmul_nn_f32, try_matmul_nt_f32, try_matmul_nt_f32_weight,
+    try_matmul_nt_f32_weight_left, try_matmul_nt_f32_weight_multi, try_mul_f32,
     try_rms_norm_mul_f32, try_silu_f32, BufferStorageMode,
     MetalGraphTensorWrite as GraphTensorWrite, MetalRuntime as Runtime,
 };
@@ -67,7 +70,7 @@ pub use crate::gpu::{
     gpu_birefnet_swin_attention, gpu_birefnet_tokens_to_planar,
     gpu_beam_cache_reorder_append, gpu_bf16_round, gpu_concat_cols, gpu_concat_rows,
     gpu_concat_rows_many,
-    gpu_conv2d_planar_cached, gpu_conv2d_planar_strided, gpu_copy_into, gpu_device_available, gpu_download, gpu_gather_cols,
+    gpu_conv2d_planar_cached, gpu_conv2d_planar_cudnn_f16, gpu_conv2d_planar_strided, gpu_cudnn_require, gpu_copy_into, gpu_device_available, gpu_download, gpu_gather_cols,
     gpu_gated_residual,
     gpu_gated_residual_mod, gpu_gated_residual_mod_round_bf16, gpu_gelu, gpu_gelu_bias_f16,
     gpu_graph_capture, gpu_graph_launch,
@@ -84,11 +87,12 @@ pub use crate::gpu::{
     gpu_linear_nt_cached_bf16_mm_from_buf, gpu_linear_nt_cached_bf16_mm_from_buf_to_buf,
     gpu_linear_nt_cached_f8_mm, gpu_linear_nt_cached_f8_mm_from_buf,
     gpu_linear_nt_cached_f8_mm_from_buf_to_buf,
+    gpu_linear_nt_cached_fp8_dynamic_from_buf, gpu_linear_nt_cached_fp8_dynamic_from_buf_to_buf,
     gpu_stream_ring_active, gpu_stream_ring_advance, gpu_stream_ring_prime,
     gpu_stream_ring_release_slots, gpu_stream_ring_setup,
     gpu_linear_nt_cached_f16_f32acc,
     gpu_linear_nt_cached_f16,
-    gpu_perf_stats, gpu_pool_cap_override, gpu_pool_clear, gpu_pool_trim,
+    gpu_perf_stats, gpu_pool_cap_override, gpu_pool_clear, gpu_pool_alloc_bytes, gpu_pool_keep, gpu_pool_phase_end, gpu_pool_trim, GpuPoolKeep,
     gpu_rms_norm_mod_indexed, gpu_rms_norm_mul, gpu_rms_norm_mul_keyed, gpu_rms_norm_mul_bf16, gpu_rms_norm_qwen3,
     gpu_sparse_conv27,
     gpu_skintokens_michelangelo_fourier,
@@ -106,12 +110,22 @@ pub use crate::gpu::{
     gpu_splat_repo3d_tables, gpu_splat_rope_pairs_per_head,
     gpu_swiglu_gate_first, gpu_swiglu_value_gate, gpu_to_f16, gpu_upload, gpu_wavenet_gate,
     gpu_quant_linear_type_supported,
-    gpu_release_cached, gpu_runtime_trim, gpu_upload_into, gpu_upload_u32, gpu_weight_cache_ensure,
+    gpu_release_cached, gpu_runtime_trim, gpu_set_blocking_sync, gpu_memory_info, gpu_device_reset, gpu_upload_into, gpu_upload_u32, gpu_weight_cache_ensure,
     gpu_weight_cache_ensure_quant, gpu_weight_cache_ensure_bf16_keyed,
-    gpu_weight_cache_evict_prefix, gpu_weight_cache_evict_prefix_if_loaded,
-    gpu_weight_cache_protect_prefixes,
+    gpu_weight_cache_evict_owner, gpu_weight_cache_evict_keys, gpu_weight_cache_evict_all_if_loaded,
+    gpu_weight_cache_protect,
     gpu_upsample_nearest2x, GemmPrecision, GpuBf16Buf, GpuLinearPart, GpuPerfStats, GpuStepGraph, GpuTensor,
 };
+
+/// Resident weight entries and bytes for a non-owning owner trace on the active backend.
+pub fn gpu_weight_cache_resident(owner: &WeightOwnerTrace) -> std::result::Result<(usize, usize), String> {
+    #[cfg(all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))]
+    { return makepad_ai_cuda::launch::gpu_weight_cache_resident(owner); }
+    #[cfg(target_os = "macos")]
+    { return makepad_ai_metal::gpu_tensor::resident_weights(owner); }
+    #[cfg(not(any(target_os = "macos", all(any(target_os = "linux", target_os = "windows"), makepad_ai_cuda_kernels))))]
+    { let _ = owner; Ok((0, 0)) }
+}
 
 pub type GraphSession = MetalGraphSession;
 pub type PreparedGraph = MetalPreparedGraph;
@@ -373,19 +387,15 @@ impl DeviceGraphSession {
     }
 }
 
-/// Release model-owned dense CUDA weight namespaces plus every reusable
-/// activation/scratch buffer on the current thread. Teardown is deliberately
-/// conditional: a cold/CPU backend never initializes CUDA just to unload.
-/// All prefixes are attempted before an error is returned so one bad release
-/// cannot strand the remaining model namespaces.
-pub fn release_gpu_runtime_namespaces(prefixes: &[&str]) -> Result<usize> {
+/// Release every dense CUDA weight and reusable activation/scratch buffer on this thread.
+/// A cold/CPU backend never initializes CUDA just to unload. Eviction and trim
+/// are both attempted and their errors are collected.
+pub fn release_gpu_runtime_all() -> Result<usize> {
     let mut released = 0usize;
     let mut errors = Vec::new();
-    for prefix in prefixes {
-        match gpu_weight_cache_evict_prefix_if_loaded(prefix) {
-            Ok(count) => released += count,
-            Err(error) => errors.push(format!("evict {prefix:?}: {error}")),
-        }
+    match gpu_weight_cache_evict_all_if_loaded() {
+        Ok(count) => released += count,
+        Err(error) => errors.push(format!("evict all weights: {error}")),
     }
     if let Err(error) = gpu_runtime_trim() {
         errors.push(format!("trim CUDA scratch: {error}"));

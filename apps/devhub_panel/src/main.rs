@@ -3,7 +3,7 @@
 //!
 //! Its menu-bar item (where the desktop has a tray) shows the fleet at a glance: devhub's glyph
 //! (off while the master is not read, attention while something red needs a look, busy while
-//! leases run) and the counts as its tooltip. A click opens the window or brings it to the
+//! leases run) and the counts in its menu. A click opens the window or brings it to the
 //! front; the secondary click's menu has the status lines, the worst needs, "Open panel" and
 //! "Quit panel". Closing the window keeps the panel in the tray: nothing is drawn and the
 //! master is asked less often until it opens again.
@@ -29,7 +29,7 @@ script_mod! {
             main_window := Window{
                 window.title: "devhub"
                 window.inner_size: vec2(1440, 860)
-                pass +: {clear_color: theme.color_bg_app}
+                pass +: {clear_color: theme.color_chart_ground}
                 body +: {
                     padding: 0 spacing: 0
                     panel := mod.widgets.DevhubPanel{}
@@ -60,7 +60,7 @@ impl App {
         menu.push(TrayMenuItem::Line);
         menu.push(TrayMenuItem::item(OPEN, "Open panel"));
         menu.push(TrayMenuItem::item(QUIT, "Quit panel"));
-        cx.set_tray(TrayIcon { id: TRAY, image: TrayImage { width: glyph::SIZE, height: glyph::SIZE, alpha: glyph::alpha(glance.glyph) }, tooltip: glance.tooltip.clone(), menu, dropdown: true });
+        cx.set_tray(TrayIcon { id: TRAY, image: TrayImage { width: glyph::SIZE, height: glyph::SIZE, alpha: glyph::alpha(glance.glyph) }, tooltip: String::new(), menu, dropdown: true });
         self.tray = Some(glance);
     }
 

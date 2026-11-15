@@ -20,7 +20,7 @@ unsafe impl<P: PinSafePointer> PinSafePointer for Pin<P> {}
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 #[fundamental]
-#[cfg_attr(not(relax_check), lang = "pin")]
+#[lang = "pin"]
 pub struct Pin<P> {
     pointer: P,
 }
@@ -42,7 +42,7 @@ impl<P: Deref> Pin<P> {
     {
         Pin { pointer }
     }
-    #[cfg_attr(not(relax_check), lang = "new_unchecked")]
+    #[lang = "new_unchecked"]
     pub const unsafe fn new_unchecked(pointer: P) -> Pin<P> {
         Pin { pointer }
     }
@@ -64,8 +64,9 @@ impl<P: DerefMut> Pin<P> {
     pub const fn as_mut(&mut self) -> Pin<&mut P::Target> {
         Pin { pointer: &mut *self.pointer }
     }
-    /// Through a pinned pinning pointer to its pointee: the inner pointer never moves it.
-    pub const fn as_deref_mut(self: Pin<&mut Pin<P>>) -> Pin<&mut P::Target> {
+    /// `Pin<&mut Pin<P>>` -> `Pin<&mut P::Target>`, as real core's (tokio's AsyncRead / AsyncWrite
+    /// for `Pin<P>` call it).
+    pub fn as_deref_mut(self: Pin<&mut Pin<P>>) -> Pin<&mut P::Target> {
         Pin { pointer: &mut *self.pointer.pointer }
     }
     pub fn set(&mut self, value: P::Target)
@@ -85,14 +86,10 @@ impl<'a, T: ?Sized> Pin<&'a T> {
     }
 }
 
-impl<T: ?Sized> Pin<&'static T> {
-    /// A static borrow never ends, so its pointee never moves.
-    pub const fn static_ref(r: &'static T) -> Pin<&'static T> {
-        Pin { pointer: r }
-    }
-}
-
 impl<'a, T: ?Sized> Pin<&'a mut T> {
+    pub const fn into_ref(self) -> Pin<&'a T> {
+        Pin { pointer: self.pointer }
+    }
     pub const fn get_mut(self) -> &'a mut T
     where
         T: Unpin,
@@ -102,17 +99,8 @@ impl<'a, T: ?Sized> Pin<&'a mut T> {
     pub const unsafe fn get_unchecked_mut(self) -> &'a mut T {
         self.pointer
     }
-    pub const fn into_ref(self) -> Pin<&'a T> {
-        Pin { pointer: self.pointer }
-    }
     pub unsafe fn map_unchecked_mut<U: ?Sized, F: FnOnce(&mut T) -> &mut U>(self, func: F) -> Pin<&'a mut U> {
         Pin { pointer: func(self.pointer) }
-    }
-}
-
-impl<T: ?Sized> Pin<&'static mut T> {
-    pub const fn static_mut(r: &'static mut T) -> Pin<&'static mut T> {
-        Pin { pointer: r }
     }
 }
 

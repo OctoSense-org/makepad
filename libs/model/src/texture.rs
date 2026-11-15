@@ -28,9 +28,6 @@ impl Texture {
         Ok(Self { width, height, rgb })
     }
     pub fn from_png(bytes: &[u8], limits: &Limits) -> Result<Self> {
-        if bytes.len() > limits.max_texture_bytes {
-            return Err(Error::Budget("texture bytes"));
-        }
         let options = DecoderOptions::default()
             .set_max_width(limits.max_texture_dimension as usize)
             .set_max_height(limits.max_texture_dimension as usize)
@@ -86,6 +83,7 @@ impl Texture {
         })
     }
     pub fn to_png(&self, limits: &Limits) -> Result<Vec<u8>> {
+        let _timer = crate::build_detail::CompileTimer::new(crate::build_detail::CompilePhase::Png);
         if self.rgb.len() != dimensions(self.width, self.height, limits)? {
             return Err(Error::Invalid("texture pixel count"));
         }
@@ -99,9 +97,6 @@ impl Texture {
         PngEncoder::new(&self.rgb, options)
             .encode(&mut out)
             .map_err(|_| Error::Invalid("PNG encode"))?;
-        if out.len() > limits.max_texture_bytes {
-            return Err(Error::Budget("encoded texture bytes"));
-        }
         Ok(out)
     }
     /// Deterministic filled UV-space disk. Pixels are top-left origin; UV V is
@@ -163,9 +158,6 @@ fn dimensions(width: u32, height: u32, limits: &Limits) -> Result<usize> {
         .checked_mul(height as usize)
         .and_then(|v| v.checked_mul(3))
         .ok_or(Error::Budget("texture pixels"))?;
-    if len > limits.max_texture_bytes {
-        return Err(Error::Budget("texture pixels"));
-    }
     Ok(len)
 }
 
@@ -203,9 +195,6 @@ impl RgbaImage {
         Ok(())
     }
     pub fn from_png(bytes: &[u8], limits: &Limits) -> Result<Self> {
-        if bytes.len() > limits.max_texture_bytes {
-            return Err(Error::Budget("PNG bytes"));
-        }
         let options = DecoderOptions::default()
             .set_max_width(limits.max_texture_dimension as usize)
             .set_max_height(limits.max_texture_dimension as usize)
@@ -251,6 +240,7 @@ impl RgbaImage {
         })
     }
     pub fn to_png(&self, limits: &Limits) -> Result<Vec<u8>> {
+        let _timer = crate::build_detail::CompileTimer::new(crate::build_detail::CompilePhase::Png);
         self.validate(limits)?;
         let options = EncoderOptions::new(
             self.width as usize,
@@ -262,9 +252,6 @@ impl RgbaImage {
         PngEncoder::new(&self.pixels, options)
             .encode(&mut bytes)
             .map_err(|_| Error::Invalid("PNG encode"))?;
-        if bytes.len() > limits.max_texture_bytes {
-            return Err(Error::Budget("PNG encoded bytes"));
-        }
         Ok(bytes)
     }
     pub fn memory_bytes(&self) -> usize {
@@ -280,9 +267,6 @@ impl RgbaImage {
         ctx: &mut crate::mesh::Context<'_>,
     ) -> Result<()> {
         self.validate(limits)?;
-        if iterations > 64 {
-            return Err(Error::Budget("dilation iterations"));
-        }
         if self.pixels.len().saturating_mul(3) > limits.mesh.max_bytes {
             return Err(Error::Budget("dilation working bytes"));
         }
@@ -346,6 +330,10 @@ impl RgbaImage {
         if self.pixels.len().saturating_mul(3) > limits.mesh.max_bytes {
             return Err(Error::Budget("mip working bytes"));
         }
+        if self.width == 1 && self.height == 1 {
+            return Ok(Vec::new());
+        }
+        let transfer = (encoding == ImageEncoding::Srgb).then(SrgbBytes::new);
         let mut levels = Vec::new();
         let mut previous = self;
         while previous.width > 1 || previous.height > 1 {
@@ -370,7 +358,7 @@ impl RgbaImage {
                             sum[3] += a;
                             for c in 0..3 {
                                 sum[c] += match encoding {
-                                    ImageEncoding::Srgb => srgb_to_linear(p[c] as f64 / 255.) * a,
+                                    ImageEncoding::Srgb => transfer.as_ref().unwrap().linear[p[c] as usize] * a,
                                     ImageEncoding::Normal => p[c] as f64 / 127.5 - 1.,
                                     ImageEncoding::Linear => p[c] as f64 / 255.,
                                 };
@@ -390,14 +378,12 @@ impl RgbaImage {
                         }
                     }
                     for c in 0..3 {
-                        let value = match encoding {
-                            ImageEncoding::Srgb => {
-                                linear_to_srgb(if sum[3] > 1e-20 { sum[c] / sum[3] } else { 0. })
-                            }
-                            ImageEncoding::Normal => sum[c],
-                            ImageEncoding::Linear => sum[c] / count,
+                        image.pixels[dst + c] = match encoding {
+                            ImageEncoding::Srgb => transfer.as_ref().unwrap().encode(
+                                if sum[3] > 1e-20 { sum[c] / sum[3] } else { 0. }),
+                            ImageEncoding::Normal => unit_byte(sum[c]),
+                            ImageEncoding::Linear => unit_byte(sum[c] / count),
                         };
-                        image.pixels[dst + c] = unit_byte(value);
                     }
                     image.pixels[dst + 3] = unit_byte(sum[3] / count);
                 }
@@ -407,6 +393,51 @@ impl RgbaImage {
         }
         Ok(levels)
     }
+}
+/// Transfer tables belong to one image operation, never to a retained build.
+/// The encoder thresholds are found with the portable reference itself: the
+/// inverse transfer only supplies a search bracket, not the rounding decision.
+pub(crate) struct SrgbBytes {
+    pub linear: [f64; 256],
+    starts: [f64; 255],
+}
+impl SrgbBytes {
+    pub fn new() -> Self {
+        let linear = srgb_decode_table();
+        let starts = std::array::from_fn(|i| {
+            let want = i as u8 + 1;
+            let estimate = srgb_to_linear((i as f64 + 0.5) / 255.).to_bits();
+            let (mut lo, mut hi) = (estimate.saturating_sub(16), estimate + 16);
+            let byte = |bits| unit_byte(linear_to_srgb(f64::from_bits(bits)));
+            if byte(lo) >= want || byte(hi) < want {
+                lo = 0;
+                hi = 1.0f64.to_bits();
+            }
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if byte(mid) >= want { hi = mid; } else { lo = mid + 1; }
+            }
+            f64::from_bits(lo)
+        });
+        Self { linear, starts }
+    }
+    pub fn encode(&self, value: f64) -> u8 {
+        let byte = self.starts.partition_point(|start| *start <= value);
+        // Portable exp(y*ln(x)) need not be monotone at its last bit. Near
+        // either neighboring byte boundary use the original arithmetic, not
+        // the bisection's choice of one transition. This absolute band is
+        // deliberately wider than the kernels' few-ulp error over [0, 1].
+        let near = |start: &f64| (value - start).abs() <= 128. * f64::EPSILON;
+        if !value.is_finite() || self.starts.get(byte).is_some_and(near)
+            || byte.checked_sub(1).and_then(|i| self.starts.get(i)).is_some_and(near) {
+            unit_byte(linear_to_srgb(value))
+        } else {
+            byte as u8
+        }
+    }
+}
+pub(crate) fn srgb_decode_table() -> [f64; 256] {
+    std::array::from_fn(|i| srgb_to_linear(i as f64 / 255.))
 }
 pub(crate) fn srgb_to_linear(value: f64) -> f64 {
     if value <= 0.04045 {
@@ -433,8 +464,5 @@ fn rgba_dimensions(w: u32, h: u32, limits: &Limits) -> Result<usize> {
         .checked_mul(h as usize)
         .and_then(|v| v.checked_mul(4))
         .ok_or(Error::Budget("RGBA dimensions"))?;
-    if len > limits.max_texture_bytes {
-        return Err(Error::Budget("RGBA pixels"));
-    }
     Ok(len)
 }

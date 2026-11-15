@@ -974,7 +974,7 @@ impl SkinnedModel {
         let mut remaining_texture_bytes = 64usize * 1024 * 1024;
         let mut start = 0usize;
         let (raw_json,_)=crate::asset_morph::chunks(bytes)?;let active=crate::asset_morph::active_nodes(&raw_json)?;
-        for (_,node) in doc.nodes_slice().iter().enumerate().filter(|(i,node)| active[*i]&&node.skin.is_some()) {
+        for (_,node) in doc.nodes_slice().iter().enumerate().filter(|(i,node)| active[*i]&&node.skin.is_some()&&node.mesh.is_some()) {
             let mesh = doc.meshes_slice().get(node.mesh.ok_or("skin node has no mesh")?).ok_or("bad skin mesh")?;
             for prim in &mesh.primitives {
                 if prim.attributes.contains_key("COLOR_0") { return Err("generated skin vertex colors require material baking before export".into()); }
@@ -1176,7 +1176,7 @@ impl SkinnedModel {
         // their joint order and decoded inverse binds are identical. Normal
         // library characters export separate body/head skins this way.
         let mut active_skins=std::collections::BTreeSet::new();
-        for (i,node) in node_vals.iter().enumerate().filter(|(i,node)|active_nodes[*i]&&node.get("mesh").is_some()) {
+        for (i,node) in node_vals.iter().enumerate().filter(|(i,node)|active_nodes[*i]&&(node.get("mesh").is_some()||node.get("extensions").and_then(|e|e.get("MSFT_lod")).is_some())) {
             let Some(skin)=node.get("skin") else{continue};
             let index=skin.f64().filter(|v|v.is_finite()&&*v>=0.&&v.fract()==0.&&*v<=usize::MAX as f64)
                 .ok_or_else(||format!("node {i}: invalid skin index"))? as usize;
@@ -1230,6 +1230,8 @@ impl SkinnedModel {
         let mut mesh_node = 0;
         for (node_index, n) in node_vals.iter().enumerate() {
             if !active_nodes[node_index]{continue}
+            // Keep the same mesh frame even when this LOD owner draws nothing.
+            if n.get("skin").is_some() && (n.get("mesh").is_some() || n.get("extensions").and_then(|e|e.get("MSFT_lod")).is_some()) { mesh_node = node_index; }
             let (Some(mesh_index), Some(_)) =
                 (n.get("mesh").and_then(Val::usize), n.get("skin"))
             else {
@@ -1361,7 +1363,11 @@ impl SkinnedModel {
             }
         }
         if vertices.is_empty() {
-            return Err("no skinned primitives found".into());
+            let empty_lod=node_vals.iter().enumerate().any(|(i,n)| active_nodes[i] && n.get("skin").is_some()
+                && n.get("mesh").is_none() && n.get("extensions").and_then(|e|e.get("MSFT_lod")).is_some());
+            if !empty_lod || node_vals.iter().enumerate().any(|(i,n)| active_nodes[i] && n.get("skin").is_some() && n.get("mesh").is_some()) {
+                return Err("no skinned primitives found".into());
+            }
         }
 
         // Animations.
@@ -1567,9 +1573,9 @@ impl SkinnedModel {
                 let image=if let Some(bytes)=bytes{crate::material_surface::texture_work(crate::material_surface::TextureWork::DecodeMip,||crate::renderer::decode_generated_png(&bytes,4096,budget))?}else{let mut image=makepad_draw::ImageBuffer::default();image.width=1;image.height=1;image.data=vec![0xffff_ffff];image};
                 let texture=crate::material_surface::texture_work(crate::material_surface::TextureWork::DecodeMip,||PreparedTexture::prepare(image,semantic));budget=budget.checked_sub(texture.bytes()).ok_or("skin textures exceed upload budget")?;Ok(texture)
             };
-            let base=image(texture("baseColorTexture"),PixelSemantic::Color)?;
-            let orm=image(texture("metallicRoughnessTexture"),PixelSemantic::Data)?;
             let definition=primitive.material.and_then(|i|crate::model::gltf_material_surface(&json,bin,i)).unwrap_or_else(MaterialSurface::default);
+            let base=image(texture("baseColorTexture"),if definition.msdf.is_some(){PixelSemantic::Data}else{PixelSemantic::Color})?;
+            let orm=image(texture("metallicRoughnessTexture"),PixelSemantic::Data)?;
             let surface=PreparedSurface::prepare(definition,&mut budget)?;
             let metallic=pbr.and_then(|m|m.get("metallicFactor")).and_then(Val::f64).unwrap_or(1.0)as f32;
             let roughness=pbr.and_then(|m|m.get("roughnessFactor")).and_then(Val::f64).unwrap_or(1.0)as f32;

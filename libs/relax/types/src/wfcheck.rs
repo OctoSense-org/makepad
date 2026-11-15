@@ -283,7 +283,7 @@ impl Tcx {
         let f = &prog.files[def.file as usize];
         let item = f.ast.item(def.item);
         let ItemKind::Fn(sig_id, _, _) = item.kind else { return Vec::new() };
-        if !matches!(f.ast.fn_sig(sig_id).self_param, Some(crate::ast::SelfParam::Typed(..))) { return Vec::new(); }
+        if !matches!(f.ast.fn_sig(sig_id).self_param.get(), Some(crate::ast::SelfParam::Typed(..))) { return Vec::new(); }
         let parent = prog.def(def.parent);
         let self_ty = match parent.kind {
             DefKind::Impl => match self.impl_self.get(&def.parent) { Some(&t) => t, None => return Vec::new() },
@@ -424,7 +424,7 @@ pub mod obligations {
 
     impl<'a, 'tcx> Wfcx<'a, 'tcx> {
         fn register(&mut self, goal: Goal, pos: u32) {
-            self.ocx.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
+            self.ocx.engine.register_predicate_obligation(self.infcx, self.ocx.prog, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
         }
 
         /// wfcheck.rs WfCheckingCtxt::deeply_normalize. A type that cannot be normalized stays as
@@ -727,7 +727,7 @@ pub mod obligations {
     pub(crate) fn fulfillment_message(infcx: &crate::infer::InferCtxt<'_>, prog: &Program, code: &str, goal: &Goal) -> Option<String> {
         let tcx = infcx.tcx;
         let goal = leaf_goal(infcx, prog, goal, 0);
-        let ty_str = |t: TyId| crate::typeck::ty_to_string(false, prog, tcx, infcx.deeply_resolve_ignoring_regions(t));
+        let ty_str = |t: TyId| crate::typeck::ty_to_diag_string(prog, tcx, infcx.deeply_resolve_ignoring_regions(t));
         match &goal.predicate.kind {
             PredicateKind::Clause(ClauseKind::Trait(p)) => {
                 let mut message = format!("{code}: {}", crate::typeck::trait_error_message(prog, tcx, code, p, &mut |t| ty_str(t)));
@@ -995,7 +995,7 @@ pub mod obligations {
             w.register_wf(ty, pos);
         }
         let ret = w.normalize(ret);
-        let ret_pos = fsig.ret.and_then(|t| ty_pos(ast, t)).unwrap_or(item.name.lo);
+        let ret_pos = fsig.ret.get().and_then(|t| ty_pos(ast, t)).unwrap_or(item.name.lo);
         w.register_wf(ret, ret_pos);
         w.check_where_clauses(item.lo);
         // If the function has a body, additionally require that the return type is sized.
@@ -1056,7 +1056,9 @@ pub mod obligations {
             let PredicateKind::Clause(ClauseKind::Trait(tc)) = &p.kind else { unreachable!() };
             let def = trait_ref.def_id;
             for q in w.tcx.clauses_of(w.prog, def) {
-                if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if matches!(u.trait_ref.args.first(), Some(GenericArg::Type(t)) if matches!(w.tcx.tys.kind(*t), TyKind::Alias(..)))) { continue; }
+                // a clause on a projection is left out, except a supertrait's associated type bound
+                // (`trait B: A<X: Copy>`), which the impl meets as in rustc
+                if matches!(&q.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if matches!(u.trait_ref.args.first(), Some(GenericArg::Type(t)) if matches!(w.tcx.tys.kind(*t), TyKind::Alias(_, a) if !matches!(a.kind, crate::types::AliasTyKind::Projection { def_id } if w.prog.def(def_id).parent != def)))) { continue; }
                 let q = w.tcx.instantiate_predicate(w.prog, def, &tc.trait_ref.args, &q);
                 if crate::next_solver::wf::predicate_has_escaping_bound_vars(&w.tcx.tys, &q) { continue; }
                 // rustc predicates_of adds `Self: Trait` to a trait's predicates: the impl's own trait
@@ -1067,7 +1069,7 @@ pub mod obligations {
                     continue;
                 }
                 // Elaborate::All: what the trait's bounds imply holds too
-                for e in w.tcx.supertraits(w.prog, q) {
+                for e in w.tcx.elaborate(w.prog, q) {
                     if matches!(&e.kind, PredicateKind::Clause(ClauseKind::Trait(u)) if u.trait_ref.def_id == def) { continue; }
                     w.register(Goal { param_env: w.env.clone(), predicate: e }, self_pos);
                 }
@@ -1279,7 +1281,7 @@ pub mod obligations {
         let ret = ocx.normalize_ty(&env, sig.ret);
         ocx.register_obligation(Goal { param_env: env.clone(), predicate: collect::trait_predicate(term, vec![GenericArg::Type(ret)]) });
         let bad = ocx.try_evaluate_obligations().into_iter().any(|e| matches!(e, NextSolverError::TrueError(_)));
-        let pos = ast.fn_sig(*s).ret.and_then(|t| ty_pos(ast, t)).unwrap_or(item.name.lo);
+        let pos = ast.fn_sig(*s).ret.get().and_then(|t| ty_pos(ast, t)).unwrap_or(item.name.lo);
         if !bad {
             // the region constraints of the `Termination` proof hold too (resolve_regions; a
             // placeholder one is "implementation of `..` is not general enough")
@@ -1535,7 +1537,7 @@ pub mod obligations {
         for p in ast.list(generics.params) {
             match p.kind {
                 ast::GenericParamKind::Lifetime(_) => continue,
-                ast::GenericParamKind::Type(_, Some(t)) => {
+                ast::GenericParamKind::Type(_, default) if let Some(t) = default.get() => {
                     let d = w.tcx.lower_ty(&cx, w.prog, def.file, def.scope, &env, t);
                     let f = w.tcx.tys.flags(d);
                     if !f.intersects(TypeFlags::HAS_PARAM) && !f.intersects(TypeFlags::HAS_ANY_INFER) && !w.tcx.tys.has_error(d) && crate::wfcheck::obligations::arity_ok(w.tcx, w.prog, d) {

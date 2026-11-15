@@ -248,6 +248,24 @@ pub fn uplink_next(timeout_ms: u32, out: &mut [u8]) -> u64 {
 
 pub(super) fn active() -> bool { ACTIVE.load(Ordering::Acquire) }
 
+/// What `locate_head` locates with while a session runs: its runtime, its reference (local)
+/// space and its head (view) space. Held across a locate, so the session's end (which clears it
+/// before destroying the spaces) waits for one in flight.
+static HEAD_LOCATOR: Mutex<Option<(Arc<Runtime>, XrSpace, XrSpace)>> = Mutex::new(None);
+
+pub fn locate_head(time_ns: u64) -> Option<crate::types::XrHeadAt> {
+    let locator = lock(&HEAD_LOCATOR);
+    let (rt, local_space, head_space) = locator.as_ref()?;
+    let mut velocity = XrSpaceVelocity::default();
+    let mut location = XrSpaceLocation { next: &mut velocity as *mut _ as *mut _, ..Default::default() };
+    unsafe { (rt.xr.xrLocateSpace)(*head_space, *local_space, XrTime::from_nanos(time_ns as i64), &mut location) }.log_error("xrLocateSpace head");
+    if !location.location_flags.contains(XrSpaceLocationFlags::ORIENTATION_VALID | XrSpaceLocationFlags::POSITION_VALID) { return None; }
+    // XR_SPACE_VELOCITY_LINEAR_VALID_BIT 1, ANGULAR 2
+    let v = |a: XrVector3f, bit: u64| if velocity.velocity_flags & bit != 0 { [a.x, a.y, a.z] } else { [0.0; 3] };
+    let (o, p) = (location.pose.orientation, location.pose.position);
+    Some(crate::types::XrHeadAt { orientation: [o.x, o.y, o.z, o.w], position: [p.x, p.y, p.z], linear_velocity: v(velocity.linear_velocity, 1), angular_velocity: v(velocity.angular_velocity, 2) })
+}
+
 /// One eye's pixels while an XR session runs (the XR window is two of them side by side).
 pub(super) fn eye_px() -> Option<[u32; 2]> { EYE_PX.get().filter(|_| active()).map(|_| eye_at(EYE_PERCENT.load(Ordering::Acquire))) }
 
@@ -274,6 +292,7 @@ pub(super) fn create_window(sid: u32, id: Id) -> bool {
     let shared = Shared::global();
     let previous = lock(&shared.registry).xr_window.replace((sid, id));
     if previous.is_some() { xr_log!("a second XR window replaces {previous:?}"); }
+    crate::backend::shell::window_made();
     let refresh = lock(&shared.state).refresh;
     shared.emit_to(sid, id, clock_ns(), |q, id| {
         q.display(id, 1., refresh);
@@ -1045,6 +1064,8 @@ struct CxOpenXrSession {
     /// deadline)
     frame_us: Vec<[u32; 4]>,
     stereo_asked_ns: u64,
+    /// The local space's generation: counted up at each reference space change (a recenter).
+    space: u32,
     /// the refresh rate last requested (mHz; 0 none)
     requested_refresh_mhz: u32,
     /// stereo frames taken this window with eyes of their own (`HalCmd::XrFrameEyes`), and
@@ -1308,7 +1329,7 @@ impl CxOpenXrSession {
             inputs: inputs.clone(), tracker: None, active: false, focused: false, active_display_refresh_rate_hz: None, panel, cursor, stereo: Some(stereo),
             pointer: Pointer { hand: 1, ..Default::default() }, controllers: Default::default(), hands: Default::default(),
             panel_shown: None, panel_visible: true, panel_over_stereo: false, panel_follow: None, cursor_ready: false, stereo_asked: None, stereo_shown: None, stereo_focus: 0.0, depth_layer, stereo_asked_at: Instant::now(),
-            stats: [0; 4], frame_us: Vec::new(), stereo_asked_ns: 0, requested_refresh_mhz: 0, eyes_own: 0, eyes_asked: 0, paths: [0; 3], phases: [0; 7], stats_at: Instant::now(), stereo_b: Some(stereo_b), stereo_shown_chain: None,
+            stats: [0; 4], frame_us: Vec::new(), stereo_asked_ns: 0, space: 0, requested_refresh_mhz: 0, eyes_own: 0, eyes_asked: 0, paths: [0; 3], phases: [0; 7], stats_at: Instant::now(), stereo_b: Some(stereo_b), stereo_shown_chain: None,
             stereo_base_format: format, stereo_blit: blit, linear_ok, foveation_applied: u32::MAX, eye_scale: EyeScale::new(xr, rt.instance, handle), chain_spare: Vec::new(), chain_build: None, hands_and_controllers: true, environment_depth: true };
         let _ = session.update_active_display_refresh_rate();
         let stop = Arc::new(AtomicBool::new(false));
@@ -1318,6 +1339,7 @@ impl CxOpenXrSession {
                 .spawn(move || track(rt, inputs, handle, local_space, head_space, stop)).map_err(|e| format!("XR tracking thread: {e}"))?
         };
         session.tracker = Some((thread, stop));
+        *lock(&HEAD_LOCATOR) = Some((rt.clone(), local_space, head_space));
         Ok(session)
     }
 
@@ -1398,9 +1420,16 @@ impl CxOpenXrSession {
                     }
                 }
                 XrStructureType::EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING => {
-                    // the old backend reset its depth (TSDF) store here; the app sees the new
-                    // poses in the next frames
-                    xr_log!("OpenXR reference space changed");
+                    // a recenter: the XR window learns it (`XrSpace`); the poses in the next
+                    // frames are in the moved space
+                    self.space = self.space.wrapping_add(1);
+                    xr_log!("OpenXR reference space changed (generation {})", self.space);
+                    let shared = Shared::global();
+                    let xr_window = lock(&shared.registry).xr_window;
+                    if let Some((sid, id)) = xr_window {
+                        let space = self.space;
+                        shared.emit_to(sid, id, clock_ns(), |q, id| q.xr_space(id, space));
+                    }
                 }
                 XrStructureType::EVENT_DATA_INSTANCE_LOSS_PENDING => { xr_log!("instance loss pending"); return false; }
                 _ => {}
@@ -2079,6 +2108,8 @@ impl Drop for CxOpenXrSession {
         unsafe { (xr.xrPassthroughPauseFB)(self.passthrough) }.log_error("xrPassthroughPauseFB");
         unsafe { (xr.xrDestroyPassthroughFB)(self.passthrough) }.log_error("xrDestroyPassthroughFB");
         if self.depth_swap_chain.0 != 0 { unsafe { (xr.xrDestroyEnvironmentDepthSwapchainMETA)(self.depth_swap_chain) }.log_error("xrDestroyEnvironmentDepthSwapchainMETA"); }
+        // (no head locate runs into the spaces from here: one in flight is waited for)
+        *lock(&HEAD_LOCATOR) = None;
         unsafe { (xr.xrDestroySpace)(self.head_space) }.log_error("xrDestroySpace");
         unsafe { (xr.xrDestroySpace)(self.local_space) }.log_error("xrDestroySpace");
         unsafe { (xr.xrDestroySpace)(self.panel_space) }.log_error("xrDestroySpace");
@@ -2411,7 +2442,7 @@ impl HandKey {
 }
 
 /// An Android system property (`adb shell setprop`), if set.
-pub(crate) fn system_property(name: &str) -> Option<String> {
+pub fn system_property(name: &str) -> Option<String> {
     extern "C" { fn __system_property_get(name: *const std::ffi::c_char, value: *mut std::ffi::c_char) -> i32; }
     let name = std::ffi::CString::new(name).ok()?;
     let mut value = [0 as std::ffi::c_char; 92];

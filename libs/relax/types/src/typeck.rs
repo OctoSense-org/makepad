@@ -187,7 +187,8 @@ pub struct Body {
     pub coercion_casts: SideTable<u32, ()>,
     /// type-relative value paths (`Ty::item`, `<Ty>::item`) that resolved to an item of a trait, not an inherent one; recorded only while the lint sink is on (prelude collision lints)
     pub trait_item_paths: SideTable<u32, DefId>,
-    /// The two lang-item calls of the `?` desugaring, with their inferred types.
+    /// The two lang-item calls of the `?` desugaring, with their inferred types. Under a `try`
+    /// block's id: its `Try::from_output`, `[Self]` and the `Output` its tail goes in as.
     pub try_branch: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
     pub try_from_residual: SideTable<u32, (DefId, crate::types::TyList)>,
     pub locals: ThinVec<Local>,
@@ -340,7 +341,7 @@ impl Body {
             args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, struct_updates, awaits, dependencies, locals, param_pats, closures, errors);
     }
 
-    /// Memory report (MAKEPAD_RUN_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
+    /// Memory report (RELAX_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
     /// accumulated into `acc` by name.
     /// Memory report: the bytes these contents took in the previous layout, counted as that
     /// layout's report counted them: a 1304 B struct; HashMap side tables grown by insertion
@@ -427,6 +428,10 @@ struct Loop {
     /// (name, position of the label: hygiene)
     label: Option<(Sym, u32)>,
     break_ty: Option<TyId>,
+    /// a `loop`'s expected type, when it is one (not a mere hint): what each `break` value is
+    /// checked against and coerced to (rustc check_expr_loop: `expected.coercion_target_type`), its
+    /// break type once one breaks
+    target: Option<TyId>,
     kind: LoopKind,
 }
 
@@ -470,6 +475,10 @@ pub struct Fcx<'a> {
     item_blocks: Vec<(u32, usize)>,
     diverges: bool,
     ret_stack: Vec<TyId>,
+    /// the `try` blocks being checked: (the block's type, `ret_stack.len()` in it, whether a `?`
+    /// left to it, the block's output type). A `?` goes to the innermost one of its own body (not
+    /// of a closure in it).
+    try_stack: Vec<(TyId, usize, bool, TyId)>,
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
     /// checking a const / static initializer or an anonymous constant (no `return` outside a closure)
     in_const: bool,
@@ -605,9 +614,9 @@ pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, 
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let sample = *SAMPLE.get_or_init(|| std::env::var("MAKEPAD_RUN_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    let sample = *SAMPLE.get_or_init(|| std::env::var("RELAX_TYPECK_BACKTRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
     if sample != 0 && CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % sample == 0 {
-        let trace = format!("makepad-run typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nmakepad-run typeck-backtrace-end\n",
+        let trace = format!("relax typeck-backtrace: {} def={} args={:?} origin={} time={}\n{}\nrelax typeck-backtrace-end\n",
             prog.def_path(def), def.0, args, crate::clock::TYS_ORIGIN.with(|o| o.get()),
             relax_codegen::fncost::mono(), std::backtrace::Backtrace::force_capture());
         // The app may write directly to fd 2 without Rust's stderr lock. Format
@@ -644,7 +653,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     let state = crate::tcx::EvalState::new();
     let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     static ST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let st = *ST.get_or_init(|| std::env::var("MAKEPAD_RUN_TYSTATS").is_ok());
+    let st = *ST.get_or_init(|| std::env::var("RELAX_TYSTATS").is_ok());
     let t0 = if st { relax_session::clock::cpu_ns() } else { 0 };
     thread_local! { static NEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
     let child0 = if st { NEST.with(|c| c.get()) } else { 0 };
@@ -663,7 +672,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
     b
 }
 
-/// MAKEPAD_RUN_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
+/// RELAX_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
 pub static CHECKED_DEFS: relax_session::sync::Mutex<Option<std::collections::HashSet<u32>>> = relax_session::sync::Mutex::new(None);
 
 fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
@@ -673,7 +682,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         crate::why::enter(cause)
     });
     static LAZY_STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *LAZY_STATS.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LAZY_STATS").is_some()) {
+    if *LAZY_STATS.get_or_init(|| std::env::var_os("RELAX_LAZY_STATS").is_some()) {
         CHECKED_DEFS.lock().unwrap().get_or_insert_with(Default::default).insert(def.0);
     }
     let d = prog.def(def);
@@ -791,6 +800,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         item_blocks: Vec::new(),
         diverges: false,
         ret_stack: Vec::new(),
+        try_stack: Vec::new(),
         closure_depth: Vec::new(),
         in_const: false,
         inline_const_floor: Vec::new(),
@@ -871,7 +881,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         return fcx.into_body();
     }
     let (fsig, body) = match &ast.item(d.item).kind {
-        ItemKind::Fn(s, b, _) => (ast.fn_sig(*s), b.or_else(|| prog.fn_body(file, d.item).ok().flatten())),
+        ItemKind::Fn(s, b, _) => (ast.fn_sig(*s), b.get().or_else(|| prog.fn_body(file, d.item).ok().flatten())),
         ItemKind::Const(_, init) | ItemKind::Static(_, _, init) if init.is_some() => {
             let init = &prog.const_body(file, d.item).expect("body_ranges validated initializer").unwrap_or(init.get().unwrap());
             // const/static initializer: checked against the declared type
@@ -904,7 +914,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     }
     let mut pi = 0;
     if fsig.self_param.is_some() {
-        let mutable = matches!(fsig.self_param, Some(SelfParam::Value(true)) | Some(SelfParam::Typed(true, _)));
+        let mutable = matches!(fsig.self_param.get(), Some(SelfParam::Value(true)) | Some(SelfParam::Typed(true, _)));
         let s = prog.syms.get("self").unwrap_or(0);
         let li = fcx.b.locals.len() as u32;
         fcx.b.locals.push(Local { name: s, ty: params[0], mutable, pat: u32::MAX });
@@ -927,7 +937,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     let mut matched_in_coroutine: Vec<(PatId, TyId)> = Vec::new();
     for p in ast.list(fsig.params) {
         let t = if pi < params.len() { params[pi] } else { fcx.tcx.tys.error };
-        let plain = matches!(ast.pat(p.pat), Pat::Ident { by_ref: false, sub: None, .. });
+        let plain = matches!(ast.pat(p.pat), Pat::Ident { by_ref: false, sub, .. } if sub.is_none());
         if async_fn_body && !plain {
             let li = fcx.b.locals.len() as u32;
             fcx.b.locals.push(Local { name: prog.syms.get("_").or_else(|| prog.syms.get("self")).unwrap_or(0), ty: t, mutable: true, pat: u32::MAX - 1 });
@@ -1064,7 +1074,7 @@ impl<'a> Fcx<'a> {
         let obligations = self.fulfillment_cx.pending_obligations();
         self.fulfillment_cx = self.suspended_fulfillment.pop().expect("open snapshot");
         self.infcx.commit_from(snapshot.inference);
-        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); }
+        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); }
     }
 
     fn fresh(&mut self, kind: u8) -> TyId {
@@ -1095,7 +1105,7 @@ impl<'a> Fcx<'a> {
             let at = self.infcx.at(self.prog, self.param_env.clone());
             let (ty, goals) = if use_lub { at.lub(b, a)? } else { (b, at.sub(a, b)?) };
             let mut engine = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
-            for goal in goals { engine.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
+            for goal in goals { engine.register_predicate_obligation(&self.infcx, self.prog, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
             if !engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() { return Err(crate::infer::relate::TypeError::Mismatch); }
             // coercion.rs:164-211,1034-1055: only fn-item/pointer coercions
             // force the extra leak check; other relations keep their own checks.
@@ -1103,7 +1113,7 @@ impl<'a> Fcx<'a> {
             Ok((ty, engine.pending_obligations()))
         });
         match result {
-            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); } Some(ty) },
+            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, obligation); } Some(ty) },
             Err(_) => None,
         }
     }
@@ -1233,6 +1243,16 @@ impl<'a> Fcx<'a> {
 
     /// rustc_hir_typeck/src/coercion.rs:1134-1164: a failed coercion returns
     /// failure without reporting. Only the demanding caller emits a diagnostic.
+    /// rustc check_expr_index: the index operand of an overloaded index is coerced to the selected
+    /// impl's index type (demand_coerce), so a reference index is reborrowed with a fresh region:
+    /// `files[name]` with `name: &String` passes `&*name`, and a closure captures `*name`, not the
+    /// local `name` (relax issue 77: an inner closure borrowed the outer closure's parameter).
+    fn reborrow_index_operand(&mut self, ti: TyId, i: ExprId) {
+        if let TyKind::Ref(m, inner, _) = self.tcx.tys.kind(self.shallow(ti)).clone() {
+            let want = self.tcx.tys.intern(TyKind::Ref(m, inner, self.fresh_region()));
+            self.try_coerce(ti, want, Some(i));
+        }
+    }
     fn try_coerce(&mut self, a: TyId, x: TyId, e: Option<ExprId>) -> bool {
         self.try_coerce_inner(a, x, e, self.last_lo, false).is_some()
     }
@@ -1587,7 +1607,7 @@ impl<'a> Fcx<'a> {
 
     fn ty_str(&mut self, t: TyId) -> String {
         let t = self.infcx.deeply_resolve_ignoring_regions(t);
-        ty_to_string(false, self.prog, self.tcx, t)
+        ty_to_diag_string(self.prog, self.tcx, t)
     }
 
     /// rustc_hir_typeck demand_eqtype / demand_suptype: the types are the same, or E0308.
@@ -1595,7 +1615,7 @@ impl<'a> Fcx<'a> {
         if self.eq(expected, actual) { return true; }
         let (x, a) = (self.infcx.deeply_resolve_ignoring_regions(expected), self.infcx.deeply_resolve_ignoring_regions(actual));
         if self.tcx.tys.has_error(x) || self.tcx.tys.has_error(a) { return false; }
-        let (sx, sa) = (ty_to_string(false, self.prog, self.tcx, x), ty_to_string(false, self.prog, self.tcx, a));
+        let (sx, sa) = (ty_to_diag_string(self.prog, self.tcx, x), ty_to_diag_string(self.prog, self.tcx, a));
         let (sx, sa) = if sx == sa { (ty_to_string_paths(self.prog, self.tcx, x), ty_to_string_paths(self.prog, self.tcx, a)) } else { (sx, sa) };
         self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", sx, sa));
         false
@@ -1887,6 +1907,19 @@ impl<'a> Fcx<'a> {
         None
     }
 
+    /// A `!` branch of an `if` or `match` is `NeverToAny` to the type the branches meet at; a type
+    /// variable it reaches is diverging (rustc fn_ctxt apply_adjustments), so `match Err(e) { Ok(v)
+    /// => v, Err(e) => return Err(e) }` falls back instead of leaving `Ok`'s type unknown
+    fn never_to_any(&mut self, e: Option<ExprId>, target: TyId) {
+        if let Some(e) = e {
+            self.set_coerce(e.0, Coerce::Never, target);
+        }
+        let s = self.shallow(target);
+        if matches!(self.tcx.tys.kind(s), TyKind::Infer(_)) {
+            self.diverging.push(s);
+        }
+    }
+
     /// A diverging scrutinee (`match return 1 { 2 => .. }`): rustc types it against a fresh
     /// variable (demand_scrutinee_type), so `!` reaches the patterns as NeverToAny to that
     /// variable, which falls back like any diverging one.
@@ -1987,11 +2020,11 @@ impl<'a> Fcx<'a> {
         // before fallback.
         self.try_handle_opaque_type_uses_next();
         self.retry_goals(false);
-        // diverging fallback (rustc fallback.rs): a variable only a `!` value flowed into is `()`
-        // before edition 2024 and `!` from 2024 (`f(|_| panic!())` instantiates R = ())
+        // diverging fallback (rustc fallback.rs): a variable only a `!` value flowed into is `!`, in
+        // every edition since rustc 1.100.0 (before it, `()` before edition 2024): `f(|_| panic!())`
+        // instantiates R = !
         if !self.diverging.is_empty() {
-            let ed = self.prog.crates[self.prog.def(self.b.def).krate as usize].edition;
-            let fb = if ed >= 2024 { self.tcx.tys.never } else { self.tcx.tys.unit };
+            let fb = self.tcx.tys.never;
             for v in std::mem::take(&mut self.diverging) {
                 let s = self.shallow(v);
                 if matches!(self.tcx.tys.kind(s), TyKind::Infer(_)) {
@@ -2181,7 +2214,7 @@ impl<'a> Fcx<'a> {
         let structural = peel_lit
             || matches!(ast.pat(p), Pat::Tuple(_) | Pat::TupleStruct(..) | Pat::Struct(..) | Pat::Slice(_))
             || matches!(ast.pat(p), Pat::Path(_) if !pre_const)
-            || matches!(ast.pat(p), Pat::Ident { sub: None, by_ref: false, mutbl: false, .. } if self.ident_pat_is_path(p) && !self.ident_pat_is_const(p));
+            || matches!(ast.pat(p), Pat::Ident { sub, by_ref: false, mutbl: false, .. } if sub.is_none() && self.ident_pat_is_path(p) && !self.ident_pat_is_const(p));
         let mut expected = expected;
         let saved_mode = self.bind_mode;
         if structural {
@@ -2258,7 +2291,7 @@ impl<'a> Fcx<'a> {
                 if !(sub.is_none() && self.ident_pat_is_path(p)) {
                     out.push((self.sym(*name), name.lo));
                 }
-                if let Some(sp) = sub {
+                if let Some(sp) = &sub.get() {
                     let more = self.pat_bindings(*sp, report);
                     add(self, &mut out, more);
                 }
@@ -2267,7 +2300,7 @@ impl<'a> Fcx<'a> {
                 // `..` may appear once (rustc_ast_passes check_pat)
                 let rests = ast.list(*l).iter().filter(|c| match ast.pat(**c) {
                     Pat::Rest => true,
-                    Pat::Ident { sub: Some(s), .. } => matches!(ast.pat(*s), Pat::Rest),
+                    Pat::Ident { sub, .. } if let Some(s) = &sub.get() => matches!(ast.pat(*s), Pat::Rest),
                     _ => false,
                 }).count();
                 if report && rests > 1 {
@@ -2279,10 +2312,12 @@ impl<'a> Fcx<'a> {
                 if report && !matches!(ast.pat(p), Pat::Slice(_)) {
                     let what = if matches!(ast.pat(p), Pat::Tuple(_)) { "tuple" } else { "tuple struct" };
                     for &c in ast.list(*l) {
-                        if let Pat::Ident { name, sub: Some(s), .. } = ast.pat(c) {
-                            if matches!(ast.pat(*s), Pat::Rest) {
-                                let shown = self.prog.syms.str(self.sym(*name)).to_string();
-                                self.err(name.lo, format!("`{shown} @` is not allowed in a {what}"));
+                        if let Pat::Ident { name, sub, .. } = ast.pat(c) {
+                            if let Some(s) = &sub.get() {
+                                if matches!(ast.pat(*s), Pat::Rest) {
+                                    let shown = self.prog.syms.str(self.sym(*name)).to_string();
+                                    self.err(name.lo, format!("`{shown} @` is not allowed in a {what}"));
+                                }
                             }
                         }
                     }
@@ -2292,7 +2327,7 @@ impl<'a> Fcx<'a> {
                     add(self, &mut out, more);
                 }
             }
-            Pat::Struct(_, fields, _) => {
+            Pat::Struct(_, _, fields) => {
                 for fp in ast.list(*fields) {
                     let more = self.pat_bindings(fp.pat, report);
                     add(self, &mut out, more);
@@ -2445,7 +2480,7 @@ impl<'a> Fcx<'a> {
                 self.local_hyg.resize(li as usize + 1, (Some(Vec::new()), 0));
                 self.local_hyg[li as usize] = h;
                 self.scopes.push((s, li));
-                if let Some(sp) = sub {
+                if let Some(sp) = &sub.get() {
                     self.check_pat(*sp, expected);
                 }
             }
@@ -2456,7 +2491,7 @@ impl<'a> Fcx<'a> {
             }
             Pat::Range(a, b, _) => {
                 // rustc pat.rs check_pat_range: each end has the scrutinee's type (demand_eqtype_pat)
-                for end in [a, b].into_iter().flatten() {
+                for end in [a.get(), b.get()].iter().flatten() {
                     let t = self.check_expr(*end, Some(expected));
                     let pos = self.ast().expr(*end).lo;
                     self.demand_eq(expected, t, pos);
@@ -2465,7 +2500,22 @@ impl<'a> Fcx<'a> {
             Pat::Tuple(v) => {
                 let et = self.shallow(expected);
                 let elems = match *self.tcx.tys.kind(et) {
-                    TyKind::Tuple(x) => self.tcx.tys.list(x).to_vec(),
+                    TyKind::Tuple(x) => {
+                        // rustc pat.rs check_pat_tuple: the pattern's tuple (its own elements, or
+                        // the scrutinee's length with a `..`) equals the scrutinee's type; a
+                        // length mismatch is E0308 and the elements check against `{error}`
+                        let tys = self.tcx.tys.list(x).to_vec();
+                        let pats = self.ast().list(*v);
+                        let has_rest = pats.iter().any(|&q| is_rest_pat(self.ast(), q));
+                        let own = pats.len() - has_rest as usize;
+                        if own > tys.len() || (!has_rest && own < tys.len()) {
+                            let n = |k: usize| format!("{} element{}", k, if k == 1 { "" } else { "s" });
+                            self.err(self.last_lo, format!("E0308: mismatched types: expected a tuple with {}, found one with {}", n(tys.len()), n(own)));
+                            vec![self.tcx.tys.error; pats.len()]
+                        } else {
+                            tys
+                        }
+                    }
                     _ => {
                         let mut x = Vec::new();
                         for _ in 0..v.len() {
@@ -2564,12 +2614,14 @@ impl<'a> Fcx<'a> {
                     if let Pat::Rest = ast.pat(*x) {
                         continue;
                     }
-                    if let Pat::Ident { sub: Some(s), .. } = ast.pat(*x) {
-                        if let Pat::Rest = ast.pat(*s) {
-                            // `name @ ..`: the subslice / subarray
-                            let st = slice_ty.unwrap_or(self.tcx.tys.error);
-                            self.check_pat(*x, st);
-                            continue;
+                    if let Pat::Ident { sub, .. } = ast.pat(*x) {
+                        if let Some(s) = &sub.get() {
+                            if let Pat::Rest = ast.pat(*s) {
+                                // `name @ ..`: the subslice / subarray
+                                let st = slice_ty.unwrap_or(self.tcx.tys.error);
+                                self.check_pat(*x, st);
+                                continue;
+                            }
                         }
                     }
                     self.check_pat(*x, elem);
@@ -2620,7 +2672,7 @@ impl<'a> Fcx<'a> {
                 }
                 self.check_seq_pats(self.ast().list(*v), &fields);
             }
-            Pat::Struct(path, fields, rest) => {
+            Pat::Struct(rest, path, fields) => {
                 let d = self.resolve_struct_path(path);
                 self.b.pat_res.insert(p.0, d);
                 if let Res::Def(dd) = d {
@@ -2661,8 +2713,7 @@ impl<'a> Fcx<'a> {
                     if !*rest && !bad && self.prog.def(dd).kind != DefKind::Union {
                         if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(self.shallow(et)).clone() {
                             if let Some(v) = self.tcx.adts.get(&ad).and_then(|a| a.variants.get(vi as usize).cloned()) {
-                                // (a field a live edit removed is a dead slot no code names, M10)
-                                let missing: Vec<String> = v.fields.iter().enumerate().filter(|(i, f)| !mentioned.contains(&(*i as u32)) && !(f.name & 0x8000_0000 == 0 && self.prog.syms.str(f.name).starts_with("__relax_dead_"))).map(|(_, f)| {
+                                let missing: Vec<String> = v.fields.iter().enumerate().filter(|(i, _)| !mentioned.contains(&(*i as u32))).map(|(_, f)| {
                                     if f.name & 0x8000_0000 != 0 { (f.name & 0x7fff_ffff).to_string() } else { self.prog.syms.str(f.name).to_string() }
                                 }).collect();
                                 if !missing.is_empty() {
@@ -2670,6 +2721,12 @@ impl<'a> Fcx<'a> {
                                 }
                             }
                         }
+                    }
+                } else {
+                    // pat.rs check_pat_struct: a path that does not resolve still checks its field
+                    // patterns, against the error type, so their bindings exist (no E0425 on a use)
+                    for fp in self.ast().list(*fields) {
+                        self.check_pat(fp.pat, self.tcx.tys.error);
                     }
                 }
             }
@@ -3073,15 +3130,8 @@ impl<'a> Fcx<'a> {
                 continue;
             }
             let fname = self.prog.syms.str(f.name).to_string();
-            // a dead slot of a live layout edit (M10) and the fields an edit added (the extension
-            // block gives them their Default) need no value
-            if fname.starts_with("__relax_dead_") || adt.ext_from != u32::MAX && i as u32 >= adt.ext_from {
-                continue;
-            }
             let cname = crate::parser::derive::default_const_name(&ty_name, variant.as_deref(), &fname);
-            // rustc: `#[rust(expr)]` is no declared default for a bare `..`.
-            match self.prog.syms.get(&cname).and_then(|s| self.prog.lookup_in_scope(scope, s, false))
-                .filter(|&cd| !crate::mir::transform::const_check::is_live_default(self.prog, cd)) {
+            match self.prog.syms.get(&cname).and_then(|s| self.prog.lookup_in_scope(scope, s, false)) {
                 Some(cd) => out.push((i as u32, cd)),
                 // rustc: E0063 missing field (a bare `..` fills only fields with a default value)
                 None => self.err(lo, format!("E0063: missing field `{}` in initializer of `{}`; `..` fills only fields declared with a default value (`{}: T = value`){}", fname, ty_name, fname, if adt.n_generics > 0 { "; default values of generic types are not supported yet" } else { "" })),
@@ -3106,11 +3156,7 @@ impl<'a> Fcx<'a> {
         let mut missing: Vec<String> = Vec::new();
         for (i, f) in v.fields.iter().enumerate() {
             if given.contains(&(i as u32)) { continue; }
-            let fname = self.prog.syms.str(f.name).to_string();
-            // a dead slot of a live layout edit (M10) and the fields an edit added (the extension
-            // block gives them their Default) need no value
-            if fname.starts_with("__relax_dead_") || adt.ext_from != u32::MAX && i as u32 >= adt.ext_from { continue; }
-            missing.push(fname);
+            missing.push(self.prog.syms.str(f.name).to_string());
         }
         if missing.is_empty() { return; }
         missing.sort();
@@ -3382,8 +3428,14 @@ impl<'a> Fcx<'a> {
                             let full = self.tcx.complete_args(self.prog, d, &v, regions);
                             self.write_user_type_annotation_from_args(key, d, &full, user_self_ty);
                             self.apply_fn_bounds(d, &full, self.last_lo);
+                            // the type with those regions too (rustc type_of(..).instantiate(args)): an
+                            // impl's lifetime in it (`impl S<'_, ()> { const C: Self }`) is no
+                            // early-bound region of the body that names the const (relax issue 188:
+                            // "wrong generic argument kind" when that body's own arguments replaced it)
+                            self.tcx.instantiate_ty(self.prog, d, &full, t)
+                        } else {
+                            self.tcx.tys.subst(t, &v)
                         }
-                        self.tcx.tys.subst(t, &v)
                     }
                     None => t,
                 }
@@ -3656,14 +3708,10 @@ impl<'a> Fcx<'a> {
         if let Some(q) = self.ast().qself(path) {
             // `<T as Trait>::item`
             let self_t = self.lower_ty(q.ty);
-            let tp = match &q.trait_path {
-                Some(tp) => tp,
-                None => return self.resolve_qself_no_trait(self_t, segs[segs.len() - 1].1, key, path.lo, path),
-            };
-            // `<T as Trait>::Assoc::item`: the qualified part names a type (a projection),
-            // the last segment an item on it, resolved type-relatively as `<Ty>::item` (rustc
-            // resolve_qpath with a partial resolution: the unresolved segments go to
-            // hir_ty_lowering's associated-path lowering)
+            // `<T as Trait>::Assoc::item` / `<T>::Assoc::item`: the qualified part names a type
+            // (a projection), the last segment an item on it, resolved type-relatively as
+            // `<Ty>::item` (rustc resolve_qpath with a partial resolution: the unresolved segments
+            // go to hir_ty_lowering's associated-path lowering). cranelift's `<M>::I::rc_for_type`.
             if segs.len() >= 2 {
                 let sub = Path { segs: path.segs.prefix(path.segs.len() - 1), lo: path.lo };
                 let env = self.env.clone();
@@ -3676,6 +3724,10 @@ impl<'a> Fcx<'a> {
                 }
                 return self.resolve_qself_no_trait(t, segs[segs.len() - 1].1, key, path.lo, path);
             }
+            let tp = &match q.trait_path.get() {
+                Some(tp) => tp,
+                None => return self.resolve_qself_no_trait(self_t, segs[segs.len() - 1].1, key, path.lo, path),
+            };
             let td = match self.tcx.resolve_type_path_def(prog, self.file, self.module, tp) {
                 Some(d) => d,
                 None => return (Res::Err, error),
@@ -3837,8 +3889,16 @@ impl<'a> Fcx<'a> {
                 if let Some(m) = crate::lint::privacy_diag(prog, self.file, path.lo, &e) { self.err(path.lo, m); }
             }
         }
-        // container path (module / enum / trait)
-        let parent = if segs[0].0 == SegKind::SelfType && n == 2 {
+        // container path (module / enum / trait). A type parameter of the item hides a module
+        // item of its name (rustc's generics rib comes before the module's items): `T::item` with
+        // a `T` in scope is type-relative even beside a trait `T` (`fn f<T>() where T: self::T`).
+        // A const parameter is in the value namespace alone: `N::item` stays the module's.
+        let first_is_param = !path.global()
+            && path.no_qself()
+            && segs[0].0 == SegKind::Ident
+            && self.env.names.iter().take(self.b.args.len()).enumerate()
+                .any(|(i, nm)| *nm == segs[0].1 && !self.env.consts.iter().any(|c| c.0 as usize == i));
+        let parent = if (segs[0].0 == SegKind::SelfType && n == 2) || first_is_param {
             None
         } else {
             prog.resolve_mod_path(self.module, path.global(), &segs[..n - 1], false, false)
@@ -3919,15 +3979,18 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        // `T::item` with T a generic param (or `Self` in a trait body): resolved through the
-        // param's bounds only, as rustc does on the generic body; an inherent item of the type
-        // a given instance substitutes is never seen (`U::from(x)` with U: From<T> calls
-        // From::from even when the instance's U has an inherent `from`).
+        // `T::item` with T a generic param (or `Self` in a trait body, or in an impl whose self
+        // type is a param: `impl<T: Build<P>> Build<W<P>> for T`): resolved through the param's
+        // bounds first, as rustc's probe takes a param's where clauses as inherent candidates
+        // (assemble_inherent_candidates_from_param) ahead of the traits in scope; an inherent
+        // item of the type a given instance substitutes is never seen (`U::from(x)` with
+        // U: From<T> calls From::from even when the instance's U has an inherent `from`), and
+        // `Self::from` with T: Build<P> is Build's, not the prelude From's (relax issue 49).
         // rustc_hir_analysis hir_ty_lowering lower_assoc_path / probe_single_bound_for_assoc_item
         let prefix_is_param = n == 2
             && path.no_qself()
             && match self.ast().segs(path.segs)[0].kind() {
-                SegKind::SelfType => self.env.trait_def.is_some(),
+                SegKind::SelfType => self.env.trait_def.is_some() || matches!(self.tcx.tys.kind(self_ty), TyKind::Param(_)),
                 _ => {
                     let s0 = self.sym(self.ast().segs(path.segs)[0].name);
                     self.env.names.iter().take(self.b.args.len()).any(|nm| *nm == s0)
@@ -4319,6 +4382,20 @@ impl<'a> Fcx<'a> {
         }
     }
 
+    /// fn_ctxt/checks.rs check_argument_types: an argument that is a closure, which a call checks
+    /// after its other arguments (an async block is not one). HIR has no parentheses, so `(|x| ..)`
+    /// is one too: peg's `call_custom_closure((|input, pos| input.ident(pos)), __input, __pos)`
+    /// learns `input` from `__input`.
+    fn is_closure_arg(&self, mut e: ExprId) -> bool {
+        loop {
+            match self.ast().expr(e).kind {
+                ExprKind::Paren(inner) => e = inner,
+                ExprKind::Closure { .. } => return true,
+                _ => return false,
+            }
+        }
+    }
+
     /// A call with the wrong number of arguments (fn_ctxt/checks.rs check_argument_types): each
     /// argument is checked with its position's input as a hint only, and nothing is demanded of
     /// it: report_arg_errors reports the call once, as E0061, not an E0308 per shifted argument.
@@ -4330,7 +4407,7 @@ impl<'a> Fcx<'a> {
                 self.select_before_closures();
             }
             for (i, a) in args.iter().enumerate() {
-                if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) == check_closures {
+                if self.is_closure_arg(*a) == check_closures {
                     let hint = params.get(i).map(|&p| self.normalize_signature(p));
                     given[i] = self.check_expr(*a, hint);
                 }
@@ -4814,7 +4891,7 @@ impl<'a> Fcx<'a> {
         let st = self.shallow(ty);
         if matches!(self.tcx.tys.kind(st), TyKind::Never) { return; }
         let blk = self.ast().block(b);
-        let tail = match self.ast().list(blk.stmts).last() { Some(Stmt::Expr(e, false)) => Some(*e), _ => None };
+        let tail = match self.ast().list(blk.stmts).last() { Some(Stmt::Expr(false, e)) => Some(*e), _ => None };
         let pos = match tail { Some(e) => self.ast().expr(e).lo, None => blk.lo };
         self.coerce_or_unify(ty, unit, tail, pos);
     }
@@ -4850,14 +4927,14 @@ impl<'a> Fcx<'a> {
                     // the annotation normalized in this body's inference context (rustc
                     // gather_locals: FnCtxt::lower_ty -> LoweredTy::from_raw normalizes):
                     // `&<(Wrap<?0>,) as Indirect>::Out` is `&?1` with that projection pending
-                    let decl = match ty {
+                    let decl = match &ty.get() {
                         Some(t) => {
                             let d = self.lower_let_ty_saving_user_provided_ty(*t);
                             Some(if self.tcx.tys.has_assoc(d) { self.norm(d) } else { d })
                         }
                         None => None,
                     };
-                    let t = match init {
+                    let t = match &init.get() {
                         Some(e) => {
                             let it = self.check_expr(*e, decl);
                             match decl {
@@ -4891,14 +4968,14 @@ impl<'a> Fcx<'a> {
                     if self.diverges {
                         diverged = true;
                     }
-                    if let Some(eb) = else_ {
+                    if let Some(eb) = &else_.get() {
                         let save = self.diverges;
                         self.diverges = false;
                         let et = self.check_block(*eb, None);
                         // rustc check_decl_local: the `else` block must have type `!`
                         let es = self.shallow(et);
                         if es != self.tcx.tys.never && !matches!(self.tcx.tys.kind(es), TyKind::Infer(_) | TyKind::Error) {
-                            let pos = match self.ast().stmts(*eb).last() { Some(Stmt::Expr(e, false)) => self.ast().expr(*e).lo, _ => self.ast().block(*eb).hi };
+                            let pos = match self.ast().stmts(*eb).last() { Some(Stmt::Expr(false, e)) => self.ast().expr(*e).lo, _ => self.ast().block(*eb).hi };
                             self.err(pos, "E0308: `else` clause of `let...else` does not diverge".to_string());
                         }
                         self.diverges = save;
@@ -4909,8 +4986,10 @@ impl<'a> Fcx<'a> {
                 }
                 // stripped at load (program::strip_cfg_stmts)
                 Stmt::Item(_) | Stmt::Attrs(..) => {}
-                Stmt::Expr(e, semi) => {
+                Stmt::Expr(semi, e) => {
                     let is_tail = i == n - 1 && !*semi;
+                    // (the tail's expectation is as much a hint as the block's)
+                    self.soft = is_tail && soft;
                     let t = self.check_expr(*e, if is_tail { expected } else { None });
                     if self.diverges {
                         diverged = true;
@@ -4940,6 +5019,13 @@ impl<'a> Fcx<'a> {
                                     self.coerce_or_unify(t, x, Some(*e), pos);
                                     result = x;
                                 }
+                            } else if !unsized_x && !soft && matches!(self.tcx.tys.kind(st), TyKind::Infer(_)) && !matches!(self.tcx.tys.kind(sx), TyKind::Infer(_)) {
+                                // rustc coerce_from_inference_variable: an open tail coerced to a
+                                // known type is unified with it (`!{ let r; .. r }` as an `if`
+                                // condition, objc's `msg_send!`, is a bool)
+                                let pos = self.ast().expr(*e).lo;
+                                self.coerce_or_unify(t, x, Some(*e), pos);
+                                result = x;
                             }
                         }
                     } else if !*semi {
@@ -4960,7 +5046,7 @@ impl<'a> Fcx<'a> {
         self.item_blocks.truncate(saved_blocks);
         if diverged {
             self.diverges = true;
-            let tail_is_expr = n > 0 && matches!(self.ast().list(blk.stmts)[n - 1], Stmt::Expr(_, false));
+            let tail_is_expr = n > 0 && matches!(self.ast().list(blk.stmts)[n - 1], Stmt::Expr(false, _));
             if !tail_is_expr {
                 return self.tcx.tys.never;
             }
@@ -4985,7 +5071,7 @@ impl<'a> Fcx<'a> {
     fn check_asm(&mut self, m: &MacCall) -> TyId {
         let ast = self.ast();
         let margs = ast.mac_arg(m.args);
-        let Some(spec) = margs.asm else { return self.tcx.tys.error };
+        let Some(spec) = margs.asm.get() else { return self.tcx.tys.error };
         let mut diverge = spec.options & ASM_NORETURN != 0;
         let ops = ast.list(spec.ops);
         // rustc_ast_lowering asm.rs: `asm_goto_with_outputs`
@@ -5001,7 +5087,7 @@ impl<'a> Fcx<'a> {
                 // rustc check_expr_asm: a label block has unit type or diverges; its divergence is
                 // not the asm's unless every path out of it diverges
                 AsmDir::Label => {
-                    let Some(x) = op.input else { continue };
+                    let Some(x) = op.input.get() else { continue };
                     let previous = self.diverges;
                     let unit = self.tcx.tys.unit;
                     let t = self.check_expr(x, Some(unit));
@@ -5012,20 +5098,20 @@ impl<'a> Fcx<'a> {
                     self.diverges = previous;
                 }
                 AsmDir::Sym | AsmDir::Const => {
-                    if let Some(x) = op.input {
+                    if let Some(x) = op.input.get() {
                         self.check_expr(x, None);
                     }
                 }
                 _ => {
-                    if let Some(x) = op.input {
+                    if let Some(x) = op.input.get() {
                         let t = self.check_expr(x, None);
-                        if let Some(y) = op.output {
+                        if let Some(y) = op.output.get() {
                             if y != x {
                                 let u = self.check_expr(y, Some(t));
                                 let _ = u;
                             }
                         }
-                    } else if let Some(y) = op.output {
+                    } else if let Some(y) = op.output.get() {
                         self.check_expr(y, None);
                     }
                 }
@@ -5073,7 +5159,10 @@ impl<'a> Fcx<'a> {
                 }
                 t
             }
-            ExprKind::Paren(x) => self.check_expr(*x, expected),
+            ExprKind::Paren(x) => {
+                self.soft = soft;
+                self.check_expr(*x, expected)
+            }
             ExprKind::Unary(op, x) => match op {
                 // rustc_hir_typeck/src/expr.rs check_expr_unary and op.rs:960-1080.
                 UnOp::Neg | UnOp::Not => {
@@ -5140,10 +5229,11 @@ impl<'a> Fcx<'a> {
                 }
                 let is_shift = matches!(op, BinOp::Shl | BinOp::Shr);
                 let tb = self.check_expr(*b, if is_shift { None } else { Some(ta) });
-                // a primitive place with a non-primitive right operand is an `<Op>Assign` call
-                // (`n /= NonZero<u32>`; rustc is_builtin_binop needs both sides primitive)
+                // a primitive place with a non-primitive right operand, or a reference to one, is an
+                // `<Op>Assign` call (`n /= NonZero<u32>`, `x %= &big`; rustc is_builtin_binop needs
+                // both sides primitive)
                 let sb0 = self.shallow(tb);
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..)) {
+                if self.non_prim_operand(sb0) || self.ref_to_var(sb0) {
                     self.cur_binop = e.0;
                     if self.prim_lhs_op(*op, e, sa, sb0, lo, true).is_some() {
                         return unit;
@@ -5227,6 +5317,11 @@ impl<'a> Fcx<'a> {
                 } else if matches!(kt, TyKind::FnPtr(..)) && matches!(kx, TyKind::FnDef(..) | TyKind::Closure(..) | TyKind::FnPtr(..)) {
                     // (a failed coercion is the cast check's E0605)
                     self.try_coerce(xt, target, Some(*x));
+                } else if matches!(kt, TyKind::Adt(..) | TyKind::Tuple(_) | TyKind::Array(..)) && self.has_open_infer(st) {
+                    // `Rc::new(v) as Rc<_>`: the `_` is decided by later uses (a `collect` into
+                    // `Vec<Rc<dyn Tr>>`), not by the operand; rustc check_casts coerces at the end
+                    // of typeck, an unsizing coercion then
+                    self.deferred_casts.push((*x, xt, target));
                 } else if matches!(kt, TyKind::Adt(..) | TyKind::Tuple(_) | TyKind::Array(..)) {
                     // no primitive cast has these targets: only a coercion (a trivial cast `Some(4u32)
                     // as Option<u32>`, `(1, 2) as (u32, u32)` types its literals); when none applies
@@ -5235,6 +5330,10 @@ impl<'a> Fcx<'a> {
                 } else if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ref(_, p, _)) if matches!(self.tcx.tys.kind(self.shallow(*p)), TyKind::Infer(_))) {
                     // `z as &_`: rustc checks the cast at the end of typeck (check_casts), where
                     // try_coercion_cast's reborrow coercion decides `_` (`&mut i32 as &_`: i32)
+                    self.deferred_casts.push((*x, xt, target));
+                } else if matches!((&kx, &kt), (TyKind::Ref(_, p, _), TyKind::Ref(..)) if matches!(self.tcx.tys.kind(self.shallow(*p)), TyKind::Infer(_))) {
+                    // `p.as_ref() as &Path`: the source referent is open (`AsRef<_>` with several
+                    // impls); rustc check_casts coerces at the end of typeck, which decides it
                     self.deferred_casts.push((*x, xt, target));
                 } else if let (TyKind::Ref(m1, a, _), TyKind::Ref(m2, bt, _)) = (&kx, &kt) {
                     // a cast is first a coercion when one applies (rustc cast.rs
@@ -5252,7 +5351,7 @@ impl<'a> Fcx<'a> {
             ExprKind::Block(b, label) => {
                 if label.is_some() {
                     let l = label.map(|x| self.sym_lifetime(x));
-                    self.loops.push(Loop { label: l, break_ty: expected, kind: LoopKind::Block });
+                    self.loops.push(Loop { label: l, break_ty: expected, target: None, kind: LoopKind::Block });
                     let t = self.check_block_soft(*b, expected, soft);
                     let lp = self.loops.pop().unwrap();
                     if let Some(bt) = lp.break_ty {
@@ -5269,6 +5368,7 @@ impl<'a> Fcx<'a> {
                 self.check_block_soft(*b, expected, soft)
             }
             ExprKind::Unsafe(b) => self.check_block_soft(*b, expected, soft),
+            ExprKind::TryBlock(b) => self.check_try_block(e, *b, if soft { None } else { expected }),
             ExprKind::ConstBlock(b) => {
                 self.inline_const_floor.push(self.b.locals.len() as u32);
                 let t = self.check_block(*b, expected);
@@ -5296,7 +5396,7 @@ impl<'a> Fcx<'a> {
                         if !then_div {
                             let s = self.shallow(tt);
                             if s != unit && s != self.tcx.tys.never {
-                                let pos = match self.ast().stmts(*then).last() { Some(crate::ast::Stmt::Expr(t2, false)) => self.ast().expr(*t2).lo, _ => lo };
+                                let pos = match self.ast().stmts(*then).last() { Some(crate::ast::Stmt::Expr(false, t2)) => self.ast().expr(*t2).lo, _ => lo };
                                 self.demand_eq(unit, s, pos);
                             }
                         }
@@ -5315,21 +5415,22 @@ impl<'a> Fcx<'a> {
                         let es = self.shallow(et);
                         if ts == self.tcx.tys.never {
                             // the `!` then-branch is `NeverToAny` to the else type
-                            if let Some(crate::ast::Stmt::Expr(t2, false)) = self.ast().stmts(*then).last() { self.set_coerce(t2.0, Coerce::Never, et); }
+                            let tail = match self.ast().stmts(*then).last() { Some(crate::ast::Stmt::Expr(false, t2)) => Some(*t2), _ => None };
+                            self.never_to_any(tail, et);
                             return et;
                         }
                         if es == self.tcx.tys.never {
-                            self.set_coerce(x.0, Coerce::Never, tt);
+                            self.never_to_any(Some(*x), tt);
                             return tt;
                         }
                         // the then-branch's value is its block's tail expression
                         let tail = match self.ast().stmts(*then).last() {
-                            Some(crate::ast::Stmt::Expr(t2, false)) => vec![*t2],
+                            Some(crate::ast::Stmt::Expr(false, t2)) => vec![*t2],
                             _ => Vec::new(),
                         };
                         // (the error is at the else branch's value: its block's tail, rustc if_cause)
                         let at = match self.ast().expr(*x).kind {
-                            ExprKind::Block(b, _) => match self.ast().stmts(b).last() { Some(crate::ast::Stmt::Expr(t2, false)) => self.ast().expr(*t2).lo, _ => self.ast().expr(*x).lo },
+                            ExprKind::Block(b, _) => match self.ast().stmts(b).last() { Some(crate::ast::Stmt::Expr(false, t2)) => self.ast().expr(*t2).lo, _ => self.ast().expr(*x).lo },
                             _ => self.ast().expr(*x).lo,
                         };
                         self.coerce_many(&tail, tt, *x, et, at)
@@ -5392,7 +5493,7 @@ impl<'a> Fcx<'a> {
                     }
                     let saved = self.scopes.len();
                     self.scopes.extend(arm_bindings[arm_index].iter().copied());
-                    if let Some(g) = arm.guard {
+                    if let Some(g) = arm.guard.get() {
                         let bool_ = self.tcx.tys.bool_;
                         self.check_expr(g, Some(bool_));
                     }
@@ -5427,7 +5528,7 @@ impl<'a> Fcx<'a> {
                 self.diverges = all_div;
                 // coercion.rs CoerceMany: a `!` arm is `NeverToAny` to the match's type
                 if let (true, Some(r)) = (any_value, result) {
-                    for body in never_arms { self.set_coerce(body.0, Coerce::Never, r); }
+                    for body in never_arms { self.never_to_any(Some(body), r); }
                 }
                 match result {
                     Some(r) if any_value => r,
@@ -5437,12 +5538,11 @@ impl<'a> Fcx<'a> {
             ExprKind::While(row) => {
                 let crate::ast::WhileRow { cond: c, body: b, label } = &self.ast().row(*row).clone();
                 let (c, b) = (c, b);
-                let label = &crate::ast::OptIdent::from(*label);
                 let bool_ = self.tcx.tys.bool_;
                 let saved = self.scopes.len();
                 let l = label.map(|x| self.sym_lifetime(x));
                 // rustc_ast_lowering puts both the condition and body in the loop scope.
-                self.loops.push(Loop { label: l, break_ty: None, kind: LoopKind::While });
+                self.loops.push(Loop { label: l, break_ty: None, target: None, kind: LoopKind::While });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, true);
                 let ct = self.check_expr(*c, Some(bool_));
                 let cpos = self.ast().expr(*c).lo;
@@ -5458,7 +5558,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Loop(b, label) => {
                 let l = label.map(|x| self.sym_lifetime(x));
-                self.loops.push(Loop { label: l, break_ty: None, kind: LoopKind::Loop });
+                self.loops.push(Loop { label: l, break_ty: None, target: if soft { None } else { expected }, kind: LoopKind::Loop });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
                 self.check_block_no_value(*b);
@@ -5487,7 +5587,7 @@ impl<'a> Fcx<'a> {
                 let item = self.check_for_iter(*it, lo);
                 self.check_pat(*p, item);
                 let l = label.map(|x| self.sym_lifetime(x));
-                self.loops.push(Loop { label: l, break_ty: None, kind: LoopKind::For });
+                self.loops.push(Loop { label: l, break_ty: None, target: None, kind: LoopKind::For });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
                 self.check_block_no_value(*b);
@@ -5521,7 +5621,7 @@ impl<'a> Fcx<'a> {
                     Some(v) => {
                         let target = self.loop_index(l);
                         let exp = match target {
-                            Some(i) => self.loops[i].break_ty,
+                            Some(i) => self.loops[i].break_ty.or(self.loops[i].target),
                             None => None,
                         };
                         let vt = self.check_expr(*v, exp);
@@ -5556,9 +5656,21 @@ impl<'a> Fcx<'a> {
                             Some(prev) => {
                                 // rustc check_expr_break: every `break` coerces to the loop's type
                                 let bpos = match x.get() { Some(v) => self.ast().expr(v).lo, None => lo };
-                                self.demand_eq(prev, bt, bpos);
+                                match (self.loops[i].target, x.get()) {
+                                    (Some(_), Some(v)) => { self.coerce_or_unify(bt, prev, Some(v), bpos); }
+                                    _ => { self.demand_eq(prev, bt, bpos); }
+                                }
                             }
-                            None => self.loops[i].break_ty = Some(bt),
+                            // the first `break` of a `loop` with an expected type coerces to it
+                            // (ec4rs: `break Some((key, val))`, key a `&String`, into `Option<(&str, _)>`)
+                            None => match (self.loops[i].target, x.get()) {
+                                (Some(tt), Some(v)) => {
+                                    let bpos = self.ast().expr(v).lo;
+                                    self.coerce_or_unify(bt, tt, Some(v), bpos);
+                                    self.loops[i].break_ty = Some(tt);
+                                }
+                                _ => self.loops[i].break_ty = Some(bt),
+                            },
                         }
                     }
                 } else if let Some((_, _)) = l {
@@ -5592,8 +5704,12 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.never
             }
             ExprKind::Return(x) => {
+                // expr.rs check_expr_return: outside a fn body there is no return type; the value
+                // is still type-checked (#86188), against nothing
                 if self.in_const && self.closure_depth.is_empty() {
                     self.err(lo, "E0572: return statement outside of function body".to_string());
+                    if let Some(v) = x.get() { self.check_expr(v, None); }
+                    return self.tcx.tys.never;
                 }
                 let rt = *self.ret_stack.last().unwrap();
                 match &x.get() {
@@ -5748,10 +5864,12 @@ impl<'a> Fcx<'a> {
                     // field access autoderef never goes through a raw pointer (Autoderef without include_raw_pointers)
                     if matches!(self.tcx.tys.kind(cur), TyKind::Ptr(..)) { break; }
                     match self.tcx.tys.kind(cur).clone() {
+                        // expr.rs check_expr_field: a tuple without that field is no match (E0609 below)
                         TyKind::Tuple(v) => {
+                            let Some(&field) = self.tcx.tys.list(v).get(*idx as usize) else { break };
                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                             self.set_operand_derefs(e.0, derefs);
-                            return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
+                            return field;
                         }
                         TyKind::Adt(d, args, regions) => {
                             let adt = self.tcx.adts.get(&d);
@@ -5827,12 +5945,17 @@ impl<'a> Fcx<'a> {
                             // unsizes to (rustc method/probe.rs lookup_indexing: unsize step)
                             // (a generic index of a polymorphic body -- `I: SliceIndex<[T]>` --
                             // goes through std's `impl<T, I: SliceIndex<[T]>> Index<I> for [T]`:
-                            // the result is `<I as SliceIndex<[T]>>::Output`; a pair of bounds,
-                            // `(Bound<usize>, Bound<usize>)`, is an index of that impl too)
+                            // the result is `<I as SliceIndex<[T]>>::Output`)
+                            // only a usize (or a still-open integer) and the std range structs
+                            // index builtin; every other index type selects `Index` (rustc
+                            // lookup_indexing), std's `(Bound<usize>, Bound<usize>)` included
+                            // (rustc try_index_step: an open index type -- a closure parameter its call
+                            // types later -- selects `Index<?I>` too, its output a projection that type
+                            // settles: `|range| &stamp[range]` called with `2..5usize`, relax issue 200)
                             let std_range = match self.tcx.tys.kind(tis) {
                                 TyKind::Adt(..) => idx_is_range,
-                                TyKind::Param(_) | TyKind::Tuple(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => false,
-                                _ => true,
+                                TyKind::Int(_) | TyKind::IntVar(_) | TyKind::Never | TyKind::Error => true,
+                                _ => false,
                             };
                             if !std_range {
                                 if let Some(td) = self.lang_item(&["ops", "Index"]) {
@@ -5841,6 +5964,7 @@ impl<'a> Fcx<'a> {
                                     for st in [cur, slice] {
                                         let ds = self.infcx.deeply_resolve_ignoring_regions(st);
                                         if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
+                                            self.reborrow_index_operand(ti, *i);
                                             let m = self.trait_fn(td, "index").unwrap();
                                             self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[ds, ti2])));
                                             let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
@@ -5904,6 +6028,9 @@ impl<'a> Fcx<'a> {
                                     }
                                 }
                                 if !matches!(found, Err(_)) {
+                                    if coerced_idx.is_none() {
+                                        self.reborrow_index_operand(ti, *i);
+                                    }
                                     self.set_operand_derefs(e.0, derefs);
                                     let m = self.trait_fn(td, "index").unwrap();
                                     let index = coerced_idx.unwrap_or(ti2);
@@ -5956,7 +6083,31 @@ impl<'a> Fcx<'a> {
                     }
                     None => None,
                 };
+                // (the operand's expectation is as much a hint as the `&`'s)
+                self.soft = soft;
                 let t = self.check_expr(*x, exp_inner);
+                // A sized referent is ExpectHasType for a value operand, and a `?` is a match
+                // whose Continue arm coerces to it (_match.rs CoerceMany). So the `?`'s value must
+                // coerce to the referent itself, even where the `&` would deref-coerce at the
+                // enclosing site (`Vec::clone(&rc_result?)` is E0308). check_try takes its
+                // expectation as a hint (relax hints binary operands, rustc does not), so the `&`
+                // demands the coercion here. A soft expectation demands nothing.
+                let mut operand = *x;
+                while let ExprKind::Paren(i) = self.ast().expr(operand).kind {
+                    operand = i;
+                }
+                let t = match exp_inner {
+                    Some(i) if !soft && matches!(self.ast().expr(operand).kind, ExprKind::Try(_)) => {
+                        let si = self.shallow(i);
+                        if matches!(self.tcx.tys.kind(si), TyKind::Infer(_) | TyKind::Error) || si == unit || self.is_unsized_ty(si) {
+                            t
+                        } else {
+                            self.coerce_or_unify(t, i, Some(operand), self.ast().expr(operand).lo);
+                            i
+                        }
+                    }
+                    _ => t,
+                };
                 if *raw {
                     // expr.rs check_named_place_expr: `&raw const <temporary>` (E0745)
                     if self.tcx.validates(self.prog, self.file) && !self.is_named_place(*x) {
@@ -5988,6 +6139,16 @@ impl<'a> Fcx<'a> {
                 // N:rustc_hir_typeck/src/expr.rs:1823 and fn_ctxt/_impl.rs:1293-1301:
                 // obligations belong to the instantiated path, including explicit args.
                 self.register_wf(adt_ty, lo);
+                // fn_ctxt/mod.rs check_struct_path, add_required_obligations_for_hir: the ADT's own
+                // predicates on the path's arguments, `S: Sized` of `Kind<S>` among them. A pending
+                // `?S: Sized` is what lets the closure in `Kind { get: |s| s }` unsize `&mut ?S` to
+                // `&mut dyn Tr` once `?S` is known, instead of taking `?S = dyn Tr` (relax issue 201).
+                if let TyKind::Adt(ad, args, regions) = self.tcx.tys.kind(self.shallow(adt_ty)).clone() {
+                    if crate::wfcheck::obligations::arity_ok(self.tcx, self.prog, adt_ty) {
+                        let full = self.tcx.complete_args(self.prog, ad, &self.tcx.tys.list(args).to_vec(), regions);
+                        self.apply_fn_bounds(ad, &full, lo);
+                    }
+                }
                 // an unsized expectation (`Wrap<dyn Debug>` for `Box::new(Wrap { .. })`) is no
                 // type to check against (rustc only_has_type of ExpectRvalueLikeUnsized)
                 if let Some(x) = expected {
@@ -6105,7 +6266,7 @@ impl<'a> Fcx<'a> {
                     }
                 }
             }
-            ExprKind::Closure(row) => { let crate::ast::ClosureRow { params, ret, body, .. } = self.ast().row(*row); self.check_closure(e, self.ast().list(*params), *ret, *body, expected) }
+            ExprKind::Closure(row) => { let crate::ast::ClosureRow { params, ret, body, .. } = self.ast().row(*row); self.check_closure(e, self.ast().list(*params), ret.get(), *body, expected) }
             ExprKind::Mac(m) => self.check_mac(e, self.ast().row(*m), expected, lo),
             ExprKind::Try(x) => self.check_try(e, *x, expected, lo),
             ExprKind::Async(mode, b) => self.check_async_block(e, *mode, *b),
@@ -6158,8 +6319,8 @@ impl<'a> Fcx<'a> {
         let mut found = false;
         for s in ast.list(blk.stmts) {
             match s {
-                Stmt::Expr(e, _) => found = found || self.expr_has_break(*e, 0, label),
-                Stmt::Let(r) => if let Some(e) = &ast.row(*r).init { found = found || self.expr_has_break(*e, 0, label) },
+                Stmt::Expr(_, e) => found = found || self.expr_has_break(*e, 0, label),
+                Stmt::Let(r) => if let Some(e) = &ast.row(*r).init.get() { found = found || self.expr_has_break(*e, 0, label) },
                 _ => {}
             }
         }
@@ -6179,7 +6340,7 @@ impl<'a> Fcx<'a> {
             ExprKind::Loop(b, _) => self.block_has_break(*b, depth + 1, label),
             ExprKind::While(row) => self.block_has_break(self.ast().row(*row).body, depth + 1, label),
             ExprKind::For(row) => self.block_has_break(self.ast().row(*row).body, depth + 1, label),
-            ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.block_has_break(*b, depth, label),
+            ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::TryBlock(b) => self.block_has_break(*b, depth, label),
             ExprKind::If(c, t, el) => {
                 self.expr_has_break(*c, depth, label) || self.block_has_break(*t, depth, label) || el.map_or(false, |x| self.expr_has_break(x, depth, label))
             }
@@ -6199,7 +6360,7 @@ impl<'a> Fcx<'a> {
         let ast = self.ast();
         for s in ast.stmts(b) {
             let r = match s {
-                Stmt::Expr(e, _) => self.expr_has_break(*e, depth, label),
+                Stmt::Expr(_, e) => self.expr_has_break(*e, depth, label),
                 Stmt::Let(r) => ast.row(*r).init.map_or(false, |e| self.expr_has_break(e, depth, label)),
                 _ => false,
             };
@@ -6242,10 +6403,18 @@ impl<'a> Fcx<'a> {
             self.diverging.push(so);
         }
         let residual = self.tcx.instantiate_ty(self.prog, def, &flow_full, residual);
-        let ret = *self.ret_stack.last().unwrap_or(&self.tcx.tys.error);
+        // the innermost `try` block of this body takes the residual, else the body's return
+        let depth = self.ret_stack.len();
+        let block = self.try_stack.last_mut().filter(|t| t.1 == depth).map(|t| { t.2 = true; (t.0, t.3) });
+        let ret = block.map_or_else(|| *self.ret_stack.last().unwrap_or(&self.tcx.tys.error), |b| b.0);
         let full = self.infer_item_args(from_residual, &[ret, residual]);
-        self.register_method_obligation(from_residual, &full);
-        self.apply_fn_bounds(from_residual, &full, lo);
+        match block {
+            Some((_, block_output)) => self.try_block_residual(ret, residual, block_output, lo),
+            None => {
+                self.register_method_obligation(from_residual, &full);
+                self.apply_fn_bounds(from_residual, &full, lo);
+            }
+        }
         self.b.dependencies.push(branch);
         self.b.dependencies.push(from_residual);
         self.b.try_branch.insert(e.0, (branch, self.tcx.tys.mk_list(&[t]), flow));
@@ -6274,6 +6443,78 @@ impl<'a> Fcx<'a> {
             }
         }
         output
+    }
+
+    /// A `?` in a `try` block (rustc_ast_lowering lower_expr_try, a homogeneous block): it breaks
+    /// out with `residual_into_try_type::<R, O>(r)`, of type `<R as Residual<O>>::TryType` for the
+    /// block's output O. The residual decides the block's type, not the context: a `?` on a
+    /// `Result<_, E>` makes it `Result<O, E>`, and an expected `Result<O, F>` is a mismatch. That
+    /// fn only calls `FromResidual::from_residual` into the type, so the typed AST keeps the
+    /// `from_residual` call (check_try) for the lowering.
+    fn try_block_residual(&mut self, block: TyId, residual: TyId, block_output: TyId, lo: u32) {
+        use crate::lang_items::LangItem;
+        let Some(into) = self.tcx.lang_items.get(LangItem::ResidualIntoTryType) else {
+            self.err(lo, "missing `into_try_type` lang item".into()); return;
+        };
+        let full = self.infer_item_args(into, &[residual, block_output]);
+        let sig = self.tcx.fn_sig(self.prog, into).unwrap().clone();
+        let (_, try_type) = self.instantiate_call_signature(into, &full, &sig);
+        self.apply_fn_bounds(into, &full, lo);
+        let try_type = self.normalize_signature(try_type);
+        self.coerce_or_unify(try_type, block, None, lo);
+        self.b.dependencies.push(into);
+    }
+
+    /// `try { stmts; tail }` (feature `try_blocks`; rustc_ast_lowering lower_expr_try_block): a
+    /// block the `?`s inside break out of (check_try, try_block_residual), whose tail is
+    /// `Try::from_output(tail)` (`from_output(())` without one). Every exit has the block's type:
+    /// the expected one, or a variable the `?`s and the tail decide. The typed AST records the
+    /// `from_output` call in `try_branch` under the block's id.
+    fn check_try_block(&mut self, e: ExprId, b: BlockId, expected: Option<TyId>) -> TyId {
+        use crate::lang_items::LangItem;
+        let lo = self.ast().expr(e).lo;
+        let Some(from_output) = self.tcx.lang_items.get(LangItem::TryTraitFromOutput) else {
+            self.err(lo, "missing `from_output` lang item".into()); return self.tcx.tys.error;
+        };
+        let t = match expected {
+            Some(x) => x,
+            None => self.fresh(0),
+        };
+        let full = self.infer_item_args(from_output, &[t]);
+        let sig = self.tcx.fn_sig(self.prog, from_output).unwrap().clone();
+        let (ps, _) = self.instantiate_call_signature(from_output, &full, &sig);
+        let output = self.normalize_signature(ps[0]);
+        self.register_method_obligation(from_output, &full);
+        self.apply_fn_bounds(from_output, &full, lo);
+        self.b.dependencies.push(from_output);
+        let prev = self.diverges;
+        self.try_stack.push((t, self.ret_stack.len(), false, output));
+        // (no expectation: the output is not a coercion site for the tail, see below; even a
+        // soft one would deref-coerce `&s` to `&str`)
+        let bt = self.check_block(b, None);
+        let (_, _, left, _) = self.try_stack.pop().unwrap();
+        let blk = *self.ast().block(b);
+        // The tail is `from_output`'s argument, whose type is the projection `<T as Try>::Output`:
+        // rustc coerces it to that projection's variable, which only unifies, and the projection
+        // then has to hold (E0271). A `&String` tail is no `&str` output; a diverging one is any.
+        let (tail, x, pos) = match self.ast().stmts(b).last() {
+            Some(Stmt::Expr(false, x)) => (bt, Some(*x), self.ast().expr(*x).lo),
+            // (`()` at the block's end, reached or not)
+            _ => (self.tcx.tys.unit, None, blk.hi),
+        };
+        let tail_s = self.shallow(tail);
+        if matches!(self.tcx.tys.kind(tail_s), TyKind::Never) {
+            self.coerce_or_unify(tail, output, x, pos);
+        } else if !self.unify_raw(tail, output, false) {
+            let (ts, os) = (self.ty_str(t), self.ty_str(tail));
+            self.err(pos, format!("E0271: type mismatch resolving `<{} as Try>::Output == {}`", ts, os));
+        }
+        // a `?` that leaves the block makes its end reachable (rustc check_block: may_break)
+        if left {
+            self.diverges = prev;
+        }
+        self.b.try_branch.insert(e.0, (from_output, self.tcx.tys.mk_list(&[t]), output));
+        t
     }
 
     pub fn lang_item(&self, path: &[&str]) -> Option<DefId> {
@@ -6379,7 +6620,7 @@ impl<'a> Fcx<'a> {
         loop {
             match self.ast().expr(x).kind {
                 ExprKind::Paren(i) => x = i,
-                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) => return None,
+                ExprKind::Match(..) | ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Unsafe(_) | ExprKind::TryBlock(_) => return None,
                 _ => return hint,
             }
         }
@@ -6425,12 +6666,20 @@ impl<'a> Fcx<'a> {
                 // builtin path only when neither operand is a type variable, and check_overloaded_binop
                 // records the method for `?T: PartialEq<?R>` while it is ambiguous. Typing it as a
                 // built-in comparison unified both sides and made the capture analysis of
-                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in Scope's code_graph).
-                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
+                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in an app's code_graph).
+                // Every alias is one too, an opaque type (`impl PartialEq` another fn returns)
+                // included, whatever its hidden type: a built-in comparison of an aggregate hidden
+                // type found two different values equal (an app's `structure(&a) != structure(&b)`
+                // over a tuple of maps, relax PR 152)
+                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(..)) {
                     if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, None) {
                         return r;
                     }
                 }
+                // a reference's type is only a hint: rustc gives the right operand a fresh
+                // variable, which the impls for `&A` (`PartialEq<&B>`, `<&mut B>`) leave open
+                // (`&n == &code?` with i32: PartialEq<Code>)
+                self.soft = prim_ref;
                 let tb = self.check_expr(b, Some(ta));
                 // A scalar left operand can implement a comparison against a local
                 // non-scalar right operand (for example `impl PartialEq<Code> for u16`).
@@ -6492,7 +6741,21 @@ impl<'a> Fcx<'a> {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa, b, lo, false);
                 }
-                self.check_expr(b, None);
+                // a non-primitive right operand, or a reference to one, is an operator trait call
+                // too (`256u32 >> &big` with `impl Shr<&Big> for u32`; rustc is_builtin_binop needs
+                // both operands integral): built in, the shift took the reference's address
+                let tb0 = self.check_expr(b, None);
+                let sb0 = self.shallow(tb0);
+                let non_prim = self.non_prim_operand(sb0);
+                if non_prim || self.ref_to_var(sb0) {
+                    if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
+                        return r;
+                    }
+                    if non_prim {
+                        let (x, y) = (self.ty_str(sa), self.ty_str(sb0));
+                        self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+                    }
+                }
                 ta
             }
             _ => {
@@ -6531,7 +6794,7 @@ impl<'a> Fcx<'a> {
                 // a primitive left operand with a non-primitive right one is an operator trait
                 // call too (`3u32 * duration`: `impl Mul<Duration> for u32`; rustc is_builtin_binop
                 // needs both sides primitive)
-                if matches!(self.tcx.tys.kind(sb0), TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Infer(_)) {
+                if self.non_prim_operand(sb0) || self.ref_to_var(sb0) || matches!(self.tcx.tys.kind(sb0), TyKind::Infer(_)) {
                     let sa = self.shallow(ta);
                     if let Some(r) = self.prim_lhs_op(op, e, sa, sb0, lo, false) {
                         return r;
@@ -6857,7 +7120,7 @@ impl<'a> Fcx<'a> {
                 self.select_before_closures();
             }
             for (i, a) in args.iter().enumerate() {
-                if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) != check_closures {
+                if self.is_closure_arg(*a) != check_closures {
                     continue;
                 }
                 if variadic && i >= params.len() {
@@ -6927,6 +7190,12 @@ impl<'a> Fcx<'a> {
         if !self.diverges {
             self.coerce_or_unify(bt, out, None, self.ast().block(b).hi);
         } else {
+            // a tail after a diverging statement still types the output (rustc coerces the
+            // tail: `async { loop { x? } Ok::<(), E>(()) }` is a future of `Result<(), E>`)
+            if !matches!(self.tcx.tys.kind(self.shallow(bt)), TyKind::Never) {
+                let save = self.start_snapshot();
+                if self.try_coerce(bt, out, None) { self.commit_from(save); } else { self.rollback_to(save); }
+            }
             // a body that only diverges (`async { todo!() }`): the return type's still-open
             // variable falls back like any variable a `!` flowed into
             let so = self.shallow(out);
@@ -7092,8 +7361,11 @@ impl<'a> Fcx<'a> {
         self.loops = save_loops;
         self.in_loop_condition = save_condition;
         self.coerce_or_unify(bt, rt, Some(body), self.ast().expr(body).lo);
-        // a coerced body keeps its own type: lowering converts it to the return type
-        if !self.b.coerce(body.0).is_some() {
+        // a coerced body keeps its own type: lowering converts it to the return type. So does one
+        // whose pointer-to-dyn coercion waits for its pointee (`|s| s` returning `&mut dyn Tr` for
+        // a `&mut ?S`): typed as the return type, its thin value was lowered as a fat one (relax
+        // issue 202).
+        if self.b.coerce(body.0).is_none() && !self.deferred_dyn.iter().any(|&(x, ..)| x.0 == body.0) {
             self.set_ty(body, rt);
         }
         self.ret_stack.pop();
@@ -7236,7 +7508,7 @@ impl<'a> Fcx<'a> {
         // lifetimes are fresh.
         let mut full = self.infer_item_args(item, &gargs);
         full[..impl_full.len()].copy_from_slice(&impl_full);
-        self.write_method_user_type(e.0, item, &full);
+        self.write_method_user_type(e.0, item, &full, &tf);
         let (ps, ret) = self.instantiate_call_signature(item, &full, &sig);
         // method/confirm.rs:150-160 (add_obligations): registered once with the
         // instantiated args, before the arguments are checked.
@@ -7303,18 +7575,19 @@ impl<'a> Fcx<'a> {
         // Some(10)`, one impl); several impls (`&A: PartialEq<&B>` / `<&mut B>`, String's) leave
         // it open, as rustc's fresh variable does -- `x == &Unicode(y.as_ref())` with x:
         // &Unicode<CowStr> is `Unicode<&str>`, not `Unicode<CowStr>` (op.rs check_overloaded_binop)
-        let hint = if self.tcx.has_param(da) {
-            None
+        // `open`: the impls leave `L: Cmp<?R>` open, so rustc's ?R takes the right operand's own type
+        let (hint, open) = if self.tcx.has_param(da) {
+            (None, false)
         } else {
             let rhs = self.fresh(0);
             let mark = self.start_snapshot();
             let hint = match self.select_trait(td, da, &[rhs]) {
                 Ok(Some(_)) => {
                     let h = self.infcx.deeply_resolve_ignoring_regions(rhs);
-                    if self.tcx.tys.has_infer(h) { None } else { Some(h) }
+                    if self.tcx.tys.has_infer(h) { (None, true) } else { (Some(h), false) }
                 }
-                Ok(None) => None,
-                Err(_) => Some(ta),
+                Ok(None) => (None, true),
+                Err(_) => (Some(ta), false),
             };
             self.rollback_to(mark);
             hint
@@ -7328,6 +7601,19 @@ impl<'a> Fcx<'a> {
         let selection = self.select_trait(td, da, &[db]);
         let rhs = if selection.is_ok() {
             db
+        } else if checked_b.is_some() && open {
+            // a right operand checked as written is not coerced: rustc coerces it to ?R, which
+            // the impls left open (`&A: PartialEq<&B>` and `<&mut B>`), so ?R is its own type and
+            // `L: Cmp<R>` is unmet (op.rs check_overloaded_binop; relax issue 87: `&usize ==
+            // &&usize` compiled). The error names the innermost pair the impls for references
+            // reach: can't compare `usize` with `&usize`.
+            let (mut x, mut y) = (da, db);
+            while let (TyKind::Ref(_, i, _), TyKind::Ref(_, j, _)) = (self.tcx.tys.kind(x).clone(), self.tcx.tys.kind(y).clone()) {
+                (x, y) = (i, j);
+            }
+            let (x, y) = (self.ty_str(x), self.ty_str(y));
+            self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+            return Some(self.tcx.tys.bool_);
         } else if !matches!(self.select_trait(td, da, &[da]), Err(_)) {
             self.coerce_or_unify(tb, ta, Some(b), lo);
             da
@@ -7429,6 +7715,32 @@ impl<'a> Fcx<'a> {
         self.norm(r)
     }
 
+    /// A right operand no primitive operator takes: a non-primitive type, or a reference to one
+    /// (`x %= &big` with `impl RemAssign<&BigUint> for u32`). rustc is_builtin_binop needs both
+    /// operands primitive; core's forward-ref operator impls take references to primitives only.
+    fn non_prim_operand(&mut self, sb: TyId) -> bool {
+        let non_prim = |k: &TyKind| matches!(k, TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..));
+        if non_prim(self.tcx.tys.kind(sb)) {
+            return true;
+        }
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
+            let si = self.shallow(inner);
+            return non_prim(self.tcx.tys.kind(si));
+        }
+        false
+    }
+
+    /// A reference to a type not known yet (`|t| x - t` where `t: &?V` comes from a map whose value
+    /// type a later `insert` gives): rustc's overloaded path, where `f64: Sub<&?V>` selects core's
+    /// `Sub<&f64> for f64`; the built-in one would unify `f64` with `&?V` (E0308).
+    fn ref_to_var(&mut self, sb: TyId) -> bool {
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(sb).clone() {
+            let si = self.shallow(inner);
+            return matches!(self.tcx.tys.kind(si), TyKind::Infer(_));
+        }
+        false
+    }
+
     /// `prim op adt`: the operator trait impl of the primitive for the right type. A literal
     /// left operand takes the type of the single primitive impl with that right type.
     /// With `assign`, `prim op= adt` through the `<Op>Assign` impl (`n /= NonZero<u32>`).
@@ -7442,6 +7754,8 @@ impl<'a> Fcx<'a> {
             (BinOp::BitAnd, true) => ("BitAndAssign", "bitand_assign"),
             (BinOp::BitOr, true) => ("BitOrAssign", "bitor_assign"),
             (BinOp::BitXor, true) => ("BitXorAssign", "bitxor_assign"),
+            (BinOp::Shl, true) => ("ShlAssign", "shl_assign"),
+            (BinOp::Shr, true) => ("ShrAssign", "shr_assign"),
             (_, true) => return None,
             (op, false) => match op {
                 BinOp::Add => ("Add", "add"),
@@ -7452,6 +7766,8 @@ impl<'a> Fcx<'a> {
                 BinOp::BitAnd => ("BitAnd", "bitand"),
                 BinOp::BitOr => ("BitOr", "bitor"),
                 BinOp::BitXor => ("BitXor", "bitxor"),
+                BinOp::Shl => ("Shl", "shl"),
+                BinOp::Shr => ("Shr", "shr"),
                 _ => return None,
             },
         };
@@ -7485,7 +7801,7 @@ impl<'a> Fcx<'a> {
                 self.select_before_closures();
             }
             for (i, a) in args.iter().enumerate() {
-                if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) != check_closures {
+                if self.is_closure_arg(*a) != check_closures {
                     continue;
                 }
                 let pt = if i + 1 < ps.len() { ps[i + 1] } else { error };
@@ -7495,7 +7811,7 @@ impl<'a> Fcx<'a> {
                     // (`.filter(|(_, c)| ..)` into `Filter<_, fn(&(usize, &str)) -> bool>`)
                     let ei = self.deeply_resolve_ignoring_regions_with_obligations(ei);
                     let to_fn_ptr = matches!(self.tcx.tys.kind(self.shallow(ei)), TyKind::FnPtr(..));
-                    if to_fn_ptr || !matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) {
+                    if to_fn_ptr || !self.is_closure_arg(*a) {
                         let t = self.check_expr(*a, Some(ei));
                         let ei = self.deeply_resolve_ignoring_regions_with_obligations(ei);
                         let pt = self.deeply_resolve_ignoring_regions_with_obligations(pt);
@@ -7554,7 +7870,7 @@ impl<'a> Fcx<'a> {
                 if matches!(known, crate::consts::GenericArg::Lifetime(_)) { *arg = known; }
             }
         }
-        self.write_method_user_type(e.0, item, &full);
+        self.write_method_user_type(e.0, item, &full, &tf);
         let (ps, r) = self.instantiate_call_signature(item, &full, &sig);
         // A probe only establishes that the trait may hold, even when it found
         // one impl. Confirm the pick by retaining its trait obligation (nightly
@@ -7731,7 +8047,7 @@ impl<'a> Fcx<'a> {
     }
 
     fn register_goal(&mut self, goal: Goal, lo: u32) {
-        self.fulfillment_cx.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
+        self.fulfillment_cx.register_predicate_obligation(&self.infcx, self.prog, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
     }
 
     fn retry_goals(&mut self, final_: bool) {
@@ -7950,11 +8266,11 @@ impl<'a> Fcx<'a> {
                 never
             }
             "matches" | "assert_matches" | "debug_assert_matches" => {
-                if let (Some(&x), Some(p)) = (mexprs.first(), margs.pat) {
+                if let (Some(&x), Some(p)) = (mexprs.first(), margs.pat.get()) {
                     let t = self.check_expr(x, None);
                     let saved = self.scopes.len();
                     self.check_pat(p, t);
-                    if let Some(g) = margs.guard {
+                    if let Some(g) = margs.guard.get() {
                         self.check_expr(g, Some(bool_));
                     }
                     self.scopes.truncate(saved);
@@ -8244,8 +8560,12 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Adt(d, args, _) => {
             let mut s = type_path(prog, tcx, *d);
-            if !args.is_empty() {
-                s.push_str(&format!("<{}>", list(tcx.tys.list(*args))));
+            // the trailing arguments that are their parameter's default are left out, as rustc's
+            // printer leaves them (`Vec<u8>` for `Vec<u8, Global>`)
+            let args = tcx.tys.list(*args);
+            let shown = tcx.shown_args(prog, *d, args);
+            if shown > 0 {
+                s.push_str(&format!("<{}>", list(&args[..shown])));
             }
             s
         }
@@ -8413,6 +8733,18 @@ pub fn item_path(prog: &Program, tcx: &Tcx, d: DefId) -> String {
 }
 
 pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -> String {
+    ty_string(stable_closures, false, prog, tcx, t)
+}
+
+/// A type as rustc's diagnostics print it: an ADT's trailing arguments that equal their
+/// parameter's default are left out (`Vec<u8>` for `Vec<u8, Global>`, rustc_middle
+/// ty/print/pretty.rs `generic_args_to_print`). For messages only: it lowers the defaults, so
+/// keys and names keep `ty_to_string`.
+pub fn ty_to_diag_string(prog: &Program, tcx: &Tcx, t: TyId) -> String {
+    ty_string(false, true, prog, tcx, t)
+}
+
+fn ty_string(stable_closures: bool, elide: bool, prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Bool => "bool".to_string(),
         TyKind::Char => "char".to_string(),
@@ -8426,7 +8758,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
                 if i > 0 {
                     s.push_str(", ");
                 }
-                s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
+                s.push_str(&ty_string(stable_closures, elide, prog, tcx, *x));
             }
             if tcx.tys.list(*v).len() == 1 {
                 s.push(',');
@@ -8434,20 +8766,22 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             s.push(')');
             s
         }
-        TyKind::Array(e, n) => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), const_str(prog, tcx, *n)),
+        TyKind::Array(e, n) => format!("[{}; {}]", ty_string(stable_closures, elide, prog, tcx, *e), const_str(prog, tcx, *n)),
         TyKind::Const(v) => const_str(prog, tcx, *v),
-        TyKind::Slice(e) => format!("[{}]", ty_to_string(stable_closures, prog, tcx, *e)),
-        TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, ty_to_string(stable_closures, prog, tcx, *e)),
-        TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_to_string(stable_closures, prog, tcx, *e)),
+        TyKind::Slice(e) => format!("[{}]", ty_string(stable_closures, elide, prog, tcx, *e)),
+        TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, ty_string(stable_closures, elide, prog, tcx, *e)),
+        TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_string(stable_closures, elide, prog, tcx, *e)),
         TyKind::Adt(d, args, _) => {
             let mut s = prog.name(*d).to_string();
+            let args = tcx.tys.list(*args);
+            let args = if elide { &args[..tcx.shown_args(prog, *d, args)] } else { args };
             if !args.is_empty() {
                 s.push('<');
-                for (i, x) in tcx.tys.list(*args).iter().enumerate() {
+                for (i, x) in args.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
+                    s.push_str(&ty_string(stable_closures, elide, prog, tcx, *x));
                 }
                 s.push('>');
             }
@@ -8459,17 +8793,18 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
                 if i > 0 {
                     s.push_str(", ");
                 }
-                s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
+                s.push_str(&ty_string(stable_closures, elide, prog, tcx, *x));
             }
             s.push_str(") -> ");
-            s.push_str(&ty_to_string(stable_closures, prog, tcx, *r));
+            s.push_str(&ty_string(stable_closures, elide, prog, tcx, *r));
             s
         }
         TyKind::FnDef(d, _, _) => format!("fn item {}", prog.def_path(*d)),
         TyKind::Param(i) => format!("T{}", i),
-        TyKind::Infer(v) => format!("?{}", v),
-        TyKind::IntVar(v) => format!("?I{}", v),
-        TyKind::FloatVar(v) => format!("?F{}", v),
+        // rustc_type_ir/src/ty_kind.rs `impl Display for InferTy`: messages name no variable
+        TyKind::Infer(_) => "_".to_string(),
+        TyKind::IntVar(_) => "{integer}".to_string(),
+        TyKind::FloatVar(_) => "{float}".to_string(),
         TyKind::Bound(d, b) => format!("^{}.{}:{:?}", d, b.var.0, b.kind),
         TyKind::Placeholder(p) => format!("!U{}.{}", p.universe.0, p.bound.0),
         TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, .. }) => {
@@ -8492,7 +8827,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&ty_to_string(stable_closures, prog, tcx, *a));
+                    s.push_str(&ty_string(stable_closures, elide, prog, tcx, *a));
                 }
                 s.push('>');
             }
@@ -8504,7 +8839,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         }
         TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: _ }) => {
             let st = match tcx.tys.list(*args).first() {
-                Some(t) => ty_to_string(stable_closures, prog, tcx, *t),
+                Some(t) => ty_string(stable_closures, elide, prog, tcx, *t),
                 None => "?".to_string(),
             };
             format!("<{} as {}>::{}", st, prog.name(prog.def(*d).parent), prog.name(*d))
@@ -8521,7 +8856,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             }
             s
         }
-        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), tcx.tys.list(alias.args).iter().map(|ty| ty_to_string(stable_closures, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
+        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), tcx.tys.list(alias.args).iter().map(|ty| ty_string(stable_closures, elide, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
         TyKind::Error => "{error}".to_string(),
     }
 }
@@ -8543,7 +8878,7 @@ pub fn prim_of(tcx: &Tcx, t: TyId) -> Option<Prim> {
 pub fn is_rest_pat(ast: &Ast, p: PatId) -> bool {
     match ast.pat(p) {
         Pat::Rest => true,
-        Pat::Ident { sub: Some(s), .. } => matches!(ast.pat(*s), Pat::Rest),
+        Pat::Ident { sub, .. } if let Some(s) = &sub.get() => matches!(ast.pat(*s), Pat::Rest),
         _ => false,
     }
 }

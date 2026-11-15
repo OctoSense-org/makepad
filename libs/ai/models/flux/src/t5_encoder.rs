@@ -1,31 +1,31 @@
+use crate::backend::{F32Weight, WeightOwner};
 use crate::backend::{
     compile_graph_session, new_runtime, try_add_f32, try_attention_softmax_weighted_sum_f32,
-    try_gelu_f32, try_matmul_nn_f32, try_matmul_nt_f32, try_mul_f32, try_rms_norm_mul_f32,
-    BufferStorageMode, GraphSession, GraphTensorWrite, Runtime,
+    try_gelu_f32, try_matmul_nn_f32, try_matmul_nt_f32, try_matmul_nt_f32_weight, try_mul_f32,
+    try_rms_norm_mul_f32, BufferStorageMode, GraphSession, GraphTensorWrite, Runtime,
 };
 use crate::flux::T5TextEncoderConfig;
+use crate::graph_growth::{build_with_graph_growth, GraphReserve};
 use crate::t5::T5TokenizedPrompt;
 use crate::{emit_byte_progress, emit_progress, DiffusionError, ProgressHook, Result};
 use makepad_ai_common::backend::{
-    try_get_rows_ggml_bytes, try_get_rows_ggml_bytes_cached, try_matmul_nt_ggml_bytes,
+    try_get_rows_ggml_bytes, try_get_rows_ggml_bytes_cached,
     try_matmul_nt_ggml_bytes_cached,
 };
 use makepad_ai_common::{
-    bf16_to_f32, f16_to_f32, f8_e4m3_to_f32, get_rows_ggml_bytes_cpu, ggml_pad, BufferUsage,
-    Context, Graph, InitParams, Op, Tensor, TensorDesc, TensorId, TensorLayout, TensorType,
+    bf16_to_f32, f16_to_f32, f8_e4m3_to_f32, get_rows_ggml_bytes_cpu, get_rows_ggml_bytes_cpu_into,
+    ggml_pad, BufferUsage, Context, Graph, InitParams, Op, Tensor, TensorDesc, TensorId, TensorLayout, TensorType,
     UnaryOp, GGML_MEM_ALIGN, GGML_TYPE_F8_E4M3,
 };
 use makepad_ai_loader::{MlxDType, MlxSafetensorsHeader, MlxTensorEntry};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const T5_LAYER_NORM_EPSILON: f32 = 1.0e-6;
 const T5_RELATIVE_MAX_DISTANCE: u32 = 128;
 const T5_GATED_FF_OUTPUT_INPUT_SCALE: f32 = 1.0 / 32.0;
 const DEFAULT_GRAPH_EXTRA_BYTES: usize = 2usize * 1024 * 1024 * 1024;
-const MAX_GRAPH_GROWTH_ATTEMPTS: usize = 3;
 const T5_FINAL_LAYER_NORM_NAMES: [&str; 2] =
     ["encoder.final_layer_norm.weight", "final_layer_norm.weight"];
 const T5_RELATIVE_ATTENTION_BIAS_NAME: &str =
@@ -55,12 +55,29 @@ impl T5ModelConfig {
 
 #[derive(Clone, Debug)]
 pub struct LoadedT5xxlWeights {
+    pub(crate) owner: Arc<WeightOwner>,
     pub ctx: Context,
     pub tensor_ids: BTreeMap<String, TensorId>,
     pub config: T5ModelConfig,
     pub path: PathBuf,
     relative_attention_bias: Vec<f32>,
+    /// The combined-checkpoint component these weights were read from.
+    prefix: Option<String>,
     graph_extra_bytes: usize,
+    /// f32 expansions of the matrices no device multiplies in their stored type, decoded once.
+    decoded_f32: DecodedF32Matrices,
+}
+
+/// Decoded f32 matrices of one loaded T5, keyed by this context's tensor ids and freed with it. Clones of the
+/// weights share it (same context contents).
+#[derive(Clone, Default)]
+struct DecodedF32Matrices(Arc<Mutex<HashMap<TensorId, F32Weight>>>);
+
+impl std::fmt::Debug for DecodedF32Matrices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.0.lock().map(|map| map.len()).unwrap_or(0);
+        write!(f, "DecodedF32Matrices({count})")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -122,6 +139,11 @@ struct T5AttentionGraphOutput {
 }
 
 impl LoadedT5xxlWeights {
+    pub(crate) fn load_component_with_owner(path: impl AsRef<Path>, prefix: Option<&str>,
+        progress: Option<ProgressHook>, owner: Option<Arc<WeightOwner>>) -> Result<Self> {
+        Self::load_scoped_with_owner(path, prefix, DEFAULT_GRAPH_EXTRA_BYTES, progress, owner)
+    }
+
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         Self::load_with_extra(path, DEFAULT_GRAPH_EXTRA_BYTES)
     }
@@ -166,7 +188,17 @@ impl LoadedT5xxlWeights {
         path: impl AsRef<Path>,
         prefix: Option<&str>,
         extra_bytes: usize,
+        progress: Option<ProgressHook>,
+    ) -> Result<Self> {
+        Self::load_scoped_with_owner(path, prefix, extra_bytes, progress, None)
+    }
+
+    pub(crate) fn load_scoped_with_owner(
+        path: impl AsRef<Path>,
+        prefix: Option<&str>,
+        extra_bytes: usize,
         mut progress: Option<ProgressHook>,
+        owner: Option<Arc<WeightOwner>>,
     ) -> Result<Self> {
         let header = crate::flux::flux_component_header(path.as_ref(), prefix)?;
         let inspect = T5TextEncoderConfig::from_header(&header)?;
@@ -182,12 +214,15 @@ impl LoadedT5xxlWeights {
         load_t5_weight_bytes(&mut ctx, &header, &tensor_ids, &mut progress)?;
 
         Ok(Self {
+            owner: owner.unwrap_or_else(|| Arc::new(WeightOwner::new("t5xxl"))),
             ctx,
             tensor_ids,
             config,
             path: header.path,
             relative_attention_bias,
+            prefix: prefix.map(str::to_owned),
             graph_extra_bytes: extra_bytes,
+            decoded_f32: DecodedF32Matrices::default(),
         })
     }
 
@@ -208,10 +243,6 @@ impl LoadedT5xxlWeights {
             "missing t5xxl tensor; tried {}",
             names.join(", ")
         )))
-    }
-
-    fn graph_reserve_bytes(&self) -> usize {
-        self.graph_extra_bytes
     }
 
     pub fn relative_attention_bias(&self) -> &[f32] {
@@ -251,6 +282,16 @@ impl LoadedT5xxlWeights {
     }
 }
 
+impl GraphReserve for LoadedT5xxlWeights {
+    fn graph_reserve_bytes(&self) -> usize {
+        self.graph_extra_bytes
+    }
+
+    fn reloaded_with_graph_reserve(&self, extra_bytes: usize) -> Result<Self> {
+        Self::load_scoped_with_owner(&self.path, self.prefix.as_deref(), extra_bytes, None, Some(self.owner.clone()))
+    }
+}
+
 impl CompiledT5xxl {
     pub fn compile(weights: &mut LoadedT5xxlWeights, prompt: &T5TokenizedPrompt) -> Result<Self> {
         let runtime = new_runtime()?;
@@ -262,30 +303,15 @@ impl CompiledT5xxl {
         weights: &mut LoadedT5xxlWeights,
         prompt: &T5TokenizedPrompt,
     ) -> Result<Self> {
-        for attempt in 0..=MAX_GRAPH_GROWTH_ATTEMPTS {
-            let graph = match build_t5xxl_graph(weights, prompt) {
-                Ok(graph) => graph,
-                Err(err) if is_context_oom(&err) && attempt < MAX_GRAPH_GROWTH_ATTEMPTS => {
-                    let next_extra = next_graph_reserve_bytes(weights)?;
-                    *weights =
-                        LoadedT5xxlWeights::load_with_extra(weights.path.clone(), next_extra)?;
-                    continue;
-                }
-                Err(err) => return Err(err),
-            };
-            let session = compile_graph_session(
-                &runtime,
-                &weights.ctx,
-                &graph.graph,
-                BufferStorageMode::Shared,
-                BufferStorageMode::Shared,
-            )?;
-            return Ok(Self { graph, session });
-        }
-
-        Err(DiffusionError::model(
-            "t5xxl graph compilation exhausted context growth attempts",
-        ))
+        let graph = build_with_graph_growth(weights, |weights| build_t5xxl_graph(weights, prompt))?;
+        let session = compile_graph_session(
+            &runtime,
+            &weights.ctx,
+            &graph.graph,
+            BufferStorageMode::Shared,
+            BufferStorageMode::Shared,
+        )?;
+        Ok(Self { graph, session })
     }
 
     pub fn execute(&self, weights: &LoadedT5xxlWeights, token_ids: &[i32]) -> Result<T5xxlRun> {
@@ -563,9 +589,9 @@ fn embed_t5_tokens(
             embedding.cols,
             embedding.rows,
             token_ids,
-            &t5_cache_namespace(weights),
+            &t5_owner(weights),
             "shared.weight",
-            || Ok(embedding.bytes.to_vec()),
+            || Ok(std::borrow::Cow::Borrowed(embedding.bytes)),
         ) {
             Some(Ok(values)) => {
                 return RowsTensor::new(token_ids.len(), model_dim, values);
@@ -628,9 +654,9 @@ fn linear_rows_ggml(
             input.rows,
             input.cols,
             weight.rows,
-            &t5_cache_namespace(weights),
+            &t5_owner(weights),
             weight_name,
-            || Ok(weight.bytes.to_vec()),
+            || Ok(std::borrow::Cow::Borrowed(weight.bytes)),
         ) {
             Some(Ok(mut output)) => {
                 if input_scale != 1.0 {
@@ -653,24 +679,22 @@ fn linear_rows_ggml(
             Some(Err(_)) | None => {}
         }
     }
-    linear_rows_ggml_matrix(input, weight, input_scale)
+    linear_rows_ggml_matrix(weights, input, weight, input_scale)
 }
 
-/// Device weight-cache namespace of these t5 weights: keyed by the source
-/// file path, so combined checkpoints share one evictable checkpoint root
-/// across all components.
-pub(crate) fn t5_cache_namespace(weights: &LoadedT5xxlWeights) -> String {
-    format!("t5xxl:{}", weights.path.display())
+/// Device weight-cache namespace of this loaded component's owner.
+pub(crate) fn t5_owner(weights: &LoadedT5xxlWeights) -> &WeightOwner {
+    &weights.owner
 }
 
 /// Drops every device weight-cache entry belonging to these t5 weights
-/// (raw FP8 payloads + gathered embedding). Called on a model switch —
-/// combined checkpoints key all components on the outgoing checkpoint path.
+/// (raw FP8 payloads + gathered embedding). Called on a model switch.
 pub(crate) fn evict_device_weight_cache(weights: &LoadedT5xxlWeights) -> usize {
-    crate::backend::gpu_weight_cache_evict_prefix(&t5_cache_namespace(weights)).unwrap_or(0)
+    crate::backend::gpu_weight_cache_evict_owner(&t5_owner(weights)).unwrap_or(0)
 }
 
 fn linear_rows_ggml_matrix(
+    weights: &LoadedT5xxlWeights,
     input: &RowsTensor,
     weight: ResidentMatrix<'_>,
     input_scale: f32,
@@ -695,20 +719,11 @@ fn linear_rows_ggml_matrix(
             .collect::<Vec<_>>();
         &scaled_input
     };
-    let mut output = if let Some(output) = try_matmul_nt_ggml_bytes(
-        input_values,
-        weight.bytes,
-        weight.ggml_type,
-        input.rows,
-        input.cols,
-        weight.rows,
-    ) {
-        output
-    } else {
-        let dequantized = decoded_matrix_f32_cached(weight)?;
-        if let Some(output) = try_matmul_nt_f32(
+    let mut output = {
+        let dequantized = decoded_matrix_f32_cached(weights, weight)?;
+        if let Some(output) = try_matmul_nt_f32_weight(
             input_values,
-            dequantized.as_slice(),
+            &dequantized,
             input.rows,
             input.cols,
             weight.rows,
@@ -1676,37 +1691,48 @@ fn resident_matrix<'a>(ctx: &'a Context, tensor_id: TensorId) -> Result<Resident
     })
 }
 
-fn decode_ggml_matrix_to_f32(matrix: ResidentMatrix<'_>) -> Result<Vec<f32>> {
+/// The matrix decoded to f32 once per loaded T5: the cache lives in `weights`, so another load (another file, or
+/// the same tensor ids over other bytes) never sees these values. Decoding runs outside the lock.
+fn decoded_matrix_f32_cached(
+    weights: &LoadedT5xxlWeights,
+    matrix: ResidentMatrix<'_>,
+) -> Result<F32Weight> {
+    let lock = || {
+        weights
+            .decoded_f32
+            .0
+            .lock()
+            .map_err(|_| DiffusionError::model("t5xxl decoded matrix cache poisoned"))
+    };
+    if let Some(decoded) = lock()?.get(&matrix.cache_key) {
+        return Ok(decoded.clone());
+    }
     let row_indices = (0..matrix.rows)
         .map(|row| {
             i32::try_from(row).map_err(|_| DiffusionError::model("t5xxl row index exceeds i32"))
         })
         .collect::<Result<Vec<_>>>()?;
-    get_rows_ggml_bytes_cpu(
-        matrix.bytes,
-        matrix.ggml_type,
-        matrix.cols,
-        matrix.rows,
-        &row_indices,
-    )
-    .ok_or_else(|| DiffusionError::model("t5xxl matrix decode fallback failed"))
-}
-
-fn decoded_matrix_f32_cached(matrix: ResidentMatrix<'_>) -> Result<Arc<Vec<f32>>> {
-    thread_local! {
-        static DECODED_F32_MATRIX_CACHE: RefCell<HashMap<TensorId, Arc<Vec<f32>>>> =
-            RefCell::new(HashMap::new());
-    }
-
-    DECODED_F32_MATRIX_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(decoded) = cache.get(&matrix.cache_key) {
-            return Ok(decoded.clone());
-        }
-        let decoded = Arc::new(decode_ggml_matrix_to_f32(matrix)?);
-        cache.insert(matrix.cache_key, decoded.clone());
-        Ok(decoded)
-    })
+    let len = matrix
+        .rows
+        .checked_mul(matrix.cols)
+        .ok_or_else(|| DiffusionError::model("t5xxl matrix decode fallback failed"))?;
+    let decoded = F32Weight::new(
+        &weights.owner,
+        &format!("decoded-f32/{}", matrix.cache_key),
+        len,
+        |out| {
+            get_rows_ggml_bytes_cpu_into(
+                matrix.bytes,
+                matrix.ggml_type,
+                matrix.cols,
+                matrix.rows,
+                &row_indices,
+                out,
+            )
+            .ok_or_else(|| DiffusionError::model("t5xxl matrix decode fallback failed"))
+        },
+    )?;
+    Ok(lock()?.entry(matrix.cache_key).or_insert(decoded).clone())
 }
 
 fn matmul_nt_f32_cpu(a: &[f32], bt: &[f32], m: usize, k: usize, n: usize) -> Result<Vec<f32>> {
@@ -1913,23 +1939,12 @@ fn shape_dim(entry: &MlxTensorEntry, index: usize) -> Option<u32> {
         .and_then(|&dim| u32::try_from(dim).ok())
 }
 
-fn is_context_oom(err: &DiffusionError) -> bool {
-    matches!(err, DiffusionError::Model(message) if message.starts_with("context out of memory allocating "))
-}
-
-fn next_graph_reserve_bytes(weights: &LoadedT5xxlWeights) -> Result<usize> {
-    weights
-        .graph_reserve_bytes()
-        .checked_mul(2)
-        .ok_or_else(|| DiffusionError::model("t5xxl graph reserve overflow"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_bias_f32_bytes, relative_position_bucket, t5_model_config_from_tensors,
-        t5_target_extents, t5_target_tensor_type, LoadedT5xxlWeights, T5ModelConfig,
-        T5_RELATIVE_ATTENTION_BIAS_NAME,
+        attention_bias_f32_bytes, linear_rows_ggml, relative_position_bucket,
+        t5_model_config_from_tensors, t5_target_extents, t5_target_tensor_type, LoadedT5xxlWeights,
+        RowsTensor, T5ModelConfig, T5_RELATIVE_ATTENTION_BIAS_NAME,
     };
     use crate::flux::T5TextEncoderConfig;
     use makepad_ai_common::TensorType;
@@ -2011,8 +2026,53 @@ mod tests {
     }
 
     #[test]
+    fn decoded_matrices_belong_to_their_load() {
+        // Two loads of a [2, 4] FP8 matrix under the same tensor id with different bytes, used in one thread.
+        // No device multiplies FP8 here, so both go through the decoded-f32 path.
+        let load = |byte: u8| {
+            let mut ctx = makepad_ai_common::Context::new(makepad_ai_common::InitParams {
+                mem_size: 1024,
+                mem_buffer: None,
+                no_alloc: false,
+            });
+            let id = ctx
+                .new_named_tensor("w", TensorType::F8E4M3, 2, &[4, 2], makepad_ai_common::BufferUsage::Weights)
+                .unwrap();
+            ctx.write_tensor_data(id, &[byte; 8]).unwrap();
+            LoadedT5xxlWeights {
+                owner: std::sync::Arc::new(crate::backend::WeightOwner::new("t5xxl")),
+                ctx,
+                tensor_ids: BTreeMap::from([("w".to_string(), id)]),
+                config: T5ModelConfig {
+                    vocab_size: 8,
+                    model_dim: 4,
+                    feedforward_dim: 16,
+                    layer_count: 1,
+                    attention_head_count: 2,
+                    relative_attention_bucket_count: 4,
+                    relative_attention_max_distance: 8,
+                    layer_norm_epsilon_bits: (1.0e-6f32).to_bits(),
+                },
+                path: PathBuf::from("unit-test.safetensors"),
+                relative_attention_bias: Vec::new(),
+                prefix: None,
+                graph_extra_bytes: 0,
+                decoded_f32: Default::default(),
+            }
+        };
+        let input = RowsTensor::new(1, 4, vec![1.0; 4]).unwrap();
+        let ones = load(0x38); // E4M3 1.0
+        let twos = load(0x40); // E4M3 2.0
+        let first = linear_rows_ggml(&ones, &input, "w", 1.0).unwrap();
+        let second = linear_rows_ggml(&twos, &input, "w", 1.0).unwrap();
+        assert_eq!(first.data, vec![4.0; 2], "first load multiplies its own matrix");
+        assert_eq!(second.data, vec![8.0; 2], "second load multiplies its own matrix, not the first load's decode");
+    }
+
+    #[test]
     fn attention_bias_uses_relative_bias_without_padding_mask() {
         let weights = LoadedT5xxlWeights {
+            owner: std::sync::Arc::new(crate::backend::WeightOwner::new("t5xxl")),
             ctx: makepad_ai_common::Context::new(makepad_ai_common::InitParams {
                 mem_size: 1024,
                 mem_buffer: None,
@@ -2036,7 +2096,9 @@ mod tests {
                 2.0, 12.0, // bucket 2
                 3.0, 13.0, // bucket 3
             ],
+            prefix: None,
             graph_extra_bytes: 0,
+            decoded_f32: Default::default(),
         };
         let bytes = attention_bias_f32_bytes(&weights, 2).unwrap();
         let values = bytes

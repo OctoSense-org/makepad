@@ -10,7 +10,7 @@
 //! drawables and presents them. What differs per OS (how work reaches the main thread, how its
 //! loop is woken, the native view of a window) is each shell's `native` module.
 
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 
 #[cfg(target_os = "macos")]
 use super::appkit::native;
@@ -163,7 +163,7 @@ use std::time::Duration;
 /// `MAKEPAD_HAL_LOG=1`: the shell says what it does (windows made, the first frame on screen).
 pub(crate) fn log_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("MAKEPAD_HAL_LOG").is_some())
+    *ON.get_or_init(|| relax_api::env::var_os("MAKEPAD_HAL_LOG").is_some())
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -225,6 +225,8 @@ pub struct Shared {
     pub(super) host: AtomicBool,
     pub(super) logged_present: AtomicBool,
     pub(super) screens: Mutex<Vec<crate::ScreenInfo>>,
+    /// the app went to the background (UIKit) since the Metal backend last gave back what it can
+    pub(super) backgrounded: AtomicBool,
 }
 
 impl Shared {
@@ -246,6 +248,7 @@ impl Shared {
             host: AtomicBool::new(false),
             logged_present: AtomicBool::new(false),
             screens: Mutex::new(Vec::new()),
+            backgrounded: AtomicBool::new(false),
         }
     }
 
@@ -334,6 +337,22 @@ impl Shared {
         }
         self.first_present();
         native::presented();
+    }
+
+    /// The backend draws with another device: the windows made from now on and every window's
+    /// layer draw with it. Called on the backend's thread, which makes the layers' drawables,
+    /// so the change is its own transaction (as a native layer's configuration is).
+    pub fn device_replaced(&self, device: ObjcId) {
+        self.device.store(device as usize, Ordering::Release);
+        let layers = lock(&self.layers);
+        unsafe {
+            let () = msg_send![class!(CATransaction), begin];
+            let () = msg_send![class!(CATransaction), setDisableActions: YES];
+            for (_, layer) in layers.values() {
+                let () = msg_send![layer.as_id(), setDevice: device];
+            }
+            let () = msg_send![class!(CATransaction), commit];
+        }
     }
 
     /// The window's layer (retained for the caller), if the main thread has made it.

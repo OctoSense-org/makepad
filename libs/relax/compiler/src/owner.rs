@@ -1,4 +1,4 @@
-//! The owner thread (local/agent_state/fast-rust/JIT_THREADS.md): the one thread that runs every
+//! The owner thread: the one thread that runs every
 //! step reading or changing a unit's mutable state -- lazy compiles' fronts and installs, constant
 //! and static evaluation (and the JIT code they run), the disk cache, patches, tier installs, the
 //! exit summary. There is no unit lock. Other threads hand it closures and wait for them
@@ -54,7 +54,7 @@ impl Class {
     /// every running job, so these are the classes the owner serves for any thread while the jobs
     /// are paused: one predicate for both sides, so a swap never waits for a job whose request
     /// the pause holds back (an O2/speculation/O3 finish queued as a background finish during a
-    /// CEF-load swap hung Stage: "jobs active 1").
+    /// CEF-load swap hung an app: "jobs active 1").
     pub fn keeps_job(self) -> bool {
         self == Class::Job || self.is_finish()
     }
@@ -83,8 +83,8 @@ const RELEASED: u8 = 3;
 const REQUESTER_SPIN_US: u32 = 60;
 const OWNER_SPIN_US: u32 = 60;
 /// The owner's spin after a request of the main thread: a lazy compile on the UI thread asks again
-/// once its back end has built a fn (a cold Fab's first drag: 60-140 UI round trips in a frame,
-/// each paying the owner's futex wake, 0.15-0.3 ms on a busy box)
+/// once its back end has built a fn (a large app's first drag on a cold start: 60-140 UI round trips
+/// in a frame, each paying the owner's futex wake, 0.15-0.3 ms on a busy box)
 const OWNER_MAIN_SPIN_US: u32 = 1000;
 /// spin iterations per microsecond (0: not measured yet, nobody spins)
 static SPIN_PER_US: AtomicU32 = AtomicU32::new(0);
@@ -132,6 +132,9 @@ struct Req {
     panic_at: Cell<crate::lifeline::PanicAt>,
     /// false: posted (heap, nobody waits); the owner frees it
     waited: bool,
+    /// asked only of a free owner (`call_within` 0: the abort reporter's warm-up): withdrawn rather
+    /// than waited for, so long work does not give way for it (request_waiting)
+    probe: bool,
     /// a program thread's lazy compile front (`call_or_yield`): served outermost, it gives the owner
     /// back rather than wait for a build another thread runs while program requests queue
     yields: bool,
@@ -139,6 +142,9 @@ struct Req {
     yielded: Cell<Option<crate::jit::Yielded>>,
     /// the class of the requester: a job it waits for runs at that (`waiter_class`)
     waiter_class: u8,
+    /// the requester holds a front read (a background check asking for a constant): a front
+    /// write made for this request would wait for that read (`serving_reader`)
+    reader: bool,
     /// main-thread request accounting (0: not a main-thread request): wall ns at the push, and at
     /// the owner's completion
     t_push: u64,
@@ -164,12 +170,15 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 /// The owner thread ends when no request is left (`stop`).
 static STOP: AtomicBool = AtomicBool::new(false);
 static OWNER_JOIN: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> = std::sync::Mutex::new(None);
-/// Program requests queued: long work on the owner stops for them (program_waiting)
+/// Program requests queued: long work on the owner stops for them (program_waiting, request_waiting)
 static FOREGROUND: AtomicU32 = AtomicU32::new(0);
 /// the main thread's requests queued
 static MAIN_QUEUED: AtomicU32 = AtomicU32::new(0);
 /// the main thread's queued publish requests (its lazy compiles' finishes): served first (pick)
 static MAIN_PUBLISH: AtomicU32 = AtomicU32::new(0);
+/// Job requests queued that a thread waits for (not posted ones, nor probes of a free owner): long
+/// work stops for them too (request_waiting)
+static JOBS_WAITING: AtomicU32 = AtomicU32::new(0);
 /// requests queued (any class): the idle owner spins on it
 static QUEUED_N: AtomicU32 = AtomicU32::new(0);
 /// the owner sleeps on WAKE (a push then notifies it; otherwise it is spinning or busy)
@@ -672,7 +681,7 @@ impl Drop for Publishing {
 fn resume_said(p: Box<dyn std::any::Any + Send>) -> ! {
     if cfg!(target_os = "android") {
         let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned());
-        if let Some(msg) = msg { eprintln!("makepad-run: a request on the owner panicked: {msg}"); }
+        if let Some(msg) = msg { eprintln!("relax: a request on the owner panicked: {msg}"); }
     }
     std::panic::resume_unwind(p)
 }
@@ -690,9 +699,9 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
                 _ => 3,
             };
             BAILS[cause].fetch_add(1, Ordering::Relaxed);
-            // MAKEPAD_RUN_BAIL_TRACE: where a background take bailed (diagnosis of the bail rate)
-            if std::env::var_os("MAKEPAD_RUN_BAIL_TRACE").is_some() {
-                eprintln!("makepad-run bail: {} (slot {}) at\n{}", what, slot, std::backtrace::Backtrace::force_capture());
+            // RELAX_BAIL_TRACE: where a background take bailed (diagnosis of the bail rate)
+            if std::env::var_os("RELAX_BAIL_TRACE").is_some() {
+                eprintln!("relax bail: {} (slot {}) at\n{}", what, slot, std::backtrace::Backtrace::force_capture());
             }
             std::panic::resume_unwind(Box::new(PublishBail { what, slots: if slot == u32::MAX { Vec::new() } else { vec![slot] } }))
         }
@@ -700,10 +709,10 @@ pub fn forbid_in_publish(what: &'static str, slot: u32) {
             // said here, before it unwinds: on the owner the panic hook is silent (a request's
             // panic resumes in its requester, where no hook runs)
             let at = std::panic::Location::caller();
-            eprintln!("makepad-run: BUG: {} inside a publish to the compiler's owner at {}:{} (rule I-PUB), slot {}", what, at.file(), at.line(), slot);
+            eprintln!("relax: BUG: {} inside a publish to the compiler's owner at {}:{} (rule I-PUB), slot {}", what, at.file(), at.line(), slot);
             crate::inspect::flightrec::event("ipub.violation", what, slot as u64, at.line() as u64);
             // (with the stack: where the publish was entered from)
-            panic!("makepad: {} inside a publish to the compiler's owner at {} (rule I-PUB: a publish is bounded and never runs a front, an initializer, JIT code or a wait)\n{}", what, at, std::backtrace::Backtrace::force_capture())
+            panic!("relax: {} inside a publish to the compiler's owner at {} (rule I-PUB: a publish is bounded and never runs a front, an initializer, JIT code or a wait)\n{}", what, at, std::backtrace::Backtrace::force_capture())
         }
     }
 }
@@ -730,7 +739,7 @@ pub fn bailing() -> bool {
 /// an install. `f` may not run what `forbid_in_publish` guards; doing so panics.
 #[track_caller]
 pub fn publish<R>(f: impl FnOnce() -> R) -> R {
-    request(std::panic::Location::caller(), Class::Publish, None, false, move || {
+    request(std::panic::Location::caller(), Class::Publish, None, false, false, move || {
         let _p = Publishing::enter(PUB_STRICT);
         f()
     })
@@ -748,7 +757,7 @@ pub fn publish_or_bail<R>(f: impl FnOnce() -> R) -> Result<R, PublishBail> {
     }
     let site = std::panic::Location::caller();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        request(site, Class::Publish, None, false, move || {
+        request(site, Class::Publish, None, false, false, move || {
             let _p = Publishing::enter(PUB_BAIL);
             let _ = take_needs();
             let _clear = ClearNeeds;
@@ -821,7 +830,7 @@ impl Drop for Leaf {
 #[track_caller]
 fn assert_no_leaf(what: &str) {
     if LEAVES.try_with(|l| l.get()).unwrap_or(0) > 0 {
-        panic!("makepad: {} while holding a leaf lock (fn_create): lock order violated, this would deadlock", what);
+        panic!("relax: {} while holding a leaf lock (fn_create): lock order violated, this would deadlock", what);
     }
 }
 
@@ -869,12 +878,22 @@ pub fn for_main() -> bool {
 }
 
 /// A program request waits now (a program thread's, a live patch's or its landing check, a structural
-/// step, inspect), or the publish that finishes the main thread's lazy compile: long work on the
-/// owner (the cache's mid-run writes, the settle rebuild) stops for either. (Stopping for the main
-/// thread's alone, a live session's landing checks waited 565-747 ms behind a mid-run write, whose
-/// startup manifest held the owner 1-6 s.)
+/// step, inspect), or the publish that finishes the main thread's lazy compile: a lazy compile
+/// front gives the owner back for either (may_yield), and long work stops for them (request_waiting).
+/// (Stopping for the main thread's alone, a live session's landing checks waited 565-747 ms behind
+/// a mid-run write, whose startup manifest held the owner 1-6 s.)
 pub fn program_waiting() -> bool {
     FOREGROUND.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0
+}
+
+/// A request waits now that long work on the owner (the cache's mid-run writes, the settle
+/// rebuild) gives the owner back for, at its next check: what `program_waiting` counts, or a Job
+/// a thread waits for (a back end's constant or static, a report, inspect). Background publishes,
+/// posted requests and probes of a free owner (`call_within` 0, which are withdrawn rather than
+/// waited for) wait for the work to end. (A startup write held the owner 4.7 s with a
+/// back end's Job queued, since it stopped only for program requests.)
+pub fn request_waiting() -> bool {
+    program_waiting() || JOBS_WAITING.load(Ordering::Relaxed) > 0
 }
 
 /// What the owner serves now (diagnostics): "idle", or the class and its requester's name.
@@ -885,14 +904,35 @@ pub fn serving_note() -> String {
     }
 }
 
+/// How long the owner thread has served its current request (0: idle).
+pub fn serving_ns() -> u64 {
+    if NOW_CLASS.load(Ordering::Relaxed) == u8::MAX { return 0; }
+    crate::jit::wall_ns().saturating_sub(NOW_T0.load(Ordering::Relaxed))
+}
+
+/// `serving_note` with the site of the request served (atomics only: an abort's report, which
+/// names what kept the owner from its lookups).
+pub fn serving_detail() -> String {
+    // SAFETY: only &'static Locations are stored
+    match unsafe { NOW_SITE.load(Ordering::Relaxed).as_ref() } {
+        Some(site) if NOW_CLASS.load(Ordering::Relaxed) != u8::MAX => format!("{}, asked at {}:{}", serving_note(), site.file(), site.line()),
+        _ => serving_note(),
+    }
+}
+
 /// The request queue as a JSON object (makepad inspect; atomics only, never the queue's lock):
-/// queued requests, of which foreground (main + app) and main.
+/// queued requests, of which foreground (main + app) and main; and `demand`, 1 while a thread of
+/// the program is inside a demand compile (a first call's lazy compile, from its first request
+/// until it runs the code). A queued request is only part of that wait: once the owner served it,
+/// the thread still waits on its compile until it runs again, and an app whose threads
+/// wait so is not idle (makepad_test's idle rule reads it).
 pub fn queued_note() -> String {
     format!(
-        "{{\"total\":{},\"foreground\":{},\"main\":{}}}",
+        "{{\"total\":{},\"foreground\":{},\"main\":{},\"demand\":{}}}",
         QUEUED_N.load(Ordering::Relaxed),
         FOREGROUND.load(Ordering::Relaxed),
-        MAIN_QUEUED.load(Ordering::Relaxed)
+        MAIN_QUEUED.load(Ordering::Relaxed),
+        u8::from(crate::jit::demand_compile_age().0)
     )
 }
 
@@ -957,10 +997,14 @@ pub fn start() {
                 // a dead owner would leave every requester waiting forever
                 crate::lifeline::run("run-owner", crate::lifeline::OnPanic::Fatal, || owner_loop());
             })
-            .expect("makepad: cannot start the compiler's owner thread");
+            .expect("relax: cannot start the compiler's owner thread");
         *OWNER_JOIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
         let _ = rx.recv();
     });
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    crate::os::fault::start_abort_reporter();
+    #[cfg(unix)]
+    crate::os::progsig::start();
 }
 
 /// The owner thread ends (`run_end`): every thread that asked it for something has ended. The next
@@ -984,7 +1028,7 @@ pub(crate) fn stop() {
 /// waits, so `f` may borrow its locals (as `std::thread::scope`'s threads do).
 #[track_caller]
 pub fn call<R>(class: Class, f: impl FnOnce() -> R) -> R {
-    request(std::panic::Location::caller(), class, None, false, f).unwrap()
+    request(std::panic::Location::caller(), class, None, false, false, f).unwrap()
 }
 
 /// `call` for a program thread's lazy compile front: served outermost, it may give the owner back
@@ -993,27 +1037,27 @@ pub fn call<R>(class: Class, f: impl FnOnce() -> R) -> R {
 /// main thread's front is never given back (it would queue behind the requests it let go first).
 #[track_caller]
 pub fn call_or_yield<R>(class: Class, f: impl FnOnce() -> R) -> Option<R> {
-    request(std::panic::Location::caller(), class, None, true, f)
+    request(std::panic::Location::caller(), class, None, true, false, f)
 }
 
 /// `call`, unless the owner has not started it within `ms`: then it is withdrawn (None).
 #[track_caller]
 pub fn call_within<R>(class: Class, ms: u64, f: impl FnOnce() -> R) -> Option<R> {
     // (at least 2 ms: an idle owner picks a request up in microseconds; 0 means "only if the
-    // owner is free now")
-    request(std::panic::Location::caller(), class, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms.max(2))), false, f)
+    // owner is free now": a probe, which long work does not give way for)
+    request(std::panic::Location::caller(), class, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms.max(2))), false, ms == 0, f)
 }
 
-fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, yields: bool, f: impl FnOnce() -> R) -> Option<R> {
+fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, yields: bool, probe: bool, f: impl FnOnce() -> R) -> Option<R> {
     forbid_in_publish("a request", u32::MAX);
-    debug_assert!(!NO_WAIT.try_with(|n| n.get()).unwrap_or(false), "makepad: a request to the compiler's owner on a JIT call's path (rule I-CALL: rt_hot waits for nothing)");
+    debug_assert!(!NO_WAIT.try_with(|n| n.get()).unwrap_or(false), "relax: a request to the compiler's owner on a JIT call's path (rule I-CALL: rt_hot waits for nothing)");
     if is_owner() || CHILD.load(Ordering::Relaxed) {
         return Some(f());
     }
     let mut out: Option<R> = None;
     let mut f = Some(f);
     let mut run = || out = Some((f.take().unwrap())());
-    if !request_dyn(site, class, deadline, yields, &mut run) {
+    if !request_dyn(site, class, deadline, yields, probe, &mut run) {
         return None;
     }
     Some(out.unwrap())
@@ -1021,7 +1065,7 @@ fn request<R>(site: &'static std::panic::Location<'static>, class: Class, deadli
 
 /// `request` past its owner fast path, for every result type (one copy, not one per caller's
 /// closure): false when the request was withdrawn or given back, and the caller asks again.
-fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, yields: bool, run: &mut dyn FnMut()) -> bool {
+fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadline: Option<std::time::Instant>, yields: bool, probe: bool, run: &mut dyn FnMut()) -> bool {
     assert_no_leaf("a request to the compiler's owner");
     // a front reader that must not wait (lowering ahead) gives the work back first; a back
     // end's finish is never refused (its slots stay in flight until it is served)
@@ -1053,9 +1097,11 @@ fn request_dyn(site: &'static std::panic::Location<'static>, class: Class, deadl
         panic: Cell::new(None),
         panic_at: Cell::new(crate::lifeline::NO_PANIC_AT),
         waited: true,
+        probe,
         yields: yields && !on_main,
         yielded: Cell::new(None),
         waiter_class: thread_class(),
+        reader: crate::jit::front_reads_held() > 0,
         t_push: if class == Class::Program && on_main { crate::jit::wall_ns().max(1) } else { 0 },
         t_main: if main_after { crate::jit::wall_ns().max(1) } else { 0 },
         t_serve: AtomicU64::new(0),
@@ -1193,9 +1239,11 @@ pub fn post_queued(class: Class, f: impl FnOnce() + Send + 'static) {
         panic: Cell::new(None),
         panic_at: Cell::new(crate::lifeline::NO_PANIC_AT),
         waited: false,
+        probe: false,
         yields: false,
         yielded: Cell::new(None),
         waiter_class: makepad_cpu_budget::INTERACTIVE,
+        reader: false,
         t_push: 0,
         t_main: 0,
         t_serve: AtomicU64::new(0),
@@ -1217,6 +1265,8 @@ fn push(r: usize, class: Class) {
         }
     } else if class == Class::Publish && from_main(r) {
         MAIN_PUBLISH.fetch_add(1, Ordering::Relaxed);
+    } else if class == Class::Job && job_waited(r) {
+        JOBS_WAITING.fetch_add(1, Ordering::Relaxed);
     }
     QUEUED_N.fetch_add(1, Ordering::SeqCst);
     // makepad inspect's timeline: this thread ends the owner's idle wait, spinning or asleep (owner_loop)
@@ -1235,7 +1285,21 @@ fn dequeued(class: usize, r: usize) {
         }
     } else if class == Class::Publish as usize && from_main(r) {
         MAIN_PUBLISH.fetch_sub(1, Ordering::Relaxed);
+    } else if class == Class::Job as usize && job_waited(r) {
+        JOBS_WAITING.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// A queued request a thread waits for (not a posted one).
+fn is_waited(r: usize) -> bool {
+    // SAFETY: a queued request stays alive until the owner releases it
+    unsafe { (*(r as *const Req)).waited }
+}
+
+/// A queued Job that counts in JOBS_WAITING: one a thread waits for, not a probe of a free owner.
+fn job_waited(r: usize) -> bool {
+    // SAFETY: a queued request stays alive until the owner releases it
+    is_waited(r) && !unsafe { (*(r as *const Req)).probe }
 }
 
 /// A queued request asked by the program's main thread.
@@ -1287,8 +1351,8 @@ fn wait(req: &Req, deadline: Option<std::time::Instant>) -> bool {
     drop(done);
     // The owner's last touch follows its unlock. The unlock's wake can put this thread on the
     // owner's CPU and preempt it right there, before that store: spinning then holds the CPU the
-    // owner needs to make it (Linux, cold Stage: 8 s of the app thread's CPU in this loop, most of
-    // it after the wait). A few spins, then yield.
+    // owner needs to make it (Linux, a large app's cold start: 8 s of the app thread's CPU in this loop,
+    // most of it after the wait). A few spins, then yield.
     let mut spins = 0u32;
     while req.state.load(Ordering::Acquire) != RELEASED {
         if spins < 64 {
@@ -1320,8 +1384,8 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     let helper = EXIT_HELPER.load(Ordering::Acquire);
     // The UI (main) thread's own requests go first, ahead of every other program thread's and every
     // background publish: it waits with no frame meanwhile, and its lazy compile's finish is a
-    // publish that queued behind the O2/O3 workers' takes (a cold Fab: seconds of UI waits behind
-    // background work). A pump serves only its publish (Class::keeps_job), as for any requester.
+    // publish that queued behind the O2/O3 workers' takes (a large app's cold start: seconds of UI waits
+    // behind background work). A pump serves only its publish (Class::keeps_job), as for any requester.
     if only == 0 && MAIN_QUEUED.load(Ordering::Relaxed) + MAIN_PUBLISH.load(Ordering::Relaxed) > 0 {
         for c in [Class::Program as usize, Class::Publish as usize] {
             if mode == Mode::Pump && !CLASS_OF[c].keeps_job() {
@@ -1338,7 +1402,7 @@ fn pick(q: &mut Queue, mode: Mode) -> Option<usize> {
     for c in SERVICE_ORDER {
         // a pump serves only what the awaited thread may be waiting for: a job's request, a
         // publish. Never a program thread's request: it opens builds of its own on top of the
-        // request that pumps -- which holds its own state open meanwhile (Sandbox's race game hung
+        // request that pumps -- which holds its own state open meanwhile (a game hung
         // on a speculative build served inside a main-thread request's pump, 2026-10-21; builds
         // are no publishes since rule I-PUB)
         if mode == Mode::Pump && !CLASS_OF[c].keeps_job() {
@@ -1373,6 +1437,9 @@ pub static SERVED: AtomicU64 = AtomicU64::new(0);
 fn serve(r: usize) {
     let req = unsafe { &*(r as *const Req) };
     SERVED.fetch_add(1, Ordering::Relaxed);
+    // served inside a pump, the owner runs: its row stops naming the pump's runner meanwhile (the
+    // requester's row names the owner; the two read as a cycle)
+    let _running = crate::waits::running();
     req.state.store(RUNNING, Ordering::Release);
     let was_serving = OWNER_SERVING.swap(true, Ordering::Relaxed);
     let t0 = crate::jit::wall_ns();
@@ -1420,12 +1487,12 @@ fn serve(r: usize) {
         Ok(()) if busy => Err(Box::new(crate::preempt::OwnerBusy) as Box<dyn Any + Send>),
         r => r,
     };
-    // MAKEPAD_RUN_OWNER_TRACE: a request's panic, with where it happened on the owner (the compiler's
+    // RELAX_OWNER_TRACE: a request's panic, with where it happened on the owner (the compiler's
     // panic hook is silent there; the requester resumes it)
     if let Err(p) = &res {
-        if std::env::var_os("MAKEPAD_RUN_OWNER_TRACE").is_some() {
+        if std::env::var_os("RELAX_OWNER_TRACE").is_some() {
             let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "(cancellation)".to_string());
-            eprintln!("makepad-run owner: a {:?} request of thread `{}` panicked on the owner: {}{}", req.class, crate::os::thread::name(req.from), msg, crate::jit::take_ice_location());
+            eprintln!("relax owner: a {:?} request of thread `{}` panicked on the owner: {}{}", req.class, crate::os::thread::name(req.from), msg, crate::jit::take_ice_location());
         }
     }
     DEPTH.with(|d| d.set(d.get() - 1));
@@ -1489,7 +1556,7 @@ fn serve(r: usize) {
             if let Err(p) = res {
                 if !crate::preempt::is_cancelled(&*p) {
                     let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
-                    eprintln!("makepad: a posted compiler task panicked: {}", msg);
+                    eprintln!("relax: a posted compiler task panicked: {}", msg);
                 }
             }
         },
@@ -1550,12 +1617,14 @@ fn owner_loop() {
         let frame = crate::jit::frame_enter(std::ptr::null());
         OWN_WORK.with(|w| w.set(true));
         if std::panic::catch_unwind(crate::jit::realtime_drain).is_err() {
-            eprintln!("makepad-run: the owner's real-time vtable drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
+            eprintln!("relax: the owner's real-time vtable drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
         }
         // ... and the constants background builds' fronts found unevaluated
         if std::panic::catch_unwind(crate::jit::const_drain).is_err() {
-            eprintln!("makepad-run: the owner's constant drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
+            eprintln!("relax: the owner's constant drain panicked ({}); the owner goes on", crate::lifeline::panic_at());
         }
+        // ... and the O3 builds that left a candidate out for what the drain makes
+        let _ = crate::jit::left_out_drain();
         #[cfg(test)]
         {
             let work = OWN_WORK_TEST.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1604,7 +1673,7 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
         let t0 = std::time::Instant::now();
         while !done() {
             if CHILD.load(Ordering::Relaxed) && t0.elapsed().as_secs() >= 10 {
-                eprintln!("makepad: forked child waited 10 s for work of a thread of the parent -- exiting");
+                eprintln!("relax: forked child waited 10 s for work of a thread of the parent -- exiting");
                 crate::os::thread::exit_now(134);
             }
             std::thread::sleep(std::time::Duration::from_micros(200));
@@ -1661,7 +1730,7 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
 /// The same holds for a query whose runner waits for a request open on the owner's stack, directly
 /// or through the queries it waits for in turn (`stack_blocks`): served nested inside an earlier
 /// request's wait, a type check's constant (a Job) waited for a constant an ahead checker ran, whose
-/// own constant request was that earlier request (makepad-fab-slice's tests with the dependency check
+/// own constant request was that earlier request (a slicer crate's tests with the dependency check
 /// beside them hung 650 s, 2026-11-03).
 ///
 /// That chain is the nested request's alone. It is read from the wait registry, whose rows lag: a
@@ -1669,7 +1738,7 @@ fn pump_wait_at(site: &'static std::panic::Location<'static>, row: (crate::waits
 /// on can look as if it waited for the owner. Served nested, a chain read wrongly costs a retry.
 /// Outermost there is nothing lower to cancel and nothing the query engine does not see (the
 /// requester's queries are the request's context: a cycle through them is the engine's cycle
-/// error), so there only the owner's own query is a cycle; a chain is waited out (four cold Fab,
+/// error), so there only the owner's own query is a cycle; a chain is waited out (four large app cold starts,
 /// synth and arm-lab starts at once stopped on an internal compiler error, 2026-11-03).
 fn pump_latch(runner: u64, done: &dyn Fn() -> bool) {
     if runner == 0 {
@@ -1703,7 +1772,7 @@ fn stack_blocked() -> ! {
         std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy));
     }
     let (class, from) = serving();
-    panic!("makepad: a query waits for itself on the compiler's owner thread (a query cycle the engine did not see; serving a {} request of {}, own work {})",
+    panic!("relax: a query waits for itself on the compiler's owner thread (a query cycle the engine did not see; serving a {} request of {}, own work {})",
         CLASS_NAMES[class as usize], crate::os::thread::name(from), OWN_WORK.with(|w| w.get()));
 }
 
@@ -1714,6 +1783,12 @@ fn stack_blocked() -> ! {
 /// its callees' back ends, 2026-11-04.)
 pub fn may_yield() -> bool {
     is_owner() && !nested() && program_waiting() && with_serving(|r| r.yields).unwrap_or(false)
+}
+
+/// The owner serves a request whose requester holds a front read: a front write for it would
+/// wait for that read, and the read for this request.
+pub(crate) fn serving_reader() -> bool {
+    is_owner() && with_serving(|r| r.reader).unwrap_or(false)
 }
 
 /// `f` on the request the owner serves now (None: none).
@@ -1864,7 +1939,7 @@ pub fn fork_child() {
 mod tests {
     use super::*;
 
-    /// The Sandbox race-game hang (2026-10-21): the owner, serving a main-thread request, pumped
+    /// A game's hang (2026-10-21): the owner, serving a main-thread request, pumped
     /// inside it (a query latch) and took a queued background request -- a speculative build --
     /// which reached the slot lock the outer request held. A pump serves Job and Publish requests
     /// only; a program thread's request waits for the top of the owner loop.
@@ -1890,6 +1965,142 @@ mod tests {
         // the owner's top loop serves it once the request ended
         call(Class::Program, || {});
         assert!(APP_RAN.load(Ordering::SeqCst));
+    }
+
+    /// Long work on the owner (the cache's mid-run writes, the settle rebuild) asks
+    /// `request_waiting` between its sections and gives the owner back when it says yes. A Job a
+    /// thread waits for counts: a startup write held the owner 4.7 s with a back end's Job queued,
+    /// since it stopped only for program requests. A posted Job, a background thread's publish
+    /// and a probe of a free owner do not: they wait for the work to end, or are withdrawn. (The
+    /// abort reporter's warm-up is such a probe: started late on a loaded machine, it reached the
+    /// owner during the work, counted as a waited Job and stopped it; stopped before the posted
+    /// Job and the publish queued, the test waited for a queue that never filled.) Every wait of
+    /// the test ends on an event: work that ends early fails it, and work that runs on 1000
+    /// sections with the waited Job queued is stopped and fails it, so it never hangs.
+    #[test]
+    fn long_owner_work_gives_way_to_a_waited_job() {
+        isolated_test!(long_owner_work_gives_way_to_a_waited_job);
+        static RUNNING: AtomicBool = AtomicBool::new(false);
+        static SECTIONS: AtomicU32 = AtomicU32::new(0);
+        static POSTED_RAN: AtomicBool = AtomicBool::new(false);
+        static GIVE_UP: AtomicBool = AtomicBool::new(false);
+        // the long work: sections until a request waits (or the test gives up on it); then the
+        // sections it ran, whether a program request waited, and whether a waited Job was counted
+        let work = std::thread::spawn(|| {
+            call(Class::Program, || {
+                RUNNING.store(true, Ordering::SeqCst);
+                while !request_waiting() && !GIVE_UP.load(Ordering::SeqCst) {
+                    SECTIONS.fetch_add(1, Ordering::SeqCst);
+                    std::thread::yield_now();
+                }
+                (SECTIONS.load(Ordering::SeqCst), program_waiting(), JOBS_WAITING.load(Ordering::SeqCst) > 0)
+            })
+        });
+        while !RUNNING.load(Ordering::SeqCst) {
+            assert!(!work.is_finished(), "the long work ended before it ran");
+            std::thread::yield_now();
+        }
+        // a probe of a free owner is withdrawn, and the work goes on
+        let probe = std::thread::spawn(|| call_within(Class::Job, 0, || ()).is_some()).join().unwrap();
+        assert!(!probe, "a probe of the busy owner was served");
+        let probed_at = SECTIONS.load(Ordering::SeqCst);
+        while SECTIONS.load(Ordering::SeqCst) < probed_at + 3 {
+            assert!(!work.is_finished(), "the long work stopped for a probe of a free owner");
+            std::thread::yield_now();
+        }
+        post(Class::Job, || POSTED_RAN.store(true, Ordering::SeqCst));
+        let publisher = std::thread::Builder::new().name("run-test-pub".into()).spawn(|| call(Class::Publish, || ())).unwrap();
+        while QUEUED_N.load(Ordering::SeqCst) < 2 {
+            assert!(!work.is_finished(), "the long work stopped before the posted Job and the publish were queued");
+            std::thread::yield_now();
+        }
+        // with both queued the work runs more sections
+        let queued_at = SECTIONS.load(Ordering::SeqCst);
+        while SECTIONS.load(Ordering::SeqCst) < queued_at + 3 {
+            assert!(!work.is_finished(), "the long work stopped for a posted Job or a background publish");
+            std::thread::yield_now();
+        }
+        // a waited Job: the work gives way; work that runs on with it queued is stopped (whether the
+        // Job counts or not). Its own request in the queue is the event: another request (the abort
+        // reporter's probe) can be queued meanwhile.
+        static WAITER: AtomicU64 = AtomicU64::new(0);
+        let waiter = std::thread::spawn(|| {
+            WAITER.store(me(), Ordering::SeqCst);
+            call(Class::Job, || SECTIONS.load(Ordering::SeqCst))
+        });
+        let queued_from = |tid: u64| {
+            let q = Q.lock().unwrap_or_else(|e| e.into_inner());
+            tid != 0 && q.lanes.iter().flatten().any(|r| unsafe { (*(*r as *const Req)).from } == tid)
+        };
+        let mut waited_at = None;
+        while !work.is_finished() {
+            let sections = SECTIONS.load(Ordering::SeqCst);
+            match waited_at {
+                None if queued_from(WAITER.load(Ordering::SeqCst)) => waited_at = Some(sections),
+                Some(at) if sections > at + 1000 => {
+                    GIVE_UP.store(true, Ordering::SeqCst);
+                    panic!("the long work ran {} sections with a waited Job queued: it did not give way", sections - at);
+                }
+                _ => {}
+            }
+            std::thread::yield_now();
+        }
+        let (stopped_at, program, job_counted) = work.join().unwrap();
+        let served_at = waiter.join().unwrap();
+        assert!(!program, "a program request waited: the work did not stop for the Job");
+        assert!(job_counted, "the work stopped with no waited Job counted");
+        assert_eq!(served_at, stopped_at, "the waited Job was served when the work gave way, with no section after");
+        assert!(POSTED_RAN.load(Ordering::SeqCst), "the posted Job, queued first, ran before the waited one");
+        publisher.join().unwrap();
+    }
+
+    /// The pool apps' deadlock reports (2026-11-08): the owner, pumping for a thread's work, served
+    /// that thread's own request, and its wait row kept naming the thread meanwhile while the
+    /// requester's named the owner: "run-owner <-> the thread", a cycle for as long as the service
+    /// ran. Serving, the owner waits for nothing; the pump's row is back once the service ended.
+    #[test]
+    fn the_owner_serving_inside_a_pump_waits_for_nothing() {
+        isolated_test!(the_owner_serving_inside_a_pump_waits_for_nothing);
+        static RUNNER: AtomicU64 = AtomicU64::new(0);
+        static DONE: AtomicBool = AtomicBool::new(false);
+        static AFTER: AtomicBool = AtomicBool::new(false);
+        // the owner's row while it served (its kind), the requester's
+        static ROWS: Mutex<Option<(Option<crate::waits::Kind>, Option<crate::waits::Kind>)>> = Mutex::new(None);
+        call(Class::Program, || {
+            let job = std::thread::spawn(|| {
+                RUNNER.store(me(), Ordering::SeqCst);
+                while !OWNER_ASLEEP.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                call(Class::Job, || {
+                    // the requester's row is written right after its push
+                    let runner = RUNNER.load(Ordering::SeqCst);
+                    let t0 = std::time::Instant::now();
+                    while crate::waits::of(runner).map(|w| w.kind) != Some(crate::waits::Kind::Owner) && t0.elapsed().as_secs() < 10 {
+                        std::thread::yield_now();
+                    }
+                    *ROWS.lock().unwrap_or_else(|e| e.into_inner()) = Some((crate::waits::of(me()).map(|w| w.kind), crate::waits::of(runner).map(|w| w.kind)));
+                    DONE.store(true, Ordering::SeqCst);
+                });
+            });
+            while RUNNER.load(Ordering::SeqCst) == 0 {
+                std::thread::yield_now();
+            }
+            let runner = RUNNER.load(Ordering::SeqCst);
+            pump_wait_for(runner, &|| {
+                // the first look after the service: the pump's row is back
+                let done = DONE.load(Ordering::SeqCst);
+                if done {
+                    AFTER.store(crate::waits::of(me()).is_some_and(|w| w.kind == crate::waits::Kind::Pump && w.holder == runner), Ordering::SeqCst);
+                }
+                done
+            });
+            job.join().unwrap();
+        });
+        let (owner, requester) = ROWS.lock().unwrap_or_else(|e| e.into_inner()).take().expect("the Job was served");
+        assert_eq!(requester, Some(crate::waits::Kind::Owner), "the requester waits for the owner");
+        assert_eq!(owner, None, "the owner serving the request waits for nothing");
+        assert!(AFTER.load(Ordering::SeqCst), "after the service the pump's row names the thread it waits for");
     }
 
     /// M55 (a crate's compute tests on the Vulkan HAL, 2026-11-03): the owner,
@@ -1922,7 +2133,7 @@ mod tests {
         assert!(call(Class::Program, || enter(Kind::Layout, 7, 2).is_ok()));
     }
 
-    /// makepad-fab-slice's tests with the dependency check beside them (2026-11-03): an ahead
+    /// a slicer crate's tests with the dependency check beside them (2026-11-03): an ahead
     /// checker's constant (a Job) pumped on the owner, which served a dependency check's constant
     /// (a Job) inside it; that one waited for a query the ahead checker ran -- whose runner waited for
     /// the Job lower on the owner's stack. 650 s, every thread waiting. The nested Job is cancelled
@@ -1990,7 +2201,7 @@ mod tests {
 
     /// The owner-wait table's rows: a wait outside every request (the owner loop draining constants)
     /// has a row of its own, found again (a row named no request site spun forever on its second use
-    /// and hung the owner: a cold Fab drew no frame).
+    /// and hung the owner: a large app's cold start drew no frame).
     #[test]
     fn owner_wait_rows_outside_requests() {
         let a = std::panic::Location::caller();
@@ -2018,7 +2229,7 @@ mod tests {
         nested_wait_on_the_stack(true);
     }
 
-    /// Four cold starts at once (Fab, synth, arm-lab; 2026-11-03): the owner, serving an outermost
+    /// Four cold starts at once (a large app, synth, arm-lab; 2026-11-03): the owner, serving an outermost
     /// request, waited for a query a type-check thread ran, and that thread's wait-registry row still
     /// named a query the owner (or the request's requester) had finished: the waiter had not run
     /// since its latch completed. The chain read "the runner waits for the owner's stack", an
@@ -2126,6 +2337,7 @@ pub(crate) unsafe fn reset_statics() {
     reset(&FOREGROUND, AtomicU32::new(0));
     reset(&MAIN_QUEUED, AtomicU32::new(0));
     reset(&MAIN_PUBLISH, AtomicU32::new(0));
+    reset(&JOBS_WAITING, AtomicU32::new(0));
     reset(&QUEUED_N, AtomicU32::new(0));
     reset(&OWNER_ASLEEP, AtomicBool::new(false));
     reset(&OWNER_SERVING, AtomicBool::new(false));

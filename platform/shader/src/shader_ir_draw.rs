@@ -9,7 +9,7 @@
 //! descriptor sets from: dyn uniforms at 2, uniform buffers at their
 //! `buffer_index`, the scope uniforms after them, then textures, samplers,
 //! the XR depth texture and the instance-record storage buffer.
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 
 use crate::shader_ids::*;
 use crate::shader_schema::{ShaderPacked, ShaderTypeKind, ShaderTypeInline};
@@ -34,6 +34,36 @@ pub struct IrDrawInfo {
     pub instance_slots: usize,
     pub pick_binding: Option<u32>,
     pub pick_texture_base: Option<u32>,
+    /// Which of the draw's textures each sampler reads, sampler by sampler (bit i: texture i;
+    /// all bits: not known, a sampler past these or one reading a texture that is not a draw
+    /// texture global): what a backend needs to pick a sampler the bound texture's format can
+    /// be read with.
+    pub sampler_textures: [u32; SAMPLER_TEXTURE_MASKS],
+}
+
+/// Samplers whose textures [`IrDrawInfo::sampler_textures`] names.
+pub const SAMPLER_TEXTURE_MASKS: usize = 16;
+
+/// Which of the draw's textures (`ShaderIoKind::Texture`, bound from `texture_base` up) each
+/// sampler reads, over every sample in the module.
+fn sampler_textures(ir: &IrModule, output: &ShaderOutput, texture_base: u32) -> [u32; SAMPLER_TEXTURE_MASKS] {
+    let textures = output.io.iter().filter(|io| matches!(io.kind, ShaderIoKind::Texture(_))).count() as u32;
+    let mut masks = [0u32; SAMPLER_TEXTURE_MASKS];
+    for f in &ir.functions {
+        for e in &f.exprs {
+            let ExprKind::Sample(s) = &e.kind else { continue };
+            let Some(mask) = masks.get_mut(s.sampler as usize) else { continue };
+            let index = match f.exprs[s.tex as usize].kind {
+                ExprKind::Global(g) => ir.globals[g as usize].binding.map(|b| b.wrapping_sub(texture_base)),
+                _ => None,
+            };
+            *mask |= match index {
+                Some(i) if i < textures.min(32) => 1 << i,
+                _ => u32::MAX,
+            };
+        }
+    }
+    masks
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -51,6 +81,41 @@ struct RecField {
     pod: ShaderTypeId,
     slots: usize,
     offset: usize,
+}
+
+/// The instance fields the fragment stage reads, as they travel to it: their
+/// record's words in flat integer varyings (`flat_instance_*`), so every
+/// fragment gets exactly the record's values, as Metal's fragment fetch does.
+/// As interpolated float lanes a constant came back perspective-corrected (an
+/// enum's 2 as 1.9999999, read as 1: a ring drawn as a capsule). Each entry is
+/// the field at its offset in that word stream, with its offset in the
+/// instance record; then the stream's length in words.
+fn fragment_instance_fields(output: &ShaderOutput, ir: &IrModule, instance: &[RecField]) -> (Vec<(RecField, usize)>, usize) {
+    let fragment_reads = match ir.function_by_name("io_fragment") {
+        Some(f) => {
+            let funcs = ir.reachable(f);
+            ir.globals_used(&funcs)
+        }
+        None => vec![false; ir.globals.len()],
+    };
+    let mut fields = Vec::new();
+    let mut words = 0;
+    for f in instance {
+        let io = &output.io[f.io];
+        let kind = match io.kind {
+            ShaderIoKind::DynInstance => IrGlobalKind::Io(IrIo::DynInstance),
+            _ => IrGlobalKind::Io(IrIo::RustInstance),
+        };
+        let read = match ir.find_global(kind, io.name) {
+            Some(g) => fragment_reads.get(g as usize).copied().unwrap_or(false),
+            None => false,
+        };
+        if read {
+            fields.push((RecField { io: f.io, pod: f.pod, slots: f.slots, offset: words }, f.offset));
+            words += f.slots;
+        }
+    }
+    (fields, words)
 }
 
 /// Lanes a field takes in a record (`attribute`: the fetch words; else the
@@ -409,35 +474,10 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     info.geometry_slots = record_end(&geometry);
     info.instance_slots = record_end(&instance);
 
-    // Varyings: the instance fields the fragment stage reads, then the
-    // varyings.
-    let fragment_reads = match ir.function_by_name("io_fragment") {
-        Some(f) => {
-            let funcs = ir.reachable(f);
-            ir.globals_used(&funcs)
-        }
-        None => vec![false; ir.globals.len()],
-    };
-    let reads_global = |ir: &IrModule, kind: IrGlobalKind, name: LiveId| -> bool {
-        match ir.find_global(kind, name) {
-            Some(g) => fragment_reads.get(g as usize).copied().unwrap_or(false),
-            None => false,
-        }
-    };
+    let (frag_instance, instance_words) = fragment_instance_fields(output, ir, &instance);
+    // The shader's own varyings, interpolated.
     let mut varyings = Vec::new();
     let mut offset = 0;
-    for rust in [false, true] {
-        for (i, io) in output.io.iter().enumerate() {
-            let kind = match io.kind {
-                ShaderIoKind::DynInstance if !rust => IrGlobalKind::Io(IrIo::DynInstance),
-                ShaderIoKind::RustInstance if rust => IrGlobalKind::Io(IrIo::RustInstance),
-                _ => continue,
-            };
-            if reads_global(ir, kind, io.name) {
-                push_field(types, &mut varyings, i, io.ty, false, &mut offset);
-            }
-        }
-    }
     for (i, io) in output.io.iter().enumerate() {
         if let ShaderIoKind::Varying = io.kind {
             push_field(types, &mut varyings, i, io.ty, false, &mut offset);
@@ -587,6 +627,11 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     for i in 0..varying_vec4s {
         outputs.push(IrEntryIo { name: format!("packed_varying_{}", i), ty: vec4, binding: IrIoBinding::Location(i as u32) });
     }
+    let uvec4 = ir.vec_ty(4, IrScalar::U32);
+    let instance_vec4s = instance_words.div_ceil(4);
+    for i in 0..instance_vec4s {
+        outputs.push(IrEntryIo { name: format!("flat_instance_{}", i), ty: uvec4, binding: IrIoBinding::Location((varying_vec4s + i) as u32) });
+    }
     let vertex_fn = ir.function_by_name("io_vertex");
     let vertex_ret_vec4 = vertex_fn.map(|f| ir.functions[f as usize].ret == vec4).unwrap_or(false);
 
@@ -640,6 +685,20 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
             let place = b.glob(g);
             b.assign(place, v);
         }
+        // the fragment stage's instance fields: their record words, as they are
+        for (f, record_at) in &frag_instance {
+            for s in 0..f.slots {
+                let slot = f.offset + s;
+                let o = b.e(ExprKind::EntryOut(1 + (varying_vec4s + slot / 4) as u32), uvec4);
+                let dst = b.lane(o, (slot % 4) as u8);
+                let base = b.e(ExprKind::Local(ib), TY_U32);
+                let kk = b.u32((record_at + s) as u32);
+                let idx = b.bin(BinOp::Add, base, kk, TY_U32);
+                let arr = b.glob(buf);
+                let word = b.e(ExprKind::Index(arr, idx), TY_U32);
+                b.assign(dst, word);
+            }
+        }
     }
     copy_uniforms(&mut b, dyn_block, &dyn_ios, scope_block, &scope_ios, &io_globals);
     let zero = b.f32(0.0);
@@ -691,6 +750,10 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     for i in 0..varying_vec4s {
         inputs.push(IrEntryIo { name: format!("packed_varying_{}", i), ty: vec4, binding: IrIoBinding::Location(i as u32) });
     }
+    let inst_in_base = inputs.len() as u32;
+    for i in 0..instance_vec4s {
+        inputs.push(IrEntryIo { name: format!("flat_instance_{}", i), ty: uvec4, binding: IrIoBinding::Location((varying_vec4s + i) as u32) });
+    }
     let mut frag_outputs = Vec::new();
     for (i, io) in output.io.iter().enumerate() {
         if let ShaderIoKind::FragmentOutput(index) = io.kind {
@@ -723,6 +786,19 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let place = b.glob(g);
         b.assign(place, v);
     }
+    let mut inst_lanes = Vec::new();
+    for i in 0..instance_vec4s * 4 {
+        let v = b.e(ExprKind::EntryIn(inst_in_base + (i / 4) as u32), uvec4);
+        inst_lanes.push(b.lane(v, (i % 4) as u8));
+    }
+    for (f, _) in &frag_instance {
+        let Some(g) = io_globals[f.io] else { continue };
+        let inline = ShaderTypeInline { id: f.pod, data: types.type_data(f.pod).clone() };
+        let mut at = f.offset;
+        let v = b.reconstruct(types, &inline, Source::Word, &inst_lanes, &mut at);
+        let place = b.glob(g);
+        b.assign(place, v);
+    }
     copy_uniforms(&mut b, dyn_block, &dyn_ios, scope_block, &scope_ios, &io_globals);
     init_frag_depth(&mut b, depth_out, &io_globals);
     init_frag_position(&mut b, output, &io_globals, FragPositionFix::AsIs);
@@ -730,6 +806,7 @@ pub fn build_draw_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
     }
+    linear_light_output(&mut b, types, output, &io_globals);
     for (k, (_, i)) in frag_outputs.iter().enumerate() {
         let Some(g) = io_globals[*i] else { continue };
         let ty = b.m.globals[g as usize].ty;
@@ -847,6 +924,83 @@ fn copy_uniforms(b: &mut Bld, dyn_block: Option<GlobalId>, dyn_ios: &[usize], sc
             b.assign(place, field);
         }
     }
+}
+
+/// The uniform buffer `block`'s global (made here when the shader's own code never reads it)
+/// and the index of its `field`; None for a shader without that buffer or field.
+fn uniform_field(ir: &mut IrModule, types: &impl crate::shader_types::ShaderTypes, output: &ShaderOutput, block: LiveId, field: LiveId) -> Option<(GlobalId, u32, TyId)> {
+    let io = output.io.iter().position(|io| matches!(io.kind, ShaderIoKind::UniformBuffer) && io.name == block)?;
+    let g = io_global(types, output, ir, io)?;
+    let IrTy::Struct(si) = ir.get(ir.globals[g as usize].ty).clone() else { return None };
+    let (k, f) = ir.structs[si as usize].fields.iter().enumerate().find(|(_, f)| f.name == field)?;
+    Some((g, k as u32, f.ty))
+}
+
+/// The output epilogue of a pass that holds linear light (`DrawPassUniforms::linear_light`,
+/// `DrawPass::set_linear_light`): the shaders write display colour (gamma 2.2), and the first
+/// colour output is decoded to linear light as it is written, so the target blends, and an
+/// MSAA target resolves, in linear light. A call that blends over writes premultiplied colour
+/// (`DrawCallUniforms::premultiplied`): it is unpremultiplied, decoded and premultiplied again
+/// (alpha 0: nothing to decode, kept as it is). Any other call (no blending: in an MSAA pass its
+/// alpha is coverage; a max blend) has its colour decoded as it is. In every other pass this is
+/// one uniform compare per fragment; a shader without the pass or call uniforms is untouched.
+fn linear_light_output(b: &mut Bld, types: &impl crate::shader_types::ShaderTypes, output: &ShaderOutput, io_globals: &[Option<GlobalId>]) {
+    let Some(io) = output.io.iter().position(|io| matches!(io.kind, ShaderIoKind::FragmentOutput(0))) else { return };
+    let Some(color) = io_globals[io] else { return };
+    if *b.m.get(b.m.globals[color as usize].ty) != IrTy::Vec(4, IrScalar::F32) {
+        return;
+    }
+    let (Some((pass, on_k, on_ty)), Some((call, pm_k, pm_ty))) = (
+        uniform_field(b.m, types, output, id!(draw_pass), id!(linear_light)),
+        uniform_field(b.m, types, output, id!(draw_call), id!(premultiplied)),
+    ) else {
+        return;
+    };
+    let vec4 = b.m.vec_ty(4, IrScalar::F32);
+    // the colour decoded: per channel max(c (/ a), 0) ^ 2.2 (* a), alpha as it is
+    fn decoded(b: &mut Bld, color: GlobalId, vec4: TyId, premultiplied: bool) -> Stmt {
+        let mut lanes = Vec::with_capacity(4);
+        for k in 0..3 {
+            let c = b.glob(color);
+            let mut x = b.lane(c, k);
+            if premultiplied {
+                let c = b.glob(color);
+                let a = b.lane(c, 3);
+                x = b.bin(BinOp::Div, x, a, TY_F32);
+            }
+            let zero = b.f32(0.0);
+            let x = b.builtin(Builtin::Max, vec![x, zero], TY_F32);
+            let gamma = b.f32(2.2);
+            let mut x = b.builtin(Builtin::Pow, vec![x, gamma], TY_F32);
+            if premultiplied {
+                let c = b.glob(color);
+                let a = b.lane(c, 3);
+                x = b.bin(BinOp::Mul, x, a, TY_F32);
+            }
+            lanes.push(x);
+        }
+        let c = b.glob(color);
+        lanes.push(b.lane(c, 3));
+        let v = b.e(ExprKind::Construct(lanes), vec4);
+        let place = b.glob(color);
+        Stmt::Assign(place, v)
+    }
+    let over = decoded(b, color, vec4, true);
+    let straight = decoded(b, color, vec4, false);
+    let c = b.glob(color);
+    let a = b.lane(c, 3);
+    let zero = b.f32(0.0);
+    let covered = b.bin(BinOp::Gt, a, zero, TY_BOOL);
+    let blk = b.glob(call);
+    let pm = b.e(ExprKind::Field(blk, pm_k), pm_ty);
+    let half = b.f32(0.5);
+    let premultiplied = b.bin(BinOp::Gt, pm, half, TY_BOOL);
+    let blk = b.glob(pass);
+    let on = b.e(ExprKind::Field(blk, on_k), on_ty);
+    let half = b.f32(0.5);
+    let linear = b.bin(BinOp::Gt, on, half, TY_BOOL);
+    let body = vec![Stmt::If(premultiplied, vec![Stmt::If(covered, vec![over], Vec::new())], vec![straight])];
+    b.f.body.push(Stmt::If(linear, body, Vec::new()));
 }
 
 /// The clip volume test at the top of `depth_clip`: discard the fragment when its world
@@ -1034,6 +1188,7 @@ fn build_depth_clip(ir: &mut IrModule, xr: bool, xr_depth: GlobalId, view_id: Gl
 
 /// A draw shader's SPIR-V: the window and the XR variant's vertex and
 /// fragment binaries, from one IR compile.
+#[derive(Default)]
 pub struct IrDrawSpirv {
     pub info: IrDrawInfo,
     pub vertex: Vec<u32>,
@@ -1059,6 +1214,7 @@ fn draw_variant_spirv_with_pick(output: &ShaderOutput, types: &impl crate::shade
     crate::shader_ir_precise::lower_precise(&mut ir, true);
     let mut info = build_draw_entries(output, &mut ir, types, xr);
     if pick { spirv_pick::apply(output, &mut ir, &mut info)?; }
+    info.sampler_textures = sampler_textures(&ir, output, info.texture_binding_base);
     let (Some(v), Some(f)) = (ir.function_by_name("vertex_main"), ir.function_by_name("fragment_main")) else {
         return Err("draw shader has no entry points".to_string());
     };
@@ -1189,31 +1345,18 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         };
     }
 
-    let fragment_reads = match ir.function_by_name("io_fragment") {
-        Some(f) => {
-            let funcs = ir.reachable(f);
-            ir.globals_used(&funcs)
-        }
-        None => vec![false; ir.globals.len()],
-    };
+    // The instance fields the fragment stage reads: exact in flat integer
+    // varyings, as on Vulkan (`fragment_instance_fields`). GL's record comes
+    // in as typed or float attributes, so they carry the fields' value lanes'
+    // bits rather than the record's words.
+    let mut frag_instance = Vec::new();
+    let mut offset = 0;
+    for (f, _) in fragment_instance_fields(output, ir, &instance).0 {
+        push_gl_field(types, &mut frag_instance, f.io, f.pod, false, &mut offset);
+    }
+    let flat_vec4s = record_end(&frag_instance).div_ceil(4);
     let mut varyings = Vec::new();
     let mut offset = 0;
-    for rust in [false, true] {
-        for (i, io) in output.io.iter().enumerate() {
-            let kind = match io.kind {
-                ShaderIoKind::DynInstance if !rust => IrGlobalKind::Io(IrIo::DynInstance),
-                ShaderIoKind::RustInstance if rust => IrGlobalKind::Io(IrIo::RustInstance),
-                _ => continue,
-            };
-            let read = match ir.find_global(kind, io.name) {
-                Some(g) => fragment_reads.get(g as usize).copied().unwrap_or(false),
-                None => false,
-            };
-            if read {
-                push_gl_field(types, &mut varyings, i, io.ty, false, &mut offset);
-            }
-        }
-    }
     for (i, io) in output.io.iter().enumerate() {
         if let ShaderIoKind::Varying = io.kind {
             push_gl_field(types, &mut varyings, i, io.ty, false, &mut offset);
@@ -1277,6 +1420,10 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
     for k in 0..varying_vec4s {
         outputs.push(IrEntryIo { name: format!("packed_varying_{}", k), ty: vec4, binding: IrIoBinding::Location(k as u32) });
     }
+    let uvec4 = ir.vec_ty(4, IrScalar::U32);
+    for k in 0..flat_vec4s {
+        outputs.push(IrEntryIo { name: format!("flat_instance_{}", k), ty: uvec4, binding: IrIoBinding::Location((varying_vec4s + k) as u32) });
+    }
     let vertex_fn = ir.function_by_name("io_vertex");
     let vertex_ret_vec4 = vertex_fn.map(|f| ir.functions[f as usize].ret == vec4).unwrap_or(false);
     let mut b = Bld { f: IrFunction::new("vertex_main".to_string(), TY_VOID), m: ir };
@@ -1329,6 +1476,24 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
                 let mut at = f.offset;
                 gl_assign_reconstructed(&mut b, types, g, &inline, Source::Attr, lanes, &mut at);
             }
+        }
+    }
+    // the fragment stage's instance fields: the record's values, as they are
+    for f in &frag_instance {
+        let Some(g) = io_globals[f.io] else { continue };
+        let inline = ShaderTypeInline { id: f.pod, data: types.type_data(f.pod).clone() };
+        let v = b.glob(g);
+        let mut lanes = Vec::new();
+        b.flatten(types, &inline, v, &mut lanes);
+        for s in 0..f.slots {
+            let slot = f.offset + s;
+            let src = match lanes.get(s) {
+                Some(e) => b.bitcast(*e, TY_U32),
+                None => b.u32(0),
+            };
+            let o = b.e(ExprKind::EntryOut(1 + (varying_vec4s + slot / 4) as u32), uvec4);
+            let dst = b.lane(o, (slot % 4) as u8);
+            b.assign(dst, src);
         }
     }
     let zero = b.f32(0.0);
@@ -1400,6 +1565,9 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
     for k in 0..varying_vec4s {
         inputs.push(IrEntryIo { name: format!("packed_varying_{}", k), ty: vec4, binding: IrIoBinding::Location(k as u32) });
     }
+    for k in 0..flat_vec4s {
+        inputs.push(IrEntryIo { name: format!("flat_instance_{}", k), ty: uvec4, binding: IrIoBinding::Location((varying_vec4s + k) as u32) });
+    }
     let mut outputs = Vec::new();
     let mut frag_outputs = Vec::new();
     for (i, io) in output.io.iter().enumerate() {
@@ -1432,6 +1600,18 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         let mut at = f.offset;
         gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &var_lanes, &mut at);
     }
+    let mut flat_lanes = Vec::new();
+    for i in 0..flat_vec4s * 4 {
+        let v = b.e(ExprKind::EntryIn((varying_vec4s + i / 4) as u32), uvec4);
+        let w = b.lane(v, (i % 4) as u8);
+        flat_lanes.push(b.bitcast(w, TY_F32));
+    }
+    for f in &frag_instance {
+        let Some(g) = io_globals[f.io] else { continue };
+        let inline = ShaderTypeInline { id: f.pod, data: types.type_data(f.pod).clone() };
+        let mut at = f.offset;
+        gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &flat_lanes, &mut at);
+    }
     init_frag_depth(&mut b, depth_out, &io_globals);
     if let Some(origin) = frag_y {
         init_frag_position(&mut b, output, &io_globals, FragPositionFix::GlYOrigin(origin));
@@ -1440,6 +1620,7 @@ pub fn build_gl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl c
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
     }
+    linear_light_output(&mut b, types, output, &io_globals);
     for (k, i) in frag_outputs.iter().enumerate() {
         let Some(g) = io_globals[*i] else { continue };
         let ty = b.m.globals[g as usize].ty;
@@ -1546,37 +1727,18 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     }
     info.instance_slots = record_end(&instance);
 
-    let fragment_reads = match ir.function_by_name("io_fragment") {
-        Some(f) => {
-            let funcs = ir.reachable(f);
-            ir.globals_used(&funcs)
-        }
-        None => vec![false; ir.globals.len()],
-    };
+    // The instance fields the pixel stage reads: their record words in
+    // nointerpolation integer varyings, as on Vulkan (`build_draw_entries`).
+    let (frag_instance, instance_words) = fragment_instance_fields(output, ir, &instance);
     let mut varyings = Vec::new();
     let mut offset = 0;
-    for rust in [false, true] {
-        for (i, io) in output.io.iter().enumerate() {
-            let kind = match io.kind {
-                ShaderIoKind::DynInstance if !rust => IrGlobalKind::Io(IrIo::DynInstance),
-                ShaderIoKind::RustInstance if rust => IrGlobalKind::Io(IrIo::RustInstance),
-                _ => continue,
-            };
-            let read = match ir.find_global(kind, io.name) {
-                Some(g) => fragment_reads.get(g as usize).copied().unwrap_or(false),
-                None => false,
-            };
-            if read {
-                push_field(types, &mut varyings, i, io.ty, false, &mut offset);
-            }
-        }
-    }
     for (i, io) in output.io.iter().enumerate() {
         if let ShaderIoKind::Varying = io.kind {
             push_field(types, &mut varyings, i, io.ty, false, &mut offset);
         }
     }
     let varying_vec4s = (record_end(&varyings) + 3) / 4;
+    let instance_vec4s = instance_words.div_ceil(4);
 
     let mut io_globals = Vec::new();
     for i in 0..output.io.len() {
@@ -1647,6 +1809,10 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
     let mut outputs = vec![IrEntryIo { name: "position".to_string(), ty: vec4, binding: IrIoBinding::Builtin(IrBuiltinIo::Position) }];
     for k in 0..varying_vec4s {
         outputs.push(IrEntryIo { name: format!("packed_varying_{}", k), ty: vec4, binding: IrIoBinding::Location(k as u32) });
+    }
+    let uvec4 = ir.vec_ty(4, IrScalar::U32);
+    for k in 0..instance_vec4s {
+        outputs.push(IrEntryIo { name: format!("flat_instance_{}", k), ty: uvec4, binding: IrIoBinding::Location((varying_vec4s + k) as u32) });
     }
     let frag_inputs = outputs.clone();
     let vertex_fn = ir.function_by_name("io_vertex");
@@ -1727,6 +1893,20 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
             let mut at = f.offset;
             gl_assign_reconstructed(&mut b, types, g, &inline, Source::Word, &words, &mut at);
         }
+        // the pixel stage's instance fields: their record words, as they are
+        for (f, record_at) in &frag_instance {
+            for s in 0..f.slots {
+                let slot = f.offset + s;
+                let o = b.e(ExprKind::EntryOut(1 + (varying_vec4s + slot / 4) as u32), uvec4);
+                let dst = b.lane(o, (slot % 4) as u8);
+                let base = b.e(ExprKind::Local(ib), TY_U32);
+                let kk = b.u32((record_at + s) as u32);
+                let idx = b.bin(BinOp::Add, base, kk, TY_U32);
+                let arr = b.glob(buf);
+                let word = b.e(ExprKind::Index(arr, idx), TY_U32);
+                b.assign(dst, word);
+            }
+        }
     }
     let zero = b.f32(0.0);
     let one = b.f32(1.0);
@@ -1795,12 +1975,24 @@ pub fn build_hlsl_entries(output: &ShaderOutput, ir: &mut IrModule, types: &impl
         let mut at = f.offset;
         gl_assign_reconstructed(&mut b, types, g, &inline, Source::Numeric, &var_lanes, &mut at);
     }
+    let mut inst_lanes = Vec::new();
+    for i in 0..instance_vec4s * 4 {
+        let v = b.e(ExprKind::EntryIn(1 + (varying_vec4s + i / 4) as u32), uvec4);
+        inst_lanes.push(b.lane(v, (i % 4) as u8));
+    }
+    for (f, _) in &frag_instance {
+        let Some(g) = io_globals[f.io] else { continue };
+        let inline = ShaderTypeInline { id: f.pod, data: types.type_data(f.pod).clone() };
+        let mut at = f.offset;
+        gl_assign_reconstructed(&mut b, types, g, &inline, Source::Word, &inst_lanes, &mut at);
+    }
     init_frag_depth(&mut b, depth_out, &io_globals);
     init_frag_position(&mut b, output, &io_globals, FragPositionFix::ReciprocalW);
     if let Some(ff) = fragment_fn {
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
     }
+    linear_light_output(&mut b, types, output, &io_globals);
     for (k, (_, i)) in frag_outputs.iter().enumerate() {
         let Some(g) = io_globals[*i] else { continue };
         let ty = b.m.globals[g as usize].ty;
@@ -1854,14 +2046,14 @@ pub struct DrawSpirvView<'a> {
     pub vertex: &'a [u32],
     pub fragment: &'a [u32],
 }
-pub fn draw_spirv_result(output: &ShaderOutput, types: &impl crate::shader_types::ShaderTypes) -> IrDrawSpirvResult {
-    IrDrawSpirvResult { result: draw_spirv(output, types) }
+/// Without `xr` the XR stages stay empty: only a headset's multiview passes draw with them.
+pub fn draw_spirv_result(output: &ShaderOutput, types: &impl crate::shader_types::ShaderTypes, xr: bool) -> IrDrawSpirvResult {
+    if xr { return IrDrawSpirvResult { result: draw_spirv(output, types) }; }
+    IrDrawSpirvResult { result: draw_variant_spirv(output, types, false).map(|window| [window, IrDrawSpirv::default()]) }
 }
+/// Pick passes are never multiview, so the XR stages stay empty.
 pub fn draw_pick_spirv_result(output: &ShaderOutput, types: &impl crate::shader_types::ShaderTypes) -> IrDrawSpirvResult {
-    IrDrawSpirvResult { result: (|| Ok([
-        draw_variant_spirv_with_pick(output, types, false, true)?,
-        draw_variant_spirv_with_pick(output, types, true, true)?,
-    ]))() }
+    IrDrawSpirvResult { result: draw_variant_spirv_with_pick(output, types, false, true).map(|window| [window, IrDrawSpirv::default()]) }
 }
 impl IrDrawSpirv {
     fn view(&self) -> DrawSpirvView<'_> {
@@ -1881,6 +2073,7 @@ impl IrDrawInfo {
     pub fn instance_slots(&self) -> usize { self.instance_slots }
     pub fn pick_binding(&self) -> Option<u32> { self.pick_binding }
     pub fn pick_texture_base(&self) -> Option<u32> { self.pick_texture_base }
+    pub fn sampler_textures(&self) -> &[u32; SAMPLER_TEXTURE_MASKS] { &self.sampler_textures }
 }
 
 /// What the Metal printer needs beyond the IR.
@@ -2150,6 +2343,7 @@ pub fn build_metal_entries(output: &ShaderOutput, ir: &mut IrModule, types: &imp
         let call = b.e(ExprKind::Call(ff, Vec::new()), TY_VOID);
         b.f.body.push(Stmt::Expr(call));
     }
+    linear_light_output(&mut b, types, output, &io_globals);
     for (k, (_, i)) in frag_outputs.iter().enumerate() {
         let Some(g) = io_globals[*i] else { continue };
         let ty = b.m.globals[g as usize].ty;

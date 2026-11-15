@@ -32,6 +32,8 @@ struct Inner {
     end_fields: cmd::EndFields,
     /// The discovery file this endpoint wrote: its caps follow later registrations.
     discovery: Mutex<Option<std::path::PathBuf>>,
+    /// When this endpoint began (ms since the epoch): its HELLO_OK's `serving_since_ms`.
+    since_ms: u64,
 }
 
 /// Called with every connection the endpoint accepts, once its handshake is done.
@@ -47,7 +49,7 @@ impl Endpoint {
 
     /// An endpoint whose replay ring holds `ring_bytes` of stream chunks.
     pub fn with_ring(app: &str, ring_bytes: usize) -> Endpoint {
-        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None), end_fields: Default::default(), discovery: Mutex::new(None) }))
+        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None), end_fields: Default::default(), discovery: Mutex::new(None), since_ms: cmd::wall_ms() }))
     }
 
     /// Listens on this process's Unix socket and writes the discovery file (register the services
@@ -149,11 +151,21 @@ impl Endpoint {
 
     /// As [`serve`](Self::serve), refusing a peer whose HELLO does not carry `token` (when it is
     /// not empty): the loopback carrier's shared secret.
-    pub fn serve_checked(&self, mut reader: FrameReader, mut writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>, token: &str) -> Result<Conn, HandshakeError> {
+    pub fn serve_checked(&self, reader: FrameReader, writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>, token: &str) -> Result<Conn, HandshakeError> {
+        self.serve_peer(reader, writer, shutdown, token, 0)
+    }
+
+    /// As [`serve_checked`](Self::serve_checked), for a peer whose process the carrier knows
+    /// (`pid`, from a Unix socket's credentials): [`Hello::pid`] of the connection's peer, which a
+    /// command's log names as who asked ([`crate::cmd::asked_by`]). With no credentials (0), a peer
+    /// that sends this process's own secret (`Hello::own`) is this process.
+    pub fn serve_peer(&self, mut reader: FrameReader, mut writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>, token: &str, pid: u32) -> Result<Conn, HandshakeError> {
         reader.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
-        let own = Hello { name: self.0.app.clone(), caps: self.caps(), token: token.to_string(), ..Hello::default() };
+        let own = Hello { name: self.0.app.clone(), caps: self.caps(), token: token.to_string(), serving_pid: std::process::id(), serving_since_ms: self.0.since_ms, ..Hello::default() };
         let peer = match hello::server_handshake(&mut reader, &mut *writer, &own) {
-            Ok(p) => p,
+            // (the loopback carrier gives no credentials: a peer with this process's own secret is
+            // this process; the secret goes no further)
+            Ok(p) => Hello { pid: if pid == 0 && crate::carrier::loopback::is_own(&p.own) { std::process::id() } else { pid }, own: String::new(), ..p },
             Err(e) => {
                 shutdown();
                 return Err(e);

@@ -1,5 +1,5 @@
 //! What the renderer prepares from an environment map, off the UI thread
-//! (renderer/ibl.rs submits it as a Heavy job): the IBL lane texture
+//! (renderer/ibl.rs submits it as a Background job): the IBL lane texture
 //! (render-material's prefiltered atlas + SH9 meta row), a full-resolution
 //! dome for the background (at most 2048 wide, RGBA f32), and the numbers
 //! the sun rig, the exposure meter and the fog take from the map.
@@ -19,6 +19,7 @@
 use makepad_render_material::ibl::{self, EnvMap};
 use super::*;
 use std::borrow::Cow;
+use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 
 /// The dome texture is never wider than this: a 2048 x 1024 RGBA f32 dome
 /// is 32 MB of texels, allocated at exactly that size (the HAL pads no
@@ -92,7 +93,7 @@ pub fn prepare_ibl_sized(
 ) -> PreparedIbl {
     let sizes = PrepareSizes { dome: max_dome_width, atlas: atlas_width, lighting: LIGHTING_MAX_WIDTH };
     let removal = sun.map_or(KeyRemoval::Nothing, KeyRemoval::Fill);
-    prepare_ibl_until(env, removal, intensity, rotation_deg, sizes, &|| false).expect("a preparation nobody stops runs to its end")
+    prepare_ibl_until(env, removal, intensity, rotation_deg, sizes, &|| false, &|n, f| (0..n).for_each(f)).expect("a preparation nobody stops runs to its end")
 }
 
 /// The lighting copy is never wider than this. The prefilter reads its
@@ -123,26 +124,25 @@ pub fn prepare_ibl_until(
     intensity: f32,
     rotation_deg: f32,
     sizes: PrepareSizes,
-    stop: &dyn Fn() -> bool,
+    stop: &(dyn Fn() -> bool + Sync),
+    run: &dyn Fn(usize, &(dyn Fn(usize) + Sync)),
 ) -> Option<PreparedIbl> {
-    let env = sane(env);
+    let env = sane_spread(env, run);
     // The dome first, from the source with its sun: resized only when the
     // cap bites (resized clones at the same size, and a 4K map is 128 MB).
     let dome_width = dome_width(env.width, sizes.dome);
     let dome_height = dome_width / 2;
-    let dome = if dome_width == env.width && dome_height == env.height {
-        env.to_rgba_f32()
-    } else {
-        env.resized(dome_width).to_rgba_f32()
-    };
+    // Resizing owns the RGBA array already; flatten it without a second
+    // full-size allocation and copy.
+    let dome = env.resized_spread(dome_width, run).data.into_flattened();
     if stop() {
         return None;
     }
-    let lit = lighting_copy(&env, removal, sizes.lighting);
+    let lit = lighting_copy_spread(&env, removal, sizes.lighting, run);
     if stop() {
         return None;
     }
-    let atlas = ibl::prefilter_until(&lit, sizes.atlas, ATLAS_LEVELS, stop)?;
+    let atlas = ibl::prefilter_spread(&lit, sizes.atlas, ATLAS_LEVELS, stop, run)?;
     if stop() {
         return None;
     }
@@ -166,7 +166,11 @@ pub fn prepare_ibl_until(
 /// narrow enough and has nothing to fill is not copied at all. `env` is
 /// already `sane` (`resized` indexes every texel its size names).
 pub fn lighting_copy<'a>(env: &'a EnvMap, removal: KeyRemoval<'a>, max_width: usize) -> Cow<'a, EnvMap> {
-    let narrow = |map: Cow<'a, EnvMap>| if map.width > max_width { Cow::Owned(map.resized(max_width)) } else { map };
+    lighting_copy_spread(env, removal, max_width, &|n, f| (0..n).for_each(f))
+}
+
+fn lighting_copy_spread<'a>(env: &'a EnvMap, removal: KeyRemoval<'a>, max_width: usize, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Cow<'a, EnvMap> {
+    let narrow = |map: Cow<'a, EnvMap>| if map.width > max_width { Cow::Owned(map.resized_spread(max_width, run)) } else { map };
     match removal {
         KeyRemoval::Nothing => narrow(Cow::Borrowed(env)),
         KeyRemoval::Fill(sun) => {
@@ -174,7 +178,7 @@ pub fn lighting_copy<'a>(env: &'a EnvMap, removal: KeyRemoval<'a>, max_width: us
             remove_sun(lit.to_mut(), sun);
             lit
         }
-        KeyRemoval::Exact(keyless) => narrow(sane(keyless)),
+        KeyRemoval::Exact(keyless) => narrow(sane_spread(keyless, run)),
     }
 }
 
@@ -219,23 +223,37 @@ pub fn horizon_band(env: &EnvMap) -> Vec3f {
 /// NaN, infinite or negative channels become 0. Borrowed when nothing is
 /// wrong, so the common case copies nothing.
 fn sane(env: &EnvMap) -> Cow<'_, EnvMap> {
+    sane_spread(env, &|n, f| (0..n).for_each(f))
+}
+
+fn sane_spread<'a>(env: &'a EnvMap, run: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Cow<'a, EnvMap> {
     if env.width < 2 || env.height < 1 || env.data.len() < env.width * env.height {
         return Cow::Owned(EnvMap::constant(2, [0.0, 0.0, 0.0]));
     }
     let bad = |v: f32| !(v.is_finite() && v >= 0.0);
-    if env.data.iter().any(|c| bad(c[0]) || bad(c[1]) || bad(c[2])) {
-        let mut copy = env.clone();
-        for c in &mut copy.data {
-            for v in c.iter_mut().take(3) {
-                if bad(*v) {
-                    *v = 0.0;
+    let found_bad = AtomicBool::new(false);
+    run(env.data.len().div_ceil(env.width), &|y| {
+        let end = ((y + 1) * env.width).min(env.data.len());
+        if env.data[y * env.width..end].iter().any(|c| bad(c[0]) || bad(c[1]) || bad(c[2])) {
+            found_bad.store(true, Ordering::Relaxed);
+        }
+    });
+    if !found_bad.load(Ordering::Relaxed) {
+        return Cow::Borrowed(env);
+    }
+    let mut data = vec![[0.0; 4]; env.data.len()];
+    {
+        let rows: Vec<_> = data.chunks_mut(env.width).map(|row| Mutex::new(Some(row))).collect();
+        run(rows.len(), &|y| {
+            let row = rows[y].lock().unwrap().take();
+            if let Some(row) = row {
+                for (out, c) in row.iter_mut().zip(&env.data[y * env.width..]) {
+                    *out = [if bad(c[0]) { 0.0 } else { c[0] }, if bad(c[1]) { 0.0 } else { c[1] }, if bad(c[2]) { 0.0 } else { c[2] }, 1.0];
                 }
             }
-            c[3] = 1.0;
-        }
-        return Cow::Owned(copy);
+        });
     }
-    Cow::Borrowed(env)
+    Cow::Owned(EnvMap { width: env.width, height: env.height, data })
 }
 
 #[cfg(test)]
@@ -283,22 +301,22 @@ mod tests {
     fn a_preparation_asks_to_stop_between_its_stages() {
         let env = map(64, |d| grey(0.2 + 0.8 * d.y.max(0.0)));
         let sizes = PrepareSizes { dome: 2048, atlas: 16, lighting: LIGHTING_MAX_WIDTH };
-        let asked = std::cell::Cell::new(0usize);
+        let asked = std::sync::atomic::AtomicUsize::new(0);
         let never = || {
-            asked.set(asked.get() + 1);
+            asked.fetch_add(1, Ordering::Relaxed);
             false
         };
-        assert_eq!(prepare_ibl_until(&env, KeyRemoval::Nothing, 1.0, 0.0, sizes, &never), Some(prepare_ibl_sized(&env, None, 1.0, 0.0, 2048, 16)));
-        let stages = asked.get();
-        assert_eq!(stages, 2 + ATLAS_LEVELS + 1, "after the dome, after the lighting copy, before every level, before the SH");
+        assert_eq!(prepare_ibl_until(&env, KeyRemoval::Nothing, 1.0, 0.0, sizes, &never, &|n, f| (0..n).for_each(f)), Some(prepare_ibl_sized(&env, None, 1.0, 0.0, 2048, 16)));
+        let stages = asked.load(Ordering::Relaxed);
+        assert_eq!(stages, 2 + ATLAS_LEVELS * (1 + sizes.atlas / 2) + 1, "after the dome, lighting copy, before every level and row, before the SH");
         for k in 0..stages {
-            asked.set(0);
+            asked.store(0, Ordering::Relaxed);
             let at_k = || {
-                asked.set(asked.get() + 1);
-                asked.get() > k
+                asked.fetch_add(1, Ordering::Relaxed);
+                asked.load(Ordering::Relaxed) > k
             };
-            assert_eq!(prepare_ibl_until(&env, KeyRemoval::Nothing, 1.0, 0.0, sizes, &at_k), None, "stopped at question {k}");
-            assert_eq!(asked.get(), k + 1, "nothing asked after the stop");
+            assert_eq!(prepare_ibl_until(&env, KeyRemoval::Nothing, 1.0, 0.0, sizes, &at_k, &|n, f| (0..n).for_each(f)), None, "stopped at question {k}");
+            assert_eq!(asked.load(Ordering::Relaxed), k + 1, "nothing asked after the stop");
         }
     }
 

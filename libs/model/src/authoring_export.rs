@@ -3,7 +3,7 @@ use crate::{Document,Result,Error,mesh,CompiledModel,PrimitiveSource,Attachment,
 use makepad_gltf::*;
 use std::collections::BTreeMap;
 
-fn f32_value(v:f64)->Result<f32>{let f=v as f32;if f.is_finite(){Ok(f)}else{Err(Error::Invalid("authoring export exceeds render precision"))}}
+pub(crate) fn f32_value(v:f64)->Result<f32>{let f=v as f32;if f.is_finite(){Ok(f)}else{Err(Error::Invalid("authoring export exceeds render precision"))}}
 fn trs(t:Transform)->Result<GlbTransform>{t.validate()?;Ok(GlbTransform{
     translation:[f32_value(t.translation[0])?,f32_value(t.translation[1])?,f32_value(t.translation[2])?],
     rotation:[f32_value(t.rotation[0])?,f32_value(t.rotation[1])?,f32_value(t.rotation[2])?,f32_value(t.rotation[3])?],
@@ -14,7 +14,13 @@ fn attachment(a:&Attachment,names:&BTreeMap<String,usize>)->Result<GlbAttachment
 
 impl Document {
     pub fn compile(&self,cancelled:Option<&dyn Fn()->bool>)->Result<CompiledModel>{
-        self.compile_view(cancelled,false)
+        self.compile_view(cancelled,false,None)
+    }
+    /// Reuse unchanged static mesh parts, tangents and encoded surface images
+    /// from a previous compile on this worker. Scene metadata and the GLB are
+    /// assembled afresh in their original order, including newly added LODs.
+    pub fn compile_with_cache(&self,cache:&mut crate::CompileCache,cancelled:Option<&dyn Fn()->bool>)->Result<CompiledModel>{
+        self.compile_view(cancelled,false,Some(cache))
     }
     /// Compile a static draft at the current editable head. Geometry, materials,
     /// shape-key weights and rest-pose lights are visible before binding is done.
@@ -22,10 +28,11 @@ impl Document {
     /// sockets, collision and delivery LODs; it is not a publication product.
     /// Source state, history and completion checks in `compile` are unchanged.
     pub fn compile_preview(&self,cancelled:Option<&dyn Fn()->bool>)->Result<CompiledModel>{
-        self.compile_view(cancelled,true)
+        self.compile_view(cancelled,true,None)
     }
-    fn compile_view(&self,cancelled:Option<&dyn Fn()->bool>,preview:bool)->Result<CompiledModel>{
-        if !preview&&self.soft_body().is_none()&&self.scene().is_empty()&&self.rig().morphs.is_empty(){return self.compile_evaluated(cancelled);}
+    fn compile_view(&self,cancelled:Option<&dyn Fn()->bool>,preview:bool,cache:Option<&mut crate::CompileCache>)->Result<CompiledModel>{
+        if !preview&&self.soft_body().is_none()&&self.scene().is_empty()&&self.rig().morphs.is_empty(){return self.compile_evaluated(cancelled,cache,None);}
+        let evaluation_timer=crate::build_detail::CompileTimer::new(crate::build_detail::CompilePhase::Evaluation);
         let mut ctx=mesh::Context::new(self.limits().mesh.clone(),cancelled);
         ctx.checkpoint(1)?;
         self.scene().validate(&self.state,self.limits(),&mut ctx)?;
@@ -61,8 +68,10 @@ impl Document {
         evaluated.state.surface.reconcile(&self.state.objects,&objects,self.limits(),&mut ctx)?;
         evaluated.state.objects=objects;
         drop(cached);
-        crate::delivery::expand(&mut evaluated,&mut ctx)?;
-        let mut product=evaluated.compile_evaluated(cancelled)?;
+        let delivery=crate::delivery::expand(&mut evaluated,&mut ctx,cancelled)?;
+        drop(evaluation_timer);
+        let mut product=evaluated.compile_evaluated(cancelled,cache,Some(&delivery))?;
+        let _assembly_timer=crate::build_detail::CompileTimer::new(crate::build_detail::CompilePhase::GlbAssembly);
         if !preview {if let Some(metadata)=self.soft_body(){
             product.glb=augment_glb_soft_body(&product.glb,metadata).map_err(|_|Error::Invalid("soft-body GLB metadata"))?;
         }}
@@ -96,7 +105,7 @@ fn prepare_preview_metadata(doc:&mut Document,ctx:&mut mesh::Context<'_>)->Resul
     Ok(())
 }
 
-pub(crate) fn finish(doc:&Document,glb:Vec<u8>,primitives:&[PrimitiveSource],ctx:&mut mesh::Context<'_>)->Result<Vec<u8>>{
+pub(crate) fn finish(doc:&Document,glb:Vec<u8>,primitives:&[PrimitiveSource],delivery:Option<&crate::delivery::LodDelivery>,ctx:&mut mesh::Context<'_>)->Result<Vec<u8>>{
     if doc.scene().is_empty()&&doc.rig().is_empty(){return Ok(glb);}
     let scene=doc.scene();let names=doc.objects().enumerate().map(|(i,(n,_))|(n.to_string(),i)).collect::<BTreeMap<_,_>>();
     let mut export=GlbAuthoring::default();
@@ -108,7 +117,10 @@ pub(crate) fn finish(doc:&Document,glb:Vec<u8>,primitives:&[PrimitiveSource],ctx
         ctx.checkpoint(1)?;let mut node=scene.nodes.get(name).cloned().unwrap_or_default();
         if node.parent.is_none(){node.transform=face(node.transform);}
         let mut extras=std::collections::HashMap::new();
-        if let Some(collision)=crate::delivery::collision(doc,name,ctx)?{extras.insert("MAKEPAD_collision".into(),collision);}
+        let collision_mesh=match crate::delivery::collision(doc,name,ctx)?{
+            Some(crate::delivery::Collision::Shape(value))=>{extras.insert("MAKEPAD_collision".into(),value);None},
+            Some(crate::delivery::Collision::Mesh(mesh))=>Some(mesh),None=>None,
+        };
         if let Some(wheel)=scene.wheels.get(name){
             if !primitives.iter().any(|p|p.object==name){return Err(Error::Invalid("vehicle wheel object has no exported geometry"));}
             let vector=|values:[f64;3]|->Result<JsonValue>{Ok(JsonValue::Array(values.into_iter().map(|v|f32_value(v).map(|v|JsonValue::F64(v as f64))).collect::<Result<_>>()?))};
@@ -129,11 +141,25 @@ pub(crate) fn finish(doc:&Document,glb:Vec<u8>,primitives:&[PrimitiveSource],ctx
             }
         }
         export.objects.push(GlbAuthoringObject{name:name.into(),parent:node.parent.as_ref().map(|n|names.get(n).copied().ok_or_else(||Error::MissingObject(n.clone()))).transpose()?,
-            transform:trs(node.transform)?,primitives:primitives.iter().enumerate().filter_map(|(i,p)|(p.object==name).then_some(i)).collect(),extras:(!extras.is_empty()).then_some(JsonValue::Object(extras)),lods:Vec::new(),lod_distances:Vec::new()});
+            transform:trs(node.transform)?,primitives:primitives.iter().enumerate().filter_map(|(i,p)|(p.object==name).then_some(i)).collect(),extras:(!extras.is_empty()).then_some(JsonValue::Object(extras)),collision_mesh,lods:Vec::new(),lod_distances:Vec::new()});
     }
-    let originals=doc.objects().filter(|(n,_)|!n.starts_with("__derived_lod_")).map(|(n,_)|n.to_owned()).collect::<Vec<_>>();
-    for (i,name) in originals.iter().enumerate(){if let Some(levels)=scene.lods.get(name){let base=*names.get(name).ok_or(Error::Invalid("LOD base object"))?;
-        for (level,options) in levels.iter().enumerate(){let derived=crate::delivery::lod_name(i,level);export.objects[base].lods.push(*names.get(&derived).ok_or(Error::Invalid("LOD geometry absent"))?);export.objects[base].lod_distances.push(f32_value(options.distance)?);}
+    if let Some(delivery)=delivery{for(name,outcomes)in &delivery.levels{
+        let base=*names.get(name).ok_or(Error::Invalid("LOD base object"))?;
+        for(level,(outcome,options))in outcomes.iter().zip(&scene.lods[name]).enumerate(){
+            let target=match outcome{
+                crate::delivery::LodGeometry::Derived(name)=>*names.get(name).ok_or(Error::Invalid("LOD geometry absent"))?,
+                crate::delivery::LodGeometry::Previous(name)=>{
+                    let source=*names.get(name).ok_or(Error::Invalid("LOD previous geometry absent"))?;
+                    let mut node=export.objects[base].clone();node.name=format!("{name}__repeat_{level}");node.parent=None;node.extras=None;node.collision_mesh=None;node.lods.clear();node.lod_distances.clear();node.primitives=export.objects[source].primitives.clone();
+                    let target=export.objects.len();export.objects.push(node);target
+                },
+                crate::delivery::LodGeometry::Empty=>{
+                    let mut node=export.objects[base].clone();node.name=format!("{name}__empty_{level}");node.parent=None;node.extras=None;node.collision_mesh=None;node.lods.clear();node.lod_distances.clear();node.primitives.clear();
+                    let target=export.objects.len();export.objects.push(node);target
+                },
+            };
+            export.objects[base].lods.push(target);export.objects[base].lod_distances.push(f32_value(options.distance)?);
+        }
     }}
     for light in scene.emitters.values(){
         ctx.checkpoint(1)?;export.lights.push(GlbPunctualLight{name:light.name.clone(),attachment:attachment(&light.attachment,&names)?,transform:trs(if light.attachment==Attachment::Root{face(light.transform)}else{light.transform})?,

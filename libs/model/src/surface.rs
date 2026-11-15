@@ -135,7 +135,7 @@ impl SurfaceDerivation {
         if !matches!(channel, SurfaceChannel::Normal | SurfaceChannel::MetallicRoughness)
             || self.source_channel == SurfaceChannel::Normal
             || self.source_layer.as_ref().is_some_and(|name| !name_valid(name, limits))
-            || !self.strength.is_finite() || !(0.0..=16.0).contains(&self.strength)
+            || !self.strength.is_finite() || self.strength < 0.
             || !unit(self.roughness_min) || !unit(self.roughness_max)
             || self.roughness_min > self.roughness_max || !unit(self.metallic)
         { return Err(Error::Invalid("surface derivation")); }
@@ -375,18 +375,24 @@ fn unit(v: f64) -> bool {
 fn color_valid(v: &[f64]) -> bool {
     v.iter().all(|x| unit(*x))
 }
-fn name_valid(v: &str, limits: &Limits) -> bool {
-    !v.is_empty() && v.len() <= limits.max_name_bytes && !v.chars().any(char::is_control)
+fn name_valid(v: &str, _limits: &Limits) -> bool {
+    !v.is_empty() && !v.chars().any(char::is_control)
 }
 fn pattern_valid(p: &SurfacePattern) -> bool {
+    // surface_pattern uses i64 lattice coordinates: plank detail multiplies
+    // coordinates by six, then the fourth noise octave by eight. A strict
+    // inequality leaves representable room for neighbour and warp offsets.
+    let lattice_scale = i64::MAX as f64 / (6. * 8.);
     color_valid(&p.color_a)
         && color_valid(&p.color_b)
         && p.scale
             .iter()
-            .all(|x| x.is_finite() && *x > 0. && *x <= 4096.)
+            .all(|x| x.is_finite() && *x > 0. && *x < lattice_scale)
 }
 impl SurfaceMaterial {
     pub fn validate(&self, limits: &Limits, ctx: &mut mesh::Context<'_>) -> Result<()> {
+        // These structs validate the glTF material contract consumed by the
+        // fur and shading shaders, independently of layer or stroke counts.
         if self.fur.is_some_and(|fur| !fur.valid()) {
             return Err(Error::Invalid("fur material: length 0.001..0.05m, density 0.05..1, scale 20..1000, seed 0..65535"));
         }
@@ -400,16 +406,13 @@ impl SurfaceMaterial {
             || !color_valid(&self.emissive)
             || !unit(self.alpha_cutoff)
             || !self.normal_scale.is_finite()
-            || !(0.0..=16.0).contains(&self.normal_scale)
+            || self.normal_scale < 0.
             || !self.emissive_strength.is_finite()
-            || !(0.0..=100000.0).contains(&self.emissive_strength)
+            || self.emissive_strength < 0.
         {
             return Err(Error::Invalid("surface material factors"));
         }
         for (channel, layers) in &self.channels {
-            if layers.len() > 32 {
-                return Err(Error::Budget("surface layers"));
-            }
             let mut ids = std::collections::BTreeSet::new();
             for layer in layers {
                 ctx.checkpoint(1)?;
@@ -447,9 +450,6 @@ impl SurfaceMaterial {
                 }
             }
         }
-        if self.memory_bytes() > limits.max_source_bytes {
-            return Err(Error::Budget("surface source bytes"));
-        }
         Ok(())
     }
     /// Flatten a retained stack in linear light. Returned pixels use the
@@ -471,31 +471,60 @@ impl SurfaceMaterial {
         if visible.is_empty() {
             return Ok(None);
         }
+        // A distance texture is one data plane, not alpha-composited paint.
+        // In particular, A=0 must not clear the independent RGB distances.
+        if channel == SurfaceChannel::BaseColor && self.shading.is_some_and(|s| s.msdf > 0.0) {
+            if visible.len() != 1 || visible[0].opacity != 1.0 || visible[0].mask.is_some()
+                || visible[0].blend != SurfaceBlend::Over {
+                return Err(Error::Invalid("MSDF base colour needs one unmodified data layer"));
+            }
+            return Ok(Some(visible[0].image.clone()));
+        }
         let width = visible.iter().map(|l| l.image.width).max().unwrap();
         let height = visible.iter().map(|l| l.image.height).max().unwrap();
         let mut image = RgbaImage::new(width, height, [0; 4], limits)?;
         if image.memory_bytes().saturating_add(self.memory_bytes()) > limits.mesh.max_bytes {
             return Err(Error::Budget("surface flatten bytes"));
         }
+        // A lone fully enabled color/data layer has no backdrop to blend.
+        // Its nonzero-coverage bytes already are the flattened transfer values;
+        // transparent texels must still discard hidden RGB, as composite does.
+        // Normal channels retain their required vector renormalization below.
+        if visible.len() == 1 && visible[0].opacity == 1.
+            && visible[0].blend == SurfaceBlend::Over && visible[0].mask.is_none() && channel != SurfaceChannel::Normal {
+            for (y, row) in image.pixels.chunks_exact_mut(width as usize * 4).enumerate() {
+                ctx.checkpoint(width as u64)?;
+                let source = &visible[0].image.pixels[y * width as usize * 4..][..row.len()];
+                row.copy_from_slice(source);
+                for pixel in row.chunks_exact_mut(4) {
+                    if pixel[3] == 0 { pixel.fill(0); }
+                }
+            }
+            return Ok(Some(image));
+        }
+        let transfer = (channel.encoding() == ImageEncoding::Srgb).then(crate::texture::SrgbBytes::new);
+        let linear = transfer.as_ref().map(|t| &t.linear);
+        let neutral = decode_bytes(channel, channel.neutral(), linear);
         for y in 0..height {
             ctx.checkpoint(width as u64 * visible.len() as u64)?;
             for x in 0..width {
-                let mut out = decode(channel, channel.neutral());
+                let mut out = neutral;
                 out[3] = 0.;
                 for layer in &visible {
                     let sx = (x as u64 * layer.image.width as u64 / width as u64) as usize;
                     let sy = (y as u64 * layer.image.height as u64 / height as u64) as usize;
                     let i = sy * layer.image.width as usize + sx;
-                    let src = decode(
+                    let src = decode_bytes(
                         channel,
                         layer.image.pixels[i * 4..i * 4 + 4].try_into().unwrap(),
+                        linear,
                     );
                     let alpha =
                         layer.opacity * layer.mask.as_ref().map_or(1., |m| m[i] as f64 / 255.);
                     out = composite(out, src, alpha, layer.blend);
                 }
                 image.pixels[(y as usize * width as usize + x as usize) * 4..][..4]
-                    .copy_from_slice(&encode(channel, out));
+                    .copy_from_slice(&encode_bytes(channel, out, transfer.as_ref()));
             }
         }
         Ok(Some(image))
@@ -514,16 +543,7 @@ impl SurfaceState {
             )
     }
     pub fn validate(&self, limits: &Limits, ctx: &mut mesh::Context<'_>) -> Result<()> {
-        if self.materials.len() > limits.max_materials
-            || self.vertex_colors.len() > limits.mesh.max_vertices
-        {
-            return Err(Error::Budget("surface entries"));
-        }
-        if self.memory_bytes() > limits.max_source_bytes
-            || self.memory_bytes() > limits.mesh.max_bytes
-        {
-            return Err(Error::Budget("surface bytes"));
-        }
+        self.validate_storage(limits)?;
         for value in self.materials.values() {
             value.validate(limits, ctx)?;
         }
@@ -532,6 +552,14 @@ impl SurfaceState {
             if !name_valid(name, limits) || id.0 == 0 || !color_valid(color) {
                 return Err(Error::Invalid("vertex color"));
             }
+        }
+        Ok(())
+    }
+    fn validate_storage(&self, limits: &Limits) -> Result<()> {
+        let bytes = self.memory_bytes();
+        if bytes > limits.mesh.max_bytes
+        {
+            return Err(Error::Budget("surface bytes"));
         }
         Ok(())
     }
@@ -563,6 +591,39 @@ impl SurfaceState {
         }
         ctx.checkpoint(0)?;
         *self = next;
+        Ok(())
+    }
+    /// The owner already holds a transaction candidate or a disposable build
+    /// workspace. Validate the changed material, without cloning every image
+    /// and every painted vertex for each operation. Storage is checked here;
+    /// aggregate reference validation runs once at the batch boundary.
+    pub(crate) fn apply_disposable(
+        &mut self,
+        op: &SurfaceOperation,
+        objects: &BTreeMap<String, mesh::Mesh>,
+        legacy: &BTreeMap<u32, Material>,
+        limits: &Limits,
+        ctx: &mut mesh::Context<'_>,
+    ) -> Result<()> {
+        ctx.checkpoint(0)?;
+        if self.memory_bytes().saturating_add(op.memory_bytes()) > limits.mesh.max_bytes {
+            return Err(Error::Budget("surface transaction bytes"));
+        }
+        self.apply_inner(op, objects, legacy, limits, ctx)?;
+        self.validate_storage(limits)?;
+        use SurfaceOperation::*;
+        let material = match op {
+            Material { material, .. } | Layer { material, .. } | RemoveLayer { material, .. }
+            | MoveLayer { material, .. } | Mask { material, .. } | Pattern { material, .. }
+            | Derive { material, .. } | Stroke { material, .. } | ProjectedStroke { material, .. }
+            | Bake { material, .. } | Dilate { material, .. } | Mips { material, .. } => Some(material),
+            RemoveMaterial { .. } | VertexPaint { .. } | VertexColors { .. } => None,
+        };
+        if let Some(material) = material {
+            if !legacy.contains_key(material) { return Err(Error::Invalid("surface references unknown material")); }
+            if let Some(value) = self.materials.get(material) { value.validate(limits, ctx)?; }
+        }
+        ctx.checkpoint(0)?;
         Ok(())
     }
     fn ensure(
@@ -707,7 +768,12 @@ impl SurfaceState {
                     return Err(Error::Budget("surface derivation bytes"));
                 }
                 let source = derivation::source_image(source_material, recipe, limits, ctx)?;
-                let image = recipe.derive_image(&source, *channel, limits, ctx)?;
+                // Optional decoded heights must fit beside the resident
+                // surface. A tight budget uses direct taps with identical bytes.
+                let mut derive_limits = limits.clone();
+                derive_limits.mesh.max_bytes = limits.mesh.max_bytes.min(ctx.limits.max_bytes)
+                    .saturating_sub(self.memory_bytes());
+                let image = recipe.derive_image(&source, *channel, &derive_limits, ctx)?;
                 let mut output = SurfaceLayer::new(layer, image);
                 output.derived = Some(recipe.clone());
                 let target = self.ensure(*material, legacy, limits)?;
@@ -736,11 +802,10 @@ impl SurfaceState {
             } => {
                 brush_validate(*radius, *hardness, *opacity, color)?;
                 if points.is_empty()
-                    || points.len() > 256
                     || points
                         .iter()
                         .flatten()
-                        .any(|x| !x.is_finite() || x.abs() > 16.)
+                        .any(|x| !x.is_finite())
                 {
                     return Err(Error::Invalid("stroke points"));
                 }
@@ -782,7 +847,6 @@ impl SurfaceState {
                 if !color_valid(color)
                     || !unit(*opacity)
                     || vertices.is_empty()
-                    || vertices.len() > limits.mesh.max_vertices
                 {
                     return Err(Error::Invalid("vertex paint"));
                 }
@@ -803,7 +867,7 @@ impl SurfaceState {
                 }
             }
             VertexColors { object, vertices, colors } => {
-                if vertices.len() != colors.len() || vertices.is_empty() || vertices.len() > limits.mesh.max_vertices || !colors.iter().all(|c| color_valid(c)) {
+                if vertices.len() != colors.len() || vertices.is_empty()  || !colors.iter().all(|c| color_valid(c)) {
                     return Err(Error::Invalid("vertex colors"));
                 }
                 let mesh = objects.get(object).ok_or(Error::Invalid("unknown paint object"))?;
@@ -834,8 +898,10 @@ impl SurfaceState {
                 channel,
                 layer,
             } => {
+                let msdf = *channel == SurfaceChannel::BaseColor && self.materials.get(material)
+                    .and_then(|m|m.shading).is_some_and(|s|s.msdf > 0.0);
                 let target = self.layer(*material, *channel, layer)?;
-                target.mips = target.image.mip_chain(channel.encoding(), limits, ctx)?;
+                target.mips = target.image.mip_chain(if msdf { ImageEncoding::Linear } else { channel.encoding() }, limits, ctx)?;
             }
         }
         Ok(())
@@ -908,6 +974,20 @@ fn encode(ch: SurfaceChannel, mut p: [f64; 4]) -> [u8; 4] {
         }
     }
     p.map(crate::texture::unit_byte)
+}
+fn decode_bytes(ch: SurfaceChannel, p: [u8; 4], linear: Option<&[f64; 256]>) -> [f64; 4] {
+    if let Some(linear) = linear {
+        [linear[p[0] as usize], linear[p[1] as usize], linear[p[2] as usize], p[3] as f64 / 255.]
+    } else {
+        decode(ch, p)
+    }
+}
+fn encode_bytes(ch: SurfaceChannel, p: [f64; 4], transfer: Option<&crate::texture::SrgbBytes>) -> [u8; 4] {
+    if let Some(transfer) = transfer {
+        [transfer.encode(p[0]), transfer.encode(p[1]), transfer.encode(p[2]), crate::texture::unit_byte(p[3])]
+    } else {
+        encode(ch, p)
+    }
 }
 fn composite(dst: [f64; 4], src: [f64; 4], opacity: f64, blend: SurfaceBlend) -> [f64; 4] {
     let a = src[3] * opacity;
@@ -998,6 +1078,7 @@ fn render_pattern(
     if !pattern_valid(pattern) {
         return Err(Error::Invalid("surface pattern"));
     }
+    let transfer = (ch.encoding() == ImageEncoding::Srgb).then(crate::texture::SrgbBytes::new);
     let (w, h) = (layer.image.width, layer.image.height);
     for y in 0..h {
         ctx.checkpoint(w as u64)?;
@@ -1024,7 +1105,7 @@ fn render_pattern(
                 color[c] = pattern.color_a[c] * (1. - t) + pattern.color_b[c] * t;
             }
             layer.image.pixels[((y * w + x) * 4) as usize..][..4]
-                .copy_from_slice(&encode(ch, color));
+                .copy_from_slice(&encode_bytes(ch, color, transfer.as_ref()));
         }
     }
     layer.pattern = Some(pattern.clone());

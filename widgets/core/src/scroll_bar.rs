@@ -1,6 +1,6 @@
 use crate::widget::*;
 use crate::animator::*;
-use crate::event::{ScrollEvent, ScrollPhase, TouchState, TAP_COUNT_DISTANCE};
+use crate::event::{ScrollDirection, ScrollEvent, ScrollPhase, TouchState, TAP_COUNT_DISTANCE};
 use crate::makepad_derive_widget::*;
 use crate::makepad_draw::*;
 use crate::scroll_motion::{
@@ -11,6 +11,9 @@ use crate::scroll_motion::{
     FLING_MIN_TOTAL_DELTA, MOMENTUM_CUT_TOUCH_WINDOW, PER_FRAME_TO_PER_SECOND,
     RUBBER_BAND_STRETCH_STIFFNESS, RUBBER_BAND_TOUCH_RANGE,
 };
+
+/// How long a [`ScrollBar::smooth_scroll_to`] takes, however far it goes.
+const SMOOTH_SCROLL_DURATION_SECS: f64 = 0.4;
 
 script_mod! {
     use mod.prelude.widgets_internal.*
@@ -261,6 +264,8 @@ enum ScrollState {
     Stopped,
     Drag {
         samples: Vec<ScrollSample>,
+        /// Whether the press has traveled the tap distance our way, so it's a scroll and not a tap.
+        has_traveled: bool,
     },
     /// The rubber-band bounce at a scroll limit (see `scroll_motion`).
     /// `x0`/`v0` are signed: negative stretches before the start, positive past the end.
@@ -282,6 +287,13 @@ enum ScrollState {
         /// so every scrollable widget decelerates identically.
         fling: Fling,
         next_frame: NextFrame,
+    },
+    /// Easing the content from `from` to `to` (see [`ScrollBar::smooth_scroll_to`]).
+    ScrollingTo {
+        next_frame: NextFrame,
+        from: f64,
+        to: f64,
+        clock: FrameClock,
     },
 }
 
@@ -335,10 +347,19 @@ pub struct ScrollBar {
     /// Whether to enable drag scrolling
     #[live(false)]
     drag_scrolling: bool,
+    /// Whether a mouse drag that starts on a widget inside us, like a button, drags us once it's
+    /// a drag our way, like a touch drag always does (e.g., for a sideways row of buttons). On by
+    /// default; a box whose buttons a mouse drag shouldn't scroll turns it off.
+    #[live(true)]
+    mouse_drags_from_widgets: bool,
     /// Whether a scroll that starts at this bar's limit stays here instead of going on to a
     /// scrollable around it, like CSS `overscroll-behavior: contain`.
     #[live(false)]
     contain_scroll: bool,
+    /// Whether a drag that scrolls us hides the soft keyboard when it ends (the focused text input loses its focus),
+    /// like a tap elsewhere does. It's off by default, since most apps keep the keyboard up while you scroll.
+    #[live(false)]
+    pub hide_keyboard_on_scroll: bool,
     /// Whether the bar fades out once scrolling stops and the pointer leaves it.
     #[live(true)]
     auto_hide: bool,
@@ -655,6 +676,28 @@ impl ScrollBar {
         return false;
     }
 
+    /// Smoothly scrolls to `scroll_pos`, easing out over a short time.
+    ///
+    /// Unlike [`ScrollBar::set_scroll_target`], this doesn't need `smoothing`.
+    /// The user scrolling or pressing on the content stops it, just like a fling.
+    pub fn smooth_scroll_to(&mut self, cx: &mut Cx, scroll_pos: f64) {
+        let to = scroll_pos.min(self.scroll_limit()).max(0.);
+        if to == self.scroll_pos {
+            // An earlier smooth scroll would carry us away from here.
+            if matches!(self.scroll_state, ScrollState::ScrollingTo { .. }) {
+                self.scroll_state = ScrollState::Stopped;
+            }
+            return;
+        }
+        self.stop_motion();
+        self.scroll_state = ScrollState::ScrollingTo {
+            next_frame: cx.new_next_frame(),
+            from: self.scroll_pos,
+            to,
+            clock: FrameClock::default(),
+        };
+    }
+
     pub fn scroll_into_view(&mut self, cx: &mut Cx, pos: f64, size: f64, smooth: bool) {
         if pos < self.scroll_pos {
             // scroll up
@@ -755,7 +798,7 @@ impl ScrollBar {
                         self.owns_gesture = false;
                         self.coasting = false;
                         self.momentum_cut_at = None;
-                        if matches!(self.scroll_state, ScrollState::Flick { .. }) {
+                        if matches!(self.scroll_state, ScrollState::Flick { .. } | ScrollState::ScrollingTo { .. }) {
                             self.scroll_state = ScrollState::Stopped;
                         }
                         if was_moving {
@@ -822,8 +865,8 @@ impl ScrollBar {
                     self.overscroll = 0.0;
                     // A wheel scroll takes over from a running bounce; the
                     // spring must stop too, or its next frame would rewrite
-                    // the overscroll just cleared above.
-                    if matches!(self.scroll_state, ScrollState::Bounce { .. }) {
+                    // the overscroll just cleared above. So must a smooth scroll.
+                    if matches!(self.scroll_state, ScrollState::Bounce { .. } | ScrollState::ScrollingTo { .. }) {
                         self.scroll_state = ScrollState::Stopped;
                     }
                     if !self.smoothing.is_none() && e.is_mouse {
@@ -924,11 +967,11 @@ impl ScrollBar {
     }
 
     /// Whether anything is moving this bar's content at `time`: a fling, the bounce,
-    /// a live coast, or active finger-driven scrolling.
+    /// a smooth scroll, a live coast, or active finger-driven scrolling.
     pub fn is_motion_live(&self, time: f64) -> bool {
         matches!(
             self.scroll_state,
-            ScrollState::Flick { .. } | ScrollState::Bounce { .. }
+            ScrollState::Flick { .. } | ScrollState::Bounce { .. } | ScrollState::ScrollingTo { .. }
         ) || self.is_coasting(time)
             || press_settles_finger_scroll(self.last_finger_scroll_time, time)
     }
@@ -946,7 +989,7 @@ impl ScrollBar {
     /// Stop an in-progress momentum fling, the "press to catch the scroll" behavior. Returns
     /// whether a fling was actually stopped. The containing view calls this on any press in
     /// the content, independent of `drag_scrolling`, so kinetic scrolling always halts on a
-    /// tap or click as it does on iOS, Android, and macOS.
+    /// tap or click as it does on iOS, Android, and macOS. A press catches a smooth scroll too.
     pub fn stop_fling(&mut self, time: f64) -> bool {
         if let ScrollState::Flick { fling, .. } = &self.scroll_state {
             // Remember the caught speed briefly: a quick same-direction re-flick
@@ -954,7 +997,7 @@ impl ScrollBar {
             // way Chrome and native scrollers allow.
             self.caught_fling = Some((fling.velocity, time));
         }
-        if self.is_flinging() || self.coasting {
+        if self.is_flinging() || self.coasting || matches!(self.scroll_state, ScrollState::ScrollingTo { .. }) {
             self.scroll_state = ScrollState::Stopped;
             self.coasting = false;
             // Release gesture ownership so a still-live OS momentum stream (e.g. a mouse click
@@ -1063,8 +1106,29 @@ impl ScrollBar {
         // A cancellation is terminal cleanup of this box's own press: it is
         // never an unrelated mouse gesture, so no held mouse stops it.
         // Another drag scroller holding the press doesn't count: nested scrollers split a drag by axis.
+        //
+        // With `mouse_drags_from_widgets` (on unless a box turns it off), nor
+        // does a widget inside us that took this very press without claiming
+        // its drag, like a button: a mouse press that starts on one is ours to
+        // take once it turns out to be a drag our way, as a touch is, so a drag
+        // that starts on a button scrolls rather than clicking it on the
+        // release. It took the press first, so it marked the press (an old
+        // capture handed its press back marks nothing) and its capture comes
+        // ahead of the one we add. A control that claims its drag, like a
+        // slider, keeps the mouse locked (`can_take_over_press`).
         let touch_event = matches!(event, Event::TouchUpdate(_) | Event::FingerCancel(_));
-        if !touch_event && cx.fingers.is_mouse_held_outside_scrollers(&[scroll_area]) {
+        let pressed_inside = match event {
+            Event::MouseDown(e) if self.mouse_drags_from_widgets && scroll_area.clipped_rect(cx).contains(e.abs) => {
+                Some(e.handled.get()).filter(|holder| !holder.is_empty() && *holder != scroll_area)
+            }
+            _ => None,
+        };
+        let held_outside = match pressed_inside {
+            Some(holder) => cx.fingers.is_mouse_held_outside_scrollers(&[scroll_area, holder]),
+            None if self.mouse_drags_from_widgets => cx.fingers.is_mouse_held_outside_drag_scroller(scroll_area),
+            None => cx.fingers.is_mouse_held_outside_scrollers(&[scroll_area]),
+        };
+        if !touch_event && held_outside {
             if matches!(self.scroll_state, ScrollState::Drag { .. }) {
                 self.stop_drag(cx, dispatch_action);
             }
@@ -1073,13 +1137,19 @@ impl ScrollBar {
 
         let axis = self.axis.vec_index();
         // We can share a press that only nested drag scrollers hold, along an axis none of them took,
-        // and a touch that widgets inside us hold, which we take from them once it's a drag our way.
+        // and a touch (or with `mouse_drags_from_widgets`, a mouse press) that widgets inside us hold,
+        // which we take from them once it's a drag our way.
         let joins = self.scrollable()
             && match event {
                 Event::MouseDown(e) => {
+                    let digit_id = live_id!(mouse).into();
                     e.button.is_primary()
                         && cx.fingers.can_mouse_drag_scroll()
-                        && cx.fingers.can_join_scroll_drag(live_id!(mouse).into(), axis, scroll_area)
+                        && if pressed_inside.is_some() {
+                            cx.fingers.can_take_over_press(digit_id, axis, scroll_area)
+                        } else {
+                            cx.fingers.can_join_scroll_drag(digit_id, axis, scroll_area)
+                        }
                 }
                 Event::TouchUpdate(e) => {
                     let mut held = e
@@ -1119,6 +1189,7 @@ impl ScrollBar {
                     };
                     self.scroll_state = ScrollState::Drag {
                         samples: vec![ScrollSample { abs, time: fe.time }],
+                        has_traveled: false,
                     };
                     self.drag_claimed = false;
                     self.drag_origin = abs;
@@ -1127,7 +1198,7 @@ impl ScrollBar {
             Hit::FingerMove(e) => match &mut self.scroll_state {
                 // A widget that claimed the drag after we took it (its own hits run after ours) keeps it.
                 ScrollState::Drag { .. } if cx.fingers.is_drag_claimed_by_widget(e.digit_id) => self.stand_down(cx),
-                ScrollState::Drag { samples } => {
+                ScrollState::Drag { samples, has_traveled } => {
                     let new_abs = match self.axis {
                         ScrollAxis::Horizontal => e.abs.x,
                         ScrollAxis::Vertical => e.abs.y,
@@ -1140,13 +1211,16 @@ impl ScrollBar {
                     // another scroller already owns is not this view's — it
                     // stands down, settling from rest.
                     let mut from = samples.last().unwrap().abs;
+                    let travel = e.abs - e.abs_start;
+                    // It's a scroll once it goes the tap distance our way, the rule that locks a drag's direction too.
+                    *has_traveled |= ScrollDirection::from_travel(travel)
+                        .is_some_and(|direction| direction.allows(axis));
                     if !self.drag_claimed {
                         // A drag we share with a scroller along the other axis, or one a widget inside us holds,
                         // keeps to the way it started out, so it doesn't need to be mostly along our axis below.
                         let is_shared = cx.fingers.is_scroll_drag_shared(e.digit_id);
                         // A widget inside us, like a button, keeps the press until it turns out to be a drag our way.
                         let is_held_by_widget = cx.fingers.is_press_held_by_widget(e.digit_id, scroll_area);
-                        let travel = e.abs - e.abs_start;
                         let direction = if is_held_by_widget {
                             cx.lock_drag_direction(e.digit_id, travel)
                         } else {
@@ -1164,10 +1238,14 @@ impl ScrollBar {
                             ScrollAxis::Horizontal => (travel.x.abs(), travel.y.abs()),
                             ScrollAxis::Vertical => (travel.y.abs(), travel.x.abs()),
                         };
-                        // Touch only: a mouse drag scrolls from its first move,
-                        // as it always has.
+                        // A mouse drag on bare content scrolls from its first
+                        // move, as it always has; one a widget holds waits for
+                        // the slop as a touch does, so a click that wobbles
+                        // stays a click.
                         let slop = touch_drag_slop(TAP_COUNT_DISTANCE, e.device.is_touch());
-                        if e.device.is_touch() && (along < slop || (along < across && !is_shared && !is_held_by_widget)) {
+                        if (e.device.is_touch() || is_held_by_widget)
+                            && (along < slop || (along < across && !is_shared && !is_held_by_widget))
+                        {
                             push_sample(samples, new_abs, e.time);
                             return;
                         }
@@ -1177,6 +1255,9 @@ impl ScrollBar {
                         }
                         self.drag_claimed = true;
                         from = drag_origin(self.drag_origin, new_abs, slop, e.device.is_touch());
+                    }
+                    if *has_traveled && !self.hide_keyboard_on_scroll {
+                        cx.fingers.mark_press_as_keeping_key_focus(e.digit_id);
                     }
                     push_sample(samples, new_abs, e.time);
 
@@ -1235,7 +1316,7 @@ impl ScrollBar {
                     self.drag_claimed = false;
                     self.stop_drag(cx, dispatch_action);
                 }
-                ScrollState::Drag { samples } => {
+                ScrollState::Drag { samples, .. } => {
                     // The press's release settles the fate of any fling it caught:
                     // only a qualifying same-direction flick below adds it back.
                     let caught_fling = self.caught_fling.take();
@@ -1316,6 +1397,7 @@ impl ScrollBar {
         }
         self.handle_flick(cx, event, dispatch_action);
         self.handle_bounce(cx, event, dispatch_action);
+        self.handle_scrolling_to(cx, event, dispatch_action);
 
         if self.hide_timer.is_event(event).is_some() {
             self.hide_timer = Timer::default();
@@ -1352,6 +1434,10 @@ impl ScrollBar {
                 Hit::FingerDown(fe) if fe.is_primary_hit() => {
                     self.animator_play(cx, ids!(hover.drag));
                     cx.claim_finger_drag(fe.digit_id);
+                    // A press on the bar is for scrolling us, so it keeps the keyboard up like our drags do.
+                    if !self.hide_keyboard_on_scroll {
+                        cx.fingers.mark_press_as_keeping_key_focus(fe.digit_id);
+                    }
                     let rel = fe.abs - fe.rect.pos;
                     let rel = match self.axis {
                         ScrollAxis::Horizontal => rel.x,
@@ -1470,6 +1556,27 @@ impl ScrollBar {
             }
             dispatch_action(cx, self.make_scroll_action());
         }
+    }
+
+    /// Eases the content along the way to where a [`ScrollBar::smooth_scroll_to`] is going.
+    fn handle_scrolling_to(
+        &mut self,
+        cx: &mut Cx,
+        event: &Event,
+        dispatch_action: &mut dyn FnMut(&mut Cx, ScrollBarAction),
+    ) {
+        let ScrollState::ScrollingTo { next_frame, from, to, clock } = &mut self.scroll_state else { return };
+        let Some(ne) = next_frame.is_event(event) else { return };
+        cx.boost_frame_rate();
+        let progress = (clock.advance(ne.time) / SMOOTH_SCROLL_DURATION_SECS).min(1.0);
+        let scroll_pos = *from + (*to - *from) * Ease::OutCubic.map(progress);
+        if progress < 1.0 {
+            *next_frame = cx.new_next_frame();
+        } else {
+            self.scroll_state = ScrollState::Stopped;
+        }
+        self.set_scroll_pos_no_action(cx, scroll_pos);
+        dispatch_action(cx, self.make_scroll_action());
     }
 
     fn handle_flick(
@@ -1839,6 +1946,23 @@ mod pointer_capture_tests {
             })
     }
 
+    /// The clicks `button` sent out of these events.
+    fn clicks(cx: &mut Cx, root: &WidgetRef, events: Vec<Event>, button: &WidgetRef) -> usize {
+        let mut clicks = 0;
+        for event in events {
+            let actions = cx.capture_actions(|cx| root.handle_event(cx, &event, &mut Scope::empty()));
+            clicks += actions
+                .iter()
+                .filter_map(|action| action.as_widget_action())
+                .filter(|action| {
+                    action.widget_uid == button.widget_uid()
+                        && matches!(action.cast::<ButtonAction>(), ButtonAction::Clicked(_))
+                })
+                .count();
+        }
+        clicks
+    }
+
     /// Press, move, release - the whole drag through the widget tree.
     fn drag(cx: &mut Cx, root: &WidgetRef, from: Vec2d, to: Vec2d) {
         cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, WINDOW));
@@ -1950,6 +2074,44 @@ mod pointer_capture_tests {
         );
         drag(&mut cx, &root, dvec2(50.0, 150.0), dvec2(50.0, 90.0));
         assert_eq!(scroll_y(&page), 60.0, "so the drag still scrolls");
+    }
+
+    /// A mouse press on a button inside the box that turns into a drag along
+    /// it is the box's: the box scrolls with the pointer, and the button, its
+    /// press taken, clicks nothing when the pointer comes back over it and
+    /// lets go. A button only gives the press up that way; one the pointer
+    /// was already locked to keeps it (above).
+    #[test]
+    fn a_mouse_drag_that_starts_on_a_button_scrolls_without_clicking_it() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (root, page, _grab) = start(&mut cx);
+        let inner = root.widget(&cx, ids!(inner));
+        let on_inner = middle(&cx, &inner);
+        cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, WINDOW));
+        let up = clicks(&mut cx, &root, vec![press(on_inner), mouse_move(on_inner - dvec2(0.0, 60.0))], &inner);
+        let scrolled = scroll_y(&page);
+        // Back down over where the button was pressed, so a press it still
+        // held would end over it, as a click.
+        let back = clicks(&mut cx, &root, vec![mouse_move(on_inner), release(on_inner)], &inner);
+        cx.fingers.first_mouse_button = None;
+        assert_eq!(scrolled, 60.0, "60 points of travel from the button moved the content 60 points");
+        assert_eq!(up + back, 0, "the drag that scrolled the box also clicked the button it started on");
+    }
+
+    /// The control for the test above: a click that wobbles less than a tap
+    /// moves is still a click, and scrolls nothing.
+    #[test]
+    fn a_click_that_wobbles_on_a_button_stays_a_click() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        let (root, page, _grab) = start(&mut cx);
+        let inner = root.widget(&cx, ids!(inner));
+        let on_inner = middle(&cx, &inner);
+        let wobble = on_inner - dvec2(0.0, 3.0);
+        cx.fingers.first_mouse_button = Some((MouseButton::PRIMARY, WINDOW));
+        let clicked = clicks(&mut cx, &root, vec![press(on_inner), mouse_move(wobble), release(wobble)], &inner);
+        cx.fingers.first_mouse_button = None;
+        assert_eq!(clicked, 1, "the click was lost");
+        assert_eq!(scroll_y(&page), 0.0, "the wobble scrolled the box");
     }
 
     /// `catch_fling_on_press` is the box's other press-driven gesture: a press

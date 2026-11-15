@@ -185,10 +185,10 @@ hal_events! {
     PipelineFailed = 53, pipeline_failed { pipeline: id, log: rng };
     BufferEvicted = 54, buffer_evicted { buffer: id };
     TextureShared = 55, texture_shared { texture: id, handle: u64 };
-    /// `status`: `readback::*`; `rect` is x, y, w, h of the pixels (RGBA8 rows).
     BufferLeases = 158, buffer_lease_records { req: u32, status: u32, records: rng };
-    Readback = 56, readback { req: u32, status: u32, rect: urect, pixels: rng };
-    PickResult = 57, pick_result { req: u32, ids: rng };
+    /// `status`: `readback::*`; `rect` is x, y, w, h of the pixels.
+    /// The payload is zero or one `lease::Record`: none for failure or a status without pixels.
+    Readback = 56, readback_record { req: u32, status: u32, rect: urect, lease: rng };
     /// The GPU device `generation` was lost (removed, reset, driver update, adapter switch). Every
     /// event the old device still owed comes before the matching `DeviceReset`; GPU commands sent
     /// meanwhile are dropped. The app stops submitting until the reset.
@@ -217,14 +217,17 @@ hal_events! {
     /// the font atlases are restored by the HAL, a shared texture answers with a new
     /// `TextureShared` handle and an imported one with `TextureImported { ok: false }`.
     DeviceReset = 66, device_reset { generation: u32 };
+    /// The HAL draws with another backend now (Android's GLES fallback): `info` is its `HalInfo` bytes.
+    /// The app makes its pipelines again in that dialect, since the `DeviceReset` after it rebuilds none.
+    BackendChanged = 69, backend_changed { info: rng };
     /// The device is short of memory for the UI: free memory fell under the reserve, or a
     /// create failed for lack of room (`failed`). `wanted_mb` brings the free memory back to
     /// the reserve (plus the failed allocation); 0 = the shortage is over. Sent to every
     /// session; the one owning the desktop asks other GPU users (the AI hub) for room.
     GpuPressure = 67, gpu_pressure { wanted_mb: u32, free_mb: u32, budget_mb: u32, reserve_mb: u32, failed: bool };
-    /// Announced immediately BEFORE a result whose size the client could not predict.
-    /// Grow the next pump's arena to at least `bytes`. The queue never drains an oversized
-    /// payload after another event in the same pump, so the announcement arrives first.
+    /// Announced alone in a pump BEFORE an event whose payload is larger than the caller's event
+    /// arena; the queue holds that event. Grow the next pump's arena to at least `bytes`: a pump
+    /// with the same arena gets a cut payload; lease records must always fit whole.
     PayloadSize = 65, payload_size { bytes: u32 };
 
     // ---- embedded windows and domains (to a parent session)
@@ -360,4 +363,10 @@ hal_events! {
     HostedNativeOut = 156, hosted_native_out { bytes: rng };
     /// The answer to `GpuProfQuery`: a recording (`makepad_gpu_trace::Recording::encode`).
     GpuProfRecording = 157, gpu_prof_recording { bytes: rng };
+    /// An XR window's tracking space was set up again: a headset session began (a remote
+    /// headset linked) or the wearer recentered, so its origin may have moved. `generation`
+    /// counts these. The `XrFrame`s that follow are in the new space.
+    XrSpace = 159, xr_space { window: obj, generation: u32 };
+    /// A system print operation's outcome (`print_status`); `message` is UTF-8 on failure.
+    PrintResult = 160, print_result { req: u32, status: u32, message: rng };
 }

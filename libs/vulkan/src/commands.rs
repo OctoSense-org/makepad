@@ -18,6 +18,7 @@ pub type PfnCmdBindIndexBuffer = unsafe extern "system" fn(CommandBuffer, Buffer
 pub type PfnCmdBindPipeline = unsafe extern "system" fn(CommandBuffer, PipelineBindPoint, Pipeline) -> ();
 pub type PfnCmdBindVertexBuffers = unsafe extern "system" fn(CommandBuffer, u32, u32, *const Buffer, *const DeviceSize) -> ();
 pub type PfnCmdBlitImage = unsafe extern "system" fn(CommandBuffer, Image, ImageLayout, Image, ImageLayout, u32, *const ImageBlit, Filter) -> ();
+pub type PfnCmdClearAttachments = unsafe extern "system" fn(CommandBuffer, u32, *const ClearAttachment, u32, *const ClearRect) -> ();
 pub type PfnCmdClearColorImage = unsafe extern "system" fn(CommandBuffer, Image, ImageLayout, *const ClearColorValue, u32, *const ImageSubresourceRange) -> ();
 pub type PfnCmdClearDepthStencilImage = unsafe extern "system" fn(CommandBuffer, Image, ImageLayout, *const ClearDepthStencilValue, u32, *const ImageSubresourceRange) -> ();
 pub type PfnCmdControlVideoCodingKHR = unsafe extern "system" fn(CommandBuffer, *const VideoCodingControlInfoKHR) -> ();
@@ -56,7 +57,6 @@ pub type PfnCreateImage = unsafe extern "system" fn(Device, *const ImageCreateIn
 pub type PfnCreateImageView = unsafe extern "system" fn(Device, *const ImageViewCreateInfo, *const AllocationCallbacks, *mut ImageView) -> Result;
 pub type PfnCreateInstance = unsafe extern "system" fn(*const InstanceCreateInfo, *const AllocationCallbacks, *mut Instance) -> Result;
 pub type PfnCreatePipelineCache = unsafe extern "system" fn(Device, *const PipelineCacheCreateInfo, *const AllocationCallbacks, *mut PipelineCache) -> Result;
-pub type PfnGetPipelineCacheData = unsafe extern "system" fn(Device, PipelineCache, *mut usize, *mut core::ffi::c_void) -> Result;
 pub type PfnCreatePipelineLayout = unsafe extern "system" fn(Device, *const PipelineLayoutCreateInfo, *const AllocationCallbacks, *mut PipelineLayout) -> Result;
 pub type PfnCreateQueryPool = unsafe extern "system" fn(Device, *const QueryPoolCreateInfo, *const AllocationCallbacks, *mut QueryPool) -> Result;
 pub type PfnCreateRenderPass = unsafe extern "system" fn(Device, *const RenderPassCreateInfo, *const AllocationCallbacks, *mut RenderPass) -> Result;
@@ -145,6 +145,7 @@ pub type PfnGetPhysicalDeviceVideoCapabilitiesKHR = unsafe extern "system" fn(Ph
 pub type PfnGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR = unsafe extern "system" fn(PhysicalDevice, *const PhysicalDeviceVideoEncodeQualityLevelInfoKHR, *mut VideoEncodeQualityLevelPropertiesKHR) -> Result;
 pub type PfnGetPhysicalDeviceVideoFormatPropertiesKHR = unsafe extern "system" fn(PhysicalDevice, *const PhysicalDeviceVideoFormatInfoKHR, *mut u32, *mut VideoFormatPropertiesKHR) -> Result;
 pub type PfnGetPhysicalDeviceWaylandPresentationSupportKHR = unsafe extern "system" fn(PhysicalDevice, u32, *mut WlDisplay) -> Bool32;
+pub type PfnGetPipelineCacheData = unsafe extern "system" fn(Device, PipelineCache, *mut usize, *mut core::ffi::c_void) -> Result;
 pub type PfnGetQueryPoolResults = unsafe extern "system" fn(Device, QueryPool, u32, u32, usize, *mut core::ffi::c_void, DeviceSize, QueryResultFlags) -> Result;
 pub type PfnGetSemaphoreCounterValue = unsafe extern "system" fn(Device, Semaphore, *mut u64) -> Result;
 pub type PfnGetSemaphoreFdKHR = unsafe extern "system" fn(Device, *const SemaphoreGetFdInfoKHR, *mut i32) -> Result;
@@ -292,6 +293,7 @@ pub struct DeviceTable {
     pub cmd_bind_pipeline: Option<PfnCmdBindPipeline>,
     pub cmd_bind_vertex_buffers: Option<PfnCmdBindVertexBuffers>,
     pub cmd_blit_image: Option<PfnCmdBlitImage>,
+    pub cmd_clear_attachments: Option<PfnCmdClearAttachments>,
     pub cmd_clear_color_image: Option<PfnCmdClearColorImage>,
     pub cmd_clear_depth_stencil_image: Option<PfnCmdClearDepthStencilImage>,
     pub cmd_control_video_coding_khr: Option<PfnCmdControlVideoCodingKHR>,
@@ -325,7 +327,6 @@ pub struct DeviceTable {
     pub create_image: Option<PfnCreateImage>,
     pub create_image_view: Option<PfnCreateImageView>,
     pub create_pipeline_cache: Option<PfnCreatePipelineCache>,
-    pub get_pipeline_cache_data: Option<PfnGetPipelineCacheData>,
     pub create_pipeline_layout: Option<PfnCreatePipelineLayout>,
     pub create_query_pool: Option<PfnCreateQueryPool>,
     pub create_render_pass: Option<PfnCreateRenderPass>,
@@ -375,6 +376,7 @@ pub struct DeviceTable {
     pub get_image_subresource_layout: Option<PfnGetImageSubresourceLayout>,
     pub get_memory_fd_khr: Option<PfnGetMemoryFdKHR>,
     pub get_memory_fd_properties_khr: Option<PfnGetMemoryFdPropertiesKHR>,
+    pub get_pipeline_cache_data: Option<PfnGetPipelineCacheData>,
     pub get_query_pool_results: Option<PfnGetQueryPoolResults>,
     pub get_semaphore_counter_value: Option<PfnGetSemaphoreCounterValue>,
     pub get_semaphore_fd_khr: Option<PfnGetSemaphoreFdKHR>,
@@ -415,6 +417,7 @@ impl DeviceTable { pub unsafe fn load(handle: Device, get: PfnGetDeviceProcAddr)
         cmd_bind_pipeline: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdBindPipeline>>(lookup(c"vkCmdBindPipeline")),
         cmd_bind_vertex_buffers: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdBindVertexBuffers>>(lookup(c"vkCmdBindVertexBuffers")),
         cmd_blit_image: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdBlitImage>>(lookup(c"vkCmdBlitImage")),
+        cmd_clear_attachments: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdClearAttachments>>(lookup(c"vkCmdClearAttachments")),
         cmd_clear_color_image: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdClearColorImage>>(lookup(c"vkCmdClearColorImage")),
         cmd_clear_depth_stencil_image: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdClearDepthStencilImage>>(lookup(c"vkCmdClearDepthStencilImage")),
         cmd_control_video_coding_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnCmdControlVideoCodingKHR>>(lookup(c"vkCmdControlVideoCodingKHR")),
@@ -448,7 +451,6 @@ impl DeviceTable { pub unsafe fn load(handle: Device, get: PfnGetDeviceProcAddr)
         create_image: core::mem::transmute::<PfnVoidFunction, Option<PfnCreateImage>>(lookup(c"vkCreateImage")),
         create_image_view: core::mem::transmute::<PfnVoidFunction, Option<PfnCreateImageView>>(lookup(c"vkCreateImageView")),
         create_pipeline_cache: core::mem::transmute::<PfnVoidFunction, Option<PfnCreatePipelineCache>>(lookup(c"vkCreatePipelineCache")),
-        get_pipeline_cache_data: core::mem::transmute::<PfnVoidFunction, Option<PfnGetPipelineCacheData>>(lookup(c"vkGetPipelineCacheData")),
         create_pipeline_layout: core::mem::transmute::<PfnVoidFunction, Option<PfnCreatePipelineLayout>>(lookup(c"vkCreatePipelineLayout")),
         create_query_pool: core::mem::transmute::<PfnVoidFunction, Option<PfnCreateQueryPool>>(lookup(c"vkCreateQueryPool")),
         create_render_pass: core::mem::transmute::<PfnVoidFunction, Option<PfnCreateRenderPass>>(lookup(c"vkCreateRenderPass")),
@@ -498,6 +500,7 @@ impl DeviceTable { pub unsafe fn load(handle: Device, get: PfnGetDeviceProcAddr)
         get_image_subresource_layout: core::mem::transmute::<PfnVoidFunction, Option<PfnGetImageSubresourceLayout>>(lookup(c"vkGetImageSubresourceLayout")),
         get_memory_fd_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnGetMemoryFdKHR>>(lookup(c"vkGetMemoryFdKHR")),
         get_memory_fd_properties_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnGetMemoryFdPropertiesKHR>>(lookup(c"vkGetMemoryFdPropertiesKHR")),
+        get_pipeline_cache_data: core::mem::transmute::<PfnVoidFunction, Option<PfnGetPipelineCacheData>>(lookup(c"vkGetPipelineCacheData")),
         get_query_pool_results: core::mem::transmute::<PfnVoidFunction, Option<PfnGetQueryPoolResults>>(lookup(c"vkGetQueryPoolResults")),
         get_semaphore_counter_value: core::mem::transmute::<PfnVoidFunction, Option<PfnGetSemaphoreCounterValue>>(lookup(c"vkGetSemaphoreCounterValue").or_else(|| lookup(c"vkGetSemaphoreCounterValueKHR"))),
         get_semaphore_fd_khr: core::mem::transmute::<PfnVoidFunction, Option<PfnGetSemaphoreFdKHR>>(lookup(c"vkGetSemaphoreFdKHR")),
@@ -658,6 +661,14 @@ impl crate::Device {
     pub unsafe fn cmd_blit_image(&self, command_buffer: CommandBuffer, src_image: Image, src_image_layout: ImageLayout, dst_image: Image, dst_image_layout: ImageLayout, regions: &[ImageBlit], filter: Filter) -> () {
         let call = self.table.cmd_blit_image.expect("vkCmdBlitImage is unavailable");
         call(command_buffer, src_image, src_image_layout, dst_image, dst_image_layout, regions.len() as _, regions.as_ptr(), filter);
+        ()
+    }
+}
+impl crate::Device {
+    #[inline]
+    pub unsafe fn cmd_clear_attachments(&self, command_buffer: CommandBuffer, attachments: &[ClearAttachment], rects: &[ClearRect]) -> () {
+        let call = self.table.cmd_clear_attachments.expect("vkCmdClearAttachments is unavailable");
+        call(command_buffer, attachments.len() as _, attachments.as_ptr(), rects.len() as _, rects.as_ptr());
         ()
     }
 }
@@ -980,22 +991,6 @@ impl crate::Device {
         let mut value: PipelineCache = PipelineCache::default();
         call(self.handle, create_info, allocator.map_or(core::ptr::null(), |v| v as *const AllocationCallbacks), &mut value).result()?;
         Ok(value)
-    }
-}
-impl crate::Device {
-    #[inline]
-    pub unsafe fn get_pipeline_cache_data(&self, pipeline_cache: PipelineCache) -> std::result::Result<Vec<u8>, Result> {
-        let call = self.table.get_pipeline_cache_data.expect("vkGetPipelineCacheData is unavailable");
-        loop {
-            let mut size: usize = 0;
-            call(self.handle, pipeline_cache, &mut size, core::ptr::null_mut()).result()?;
-            let mut data: Vec<u8> = vec![0; size];
-            let code = call(self.handle, pipeline_cache, &mut size, data.as_mut_ptr() as *mut core::ffi::c_void);
-            if code == Result::INCOMPLETE { continue; }
-            code.result()?;
-            data.truncate(size);
-            return Ok(data);
-        }
     }
 }
 impl crate::Device {
@@ -1848,6 +1843,23 @@ impl crate::Instance {
     pub unsafe fn get_physical_device_wayland_presentation_support(&self, physical_device: PhysicalDevice, queue_family_index: u32, display: *mut WlDisplay) -> Bool32 {
         let call = self.table.get_physical_device_wayland_presentation_support_khr.expect("vkGetPhysicalDeviceWaylandPresentationSupportKHR is unavailable");
         call(physical_device, queue_family_index, display)
+    }
+}
+impl crate::Device {
+    #[inline]
+    pub unsafe fn get_pipeline_cache_data(&self, pipeline_cache: PipelineCache) -> std::result::Result<Vec<u8>, Result> {
+        let call = self.table.get_pipeline_cache_data.expect("vkGetPipelineCacheData is unavailable");
+        loop {
+            let mut count: usize = 0;
+            call(self.handle, pipeline_cache, &mut count, core::ptr::null_mut()).result()?;
+            let mut values: Vec<u8> = Vec::with_capacity(count as usize);
+            values.resize(count as usize, u8::default());
+            let code = call(self.handle, pipeline_cache, &mut count, values.as_mut_ptr().cast());
+            if code == Result::INCOMPLETE { continue; }
+            code.result()?;
+            values.truncate(count as usize);
+            return Ok(values);
+        }
     }
 }
 impl crate::Device {

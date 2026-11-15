@@ -603,6 +603,28 @@ impl<'a> Iter<'a> {
     }
 }
 
+// library/std/src/path.rs: the rest of the path still to iterate, as a path.
+impl AsRef<Path> for Components<'_> {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+impl AsRef<OsStr> for Components<'_> {
+    fn as_ref(&self) -> &OsStr {
+        self.as_path().as_os_str()
+    }
+}
+impl AsRef<Path> for Iter<'_> {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+impl AsRef<OsStr> for Iter<'_> {
+    fn as_ref(&self) -> &OsStr {
+        self.as_path().as_os_str()
+    }
+}
+
 impl<'a> Iterator for Iter<'a> {
     type Item = &'a OsStr;
     fn next(&mut self) -> Option<&'a OsStr> {
@@ -778,6 +800,10 @@ impl Path {
             Some(c) => Ok(c.as_path()),
             None => Err(StripPrefixError(())),
         }
+    }
+    /// rustc 1.100.0 (trim_prefix_suffix): `self` without the leading `base` components, else `self`
+    pub fn trim_prefix<P: AsRef<Path>>(&self, base: P) -> &Path {
+        self.strip_prefix(base).unwrap_or(self)
     }
     pub fn starts_with<P: AsRef<Path>>(&self, base: P) -> bool {
         iter_after(self.components(), base.as_ref().components()).is_some()
@@ -1079,14 +1105,6 @@ impl AsRef<OsStr> for PathBuf {
     }
 }
 
-// `"dir".parse::<PathBuf>()` (std: infallible); comrak's build script parses OUT_DIR this way.
-impl core::str::FromStr for PathBuf {
-    type Err = core::convert::Infallible;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(PathBuf::from(s))
-    }
-}
-
 impl From<String> for PathBuf {
     fn from(s: String) -> PathBuf {
         PathBuf { inner: OsString::from(s) }
@@ -1101,6 +1119,13 @@ impl<T: ?Sized + AsRef<OsStr>> From<&T> for PathBuf {
 impl From<OsString> for PathBuf {
     fn from(s: OsString) -> PathBuf {
         PathBuf { inner: s }
+    }
+}
+/// `"a/b".parse::<PathBuf>()`, as real std (it never fails).
+impl core::str::FromStr for PathBuf {
+    type Err = core::convert::Infallible;
+    fn from_str(s: &str) -> Result<PathBuf, core::convert::Infallible> {
+        Ok(PathBuf::from(s))
     }
 }
 impl From<PathBuf> for OsString {
@@ -1184,11 +1209,49 @@ impl Ord for Path {
         Ord::cmp(&self.components(), &other.components())
     }
 }
+/// Real std's hash (std path.rs): the byte runs between separators, skipping a `.` component
+/// after a separator as `components()` does, then a mix of the run lengths, so a path hashes
+/// the same in a Relax program as in a rustc-built one.
 impl Hash for Path {
     fn hash<H: Hasher>(&self, h: &mut H) {
-        for c in self.components() {
-            c.hash(h);
+        let bytes = self.bytes();
+        let (prefix_len, verbatim) = match parse_prefix(&self.inner) {
+            Some(prefix) => {
+                prefix.hash(h);
+                (prefix.len(), prefix.is_verbatim())
+            }
+            None => (0, false),
+        };
+        let bytes = &bytes[prefix_len..];
+        let mut component_start = 0;
+        let mut chunk_bits: usize = 0;
+        for i in 0..bytes.len() {
+            let is_sep = if verbatim { is_verbatim_sep(bytes[i]) } else { is_sep_byte(bytes[i]) };
+            if is_sep {
+                if i > component_start {
+                    let to_hash = &bytes[component_start..i];
+                    chunk_bits = chunk_bits.wrapping_add(to_hash.len());
+                    chunk_bits = chunk_bits.rotate_right(2);
+                    h.write(to_hash);
+                }
+                component_start = i + 1;
+                let tail = &bytes[component_start..];
+                if !verbatim {
+                    component_start += match tail {
+                        [b'.'] => 1,
+                        [b'.', sep, ..] if is_sep_byte(*sep) => 1,
+                        _ => 0,
+                    };
+                }
+            }
         }
+        if component_start < bytes.len() {
+            let to_hash = &bytes[component_start..];
+            chunk_bits = chunk_bits.wrapping_add(to_hash.len());
+            chunk_bits = chunk_bits.rotate_right(2);
+            h.write(to_hash);
+        }
+        h.write_usize(chunk_bits);
     }
 }
 
@@ -1213,26 +1276,84 @@ impl Hash for PathBuf {
         self.as_path().hash(h)
     }
 }
-impl PartialEq<Path> for PathBuf {
-    fn eq(&self, other: &Path) -> bool {
-        self.as_path() == other
-    }
+// Real std's impl_cmp and impl_cmp_os_str: equality and order both ways between Path's owned,
+// borrowed and Cow forms, and between those and OsStr's, as Path compares (by components).
+macro_rules! impl_cmp {
+    (<$($life:lifetime),*> $lhs:ty, $rhs:ty) => {
+        impl<$($life),*> PartialEq<$rhs> for $lhs {
+            #[inline]
+            fn eq(&self, other: &$rhs) -> bool {
+                <Path as PartialEq>::eq(self, other)
+            }
+        }
+        impl<$($life),*> PartialEq<$lhs> for $rhs {
+            #[inline]
+            fn eq(&self, other: &$lhs) -> bool {
+                <Path as PartialEq>::eq(self, other)
+            }
+        }
+        impl<$($life),*> PartialOrd<$rhs> for $lhs {
+            #[inline]
+            fn partial_cmp(&self, other: &$rhs) -> Option<Ordering> {
+                <Path as PartialOrd>::partial_cmp(self, other)
+            }
+        }
+        impl<$($life),*> PartialOrd<$lhs> for $rhs {
+            #[inline]
+            fn partial_cmp(&self, other: &$lhs) -> Option<Ordering> {
+                <Path as PartialOrd>::partial_cmp(self, other)
+            }
+        }
+    };
 }
-impl PartialEq<PathBuf> for Path {
-    fn eq(&self, other: &PathBuf) -> bool {
-        self == other.as_path()
-    }
+impl_cmp!(<> PathBuf, Path);
+impl_cmp!(<'a> PathBuf, &'a Path);
+impl_cmp!(<'a> Cow<'a, Path>, Path);
+impl_cmp!(<'a, 'b> Cow<'a, Path>, &'b Path);
+impl_cmp!(<'a> Cow<'a, Path>, PathBuf);
+
+macro_rules! impl_cmp_os_str {
+    (<$($life:lifetime),*> $lhs:ty, $rhs:ty) => {
+        impl<$($life),*> PartialEq<$rhs> for $lhs {
+            #[inline]
+            fn eq(&self, other: &$rhs) -> bool {
+                <Path as PartialEq>::eq(self, other.as_ref())
+            }
+        }
+        impl<$($life),*> PartialEq<$lhs> for $rhs {
+            #[inline]
+            fn eq(&self, other: &$lhs) -> bool {
+                <Path as PartialEq>::eq(self.as_ref(), other)
+            }
+        }
+        impl<$($life),*> PartialOrd<$rhs> for $lhs {
+            #[inline]
+            fn partial_cmp(&self, other: &$rhs) -> Option<Ordering> {
+                <Path as PartialOrd>::partial_cmp(self, other.as_ref())
+            }
+        }
+        impl<$($life),*> PartialOrd<$lhs> for $rhs {
+            #[inline]
+            fn partial_cmp(&self, other: &$lhs) -> Option<Ordering> {
+                <Path as PartialOrd>::partial_cmp(self.as_ref(), other)
+            }
+        }
+    };
 }
-impl<'a> PartialEq<&'a Path> for PathBuf {
-    fn eq(&self, other: &&'a Path) -> bool {
-        self.as_path() == *other
-    }
-}
-impl<'a> PartialEq<PathBuf> for &'a Path {
-    fn eq(&self, other: &PathBuf) -> bool {
-        *self == other.as_path()
-    }
-}
+impl_cmp_os_str!(<> PathBuf, OsStr);
+impl_cmp_os_str!(<'a> PathBuf, &'a OsStr);
+impl_cmp_os_str!(<'a> PathBuf, Cow<'a, OsStr>);
+impl_cmp_os_str!(<> PathBuf, OsString);
+impl_cmp_os_str!(<> Path, OsStr);
+impl_cmp_os_str!(<'a> Path, &'a OsStr);
+impl_cmp_os_str!(<'a> Path, Cow<'a, OsStr>);
+impl_cmp_os_str!(<> Path, OsString);
+impl_cmp_os_str!(<'a> &'a Path, OsStr);
+impl_cmp_os_str!(<'a, 'b> &'a Path, Cow<'b, OsStr>);
+impl_cmp_os_str!(<'a> &'a Path, OsString);
+impl_cmp_os_str!(<'a> Cow<'a, Path>, OsStr);
+impl_cmp_os_str!(<'a, 'b> Cow<'a, Path>, &'b OsStr);
+impl_cmp_os_str!(<'a> Cow<'a, Path>, OsString);
 
 impl fmt::Debug for Path {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1334,7 +1455,6 @@ extern "system" {
 }
 
 /// Byte copy of the whole value (real std's CloneToUninit for Path), for Rc/Arc::make_mut.
-#[cfg(not(relax_shim))]
 unsafe impl core::clone::CloneToUninit for Path {
     unsafe fn clone_to_uninit(&self, dest: *mut u8) {
         let n = core::mem::size_of_val(self);
@@ -1348,15 +1468,15 @@ impl From<&Path> for Box<Path> {
     }
 }
 
-impl From<PathBuf> for Box<Path> {
-    fn from(p: PathBuf) -> Box<Path> {
-        p.into_boxed_path()
+impl Clone for Box<Path> {
+    fn clone(&self) -> Self {
+        self.to_path_buf().into_boxed_path()
     }
 }
 
-impl Clone for Box<Path> {
-    fn clone(&self) -> Box<Path> {
-        self.to_path_buf().into_boxed_path()
+impl From<PathBuf> for Box<Path> {
+    fn from(p: PathBuf) -> Box<Path> {
+        p.into_boxed_path()
     }
 }
 

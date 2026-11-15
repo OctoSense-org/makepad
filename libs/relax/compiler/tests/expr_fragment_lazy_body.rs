@@ -78,11 +78,14 @@ fn the_same_bodies_under_makepad_run() {
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"expr_fragment_lazy_body\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[[bin]]\nname=\"expr_fragment_lazy_body\"\npath=\"main.rs\"\n[workspace]\n").unwrap();
     let source = include_str!("expr_fragment_lazy_body.rs").to_string() + "\nfn main() { checks(); println!(\"lazy bodies ok\"); }\n";
     std::fs::write(dir.join("main.rs"), source).unwrap();
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
+    // `$RELAX_LOADER run ..` is a launch of the loader; a spawn of current_exe() runs this test
+    // program again (with "run" as its filter: this test, without end)
+    let loader = std::env::var_os("RELAX_LOADER").expect("Relax names its test loader");
+    let output = std::process::Command::new(loader)
         .args(["run", "expr_fragment_lazy_body"])
         .current_dir(&dir)
-        .env("MAKEPAD_RUN_HOME", dir.join("home"))
-        .env("MAKEPAD_RUN_LAZY_BODIES", "1")
+        .env("RELAX_HOME", dir.join("home"))
+        .env("RELAX_LAZY_BODIES", "1")
         .output().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

@@ -1068,8 +1068,9 @@ pub fn link_mass(l: &Link, density: f64) -> MassProps {
     MassProps { volume: m / density, mass: m, com, inertia }
 }
 
-/// A box3d world for a weave: free links, sleeping, contacts made a bar diameter early, speed capped so no
-/// link moves more than that in one step at `hz`.
+/// A weave's world: free links, sleeping, contacts made a bar diameter early, speed capped so no link moves
+/// more than that in one step at `hz`. Its substeps are box3d's (the reference the engine is compared with);
+/// the dynamics engine, which steps weaves, takes its own ([`crate::runner::dynamics_world`]).
 pub fn assembly(w: &Weave, density: f64, hz: f64) -> crate::sim::Assembly {
     let margin = 2.0 * w.link.r;
     crate::sim::Assembly {
@@ -1081,14 +1082,17 @@ pub fn assembly(w: &Weave, density: f64, hz: f64) -> crate::sim::Assembly {
         workers: 1,
         contact_margin: margin,
         max_speed: margin * hz,
-        // a hanging cloth is a long stack of light contacts: stiff contacts and 8 substeps keep 40 rows
-        // interlocked (4 substeps let deep rows pass through each other)
+        // a hanging cloth is a long stack of light contacts: stiff contacts and, on box3d, 8 substeps keep
+        // 40 rows interlocked (4 substeps let deep rows pass through each other there)
         contact_hertz: 240.0,
         substeps: 8,
         ball: None,
         shake_about: [0.0; 3],
         shake_tempo: 0.0,
         lift: 0.0,
+        strings: Vec::new(),
+        interlocks: w.pairs.iter().map(|&(a, b)| (a as usize, b as usize)).collect(),
+        contact_layer: 0.0,
     }
 }
 
@@ -1306,13 +1310,14 @@ pub struct WeaveSimReport {
     pub cancelled: bool,
 }
 
-/// Runs a weave in a scene for `seconds` (simulated; at most 30), the same every run.
-pub fn simulate(w: &Weave, density: f64, which: WeaveScene, seconds: f64, cancelled: &dyn Fn() -> bool) -> WeaveSimReport {
+/// Runs a weave in a scene for `seconds` (simulated; at most 30), the same every run, on the world the live
+/// sim steps for it (the dynamics engine).
+pub fn simulate(w: &Weave, density: f64, which: WeaveScene, seconds: f64, cancelled: &dyn Fn() -> bool) -> Result<WeaveSimReport, String> {
     let started = std::time::Instant::now();
     let setup = scene(w, density, which);
     let rest: Vec<P3> = setup.asm.bodies.iter().map(|b| b.mass.com).collect();
     let start_pts: Vec<Vec<P3>> = setup.asm.bodies.iter().map(|b| b.tubes[0].0.clone()).collect();
-    let mut mw = crate::sim::MechWorld::new(&setup.asm, setup.gravity, setup.floor);
+    let mut mw = crate::runner::Engine::new(&setup.asm, setup.gravity, setup.floor)?;
     let hz = crate::runner::HZ;
     let dt = 1.0 / hz;
     let steps = (seconds.clamp(0.0, 30.0) * hz) as usize;
@@ -1371,7 +1376,7 @@ pub fn simulate(w: &Weave, density: f64, which: WeaveScene, seconds: f64, cancel
     let pair_motion = motion.get(motion.len() / 2).copied().unwrap_or(0.0);
     let low_start = start_pts.iter().flatten().map(|p| dot(*p, setup.gravity)).fold(f64::MIN, f64::max);
     let low_end = posed.iter().flat_map(|l| l.pts.iter()).map(|p| dot(*p, setup.gravity)).fold(f64::MIN, f64::max);
-    WeaveSimReport {
+    Ok(WeaveSimReport {
         scene: which.name(),
         links: w.links.len(),
         unlinked,
@@ -1384,5 +1389,5 @@ pub fn simulate(w: &Weave, density: f64, which: WeaveScene, seconds: f64, cancel
         wall_ms: started.elapsed().as_secs_f64() * 1e3,
         step_ms: if done > 0 { stepping * 1e3 / done as f64 } else { 0.0 },
         cancelled: done < steps,
-    }
+    })
 }

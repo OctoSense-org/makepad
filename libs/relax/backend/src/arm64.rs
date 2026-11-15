@@ -64,12 +64,12 @@ const X8: u8 = 8;
 
 /// Whether the CPU running the JIT'd code has ARMv8.1 LSE atomics (`cas`, `ldadd`, ...). Every
 /// Apple arm64 CPU does; Android and Linux ask the kernel (HWCAP_ATOMICS: Cortex-A53/A73 class
-/// cores have none). `MAKEPAD_RUN_NO_LSE=1` forces the ARMv8.0 exclusive-load/store loops (to test
+/// cores have none). `RELAX_NO_LSE=1` forces the ARMv8.0 exclusive-load/store loops (to test
 /// them on an LSE machine; stored code is keyed by this class, relax-compiler codegen_id::target_tag).
 pub fn lse_atomics() -> bool {
     static LSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LSE.get_or_init(|| {
-        if std::env::var_os("MAKEPAD_RUN_NO_LSE").is_some_and(|v| !v.is_empty()) {
+        if std::env::var_os("RELAX_NO_LSE").is_some_and(|v| !v.is_empty()) {
             return false;
         }
         #[cfg(all(target_arch = "aarch64", any(target_os = "linux", target_os = "android")))]
@@ -89,7 +89,7 @@ pub fn lse_atomics() -> bool {
 const INT_ARGS: usize = 8;
 const FLT_ARGS: usize = 8;
 
-/// arm64 isel switches for measurements: `MAKEPAD_RUN_A64=none` or `-fuse,-fconst`.
+/// arm64 isel switches for measurements: `RELAX_A64=none` or `-fuse,-fconst`.
 const A64_FUSE: u8 = 1;
 const A64_FCONST: u8 = 2;
 /// struct copies of >= 32 bytes through 16-byte vector pairs (off: 8-byte pieces; measurement switch)
@@ -153,10 +153,16 @@ fn keeps_flags(i: &Inst) -> bool {
 /// operand locations) only narrow these shapes; the loop asks this before each deferral.
 fn arm64_defers(b: &Block, k: usize, uses: &[u32]) -> bool {
     let n = b.insts.len();
+    let once = |t: VReg| uses[t.0 as usize] == 1;
+    // `t = x & K` before a branch on `t ==/!= 0`: tst x, #K
+    if let (Some(Cmp::K(Cond::Eq | Cond::Ne, _, t2, 0)), ne) = regalloc::branch_compare(b, uses) {
+        if k + 1 == ne {
+            return matches!(b.insts[k], Inst::IBinI(IOp::And, _, t, x, _) if x != t && once(t) && t2 == t);
+        }
+    }
     if k + 1 >= n {
         return false;
     }
-    let once = |t: VReg| uses[t.0 as usize] == 1;
     let next = &b.insts[k + 1];
     match b.insts[k] {
         Inst::IBinI(IOp::Shl | IOp::Shr, it, t, _, sh) if it.bits == 64 && (1..64).contains(&sh) && once(t) => match *next {
@@ -174,9 +180,14 @@ fn arm64_defers(b: &Block, k: usize, uses: &[u32]) -> bool {
             _ => false,
         },
         Inst::IBit(BitOp::Bswap | BitOp::Rev, t, _) if once(t) => matches!(*next, Inst::IBinI(IOp::Shr, it, _, x, 32 | 48) if x == t && it.bits == 64 && !it.signed),
-        Inst::IBinI(IOp::And, _, t, x, _) if k + 2 == n && x != t && once(t) => matches!((next, &b.term), (Inst::ICmpI(Cond::Eq | Cond::Ne, _, c, t2, 0), Term::Branch(c2, _, _)) if *t2 == t && c == c2 && once(*c)),
         _ => false,
     }
+}
+
+/// The selects arm64 makes on a compare's flags: csel / fcsel take any condition (a float compare's
+/// conditions are false when unordered but for `!=`, as Rust's).
+pub fn arm64_sel_ok(_: &Cmp, data: Cls) -> bool {
+    matches!(data, Cls::I | Cls::F32 | Cls::F64)
 }
 
 /// mul_add's second instructions for a product t
@@ -236,7 +247,7 @@ fn keeps_v0_7(f: &Func, i: &Inst) -> bool {
     match i {
         Inst::Iconst(..) | Inst::IBinI(..) | Inst::ICmpI(..) | Inst::ICmp(..) | Inst::IBin(..) | Inst::IBit(..) | Inst::INeg(..) | Inst::INot(..) => true,
         Inst::SlotAddr(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::Mov(..) | Inst::Load(..) | Inst::Store(..) | Inst::LoadX(..) | Inst::StoreX(..) => true,
-        Inst::Fconst(..) | Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) | Inst::Sel(..) | Inst::Conv(..) | Inst::Copy(..) => true,
+        Inst::Fconst(..) | Inst::FBin(..) | Inst::FUnary(..) | Inst::FCmp(..) | Inst::FMulAdd(..) | Inst::Sel(..) | Inst::SelCmp(..) | Inst::Conv(..) | Inst::Copy(..) => true,
         Inst::VLoad(..) | Inst::VStore(..) | Inst::VLoadX(..) | Inst::VStoreX(..) | Inst::VConst(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) => true,
         Inst::VSel(..) | Inst::VFma(..) | Inst::VAny(..) | Inst::VGather(..) => true,
         Inst::VX(op, ..) => {
@@ -851,11 +862,13 @@ struct Gen<'a> {
     qcopy: bool,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as tst x, #K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
-    /// a compare whose flags the selects right after it read (csel / fcsel on the condition, no
-    /// `cmp c, #0`): (its bool vreg, condition). Valid only for the selects that directly follow
-    /// the compare in its block: any other instruction, a fused compare-and-branch, or a block
-    /// boundary ends it (the flags then belong to something else).
-    sel_chain: Option<(VReg, u8)>,
+    /// the compare whose flags the selects right after it read (csel / fcsel on the condition, no
+    /// `cmp c, #0`): (its bool vreg when it was made as one and not written since, the compare while
+    /// its operands are not written, condition). Valid only for
+    /// the selects that follow it in its block with nothing but keeps_flags instructions between:
+    /// any other instruction, a fused compare-and-branch, or a block boundary ends it (the flags
+    /// then belong to something else).
+    sel_chain: Option<(Option<VReg>, Option<Cmp>, u8)>,
     /// a zero vector whose definition was skipped: the VInsert of lane 0 right after it reads
     /// it (fmov s, which zeroes lanes 1-3)
     zero_ins: Option<VReg>,
@@ -896,6 +909,11 @@ struct Gen<'a> {
     /// bytes of callee-saved registers below fp
     saved: i64,
     slot_off: Vec<i64>,
+    /// per slot: the sp offset of the cell that holds its aligned address when its alignment
+    /// is above the frame base's (frame::FRAME_BASE_ALIGN; -1: its slot_off is its address)
+    slot_cell: Vec<i64>,
+    /// the over-aligned storages the prologue aligns: (start sp offset, alignment, cell)
+    realign: Vec<(i64, u32, i64)>,
     /// per value: its frame position when it is a slot address (frame::slot_addr_positions)
     slot_pos: Vec<i64>,
     block_pos: Vec<usize>,
@@ -1037,10 +1055,7 @@ impl<'a> Gen<'a> {
         match k {
             // never xzr for 0: register 31 is sp in add-immediate and address operands
             Remat::Const(k) => self.a.mov_imm(r, k),
-            Remat::Slot(s) => {
-                let off = self.slot_off[s as usize];
-                self.a.add_any(r, SP, off);
-            }
+            Remat::Slot(s) => self.slot_addr_into(r, s),
             Remat::Addr(a) => self.ldr_reloc(r, Reloc::Sym(a)),
             Remat::FnAddr(id) => self.ldr_reloc(r, Reloc::Thunk(id)),
             Remat::Offset(..) => unreachable!("base + k moves through use_i"),
@@ -1056,10 +1071,23 @@ impl<'a> Gen<'a> {
             r => unreachable!("float move from {:?}", r),
         }
     }
-    /// A stack-slot address without a register (Alloc::remat) as a load/store base: sp + its offset.
+    /// Slot `s`'s address into r: sp + its offset, or an over-aligned storage's cell
+    fn slot_addr_into(&mut self, r: u8, s: u32) {
+        match self.slot_cell[s as usize] {
+            -1 => self.a.add_any(r, SP, self.slot_off[s as usize]),
+            cell if cell < 8 * 4096 => self.a.ldst(LDRX, 8, r, SP, cell),
+            // (a far cell through r itself: ldst's far form would take ip1, which may be live here)
+            cell => {
+                self.a.add_any(r, SP, cell);
+                self.a.ldst(LDRX, 8, r, r, 0);
+            }
+        }
+    }
+    /// A stack-slot address without a register (Alloc::remat) as a load/store base: sp + its
+    /// offset (an over-aligned one is no fixed offset: its cell is loaded as a register's value).
     fn slot_base(&self, base: VReg) -> Option<i64> {
         match (self.al.loc[base.0 as usize], self.al.remat[base.0 as usize]) {
-            (Loc::None, Remat::Slot(s)) => Some(self.slot_off[s as usize]),
+            (Loc::None, Remat::Slot(s)) if self.slot_cell[s as usize] < 0 => Some(self.slot_off[s as usize]),
             _ => None,
         }
     }
@@ -1247,8 +1275,24 @@ impl<'a> Gen<'a> {
         // only slots something addresses take space (SROA and inlining leave many unreferenced:
         // the Splash VM's O3 opcode() had 1749 slots, 515 in use); slots whose lifetimes cannot
         // overlap share it (frame::slot_layout)
-        let (slot_fp, mut off) = crate::frame::slot_layout_aligned(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"), if crate::stats::opt_off(options, "-a64slotalign") { |_| 1 } else { a64_slot_align });
+        let (slot_fp, mut off, over) = crate::frame::slot_layout_aligned(self.f, self.saved + self.al.spill_bytes as i64, !crate::stats::opt_off(options, "-slotcolor"), if crate::stats::opt_off(options, "-a64slotalign") { |_| 1 } else { a64_slot_align }, true);
         self.slot_pos = crate::frame::slot_addr_positions(self.f, &slot_fp);
+        // a storage aligned above fp's 16 (laid out with room for it): its aligned address, made
+        // once by the prologue, in a cell every address of its slots loads (fp offsets for now)
+        let mut cell_fp = vec![-1i64; slot_fp.len()];
+        let mut over_fp: Vec<(i64, u32, i64)> = Vec::new();
+        for s in 0..slot_fp.len() {
+            if over[s] == 0 {
+                continue;
+            }
+            if let Some(&(_, _, cell)) = over_fp.iter().find(|r| r.0 == slot_fp[s]) {
+                cell_fp[s] = cell;
+                continue;
+            }
+            off = (off + 7) / 8 * 8 + 8;
+            over_fp.push((slot_fp[s], over[s], off));
+            cell_fp[s] = off;
+        }
         // C ABI body: buffers that rebuild aggregate params from their registers, and the
         // buffer an aggregate result is written to before Ret loads it into registers
         let mut cbuf_fp: Vec<i64> = Vec::new();
@@ -1325,6 +1369,8 @@ impl<'a> Gen<'a> {
         for x in slot_fp {
             self.slot_off.push(frame - x);
         }
+        self.slot_cell = cell_fp.iter().map(|&c| if c < 0 { -1 } else { frame - c }).collect();
+        self.realign = over_fp.iter().map(|&(start, align, cell)| (frame - start, align, frame - cell)).collect();
         for x in cbuf_fp {
             self.cbuf.push(if x < 0 { -1 } else { frame - x });
         }
@@ -1338,6 +1384,14 @@ impl<'a> Gen<'a> {
             self.stack_probe(frame);
             self.a.add_any(SP, SP, -frame);
             self.callee_saves(true);
+            // (ip0: no argument; ldst's far offsets take ip1)
+            for (start, align, cell) in self.realign.clone() {
+                let k = align.trailing_zeros();
+                self.a.add_any(IP0, SP, start + align as i64 - 1);
+                self.a.ubfm(IP0, IP0, k, 63);
+                self.a.ubfm(IP0, IP0, 64 - k, 63 - k);
+                self.a.ldst(STRX, 8, IP0, SP, cell);
+            }
             self.tail = crate::tail::sibling_calls(options, self.f, &reach, crate::tail::Arch::Arm64);
             if self.dom_read.first() == Some(&true) {
                 self.dom_base();
@@ -1374,22 +1428,18 @@ impl<'a> Gen<'a> {
             }
             let b = &self.f.blocks[bi];
             let n = b.insts.len();
-            // a compare feeding only the branch is fused into cmp + b.cond
-            let mut fused = false;
-            if let Term::Branch(c, _, _) = &b.term {
-                if n > 0 && self.al.uses[c.0 as usize] == 1 && isel_flags(options) & A64_FUSE != 0 {
-                    match &b.insts[n - 1] {
-                        Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) if d == c => fused = true,
-                        _ => {}
-                    }
-                }
-            }
-            // `t = x & K; c = t ==/!= 0` feeding the branch (t used once, K a bitmask immediate): tst x, #K
+            // the compare the branch reads (fused into cmp + b.cond): the instructions before it
+            // (-fuse: a compare made for the branch is a bool the branch tests)
+            let (bcmp, mut ne) = match regalloc::branch_compare(b, &self.al.uses) {
+                (Some(c), ne) if ne == n || isel_flags(options) & A64_FUSE != 0 => (Some(c), ne),
+                _ => (None, n),
+            };
+            // `t = x & K` and a branch on `t ==/!= 0` (t used once, K a bitmask immediate): tst x, #K
             self.test_fuse = None;
             let mut test_pair = false;
-            if fused && n >= 2 {
-                if let (Inst::IBinI(IOp::And, it, t, x, k), Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, t2, 0)) = (&b.insts[n - 2], &b.insts[n - 1]) {
-                    if t == t2 && *x != *t && self.al.uses[t.0 as usize] == 1 && (it.bits == 64 || (0..1i64 << 32).contains(k)) && bitmask_imm(*k as u64).is_some() && arm64_defers(b, n - 2, &self.al.uses) {
+            if let (Some(Cmp::K(Cond::Eq | Cond::Ne, _, t2, 0)), true) = (bcmp, ne >= 1) {
+                if let Inst::IBinI(IOp::And, it, t, x, k) = &b.insts[ne - 1] {
+                    if *t == t2 && *x != *t && self.al.uses[t.0 as usize] == 1 && (it.bits == 64 || (0..1i64 << 32).contains(k)) && bitmask_imm(*k as u64).is_some() && arm64_defers(b, ne - 1, &self.al.uses) {
                         self.test_fuse = Some((*x, *k));
                         test_pair = true;
                     }
@@ -1398,11 +1448,11 @@ impl<'a> Gen<'a> {
             // `c = x & K` branched on directly (c used once): tst x, #K / tbnz (switch bit tests:
             // `lsr; and #1; cbnz` was three instructions)
             if let Term::Branch(c, _, _) = &b.term {
-                if !fused && n > 0 && self.al.uses[c.0 as usize] == 1 && isel_flags(options) & A64_FUSE != 0 {
+                if bcmp.is_none() && n > 0 && self.al.uses[c.0 as usize] == 1 && isel_flags(options) & A64_FUSE != 0 {
                     if let Inst::IBinI(IOp::And, it, t, x, k) = &b.insts[n - 1] {
                         if t == c && *x != *t && (it.bits == 64 || (0..1i64 << 32).contains(k)) && bitmask_imm(*k as u64).is_some() {
                             self.test_fuse = Some((*x, *k));
-                            fused = true;
+                            ne = n - 1;
                         }
                     }
                 }
@@ -1452,14 +1502,15 @@ impl<'a> Gen<'a> {
                 // only selects (and what leaves the flags alone) continue a chain; checked before
                 // any instruction is skipped or fused into the terminator (a fused compare
                 // rewrites the flags)
-                if !matches!(inst, Inst::Sel(..)) && !keeps_flags(inst) {
+                if !matches!(inst, Inst::Sel(..) | Inst::SelCmp(..)) && !keeps_flags(inst) {
                     self.sel_chain = None;
                 }
-                if fused && ii == n - 1 {
-                    break;
+                // a select reads the flags before it writes (Gen::sel_written)
+                if !matches!(inst, Inst::Sel(..) | Inst::SelCmp(..)) {
+                    regalloc::for_defs(inst, |d| self.sel_written(d));
                 }
-                if test_pair && ii == n - 2 {
-                    continue;
+                if ii == ne || test_pair && ii + 1 == ne {
+                    break;
                 }
                 if skip_next {
                     skip_next = false;
@@ -1479,7 +1530,7 @@ impl<'a> Gen<'a> {
                     continue;
                 }
                 // three or more zero stores off one base in a row: the widest zr stores over their bytes
-                let limit = if test_pair { n - 2 } else if fused { n - 1 } else { n };
+                let limit = if test_pair { ne - 1 } else { ne };
                 if ii + 2 < limit && isel_flags(options) & A64_FUSE != 0 {
                     let k = self.zero_run(bi, ii, limit);
                     if k > 0 {
@@ -1487,7 +1538,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                 }
-                if ii + 1 < n && !(fused && ii + 1 == n - 1) {
+                if ii + 1 < ne {
                     // a shift by a constant feeding only the next add/sub/and/or/xor: the shifted
                     // register operand form (`eor d, a, b, lsl #13`); a 64-bit byte swap whose only
                     // use shifts the low half back down: the 32-bit forms (u32 / u16
@@ -1504,7 +1555,7 @@ impl<'a> Gen<'a> {
                 }
                 // a float multiply only read by the negation right after it: fnmul (one
                 // instruction; -(a*b) bit for bit, NaNs included)
-                if ii + 1 < n && !(fused && ii + 1 == n - 1) {
+                if ii + 1 < ne {
                     if let (Inst::FBin(FOp::Mul, w1, t, a, bb), Inst::FUnary(FUn::Neg, w2, _, t2)) = (inst, &b.insts[ii + 1]) {
                         if w1 == w2 && t == t2 && t != a && t != bb && self.al.uses[t.0 as usize] == 1 {
                             self.fnmul_ins = Some((*a, *bb));
@@ -1514,7 +1565,7 @@ impl<'a> Gen<'a> {
                 }
                 // a zero vector only read by the lane-0 insert right after it (SROA'd vector cells,
                 // `_mm_setr_ps` gathers): no movi; the insert is `fmov s` (zeroes lanes 1-3)
-                if ii + 1 < n && !(fused && ii + 1 == n - 1) && self.zero_then_insert(inst, &b.insts[ii + 1]) {
+                if ii + 1 < ne && self.zero_then_insert(inst, &b.insts[ii + 1]) {
                     if let Inst::VConst(z, _) | Inst::VX(_, z, _, _) = inst {
                         self.zero_ins = Some(*z);
                     }
@@ -1524,9 +1575,10 @@ impl<'a> Gen<'a> {
                 // sets flags: other selects of it, keeps_flags instructions); when they are all its
                 // uses, the bool is never materialised (`cmp; cset; cmp #0; csel` was `cmp; csel`:
                 // Paeth's lo / hi / thresh selects, a min and max of one compare)
-                if let Inst::ICmp(_, _, d, ..) | Inst::ICmpI(_, _, d, ..) | Inst::FCmp(_, _, d, ..) = inst {
+                if let Some((d, cmp)) = Cmp::of(inst) {
+                    let d = &d;
                     let (mut k, mut span) = (0, 0);
-                    while ii + 1 + span < n && !(fused && ii + 1 + span == n - 1) {
+                    while ii + 1 + span < ne {
                         let next = &b.insts[ii + 1 + span];
                         match next {
                             Inst::Sel(sd, c, x, y) if c == d && x != d && y != d && sd != d => k += 1,
@@ -1543,14 +1595,15 @@ impl<'a> Gen<'a> {
                         span += 1;
                     }
                     if k > 0 {
+                        let held = (!cmp.reads(*d)).then_some(cmp);
                         if self.al.uses[d.0 as usize] as usize == k {
-                            let cond = self.cmp_flags(inst);
-                            self.sel_chain = Some((*d, cond));
+                            let cond = self.cmp_flags(cmp);
+                            self.sel_chain = Some((Some(*d), held, cond));
                             continue;
                         }
-                        if let Inst::ICmp(c, sg, ..) | Inst::ICmpI(c, sg, ..) = inst {
+                        if let Cmp::R(c, sg, ..) | Cmp::K(c, sg, ..) = cmp {
                             self.inst(options, inst);
-                            self.sel_chain = Some((*d, icc(*c, *sg)));
+                            self.sel_chain = Some((Some(*d), held, icc(c, sg)));
                             continue;
                         }
                     }
@@ -1569,7 +1622,7 @@ impl<'a> Gen<'a> {
             }
             // region windows entered from here: loaded before the terminator (regalloc edge loads);
             // the region's register home before it (exit stores)
-            if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::Switch(..)) {
+            if matches!(b.term, Term::Jump(_) | Term::Branch(..) | Term::BranchCmp(..) | Term::Switch(..)) {
                 let tp = self.al.block_end[bi] - 1;
                 self.exit_stores(tp);
                 if let Some(ls) = self.win_start.get(&tp).cloned() {
@@ -1585,8 +1638,7 @@ impl<'a> Gen<'a> {
             if self.rir_map_on {
                 self.rir_map.push(((self.a.pos() * 4) as u32, bi as u32, u32::MAX));
             }
-            let fuse_inst = if fused { Some(b.insts[n - 1].clone()) } else { None };
-            self.term(&b.term, bi, fuse_inst);
+            self.term(&b.term, bi, bcmp);
         }
         if crate::rir::unwind_stats_on() {
             // bytes of blocks only reachable through unwind edges (cleanup pads)
@@ -2895,8 +2947,8 @@ impl<'a> Gen<'a> {
             self.fin_f(d, xd);
             return;
         }
-        // core::arch exposes Intel semantics on Arm too (check_arch's cross-ISA
-        // fixtures exercise them). Keep these in hardware, with lane conversion.
+        // core::arch exposes Intel semantics on Arm too (tests/std/core_arch_x86_64.rs run on an
+        // Arm host exercises them). Keep these in hardware, with lane conversion.
         if matches!(op, VX::X86Sha1Rnds4(_) | VX::X86Sha1NextE | VX::X86Sha1Msg1
             | VX::X86Sha1Msg2 | VX::X86Sha256Msg1 | VX::X86Sha256Msg2) {
             let xa = self.use_f(a, FS0);
@@ -3855,22 +3907,31 @@ impl<'a> Gen<'a> {
         k - ii
     }
 
+    /// v was written: the select chain no longer holds its bool (when v is it) nor its compare (when
+    /// v is an operand): later selects on them read another value.
+    fn sel_written(&mut self, v: VReg) {
+        if let Some((b, c, cc)) = self.sel_chain {
+            let b = b.filter(|b| *b != v);
+            let c = c.filter(|c| !c.reads(v));
+            self.sel_chain = if b.is_none() && c.is_none() { None } else { Some((b, c, cc)) };
+        }
+    }
+
     /// Sets the flags for a fused compare and returns the condition for "true".
-    fn cmp_flags(&mut self, i: &Inst) -> u8 {
-        match i {
-            Inst::ICmp(c, signed, _, a, b) => {
-                let ra = self.use_i(*a, S0);
-                let rb = self.use_i(*b, S1);
+    fn cmp_flags(&mut self, c: Cmp) -> u8 {
+        match c {
+            Cmp::R(c, signed, a, b) => {
+                let ra = self.use_i(a, S0);
+                let rb = self.use_i(b, S1);
                 self.a.cmp(ra, rb);
-                icc(*c, *signed)
+                icc(c, signed)
             }
-            Inst::ICmpI(c, signed, _, a, v) => {
-                let ra = self.use_i(*a, S0);
-                self.cmp_imm(ra, *v);
-                icc(*c, *signed)
+            Cmp::K(c, signed, a, v) => {
+                let ra = self.use_i(a, S0);
+                self.cmp_imm(ra, v);
+                icc(c, signed)
             }
-            Inst::FCmp(c, f64_, _, a, b) => fcc(self.fcmp_v(*c, *f64_, *a, *b)),
-            _ => NE,
+            Cmp::F(c, f64_, a, b) => fcc(self.fcmp_v(c, f64_, a, b)),
         }
     }
 
@@ -3958,7 +4019,7 @@ impl<'a> Gen<'a> {
         // inlined callees, are worse than the lowering's then-first order: +0.7% instructions on
         // rust_tokenize); static code takes the back edge, and of two targets laid out before
         // the nearer one (the innermost loop's header; an exit placed before the loop is further
-        // back). (MAKEPAD_RUN_OPT=-a64backedge: off, A/B)
+        // back). (RELAX_OPT=-a64backedge: off, A/B)
         let on = !crate::stats::opt_env_off("-a64backedge");
         let back = |b: u32| b as usize <= bi;
         let (ct, cf) = (self.f.blocks[tt as usize].count, self.f.blocks[ff as usize].count);
@@ -4065,48 +4126,54 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn term(&mut self, t: &Term, bi: usize, fused: Option<Inst>) {
+    fn term(&mut self, t: &Term, bi: usize, fused: Option<Cmp>) {
         match t {
             Term::Jump(target) => self.jump_to(*target, bi),
-            Term::Branch(c, tt, ff) => {
+            Term::Branch(_, tt, ff) | Term::BranchCmp(_, tt, ff) => {
+                if let Some((src, mask)) = self.test_fuse.take() {
+                    // and with a bitmask immediate, compared with zero (or branched on directly:
+                    // `!= 0`): tst + b.cond
+                    let cnd = match fused {
+                        Some(Cmp::K(c, ..)) => c,
+                        _ => Cond::Ne,
+                    };
+                    let rs = self.use_i(src, S0);
+                    if self.tbz && (mask as u64).is_power_of_two() {
+                        // one bit: tbz / tbnz (branch to tt when the bit is zero == Eq)
+                        let bit = (mask as u64).trailing_zeros();
+                        let zero_to_tt = cnd == Cond::Eq;
+                        let (yes, no) = if zero_to_tt { (CondBr::Tz(rs, bit), CondBr::Tnz(rs, bit)) } else { (CondBr::Tnz(rs, bit), CondBr::Tz(rs, bit)) };
+                        self.branch_pair(yes, no, *tt, *ff, bi);
+                        return;
+                    }
+                    let (nn, immr, imms) = bitmask_imm(mask as u64).unwrap();
+                    // ANDS xzr, xs, #mask
+                    self.a.e(0xF200_001F | nn << 22 | immr << 16 | imms << 10 | (rs as u32) << 5);
+                    let cc = if cnd == Cond::Eq { EQ } else { NE };
+                    self.branch_pair(CondBr::B(cc), CondBr::B(cc ^ 1), *tt, *ff, bi);
+                    return;
+                }
                 match fused {
-                    // and with a bitmask immediate, compared with zero: tst + b.cond
-                    Some(ref fi @ (Inst::ICmpI(Cond::Eq | Cond::Ne, _, _, _, 0) | Inst::IBinI(IOp::And, ..))) if self.test_fuse.is_some() => {
-                        // (x & K) != 0 for a branch straight on the and
-                        let cnd = match fi {
-                            Inst::ICmpI(c, ..) => *c,
-                            _ => Cond::Ne,
-                        };
-                        let (src, mask) = self.test_fuse.take().unwrap();
-                        let rs = self.use_i(src, S0);
-                        if self.tbz && (mask as u64).is_power_of_two() {
-                            // one bit: tbz / tbnz (branch to tt when the bit is zero == Eq)
-                            let bit = (mask as u64).trailing_zeros();
-                            let zero_to_tt = cnd == Cond::Eq;
-                            let (yes, no) = if zero_to_tt { (CondBr::Tz(rs, bit), CondBr::Tnz(rs, bit)) } else { (CondBr::Tnz(rs, bit), CondBr::Tz(rs, bit)) };
-                            self.branch_pair(yes, no, *tt, *ff, bi);
-                            return;
-                        }
-                        let (nn, immr, imms) = bitmask_imm(mask as u64).unwrap();
-                        // ANDS xzr, xs, #mask
-                        self.a.e(0xF200_001F | nn << 22 | immr << 16 | imms << 10 | (rs as u32) << 5);
-                        let cc = if cnd == Cond::Eq { EQ } else { NE };
+                    // the flags of the compare the selects right before read
+                    Some(cmp) if self.sel_chain.is_some_and(|(_, c0, _)| c0 == Some(cmp)) => {
+                        let cc = self.sel_chain.map_or(NE, |(_, _, cc)| cc);
                         self.branch_pair(CondBr::B(cc), CondBr::B(cc ^ 1), *tt, *ff, bi);
                     }
                     // compare with zero for (in)equality: cbz / cbnz, no flags
-                    Some(Inst::ICmpI(cnd @ (Cond::Eq | Cond::Ne), _, _, a, 0)) => {
+                    Some(Cmp::K(cnd @ (Cond::Eq | Cond::Ne), _, a, 0)) => {
                         let r = self.use_i(a, S0);
                         // branch to tt when (r == 0) == (cnd == Eq)
                         let zero_to_tt = cnd == Cond::Eq;
                         let (yes, no) = if zero_to_tt { (CondBr::Z(r), CondBr::Nz(r)) } else { (CondBr::Nz(r), CondBr::Z(r)) };
                         self.branch_pair(yes, no, *tt, *ff, bi);
                     }
-                    Some(i) => {
-                        let cc = self.cmp_flags(&i);
+                    Some(cmp) => {
+                        let cc = self.cmp_flags(cmp);
                         // the condition codes come in true/false pairs: cc ^ 1 negates
                         self.branch_pair(CondBr::B(cc), CondBr::B(cc ^ 1), *tt, *ff, bi);
                     }
                     None => {
+                        let Term::Branch(c, ..) = t else { unreachable!("a BranchCmp carries its compare") };
                         let r = self.use_i(*c, S0);
                         self.branch_pair(CondBr::Nz(r), CondBr::Z(r), *tt, *ff, bi);
                     }
@@ -4438,8 +4505,7 @@ impl<'a> Gen<'a> {
             }
             Inst::SlotAddr(d, s) => {
                 let rd = self.def_i(*d, S0);
-                let off = self.slot_off[*s as usize];
-                self.a.add_any(rd, SP, off);
+                self.slot_addr_into(rd, *s);
                 self.fin_i(*d, rd);
             }
             Inst::Addr(d, sym) => {
@@ -4460,7 +4526,13 @@ impl<'a> Gen<'a> {
             // a slot copied onto its own storage (frame::slot_addr_positions): nothing moves
             Inst::Copy(dst, src, _) if self.slot_pos[dst.0 as usize] != i64::MIN && self.slot_pos[dst.0 as usize] == self.slot_pos[src.0 as usize] => {}
             // overlapping bytes of the frame (frame::copy_overlap; a verify build fails on it,
-            // compile_freq): memmove order, each piece loaded whole before it is stored
+            // compile_freq): memmove order, each piece loaded whole before it is stored.
+            // Valid RIR never gets here (a Copy is a memcpy): coalesce_slot_copies joins slots in
+            // the RIR and keeps two apart where a copy between them would meet bytes of the
+            // joined slot (codegen tests/slot_coalesce.rs
+            // a_second_copy_at_another_offset_keeps_joined_slots_apart), and ptr::copy is a
+            // memmove call, never a Copy. Kept as the release build's guard against a pass or
+            // frame layout fault.
             Inst::Copy(dst, src, size) if crate::frame::copy_overlap(&self.slot_pos, *dst, *src, *size) != 0 => {
                 let delta = crate::frame::copy_overlap(&self.slot_pos, *dst, *src, *size);
                 let rd = self.use_i(*dst, S0);
@@ -4602,10 +4674,20 @@ impl<'a> Gen<'a> {
             Inst::VShuffle(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VLoadX(..) | Inst::VStoreX(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VTbl(..) | Inst::VConst(..) => self.vinst(i),
             Inst::VX(op, d, a, b) => self.vx(*op, *d, *a, *b),
             Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
-            Inst::Sel(d, c, a, b) => {
-                let cond = match self.sel_chain {
-                    Some((c0, cc)) if c0 == *c => cc,
-                    _ => {
+            Inst::Sel(..) | Inst::SelCmp(..) => {
+                let (d, a, b) = match i {
+                    Inst::Sel(d, _, a, b) | Inst::SelCmp(d, _, a, b) => (d, a, b),
+                    _ => unreachable!(),
+                };
+                let cond = match (i, self.sel_chain) {
+                    (Inst::Sel(_, c, ..), Some((Some(c0), _, cc))) if c0 == *c => cc,
+                    (Inst::SelCmp(_, cmp, ..), Some((_, Some(c0), cc))) if c0 == *cmp => cc,
+                    (Inst::SelCmp(_, cmp, ..), _) => {
+                        let cc = self.cmp_flags(*cmp);
+                        self.sel_chain = Some((None, Some(*cmp), cc));
+                        cc
+                    }
+                    (Inst::Sel(_, c, ..), _) => {
                         let rc = self.use_i(*c, S0);
                         self.cmp_imm(rc, 0);
                         // the flags now hold this test: a chained compare's are gone (a later
@@ -4613,6 +4695,7 @@ impl<'a> Gen<'a> {
                         self.sel_chain = None;
                         NE
                     }
+                    _ => unreachable!(),
                 };
                 if self.cls(*d) == Cls::I {
                     // (a 0 is xzr: register 31 in csel's operands)
@@ -4629,6 +4712,7 @@ impl<'a> Gen<'a> {
                     self.a.e(0x1E20_0C00 | if w { DBL } else { 0 } | (xb as u32) << 16 | (cond as u32) << 12 | (xa as u32) << 5 | xd as u32);
                     self.fin_f(*d, xd);
                 }
+                self.sel_written(*d);
             }
             Inst::FMulAdd(np, na, w, d, a, b, c) => {
                 let xa = self.use_f(*a, FS0);
@@ -4671,15 +4755,16 @@ impl<'a> Gen<'a> {
     }
     /// `ext`: re-extend a narrow result (false: nobody reads its upper bits, passes::low_bits_only)
     fn ibin_rr(&mut self, op: IOp, it: IntTy, rd: u8, ra: u8, rb: u8, ext: bool) {
-        if let Some(n) = op.crc32_bits() {
-            // crc32b/h/w wd, wn, wm and crc32x wd, wn, xm: the W result zero-extends
+        if let Some((n, castagnoli)) = op.crc32() {
+            // crc32{,c}b/h/w wd, wn, wm and crc32{,c}x wd, wn, xm (C, bit 12: Castagnoli): the W
+            // result zero-extends
             let base = match n {
                 8 => 0x1AC0_4000u32,
                 16 => 0x1AC0_4400,
                 32 => 0x1AC0_4800,
                 _ => 0x9AC0_4C00,
             };
-            self.a.rrr(base, rd, ra, rb);
+            self.a.rrr(base | (castagnoli as u32) << 12, rd, ra, rb);
             return;
         }
         if op == IOp::Bzhi {
@@ -4726,7 +4811,7 @@ impl<'a> Gen<'a> {
             // smulh / umulh
             IOp::MulHi => self.a.rrr(if it.signed { 0x9B40_7C00 } else { 0x9BC0_7C00 }, rd, ra, rb),
             // handled at the top
-            IOp::Rotl | IOp::Bzhi | IOp::Crc32B | IOp::Crc32H | IOp::Crc32W | IOp::Crc32X => {}
+            IOp::Rotl | IOp::Bzhi | IOp::Crc32B | IOp::Crc32H | IOp::Crc32W | IOp::Crc32X | IOp::Crc32CB | IOp::Crc32CH | IOp::Crc32CW | IOp::Crc32CX => {}
             IOp::Rem => {
                 // q = a / b; d = a - q * b  (rd may alias ra or rb: compute q in IP0)
                 self.a.rrr(if it.signed { 0x9AC0_0C00 } else { 0x9AC0_0800 }, IP0, ra, rb);
@@ -5630,7 +5715,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     // vector ops without an instruction sequence here: per-lane scalar code
     let legal;
-    // (MAKEPAD_RUN_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
+    // (RELAX_OPT=-vxnative: every expandable op, the legaliser's reference meaning)
     let all = crate::stats::opt_off(options, "-vxnative");
     let native = |op| !all && vx_native(op);
     let f = if crate::legal::needed(f, &native, !all) {
@@ -5676,9 +5761,9 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // counter steps after the last read of the old value (no copy per iteration)
     let stepped = if env.opt_regs || f.full { regalloc::sink_increments(options, f) } else { None };
     let f = stepped.as_ref().unwrap_or(f);
-    // branch compares at the end of their block (fused into cmp + b.cond)
-    let brs = if env.opt_regs || f.full { regalloc::sink_branch_compares(options, f) } else { None };
-    let f = brs.as_ref().unwrap_or(f);
+    // branches and selects on their compares' flags (cmp + b.cond, cmp + csel)
+    let cmps = if env.opt_regs || f.full { regalloc::compares_into_readers(options, f, arm64_sel_ok) } else { None };
+    let f = cmps.as_ref().unwrap_or(f);
     // the backend-internal rewrites above run after the last pipeline verify
     f.verify_after("arm64 backend rewrites (legalize/switch/folds/hoist/share/sink)")?;
     // v0-v7 are allocatable outside the instructions that name them (arm64_clobbers), except
@@ -5711,7 +5796,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     drop(_cost_ra);
     let alloc_sig = regalloc::alloc_sig(&al0);
     regalloc::trace_alloc(f, &al0);
-    // the allocation checker (MAKEPAD_RUN_OPT=+checkra; gates, fuzzer): a finding fails the compile
+    // the allocation checker (RELAX_OPT=+checkra; gates, fuzzer): a finding fails the compile
     if regalloc::check_on(options) {
         regalloc::check_or_fail(options, f, &cfg, &al0, env.opt_regs || f.full)?;
     }
@@ -5760,6 +5845,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         tail: Vec::new(),
         saved: 0,
         slot_off: Vec::new(),
+        slot_cell: Vec::new(),
+        realign: Vec::new(),
         slot_pos: Vec::new(),
         block_pos: Vec::new(),
         next_block: Vec::new(),
@@ -5835,10 +5922,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // where the named locals are at each call (makepad inspect `locals`; side metadata)
     let mut pc_map = std::mem::take(&mut g.pc_map);
     if !g.f.naked && !g.f.dbg.is_empty() {
-        let (saved, fsz, slot_off) = (g.saved, g.frame, &g.slot_off);
+        let (saved, fsz, slot_off, slot_cell) = (g.saved, g.frame, &g.slot_off, &g.slot_cell);
         // sp = fp - frame in the body
         let spill = |o: i32| -(saved as i32 + o);
-        let slot = |s: u32| (slot_off[s as usize] - fsz) as i32;
+        // (an over-aligned slot is where its cell points: no fixed home)
+        let slot = |s: u32| (slot_cell[s as usize] < 0).then(|| (slot_off[s as usize] - fsz) as i32);
         let fr = crate::dbgloc::Frame { callee_int: &cfg.int_callee, callee_flt: &cfg.flt_callee, arg_regs: &[0, 1, 2, 3, 4, 5, 6, 7], captured: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], call_writes: &[S0, S1, IP0, IP1], spill_fp: &spill, slot_fp: &slot };
         let vars = crate::dbgloc::build(g.f, &g.al, &fr, &g.var_calls);
         let e = crate::dbgloc::pc_entries(&vars, g.f.file);
@@ -6316,7 +6404,7 @@ mod tests {
     /// the compare's other select sits in the next block, after a fused `cmp; b.cond` rewrote the
     /// flags, so it must test the materialised bool again (`cmp c, #0; csel`). It used to read the
     /// branch's flags and pick the wrong side: zune-jpeg's `get_mut(..).unwrap_or(&mut tmp)`
-    /// wrote every IDCT row into `tmp` at O3, and Stage's thumbnails came out as garbage.
+    /// wrote every IDCT row into `tmp` at O3, and an app's thumbnails came out as garbage.
     #[test]
     fn a_select_after_a_fused_branch_tests_its_bool_again() {
         let options = &relax_session::Options::default();

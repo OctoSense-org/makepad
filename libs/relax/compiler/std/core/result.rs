@@ -7,9 +7,9 @@ use crate::option::Option::{self, None, Some};
 #[derive(Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Debug, Hash)]
 #[must_use]
 pub enum Result<T, E> {
-    #[cfg_attr(not(relax_check), lang = "Ok")]
+    #[lang = "Ok"]
     Ok(T),
-    #[cfg_attr(not(relax_check), lang = "Err")]
+    #[lang = "Err"]
     Err(E),
 }
 
@@ -92,12 +92,6 @@ impl<T, E> Result<T, E> {
         match self {
             Ok(t) => f(t),
             Err(e) => default(e),
-        }
-    }
-    pub fn map_or_default<U: Default, F: FnOnce(T) -> U>(self, f: F) -> U {
-        match self {
-            Ok(t) => f(t),
-            Err(_) => U::default(),
         }
     }
     pub const fn map_err<F2, O: FnOnce(E) -> F2>(self, op: O) -> Result<T, F2> {
@@ -214,22 +208,6 @@ impl<T, E> Result<T, E> {
         match self {
             Ok(t) => t,
             Err(_) => crate::hint::unreachable_unchecked(),
-        }
-    }
-    #[track_caller]
-    pub const unsafe fn unwrap_err_unchecked(self) -> E {
-        match self {
-            Ok(_) => crate::hint::unreachable_unchecked(),
-            Err(e) => e,
-        }
-    }
-}
-
-impl<T, E> Result<Result<T, E>, E> {
-    pub const fn flatten(self) -> Result<T, E> {
-        match self {
-            Ok(inner) => inner,
-            Err(e) => Err(e),
         }
     }
 }

@@ -2,7 +2,7 @@
 //! S1), at real alloc's paths.
 
 pub mod alloc {
-    pub use core::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, GlobalAlloc, Layout, LayoutErr, LayoutError, System};
+    pub use core::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, AllocError, Allocator, AllocatorNightly, Global, GlobalAlloc, Layout, LayoutErr, LayoutError, StaticAllocator, System};
 }
 
 pub mod borrow {
@@ -35,9 +35,10 @@ pub mod ffi {
 pub mod fmt {
     pub use core::fmt::format;
     pub use core::fmt::{
-        write, Alignment, Arguments, Binary, Debug, DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple, Display, Error,
-        Formatter, LowerExp, LowerHex, Octal, Pointer, Result, UpperExp, UpperHex, Write,
+        from_fn, write, Alignment, Arguments, Binary, Debug, DebugList, DebugMap, DebugSet, DebugStruct, DebugTuple, Display,
+        Error, Formatter, FromFn, LowerExp, LowerHex, Octal, Pointer, Result, UpperExp, UpperHex, Write,
     };
+    pub use core::fmt::NumBuffer;
 }
 
 pub mod rc {
@@ -46,7 +47,7 @@ pub mod rc {
 
 pub mod slice {
     pub use core::slice::{
-        from_mut, from_raw_parts, from_raw_parts_mut, from_ref, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Concat, Iter,
+        from_mut, from_raw_parts, from_raw_parts_mut, from_ref, ArrayWindows, Chunks, ChunksExact, ChunksExactMut, ChunksMut, Concat, Iter,
         IterMut, Join, RChunks, RSplit, RSplitN, SliceIndex, Split, SplitInclusive, SplitMut, SplitN, Windows,
     };
 }
@@ -69,7 +70,7 @@ pub mod sync {
 }
 
 pub mod vec {
-    pub use core::vec::{from_elem, Drain, ExtractIf, IntoIter, Vec};
+    pub use core::vec::{from_elem, Drain, ExtractIf, IntoIter, Splice, Vec};
 }
 
 pub mod task {

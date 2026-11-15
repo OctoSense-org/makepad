@@ -45,32 +45,41 @@ pub const UNUSED_VISIBILITIES: Lint = lint::lint("unused_visibilities");
 /// Item-level passes over the definitions of the checked crates marked in `own`.
 pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
-    for i in 0..prog.defs.len() {
-        let def = prog.defs[i];
-        if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
-        if lint::generated(prog, DefId(i as u32)) {
-            // (rustc's wfcheck lints a derive's impl too: its lifetime parameters carry the spans of the
-            // type's own, outside the expansion)
-            if def.kind == DefKind::Impl && lint::derived(prog, DefId(i as u32)) { redundant_lifetimes(prog, tcx, DefId(i as u32)); }
-            continue;
-        }
-        attr_lints(prog, DefId(i as u32));
-        check_def_item(prog, tcx, DefId(i as u32));
-        if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, DefId(i as u32)); }
-        if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
-            | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
-            | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic) { continue; }
-        let d = DefId(i as u32);
-        let mut w = W::new(prog, def.file, d);
-        w.names = Some(names(prog, tcx, d));
-        w.item(def.item, def.kind);
-        item_lints(prog, d);
-    }
+    let mut pt = crate::lint_dead::PartTimes::new("lint_early::check_items");
+    // the definitions on the pool (each one's lints are its own)
+    let defs: Vec<DefId> = (0..prog.defs.len() as u32).map(DefId).filter(|&d| own.get(prog.def(d).krate as usize).copied().unwrap_or(false)).collect();
+    lint::par_each(&defs, |&d| check_item(prog, tcx, d));
+    pt.mark("items");
     for (k, o) in own.iter().enumerate() {
         if *o { special_module_name(prog, k as u32); }
     }
+    pt.mark("special_module_name");
     check_module_items(prog, own);
+    pt.mark("check_module_items");
     token_lints(prog, own);
+    pt.mark("token_lints");
+    pt.report(own.iter().filter(|&&o| o).count());
+}
+
+/// check_items of one definition.
+fn check_item(prog: &Program, tcx: &Tcx, d: DefId) {
+    let def = *prog.def(d);
+    if lint::generated(prog, d) {
+        // (rustc's wfcheck lints a derive's impl too: its lifetime parameters carry the spans of the
+        // type's own, outside the expansion)
+        if def.kind == DefKind::Impl && lint::derived(prog, d) { redundant_lifetimes(prog, tcx, d); }
+        return;
+    }
+    attr_lints(prog, d);
+    check_def_item(prog, tcx, d);
+    if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, d); }
+    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
+        | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
+        | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic) { return; }
+    let mut w = W::new(prog, def.file, d);
+    w.names = Some(names(prog, tcx, d));
+    w.item(def.item, def.kind);
+    item_lints(prog, d);
 }
 
 /// Body-level passes over one typed body owner.
@@ -227,7 +236,7 @@ fn attr_lints(prog: &Program, d: DefId) {
         if name == b"inline" {
             let Some(item) = item else { continue };
             let bodiless_trait_method = def.kind == DefKind::AssocFn && prog.def(def.parent).kind == DefKind::Trait
-                && matches!(item.kind, ItemKind::Fn(sig, None, _) if ast.fn_sig(sig).lazy_body.is_none());
+                && matches!(item.kind, ItemKind::Fn(sig, body, _) if body.is_none() && ast.fn_sig(sig).lazy_body.is_none());
             if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
             else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
         }
@@ -262,7 +271,7 @@ fn special_module_name(prog: &Program, krate: u32) {
     let ast = &pf.ast;
     for it in ast.root_items.iter() {
         let item = ast.item(*it);
-        let ItemKind::Mod(None) = item.kind else { continue };
+        let ItemKind::Mod(crate::ast::Opt::None) = item.kind else { continue };
         if lint::has_attr(prog, m.file, ast.list(item.attrs), "path") { continue; }
         let msg = match pf.text(item.name) {
             "lib" => "found module declaration for lib.rs",
@@ -369,6 +378,7 @@ fn def_spans(prog: &Program, file: u32) -> Vec<(u32, u32, DefId)> {
         let named_mod = d.kind == DefKind::Mod && d.parent != crate::program::NO_DEF && prog.block_owner.get(&d.sub).is_none();
         if !(named_mod || matches!(d.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union | DefKind::Enum
             | DefKind::TypeAlias | DefKind::AssocTy | DefKind::Trait | DefKind::Impl | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic)) { continue; }
+        crate::lint::parse_owner(prog, file, d.item);
         let it = ast.item(d.item);
         out.push((it.lo, it.hi, DefId(i as u32)));
     }
@@ -568,7 +578,7 @@ impl<'a> W<'a> {
                 Some(at)
             }
             Pat::Lit(e) => Some(ast.expr(e).lo),
-            Pat::Range(a, b, _) => match (a, b) {
+            Pat::Range(a, b, _) => match (a.get(), b.get()) {
                 (Some(a), _) => Some(ast.expr(a).lo),
                 (None, Some(b)) => {
                     let mut at = ast.expr(b).lo;
@@ -580,7 +590,7 @@ impl<'a> W<'a> {
                 }
                 _ => None,
             },
-            Pat::Path(path) | Pat::TupleStruct(path, _) | Pat::Struct(path, _, _) => Some(path.lo),
+            Pat::Path(path) | Pat::TupleStruct(path, _) | Pat::Struct(_, path, _) => Some(path.lo),
             Pat::Mac(m) => Some(ast.row(m).path.lo),
             Pat::Tuple(ps) => ast.list(ps).first().and_then(|x| self.pat_start(*x)).map(|s| self.back_char(s, b'(')),
             Pat::Slice(ps) => ast.list(ps).first().and_then(|x| self.pat_start(*x)).map(|s| self.back_char(s, b'[')),
@@ -635,10 +645,10 @@ impl<'a> W<'a> {
         match *ast.ty(t) {
             Ty::Path(p) => Some(p.lo),
             Ty::Mac(m) => Some(ast.row(m).path.lo),
-            Ty::Ref(lt, m, x) => {
+            Ty::Ref(m, lt, x) => {
                 let mut at = self.ty_start(x)?;
                 if m { at = self.back_kw(at, "mut"); }
-                if let Some(l) = lt { at = l.lo; }
+                if let Some(l) = lt.get() { at = l.lo; }
                 Some(self.back_char(at, b'&'))
             }
             Ty::Ptr(m, x) => {
@@ -728,7 +738,7 @@ impl<'a> W<'a> {
     /// rustc `classify::expr_requires_semi_to_be_stmt`.
     fn requires_semi(&self, e: ExprId) -> bool {
         !matches!(self.kind(e), ExprKind::If(..) | ExprKind::Match(..) | ExprKind::Block(..) | ExprKind::Unsafe(_)
-            | ExprKind::While(_) | ExprKind::Loop(..) | ExprKind::For(_) | ExprKind::ConstBlock(_))
+            | ExprKind::While(_) | ExprKind::Loop(..) | ExprKind::For(_) | ExprKind::ConstBlock(_) | ExprKind::TryBlock(_))
     }
 
     /// rustc `classify::expr_trailing_brace(e).is_some()`.
@@ -742,7 +752,7 @@ impl<'a> W<'a> {
                     None => return false,
                 },
                 ExprKind::Closure(r) => self.ast.row(r).body,
-                ExprKind::Block(..) | ExprKind::Unsafe(_) | ExprKind::Async(..) | ExprKind::ConstBlock(_) | ExprKind::For(_)
+                ExprKind::Block(..) | ExprKind::Unsafe(_) | ExprKind::Async(..) | ExprKind::ConstBlock(_) | ExprKind::TryBlock(_) | ExprKind::For(_)
                 | ExprKind::If(..) | ExprKind::Loop(..) | ExprKind::Match(..) | ExprKind::Struct(_) | ExprKind::While(_) => return true,
                 _ => return false,
             };
@@ -794,7 +804,7 @@ impl<'a> W<'a> {
                     let stmts = self.ast.stmts(b);
                     if stmts.len() != 1 || !self.ast.list(blk.attrs).is_empty() { return; }
                     let expr = match stmts[0] {
-                        Stmt::Expr(e, false) => e,
+                        Stmt::Expr(false, e) => e,
                         Stmt::Attrs(r) => {
                             let a = *self.ast.row(r);
                             if a.semi { return; }
@@ -849,10 +859,11 @@ impl<'a> W<'a> {
             Pat::TupleStruct(_, ps) | Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) => {
                 for &x in ast.list(ps) { self.pat_parens(x, false, false, at); }
             }
-            Pat::Struct(_, fs, _) => {
+            Pat::Struct(_, _, fs) => {
                 for f in ast.list(fs) { self.pat_parens(f.pat, false, false, at); }
             }
-            Pat::Ident { sub: Some(x), .. } | Pat::Box(x) => self.pat_parens(x, true, false, at),
+            Pat::Ident { sub, .. } if let Some(x) = sub.get() => self.pat_parens(x, true, false, at),
+            Pat::Box(x) => self.pat_parens(x, true, false, at),
             Pat::Ref(m, x) => self.pat_parens(x, true, !m, at),
             _ => {}
         }
@@ -1000,7 +1011,7 @@ impl<'a> W<'a> {
             }
             ExprKind::Block(b, label) => self.labeled(label, |w| w.block(b)),
             ExprKind::Loop(b, label) => self.labeled(label, |w| w.block(b)),
-            ExprKind::Unsafe(b) | ExprKind::ConstBlock(b) => self.block(b),
+            ExprKind::Unsafe(b) | ExprKind::ConstBlock(b) | ExprKind::TryBlock(b) => self.block(b),
             ExprKind::Async(_, b) => {
                 self.labels.push(LabelScope { name: Vec::new(), pos: 0, used: true, barrier: true });
                 self.block(b);
@@ -1021,14 +1032,14 @@ impl<'a> W<'a> {
                     self.enter(a.attrs);
                     self.pat_parens(a.pat, false, false, ex.lo);
                     self.pat(a.pat, ex.lo);
-                    if let Some(g) = a.guard { self.expr(g); }
+                    if let Some(g) = a.guard.get() { self.expr(g); }
                     self.expr(a.body);
                     self.leave(a.attrs);
                 }
             }
             ExprKind::While(r) => {
                 let w = *ast.row(r);
-                self.labeled(OptIdent::from(w.label), |s| {
+                self.labeled(w.label, |s| {
                     s.expr(w.cond);
                     s.block(w.body);
                 });
@@ -1037,7 +1048,7 @@ impl<'a> W<'a> {
                 let f = *ast.row(r);
                 self.expr(f.iter);
                 self.pat(f.pat, ex.lo);
-                self.labeled(OptIdent::from(f.label), |s| s.block(f.body));
+                self.labeled(f.label, |s| s.block(f.body));
             }
             ExprKind::Break(l, x) => {
                 self.use_label(l);
@@ -1068,10 +1079,10 @@ impl<'a> W<'a> {
                     self.enter(p.attrs);
                     self.pat_parens(p.pat, true, false, ex.lo);
                     self.pat(p.pat, ex.lo);
-                    if let Some(t) = p.ty { self.ty(t); }
+                    if let Some(t) = p.ty.get() { self.ty(t); }
                     self.leave(p.attrs);
                 }
-                if let Some(t) = c.ret { self.ty(t); }
+                if let Some(t) = c.ret.get() { self.ty(t); }
                 self.expr(c.body);
                 self.labels.pop();
             }
@@ -1095,8 +1106,8 @@ impl<'a> W<'a> {
                 if m.args == NO_MAC_ARGS { return; }
                 let args = *ast.mac_arg(m.args);
                 self.exprs(args.exprs);
-                if let Some(p) = args.pat { self.pat(p, ex.lo); }
-                if let Some(g) = args.guard { self.expr(g); }
+                if let Some(p) = args.pat.get() { self.pat(p, ex.lo); }
+                if let Some(g) = args.guard.get() { self.expr(g); }
             }
         }
     }
@@ -1149,7 +1160,7 @@ impl<'a> W<'a> {
                 self.enter(l.attrs);
                 // UnusedParens::check_stmt
                 self.pat_parens(l.pat, true, false, blk.lo);
-                if let Some(init) = l.init {
+                if let Some(init) = l.init.get() {
                     let els = l.else_.is_some();
                     let skip = els && match self.kind(init) {
                         ExprKind::Paren(inner) => self.pf.hyg_ctxt(ast.expr(init).lo) != self.pf.hyg_ctxt(ast.expr(inner).lo),
@@ -1158,12 +1169,12 @@ impl<'a> W<'a> {
                     if !skip { self.delims(true, init, if els { Ctx::AssignedValueLetElse } else { Ctx::AssignedValue }, false); }
                 }
                 self.pat(l.pat, blk.lo);
-                if let Some(t) = l.ty { self.ty(t); }
-                if let Some(x) = l.init { self.expr(x); }
-                if let Some(e) = l.else_ { self.block(e); }
+                if let Some(t) = l.ty.get() { self.ty(t); }
+                if let Some(x) = l.init.get() { self.expr(x); }
+                if let Some(e) = l.else_.get() { self.block(e); }
                 self.leave(l.attrs);
             }
-            Stmt::Expr(e, semi) => {
+            Stmt::Expr(semi, e) => {
                 // the lint attributes of an expression statement survive cfg stripping
                 let attrs = ast.stmt_attrs(e);
                 self.enter(attrs);
@@ -1250,7 +1261,7 @@ impl<'a> W<'a> {
     fn stmt_start(&self, s: &Stmt) -> Option<u32> {
         let ast = self.ast;
         match *s {
-            Stmt::Expr(e, _) => Some(ast.expr(e).lo),
+            Stmt::Expr(_, e) => Some(ast.expr(e).lo),
             Stmt::Attrs(r) => Some(ast.expr(ast.row(r).expr).lo),
             Stmt::Item(i) => Some(ast.item(i).lo),
             Stmt::Let(r) => self.pat_start(ast.row(r).pat),
@@ -1261,13 +1272,13 @@ impl<'a> W<'a> {
     fn stmt_end(&self, s: &Stmt) -> Option<u32> {
         let ast = self.ast;
         match *s {
-            Stmt::Expr(e, _) => Some(ast.expr(e).hi),
+            Stmt::Expr(_, e) => Some(ast.expr(e).hi),
             Stmt::Attrs(r) => Some(ast.expr(ast.row(r).expr).hi),
             Stmt::Item(i) => Some(ast.item(i).hi),
             Stmt::Let(r) => {
                 let l = *ast.row(r);
-                if let Some(e) = l.else_ { return Some(ast.block(e).hi); }
-                if let Some(x) = l.init { return Some(ast.expr(x).hi); }
+                if let Some(e) = l.else_.get() { return Some(ast.block(e).hi); }
+                if let Some(x) = l.init.get() { return Some(ast.expr(x).hi); }
                 self.pat_start(l.pat)
             }
             Stmt::Empty => None,
@@ -1285,9 +1296,10 @@ impl<'a> W<'a> {
             Pat::Ref(_, x) => (true, *ast.pat(x)),
             other => (false, other),
         };
-        let Pat::Range(a, Some(b), true) = range else { return false };
+        let Pat::Range(a, b, true) = range else { return false };
+        let Some(b) = b.get() else { return false };
         // the tree keeps no mark of the spelling: the text between the endpoints
-        let from = match a { Some(a) => ast.expr(a).hi, None => self.pat_start(p).unwrap_or(fallback) };
+        let from = match a.get() { Some(a) => ast.expr(a).hi, None => self.pat_start(p).unwrap_or(fallback) };
         let to = ast.expr(b).lo;
         if to <= from { return false; }
         let text = self.pf.bytes(from, to);
@@ -1318,18 +1330,18 @@ impl<'a> W<'a> {
         let at = self.pat_start(p).unwrap_or(fallback);
         match *ast.pat(p) {
             Pat::Wild | Pat::Rest | Pat::Mac(_) => {}
-            Pat::Ident { sub, .. } => if let Some(s) = sub { self.pat(s, at) },
+            Pat::Ident { sub, .. } => if let Some(s) = sub.get() { self.pat(s, at) },
             Pat::Lit(e) => self.expr(e),
             Pat::Range(a, b, _) => {
-                if let Some(x) = a { self.expr(x); }
-                if let Some(x) = b { self.expr(x); }
+                if let Some(x) = a.get() { self.expr(x); }
+                if let Some(x) = b.get() { self.expr(x); }
             }
             Pat::Path(path) => self.path(&path),
             Pat::TupleStruct(path, ps) => {
                 self.path(&path);
                 for &x in ast.list(ps) { self.pat(x, at); }
             }
-            Pat::Struct(path, fs, _) => {
+            Pat::Struct(_, path, fs) => {
                 self.path(&path);
                 for f in ast.list(fs) {
                     self.enter(f.attrs);
@@ -1350,8 +1362,8 @@ impl<'a> W<'a> {
         self.ty_pre(t, ty);
         match ty {
             Ty::Path(p) => self.path(&p),
-            Ty::Ref(lt, _, x) => {
-                if let Some(l) = lt { self.lt_use(l); }
+            Ty::Ref(_, lt, x) => {
+                if let Some(l) = lt.get() { self.lt_use(l); }
                 self.ty(x);
             }
             Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Paren(x) => self.ty(x),
@@ -1368,7 +1380,7 @@ impl<'a> W<'a> {
                 self.lt_rib(LRib::Anon(binder));
                 for &x in ast.list(f.params) { self.ty(x); }
                 self.lt_rib(LRib::Fail);
-                if let Some(r) = f.ret { self.ty(r); }
+                if let Some(r) = f.ret.get() { self.ty(r); }
                 self.lt_pop();
                 self.lt_pop();
                 self.lt_end_scope();
@@ -1432,9 +1444,11 @@ impl<'a> W<'a> {
                     let Bound::Trait { path, .. } = *b else { continue };
                     let mut fn_with_explicit_ret_ty = false;
                     if let Some(seg) = ast.segs(path.segs).last() {
-                        if let Some(GenericArgs::Paren(_, Some(ret))) = ast.gargs(seg.args()) {
-                            self.nb.insert(ret.0, if is_last { Nb::OneBound } else { Nb::None });
-                            fn_with_explicit_ret_ty = true;
+                        if let Some(GenericArgs::Paren(_, ret)) = ast.gargs(seg.args()) {
+                            if let Some(ret) = ret.get() {
+                                self.nb.insert(ret.0, if is_last { Nb::OneBound } else { Nb::None });
+                                fn_with_explicit_ret_ty = true;
+                            }
                         }
                     }
                     let dyn2015_exception = self.pf.edition == 2015 && is_dyn && i == 0 && path.global();
@@ -1483,7 +1497,7 @@ impl<'a> W<'a> {
         if p.has_qself() {
             if let Some(q) = ast.qself(p) {
                 self.ty(q.ty);
-                if let Some(tp) = q.trait_path {
+                if let Some(tp) = q.trait_path.get() {
                     self.path(&tp);
                     // rustc resolves the trait part of a qualified path twice
                     if self.lt.is_none() { absolute_path(self.prog, self.def, &self.stack, self.file, &tp, 1); }
@@ -1547,7 +1561,7 @@ impl<'a> W<'a> {
                 for &t in ast.list(tys) { self.ty(t); }
                 self.lt_pop();
                 self.lt_rib(LRib::Fail);
-                if let Some(r) = ret { self.ty(r); }
+                if let Some(r) = ret.get() { self.ty(r); }
                 self.lt_pop();
             }
         }
@@ -1563,11 +1577,11 @@ impl<'a> W<'a> {
                     let s = std::mem::replace(&mut self.bound_self, self.pf.text(p.name).to_string());
                     self.bounds(b);
                     self.bound_self = s;
-                    if let Some(t) = d { self.ty(t); }
+                    if let Some(t) = d.get() { self.ty(t); }
                 }
                 GenericParamKind::Const(t, d) => {
                     self.ty(t);
-                    if let Some(e) = d { self.expr(e); }
+                    if let Some(e) = d.get() { self.expr(e); }
                 }
             }
             self.leave(p.attrs);
@@ -1692,9 +1706,9 @@ impl<'a> W<'a> {
         let binder = self.lt_scope(sig.generics.params, true);
         self.generics(sig.generics);
         self.lt_rib(LRib::Anon(binder));
-        if let Some(sp) = sig.self_param {
+        if let Some(sp) = sig.self_param.get() {
             match sp {
-                SelfParam::Ref(Some(l), _) => self.lt_use(l),
+                SelfParam::Ref(lt, _) if let Some(l) = lt.get() => self.lt_use(l),
                 SelfParam::Typed(_, t) => self.ty(t),
                 _ => {}
             }
@@ -1704,7 +1718,7 @@ impl<'a> W<'a> {
             self.ty(p.ty);
         }
         self.lt_rib(LRib::Fail);
-        if let Some(r) = sig.ret { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
+        if let Some(r) = sig.ret.get() { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
         self.lt_pop();
         self.lt_pop();
         // the body: lifetimes written in it are used many times
@@ -1721,7 +1735,7 @@ impl<'a> W<'a> {
         let i = *ast.row(r);
         let binder = self.lt_scope(i.generics.params, true);
         self.lt_rib(LRib::Anon(binder));
-        if let Some(p) = i.trait_ { self.path(&p); }
+        if let Some(p) = i.trait_.get() { self.path(&p); }
         self.ty(i.self_ty);
         self.generics(i.generics);
         let outer = self.def;
@@ -1740,7 +1754,7 @@ impl<'a> W<'a> {
                     self.lt_rib(LRib::Fail);
                     let a = *ast.row(tr);
                     self.generics(a.generics);
-                    if let Some(t) = a.ty { self.ty(t); }
+                    if let Some(t) = a.ty.get() { self.ty(t); }
                     self.lt_pop();
                 }
                 _ => {}
@@ -1776,7 +1790,7 @@ impl<'a> W<'a> {
         for f in ast.list(l) {
             self.enter(f.attrs);
             self.ty(f.ty);
-            if let Some(d) = f.default { self.expr(d); }
+            if let Some(d) = f.default.get() { self.expr(d); }
             self.leave(f.attrs);
         }
     }
@@ -1797,7 +1811,7 @@ impl<'a> W<'a> {
             ItemKind::Fn(sig, _, _) => {
                 let sig = *ast.fn_sig(sig);
                 self.generics(sig.generics);
-                if let Some(SelfParam::Typed(_, t)) = sig.self_param { self.ty(t); }
+                if let Some(SelfParam::Typed(_, t)) = sig.self_param.get() { self.ty(t); }
                 for p in ast.list(sig.params) {
                     self.enter(p.attrs);
                     self.pat_parens(p.pat, true, false, item.lo);
@@ -1805,7 +1819,7 @@ impl<'a> W<'a> {
                     self.ty(p.ty);
                     self.leave(p.attrs);
                 }
-                if let Some(r) = sig.ret { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
+                if let Some(r) = sig.ret.get() { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
             }
             ItemKind::Struct(r) => {
                 let s = *ast.row(r);
@@ -1823,7 +1837,7 @@ impl<'a> W<'a> {
                 for v in ast.list(en.variants) {
                     self.enter(v.attrs);
                     self.variant_data(v.data);
-                    if let Some(d) = v.disc {
+                    if let Some(d) = v.disc.get() {
                         self.delims(false, d, Ctx::AnonConst, false);
                         self.expr(d);
                     }
@@ -1834,7 +1848,7 @@ impl<'a> W<'a> {
                 let a = *ast.row(r);
                 self.generics(a.generics);
                 self.bounds(a.bounds);
-                if let Some(t) = a.ty { self.ty(t); }
+                if let Some(t) = a.ty.get() { self.ty(t); }
             }
             ItemKind::Const(t, v) => {
                 if let Some(t) = t.get() { self.ty(t); }
@@ -1854,7 +1868,7 @@ impl<'a> W<'a> {
             ItemKind::Impl(r) => {
                 let i = *ast.row(r);
                 self.generics(i.generics);
-                if let Some(p) = i.trait_ { self.path(&p); }
+                if let Some(p) = i.trait_.get() { self.path(&p); }
                 self.ty(i.self_ty);
             }
             _ => {}
@@ -1930,8 +1944,8 @@ impl Collector<'_, '_> {
     fn ty(&mut self, t: TyId) {
         let ast = self.w.ast;
         match *ast.ty(t) {
-            Ty::Ref(lt, _, inner) => {
-                match lt {
+            Ty::Ref(_, lt, inner) => {
+                match lt.get() {
                     Some(l) => self.written(l, Source::Reference),
                     None => {
                         let pos = self.w.ty_start(t).unwrap_or(self.w.cur);
@@ -1945,7 +1959,7 @@ impl Collector<'_, '_> {
             Ty::Fn(f) => {
                 let f = *ast.fn_ptr(f);
                 for &x in ast.list(f.params) { self.ty(x); }
-                if let Some(r) = f.ret { self.ty(r); }
+                if let Some(r) = f.ret.get() { self.ty(r); }
             }
             Ty::Path(p) => self.path(&p, t),
             Ty::ImplTrait(b) => if !self.input { self.bounds(b, t) },
@@ -1978,7 +1992,7 @@ impl Collector<'_, '_> {
         if p.has_qself() {
             if let Some(q) = ast.qself(p) {
                 self.ty(q.ty);
-                if let Some(tp) = q.trait_path { self.path(&tp, owner); }
+                if let Some(tp) = q.trait_path.get() { self.path(&tp, owner); }
             }
         }
         for (i, seg) in ast.segs(p.segs).iter().enumerate() {
@@ -2003,7 +2017,7 @@ impl Collector<'_, '_> {
                 }
                 Some(GenericArgs::Paren(tys, ret)) => {
                     for &t in ast.list(*tys) { self.ty(t); }
-                    if let Some(r) = ret { self.ty(*r); }
+                    if let Some(r) = &ret.get() { self.ty(*r); }
                 }
                 None => {}
             }
@@ -2052,8 +2066,8 @@ fn mismatched_lifetime_syntaxes(prog: &Program, tcx: &Tcx, d: DefId) {
     let ItemKind::Fn(sig, _, _) = item.kind else { return };
     let sig = *ast.fn_sig(sig);
     // no output, or no input: nothing can disagree
-    let Some(ret) = sig.ret else { return };
-    if sig.self_param.is_none_or(|s| matches!(s, SelfParam::Value(_))) && ast.list(sig.params).is_empty() { return; }
+    let Some(ret) = sig.ret.get() else { return };
+    if sig.self_param.get().is_none_or(|s| matches!(s, SelfParam::Value(_))) && ast.list(sig.params).is_empty() { return; }
     let names = names(prog, tcx, d);
     let mut w = W::new(prog, def.file, d);
     w.cur = item.lo;
@@ -2062,8 +2076,8 @@ fn mismatched_lifetime_syntaxes(prog: &Program, tcx: &Tcx, d: DefId) {
     let outputs = outputs.out;
     if outputs.is_empty() { return; }
     let mut inputs = Collector { w: &w, names: &names, out: Vec::new(), input: true };
-    match sig.self_param {
-        Some(SelfParam::Ref(lt, _)) => match lt {
+    match sig.self_param.get() {
+        Some(SelfParam::Ref(lt, _)) => match lt.get() {
             Some(l) => inputs.written(l, Source::Reference),
             None => {
                 let pos = params_start(&w, &item);
@@ -2113,7 +2127,7 @@ fn opaque_types(ast: &Ast, t: TyId, out: &mut Vec<TyId>) {
         if p.has_qself() {
             if let Some(q) = ast.qself(p) {
                 opaque_types(ast, q.ty, out);
-                if let Some(tp) = q.trait_path { path_args(ast, &tp, out); }
+                if let Some(tp) = q.trait_path.get() { path_args(ast, &tp, out); }
             }
         }
         for seg in ast.segs(p.segs) {
@@ -2129,7 +2143,7 @@ fn opaque_types(ast: &Ast, t: TyId, out: &mut Vec<TyId>) {
                 }
                 Some(GenericArgs::Paren(tys, ret)) => {
                     for &t in ast.list(*tys) { opaque_types(ast, t, out); }
-                    if let Some(r) = ret { opaque_types(ast, *r, out); }
+                    if let Some(r) = &ret.get() { opaque_types(ast, *r, out); }
                 }
                 None => {}
             }
@@ -2141,7 +2155,7 @@ fn opaque_types(ast: &Ast, t: TyId, out: &mut Vec<TyId>) {
         Ty::Fn(f) => {
             let f = *ast.fn_ptr(f);
             for &x in ast.list(f.params) { opaque_types(ast, x, out); }
-            if let Some(r) = f.ret { opaque_types(ast, r, out); }
+            if let Some(r) = f.ret.get() { opaque_types(ast, r, out); }
         }
         Ty::Path(p) => path_args(ast, &p, out),
         Ty::ImplTrait(b) => { out.push(t); bounds(ast, b, out); }
@@ -2161,13 +2175,13 @@ fn impl_trait_redundant_captures(prog: &Program, tcx: &Tcx, d: DefId) {
     let item = *ast.item(def.item);
     let ItemKind::Fn(sig, _, _) = item.kind else { return };
     let sig = *ast.fn_sig(sig);
-    let Some(ret) = sig.ret else { return };
+    let Some(ret) = sig.ret.get() else { return };
     let mut opaques = Vec::new();
     opaque_types(ast, ret, &mut opaques);
     if !opaques.iter().any(|&t| matches!(*ast.ty(t), Ty::ImplTrait(b) if ast.list(b).iter().any(|x| matches!(x, Bound::Use(_))))) { return; }
     // a parameter-position `impl Trait` is a generic parameter nothing can capture by name
     if ast.list(sig.params).iter().any(|p| ty_has_impl_trait(ast, p.ty)) { return; }
-    if let Some(SelfParam::Typed(_, t)) = sig.self_param { if ty_has_impl_trait(ast, t) { return; } }
+    if let Some(SelfParam::Typed(_, t)) = sig.self_param.get() { if ty_has_impl_trait(ast, t) { return; } }
     // the type and const parameters in scope, by name; `Self` in a trait
     let mut params: Vec<String> = Vec::new();
     fn add(params: &mut Vec<String>, ast: &Ast, pf: &ParsedFile, g: Generics) {
@@ -2242,8 +2256,8 @@ fn sig_lifetime_variances(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeReso
         fn walk(&mut self, t: TyId, ctx: V) {
             let ast = self.ast;
             match *ast.ty(t) {
-                Ty::Ref(lt, m, x) => {
-                    let r = match lt { Some(l) => self.nm.named(l.lo, l.hi), None => self.nm.reference(t.0) };
+                Ty::Ref(m, lt, x) => {
+                    let r = match lt.get() { Some(l) => self.nm.named(l.lo, l.hi), None => self.nm.reference(t.0) };
                     self.record(r, xform(ctx, V::Co));
                     self.walk(x, xform(ctx, if m { V::Inv } else { V::Co }));
                 }
@@ -2254,7 +2268,7 @@ fn sig_lifetime_variances(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeReso
                 Ty::Fn(f) => {
                     let f = *ast.fn_ptr(f);
                     for &x in ast.list(f.params) { self.walk(x, xform(ctx, V::Contra)); }
-                    if let Some(r) = f.ret { self.walk(r, ctx); }
+                    if let Some(r) = f.ret.get() { self.walk(r, ctx); }
                 }
                 Ty::Path(p) => self.path(p, ctx),
                 Ty::ImplTrait(b) => {
@@ -2297,7 +2311,7 @@ fn sig_lifetime_variances(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeReso
                     },
                     Some(GenericArgs::Paren(tys, ret)) => {
                         for &t in ast.list(*tys) { self.inv(t, ctx); }
-                        if let Some(r) = ret { self.inv(*r, ctx); }
+                        if let Some(r) = &ret.get() { self.inv(*r, ctx); }
                     }
                     None => {}
                 }
@@ -2363,9 +2377,9 @@ fn sig_lifetime_variances(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeReso
             }
         }
         let mut receiver: Vec<(TyId, V)> = Vec::new();
-        match sig.self_param {
+        match sig.self_param.get() {
             Some(SelfParam::Ref(lt, m)) => {
-                let r = match lt { Some(l) => nm.named(l.lo, l.hi), None => nm.self_reference() };
+                let r = match lt.get() { Some(l) => nm.named(l.lo, l.hi), None => nm.self_reference() };
                 cx.record(r, V::Contra);
                 if let Some((t, _, _)) = &self_ty { receiver.push((*t, xform(V::Contra, if m { V::Inv } else { V::Co }))); }
             }
@@ -2373,7 +2387,7 @@ fn sig_lifetime_variances(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeReso
             Some(SelfParam::Value(..)) => if let Some((t, _, _)) = &self_ty { receiver.push((*t, V::Contra)); },
             _ => {}
         }
-        if let Some(r) = sig.ret { cx.walk(r, V::Co); }
+        if let Some(r) = sig.ret.get() { cx.walk(r, V::Co); }
         let mut out = std::mem::take(&mut cx.out);
         if let Some((_, pn, pd)) = &self_ty {
             let parent = prog.def(*pd);
@@ -2401,7 +2415,7 @@ fn impl_trait_overcaptures(prog: &Program, tcx: &Tcx, d: DefId) {
     let item = *ast.item(def.item);
     let ItemKind::Fn(sig, _, _) = item.kind else { return };
     let sig = *ast.fn_sig(sig);
-    let Some(ret) = sig.ret else { return };
+    let Some(ret) = sig.ret.get() else { return };
     let mut opaques = Vec::new();
     opaque_types(ast, ret, &mut opaques);
     if opaques.is_empty() { return; }
@@ -2463,7 +2477,7 @@ fn impl_trait_overcaptures(prog: &Program, tcx: &Tcx, d: DefId) {
         }
         fn path(&mut self, p: Path) {
             let ast = self.ast;
-            if let Some(q) = ast.qself(&p) { self.ty(q.ty); if let Some(tp) = q.trait_path { self.path(tp); } }
+            if let Some(q) = ast.qself(&p) { self.ty(q.ty); if let Some(tp) = q.trait_path.get() { self.path(tp); } }
             for seg in ast.segs(p.segs) {
                 match ast.gargs(seg.args()) {
                     Some(GenericArgs::Angle(l)) => for a in ast.list(*l) {
@@ -2475,7 +2489,7 @@ fn impl_trait_overcaptures(prog: &Program, tcx: &Tcx, d: DefId) {
                     },
                     Some(GenericArgs::Paren(tys, ret)) => {
                         for &t in ast.list(*tys) { self.ty(t); }
-                        if let Some(r) = ret { self.ty(*r); }
+                        if let Some(r) = &ret.get() { self.ty(*r); }
                     }
                     None => {}
                 }
@@ -2489,7 +2503,7 @@ fn impl_trait_overcaptures(prog: &Program, tcx: &Tcx, d: DefId) {
                 Ty::Fn(f) => {
                     let f = *ast.fn_ptr(f);
                     for &x in ast.list(f.params) { self.ty(x); }
-                    if let Some(r) = f.ret { self.ty(r); }
+                    if let Some(r) = f.ret.get() { self.ty(r); }
                 }
                 Ty::Path(p) => self.path(p),
                 Ty::ImplTrait(b) => {
@@ -2535,8 +2549,8 @@ pub const REDUNDANT_LIFETIMES: Lint = lint::lint("redundant_lifetimes");
 /// The regions written in a type (references, explicit and hidden path arguments).
 fn ty_regions(ast: &Ast, names: &LifetimeResolution, t: TyId, out: &mut Vec<LifetimeRes>) {
     match *ast.ty(t) {
-        Ty::Ref(lt, _, x) => {
-            let r = match lt { Some(l) => names.named(l.lo, l.hi), None => names.reference(t.0) };
+        Ty::Ref(_, lt, x) => {
+            let r = match lt.get() { Some(l) => names.named(l.lo, l.hi), None => names.reference(t.0) };
             if let Some(r) = r { out.push(r); }
             ty_regions(ast, names, x, out);
         }
@@ -2565,8 +2579,8 @@ fn ty_regions(ast: &Ast, names: &LifetimeResolution, t: TyId, out: &mut Vec<Life
 fn wf_edges(cx: &(&Program, u32, u32), names: &LifetimeResolution, t: TyId, edges: &mut Vec<(LifetimeRes, LifetimeRes)>) {
     let ast = &cx.0.files[cx.2 as usize].ast;
     match *ast.ty(t) {
-        Ty::Ref(lt, _, x) => {
-            let r = match lt { Some(l) => names.named(l.lo, l.hi), None => names.reference(t.0) };
+        Ty::Ref(_, lt, x) => {
+            let r = match lt.get() { Some(l) => names.named(l.lo, l.hi), None => names.reference(t.0) };
             if let Some(r) = r {
                 let mut inner = Vec::new();
                 ty_regions(ast, names, x, &mut inner);
@@ -2663,10 +2677,10 @@ fn outlives_edges(prog: &Program, tcx: &Tcx, d: DefId, nm: &LifetimeResolution) 
             declared_edges(ast, nm, sig.generics, &mut edges);
             let cx = (prog, tcx.item_module(prog, d), def.file);
             for p in ast.list(sig.params) { wf_edges(&cx, nm, p.ty, &mut edges); }
-            if let Some(r) = sig.ret { wf_edges(&cx, nm, r, &mut edges); }
-            match sig.self_param {
+            if let Some(r) = sig.ret.get() { wf_edges(&cx, nm, r, &mut edges); }
+            match sig.self_param.get() {
                 Some(SelfParam::Ref(lt, _)) => {
-                    let r = match lt { Some(l) => nm.named(l.lo, l.hi), None => nm.self_reference() };
+                    let r = match lt.get() { Some(l) => nm.named(l.lo, l.hi), None => nm.self_reference() };
                     if let (Some(r), Some((st, pn))) = (r, &impl_self) {
                         let pa = &prog.files[prog.def(def.parent).file as usize].ast;
                         let mut inner = Vec::new();
@@ -3245,7 +3259,7 @@ pub fn check_module_items(prog: &Program, own: &[bool]) {
         } else {
             let ast = &prog.files[def.file as usize].ast;
             match ast.item(def.item).kind {
-                ItemKind::Mod(Some(l)) => (def.file, ast.list(l).to_vec()),
+                ItemKind::Mod(crate::ast::Opt::Some(l)) => (def.file, ast.list(l).to_vec()),
                 _ => continue,
             }
         };
@@ -3300,7 +3314,7 @@ impl Inference<'_> {
     /// rustc `push_outlives_components`: the regions and parameters of a type.
     fn components(&self, ast: &Ast, t: TyId, out: &mut Vec<Subject>) -> Option<()> {
         match *ast.ty(t) {
-            Ty::Ref(Some(l), _, inner) => {
+            Ty::Ref(_, lt, inner) if let Some(l) = lt.get() => {
                 let name = self.pf.text(l).to_string();
                 if name != "'static" && !self.lifetimes.contains(&name) { return None; }
                 let s = Subject::Region(name);
@@ -3335,8 +3349,8 @@ impl Inference<'_> {
     /// rustc `insert_required_predicates_to_be_wf` over one field type: every reference in it.
     fn field(&mut self, ast: &Ast, t: TyId) -> Option<()> {
         match *ast.ty(t) {
-            Ty::Ref(lt, _, inner) => {
-                let name = self.pf.text(lt?).to_string();
+            Ty::Ref(_, lt, inner) => {
+                let name = self.pf.text(lt.get()?).to_string();
                 self.outlived_by(ast, inner, &name)?;
                 self.field(ast, inner)
             }
@@ -3702,64 +3716,108 @@ fn meta_variable_misuse(prog: &Program, own: &[bool]) {
 pub const UNUSED_MACROS: Lint = lint::lint("unused_macros");
 pub const UNUSED_MACRO_RULES: Lint = lint::lint("unused_macro_rules");
 
+/// The early lints that wait for the checked crates' bodies to be expanded (what the parser and
+/// the expansion recorded), and the unused macros.
+pub fn finish(prog: &Program, own: &[bool]) {
+    if !lint::enabled() { return; }
+    let mut pt = crate::lint_dead::PartTimes::new("lint_early::finish");
+    trailing_semis(prog, own); pt.mark("trailing_semis");
+    incomplete_includes(prog, own); pt.mark("incomplete_includes");
+    meta_variable_misuse(prog, own); pt.mark("meta_variable_misuse");
+    cfg_attr_empties(prog, own); pt.mark("cfg_attr_empties");
+    varargs_without_patterns(prog, own); pt.mark("varargs_without_patterns");
+    named_args_positional(prog, own); pt.mark("named_args_positional");
+    macro_expanded_macro_exports(prog, own); pt.mark("macro_expanded_macro_exports");
+    macro_call_ambiguities(prog, own); pt.mark("macro_call_ambiguities");
+    crate_attr_lints(prog, own); pt.mark("crate_attr_lints");
+    unused_macros(prog, own); pt.mark("unused_macros");
+    pt.report(own.iter().filter(|&&o| o).count());
+}
+
 /// rustc_resolve `check_unused_macros`, after the checked crates' bodies are all expanded: a
 /// private `macro_rules!` no invocation resolved to, and the rules of the others that no
 /// expansion matched.
-pub fn finish(prog: &Program, own: &[bool]) {
-    if !lint::enabled() { return; }
-    trailing_semis(prog, own);
-    incomplete_includes(prog, own);
-    meta_variable_misuse(prog, own);
-    cfg_attr_empties(prog, own);
-    varargs_without_patterns(prog, own);
-    named_args_positional(prog, own);
-    macro_expanded_macro_exports(prog, own);
-    macro_call_ambiguities(prog, own);
-    crate_attr_lints(prog, own);
+fn unused_macros(prog: &Program, own: &[bool]) {
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }
+    let own_file = |i: usize| own.get(prog.file_crate.get(i).copied().unwrap_or(u32::MAX) as usize).copied().unwrap_or(false);
     // Bodies nothing demanded are never expanded, so an invocation inside one leaves no record:
-    // a macro whose `name!` is written anywhere in the checked crates counts as used.
-    let written = |name: &str| -> bool {
-        let n = name.as_bytes();
+    // a macro whose `name!` is written anywhere in the checked crates counts as used: its name
+    // after no word byte, then spaces and a `!` that is not `!=`.
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    fn src(f: &ParsedFile) -> &[u8] { &f.src[..(f.src_len as usize).min(f.src.len())] }
+    let bang_at = |s: &[u8], mut j: usize| { while j < s.len() && s[j].is_ascii_whitespace() { j += 1; } j < s.len() && s[j] == b'!' && s.get(j + 1) != Some(&b'=') };
+    let written_at = |n: &[u8]| -> bool {
         prog.files.iter().enumerate().any(|(i, f)| {
-            if !own.get(prog.file_crate.get(i).copied().unwrap_or(u32::MAX) as usize).copied().unwrap_or(false) { return false; }
-            let s = &f.src[..(f.src_len as usize).min(f.src.len())];
+            if !own_file(i) { return false; }
+            let s = src(f);
             let mut from = 0;
             while let Some(k) = s[from..].windows(n.len()).position(|w| w == n) {
                 let at = from + k;
                 from = at + 1;
-                if at > 0 && (s[at - 1].is_ascii_alphanumeric() || s[at - 1] == b'_') { continue; }
-                let mut j = at + n.len();
-                while j < s.len() && s[j].is_ascii_whitespace() { j += 1; }
-                if j < s.len() && s[j] == b'!' && s.get(j + 1) != Some(&b'=') { return true; }
+                if at > 0 && word(s[at - 1]) { continue; }
+                if bang_at(s, at + n.len()) { return true; }
             }
             false
         })
     };
+    // For an ASCII name (`r#` and all for a raw one) the same answer from the set of the names
+    // written so, one pass over the checked crates' text when a macro first asks: every word at a
+    // word start followed by the `!`, with its `r#` too when one stands before it at a word start.
+    let mut written: Option<std::collections::HashSet<&[u8]>> = None;
+    let written_names = || {
+        let mut set = std::collections::HashSet::new();
+        for (i, f) in prog.files.iter().enumerate() {
+            if !own_file(i) { continue; }
+            let s = src(f);
+            let mut at = 0;
+            while at < s.len() {
+                if !word(s[at]) || (at > 0 && word(s[at - 1])) { at += 1; continue; }
+                let mut end = at;
+                while end < s.len() && word(s[end]) { end += 1; }
+                if bang_at(s, end) {
+                    set.insert(&s[at..end]);
+                    if at >= 2 && &s[at - 2..at] == b"r#" && (at == 2 || !word(s[at - 3])) { set.insert(&s[at - 2..end]); }
+                }
+                at = end;
+            }
+        }
+        set
+    };
+    // each macro's file (the first of its path), and the `macro_rules!` definitions by (file, name position)
+    let mut file_of: HashMap<&str, usize> = HashMap::new();
+    for (i, p) in prog.file_paths.iter().enumerate() { file_of.entry(p.as_str()).or_insert(i); }
+    let mut rules_def: HashMap<(u32, u32), DefId> = HashMap::new();
+    for i in 0..prog.defs.len() {
+        let x = prog.def(DefId(i as u32));
+        if x.kind != DefKind::MacroRules { continue; }
+        let Some(pf) = prog.files.get(x.file as usize).filter(|_| x.item.0 != u32::MAX) else { continue };
+        rules_def.entry((x.file, pf.ast.item(x.item).name.lo)).or_insert(DefId(i as u32));
+    }
     for d in defs {
         if d.exported || d.file.is_empty() || d.name.starts_with('_') { continue; }
-        let Some(file) = prog.file_paths.iter().position(|p| *p == d.file) else { continue };
+        let Some(&file) = file_of.get(d.file.as_str()) else { continue };
         let krate = prog.file_crate.get(file).copied().unwrap_or(u32::MAX);
         if !own.get(krate as usize).copied().unwrap_or(false) { continue; }
         let pf = &prog.files[file];
         // the definition's own node gives the lint level (a macro written by a macro has none:
-        // the enclosing definition does)
-        let def = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&i| {
-            let x = prog.def(i);
-            x.kind == DefKind::MacroRules && x.file == file as u32 && pf.ast.item(x.item).name.lo == d.pos
-        }).unwrap_or_else(|| enclosing_def(prog, file as u32, d.pos, krate));
+        // the enclosing definition does), looked up for a report only
+        let def = || rules_def.get(&(file as u32, d.pos)).copied().unwrap_or_else(|| enclosing_def(prog, file as u32, d.pos, krate));
         let resolved = used.contains(&(d.file.clone(), d.pos, crate::macros::uses::RESOLVED));
         let any_rule = (0..d.rules.len() as u32).any(|i| used.contains(&(d.file.clone(), d.pos, i)));
         if !resolved && !any_rule {
-            if written(&d.name) { continue; }
+            let n = d.name.as_bytes();
+            let plain = n.strip_prefix(b"r#").unwrap_or(n);
+            let is_written = if !plain.is_empty() && plain.iter().all(|&b| word(b)) { written.get_or_insert_with(written_names).contains(n) } else { written_at(n) };
+            if is_written { continue; }
             if pf.expansion_kind(d.pos) == crate::parser::ExpnKind::ExternalRules { continue; }
-            emit(prog, def, &UNUSED_MACROS, file as u32, d.pos, &format!("unused macro definition: `{}`", d.name));
+            emit(prog, def(), &UNUSED_MACROS, file as u32, d.pos, &format!("unused macro definition: `{}`", d.name));
             continue;
         }
+        let mut at = None;
         for (i, (pos, compile_error)) in d.rules.iter().enumerate() {
             if *compile_error || used.contains(&(d.file.clone(), d.pos, i as u32)) { continue; }
-            emit(prog, def, &UNUSED_MACRO_RULES, file as u32, *pos, &format!("rule #{} of macro `{}` is never used", i + 1, d.name));
+            emit(prog, *at.get_or_insert_with(&def), &UNUSED_MACRO_RULES, file as u32, *pos, &format!("rule #{} of macro `{}` is never used", i + 1, d.name));
         }
     }
 }
@@ -3779,7 +3837,7 @@ fn root_extern_crates(prog: &Program, krate: u32) -> Vec<String> {
     let mut out = vec!["std".to_string(), "core".to_string()];
     for it in ast.root_items.iter() {
         let item = ast.item(*it);
-        if let ItemKind::ExternCrate(None) = item.kind { out.push(pf.text(item.name).to_string()); }
+        if matches!(item.kind, ItemKind::ExternCrate(rename) if rename.is_none()) { out.push(pf.text(item.name).to_string()); }
     }
     out
 }
@@ -3820,7 +3878,7 @@ pub(crate) fn unused_import_braces(prog: &Program, d: DefId, file: u32, item: &I
                 let node = match *one {
                     UseTree::Name(seg, rename) => {
                         if seg.kind() == SegKind::SelfValue { return; }
-                        pf.text(rename.unwrap_or(seg.name)).to_string()
+                        pf.text(rename.get().unwrap_or(seg.name)).to_string()
                     }
                     UseTree::Glob => "*".to_string(),
                     _ => return,

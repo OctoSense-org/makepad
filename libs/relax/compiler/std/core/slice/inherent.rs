@@ -1,5 +1,5 @@
-//! `impl<T> [T]` and `impl [u8]` (Relax only: inherent impls on primitive types). Bodies
-//! forward to the free functions of this module tree, which the rustc shim checks.
+//! Relax's `impl<T> [T]` and `impl [u8]`. Bodies forward to the free functions of this
+//! module tree.
 
 use super::iter as it;
 use super::sort;
@@ -48,7 +48,7 @@ impl<T> [T] {
         let right = crate::slice::from_raw_parts_mut(ptr.add(rest_len - ts_len), ts_len);
         (left, mid, right)
     }
-    #[cfg_attr(not(relax_check), lang = "slice_len_fn")]
+    #[lang = "slice_len_fn"]
     #[rustc_no_implicit_autorefs]
     pub const fn len(&self) -> usize {
         unsafe { im::slice_len(self) }
@@ -163,11 +163,75 @@ impl<T> [T] {
         let end = unsafe { im::ptr_add(start, self.len()) };
         start..end
     }
-    // core/src/slice/mod.rs (stable 1.48; zerovec's VarZeroVecOwned)
     pub const fn as_mut_ptr_range(&mut self) -> crate::ops::Range<*mut T> {
+        let len = self.len();
         let start = self.as_mut_ptr();
-        let end = unsafe { im::ptr_add_mut(start, self.len()) };
+        let end = unsafe { im::ptr_add(start as *const T, len) as *mut T };
         start..end
+    }
+    /// library/core/src/slice/mod.rs: takes the one-sided `range` off this slice (`..n` from the
+    /// front, `n..` from the back), None when it reaches past the end.
+    pub fn split_off<'a, R: crate::ops::OneSidedRange<usize>>(self: &mut &'a Self, range: R) -> Option<&'a Self> {
+        let (front_part, split_index) = split_point_of(range)?;
+        if split_index > self.len() {
+            return None;
+        }
+        let (front, back) = self.split_at(split_index);
+        if front_part {
+            *self = back;
+            Some(front)
+        } else {
+            *self = front;
+            Some(back)
+        }
+    }
+    pub fn split_off_mut<'a, R: crate::ops::OneSidedRange<usize>>(self: &mut &'a mut Self, range: R) -> Option<&'a mut Self> {
+        let (front_part, split_index) = split_point_of(range)?;
+        if split_index > self.len() {
+            return None;
+        }
+        let (front, back) = crate::mem::take(self).split_at_mut(split_index);
+        if front_part {
+            *self = back;
+            Some(front)
+        } else {
+            *self = front;
+            Some(back)
+        }
+    }
+    pub fn split_off_first<'a>(self: &mut &'a Self) -> Option<&'a T> {
+        let (first, rest) = self.split_first()?;
+        *self = rest;
+        Some(first)
+    }
+    pub fn split_off_first_mut<'a>(self: &mut &'a mut Self) -> Option<&'a mut T> {
+        let (first, rest) = crate::mem::take(self).split_first_mut()?;
+        *self = rest;
+        Some(first)
+    }
+    pub fn split_off_last<'a>(self: &mut &'a Self) -> Option<&'a T> {
+        let (last, rest) = self.split_last()?;
+        *self = rest;
+        Some(last)
+    }
+    pub fn split_off_last_mut<'a>(self: &mut &'a mut Self) -> Option<&'a mut T> {
+        let (last, rest) = crate::mem::take(self).split_last_mut()?;
+        *self = rest;
+        Some(last)
+    }
+    /// Real core's `element_offset` (slice/mod.rs): the index of `element` if it is one of this
+    /// slice's elements by address (not by value); panics for a zero-sized `T`.
+    pub fn element_offset(&self, element: &T) -> Option<usize> {
+        let size = crate::mem::size_of::<T>();
+        if size == 0 {
+            panic!("elements are zero-sized");
+        }
+        let byte_offset = (element as *const T as usize).wrapping_sub(self.as_ptr() as usize);
+        if byte_offset % size != 0 {
+            return None;
+        }
+        let offset = byte_offset / size;
+        if offset < self.len() { Some(offset) } else { None }
     }
     #[track_caller]
     pub fn swap(&mut self, a: usize, b: usize) {
@@ -185,6 +249,9 @@ impl<T> [T] {
     #[track_caller]
     pub const fn windows(&self, size: usize) -> Windows<'_, T> {
         it::windows(self, size)
+    }
+    pub const fn array_windows<const N: usize>(&self) -> it::ArrayWindows<'_, T, N> {
+        it::array_windows(self)
     }
     #[track_caller]
     pub const fn chunks(&self, chunk_size: usize) -> Chunks<'_, T> {
@@ -250,24 +317,20 @@ impl<T> [T] {
     pub const fn split_at_mut(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
         super::split_at_mut(self, mid)
     }
+    // core/src/slice/mod.rs (stable 1.79; zerovec's VarZeroVec components): `mid <= len` is
+    // the caller's to keep
+    pub const unsafe fn split_at_unchecked(&self, mid: usize) -> (&[T], &[T]) {
+        unsafe { super::split_at_unchecked(self, mid) }
+    }
+    pub const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
+        unsafe { super::split_at_mut_unchecked(self, mid) }
+    }
     pub const fn split_at_checked(&self, mid: usize) -> Option<(&[T], &[T])> {
         if mid > self.len() {
             None
         } else {
             Some((&self[..mid], &self[mid..]))
         }
-    }
-    // core/src/slice/mod.rs (stable 1.79; cmov 0.5's slice_as_chunks, under every constant-time
-    // comparison of ctutils: the AEAD tag check of chacha20poly1305)
-    pub const unsafe fn split_at_unchecked(&self, mid: usize) -> (&[T], &[T]) {
-        let len = self.len();
-        let ptr = self.as_ptr();
-        unsafe { (crate::slice::from_raw_parts(ptr, mid), crate::slice::from_raw_parts(ptr.add(mid), len - mid)) }
-    }
-    pub const unsafe fn split_at_mut_unchecked(&mut self, mid: usize) -> (&mut [T], &mut [T]) {
-        let len = self.len();
-        let ptr = self.as_mut_ptr();
-        unsafe { (crate::slice::from_raw_parts_mut(ptr, mid), crate::slice::from_raw_parts_mut(ptr.add(mid), len - mid)) }
     }
     // core/src/slice/mod.rs (stable 1.80; getrandom 0.4's sys_fill_exact)
     pub const fn split_at_mut_checked(&mut self, mid: usize) -> Option<(&mut [T], &mut [T])> {
@@ -333,6 +396,33 @@ impl<T> [T] {
             None
         }
     }
+    /// rustc 1.100.0 (trim_prefix_suffix): `self` without `prefix` if it starts with it, else `self`
+    pub fn trim_prefix(&self, prefix: &[T]) -> &[T]
+    where
+        T: PartialEq,
+    {
+        let n = prefix.len();
+        if n <= self.len() {
+            let (head, tail) = self.split_at(n);
+            if head == prefix {
+                return tail;
+            }
+        }
+        self
+    }
+    pub fn trim_suffix(&self, suffix: &[T]) -> &[T]
+    where
+        T: PartialEq,
+    {
+        let (len, n) = (self.len(), suffix.len());
+        if n <= len {
+            let (head, tail) = self.split_at(len - n);
+            if tail == suffix {
+                return head;
+            }
+        }
+        self
+    }
     pub fn binary_search(&self, x: &T) -> Result<usize, usize>
     where
         T: Ord,
@@ -394,6 +484,14 @@ impl<T> [T] {
     pub fn select_nth_unstable_by<F: FnMut(&T, &T) -> Ordering>(&mut self, index: usize, compare: F) -> (&mut [T], &mut T, &mut [T]) {
         let mut compare = compare;
         sort::select_nth(self, index, &mut |a: &T, b: &T| compare(a, b) == Ordering::Less);
+        let (left, rest) = super::split_at_mut(self, index);
+        let (mid, right) = super::split_at_mut(rest, 1);
+        (left, &mut mid[0], right)
+    }
+    #[track_caller]
+    pub fn select_nth_unstable_by_key<K: Ord, F: FnMut(&T) -> K>(&mut self, index: usize, f: F) -> (&mut [T], &mut T, &mut [T]) {
+        let mut f = f;
+        sort::select_nth(self, index, &mut |a: &T, b: &T| f(a).lt(&f(b)));
         let (left, rest) = super::split_at_mut(self, index);
         let (mid, right) = super::split_at_mut(rest, 1);
         (left, &mut mid[0], right)
@@ -493,10 +591,16 @@ impl<T> [T] {
     {
         super::to_vec(self)
     }
-    pub fn into_vec(self: crate::boxed::Box<[T]>) -> Vec<T> {
+    pub fn to_vec_in<A: crate::heap::Allocator>(&self, alloc: A) -> Vec<T, A>
+    where
+        T: Clone,
+    {
+        super::to_vec_in(self, alloc)
+    }
+    pub fn into_vec<A: crate::heap::Allocator>(self: crate::boxed::Box<[T], A>) -> Vec<T, A> {
         let len = self.len();
-        let p = crate::boxed::Box::into_raw(self) as *mut T;
-        unsafe { Vec::from_raw_parts(p, len, len) }
+        let (p, alloc) = crate::boxed::Box::into_non_null_with_allocator(self);
+        unsafe { Vec::from_raw_parts_in(p.cast::<T>().as_ptr(), len, len, alloc) }
     }
     pub fn repeat(&self, n: usize) -> Vec<T>
     where
@@ -522,6 +626,24 @@ impl<T> [T] {
         [T]: Join<Separator>,
     {
         Join::join(self, sep)
+    }
+    /// The slice as an array reference, `None` when its length is not exactly `N` (stable since 1.93).
+    pub const fn as_array<const N: usize>(&self) -> Option<&[T; N]> {
+        if self.len() == N {
+            // SAFETY: a slice of N elements is laid out as `[T; N]`
+            Some(unsafe { &*(self.as_ptr() as *const [T; N]) })
+        } else {
+            None
+        }
+    }
+    /// The slice as a mutable array reference, `None` when its length is not exactly `N`.
+    pub const fn as_mut_array<const N: usize>(&mut self) -> Option<&mut [T; N]> {
+        if self.len() == N {
+            // SAFETY: a slice of N elements is laid out as `[T; N]`
+            Some(unsafe { &mut *(self.as_mut_ptr() as *mut [T; N]) })
+        } else {
+            None
+        }
     }
     pub const fn first_chunk<const N: usize>(&self) -> Option<&[T; N]> {
         if self.len() < N {
@@ -679,4 +801,15 @@ impl<T, const N: usize> [[T; N]] {
         };
         unsafe { crate::slice::from_raw_parts_mut(self.as_mut_ptr() as *mut T, len) }
     }
+}
+
+/// library/core/src/slice/mod.rs `split_point_of`: where a one-sided range splits a slice, and
+/// whether it takes the front part (`..n`, `..=n`) or the back (`n..`).
+fn split_point_of(range: impl crate::ops::OneSidedRange<usize>) -> Option<(bool, usize)> {
+    use crate::ops::OneSidedRangeBound::{End, EndInclusive, StartInclusive};
+    Some(match range.bound() {
+        (StartInclusive, i) => (false, i),
+        (End, i) => (true, i),
+        (EndInclusive, i) => (true, i.checked_add(1)?),
+    })
 }

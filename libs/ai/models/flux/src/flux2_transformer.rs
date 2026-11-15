@@ -23,13 +23,13 @@ use crate::backend::{
     gpu_layer_norm_mod_to_bf16buf, gpu_linear_nt_cached_bf16_mm,
     gpu_linear_nt_cached_bf16_mm_from_buf, gpu_linear_nt_cached_bf16_mm_from_buf_to_buf,
     gpu_linear_nt_cached_f8_mm, gpu_linear_nt_cached_f8_mm_from_buf,
-    gpu_linear_nt_cached_f8_mm_from_buf_to_buf,
-    gpu_pool_clear, gpu_rms_norm_mul_from_bf16_slab, gpu_rope_interleaved, gpu_silu,
-    gpu_slice_rows, gpu_stream_ring_active, gpu_stream_ring_advance, gpu_stream_ring_prime,
-    gpu_stream_ring_setup,
-    gpu_swiglu_gate_first_from_bf16, gpu_upload, gpu_upload_into,
-    gpu_weight_cache_ensure, gpu_weight_cache_ensure_quant,
-    gpu_weight_cache_evict_prefix, GpuBf16Buf, GpuLinearPart, GpuTensor,
+    gpu_linear_nt_cached_f8_mm_from_buf_to_buf, gpu_linear_nt_cached_fp8_dynamic_from_buf,
+    gpu_linear_nt_cached_fp8_dynamic_from_buf_to_buf, gpu_rms_norm_mul_from_bf16_slab,
+    gpu_rope_interleaved, gpu_silu, gpu_slice_rows, gpu_stream_ring_active,
+    gpu_stream_ring_advance, gpu_stream_ring_prime, gpu_stream_ring_setup,
+    gpu_swiglu_gate_first_from_bf16, gpu_upload, gpu_upload_into, gpu_weight_cache_ensure,
+    gpu_weight_cache_ensure_bf16_precision_keyed, gpu_weight_cache_ensure_quant, GpuBf16Buf,
+    GpuLinearPart, GpuLinearPrecision, GpuTensor, WeightKey, WeightOwner,
 };
 use crate::flux2::{Flux2PosId, Flux2TransformerConfig, Flux2WeightFile};
 use crate::{DiffusionError, Result};
@@ -39,14 +39,29 @@ use makepad_ai_common::quant::{
 };
 use std::path::{Path, PathBuf};
 
-pub const FLUX2_DIT_NAMESPACE: &str = "flux2-dit-bf16";
 const LAYER_NORM_EPS: f32 = 1.0e-6;
 const TIME_EMBED_DIM: usize = 256;
 
+/// How the DiT's MLP linears run: the double blocks' mlps and the single
+/// blocks' linear1/linear2, nine tenths of its arithmetic (the linears the
+/// fp8mixed checkpoint stores in FP8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flux2MlpArithmetic {
+    /// As the checkpoint stores them: bf16, or the fp8mixed file's scaled FP8.
+    AsStored,
+    /// bf16 weights quantized to FP8 E4M3 at upload (one scale per tensor),
+    /// each input quantized per call by its own absmax: about twice the
+    /// tensor-core rate of bf16, for a live loop that wants speed over the
+    /// last bits.
+    Fp8,
+}
+
 pub struct Flux2TransformerWeights {
+    owner: WeightOwner,
     pub path: PathBuf,
     pub config: Flux2TransformerConfig,
     pub file: Flux2WeightFile,
+    mlps: Flux2MlpArithmetic,
     /// Lazily-read `(weight_scale, input_scale)` pairs of the fp8mixed
     /// checkpoint, cached so the per-step ensure path never re-opens the
     /// weight file for 4-byte scalars.
@@ -55,6 +70,10 @@ pub struct Flux2TransformerWeights {
 
 impl Flux2TransformerWeights {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::load_with(path, Flux2MlpArithmetic::AsStored)
+    }
+
+    pub fn load_with(path: impl AsRef<Path>, mlps: Flux2MlpArithmetic) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = Flux2WeightFile::load(&path)?;
         let config = file.detect_transformer_config()?;
@@ -67,9 +86,11 @@ impl Flux2TransformerWeights {
             ));
         }
         Ok(Self {
+            owner: WeightOwner::new("flux2-dit"),
             path,
             config,
             file,
+            mlps,
             f8_scales: std::cell::RefCell::new(std::collections::HashMap::new()),
         })
     }
@@ -98,14 +119,6 @@ impl Flux2TransformerWeights {
             .insert(resolved.to_owned(), (scale, input_scale));
         Ok((scale, input_scale))
     }
-}
-
-pub fn flux2_transformer_release() -> Result<usize> {
-    gpu_weight_cache_evict_prefix(&format!("{FLUX2_DIT_NAMESPACE}::")).map_err(DiffusionError::model)
-}
-
-fn ns(weights: &Flux2TransformerWeights) -> String {
-    format!("{FLUX2_DIT_NAMESPACE}:{}", weights.path.display())
 }
 
 fn alias_one(name: &str) -> Option<String> {
@@ -283,7 +296,7 @@ fn ensure_linear<'a>(
         Some(resolved) if weights.file.tensor(&resolved)?.dtype == "F8_E4M3" => {
             let scales = weights.f8_scale(&resolved)?;
             gpu_weight_cache_ensure(
-                &ns(weights),
+                &weights.owner,
                 name,
                 GGML_TYPE_F8_E4M3,
                 output_cols,
@@ -302,7 +315,7 @@ fn ensure_linear<'a>(
         Some(resolved) if gguf_kquant_type(weights, &resolved).is_some() => {
             let ggml_type = gguf_kquant_type(weights, &resolved).expect("checked");
             gpu_weight_cache_ensure_quant(
-                &ns(weights),
+                &weights.owner,
                 name,
                 ggml_type,
                 output_cols,
@@ -319,7 +332,7 @@ fn ensure_linear<'a>(
         }
         _ => {
             gpu_weight_cache_ensure(
-                &ns(weights),
+                &weights.owner,
                 name,
                 GGML_TYPE_BF16,
                 output_cols,
@@ -350,10 +363,14 @@ fn linear(
 ) -> Result<GpuTensor> {
     let ensured = ensure_linear(weights, name, output_cols, input.cols())?;
     match ensured.f8_scale {
-        Some((scale, input_scale)) => {
-            gpu_linear_nt_cached_f8_mm(input, &ns(weights), &[ensured.part], scale, input_scale)
-        }
-        None => gpu_linear_nt_cached_bf16_mm(input, &ns(weights), &[ensured.part]),
+        Some((scale, input_scale)) => gpu_linear_nt_cached_f8_mm(
+            input,
+            &weights.owner,
+            &[ensured.part],
+            scale,
+            input_scale,
+        ),
+        None => gpu_linear_nt_cached_bf16_mm(input, &weights.owner, &[ensured.part]),
     }
     .map_err(DiffusionError::model)
 }
@@ -368,12 +385,14 @@ fn linear_from_buf(
     match ensured.f8_scale {
         Some((scale, input_scale)) => gpu_linear_nt_cached_f8_mm_from_buf(
             input,
-            &ns(weights),
+            &weights.owner,
             &[ensured.part],
             scale,
             input_scale,
         ),
-        None => gpu_linear_nt_cached_bf16_mm_from_buf(input, &ns(weights), &[ensured.part]),
+        None => {
+            gpu_linear_nt_cached_bf16_mm_from_buf(input, &weights.owner, &[ensured.part])
+        }
     }
     .map_err(DiffusionError::model)
 }
@@ -388,16 +407,72 @@ fn linear_from_buf_to_buf(
     match ensured.f8_scale {
         Some((scale, input_scale)) => gpu_linear_nt_cached_f8_mm_from_buf_to_buf(
             input,
-            &ns(weights),
+            &weights.owner,
             &[ensured.part],
             scale,
             input_scale,
         ),
-        None => {
-            gpu_linear_nt_cached_bf16_mm_from_buf_to_buf(input, &ns(weights), &[ensured.part])
-        }
+        None => gpu_linear_nt_cached_bf16_mm_from_buf_to_buf(
+            input,
+            &weights.owner,
+            &[ensured.part],
+        ),
     }
     .map_err(DiffusionError::model)
+}
+
+/// The cache key of an MLP linear its arithmetic makes FP8 from bf16, or
+/// `None` when it runs as stored (`AsStored`, or a tensor not stored bf16).
+fn fp8_mlp_key(
+    weights: &Flux2TransformerWeights,
+    name: &str,
+    output_cols: usize,
+    input_cols: usize,
+) -> Result<Option<WeightKey>> {
+    if weights.mlps != Flux2MlpArithmetic::Fp8 {
+        return Ok(None);
+    }
+    let Some(resolved) = resolve_name(weights, name) else {
+        return Ok(None);
+    };
+    if weights.file.tensor(&resolved)?.dtype != "BF16" {
+        return Ok(None);
+    }
+    let key = weights.owner.key(&format!("{name}::fp8"));
+    gpu_weight_cache_ensure_bf16_precision_keyed(&key, output_cols, input_cols, GpuLinearPrecision::Fp8F32, || {
+        load_linear_bytes(weights, name).map_err(|err| err.to_string())
+    })
+    .map_err(DiffusionError::model)?;
+    Ok(Some(key))
+}
+
+/// An MLP linear (see `Flux2MlpArithmetic`), bf16 in, bf16 out.
+fn mlp_linear_from_buf_to_buf(
+    weights: &Flux2TransformerWeights,
+    input: &GpuBf16Buf,
+    name: &str,
+    output_cols: usize,
+) -> Result<GpuBf16Buf> {
+    match fp8_mlp_key(weights, name, output_cols, input.cols())? {
+        Some(key) => gpu_linear_nt_cached_fp8_dynamic_from_buf_to_buf(input, &key, output_cols)
+            .map_err(DiffusionError::model),
+        None => linear_from_buf_to_buf(weights, input, name, output_cols),
+    }
+}
+
+/// An MLP linear (see `Flux2MlpArithmetic`), bf16 in, f32 out.
+fn mlp_linear_from_buf(
+    weights: &Flux2TransformerWeights,
+    input: &GpuBf16Buf,
+    name: &str,
+    output_cols: usize,
+) -> Result<GpuTensor> {
+    match fp8_mlp_key(weights, name, output_cols, input.cols())? {
+        Some(key) => {
+            gpu_linear_nt_cached_fp8_dynamic_from_buf(input, &key, output_cols).map_err(DiffusionError::model)
+        }
+        None => linear_from_buf(weights, input, name, output_cols),
+    }
 }
 
 fn round_bf16(tensor: GpuTensor) -> Result<GpuTensor> {
@@ -695,7 +770,7 @@ fn flux2_transformer_core(
 
 thread_local! {
     /// Namespace the stream ring currently serves (one resident dev DiT).
-    static FLUX2_RING_NS: std::cell::RefCell<Option<String>> =
+    static FLUX2_RING_OWNER_ID: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -722,9 +797,9 @@ fn double_block_ring_names(layer: usize) -> [String; 8] {
 /// what [`ensure_linear`] would have cached for it.
 fn ring_tensor_key_and_bytes(
     weights: &Flux2TransformerWeights,
-    namespace: &str,
+    namespace: &WeightOwner,
     name: &str,
-) -> Result<(String, Vec<u8>)> {
+) -> Result<(WeightKey, Vec<u8>)> {
     let resolved = resolve_name(weights, name);
     if let Some(resolved) = &resolved {
         if weights.file.tensor(resolved)?.dtype == "F8_E4M3" {
@@ -732,19 +807,19 @@ fn ring_tensor_key_and_bytes(
             // touches the file.
             let _ = weights.f8_scale(resolved)?;
             return Ok((
-                format!("{namespace}::{name}::f8"),
+                namespace.key(&format!("{name}::f8")),
                 weights.file.read_bytes(resolved)?,
             ));
         }
         if let Some(ggml_type) = gguf_kquant_type(weights, resolved) {
             return Ok((
-                format!("{namespace}::{name}::q{ggml_type}"),
+                namespace.key(&format!("{name}::q{ggml_type}")),
                 weights.file.read_bytes(resolved)?,
             ));
         }
     }
     Ok((
-        format!("{namespace}::{name}"),
+        namespace.key(name),
         load_linear_bytes(weights, name)?,
     ))
 }
@@ -754,8 +829,8 @@ fn flux2_ensure_double_ring(weights: &Flux2TransformerWeights) -> Result<bool> {
     if !weights.config.guidance_embed {
         return Ok(false);
     }
-    let namespace = ns(weights);
-    let already = FLUX2_RING_NS.with(|cell| cell.borrow().as_deref() == Some(namespace.as_str()));
+    let namespace = &weights.owner;
+    let already = FLUX2_RING_OWNER_ID.with(|cell| *cell.borrow() == Some(namespace.id()));
     if already && gpu_stream_ring_active() {
         // Slots may have been released for the VAE-decode phase.
         gpu_stream_ring_prime().map_err(DiffusionError::model)?;
@@ -766,17 +841,17 @@ fn flux2_ensure_double_ring(weights: &Flux2TransformerWeights) -> Result<bool> {
     for layer in 0..depth {
         let mut group = Vec::with_capacity(8);
         for name in double_block_ring_names(layer) {
-            group.push(ring_tensor_key_and_bytes(weights, &namespace, &name)?);
+            group.push(ring_tensor_key_and_bytes(weights, namespace, &name)?);
         }
         groups.push(group);
     }
     gpu_stream_ring_setup(groups).map_err(DiffusionError::model)?;
-    FLUX2_RING_NS.with(|cell| *cell.borrow_mut() = Some(namespace));
+    FLUX2_RING_OWNER_ID.with(|cell| *cell.borrow_mut() = Some(namespace.id()));
     Ok(true)
 }
 
 struct Flux2DeviceState {
-    namespace: String,
+    owner_id: u64,
     img_count: usize,
     txt_count: usize,
     gen_tokens: usize,
@@ -832,10 +907,10 @@ fn flux2_forward_state(
     let txt_count = txt_ids.len();
     FLUX2_DEVICE_STATE.with(|cell| {
         let mut slot = cell.borrow_mut();
-        let namespace = ns(weights);
+        let namespace = &weights.owner;
         let ids_fp = flux2_ids_fingerprint(txt_ids, img_ids);
         let matches = slot.as_ref().is_some_and(|state| {
-            state.namespace == namespace
+            state.owner_id == namespace.id()
                 && state.img_count == img_count
                 && state.txt_count == txt_count
                 && state.gen_tokens == gen_tokens
@@ -849,7 +924,7 @@ fn flux2_forward_state(
             let (cos, sin) = flux2_rope_tables(&all_ids, config);
             let half = (config.head_dim / 2) as usize;
             *slot = Some(Flux2DeviceState {
-                namespace,
+                owner_id: weights.owner.id(),
                 img_count,
                 txt_count,
                 gen_tokens,
@@ -928,7 +1003,7 @@ fn head_rms_slab(
         col_off,
         cols,
         head_dim,
-        &ns(weights),
+        &weights.owner,
         name,
         &scale,
         LAYER_NORM_EPS,
@@ -1045,12 +1120,12 @@ fn swiglu_mlp(
     hidden: usize,
     mlp: usize,
 ) -> Result<GpuTensor> {
-    let fused = linear_from_buf_to_buf(weights, input, &format!("{prefix}.0.weight"), 2 * mlp)?;
+    let fused = mlp_linear_from_buf_to_buf(weights, input, &format!("{prefix}.0.weight"), 2 * mlp)?;
     // DiT SwiGLU is gate-first: silu(left) * right, read straight off the
     // fused bf16 buffer (same silu/mul arithmetic as the old slice+swap
     // path, stored bf16-RN like the down-projection's staging).
     let act = gpu_swiglu_gate_first_from_bf16(&fused, 0, mlp).map_err(DiffusionError::model)?;
-    linear_from_buf(weights, &act, &format!("{prefix}.2.weight"), hidden)
+    mlp_linear_from_buf(weights, &act, &format!("{prefix}.2.weight"), hidden)
 }
 
 fn single_block(
@@ -1070,7 +1145,7 @@ fn single_block(
         .map_err(DiffusionError::model)?;
     let linear1_out = 3 * hidden + 2 * mlp;
     let fused =
-        linear_from_buf_to_buf(weights, &normed, &format!("{prefix}.linear1.weight"), linear1_out)?;
+        mlp_linear_from_buf_to_buf(weights, &normed, &format!("{prefix}.linear1.weight"), linear1_out)?;
     let v = gpu_bf16buf_slab_to_f32(&fused, 2 * hidden, hidden).map_err(DiffusionError::model)?;
     let q = head_rms_slab(
         weights,
@@ -1094,7 +1169,7 @@ fn single_block(
     let mlp_act =
         gpu_swiglu_gate_first_from_bf16(&fused, 3 * hidden, mlp).map_err(DiffusionError::model)?;
     let cat = gpu_concat_f32rn_bf16buf(&attn, &mlp_act).map_err(DiffusionError::model)?;
-    let proj = linear_from_buf(weights, &cat, &format!("{prefix}.linear2.weight"), hidden)?;
+    let proj = mlp_linear_from_buf(weights, &cat, &format!("{prefix}.linear2.weight"), hidden)?;
     gpu_gated_residual_mod_round_bf16(x, &proj, single_mod, 2 * hidden).map_err(DiffusionError::model)
 }
 
@@ -1112,10 +1187,6 @@ pub fn flux2_euler_step(sample: &mut [f32], pred: &[f32], sigma: f32, sigma_next
         *x += dt * *p;
     }
     Ok(())
-}
-
-pub fn flux2_dit_clear_pool() {
-    gpu_pool_clear();
 }
 
 #[cfg(test)]

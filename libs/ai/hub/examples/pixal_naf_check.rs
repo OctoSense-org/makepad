@@ -1,18 +1,24 @@
 //! Offline native encoder + sparse NAF oracle fixture. See trellis/tests.
 #[cfg(feature = "mesh")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> std::process::ExitCode {
+    makepad_ai_common::backend::metal::run_model_worker("pixal_naf_check", || std::process::Termination::report(model_main()))
+}
+
+#[cfg(feature = "mesh")]
+fn model_main() -> Result<(), Box<dyn std::error::Error>> {
     use makepad_ai_trellis::{
-        backend::{gpu_download, gpu_upload},
+        backend::{gpu_download, gpu_upload, WeightOwner},
         pixal_naf::PixalNaf,
         trellis::TrellisWeights,
         trellis_image::T2Image,
     };
+    use std::sync::Arc;
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 {
         return Err("usage: pixal_naf_check DINO_NAF.safetensors OUTPUT.f32".into());
     }
     let weights = TrellisWeights::load(&args[1])?;
-    let naf = PixalNaf::prepare(&weights)?;
+    let naf = PixalNaf::prepare(&weights, Arc::new(WeightOwner::new("p3naf")))?;
     let image = T2Image {
         width: 32,
         height: 32,

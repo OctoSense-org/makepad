@@ -142,8 +142,35 @@ pub fn hash_bytes(b: &[u8]) -> u128 {
 /// re-checks them before trusting the world (C3).
 pub const LATE_FILE: u8 = 1;
 pub const LATE_ENV: u8 = 2;
+/// A proc macro's read of cargo's `[env]` configuration for the crate invoking it
+/// (macro_reg::call_krate_env, past the crate's own variables): present or absent, compared with
+/// that configuration alone (a confined macro never sees the process environment, as env!'s
+/// LATE_ENV value can fall through to).
+pub const LATE_CONFIG_ENV: u8 = 3;
+/// Or'ed into a late input's kind when read while parsing a hole body: a fn body that is not
+/// const, not async and returns no `impl Trait`; no other crate's check sees it.
+pub const LATE_HOLE: u8 = 0x80;
+/// Or'ed into a late input's kind when read while expanding an item-position macro call (an
+/// `include!` of items and its arguments): the expansion is the crate's interface text, so another
+/// crate's check sees the input through that text, not through the input.
+pub const LATE_ITEMS: u8 = 0x40;
+
+/// A late input's kind without its position bits: LATE_FILE, LATE_ENV or LATE_CONFIG_ENV.
+pub fn late_base(kind: u8) -> u8 { kind & !(LATE_HOLE | LATE_ITEMS) }
+
+/// A late input's kind as a word: `file`, `env` or `config env`.
+pub fn late_kind_name(kind: u8) -> &'static str {
+    match late_base(kind) { LATE_FILE => "file", LATE_CONFIG_ENV => "config env", _ => "env" }
+}
+
+/// Whether a late input of a checked dependency can change another crate's check by its value
+/// (read in an expression of the dependency's interface: a const, a const fn's body, an array length).
+pub fn late_reaches_callers(kind: u8) -> bool { kind & (LATE_HOLE | LATE_ITEMS) == 0 }
 
 static LATE: crate::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = crate::sync::Mutex::new(None);
+/// The hash each late input had when this run first read it: a live edit of an included file
+/// moves its hash in LATE (the patched code read the new contents), this one stays (late_moved).
+static LATE_FIRST: crate::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = crate::sync::Mutex::new(None);
 
 /// The content hash a late input is recorded with.
 pub fn late_hash(content: Option<&[u8]>) -> u128 {
@@ -173,9 +200,10 @@ pub fn on_late_new(wake: fn()) {
 pub fn note_late_hash(krate: &str, kind: u8, name: &str, hash: u128) {
     let key = (krate.to_string(), kind, name.to_string());
     let mut g = LATE.lock().unwrap_or_else(|e| e.into_inner());
-    if g.get_or_insert_with(Default::default).insert(key, hash).is_none() {
+    if g.get_or_insert_with(Default::default).insert(key.clone(), hash).is_none() {
         LATE_NEW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         drop(g);
+        LATE_FIRST.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).entry(key).or_insert(hash);
         if let Some(wake) = LATE_WAKE.get() { wake(); }
     }
 }
@@ -188,7 +216,7 @@ pub fn late_count() -> u64 {
 /// The files read by include_str!/include_bytes! so far (any crate), each once.
 pub fn late_files() -> Vec<String> {
     let g = LATE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut v: Vec<String> = g.as_ref().map_or(Vec::new(), |m| m.keys().filter(|k| k.1 == LATE_FILE).map(|k| k.2.clone()).collect());
+    let mut v: Vec<String> = g.as_ref().map_or(Vec::new(), |m| m.keys().filter(|k| late_base(k.1) == LATE_FILE).map(|k| k.2.clone()).collect());
     v.sort();
     v.dedup();
     v
@@ -197,7 +225,7 @@ pub fn late_files() -> Vec<String> {
 /// The included files' records, (crate, path, content hash): what the code compiled so far read.
 pub fn late_file_records() -> Vec<(String, String, u128)> {
     let g = LATE.lock().unwrap_or_else(|e| e.into_inner());
-    g.as_ref().map_or(Vec::new(), |m| m.iter().filter(|(k, _)| k.1 == LATE_FILE).map(|((c, _, n), h)| (c.clone(), n.clone(), *h)).collect())
+    g.as_ref().map_or(Vec::new(), |m| m.iter().filter(|(k, _)| late_base(k.1) == LATE_FILE).map(|((c, _, n), h)| (c.clone(), n.clone(), *h)).collect())
 }
 
 /// Puts included files' records back (a live edit whose parse read new contents was not applied:
@@ -220,8 +248,21 @@ pub fn late_inputs() -> Vec<(String, u8, String, u128)> {
     v
 }
 
+/// The late inputs whose hash moved since this run first read them (a live edit of an included
+/// file), as (crate, kind, name): code built since read the new contents and code from before
+/// the old, so a cache store whose ledger names one holds neither alone (cache.rs writes none).
+pub fn late_moved() -> Vec<(String, u8, String)> {
+    let first = LATE_FIRST.lock().unwrap_or_else(|e| e.into_inner());
+    let g = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (Some(first), Some(g)) = (first.as_ref(), g.as_ref()) else { return Vec::new() };
+    let mut v: Vec<_> = g.iter().filter(|(k, h)| first.get(*k).is_some_and(|f| f != *h)).map(|(k, _)| k.clone()).collect();
+    v.sort();
+    v
+}
+
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use crate::reset_static as reset;
     reset(&LATE, crate::sync::Mutex::new(None));
+    reset(&LATE_FIRST, crate::sync::Mutex::new(None));
 }

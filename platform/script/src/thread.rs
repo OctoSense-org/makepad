@@ -1,4 +1,4 @@
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 use crate::heap::*;
 use crate::json::*;
 use crate::makepad_live_id::*;
@@ -8,7 +8,7 @@ use crate::trap::*;
 use crate::value::*;
 use crate::*;
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StackBases {
     pub loops: usize,
@@ -19,7 +19,7 @@ pub struct StackBases {
     pub slots: usize,
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Debug)]
 pub struct LoopValues {
     pub value_id: LiveId,
@@ -34,7 +34,7 @@ pub struct LoopValues {
     pub range_cache: Option<(f64, f64)>,
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Debug)]
 pub struct TryFrame {
     pub push_nil: bool,
@@ -43,7 +43,7 @@ pub struct TryFrame {
     pub bases: StackBases,
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Debug)]
 pub struct LoopFrame {
     pub values: Option<LoopValues>,
@@ -52,7 +52,7 @@ pub struct LoopFrame {
     pub bases: StackBases,
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 pub struct CallFrame {
     pub bases: StackBases,
     pub args: OpcodeArgs,
@@ -94,7 +94,7 @@ impl Into<ScriptValue> for ScriptMe {
     }
 }
 
-#[relax_api(plain)]
+#[relax_api(plain, run)]
 #[derive(Default, Debug, Clone, Copy)]
 #[repr(transparent)]
 pub struct ScriptThreadId(pub(crate) u32);
@@ -105,7 +105,7 @@ impl ScriptThreadId {
     }
 }
 
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 #[allow(unused)]
 pub struct ScriptThread {
     pub(crate) is_paused: bool,
@@ -144,6 +144,24 @@ pub struct ScriptThread {
     /// Edit mode, while a program loads: the names read and where (see
     /// `crate::literal::LoadTrace::name_reads`). None otherwise.
     pub(crate) name_reads: Option<Box<crate::literal::NameReads>>,
+    /// A sliced run ([`crate::vm::ScriptRunBudget::slice`]) stopped here at its soft deadline,
+    /// between two instructions; `resume` continues it.
+    pub(crate) yielded: bool,
+    /// What the entries a yielded run returned through still owe its end, innermost first:
+    /// done by the `resume` that completes the run.
+    pub(crate) completions: Vec<RunCompletion>,
+}
+
+/// An entry's work after its run, owed by a sliced run that yielded through it
+/// ([`ScriptThread::completions`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RunCompletion {
+    /// `run_root`: the body keeps the scope its root frame ended in.
+    RootEnd { body_id: u16 },
+    /// `eval_body`: the body counts as evaluated and its result as an eval's.
+    EvalBody { body_id: u16 },
+    /// `eval_with_append_source`: the run is silenced like a streaming one and its result is an eval's.
+    Streaming,
 }
 
 impl ScriptThread {
@@ -171,6 +189,8 @@ impl ScriptThread {
             trap: ScriptTrapInner::default(),
             json_parser: Default::default(),
             name_reads: None,
+            yielded: false,
+            completions: Vec::new(),
         }
     }
 
@@ -194,6 +214,13 @@ impl ScriptThread {
     #[inline]
     pub fn is_paused(&self) -> bool {
         self.is_paused
+    }
+
+    /// The run on this thread returned before its end: it yielded at a sliced run's deadline,
+    /// or a native paused it. The entries it returned through owe their ends to its `resume`.
+    #[inline]
+    pub(crate) fn run_unfinished(&self) -> bool {
+        self.yielded || self.is_paused
     }
 
     /// What this thread is rooting for the collector, as sizes: the value
@@ -469,7 +496,7 @@ impl ScriptThread {
 /// Wrapper around Vec<ScriptThread> with a current thread index.
 /// This allows accessing the current thread without borrowing the entire container,
 /// enabling split borrows between threads and other fields like heap/code.
-#[relax_api(handle)]
+#[relax_api(handle, run)]
 pub struct ScriptThreads {
     threads: Vec<ScriptThread>,
     current: usize,

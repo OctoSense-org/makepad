@@ -100,10 +100,10 @@ pub fn disambiguate_multi_version_crates(units: &mut [CrateUnit]) {
     }
 }
 
-/// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root>`):
-/// a unit of that crate at a matching version loads the provided root instead of its sources
-/// (same name; deps become core/alloc/std only; features ignored, except the ones the table says
-/// the provided root implements, each with the dependency it names); one at another version is
+/// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root> <features>`):
+/// a unit of that crate at a matching version that enables none of its features but those the
+/// root implements loads the provided root instead of its sources (same name and features; deps
+/// become core/alloc/std only); one at another version or with another feature enabled is
 /// compiled from its own source, which a --verbose load says. The rustc build keeps the real crates.
 /// Also hands the graph to the proc-macro host (macro_reg::register_and_strip); `additive`: the
 /// graph of a program started into a running one joins the registered graph.
@@ -117,7 +117,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
     };
     for line in apply_substitute_table(units, std_dir, &table) {
         if sess.options.verbose {
-            eprintln!("makepad run: {line}");
+            eprintln!("relax run: {line}");
         }
     }
     // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
@@ -125,8 +125,10 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
     Ok(())
 }
 
-/// The table's substitutions made in `units`; returns a line for each unit of a provided crate at
-/// another version (its own source is compiled).
+/// The table's substitutions made in `units`; returns a line for each unit of a provided crate
+/// whose own source is compiled: one at another version, or one with a feature enabled that the
+/// provided root does not implement (cargo enabled it for the graph, and the root would leave out
+/// what it gates: smallvec's `serde` impls).
 fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -> Vec<String> {
     let mut own = Vec::new();
     for line in table.lines() {
@@ -135,15 +137,11 @@ fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -
             continue;
         }
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 3 {
+        if !(3..=4).contains(&parts.len()) {
             continue;
         }
         let (name, ver, root) = (parts[0], parts[1], parts[2]);
-        // the features the provided root implements: (feature, the extern crate it needs)
-        let provided: Vec<(&str, Option<&str>)> = parts[3..].iter().map(|f| match f.split_once('=') {
-            Some((feature, dep)) => (feature, Some(dep)),
-            None => (*f, None),
-        }).collect();
+        let implemented: Vec<&str> = parts.get(3).map_or(Vec::new(), |f| f.split(',').collect());
         for u in units.iter_mut() {
             if base_crate_name(&u.name) != name || u.proc_macro {
                 continue;
@@ -153,13 +151,14 @@ fn apply_substitute_table(units: &mut [CrateUnit], std_dir: &str, table: &str) -
                 own.push(format!("crate `{}` is version {}, substitutes.txt provides {}: its own source is compiled", name, u.version, ver));
                 continue;
             }
+            let missing: Vec<&str> = u.features.iter().map(|f| f.as_str()).filter(|f| !implemented.contains(f)).collect();
+            if !missing.is_empty() {
+                own.push(format!("crate `{}` {} enables feature `{}`, which the provided {} lacks: its own source is compiled", name, u.version, missing.join("`, `"), name));
+                continue;
+            }
             u.src_path = format!("{}/{}", std_dir, root);
             u.edition = 2021;
-            // `ArrayVec<T, N>: Serialize` is part of what a dependent asked the crate for: a
-            // provided root without it fails that dependent's own impls (vodozemac's pickles).
-            u.features.retain(|f| provided.iter().any(|(feature, _)| feature == f));
-            let features = &u.features;
-            u.deps.retain(|(_, dep)| provided.iter().any(|(feature, needs)| *needs == Some(dep.as_str()) && features.iter().any(|f| f == feature)));
+            u.deps.clear();
             u.host = None;
         }
     }
@@ -185,46 +184,21 @@ fn a_provided_crate_at_another_version_compiles_its_own_source_and_says_so() {
         host_only: false,
     };
     let mut units = vec![unit("1.13.2"), unit("0.6.14")];
-    let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs\n");
+    let said = apply_substitute_table(&mut units, "/std", "# comment\nsmallvec 1 smallvec/lib.rs union\n");
     assert_eq!(units[0].src_path, "/std/smallvec/lib.rs");
-    assert!(units[0].features.is_empty());
+    assert_eq!(units[0].features, ["union"], "the provided crate keeps the features it implements");
     assert_eq!(units[1].src_path, "/registry/smallvec-0.6.14/src/lib.rs");
     assert_eq!(units[1].features, ["union"]);
     assert_eq!(said, ["crate `smallvec` is version 0.6.14, substitutes.txt provides 1: its own source is compiled"]);
-}
-
-#[cfg(test)]
-#[test]
-fn a_provided_crate_keeps_the_features_its_root_implements_and_their_dependency() {
-    let unit = |features: &[&str]| CrateUnit {
-        name: "arrayvec".to_string(),
-        src_path: "/registry/arrayvec-0.7.8/src/lib.rs".to_string(),
-        edition: 2018,
-        features: features.iter().map(|f| f.to_string()).collect(),
-        deps: vec![(7, "serde".to_string()), (9, "zeroize".to_string())],
-        host: None,
-        proc_macro: false,
-        bin: false,
-        harness: false,
-        build_script: false,
-        version: "0.7.8".to_string(),
-        registry: true,
-        host_only: false,
-    };
-    let mut units = vec![unit(&["default", "serde", "std", "zeroize"]), unit(&["default", "std"])];
-    let said = apply_substitute_table(&mut units, "/std", "arrayvec 0.7 arrayvec/lib.rs serde=serde\n");
-    assert!(said.is_empty());
-    assert_eq!(units[0].src_path, "/std/arrayvec/lib.rs");
-    assert_eq!(units[0].features, ["serde"]);
-    assert_eq!(units[0].deps, [(7, "serde".to_string())]);
-    // a unit that did not ask for the feature gets neither it nor the dependency
-    assert!(units[1].features.is_empty());
-    assert!(units[1].deps.is_empty());
-    // a feature without a dependency of its own
-    let mut units = vec![unit(&["write", "union"])];
-    apply_substitute_table(&mut units, "/std", "arrayvec 0.7 arrayvec/lib.rs write serde=serde\n");
-    assert_eq!(units[0].features, ["write"]);
-    assert!(units[0].deps.is_empty());
+    // relax issue 117: a feature the provided crate does not implement (`serde` impls) keeps the
+    // crate's own source, with its features and dependencies
+    let mut units = vec![unit("1.13.2")];
+    units[0].features.push("serde".to_string());
+    units[0].deps.push((7, "serde".to_string()));
+    let said = apply_substitute_table(&mut units, "/std", "smallvec 1 smallvec/lib.rs union,write\n");
+    assert_eq!((units[0].src_path.as_str(), units[0].deps.len()), ("/registry/smallvec-1.13.2/src/lib.rs", 1));
+    assert_eq!(units[0].features, ["union", "serde"]);
+    assert_eq!(said, ["crate `smallvec` 1.13.2 enables feature `serde`, which the provided smallvec lacks: its own source is compiled"]);
 }
 
 /// Unit indices with every crate after its dependencies.
@@ -284,7 +258,7 @@ pub fn load_units(path: &str) -> Result<Vec<CrateUnit>, String> {
         if let Some(k) = t.get("kind") {
             for s in k.arr() {
                 match s.str() {
-                    "lib" | "rlib" => kind_lib = true,
+                    "lib" | "rlib" | "dylib" => kind_lib = true,
                     "proc-macro" => kind_pm = true,
                     "custom-build" => kind_build = true,
                     _ => {}
@@ -581,7 +555,7 @@ fn collect_mods(p: &ParsedFile, cfg: &crate::cfg::CfgSet, active: bool, items: &
             };
             let mut paths = Vec::new();
             path_attrs(p, p.ast.list(it.attrs), cfg, &mut paths);
-            match body {
+            match &body.get() {
                 None => {
                     if !paths.is_empty() {
                         let rel = if top { base_dir } else { child_dir };
@@ -646,9 +620,98 @@ pub fn config_env_value(key: &str) -> Option<String> {
     CONFIG_ENV.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
-/// Value of `env!(key)` / `option_env!(key)` in crate `krate`.
+/// The value late input `name` of crate `krate` (sip LATE_*, kind `kind`) has now: an included
+/// file's contents, an `env!` value (crate_env_named), or cargo's `[env]` value a proc macro read
+/// (config_env_value alone).
+pub fn late_value_now(krate: &str, kind: u8, name: &str) -> Option<Vec<u8>> {
+    match crate::sip::late_base(kind) {
+        crate::sip::LATE_FILE => crate::vfs::read(name).ok(),
+        crate::sip::LATE_CONFIG_ENV => config_env_value(name).map(String::into_bytes),
+        _ => crate_env_named(krate, name).map(String::into_bytes),
+    }
+}
+
+/// Value of `env!(key)` / `option_env!(key)` in crate `krate`. The process environment is the one
+/// the run was started with: a variable the run set for its program (set_program_env) reads as it
+/// was before, as rustc never sees the run-time variables of the target cargo runs.
 pub fn crate_env_named(krate: &str, key: &str) -> Option<String> {
-    crate_env_registered(krate, key).or_else(|| config_env_value(key)).or_else(|| std::env::var(key).ok())
+    crate_env_registered(krate, key).or_else(|| config_env_value(key)).or_else(|| match program_env_before(key) {
+        Some(before) => before.and_then(|v| v.into_string().ok()),
+        None => std::env::var(key).ok(),
+    })
+}
+
+/// What the run changed in its own process for its program, as it was before: each variable it set
+/// (None: it was unset) and the working folder it left.
+struct ProgramProcess {
+    env: Vec<(String, Option<std::ffi::OsString>)>,
+    dir: Option<std::path::PathBuf>,
+}
+
+static PROGRAM_PROCESS: Mutex<ProgramProcess> = Mutex::new(ProgramProcess { env: Vec::new(), dir: None });
+
+/// Sets the variables of `env` in this process for the program the run calls next (the first
+/// value of a name stands), and makes `dir` the working folder when given. Each one's previous
+/// state is kept: crate_env_named reads it, and the run's end puts it back (reset_statics), so a
+/// restart starts as this run did. A reserved name (`RELAX_*`, a path package's build-script
+/// `rustc-env`) is the program's alone (progenv `set_program_value`): never in this process's
+/// environment, which this host and a self-exec child's host read their options from. Call it
+/// with no program thread running.
+pub fn set_program_env(env: &[(String, String)], dir: Option<&str>) {
+    // the record lives for the run: grown in the kept phase
+    let _k = crate::zone_alloc::kept();
+    let mut p = PROGRAM_PROCESS.lock().unwrap();
+    for (i, (k, v)) in env.iter().enumerate() {
+        if env[..i].iter().any(|(n, _)| n == k) { continue; }
+        if crate::progenv::reserved(k.as_bytes()) {
+            crate::progenv::set_program_value(k, v);
+            continue;
+        }
+        if !p.env.iter().any(|(n, _)| n == k) { p.env.push((k.clone(), std::env::var_os(k))); }
+        unsafe { std::env::set_var(k, v) };
+    }
+    if let Some(dir) = dir {
+        if let Ok(before) = std::env::current_dir() {
+            if std::env::set_current_dir(dir).is_ok() && p.dir.is_none() { p.dir = Some(before); }
+        }
+    }
+}
+
+/// Puts the program's environment outside the `RELAX_` namespace in this process (`start`, name and
+/// value bytes as the process was started: relax-base progenv `program_start`), in place of the
+/// build environment its host built with: each other such variable goes, each of `start` is set.
+/// Each one's previous state is kept as set_program_env keeps it. Call it with no program thread
+/// running.
+pub fn set_program_start_env(start: &[(Vec<u8>, Vec<u8>)]) {
+    let _k = crate::zone_alloc::kept();
+    let os = |b: &[u8]| unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b) }.to_os_string();
+    let mut p = PROGRAM_PROCESS.lock().unwrap();
+    let keep = |p: &mut ProgramProcess, k: &str| {
+        if !p.env.iter().any(|(n, _)| n == k) { p.env.push((k.to_string(), std::env::var_os(k))); }
+    };
+    for (k, _) in std::env::vars_os() {
+        let Some(name) = k.to_str() else { continue };
+        if name.starts_with("RELAX_") || start.iter().any(|(s, _)| s.as_slice() == name.as_bytes()) { continue; }
+        keep(&mut p, name);
+        unsafe { std::env::remove_var(name) };
+    }
+    for (k, v) in start {
+        let Ok(name) = std::str::from_utf8(k) else { continue };
+        keep(&mut p, name);
+        unsafe { std::env::set_var(name, os(v)) };
+    }
+}
+
+/// Some(the value before the run set it for its program) for a variable set_program_env set.
+fn program_env_before(key: &str) -> Option<Option<std::ffi::OsString>> {
+    PROGRAM_PROCESS.lock().unwrap().env.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
+/// The process as the run was started, for a restart that starts another process from this one:
+/// the variables set_program_env changed with their values before, and the folder it left.
+pub fn program_process_before() -> (Vec<(String, Option<std::ffi::OsString>)>, Option<std::path::PathBuf>) {
+    let p = PROGRAM_PROCESS.lock().unwrap();
+    (p.env.clone(), p.dir.clone())
 }
 
 /// The value `makepad run` registered for the crate (cargo's per-crate vars, build-script
@@ -681,6 +744,16 @@ fn a_package_crate_never_keeps_a_sysroot_name() {
 /// What this module holds of a run, as a fresh process has it (`run_end`). Nothing of the run is left that could see it.
 pub(crate) unsafe fn reset_statics() {
     use relax_session::reset_static as reset;
+    // the process as the run was started: its program's variables and folder go back
+    let (env, dir) = program_process_before();
+    for (k, before) in env {
+        match before {
+            Some(v) => std::env::set_var(k, v),
+            None => std::env::remove_var(k),
+        }
+    }
+    if let Some(dir) = dir { let _ = std::env::set_current_dir(dir); }
     reset(&CRATE_ENV, relax_session::sync::Mutex::new(Vec::new()));
     reset(&CONFIG_ENV, relax_session::sync::Mutex::new(Vec::new()));
+    reset(&PROGRAM_PROCESS, Mutex::new(ProgramProcess { env: Vec::new(), dir: None }));
 }

@@ -1,4 +1,4 @@
-//! Heap accounting by subsystem (MAKEPAD_RUN_MEM_REPORT=1): which part of the compiler holds the
+//! Heap accounting by subsystem (RELAX_MEM_REPORT=1): which part of the compiler holds the
 //! process's memory. Off (the default) the global allocator is the system allocator plus one
 //! relaxed load per call. On, every block carries a 16-byte header with the subsystem tag of
 //! the thread that allocated it (`tag` guards set it around parsing, type checking, lowering,
@@ -8,7 +8,8 @@
 //! A block keeps the tag it was allocated with when it grows (realloc), so a table built at
 //! boot and grown later stays a boot table. The program's own heap (Relax's std calls
 //! the program allocator ABI) is not counted; rustc-built provided crates allocate through here, as
-//! `other`.
+//! `other`, except an op's blocks in its thread's domain heap (the run phase): those are the
+//! program's, carry no header and are not counted, since JIT code frees them by address.
 
 use std::alloc::{GlobalAlloc, Layout};
 // the heap underneath: the system allocator, Relax's own malloc zone after a program swaps
@@ -82,13 +83,20 @@ pub enum Tag {
     MacroOutput,
     /// the demand planner: names, bindings, closure, recorded parts (front/src/lazy.rs, demand*.rs, rs_items.rs)
     Planner,
+    /// early and late body lints, stability gates, unsafety, and body privacy
+    BodyLints,
+    /// pattern exhaustiveness and usefulness analysis of a body
+    Patterns,
+    /// building and transforming a body's MIR for the borrow checker
+    Mir,
 }
 
-pub const N_TAGS: usize = 36;
+pub const N_TAGS: usize = 39;
 pub const TAG_NAMES: [&str; N_TAGS] = [
     "other", "boot", "parse", "parse-body", "derive", "macro_rules", "fmt", "mac-other", "load", "resolve", "syms", "sigs", "types",
     "typeck", "gandalf", "lower", "opt", "codegen", "layout", "unit", "cache-load", "cache-store", "ctfe", "O3", "pmhost", "parse-lazy",
     "rx-sources", "rx-schema", "rx-lower", "rx-input", "source", "front-image", "front-record", "program-items", "macro-output", "planner",
+    "body-lints", "patterns", "mir",
 ];
 
 /// 0 undecided, 1 off, 2 on (decided at the first allocation, never changed)
@@ -107,7 +115,7 @@ extern "C" {
 
 #[cold]
 fn decide() -> bool {
-    let v = unsafe { getenv(b"MAKEPAD_RUN_MEM_REPORT\0".as_ptr().cast()).cast::<u8>() };
+    let v = unsafe { getenv(b"RELAX_MEM_REPORT\0".as_ptr().cast()).cast::<u8>() };
     let on = !v.is_null() && unsafe { *v } != 0 && unsafe { *v } != b'0';
     STATE.store(if on { 2 } else { 1 }, Relaxed);
     on
@@ -122,7 +130,7 @@ fn on() -> bool {
     }
 }
 
-/// Accounting is on (MAKEPAD_RUN_MEM_REPORT set).
+/// Accounting is on (RELAX_MEM_REPORT set).
 #[inline(always)]
 pub fn enabled() -> bool {
     STATE.load(Relaxed) == 2
@@ -290,8 +298,15 @@ unsafe impl GlobalAlloc for Counting {
             }
             return p;
         }
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+        {
+            let p = crate::zone_alloc::domain::run_alloc(l, false);
+            if !p.is_null() {
+                return p;
+            }
+        }
         let h = hdr(l.align());
-        let b = System.alloc(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR)));
+        let b = outside_domains(|| System.alloc(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR))));
         if b.is_null() {
             return b;
         }
@@ -315,8 +330,15 @@ unsafe impl GlobalAlloc for Counting {
             }
             return p;
         }
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+        {
+            let p = crate::zone_alloc::domain::run_alloc(l, true);
+            if !p.is_null() {
+                return p;
+            }
+        }
         let h = hdr(l.align());
-        let b = System.alloc_zeroed(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR)));
+        let b = outside_domains(|| System.alloc_zeroed(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR))));
         if b.is_null() {
             return b;
         }
@@ -346,12 +368,7 @@ unsafe impl GlobalAlloc for Counting {
         if TRACK.load(Relaxed) {
             track_free(p);
         }
-        let h = hdr(l.align());
-        let b = p.sub(h);
-        sites::on_free(p, l.size());
-        add(*b.add(h - 1), -(l.size() as i64));
-        add_block(*b.add(h - 1), l.size(), -1);
-        System.dealloc(b, Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR)));
+        self.dealloc_counted(p, l);
     }
 
     #[inline(always)]
@@ -380,14 +397,36 @@ unsafe impl GlobalAlloc for Counting {
 }
 
 impl Counting {
-    /// `realloc` with accounting on (MAKEPAD_RUN_MEM_REPORT).
+    /// Frees block `p` with its header (accounting on).
+    #[inline(always)]
+    unsafe fn dealloc_counted(&self, p: *mut u8, l: Layout) {
+        let h = hdr(l.align());
+        let b = p.sub(h);
+        sites::on_free(p, l.size());
+        add(*b.add(h - 1), -(l.size() as i64));
+        add_block(*b.add(h - 1), l.size(), -1);
+        System.dealloc(b, Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR)));
+    }
+
+    /// `realloc` with accounting on (RELAX_MEM_REPORT).
     #[inline(always)]
     unsafe fn realloc_counted(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        // A counted block an op grows moves into the op's domain heap, headerless, as a new one
+        // would be there.
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android", windows))]
+        {
+            let q = crate::zone_alloc::domain::run_alloc(Layout::from_size_align_unchecked(new, l.align()), false);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+                self.dealloc_counted(p, l);
+                return q;
+            }
+        }
         let h = hdr(l.align());
         let b = p.sub(h);
         let t = *b.add(h - 1);
         if l.align() <= HDR {
-            let nb = System.realloc(b, Layout::from_size_align_unchecked(l.size() + h, HDR), new + h);
+            let nb = outside_domains(|| System.realloc(b, Layout::from_size_align_unchecked(l.size() + h, HDR), new + h));
             if nb.is_null() {
                 return nb;
             }
@@ -397,7 +436,7 @@ impl Counting {
             add_block(t, new, 1);
             return nb.add(h);
         }
-        let nb = System.alloc(Layout::from_size_align_unchecked(new + h, l.align()));
+        let nb = outside_domains(|| System.alloc(Layout::from_size_align_unchecked(new + h, l.align())));
         if nb.is_null() {
             return nb;
         }
@@ -413,12 +452,23 @@ impl Counting {
     }
 }
 
-/// Live bytes charged to `t` (0 unless MAKEPAD_RUN_MEM_REPORT).
+/// `f` with the run phase's routing into a domain heap off: a block with the header never lives
+/// in one, where a free by address would miss the header (only `run_alloc`'s headerless blocks do).
+#[inline(always)]
+fn outside_domains<R>(f: impl FnOnce() -> R) -> R {
+    if relax_session::phase::in_run() {
+        let _kept = relax_session::phase::kept();
+        return f();
+    }
+    f()
+}
+
+/// Live bytes charged to `t` (0 unless RELAX_MEM_REPORT).
 pub fn live_of(t: Tag) -> i64 {
     CTRS[t as usize].live.load(Relaxed)
 }
 
-/// Live bytes charged to the tag with index `i` (TAG_NAMES order; 0 unless MAKEPAD_RUN_MEM_REPORT).
+/// Live bytes charged to the tag with index `i` (TAG_NAMES order; 0 unless RELAX_MEM_REPORT).
 pub fn live_of_index(i: usize) -> i64 {
     CTRS.get(i).map_or(0, |c| c.live.load(Relaxed))
 }
@@ -428,16 +478,16 @@ pub fn live_total() -> i64 {
     TOTAL.live.load(Relaxed)
 }
 
-/// This thread's allocated-minus-freed bytes (0 unless MAKEPAD_RUN_MEM_REPORT).
+/// This thread's allocated-minus-freed bytes (0 unless RELAX_MEM_REPORT).
 pub fn thread_live() -> i64 {
     TL_LIVE.with(|x| x.get())
 }
 
-/// MAKEPAD_RUN_MEM_SAMPLE_MS=<ms> (with MAKEPAD_RUN_MEM_REPORT): a thread that prints
+/// RELAX_MEM_SAMPLE_MS=<ms> (with RELAX_MEM_REPORT): a thread that prints
 /// one `mem-sample:` line per interval (ms since start, rss, live total, every tag over 8 MB) and
-/// appends the JSON snapshot to MAKEPAD_RUN_MEM_JSON, so a run that is killed still leaves a timeline.
+/// appends the JSON snapshot to RELAX_MEM_JSON, so a run that is killed still leaves a timeline.
 pub fn start_sampler() {
-    let Some(ms) = std::env::var("MAKEPAD_RUN_MEM_SAMPLE_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&n| n > 0) else { return };
+    let Some(ms) = std::env::var("RELAX_MEM_SAMPLE_MS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&n| n > 0) else { return };
     if !enabled() {
         return;
     }
@@ -453,7 +503,7 @@ pub fn start_sampler() {
                 }
             }
             eprintln!("{s}");
-            if let Ok(path) = std::env::var("MAKEPAD_RUN_MEM_JSON") {
+            if let Ok(path) = std::env::var("RELAX_MEM_JSON") {
                 use std::io::Write;
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                     let _ = f.write_all(json("sample", &[]).as_bytes());
@@ -486,7 +536,7 @@ pub fn footprint() -> Option<u64> {
 
 /// The process's resident size in bytes, cheaply: no allocator statistics (process_rss's
 /// mallinfo2 walks every malloc arena -- Linux, the monitor thread's 500 ms growth check spent
-/// ~0.4 of a core in it under the sandbox game leap; macOS's malloc_zone_statistics walks the
+/// ~0.4 of a core in it under a game; macOS's malloc_zone_statistics walks the
 /// zones likewise). For checks that only compare sizes.
 pub fn resident() -> u64 {
     #[cfg(target_os = "linux")]
@@ -544,9 +594,9 @@ pub fn process_rss() -> (u64, u64, String) {
             fn mallinfo2() -> Mallinfo2;
         }
         let m = unsafe { mallinfo2() };
-        // MAKEPAD_RUN_MEM_ARENAS_OUT=<file>: each report appends glibc's malloc_info XML (per arena:
+        // RELAX_MEM_ARENAS_OUT=<file>: each report appends glibc's malloc_info XML (per arena:
         // heap size and free bytes), to see which threads' arenas hold the free-held bytes
-        if let Ok(path) = std::env::var("MAKEPAD_RUN_MEM_ARENAS_OUT") {
+        if let Ok(path) = std::env::var("RELAX_MEM_ARENAS_OUT") {
             extern "C" {
                 fn fopen(path: *const i8, mode: *const i8) -> *mut u8;
                 fn fclose(f: *mut u8) -> i32;
@@ -643,7 +693,7 @@ fn mbf(b: i64) -> f64 {
 pub fn print_tag(label: &str, tag: Tag) {
     if !enabled() { return; }
     let c = &CTRS[tag as usize];
-    eprintln!("makepad-run mem: {}: {} live {:.3} MB, peak {:.3} MB, allocated {:.3} MB",
+    eprintln!("relax mem: {}: {} live {:.3} MB, peak {:.3} MB, allocated {:.3} MB",
         label, TAG_NAMES[tag as usize], mbf(c.live.load(Relaxed)), mbf(c.peak.load(Relaxed)), mbf(c.gross.load(Relaxed) as i64));
 }
 
@@ -654,7 +704,7 @@ pub fn report(label: &str) -> String {
     let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
     let (scommitted, slive, schunks) = crate::zone_alloc::slots_stats();
     let mut out = format!(
-        "makepad-run mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}; slot arena: committed {} MB, live {} MB, chunks {}\n",
+        "relax mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}; slot arena: committed {} MB, live {} MB, chunks {}\n",
         label,
         mb(rss),
         mb(hwm),
@@ -678,14 +728,14 @@ pub fn report(label: &str) -> String {
     }
     let mut ix: Vec<usize> = (0..N_TAGS).collect();
     ix.sort_by_key(|&i| std::cmp::Reverse(CTRS[i].live.load(Relaxed).max(AT_PEAK[i].load(Relaxed))));
-    out.push_str(&format!("makepad-run mem: {}:   {:<12} {:>9} {:>9} {:>9} {:>10} {:>10}\n", label, "tag", "live MB", "@peak MB", "peak MB", "alloc MB", "blocks"));
+    out.push_str(&format!("relax mem: {}:   {:<12} {:>9} {:>9} {:>9} {:>10} {:>10}\n", label, "tag", "live MB", "@peak MB", "peak MB", "alloc MB", "blocks"));
     for i in ix {
         let c = &CTRS[i];
         if c.n.load(Relaxed) == 0 {
             continue;
         }
         out.push_str(&format!(
-            "makepad-run mem: {}:   {:<12} {:>9.1} {:>9.1} {:>9.1} {:>10.0} {:>10}\n",
+            "relax mem: {}:   {:<12} {:>9.1} {:>9.1} {:>9.1} {:>10.0} {:>10}\n",
             label,
             TAG_NAMES[i],
             mbf(c.live.load(Relaxed)),
@@ -709,7 +759,7 @@ pub fn report(label: &str) -> String {
                 }
             })
             .collect();
-        out.push_str(&format!("makepad-run mem: {}:   blocks of {} by size: {}\n", label, TAG_NAMES[i], row.join(" ")));
+        out.push_str(&format!("relax mem: {}:   blocks of {} by size: {}\n", label, TAG_NAMES[i], row.join(" ")));
     }
     out
 }
@@ -736,7 +786,7 @@ pub fn json(label: &str, extra: &[(String, u64)]) -> String {
         }
         let blocks: i64 = SIZE_LIVE[i].iter().map(|x| x.load(Relaxed)).sum();
         o.push_str(&format!(
-            "{}{{\"name\":\"makepad-run.{}\",\"live\":{},\"live_blocks\":{},\"at_heap_peak\":{},\"peak\":{},\"allocated\":{},\"allocations\":{}}}",
+            "{}{{\"name\":\"relax.{}\",\"live\":{},\"live_blocks\":{},\"at_heap_peak\":{},\"peak\":{},\"allocated\":{},\"allocations\":{}}}",
             if first { "" } else { "," },
             TAG_NAMES[i],
             c.live.load(Relaxed),
@@ -757,12 +807,12 @@ pub fn json(label: &str, extra: &[(String, u64)]) -> String {
 }
 
 /// Prints `report(label)` plus `extra` lines (structure sizes) to stderr when accounting is on;
-/// MAKEPAD_RUN_MEM_JSON=<path> also appends the snapshot there as one JSON line.
+/// RELAX_MEM_JSON=<path> also appends the snapshot there as one JSON line.
 pub fn print(label: &str, extra: &[(String, u64)]) {
     if !enabled() {
         return;
     }
-    if let Ok(path) = std::env::var("MAKEPAD_RUN_MEM_JSON") {
+    if let Ok(path) = std::env::var("RELAX_MEM_JSON") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = f.write_all(json(label, extra).as_bytes());
@@ -771,7 +821,7 @@ pub fn print(label: &str, extra: &[(String, u64)]) {
     let mut s = report(label);
     sites::report(label);
     for (k, v) in extra {
-        s.push_str(&format!("makepad-run mem: {}:   size {:<40} {:>9.1} MB\n", label, k, *v as f64 / (1u64 << 20) as f64));
+        s.push_str(&format!("relax mem: {}:   size {:<40} {:>9.1} MB\n", label, k, *v as f64 / (1u64 << 20) as f64));
     }
     eprint!("{}", s);
 }
@@ -796,25 +846,27 @@ pub fn peak_end(s: PeakScope) -> i64 {
     TL_PEAK.with(|p| p.get()) - s.0
 }
 
-/// MAKEPAD_RUN_MEM_BIG=<MB> (default 16): calls whose working set reaches it are listed (`what`).
+/// RELAX_MEM_BIG=<MB> (default 16): calls whose working set reaches it are listed (`what`).
 pub fn note_big(kind: &str, name: &str, s: PeakScope, what: impl FnOnce() -> String) {
     if !enabled() {
         return;
     }
     static LIM: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    let lim = *LIM.get_or_init(|| std::env::var("MAKEPAD_RUN_MEM_BIG").ok().and_then(|v| v.parse().ok()).unwrap_or(16i64)) << 20;
+    let lim = *LIM.get_or_init(|| std::env::var("RELAX_MEM_BIG").ok().and_then(|v| v.parse().ok()).unwrap_or(16i64)) << 20;
     let p = peak_end(s);
     if p >= lim {
-        eprintln!("makepad-run mem: big {} {:.0} MB: {} ({})", kind, mbf(p), name, what());
+        eprintln!("relax mem: big {} {:.0} MB: {} ({})", kind, mbf(p), name, what());
     }
 }
 
 /// glibc malloc keeps freed memory at the top of each thread arena until the top exceeds the trim
-/// threshold, which grows by itself (to 32 MB) whenever a large mapped block is freed. With the
-/// compiler's and the apps' threads each using an arena, a domain's start/stop cycles left ~5 MB
-/// per cycle of such free-but-resident tops (and `malloc_trim` does not release an arena's top).
-/// A fixed 1 MB threshold (which also turns the dynamic adjustment off) returns them as they
-/// are freed. Call once at process start, before threads exist. Other platforms: nothing.
+/// threshold, which grows by itself (to 32 MB) whenever a large mapped block is freed. A fixed 1 MB
+/// threshold returns such tops as they are freed: for a long-lived process whose threads come and go
+/// and whose memory is what counts (a devhub hub, devhub heap.rs). Not for a JIT process: it turns
+/// the dynamic adjustment off for the mmap threshold too, which stays at 128 KB, so every block of
+/// that size or more is its own mapping, faulted in 4 KB at a time and unmapped when it is freed
+/// (a slice's Vec growth and buffers: 1.73M faults against 0.65M, 6% of its wall time). Call once at
+/// process start, before threads exist. Other platforms: nothing.
 pub fn tune_malloc() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
@@ -869,11 +921,11 @@ pub fn name_mapping(addr: usize, len: usize, name: &'static std::ffi::CStr) {
     let _ = (addr, len, name);
 }
 
-/// Heap sites (MAKEPAD_RUN_MEM_SITES=<KB>, with MAKEPAD_RUN_MEM_REPORT): which call stacks hold the live
+/// Heap sites (RELAX_MEM_SITES=<KB>, with RELAX_MEM_REPORT): which call stacks hold the live
 /// heap. Each thread samples the allocation that crosses every <KB> of its allocated bytes
 /// (a block at least that large is always sampled); a sample stores its stack's site id in the
 /// block's header, and the site's estimated live bytes (max(size, interval) per live sampled
-/// block) drop when the block is freed. Reports go to MAKEPAD_RUN_MEM_SITES_OUT (default
+/// block) drop when the block is freed. Reports go to RELAX_MEM_SITES_OUT (default
 /// /tmp/relax-mem-sites-<pid>.txt) as raw return addresses relative to the executable's base,
 /// for offline symbolisation (nm). Linux only; off by default (no cost beyond one load).
 mod sites {
@@ -922,7 +974,7 @@ mod sites {
     #[cold]
     fn decide() -> i64 {
         extern "C" { fn getenv(name: *const core::ffi::c_char) -> *mut core::ffi::c_char; }
-        let p = unsafe { getenv(b"MAKEPAD_RUN_MEM_SITES\0".as_ptr().cast()).cast::<u8>() };
+        let p = unsafe { getenv(b"RELAX_MEM_SITES\0".as_ptr().cast()).cast::<u8>() };
         let mut v: i64 = 0;
         if !p.is_null() && cfg!(target_os = "linux") {
             let mut q = p;
@@ -1041,18 +1093,18 @@ mod sites {
         d.fbase as usize
     }
 
-    /// Appends the sites with >= 1 MB (MAKEPAD_RUN_MEM_SITES_MIN_KB) live or peak (estimated) to the sites file.
+    /// Appends the sites with >= 1 MB (RELAX_MEM_SITES_MIN_KB) live or peak (estimated) to the sites file.
     pub fn report(label: &str) {
         if iv() <= 0 { return; }
         #[cfg(target_os = "linux")]
         {
             use std::io::Write;
             let _g = BUSY.with(|b| b.replace(true));
-            let path = std::env::var("MAKEPAD_RUN_MEM_SITES_OUT").unwrap_or_else(|_| format!("/tmp/makepad-run-mem-sites-{}.txt", std::process::id()));
+            let path = std::env::var("RELAX_MEM_SITES_OUT").unwrap_or_else(|_| format!("/tmp/relax-mem-sites-{}.txt", std::process::id()));
             let b = base();
             let mut rows: Vec<(i64, i64, i64, usize)> = Vec::new();
-            // MAKEPAD_RUN_MEM_SITES_MIN_KB (default 1024): the smallest live / peak a listed site has
-            let min = std::env::var("MAKEPAD_RUN_MEM_SITES_MIN_KB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(1024) << 10;
+            // RELAX_MEM_SITES_MIN_KB (default 1024): the smallest live / peak a listed site has
+            let min = std::env::var("RELAX_MEM_SITES_MIN_KB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(1024) << 10;
             for i in 1..N {
                 let (l, p) = (LIVE[i].load(Relaxed), PEAK[i].load(Relaxed));
                 if l >= min || p >= min || COUNT[i].load(Relaxed) * iv() >= min { rows.push((l, p, COUNT[i].load(Relaxed), i)); }

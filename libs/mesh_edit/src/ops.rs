@@ -63,7 +63,7 @@ impl Mesh {
         *self = candidate;
         Ok((result, changes))
     }
-    fn element_ids(&self, ctx: &mut Context<'_>) -> Result<BTreeSet<ElementId>> {
+    pub(crate) fn element_ids(&self, ctx: &mut Context<'_>) -> Result<BTreeSet<ElementId>> {
         let mut ids = BTreeSet::new();
         for v in &self.vertices {
             ctx.checkpoint(1)?;
@@ -90,19 +90,28 @@ impl Mesh {
         Ok(ids)
     }
     pub(crate) fn repack_faces(&mut self, remove: &BTreeSet<FaceId>, ctx: &mut Context<'_>) -> Result<()> {
-        let mut faces = Vec::with_capacity(self.faces.len() - remove.len());
-        let mut corners = Vec::with_capacity(self.corners.len());
-        for f in &self.faces {
+        let mut face_count = 0;
+        let mut corner_count = 0;
+        for i in 0..self.faces.len() {
             ctx.checkpoint(1)?;
+            let f = &self.faces[i];
             if !remove.contains(&f.id) {
                 let mut face = f.clone();
-                face.first_corner = corners.len() as u32;
-                corners.extend_from_slice(self.face_corners(f.id)?);
-                faces.push(face);
+                let start = f.first_corner as usize;
+                let count = f.corner_count as usize;
+                // Destinations never overtake sources, including overlapping
+                // ranges. Corner has no heap-owned fields.
+                for j in 0..count {
+                    self.corners[corner_count + j] = self.corners[start + j].clone();
+                }
+                face.first_corner = corner_count as u32;
+                self.faces[face_count] = face;
+                face_count += 1;
+                corner_count += count;
             }
         }
-        self.faces = faces;
-        self.corners = corners;
+        self.faces.truncate(face_count);
+        self.corners.truncate(corner_count);
         self.prune_edge_attributes();
         Ok(())
     }
@@ -123,11 +132,6 @@ impl Mesh {
         ctx: &mut Context<'_>,
     ) -> Result<BTreeSet<VertexId>> {
         ctx.checkpoint(ids.len() as u64)?;
-        ctx.limit(
-            "selected vertices",
-            ids.len() as u64,
-            ctx.limits.max_vertices as u64,
-        )?;
         ctx.bytes(
             self.estimated_bytes()
                 .saturating_add(ids.len().saturating_mul(64)),
@@ -168,11 +172,6 @@ impl Mesh {
         ctx: &mut Context<'_>,
     ) -> Result<ChangeSet> {
         ctx.checkpoint(weights.len() as u64)?;
-        ctx.limit(
-            "selected vertices",
-            weights.len() as u64,
-            ctx.limits.max_vertices as u64,
-        )?;
         let count = weights
             .iter()
             .fold(0usize, |n, (_, w)| n.saturating_add(w.len()));
@@ -370,11 +369,6 @@ impl Mesh {
     /// unreferenced non-loose edge attributes are discarded.
     pub fn delete_faces(&mut self, faces: &[FaceId], ctx: &mut Context<'_>) -> Result<ChangeSet> {
         ctx.checkpoint(faces.len() as u64)?;
-        ctx.limit(
-            "selected faces",
-            faces.len() as u64,
-            ctx.limits.max_faces as u64,
-        )?;
         ctx.bytes(
             self.estimated_bytes()
                 .saturating_add(faces.len().saturating_mul(64)),
@@ -837,11 +831,6 @@ pub(crate) fn normalize_weights(
     weights: &[JointWeight],
     ctx: &mut Context<'_>,
 ) -> Result<Vec<JointWeight>> {
-    ctx.limit(
-        "weights per vertex",
-        weights.len() as u64,
-        ctx.limits.max_weights_per_vertex as u64,
-    )?;
     let mut merged = BTreeMap::<u32, f64>::new();
     for w in weights {
         ctx.checkpoint(1)?;

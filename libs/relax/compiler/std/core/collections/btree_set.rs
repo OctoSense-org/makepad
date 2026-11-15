@@ -59,6 +59,11 @@ impl<T> BTreeSet<T> {
 }
 
 impl<T: Ord> BTreeSet<T> {
+    /// The elements of `range`, in order, for which `pred` holds: each is removed as the iterator
+    /// yields it (real std 1.91; an element the iterator does not reach stays).
+    pub fn extract_if<'a, F: 'a + FnMut(&T) -> bool, R: RangeBounds<T>>(&'a mut self, range: R, pred: F) -> ExtractIf<'a, T, R, F> {
+        ExtractIf { inner: btree_map::ExtractIfInner::new(&mut self.map, range), pred }
+    }
     pub fn range<K: ?Sized + Ord, R: RangeBounds<K>>(&self, range: R) -> Range<'_, T>
     where
         T: Borrow<K>,
@@ -288,6 +293,13 @@ pub struct IntoIter<T> {
     iter: btree_map::IntoKeys<T, ()>,
 }
 
+// alloc/src/collections/btree/set.rs: the elements still to come
+impl<T: fmt::Debug> fmt::Debug for IntoIter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("IntoIter").field(&self.iter).finish()
+    }
+}
+
 impl<T> Iterator for IntoIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
@@ -305,6 +317,24 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 }
 
 impl<T> ExactSizeIterator for IntoIter<T> {}
+
+pub struct ExtractIf<'a, T, R, F> {
+    inner: btree_map::ExtractIfInner<'a, T, (), R>,
+    pred: F,
+}
+
+impl<'a, T: Ord, R: RangeBounds<T>, F: 'a + FnMut(&T) -> bool> Iterator for ExtractIf<'a, T, R, F> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        let pred = &mut self.pred;
+        self.inner.next(&mut |k: &T, _: &mut ()| pred(k)).map(|(k, _)| k)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, T: Ord, R: RangeBounds<T>, F: 'a + FnMut(&T) -> bool> FusedIterator for ExtractIf<'a, T, R, F> {}
 
 pub struct Range<'a, T: 'a> {
     iter: btree_map::Range<'a, T, ()>,
@@ -365,6 +395,19 @@ impl<'a, T: Ord> Iterator for Difference<'a, T> {
 
 impl<'a, T: Ord> FusedIterator for Difference<'a, T> {}
 
+// alloc/src/collections/btree/set.rs (a wrapper type can derive Clone and Debug over these):
+// Debug shows the two sides still to merge (rustc's shows its own merge state)
+impl<'a, T> Clone for Difference<'a, T> {
+    fn clone(&self) -> Self {
+        Difference { a: self.a.clone(), b: self.b.clone() }
+    }
+}
+impl<'a, T: fmt::Debug> fmt::Debug for Difference<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Difference").field(&self.a).field(&self.b).finish()
+    }
+}
+
 pub struct SymmetricDifference<'a, T: 'a> {
     a: Peekable<Iter<'a, T>>,
     b: Peekable<Iter<'a, T>>,
@@ -393,6 +436,19 @@ impl<'a, T: Ord> Iterator for SymmetricDifference<'a, T> {
 }
 
 impl<'a, T: Ord> FusedIterator for SymmetricDifference<'a, T> {}
+
+// alloc/src/collections/btree/set.rs (a wrapper type can derive Clone and Debug over these):
+// Debug shows the two sides still to merge (rustc's shows its own merge state)
+impl<'a, T> Clone for SymmetricDifference<'a, T> {
+    fn clone(&self) -> Self {
+        SymmetricDifference { a: self.a.clone(), b: self.b.clone() }
+    }
+}
+impl<'a, T: fmt::Debug> fmt::Debug for SymmetricDifference<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SymmetricDifference").field(&self.a).field(&self.b).finish()
+    }
+}
 
 pub struct Intersection<'a, T: 'a> {
     a: Peekable<Iter<'a, T>>,
@@ -423,6 +479,19 @@ impl<'a, T: Ord> Iterator for Intersection<'a, T> {
 
 impl<'a, T: Ord> FusedIterator for Intersection<'a, T> {}
 
+// alloc/src/collections/btree/set.rs (a wrapper type can derive Clone and Debug over these):
+// Debug shows the two sides still to merge (rustc's shows its own merge state)
+impl<'a, T> Clone for Intersection<'a, T> {
+    fn clone(&self) -> Self {
+        Intersection { a: self.a.clone(), b: self.b.clone() }
+    }
+}
+impl<'a, T: fmt::Debug> fmt::Debug for Intersection<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Intersection").field(&self.a).field(&self.b).finish()
+    }
+}
+
 pub struct Union<'a, T: 'a> {
     a: Peekable<Iter<'a, T>>,
     b: Peekable<Iter<'a, T>>,
@@ -449,6 +518,19 @@ impl<'a, T: Ord> Iterator for Union<'a, T> {
 }
 
 impl<'a, T: Ord> FusedIterator for Union<'a, T> {}
+
+// alloc/src/collections/btree/set.rs (a wrapper type can derive Clone and Debug over these):
+// Debug shows the two sides still to merge (rustc's shows its own merge state)
+impl<'a, T> Clone for Union<'a, T> {
+    fn clone(&self) -> Self {
+        Union { a: self.a.clone(), b: self.b.clone() }
+    }
+}
+impl<'a, T: fmt::Debug> fmt::Debug for Union<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Union").field(&self.a).field(&self.b).finish()
+    }
+}
 
 impl<'a, T> IntoIterator for &'a BTreeSet<T> {
     type Item = &'a T;

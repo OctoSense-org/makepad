@@ -1,6 +1,6 @@
 // ported from N:rustc_const_eval/src/interpret/{memory.rs,step.rs,operator.rs,cast.rs,discriminant.rs,intern.rs,validity.rs}
 // ported from N:rustc_middle/src/mir/interpret/allocation.rs (+ provenance_map.rs, init_mask.rs) @8d1a764
-//! The check-mode const-eval interpreter (design: local/agent_state/relax-campaign/suite/consteval.DESIGN.md).
+//! The check-mode const-eval interpreter.
 //!
 //! `makepad check` only, diagnostics only: a constant's value still comes from ctfe.rs / the JIT. The
 //! interpreter runs the constant's MIR with rustc's CTFE memory model -- allocations with an init mask,
@@ -25,7 +25,7 @@ pub enum Outcome {
     Ok,
     /// rustc's error for it: (span in the constant's own body or at the item, message with its code)
     Error(mir::Span, String),
-    /// an operation the interpreter does not have yet (`MAKEPAD_RUN_INTERP_TRACE=1` prints it)
+    /// an operation the interpreter does not have yet (`RELAX_INTERP_TRACE=1` prints it)
     Unsupported(String),
 }
 
@@ -187,6 +187,9 @@ struct Interp<'a> {
     in_progress: Vec<DefId>,
     /// validity.rs runs with validation_in_progress: no before_alloc_access hook
     validating: bool,
+    /// the MIR of each body this run entered, by (def, args): rustc builds a body's
+    /// mir_for_ctfe once (a query), not at every call
+    bodies: HashMap<(DefId, Vec<TyId>), Rc<Body>>,
 }
 
 /// rustc machine.rs LINT_TERMINATOR_LIMIT: past it the JIT path reports long_running_const_eval.
@@ -196,7 +199,7 @@ const STEP_LIMIT: u64 = 2_000_000;
 pub fn check_item(prog: &Program, tcx: &Tcx, def: DefId) -> Outcome {
     let is_static = prog.def(def).kind == DefKind::Static;
     let mut it = Interp { prog, tcx, lay: crate::layout::Layouts::new(), allocs: Vec::new(), frames: Vec::new(), steps: 0, consts: HashMap::new(), ps: tcx.tys.ptr_bytes as u64, frames_root_ty: None, nesting: 0,
-        statics: HashMap::new(), static_root: is_static.then_some(def), mut_global_ok: is_static, in_progress: if is_static { vec![def] } else { Vec::new() }, validating: false };
+        statics: HashMap::new(), static_root: is_static.then_some(def), mut_global_ok: is_static, in_progress: if is_static { vec![def] } else { Vec::new() }, validating: false, bodies: HashMap::new() };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.eval_const(def, &[], true, is_static)));
     let _ = &r;
     let span_of_item = || { let d = prog.def(def); let lo = prog.files[d.file as usize].ast.item(d.item).lo; mir::Span { file: d.file, lo, hi: lo } };
@@ -226,7 +229,7 @@ pub enum ValtreeWalk {
 }
 pub fn valtree_of_const(prog: &Program, tcx: &Tcx, def: DefId) -> ValtreeWalk {
     let mut it = Interp { prog, tcx, lay: crate::layout::Layouts::new(), allocs: Vec::new(), frames: Vec::new(), steps: 0, consts: HashMap::new(), ps: tcx.tys.ptr_bytes as u64, frames_root_ty: None, nesting: 0,
-        statics: HashMap::new(), static_root: None, mut_global_ok: false, in_progress: Vec::new(), validating: false };
+        statics: HashMap::new(), static_root: None, mut_global_ok: false, in_progress: Vec::new(), validating: false, bodies: HashMap::new() };
     let Some(ty) = tcx.const_ty(prog, def) else { return ValtreeWalk::Unknown };
     let mut adts = Vec::new();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> R<Option<TyId>> {
@@ -299,8 +302,16 @@ impl<'a> Interp<'a> {
 
     // ---- bodies and frames
 
-    /// The MIR of `def` at `args` (instantiated typeck, built, promoted).
-    fn body_of(&self, def: DefId, args: &[TyId]) -> R<Rc<Body>> {
+    /// The MIR of `def` at `args` (instantiated typeck, built, promoted), built once per run.
+    fn body_of(&mut self, def: DefId, args: &[TyId]) -> R<Rc<Body>> {
+        let key = (def, args.to_vec());
+        if let Some(b) = self.bodies.get(&key) { return Ok(b.clone()); }
+        let b = self.build_body(def, args)?;
+        self.bodies.insert(key, b.clone());
+        Ok(b)
+    }
+
+    fn build_body(&self, def: DefId, args: &[TyId]) -> R<Rc<Body>> {
         use crate::mir::build::{build_mir, BuildCx, BuildRoot};
         let (prog, tcx) = (self.prog, self.tcx);
         let state = crate::tcx::EvalState::new();

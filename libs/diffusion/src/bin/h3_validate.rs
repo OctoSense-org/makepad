@@ -14,7 +14,7 @@ use makepad_diffusion::h3::{
     h3_build_packed_layout, h3_build_row_timesteps_cond, h3_patchify_video_latents,
     h3_rope_tables, h3_scale_noise, H3ShardedWeights, H3_KEYFRAME_NOISE_AUG, H3_ROT_HALF,
 };
-use makepad_diffusion::h3_text::{h3_text_encode, h3_text_encoder_evict, H3TextEncoderPrepared};
+use makepad_diffusion::h3_text::{h3_text_encode, H3TextEncoderPrepared};
 use makepad_diffusion::h3_transformer::{h3_dit_forward, H3DitPrepared};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -147,6 +147,10 @@ fn compare(name: &str, ours: &[f32], reference: &[f32]) {
 }
 
 fn main() {
+    makepad_diffusion::backend::metal::run_model_worker("h3_validate", model_main)
+}
+
+fn model_main() {
     let args: Vec<String> = std::env::args().collect();
     let mut opts: HashMap<String, String> = HashMap::new();
     let mut key: Option<String> = None;
@@ -310,7 +314,11 @@ fn run(dump: &Path, models: &Path, stage: &str) -> Result<(), String> {
             .or_else(|_| load("te_hidden_50.npy"))?
             .as_f32()?;
         compare("te.hidden50", &hidden, &reference);
-        let freed = h3_text_encoder_evict().map_err(|err| err.to_string())?;
+        let ns = te_weights.owner().trace();
+        let (freed, _) = makepad_diffusion::backend::gpu_weight_cache_resident(&ns)?;
+        drop(prepared);
+        drop(te_weights);
+        makepad_diffusion::backend::gpu_weight_cache_resident(&ns)?;
         println!("te cache evicted: {freed} buffers");
     }
 

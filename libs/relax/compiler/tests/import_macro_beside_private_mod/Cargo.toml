@@ -1,3 +1,0 @@
-[workspace]
-members = ["mac", "samename", "app"]
-resolver = "2"

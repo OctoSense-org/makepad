@@ -16,6 +16,9 @@ use crate::state::{Pair, Pushed};
 use makepad_remote::json_str;
 
 pub const TRAILER: &str = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>";
+/// Codex's credit on a pushed commit that carries code Codex wrote: GitHub's `codex` account, which
+/// links (`noreply@openai.com` links to no account).
+pub const CODEX_TRAILER: &str = "Co-Authored-By: Codex <267193182+codex@users.noreply.github.com>";
 /// The most new commits the pre-push hook takes in one push.
 const HOOK_COMMITS: usize = 20;
 /// Where the commercial checkout's crates stand in the tree (`Ctx::commercial`).
@@ -143,7 +146,8 @@ fn commit_rows(groups: &Groups, set: &[(usize, String)]) -> String {
         .map(|(at, sha)| {
             let stat = &groups.stats[*at];
             let areas: Vec<String> = groups.areas(*at).iter().map(|a| json_str(a)).collect();
-            format!("{{\"sha\":{},\"title\":{},\"files\":{},\"added\":{},\"removed\":{},\"areas\":[{}]}}", json_str(sha), json_str(&groups.blocks[*at].title), stat.files.len(), stat.added, stat.removed, areas.join(","))
+            let credits: Vec<String> = groups.contributors.get(*at).filter(|c| !c.is_empty()).map(|c| json_str(c.trim_start_matches("Contributors: "))).into_iter().collect();
+            format!("{{\"sha\":{},\"title\":{},\"files\":{},\"added\":{},\"removed\":{},\"areas\":[{}],\"contributors\":[{}]}}", json_str(sha), json_str(&groups.blocks[*at].title), stat.files.len(), stat.added, stat.removed, areas.join(","), credits.join(","))
         })
         .collect();
     rows.join(",")
@@ -165,6 +169,9 @@ pub fn serve(ctx: &Ctx, line: &str) -> Result<String, String> {
     let json = line.split_once(' ').map_or("{}", |(_, j)| j.trim());
     let v = makepad_strict_json::parse(json.as_bytes()).map_err(|_| "push: bad request")?;
     let st = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string).filter(|x| !x.is_empty());
+    if let Some(path) = st("remap") {
+        return remap(ctx, &path);
+    }
     let dry = v.get("dry").and_then(|x| x.as_bool()).unwrap_or(false);
     let parents: Vec<String> = v.get("parents").and_then(|a| a.as_arr()).unwrap_or(&[]).iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
     let repo = &ctx.repo;
@@ -174,7 +181,7 @@ pub fn serve(ctx: &Ctx, line: &str) -> Result<String, String> {
     let sha = tip.work.clone();
     git(repo, &["fetch", "-q", "origin", "work"])?;
     let origin = git(repo, &["rev-parse", "refs/remotes/origin/work"])?;
-    let groups = Groups::between(repo, &origin, &sha)?;
+    let mut groups = Groups::between(repo, &origin, &sha)?;
     if groups.is_empty() {
         return Ok(format!("{{\"pushed\":false,\"why\":\"origin/work already has the tree of {}\",\"origin\":{}}}", super::short(&sha), json_str(&origin)));
     }
@@ -195,6 +202,10 @@ pub fn serve(ctx: &Ctx, line: &str) -> Result<String, String> {
     if groups.commits() > HOOK_COMMITS {
         return Err(format!("push: {} groups, the pre-push hook takes {HOOK_COMMITS} commits: join blocks in {}", groups.commits(), group::BLOCKS_FILE));
     }
+    // the commits it carries: since the work commit origin's tip was pushed from (all of
+    // origin..tip when no push of ours made it)
+    let since = ctx.store.read(|d| d.pushes.iter().rev().find(|p| p.commit == origin).map(|p| p.pair.work.clone())).unwrap_or_else(|| origin.clone());
+    groups.credit(repo, &since)?;
     let message = st("message");
     let from = format!("work tip {} (with commercial {})", super::short(&sha), super::short(&tip.main));
     let note = |n: usize, of: usize| Some(format!("Part {n} of {of} of {from}.{}", message.as_deref().map_or(String::new(), |m| format!("\n\n{m}"))));
@@ -214,6 +225,54 @@ pub fn serve(ctx: &Ctx, line: &str) -> Result<String, String> {
     ctx.store.update(|d| d.pushes.push(p))?;
     ctx.store.event("push", Sev::Info, format!("push: origin/work {} -> {}, {} commits (tree of tip {}, {files} files)", super::short(&origin), super::short(&last), set.len(), tip.short()), None);
     Ok(format!("{{\"pushed\":true,\"commit\":{},\"origin_was\":{},\"tip\":{},\"files\":{files},\"commits\":[{commits}]}}", json_str(&last), json_str(&origin), json_str(&sha)))
+}
+
+/// `push {"remap":"<file>"}`: after a rewrite of origin's public history the ledger's public names
+/// follow it. The file has one `<old> <new>` line per rewritten commit (the rewrite's commit map);
+/// each entry's `commit` and `origin_was` found there takes its new name. Refused, nothing changed,
+/// unless the newest entry then names origin/work's tip: the next push's `since`, and so its
+/// credits, stay those of the last push.
+fn remap(ctx: &Ctx, path: &str) -> Result<String, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("push remap: {path}: {e}"))?;
+    let oid = |s: &str| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut map = std::collections::HashMap::new();
+    for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+        let mut w = line.split_whitespace();
+        match (w.next(), w.next(), w.next()) {
+            (Some(old), Some(new), None) if oid(old) && oid(new) => map.insert(old.to_string(), new.to_string()),
+            _ => return Err(format!("push remap: {path}:{}: not `<old sha> <new sha>`", n + 1)),
+        };
+    }
+    let repo = &ctx.repo;
+    git(repo, &["fetch", "-q", "origin", "work"])?;
+    let origin = git(repo, &["rev-parse", "refs/remotes/origin/work"])?;
+    let changed = ctx.store.update(|d| {
+        let mut pushes = d.pushes.clone();
+        let changed = remap_pushes(&mut pushes, &map);
+        match pushes.last() {
+            Some(p) if p.commit == origin => {
+                d.pushes = pushes;
+                Ok(changed)
+            }
+            last => Err(format!("push remap: the newest push would name {}, origin/work is {}: nothing changed", last.map_or("nothing".into(), |p| super::short(&p.commit)), super::short(&origin))),
+        }
+    })??;
+    ctx.store.event("push", Sev::Info, format!("push remap: {changed} ledger names follow the rewrite of origin ({} commits mapped); origin/work {}", map.len(), super::short(&origin)), None);
+    Ok(format!("{{\"remapped\":{changed},\"mapped\":{},\"origin\":{}}}", map.len(), json_str(&origin)))
+}
+
+/// Renames each push's `commit` and `origin_was` found in `map`; how many names changed.
+fn remap_pushes(pushes: &mut [Pushed], map: &std::collections::HashMap<String, String>) -> usize {
+    let mut changed = 0;
+    for p in pushes {
+        for name in [&mut p.commit, &mut p.origin_was] {
+            if let Some(new) = map.get(name.as_str()) {
+                *name = new.clone();
+                changed += 1;
+            }
+        }
+    }
+    changed
 }
 
 #[cfg(test)]

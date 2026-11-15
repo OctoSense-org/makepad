@@ -61,9 +61,6 @@ pub struct ServiceHandle {
     pub http_thread: makepad_network::HttpServerThread,
     pub route_thread: JoinHandle<()>,
     pub worker_thread: JoinHandle<()>,
-    /// One per chat lane. They take from the chat admission class only, so a
-    /// chat turn never waits on the heavy worker and vice versa.
-    pub chat_threads: Vec<JoinHandle<()>>,
     /// The per-data-dir lock. Hold this for the life of the daemon (main.rs
     /// never drops its handle). Dropping the handle releases it (tests rely
     /// on that for restarts).
@@ -98,7 +95,7 @@ impl ServiceHandle {
     /// loopback server and every worker thread end, the loaded models are released and the
     /// service locks are dropped. A new [`start_service`] may follow in the same process.
     pub fn stop(self) {
-        let ServiceHandle { activity_monitor, http_thread, route_thread, worker_thread, chat_threads, singleton, shared, mut fleet_run, fleet_view_thread, node_entry, .. } = self;
+        let ServiceHandle { activity_monitor, http_thread, route_thread, worker_thread, singleton, shared, mut fleet_run, fleet_view_thread, node_entry, .. } = self;
         if let Some(entry) = node_entry {
             let _ = std::fs::remove_file(entry);
         }
@@ -123,18 +120,7 @@ impl ServiceHandle {
         crate::fleet_report::stop_probe_workers();
         let _ = route_thread.join();
         let _ = worker_thread.join();
-        for thread in chat_threads {
-            let _ = thread.join();
-        }
         drop(activity_monitor);
-        with_backends(&shared, |backends| {
-            for (id, backend) in backends.iter_mut() {
-                if let Err(error) = backend.unload() {
-                    eprintln!("{}: stop: unload {id}: {error}", crate::SERVICE_NAME);
-                }
-            }
-            backends.clear();
-        });
         shared.residency_claims.lock().unwrap_or_else(|e| e.into_inner()).clear();
         drop(singleton);
     }
@@ -461,8 +447,6 @@ pub fn start_service(mut config: ServiceConfig) -> Result<ServiceHandle, AssetAi
         drop(shared);
         std::thread::park_timeout(Duration::from_secs(5));
     }).expect("spawn fleet view worker");
-    let worker_shared = shared.clone();
-    let worker_thread = std::thread::spawn(move || worker_loop(worker_shared));
     let reaper_shared = shared.clone();
     std::thread::Builder::new()
         .name("ai-hub-lease-reaper".into())
@@ -503,13 +487,15 @@ pub fn start_service(mut config: ServiceConfig) -> Result<ServiceHandle, AssetAi
         })
         .collect();
 
+    let worker_shared = shared.clone();
+    let worker_thread = std::thread::spawn(move || worker_loop(worker_shared, chat_threads));
+
     Ok(ServiceHandle {
         activity_monitor,
         addr,
         http_thread,
         route_thread,
         worker_thread,
-        chat_threads,
         singleton,
         shared,
         fleet_run,
@@ -767,6 +753,14 @@ fn route_loop(shared: Arc<ServiceShared>, request_rx: mpsc::Receiver<HttpServerR
                 body,
                 response,
             } => {
+                // the intake gate answers from its own worker: the route loop never waits on the
+                // upstream Messages API
+                if headers.path == "/v1/messages" {
+                    let client = caller_of(&shared, &headers).map(|c| c.client_id);
+                    let serving = shared.registry.models.iter().any(|spec| spec.backend == crate::claude_cli::BACKEND);
+                    crate::intake_scope::route_messages(&shared.cache_dir, client.as_deref(), serving, &headers.lines, body, response);
+                    continue;
+                }
                 if headers.path.starts_with("/kernel") {
                     let _ = response.send(error_json(404, "no such kernel route".into()));
                     continue;
@@ -872,8 +866,15 @@ fn route_loop(shared: Arc<ServiceShared>, request_rx: mpsc::Receiver<HttpServerR
 /// The `kernel` domain (`crate::kernel_wire`): compute programs on this node, for the callers
 /// [`kernel_caller`] takes. `GET /kernel` is the node's info; the programs run over the stream.
 fn route_kernel(shared: &Arc<ServiceShared>, headers: &HttpServerHeaders, response_sender: mpsc::Sender<HttpServerResponse>) {
-    if kernel_caller(shared, headers).is_none() {
+    let Some(caller) = kernel_caller(shared, headers) else {
         let _ = response_sender.send(error_json(401, "compute programs need this machine's token or a fleet machine credential".into()));
+        return;
+    };
+    // a machine held quiet runs no programs: a client that asks finds the node busy and goes
+    // to another (or its own cores)
+    if let Some(reason) = quiet_refusal(shared) {
+        shared.activity.refused(&format!("GET /kernel from {}", caller.client_id));
+        let _ = response_sender.send(error_json(503, reason));
         return;
     }
     let path = headers.path.split('?').next().unwrap_or_default();
@@ -899,12 +900,24 @@ fn route_kernel_stream(shared: &Arc<ServiceShared>, headers: &HttpServerHeaders,
     let caller = kernel_caller(shared, headers);
     #[cfg(feature = "kernel")]
     if let Some(caller) = caller {
+        if quiet_refusal(shared).is_some() {
+            shared.activity.refused(&format!("kernel stream from {}", caller.client_id));
+            let _ = response_sender.send(Vec::new());
+            return;
+        }
         crate::program_serve::service().stream_open(web_socket_id, &caller.client_id, response_sender);
         return;
     }
     #[cfg(not(feature = "kernel"))]
     let _ = (caller, web_socket_id);
     let _ = response_sender.send(Vec::new());
+}
+
+/// The refusal while a timed run holds the machine quiet ([`crate::activity::ActivityGate::set_quiet`]):
+/// compute programs, which the AI admission gate does not take part in otherwise, stop then too.
+fn quiet_refusal(shared: &ServiceShared) -> Option<String> {
+    let holder = shared.activity.quiet_holder();
+    (!holder.is_empty()).then(|| format!("local-use: timed-lease ({holder})"))
 }
 
 /// Who may run compute programs here: an app on this machine, by the machine token on the
@@ -964,6 +977,16 @@ fn route_post_request(
         }
         return control_local_use(shared, body);
     }
+    if crate::intake_scope::is_intake(&caller.client_id) {
+        if !crate::intake_scope::route_allowed("POST", &headers.path) {
+            return error_json(403, "intake scope: route".to_string());
+        }
+        if headers.path == "/generate" {
+            if let Err(refusal) = crate::intake_scope::gate_generate(&shared.cache_dir, &caller.client_id, &headers.lines, body) {
+                return refusal;
+            }
+        }
+    }
     route_post_by(shared, &caller, &headers.path, body)
 }
 
@@ -987,7 +1010,10 @@ pub fn control_post(shared: &Arc<ServiceShared>, path: &str, body: &[u8]) -> Res
 /// the hosting WM's report (`crate::activity::ComputeMode`). Closing admission goes the way
 /// of all local use: running jobs are cancelled as `local-use: …` (their clients reroute),
 /// queued ones wait or reroute, and the model worker unloads. AI First drops the UI reserve:
-/// it never yields GPU memory.
+/// it never yields GPU memory. `"quiet": "<holder>"` is the machine's lease hub instead: a timed
+/// run holds the box, admission closes whatever the mode and the compute programs' streams end
+/// (their clients go to other nodes); `"quiet": ""` ends it, and the answer says what it refused
+/// meanwhile (`refused`, `refused_said`). A field left out is left as it is.
 fn control_local_use(shared: &Arc<ServiceShared>, body: &[u8]) -> HttpServerResponse {
     let Ok(value) = json::parse(body) else {
         return error_json(400, "need {\"mode\": \"auto\"|\"ui-first\"|\"ai-first\"|\"unavailable\", \"use\": \"gaming\"|\"\"}".to_string());
@@ -1005,13 +1031,36 @@ fn control_local_use(shared: &Arc<ServiceShared>, body: &[u8]) -> HttpServerResp
         Some("") => false,
         Some(other) => return error_json(400, format!("unknown local use {other:?}")),
     };
+    let quiet = match value.get("quiet") {
+        None => None,
+        Some(v) => match v.as_str() {
+            Some(holder) => Some(holder.trim().to_string()),
+            None => return error_json(400, "\"quiet\" is who holds the machine quiet, or \"\"".to_string()),
+        },
+    };
     let (was_mode, was_gaming) = (shared.activity.mode(), shared.activity.gaming());
     shared.activity.set_local_use(mode, gaming);
+    let was_quiet = shared.activity.quiet_holder();
+    let ended = quiet.as_deref().and_then(|holder| shared.activity.set_quiet(holder));
     if mode == crate::activity::ComputeMode::AiFirst {
         crate::gpu_yield::set_ui_reserve_mb(0);
     }
     shared.jobs.with(|store| store.interrupt_for_activity());
-    let snap = shared.activity.snapshot();
+    if let Some(holder) = quiet.as_deref().filter(|h| !h.is_empty() && *h != was_quiet) {
+        #[cfg(feature = "kernel")]
+        let streams = crate::program_serve::service().end_all();
+        #[cfg(not(feature = "kernel"))]
+        let streams = 0;
+        eprintln!("[local-use] {holder} holds this machine quiet: admission closed, {streams} compute program stream(s) ended");
+    }
+    if let Some(e) = &ended {
+        eprintln!("[local-use] the quiet of {} is over: it refused {} request(s){}", e.holder, e.refused, if e.said.is_empty() { String::new() } else { format!(" ({})", e.said.join("; ")) });
+    }
+    let mut snap = shared.activity.snapshot();
+    if let Some(e) = ended {
+        snap.refused = Some(e.refused);
+        snap.refused_said = Some(e.said);
+    }
     if (was_mode, was_gaming) != (mode, gaming) {
         eprintln!(
             "[local-use] mode {} {}: admission {} ({})",
@@ -1595,7 +1644,9 @@ fn control_json(shared: &Arc<ServiceShared>) -> String {
     let now_ms = crate::jobs::now_ms();
     let num = |v: Option<u64>| v.map_or(Value::Null, |n| Value::Int(n as i64));
     let text = |v: Option<String>| v.map_or(Value::Null, json::s);
-    let device_kind = if gpu.name.is_some() {
+    let device_kind = if gpu.unified {
+        "metal"
+    } else if gpu.name.is_some() {
         "cuda"
     } else if cfg!(target_os = "macos") {
         "metal"
@@ -1845,6 +1896,7 @@ fn route_post_by(shared: &Arc<ServiceShared>, caller: &makepad_network::fleet::f
     }
     if matches!(path, "/generate" | "/jobs" | "/realtime") {
         if let Some(reason) = shared.activity.refusal() {
+            shared.activity.refused(&format!("POST {path} from {}", caller.client_id));
             return generate_refused(&AssetAiError::Unavailable(reason));
         }
     }
@@ -1941,6 +1993,27 @@ fn route_post_by(shared: &Arc<ServiceShared>, caller: &makepad_network::fleet::f
             CancelOutcome::Unknown => error_json(404, format!("no such job: {job_id}")),
         };
     }
+    // POST /job/<id>/discard — the owner has what the finished job made: its record and artifacts
+    // are deleted now instead of waiting out the retention ring (a job made of someone's
+    // voice is not kept). 409 for a job that has not finished.
+    if let Some(job_id) = path
+        .strip_prefix("/job/")
+        .and_then(|rest| rest.strip_suffix("/discard"))
+    {
+        let owner = shared.job_owners.lock().unwrap().get(job_id).cloned();
+        if owner.is_some_and(|owner| owner != caller.client_id) && caller.client_id != "local" {
+            return error_json(403, format!("job {job_id} belongs to another client"));
+        }
+        let gone = shared.jobs.with(|store| store.discard_finished(job_id));
+        return match gone {
+            Some(job) => {
+                purge_jobs(shared, std::slice::from_ref(&job));
+                shared.job_owners.lock().unwrap().remove(job_id);
+                ok_json(r#"{"discarded":true}"#.to_string())
+            }
+            None => error_json(409, format!("job {job_id} is unknown or has not finished")),
+        };
+    }
     if path == "/realtime" {
         return route_realtime_post(shared, body);
     }
@@ -2022,6 +2095,13 @@ fn route_generate(shared: &Arc<ServiceShared>, caller: &makepad_network::fleet::
     if spec.domain == crate::registry::Domain::Ocr {
         if let Err(e) = crate::ocr_backend::validate_ocr_params(&params) {
             return error_json(400, e.to_string());
+        }
+    }
+    // A claude-cli turn runs the Claude model it names, one of those this hub accepts: any
+    // other is a 400 that lists them, never a queued job that can only fail.
+    if spec.backend == crate::claude_cli::BACKEND {
+        if let Err(e) = crate::claude_cli::accepted_model(&params.claude_model) {
+            return error_json(400, e);
         }
     }
     // Admission class. Chat rides the lane worker, which serves several turns
@@ -2116,7 +2196,10 @@ fn generate_refused(refused: &AssetAiError) -> HttpServerResponse {
 /// admits an ordinary job (same FIFO / `queue_policy=reject` gate); see the
 /// "Realtime session wire protocol" doc block in `protocol.rs`.
 fn route_realtime_post(shared: &Arc<ServiceShared>, body: &[u8]) -> HttpServerResponse {
-    if let Some(reason) = shared.activity.refusal() { return generate_refused(&AssetAiError::Unavailable(reason)); }
+    if let Some(reason) = shared.activity.refusal() {
+        shared.activity.refused("POST /realtime");
+        return generate_refused(&AssetAiError::Unavailable(reason));
+    }
     let text = match std::str::from_utf8(body) {
         Ok(text) => text,
         Err(_) => return error_json(400, "request body is not utf-8".to_string()),
@@ -2203,10 +2286,10 @@ fn health_json(shared: &Arc<ServiceShared>) -> HealthJson {
         .iter()
         .filter(|spec| {
             model_availability(spec, &gpu, shared.residency.reserve_mb).is_ok()
-                && shared.vram_usable.get().is_none_or(|usable_mb| {
+                && (gpu.unified || shared.vram_usable.get().is_none_or(|usable_mb| {
                     residency::too_small_note(spec, shared.residency.reserve_mb, usable_mb)
                         .is_none()
-                })
+                }))
         })
         .map(|spec| crate::claude_cli::advertised_domain(spec).to_string())
         .collect();
@@ -2228,6 +2311,7 @@ fn health_json(shared: &Arc<ServiceShared>) -> HealthJson {
         vram_free_mb: gpu.vram_free_mb,
         vram_total_mb: gpu.vram_total_mb,
         vram_usable_mb: shared.vram_usable.get(),
+        vram_unified: Some(gpu.unified),
         models_loaded,
         jobs_pending: Some(jobs_pending),
         node_id: Some(shared.node_id),
@@ -2332,7 +2416,7 @@ fn models_json(shared: &Arc<ServiceShared>) -> ModelsJson {
                     }
                 })
             });
-            let too_small_note = shared.vram_usable.get().and_then(|usable_mb| {
+            let too_small_note = shared.vram_usable.get().filter(|_| !gpu.unified).and_then(|usable_mb| {
                 residency::too_small_note(spec, shared.residency.reserve_mb, usable_mb)
             });
             let available = unavailable_reason.is_none() && too_small_note.is_none();
@@ -2463,7 +2547,7 @@ fn chat_worker_loop(shared: Arc<ServiceShared>) {
     }
 }
 
-fn worker_loop(shared: Arc<ServiceShared>) {
+fn worker_loop(shared: Arc<ServiceShared>, chat_threads: Vec<JoinHandle<()>>) {
     let mut last_empty_vram_refresh = Instant::now();
     // Whether the device caches this thread owns have already been released
     // for the current idle stretch. Cleared the moment a job runs, so the
@@ -2521,6 +2605,19 @@ fn worker_loop(shared: Arc<ServiceShared>) {
         }
         apply_finished_retention(&shared);
     }
+    // Chat turns can still access the backend map after their concurrent handle
+    // drops. Join the lanes before unloading and clearing it on this worker.
+    for thread in chat_threads {
+        let _ = thread.join();
+    }
+    with_backends(&shared, |backends| {
+        for (id, backend) in backends.iter_mut() {
+            if let Err(error) = backend.unload() {
+                eprintln!("{}: stop: unload {id}: {error}", crate::SERVICE_NAME);
+            }
+        }
+        backends.clear();
+    });
 }
 
 /// The process is told to stop (SIGTERM; a WM restarting its hub): admission closes as
@@ -2634,8 +2731,13 @@ fn apply_finished_retention(shared: &Arc<ServiceShared>) {
     if evicted.is_empty() {
         return;
     }
+    purge_jobs(shared, &evicted);
+}
+
+/// Deletes the artifacts (files and map entries) of jobs the store let go.
+fn purge_jobs(shared: &Arc<ServiceShared>, jobs: &[crate::jobs::EvictedJob]) {
     let mut artifacts = shared.artifacts.lock().unwrap();
-    for job in &evicted {
+    for job in jobs {
         for artifact_id in &job.artifact_ids {
             if let Some(meta) = artifacts.remove(artifact_id) {
                 let _ = fs::remove_file(&meta.path);
@@ -3787,26 +3889,9 @@ fn evict_resident(
 #[allow(unused_variables, unused_mut)]
 fn release_worker_thread_device_caches(progress: &mut dyn FnMut(&str)) -> usize {
     let mut released_bytes = 0usize;
-    #[cfg(any(
-        feature = "flux",
-        feature = "mesh",
-        feature = "matte-native",
-        feature = "depth-native",
-        feature = "segment-native",
-        feature = "rig-native",
-        feature = "motion-native",
-        feature = "video",
-        feature = "audio",
-        feature = "indextts",
-        // Both of these run heavy GPU pipelines through the same thread-local
-        // weight cache, and both were missing: a build enabled for them and
-        // nothing else compiled this whole function to a no-op, so the release
-        // that the retire path depends on silently did not exist.
-        feature = "paint-cuda",
-        feature = "upscale-native"
-    ))]
+    #[cfg(feature = "ai-common")]
     {
-        match makepad_ai_common::backend::gpu_weight_cache_evict_prefix_if_loaded("") {
+        match makepad_ai_common::backend::gpu_weight_cache_evict_all_if_loaded() {
             Ok(count) => progress(&format!(
                 "vram-release: evicted {count} cached weight buffers on the service worker thread"
             )),
@@ -3824,6 +3909,14 @@ fn release_worker_thread_device_caches(progress: &mut dyn FnMut(&str)) -> usize 
         }
     }
     released_bytes
+}
+
+/// After reclaiming idle allocations, unified memory may exceed its advisory
+/// working set. A note is also the admission decision; CUDA keeps its byte gate.
+fn over_recommended_admission(unified: bool, need: u64, free: u64) -> Option<String> {
+    (unified && free < need).then(|| {
+        format!("admitted over the recommended working set (unified memory): need {need} MB, free {free} MB")
+    })
 }
 
 /// The admission gate run before a model loads: single-heavy default
@@ -3918,13 +4011,17 @@ fn admit_for_load(
     // ensure-style device caches (weights parked by backends without unload
     // hooks, idle pool blocks), then give the driver a bounded window to
     // publish the freed memory (WDDM bookkeeping trails the allocator), and
-    // only then refuse — explicitly, never a silent fallback.
+    // only then refuse on discrete memory. Unified memory admits with a note.
     let pool_trim = pool_trim.unwrap_or_else(|| {
         trim_worker_thread_cached_pool(shared, backends, &mut progress)
     });
     let (post_trim_free, admitted) = residency::admission_after_trim(&pool_trim, free, need);
     free = post_trim_free;
     if admitted {
+        return Ok(());
+    }
+    if let Some(note) = over_recommended_admission(gpu.unified, need, free) {
+        progress(&note);
         return Ok(());
     }
     // The request can never fit when it is bigger than the device itself.
@@ -3994,6 +4091,28 @@ mod lifecycle_tests {
     use super::*;
     use crate::backend::{ArtifactData, CancelToken, ProgressSink};
     use crate::registry::{Domain, FileSpec, ModelSpec};
+
+    #[test]
+    fn unified_admission_reports_the_overage_without_bypassing_cuda() {
+        let need = 30720;
+        let free = 1;
+        assert_eq!(
+            over_recommended_admission(true, need, free).as_deref(),
+            Some("admitted over the recommended working set (unified memory): need 30720 MB, free 1 MB")
+        );
+        assert!(over_recommended_admission(false, need, free).is_none());
+        assert!(over_recommended_admission(true, need, need).is_none());
+        let trimmed = residency::CachedPoolTrim {
+            before_free_mb: Some(free),
+            after_gpu: crate::gpu::GpuInfo {
+                vram_free_mb: Some(free),
+                vram_total_mb: Some(2),
+                unified: false,
+                ..Default::default()
+            },
+        };
+        assert!(!residency::admission_after_trim(&trimmed, free, need).1);
+    }
 
     #[test]
     fn networked_hub_off_keeps_the_listener_on_loopback() {
@@ -5040,7 +5159,6 @@ mod lifecycle_tests {
     fn actual_generate_refusals_preserve_typed_reject_results_over_http() {
         use crate::client::{ContentProvider, LocalService};
         use std::io::{Read, Write};
-        use std::time::{Duration, Instant};
 
         for refused in [
             AssetAiError::Busy,
@@ -5052,8 +5170,8 @@ mod lifecycle_tests {
             // ws_path:null and silently turned these refusals into Http errors.
             let response = generate_refused(&refused);
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
+            let address = listener.local_addr().unwrap();
+            let url = format!("http://{address}");
             let request = GenerateRequestJson {
                 model: "flux1-schnell".into(),
                 prompt: Some("old car".into()),
@@ -5066,24 +5184,17 @@ mod lifecycle_tests {
             let expected_body = request.serialize_json().into_bytes();
             std::thread::scope(|scope| {
                 let server = scope.spawn(move || {
-                    let deadline = Instant::now() + Duration::from_secs(3);
-                    let (mut stream, _) = loop {
-                        match listener.accept() {
-                            Ok(stream) => break stream,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-                                && Instant::now() < deadline => {
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                            Err(error) => panic!("refusal fixture accept: {error}"),
-                        }
-                    };
-                    stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                    stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                    // Blocking accept and reads: the fixture waits for the
+                    // client's POST itself, however long a loaded box takes.
+                    // (A stream accepted from a non-blocking listener is
+                    // non-blocking on macOS, so its reads saw WouldBlock
+                    // whenever the POST had not arrived yet.)
+                    let (mut stream, _) = listener.accept().unwrap();
                     let mut head = Vec::new();
                     let mut byte = [0];
                     while !head.ends_with(b"\r\n\r\n") {
                         assert!(head.len() < 16 * 1024, "fixture request head too large");
-                        stream.read_exact(&mut byte).unwrap();
+                        stream.read_exact(&mut byte).expect("the client's POST head");
                         head.push(byte[0]);
                     }
                     let head = String::from_utf8(head).unwrap();
@@ -5104,6 +5215,11 @@ mod lifecycle_tests {
                     Domain::Image, &request, &|| false,
                     &mut |_| panic!("explicit reject must not wait for admission"),
                 );
+                // A client that returned without connecting must fail the
+                // test, not leave the fixture in accept(): this connection
+                // wakes it (EOF on the head). After a real POST it only
+                // reaches the backlog of a listener that is done.
+                drop(std::net::TcpStream::connect(address));
                 server.join().unwrap();
                 assert_eq!(result, Err(refused));
             });

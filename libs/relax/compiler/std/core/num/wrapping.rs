@@ -123,6 +123,133 @@ impl<T: BitAnd<Output = T> + Copy> BitAndAssign for Wrapping<T> {
         self.0 = self.0 & rhs.0;
     }
 }
+// The by-reference forms real core gets from forward_ref_binop!, forward_ref_op_assign! and
+// forward_ref_unop!: `a + &b`, `&a + b`, `&a + &b`, `a += &b`, `-&a`, `!&a`.
+macro_rules! wrapping_ref_ops {
+    ($($Op:ident $op:ident $OpAssign:ident $op_assign:ident;)*) => {$(
+        impl<'a, T: $Op<Output = T> + Copy> $Op<&'a Wrapping<T>> for Wrapping<T> {
+            type Output = Wrapping<T>;
+            fn $op(self, rhs: &'a Wrapping<T>) -> Wrapping<T> {
+                Wrapping($Op::$op(self.0, rhs.0))
+            }
+        }
+        impl<'a, T: $Op<Output = T> + Copy> $Op<Wrapping<T>> for &'a Wrapping<T> {
+            type Output = Wrapping<T>;
+            fn $op(self, rhs: Wrapping<T>) -> Wrapping<T> {
+                Wrapping($Op::$op(self.0, rhs.0))
+            }
+        }
+        impl<'a, 'b, T: $Op<Output = T> + Copy> $Op<&'b Wrapping<T>> for &'a Wrapping<T> {
+            type Output = Wrapping<T>;
+            fn $op(self, rhs: &'b Wrapping<T>) -> Wrapping<T> {
+                Wrapping($Op::$op(self.0, rhs.0))
+            }
+        }
+        impl<'a, T: $Op<Output = T> + Copy> $OpAssign<&'a Wrapping<T>> for Wrapping<T> {
+            fn $op_assign(&mut self, rhs: &'a Wrapping<T>) {
+                self.0 = $Op::$op(self.0, rhs.0);
+            }
+        }
+    )*};
+}
+wrapping_ref_ops! {
+    Add add AddAssign add_assign; Sub sub SubAssign sub_assign; Mul mul MulAssign mul_assign;
+    BitXor bitxor BitXorAssign bitxor_assign;
+    BitOr bitor BitOrAssign bitor_assign; BitAnd bitand BitAndAssign bitand_assign;
+}
+// Division and remainder wrap as well: `MIN / -1` is `MIN` and `MIN % -1` is 0 where the plain
+// operators overflow, so these go through wrapping_div and wrapping_rem per integer type, in
+// every by-value and by-reference form.
+macro_rules! wrapping_div_rem {
+    ($($t:ty)*) => {$(
+        wrapping_div_rem! { @ops $t; Div div DivAssign div_assign wrapping_div; Rem rem RemAssign rem_assign wrapping_rem; }
+    )*};
+    (@ops $t:ty; $($Op:ident $op:ident $OpAssign:ident $op_assign:ident $wrapping:ident;)*) => {$(
+        impl $Op for Wrapping<$t> {
+            type Output = Wrapping<$t>;
+            fn $op(self, rhs: Wrapping<$t>) -> Wrapping<$t> {
+                Wrapping(self.0.$wrapping(rhs.0))
+            }
+        }
+        impl<'a> $Op<&'a Wrapping<$t>> for Wrapping<$t> {
+            type Output = Wrapping<$t>;
+            fn $op(self, rhs: &'a Wrapping<$t>) -> Wrapping<$t> {
+                Wrapping(self.0.$wrapping(rhs.0))
+            }
+        }
+        impl<'a> $Op<Wrapping<$t>> for &'a Wrapping<$t> {
+            type Output = Wrapping<$t>;
+            fn $op(self, rhs: Wrapping<$t>) -> Wrapping<$t> {
+                Wrapping(self.0.$wrapping(rhs.0))
+            }
+        }
+        impl<'a, 'b> $Op<&'b Wrapping<$t>> for &'a Wrapping<$t> {
+            type Output = Wrapping<$t>;
+            fn $op(self, rhs: &'b Wrapping<$t>) -> Wrapping<$t> {
+                Wrapping(self.0.$wrapping(rhs.0))
+            }
+        }
+        impl $OpAssign for Wrapping<$t> {
+            fn $op_assign(&mut self, rhs: Wrapping<$t>) {
+                self.0 = self.0.$wrapping(rhs.0);
+            }
+        }
+        impl<'a> $OpAssign<&'a Wrapping<$t>> for Wrapping<$t> {
+            fn $op_assign(&mut self, rhs: &'a Wrapping<$t>) {
+                self.0 = self.0.$wrapping(rhs.0);
+            }
+        }
+    )*};
+}
+wrapping_div_rem! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
+// `x op= int` and `x op= &int` with the plain integer on the right, which real core has for
+// every integer type (wrapping_int_assign_impl!, stable since 1.60).
+macro_rules! wrapping_int_assign {
+    ($($t:ty)*) => {$(
+        wrapping_int_assign! { @ops $t;
+            AddAssign add_assign; SubAssign sub_assign; MulAssign mul_assign; DivAssign div_assign;
+            RemAssign rem_assign; BitXorAssign bitxor_assign; BitOrAssign bitor_assign;
+            BitAndAssign bitand_assign;
+        }
+    )*};
+    (@ops $t:ty; $($OpAssign:ident $op_assign:ident;)*) => {$(
+        impl $OpAssign<$t> for Wrapping<$t> {
+            fn $op_assign(&mut self, rhs: $t) {
+                <Wrapping<$t> as $OpAssign<Wrapping<$t>>>::$op_assign(self, Wrapping(rhs))
+            }
+        }
+        impl<'a> $OpAssign<&'a $t> for Wrapping<$t> {
+            fn $op_assign(&mut self, rhs: &'a $t) {
+                <Wrapping<$t> as $OpAssign<Wrapping<$t>>>::$op_assign(self, Wrapping(*rhs))
+            }
+        }
+    )*};
+}
+wrapping_int_assign! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
+// Unary minus is `0 - x` for every integer type, the unsigned ones too, as in real core.
+macro_rules! wrapping_neg {
+    ($($t:ty)*) => {$(
+        impl Neg for Wrapping<$t> {
+            type Output = Wrapping<$t>;
+            fn neg(self) -> Wrapping<$t> {
+                Wrapping(self.0.wrapping_neg())
+            }
+        }
+        impl<'a> Neg for &'a Wrapping<$t> {
+            type Output = Wrapping<$t>;
+            fn neg(self) -> Wrapping<$t> {
+                Wrapping(self.0.wrapping_neg())
+            }
+        }
+    )*};
+}
+wrapping_neg! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
+impl<'a, T: Not<Output = T> + Copy> Not for &'a Wrapping<T> {
+    type Output = Wrapping<T>;
+    fn not(self) -> Wrapping<T> {
+        Wrapping(!self.0)
+    }
+}
 impl<T: Shl<usize, Output = T> + Copy> ShlAssign<usize> for Wrapping<T> {
     fn shl_assign(&mut self, rhs: usize) {
         self.0 = self.0 << rhs;
@@ -133,131 +260,36 @@ impl<T: Shr<usize, Output = T> + Copy> ShrAssign<usize> for Wrapping<T> {
         self.0 = self.0 >> rhs;
     }
 }
-
-// library/core/src/num/wrapping.rs wrapping_impl! and sh_impl_all!: what is per integer type
-// there. Div and Rem go through wrapping_div / wrapping_rem (MIN / -1 is MIN, not a panic), unary
-// minus is 0 - x (so the unsigned words have it), and every operator gets its forward_ref_binop!,
-// forward_ref_unop! and forward_ref_op_assign! family -- `a op &b`, `&a op b`, `&a op &b`,
-// `a op= &b` -- plus `a op= int` and `a op= &int` (ring's SHA-1 adds the `&Wrapping<u32>` a slice
-// iterator hands it).
-macro_rules! wrapping_forward_binop {
-    ($t:ty, $rhs:ty, $($tr:ident $m:ident)*) => ($(
-        impl<'a> $tr<$rhs> for &'a Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn $m(self, rhs: $rhs) -> Wrapping<$t> {
-                <Wrapping<$t> as $tr<$rhs>>::$m(*self, rhs)
+// The shifts with the value or the count by reference (forward_ref_binop! and
+// forward_ref_op_assign! in real core): `a << &n`, `&a << n`, `&a << &n`, `a <<= &n`.
+macro_rules! wrapping_ref_shifts {
+    ($($Op:ident $op:ident $OpAssign:ident $op_assign:ident;)*) => {$(
+        impl<'a, T: $Op<usize, Output = T>> $Op<&'a usize> for Wrapping<T> {
+            type Output = Wrapping<T>;
+            fn $op(self, rhs: &'a usize) -> Wrapping<T> {
+                <Wrapping<T> as $Op<usize>>::$op(self, *rhs)
             }
         }
-        impl<'a> $tr<&'a $rhs> for Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn $m(self, rhs: &'a $rhs) -> Wrapping<$t> {
-                <Wrapping<$t> as $tr<$rhs>>::$m(self, *rhs)
+        impl<'a, T: $Op<usize, Output = T> + Copy> $Op<usize> for &'a Wrapping<T> {
+            type Output = Wrapping<T>;
+            fn $op(self, rhs: usize) -> Wrapping<T> {
+                <Wrapping<T> as $Op<usize>>::$op(*self, rhs)
             }
         }
-        impl<'a, 'b> $tr<&'a $rhs> for &'b Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn $m(self, rhs: &'a $rhs) -> Wrapping<$t> {
-                <Wrapping<$t> as $tr<$rhs>>::$m(*self, *rhs)
+        impl<'a, 'b, T: $Op<usize, Output = T> + Copy> $Op<&'b usize> for &'a Wrapping<T> {
+            type Output = Wrapping<T>;
+            fn $op(self, rhs: &'b usize) -> Wrapping<T> {
+                <Wrapping<T> as $Op<usize>>::$op(*self, *rhs)
             }
         }
-    )*)
+        impl<'a, T: $Op<usize, Output = T> + Copy> $OpAssign<&'a usize> for Wrapping<T> {
+            fn $op_assign(&mut self, rhs: &'a usize) {
+                <Wrapping<T> as $OpAssign<usize>>::$op_assign(self, *rhs)
+            }
+        }
+    )*};
 }
-
-macro_rules! wrapping_forward_assign {
-    ($t:ty, $($tr:ident $m:ident)*) => ($(
-        impl<'a> $tr<&'a Wrapping<$t>> for Wrapping<$t> {
-            #[inline]
-            fn $m(&mut self, rhs: &'a Wrapping<$t>) {
-                <Wrapping<$t> as $tr<Wrapping<$t>>>::$m(self, *rhs)
-            }
-        }
-        impl $tr<$t> for Wrapping<$t> {
-            #[inline]
-            fn $m(&mut self, rhs: $t) {
-                <Wrapping<$t> as $tr<Wrapping<$t>>>::$m(self, Wrapping(rhs))
-            }
-        }
-        impl<'a> $tr<&'a $t> for Wrapping<$t> {
-            #[inline]
-            fn $m(&mut self, rhs: &'a $t) {
-                <Wrapping<$t> as $tr<Wrapping<$t>>>::$m(self, Wrapping(*rhs))
-            }
-        }
-    )*)
-}
-
-macro_rules! wrapping_impl {
-    ($($t:ty)*) => ($(
-        impl Div for Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn div(self, rhs: Wrapping<$t>) -> Wrapping<$t> {
-                Wrapping(self.0.wrapping_div(rhs.0))
-            }
-        }
-        impl DivAssign for Wrapping<$t> {
-            #[inline]
-            fn div_assign(&mut self, rhs: Wrapping<$t>) {
-                self.0 = self.0.wrapping_div(rhs.0);
-            }
-        }
-        impl Rem for Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn rem(self, rhs: Wrapping<$t>) -> Wrapping<$t> {
-                Wrapping(self.0.wrapping_rem(rhs.0))
-            }
-        }
-        impl RemAssign for Wrapping<$t> {
-            #[inline]
-            fn rem_assign(&mut self, rhs: Wrapping<$t>) {
-                self.0 = self.0.wrapping_rem(rhs.0);
-            }
-        }
-        impl Neg for Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn neg(self) -> Wrapping<$t> {
-                Wrapping((0 as $t).wrapping_sub(self.0))
-            }
-        }
-        impl<'a> Neg for &'a Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn neg(self) -> Wrapping<$t> {
-                Wrapping((0 as $t).wrapping_sub(self.0))
-            }
-        }
-        impl<'a> Not for &'a Wrapping<$t> {
-            type Output = Wrapping<$t>;
-            #[inline]
-            fn not(self) -> Wrapping<$t> {
-                Wrapping(!self.0)
-            }
-        }
-        wrapping_forward_binop! { $t, Wrapping<$t>, Add add Sub sub Mul mul Div div Rem rem BitXor bitxor BitOr bitor BitAnd bitand }
-        wrapping_forward_binop! { $t, usize, Shl shl Shr shr }
-        wrapping_forward_assign! { $t, AddAssign add_assign SubAssign sub_assign MulAssign mul_assign DivAssign div_assign
-            RemAssign rem_assign BitXorAssign bitxor_assign BitOrAssign bitor_assign BitAndAssign bitand_assign }
-        impl<'a> ShlAssign<&'a usize> for Wrapping<$t> {
-            #[inline]
-            fn shl_assign(&mut self, rhs: &'a usize) {
-                self.0 = self.0 << *rhs;
-            }
-        }
-        impl<'a> ShrAssign<&'a usize> for Wrapping<$t> {
-            #[inline]
-            fn shr_assign(&mut self, rhs: &'a usize) {
-                self.0 = self.0 >> *rhs;
-            }
-        }
-    )*)
-}
-
-wrapping_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
+wrapping_ref_shifts! { Shl shl ShlAssign shl_assign; Shr shr ShrAssign shr_assign; }
 
 /// Saturating<T>: the operator impls of core::num::saturating (binops with a `Saturating` rhs, the
 /// `op=` impls with either rhs, Not), through the integer's saturating methods.

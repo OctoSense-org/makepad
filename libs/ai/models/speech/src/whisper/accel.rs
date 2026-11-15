@@ -26,6 +26,7 @@
 //! after the build, transcribes on the CPU.
 //!
 use crate::whisper::model::{DecoderLayer, EncoderLayer};
+use makepad_ai_loader::{F32Weight, WeightOwner};
 
 /// Explicit CPU selection is useful for reference runs. Defaults leave the
 /// established Metal/CUDA selection unchanged.
@@ -75,6 +76,17 @@ pub(crate) fn is_requested() -> bool {
 /// An explicitly selected Vulkan path falls back to CPU, never to a different
 /// GPU backend. The established ordering is unchanged otherwise.
 macro_rules! dispatch {
+    ($name:ident ( $($arg:expr),* $(,)? ) owner($owner:expr)) => {{
+        if cpu_selected() { return None; }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if vulkan_selected() {
+            return crate::whisper::vulkan_backend::$name($($arg),*);
+        }
+        if let Some(out) = crate::whisper::metal_backend::$name($($arg),*, $owner) {
+            return Some(out);
+        }
+        crate::whisper::cuda_backend::$name($($arg),*, $owner)
+    }};
     ($name:ident ( $($arg:expr),* $(,)? )) => {{
         if cpu_selected() { return None; }
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -104,8 +116,60 @@ pub(crate) fn try_matmul_nt_f32(
     m: usize,
     k: usize,
     n: usize,
+    owner: Option<&WeightOwner>,
 ) -> Option<Vec<f32>> {
-    dispatch!(try_matmul_nt_f32(a, bt, m, k, n))
+    dispatch!(try_matmul_nt_f32(a, bt, m, k, n) owner(owner))
+}
+
+pub(crate) fn try_matmul_nt_f32_weight(
+    a: &[f32],
+    w: &F32Weight,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Option<Vec<f32>> {
+    if cpu_selected() { return None; }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if vulkan_selected() {
+        return crate::whisper::vulkan_backend::try_matmul_nt_f32(a, w.as_slice(), m, k, n);
+    }
+    if crate::whisper::metal_backend::is_requested() {
+        if let Some(out) = makepad_ai_common::backend::metal::try_matmul_nt_f32_weight(a, w, m, k, n) {
+            return Some(out);
+        }
+    }
+    crate::whisper::cuda_backend::try_matmul_nt_f32(a, w.as_slice(), m, k, n, Some(w.owner()))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[test]
+fn token_logits_are_the_same_bits_resident_or_copied() {
+    std::thread::spawn(|| {
+        let (m, k, n) = (3, 64, 512);
+        let owner = std::sync::Arc::new(WeightOwner::new("whisper-token-logits-test"));
+        let w = match F32Weight::new(&owner, "decoder.token_embedding.weight", n * k, |out| {
+            for (i, value) in out.iter_mut().enumerate() {
+                *value = ((i % 31) as f32 - 15.0) * 0.037;
+            }
+            Ok::<(), std::convert::Infallible>(())
+        }) {
+            Ok(w) => w,
+            Err(never) => match never {},
+        };
+        let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.043).collect();
+        let resident = try_matmul_nt_f32_weight(&x, &w, m, k, n)
+            .expect("resident Metal token logits must run");
+        let copied = crate::whisper::metal_backend::try_matmul_nt_f32(&x, w.as_slice(), m, k, n, None)
+            .expect("copied Metal token logits must run");
+        assert_eq!(resident.len(), m * n, "resident token logits have the expected shape");
+        assert_eq!(copied.len(), m * n, "copied token logits have the expected shape");
+        for (i, (&resident, &copied)) in resident.iter().zip(&copied).enumerate() {
+            assert_eq!(resident.to_bits(), copied.to_bits(),
+                "token logits are bit-identical at index {i}: resident={resident:?}, copied={copied:?}");
+        }
+    })
+    .join()
+    .expect("the token logits bitwise comparison worker must pass");
 }
 
 pub(crate) fn try_matmul_nt_f32_bytes(
@@ -114,8 +178,9 @@ pub(crate) fn try_matmul_nt_f32_bytes(
     m: usize,
     k: usize,
     n: usize,
+    owner: Option<&WeightOwner>,
 ) -> Option<Vec<f32>> {
-    dispatch!(try_matmul_nt_f32_bytes(a, bt_bytes, m, k, n))
+    dispatch!(try_matmul_nt_f32_bytes(a, bt_bytes, m, k, n) owner(owner))
 }
 
 pub(crate) fn try_matmul_nt_f16_bytes(
@@ -124,8 +189,9 @@ pub(crate) fn try_matmul_nt_f16_bytes(
     m: usize,
     k: usize,
     n: usize,
+    owner: Option<&WeightOwner>,
 ) -> Option<Vec<f32>> {
-    dispatch!(try_matmul_nt_f16_bytes(a, bt_f16_bytes, m, k, n))
+    dispatch!(try_matmul_nt_f16_bytes(a, bt_f16_bytes, m, k, n) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -136,6 +202,7 @@ pub(crate) fn try_matmul_nt_ggml_bytes(
     m: usize,
     k: usize,
     n: usize,
+    owner: Option<&WeightOwner>,
 ) -> Option<Vec<f32>> {
     dispatch!(try_matmul_nt_ggml_bytes(
         a,
@@ -144,7 +211,7 @@ pub(crate) fn try_matmul_nt_ggml_bytes(
         m,
         k,
         n
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,6 +223,7 @@ pub(crate) fn try_matmul_nt_ggml_bytes_add_bias(
     k: usize,
     n: usize,
     bias: &[f32],
+    owner: Option<&WeightOwner>,
 ) -> Option<Vec<f32>> {
     dispatch!(try_matmul_nt_ggml_bytes_add_bias(
         a,
@@ -165,7 +233,7 @@ pub(crate) fn try_matmul_nt_ggml_bytes_add_bias(
         k,
         n,
         bias
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,6 +258,11 @@ pub(crate) fn try_flash_attn_f32_packed(
 /// Free this thread's device-resident Whisper state (see the CUDA backend).
 pub fn release_device_state() {
     crate::whisper::cuda_backend::release_device_state();
+}
+
+/// Cross K/V was recomputed, so CUDA must upload the new values on its next use.
+pub(crate) fn cross_kv_changed() {
+    crate::whisper::cuda_backend::clear_decoder_kv_cache();
 }
 
 pub(crate) fn clear_decoder_kv_cache() {
@@ -323,6 +396,7 @@ pub(crate) fn try_encoder_attn_block_f32(
     out_w_bytes: &[u8],
     out_w_ggml_type: u32,
     out_b: &[f32],
+    owner: &WeightOwner,
 ) -> Option<Vec<f32>> {
     dispatch!(try_encoder_attn_block_f32(
         x,
@@ -342,7 +416,7 @@ pub(crate) fn try_encoder_attn_block_f32(
         out_w_bytes,
         out_w_ggml_type,
         out_b
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -358,6 +432,7 @@ pub(crate) fn try_encoder_ffn_block_f32(
     w1_bytes: &[u8],
     w1_ggml_type: u32,
     b1: &[f32],
+    owner: &WeightOwner,
 ) -> Option<Vec<f32>> {
     dispatch!(try_encoder_ffn_block_f32(
         x,
@@ -371,7 +446,7 @@ pub(crate) fn try_encoder_ffn_block_f32(
         w1_bytes,
         w1_ggml_type,
         b1
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -401,6 +476,7 @@ pub(crate) fn try_encoder_layer_f32(
     w1_bytes: &[u8],
     w1_ggml_type: u32,
     b1: &[f32],
+    owner: &WeightOwner,
 ) -> Option<Vec<f32>> {
     dispatch!(try_encoder_layer_f32(
         x,
@@ -428,7 +504,7 @@ pub(crate) fn try_encoder_layer_f32(
         w1_bytes,
         w1_ggml_type,
         b1
-    ))
+    ) owner(owner))
 }
 
 pub(crate) fn try_encoder_stack_f32(
@@ -439,10 +515,11 @@ pub(crate) fn try_encoder_stack_f32(
     layers: &[EncoderLayer],
     final_ln_w: &[f32],
     final_ln_b: &[f32],
+    owner: &WeightOwner,
 ) -> Option<Vec<f32>> {
     dispatch!(try_encoder_stack_f32(
         x, seq_len, n_state, n_head, layers, final_ln_w, final_ln_b
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -459,6 +536,7 @@ pub(crate) fn try_decoder_self_qkv_step_f32(
     v_w_bytes: &[u8],
     v_w_ggml_type: u32,
     v_b: &[f32],
+    owner: &WeightOwner,
 ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     dispatch!(try_decoder_self_qkv_step_f32(
         x,
@@ -473,7 +551,7 @@ pub(crate) fn try_decoder_self_qkv_step_f32(
         v_w_bytes,
         v_w_ggml_type,
         v_b
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -486,6 +564,7 @@ pub(crate) fn try_decoder_cross_ffn_step_f32(
     v_cross: &[f32],
     n_audio_ctx: usize,
     layer: &DecoderLayer,
+    owner: &WeightOwner,
 ) -> Option<Vec<f32>> {
     dispatch!(try_decoder_cross_ffn_step_f32(
         layer_idx,
@@ -496,7 +575,7 @@ pub(crate) fn try_decoder_cross_ffn_step_f32(
         v_cross,
         n_audio_ctx,
         layer
-    ))
+    ) owner(owner))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,6 +592,7 @@ pub(crate) fn try_decoder_self_cross_ffn_step_f32(
     v_cross: &[f32],
     n_audio_ctx: usize,
     layer: &DecoderLayer,
+    owner: &WeightOwner,
 ) -> Option<Vec<f32>> {
     dispatch!(try_decoder_self_cross_ffn_step_f32(
         layer_idx,
@@ -527,5 +607,5 @@ pub(crate) fn try_decoder_self_cross_ffn_step_f32(
         v_cross,
         n_audio_ctx,
         layer
-    ))
+    ) owner(owner))
 }

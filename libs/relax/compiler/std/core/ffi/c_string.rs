@@ -183,11 +183,10 @@ impl From<&CStr> for CString {
     }
 }
 
-// alloc/src/ffi/c_str.rs: the conversions with `Cow<CStr>` (objc2 names a class's ivars with
-// `Cow<'static, CStr>` values built by `CString::new(..).unwrap().into()`).
-impl<'a> From<CString> for crate::borrow::Cow<'a, CStr> {
-    fn from(s: CString) -> crate::borrow::Cow<'a, CStr> {
-        crate::borrow::Cow::Owned(s)
+impl crate::borrow::ToOwned for CStr {
+    type Owned = CString;
+    fn to_owned(&self) -> CString {
+        CString { inner: self.to_bytes_with_nul().into() }
     }
 }
 
@@ -197,22 +196,15 @@ impl<'a> From<&'a CStr> for crate::borrow::Cow<'a, CStr> {
     }
 }
 
+impl<'a> From<CString> for crate::borrow::Cow<'a, CStr> {
+    fn from(s: CString) -> crate::borrow::Cow<'a, CStr> {
+        crate::borrow::Cow::Owned(s)
+    }
+}
+
 impl<'a> From<&'a CString> for crate::borrow::Cow<'a, CStr> {
     fn from(s: &'a CString) -> crate::borrow::Cow<'a, CStr> {
         crate::borrow::Cow::Borrowed(s.as_c_str())
-    }
-}
-
-impl<'a> From<crate::borrow::Cow<'a, CStr>> for CString {
-    fn from(s: crate::borrow::Cow<'a, CStr>) -> CString {
-        s.into_owned()
-    }
-}
-
-impl crate::borrow::ToOwned for CStr {
-    type Owned = CString;
-    fn to_owned(&self) -> CString {
-        CString { inner: self.to_bytes_with_nul().into() }
     }
 }
 
@@ -276,14 +268,14 @@ impl From<&CStr> for Box<CStr> {
     }
 }
 
-impl From<CString> for Box<CStr> {
-    fn from(s: CString) -> Box<CStr> {
-        s.into_boxed_c_str()
+impl Clone for Box<CStr> {
+    fn clone(&self) -> Self {
+        (**self).into()
     }
 }
 
-impl Clone for Box<CStr> {
-    fn clone(&self) -> Box<CStr> {
-        CString::from(&**self).into_boxed_c_str()
+impl From<CString> for Box<CStr> {
+    fn from(s: CString) -> Box<CStr> {
+        s.into_boxed_c_str()
     }
 }

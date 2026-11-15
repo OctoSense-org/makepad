@@ -15,18 +15,18 @@ use std::{
 use crate::{HostBuf, gpu_admission::ReadbackReservation};
 use makepad_hal::buffers::Wire;
 
-type RawPixels = Result<(usize, usize, Arc<[u8]>), ReadbackError>;
+type RawPixels = Result<(usize, usize, HostBuf), ReadbackError>;
 type RawCallback = Box<dyn FnOnce(RawPixels) + Send>;
 
 /// Callbacks run one at a time, in the order they came, by one pool worker that drains them:
 /// the next never waits for a UI turn to start it.
 #[derive(Clone, Default)]
-struct Strand(Arc<Mutex<StrandQueue>>);
+pub(super) struct Strand(Arc<Mutex<StrandQueue>>);
 #[derive(Default)]
 struct StrandQueue { jobs: VecDeque<Box<dyn FnOnce() + Send>>, running: bool }
 impl Strand {
     fn lock(&self) -> MutexGuard<'_, StrandQueue> { self.0.lock().unwrap_or_else(|e| e.into_inner()) }
-    fn push(&self, job: Box<dyn FnOnce() + Send>) { self.lock().jobs.push_back(job); }
+    pub(super) fn push(&self, job: Box<dyn FnOnce() + Send>) { self.lock().jobs.push_back(job); }
     /// A worker at `class` unless one runs or nothing waits.
     fn start(&self, pool: &TaskPool, class: Class) {
         {
@@ -52,6 +52,48 @@ impl Strand {
     }
 }
 
+/// The `screen_capture` windows whose last frame still waits for its sinks (behind other
+/// callbacks in [`Readbacks::jobs`], or for a pool worker the app's work holds), each with the
+/// frames it left uncopied since. Such a window gets no new copy: a stuck delivery holds one frame
+/// per window, never one per frame presented meanwhile (at 60 a second, gigabytes in a minute).
+/// The wait is logged when it first skips a frame and when it ends.
+#[derive(Clone, Default)]
+struct CaptureBacklog(Arc<Mutex<HashMap<usize, u64>>>);
+impl CaptureBacklog {
+    fn lock(&self) -> MutexGuard<'_, HashMap<usize, u64>> { self.0.lock().unwrap_or_else(|e| e.into_inner()) }
+    fn waits(&self, window: usize) -> bool { self.lock().contains_key(&window) }
+    /// A frame of `window` the sinks want is not copied: its last still waits for them.
+    fn skip(&self, window: usize) {
+        let first = match self.lock().get_mut(&window) {
+            Some(skipped) => {
+                *skipped += 1;
+                *skipped == 1
+            }
+            None => false,
+        };
+        if first {
+            crate::log!("screen capture: window {window}'s last frame still waits for its sinks; its next frames are skipped until they take it");
+        }
+    }
+}
+/// A frame of a `screen_capture` window queued for its sinks: dropped once they took it (or it
+/// was dropped unrun), the window's frames are copied again.
+struct CaptureQueued(CaptureBacklog, usize);
+impl CaptureQueued {
+    fn new(backlog: &CaptureBacklog, window: usize) -> Self {
+        backlog.lock().insert(window, 0);
+        CaptureQueued(backlog.clone(), window)
+    }
+}
+impl Drop for CaptureQueued {
+    fn drop(&mut self) {
+        let skipped = self.0.lock().remove(&self.1).unwrap_or(0);
+        if skipped > 0 {
+            crate::log!("screen capture: window {}'s sinks took its frame; {skipped} frames were skipped while it waited", self.1);
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Readbacks {
     next: u32,
@@ -61,11 +103,12 @@ pub(crate) struct Readbacks {
     snapshots: HashMap<u32, Texture>,
     /// Window copies in flight for `screen_capture` byte sinks: req -> window index. One per window.
     captures: HashMap<u32, usize>,
+    capture_backlog: CaptureBacklog,
     picks: HashMap<u32, (crate::pick::PickTicket, Texture, Texture)>,
-    images: VecDeque<(Vec<u64>, u32, u32, Arc<[u8]>)>,
+    images: VecDeque<(Vec<u64>, u32, u32, HostBuf)>,
     workers: Vec<TaskHandle<()>>,
     raw: HashMap<u32, (Texture, usize, usize, usize, RawCallback)>,
-    jobs: Strand,
+    pub(super) jobs: Strand,
     texture_pending: Vec<(crate::TextureId, makepad_hal::Id, u32, usize, usize)>,
     buffer_pending: Vec<(u32, Vec<makepad_hal::BufferReadRange>)>,
     buffers: HashMap<u32, BufferRequest>,
@@ -125,14 +168,14 @@ impl Drop for Cx {
 
 impl Cx {
     /// Read the current render or storage allocation without blocking Cx or the HAL main thread.
-    /// The callback runs on the worker pool. UNORM8 is BGRA; other formats keep their
+    /// The callback runs on the worker pool. UNORM8 colour is RGBA; other formats keep their
     /// native packed texels (for example R32F is little-endian f32). The texture stays alive
     /// through completion. Storage reads follow pending compute producers; render
     /// targets must have rendered once before requesting a read.
     pub fn read_render_texture(
         &mut self,
         texture: &Texture,
-        done: impl FnOnce(Result<(usize, usize, Arc<[u8]>), ReadbackError>) + Send + 'static,
+        done: impl FnOnce(Result<(usize, usize, HostBuf), ReadbackError>) + Send + 'static,
     ) -> Result<(), ReadbackError> {
         let id = texture.texture_id();
         let storage = matches!(self.textures[id].format, crate::TextureFormat::Storage { .. });
@@ -160,7 +203,6 @@ impl Cx {
             .texture_hal_id(id.0, id.generation())
             .ok_or(ReadbackError::NotRendered)?;
         let req = self.hal_readback_request();
-        self.hal.event_arena_min = self.hal.event_arena_min.max(bytes);
         if storage && self.hal.compute.binds_texture(id) {
             self.hal.readbacks.texture_pending.push((id, hal, req, width, height));
         } else {
@@ -204,7 +246,7 @@ impl Cx {
         let reservation = self.gpu_admission().admit_readback(bytes).map_err(|_| ReadbackError::Backpressure)?;
         let req = self.hal_readback_request();
         // Only the small lease records go into the event arena.
-        self.hal.event_arena_min = self.hal.event_arena_min.max(record_bytes);
+        self.hal.event_arena.ask(record_bytes);
         if reads.iter().any(|r| self.hal.compute.binds_buffer(r.id)) {
             self.hal.readbacks.buffer_pending.push((req, reads.clone()));
         } else { encode_buffer_reads(&mut self.hal.frames.w, req, &reads); }
@@ -308,7 +350,6 @@ impl Cx {
                 continue;
             };
             let req = self.hal_readback_request();
-            self.hal.event_arena_min = self.hal.event_arena_min.max(work.width * work.height * 4);
             fb.w.texture_readback(id, req, [0, 0, work.width as u32, work.height as u32]);
             self.hal
                 .readbacks
@@ -350,9 +391,10 @@ impl Cx {
         }
         if self.hal_capture_due(window) {
             let req = self.hal_readback_request();
-            self.hal.event_arena_min = self.hal.event_arena_min.max(width * height * 4);
             fb.w.snapshot(crate::event::hal_intake::hal_window_id(window), req);
             self.hal.readbacks.captures.insert(req, window.id());
+        } else if crate::screen_capture::capture_wants_window(Some(window.id())) {
+            self.hal.readbacks.capture_backlog.skip(window.id());
         }
         // A grab is of a whole paint: one that left a draw out (its pipeline or shader still
         // compiling, a picture it samples unfinished) keeps the grabs waiting for the paint the
@@ -374,17 +416,17 @@ impl Cx {
         }
         crate::remote::note_grabs_drawn(&ids, self.repaint_id, self.live_patches);
         let req = self.hal_readback_request();
-        self.hal.event_arena_min = self.hal.event_arena_min.max(width * height * 4);
         fb.w.snapshot(crate::event::hal_intake::hal_window_id(window), req);
         self.hal.readbacks.windows.insert(req, ids);
     }
 
-    /// A `screen_capture` byte sink is owed this window's frame and no copy of it is in flight.
-    /// Every HAL backend answers the copy (it is the `/g` grab's snapshot), so cap streams work
-    /// wherever grabs do.
+    /// A `screen_capture` byte sink is owed this window's frame, no copy of it is in flight and
+    /// its sinks took the last ([`CaptureBacklog`]). Every HAL backend answers the copy (it is the
+    /// `/g` grab's snapshot), so cap streams work wherever grabs do.
     pub(crate) fn hal_capture_due(&self, window: WindowId) -> bool {
         crate::screen_capture::capture_wants_window(Some(window.id()))
             && !self.hal.readbacks.captures.values().any(|w| *w == window.id())
+            && !self.hal.readbacks.capture_backlog.waits(window.id())
     }
 
     pub(crate) fn hal_pick_readback(
@@ -406,7 +448,6 @@ impl Cx {
         };
         let (width, height) = (alloc.width, alloc.height);
         let req = self.hal_readback_request();
-        self.hal.event_arena_min = self.hal.event_arena_min.max(width * height * 4);
         fb.w.texture_readback(hal, req, [0, 0, width as u32, height as u32]);
         self.hal
             .readbacks
@@ -431,12 +472,12 @@ impl Cx {
             .chain(r.picks.keys()).copied().collect();
         r.buffer_pending.clear();
         r.texture_pending.clear();
-        for req in requests { self.hal_readback(req, makepad_hal::readback::FAILED, [0; 4], &[]); }
+        for req in requests { self.hal_readback(req, makepad_hal::readback::FAILED, [0; 4], None); }
     }
 
-    pub(crate) fn hal_readback(&mut self, req: u32, status: u32, rect: [u32; 4], pixels: &[u8]) {
+    pub(crate) fn hal_readback(&mut self, req: u32, status: u32, rect: [u32; 4], mut pixels: Option<HostBuf>) {
         self.hal.readbacks.active.remove(&req);
-        if self.hal_encoder_readback(req, status, rect, pixels) {
+        if self.hal_encoder_readback(req, status, rect, &mut pixels) {
             return;
         }
         if let Some(texture) = self.hal.readbacks.snapshots.remove(&req) {
@@ -460,17 +501,11 @@ impl Cx {
                 makepad_hal::readback::OK | makepad_hal::readback::NATIVE
             ) && rect[2] as usize == width
                 && rect[3] as usize == height
-                && pixels.len() == bytes
+                && pixels.as_ref().is_some_and(|pixels| pixels.len() == bytes)
             {
-                let mut pixels = pixels.to_vec();
-                // 8-bit colour comes from the HAL as RGBA and goes out BGRA; every other
-                // format's texels as the GPU packed them
-                if status == makepad_hal::readback::OK {
-                    for px in pixels.chunks_exact_mut(4) {
-                        px.swap(0, 2);
-                    }
-                }
-                Ok((width, height, Arc::from(pixels)))
+                // 8-bit colour as the HAL hands it over (RGBA); every other format's
+                // texels as the GPU packed them
+                Ok((width, height, pixels.unwrap()))
             } else {
                 Err(ReadbackError::Failed)
             };
@@ -482,13 +517,15 @@ impl Cx {
             return;
         }
         let [_, _, w, h] = rect;
-        let ok = status == makepad_hal::readback::OK && pixels.len() == w as usize * h as usize * 4;
+        let ok = status == makepad_hal::readback::OK && pixels.as_ref().is_some_and(|pixels| pixels.len() == w as usize * h as usize * 4);
         if let Some(window) = self.hal.readbacks.captures.remove(&req) {
             // Same RGBA top-left rows as a grab; sinks run off the Cx thread, in frame order.
             if ok {
-                let pixels: Arc<[u8]> = Arc::from(pixels);
+                let pixels = pixels.unwrap();
+                let queued = CaptureQueued::new(&self.hal.readbacks.capture_backlog, window);
                 self.hal.readbacks.jobs.push(Box::new(move || {
-                    crate::screen_capture::deliver_capture_frame(Some(window), w, h, &pixels)
+                    crate::screen_capture::deliver_capture_frame(Some(window), w, h, &pixels);
+                    drop(queued);
                 }));
                 self.hal_poll_readback_images();
             }
@@ -507,14 +544,10 @@ impl Cx {
                 return;
             }
             let result = if ok {
-                let mut bytes = pixels.to_vec();
-                for px in bytes.chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
                 Ok(crate::pick::PickImage {
                     width: w as usize,
                     height: h as usize,
-                    bytes,
+                    bytes: pixels.unwrap(),
                 })
             } else {
                 Err(crate::pick::PickError::Failed)
@@ -522,7 +555,7 @@ impl Cx {
             self.pick.results.push((ticket, result));
         } else if let Some((width, height, completion)) = self.hal.readbacks.textures.remove(&req) {
             let result = if ok && width == w as usize && height == h as usize {
-                Ok(Arc::from(pixels))
+                Ok(pixels.unwrap())
             } else if status == makepad_hal::readback::NO_RASTER {
                 Err(ReadbackError::UnsupportedBackend)
             } else {
@@ -534,7 +567,7 @@ impl Cx {
                 self.hal
                     .readbacks
                     .images
-                    .push_back((ids, w, h, Arc::from(pixels)));
+                    .push_back((ids, w, h, pixels.unwrap()));
                 self.hal_poll_readback_images();
             } else {
                 crate::error!("HAL window readback failed: status={status}");
@@ -545,6 +578,7 @@ impl Cx {
 
     pub(crate) fn poll_texture_readbacks(&mut self) {
         self.validate_pending_readbacks();
+        self.admit_waiting_readbacks();
         let mut fb = std::mem::take(&mut self.hal.frames);
         self.hal_texture_readbacks(&mut fb, None);
         self.hal.frames = fb;
@@ -561,10 +595,17 @@ impl Cx {
             .iter()
             .any(|s| s.legacy && s.texture.texture_id() == texture.texture_id())
         {
+            self.textures.1.readbacks.legacy_waiting.retain(|pending| pending != texture);
             return true;
         }
         match texture.read_back(self, ReadbackRequest { next_render: true }) {
             Ok(ticket) => {
+                let waiting = &mut self.textures.1.readbacks.legacy_waiting;
+                if let Some(index) = waiting.iter().position(|pending| pending == texture) {
+                    waiting.remove(index);
+                    // This retry was outside the producer's original draw.
+                    self.redraw_all();
+                }
                 if let Some(slot) = self
                     .textures
                     .1
@@ -577,7 +618,12 @@ impl Cx {
                 }
                 true
             }
+            Err(ReadbackError::Backpressure) => {
+                self.defer_render_texture_capture(texture);
+                true
+            }
             Err(error) => {
+                self.textures.1.readbacks.legacy_waiting.retain(|pending| pending != texture);
                 crate::error!("render texture capture: {error}");
                 false
             }
@@ -588,7 +634,14 @@ impl Cx {
         self.take_texture_readback_results(true)
             .into_iter()
             .filter_map(|(id, result)| {
-                let mut bytes = result.data.ok()?.to_vec();
+                // a capture that cannot be made says why, once, here: the result carries no bytes
+                let mut bytes = match result.data {
+                    Ok(data) => data.to_vec(),
+                    Err(error) => {
+                        crate::log!("render texture capture of {id:?} ({}x{}): {error}", result.width, result.height);
+                        return None;
+                    }
+                };
                 for pixel in bytes.chunks_exact_mut(4) {
                     pixel.swap(0, 2);
                 }
@@ -597,7 +650,7 @@ impl Cx {
             .collect()
     }
 
-    fn hal_poll_readback_images(&mut self) {
+    pub(super) fn hal_poll_readback_images(&mut self) {
         self.hal
             .readbacks
             .workers
@@ -605,11 +658,28 @@ impl Cx {
         let pool = self.task_pool();
         self.hal.readbacks.jobs.start(&pool, Class::Visible);
         while let Some((ids, ..)) = self.hal.readbacks.images.front() {
-            let class = if crate::remote::grab_ids_only(ids) { Class::Interactive } else { Class::Visible };
+            // A remote grab's pixels go from here to the grab encoder's own thread: no pool job
+            // carries them, so the app's work cannot keep a grab waiting (at two cores the pool
+            // has one worker, and one long job without a task boundary holds it). What is left
+            // to do here is a few map updates under the sinks' lock and a send that never waits;
+            // with the remote off no grab waits for them.
+            if crate::remote::grab_ids_only(ids) {
+                let (ids, width, height, pixels) = self.hal.readbacks.images.pop_front().unwrap();
+                let _no_remote = crate::remote::deliver_grab_pixels(
+                    ids,
+                    width,
+                    height,
+                    pixels,
+                    width as usize * 4,
+                    crate::texture::ReadbackChannelOrder::Rgba,
+                    crate::texture::ReadbackOrigin::TopLeft,
+                );
+                continue;
+            }
             let pool = self.task_pool();
             if !pool.is_open() { break; }
             let (ids, width, height, pixels) = self.hal.readbacks.images.pop_front().unwrap();
-            if let Ok(handle) = pool.submit(class, move || {
+            if let Ok(handle) = pool.submit(Class::Visible, move || {
                 let ids = crate::remote::deliver_grab_pixels(
                     ids,
                     width,
@@ -686,6 +756,44 @@ mod tests {
             assert!(start.elapsed() < Duration::from_secs(5), "readback callback was not answered");
             std::thread::yield_now();
         }
+    }
+
+    /// A remote grab's pixels leave the readback queue on the turn that has them, with a task
+    /// pool that takes no job at all: a grab never waits for a worker the app's own work holds.
+    #[test]
+    fn a_grab_s_pixels_never_wait_for_a_pool_worker() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.use_closed_task_pool();
+        // the remote's grab ids start at 1 << 62
+        let grab = (1u64 << 62) + 1;
+        assert!(crate::remote::grab_ids_only(&[grab]), "a remote grab's id");
+        cx.hal.readbacks.images.push_back((vec![grab], 2, 1, HostBuf::from_vec(vec![0u8; 8])));
+        cx.hal_poll_readback_images();
+        assert!(cx.hal.readbacks.images.is_empty(), "the grab's pixels went on without a pool job");
+    }
+
+    /// A screen capture's frame that waits for its sinks (here behind a pool that takes no job)
+    /// keeps its window from a new copy: a stuck delivery holds one frame, not one per frame the
+    /// window presents meanwhile.
+    #[test]
+    fn a_capture_frame_waiting_for_its_sinks_holds_back_the_next_copy() {
+        let mut cx = Cx::new(Box::new(|_, _| {}));
+        cx.use_closed_task_pool();
+        // a window no other test captures
+        let window = WindowId(9001, 0);
+        let sink = crate::screen_capture::add_screen_capture(
+            crate::screen_capture::ScreenCaptureOptions { window_id: Some(window.id()), max_fps: 0.0 },
+            |_frame: &crate::screen_capture::ScreenCaptureFrame<'_>| {},
+        );
+        assert!(cx.hal_capture_due(window), "the sink wants the window's frames");
+        let req = cx.hal_readback_request();
+        cx.hal.readbacks.captures.insert(req, window.id());
+        cx.hal_readback(req, makepad_hal::readback::OK, [0, 0, 2, 1], Some(HostBuf::from_vec(vec![0u8; 8])));
+        assert!(!cx.hal_capture_due(window), "no new copy while the last frame waits for its sinks");
+        let job = cx.hal.readbacks.jobs.lock().jobs.pop_front().expect("the frame waits for its sinks");
+        job();
+        assert!(cx.hal_capture_due(window), "the window's frames are copied again once its sinks took the last");
+        crate::screen_capture::remove_screen_capture(sink);
     }
 
     #[test]
@@ -806,18 +914,24 @@ mod tests {
     }
 
     #[test]
-    fn a_texture_readback_swaps_red_and_blue_of_8_bit_colour_only() {
+    fn a_raw_readback_hands_texels_over_as_the_hal_gave_them() {
         let _reads = READS.lock().unwrap();
         let (mut cx, _) = cx();
         let texture = crate::Texture::new_with_format(&mut cx, crate::TextureFormat::RenderRGBAf32 { size: crate::TextureSize::Auto, initial: true });
-        let texels: Vec<u8> = (0..8).collect();
-        // an RGBA32F texel (NATIVE) is its bytes as the GPU wrote them; RGBA8 (OK) goes out BGRA
-        for (status, expected) in [(makepad_hal::readback::NATIVE, [0, 1, 2, 3, 4, 5, 6, 7]), (makepad_hal::readback::OK, [2, 1, 0, 3, 6, 5, 4, 7])] {
+        // an RGBA32F texel (NATIVE) is its bytes as the GPU wrote them; 8-bit colour (OK) stays RGBA
+        for (status, expected) in [(makepad_hal::readback::NATIVE, [0, 1, 2, 3, 4, 5, 6, 7]), (makepad_hal::readback::OK, [0, 1, 2, 3, 4, 5, 6, 7])] {
             let (tx, rx) = mpsc::channel();
             let req = cx.hal_readback_request();
-            cx.hal.readbacks.raw.insert(req, (texture.clone(), 2, 1, 8, Box::new(move |r: RawPixels| { tx.send(r.unwrap().2.to_vec()).unwrap(); })));
-            cx.hal_readback(req, status, [0, 0, 2, 1], &texels);
-            assert_eq!(receive(&rx), expected, "status {status}");
+            cx.hal.readbacks.raw.insert(req, (texture.clone(), 2, 1, 8, Box::new(move |r: RawPixels| { tx.send(r.unwrap().2).unwrap(); })));
+            let texels: Vec<u8> = (0..8).collect();
+            let record = makepad_hal::lease::Lease::from_vec(texels, 0).into_record();
+            // SAFETY: this record transfers its one release obligation to the intake wrapper.
+            let pixels = unsafe { crate::event::hal_intake::texture_readback_pixels(record) };
+            cx.hal_readback(req, status, [0, 0, 2, 1], Some(pixels));
+            let result = receive(&rx);
+            assert_eq!(&*result, &expected, "status {status}");
+            drop(result);
+            assert_eq!(makepad_hal::hal_lease_release(record.token), 0, "the callback's result released its lease");
         }
     }
 

@@ -620,7 +620,10 @@ impl App {
                 x::XFreePixmap(self.display, bitmap);
                 value
             } else {
-                x::XcursorLibraryLoadCursor(self.display, input::cursor_name(cursor).as_ptr())
+                input::cursor_names(cursor)
+                    .map(|name| x::XcursorLibraryLoadCursor(self.display, name.as_ptr()))
+                    .find(|&handle| handle != 0)
+                    .unwrap_or(0)
             }
         });
         unsafe {
@@ -1498,8 +1501,11 @@ impl Shell for App {
                         }
                     }
                 }
-                OsCmd::ClipSet { text } => self.selection.set(text, false),
-                OsCmd::SelectionSet { text } => self.selection.set(text, true),
+                OsCmd::ClipSet { data } => self.selection.set(data, false),
+                OsCmd::SelectionSet { text } => self.selection.set(
+                    crate::clipboard::ClipboardData { text, ..Default::default() },
+                    true,
+                ),
                 OsCmd::ClipRead { req, primary } => self
                     .selection
                     .read(selection::Purpose::Reply(sid, req), primary),
@@ -1509,7 +1515,7 @@ impl Shell for App {
                         self.selection.start_drag(n, (sid, id), items, self.shared);
                     }
                 }
-                OsCmd::DragReply { id, to, answer } => {
+                OsCmd::DragReply { id, to, answer, .. } => {
                     if let Some(n) = self.find((sid, id)) {
                         if to == raw::reply::QUERY {
                             self.query_answer(n, answer);
@@ -1586,6 +1592,7 @@ impl Shell for App {
                         }
                     }
                 }
+                OsCmd::PrintPdf { req, .. } => self.shared.push((sid, crate::Id::NONE), |q, _| q.print_result(req, crate::print_status::UNSUPPORTED, &[])),
                 OsCmd::FileDialog { req, .. } => self
                     .shared
                     .push((sid, crate::Id::NONE), |q, _| q.dialog_result(req, 0, &[])),

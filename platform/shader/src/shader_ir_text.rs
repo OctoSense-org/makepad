@@ -2,7 +2,7 @@
 //! syntax of a text backend. The module around them (declarations, entry
 //! points, preambles) is each backend's own (shader_ir_wgsl.rs,
 //! shader_ir_glsl.rs, ...).
-use makepad_relax_api::relax_api;
+use relax_api::relax_api;
 
 use crate::shader_ir::*;
 use crate::shader_output::TextureType;
@@ -851,20 +851,20 @@ impl<'a> TextCx<'a> {
             Builtin::Max => "max",
             Builtin::Min => "min",
             Builtin::Mix => "mix",
-            Builtin::FMod => {
-                let a = self.arg_as(f, args[0], ty);
-                let b = self.arg_as(f, args[1], ty);
-                // Each backend keeps its own float remainder: GLSL's
-                // floor-based mod, WGSL's truncating %.
-                if glsl {
-                    return format!("mod({}, {})", a, b);
-                }
-                return format!("({} % {})", a, b);
-            }
             Builtin::Normalize => "normalize",
             Builtin::Pow => "pow",
             Builtin::Radians => "radians",
-            Builtin::Round => "round",
+            // halfway cases to even on every target, as WGSL's and HLSL's round and SPIR-V's
+            // RoundEven: MSL's round goes away from zero and GLSL's is either
+            Builtin::Round => {
+                if self.metal() {
+                    "rint"
+                } else if glsl {
+                    "roundEven"
+                } else {
+                    "round"
+                }
+            }
             Builtin::Sign => "sign",
             Builtin::Sin => "sin",
             Builtin::Sinh => "sinh",
@@ -1279,11 +1279,6 @@ impl<'a> TextCx<'a> {
                 let a = self.expr(f, args[0]);
                 return Some(format!("(({})sign({}))", self.ty_name(ty), a));
             }
-            Builtin::FMod => {
-                let a = self.arg_as(f, args[0], ty);
-                let b = self.arg_as(f, args[1], ty);
-                return Some(format!("fmod({}, {})", a, b));
-            }
             Builtin::Asinh => {
                 let a = self.expr(f, args[0]);
                 return Some(format!("_mp_asinh({})", a));
@@ -1378,7 +1373,7 @@ impl<'a> TextCx<'a> {
                     }
                 }
             }
-            ExprKind::Builtin(op, args) => return self.metal_builtin(f, *op, args, ty),
+            ExprKind::Builtin(op, args) => return self.metal_builtin(f, *op, args),
             ExprKind::Select(c, t, fl) => {
                 let ct = f.exprs[*c as usize].ty;
                 let cs = self.expr(f, *c);
@@ -1410,6 +1405,8 @@ impl<'a> TextCx<'a> {
                         let l = self.expr(f, smp.lod);
                         format!("{}.sample(_s{}, {}, level({}))", t, smp.sampler, coord, l)
                     }
+                    // a kernel has no derivatives: an implicit sample reads the top level
+                    SampleKind::Implicit | SampleKind::Video if self.compute.is_some() => format!("{}.sample(_s{}, {}, level(0.0))", t, smp.sampler, coord),
                     SampleKind::Implicit | SampleKind::Video => format!("{}.sample(_s{}, {})", t, smp.sampler, coord),
                 };
                 // The pick variant: a 2D texture's sample also reads its twin.
@@ -1479,17 +1476,12 @@ impl<'a> TextCx<'a> {
         })
     }
 
-    fn metal_builtin(&mut self, f: &IrFunction, op: Builtin, args: &[ExprId], ty: TyId) -> Option<String> {
+    fn metal_builtin(&mut self, f: &IrFunction, op: Builtin, args: &[ExprId]) -> Option<String> {
         let name = match op {
             Builtin::InverseSqrt => "rsqrt",
             Builtin::Dpdx => "dfdx",
             Builtin::Dpdy => "dfdy",
             Builtin::Inverse => "_mp_inverse",
-            Builtin::FMod => {
-                let a = self.arg_as(f, args[0], ty);
-                let b = self.arg_as(f, args[1], ty);
-                return Some(format!("fmod({}, {})", a, b));
-            }
             Builtin::Unpack2f16 | Builtin::Unpack4u8 => {
                 let a = self.expr(f, args[0]);
                 let at = f.exprs[args[0] as usize].ty;

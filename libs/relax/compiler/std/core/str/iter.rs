@@ -191,6 +191,12 @@ impl<'a> Iterator for Bytes<'a> {
             None
         }
     }
+    #[doc(hidden)]
+    #[inline]
+    unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> u8 {
+        // SAFETY: idx is below the bytes left where Zip took the iterator, so front + idx < back
+        unsafe { *self.b.get_unchecked(self.front + idx) }
+    }
 }
 
 impl<'a> DoubleEndedIterator for Bytes<'a> {
@@ -215,6 +221,10 @@ impl<'a> DoubleEndedIterator for Bytes<'a> {
 
 impl<'a> ExactSizeIterator for Bytes<'a> {}
 impl<'a> FusedIterator for Bytes<'a> {}
+unsafe impl<'a> crate::iter::TrustedRandomAccess for Bytes<'a> {}
+unsafe impl<'a> crate::iter::TrustedRandomAccessNoCoerce for Bytes<'a> {
+    const MAY_HAVE_SIDE_EFFECT: bool = false;
+}
 
 // ---------------------------------------------------------------- EncodeUtf16
 
@@ -331,7 +341,7 @@ impl<'a> Iterator for EscapeDefault<'a> {
                 self.cur = None;
             }
             let c = self.chars.next()?;
-            self.cur = Some(crate::char::escape_default(c));
+            self.cur = Some(crate::char::methods::escape_default(c));
         }
     }
 }
@@ -369,7 +379,7 @@ impl<'a> Iterator for EscapeUnicode<'a> {
                 self.cur = None;
             }
             let c = self.chars.next()?;
-            self.cur = Some(crate::char::escape_unicode(c));
+            self.cur = Some(crate::char::methods::escape_unicode(c));
         }
     }
 }

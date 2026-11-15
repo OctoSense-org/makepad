@@ -49,7 +49,7 @@ fn outward(mesh: &mesh::Mesh) {
 
 #[test]
 fn sphere_normals_are_analytic_at_poles_and_uv_seams_without_changing_topology() {
-    for (segments, rings) in [(3, 2), (12, 6), (31, 15)] {
+    for (segments, rings) in [(3, 2), (12, 6), (31, 15), (129, 2), (3, 129)] {
         let doc = primitive("sphere", None, segments, rings);
         let explicit = primitive("sphere", Some(true), segments, rings);
         let flat = primitive("sphere", Some(false), segments, rings);
@@ -92,7 +92,7 @@ fn sphere_normals_are_analytic_at_poles_and_uv_seams_without_changing_topology()
 
 #[test]
 fn cylinder_sides_are_radial_with_seam_continuity_and_hard_flat_caps() {
-    for segments in [3, 12, 31] {
+    for segments in [3, 12, 31, 129] {
         let doc = primitive("cylinder", None, segments, 0);
         let explicit = primitive("cylinder", Some(true), segments, 0);
         let mesh = doc.object("shape").unwrap();
@@ -310,9 +310,118 @@ fn glossy_primitives_export_stored_normals_uvs_and_low_roughness_pbr_without_sou
 }
 
 #[test]
-fn smooth_is_a_strict_optional_boolean_and_primitive_budgets_still_apply() {
-    let mut limits = Limits::default();
-    limits.mesh.max_corners = 8;
-    assert!(Operation::sphere("shape", 1., 12, 6, true, &limits).is_err());
-    assert!(Operation::cylinder("shape", 1., 2., 12, true, &limits).is_err());
+fn primitives_accept_geometry_beyond_former_count_limits() {
+    let limits = Limits::default();
+    assert!(Operation::sphere("shape", 1., 12, 6, true, &limits).is_ok());
+    assert!(Operation::cylinder("shape", 1., 2., 12, true, &limits).is_ok());
+}
+
+#[test]
+fn repeated_program_primitives_match_explicit_source_bytes() {
+    let limits = Limits::default();
+    let mut generated = Vec::new();
+    let mut explicit = Vec::new();
+    // Vary every parameter independently, then exercise both a retained cache
+    // hit and the final use. Small meshes keep this a byte-identity check.
+    for copy in 0..3 {
+        for (variant, (radius, segments, rings, smooth)) in [
+            (0.5, 3, 2, true),
+            (0.7, 3, 2, true),
+            (0.5, 4, 2, true),
+            (0.5, 3, 3, true),
+            (0.5, 3, 2, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let object = format!("sphere-{copy}-{variant}");
+            explicit.push(ProgramOp::Op(
+                Operation::sphere(&object, radius, segments, rings, smooth, &limits).unwrap(),
+            ));
+            generated.push(ProgramOp::Mesh(MeshPrimitive::Sphere {
+                object,
+                radius,
+                segments,
+                rings,
+                smooth,
+            }));
+        }
+        for (variant, (radius, height, segments, smooth)) in [
+            (0.5, 1.0, 3, true),
+            (0.7, 1.0, 3, true),
+            (0.5, 1.2, 3, true),
+            (0.5, 1.0, 4, true),
+            (0.5, 1.0, 3, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let object = format!("cylinder-{copy}-{variant}");
+            explicit.push(ProgramOp::Op(
+                Operation::cylinder(&object, radius, height, segments, smooth, &limits).unwrap(),
+            ));
+            generated.push(ProgramOp::Mesh(MeshPrimitive::Cylinder {
+                object,
+                radius,
+                height,
+                segments,
+                smooth,
+            }));
+        }
+    }
+    let generated = build_program(&generated, limits.clone(), &mut |_| unreachable!(), None).unwrap();
+    let explicit = build_program(&explicit, limits, &mut |_| unreachable!(), None).unwrap();
+    assert_eq!(
+        generated.document.to_bytes(None).unwrap(),
+        explicit.document.to_bytes(None).unwrap(),
+        "primitive reuse must preserve the authoring document"
+    );
+    assert_eq!(
+        generated.compiled.glb, explicit.compiled.glb,
+        "primitive reuse must preserve the exported bytes"
+    );
+
+    // Construction factories are the live builder's box/cylinder path. A
+    // single batch can reuse them; individual transactions cannot. Keep raw
+    // signed-zero parameters and a different material in the comparison.
+    let shapes = [
+        (Shape::Box { size: [1., 2., 3.], radius: 0., segments: 1 }, 0),
+        (Shape::Box { size: [1., 2., 3.], radius: -0., segments: 1 }, 0),
+        (Shape::Box { size: [1., 2., 3.], radius: 0.1, segments: 1 }, 0),
+        (Shape::Cone { bottom: 0.5, top: 0.5, height: 1., segments: 4, smooth: true }, 0),
+        (Shape::Cone { bottom: 0.5, top: 0.5, height: 1., segments: 4, smooth: true }, 1),
+        (Shape::Cone { bottom: 0.5, top: -0., height: 1., segments: 4, smooth: false }, 0),
+        (Shape::Cone { bottom: 0.5, top: 0., height: 1., segments: 4, smooth: false }, 0),
+        (Shape::Capsule { radius: 0.2, height: 1., segments: 4, rings: 1 }, 0),
+    ];
+    let mut operations = vec![Operation::SetMaterial { material: 1, value: Material::default() }];
+    for copy in 0..3 {
+        for (variant, (shape, material)) in shapes.iter().enumerate() {
+            operations.push(Operation::Construction(ConstructionOperation {
+                object: format!("shape-{copy}-{variant}"),
+                kind: Construction::Shape { shape: shape.clone(), material: *material },
+            }));
+        }
+    }
+    let mut batched = Document::new(Limits::default()).unwrap();
+    let batch = batched.apply(Transaction {
+        request_id: "batch".into(),
+        expected: batched.head(),
+        operations: operations.clone(),
+    }, None).unwrap();
+    let mut individual = Document::new(Limits::default()).unwrap();
+    let mut individual_results = Vec::new();
+    for (index, operation) in operations.into_iter().enumerate() {
+        individual_results.extend(individual.apply(Transaction {
+            request_id: format!("individual-{index}"),
+            expected: individual.head(),
+            operations: vec![operation],
+        }, None).unwrap().results);
+    }
+    assert_eq!(batch.results, individual_results, "construction reuse must preserve operation results");
+    assert_eq!(
+        batched.compile(None).unwrap().glb,
+        individual.compile(None).unwrap().glb,
+        "construction reuse must preserve the exported bytes"
+    );
 }

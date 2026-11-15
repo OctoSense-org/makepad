@@ -12,6 +12,7 @@
 //!   no tanh.
 
 use crate::ace::{ace_open_shards, ace_tensor_any};
+use crate::backend::WeightOwner;
 use crate::error::{DiffusionError, Result};
 use makepad_ai_h3::h3::H3ShardedWeights;
 use makepad_ai_sfx::sa3::{par_rows, F16Weight};
@@ -39,8 +40,8 @@ pub struct OobleckSpec {
     pub hop: usize,
     pub out_bias: bool,
     pub names: OobleckNames,
-    /// Device weight-cache namespace (distinct per checkpoint family).
-    pub key: &'static str,
+    /// Label for the per-decoder device weight owner.
+    pub label: &'static str,
 }
 
 pub const ACE_OOBLECK: OobleckSpec = OobleckSpec {
@@ -52,7 +53,7 @@ pub const ACE_OOBLECK: OobleckSpec = OobleckSpec {
     hop: crate::ace::ACE_HOP,
     out_bias: false,
     names: OobleckNames::Diffusers,
-    key: "acevae",
+    label: "ace-vae",
 };
 
 pub const YUE2_OOBLECK: OobleckSpec = OobleckSpec {
@@ -64,7 +65,7 @@ pub const YUE2_OOBLECK: OobleckSpec = OobleckSpec {
     hop: 1920,
     out_bias: false,
     names: OobleckNames::StableAudio,
-    key: "yue2vae",
+    label: "yue2-vae",
 };
 
 impl OobleckSpec {
@@ -163,6 +164,7 @@ struct DecBlock {
 }
 
 pub struct OobleckDecoder {
+    owner: WeightOwner,
     spec: OobleckSpec,
     conv_in: Conv,
     blocks: Vec<DecBlock>,
@@ -373,7 +375,7 @@ impl OobleckDecoder {
         let snake_out = load_snake(&weights, &spec.snake_out(), ch)?;
         let conv_out = load_conv(&weights, &spec.conv_out(), spec.audio_channels, ch, 7, 1, 3, spec.out_bias)?;
         emit_progress(&mut progress, "load vae", 1.0)?;
-        Ok(Self { spec, conv_in, blocks, snake_out, conv_out })
+        Ok(Self { owner: WeightOwner::new(spec.label), spec, conv_in, blocks, snake_out, conv_out })
     }
 
     /// Decode token-major `[T, 64]` latents to planar stereo `[left, right]`.
@@ -561,14 +563,14 @@ impl OobleckDecoder {
             dilation: usize,
             padding: usize,
             key: &str,
-            ns: &str,
+            owner: &makepad_ai_common::backend::WeightOwner,
         ) -> Result<(GpuTensor, usize)> {
             use makepad_ai_sfx::sa3::dev_err;
             use makepad_ai_common::backend::cuda::gpu_conv1d_cached;
             if x.rows() != len || x.cols() != in_ch {
                 return Err(DiffusionError::model("vae conv input shape"));
             }
-            let out = gpu_conv1d_cached(x, w, b, out_ch, k, dilation, padding, ns, key)
+            let out = gpu_conv1d_cached(x, w, b, out_ch, k, dilation, padding, owner, key)
                 .map_err(|e| dev_err("vae conv", e))?;
             let out_len = out.rows();
             Ok((out, out_len))
@@ -584,16 +586,16 @@ impl OobleckDecoder {
             x: &GpuTensor,
             len: usize,
             conv: &TConv,
-            ns: &str,
+            owner: &makepad_ai_common::backend::WeightOwner,
         ) -> Result<(GpuTensor, usize)> {
             use makepad_ai_sfx::sa3::dev_err;
             use makepad_ai_common::backend::cuda::gpu_linear_nt_cached;
             if conv.k != 2 * conv.stride {
                 return Err(DiffusionError::model("vae tconv k"));
             }
-            let y_hi = gpu_linear_nt_cached(x, ns, &[conv.device_lo.part()], &conv.device_bias)
+            let y_hi = gpu_linear_nt_cached(x, owner, &[conv.device_lo.part()], &conv.device_bias)
                 .map_err(|e| dev_err("vae tlo", e))?;
-            let y_lo = gpu_linear_nt_cached(x, ns, &[conv.device_hi.part()], &[])
+            let y_lo = gpu_linear_nt_cached(x, owner, &[conv.device_hi.part()], &[])
                 .map_err(|e| dev_err("vae thi", e))?;
             let g = makepad_ai_common::backend::cuda::gpu_tconv_stitch(
                 &y_hi, &y_lo, len, conv.out_ch, conv.stride, conv.padding, conv.k,
@@ -603,10 +605,10 @@ impl OobleckDecoder {
             Ok((g, out_len))
         }
 
-        let ns = self.spec.key;
+        let owner = &self.owner;
         let conv = &self.conv_in;
         let (y, nlen) = conv_tm(
-            &x, len, &conv.w, &conv.b, conv.out_ch, conv.in_ch, conv.k, conv.dilation, conv.padding, "in", ns,
+            &x, len, &conv.w, &conv.b, conv.out_ch, conv.in_ch, conv.k, conv.dilation, conv.padding, "in", owner,
         )?;
         x = y;
         len = nlen;
@@ -614,7 +616,7 @@ impl OobleckDecoder {
         for (bi, block) in self.blocks.iter().enumerate() {
             x = snake_tm(&x, &block.snake.alpha, &block.snake.inv_beta)?;
             let up = &block.up;
-            let (yy, nn) = tconv_tm(&x, len, up, ns)?;
+            let (yy, nn) = tconv_tm(&x, len, up, owner)?;
             x = yy;
             len = nn;
             for (ui, unit) in block.units.iter().enumerate() {
@@ -623,14 +625,14 @@ impl OobleckDecoder {
                 let c1 = &unit.conv1;
                 let (hh, hlen) = conv_tm(
                     &h, len, &c1.w, &c1.b, c1.out_ch, c1.in_ch, c1.k, c1.dilation, c1.padding,
-                    &format!("b{bi}u{ui}c1"), ns,
+                    &format!("b{bi}u{ui}c1"), owner,
                 )?;
                 h = snake_tm(&hh, &unit.snake2.alpha, &unit.snake2.inv_beta)?;
                 drop(hh);
                 let c2 = &unit.conv2;
                 let (hh2, hlen2) = conv_tm(
                     &h, hlen, &c2.w, &c2.b, c2.out_ch, c2.in_ch, c2.k, c2.dilation, c2.padding,
-                    &format!("b{bi}u{ui}c2"), ns,
+                    &format!("b{bi}u{ui}c2"), owner,
                 )?;
                 drop(h);
                 if hlen2 != len {
@@ -643,7 +645,7 @@ impl OobleckDecoder {
         x = snake_tm(&x, &self.snake_out.alpha, &self.snake_out.inv_beta)?;
         let co = &self.conv_out;
         let (yy, nlen) = conv_tm(
-            &x, len, &co.w, &co.b, co.out_ch, co.in_ch, co.k, co.dilation, co.padding, "out", ns,
+            &x, len, &co.w, &co.b, co.out_ch, co.in_ch, co.k, co.dilation, co.padding, "out", owner,
         )?;
         let host = gpu_download(&yy).map_err(|e| dev_err("vae out", e))?;
         Ok((host, nlen))

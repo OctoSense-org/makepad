@@ -5,8 +5,9 @@ use super::super::log_enabled;
 use makepad_vulkan::{vk, Entry};
 use std::collections::{HashSet, VecDeque};
 use std::ffi::CStr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -66,7 +67,9 @@ pub struct Device {
     /// header: another device's or driver's data is ignored), so a relaunch does not compile
     /// every pipeline variant from SPIR-V again (`save_pipeline_cache` writes it back).
     pub pipeline_cache: vk::PipelineCache,
-    pipeline_cache_file: Option<PathBuf>,
+    pipeline_cache_file: Option<PipelineCacheFile>,
+    /// The cache started without this app build's pipelines (`info_flags::PIPELINE_CACHE_COLD`).
+    pub pipeline_cache_cold: bool,
     /// Pipelines made since the cache was last saved, and when the last one was (clock_ns).
     pub pipelines_made: AtomicU32,
     pub pipeline_made_ns: AtomicU64,
@@ -80,6 +83,8 @@ pub struct Device {
     /// What the backend made for itself (arenas, staging, leases, multisample and window
     /// copies): the ledger's backend rows.
     pub pools: Arc<crate::ledger::Pools>,
+    /// The device memory retained buffers take their ranges of (`Buffer::unzeroed`).
+    pub(super) blocks: Mutex<super::blocks::Blocks>,
     /// The driver reported VK_ERROR_DEVICE_LOST (or a simulated loss): the backend replaces
     /// the device. Nothing else marks a device lost; running out of memory never does.
     pub lost: AtomicBool,
@@ -101,6 +106,9 @@ pub struct Device {
     /// The samplers of video textures (`Device::video_sampler`), by external format (0: an
     /// ordinary image's), destroyed with the device.
     video_samplers: Mutex<std::collections::HashMap<u64, VideoSampler>>,
+    /// The blend-free twins of draw samplers (`Device::unfiltered_sampler`), by the sampler
+    /// they stand in for, made when a draw first needs one and destroyed with the device.
+    unfiltered_samplers: Mutex<std::collections::HashMap<crate::spirv::SpirvSampler, vk::Sampler>>,
 }
 
 /// The immutable sampler of a video texture slot: a linear clamp-to-edge one for an ordinary
@@ -205,6 +213,12 @@ impl Device {
         let device = Device::new(instance_extensions, optional, source)?;
         *shared = Some((instance_extensions.iter().map(|n| n.to_string_lossy().into_owned()).collect(), device.clone()));
         Ok(device)
+    }
+
+    /// The process is done with Vulkan (Android's GLES fallback), so its device goes with the
+    /// last backend holding it.
+    pub(crate) fn release_shared() {
+        lock(&SHARED).take();
     }
 
     fn new(instance_extensions: &[&CStr], optional: &[&CStr], source: &mut dyn super::surface::VkSurfaceSource) -> Result<Arc<Self>, String> {
@@ -348,13 +362,14 @@ impl Device {
             plane444.p_next = std::ptr::null_mut();
             if plane444.ycbcr2plane444_formats != 0 { wanted.push(vk::EXT_YCBCR_2PLANE_444_FORMATS_NAME); }
         }
-        // QP delta maps for the encoder (a QP per region of the picture)
+        // QP delta maps for the encoder (a QP per region of the picture); below Vulkan 1.3 (the
+        // device runs 1.1) the extension requires VK_KHR_format_feature_flags2 enabled with it
         let mut qp_map = vk::PhysicalDeviceVideoEncodeQuantizationMapFeaturesKHR::default();
-        if video_family.is_some() && supported(vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME) {
+        if video_family.is_some() && supported(vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME) && supported(vk::KHR_FORMAT_FEATURE_FLAGS_2_NAME) {
             let mut query = vk::PhysicalDeviceFeatures2::default().next_physical_device_video_encode_quantization_map_features_khr(&mut qp_map);
             unsafe { instance.get_physical_device_features2(physical, &mut query); }
             qp_map.p_next = std::ptr::null_mut();
-            if qp_map.video_encode_quantization_map != 0 { wanted.push(vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME); }
+            if qp_map.video_encode_quantization_map != 0 { wanted.extend([vk::KHR_VIDEO_ENCODE_QUANTIZATION_MAP_NAME, vk::KHR_FORMAT_FEATURE_FLAGS_2_NAME]); }
         }
         let has_qp_map = qp_map.video_encode_quantization_map != 0;
         // fragment density maps (an XR runtime's foveation of its swapchains)
@@ -412,6 +427,7 @@ impl Device {
         let mut ycbcr = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default().sampler_ycbcr_conversion(has_ycbcr);
 
         let features = vk::PhysicalDeviceFeatures::default()
+            .sampler_anisotropy(supported_features.sampler_anisotropy == vk::TRUE)
             .independent_blend(supported_features.independent_blend == vk::TRUE)
             .shader_storage_image_extended_formats(supported_features.shader_storage_image_extended_formats == vk::TRUE)
             .shader_int64(compute && supported_features.shader_int64 == vk::TRUE)
@@ -481,15 +497,15 @@ impl Device {
         let video_encode = video_family.map(|f| VideoQueue { family: f as u32, queue: unsafe { raw.get_device_queue(f as u32, 0) }, timestamp_bits: video_timestamp_bits,
             more: (1..video_count).map(|i| (unsafe { raw.get_device_queue(f as u32, i) }, Mutex::new(()))).collect(), lock: Mutex::new(()), h265, qp_map: has_qp_map });
         if let Some(v) = &video_encode { if log_enabled() { eprintln!("[hal-vulkan] hardware video encode queue family={}", v.family); } }
-        let (pipeline_cache, pipeline_cache_file) = open_pipeline_cache(&raw, &properties);
+        let (pipeline_cache, pipeline_cache_file, pipeline_cache_cold) = open_pipeline_cache(&raw, &properties);
         Ok(Some(Arc::new(Self {
             queue: unsafe { raw.get_device_queue(family as u32, 0) }, queue_lock: Mutex::new(()), raw, instance: instance.clone(),
             physical, family: family as u32, properties, memory, features, formats,
             timestamp_bits: queue.timestamp_valid_bits, calibrated, extensions, present_wait: pacing, multiview: has_multiview, compute, fdm: has_fdm, msaa, life: life.clone(),
             video_encode,
-            pools: Default::default(), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), rebar_fallback_logged: AtomicBool::new(false), budget: Mutex::new(None),
-            ycbcr: has_ycbcr, video_samplers: Mutex::new(Default::default()),
-            pipeline_cache, pipeline_cache_file, pipelines_made: AtomicU32::new(0), pipeline_made_ns: AtomicU64::new(0),
+            pools: Default::default(), blocks: Default::default(), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), rebar_fallback_logged: AtomicBool::new(false), budget: Mutex::new(None),
+            ycbcr: has_ycbcr, video_samplers: Mutex::new(Default::default()), unfiltered_samplers: Mutex::new(Default::default()),
+            pipeline_cache, pipeline_cache_file, pipeline_cache_cold, pipelines_made: AtomicU32::new(0), pipeline_made_ns: AtomicU64::new(0),
         })))
     }
 
@@ -535,6 +551,19 @@ impl Device {
         };
         let v = VideoSampler { conversion, sampler };
         samplers.insert(external_format, v);
+        Ok(v)
+    }
+
+    /// The twin of draw sampler `s` that blends nothing (nearest within and between mip
+    /// levels): what a texture whose format lacks `SAMPLED_IMAGE_FILTER_LINEAR` is read through
+    /// instead of a sampler that blends (Vulkan allows no linear filter or mip blend on it).
+    /// Made once per sampler and logged then.
+    pub fn unfiltered_sampler(&self, s: &crate::spirv::SpirvSampler) -> Result<vk::Sampler, String> {
+        let mut samplers = lock(&self.unfiltered_samplers);
+        if let Some(v) = samplers.get(s) { return Ok(*v); }
+        let v = super::pipeline::sampler(self, s, true)?;
+        eprintln!("[hal-vulkan] a texture whose format the device cannot filter is read through a blending sampler ({s:?}); it reads through a nearest twin");
+        samplers.insert(*s, v);
         Ok(v)
     }
 
@@ -640,14 +669,14 @@ impl Device {
         let raw = unsafe { instance.create_device(physical, &create, None) }.map_err(error)?;
         let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
         let formats = std::array::from_fn(|f| unsafe { instance.get_physical_device_format_properties(physical, super::resources::vk_format(f as u32).unwrap()) });
-        let (pipeline_cache, pipeline_cache_file) = open_pipeline_cache(&raw, &properties);
+        let (pipeline_cache, pipeline_cache_file, pipeline_cache_cold) = open_pipeline_cache(&raw, &properties);
         Ok(Arc::new(Self { instance: instance.clone(), queue: unsafe { raw.get_device_queue(family as u32, 0) },
             raw, physical, queue_lock: Mutex::new(()), family: family as u32, properties, memory, features, formats,
             // a display peer only scans out: the GPU profiler times the rendering device
             timestamp_bits: queue.timestamp_valid_bits, calibrated: false, extensions, present_wait: pacing, multiview: false, compute: false, fdm: false, msaa: 1, life: owner.life.clone(), video_encode: None,
-            pools: Default::default(), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), rebar_fallback_logged: AtomicBool::new(false), budget: Mutex::new(None),
-            ycbcr: false, video_samplers: Mutex::new(Default::default()),
-            pipeline_cache, pipeline_cache_file, pipelines_made: AtomicU32::new(0), pipeline_made_ns: AtomicU64::new(0) }))
+            pools: Default::default(), blocks: Default::default(), lost: AtomicBool::new(false), starved: AtomicBool::new(false), files_reported: AtomicBool::new(false), rebar_fallback_logged: AtomicBool::new(false), budget: Mutex::new(None),
+            ycbcr: false, video_samplers: Mutex::new(Default::default()), unfiltered_samplers: Mutex::new(Default::default()),
+            pipeline_cache, pipeline_cache_file, pipeline_cache_cold, pipelines_made: AtomicU32::new(0), pipeline_made_ns: AtomicU64::new(0) }))
     }
 }
 
@@ -660,66 +689,165 @@ impl Drop for Device {
                 self.raw.destroy_sampler(v.sampler, None);
                 if v.conversion != vk::SamplerYcbcrConversion::null() { self.raw.destroy_sampler_ycbcr_conversion(v.conversion, None); }
             }
+            for (_, s) in lock(&self.unfiltered_samplers).drain() { self.raw.destroy_sampler(s, None); }
             if self.pipeline_cache != vk::PipelineCache::null() { self.raw.destroy_pipeline_cache(self.pipeline_cache, None); }
+            lock(&self.blocks).release(self);
             self.raw.destroy_device(None);
         }
     }
 }
 
 /// The pipeline cache file of this device and driver, under the app's cache directory
-/// (MAKEPAD_HAL_CACHE_DIR; Android: TMPDIR, the app's cache dir; Apple: Library/Caches; else
+/// (MAKEPAD_HAL_CACHE_DIR; Android: the app's cache dir, else TMPDIR; Apple: Library/Caches; else
 /// XDG_CACHE_HOME, LOCALAPPDATA or ~/.cache). None: pipelines are not kept across runs.
 fn pipeline_cache_file(properties: &vk::PhysicalDeviceProperties) -> Option<PathBuf> {
+    // from the Activity's params, since Android 9 and older don't set TMPDIR
+    #[cfg(target_os = "android")]
+    let android = Some(crate::backend::android::AndroidBackend::params().cache_path).filter(|d| !d.is_empty());
+    #[cfg(not(target_os = "android"))]
+    let android: Option<String> = None;
     let dir = if let Some(d) = std::env::var_os("MAKEPAD_HAL_CACHE_DIR") { PathBuf::from(d) }
-        else if cfg!(target_os = "android") { PathBuf::from(std::env::var_os("TMPDIR")?) }
+        else if cfg!(target_os = "android") { android.map(PathBuf::from).or_else(|| std::env::var_os("TMPDIR").map(PathBuf::from))? }
         else if cfg!(target_vendor = "apple") { PathBuf::from(apple_cache_dir()?) }
         else if let Some(d) = std::env::var_os("XDG_CACHE_HOME") { PathBuf::from(d) }
         else if let Some(d) = std::env::var_os("LOCALAPPDATA") { PathBuf::from(d) }
         else { PathBuf::from(std::env::var_os("HOME")?).join(".cache") };
-    Some(dir.join("makepad-hal").join(format!("pipelines-{:x}-{:x}-{:x}.bin", properties.vendor_id, properties.device_id, properties.driver_version)))
+    // outside Android, apps share the user's cache dir, so each app's file has its name in it
+    let app = if cfg!(target_os = "android") { None }
+        else { std::env::current_exe().ok().and_then(|exe| Some(format!("{}-", exe.file_stem()?.to_string_lossy()))) };
+    Some(dir.join("makepad-hal").join(format!("pipelines-{}{:x}-{:x}-{:x}.bin", app.unwrap_or_default(), properties.vendor_id, properties.device_id, properties.driver_version)))
 }
 #[cfg(target_vendor = "apple")]
 fn apple_cache_dir() -> Option<String> { crate::app_cache_dir() }
 #[cfg(not(target_vendor = "apple"))]
 fn apple_cache_dir() -> Option<String> { None }
 
+/// Where a device's pipeline cache is kept between runs.
+struct PipelineCacheFile {
+    path: PathBuf,
+    /// What the file starts with, naming the app build that saved it. The driver data's length
+    /// and hash come next.
+    header: Vec<u8>,
+    /// The driver's cache size when it was opened or last saved. A save only writes past that,
+    /// since a launch that found all its pipelines in the cache doesn't grow it.
+    saved: AtomicUsize,
+}
+
+/// How big `cache` is right now, without copying its data out.
+fn pipeline_cache_size(raw: &makepad_vulkan::Device, cache: vk::PipelineCache) -> usize {
+    let Some(call) = raw.table.get_pipeline_cache_data else { return 0 };
+    let mut size = 0;
+    unsafe { call(raw.handle(), cache, &mut size, std::ptr::null_mut()) }.result().map_or(0, |_| size)
+}
+
 /// The device's pipeline cache, primed from its file when there is one. On a phone's GPU
 /// an app's warm start spent seconds of its HAL thread in vkCreateGraphicsPipelines
 /// (every variant compiled from SPIR-V, every launch) before this.
-fn open_pipeline_cache(raw: &makepad_vulkan::Device, properties: &vk::PhysicalDeviceProperties) -> (vk::PipelineCache, Option<PathBuf>) {
-    let file = pipeline_cache_file(properties);
-    let data = file.as_ref().and_then(|f| std::fs::read(f).ok()).unwrap_or_default();
+fn open_pipeline_cache(raw: &makepad_vulkan::Device, properties: &vk::PhysicalDeviceProperties) -> (vk::PipelineCache, Option<PipelineCacheFile>, bool) {
+    let path = pipeline_cache_file(properties);
+    // we delete files no launch will read: temp files of saves that died midway, and this app's files
+    // for other drivers of its GPU (or on Android, where the folder is the app's own, every other file)
+    if let Some((dir, name)) = path.as_ref().and_then(|p| Some((p.parent()?, p.file_name()?.to_str()?))) {
+        let app_gpu = name.rsplit_once('-').map_or(name, |(app_gpu, _)| app_gpu);
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let file = entry.file_name();
+            let Some(file) = file.to_str().filter(|f| f.starts_with("pipelines-") && *f != name) else { continue };
+            let stale = match file.strip_suffix(".tmp") {
+                Some(tmp) => tmp.rsplit_once('.').and_then(|(_, n)| n.split_once('-')).is_some_and(|(pid, _)| !Path::new("/proc").join(pid).exists()),
+                None => file.ends_with(".bin") && (cfg!(target_os = "android") || file.rsplit_once('-').is_some_and(|(other, _)| other == app_gpu)),
+            };
+            if stale {
+                let _ = std::fs::remove_file(entry.path());
+                if log_enabled() { eprintln!("[hal-vulkan] pipeline cache: deleted stale {file}"); }
+            }
+        }
+    }
+    // what changes with each new build of the app, so it starts a fresh cache: on Android the
+    // package's version and last update time, elsewhere the executable's size and mtime
+    #[cfg(target_os = "android")]
+    let build = crate::backend::android::AndroidBackend::params().app_build;
+    #[cfg(not(target_os = "android"))]
+    let build = {
+        // an AppImage runs from a new mount folder each launch, so there we key on the image file,
+        // but only from inside it (APPDIR), since APPIMAGE leaks into the programs an AppImage starts
+        let exe = std::env::current_exe().ok();
+        let appimage = std::env::var_os("APPDIR").filter(|dir| exe.as_ref().is_some_and(|exe| exe.starts_with(dir)))
+            .and_then(|_| std::env::var_os("APPIMAGE")).map(PathBuf::from);
+        let meta = appimage.clone().or(exe).and_then(|f| f.metadata().ok());
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+        format!("{} {} {}", appimage.unwrap_or_default().display(), meta.map_or(0, |m| m.len()), mtime.as_nanos())
+    };
+    let header = format!("makepad pipeline cache: {build}\0").into_bytes();
+    let read = path.as_ref().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
+    let data = read.strip_prefix(header.as_slice()).filter(|rest| rest.len() >= 16).map(|rest| rest.split_at(16))
+        .filter(|(check, data)| check[..8] == (data.len() as u64).to_le_bytes() && check[8..] == fxhash::hash64(*data).to_le_bytes());
+    let data = match data {
+        Some((_, data)) => data,
+        None => {
+            // another build's file, or a damaged one, counts as no cache, so we drop it and this build saves its own
+            if let Some(p) = path.as_ref().filter(|_| !read.is_empty()) {
+                let _ = std::fs::remove_file(p);
+                if log_enabled() { eprintln!("[hal-vulkan] pipeline cache: {} is from another build or damaged, dropped", p.display()); }
+            }
+            &[]
+        }
+    };
     let mut info = vk::PipelineCacheCreateInfo::default();
     if !data.is_empty() { info.initial_data_size = data.len(); info.p_initial_data = data.as_ptr() as *const std::ffi::c_void; }
-    let made = unsafe { raw.create_pipeline_cache(&info, None) }
-        .or_else(|_| unsafe { raw.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) });
+    // the driver ignores data whose header names another device or cache UUID, and a header
+    // alone has no pipelines in it
+    let warm = data.len() > 32 && data[8..12] == properties.vendor_id.to_le_bytes()
+        && data[12..16] == properties.device_id.to_le_bytes() && data[16..32] == properties.pipeline_cache_uuid;
+    let made = unsafe { raw.create_pipeline_cache(&info, None) }.map(|cache| (cache, !warm))
+        .or_else(|_| unsafe { raw.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None) }.map(|cache| (cache, true)));
     match made {
-        Ok(cache) => {
-            if log_enabled() { eprintln!("[hal-vulkan] pipeline cache: {} bytes from {}", data.len(), file.as_ref().map_or("nowhere".into(), |f| f.display().to_string())); }
-            (cache, file)
+        Ok((cache, cold)) => {
+            // without a file nothing is kept for the next launch, so no launch counts as cold
+            let cold = cold && path.is_some();
+            if log_enabled() { eprintln!("[hal-vulkan] pipeline cache: {} bytes from {} (cold: {cold})", data.len(), path.as_ref().map_or("nowhere".into(), |p| p.display().to_string())); }
+            (cache, path.map(|path| PipelineCacheFile { path, header, saved: AtomicUsize::new(pipeline_cache_size(raw, cache)) }), cold)
         }
-        Err(e) => { eprintln!("[hal-vulkan] pipeline cache: {e:?}; pipelines are compiled every run"); (vk::PipelineCache::null(), None) }
+        Err(e) => { eprintln!("[hal-vulkan] pipeline cache: {e:?}; pipelines are compiled every run"); (vk::PipelineCache::null(), None, false) }
     }
 }
 
 impl Device {
-    /// Writes the pipeline cache when pipelines were made since it was last saved (the file is
-    /// replaced whole, through a rename). Called from the compile worker and at exit.
+    /// Writes the pipeline cache when pipelines were made since it was last saved and the cache
+    /// grew (the file is replaced whole, through a rename). Called from the compile worker and at exit.
     pub fn save_pipeline_cache(&self) {
         if self.pipeline_cache == vk::PipelineCache::null() { return; }
         let Some(file) = &self.pipeline_cache_file else { return };
         if self.pipelines_made.swap(0, Ordering::AcqRel) == 0 { return; }
+        let size = pipeline_cache_size(&self.raw, self.pipeline_cache);
+        if size <= file.saved.load(Ordering::Relaxed) {
+            if log_enabled() { eprintln!("[hal-vulkan] pipeline cache didn't grow ({size} bytes), not saved"); }
+            return;
+        }
         let data = match unsafe { self.raw.get_pipeline_cache_data(self.pipeline_cache) } {
             Ok(d) => d,
             Err(e) => { eprintln!("[hal-vulkan] pipeline cache data: {e:?}"); return; }
         };
-        let tmp = file.with_extension("tmp");
-        let written = file.parent().map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&tmp, &data))
-            .and_then(|_| std::fs::rename(&tmp, file));
+        // each save writes its own temp file, so two saves at once (ours at exit, or another
+        // instance of the app's) can't publish a mix of both
+        static SAVES: AtomicU32 = AtomicU32::new(0);
+        let tmp = file.path.with_extension(format!("{}-{}.tmp", std::process::id(), SAVES.fetch_add(1, Ordering::Relaxed)));
+        let written = file.path.parent().map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::File::create(&tmp))
+            .and_then(|mut f| {
+                f.write_all(&file.header)?;
+                f.write_all(&(data.len() as u64).to_le_bytes())?;
+                f.write_all(&fxhash::hash64(&data[..]).to_le_bytes())?;
+                f.write_all(&data)?;
+                // on disk before the rename, so a crash right after a save can't leave a short file
+                f.sync_all()
+            })
+            .and_then(|_| std::fs::rename(&tmp, &file.path));
         match written {
-            Ok(()) => if log_enabled() { eprintln!("[hal-vulkan] pipeline cache saved: {} bytes", data.len()); },
-            Err(e) => eprintln!("[hal-vulkan] pipeline cache {}: {e}", file.display()),
+            Ok(()) => {
+                file.saved.store(data.len(), Ordering::Relaxed);
+                if log_enabled() { eprintln!("[hal-vulkan] pipeline cache saved: {} bytes", data.len()); }
+            }
+            Err(e) => { let _ = std::fs::remove_file(&tmp); eprintln!("[hal-vulkan] pipeline cache {}: {e}", file.path.display()) }
         }
     }
 }
@@ -838,25 +966,63 @@ pub(crate) mod compile_rank {
     pub const SAVE: u8 = 3;
 }
 
-/// The pipeline compiles, on up to `Compilers::threads()` threads sharing one queue: Vulkan
+/// The pipeline compiles, on up to `Compilers::threads` threads sharing one queue: Vulkan
 /// creates pipelines on any thread at once, and the driver compiles on the calling thread
 /// (NVIDIA with a cold shader cache: a large app's cold first frame waited 19.8 s for 183 pipelines on
 /// one thread, 7.7 s on eight). Each job carries its rank (`compile_rank`), which a waiting frame lowers
 /// (`Compilers::waited`); a free thread takes the lowest-ranked job, the oldest first. A job runs
 /// inside the process CPU budget, so compiles and the JIT do not oversubscribe the cores, and in
 /// its interactive class: something waits for every compile (a frame for its draw programs, a
-/// held pass for its kernel), and none is made ahead of need.
+/// held pass for its kernel), and none is made ahead of need. A thread takes its slot of the budget
+/// before it takes a job: one waiting for the CPU holds no job, so when a slot frees, the job a
+/// frame waits for is the one that runs, whatever was queued before it.
 pub(crate) struct Compilers {
     shared: Arc<CompileShared>,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 struct CompileShared {
+    budget: CompileBudget,
     queue: Mutex<CompileQueue>,
     /// a job was queued, or the pool closed
     work: std::sync::Condvar,
     /// a job ended (`settle`)
     ended: std::sync::Condvar,
+}
+
+/// The CPU budget a compile pool admits its jobs through.
+enum CompileBudget {
+    /// the process's: a device's compiles share the cores with the app's other work and the JIT
+    Process,
+    /// one of its own (a pool under test, sized for its test)
+    #[cfg(test)]
+    Own(Arc<tests::Slots>),
+}
+
+impl CompileBudget {
+    fn cores(&self) -> usize {
+        match self {
+            Self::Process => makepad_cpu_budget::cores() as usize,
+            #[cfg(test)]
+            Self::Own(slots) => slots.cores,
+        }
+    }
+
+    fn admit(&self) -> u32 {
+        match self {
+            Self::Process => makepad_cpu_budget::admit(makepad_cpu_budget::INTERACTIVE, makepad_cpu_budget::HAL, "pipeline compile"),
+            #[cfg(test)]
+            Self::Own(slots) => slots.admit(),
+        }
+    }
+
+    fn release(&self, permit: u32) {
+        match self {
+            Self::Process => makepad_cpu_budget::release(permit),
+            #[cfg(test)]
+            Self::Own(slots) => slots.release(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -872,13 +1038,20 @@ struct CompileQueue {
 
 impl Compilers {
     pub fn new() -> Self {
-        Self { shared: Arc::new(CompileShared { queue: Mutex::new(CompileQueue::default()), work: std::sync::Condvar::new(), ended: std::sync::Condvar::new() }),
+        Self::with_budget(CompileBudget::Process)
+    }
+
+    fn with_budget(budget: CompileBudget) -> Self {
+        Self { shared: Arc::new(CompileShared { budget, queue: Mutex::new(CompileQueue::default()), work: std::sync::Condvar::new(), ended: std::sync::Condvar::new() }),
             threads: Mutex::new(Vec::new()) }
     }
 
-    /// Half the cores, 2 to 8.
-    fn threads() -> usize {
-        std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(2, 8)
+    /// Half the budget's cores, 2 to 8, and never more than it has: a thread the budget cannot
+    /// admit would only wait. The budget's, not the machine's: a run granted part of the box
+    /// (`MAKEPAD_CPU_CORES`) started eight threads for a budget of two.
+    fn threads(&self) -> usize {
+        let cores = self.shared.budget.cores().max(1);
+        (cores / 2).clamp(2, 8).min(cores)
     }
 
     /// A rank a job is queued with and its waiters lower (`waited`).
@@ -898,7 +1071,7 @@ impl Compilers {
         q.jobs.push_back((rank, Box::new(job)));
         // an idle thread takes one queued job: woken, it counts as idle until it takes it, so
         // the jobs queued past the idle threads are the ones without a thread
-        if q.jobs.len() > q.idle && q.started < Self::threads() {
+        if q.jobs.len() > q.idle && q.started < self.threads() {
             q.started += 1;
             let n = q.started;
             let shared = self.shared.clone();
@@ -914,19 +1087,28 @@ impl Compilers {
     fn run(shared: &CompileShared) {
         let mut q = lock(&shared.queue);
         loop {
-            let at = q.jobs.iter().enumerate().min_by_key(|(_, (r, _))| r.load(Ordering::Relaxed)).map(|(i, _)| i);
-            let Some((_, job)) = at.and_then(|i| q.jobs.remove(i)) else {
+            if q.jobs.is_empty() {
                 if q.closed { return; }
                 q.idle += 1;
                 q = shared.work.wait(q).unwrap_or_else(|e| e.into_inner());
                 q.idle -= 1;
                 continue;
+            }
+            // a job is queued: the slot first, then the job, the best one when it can run (an idle
+            // thread holds no slot; one admitted to an emptied queue gives it back at once)
+            drop(q);
+            let permit = shared.budget.admit();
+            q = lock(&shared.queue);
+            let at = q.jobs.iter().enumerate().min_by_key(|(_, (r, _))| r.load(Ordering::Relaxed)).map(|(i, _)| i);
+            let Some((_, job)) = at.and_then(|i| q.jobs.remove(i)) else {
+                // another thread took the last one meanwhile
+                shared.budget.release(permit);
+                continue;
             };
             q.running += 1;
             drop(q);
-            let permit = makepad_cpu_budget::admit(makepad_cpu_budget::INTERACTIVE, makepad_cpu_budget::HAL, "pipeline compile");
             job();
-            makepad_cpu_budget::release(permit);
+            shared.budget.release(permit);
             q = lock(&shared.queue);
             q.running -= 1;
             shared.ended.notify_all();
@@ -969,6 +1151,21 @@ impl Drop for Compilers {
 /// The Vulkan loader. makepad-vulkan opens it once per process and never closes it (ICDs register
 /// process-exit and thread-exit handlers that must not outlive their library).
 fn loader() -> Result<Entry, String> { unsafe { Entry::load() } }
+
+/// The vendor and device ids and driver version of the Vulkan 1.1 GPU a backend would open, read
+/// from an instance that's dropped right away, without making a device.
+pub fn first_gpu_driver() -> Option<[u32; 3]> {
+    let entry = loader().ok()?;
+    let app = vk::ApplicationInfo::default().application_name(c"Makepad HAL").api_version(vk::API_VERSION_1_1);
+    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }.ok()?;
+    let life = InstanceLife(instance.clone(), None);
+    let mut gpus: Vec<_> = unsafe { instance.enumerate_physical_devices() }.ok()?.into_iter()
+        .map(|p| unsafe { instance.get_physical_device_properties(p) })
+        .filter(|p| p.api_version >= vk::API_VERSION_1_1).collect();
+    drop(life);
+    gpus.sort_by_key(|p| match p.device_type { vk::PhysicalDeviceType::DISCRETE_GPU => 0, vk::PhysicalDeviceType::INTEGRATED_GPU => 1, _ => 2 });
+    gpus.first().map(|p| [p.vendor_id, p.device_id, p.driver_version])
+}
 
 #[cfg(test)]
 mod tests {
@@ -1016,10 +1213,11 @@ mod tests {
     /// frame waits for first, then the draw programs, then the kernels made ahead.
     #[test]
     fn compiles_run_at_once_waited_first() {
-        use super::{compile_rank, Compilers};
+        use super::{compile_rank, CompileBudget, Compilers};
         use std::sync::mpsc::{channel, sync_channel};
-        let pool = Compilers::new();
-        let n = Compilers::threads();
+        // a budget of its own: the other tests of the process hold slots of its budget
+        let pool = Compilers::with_budget(CompileBudget::Own(Slots::new(8)));
+        let n = pool.threads();
         let (started_tx, started) = channel();
         let gates: Vec<_> = (0..n).map(|_| {
             let (gate, wait) = sync_channel::<()>(0);
@@ -1054,9 +1252,9 @@ mod tests {
     /// one, and the others each get a thread of their own instead of queueing behind it.
     #[test]
     fn pushes_past_an_idle_thread_start_threads() {
-        use super::{compile_rank, Compilers};
+        use super::{compile_rank, CompileBudget, Compilers};
         use std::sync::mpsc::{channel, sync_channel};
-        let pool = Compilers::new();
+        let pool = Compilers::with_budget(CompileBudget::Own(Slots::new(4)));
         pool.push(Compilers::rank(compile_rank::KERNEL), || {});
         assert!(pool.settle(std::time::Duration::from_secs(10)), "the first job ran");
         assert_eq!(super::lock(&pool.shared.queue).idle, 1, "its thread idles");
@@ -1072,5 +1270,80 @@ mod tests {
         }
         drop(gates);
         pool.stop();
+    }
+
+    /// A pool has as many threads as its budget admits, and a thread takes its slot before it
+    /// takes a job: while the app's other work holds every slot of a 2-core budget, both threads
+    /// wait holding no job, and when slots free the job a frame waits for runs first.
+    #[test]
+    fn a_compile_takes_its_cpu_slot_before_its_job() {
+        use super::{compile_rank, CompileBudget, Compilers};
+        let budget = Slots::new(2);
+        let pool = Compilers::with_budget(CompileBudget::Own(budget.clone()));
+        assert_eq!(pool.threads(), 2, "as many threads as the budget's cores");
+        // the app's other work holds both slots
+        for _ in 0..2 { budget.admit(); }
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let push = |name: &'static str, rank: u8| {
+            let (order, rank) = (order.clone(), Compilers::rank(rank));
+            pool.push(rank.clone(), move || order.lock().unwrap().push(name));
+            rank
+        };
+        push("kernel", compile_rank::KERNEL);
+        push("draw", compile_rank::DRAW);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while budget.waiting() < 2 && std::time::Instant::now() < end { std::thread::yield_now(); }
+        assert_eq!(budget.waiting(), 2, "both threads wait for a slot");
+        assert_eq!(super::lock(&pool.shared.queue).started, 2, "no thread past the budget's cores");
+        assert_eq!(super::lock(&pool.shared.queue).jobs.len(), 2, "a thread waiting for a slot holds no job");
+        Compilers::waited(&push("waited", compile_rank::KERNEL));
+        // one slot frees: the three run on it one by one, in rank order
+        budget.release();
+        while order.lock().unwrap().len() < 3 && std::time::Instant::now() < end { std::thread::yield_now(); }
+        assert_eq!(*order.lock().unwrap(), ["waited", "draw", "kernel"]);
+        budget.release();
+        assert!(pool.settle(std::time::Duration::from_secs(10)), "the queue ran out");
+        // an idle thread holds no slot: the app's other work has every core while nothing compiles
+        while super::lock(&pool.shared.queue).idle < 2 && std::time::Instant::now() < end { std::thread::yield_now(); }
+        assert_eq!(super::lock(&pool.shared.queue).idle, 2, "both threads idle");
+        assert_eq!(budget.held(), 0, "with no job queued the pool holds no slot");
+        pool.stop();
+    }
+
+    /// A CPU budget of a test's own, `cores` slots: the pool admits through it as through the
+    /// process budget (a slot before a job, given back when the job ends), and the slots the
+    /// process's other tests hold cannot starve it. Not a second `makepad_cpu_budget` budget: under
+    /// Relax that crate runs in the loader, where JIT-compiled code reaches only its ops (the
+    /// process budget's own rules are its tests).
+    pub(super) struct Slots {
+        pub(super) cores: usize,
+        /// held, waiting
+        state: std::sync::Mutex<[usize; 2]>,
+        freed: std::sync::Condvar,
+    }
+
+    impl Slots {
+        pub(super) fn new(cores: usize) -> Arc<Self> {
+            Arc::new(Self { cores, state: Default::default(), freed: Default::default() })
+        }
+
+        /// Waits for a slot (counted as waiting meanwhile).
+        pub(super) fn admit(&self) -> u32 {
+            let mut s = self.state.lock().unwrap();
+            s[1] += 1;
+            while s[0] == self.cores { s = self.freed.wait(s).unwrap(); }
+            s[1] -= 1;
+            s[0] += 1;
+            0
+        }
+
+        pub(super) fn release(&self) {
+            self.state.lock().unwrap()[0] -= 1;
+            self.freed.notify_all();
+        }
+
+        fn held(&self) -> usize { self.state.lock().unwrap()[0] }
+
+        fn waiting(&self) -> usize { self.state.lock().unwrap()[1] }
     }
 }

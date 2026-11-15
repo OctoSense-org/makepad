@@ -199,3 +199,60 @@ fn round31_discriminant_errors_preserve_recovery_and_diagnostics() {
     assert_eq!(adt.discriminant_for_variant(&tcx, &prog, 1).unwrap().val, 1);
     assert!(tcx.adts[&named(&prog, "Reset")].check_discriminants(&tcx, &prog).is_empty());
 }
+
+// rustc's load_mir: a constant whose body has type errors is not evaluated. Its body's errors are
+// the report: no E0080 joins them (which thread ran the evaluation used to decide that).
+#[test]
+fn tainted_body_is_not_evaluated() {
+    let dir = std::env::temp_dir().join(format!("relax-const-tainted-{}-{}", std::process::id(), crate::unique_test_suffix()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("lib.rs");
+    std::fs::write(&path, br#"#![no_std]
+        const fn one() -> u8 { 1 }
+        const BAD: usize = one();
+    "#).unwrap();
+    let mut prog = Program::new(&std::sync::Arc::new(crate::Session::default()));
+    prog.load_crate("const_tainted", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&prog.session, &[]), Vec::new()).unwrap();
+    // a checked crate: the check reports its bodies' errors
+    for c in prog.crates.iter_mut() { c.validate = true; }
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+    assert!(tcx.typeck(&prog, named(&prog, "BAD")).errors.iter().any(|e| e.contains("E0308")));
+    let reported = tcx.dcx.err_count();
+    let value = tcx.const_eval_resolve(&prog, TypingEnv::fully_monomorphized(&prog), named(&prog, "BAD"), &[]);
+    assert_eq!(value, Err(ErrorHandled::Reported(crate::const_eval::ValTreeCreationError::Tainted)));
+    assert_eq!(tcx.dcx.err_count(), reported, "the evaluation reports nothing of its own");
+}
+
+/// An anonymous constant typed before anything lowered its holder: a warm `makepad run` takes the
+/// holder's code and the constant's from the disk cache, and then the checker types the constant
+/// (gandalf after a relaunch: once a panic, "anonymous const type of `..` (its holder never fed
+/// it)", a static's array length). The holder is lowered then: a static's declared type, a fn's
+/// signature, the body whose path holds a const argument.
+#[test]
+fn an_anonymous_constant_typed_before_its_holder_is_lowered() {
+    use crate::def_collector::NodeId;
+    use crate::program::DefKind;
+    let src = br#"#![no_std]
+        pub const fn len(n: usize) -> usize { n + 1 }
+        pub fn take<const N: usize>() -> usize { N }
+        pub static S: [u8; len(3)] = [7; 4];
+        pub fn sig() -> [u8; len(2)] { [1; 3] }
+        pub fn body() -> usize { take::<{ len(5) }>() }
+    "#;
+    for holder in ["S", "sig", "body"] {
+        let (prog, tcx) = program(src);
+        let owner = named(&prog, holder);
+        // its constant that calls `len` (the repeat counts are literals of the bodies)
+        let consts: Vec<DefId> = prog.def_id_to_node_id.iter()
+            .filter(|(d, (_, n))| matches!(n, NodeId::AnonConst(_)) && prog.def(**d).kind == DefKind::AnonConst
+                && !prog.repeat_expr_counts.contains(*d) && crate::borrowck::body::root_owner(&prog, **d) == owner)
+            .map(|(d, _)| *d).collect();
+        assert_eq!(consts.len(), 1, "{holder}: {consts:?}");
+        let body = tcx.typeck(&prog, consts[0]);
+        assert!(body.errors.is_empty(), "{holder}: {:?}", body.errors);
+        assert_eq!(tcx.const_ty(&prog, consts[0]), Some(tcx.tys.usize_), "{holder}: the type its holder gives it");
+    }
+}

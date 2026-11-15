@@ -15,7 +15,7 @@ impl Renderer {
             if model.morph.is_some(){continue;}
             let (min,max) = crate::lightmap::world_bounds(&inst.transform,(model.min,model.max));
             for geometry in std::iter::once(model.geometry.as_ref()).chain(model.extra_draws.iter().map(|(g,..)|g.as_ref())) {
-                out.push(GpuBakeMesh {geometry:geometry.geometry_id(),transform:inst.transform,min,max, cutout: None, band: Default::default() });
+                out.push(GpuBakeMesh {geometry:geometry.geometry_id(),transform:inst.transform,min,max, cutout: None, msdf: None, band: Default::default() });
             }
         }
         fn shadow_geometry(cx:&mut Cx,source:&Geometry,cached:&mut Option<Geometry>)->Option<GeometryId> {
@@ -37,14 +37,14 @@ impl Renderer {
                 self.ensure_terrain_tiles(cx,terrain,world.terrain_materials.as_deref());
                 for tile in &mut self.terrain_tiles {
                     if let Some(geometry)=shadow_geometry(cx,&tile.geometry,&mut tile.shadow_geometry) {
-                        out.push(GpuBakeMesh{geometry,transform:Mat4f::identity(),min:tile.min,max:tile.max, cutout: None, band: Default::default() });
+                        out.push(GpuBakeMesh{geometry,transform:Mat4f::identity(),min:tile.min,max:tile.max, cutout: None, msdf: None, band: Default::default() });
                     }
                 }
             }
             self.ensure_voxel_tiles(cx,world.voxel.as_deref());
             for tile in &mut self.voxel_tiles {
                 if let Some(geometry)=shadow_geometry(cx,&tile.geometry,&mut tile.shadow_geometry) {
-                    out.push(GpuBakeMesh{geometry,transform:Mat4f::identity(),min:tile.min,max:tile.max, cutout: None, band: Default::default() });
+                    out.push(GpuBakeMesh{geometry,transform:Mat4f::identity(),min:tile.min,max:tile.max, cutout: None, msdf: None, band: Default::default() });
                 }
             }
         }
@@ -120,6 +120,7 @@ impl Renderer {
         &self,
         world: &World,
         eye:Vec3f,
+        lod_scale:f32,
         skinned_items: Option<&[SkinnedDraw]>,
     ) -> Vec<crate::gpu_lightmap::GpuLmMover> {
         let mut out = Vec::new();
@@ -149,7 +150,7 @@ impl Renderer {
             };
             if self.model_casts_shadow.get(&inst.model)==Some(&false){continue;}
             let root=&self.static_models[at].1;
-            let distance=crate::asset_lod::instance_distance(&inst.transform,eye);
+            let distance=crate::asset_lod::instance_distance(&inst.transform,eye)*lod_scale;
             // A chained base (hand-built LOD models) casts from its last,
             // cheapest level: a car's shadow is its silhouette on the road.
             let lod=if self.is_lod_chain_base(&inst.model)&&!root.lods.is_empty(){root.lods.len()}else{root.lods.partition_point(|(threshold,_)|*threshold<=distance)};
@@ -239,7 +240,7 @@ impl Renderer {
                 let (min, max) = item
                     .bounds
                     .unwrap_or((vec3f(-1.0, 0.0, -1.0), vec3f(1.0, 2.2, 1.0)));
-                let distance=crate::asset_lod::instance_distance(&item.transform,eye);
+                let distance=crate::asset_lod::instance_distance(&item.transform,eye)*lod_scale;
                 let lod=self.skin_lods.get(&item.rig).and_then(|levels|{let n=levels.partition_point(|(threshold,_)|*threshold<=distance);n.checked_sub(1).map(|i|&levels[i].1)});
                 let morph=if let Some(lod)=lod{lod.morph.as_ref()}else{self.skin_morphs.get(&item.rig)};
                 let morph=morph.map(|m|m.depth(m.source.sample_playback(item.morph_clip.as_deref(),item.morph_time,item.morph_looping)));
@@ -363,7 +364,7 @@ impl Renderer {
                             pgm.extend(bytes.chunks_exact(4).map(|px| px[3]));
                             let _ = std::fs::write(format!("{prefix}.a.pgm"), pgm);
                             let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-                            for px in bytes.chunks_exact(4) { ppm.extend([px[2], px[1], px[0]]); }
+                            for px in bytes.chunks_exact(4) { ppm.extend([px[0], px[1], px[2]]); }
                             let _ = std::fs::write(format!("{prefix}.rgb.ppm"), ppm);
                             log!("gpu lightmap: dumped {w}x{h} atlas to {prefix}.a.pgm/.rgb.ppm");
                         }) { log!("gpu lightmap: {error}"); }
@@ -374,11 +375,11 @@ impl Renderer {
                         if let Err(error) = cx.cx.read_render_texture(&tex, move |result| {
                             let Ok((w, h, bytes)) = result else { log!("gpu lightmap: {name} readback failed"); return };
                             if name.contains("depth") {
-                                let _ = std::fs::write(format!("{prefix}.{name}.{w}x{h}.f32"), &bytes);
+                                let _ = std::fs::write(format!("{prefix}.{name}.{w}x{h}.f32"), bytes.as_slice());
                                 return;
                             }
                             let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-                            for px in bytes.chunks_exact(4) { ppm.extend([px[2], px[1], px[0]]); }
+                            for px in bytes.chunks_exact(4) { ppm.extend([px[0], px[1], px[2]]); }
                             let _ = std::fs::write(format!("{prefix}.{name}.ppm"), ppm);
                         }) { log!("gpu lightmap: {error}"); }
                     }
@@ -749,7 +750,7 @@ impl Renderer {
             da[i] = gs;
             db[i] = go;
         }
-        dv.set_uniform(cx, live_id!(csm_p), &[1.0, *inv_res, frame.seed, 0.0]);
+        dv.set_uniform(cx, live_id!(csm_p), &[1.0, *inv_res, frame.seed, crate::shadow_csm::CSM_CELL_PERIOD as f32]);
         dv.set_uniform(cx, live_id!(csm_da), &da);
         dv.set_uniform(cx, live_id!(csm_db), &db);
         dv.set_uniform(
@@ -762,6 +763,8 @@ impl Renderer {
             live_id!(csm_texel),
             &[c[0].texel_world, c[1].texel_world, c[2].texel_world, c[3].texel_world],
         );
+        dv.set_uniform(cx, live_id!(csm_gx), &[c[0].grid[0], c[1].grid[0], c[2].grid[0], c[3].grid[0]]);
+        dv.set_uniform(cx, live_id!(csm_gy), &[c[0].grid[1], c[1].grid[1], c[2].grid[1], c[3].grid[1]]);
         let rows = |v: Vec4f| [v.x, v.y, v.z, v.w];
         for (i, (rx, ry, rz)) in [
             (live_id!(csm_rx0), live_id!(csm_ry0), live_id!(csm_rz0)),

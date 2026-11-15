@@ -2,16 +2,15 @@
 //! worker owns queue access; a separate completion worker waits fences and reads timestamps.
 
 use super::device::{error, lock, Device, Worker};
-use super::pipeline::{Pipeline, Program, RenderPass};
+use super::pipeline::{Pipeline, RenderPass};
 use super::resources::{buffer_usage, Buffer, Image};
 use super::surface::{Present, Shown};
 use crate::font::FrameProgress;
 use crate::types::*;
 use makepad_vulkan::vk;
-use crate::FastMap;
 use std::collections::HashSet;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone)]
 pub(super) struct Token { pub sid: u32, pub incarnation: Arc<FrameProgress> }
@@ -20,12 +19,11 @@ pub(super) enum Event {
     Capture { window: Id, surface: Arc<crate::backend::linux::media::capture_surface::Surface> },
     Presented { target: Id, frame: u64 },
     /// `gpu_span`: the frame's first and last timestamps in seconds of the device's clock (the
-    /// frame timer orders a frame's passes by it).
-    Frame { target: Id, kind: u32, frame: u64, window: bool, gpu_ns: u64, gpu_span: [f64; 2] },
+    /// frame timer orders a frame's passes by it). `ran`: the GPU did the frame's work.
+    Frame { target: Id, kind: u32, frame: u64, window: bool, gpu_ns: u64, gpu_span: [f64; 2], ran: bool },
     DispatchTime { name: String, gpu_ns: u64 },
     BufferLeases { req: u32, status: u32, leases: Vec<crate::lease::Lease> },
-    Readback { req: u32, status: u32, rect: [u32; 4], pixels: Vec<u8> },
-    Pick { req: u32, ids: Vec<u32> },
+    Readback { req: u32, status: u32, rect: [u32; 4], lease: Option<crate::lease::Lease> },
     Shared { id: Id, handle: u64 },
 }
 pub(super) struct Done { pub token: Token, pub time: u64, pub event: Event }
@@ -48,7 +46,7 @@ pub(super) enum Ticket {
     #[cfg(target_os = "linux")]
     Capture { token: Token, window: Id, size: [u32;2], format: u32, buffer: Arc<Buffer> },
     Frame { token: Token, target: Id, kind: u32, frame: u64, window: bool },
-    Read { token: Token, req: u32, rect: [u32; 4], format: u32, staging: Arc<Buffer>, stencil: Option<Arc<Buffer>>, pick: Option<[f32; 2]> },
+    Read { token: Token, req: u32, rect: [u32; 4], format: u32, staging: Arc<Buffer>, stencil: Option<Arc<Buffer>> },
     Shared { token: Token, id: Id, handle: u64 },
     Copy { token: Token, req: u32, rect: [u32; 4] },
     Host { reply: std::sync::mpsc::SyncSender<Option<crate::backend::Pixels>>, image: Arc<Image>, staging: Arc<Buffer> },
@@ -83,9 +81,9 @@ const SHOW_TRIES: u32 = 125;
 const FENCE_SLICE_NS: u64 = 250_000_000;
 const FENCE_STALL_SAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The Vulkan objects of a finished batch, reset for the next one. A command pool, fence,
-/// timestamp pool and descriptor pools made and destroyed per batch cost about a millisecond
-/// each way (NVIDIA); a page of live effects submits dozens of target frames a beat.
+/// The Vulkan objects of a finished batch, reset for the next one. A command pool, fence and
+/// timestamp pool made and destroyed per batch cost about a millisecond each way (NVIDIA); a
+/// page of live effects submits dozens of target frames a beat.
 pub(super) struct Slot {
     dev: Arc<Device>,
     pool: vk::CommandPool,
@@ -93,15 +91,10 @@ pub(super) struct Slot {
     fence: vk::Fence,
     /// the timestamp pool and how many queries it holds (a profiled frame's batch grew it)
     query: (vk::QueryPool, u32),
-    /// Per program (`Program::alive`'s address: taken while the `Weak` holds it, so another program
-    /// never finds this pool, whatever handles the driver gives): the pool, how many sets it holds,
-    /// and whether its program is still there.
-    descriptors: FastMap<usize, (vk::DescriptorPool, u32, Weak<()>)>,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) { unsafe {
-        for (_, (pool, _, _)) in self.descriptors.drain() { self.dev.raw.destroy_descriptor_pool(pool, None); }
         if self.query.0 != vk::QueryPool::null() { self.dev.raw.destroy_query_pool(self.query.0, None); }
         self.dev.raw.destroy_fence(self.fence, None);
         self.dev.raw.destroy_command_pool(self.pool, None);
@@ -110,57 +103,138 @@ impl Drop for Slot {
 
 /// What one backend's finished batches leave for the next ones: the reset slots and the upload
 /// arenas no batch holds. Shared with its batches in flight (each returns its own).
+///
+/// Nothing here waits: a session's event loop bounds its beats by its frames on the GPU
+/// (`FRAMES_IN_FLIGHT`, every path that beats), so the batches in flight are those of a couple
+/// of beats per session, however many target frames a beat has. Unbounded, a submit worker
+/// slower than the renderer queued seconds of frames, each batch on a fresh slot, descriptor
+/// pools and arena (a phone: 1,439 slots made in 27 s). A wait for room here bounded that by
+/// holding the UI thread inside its submit, under the HAL's state lock, for the GPU to finish
+/// the same beat's earlier batches (17 to 19 batches a beat against 8 allowed: a beat of 75 ms
+/// of GPU work held its UI thread 75 ms in the submit, and every other session's submit and
+/// pump with it).
 #[derive(Default)]
 pub(super) struct Spare {
     slots: Mutex<Vec<Slot>>,
     arenas: Mutex<Arenas>,
-    /// batches made and not yet dropped (completed or abandoned): at `IN_FLIGHT_MAX` the
-    /// renderer waits for room (`Batch::new`) instead of recording ahead of the submit worker
-    in_flight: Mutex<usize>,
-    room: std::sync::Condvar,
+    /// readback staging (CPU-cached, `readback::STAGING`) whose readback was read: the next
+    /// readback takes one back instead of allocating on the submitting thread (a 3.9 MB one took
+    /// 1 to 4 ms there on NVIDIA, up to 44 ms on a loaded machine, every band of a page export)
+    readbacks: Mutex<Arenas>,
+    /// batches made and not yet dropped (completed or abandoned)
+    in_flight: AtomicUsize,
+    /// the most batches in flight at once since the last sweep (`sweep_slots`), and in the sweep
+    /// interval before it: finished batches keep their slots while the slots alive stay within
+    /// the larger, so steady beats reuse every slot and a burst's extra slots go two sweeps on
+    peak: AtomicUsize,
+    last_peak: AtomicUsize,
+    /// an arena is being made ahead (`make_ahead`)
+    ahead: AtomicBool,
+    /// the thread that makes arenas ahead, started with the first one (`None`: it could not start,
+    /// submits make their arenas)
+    maker: OnceLock<Option<Worker>>,
 }
 pub(super) type Spares = Arc<Spare>;
 
 impl Spare {
     /// Command buffer slots alive: the batches in flight and the reset ones kept for reuse
-    /// (each with its command, descriptor and timestamp pools).
+    /// (each with its command and timestamp pools).
     pub fn slots(&self) -> u64 {
         (self.in_flight() + lock(&self.slots).len()) as u64
     }
 
-    /// The descriptor pools the reset slots keep for the next frames.
-    pub fn descriptor_pools(&self) -> u64 {
-        lock(&self.slots).iter().map(|slot| slot.descriptors.len() as u64).sum()
-    }
-
     /// Batches made and not yet dropped.
     pub fn in_flight(&self) -> usize {
-        *lock(&self.in_flight)
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// The slots kept for reuse: as many as were alive at the busiest moment of this sweep
+    /// interval or the last one.
+    fn slots_wanted(&self) -> usize {
+        self.peak.load(Ordering::Acquire).max(self.last_peak.load(Ordering::Acquire))
+    }
+
+    /// A sweep (`Vulkan::sweep`): the peak of the interval that ended becomes the last one, and
+    /// spare slots beyond what both intervals needed are destroyed.
+    pub fn sweep_slots(&self) {
+        let now = self.in_flight();
+        self.last_peak.store(self.peak.swap(now, Ordering::AcqRel), Ordering::Release);
+        let keep = self.slots_wanted().saturating_sub(now);
+        let gone: Vec<Slot> = {
+            let mut slots = lock(&self.slots);
+            let n = slots.len().saturating_sub(keep);
+            slots.drain(..n).collect()
+        };
+        drop(gone);
     }
 
     /// Releases the free arenas no batch took for `ARENA_IDLE` (an idle app frees its uploads).
     pub fn trim(&self) {
         let released = lock(&self.arenas).give(std::iter::empty());
+        let staging = lock(&self.readbacks).give(std::iter::empty());
+        drop((released, staging));
+    }
+
+    /// When `trim` should look again (HAL clock ns): a free arena going idle, or the one a batch took
+    /// last, since a batch with no frame gives its arenas back without waking any pump.
+    pub fn trim_due(&self) -> Option<u64> {
+        let now = crate::clock_ns();
+        let due = |arenas: &Arenas| arenas.free.iter().map(|(_, since)| now.saturating_sub(since.elapsed().as_nanos() as u64)).chain(arenas.lent).min();
+        let (uploads, staging) = (due(&lock(&self.arenas)), due(&lock(&self.readbacks)));
+        uploads.into_iter().chain(staging).min().map(|since| since + ARENA_IDLE.as_nanos() as u64)
+    }
+
+    /// A readback's staging of at least `size` bytes: one a read readback gave back, else a new one.
+    pub fn readback_staging(&self, dev: &Arc<Device>, size: u64) -> Result<Arc<Buffer>, String> {
+        let kept = lock(&self.readbacks).take(size, size);
+        match kept {
+            Some(staging) => Ok(staging),
+            None => Buffer::scratch(dev.clone(), crate::ledger::Pool::Staging, size, super::readback::STAGING),
+        }
+    }
+
+    /// A readback's staging after its pixels were read: kept for the next readback (released once
+    /// idle for `ARENA_IDLE`, or beyond `ARENA_KEEP`).
+    fn readback_read(&self, staging: Arc<Buffer>) {
+        let released = lock(&self.readbacks).give(std::iter::once(staging));
         drop(released);
     }
-}
 
-/// More slots than this are not kept for reuse: twice the batches that may be in flight.
-const SPARE_SLOTS: usize = 2 * IN_FLIGHT_MAX;
-/// Batches recorded and not yet completed at once; the renderer waits for room at this many
-/// (every target frame of a beat is a batch: a window frame with its effect passes is a few).
-/// Without the bound a submit worker slower than the renderer queued seconds of frames, and the
-/// backlog fed itself: every batch took a fresh slot, descriptor pools and arena (a Snapdragon
-/// 685 swipe: 1,439 slots made in 27 s, none reused, each frame shown 21 s after its recording).
-const IN_FLIGHT_MAX: usize = 8;
-/// The longest one wait for room: the worker may itself wait on the host freeing GPU memory
-/// (`submit_until_room`), which needs the renderer running.
-const IN_FLIGHT_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+    /// Releases every free arena now (the app went to the background).
+    #[cfg(target_os = "android")]
+    pub fn release_all(&self) {
+        let released = lock(&self.arenas).release_all();
+        let staging = lock(&self.readbacks).release_all();
+        drop((released, staging));
+    }
+
+    /// Makes a free arena of `size` on the arena thread, unless one is already on its way: the
+    /// batch that took the pool's last arena of a size leaves the next one to that thread instead
+    /// of to a later submit (making an 8 MiB arena took 1.4 ms on NVIDIA, a 32 MiB one 5.3 ms).
+    fn make_ahead(self: &Arc<Self>, dev: &Arc<Device>, size: u64) {
+        if self.ahead.swap(true, Ordering::AcqRel) { return; }
+        let maker = self.maker.get_or_init(|| Worker::new("makepad-vulkan-arenas")
+            .map_err(|e| eprintln!("[hal-vulkan] no arena thread ({e}): submits make their upload arenas")).ok());
+        // without the thread `ahead` stays set: nothing is made ahead
+        let Some(maker) = maker else { return };
+        let (spare, dev) = (self.clone(), dev.clone());
+        maker.push(move || {
+            // out of memory: no spare (a submit that needs one asks for room)
+            if let Ok(arena) = Buffer::scratch(dev, crate::ledger::Pool::UploadArena, size, buffer_usage()) {
+                crate::profile::count("upload arena made ahead");
+                let released = lock(&spare.arenas).give(std::iter::once(arena));
+                drop(released);
+            }
+            spare.ahead.store(false, Ordering::Release);
+        });
+    }
+}
 
 /// The smallest upload arena; arenas grow by powers of two up to `ARENA_MAX`.
 const ARENA_MIN: u64 = 256 * 1024;
 /// The largest arena a batch asks for: a frame with more upload bytes spreads them over several
-/// arenas. Only a single upload larger than this gets an arena of its own size.
+/// arenas, and so does a texture region (`put_rows`). Only an upload that stays whole (inline
+/// instances, a single texture row) and is larger than this gets an arena of its own size.
 const ARENA_MAX: u64 = 8 << 20;
 /// Free arena bytes kept for the next batches; beyond it the largest free arenas are released.
 const ARENA_KEEP: u64 = 64 << 20;
@@ -181,11 +255,25 @@ fn arena_size(need: u64) -> u64 {
 struct Arenas {
     free: Vec<(Arc<Buffer>, std::time::Instant)>,
     bytes: u64,
+    /// when a batch last took one or made its own (HAL clock ns), until `ARENA_IDLE` after
+    lent: Option<u64>,
 }
 
 impl Arenas {
+    /// A batch took an arena within `ARENA_IDLE`: the uploads are going on (a batch that finds no
+    /// arena now is growing the pool, not waking an idle app).
+    fn in_use(&self) -> bool {
+        self.lent.is_some_and(|lent| crate::clock_ns().saturating_sub(lent) <= ARENA_IDLE.as_nanos() as u64)
+    }
+
+    /// A free arena of at least `want` bytes.
+    fn holds(&self, want: u64) -> bool {
+        self.free.iter().any(|(arena, _)| arena.size >= want)
+    }
+
     /// The smallest free arena of at least `want` bytes, else the largest that holds `len`.
     fn take(&mut self, want: u64, len: u64) -> Option<Arc<Buffer>> {
+        self.lent = Some(crate::clock_ns());
         let fits = |min: u64| self.free.iter().enumerate().filter(move |(_, (a, _))| a.size >= min);
         let i = fits(want).min_by_key(|(_, (a, _))| a.size).or_else(|| fits(len).max_by_key(|(_, (a, _))| a.size)).map(|(i, _)| i)?;
         let (arena, _) = self.free.swap_remove(i);
@@ -217,9 +305,16 @@ impl Arenas {
             let (arena, _) = self.free.swap_remove(i);
             self.bytes -= arena.bytes; released.push(arena);
         }
+        self.lent = self.lent.filter(|lent| crate::clock_ns().saturating_sub(*lent) <= ARENA_IDLE.as_nanos() as u64);
         released
     }
 }
+
+/// Where an upload landed (`Batch::put`): its arena (the buffer, its size and its serial) and
+/// the byte offset.
+#[derive(Clone, Copy)]
+pub(super) struct Placed { pub buffer: vk::Buffer, pub size: u64, pub serial: u64, pub at: u64 }
+impl Placed { const NONE: Self = Self { buffer: vk::Buffer::null(), size: 0, serial: 0, at: 0 }; }
 
 pub(super) struct Batch {
     pub dev: Arc<Device>,
@@ -246,10 +341,9 @@ pub(super) struct Batch {
     pub compute_descriptors: Vec<super::compute::Descriptors>,
     pub passes: Vec<Arc<RenderPass>>,
     pub framebuffers: Vec<vk::Framebuffer>,
-    /// Per program (`Slot::descriptors`): the pool, how many sets it holds, whether this batch sized
-    /// it (a reused pool is checked against this batch's draws once), and whether its program is
-    /// still there.
-    descriptors: FastMap<usize, (vk::DescriptorPool, u32, bool, Weak<()>)>,
+    /// The kept descriptor sets' pools this batch bound sets of (`sets::KeptSets::set`): they go
+    /// once the GPU is done with it.
+    pub generations: Vec<Arc<super::sets::Generation>>,
     pub tickets: Vec<Ticket>,
     pub scanout: Option<(Arc<dyn super::surface::FramePresenter>, Arc<Image>, Token, u32, Id, Id, u32, u64)>,
     pub present: Option<Present>,
@@ -268,13 +362,13 @@ pub(super) struct Batch {
     reserve: u64,
     /// arenas this batch had to allocate (none in steady frames): the frame stats' `arena_allocs`
     pub allocs: u64,
-    pub draw_counts: FastMap<usize, u32>,
-    /// The sets this batch wrote, by what they hold (`descriptor_set`): a draw with the same
-    /// buffers, images and samplers binds one again with its own dynamic offsets.
-    sets: FastMap<u64, (vk::DescriptorSet, Vec<u64>)>,
-    set_key: Vec<u64>,
+    /// arenas this batch made while the pool was in use (no spare was ready), their bytes and the
+    /// time it took: said once at `finish`
+    grew: (u64, u64, u64),
     /// The uniform blocks this pass already uploaded, per binding role (`put_block`).
-    blocks: [(usize, usize, vk::Buffer, u64); 8],
+    blocks: [(usize, usize, Placed); 8],
+    /// The pick block this pass uploaded last (`put_pick`).
+    pick_block: Option<([u8; 16], Placed)>,
     /// When `finish` handed the batch to the submit worker, while the frame profile records (0:
     /// not recording): its submit queue wait, vkQueueSubmit and submit->rendered times.
     finished_ns: u64,
@@ -335,28 +429,17 @@ impl Batch {
     /// A batch on a reset slot. `queries`: timestamps it writes (0: none; 2: its own start and
     /// end; more: a profiled frame's passes, `prof`).
     pub fn new(dev: Arc<Device>, spares: &Spares, queries: u32, reserve: u64) -> Result<Self, String> {
-        {
-            let mut n = lock(&spares.in_flight);
-            if *n >= IN_FLIGHT_MAX {
-                crate::profile::count("vk batch waited for room");
-                let waited = std::time::Instant::now();
-                while *n >= IN_FLIGHT_MAX {
-                    let (guard, timeout) = spares.room.wait_timeout(n, IN_FLIGHT_WAIT.saturating_sub(waited.elapsed())).unwrap_or_else(|e| e.into_inner());
-                    n = guard;
-                    if timeout.timed_out() && *n >= IN_FLIGHT_MAX { crate::profile::count("vk batch waited for room: timed out"); break; }
-                }
-            }
-            *n += 1;
-        }
+        let n = spares.in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        spares.peak.fetch_max(n, Ordering::AcqRel);
         let spare = lock(&spares.slots).pop();
         if spare.is_none() { crate::profile::count("vk batch slot made"); }
         let mut b = Self { dev, spares: spares.clone(), reusable: false, pool: vk::CommandPool::null(), cb: vk::CommandBuffer::null(), fence: vk::Fence::null(),
             query: (vk::QueryPool::null(), 0), idle_query: (vk::QueryPool::null(), 0), prof: None, prof_key: None, dispatch_query: 2, dispatch_times: Vec::new(),
             images: Vec::new(), buffers: Vec::new(), pipelines: Vec::new(), compute_pipelines: Vec::new(), compute_descriptors: Vec::new(), passes: Vec::new(), framebuffers: Vec::new(),
-            descriptors: FastMap::default(), tickets: Vec::new(), scanout: None, present: None, tap: None, arena: None, arenas: Vec::new(), reserve, allocs: 0, draw_counts: FastMap::default(),
+            generations: Vec::new(), tickets: Vec::new(), scanout: None, present: None, tap: None, arena: None, arenas: Vec::new(), reserve, allocs: 0, grew: (0, 0, 0),
             #[cfg(target_os = "android")] native_frame: None,
             #[cfg(target_os = "android")] native_signal: None,
-            sets: FastMap::default(), set_key: Vec::new(), blocks: [(0, 0, vk::Buffer::null(), 0); 8], finished_ns: 0,
+            blocks: [(0, 0, Placed::NONE); 8], pick_block: None, finished_ns: 0,
             #[cfg(target_os = "linux")] external_waits: Vec::new(),
             #[cfg(target_os = "linux")] external_signals: Vec::new(),
             #[cfg(target_os = "linux")] release_fence: None,
@@ -367,12 +450,6 @@ impl Batch {
             b.cb = slot.cb;
             b.fence = std::mem::replace(&mut slot.fence, vk::Fence::null());
             b.idle_query = std::mem::replace(&mut slot.query, (vk::QueryPool::null(), 0));
-            // A pool goes with its program: nothing else would free it, and a slot would reset it
-            // every batch for good.
-            for (program, (pool, sets, alive)) in slot.descriptors.drain() {
-                if alive.strong_count() == 0 { unsafe { b.dev.raw.destroy_descriptor_pool(pool, None); } }
-                else { b.descriptors.insert(program, (pool, sets, false, alive)); }
-            }
         }
         unsafe {
             if b.pool == vk::CommandPool::null() {
@@ -434,121 +511,141 @@ impl Batch {
         let _ = image;
     }
 
-    pub fn put(&mut self, bytes: &[u8]) -> Result<(Arc<Buffer>, u64), String> {
-        // Sixteen also satisfies the byte alignment of HAL's largest texel/compression block.
-        let align = self.dev.properties.limits.min_uniform_buffer_offset_alignment.max(self.dev.properties.limits.min_storage_buffer_offset_alignment).max(16);
+    /// Sixteen also satisfies the byte alignment of HAL's largest texel/compression block.
+    fn align(&self) -> u64 {
+        self.dev.properties.limits.min_uniform_buffer_offset_alignment.max(self.dev.properties.limits.min_storage_buffer_offset_alignment).max(16)
+    }
+
+    /// A readback's staging (`readback::record_read`): one a read readback gave back, else a new one.
+    pub fn readback_staging(&self, size: u64) -> Result<Arc<Buffer>, String> {
+        self.spares.readback_staging(&self.dev, size)
+    }
+
+    pub fn put(&mut self, bytes: &[u8]) -> Result<Placed, String> {
+        let align = self.align();
         let len = bytes.len().max(16) as u64;
-        let available = self.arena.as_ref().map(|(b, used)| (b.clone(), used.div_ceil(align) * align));
-        let (buffer, at) = match available.filter(|(b, at)| at.checked_add(len).is_some_and(|end| end <= b.size)) {
-            Some(loc) => loc,
+        let step = len.div_ceil(align) * align;
+        // the arena being filled, when it has room (the usual upload: a draw's uniform block)
+        if let Some((arena, used)) = self.arena.as_mut() {
+            let at = used.div_ceil(align) * align;
+            if at.checked_add(len).is_some_and(|end| end <= arena.size) {
+                arena.write_unflushed(at, bytes)?;
+                *used = at + len;
+                self.reserve = self.reserve.saturating_sub(step);
+                return Ok(Placed { buffer: arena.buffer, size: arena.size, serial: arena.serial, at });
+            }
+        }
+        // the rest of the frame's uploads in one arena when it fits under ARENA_MAX
+        let arena = self.next_arena(arena_size(self.reserve.min(ARENA_MAX).max(len)), len)?;
+        arena.write_unflushed(0, bytes)?;
+        let placed = Placed { buffer: arena.buffer, size: arena.size, serial: arena.serial, at: 0 };
+        self.arena = Some((arena, len));
+        self.reserve = self.reserve.saturating_sub(step);
+        Ok(placed)
+    }
+
+    /// Places an upload of whole rows of `row` bytes (a texture region's texels) over as many
+    /// arenas as it takes and calls `piece(placed, first_row, rows)` for each part: the room left
+    /// in the arena being filled, then free arenas, then new ones. A region larger than an arena
+    /// so spreads over the pool's arenas like the frame's other uploads, and only a single row
+    /// larger than ARENA_MAX gets an arena of its own size (a 32 MiB texture made one at its
+    /// submit: 5.3 ms of the frame).
+    pub fn put_rows(&mut self, bytes: &[u8], row: u64, mut piece: impl FnMut(Placed, u64, u64)) -> Result<(), String> {
+        let align = self.align();
+        let total = bytes.len() as u64 / row;
+        let mut first = 0;
+        while first < total {
+            if let Some((arena, used)) = self.arena.as_mut() {
+                let at = used.div_ceil(align) * align;
+                let rows = (arena.size.saturating_sub(at) / row).min(total - first);
+                if rows > 0 {
+                    arena.write_unflushed(at, &bytes[(first * row) as usize..((first + rows) * row) as usize])?;
+                    *used = at + rows * row;
+                    piece(Placed { buffer: arena.buffer, size: arena.size, serial: arena.serial, at }, first, rows);
+                    first += rows;
+                    continue;
+                }
+            }
+            let left = (total - first) * row;
+            let arena = self.next_arena(arena_size(self.reserve.max(left).min(ARENA_MAX).max(row)), row)?;
+            self.arena = Some((arena, 0));
+        }
+        Ok(())
+    }
+
+    /// The batch's next arena: a free one of at least `want` bytes (else the largest that holds
+    /// `len`), or a new one of `want`. Taking the pool's last arena of that size has the next one
+    /// made ahead on the arena thread; a submit that finds none while the uploads go on makes it
+    /// here and says so at `finish`.
+    fn next_arena(&mut self, want: u64, len: u64) -> Result<Arc<Buffer>, String> {
+        let (reused, in_use, short) = {
+            let mut arenas = lock(&self.spares.arenas);
+            let in_use = arenas.in_use();
+            let reused = arenas.take(want, len);
+            (reused, in_use, !arenas.holds(want))
+        };
+        let arena = match reused {
+            Some(b) => b,
             None => {
-                // the rest of the frame's uploads in one arena when it fits under ARENA_MAX
-                let want = arena_size(self.reserve.min(ARENA_MAX).max(len));
-                let reused = lock(&self.spares.arenas).take(want, len);
-                let b = match reused {
-                    Some(b) => b,
-                    None => {
-                        self.allocs += 1;
-                        crate::profile::count("upload arena allocs");
-                        match Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage()) {
-                            Ok(b) => b,
-                            // out of memory: the pool's free arenas go first (and the host is
-                            // asked for room), then one more try
-                            Err(e) if super::pipeline::out_of_memory(&e) => {
-                                let released = lock(&self.spares.arenas).release_all();
-                                drop(released);
-                                self.dev.refused("upload arena");
-                                Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage())?
-                            }
-                            Err(e) => return Err(e),
-                        }
+                self.allocs += 1;
+                crate::profile::count("upload arena allocs");
+                let made_at = std::time::Instant::now();
+                let made = match Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage()) {
+                    Ok(b) => b,
+                    // out of memory: the pool's free arenas go first (and the host is
+                    // asked for room), then one more try
+                    Err(e) if super::pipeline::out_of_memory(&e) => {
+                        let released = lock(&self.spares.arenas).release_all();
+                        drop(released);
+                        self.dev.refused("upload arena");
+                        Buffer::scratch(self.dev.clone(), crate::ledger::Pool::UploadArena, want, buffer_usage())?
                     }
+                    Err(e) => return Err(e),
                 };
-                self.arenas.push(b.clone()); (b, 0)
+                if in_use { self.grew = (self.grew.0 + 1, self.grew.1 + want, self.grew.2 + made_at.elapsed().as_nanos() as u64); }
+                made
             }
         };
-        buffer.write_unflushed(at, bytes)?;
-        self.arena = Some((buffer.clone(), at + len));
-        self.reserve = self.reserve.saturating_sub(len.div_ceil(align) * align);
-        Ok((buffer, at))
+        if short { self.spares.make_ahead(&self.dev, want); }
+        self.arenas.push(arena.clone());
+        Ok(arena)
     }
 
     /// Upload a uniform block for the binding role `which`, unless this pass's previous upload
-    /// for the role was the same bytes (the pass block, a draw list's block): those are shared.
-    pub fn put_block(&mut self, which: usize, bytes: &[u8]) -> Result<(vk::Buffer, u64), String> {
+    /// for the role was the same bytes: the pass block, a draw list's block, and the draw blocks
+    /// of a run of draws made with the same values (a part's mesh chunks) are shared.
+    pub fn put_block(&mut self, which: usize, bytes: &[u8]) -> Result<Placed, String> {
         let memo = (bytes.as_ptr() as usize, bytes.len());
-        if let Some((ptr, len, buffer, at)) = self.blocks.get(which).copied() {
-            if (ptr, len) == memo && buffer != vk::Buffer::null() { return Ok((buffer, at)); }
+        if let Some((ptr, len, placed)) = self.blocks.get(which).copied() {
+            // SAFETY: `ptr` is an earlier draw's block of this pass (`forget_blocks` starts a
+            // pass), held for the submit call that encodes it, as `bytes` is
+            if placed.buffer != vk::Buffer::null() && len == memo.1 && (ptr == memo.0 || unsafe { std::slice::from_raw_parts(ptr as *const u8, len) } == bytes) {
+                return Ok(placed);
+            }
         }
-        let (buffer, at) = self.put(bytes)?;
-        if let Some(slot) = self.blocks.get_mut(which) { *slot = (memo.0, memo.1, buffer.buffer, at); }
-        Ok((buffer.buffer, at))
+        let placed = self.put(bytes)?;
+        if let Some(slot) = self.blocks.get_mut(which) { *slot = (memo.0, memo.1, placed); }
+        Ok(placed)
+    }
+
+    /// Upload a draw's pick block (its pick id and pick-twin mask), unless the pass's previous
+    /// one held the same: the draws of one widget or part share it.
+    pub fn put_pick(&mut self, bytes: [u8; 16]) -> Result<Placed, String> {
+        if let Some((_, placed)) = self.pick_block.filter(|(held, _)| *held == bytes) { return Ok(placed); }
+        let placed = self.put(&bytes)?;
+        self.pick_block = Some((bytes, placed));
+        Ok(placed)
     }
 
     /// A new pass's command data: no uploaded block is known to match it.
-    pub fn forget_blocks(&mut self) { self.blocks = [(0, 0, vk::Buffer::null(), 0); 8]; }
-
-    /// The set for a draw's bindings: one this batch already wrote with the same buffers,
-    /// images and samplers (`false`: nothing to write), or a new one to write (`true`).
-    pub fn descriptor_set(&mut self, p: &Program, state: usize, bins: &[(u32, vk::DescriptorType, vk::DescriptorBufferInfo)],
-        images: &[(u32, vk::DescriptorType, vk::DescriptorImageInfo)]) -> Result<(vk::DescriptorSet, bool), String> {
-        let mut key = std::mem::take(&mut self.set_key);
-        key.clear();
-        key.push(p.descriptors.0);
-        for (slot, ty, info) in bins { key.extend([*slot as u64 | (ty.0 as u64) << 32, info.buffer.0, info.offset, info.range]); }
-        for (slot, ty, info) in images { key.extend([*slot as u64 | (ty.0 as u64) << 32, info.sampler.0, info.image_view.0, info.image_layout.0 as u64]); }
-        let hash = key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| (h ^ *v).wrapping_mul(0x0100_0000_01b3).rotate_left(23));
-        let found = self.sets.get(&hash).filter(|(_, k)| *k == key).map(|(set, _)| *set);
-        let out = match found {
-            Some(set) => Ok((set, false)),
-            None => self.descriptors(p, state).map(|set| {
-                // a hash two different keys share keeps its first set; the second is not reused
-                if !self.sets.contains_key(&hash) { self.sets.insert(hash, (set, key.clone())); }
-                (set, true)
-            }),
-        };
-        self.set_key = key;
-        out
-    }
-
-    fn descriptors(&mut self, p: &Program, state: usize) -> Result<vk::DescriptorSet, String> {
-        let program = Arc::as_ptr(&p.alive) as usize;
-        // a reused pool that holds fewer sets than this batch draws with the program is replaced
-        if let Some((pool, sets, sized, _)) = self.descriptors.get_mut(&program).filter(|(_, _, sized, _)| !*sized) {
-            let draws = *self.draw_counts.get(&state).ok_or("pipeline missing from frame descriptor counts")?;
-            *sized = true;
-            if *sets < draws {
-                crate::profile::count("vk descriptor pool too small: remade");
-                unsafe { self.dev.raw.destroy_descriptor_pool(*pool, None); }
-                self.descriptors.remove(&program);
-            }
-        }
-        let pool = if let Some((pool, _, _, _)) = self.descriptors.get(&program) { *pool } else {
-            // Sized to the next power of two: a slot's pool serves the frames after this one, and a
-            // frame drawing one more than its pool holds remade it (a destroy and a create, both
-            // driver round trips) every few frames as a view's draw count wandered.
-            let draws = self.draw_counts.get(&state).ok_or("pipeline missing from frame descriptor counts")?.next_power_of_two();
-            let mut counts: FastMap<vk::DescriptorType, u32> = FastMap::default();
-            // (a combined image sampler through a Y'CbCr conversion may take up to three
-            // descriptors: combinedImageSamplerDescriptorCount)
-            for (_, ty) in &p.descriptor_types {
-                let per = if *ty == vk::DescriptorType::COMBINED_IMAGE_SAMPLER { 3 } else { 1 };
-                let count = counts.entry(*ty).or_default(); *count = count.saturating_add(draws.saturating_mul(per));
-            }
-            let sizes: Vec<_> = counts.into_iter().map(|(ty, count)| vk::DescriptorPoolSize::default().ty(ty).descriptor_count(count)).collect();
-            let pool = unsafe { self.dev.raw.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(draws).pool_sizes(&sizes), None) }.map_err(error)?;
-            self.descriptors.insert(program, (pool, draws, true, Arc::downgrade(&p.alive))); pool
-        };
-        let layouts = [p.descriptors];
-        // one set, written in place (the wrapper returns a Vec per call)
-        let allocate = self.dev.raw.table.allocate_descriptor_sets.ok_or("vkAllocateDescriptorSets is unavailable")?;
-        let mut set = vk::DescriptorSet::null();
-        unsafe { allocate(self.dev.raw.handle(), &vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts), &mut set) }.result().map_err(error)?;
-        Ok(set)
-    }
+    pub fn forget_blocks(&mut self) { self.blocks = [(0, 0, Placed::NONE); 8]; self.pick_block = None; }
 
     pub fn finish(mut self, submit: &Worker, complete: Arc<Worker>, mailbox: Mailbox) {
         if crate::profile::on() { self.finished_ns = crate::clock_ns(); }
+        if self.grew.0 > 0 {
+            eprintln!("[hal-vulkan] upload arenas: no spare was ready, a submit made {} ({} KB) in {:.2} ms",
+                self.grew.0, self.grew.1 >> 10, self.grew.2 as f64 / 1e6);
+        }
         let later = submit.later();
         #[cfg(target_os = "linux")]
         let mut published: Vec<(Arc<super::share::sync::Timeline>, u64)> = Vec::new();
@@ -826,10 +923,10 @@ impl Batch {
                     // all the same, never presented: its app paints again (a dropped frame) or
                     // after DeviceReset (a lost device)
                     token.incarnation.done(frame);
-                    push(token, Event::Frame { target, kind, frame, window: window && !failed, gpu_ns, gpu_span });
+                    push(token, Event::Frame { target, kind, frame, window: window && !failed, gpu_ns, gpu_span, ran: !failed });
                 }
                 Ticket::Copy { token, req, rect } => push(token, Event::Readback {
-                    req, rect, status: if failed { readback::FAILED } else { readback::OK }, pixels: Vec::new(),
+                    req, rect, status: if failed { readback::FAILED } else { readback::OK }, lease: None,
                 }),
                 Ticket::Shared { token, id, handle } => push(token, Event::Shared { id, handle: if failed { 0 } else { handle } }),
                 Ticket::FrameCap { staging, len, done } => done(if failed { None } else { staging.read(len).ok() }),
@@ -840,40 +937,26 @@ impl Batch {
                     }) };
                     let _ = reply.try_send(pixels);
                 }
-                Ticket::Read { token, req, rect, format: fmt, staging, stencil, pick } => {
+                Ticket::Read { token, req, rect, format: fmt, staging, stencil } => {
                     let pixels = if failed { Err("GPU submission failed".into()) } else {
                         staging.read(format::level_bytes(fmt, rect[2], rect[3]) as usize)
                     };
+                    if !failed { self.spares.readback_read(staging); }
                     match pixels {
                         Ok(mut pixels) => {
                             if let Some(stencil) = stencil {
                                 match stencil.read(rect[2] as usize * rect[3] as usize) {
                                     Ok(values) => { for (p, s) in pixels.chunks_exact_mut(4).zip(values) { p[3] = s; } }
-                                    Err(_) => { push(token, Event::Readback { req, rect, status: readback::FAILED, pixels: Vec::new() }); continue; }
+                                    Err(_) => { push(token, Event::Readback { req, rect, status: readback::FAILED, lease: None }); continue; }
                                 }
                             }
                             if fmt == format::BGRA8 { for pixel in pixels.chunks_exact_mut(4) { pixel.swap(0, 2); } }
-                            if let Some(pos) = pick {
-                                let mut ids = Vec::new();
-                                let mut ordered: Vec<_> = pixels.chunks_exact(4).enumerate().map(|(i, px)| {
-                                    let x = rect[0] as f32 + (i as u32 % rect[2]) as f32;
-                                    let y = rect[1] as f32 + (i as u32 / rect[2]) as f32;
-                                    ((x - pos[0]).powi(2) + (y - pos[1]).powi(2), u32::from_le_bytes(px.try_into().unwrap()) & 0x00ff_ffff)
-                                }).collect();
-                                ordered.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-                                for (_, id) in ordered {
-                                    if id != 0 && !ids.contains(&id) { ids.push(id); }
-                                }
-                                push(token, Event::Pick { req, ids });
-                            } else {
-                                let status = if matches!(fmt, format::RGBA8 | format::BGRA8) { readback::OK } else { readback::NATIVE };
-                                push(token, Event::Readback { req, rect, status, pixels });
-                            }
+                            let status = if matches!(fmt, format::RGBA8 | format::BGRA8) { readback::OK } else { readback::NATIVE };
+                            push(token, Event::Readback { req, rect, status, lease: Some(crate::lease::Lease::from_vec(pixels, 0)) });
                         }
                         Err(e) => {
                             eprintln!("[hal-vulkan] readback: {e}");
-                            push(token, if pick.is_some() { Event::Pick { req, ids: Vec::new() } }
-                                else { Event::Readback { req, rect, status: readback::FAILED, pixels: Vec::new() } });
+                            push(token, Event::Readback { req, rect, status: readback::FAILED, lease: None });
                         }
                     }
                 }
@@ -913,15 +996,13 @@ fn hand_over(scanout: (Arc<dyn super::surface::FramePresenter>, Arc<Image>, Toke
 
 impl Drop for Batch {
     fn drop(&mut self) { unsafe {
-        // room for the renderer's next batch, whatever this one's end
-        { let mut n = lock(&self.spares.in_flight); *n = n.saturating_sub(1); }
-        self.spares.room.notify_all();
+        // made by `new`, whatever this one's end
+        self.spares.in_flight.fetch_sub(1, Ordering::AcqRel);
         // a batch dropped before it completed (never submitted): its timed passes answer nothing
         if let Some(prof) = self.prof.take() { prof.finish(&self.dev, vk::QueryPool::null(), true); }
         for framebuffer in self.framebuffers.drain(..) { self.dev.raw.destroy_framebuffer(framebuffer, None); }
         let slot = Slot { dev: self.dev.clone(), pool: self.pool, cb: self.cb, fence: self.fence,
-            query: if self.query.0 != vk::QueryPool::null() { self.query } else { self.idle_query },
-            descriptors: self.descriptors.drain().map(|(program, (pool, sets, _, alive))| (program, (pool, sets, alive))).collect() };
+            query: if self.query.0 != vk::QueryPool::null() { self.query } else { self.idle_query } };
         if self.query.0 != vk::QueryPool::null() && self.idle_query.0 != vk::QueryPool::null() { self.dev.raw.destroy_query_pool(self.idle_query.0, None); }
         if !self.reusable { crate::profile::count("vk batch slot destroyed (not reusable)"); return; } // dropping the slot destroys its objects
         // the arenas go back once nothing else holds them (freed here, outside the lock, if the
@@ -931,10 +1012,10 @@ impl Drop for Batch {
         let released = lock(&self.spares.arenas).give(self.arenas.drain(..).filter(|arena| Arc::strong_count(arena) == 1));
         drop(released);
         let reset = self.dev.raw.reset_command_buffer(slot.cb, vk::CommandBufferResetFlags::default())
-            .and_then(|_| self.dev.raw.reset_fences(&[slot.fence]))
-            .and_then(|_| slot.descriptors.values().try_for_each(|(pool, _, _)| self.dev.raw.reset_descriptor_pool(*pool, vk::DescriptorPoolResetFlags::default())));
+            .and_then(|_| self.dev.raw.reset_fences(&[slot.fence]));
         if reset.is_err() { crate::profile::count("vk batch slot destroyed (reset failed)"); return; }
+        let wanted = self.spares.slots_wanted().saturating_sub(self.spares.in_flight());
         let mut slots = lock(&self.spares.slots);
-        if slots.len() < SPARE_SLOTS { slots.push(slot); } else { crate::profile::count("vk batch slot destroyed (spares full)"); }
+        if slots.len() < wanted { slots.push(slot); } else { crate::profile::count("vk batch slot destroyed (spares full)"); }
     } }
 }

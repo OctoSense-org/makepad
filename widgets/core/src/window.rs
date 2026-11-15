@@ -72,6 +72,8 @@ pub enum WindowDoubleClick {
     Maximize = 0,
     /// Fullscreen on the window's screen, over bars and dock, no caption (a presenter's
     /// output on a second screen); a double click while fullscreen restores it exactly.
+    /// Under the makepad WM a double click on a caption maximises and the green button is the
+    /// full screen; a drag-anywhere window keeps this double click there too.
     Fullscreen = 1,
 }
 
@@ -737,8 +739,9 @@ impl ScriptHook for Window {
         self.caption_has_content = None;
         self.caption_window_gap = None;
         self.caption_centering_inputs = None;
-        // A host window manager reads it from the drag query's answer.
-        self.window.handle.set_double_click_fullscreen(vm.cx_mut(), self.double_click == WindowDoubleClick::Fullscreen);
+        // A host window manager reads it from the drag query's answer. Its captions maximise on a
+        // double click; only a window that drags by its content keeps its own.
+        self.window.handle.set_double_click_fullscreen(vm.cx_mut(), self.double_click == WindowDoubleClick::Fullscreen && self.drag == WindowDrag::Window);
         if !self.create_on_start && !self.initial_create_policy_applied {
             apply_initial_create_policy(vm.cx_mut(), &self.window.handle, false);
             self.initial_create_policy_applied = true;
@@ -1171,6 +1174,14 @@ impl Window {
         let content = label_content || bar_content;
         self.caption_has_content = Some(content);
         content
+    }
+
+    /// One line per click on a caption button, saying whose it was: input injected by a command
+    /// (its agent and process) or the window system's (the person's pointer, or a remote viewer's).
+    /// Apps closed by their caption's button and nothing said who clicked it.
+    fn say_caption_click(&self, cx: &Cx, button: &str) {
+        let by = cx.injected_by().map_or_else(|| "the window system's input".to_string(), |who| format!("a click injected by {who}"));
+        log!("window {}: its caption's {button} button: {by}", self.window.window_id().id());
     }
 
     /// `ask`: the caption's close button (the app is asked, as by a native close button);
@@ -2883,12 +2894,19 @@ impl WindowRef {
             false
         }
     }
+    pub fn is_maximized(&self, cx: &Cx) -> bool {
+        if let Some(inner) = self.borrow() {
+            inner.window.handle.is_maximized(cx)
+        } else {
+            false
+        }
+    }
     /// OS-native maximize (Windows: `ShowWindow(SW_MAXIMIZE)`; macOS: `toggleFullScreen:`).
     /// Unlike `fullscreen()`/`disable_fullscreen()` (which push
     /// `FullscreenWindow`/`NormalizeWindow` — not handled by every
     /// backend), `maximize`/`restore` push the ops the Windows backend
-    /// actually implements, and `is_fullscreen()` reflects this state
-    /// there too (`window_geom.is_fullscreen` mirrors `get_is_maximized`).
+    /// actually implements. Windows, X11 and Wayland report this state as
+    /// `window_geom.is_maximized`, macOS as `is_fullscreen`.
     pub fn maximize(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.window.handle.maximize(cx);
@@ -2973,8 +2991,7 @@ impl WindowRef {
     }
     /// Configure the window's size, position, title, and whether it starts out big.
     ///
-    /// `fullscreen` is the legacy maximize-or-fullscreen flag that `is_fullscreen()`
-    /// reports back, so saving that value on exit and feeding it in here round-trips.
+    /// `fullscreen` is the legacy maximize-or-fullscreen flag.
     /// x11, Wayland and Win32 all create the window MAXIMIZED for it, keeping the title
     /// bar and chrome buttons; only macOS takes it literally and enters fullscreen,
     /// where AppKit still supplies an auto-hiding menu bar and traffic lights. Nothing
@@ -3028,6 +3045,11 @@ impl Widget for Window {
         (self.has_focus || !self.focus_known) && self.cancel_children_impl(visit)
     }
 
+    // A swipe belongs to the window it starts in, even one without focus, just like a scroll.
+    fn visit_cancel_for_swipe(&self, window_id: WindowId, visit: &mut dyn FnMut(LiveId, WidgetRef)) -> bool {
+        window_id == self.window.window_id() && self.cancel_children_impl(visit)
+    }
+
     fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
         // A drag-anywhere window's double click toggles maximise or fullscreen (`double_click`).
         // Under the WM the WM does it (the press is a caption press there), except while the
@@ -3074,6 +3096,8 @@ impl Widget for Window {
                 } else {
                     VirtualKeyboardEvent::WillHide { time, height: 0.0, duration: 0.22, ease: makepad_platform::event::Ease::OutCubic }
                 };
+                // This event skips `call_event_handler`, which is where the height normally gets noted.
+                cx.keyboard.note_virtual_keyboard_event(&event);
                 self.view.handle_event(cx, &Event::VirtualKeyboard(event), scope);
                 self.view.redraw(cx);
                 return;
@@ -3453,12 +3477,19 @@ impl Widget for Window {
                 let clicked = |button: &WidgetRef| actions.find_widget_action(button.widget_uid())
                     .is_some_and(|action| matches!(action.cast(), crate::button::ButtonAction::Clicked(_)));
                 if clicked(&self.hosted_min) {
+                    self.say_caption_click(cx, "minimize");
                     self.window.handle.minimize(cx);
                 }
                 if clicked(&self.hosted_max) {
-                    self.window.handle.maximize(cx);
+                    self.say_caption_click(cx, "maximize");
+                    if self.window.handle.is_fullscreen(cx) || self.window.handle.is_maximized(cx) {
+                        self.window.handle.restore(cx);
+                    } else {
+                        self.window.handle.maximize(cx);
+                    }
                 }
                 if clicked(&self.hosted_close) {
+                    self.say_caption_click(cx, "close");
                     self.close_after_recording(cx, true);
                 }
             }
@@ -3473,13 +3504,15 @@ impl Widget for Window {
                 .desktop_button(cx, ids!(windows_buttons.min))
                 .clicked(&actions)
             {
+                self.say_caption_click(cx, "minimize");
                 self.window.handle.minimize(cx);
             }
             if self
                 .desktop_button(cx, ids!(windows_buttons.max))
                 .clicked(&actions)
             {
-                if self.window.handle.is_fullscreen(cx) {
+                self.say_caption_click(cx, "maximize");
+                if self.window.handle.is_fullscreen(cx) || self.window.handle.is_maximized(cx) {
                     self.window.handle.restore(cx);
                 } else {
                     self.window.handle.maximize(cx);
@@ -3489,6 +3522,7 @@ impl Widget for Window {
                 .desktop_button(cx, ids!(windows_buttons.close))
                 .clicked(&actions)
             {
+                self.say_caption_click(cx, "close");
                 if self.screen_cap.is_managed() {
                     log!("[makepad-remote] user closed window {}; finalizing Studio recording", self.window.window_id().id());
                 }

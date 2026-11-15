@@ -12,13 +12,13 @@ WANT="renamed macros 34 true true | 6 30"
 ok=1
 run() { # run <label> <expected> [env..]
   local label=$1 want=$2; shift 2
-  OUT=$(cd "$T/x" && env "$@" MAKEPAD_RUN_STD=$H/../../std MAKEPAD_HOME=$T/home MAKEPAD_RUN_HOME=$T MAKEPAD_RUN_CACHE_DIR=$T/cache MAKEPAD_RUN_TARGET_DIR=$T/target "$R" run --quiet mrx-app 2>>"$T/err")
+  OUT=$(cd "$T/x" && env "$@" RELAX_STD=$H/../../std MAKEPAD_HOME=$T/home RELAX_HOME=$T RELAX_CACHE_DIR=$T/cache RELAX_TARGET_DIR=$T/target "$R" run --quiet mrx-app 2>>"$T/err")
   echo "$label: $OUT"
   [ "$OUT" = "$want" ] || ok=0
 }
 R=$1
 mkdir -p "$T/x" && cp -R "$H/Cargo.toml" "$H/app" "$H/lib" "$T/x/"
-run "uncached" "$WANT" MAKEPAD_RUN_CACHE=off
+run "uncached" "$WANT" RELAX_CACHE=off
 run "cold" "$WANT"
 run "warm" "$WANT"
 sed -i.bak 's/"yes"/"yep"/' "$T/x/lib/src/extensions/unicode.rs" "$T/x/app/src/main.rs"

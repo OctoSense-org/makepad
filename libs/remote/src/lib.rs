@@ -9,7 +9,7 @@
 //! same name is built from `main.rs` and keeps its own wire until it moves onto this one.
 
 // Diagnostics never panic: std's print macros panic when a write fails (ENOSPC on the session
-// log in a full tmpfs /tmp aborted a fleet Sandbox inside a lazy compile, 2026-10-23), so in this
+// log in a full tmpfs /tmp aborted a fleet run inside a lazy compile, 2026-10-23), so in this
 // crate every print is a write whose error is dropped. Test builds keep std's captured macros.
 #[cfg(not(test))]
 #[allow(unused_macros)]
@@ -59,6 +59,7 @@ pub mod relay;
 pub mod ring;
 pub mod stream;
 pub mod watch;
+mod served;
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -69,3 +70,4 @@ pub use cmd::{json_str, now_ms, Out, Req};
 pub use conn::{Channel, ChannelTx, Conn, Event, Hooks};
 pub use endpoint::Endpoint;
 pub use link::Client;
+pub use served::{asked_cpu_ns, charge_served, own_thread, runtime_cpu_ns, runtime_waited_ns, served_count, served_cpu_ns};

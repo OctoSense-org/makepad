@@ -1,4 +1,5 @@
-//! `Repository::object_size` (header-only sizes) and `Repository::first_parents`.
+//! `Repository::object_size` (header-only sizes, and reads under a repack) and
+//! `Repository::first_parents`.
 //! No git binary.
 use makepad_git::test_support::{
     delta_copy, delta_header, delta_insert, tempdir, write_pack_entries, PackEntry,
@@ -53,6 +54,39 @@ fn object_size_reads_loose_packed_and_delta_headers() {
     }
     let missing = ObjectId::from_hex("0123456789012345678901234567890123456789").unwrap();
     assert!(matches!(repo.object_size(&missing), Err(GitError::ObjectNotFound(_))));
+
+    // A repack under this open reader (any process's `git repack -d`): objects loose when its
+    // packs were read are packed since, their loose files removed. Both reads find them in the
+    // new packs, and a real miss is still one.
+    let git = dir.path().join(".git");
+    let repack = |oid: &ObjectId, data: &[u8]| {
+        write_pack_entries(&git, &[PackEntry::Full(ObjectKind::Blob, data.to_vec())]).unwrap();
+        let (d, f) = oid.loose_path_components();
+        fs::remove_file(git.join("objects").join(d).join(f)).unwrap();
+    };
+    let (first, second) = (b"loose when the packs were read\n", b"loose too, packed by a later repack\n");
+    let (a, b) = (repo.write_blob(first).unwrap(), repo.write_blob(second).unwrap());
+    assert_eq!(repo.object_size(&a).unwrap(), first.len() as u64);
+    repack(&a, first);
+    assert_eq!(repo.object_size(&a).unwrap(), first.len() as u64, "a size read after a repack packed the object");
+    repack(&b, second);
+    assert_eq!(repo.read_object(&b).unwrap().data, second, "a read after a repack packed the object");
+    assert!(matches!(repo.read_object(&missing), Err(GitError::ObjectNotFound(_))), "a real miss after a repack");
+
+    // The same under a diff, whose subtrees are read through the packs it read first: the tip's
+    // subtree, loose then, is packed and its file removed before the diff reads it.
+    let file = |name: &str, oid| TreeEntry { name: name.into(), mode: 0o100644, oid };
+    let sub = Tree { entries: vec![file("b", b)] };
+    let sub_bytes = tree::serialize_tree(&sub);
+    let sub_oid = repo.write_tree(&sub).unwrap();
+    let base = repo.write_tree(&Tree { entries: vec![file("a", a)] }).unwrap();
+    let tip = repo.write_tree(&Tree { entries: vec![file("a", a), TreeEntry { name: "dir".into(), mode: 0o040000, oid: sub_oid }] }).unwrap();
+    assert_eq!(repo.read_tree(&base).unwrap().entries.len(), 1);
+    write_pack_entries(&git, &[PackEntry::Full(ObjectKind::Tree, sub_bytes)]).unwrap();
+    let (d, f) = sub_oid.loose_path_components();
+    fs::remove_file(git.join("objects").join(d).join(f)).unwrap();
+    let changes = repo.diff_trees(&base, &tip).unwrap();
+    assert!(matches!(&changes[..], [TreeChange::Added { path, .. }] if path == "dir/b"), "a diff after a repack packed its subtree: {changes:?}");
 }
 
 #[test]

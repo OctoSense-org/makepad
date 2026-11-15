@@ -5,6 +5,7 @@ use makepad_zune_png::{makepad_zune_core::bytestream::ZCursor, PngDecoder};
 // Texture ids have their own pool. The HAL lends its glyph atlas a different id.
 pub const TEXTURE: Id = Id::new(0, 1);
 
+#[derive(Clone)]
 pub struct Icon {
     size: [u32; 2],
     rgba: Vec<u8>,
@@ -51,6 +52,11 @@ impl Icon {
             [1, 1],
             Attr::default(),
         );
+        self.fill(writer);
+    }
+
+    /// The pixels, into the texture `upload` made (again on a new GPU device).
+    pub(crate) fn fill(&self, writer: &mut CmdWriter) {
         writer.texture_update(
             TEXTURE,
             0,

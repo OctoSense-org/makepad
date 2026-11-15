@@ -311,16 +311,26 @@ pub enum IOp {
     Crc32H,
     Crc32W,
     Crc32X,
+    /// CRC-32C (Castagnoli, reflected polynomial 0x82F63B78), otherwise as Crc32B/H/W/X: Arm's
+    /// `__crc32cb/h/w/d` (`crc32cb/h/w/x`), x86's `_mm_crc32_u8/16/32/64` (SSE4.2 `crc32`)
+    Crc32CB,
+    Crc32CH,
+    Crc32CW,
+    Crc32CX,
 }
 
 impl IOp {
-    /// the payload bits of a Crc32 op (8, 16, 32, 64)
-    pub fn crc32_bits(self) -> Option<u8> {
+    /// a Crc32 / Crc32C op: its payload bits (8, 16, 32, 64) and whether it is CRC-32C
+    pub fn crc32(self) -> Option<(u8, bool)> {
         match self {
-            IOp::Crc32B => Some(8),
-            IOp::Crc32H => Some(16),
-            IOp::Crc32W => Some(32),
-            IOp::Crc32X => Some(64),
+            IOp::Crc32B => Some((8, false)),
+            IOp::Crc32H => Some((16, false)),
+            IOp::Crc32W => Some((32, false)),
+            IOp::Crc32X => Some((64, false)),
+            IOp::Crc32CB => Some((8, true)),
+            IOp::Crc32CH => Some((16, true)),
+            IOp::Crc32CW => Some((32, true)),
+            IOp::Crc32CX => Some((64, true)),
             _ => None,
         }
     }
@@ -334,6 +344,95 @@ pub enum Cond {
     Le,
     Gt,
     Ge,
+}
+
+impl Cond {
+    /// The condition that holds exactly when this one does not (on integers; of float compares only
+    /// `==` and `!=`: `!=` is true when unordered)
+    pub fn not(self) -> Cond {
+        match self {
+            Cond::Eq => Cond::Ne,
+            Cond::Ne => Cond::Eq,
+            Cond::Lt => Cond::Ge,
+            Cond::Ge => Cond::Lt,
+            Cond::Le => Cond::Gt,
+            Cond::Gt => Cond::Le,
+        }
+    }
+}
+
+/// The compare a branch or a select reads in place (`Term::BranchCmp`, `Inst::SelCmp`): the
+/// condition is the compare's flags and never lives in a register. Backend-only, made by
+/// `regalloc::compares_into_readers` just before register allocation, from the `ICmp` / `ICmpI` /
+/// `FCmp` (and `c ^ 1` of one) a `Branch` or `Sel` read; the optimiser passes never see it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Cmp {
+    /// `ICmp(cond, signed, _, a, b)`
+    R(Cond, bool, VReg, VReg),
+    /// `ICmpI(cond, signed, _, a, k)`
+    K(Cond, bool, VReg, i64),
+    /// `FCmp(cond, f64, _, a, b)`
+    F(Cond, bool, VReg, VReg),
+}
+
+impl Cmp {
+    /// The compare an instruction makes, and its result.
+    pub fn of(i: &Inst) -> Option<(VReg, Cmp)> {
+        match *i {
+            Inst::ICmp(c, s, d, a, b) => Some((d, Cmp::R(c, s, a, b))),
+            Inst::ICmpI(c, s, d, a, k) => Some((d, Cmp::K(c, s, a, k))),
+            Inst::FCmp(c, w, d, a, b) => Some((d, Cmp::F(c, w, a, b))),
+            _ => None,
+        }
+    }
+    /// The instruction that makes this compare's 0 / 1 in d.
+    pub fn inst(self, d: VReg) -> Inst {
+        match self {
+            Cmp::R(c, s, a, b) => Inst::ICmp(c, s, d, a, b),
+            Cmp::K(c, s, a, k) => Inst::ICmpI(c, s, d, a, k),
+            Cmp::F(c, w, a, b) => Inst::FCmp(c, w, d, a, b),
+        }
+    }
+    pub fn cond(self) -> Cond {
+        match self {
+            Cmp::R(c, ..) | Cmp::K(c, ..) | Cmp::F(c, ..) => c,
+        }
+    }
+    /// The compare that is true exactly when this one is false (None: an ordered float compare,
+    /// false both ways when unordered).
+    pub fn not(self) -> Option<Cmp> {
+        match self {
+            Cmp::R(c, s, a, b) => Some(Cmp::R(c.not(), s, a, b)),
+            Cmp::K(c, s, a, k) => Some(Cmp::K(c.not(), s, a, k)),
+            Cmp::F(c @ (Cond::Eq | Cond::Ne), w, a, b) => Some(Cmp::F(c.not(), w, a, b)),
+            Cmp::F(..) => None,
+        }
+    }
+    /// Whether it reads v.
+    pub fn reads(self, v: VReg) -> bool {
+        let mut r = false;
+        self.uses(|u| r |= u == v);
+        r
+    }
+    /// The registers it reads.
+    pub fn uses(self, mut f: impl FnMut(VReg)) {
+        match self {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) => {
+                f(a);
+                f(b);
+            }
+            Cmp::K(_, _, a, _) => f(a),
+        }
+    }
+    pub fn vregs_mut(&mut self, mut f: impl FnMut(&mut VReg)) {
+        match self {
+            Cmp::R(_, _, a, b) | Cmp::F(_, _, a, b) => {
+                f(a);
+                f(b);
+            }
+            Cmp::K(_, _, a, _) => f(a),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -923,6 +1022,8 @@ pub enum Inst {
     Copy(VReg, VReg, u32),
     /// d = c != 0 ? a : b (c an integer vreg; a, b, d of one class)
     Sel(VReg, VReg, VReg, VReg), // d, c, a, b
+    /// backend-only (`Cmp`): d = cmp ? a : b
+    SelCmp(VReg, Cmp, VReg, VReg), // d, cmp, a, b
     /// fused multiply-add, one rounding: d = (neg_prod ? -a : a) * b + (neg_add ? -c : c), the
     /// negations those of the operands (a NaN's sign flips: `(-a).mul_add(b, c)`). A NaN result
     /// is [`fma_nan_f32`] / [`fma_nan_f64`] of the negated operands on every tier and register
@@ -996,6 +1097,8 @@ pub enum Inst {
 pub enum Term {
     Jump(u32),
     Branch(VReg, u32, u32),
+    /// backend-only (`Cmp`): to the first block when the compare holds, else the second
+    BranchCmp(Cmp, u32, u32),
     Ret(Vec<VReg>),
     Unreachable,
     /// (normal, unwind): the block's last instruction is a call (Callee::Fn / Indirect / Host)
@@ -1080,7 +1183,7 @@ impl Inst {
             Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::SlotAddr(d, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) | Inst::TlsAddr(d, _) | Inst::TlsStatic(d, _) | Inst::VConst(d, _) => f(*d),
             Inst::Mov(d, _) | Inst::INeg(_, d, _) | Inst::INot(_, d, _) | Inst::IBit(_, d, _) | Inst::FUnary(_, _, d, _) | Inst::Conv(_, d, _) | Inst::IBinI(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::Load(_, d, _, _) | Inst::VSplat(d, _) | Inst::VExtract(d, _, _) | Inst::VLoad(d, _, _) | Inst::VAny(d, _) | Inst::AtomicLoad(_, _, d, _) => f(*d),
             Inst::IBin(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) | Inst::FBin(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) | Inst::VGather(d, _, _) | Inst::VTbl(d, _, _, _) | Inst::VShuffle(d, _, _, _) | Inst::VX(_, d, _, _) | Inst::AtomicRmw(_, _, _, d, _, _) | Inst::LoadX(_, d, _, _, _, _) | Inst::VLoadX(d, _, _, _, _) => f(*d),
-            Inst::Sel(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, _, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
+            Inst::Sel(d, _, _, _) | Inst::SelCmp(d, _, _, _) | Inst::VX3(_, d, _, _, _) | Inst::VSel(d, _, _, _) | Inst::VFma(_, _, _, _, d, _, _, _) | Inst::FMulAdd(_, _, _, d, _, _, _) | Inst::AtomicCas(_, _, _, d, _, _, _) => f(*d),
             Inst::VInsert(d, _, _, _) => f(*d),
             Inst::Call(_, _, rets) => rets.iter().for_each(|r| f(*r)),
             Inst::FpEnv(_, v) => f(*v),
@@ -1118,6 +1221,12 @@ impl Inst {
                 f(b);
                 f(c);
             }
+            Inst::SelCmp(d, c, a, b) => {
+                f(d);
+                c.vregs_mut(&mut f);
+                f(a);
+                f(b);
+            }
             Inst::Call(c, args, rets) => {
                 if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
                     f(v);
@@ -1144,7 +1253,7 @@ impl Term {
     pub fn succs(&self) -> Succs {
         match *self {
             Term::Jump(t) => Succs { a: [t, 0], n: 1, i: 0, sw: None },
-            Term::Branch(_, t, e) | Term::Invoke(t, e) => Succs { a: [t, e], n: if t == e { 1 } else { 2 }, i: 0, sw: None },
+            Term::Branch(_, t, e) | Term::BranchCmp(_, t, e) | Term::Invoke(t, e) => Succs { a: [t, e], n: if t == e { 1 } else { 2 }, i: 0, sw: None },
             Term::Ret(_) | Term::Unreachable | Term::Resume => Succs { a: [0, 0], n: 0, i: 0, sw: None },
             Term::Switch(_, ref t) => Succs { a: [0, 0], n: 0, i: 0, sw: Some(t.clone()) },
         }
@@ -1154,7 +1263,7 @@ impl Term {
     pub fn map_succs(&mut self, mut f: impl FnMut(u32) -> u32) {
         match self {
             Term::Jump(t) => *t = f(*t),
-            Term::Branch(_, t, e) | Term::Invoke(t, e) => {
+            Term::Branch(_, t, e) | Term::BranchCmp(_, t, e) | Term::Invoke(t, e) => {
                 *t = f(*t);
                 *e = f(*e);
             }
@@ -1266,6 +1375,19 @@ pub struct Func {
     /// This O1 body needs only mandatory legalization before direct codegen.
     /// Retained with the RIR across the startup boundary; O3 clears it.
     pub baseline: bool,
+    /// A baseline body's own lowering (before its inlining and passes): the JIT builds the
+    /// slot's normal body from it later, so that body does not depend on how the slot was first
+    /// built. Carried from the preparation to the slot, which takes it off when it stores the
+    /// body; not compared or hashed, not renamed (the back-end memo drops it from its copies).
+    pub lowering: Option<std::sync::Arc<Func>>,
+    /// The slots whose final body this one could not take in yet: inline candidates its build
+    /// left out because their verdict was pending (SPEC-V: unverified code is not inlined into
+    /// verified code), and candidates offered with a body that was itself provisional (inlined
+    /// or not: the inliner priced that body). Build inputs
+    /// like `inl_slots`: a body with any is provisional (its cache record ranks below complete
+    /// code; the JIT builds it once more when every one of them is final). Compared, hashed and
+    /// renamed.
+    pub pending: Vec<u32>,
     /// O1 as it runs without O3 (full opt pipeline, Relax core inlined, thorough
     /// register allocation): code marked `// relax: hot`, whose first code is its only code
     /// until O3 replaces it
@@ -1312,18 +1434,33 @@ pub struct Func {
     /// copy's site calls the slot, which holds the patched body (`guard_calls`). Side metadata of
     /// the callee for its callers' inliner: the body's own code does not read it.
     pub patch_flag: Option<Sym>,
-    /// The calls a guarded inline copy falls back to (call position, slot): never inlined again.
+    /// The calls a guarded inline copy falls back to (call position, with `POS_GUARD`; slot): never
+    /// inlined again.
     pub guard_calls: Vec<(u64, u32)>,
     /// A live session: the patch flags of the copies this body inlined unguarded (no call and no
     /// loop on any path from its entry to the site: a frame there cannot wait for a patch; the
     /// patch rebuilds the callers that inlined the body). A guarded copy of this body elsewhere
     /// reads them with its own (`opt::inline_site`). Side metadata, like `patch_flag`.
     pub unguarded_flags: Vec<Sym>,
+    /// A live session: the copy version of the slot this body is built for (a word of its tier
+    /// record) and the value the build read. The guards its inliner makes compare the word with
+    /// the value before they read their flags: the word moves once a flag the slot's code reads
+    /// is set (`opt::inline_site`). Side metadata of the build, like `patch_flag`.
+    pub copy_ver: Option<(Sym, u64)>,
+    /// A live session: the size of the guards of the copies this body inlined (`opt::inline_site`):
+    /// code only a patch runs, which a caller's inliner prices the body without, so a live session
+    /// inlines what a run without patches does.
+    pub guard_size: GuardSize,
+    /// A live session's root build split after its first inlining round (`opt::split_patched_path`):
+    /// its copy-version compares are exits, each leaving for the patched path (a copy of the rest of
+    /// the fn whose copies keep their guards) once a patch moved the version, and never coming back.
+    /// Its fast blocks hold no guard and no slow call.
+    pub patched_path: bool,
     /// A sandbox twin: the instructions of the canonical body it was made from, and its own once
     /// confined (the masks, the shadow frame, the meters). The inliner prices the body by that
     /// share (`Func::priced`), so a twin's O3 build takes in the twins its base's build takes in
     /// the bases of: its limits are about the source's code, and a confined body is two to three
-    /// times that. Side metadata, like `patch_flag`.
+    /// times that. Side metadata, like `guard_size`.
     pub confined: Option<(u32, u32)>,
     /// A sandbox twin's body whose memory is not confined yet: the input of a twin's O3 build
     /// (`sandbox::early_rir`: meters, call targets and data addresses are the twin's, its loads
@@ -1332,6 +1469,27 @@ pub struct Func {
     /// body that takes such a body in is one too (`opt::inline_site`), and the backends refuse
     /// to emit one.
     pub unconfined: bool,
+}
+
+/// The guards' share of a body (`Func::guard_size`): their compares at the sites (the check and
+/// slow blocks they branch to are found from the slow calls: `opt::guard_blocks`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct GuardSize {
+    pub insts: u32,
+    /// their rustc inline cost (`opt::rustc_inline_cost`; the sites' branches included)
+    pub cost: u32,
+}
+
+impl GuardSize {
+    pub fn add(&mut self, o: GuardSize) {
+        self.insts += o.insts;
+        self.cost += o.cost;
+    }
+
+    pub fn sub(&mut self, o: GuardSize) {
+        self.insts = self.insts.saturating_sub(o.insts);
+        self.cost = self.cost.saturating_sub(o.cost);
+    }
 }
 
 /// A named local of the source and its storage (`Func::dbg`).
@@ -1396,6 +1554,9 @@ impl Func {
         for c in &mut self.inl_slots {
             f(c);
         }
+        for c in &mut self.pending {
+            f(c);
+        }
         for (_, c) in &mut self.guard_calls {
             f(c);
         }
@@ -1405,7 +1566,7 @@ impl Func {
     /// compared through its own map (`ma` for self, `mb` for `o`; block counts by bits). With
     /// injective maps: the bodies are equal up to a renaming of their slots.
     pub fn same_body_mapped(&self, ma: &mut dyn FnMut(u32) -> u32, o: &Func, mb: &mut dyn FnMut(u32) -> u32) -> bool {
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, confined, unconfined } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, confined, unconfined } = self;
         let callee_eq = |a: &Callee, ma: &mut dyn FnMut(u32) -> u32, b: &Callee, mb: &mut dyn FnMut(u32) -> u32| match (a, b) {
             (Callee::Fn(x), Callee::Fn(y)) => ma(*x) == mb(*y),
             (Callee::CFn(x, xs), Callee::CFn(y, ys)) => ma(*x) == mb(*y) && xs == ys,
@@ -1456,10 +1617,14 @@ impl Func {
             && *inl == o.inl
             && inl_slots.len() == o.inl_slots.len()
             && inl_slots.iter().zip(&o.inl_slots).all(|(x, y)| ma(*x) == mb(*y))
+            && pending.len() == o.pending.len()
+            && pending.iter().zip(&o.pending).all(|(x, y)| ma(*x) == mb(*y))
             && *dbg == o.dbg
             && *halves == o.halves
             && guard_calls.len() == o.guard_calls.len()
             && guard_calls.iter().zip(&o.guard_calls).all(|(x, y)| x.0 == y.0 && ma(x.1) == mb(y.1))
+            && *guard_size == o.guard_size
+            && *patched_path == o.patched_path
             && *confined == o.confined
             && *unconfined == o.unconfined
     }
@@ -1467,7 +1632,7 @@ impl Func {
     /// A hash of what `same_body_mapped` compares, the function slots replaced by `m(slot)`.
     pub fn hash_body_mapped<H: std::hash::Hasher>(&self, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
         use std::hash::Hash;
-        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, confined, unconfined } = self;
+        let Func { name: _, blocks, vregs, slots, params, rets, file, noalias, withheld_noalias, plain_calls, deref, cabi, sret, sret_callees, nocapture, nounwind_inputs, baseline, lowering: _, pending, full, owned, nonnull, param_ints, ranged, naked, inl, inl_slots, dbg, halves, patch_flag: _, guard_calls, unguarded_flags: _, copy_ver: _, guard_size, patched_path, confined, unconfined } = self;
         fn callee<H: std::hash::Hasher>(c: &Callee, h: &mut H, m: &mut dyn FnMut(u32) -> u32) {
             match c {
                 Callee::Fn(x) => {
@@ -1531,6 +1696,12 @@ impl Func {
         for x in inl_slots {
             m(*x).hash(h);
         }
+        if !pending.is_empty() {
+            pending.len().hash(h);
+            for x in pending {
+                m(*x).hash(h);
+            }
+        }
         // (only when present, as `halves` below)
         if !param_ints.is_empty() {
             param_ints.hash(h);
@@ -1544,6 +1715,10 @@ impl Func {
             for (p, x) in guard_calls {
                 (p, m(*x)).hash(h);
             }
+            guard_size.hash(h);
+        }
+        if *patched_path {
+            patched_path.hash(h);
         }
         if confined.is_some() {
             confined.hash(h);
@@ -1656,15 +1831,31 @@ impl Func {
     }
 }
 
-/// Source positions are `(file << 32) | byte`, with the inline context in bits 48..63 (0: the
-/// function's own body; k: inlined through `Func::inl[k - 1]`). File indices stay below 1 << 16.
+/// Source positions are `(file << 32) | byte`, with the inline context in bits 48..61 (0: the
+/// function's own body; k: inlined through `Func::inl[k - 1]`), bit 62 set on a guarded inline
+/// copy's slow call (`POS_GUARD`) and bit 63 on the code of a split body's patched path
+/// (`POS_PATCHED`). File indices stay below 1 << 16.
 pub const POS_CTX_SHIFT: u32 = 48;
-/// An inline chain deeper / wider than 16 bits: the context is lost (positions still name lines).
-pub const POS_CTX_LOST: u64 = 0xffff;
+/// An inline chain deeper / wider than 14 bits: the context is lost (positions still name lines).
+pub const POS_CTX_LOST: u64 = 0x3fff;
+/// The position bit of a guarded inline copy's slow call (`Func::guard_calls`, `codegen::opt`
+/// `inline_site`). The front lowers some source places more than once (a match guard of an
+/// or-pattern, once per alternative): a call there of the same callee is a plain call, which the
+/// call position alone would take for the slow call (never inlined, and its block's branch read as
+/// a guard test: `codegen::patched` sent the fast half to the panic side of a bounds check).
+pub const POS_GUARD: u64 = 1 << 62;
+/// The position bit of an instruction in a split body's patched path (`codegen::patched`): the
+/// pc map tells a frame there from one in the fast half (makepad inspect, the patch report).
+pub const POS_PATCHED: u64 = 1 << 63;
 
 /// The inline context of a position.
 pub fn pos_ctx(p: u64) -> u64 {
-    p >> POS_CTX_SHIFT
+    (p >> POS_CTX_SHIFT) & POS_CTX_LOST
+}
+
+/// Whether a position lies in a split body's patched path.
+pub fn pos_patched(p: u64) -> bool {
+    p & POS_PATCHED != 0
 }
 
 /// A position without its inline context: what names a source place (keys, lookups).
@@ -1677,9 +1868,9 @@ pub fn pos_file(p: u64) -> u32 {
     ((p >> 32) & 0xffff) as u32
 }
 
-/// `p` with inline context `ctx`.
+/// `p` with inline context `ctx` (a slow call, in the patched path, when `p` is).
 pub fn pos_with_ctx(p: u64, ctx: u64) -> u64 {
-    pos_plain(p) | (ctx.min(POS_CTX_LOST) << POS_CTX_SHIFT)
+    (p & (POS_PATCHED | POS_GUARD)) | pos_plain(p) | (ctx.min(POS_CTX_LOST) << POS_CTX_SHIFT)
 }
 
 /// The pc-map entries carrying `f`'s inline stack: two per context, at code offset u32::MAX
@@ -1691,7 +1882,7 @@ pub fn inline_pc_entries(f: &Func) -> impl Iterator<Item = (u32, u64)> + '_ {
 
 impl Func {
     pub fn new(name: String, file: u32) -> Func {
-        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), confined: None, unconfined: false }
+        Func { name, blocks: Vec::new(), vregs: Vec::new(), slots: Vec::new(), params: Vec::new(), rets: Vec::new(), file, noalias: Vec::new(), withheld_noalias: Vec::new(), plain_calls: false, deref: Vec::new(), cabi: None, sret: None, sret_callees: Vec::new(), nocapture: Vec::new(), nounwind_inputs: Vec::new(), baseline: false, lowering: None, pending: Vec::new(), full: false, owned: Vec::new(), nonnull: Vec::new(), param_ints: Vec::new(), ranged: Vec::new(), naked: false, inl: Vec::new(), inl_slots: Vec::new(), dbg: Vec::new(), halves: Vec::new(), patch_flag: None, guard_calls: Vec::new(), unguarded_flags: Vec::new(), copy_ver: None, guard_size: GuardSize::default(), patched_path: false, confined: None, unconfined: false }
     }
     /// `n` instructions (or cost units) of this body as the inliner prices them: a sandbox
     /// twin's by its base's share (`Func::confined`).
@@ -1721,7 +1912,8 @@ impl Func {
             return false;
         }
         let Some(Inst::Call(Callee::Fn(id) | Callee::CFn(id, _), _, _)) = self.blocks[bi].insts.get(ii) else { return false };
-        let p = self.blocks[bi].pos.get(ii).copied().unwrap_or(0);
+        // (a copy's call in a split body's patched path: its position carries POS_PATCHED)
+        let p = self.blocks[bi].pos.get(ii).copied().unwrap_or(0) & !POS_PATCHED;
         self.guard_calls.iter().any(|&(q, s)| q == p && s == *id)
     }
 
@@ -1744,6 +1936,21 @@ impl Func {
             s.push_str(&format!("  {:?}\n", b.term));
         }
         s
+    }
+
+    /// A compare's operands against its kind.
+    fn check_cmp(&self, c: &Cmp, what: &str) -> Result<(), String> {
+        let want = match c {
+            Cmp::R(..) | Cmp::K(..) => Cls::I,
+            Cmp::F(_, true, ..) => Cls::F64,
+            Cmp::F(_, false, ..) => Cls::F32,
+        };
+        let mut bad = false;
+        c.uses(|u| bad |= self.vregs[u.0 as usize] != want);
+        if bad {
+            return Err(format!("{}: {} compare class mismatch: {:?}", self.name, what, c));
+        }
+        Ok(())
     }
 
     /// C ABI vregs (call arguments or body params) against their CSig.
@@ -1771,7 +1978,7 @@ impl Func {
 
     /// Structural verifier: every use has a class-correct vreg, every target exists.
     /// Hard verification after a rewrite that runs past the last `verify` (JITSAFE 19): always in
-    /// debug builds; in release with MAKEPAD_RUN_VERIFY_PASSES (the gates' diff_fast legs set it).
+    /// debug builds; in release with RELAX_VERIFY_PASSES (the gates' diff_fast legs set it).
     /// A broken function is an error naming the pass -- never compiled.
     pub fn verify_after(&self, pass: &str) -> Result<(), String> {
         if !verify_passes_on() {
@@ -1880,6 +2087,12 @@ impl Func {
                         regs.push(*a);
                         regs.push(*b);
                     }
+                    Inst::SelCmp(d, c, a, b) => {
+                        regs.push(*d);
+                        c.uses(|u| regs.push(u));
+                        regs.push(*a);
+                        regs.push(*b);
+                    }
                     Inst::FMulAdd(_, _, _, d, a, b, c) => {
                         regs.push(*d);
                         regs.push(*a);
@@ -1930,6 +2143,13 @@ impl Func {
                             return Err(format!("{}: b{} select class mismatch: {:?}", self.name, bi, x));
                         }
                     }
+                    Inst::SelCmp(d, c, a, b2) => {
+                        let cd = self.vregs[d.0 as usize];
+                        if self.vregs[a.0 as usize] != cd || self.vregs[b2.0 as usize] != cd {
+                            return Err(format!("{}: b{} select class mismatch: {:?}", self.name, bi, x));
+                        }
+                        self.check_cmp(c, &format!("b{} select", bi))?;
+                    }
                     _ => {}
                 }
             }
@@ -1941,6 +2161,17 @@ impl Func {
                 }
                 Term::Branch(c, t, f) => {
                     chk(*c)?;
+                    if *t >= nb || *f >= nb {
+                        return Err(format!("{}: bad branch target", self.name));
+                    }
+                }
+                Term::BranchCmp(c, t, f) => {
+                    let mut ops: Vec<VReg> = Vec::new();
+                    c.uses(|u| ops.push(u));
+                    for u in ops {
+                        chk(u)?;
+                    }
+                    self.check_cmp(c, &format!("b{} branch", bi))?;
                     if *t >= nb || *f >= nb {
                         return Err(format!("{}: bad branch target", self.name));
                     }
@@ -2239,12 +2470,12 @@ pub fn split_unwind_info(code: &[u8]) -> (usize, Option<UnwindInfo>) {
     }
 }
 
-/// MAKEPAD_RUN_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
+/// RELAX_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
 pub static UNWIND_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 pub fn unwind_stats_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_UNWIND_STATS").is_ok())
+    *ON.get_or_init(|| std::env::var("RELAX_UNWIND_STATS").is_ok())
 }
 
 /// Per stack slot: whether any SlotAddr names it (the only way to reach a slot).
@@ -2341,11 +2572,11 @@ mod unwind_trailer_tests {
     }
 }
 
-/// MAKEPAD_RUN_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
+/// RELAX_VERIFY_PASSES (any value), `force_verify_passes`, or a debug build:
 /// `Func::verify_after` checks.
 pub fn verify_passes_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    cfg!(debug_assertions) || FORCE_VERIFY.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_PASSES").is_some())
+    cfg!(debug_assertions) || FORCE_VERIFY.load(std::sync::atomic::Ordering::Relaxed) || *ON.get_or_init(|| std::env::var_os("RELAX_VERIFY_PASSES").is_some())
 }
 
 static FORCE_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

@@ -44,7 +44,7 @@ pub struct TcpListener {
     sock: Socket,
 }
 
-// library/std/src/net/tcp.rs: `#[derive(Debug)]`, it prints the listener it borrows
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 #[derive(Debug)]
 pub struct Incoming<'a> {
     listener: &'a TcpListener,
@@ -55,7 +55,7 @@ impl TcpStream {
         each_addr(addr, |a| {
             let s = Socket::new(family_of(a), sn::SOCK_STREAM)?;
             let mut buf = sn::zeroed();
-            let len = a.encode(&mut buf);
+            let len = super::addr::encode(a, &mut buf);
             s.connect(&buf, len)?;
             Ok(TcpStream { sock: s })
         })
@@ -63,17 +63,17 @@ impl TcpStream {
     pub fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
         let s = Socket::new(family_of(addr), sn::SOCK_STREAM)?;
         let mut buf = sn::zeroed();
-        let len = addr.encode(&mut buf);
+        let len = super::addr::encode(addr, &mut buf);
         s.connect_timeout(&buf, len, timeout)?;
         Ok(TcpStream { sock: s })
     }
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         let (buf, _) = self.sock.name(true)?;
-        SocketAddr::decode(&buf)
+        super::addr::decode(&buf)
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let (buf, _) = self.sock.name(false)?;
-        SocketAddr::decode(&buf)
+        super::addr::decode(&buf)
     }
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         self.sock.shutdown(how)
@@ -166,7 +166,7 @@ impl TcpListener {
                 s.set_int(sn::SOL_SOCKET, sn::SO_REUSEADDR, 1)?;
             }
             let mut buf = sn::zeroed();
-            let len = a.encode(&mut buf);
+            let len = super::addr::encode(a, &mut buf);
             s.bind(&buf, len)?;
             s.listen(BACKLOG)?;
             Ok(TcpListener { sock: s })
@@ -174,14 +174,14 @@ impl TcpListener {
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         let (buf, _) = self.sock.name(false)?;
-        SocketAddr::decode(&buf)
+        super::addr::decode(&buf)
     }
     pub fn try_clone(&self) -> io::Result<TcpListener> {
         Ok(TcpListener { sock: self.sock.try_clone()? })
     }
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let (s, buf, _) = self.sock.accept()?;
-        Ok((TcpStream { sock: s }, SocketAddr::decode(&buf)?))
+        Ok((TcpStream { sock: s }, super::addr::decode(&buf)?))
     }
     pub fn incoming(&self) -> Incoming<'_> {
         Incoming { listener: self }
@@ -210,7 +210,7 @@ impl<'a> Iterator for Incoming<'a> {
     }
 }
 
-impl crate::iter::FusedIterator for Incoming<'_> {}
+impl core::iter::FusedIterator for Incoming<'_> {}
 
 impl fmt::Debug for TcpListener {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {

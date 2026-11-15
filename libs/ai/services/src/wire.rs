@@ -47,9 +47,6 @@ use makepad_micro_serde::*;
 
 /// Bytes a service brief may occupy in the system prompt.
 pub const MAX_BRIEF_BYTES: usize = 4 * 1024;
-/// Bytes of a tool description. A tool with many options says what each does
-/// and when to use it; the longest of a large service runs to about a kilobyte.
-pub const MAX_DESCRIPTION_BYTES: usize = 1536;
 /// Bytes of one tool's JSON-schema text.
 pub const MAX_PARAMETERS_BYTES: usize = 8 * 1024;
 /// Tools one service may declare. Studio's F10 service alone carries its
@@ -66,7 +63,7 @@ pub const MAX_FILTER_BYTES: usize = 1024;
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 /// Bytes of a result's model-facing text; the router truncates past this.
 pub const MAX_RESULT_BYTES: usize = 16 * 1024;
-/// Combined base64 bytes of a result's PNG images, separate from its text.
+/// Combined base64 bytes of a result's PNG or JPEG images, separate from its text.
 pub const MAX_RESULT_IMAGE_BYTES: usize = 900 * 1024;
 /// Bytes of a result's structured data (JSON).
 pub const MAX_DATA_BYTES: usize = 16 * 1024;
@@ -76,8 +73,17 @@ pub const MAX_NOTE_BYTES: usize = 256;
 pub const MAX_TASK_BYTES: usize = 4 * 1024;
 /// Bytes of a service's volatile per-turn context.
 pub const MAX_CONTEXT_BYTES: usize = 2 * 1024;
-/// Bytes of a call's argument JSON.
-pub const MAX_ARGS_BYTES: usize = 16 * 1024;
+/// Bytes of a call's argument JSON: the existing remote OPEN payload capacity
+/// (`libs/remote/src/frame.rs`: 1 MiB minus chan/kind/flags). This is a sanity
+/// check, not a buffer allocation. The remote sender also checks the actual
+/// OPEN payload, including its variable service/routing header, before queueing.
+/// Mirrored by ai-hub's chat_wire::MAX_TOOL_JSON_BYTES (neither data-only
+/// crate depends on the remote transport).
+pub const MAX_ARGS_BYTES: usize = (1 << 20) - 4;
+
+pub fn arguments_too_large(bytes: usize) -> String {
+    format!("the encoded call is {bytes} bytes; one call carries {MAX_ARGS_BYTES} (including routing fields). Send a smaller first part, then append the rest with the service's edit tool.")
+}
 /// Longest service id.
 pub const MAX_SERVICE_ID: usize = 24;
 /// Longest tool short name.
@@ -85,12 +91,9 @@ pub const MAX_TOOL_NAME: usize = 32;
 /// Longest call id or endpoint id.
 pub const MAX_ID_BYTES: usize = 64;
 /// Bytes of a whole manifest's text fields together: brief, label and every
-/// tool's and topic's name, description and schema. Sized so a manifest at
-/// every per-field cap still fits ([`MAX_TOOLS`] tools and [`MAX_TOPICS`]
-/// topics, each at [`MAX_DESCRIPTION_BYTES`] + [`MAX_PARAMETERS_BYTES`] +
-/// [`MAX_TOOL_NAME`] + [`MAX_LAYOUT_BYTES`], plus [`MAX_BRIEF_BYTES`] and the
-/// label): about 1.7 million bytes, rounded up to 7 × 256 KiB. The compile-time check below keeps it
-/// consistent with the per-field caps.
+/// tool's and topic's name, description, schema and card layout. This is a
+/// bound in its own right, so one `Register` frame always carries a manifest
+/// that validates. The frame assertion below accounts for JSON escaping.
 pub const MAX_MANIFEST_BYTES: usize = 1792 * 1024;
 /// Bytes of one hosted frame. Anything larger is dropped unread. A
 /// `Register` frame carries a whole manifest as JSON, and JSON escaping can
@@ -103,12 +106,6 @@ pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LABEL_BYTES: usize = 48;
 /// Bytes of one tool's card layout text.
 pub const MAX_LAYOUT_BYTES: usize = 2 * 1024;
-/// Worst-case text bytes of one tool or topic at every per-field cap.
-const MAX_ENTRY_BYTES: usize = MAX_DESCRIPTION_BYTES + MAX_PARAMETERS_BYTES + MAX_TOOL_NAME + MAX_LAYOUT_BYTES;
-const _: () = assert!(
-    MAX_MANIFEST_BYTES >= MAX_TOOLS * MAX_ENTRY_BYTES + MAX_TOPICS * MAX_ENTRY_BYTES + MAX_BRIEF_BYTES + MAX_LABEL_BYTES,
-    "MAX_MANIFEST_BYTES must hold a manifest at every per-field cap"
-);
 const _: () = assert!(
     MAX_FRAME_BYTES >= 2 * MAX_MANIFEST_BYTES + 64 * 1024,
     "MAX_FRAME_BYTES must hold a JSON-escaped maximal manifest plus its envelope"
@@ -225,6 +222,31 @@ impl TopicDef {
         self.schema = Some(schema.into());
         self
     }
+
+    fn bytes(&self) -> usize {
+        self.name.len() + self.description.len() + self.schema.as_ref().map_or(0, String::len)
+    }
+
+    fn problem(&self, service: &str, earlier: &[TopicDef]) -> Option<String> {
+        if !is_ident(&self.name, MAX_TOOL_NAME) {
+            return Some(format!("service '{}' topic '{}' is not [a-z0-9_]{{1,{}}}", service, self.name, MAX_TOOL_NAME));
+        }
+        if earlier.iter().any(|topic| topic.name == self.name) {
+            return Some(format!("service '{}' declares topic '{}' twice", service, self.name));
+        }
+        if self.description.trim().is_empty() {
+            return Some(format!("topic '{}.{}' description is empty after trimming ({} bytes)", service, self.name, self.description.len()));
+        }
+        if let Some(schema) = &self.schema {
+            if schema.len() > MAX_PARAMETERS_BYTES {
+                return Some(format!("topic '{}.{}' schema is {} bytes; the cap is {}", service, self.name, schema.len(), MAX_PARAMETERS_BYTES));
+            }
+            if !matches!(makepad_strict_json::parse(schema.as_bytes()), Ok(makepad_strict_json::Value::Obj(_))) {
+                return Some(format!("topic '{}.{}' schema is not a JSON object", service, self.name));
+            }
+        }
+        None
+    }
 }
 
 impl ToolDef {
@@ -270,6 +292,47 @@ impl ToolDef {
     /// Whether the app confirms this tool itself.
     pub fn confirms_itself(&self) -> bool {
         self.self_confirm == Some(true)
+    }
+
+    fn bytes(&self) -> usize {
+        self.name.len() + self.description.len() + self.parameters.len()
+            + self.layout.as_ref().map_or(0, CardLayout::bytes)
+    }
+
+    fn problem(&self, service: &str, earlier: &[ToolDef]) -> Option<String> {
+        if !is_ident(&self.name, MAX_TOOL_NAME) {
+            return Some(format!("service '{}' tool '{}' is not [a-z0-9_]{{1,{}}}", service, self.name, MAX_TOOL_NAME));
+        }
+        if earlier.iter().any(|tool| tool.name == self.name) {
+            return Some(format!("service '{}' declares '{}' twice", service, self.name));
+        }
+        if self.description.trim().is_empty() {
+            return Some(format!("tool '{}.{}' description is empty after trimming ({} bytes)", service, self.name, self.description.len()));
+        }
+        if self.self_confirm.is_some() && !(self.confirms_itself() && self.risk == Risk::Destructive) {
+            return Some(format!("tool '{}.{}' may only confirm itself when it is destructive", service, self.name));
+        }
+        if self.parameters.len() > MAX_PARAMETERS_BYTES {
+            return Some(format!("tool '{}.{}' schema is {} bytes; the cap is {}", service, self.name, self.parameters.len(), MAX_PARAMETERS_BYTES));
+        }
+        match makepad_strict_json::parse(self.parameters.as_bytes()) {
+            Ok(makepad_strict_json::Value::Obj(fields)) => {
+                let is_object = fields
+                    .iter()
+                    .any(|(k, v)| k == "type" && v.as_str() == Some("object"));
+                if !is_object {
+                    return Some(format!("tool '{}.{}' schema must be an argument object (\"type\":\"object\")", service, self.name));
+                }
+            }
+            Ok(_) => return Some(format!("tool '{}.{}' schema is not a JSON object", service, self.name)),
+            Err(e) => return Some(format!("tool '{}.{}' schema does not parse: {e}", service, self.name)),
+        }
+        if let Some(layout) = &self.layout {
+            if layout.bytes() > MAX_LAYOUT_BYTES {
+                return Some(format!("tool '{}.{}' card layout is {} bytes; the cap is {}", service, self.name, layout.bytes(), MAX_LAYOUT_BYTES));
+            }
+        }
+        None
     }
 }
 
@@ -347,80 +410,80 @@ impl ServiceManifest {
                 MAX_TOPICS
             ));
         }
-        let mut total = self.brief.len() + self.label.len();
         for (i, tool) in self.tools.iter().enumerate() {
-            if !is_ident(&tool.name, MAX_TOOL_NAME) {
-                return Err(format!("service '{}' tool '{}' is not [a-z0-9_]{{1,{}}}", self.id, tool.name, MAX_TOOL_NAME));
+            if let Some(problem) = tool.problem(&self.id, &self.tools[..i]) {
+                return Err(problem);
             }
-            if self.tools[..i].iter().any(|t| t.name == tool.name) {
-                return Err(format!("service '{}' declares '{}' twice", self.id, tool.name));
-            }
-            if tool.description.trim().is_empty() || tool.description.len() > MAX_DESCRIPTION_BYTES {
-                return Err(format!("tool '{}.{}' description must be 1..{} bytes", self.id, tool.name, MAX_DESCRIPTION_BYTES));
-            }
-            if tool.self_confirm.is_some() && !(tool.confirms_itself() && tool.risk == Risk::Destructive) {
-                return Err(format!("tool '{}.{}' may only confirm itself when it is destructive", self.id, tool.name));
-            }
-            if tool.parameters.len() > MAX_PARAMETERS_BYTES {
-                return Err(format!("tool '{}.{}' schema is {} bytes; the cap is {}", self.id, tool.name, tool.parameters.len(), MAX_PARAMETERS_BYTES));
-            }
-            match makepad_strict_json::parse(tool.parameters.as_bytes()) {
-                Ok(makepad_strict_json::Value::Obj(fields)) => {
-                    let is_object = fields
-                        .iter()
-                        .any(|(k, v)| k == "type" && v.as_str() == Some("object"));
-                    if !is_object {
-                        return Err(format!("tool '{}.{}' schema must be an argument object (\"type\":\"object\")", self.id, tool.name));
-                    }
-                }
-                Ok(_) => return Err(format!("tool '{}.{}' schema is not a JSON object", self.id, tool.name)),
-                Err(e) => return Err(format!("tool '{}.{}' schema does not parse: {e}", self.id, tool.name)),
-            }
-            if let Some(layout) = &tool.layout {
-                if layout.bytes() > MAX_LAYOUT_BYTES {
-                    return Err(format!("tool '{}.{}' card layout is {} bytes; the cap is {}", self.id, tool.name, layout.bytes(), MAX_LAYOUT_BYTES));
-                }
-                total += layout.bytes();
-            }
-            total += tool.description.len() + tool.parameters.len() + tool.name.len();
         }
         for (i, topic) in self.topics.iter().enumerate() {
-            if !is_ident(&topic.name, MAX_TOOL_NAME) {
-                return Err(format!(
-                    "service '{}' topic '{}' is not [a-z0-9_]{{1,{}}}",
-                    self.id, topic.name, MAX_TOOL_NAME
-                ));
+            if let Some(problem) = topic.problem(&self.id, &self.topics[..i]) {
+                return Err(problem);
             }
-            if self.topics[..i].iter().any(|t| t.name == topic.name) {
-                return Err(format!("service '{}' declares topic '{}' twice", self.id, topic.name));
-            }
-            if topic.description.trim().is_empty() || topic.description.len() > MAX_DESCRIPTION_BYTES {
-                return Err(format!(
-                    "topic '{}.{}' description must be 1..{} bytes",
-                    self.id, topic.name, MAX_DESCRIPTION_BYTES
-                ));
-            }
-            if let Some(schema) = &topic.schema {
-                if schema.len() > MAX_PARAMETERS_BYTES {
-                    return Err(format!(
-                        "topic '{}.{}' schema is {} bytes; the cap is {}",
-                        self.id,
-                        topic.name,
-                        schema.len(),
-                        MAX_PARAMETERS_BYTES
-                    ));
-                }
-                if !matches!(makepad_strict_json::parse(schema.as_bytes()), Ok(makepad_strict_json::Value::Obj(_))) {
-                    return Err(format!("topic '{}.{}' schema is not a JSON object", self.id, topic.name));
-                }
-                total += schema.len();
-            }
-            total += topic.description.len() + topic.name.len();
         }
+        let total = self.bytes();
         if total > MAX_MANIFEST_BYTES {
             return Err(format!("service '{}' manifest is {} bytes; the cap is {}", self.id, total, MAX_MANIFEST_BYTES));
         }
         Ok(())
+    }
+
+    /// Drop entries with bad names, later duplicates, empty descriptions,
+    /// invalid or oversized schemas, or oversized layouts. Then drop tools
+    /// and topics past their count caps, then the largest entries until the
+    /// text fits the manifest cap. Ties drop the later entry, with topics
+    /// after tools. Every other tool and topic stays, in its original order.
+    /// Each removal returns a diagnostic. The id, label and brief remain
+    /// unchanged; only problems with these fields can still fail `validate()`.
+    pub fn admit(&mut self) -> Vec<String> {
+        let mut problems = Vec::new();
+        for tool in std::mem::take(&mut self.tools) {
+            if let Some(problem) = tool.problem(&self.id, &self.tools) {
+                problems.push(format!("ai service '{}': tool '{}' not served: {problem} (entry is {} bytes)", self.id, tool.name, tool.bytes()));
+            } else {
+                self.tools.push(tool);
+            }
+        }
+        for topic in std::mem::take(&mut self.topics) {
+            if let Some(problem) = topic.problem(&self.id, &self.topics) {
+                problems.push(format!("ai service '{}': topic '{}' not served: {problem} (entry is {} bytes)", self.id, topic.name, topic.bytes()));
+            } else {
+                self.topics.push(topic);
+            }
+        }
+        let tool_count = self.tools.len();
+        if tool_count > MAX_TOOLS {
+            for tool in self.tools.drain(MAX_TOOLS..) {
+                problems.push(format!("ai service '{}': tool '{}' not served: {tool_count} tools; the cap is {MAX_TOOLS} (entry is {} bytes)", self.id, tool.name, tool.bytes()));
+            }
+        }
+        let topic_count = self.topics.len();
+        if topic_count > MAX_TOPICS {
+            for topic in self.topics.drain(MAX_TOPICS..) {
+                problems.push(format!("ai service '{}': topic '{}' not served: {topic_count} topics; the cap is {MAX_TOPICS} (entry is {} bytes)", self.id, topic.name, topic.bytes()));
+            }
+        }
+        let mut total = self.bytes();
+        while total > MAX_MANIFEST_BYTES {
+            let largest = self.tools.iter().enumerate()
+                .map(|(index, tool)| (tool.bytes(), false, index))
+                .chain(self.topics.iter().enumerate().map(|(index, topic)| (topic.bytes(), true, index)))
+                .max_by_key(|(bytes, _, _)| *bytes);
+            let Some((bytes, is_topic, index)) = largest else { break };
+            let (kind, name) = if is_topic {
+                ("topic", self.topics.remove(index).name)
+            } else {
+                ("tool", self.tools.remove(index).name)
+            };
+            problems.push(format!("ai service '{}': {kind} '{name}' not served: manifest is {total} bytes; the cap is {MAX_MANIFEST_BYTES} (entry is {bytes} bytes)", self.id));
+            total -= bytes;
+        }
+        problems
+    }
+
+    fn bytes(&self) -> usize {
+        self.brief.len() + self.label.len()
+            + self.tools.iter().map(ToolDef::bytes).sum::<usize>()
+            + self.topics.iter().map(TopicDef::bytes).sum::<usize>()
     }
 }
 
@@ -637,7 +700,7 @@ pub struct ToolResult {
     pub data: String,
     /// One dim transcript line: "planned Dam → Utrecht, 41 min".
     pub note: String,
-    /// PNG images encoded as base64. The app sizes them before replying;
+    /// PNG or JPEG images encoded as base64. The app sizes them before replying;
     /// their combined size is bounded at [`MAX_RESULT_IMAGE_BYTES`].
     pub images: Vec<String>,
     /// Show the service's live preview under this call's card.
@@ -959,7 +1022,7 @@ impl ServiceDown {
                     return Err("call: bad tool name".into());
                 }
                 if c.args.len() > MAX_ARGS_BYTES {
-                    return Err("call: args over cap".into());
+                    return Err(arguments_too_large(c.args.len()));
                 }
                 Ok(())
             }
@@ -1117,7 +1180,7 @@ impl AppRequest {
                     .join(" ");
                 let args = if body.trim().is_empty() { "{}".to_string() } else { body.trim().to_string() };
                 if args.len() > MAX_ARGS_BYTES {
-                    return Err("call: the arguments are over the cap".into());
+                    return Err(arguments_too_large(args.len()));
                 }
                 Ok(AppRequest::Call {
                     service: service.to_string(),
@@ -1327,6 +1390,11 @@ mod tests {
         let mut dup = route();
         dup.tools.push(dup.tools[0].clone());
         assert!(dup.validate().unwrap_err().contains("twice"));
+        assert_eq!(dup.admit().len(), 1);
+        assert_eq!(dup, route(), "the first tool survives a duplicate");
+        dup.topics.push(dup.topics[0].clone());
+        assert_eq!(dup.admit().len(), 1);
+        assert_eq!(dup, route(), "the first topic survives a duplicate");
         let mut schema = route();
         schema.tools[0].parameters = "[]".into();
         assert!(schema.validate().unwrap_err().contains("not a JSON object"));
@@ -1341,20 +1409,67 @@ mod tests {
             .map(|index| TopicDef::new(format!("topic_{index}"), "Updates."))
             .collect();
         assert!(topics.validate().unwrap_err().contains("17 topics"));
+        let problems = topics.admit();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("topic 'topic_16' not served: 17 topics; the cap is 16"));
+        assert_eq!(topics.topics.len(), MAX_TOPICS);
+        topics.validate().unwrap();
         let mut topic_schema = route();
         topic_schema.topics[0].schema = Some("[]".into());
         assert!(topic_schema.validate().unwrap_err().contains("schema is not a JSON object"));
+
+        let mut admitted = route().with_tool(ToolDef::new("verbose", "d".repeat(4 * 1024), r#"{"type":"object"}"#, Risk::Read));
+        admitted.topics[0].description = "d".repeat(4 * 1024);
+        admitted.validate().expect("4 KiB descriptions are valid for tools and topics");
+        let good = admitted.clone();
+        let mut oversized = maximal_tool(0);
+        oversized.name = "oversize_schema".into();
+        oversized.parameters.push(' ');
+        let schema_bytes = oversized.parameters.len();
+        admitted.tools.push(oversized);
+        let error = admitted.validate().unwrap_err();
+        assert!(error.contains(&format!("schema is {schema_bytes} bytes; the cap is {MAX_PARAMETERS_BYTES}")), "{error}");
+        let problems = admitted.admit();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].starts_with("ai service 'route': tool 'oversize_schema' not served:"), "{problems:?}");
+        assert!(problems[0].contains(&format!("schema is {schema_bytes} bytes")), "{problems:?}");
+        assert_eq!(admitted, good, "good tools, long descriptions and topics stay unchanged");
+        admitted.validate().unwrap();
+        assert!(admitted.admit().is_empty(), "admission is idempotent");
+
+        let mut empty = route();
+        empty.tools[0].description = " \t\n".into();
+        empty.topics[0].description.clear();
+        assert!(empty.validate().unwrap_err().contains("description is empty after trimming"));
+        let mut names = route();
+        names.tools[0].name = "Bad".into();
+        names.topics[0].name = "long".repeat(MAX_TOOL_NAME);
+        let mut layout = route();
+        layout.tools[0].layout = Some(CardLayout::new("x".repeat(MAX_LAYOUT_BYTES + 1), ""));
+        let mut topic_size = route();
+        topic_size.topics[0].schema = Some(" ".repeat(MAX_PARAMETERS_BYTES + 1));
+        for mut invalid in [schema, not_object, topic_schema, empty, names, layout, topic_size] {
+            assert!(!invalid.admit().is_empty());
+            invalid.validate().unwrap();
+        }
+        let mut label = route();
+        label.label.clear();
+        for mut invalid in [bad, brief, label] {
+            let original = invalid.clone();
+            assert!(invalid.admit().is_empty(), "service fields are not entries");
+            assert_eq!(invalid, original, "admission leaves service fields alone");
+            assert!(invalid.validate().is_err());
+        }
     }
 
-    /// A tool at every per-field cap: a 32-byte name, a 1536-byte
-    /// description and an 8 KiB schema that is still a valid argument object.
+    /// A tool at the name, schema and layout caps, with a valid argument object.
     fn maximal_tool(index: usize) -> ToolDef {
         let name = format!("{:_<width$}", format!("t{index}"), width = MAX_TOOL_NAME);
         let head = r#"{"type":"object","properties":{"p":{"type":"string","description":""#;
         let tail = r#""}},"additionalProperties":false}"#;
         let schema = format!("{head}{}{tail}", "s".repeat(MAX_PARAMETERS_BYTES - head.len() - tail.len()));
         assert_eq!(schema.len(), MAX_PARAMETERS_BYTES);
-        ToolDef::new(name, "d".repeat(MAX_DESCRIPTION_BYTES), &schema, Risk::Act)
+        ToolDef::new(name, "d", &schema, Risk::Act)
             .with_layout(CardLayout::new("c".repeat(MAX_LAYOUT_BYTES), ""))
     }
 
@@ -1363,7 +1478,7 @@ mod tests {
         let head = r#"{"type":"object","properties":{"v":{"type":"string","description":""#;
         let tail = r#""}}}"#;
         let schema = format!("{head}{}{tail}", "s".repeat(MAX_PARAMETERS_BYTES - head.len() - tail.len()));
-        TopicDef::new(name, "d".repeat(MAX_DESCRIPTION_BYTES)).with_schema(schema)
+        TopicDef::new(name, "d").with_schema(schema)
     }
 
     #[test]
@@ -1374,13 +1489,18 @@ mod tests {
         }
         assert_eq!(m.tools.len(), 128);
         assert!(m.validate().is_ok(), "{:?}", m.validate());
-        let over = m.with_tool(ToolDef::new("tool_129", "One too many.", r#"{"type":"object","properties":{}}"#, Risk::Read));
+        let mut over = m.clone().with_tool(ToolDef::new("tool_129", "One too many.", r#"{"type":"object","properties":{}}"#, Risk::Read));
         let err = over.validate().unwrap_err();
         assert!(err.contains("129 tools; the cap is 128"), "{err}");
+        let problems = over.admit();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("tool 'tool_129' not served: 129 tools; the cap is 128"));
+        assert_eq!(over, m, "the earlier tools stay in order");
+        over.validate().unwrap();
     }
 
     #[test]
-    fn a_manifest_at_every_cap_validates_and_transports() {
+    fn a_manifest_at_the_text_cap_validates_and_transports() {
         let mut m = ServiceManifest::new(
             &"s".repeat(MAX_SERVICE_ID),
             &"l".repeat(MAX_LABEL_BYTES),
@@ -1392,13 +1512,10 @@ mod tests {
         for i in 0..MAX_TOPICS {
             m = m.with_topic(maximal_topic(i));
         }
+        let padding = MAX_MANIFEST_BYTES - m.bytes();
+        m.tools[0].description.push_str(&"\"".repeat(padding));
+        assert_eq!(m.bytes(), MAX_MANIFEST_BYTES);
         assert!(m.validate().is_ok(), "{:?}", m.validate());
-        let text_bytes = m.brief.len()
-            + m.label.len()
-            + m.tools.iter().map(|t| t.name.len() + t.description.len() + t.parameters.len() + t.layout.as_ref().map_or(0, CardLayout::bytes)).sum::<usize>()
-            + m.topics.iter().map(|t| t.name.len() + t.description.len() + t.schema.as_ref().map_or(0, |s| s.len())).sum::<usize>();
-        assert!(text_bytes <= MAX_MANIFEST_BYTES, "{text_bytes} > {MAX_MANIFEST_BYTES}");
-        assert!(text_bytes > MAX_MANIFEST_BYTES * 9 / 10, "the cap is not slack: {text_bytes}");
         // The registration frame of that manifest must survive the frame cap
         // with every quote escaped.
         let up = HostedUp { from: None, msg: ServiceUp::Register { manifest: m.clone(), port_tag: 1 } };
@@ -1408,8 +1525,42 @@ mod tests {
         assert_eq!(parsed.msg, up.msg);
         // One more byte of text and the byte cap, not the tool cap, says no.
         let mut fat = m;
-        fat.brief.push('b');
-        assert!(fat.validate().unwrap_err().contains("brief"));
+        fat.tools[0].description.push('d');
+        assert!(fat.validate().unwrap_err().contains("manifest"));
+        let largest = fat.tools[0].clone();
+        let problems = fat.admit();
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains(&format!("tool '{}' not served: manifest is {} bytes", largest.name, MAX_MANIFEST_BYTES + 1)));
+        assert!(problems[0].contains(&format!("entry is {} bytes", largest.bytes())));
+        assert!(fat.tool(&largest.name).is_none());
+        assert_eq!((fat.tools.len(), fat.topics.len()), (MAX_TOOLS - 1, MAX_TOPICS));
+        fat.validate().unwrap();
+
+        // Equal-size entries are removed from the end, across both kinds,
+        // until the total fits. Names, schemas and layouts all count.
+        let mut tied = ServiceManifest::new("service", "Service", "")
+            .with_tool(ToolDef::new("first", "d", r#"{"type":"object"}"#, Risk::Read))
+            .with_tool(ToolDef::new("later", "d", r#"{"type":"object"}"#, Risk::Read)
+                .with_layout(CardLayout::new("Card", "Run")))
+            .with_topic(TopicDef::new("topic", "d").with_schema("{}"));
+        for tool in &mut tied.tools {
+            tool.description = "d".repeat(MAX_MANIFEST_BYTES / 2 - tool.bytes() + 1);
+        }
+        let topic = &mut tied.topics[0];
+        topic.description = "d".repeat(MAX_MANIFEST_BYTES / 2 - topic.bytes() + 1);
+        let problems = tied.admit();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("topic 'topic' not served:"));
+        assert!(problems[1].contains("tool 'later' not served:"));
+        assert_eq!(tied.tools.len(), 1);
+        assert_eq!(tied.tools[0].name, "first");
+        assert!(tied.topics.is_empty());
+        tied.validate().unwrap();
+
+        let mut service_only = ServiceManifest::new("service", "Service", "b".repeat(MAX_MANIFEST_BYTES));
+        assert!(service_only.admit().is_empty());
+        assert_eq!(service_only.brief.len(), MAX_MANIFEST_BYTES);
+        assert!(service_only.validate().unwrap_err().contains("brief"));
         // The frame cap still refuses anything larger than it.
         let huge = format!(
             "{{\"wm_ai\":{{\"from\":null,\"msg\":{{\"Unregister\":{{}}}}}},\"pad\":\"{}\"}}",

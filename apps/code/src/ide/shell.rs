@@ -297,6 +297,37 @@ fn saved_sidebar_width() -> Option<f64> {
     text.trim().parse::<f64>().ok().filter(|w| (80.0..=1200.0).contains(w))
 }
 
+/// Where the open file tabs of one workspace are kept: a small file named by
+/// a stable hash of the workspace root.
+fn open_files_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in root.to_string_lossy().bytes() {
+        hash = (hash ^ byte as u64).wrapping_mul(0x100000001b3);
+    }
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(format!(".makepad/code/open-files-{hash:016x}")))
+}
+
+/// The remembered file tabs, in order, and the one that was selected.
+fn saved_open_files(root: &std::path::Path) -> (Vec<String>, Option<String>) {
+    let mut paths = Vec::new();
+    let mut selected = None;
+    let Some(text) = open_files_file(root).and_then(|f| std::fs::read_to_string(f).ok()) else { return (paths, selected) };
+    for line in text.lines() {
+        let (path, is_selected) = match line.strip_prefix("* ") {
+            Some(path) => (path, true),
+            None => (line, false),
+        };
+        if path.is_empty() {
+            continue;
+        }
+        if is_selected {
+            selected = Some(path.to_string());
+        }
+        paths.push(path.to_string());
+    }
+    (paths, selected)
+}
+
 fn save_sidebar_width(width: f64) {
     let Some(path) = sidebar_file() else { return };
     if let Some(dir) = path.parent() {
@@ -346,6 +377,9 @@ pub struct IdeShell {
     /// The remembered sidebar width was applied (once, on the first draw).
     #[rust]
     sidebar_restored: bool,
+    /// The remembered file tabs were reopened (once, on the first draw).
+    #[rust]
+    files_restored: bool,
     /// What waits on the prompt: a dirty tab's close, or the quit.
     #[rust]
     closing: Option<Pending>,
@@ -363,6 +397,44 @@ fn file_name(path: &str) -> String {
 }
 
 impl IdeShell {
+    /// Remember the open file tabs and the selected one for this workspace.
+    fn save_open_files(&self, cx: &mut Cx) {
+        let Some(root) = Workspace::of(cx).map(|w| w.root.clone()) else { return };
+        let Some(path) = open_files_file(&root) else { return };
+        let selected = self.active.and_then(|tab| self.editors.iter().find(|e| e.tab == tab)).map(|e| e.path.as_str());
+        let mut text = String::new();
+        for e in &self.editors {
+            if selected == Some(e.path.as_str()) {
+                text.push_str("* ");
+            }
+            text.push_str(&e.path);
+            text.push('\n');
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, text);
+    }
+
+    /// Reopen the file tabs the person had open, then select the remembered one.
+    /// Every remembered tab reopens, also one inside a protected home folder: the
+    /// person opened it there themselves, so its access was already given.
+    fn restore_open_files(&mut self, cx: &mut Cx) {
+        let Some(root) = Workspace::of(cx).map(|w| w.root.clone()) else { return };
+        let (paths, selected) = saved_open_files(&root);
+        for path in &paths {
+            self.open_file(cx, path, None, None);
+        }
+        if let Some(path) = selected {
+            self.open_file(cx, &path, None, None);
+        }
+        // Files named on the command line open last, so the last one is in front.
+        let named = Workspace::of(cx).map(|w| w.open_at_start.clone()).unwrap_or_default();
+        for path in &named {
+            self.open_file(cx, path, None, None);
+        }
+    }
+
     pub fn open_file(&mut self, cx: &mut Cx, path: &str, line: Option<u32>, col: Option<u32>) {
         let Some(root) = Workspace::of(cx).map(|w| w.root.clone()) else { return };
         if !root.join(path).is_file() {
@@ -396,6 +468,7 @@ impl IdeShell {
             quick.note_opened(path);
         }
         self.reveal(cx, path);
+        self.save_open_files(cx);
         self.view.redraw(cx);
     }
 
@@ -649,7 +722,7 @@ impl IdeShell {
                 }
                 FileEditorAction::Caret { line, col } => {
                     if self.editors.iter().any(|e| e.uid == wa.widget_uid) {
-                        self.view.label(cx, ids!(status_caret)).set_text(cx, &format!("Ln {line}, Col {col}"));
+                        self.view.label(cx, ids!(ide_status.status_caret)).set_text(cx, &format!("Ln {line}, Col {col}"));
                     }
                 }
                 FileEditorAction::Saved => {
@@ -718,6 +791,7 @@ impl IdeShell {
                     if let Some(path) = self.editors.iter().find(|e| e.tab == tab).map(|e| e.path.clone()) {
                         self.active = Some(tab);
                         self.reveal(cx, &path);
+                        self.save_open_files(cx);
                     }
                 }
                 _ => {}
@@ -748,6 +822,7 @@ impl IdeShell {
         if self.active == Some(tab) {
             self.active = None;
         }
+        self.save_open_files(cx);
     }
 
     fn prompt(&mut self, cx: &mut Cx, title: &str, text: &str, save: Option<&str>, drop: &str) {
@@ -891,6 +966,7 @@ impl Widget for IdeShell {
         }
         let actions = cx.capture_actions(|cx| self.view.handle_event(cx, event, scope));
         if !actions.is_empty() {
+            super::forward_tips(cx, &actions);
             self.discard_actions(cx, &actions);
             self.handle_dock_actions(cx, &actions);
             self.handle_ide_actions(cx, &actions);
@@ -904,6 +980,10 @@ impl Widget for IdeShell {
                 self.view.dock(cx, ids!(dock)).set_splitter_align(cx, id!(root), SplitterAlign::FromA(width), false);
             }
         }
+        if !self.files_restored {
+            self.files_restored = true;
+            self.restore_open_files(cx);
+        }
         // The declared chat tab's widget exists once the dock has made it.
         if let Some(first) = self.chats.iter_mut().find(|c| c.uid == WidgetUid::default()) {
             let uid = self.view.dock(cx, ids!(dock)).item(first.tab).widget_uid();
@@ -914,8 +994,8 @@ impl Widget for IdeShell {
             Some(e) => (e.path.clone(), if e.dirty { "● unsaved" } else { "" }),
             None => (String::new(), ""),
         };
-        self.view.label(cx, ids!(status_path)).set_text(cx, &path);
-        self.view.label(cx, ids!(status_state)).set_text(cx, state);
+        self.view.label(cx, ids!(ide_status.status_path)).set_text(cx, &path);
+        self.view.label(cx, ids!(ide_status.status_state)).set_text(cx, state);
         // The line belongs to the editor: a chat tab has its own.
         self.view.view(cx, ids!(ide_status)).set_visible(cx, active.is_some());
         self.view.draw_walk(cx, scope, walk)

@@ -19,8 +19,20 @@ pub fn paths(pid: u32) -> (PathBuf, PathBuf) {
 /// scratch dir made one 121 bytes long, and the JIT in it could not be reached: a capture held a
 /// jitlegs leg to twice its time, 11-05). A desktop Unix: `/tmp/makepad-<uid>`, this user's own
 /// (0700, made by the first endpoint that listens). A phone's app writes only in its own temp
-/// dir, and that one is short.
+/// dir, and that one is short. This crate's own tests use [`test_root`] instead.
 pub fn socket_dir() -> PathBuf {
+    #[cfg(not(test))]
+    {
+        user_socket_dir()
+    }
+    #[cfg(test)]
+    {
+        test_root()
+    }
+}
+
+/// [`socket_dir`] of every process of this user.
+pub(crate) fn user_socket_dir() -> PathBuf {
     #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
     {
         extern "C" {
@@ -30,6 +42,20 @@ pub fn socket_dir() -> PathBuf {
     }
     #[cfg(not(all(unix, not(any(target_os = "android", target_os = "ios")))))]
     std::env::temp_dir()
+}
+
+/// The socket and registry dir of this crate's tests: never the process's own ones. A test process
+/// a live JIT runs is that JIT's process, and the JIT serves its own inspect endpoint there under
+/// the same pid: the tests' endpoint replaced its socket and discovery file, devhub's questions to
+/// the session reached the tests' fixture, and the run never went idle (11-11).
+#[cfg(test)]
+pub(crate) fn test_root() -> PathBuf {
+    let root = user_socket_dir().join("tests");
+    #[cfg(unix)]
+    let _ = imp::make_own(&user_socket_dir()).and_then(|()| imp::make_own(&root));
+    #[cfg(not(unix))]
+    let _ = std::fs::create_dir_all(&root);
+    root
 }
 
 /// [`socket_dir`], made this user's own first (0700; one that is not this user's own directory is
@@ -47,6 +73,38 @@ extern "C" fn cleanup() {
     let (sock, disc) = paths(std::process::id());
     let _ = std::fs::remove_file(sock);
     let _ = std::fs::remove_file(disc);
+}
+
+/// Removes this process's socket and discovery file now: where the process ends without exit
+/// handlers (`_exit`, a Windows session end), or once its exit's own work is done, before slow
+/// ones run. The atexit cleanup runs after every exit handler registered after it (a GPU driver's
+/// teardown, which can take seconds), and a process killed during those (a window manager's stop
+/// gives its apps a grace, then SIGKILL) left its discovery file behind, which the node's hub
+/// reads as a crash.
+pub fn withdraw() {
+    cleanup();
+}
+
+/// This process's socket and discovery file as C strings, made when it listened: what
+/// [`withdraw_in_signal`] removes.
+#[cfg(unix)]
+static C_PATHS: std::sync::OnceLock<(std::ffi::CString, std::ffi::CString)> = std::sync::OnceLock::new();
+
+/// Removes this process's socket and discovery file now, from a signal handler about to end the
+/// process with `_exit` (a second quit signal forces the exit): the atexit cleanup does not run
+/// there, and a discovery file left behind reads as a crash to the node's hub. Async-signal-safe:
+/// an atomic load and unlink(2) of paths made when the endpoint listened.
+#[cfg(unix)]
+pub fn withdraw_in_signal() {
+    extern "C" {
+        fn unlink(path: *const std::ffi::c_char) -> i32;
+    }
+    if let Some((sock, disc)) = C_PATHS.get() {
+        unsafe {
+            unlink(sock.as_ptr());
+            unlink(disc.as_ptr());
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -99,11 +157,13 @@ mod imp {
         Ok(l)
     }
 
-    /// Only this user's processes may connect (the socket is 0600 too).
-    fn same_user(c: &UnixStream) -> bool {
+    /// The peer's process when it is this user's (only this user's processes may connect; the
+    /// socket is 0600 too), from the socket's credentials; 0 where they carry no pid.
+    fn own_user_peer(c: &UnixStream) -> Option<u32> {
         use std::os::unix::io::AsRawFd;
         extern "C" {
             fn getuid() -> u32;
+            fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
         }
         #[cfg(target_os = "macos")]
         {
@@ -111,17 +171,21 @@ mod imp {
                 fn getpeereid(fd: i32, uid: *mut u32, gid: *mut u32) -> i32;
             }
             let (mut uid, mut gid) = (u32::MAX, 0u32);
-            unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) == 0 && uid == getuid() }
+            if unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) } != 0 || uid != unsafe { getuid() } {
+                return None;
+            }
+            // SOL_LOCAL 0, LOCAL_PEERPID 2
+            let (mut pid, mut len) = (0i32, 4u32);
+            let read = unsafe { getsockopt(c.as_raw_fd(), 0, 2, (&mut pid as *mut i32).cast(), &mut len) } == 0;
+            Some(if read { u32::try_from(pid).unwrap_or(0) } else { 0 })
         }
         #[cfg(not(target_os = "macos"))]
         {
-            extern "C" {
-                fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
-            }
             // SOL_SOCKET 1, SO_PEERCRED 17: struct ucred { pid, uid, gid }
             let mut cred = [0u32; 3];
             let mut len = 12u32;
-            unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) == 0 && cred[1] == getuid() }
+            let read = unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) } == 0;
+            (read && cred[1] == unsafe { getuid() }).then_some(cred[0])
         }
     }
 
@@ -137,10 +201,15 @@ mod imp {
         })
     }
 
-    /// Connects to the endpoint socket at `path`. The read timeout is for the handshake: call
+    /// Connects to the endpoint socket at `path` when a process of this user's serves it: one
+    /// another user bound (where both may write) is refused, never asked, or its answers would
+    /// be taken as the app's or the hub's. The read timeout is for the handshake: call
     /// [`settle`] on the returned stream handle afterwards.
     pub fn dial(path: &Path) -> io::Result<(Carrier, UnixStream)> {
         let s = UnixStream::connect(path)?;
+        if own_user_peer(&s).is_none() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("the socket {} is served by another user's process", path.display())));
+        }
         s.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
         let keep = s.try_clone()?;
         Ok((carrier(s)?, keep))
@@ -174,12 +243,18 @@ mod imp {
     /// (`"socket_error"`, no caps): a client names the reason instead of finding no app.
     pub fn listen(ep: &Endpoint, extra: &str) -> io::Result<PathBuf> {
         let _ = crate::cmd::now_ms();
+        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        crate::discovery::remove_stale(ep.hooks());
         let (sock, disc) = paths(std::process::id());
         let served = serve_announced(ep, extra, &sock, &disc, own_dir);
-        extern "C" {
-            fn atexit(f: extern "C" fn()) -> i32;
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).ok();
+            if let (Some(s), Some(d)) = (c(&sock), c(&disc)) {
+                let _ = C_PATHS.set((s, d));
+            }
         }
-        unsafe { atexit(cleanup) };
+        makepad_core_util::process_end::at_exit(cleanup);
         served.map(|()| sock)
     }
 
@@ -215,16 +290,14 @@ mod imp {
             (hooks.enter)();
             for conn in listener.incoming() {
                 let Ok(conn) = conn else { continue };
-                if !same_user(&conn) {
-                    continue;
-                }
+                let Some(pid) = own_user_peer(&conn) else { continue };
                 let ep = ep.clone();
                 let _ = std::thread::Builder::new().name("makepad-remote-hello".into()).spawn(move || {
                     let (hooks, keep) = (ep.hooks(), conn.try_clone());
                     (hooks.enter)();
                     let _ = conn.set_read_timeout(Some(std::time::Duration::from_secs(1)));
                     if let Ok(c) = carrier(conn) {
-                        if let Err(e) = ep.serve(c.reader, c.writer, c.shutdown) {
+                        if let Err(e) = ep.serve_peer(c.reader, c.writer, c.shutdown, "", pid) {
                             eprintln!("makepad-remote: a client was refused: {e}");
                         } else if let Ok(k) = keep {
                             settle(&k);
@@ -310,10 +383,7 @@ mod imp {
         );
         std::fs::write(paths(pid).1, info)?;
         ep.set_discovery(paths(pid).1);
-        extern "C" {
-            fn atexit(f: extern "C" fn()) -> i32;
-        }
-        unsafe { atexit(cleanup) };
+        makepad_core_util::process_end::at_exit(cleanup);
         Ok(PathBuf::from(socket))
     }
     /// Serves `ep` at a fixed address such as the hub's: loopback TCP behind a fresh token, both

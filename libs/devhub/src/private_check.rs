@@ -91,7 +91,7 @@ pub fn merge_gate(root: &Path, base: &str, sha: &str, tree: &str) -> Result<(), 
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, Vec<String>> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output().map_err(|e| vec![format!("private check: git: {e}")])?;
+    let out = Command::new(crate::os::tool("git")).arg("-C").arg(root).args(args).output().map_err(|e| vec![format!("private check: git: {e}")])?;
     if !out.status.success() {
         return Err(vec![format!("private check: git {} failed: {}", args[0], String::from_utf8_lossy(&out.stderr).trim())]);
     }
@@ -138,7 +138,7 @@ pub fn scan_in(makepad_root: &Path) -> PathBuf {
 /// One scan.sh run over `input`; Ok holds its hit lines (none when clean).
 fn scan(staged: &Staged, root: &Path, mode: &str, input: &str) -> Result<Vec<String>, Vec<String>> {
     let script = staged.0.join("scan.sh");
-    let mut child = Command::new("sh")
+    let mut child = Command::new(crate::os::tool("sh"))
         .arg(&script)
         .arg(mode)
         .current_dir(root)
@@ -197,6 +197,43 @@ mod tests {
         for s in ["Some([192, 0, 2, 1].into())", "Ipv4Addr::new(127, 0, 0, 1)", "[10, 20, 30, 40]", "Ipv4Addr::new(10, 77, 0, 3)", "[192, 168, 77, 1]", "[172, 16, 77, 2]", "[172, 15, 0, 1]"] {
             assert!(!hit(s), "{s}");
         }
+    }
+
+    /// A node's number used as its machine's name is one: "<N>'s", "<N>, <date>", "<N> sat", and in
+    /// parentheses with a date, "(<N>: ...)" and "held <N> at" (a test string and two comments got
+    /// past the other shapes, 11-07), and a job named after its box, "prebuild-<N>" (two doc
+    /// comments, 11-08). Seven such comments reached work through the hooks (11-06). An exit
+    /// code, a count, a lease or a line number is none, and without the untracked file's numbers
+    /// the shapes are off. Fake numbers here, defined as the untracked file defines the real ones;
+    /// the tree scan takes the same rules.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_number_as_a_machine_is_one_and_a_count_is_not() {
+        let staged = Staged::new().unwrap();
+        let defs = staged.0.join("fake-patterns");
+        std::fs::write(&defs, "define node-number 90[1-7]\n").unwrap();
+        let scan = |dir: &Path, patterns: &Path, args: &[&str], input: &str| {
+            let mut child = Command::new("sh").arg(staged.0.join("scan.sh")).args(args).current_dir(dir).env("MAKEPAD_PRIVATE_PATTERNS", patterns).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+            child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+            String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+        };
+        let hit = |s: &str| scan(&root(), &defs, &["text", "t"], &format!("{s}\n")).contains("t:1: node-number");
+        for s in ["(a build's target and log, 901, 11-06)", "(903 sat as a bench box, 11-06)", "an override ended L515981, 905's lease", "(L515981, 905's, 11-06)", "the baseline: 901, 2026-11-06)", "(902, the bench box, 11-06)", "(11-06, 904)", "(11-06 on 901 and 902)", "906 crashed twice", "the build log 905's tail", "L5 gate: 1st in queue (901: waits)", "a landing gate held 902 at \"node busy\"", "gate held 902 behind four leases", "started on 903.", "on 903 and 904", "holds 905, the gate", "moved to 906)", "the box's prebuild-903 waited", "(warm-905)", "upkeep-901."] {
+            assert!(hit(s), "{s}");
+        }
+        for s in ["exit 901", "took(\"L2\", 902, 8)", "(exit 901, 11-06)", "L901's lease", "W903 sat", "#905's", "a.rs:901, 11-06", "line 902 is short", "903 ms (11-06)", "(11-06, 905 ms)", "test result: ok. 905 passed; 0 failed", "exit code 901 was its panic", "(took 902 ms, 11-06)", "v1.903's", "(901 ms, 11-06)", "the 9015's", "height: 904 is_multiline", "// 901 is indivisible by 3", "field 901 has trailing bytes", "sun_path holds 904 bytes", "on 901 files", "(901:3)", "from 900 to 907 ms", "exit 901: a::b", "OSC 904: reset", "above 905: limits", "held 9021 at", "the centre (WR-903)", "baked field-901 hits", "rfc-9035", "prebuild-9031", "test-902 fails"] {
+            assert!(!hit(s), "{s}");
+        }
+        let none = staged.0.join("no-patterns");
+        std::fs::write(&none, "").unwrap();
+        assert_eq!(scan(&root(), &none, &["text", "t"], "(901, 11-06)\n"), "", "no numbers defined: the shapes are off");
+        // the tree scan: its candidate lines come from the same rules, defines put in
+        let repo = staged.0.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("a.txt"), "exit 903\n(903 sat, 11-06)\n").unwrap();
+        let git = |args: &[&str]| crate::git_exec::command().arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(git(&["init", "-q", "--template="]).status.success() && git(&["add", "a.txt"]).status.success());
+        assert_eq!(scan(&repo, &defs, &["tree"], "").lines().next(), Some("a.txt:2: node-number"));
     }
 
     /// A lane's commit with a private shape in its message is refused as it is written, in both

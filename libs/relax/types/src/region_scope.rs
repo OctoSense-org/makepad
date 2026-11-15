@@ -14,7 +14,7 @@ pub enum Node {
     Synthetic(u32, Synthetic),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext, TryBranch, TryFromResidual, WhileElse, WhileElseBlock, WhileBreak, WhileBreakExpr, AwaitIntoFuture, AwaitPollCall, AwaitNewUnchecked, AwaitGetContext, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
+pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext, TryBranch, TryFromResidual, TryFromOutput, WhileElse, WhileElseBlock, WhileBreak, WhileBreakExpr, AwaitIntoFuture, AwaitPollCall, AwaitNewUnchecked, AwaitGetContext, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScopeData { Node, CallSite, Arguments, Destruction, IfThen, IfThenRescope, MatchGuard, Remainder(u32) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -45,7 +45,7 @@ pub struct ScopeTree {
     /// The tail expressions of blocks of editions before 2024, whose temporaries are dropped earlier
     /// from edition 2024 (rustc `backwards_incompatible_scope`; recorded for the lint
     /// `tail_expr_drop_order`, which only `makepad check` runs).
-    backwards_incompatible_nodes: std::collections::HashSet<Node>,
+    backwards_incompatible_nodes: crate::fxhash::HashSet<Node>,
     positions: HashMap<u32, ExprPosition>,
     yield_in_scope: Vec<Vec<u32>>,
 }
@@ -165,6 +165,12 @@ impl Resolve<'_> {
     /// Remainders are nested in declaration order; let-else exits to the preceding context.
     /// rustc_hir_analysis/src/check/region.rs:56-167.
     fn block(&mut self, b: BlockId, terminating: bool) {
+        self.block_with(b, terminating, None)
+    }
+    /// `try_block`: the `try` expression whose block this is. Its tail is rustc's
+    /// `Try::from_output(tail)` (of `()` without one), a call node of its own around the tail
+    /// (rustc_ast_lowering lower_expr_try_block).
+    fn block_with(&mut self, b: BlockId, terminating: bool, try_block: Option<ExprId>) {
         let saved = self.cx;
         self.node(Node::Block(b.0), terminating);
         self.cx.var_parent = self.cx.parent;
@@ -174,11 +180,18 @@ impl Resolve<'_> {
             if i + 1 == statements.len() {
                 if let Some((e, false)) = ast.stmt_expr(stmt) {
                     let terminating = node_edition(self.file, Node::Block(b.0)) >= 2024;
+                    let tail = match try_block { Some(t) => Node::Synthetic(t.0, Synthetic::TryFromOutput), None => Node::Expr(e.0) };
                     if !terminating && crate::lint::enabled() {
-                        self.tree.backwards_incompatible_nodes.insert(Node::Expr(e.0));
+                        self.tree.backwards_incompatible_nodes.insert(tail);
                     }
-                    self.expr(e, terminating);
-                    break;
+                    if try_block.is_some() {
+                        self.node(tail, terminating);
+                        self.expr(e, false);
+                    } else {
+                        self.expr(e, terminating);
+                    }
+                    self.cx = saved;
+                    return;
                 }
             }
             if matches!(stmt, Stmt::Item(_)) { continue; }
@@ -192,22 +205,31 @@ impl Resolve<'_> {
             match *stmt {
                 Stmt::Let(r) => {
                     let crate::ast::LetStmt { pat, init, .. } = *ast.row(r);
-                    if let Some(e) = init {
+                    if let Some(e) = init.get() {
                         self.extend_borrows(e, self.cx.var_parent);
                         if self.explicit_ref(pat) { self.extend_place(e, self.cx.var_parent); }
                         self.expr(e, false);
                     }
                     self.pat(pat);
                 }
-                Stmt::Expr(e, _) => self.expr(e, false),
+                Stmt::Expr(_, e) => self.expr(e, false),
                 Stmt::Attrs(r) => self.expr(ast.row(r).expr, false),
                 Stmt::Item(_) | Stmt::Empty => (),
             }
-            if let Some(els) = if let Stmt::Let(r) = *stmt { ast.row(r).else_ } else { None } {
+            if let Some(els) = if let Stmt::Let(r) = *stmt { ast.row(r).else_.get() } else { None } {
                 self.cx = before;
                 self.block(els, true);
             }
             self.cx = remainder;
+        }
+        // a `try` block without a tail ends in `from_output(())`
+        if let Some(t) = try_block {
+            let tail = Node::Synthetic(t.0, Synthetic::TryFromOutput);
+            let terminating = node_edition(self.file, Node::Block(b.0)) >= 2024;
+            if !terminating && crate::lint::enabled() {
+                self.tree.backwards_incompatible_nodes.insert(tail);
+            }
+            self.node(tail, terminating);
         }
         self.cx = saved;
     }
@@ -219,11 +241,12 @@ impl Resolve<'_> {
         }
         let ast = &self.file.ast;
         match *ast.pat(p) {
-            Pat::Ident { sub: Some(s), .. } | Pat::Ref(_, s) | Pat::Paren(s) | Pat::Box(s) => self.pat(s),
+            Pat::Ident { sub, .. } if let Some(s) = sub.get() => self.pat(s),
+            Pat::Ref(_, s) | Pat::Paren(s) | Pat::Box(s) => self.pat(s),
             Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) | Pat::TupleStruct(_, ps) => for p in ast.list(ps) { self.pat(*p); },
-            Pat::Struct(_, fs, _) => for f in ast.list(fs) { self.pat(f.pat); },
+            Pat::Struct(_, _, fs) => for f in ast.list(fs) { self.pat(f.pat); },
             Pat::Lit(e) => self.expr(e, false),
-            Pat::Range(a, b, _) => { if let Some(e) = a { self.expr(e, false); } if let Some(e) = b { self.expr(e, false); } }
+            Pat::Range(a, b, _) => { if let Some(e) = a.get() { self.expr(e, false); } if let Some(e) = b.get() { self.expr(e, false); } }
             _ => (),
         }
         self.cx = saved;
@@ -235,7 +258,7 @@ impl Resolve<'_> {
             Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) | Pat::TupleStruct(_, ps) => {
                 for p in ast.list(ps) { if self.explicit_ref(*p) { return true; } } false
             }
-            Pat::Struct(_, fs, _) => { for f in ast.list(fs) { if self.explicit_ref(f.pat) { return true; } } false }
+            Pat::Struct(_, _, fs) => { for f in ast.list(fs) { if self.explicit_ref(f.pat) { return true; } } false }
             Pat::Paren(p) | Pat::Box(p) => self.explicit_ref(p),
             _ => false,
         }
@@ -316,6 +339,7 @@ impl Resolve<'_> {
             ExprKind::Call(f, args) => { self.expr(f, false); for x in ast.list(args) { self.expr(*x, false); } }
             ExprKind::MethodCall(recv, row) => { self.expr(recv, false); for x in ast.list(ast.row(row).args) { self.expr(*x, false); } }
             ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.block(b, false),
+            ExprKind::TryBlock(b) => self.block_with(b, false, Some(e)),
             ExprKind::If(cond, then, els) => {
                 let cx = self.cx;
                 self.if_then(e, cond, then);
@@ -362,7 +386,7 @@ impl Resolve<'_> {
                     let node = Node::Arm(arms.lo + i as u32);
                     self.node(node, true); self.cx.var_parent = self.cx.parent;
                     self.pat(a.pat);
-                    if let Some(g) = a.guard {
+                    if let Some(g) = a.guard.get() {
                         self.enter(node, ScopeData::MatchGuard); self.cx.var_parent = self.cx.parent;
                         self.condition(g);
                     }
@@ -486,8 +510,8 @@ impl Resolve<'_> {
                 if let Some(x) = xs.first() { self.expr(*x, false); }
                 let node = Node::Synthetic(e.0, Synthetic::MacroArm);
                 self.node(node, true); self.cx.var_parent = self.cx.parent;
-                if let Some(p) = args.pat { self.pat(p); }
-                if let Some(g) = args.guard {
+                if let Some(p) = args.pat.get() { self.pat(p); }
+                if let Some(g) = args.guard.get() {
                     self.enter(node, ScopeData::MatchGuard); self.cx.var_parent = self.cx.parent;
                     self.condition(g);
                 }

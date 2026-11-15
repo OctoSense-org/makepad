@@ -8,7 +8,8 @@ GATE_PACKAGES are checked when the diff reaches them, along with every changed
 package with a lib or bin target. A diff that reaches the JIT checks JIT_CHECKS too, whatever
 uses the changed crates. A diff that reaches no gate package gates
 Calculator, the one canary; a diff only in devhub's own crate gates
-its build alone. The other repo's crates that use a changed crate get a `cargo` line each: the
+its build alone. The other repo's crates that use a changed crate get a `cargo` line each, and so do
+this repo's users that nothing else here type-checks (no gate package, unchanged, no test target): the
 gate checks them all in one cargo check. Prints `jit yes|no`: whether the diff touches what the JIT binary
 is built from; `devhub yes|no`: whether it touches devhub's own binary. A `check` line may end in
 `--also=<libs>`: libs checked as that build compiles them (feature flips, below).
@@ -17,7 +18,12 @@ since: selected whatever the diff reaches, as a diff that never reaches it says 
 `gone <unit>` line: its package left the tree. A `suite <package>` line: a JIT suite failing since.
 A `tests <package> <dir>` line: a package whose test targets the diff reaches, the changed packages
 and every package that uses one (a dev-dependency too), in both repos: the gate type-checks them in
-one `cargo check --tests` ([`tested`]). `--tests` prints only those lines, in any cargo workspace.
+one `cargo check --tests` ([`tested`]). It ends in `--features=<package>/<feature>,..` when its users
+turn on features of it ([`turned_on`]): it is checked with them whatever else that check holds. `--tests` prints only those lines, in any cargo workspace
+(land_gate.sh tests). `--runs` prints the tests bucket's: `tests` lines of the packages whose tests it runs under
+the JIT after a landing (land_gate.sh testrun, [`run_units`]): the changed packages and the gate packages the
+diff reaches, as the fast bucket picks its checks; GATE_FULL=1 (the full bucket, daily) runs every package's,
+whatever the diff. A package's test variants ([`variants`]) run beside it, a `tests` line each.
 """
 import json
 import os
@@ -37,6 +43,28 @@ GATE_PACKAGES = SMOKE + ("makepad-example-counter", "makepad-platform", "makepad
 # A fixed set that stands for the rest (the smoke set's commercial apps for a commercial app)
 JIT_CHECKS = ("makepad-widgets-core", "makepad-platform", "makepad-draw", "makepad-example-counter", "makepad-story-web-export")
 CALC = "makepad-app-calculator"
+# GPU guards, (package, target, test filter): render tests of a user-visible effect that broke more than once with
+# every test green. The target is `lib` (the package's library tests) or `test:<name>` (one of its test targets). The
+# hot bucket runs one on its node's real GPU under the JIT after every landing that reaches its package
+# (land_gate.sh step_guards): the map's zoom into text, its phosphor lens (11-06); Fab's far wall face in the
+# headset, its layers even (11-11); the GI field, empty for weeks with every test green (11-12); a store game
+# entered at startup with no click, held behind its loading screen for good (11-12); the sun's shadow edges
+# boiling under a moving camera (11-12). Each is a unit of its own (guard_unit). Every package named in SMOKE,
+# JIT_CHECKS and GUARDS needs a stub in the gate fixtures' workspaces (merge_break.sh, jit_break.sh, guard_units.sh,
+# tests_features.sh): main() refuses a workspace without one
+GUARDS = (
+    ("makepad-scope", "lib", "gpu_guard"),
+    ("makepad-fab", "test:xr_far_face", "a_far_wall_face_shows_no_darker_layers_in_the_headset"),
+    ("makepad-render", "lib", "gpu_guard"),
+    ("makepad-sandbox", "test:store_play_ready", "a_store_game_entered_at_startup_reaches_world_ready"),
+    ("makepad-sandbox", "test:penumbra_still", "the_sun_s_shadow_edges_hold_still_while_the_camera_moves"),
+)
+
+
+def guard_unit(name, target):
+    """A GPU guard's unit, as land_gate.sh step_guards names it: `guard <pkg>` for a library's guard,
+    `guard <pkg> --test <target>` for a test target's, so two guards of one package are two units."""
+    return ["guard", name] if target == "lib" else ["guard", name, "--test", target.removeprefix("test:")]
 # the JIT binary; devhub's binary
 JIT_PACKAGE = "makepad-run"
 DEVHUB_PACKAGE = "makepad-devhub"
@@ -113,8 +141,48 @@ def tested(packages, members, touched, retry):
     has_tests = {d for d in members if any(t.get("test", True) for t in packages[d]["targets"])}
     names = {packages[d]["name"] for d in reached & has_tests}
     by_name = {p["name"]: d for d, p in packages.items()}
-    names |= {words[1] for words in retry if words[0] == "tests" and by_name.get(words[1]) in has_tests}
+    # a test-target check (`tests <pkg>`) or a run of the tests (`test <pkg>`, the tests bucket) red since
+    names |= {words[1] for words in retry if words[0] in ("tests", "test") and by_name.get(words[1]) in has_tests}
     return sorted((name, by_name[name]) for name in names)
+
+
+def turned_on(packages, directory):
+    """The features of the package at `directory` that its users' path dependencies turn on (any
+    edge kind that can hold). Features unify per build, so a target that needs one (a bin's
+    `required-features`, a `#[cfg(feature)]` body) compiles only in a check that also holds such
+    a user. makepad-ai-hub's multiview_check bin (required-features multiview-native, which the AI
+    hub app turns on) failed the fast bucket's one test check beside the app. Checked again alone,
+    as a retry, the bin was skipped and the break read as fixed (11-08). Sorted."""
+    own = set(packages[directory].get("features") or {})
+    on = set()
+    for d, pkg in packages.items():
+        if d == directory:
+            continue
+        for dep in pkg["dependencies"]:
+            if dep.get("path") and dep.get("target") != "cfg(any())" and Path(dep["path"]).resolve() == directory:
+                on.update(f for f in dep.get("features") or () if f in own)
+    return sorted(on)
+
+
+def variants(pkg):
+    """The features a package's tests also run with, each set a unit of its own (its Cargo.toml's
+    `[package.metadata.makepad] test-variants`, e.g. `["web"]`): a feature that swaps what the package
+    builds, which no user turns on and no other build may hold, such as a package's portable `web`
+    build: without a unit of its own nothing built those tests, and they stopped compiling."""
+    return ((pkg.get("metadata") or {}).get("makepad") or {}).get("test-variants") or []
+
+
+def tests_line(packages, name, directory, root):
+    """A `tests` line: the package, its directory, and the features its users turn on ([`turned_on`])."""
+    on = turned_on(packages, directory)
+    extra = f" --features={','.join(f'{name}/{f}' for f in on)}" if on else ""
+    return f"tests {name} {directory.relative_to(root)}{extra}"
+
+
+def nested_bases():
+    """The other nested repositories a bucket's tip pins, each with its base commit
+    (GATE_NESTED_BASES=<name>=<base sha|->,..)."""
+    return [tuple(side.split("=", 1)) for side in os.environ.get("GATE_NESTED_BASES", "").split(",") if side]
 
 
 def changed(root, base, cbase):
@@ -126,6 +194,14 @@ def changed(root, base, cbase):
         if not (commercial / ".git").exists():
             raise RuntimeError("commercial base supplied but checkout is missing")
         files += ["apps/commercial/" + p for p in git(commercial, "diff", "--no-renames", "--name-only", "-z", cbase, "HEAD").split("\0") if p]
+    # each other nested repository's diff from its base under apps/<name>/; `-`: the bucket's base
+    # had none of it, so every file of it is new
+    for name, nbase in nested_bases():
+        nested = root / "apps" / name
+        if not (nested / ".git").exists():
+            raise RuntimeError(f"{name} base supplied but its checkout is missing")
+        listed = git(nested, "ls-files", "-z") if nbase == "-" else git(nested, "diff", "--no-renames", "--name-only", "-z", nbase, "HEAD")
+        files += [f"apps/{name}/" + p for p in listed.split("\0") if p]
     return files
 
 
@@ -159,18 +235,68 @@ def local(root, meta, packages):
     return out
 
 
-def tests_only(root, base, cbase):
+def built_from(packages, name):
+    """The directories a package's binary is built from: it and the path crates it uses (normal and
+    build edges), or none when the tree has no such package."""
+    forward = {directory: {Path(d["path"]).resolve() for d in pkg["dependencies"] if d.get("path") and d["kind"] != "dev"}
+               for directory, pkg in packages.items()}
+    top = next((d for d, p in packages.items() if p["name"] == name), None)
+    return closure({top}, forward) if top else set()
+
+
+def workspace_wide(compiled):
+    """Whether the diff changed a resolver/patch/profile input of every member."""
+    return any(p in ("Cargo.toml", "Cargo.lock", ".cargo/config", ".cargo/config.toml") for p in compiled)
+
+
+def run_units(packages, members, touched, workspace, jit, retry):
+    """The packages whose tests the tests bucket runs after a landing: the changed ones, and the gate
+    packages the diff reaches (GATE_PACKAGES, through normal and build edges; every one on a workspace-wide
+    input), the smoke set and JIT_CHECKS too when it reaches the JIT or a workspace-wide input: the fast
+    bucket's selection, of the root workspace's packages with a test target; and a unit red since. Not
+    every user of a changed crate: a change to the JIT or makepad-platform reached all 547 units, and the
+    bucket held most of the pool's boxes for 78-106 min a run, a new run queued as one ended
+    (11-08). The full bucket runs every package's daily; the fast bucket type-checks every reached test
+    target ([`tested`]). Sorted (name, dir) pairs."""
+    reverse = {}
+    for directory, pkg in packages.items():
+        for dep in pkg["dependencies"]:
+            if dep.get("path") and dep["kind"] != "dev":
+                reverse.setdefault(Path(dep["path"]).resolve(), set()).add(directory)
+    by_name = {p["name"]: d for d, p in packages.items()}
+    reached = set(packages) if workspace else closure(touched, reverse)
+    gate = {by_name[name] for name in GATE_PACKAGES if by_name.get(name) in reached}
+    if workspace or jit:
+        gate |= {by_name[name] for name in SMOKE + JIT_CHECKS if name in by_name}
+    has_tests = {d for d in members if any(t.get("test", True) for t in packages[d]["targets"])}
+    names = {packages[d]["name"] for d in (touched | gate) & has_tests}
+    names |= {words[1] for words in retry if words[0] in ("tests", "test") and by_name.get(words[1]) in has_tests}
+    return sorted((name, by_name[name]) for name in names)
+
+
+def tests_only(root, base, cbase, runs):
     packages = {}
     members = local(root, metadata(root / "Cargo.toml"), packages)
-    _, touched = owners(root, packages, changed(root, base, cbase))
-    for name, directory in tested(packages, members, touched, retried()):
-        print(f"tests {name} {directory.relative_to(root)}")
+    compiled, touched = owners(root, packages, changed(root, base, cbase))
+    workspace, jit = workspace_wide(compiled), bool(touched & built_from(packages, JIT_PACKAGE))
+    if os.environ.get("GATE_FULL") == "1":
+        units = tested(packages, members, set(members), retried())
+    elif runs:
+        units = run_units(packages, members, touched, workspace, jit, retried())
+    else:
+        # the test targets the diff reaches; a JIT or workspace-wide change reaches every package's
+        units = tested(packages, members, set(members) if workspace or jit else touched, retried())
+    for name, directory in units:
+        # (the tests bucket's runs take the package's own features, as `makepad test` does)
+        print(f"tests {name} {directory.relative_to(root)}" if runs else tests_line(packages, name, directory, root))
+        for features in variants(packages[directory]) if runs else ():
+            print(f"tests {name} {directory.relative_to(root)} --features {features}")
 
 
 def main():
     root = Path.cwd().resolve()
-    if sys.argv[1] == "--tests":
-        return tests_only(root, *sys.argv[2:4])
+    if sys.argv[1] in ("--tests", "--runs"):
+        return tests_only(root, *sys.argv[2:4], sys.argv[1] == "--runs")
     base, cbase = sys.argv[1:3]
     files = changed(root, base, cbase)
     commercial = root / "apps/commercial"
@@ -196,23 +322,21 @@ def main():
     compiled, touched = owners(root, packages, files)
     affected = closure(touched, reverse)
     by_name = {p["name"]: d for d, p in packages.items()}
-    missing = [name for name in SMOKE + JIT_CHECKS if name not in by_name]
+    missing = [name for name in SMOKE + JIT_CHECKS + tuple(name for name, _, _ in GUARDS) if name not in by_name]
     if missing:
         raise RuntimeError("smoke or JIT check packages missing from metadata: " + " ".join(missing))
 
     # What the JIT binary and devhub's are built from.
-    forward = {}
-    for directory, pkg in packages.items():
-        forward[directory] = {Path(d["path"]).resolve() for d in pkg["dependencies"]
-                              if d.get("path") and d["kind"] != "dev"}
-    jit_dir = by_name.get(JIT_PACKAGE)
-    jit_code = closure({jit_dir}, forward) if jit_dir else set()
+    jit_code = built_from(packages, JIT_PACKAGE)
     devhub_dir = by_name.get(DEVHUB_PACKAGE)
-    devhub_code = closure({devhub_dir}, forward) if devhub_dir else set()
+    devhub_code = built_from(packages, DEVHUB_PACKAGE)
     # Workspace-wide resolver/patch/profile inputs apply to every member.
-    workspace = any(p in ("Cargo.toml", "Cargo.lock", ".cargo/config", ".cargo/config.toml") for p in compiled)
+    workspace = workspace_wide(compiled)
     retry = retried()
-    gone = [words for words in retry if words[1] not in by_name or (words[0] == "present" and words[1] not in PRESENT_ARGS)]
+    # a guard unit no GUARDS entry names any more (renamed, or the guard removed) is gone too
+    guard_units = [guard_unit(name, target) for name, target, _ in GUARDS]
+    gone = [words for words in retry if words[1] not in by_name or (words[0] == "present" and words[1] not in PRESENT_ARGS)
+            or (words[0] == "guard" and words not in guard_units)]
     live = [words for words in retry if words not in gone]
     retry_presents = {words[1] for words in live if words[0] == "present"}
     retry_devhub = any(words[0] == "devhub" for words in live)
@@ -243,6 +367,12 @@ def main():
         for name in SMOKE:
             if name in selected:
                 print(" ".join(["present", name, str(by_name[name].relative_to(root)), *PRESENT_ARGS[name]]))
+        # a guard runs under the JIT: a JIT change reaches it as much as one of its package's crates; a guard
+        # red since runs whatever the diff reaches, until it passes
+        retry_guards = [words for words in live if words[0] == "guard"]
+        for name, target, test in GUARDS:
+            if workspace or by_name[name] in affected or touched & jit_code or guard_unit(name, target) in retry_guards:
+                print(f"guard {name} {by_name[name].relative_to(root)} {target} {test}")
         return
     if workspace:
         affected.update(packages)
@@ -288,10 +418,9 @@ def main():
     for t in touched:
         manifest = t / "Cargo.toml"
         rel = str(manifest.relative_to(root))
-        if rel.startswith("apps/commercial/"):
-            repo, ref, rel = commercial, cbase, rel[len("apps/commercial/"):]
-        else:
-            repo, ref = root, base
+        sides = [("commercial", cbase)] + nested_bases()
+        side = next(((root / "apps" / name, nbase, rel[len(f"apps/{name}/"):]) for name, nbase in sides if rel.startswith(f"apps/{name}/")), None)
+        repo, ref, rel = side or (root, base, rel)
         if ref == "-" or not any(p == str(manifest.relative_to(root)) for p in files):
             continue
         before = old_dep_features(repo, ref, rel, t)
@@ -348,8 +477,14 @@ def main():
     def private(d):
         return d == commercial or commercial in d.parents
     checked = selected | set(also) | alone
+    tests = tested(packages, members, touched, live)
+    # and a user in the same repo that no line here type-checks: no gate package, not changed, no test target
+    # (the test-target check builds the others' libs): every user of a changed crate is checked on its landing,
+    # not when a later diff happens to reach it
+    covered = checked | {name for name, _ in tests}
     other = {packages[d]["name"] for t in touched for d in closure({t}, users) - {t}
-             if private(d) != private(t) and has_target(d, ("lib", "rlib", "dylib", "proc-macro", "bin"))} - checked
+             if has_target(d, ("lib", "rlib", "dylib", "proc-macro", "bin"))
+             and (private(d) != private(t) or (d in members and packages[d]["name"] not in covered))} - checked
     other |= {words[1] for words in live if words[0] == "cargo"}
 
     def where(name):
@@ -374,8 +509,8 @@ def main():
         print(f"check {name} {where(name)}")
     for name in sorted(other):
         print(f"cargo {name} {where(name)}")
-    for name, directory in tested(packages, members, touched, live):
-        print(f"tests {name} {directory.relative_to(root)}")
+    for name, directory in tests:
+        print(tests_line(packages, name, directory, root))
     for name in SMOKE:
         if name in PRESENT_ARGS and (name in selected or name in retry_presents):
             print(" ".join(["present", name, where(name), *PRESENT_ARGS[name]]))

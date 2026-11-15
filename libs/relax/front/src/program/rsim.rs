@@ -2,16 +2,18 @@
 //! `resolve_imports` / `finalize_imports`, ident.rs `resolve_ident_in_scope_set_inner` and the
 //! module lookups), `makepad check` only.
 //!
-//! Relax resolves a `use` optimistically: an import finds its target as soon as the target exists,
-//! whatever else could still define the name. rustc's resolution is a fixed point in which a name
-//! that a glob provides is *undetermined* while a single import of the same name may still define
-//! it, an import path through such a name is undetermined too, and an import left undetermined when
-//! no progress is made is an error ("cannot determine resolution for the import"). The same walk
-//! over the scopes (module, extern prelude, std prelude, primitive types) reports `E0659` when two
-//! scopes provide different items to an import path. This module re-runs that algorithm on the
-//! imports and items Relax collected, and reports only what rustc reports on top of Relax's own
-//! import errors; modules of crates that are not checked are answered by Relax's tables (a crate
-//! the checked crates import from is resolved completely).
+//! rustc's resolution is a fixed point in which a name that a glob provides is *undetermined* while
+//! a single import of the same name may still define it, an import path through such a name is
+//! undetermined too, and an import left undetermined when no progress is made is an error ("cannot
+//! determine resolution for the import"). Relax's fixpoint waits the same way
+//! (`Program::import_fixpoint`), but where rustc stops it forces one import through and marks what
+//! follows (BOUND_SETTLED). The same walk over the scopes (module, extern prelude, std prelude,
+//! primitive types) reports `E0659` when two scopes provide different items to an import path. This
+//! module re-runs that algorithm on the imports and items Relax collected and reports what rustc
+//! reports on top of Relax's own import errors; modules of crates that are not checked are answered
+//! by Relax's tables (a crate the checked crates import from is resolved completely). Where the two
+//! disagree on an import rustc accepts -- the replay determines another item than Relax bound, or
+//! cannot determine one Relax bound without forcing -- that is an internal error of the check.
 //!
 //! Not modelled (nothing in these crates' imports needs them): macro
 //! expansion rounds (every item exists from the start; `expansion` only orders the output of
@@ -65,8 +67,9 @@ struct Decl {
     /// `Some`: a definition; None with no import: the dummy `Res::Err` binding
     def: Option<DefId>,
     import: Option<(u32, DeclId)>,
-    ambiguity: Option<DeclId>,
-    warn_ambiguity: bool,
+    /// the other declaration of a glob ambiguity, and whether a use of it is the lint
+    /// `ambiguous_glob_imports` (true) or E0659
+    ambiguity: Option<(DeclId, bool)>,
     vis: BindVis,
     vis_max: Option<DeclId>,
     vis_min: Option<DeclId>,
@@ -141,6 +144,13 @@ struct Sim<'a> {
     busy: crate::fxhash::HashSet<(u32, Sym, usize)>,
     ext_names: crate::fxhash::HashMap<u32, std::rc::Rc<Vec<(Sym, usize)>>>,
     ext_decls: crate::fxhash::HashMap<(u32, Sym, usize), Option<DeclId>>,
+    /// the flattened type and value bindings of the unchecked modules a glob of a checked crate read
+    ext_tables: crate::fxhash::HashMap<u32, std::rc::Rc<ExtTable>>,
+    /// the registered proc macro names (None: not read yet), and per unchecked module the ones a
+    /// walk of its imports can find (`MacroScope::proc_macro_reach`)
+    proc_names: Option<crate::fxhash::HashSet<String>>,
+    ext_procs: crate::fxhash::HashMap<u32, std::rc::Rc<crate::fxhash::HashSet<String>>>,
+    proc_memo: crate::macros::ProcReach,
     amb: Vec<AmbErr>,
     cannot_determine: Vec<u32>,
     unresolved: Vec<u32>,
@@ -161,6 +171,34 @@ struct Sim<'a> {
 }
 
 fn ns_type(ns: usize) -> bool { ns == 0 }
+
+/// An unchecked module's bindings in the type (true) and value namespaces, flattened through its
+/// globs, as rustc reads an extern module's names from metadata: per name, what
+/// `Program::lookup_in_module_vis` answers for it (precise visibilities), computed for the whole
+/// module at once. Inside a glob cycle such a lookup can depend on the module it enters the cycle
+/// at -- when two definitions, or two visibilities neither of which is the wider, reach a name
+/// there --; those names are `contested` and are looked up one at a time, and every name of a
+/// cycle that did not settle is (`unsettled`). `ambiguous`: the names two of the module's globs give
+/// different definitions, or a glob gives from a module where they are ambiguous (privacy.rs
+/// `glob_ambiguity_in`): rustc stores them in metadata as ambiguous children (imports.rs
+/// `finalize_resolutions_in`, `AmbigModChild`), and a crate that uses one gets the lint
+/// `ambiguous_glob_imports` (build_reduced_graph.rs `define_extern`).
+#[derive(Default)]
+struct ExtTable {
+    names: crate::fxhash::HashMap<(Sym, bool), (DefId, BindVis)>,
+    contested: crate::fxhash::HashSet<(Sym, bool)>,
+    ambiguous: crate::fxhash::HashSet<(Sym, bool)>,
+    unsettled: bool,
+}
+
+impl ExtTable {
+    /// The table's answer for a name (with whether it is ambiguous), or None when the name is
+    /// looked up one at a time.
+    fn answer(&self, key: (Sym, bool)) -> Option<(Option<(DefId, BindVis)>, bool)> {
+        if self.unsettled || self.contested.contains(&key) { return None; }
+        Some((self.names.get(&key).copied(), self.ambiguous.contains(&key)))
+    }
+}
 
 /// The bang macros of the std family's modules as rustc's library defines them (Relax implements them
 /// by name, builtins.rs): core's prelude (library/core/src/prelude/v1.rs), std's (std/src/prelude/v1.rs),
@@ -198,8 +236,7 @@ impl Program {
     /// errors Relax's own resolution found (see the module comment); the glob ambiguities it
     /// found become the answer of `glob_ambiguity` for the checked modules.
     pub fn run_import_sim(&mut self, own: &[bool]) {
-        let prev = record_import_uses();
-        set_record_import_uses(false);
+        let prev = super::pause_import_uses();
         let (out, amb, macros) = {
             let mut sim = Sim::new(self, own);
             sim.init(false);
@@ -208,10 +245,12 @@ impl Program {
             sim.init(true);
             sim.resolve_imports();
             let out = sim.finalize_imports();
-            (out, sim.ambiguity_table(), sim.macro_table())
+            let chains = sim.chain_summaries();
+            (out, sim.ambiguity_table(&chains), sim.macro_table(&chains))
         };
         self.sim_macros = Some(macros);
-        set_record_import_uses(prev);
+        super::resume_import_uses(prev);
+        self.sim_own = own.to_vec();
         self.sim_ambiguity = Some(amb);
         self.sim_diags = Some(out);
         self.glob_amb_cache.clear();
@@ -237,48 +276,27 @@ impl Program {
         // names some checked module binds through a glob: only their calls can be ambiguous
         let globbed: crate::fxhash::HashSet<Sym> = table.iter().filter(|(_, b)| b.glob.is_some()).map(|(&(_, n), _)| n).collect();
         if globbed.is_empty() { return out; }
+        // (each path's first file, as a search of the paths finds it)
+        let mut by_path: crate::fxhash::HashMap<&str, u32> = Default::default();
+        for (i, p) in self.file_paths.iter().enumerate() { by_path.entry(p.as_str()).or_insert(i as u32); }
         let mut seen = crate::fxhash::HashSet::default();
-        let mut items_of: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
-        let mut blocks_of: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
+        let mut todo: Vec<(u32, u32, Sym, u32)> = Vec::new();
         for (path, pos, name) in calls {
             let Some(name) = self.syms.get(&name) else { continue };
             if !globbed.contains(&name) { continue; }
-            let Some(file) = self.file_paths.iter().position(|p| *p == path) else { continue };
-            let file = file as u32;
+            let Some(&file) = by_path.get(path.as_str()) else { continue };
             let krate = self.file_crate.get(file as usize).copied().unwrap_or(u32::MAX);
             if !own.get(krate as usize).copied().unwrap_or(false) || !seen.insert((file, pos)) { continue; }
-            let Some(module) = self.call_module(file, pos, &mut items_of, &mut blocks_of) else { continue };
-            if self.textual_macro_at(module, file, pos, name) { continue; }
+            todo.push((file, pos, name, krate));
+        }
+        if todo.is_empty() { return out; }
+        let ix = CallScopes::new(self, todo.iter().map(|t| t.0).collect());
+        for (file, pos, name, krate) in todo {
+            let Some(module) = ix.call_module(self, file, pos) else { continue };
+            if ix.textual_macro_at(self, module, file, pos, name) { continue; }
             if let Some(d) = self.macro_call_ambiguity(table, module, krate, name) { out.push((file, pos, d.0, d.1)); }
         }
         out
-    }
-
-    /// The module whose scope a call at `pos` of `file` resolves in: the innermost body block that is a
-    /// module, else the scope of the innermost item holding it.
-    fn call_module(&self, file: u32, pos: u32, items_of: &mut crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>, blocks_of: &mut crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>) -> Option<u32> {
-        let ast = &self.files.get(file as usize)?.ast;
-        let blocks = blocks_of.entry(file).or_insert_with(|| {
-            self.block_mods.iter().filter(|((f, _), _)| *f == file).map(|(&(_, b), &m)| { let bl = ast.block(BlockId(b)); (bl.lo, bl.hi, m) }).collect()
-        });
-        if let Some(&(_, _, m)) = blocks.iter().filter(|(lo, hi, _)| *lo <= pos && pos < *hi).min_by_key(|(lo, hi, _)| hi - lo) { return Some(m); }
-        let items = items_of.entry(file).or_insert_with(|| {
-            // (an inline `mod` item: the calls written in it resolve in that module)
-            self.defs.iter().filter(|d| d.file == file && d.item.0 != u32::MAX && !matches!(d.kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Prim(_) | DefKind::Field | DefKind::Variant | DefKind::MacroRules))
-                .map(|d| { let it = ast.item(d.item); (it.lo, it.hi, if d.kind == DefKind::Mod { d.sub } else { d.scope }) }).collect()
-        });
-        if let Some(&(_, _, m)) = items.iter().filter(|(lo, hi, _)| *lo <= pos && pos < *hi).min_by_key(|(lo, hi, _)| hi - lo) { return Some(m); }
-        (0..self.mods.len()).find(|&i| { let md = &self.mods[i]; md.file == file && md.lexical_parent.is_none() && self.def(md.def).kind == DefKind::Mod && self.def(md.def).sub as usize == i }).map(|m| m as u32)
-    }
-
-    /// A `macro_rules! name` written before `pos` of `file` in the call's module or an enclosing one
-    /// (rustc's MacroRules scopes, searched first: a result there is never ambiguous with a module's).
-    fn textual_macro_at(&self, module: u32, file: u32, pos: u32, name: Sym) -> bool {
-        let mut chain = Vec::new();
-        let mut m = Some(module);
-        while let Some(x) = m { chain.push(self.mods[x as usize].def); m = self.mods[x as usize].lexical_parent.or(self.mods[x as usize].parent_mod); }
-        let Some(f) = self.files.get(file as usize) else { return false };
-        self.defs.iter().any(|d| d.kind == DefKind::MacroRules && d.name == name && d.file == file && chain.contains(&d.parent) && f.ast.item(d.item).lo < pos)
     }
 
     fn macro_call_ambiguity(&self, table: &HashMap<(u32, Sym), MacBinding>, module: u32, krate: u32, name: Sym) -> Option<(Option<&'static str>, String)> {
@@ -335,11 +353,12 @@ impl<'a> Sim<'a> {
             res: Default::default(), order: Default::default(), imps: Vec::new(),
             all_globs: Default::default(), glob_importers: Default::default(), propagating: Default::default(),
             busy: Default::default(), ext_names: Default::default(), ext_decls: Default::default(),
+            ext_tables: Default::default(), proc_names: None, ext_procs: Default::default(), proc_memo: Default::default(),
             amb: Vec::new(), cannot_determine: Vec::new(), unresolved: Vec::new(), privacy_errors: 0, priv_list: Vec::new(), hack_applied: false, cur_imp: 0,
             no_prelude: Default::default(), extern_items: Default::default(), dummy: 0, unexpanded: Default::default(),
             indeterminate: Vec::new(), determined: Vec::new(), synthetic_macros: Vec::new(), proc_macros: Vec::new(),
         };
-        s.dummy = s.alloc(Decl { def: None, import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
+        s.dummy = s.alloc(Decl { def: None, import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 });
         s
     }
 
@@ -402,11 +421,6 @@ impl<'a> Sim<'a> {
         dd.ambiguity.is_some() || dd.import.map_or(false, |(_, s)| self.is_ambiguity_recursive(s))
     }
 
-    fn warn_ambiguity_recursive(&self, d: DeclId) -> bool {
-        let dd = &self.decls[d as usize];
-        dd.warn_ambiguity || dd.import.map_or(false, |(_, s)| self.warn_ambiguity_recursive(s))
-    }
-
     fn is_extern_crate_import(&self, d: DeclId) -> bool {
         // `extern crate` imports are planted with an `ext` Program import
         match self.decls[d as usize].import {
@@ -420,15 +434,181 @@ impl<'a> Sim<'a> {
     fn ext_decl(&mut self, m: u32, name: Sym, ns: usize) -> Option<DeclId> {
         if let Some(r) = self.ext_decls.get(&(m, name, ns)) { return *r; }
         let r = if ns == 2 {
-            self.ext_macro(m, name).map(|d| self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 }))
+            self.ext_macro(m, name).map(|d| self.alloc(Decl { def: Some(d), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 }))
         } else {
-            let mut q = GlobQuery { precise: true, ..Default::default() };
-            self.p.lookup_in_module_vis(m, name, ns_type(ns), &mut q).map(|(d, v)| {
-                self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: v, vis_max: None, vis_min: None, exp: 0 })
-            })
+            // a module a glob read answers from its flattened table; a single name of another
+            // module, and a contested one, is looked up as it is
+            let p = self.p;
+            let lookup = || p.lookup_in_module_vis(m, name, ns_type(ns), &mut GlobQuery { precise: true, ..Default::default() });
+            let ambiguous = || p.glob_ambiguity(m, name, ns_type(ns), m, false) != 0;
+            let (found, amb) = match self.ext_tables.get(&m).and_then(|t| t.answer((name, ns_type(ns)))) {
+                Some(a) => {
+                    debug_assert_eq!(a.0, lookup(), "the flattened table of module {m} for `{}`", p.syms.str(name));
+                    debug_assert!(a.0.is_none() || a.1 == ambiguous(), "the flattened table's ambiguity of module {m} for `{}`", p.syms.str(name));
+                    a
+                }
+                None => { let f = lookup(); let a = f.is_some() && ambiguous(); (f, a) }
+            };
+            // an ambiguous child of an extern module: its other binding is not needed (only that
+            // there is one), and its use is always the lint (build_reduced_graph.rs `define_extern`)
+            let dummy = self.dummy;
+            found.map(|(d, v)| self.alloc(Decl { def: Some(d), import: None, ambiguity: amb.then_some((dummy, true)), vis: v, vis_max: None, vis_min: None, exp: 0 }))
         };
         self.ext_decls.insert((m, name, ns), r);
         r
+    }
+
+    /// Builds the flattened table (ExtTable) of unchecked module `t` and of every module its globs
+    /// reach: Tarjan's components of the glob graph, each after the components it reads.
+    fn build_ext_table(&mut self, t: u32) {
+        if self.ext_tables.contains_key(&t) { return; }
+        let p = self.p;
+        let targets = |m: u32| -> Vec<u32> {
+            p.mods[m as usize].globs.iter().filter_map(|&(g, _)| { let gd = p.def(g); (gd.kind == DefKind::Mod).then_some(gd.sub) }).collect()
+        };
+        let mut index: crate::fxhash::HashMap<u32, u32> = Default::default();
+        let mut low: crate::fxhash::HashMap<u32, u32> = Default::default();
+        let mut on_stack: crate::fxhash::HashSet<u32> = Default::default();
+        let mut stack: Vec<u32> = Vec::new();
+        let mut comps: Vec<Vec<u32>> = Vec::new();
+        let mut walk: Vec<(u32, Vec<u32>, usize)> = vec![(t, targets(t), 0)];
+        index.insert(t, 0);
+        low.insert(t, 0);
+        stack.push(t);
+        on_stack.insert(t);
+        let mut next = 1;
+        while let Some(top) = walk.last_mut() {
+            let m = top.0;
+            if top.2 < top.1.len() {
+                let w = top.1[top.2];
+                top.2 += 1;
+                if self.ext_tables.contains_key(&w) { continue; }
+                match index.get(&w) {
+                    Some(&wi) => if on_stack.contains(&w) { low.insert(m, low[&m].min(wi)); },
+                    None => {
+                        index.insert(w, next);
+                        low.insert(w, next);
+                        next += 1;
+                        stack.push(w);
+                        on_stack.insert(w);
+                        walk.push((w, targets(w), 0));
+                    }
+                }
+                continue;
+            }
+            walk.pop();
+            if let Some(parent) = walk.last() { low.insert(parent.0, low[&parent.0].min(low[&m])); }
+            if low[&m] == index[&m] {
+                let mut comp = Vec::new();
+                while let Some(x) = stack.pop() {
+                    on_stack.remove(&x);
+                    comp.push(x);
+                    if x == m { break; }
+                }
+                comps.push(comp);
+            }
+        }
+        for comp in comps { self.table_component(&comp); }
+    }
+
+    /// The tables of one component of the glob graph. A cycle's start from nothing bound inside
+    /// it (what a lookup's first pass answers for a module it is still looking through) and are
+    /// folded again until they hold; then one more fold finds its contested names.
+    fn table_component(&mut self, comp: &[u32]) {
+        let p = self.p;
+        let cyclic = comp.len() > 1 || p.mods[comp[0] as usize].globs.iter().any(|&(g, _)| { let gd = p.def(g); gd.kind == DefKind::Mod && gd.sub == comp[0] });
+        let mut work: crate::fxhash::HashMap<u32, ExtTable> = comp.iter().map(|&m| (m, ExtTable::default())).collect();
+        if !cyclic {
+            let t = self.fold_ext(comp[0], &work, None);
+            self.ext_tables.insert(comp[0], std::rc::Rc::new(t));
+            return;
+        }
+        let mut settled = false;
+        for _ in 0..comp.len() + 2 {
+            let mut changed = false;
+            for &m in comp {
+                let t = self.fold_ext(m, &work, None);
+                changed |= t.names != work[&m].names || t.ambiguous != work[&m].ambiguous || t.unsettled != work[&m].unsettled;
+                work.insert(m, t);
+            }
+            if !changed { settled = true; break; }
+        }
+        let mut contest = crate::fxhash::HashSet::default();
+        if settled {
+            for &m in comp { self.fold_ext(m, &work, Some(&mut contest)); }
+        }
+        for &m in comp {
+            let mut t = work.remove(&m).unwrap_or_default();
+            t.unsettled |= !settled;
+            let md = &p.mods[m as usize];
+            t.contested.extend(contest.iter().filter(|k| !(if k.1 { md.types.contains_key(&k.0) } else { md.values.contains_key(&k.0) })));
+            self.ext_tables.insert(m, std::rc::Rc::new(t));
+        }
+    }
+
+    /// Module `m`'s table from the tables of its glob targets (`work`: a cycle's tables so far; the
+    /// rest are built): its own bindings, then each glob's, as `lookup_in_module_globs` takes them
+    /// -- visible to `m`, at most as visible as the glob, the first one found unless the same
+    /// definition comes again more visible. `contest` collects the names two globs give different
+    /// definitions, or visibilities neither of which is the wider; `ambiguous` the names two visible
+    /// globs give different definitions, and those whose binding a glob brings from a module that
+    /// has the name ambiguous -- as rustc 1.100's `select_glob_decl` keeps it: the first glob's,
+    /// or a later one's of the same definition at the first one's visibility. A binding the glob's
+    /// module holds that `m` cannot see is no import of `m`, nor its ambiguity (a private module's
+    /// two globs of `shader` under the crate root's `pub use that::*`, beside a visible `shader`).
+    fn fold_ext(&self, m: u32, work: &crate::fxhash::HashMap<u32, ExtTable>, mut contest: Option<&mut crate::fxhash::HashSet<(Sym, bool)>>) -> ExtTable {
+        use std::collections::hash_map::Entry;
+        let p = self.p;
+        let md = &p.mods[m as usize];
+        let own = |k: &(Sym, bool)| if k.1 { md.types.contains_key(&k.0) } else { md.values.contains_key(&k.0) };
+        let mut t = ExtTable::default();
+        for (&n, &d) in &md.types { t.names.insert((n, true), (d, p.precise_vis(m, n, true, d))); }
+        for (&n, &d) in &md.values { t.names.insert((n, false), (d, p.precise_vis(m, n, false, d))); }
+        // the visibility of each name's first glob binding (rustc's `old_glob_decl.vis()`: a later
+        // binding of the same definition at another visibility changes no ambiguity)
+        let mut first_vis: crate::fxhash::HashMap<(Sym, bool), BindVis> = Default::default();
+        for &(g, gv) in &md.globs {
+            let gd = p.def(g);
+            // `amb`: the glob's module has the name ambiguous
+            let mut take = |t: &mut ExtTable, k: (Sym, bool), d: DefId, v: BindVis, amb: bool| {
+                if own(&k) || !p.vis_visible(v, m) { return; }
+                let v = p.vis_min(gv, v);
+                match t.names.entry(k) {
+                    Entry::Vacant(e) => {
+                        e.insert((d, v));
+                        first_vis.insert(k, v);
+                        if amb { t.ambiguous.insert(k); }
+                    }
+                    Entry::Occupied(mut e) => {
+                        let (bd, bv) = *e.get();
+                        if bd != d || (amb && first_vis.get(&k) == Some(&v)) { t.ambiguous.insert(k); }
+                        if bd == d && p.vis_wider(v, bv) {
+                            e.insert((d, v));
+                        } else if bd != d || (v != bv && !p.vis_wider(bv, v)) {
+                            if let Some(c) = contest.as_deref_mut() { c.insert(k); }
+                        }
+                    }
+                }
+            };
+            match gd.kind {
+                DefKind::Mod => {
+                    let src = work.get(&gd.sub).or_else(|| self.ext_tables.get(&gd.sub).map(|x| &**x)).expect("a glob target's table is built before its importer's");
+                    // (what privacy.rs `glob_ambiguity_in` judges the same way)
+                    for (&k, &(d, v)) in &src.names { take(&mut t, k, d, v, src.ambiguous.contains(&k)); }
+                    t.contested.extend(src.contested.iter().filter(|k| !own(k)));
+                    t.unsettled |= src.unsettled;
+                }
+                DefKind::Enum => {
+                    for &v in &p.variants[gd.sub as usize] {
+                        let n = p.def(v).name;
+                        take(&mut t, (n, true), v, None, false);
+                        take(&mut t, (n, false), v, None, false);
+                    }
+                }
+                _ => {}
+            }
+        }
+        t
     }
 
     /// Which std-family macro set module `m` holds: the roots of core / std / alloc and the modules of
@@ -458,7 +638,7 @@ impl<'a> Sim<'a> {
         let n = self.p.syms.str(name);
         if !set.names().contains(&n) { return None; }
         let d = self.builtin_macro(name, set == StdMacros::Std && n == "panic");
-        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 }))
+        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 }))
     }
 
     fn builtin_macro(&mut self, name: Sym, std_panic: bool) -> DefId {
@@ -478,6 +658,12 @@ impl<'a> Sim<'a> {
         if let Some(set) = self.std_macro_module(m) {
             if set.names().contains(&n) { return Some(self.builtin_macro(name, set == StdMacros::Std && n == "panic")); }
         }
+        // a registered proc macro name no import of the module's reach binds has no walk to find it
+        if self.proc_names.get_or_insert_with(|| crate::macro_reg::proc_macro_names().into_iter().collect()).contains(n) && !self.ext_procs(m).contains(n) {
+            #[cfg(debug_assertions)]
+            assert_eq!(self.ext_macro_walk(m, n), None, "the proc macro reach of module {m} for `{n}`");
+            return None;
+        }
         let md = &self.p.mods[m as usize];
         let krate = self.p.syms.str(self.p.crates[md.krate as usize].name);
         let module = self.p.def_path(md.def);
@@ -490,6 +676,33 @@ impl<'a> Sim<'a> {
             }
         }
         None
+    }
+
+    /// The registered proc macro names a walk of unchecked module `m`'s imports can find
+    /// (`MacroScope::proc_macro_reach`, as its own crate sees it), once per module.
+    fn ext_procs(&mut self, m: u32) -> std::rc::Rc<crate::fxhash::HashSet<String>> {
+        if let Some(x) = self.ext_procs.get(&m) { return x.clone(); }
+        let md = &self.p.mods[m as usize];
+        let krate = self.p.syms.str(self.p.crates[md.krate as usize].name);
+        let module = self.p.def_path(md.def);
+        let scope = crate::macros::MacroScope::new(self.p.macros.clone());
+        let names = self.proc_names.get_or_insert_with(|| crate::macro_reg::proc_macro_names().into_iter().collect());
+        let r = scope.proc_macro_reach(krate, &module, names, &mut self.proc_memo);
+        self.ext_procs.insert(m, r.clone());
+        r
+    }
+
+    /// The proc macro `name` of module `m` by a walk of its imports for that name alone (for the
+    /// debug check of the reach filter).
+    #[cfg(debug_assertions)]
+    fn ext_macro_walk(&self, m: u32, n: &str) -> Option<(usize, String)> {
+        let md = &self.p.mods[m as usize];
+        let krate = self.p.syms.str(self.p.crates[md.krate as usize].name);
+        let module = self.p.def_path(md.def);
+        let scope = crate::macros::MacroScope::new(self.p.macros.clone());
+        [crate::macro_reg::Kind::Bang, crate::macro_reg::Kind::Attr, crate::macro_reg::Kind::Derive].into_iter()
+            .find_map(|kind| scope.proc_macro_path(krate, &module, &[n.to_string()], kind, &mut Default::default()))
+            .map(|e| (e.unit, e.fname))
     }
 
     /// rustc's MacroRules scopes at import `i`: a `macro_rules! name` written before it in its file, in its
@@ -508,12 +721,12 @@ impl<'a> Sim<'a> {
             if lo < pos && best.map_or(true, |(b, _)| lo > b) { best = Some((lo, DefId(k as u32))); }
         }
         let (_, d) = best?;
-        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 }))
+        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 }))
     }
 
     fn container_decl(&mut self, c: DefId, name: Sym, ns: usize) -> Option<DeclId> {
         let d = self.p.lookup_in_container(c, name, ns_type(ns))?;
-        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 }))
+        Some(self.alloc(Decl { def: Some(d), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 }))
     }
 
     fn import_decl_vis_ext(&self, decl: DeclId, imp: u32, min: bool) -> BindVis {
@@ -539,7 +752,7 @@ impl<'a> Sim<'a> {
                 if let IK::Glob { max_vis } = &mut self.imps[imp as usize].kind { *max_vis = Some(vis); }
             }
         }
-        self.alloc(Decl { def: None, import: Some((imp, decl)), ambiguity: None, warn_ambiguity: false, vis, vis_max: None, vis_min: None, exp })
+        self.alloc(Decl { def: None, import: Some((imp, decl)), ambiguity: None, vis, vis_max: None, vis_min: None, exp })
     }
 
     fn remove_same_import(&self, d1: DeclId, d2: DeclId) -> (DeclId, DeclId) {
@@ -549,19 +762,21 @@ impl<'a> Sim<'a> {
         (d1, d2)
     }
 
-    fn select_glob_decl(&mut self, old: DeclId, new: DeclId, warn: bool) -> DeclId {
-        let (old_deep, deep) = self.remove_same_import(old, new);
+    /// rustc_resolve imports.rs `select_glob_decl`: which of two glob declarations of a name a module
+    /// keeps. Two different items are an ambiguity a use reports as E0659 (rustc's lint exceptions for
+    /// four old crate versions -- noise, rustybuzz, pdf, net2 -- are not modelled); a glob that brings
+    /// an ambiguous declaration over a plain one of the same item, or a re-fetched one that kept the
+    /// old one's, is the lint `ambiguous_glob_imports`.
+    fn select_glob_decl(&mut self, old: DeclId, new: DeclId) -> DeclId {
+        let (_, deep) = self.remove_same_import(old, new);
         if deep != new {
-            let _ = old_deep;
-            if self.decls[old as usize].ambiguity.is_some() && self.decls[new as usize].ambiguity.is_none() {
-                self.decls[new as usize].ambiguity = self.decls[old as usize].ambiguity;
+            if let Some((a, _)) = self.decls[old as usize].ambiguity {
+                if self.decls[new as usize].ambiguity.is_none() { self.decls[new as usize].ambiguity = Some((a, true)); }
             }
-            if self.is_ambiguity_recursive(new) { self.decls[new as usize].warn_ambiguity = true; }
             new
         } else if self.dres(new) != self.dres(old) {
-            self.decls[old as usize].ambiguity = Some(new);
-            self.decls[old as usize].warn_ambiguity = warn;
-            if warn { old } else { let c = self.decls[old as usize].clone(); self.alloc(c) }
+            self.decls[old as usize].ambiguity = Some((new, false));
+            old
         } else if self.dvis(old) != self.dvis(new) {
             let (old_vis, vis) = (self.dvis(old), self.dvis(new));
             if self.greater_than(vis, old_vis) {
@@ -572,8 +787,7 @@ impl<'a> Sim<'a> {
             }
             old
         } else if self.is_ambiguity_recursive(new) && !self.is_ambiguity_recursive(old) {
-            self.decls[old as usize].ambiguity = Some(new);
-            self.decls[old as usize].warn_ambiguity = true;
+            self.decls[old as usize].ambiguity = Some((new, true));
             old
         } else {
             old
@@ -581,36 +795,37 @@ impl<'a> Sim<'a> {
     }
 
     fn resolution_mut(&mut self, key: (u32, Sym, usize)) -> &mut NameRes {
-        if !self.res.contains_key(&key) {
-            self.order.entry(key.0).or_default().push((key.1, key.2));
-            self.res.insert(key, NameRes::default());
+        match self.res.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.order.entry(key.0).or_default().push((key.1, key.2));
+                e.insert(NameRes::default())
+            }
         }
-        self.res.get_mut(&key).unwrap()
     }
 
     /// `update_local_resolution`: `f` changes the resolution; a new or changed determined declaration
     /// is defined in the module's glob importers.
-    fn update_local_resolution<T>(&mut self, module: u32, name: Sym, ns: usize, warn: bool, f: impl FnOnce(&mut Self, &mut NameRes) -> T) -> T {
+    fn update_local_resolution<T>(&mut self, module: u32, name: Sym, ns: usize, f: impl FnOnce(&mut Self, &mut NameRes) -> T) -> T {
         let key = (module, name, ns);
-        self.resolution_mut(key);
-        let mut r = self.res.remove(&key).unwrap();
+        // (taken out while `f` runs: none of them reads the resolutions)
+        let mut r = std::mem::take(self.resolution_mut(key));
         let old_decl = r.determined_decl();
         let old_vis = old_decl.map(|d| self.dvis(d));
         let t = f(self, &mut r);
         let new_decl = r.determined_decl();
-        self.res.insert(key, r);
+        *self.res.get_mut(&key).expect("the resolution taken out above") = r;
         let binding = match new_decl {
             Some(b) if old_decl != Some(b) || old_vis != Some(self.dvis(b)) => b,
             _ => return t,
         };
-        let warn = warn || old_decl.is_some();
         if !self.propagating.insert(module) { return t; }
         let importers = self.glob_importers.get(&module).cloned().unwrap_or_default();
         for imp in importers {
             let scope = self.imps[imp as usize].module;
             if self.accessible(self.dvis(binding), scope) {
                 let d = self.new_import_decl(binding, imp);
-                let _ = self.try_plant(scope, name, ns, d, warn);
+                let _ = self.try_plant(scope, name, ns, d);
             }
         }
         self.propagating.remove(&module);
@@ -618,10 +833,10 @@ impl<'a> Sim<'a> {
     }
 
     /// `try_plant_decl_into_local_module`; the module is the declaration's parent.
-    fn try_plant(&mut self, module: u32, name: Sym, ns: usize, decl: DeclId, warn: bool) -> Result<(), DeclId> {
+    fn try_plant(&mut self, module: u32, name: Sym, ns: usize, decl: DeclId) -> Result<(), DeclId> {
         let is_glob = self.is_glob_decl(decl);
         let is_err = self.dres(decl).is_none();
-        self.update_local_resolution(module, name, ns, warn, |this, r| {
+        self.update_local_resolution(module, name, ns, |this, r| {
             // error recovery does not override a real declaration
             if is_err {
                 if let Some(old) = r.best_decl() {
@@ -630,7 +845,7 @@ impl<'a> Sim<'a> {
             }
             if is_glob {
                 r.glob = Some(match r.glob {
-                    Some(old) => this.select_glob_decl(old, decl, warn && r.non_glob.is_none()),
+                    Some(old) => this.select_glob_decl(old, decl),
                     None => decl,
                 });
                 Ok(())
@@ -668,6 +883,11 @@ impl<'a> Sim<'a> {
     fn init(&mut self, expanded: bool) {
         let p = self.p;
         let nmods = p.mods.len() as u32;
+        // (a resolution per item name of the checked modules at least: room for them up front)
+        if !expanded {
+            let names: usize = (0..nmods).filter(|&m| self.local(m)).map(|m| { let md = &p.mods[m as usize]; md.types.len() + md.values.len() + md.macros.len() }).sum();
+            self.res.reserve(names);
+        }
         // items
         for m in 0..nmods {
             if !self.local(m) { continue; }
@@ -684,8 +904,8 @@ impl<'a> Sim<'a> {
                         if exp != 0 { self.unexpanded.insert(m); }
                         continue;
                     }
-                    let decl = self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis, vis_max: None, vis_min: None, exp });
-                    let _ = self.try_plant(m, name, ns, decl, false);
+                    let decl = self.alloc(Decl { def: Some(d), import: None, ambiguity: None, vis, vis_max: None, vis_min: None, exp });
+                    let _ = self.try_plant(m, name, ns, decl);
                 }
             }
             // the macro namespace: a `#[macro_export]` macro_rules! is a binding of its crate root
@@ -697,8 +917,8 @@ impl<'a> Sim<'a> {
                     if exp != 0 { self.unexpanded.insert(m); }
                     continue;
                 }
-                let decl = self.alloc(Decl { def: Some(d), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp });
-                let _ = self.try_plant(m, name, 2, decl, false);
+                let decl = self.alloc(Decl { def: Some(d), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp });
+                let _ = self.try_plant(m, name, 2, decl);
             }
         }
         // imports
@@ -726,11 +946,11 @@ impl<'a> Sim<'a> {
                 };
                 let Some(c) = krate else { continue };
                 let root = p.mods[p.crates[c as usize].root_mod as usize].def;
-                let src = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
+                let src = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 });
                 let idx = self.imps.len() as u32;
                 self.imps.push(SImp { pi, module, vis, exp, kind: IK::Single { source: name, target: bind, decls: [Pend::Ready(None), Pend::Ready(None), Pend::Ready(None)] }, path: Vec::new(), global: false, imported: None, edition });
                 let d = self.new_import_decl(src, idx);
-                let _ = self.try_plant(module, bind, 0, d, false);
+                let _ = self.try_plant(module, bind, 0, d);
                 if let IK::Single { decls, .. } = &mut self.imps[idx as usize].kind { decls[0] = Pend::Ready(Some(d)); }
                 if module == p.crates[p.mods[module as usize].krate as usize].root_mod {
                     self.extern_items.entry((p.mods[module as usize].krate, bind)).or_insert(d);
@@ -755,11 +975,11 @@ impl<'a> Sim<'a> {
                 // `use crate as c;` / `use self as s;` / `use super as p;`: a module, resolved at once
                 if let Some(def) = p.resolve_mod_path(module, im.global, &im.segs, edition < 2018, true) {
                     if p.def(def).kind == DefKind::Mod {
-                        let src = self.alloc(Decl { def: Some(def), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
+                        let src = self.alloc(Decl { def: Some(def), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 });
                         let idx = self.imps.len() as u32;
                         self.imps.push(SImp { pi, module, vis, exp, kind: IK::Single { source: last, target, decls: [Pend::Ready(None), Pend::Ready(None), Pend::Ready(None)] }, path: Vec::new(), global: false, imported: None, edition });
                         let d = self.new_import_decl(src, idx);
-                        if p.syms.str(target) != "_" { let _ = self.try_plant(module, target, 0, d, false); }
+                        if p.syms.str(target) != "_" { let _ = self.try_plant(module, target, 0, d); }
                         if let IK::Single { decls, .. } = &mut self.imps[idx as usize].kind { decls[0] = Pend::Ready(Some(d)); }
                     }
                 }
@@ -796,13 +1016,7 @@ impl<'a> Sim<'a> {
     /// The visibility and expansion of the `use` item an import came from.
     fn import_vis_exp(&self, im: &Import) -> (BindVis, u32) {
         let p = self.p;
-        let Some(f) = p.files.get(im.file as usize) else { return (Some(p.mods[im.module as usize].normal), 0) };
-        let exp = f.expansion_region_id(im.pos);
-        let item = f.ast.items.iter().find(|it| it.lo == im.pos && matches!(it.kind, ItemKind::Use { .. } | ItemKind::ExternCrate(_)));
-        match item {
-            Some(it) => (p.vis_module(im.file, im.module, &it.vis), exp),
-            None => (Some(p.mods[im.module as usize].normal), exp),
-        }
+        (p.import_vis(im), p.files.get(im.file as usize).map_or(0, |f| f.expansion_region_id(im.pos)))
     }
 
     // ------------------------------------------------------------------ globs of unchecked modules
@@ -957,7 +1171,11 @@ impl<'a> Sim<'a> {
                 let aps = if matches!(set, ScopeSet::Module(..) | ScopeSet::ModuleAndExternPrelude(..)) { ps } else { Ps { module: m, exp: ps.exp } };
                 if !self.local(m) {
                     return match self.ext_decl(m, name, ns) {
-                        Some(d) if Some(d) != ign_decl => if self.accessible(self.dvis(d), aps.module) { Ok(d) } else { Err(Ctl::Break(Determined)) },
+                        Some(d) if Some(d) != ign_decl => if self.accessible(self.dvis(d), aps.module) {
+                            // (finalizing: a use of an extern module's ambiguous child)
+                            if fin.is_some() { self.record_use(name, d); }
+                            Ok(d)
+                        } else { Err(Ctl::Break(Determined)) },
                         _ => Err(Ctl::Continue(Determined)),
                     };
                 }
@@ -982,7 +1200,7 @@ impl<'a> Sim<'a> {
                 match found {
                     Some(c) => {
                         let root = self.p.mods[self.p.crates[c as usize].root_mod as usize].def;
-                        let d = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
+                        let d = self.alloc(Decl { def: Some(root), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 });
                         Ok(d)
                     }
                     None => Err(Ctl::Continue(Determined)),
@@ -1007,7 +1225,7 @@ impl<'a> Sim<'a> {
             Scope::Builtin => {
                 for i in 0..PRIMS.len() {
                     if self.p.syms.get(PRIMS[i].0) == Some(name) {
-                        let d = self.alloc(Decl { def: Some(self.p.prim_defs[i]), import: None, ambiguity: None, warn_ambiguity: false, vis: None, vis_max: None, vis_min: None, exp: 0 });
+                        let d = self.alloc(Decl { def: Some(self.p.prim_defs[i]), import: None, ambiguity: None, vis: None, vis_max: None, vis_min: None, exp: 0 });
                         return Ok(d);
                     }
                 }
@@ -1108,16 +1326,26 @@ impl<'a> Sim<'a> {
         Ok(b)
     }
 
-    /// `record_use_inner`'s walk down a declaration's import chain: the ambiguity errors it records,
-    /// as the `warning` of each (None: an error).
-    fn chain_ambiguities(&self, used: DeclId) -> Vec<Option<Warn>> {
+    /// The crate of the module an import declaration is in (None: a definition's declaration).
+    fn import_crate(&self, d: DeclId) -> Option<u32> {
+        self.decls[d as usize].import.map(|(i, _)| self.p.mods[self.imps[i as usize].module as usize].krate)
+    }
+
+    /// `record_use`'s walk down a declaration's import chain (rustc_resolve lib.rs): the ambiguity of
+    /// each declaration on it, as its `warning` (None: an error). `krate`: the crate of the use. To it
+    /// another crate's declaration is an extern one, which holds the first ambiguity of its chain
+    /// (metadata's ambiguous children, imports.rs `finalize_resolutions_in`), always as the lint.
+    fn chain_ambiguities(&self, used: DeclId, krate: Option<u32>) -> Vec<Option<Warn>> {
         let mut out = Vec::new();
         let mut cur = used;
-        let mut warn = self.decls[used as usize].warn_ambiguity;
         loop {
-            if self.decls[cur as usize].ambiguity.is_some() { out.push(if warn { Some(Warn::Glob) } else { None }); }
+            if krate.is_some() && self.import_crate(cur).is_some_and(|k| Some(k) != krate) {
+                if self.is_ambiguity_recursive(cur) { out.push(Some(Warn::Glob)); }
+                break;
+            }
+            if let Some((_, w)) = self.decls[cur as usize].ambiguity { out.push(if w { Some(Warn::Glob) } else { None }); }
             match self.decls[cur as usize].import {
-                Some((_, src)) => { warn = warn || self.decls[src as usize].warn_ambiguity; cur = src; }
+                Some((_, src)) => cur = src,
                 None => break,
             }
         }
@@ -1125,7 +1353,8 @@ impl<'a> Sim<'a> {
     }
 
     fn record_use(&mut self, name: Sym, used: DeclId) {
-        for w in self.chain_ambiguities(used) { self.push_amb(name, w); }
+        let krate = self.imps.get(self.cur_imp as usize).map(|im| self.p.mods[im.module as usize].krate);
+        for w in self.chain_ambiguities(used, krate) { self.push_amb(name, w); }
     }
 
     fn push_amb(&mut self, name: Sym, warning: Option<Warn>) {
@@ -1370,13 +1599,13 @@ impl<'a> Sim<'a> {
                 Ok(binding) => {
                     let d = self.new_import_decl(binding, i);
                     let m = ps.module;
-                    if self.p.syms.str(target) != "_" { let _ = self.try_plant(m, target, ns, d, false); }
+                    if self.p.syms.str(target) != "_" { let _ = self.try_plant(m, target, ns, d); }
                     Pend::Ready(Some(d))
                 }
                 Err(Determined) => {
                     if self.p.syms.str(target) != "_" {
                         let m = ps.module;
-                        self.update_local_resolution(m, target, ns, false, |_, r| { r.single_imports.retain(|&x| x != i); });
+                        self.update_local_resolution(m, target, ns, |_, r| { r.single_imports.retain(|&x| x != i); });
                     }
                     Pend::Ready(None)
                 }
@@ -1399,6 +1628,7 @@ impl<'a> Sim<'a> {
                         self.plant_glob(i, here, name, ns, binding);
                     }
                 } else {
+                    self.build_ext_table(module);
                     for &(name, ns) in self.ext_names(module).iter() {
                         if let Some(binding) = self.ext_decl(module, name, ns) { self.plant_glob(i, here, name, ns, binding); }
                     }
@@ -1422,22 +1652,43 @@ impl<'a> Sim<'a> {
     fn plant_glob(&mut self, i: u32, here: u32, name: Sym, ns: usize, binding: DeclId) {
         if !self.accessible(self.dvis(binding), here) { return; }
         let d = self.new_import_decl(binding, i);
-        let warn = self.res.get(&(here, name, ns)).and_then(|r| r.determined_decl()).map_or(false, |b| self.warn_ambiguity_recursive(b));
-        let _ = self.try_plant(here, name, ns, d, warn);
+        let _ = self.try_plant(here, name, ns, d);
     }
 
     // ------------------------------------------------------------------ finalization
 
-    /// The ambiguities recorded on the glob declarations of the modules: (module, name, type ns).
-    fn ambiguity_table(&self) -> HashMap<(u32, Sym, bool), u8> {
-        let mut t = HashMap::default();
+    /// `chain_ambiguities` of every declaration, for a use in its own crate, summed up: 0 none, 1 one
+    /// of them an error, 2 the lint. One pass: an import declaration's source was allocated before it.
+    fn chain_summaries(&self) -> Vec<u8> {
+        // (an ambiguity on the chain, one of them an error)
+        let mut s: Vec<(bool, bool)> = Vec::with_capacity(self.decls.len());
+        for (k, d) in self.decls.iter().enumerate() {
+            let (amb, err) = d.ambiguity.map_or((false, false), |(_, w)| (true, !w));
+            let (any, below) = match d.import {
+                Some((_, src)) => {
+                    let (a, e) = s[src as usize];
+                    // another crate's declaration is an extern one here: its ambiguity is the lint
+                    let cross = self.import_crate(src).is_some_and(|c| Some(c) != self.import_crate(k as DeclId));
+                    (a, e && !cross)
+                }
+                None => (false, false),
+            };
+            s.push((amb || any, err || below));
+        }
+        s.into_iter().map(|(any, err)| if !any { 0 } else if err { 1 } else { 2 }).collect()
+    }
+
+    fn ambiguity_table(&self, chains: &[u8]) -> HashMap<(u32, Sym, bool), u8> {
+        let mut t = HashMap::with_capacity_and_hasher(self.res.len(), Default::default());
         for (&(m, name, ns), r) in &self.res {
             if ns == 2 { continue; }
-            // low bits: what a use of the name finds (a name a module binds directly -- an item or a
-            // single import -- has no glob ambiguity); bits 2..: the glob declaration's own
-            let glob = r.glob.map_or(0, |g| { let amb = self.chain_ambiguities(g); if amb.is_empty() { 0 } else if amb.iter().any(|w| w.is_none()) { 1 } else { 2 } });
+            // bits 0-1: what a use of the name finds (its own declaration's, an item's or a single
+            // import's, when the module binds it so: a use goes down an import's chain to an
+            // ambiguous declaration); bits 2-3: the glob declaration's; bit 4: an own declaration
+            let glob = r.glob.map_or(0, |g| chains[g as usize]);
             if r.non_glob.is_none() && r.glob.is_none() { continue; }
-            t.insert((m, name, ns_type(ns)), (if r.non_glob.is_some() { 0 } else { glob }) | (glob << 2));
+            let found = r.non_glob.map_or(glob, |d| chains[d as usize]);
+            t.insert((m, name, ns_type(ns)), found | (glob << 2) | if r.non_glob.is_some() { 16 } else { 0 });
         }
         t
     }
@@ -1451,11 +1702,11 @@ impl<'a> Sim<'a> {
     }
 
     /// The macro namespace of the checked modules for the macro-call check (lint.rs `macro_call_ambiguities`).
-    fn macro_table(&self) -> HashMap<(u32, Sym), MacBinding> {
+    fn macro_table(&self, chains: &[u8]) -> HashMap<(u32, Sym), MacBinding> {
         let mut t = HashMap::default();
         for (&(m, name, ns), r) in &self.res {
             if ns != 2 { continue; }
-            let glob_amb = r.glob.map_or(0, |g| { let amb = self.chain_ambiguities(g); if amb.is_empty() { 0 } else if amb.iter().any(|w| w.is_none()) { 1 } else { 2 } });
+            let glob_amb = r.glob.map_or(0, |g| chains[g as usize]);
             let b = MacBinding { non_glob: r.non_glob.and_then(|d| self.mac_res(d)), glob: r.glob.and_then(|d| self.mac_res(d)), glob_amb,
                 non_glob_vis: r.non_glob.and_then(|d| self.decls[d as usize].vis), glob_vis: r.glob.and_then(|d| self.decls[d as usize].vis) };
             if b.non_glob.is_some() || b.glob.is_some() { t.insert((m, name), b); }
@@ -1483,11 +1734,12 @@ impl<'a> Sim<'a> {
         for &i in &self.cannot_determine {
             if !seen.insert(i) { continue; }
             let (file, pos) = at(i);
-            // invariant: an import the replay cannot determine is one the real resolver left unresolved
-            let pim = &p.imports[self.imps[i as usize].pi];
-            debug_assert!(!pim.done || !(pim.glob || pim.bound & (BOUND_TYPES | BOUND_VALUES) != 0),
-                "replay cannot determine an import the real resolver resolved (file {file}, pos {pos})");
             out.push(SimDiag { file, pos, kind: SimKind::Error, msg: "cannot determine resolution for the import".to_string() });
+            // the resolver binds such an import only by forcing it (or after a forced one)
+            let pim = &p.imports[self.imps[i as usize].pi];
+            if pim.done && (pim.glob || pim.bound & (BOUND_TYPES | BOUND_VALUES) != 0) && pim.bound & BOUND_SETTLED == 0 {
+                out.push(SimDiag { file, pos, kind: SimKind::Error, msg: "internal error: the import resolver determined an import rustc cannot determine".to_string() });
+            }
         }
         // rustc throws the unresolved errors of the imports, and only when there are none the
         // indeterminate imports whose path has a `::`
@@ -1531,6 +1783,29 @@ impl<'a> Sim<'a> {
                 Some(Warn::Vis) => (SimKind::Lint("ambiguous_import_visibilities"), format!("ambiguous import visibility")),
             };
             out.push(SimDiag { file, pos, kind, msg });
+        }
+        // the resolver against the replay: an import with no diagnostic, no name clash and no forced
+        // binding binds, in each namespace it bound, the item rustc determines for it; another one
+        // is a wrong binding of code rustc accepts
+        let mut noisy: crate::fxhash::HashSet<u32> = self.cannot_determine.iter().chain(&self.unresolved).chain(&indet).copied().collect();
+        noisy.extend(self.priv_list.iter().map(|&(i, _, _)| i));
+        noisy.extend(self.amb.iter().map(|e| e.imp));
+        for (i, im) in self.imps.iter().enumerate() {
+            let IK::Single { decls, .. } = &im.kind else { continue };
+            let pim = &p.imports[im.pi];
+            let Some(bind) = pim.bind else { continue };
+            if noisy.contains(&(i as u32)) || pim.bound & (CLASH_TYPES | CLASH_VALUES | BOUND_SETTLED) != 0 || p.syms.str(bind) == "_" { continue; }
+            for (ns, bit) in [(0, BOUND_TYPES), (1, BOUND_VALUES)] {
+                if pim.bound & bit == 0 { continue; }
+                let Some(want) = decls[ns].decl().and_then(|d| self.dres(d)) else { continue };
+                let md = &p.mods[pim.module as usize];
+                let got = if ns == 0 { md.types.get(&bind) } else { md.values.get(&bind) }.copied();
+                if got != Some(want) {
+                    let got = got.map_or_else(|| "nothing".to_string(), |d| format!("`{}`", p.def_path(d)));
+                    out.push(SimDiag { file: pim.file, pos: pim.pos, kind: SimKind::Error,
+                        msg: format!("internal error: the import resolver bound `{}` to {got} where rustc binds `{}`", p.syms.str(bind), p.def_path(want)) });
+                }
+            }
         }
         out
     }
@@ -1598,8 +1873,8 @@ impl<'a> Sim<'a> {
         let m = self.imps[i as usize].module;
         for ns in 0..3 {
             if self.p.syms.str(target) != "_" {
-                let _ = self.try_plant(m, target, ns, d, false);
-                self.update_local_resolution(m, target, ns, false, |_, r| { r.single_imports.retain(|&x| x != i); });
+                let _ = self.try_plant(m, target, ns, d);
+                self.update_local_resolution(m, target, ns, |_, r| { r.single_imports.retain(|&x| x != i); });
             }
         }
     }
@@ -1610,7 +1885,11 @@ mod tests {
     use super::*;
 
     /// The diagnostics of the replay over a crate written in `source` (no std: nothing to import from it).
-    fn replay(source: &str, edition: u16) -> Vec<(String, usize)> {
+    fn replay(source: &str, edition: u16) -> Vec<(String, usize)> { replayed(source, edition).2 }
+
+    /// A crate written in `source` (no std), its imports resolved and replayed: the program, the
+    /// crate's root module and the replay's diagnostics.
+    fn replayed(source: &str, edition: u16) -> (Program, u32, Vec<(String, usize)>) {
         let sess = &std::sync::Arc::new(relax_session::Session::default());
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1625,7 +1904,9 @@ mod tests {
         prog.own_crates = own.clone();
         prog.run_import_sim(&own);
         let diags = prog.sim_diags.take().unwrap();
-        diags.into_iter().map(|d| (match d.kind { SimKind::Error => d.msg, SimKind::Lint(l) => format!("lint {l}: {}", d.msg) }, prog.files[d.file as usize].line_col(d.pos).0)).collect()
+        let diags = diags.into_iter().map(|d| (match d.kind { SimKind::Error => d.msg, SimKind::Lint(l) => format!("lint {l}: {}", d.msg) }, prog.files[d.file as usize].line_col(d.pos).0)).collect();
+        let root = prog.crates[k as usize].root_mod;
+        (prog, root, diags)
     }
 
     fn has(v: &[(String, usize)], text: &str, line: usize) -> bool { v.iter().any(|(m, l)| m.contains(text) && *l == line) }
@@ -1642,10 +1923,126 @@ mod tests {
     #[test]
     fn a_glob_shadowed_by_a_pending_import_cannot_be_determined() {
         // rustc tests/ui/imports/shadow-glob-module-resolution-1.rs
-        let d = replay("mod a { pub mod b { pub mod c {} } }\nuse a::*;\nuse b::c;\nuse c as b;\nfn main() {}\n", 2015);
+        let (p, _, d) = replayed("mod a { pub mod b { pub mod c {} } }\nuse a::*;\nuse b::c;\nuse c as b;\nfn main() {}\n", 2015);
         assert!(has(&d, "cannot determine resolution for the import", 3), "{d:?}");
         assert!(has(&d, "unresolved import `b::c`", 3), "{d:?}");
         assert!(!d.iter().any(|(_, l)| *l == 4), "{d:?}");
+        // the two single imports wait on each other: the resolver binds them by forcing one, so the
+        // replay's undetermined import is one the resolver marked forced (an internal error otherwise)
+        assert_eq!(p.imports.iter().filter(|i| i.bound & BOUND_SETTLED != 0).count(), 2);
+        assert!(d.iter().all(|(m, _)| !m.contains("internal error")), "{d:?}");
+    }
+
+    #[test]
+    fn a_name_a_single_import_may_still_define_waits_for_it() {
+        // (source, the value bound at the root, the item rustc binds it to); every order of the
+        // imports binds the same item, and none is forced
+        let ab = "mod a { pub mod t { pub fn g() {} } }\nmod b { pub mod t { pub fn g() {} } }\n";
+        let cases = [
+            // a path through a name a glob gives and a single import shadows
+            (format!("{ab}use a::*;\nuse t::g;\nuse b::t;\n"), "g", "b::t::g"),
+            (format!("{ab}use a::*;\nuse b::t;\nuse t::g;\n"), "g", "b::t::g"),
+            (format!("{ab}use t::g;\nuse a::*;\nuse b::t;\n"), "g", "b::t::g"),
+            // the shadowing import in a module a glob reaches
+            (format!("{ab}mod m {{ pub use crate::a::*; pub use crate::b::t; }}\nuse m::*;\nuse t::g;\n"), "g", "b::t::g"),
+            (format!("{ab}mod m {{ pub use crate::b::t; pub use crate::a::*; }}\nuse t::g;\nuse m::*;\n"), "g", "b::t::g"),
+            // the import being resolved does not wait on itself
+            ("mod a { pub mod t { pub fn t() {} } }\nuse a::*;\nuse t::t;\n".to_string(), "t", "a::t::t"),
+            // a renaming import binds its new name
+            ("mod a { pub mod t { pub fn g() {} } }\nmod b { pub mod u { pub fn g() {} } }\nuse a::*;\nuse t::g;\nuse b::u as t;\n".to_string(), "g", "b::u::g"),
+            // a single import of a value leaves the type namespace to the glob
+            ("mod a { pub mod t { pub fn g() {} } }\nmod b { pub fn t() {} }\nuse a::*;\nuse t::g;\nuse b::t;\n".to_string(), "g", "a::t::g"),
+            ("mod a { pub mod t { pub fn g() {} } }\nmod b { pub fn t() {} }\nuse a::*;\nuse b::t;\nuse t::g;\n".to_string(), "g", "a::t::g"),
+            // `extern crate` binds a name like a single import
+            ("mod a { pub mod t { pub fn g() {} } }\npub fn g() {}\nuse a::*;\nuse t::g as h;\nextern crate self as t;\n".to_string(), "h", "g"),
+        ];
+        for (src, name, want) in cases {
+            let src = format!("{src}fn main() {{}}\n");
+            let (p, root, d) = replayed(&src, 2018);
+            let got = p.syms.get(name).and_then(|n| p.mods[root as usize].values.get(&n)).map(|&x| p.def_path(x));
+            assert_eq!(got, Some(format!("rsim_test::{want}")), "{src}");
+            assert!(d.is_empty(), "{src}: {d:?}");
+            assert!(p.imports.iter().all(|i| i.bound & BOUND_SETTLED == 0), "{src}: a forced binding");
+        }
+        // two child modules import the same name from the root, which has it through a glob: neither
+        // private import can define a name another module sees, so neither waits on the other
+        let defs = "mod defs { pub struct Literal; }\n";
+        let kids = ["mod values { use crate::Literal; pub fn v(_: Literal) {} }\n", "mod instance { use crate::Literal; pub fn i(_: Literal) {} }\n"];
+        for src in [format!("{defs}{}{}pub use values::*;\npub use instance::*;\npub use defs::*;\nfn main() {{}}\n", kids[0], kids[1]),
+                    format!("{}{}pub use defs::*;\npub use instance::*;\npub use values::*;\n{defs}fn main() {{}}\n", kids[1], kids[0])] {
+            let (p, _, d) = replayed(&src, 2018);
+            assert!(d.is_empty(), "{src}: {d:?}");
+            assert!(p.imports.iter().all(|i| i.bound & BOUND_SETTLED == 0), "{src}: a forced binding");
+            let lit = p.syms.get("Literal").unwrap();
+            for m in ["values", "instance"] {
+                let m = (0..p.mods.len()).find(|&x| p.def_path(p.mods[x].def) == format!("rsim_test::{m}")).unwrap();
+                assert_eq!(p.mods[m].types.get(&lit).map(|&x| p.def_path(x)).as_deref(), Some("rsim_test::defs::Literal"), "{src}");
+            }
+        }
+        // the other namespace of an import found in one: its lookup goes on through a private glob of the
+        // module (back to the root) to an open import of the same name, which the importing module cannot
+        // see that way
+        let tex = "mod texture { use crate::*; pub enum ReadbackError { NotRendered } }\nmod hal { pub use crate::texture::ReadbackError; }\n";
+        for roots in ["pub use hal::*;\npub use crate::texture::ReadbackError;\n", "pub use crate::texture::ReadbackError;\npub use hal::*;\n"] {
+            let src = format!("{tex}{roots}fn main() {{}}\n");
+            let (p, root, d) = replayed(&src, 2018);
+            assert!(d.is_empty(), "{src}: {d:?}");
+            assert!(p.imports.iter().all(|i| i.bound & BOUND_SETTLED == 0), "{src}: a forced binding");
+            let e = p.syms.get("ReadbackError").unwrap();
+            let hal = (0..p.mods.len()).find(|&x| p.def_path(p.mods[x].def) == "rsim_test::hal").unwrap();
+            for m in [root as usize, hal] {
+                assert_eq!(p.mods[m].types.get(&e).map(|&x| p.def_path(x)).as_deref(), Some("rsim_test::texture::ReadbackError"), "{src}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_macro_name_a_single_import_may_still_define_waits_for_it() {
+        // the macro scopes (macros.rs CrateScope) resolve like the items: every order of the imports
+        // expands the macro of `b`
+        let ab = "mod a { macro_rules! ma { () => { pub fn from_a() {} } } pub(crate) use ma as m; }\nmod b { macro_rules! mb { () => { pub fn from_b() {} } } pub(crate) use mb as m; }\n";
+        let abt = "mod a { pub mod t { macro_rules! mc { () => { pub fn from_a() {} } } pub(crate) use mc; } }\nmod b { pub mod t { macro_rules! mc { () => { pub fn from_b() {} } } pub(crate) use mc; } }\n";
+        let cases = [
+            // a macro name a glob gives and a single import shadows
+            (ab, "use a::*;\nuse self::m as n;\nuse b::m;\nn!();\n"),
+            (ab, "use a::*;\nuse b::m;\nuse self::m as n;\nn!();\n"),
+            (ab, "use self::m as n;\nuse a::*;\nuse b::m;\nn!();\n"),
+            (ab, "use a::*;\nuse b::m;\nm!();\n"),
+            (ab, "use b::m;\nuse a::*;\nm!();\n"),
+            // a path to a macro through a module name a glob gives and a single import shadows
+            (abt, "use a::*;\nuse t::mc as n;\nuse b::t;\nn!();\n"),
+            (abt, "use a::*;\nuse b::t;\nuse t::mc as n;\nn!();\n"),
+        ];
+        for (items, uses) in cases {
+            let src = format!("{items}{uses}fn main() {{}}\n");
+            let (p, root, d) = replayed(&src, 2018);
+            let has = |n: &str| p.syms.get(n).is_some_and(|s| p.mods[root as usize].values.contains_key(&s));
+            assert!(has("from_b") && !has("from_a"), "{src}: from_a {} from_b {}", has("from_a"), has("from_b"));
+            assert!(d.is_empty() && p.errors.is_empty(), "{src}: {d:?} {:?}", p.errors);
+        }
+    }
+
+    #[test]
+    fn a_glob_trait_binding_is_shadowed_by_its_binding_name_only() {
+        // a module whose glob brings traits and which has items named like them: an `as _` import
+        // (no name) and `use T as Ext` (shadowed by an `Ext`, not by a `T`) keep their traits'
+        // methods in scope; a binding of the trait's own name is shadowed
+        let src = concat!(
+            "mod traits { pub trait Stream { fn timeout(&self) {} } pub trait Renamed { fn renamed(&self) {} } pub trait Named { fn named(&self) {} } }\n",
+            "mod prelude { pub use crate::traits::Stream as _; pub use crate::traits::Renamed as Ext; pub use crate::traits::Named; }\n",
+            "mod imp { use crate::prelude::*; pub struct Stream; pub struct Renamed; pub struct Named; }\n",
+            "mod ext { use crate::prelude::*; pub struct Ext; }\nfn main() {}\n",
+        );
+        let (p, _, d) = replayed(src, 2018);
+        assert!(d.is_empty(), "{d:?}");
+        for (m, want) in [("imp", ["traits::Stream", "traits::Renamed"]), ("ext", ["traits::Stream", "traits::Named"])] {
+            let m = (0..p.mods.len()).find(|&x| p.def_path(p.mods[x].def) == format!("rsim_test::{m}")).unwrap();
+            let mut got: Vec<String> = p.traits_in_scope(m as u32).iter().map(|&t| p.def_path(t)).collect();
+            got.sort();
+            let mut want: Vec<String> = want.iter().map(|t| format!("rsim_test::{t}")).collect();
+            want.sort();
+            assert_eq!(got, want, "the traits in scope of {}", p.def_path(p.mods[m].def));
+        }
     }
 
     #[test]
@@ -1710,5 +2107,64 @@ mod tests {
         let k = k.unwrap();
         let expansions: usize = prog.files.iter().zip(&prog.file_crate).filter(|(_, &c)| c == k).map(|(f, _)| f.exp_map.len()).sum();
         assert_eq!(expansions, 9, "expansions of a chain of 9 calls");
+    }
+}
+
+/// What `macro_call_ambiguities` looks up in each file with calls, gathered in one pass over the
+/// definitions, block modules and modules (in their order: the first of equally small spans wins,
+/// as a search finds it).
+struct CallScopes {
+    /// by file: the innermost-first candidates of a call's scope, (lo, hi, module)
+    blocks: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>,
+    items: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>>,
+    /// the file's own module (no lexical parent)
+    file_mod: crate::fxhash::HashMap<u32, u32>,
+    /// the `macro_rules!` definitions by (file, name)
+    rules: crate::fxhash::HashMap<(u32, Sym), Vec<DefId>>,
+}
+
+impl CallScopes {
+    fn new(p: &Program, files: crate::fxhash::HashSet<u32>) -> Self {
+        let mut blocks: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
+        for (&(f, b), &m) in p.block_mods.iter() {
+            if !files.contains(&f) { continue; }
+            let bl = p.files[f as usize].ast.block(BlockId(b));
+            blocks.entry(f).or_default().push((bl.lo, bl.hi, m));
+        }
+        let mut items: crate::fxhash::HashMap<u32, Vec<(u32, u32, u32)>> = Default::default();
+        let mut rules: crate::fxhash::HashMap<(u32, Sym), Vec<DefId>> = Default::default();
+        for (i, d) in p.defs.iter().enumerate() {
+            if !files.contains(&d.file) { continue; }
+            if d.kind == DefKind::MacroRules { rules.entry((d.file, d.name)).or_default().push(DefId(i as u32)); }
+            // (an inline `mod` item: the calls written in it resolve in that module)
+            if d.item.0 != u32::MAX && !matches!(d.kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Prim(_) | DefKind::Field | DefKind::Variant | DefKind::MacroRules) {
+                let it = p.files[d.file as usize].ast.item(d.item);
+                items.entry(d.file).or_default().push((it.lo, it.hi, if d.kind == DefKind::Mod { d.sub } else { d.scope }));
+            }
+        }
+        let mut file_mod: crate::fxhash::HashMap<u32, u32> = Default::default();
+        for (i, md) in p.mods.iter().enumerate() {
+            if !files.contains(&md.file) || md.lexical_parent.is_some() || p.def(md.def).kind != DefKind::Mod || p.def(md.def).sub as usize != i { continue; }
+            file_mod.entry(md.file).or_insert(i as u32);
+        }
+        CallScopes { blocks, items, file_mod, rules }
+    }
+
+    /// The module whose scope a call at `pos` of `file` resolves in: the innermost body block that is a
+    /// module, else the scope of the innermost item holding it.
+    fn call_module(&self, p: &Program, file: u32, pos: u32) -> Option<u32> {
+        p.files.get(file as usize)?;
+        let inner = |v: Option<&Vec<(u32, u32, u32)>>| v.into_iter().flatten().filter(|(lo, hi, _)| *lo <= pos && pos < *hi).min_by_key(|(lo, hi, _)| hi - lo).map(|x| x.2);
+        inner(self.blocks.get(&file)).or_else(|| inner(self.items.get(&file))).or_else(|| self.file_mod.get(&file).copied())
+    }
+
+    /// A `macro_rules! name` written before `pos` of `file` in the call's module or an enclosing one
+    /// (rustc's MacroRules scopes, searched first: a result there is never ambiguous with a module's).
+    fn textual_macro_at(&self, p: &Program, module: u32, file: u32, pos: u32, name: Sym) -> bool {
+        let mut chain = Vec::new();
+        let mut m = Some(module);
+        while let Some(x) = m { chain.push(p.mods[x as usize].def); m = p.mods[x as usize].lexical_parent.or(p.mods[x as usize].parent_mod); }
+        let Some(f) = p.files.get(file as usize) else { return false };
+        self.rules.get(&(file, name)).into_iter().flatten().any(|&d| { let d = p.def(d); chain.contains(&d.parent) && f.ast.item(d.item).lo < pos })
     }
 }

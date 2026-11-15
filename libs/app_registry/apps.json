@@ -60,6 +60,11 @@
     "policy": "or_focus", "menu_visible": true, "wm_launchable": true, "features": [], "mobile": true
   },
   {
+    "id": "party", "label": "Party", "package": "makepad-app-party",
+    "dir": "apps/party", "bin": "makepad-app-party", "manifest": null, "args": [],
+    "policy": "or_focus", "menu_visible": true, "wm_launchable": true, "features": [], "mobile": false
+  },
+  {
     "id": "clock", "label": "Clock", "package": "makepad-app-clock",
     "dir": "apps/clock", "bin": "makepad-app-clock", "manifest": null, "args": [],
     "policy": "or_focus", "menu_visible": true, "wm_launchable": true, "features": ["standalone"], "mobile": true
@@ -157,6 +162,11 @@
   {
     "id": "xrbridge", "label": "XR Bridge", "package": "makepad-app-xr-bridge",
     "dir": "apps/xr_bridge", "bin": "makepad-app-xr-bridge", "manifest": null, "args": [],
+    "policy": "or_focus", "menu_visible": true, "wm_launchable": true, "features": [], "mobile": false
+  },
+  {
+    "id": "arch-installer", "label": "Install Makepad", "package": "makepad-arch-installer",
+    "dir": "tools/arch_installer", "bin": "makepad-arch-installer", "manifest": null, "args": [],
     "policy": "or_focus", "menu_visible": true, "wm_launchable": true, "features": [], "mobile": false
   },
   {

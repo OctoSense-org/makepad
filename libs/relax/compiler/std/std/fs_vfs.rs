@@ -1,7 +1,7 @@
 //! Relax's VFS (both OS halves of std::fs, env and process): a program run from a git
 //! repository (`makepad run <git url>`) reads its files from the repository's store; the loader
 //! answers paths under its virtual folders (compiler vfs.rs). Every other path is the disk, as
-//! before. Virtual files are read-only, unless the run has an edits folder (MAKEPAD_RUN_EDITS, compiler
+//! before. Virtual files are read-only, unless the run has an edits folder (RELAX_EDITS, compiler
 //! vfs.rs): then a write into a virtual folder goes to that folder on disk (`edit_target`).
 
 use alloc::borrow::Cow;
@@ -12,12 +12,22 @@ use crate::io;
 use crate::path::{Path, PathBuf};
 
 extern "C" {
-    fn relax_vfs_stat(p: *const u8, n: usize, size: *mut u64) -> i32;
+    fn relax_vfs_stat(p: *const u8, n: usize, size: *mut u64, mtime_ns: *mut u64) -> i32;
     fn relax_vfs_read(p: *const u8, n: usize, out: *mut *const u8, out_len: *mut usize) -> u64;
     fn relax_vfs_list(p: *const u8, n: usize, out: *mut *const u8, out_len: *mut usize) -> u64;
     fn relax_vfs_mounts(out: *mut *const u8, out_len: *mut usize) -> u64;
     fn relax_vfs_release(id: u64);
     fn relax_vfs_edit(p: *const u8, n: usize, mode: u32, out: *mut *const u8, out_len: *mut usize) -> u64;
+    fn relax_vfs_note(p: *const u8, n: usize, kind: u32);
+}
+
+/// What the program looked at, opened or not: on the disk the path as given (relative to its
+/// current folder), in a virtual folder its absolute path. `b'f'` a file it opened for reading,
+/// `b'd'` a folder it listed, `b'p'` a path it probed (metadata, exists). A live session keeps it (compiler reload.rs `relax_vfs_note`): a data file a
+/// test reads is part of its verdict wherever it lies.
+pub(crate) fn note(path: &Path, kind: u8) {
+    let b = key(path);
+    unsafe { relax_vfs_note(b.as_ptr(), b.len(), kind as u32) };
 }
 
 /// What a write into a virtual path does (relax_vfs_edit's mode).
@@ -53,18 +63,61 @@ pub(crate) fn edit_target(path: &Path, how: Edit) -> Option<io::Result<PathBuf>>
     })
 }
 
+/// A virtual file's stat: its length, and when it last changed in ns since the Unix epoch (an
+/// edited file's disk time; a store file's, derived from its blob, moves when the blob does).
+#[derive(Clone, Copy)]
+pub(crate) struct Stat {
+    pub len: u64,
+    pub mtime_ns: u64,
+}
+
 pub(crate) enum Kind {
-    File(u64),
+    File(Stat),
     Dir,
     Missing,
 }
 
-/// The program's virtual current folder: the workspace of a git run (MAKEPAD_RUN_WORKSPACE, when
-/// it is a virtual folder).
+/// The current folder the program changed to (set_current_dir): Some(Some(a virtual folder)), or
+/// Some(None) for a real one (the OS's). None: the one it started in.
+static CHOSEN: crate::sync::Mutex<Option<Option<PathBuf>>> = crate::sync::Mutex::new(None);
+
+/// The program's virtual current folder: the one it changed to, else the workspace of a git run
+/// (the host's RELAX_WORKSPACE, when it is a virtual folder).
 pub(crate) fn cwd() -> Option<PathBuf> {
-    let w = crate::env::var_os("MAKEPAD_RUN_WORKSPACE")?;
+    if let Some(c) = chosen() {
+        return c;
+    }
+    let w = crate::env::host_var_os("RELAX_WORKSPACE")?;
     let p = PathBuf::from(w);
     matches!(kind_abs(&p), Some(Kind::Dir)).then_some(p)
+}
+
+/// The folder set_current_dir changed to, if the program changed it: Some(None) for a real one.
+pub(crate) fn chosen() -> Option<Option<PathBuf>> {
+    CHOSEN.lock().unwrap().clone()
+}
+
+/// set_current_dir: a virtual folder becomes the program's current folder (Ok: the result). A
+/// real one is Err(the folder): the caller changes the OS's folder to it, then calls `chose_real`.
+pub(crate) fn set_cwd(path: &Path) -> Result<io::Result<()>, PathBuf> {
+    let Some((abs, k)) = kind(path) else {
+        // (a relative path is the virtual folder's while the program is in one)
+        return Err(absolute(path).unwrap_or_else(|| path.to_path_buf()));
+    };
+    Ok(match k {
+        Kind::Dir => {
+            let abs = abs.into_owned();
+            *CHOSEN.lock().unwrap() = Some(Some(abs));
+            Ok(())
+        }
+        Kind::File(_) => Err(io::Error::from(io::ErrorKind::NotADirectory)),
+        Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
+    })
+}
+
+/// The program changed to a real folder: it is in no virtual one any more.
+pub(crate) fn chose_real() {
+    *CHOSEN.lock().unwrap() = Some(None);
 }
 
 /// `path` made absolute against the virtual current folder (a relative path of a git run).
@@ -88,9 +141,9 @@ fn key(path: &Path) -> &[u8] {
 
 fn kind_abs(path: &Path) -> Option<Kind> {
     let b = key(path);
-    let mut size = 0u64;
-    match unsafe { relax_vfs_stat(b.as_ptr(), b.len(), &mut size) } {
-        1 => Some(Kind::File(size)),
+    let (mut len, mut mtime_ns) = (0u64, 0u64);
+    match unsafe { relax_vfs_stat(b.as_ptr(), b.len(), &mut len, &mut mtime_ns) } {
+        1 => Some(Kind::File(Stat { len, mtime_ns })),
         2 => Some(Kind::Dir),
         -1 => Some(Kind::Missing),
         _ => None,
@@ -140,5 +193,5 @@ pub(crate) fn mounts() -> String {
 }
 
 pub(crate) fn read_only() -> io::Error {
-    io::const_error!(io::ErrorKind::PermissionDenied, "a file of a git repository run (makepad run's VFS) is read-only")
+    io::const_error!(io::ErrorKind::PermissionDenied, "a file of a git repository run (Relax's VFS) is read-only")
 }

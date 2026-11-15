@@ -64,7 +64,7 @@ pub fn relayout_order(f: &mut Func) -> Vec<u32> {
     }
     // loop blocks: an equality of two values decides a search there (`find`, `position`, a key
     // compare per element): the hit is the rare way out of the scan
-    // (MAKEPAD_RUN_OPT=-searchlayout: off, A/B)
+    // (RELAX_OPT=-searchlayout: off, A/B)
     let eq_test = |b: usize| match f.blocks[b].term {
         Term::Branch(c, ..) => f.blocks[b].insts.iter().rev().find(|i| {
             let mut d = false;
@@ -232,6 +232,29 @@ impl std::ops::Index<usize> for DomKids {
     #[inline]
     fn index(&self, b: usize) -> &[u32] {
         &self.child[self.off[b] as usize..self.off[b + 1] as usize]
+    }
+}
+
+/// Dominance over f's blocks (pre/post numbers of the dominator tree).
+pub struct Dom {
+    pre: Vec<u32>,
+    post: Vec<u32>,
+}
+
+impl Dom {
+    pub fn new(f: &Func) -> Dom {
+        let idom = idoms(f);
+        let (pre, post, _) = dom_numbers(&idom);
+        Dom { pre, post }
+    }
+    /// instruction (a, i) runs before (b, j) on every path from the entry to (b, j)
+    /// (j == usize::MAX: b's terminator)
+    pub fn before(&self, a: (u32, usize), b: (u32, usize)) -> bool {
+        if a.0 == b.0 {
+            return a.1 < b.1;
+        }
+        let (x, y) = (a.0 as usize, b.0 as usize);
+        self.pre[x] <= self.pre[y] && self.post[y] <= self.post[x]
     }
 }
 

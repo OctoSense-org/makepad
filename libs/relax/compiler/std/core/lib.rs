@@ -4,8 +4,8 @@
 //! types (Box, Vec, String, Rc, Arc, collections); the `alloc` and `std` crates re-export it at
 //! their real paths (coord.md S1).
 //!
-//! Files shared with the rustc shim (std/check) gate Relax-only items with
-//! `#[cfg(not(relax_check))]`.
+//! Language items, primitive implementations and runtime hooks are defined directly
+//! for Relax.
 
 // rustc library/{core,alloc}/src/lib.rs: unsized FnOnce receivers need this
 // semantic feature even though Relax does not enforce nightly feature gates.
@@ -91,7 +91,7 @@ pub mod vec;
 
 /// core::alloc / alloc::alloc
 pub mod alloc {
-    pub use crate::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, GlobalAlloc, Layout, LayoutErr, LayoutError, System};
+    pub use crate::heap::{alloc, alloc_zeroed, dealloc, handle_alloc_error, realloc, AllocError, Allocator, AllocatorNightly, GlobalAlloc, Layout, LayoutErr, LayoutError, StaticAllocator, System};
 }
 
 pub mod sync {
@@ -104,11 +104,14 @@ pub mod sync {
 // ---- std-os: `pub mod time;` (core/time.rs) and `pub mod ffi;` (core/ffi/mod.rs) go here
 pub mod time;
 pub mod ffi;
+pub mod net;
 
 pub mod f64 {
     pub mod consts {
         pub const PI: f64 = 3.14159265358979323846264338327950288_f64;
         pub const TAU: f64 = 6.28318530717958647692528676655900577_f64;
+        pub const GOLDEN_RATIO: f64 = 1.618033988749894848204586834365638118_f64;
+        pub const EULER_GAMMA: f64 = 0.577215664901532860606512090082402431_f64;
         pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144_f64;
         pub const FRAC_PI_3: f64 = 1.04719755119659774615421446109316763_f64;
         pub const FRAC_PI_4: f64 = 0.785398163397448309615660845819875721_f64;
@@ -147,6 +150,8 @@ pub mod f32 {
     pub mod consts {
         pub const PI: f32 = 3.14159265358979323846264338327950288_f32;
         pub const TAU: f32 = 6.28318530717958647692528676655900577_f32;
+        pub const GOLDEN_RATIO: f32 = 1.618033988749894848204586834365638118_f32;
+        pub const EULER_GAMMA: f32 = 0.577215664901532860606512090082402431_f32;
         pub const FRAC_PI_2: f32 = 1.57079632679489661923132169163975144_f32;
         pub const FRAC_PI_3: f32 = 1.04719755119659774615421446109316763_f32;
         pub const FRAC_PI_4: f32 = 0.785398163397448309615660845819875721_f32;

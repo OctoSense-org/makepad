@@ -5,11 +5,11 @@ authors = ["Makepad <info@makepad.nl>"]
 edition = "2021"
 description = "Makepad platform layer"
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/makepad/makepad/"
 repository = "https://github.com/makepad/makepad/"
 metadata.makepad-auto-version = "ue5pTU0e_KaMiNqLQpo2CaD-WeQ="
 
-# Measure wake-up latency on the process main thread, without a UI backend.
+# The app pool leaves the process main thread its cores under a full Background load (counted;
+# the main thread's wake times are printed, not gated). No UI backend.
 [[test]]
 name = "pool_latency"
 harness = false
@@ -27,7 +27,7 @@ harness = false
 [dependencies]
 makepad-cpu-budget = { workspace = true }
 makepad-a11y = { path = "../libs/a11y", version = "0.1.0" }
-makepad-relax = { workspace = true }
+relax-attr = { workspace = true }
 makepad-alloc-epoch = { path = "../libs/alloc_epoch", version = "1.0.0" }
 makepad-stack = { path = "../libs/stack", version = "1.0.0" }
 makepad-studio-protocol = { path = "./studio", version = "0.1.0" }
@@ -44,6 +44,10 @@ makepad-zune-png = { path = "../libs/zune/zune-png", version = "0.5.2" }
 # Camera frames that arrive as MJPEG.
 makepad-zune-jpeg = { path = "../libs/zune/zune-jpeg", version = "0.5.15" }
 makepad-tsdf = { path = "../libs/tsdf", version = "0.1.0" }
+# The eases behind `event::Ease`, shared with the Animator's `Ease`.
+makepad-tween = { path = "../libs/tween", version = "0.1.0" }
+# The web audio entry's output slot (the worklet thread never locks).
+makepad-lock-free = { path = "../libs/lock_free", version = "0.1.0" }
 smallvec = { version = "1.15", path = "../libs/smallvec" }
 bitflags = { version = "2.10", path = "../libs/bitflags" }
 # The collect-web run mode writes its manifest in this format; a web build
@@ -55,6 +59,8 @@ foldhash = { version = "0.2", path = "../libs/vulkan/foldhash" }
 # these targets.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 makepad-remote = { path = "../libs/remote", version = "0.1.0" }
+# how the process ends (the same end under the JIT and natively)
+makepad-core-util = { path = "../libs/core_util", version = "0.1.0" }
 makepad-prof-stream = { path = "../libs/prof_stream", version = "1.0.0" }
 # Every native target uses the HAL; web retains its browser backend.
 makepad-hal = { path = "./hal", version = "1.0.0" }
@@ -64,6 +70,8 @@ makepad-wasm-bridge = { path = "../libs/wasm_bridge", version = "1.0.0", optiona
 
 [target.wasm32-unknown-unknown.dependencies]
 makepad-wasm-bridge = { path = "../libs/wasm_bridge", version = "1.0.0" }
+# the HAL's window_controls.rs, compiled in directly here (lib.rs), derives its wire messages
+makepad-micro-serde = { path = "../libs/micro_serde", version = "1.0.0" }
 
 [target.aarch64-apple-darwin.dependencies]
 makepad-objc-sys = { path = "../libs/objc-sys", version = "1.0.0" }
@@ -107,3 +115,9 @@ version = "0.1.0"
 # The web backend's message types built for this machine (src/web_protocol.rs): the web trace
 # host (apps/commercial/tools/wasm-export/trace) plays the page's side of them.
 web-protocol = ["dep:makepad-wasm-bridge"]
+
+[package.metadata.relax]
+# its build script stays: relax runs it as a program, the makepad host answers it natively
+build-script = "keep"
+# a program that links it presents frames (relax_frame_done): live edits wait for a present
+presents = true

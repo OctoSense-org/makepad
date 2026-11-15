@@ -62,13 +62,20 @@ Unsupported:
 
 The runtime is synchronous and serial-first:
 
-- action timeout: `10s`
+- action budget: a wait fails once the app's main thread has run `10s` of CPU, or the app has
+  sat idle (nothing running, nothing pending) for `10s`, without what it waits for: a loaded
+  box or a cold JIT spends neither. What the app spends answering the test's asks (snapshots,
+  log reads, tool calls, grabs) is not its own work: its share is what it runs outside a wait's
+  closure, over the time outside it, so a wait that asks every poll still sees an app with
+  nothing to do as idle, and a closure that sleeps hides none of the app's work
 - poll interval: `50ms`
 - artifacts: `<manifest_dir>/target/makepad_test/<package>/<test>/` (`$MAKEPAD_TEST_ARTIFACTS/<package>/<test>/` when set; devhub sets it per lease)
 
 The runner serializes app sessions within each test executable. Use
 `--test-threads=1` for predictable suite order. `MAKEPAD_TEST_PARALLEL=1` opts out
-of the runner lock when a suite is designed for concurrent owned instances.
+of the runner lock when a suite is designed for concurrent owned instances; a suite
+whose waits count the app's own time (a sim's clock, its frames) sets
+`TestConfig::concurrent` and runs its apps side by side, one thread each.
 
 ## Visible Mode and Configuration
 
@@ -171,6 +178,13 @@ Inspection helpers:
 - `widget_dump()`
 - `screenshot()`
 - `wait_for_log_contains(...)`
+- `wait_until(|| ...)`: waits until the closure answers `None`; while it answers
+  `Some(what)`, what is still missing, the wait goes on under the action budget and
+  fails with that `what`. For what a locator cannot say: several nodes together, the
+  app's log, files the app writes.
+- `wait_until_within(budget, || ...)`: the same, for what takes the app long (a
+  slice, a restart): `budget` of the app's main thread's CPU instead of the action
+  budget. Idle still fails it after the action timeout.
 
 Lower-level escape hatch:
 

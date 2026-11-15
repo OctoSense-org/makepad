@@ -18,7 +18,7 @@ use crate::typeck::{Body, Res, PAT_KEY};
 use crate::types::{TyId, TyKind, TypeFlags};
 use constructor::{ConstructorSet, Ctor, IntRange, MaybeInfiniteInt, RangeEnd, Slice, SliceKind, VariantVisibility};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use crate::fxhash::HashMap;
 use usefulness::{MatchArm, PlaceValidity, Usefulness, WitnessPat};
 
 /// A deconstructed pattern's index in `Cx::pats`.
@@ -288,8 +288,8 @@ impl<'a> Cx<'a> {
             Pat::Wild | Pat::Rest => None,
             Pat::Ident { name, .. } => Some(name.lo),
             Pat::Lit(e) => Some(ast.expr(*e).lo),
-            Pat::Range(a, b, _) => a.or(*b).map(|e| ast.expr(e).lo),
-            Pat::Path(path) | Pat::TupleStruct(path, _) | Pat::Struct(path, _, _) => Some(path.lo),
+            Pat::Range(a, b, _) => a.get().or(b.get()).map(|e| ast.expr(e).lo),
+            Pat::Path(path) | Pat::TupleStruct(path, _) | Pat::Struct(_, path, _) => Some(path.lo),
             Pat::Tuple(v) | Pat::Slice(v) | Pat::Or(v) => ast.list(*v).iter().find_map(|x| self.pat_pos(*x)),
             Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.pat_pos(*x),
             Pat::Mac(m) => Some(ast.row(*m).path.lo),
@@ -403,14 +403,14 @@ impl<'a> Cx<'a> {
                         return self.lower_path_res(p, d, t, pos);
                     }
                 }
-                match sub {
+                match sub.get() {
                     Some(s) => self.lower(s),
                     None => Some(self.push(Ctor::Wildcard, Vec::new(), 0, t, pos)),
                 }
             }
             Pat::Paren(x) => self.lower(x),
             Pat::Lit(e) => self.lower_lit(e, t, pos),
-            Pat::Range(a, b, incl) => self.lower_range(a, b, incl, t, pos),
+            Pat::Range(a, b, incl) => self.lower_range(a.get(), b.get(), incl, t, pos),
             Pat::Path(_) => match self.body.pat_res.get(&p.0).copied() {
                 Some(Res::Def(d)) => self.lower_path_res(p, d, t, pos),
                 _ => None,
@@ -421,7 +421,7 @@ impl<'a> Cx<'a> {
                 let fields = self.seq_fields(ast.list(subs), arity)?;
                 Some(self.push(ctor, fields, arity, t, pos))
             }
-            Pat::Struct(_, fps, _) => {
+            Pat::Struct(_, _, fps) => {
                 let Some(Res::Def(d)) = self.body.pat_res.get(&p.0).copied() else { return None };
                 let (ctor, arity) = self.adt_ctor(t, d)?;
                 let TyKind::Adt(ad, _, _) = self.kind(t) else { return None };
@@ -449,7 +449,7 @@ impl<'a> Cx<'a> {
                 let subs = ast.list(subs);
                 let is_rest = |x: PatId| match ast.pat(x) {
                     Pat::Rest => true,
-                    Pat::Ident { sub: Some(s), .. } => matches!(ast.pat(*s), Pat::Rest),
+                    Pat::Ident { sub, .. } if let Some(s) = &sub.get() => matches!(ast.pat(*s), Pat::Rest),
                     _ => false,
                 };
                 let rest = subs.iter().position(|x| is_rest(*x));
@@ -1244,7 +1244,7 @@ enum LetSource {
 pub fn body_cx<'a>(prog: &'a Program, tcx: &'a Tcx, body: &'a Body) -> Cx<'a> {
     let d = prog.def(body.def);
     let env = TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::non_body_analysis() };
-    Cx { prog, tcx, body, env, module: d.scope, krate: d.krate, pats: Vec::new(), next_opaque: 0, inhabited: RefCell::new(HashMap::new()), const_errors: Vec::new() }
+    Cx { prog, tcx, body, env, module: d.scope, krate: d.krate, pats: Vec::new(), next_opaque: 0, inhabited: RefCell::new(HashMap::default()), const_errors: Vec::new() }
 }
 
 impl Cx<'_> {
@@ -1289,9 +1289,9 @@ impl<'a> Checker<'a> {
         let n = body.expr_ty.len();
         let typed = |i: usize| body.expr_typed.get(i);
         // the `let` expressions of `if` / `while` conditions
-        let mut let_source: HashMap<u32, LetSource> = HashMap::new();
+        let mut let_source: HashMap<u32, LetSource> = HashMap::default();
         // the attributes of the arm an `if let` guard belongs to
-        let mut guard_attrs: HashMap<u32, Vec<Attr>> = HashMap::new();
+        let mut guard_attrs: HashMap<u32, Vec<Attr>> = HashMap::default();
         let mut blocks: Vec<BlockId> = body.body.into_iter().collect();
         for i in 0..n {
             if !typed(i) { continue; }
@@ -1308,11 +1308,11 @@ impl<'a> Checker<'a> {
                     let c = crate::lit::strip_paren(ast, w.cond);
                     if let ExprKind::Let(..) = ast.expr(c).kind { let_source.insert(c.0, LetSource::WhileLet); }
                 }
-                ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::Async(_, b) | ExprKind::ConstBlock(b) | ExprKind::Loop(b, _) => blocks.push(b),
+                ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::TryBlock(b) | ExprKind::Async(_, b) | ExprKind::ConstBlock(b) | ExprKind::Loop(b, _) => blocks.push(b),
                 ExprKind::For(row) => blocks.push(ast.row(row).body),
                 ExprKind::Match(_, arms) => {
                     for arm in ast.list(arms) {
-                        let Some(g) = arm.guard else { continue };
+                        let Some(g) = arm.guard.get() else { continue };
                         let g = crate::lit::strip_paren(ast, g);
                         if let ExprKind::Let(..) = ast.expr(g).kind {
                             let_source.insert(g.0, LetSource::IfLetGuard);
@@ -1337,10 +1337,10 @@ impl<'a> Checker<'a> {
             for s in ast.stmts(b) {
                 let Stmt::Let(row) = s else { continue };
                 let l = *ast.row(*row);
-                match l.else_ {
-                    None => self.check_binding_is_irrefutable(l.pat, "local binding", l.init, l.init.map(|e| ast.expr(e).lo)),
+                match l.else_.get() {
+                    None => self.check_binding_is_irrefutable(l.pat, "local binding", l.init.get(), l.init.map(|e| ast.expr(e).lo)),
                     Some(_) => {
-                        if let Some(true) = self.is_let_irrefutable(l.pat, l.init) {
+                        if let Some(true) = self.is_let_irrefutable(l.pat, l.init.get()) {
                             let pos = self.cx.pat_pos(l.pat).or(l.init.map(|e| ast.expr(e).lo));
                             if let Some(pos) = pos {
                                 self.lint(&crate::lint::IRREFUTABLE_LET_PATTERNS, pos, "unreachable `else` clause -- this pattern always matches, so the else clause is unreachable");
@@ -1389,7 +1389,7 @@ impl<'a> Checker<'a> {
                     if mc.args == NO_MAC_ARGS { continue; }
                     let args = ast.mac_arg(mc.args);
                     // `matches!(e, pat if guard)`: `match e { pat if guard => true, _ => false }`
-                    if let (Some(pat), Some(&scrut)) = (args.pat, ast.list(args.exprs).first()) {
+                    if let (Some(pat), Some(&scrut)) = (args.pat.get(), ast.list(args.exprs).first()) {
                         self.check_match(scrut, &[(pat, args.guard.is_some(), ex.lo, List::default())], true, &[]);
                     }
                 }
@@ -1627,9 +1627,10 @@ impl<'a> Checker<'a> {
     fn pat_children(&self, p: PatId) -> Vec<PatId> {
         let ast = self.ast();
         match ast.pat(p) {
-            Pat::Ident { sub: Some(s), .. } | Pat::Ref(_, s) | Pat::Paren(s) | Pat::Box(s) => vec![*s],
+            Pat::Ident { sub, .. } if let Some(s) = &sub.get() => vec![*s],
+            Pat::Ref(_, s) | Pat::Paren(s) | Pat::Box(s) => vec![*s],
             Pat::TupleStruct(_, l) | Pat::Tuple(l) | Pat::Slice(l) | Pat::Or(l) => ast.list(*l).to_vec(),
-            Pat::Struct(_, fields, _) => ast.list(*fields).iter().map(|f| f.pat).collect(),
+            Pat::Struct(_, _, fields) => ast.list(*fields).iter().map(|f| f.pat).collect(),
             _ => Vec::new(),
         }
     }
@@ -1654,7 +1655,9 @@ impl<'a> Checker<'a> {
     /// check_match.rs lower_pattern's walk: check_borrow_conflicts_in_at_patterns at every
     /// subpattern of `p`.
     fn check_at_patterns(&mut self, p: PatId) {
-        if let Pat::Ident { sub: Some(sub), .. } = *self.ast().pat(p) { self.check_borrow_conflicts_in_at_pattern(p, sub); }
+        if let Pat::Ident { sub, .. } = *self.ast().pat(p) {
+            if let Some(sub) = sub.get() { self.check_borrow_conflicts_in_at_pattern(p, sub); }
+        }
         for c in self.pat_children(p) { self.check_at_patterns(c); }
     }
 

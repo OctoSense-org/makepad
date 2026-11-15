@@ -19,10 +19,13 @@ pub struct HealthJson {
     pub lan_listening: Option<bool>,
     /// `server` or `user`, independent of the user networking toggle.
     pub role: Option<String>,
-    /// GPU name when cheaply obtainable (nvidia-smi), else null.
+    /// GPU name when cheaply obtainable (Metal or nvidia-smi), else null.
     pub gpu: Option<String>,
     pub vram_free_mb: Option<u64>,
     pub vram_total_mb: Option<u64>,
+    /// `true`: the memory figures are a unified device's advisory working set (they guide eviction and sizing,
+    /// never refuse). Absent on older nodes, which reads as not unified.
+    pub vram_unified: Option<bool>,
     /// Maximum VRAM this service can make free after retiring all of its
     /// residents. Missing on older services; schedulers then fall back to
     /// `vram_total_mb` for the permanent card-size compatibility check.
@@ -51,7 +54,7 @@ pub struct HealthJson {
     /// admission is reported separately in `activity`.
     pub capabilities: Option<Vec<String>>,
     /// VRAM admission safety reserve in MB (see the server residency policy);
-    /// a heavy model loads only when fresh free VRAM >= estimate + reserve.
+    /// discrete-memory loads require fresh free VRAM >= estimate + reserve.
     pub vram_reserve_mb: Option<u64>,
     /// The chat model's context window set through `POST /llm/context`
     /// (absent until set), the window of the loaded session (absent when none),
@@ -111,6 +114,14 @@ pub struct ActivityJson {
     /// The node's compute mode as its hosting WM set it (`auto`, `ui-first`,
     /// `ai-first`, `unavailable`). Missing on older services.
     pub mode: Option<String>,
+    /// Who holds the machine quiet now (a timed run, as its lease hub names
+    /// it; `crate::activity::ActivityGate::set_quiet`). Missing when nobody
+    /// does, and on older services.
+    pub quiet: Option<String>,
+    /// In the answer that ended a quiet: how many requests it refused, and
+    /// the first of them by route and caller.
+    pub refused: Option<u64>,
+    pub refused_said: Option<Vec<String>>,
 }
 
 /// What a box advertises about its concurrent decode capacity.
@@ -665,6 +676,10 @@ pub struct GenerateRequestJson {
     /// Conversational reasoning control. Absent preserves the model/node
     /// default; `false` asks Qwen to answer without a generated think phase.
     pub thinking: Option<bool>,
+    /// The Claude model a `claude-cli` chat turn runs (`claude_cli::CLAUDE_MODELS`, e.g.
+    /// `claude-fable-5-2`). The claude-cli backend refuses a turn without one, or with one it
+    /// does not list; other backends ignore it.
+    pub claude_model: Option<String>,
 
     // -- speech domain (kokoro + indextts backends) --
     /// Text to speak. (`prompt` is accepted as a fallback when empty.)
@@ -733,8 +748,9 @@ pub struct GenerateRequestJson {
     pub pixal: Option<PixalOptionsJson>,
 
     // -- splat domain (triposplat backend) --
-    /// Target gaussian count for the splat PLY. Default 262144 (the model's
-    /// maximum); clamped to 32768..=262144 and rounded to a multiple of 32,
+    /// Target gaussian count for the splat PLY. TripoSplat clamps to
+    /// 32768..=262144, Idol to 32768..=1048576; default 262144.
+    /// Rounded to a multiple of 32,
     /// the decoder's gaussians-per-anchor stride. More gaussians = more
     /// detail at linear storage and render cost; the denoiser runs once
     /// regardless, only the decode scales.
@@ -927,6 +943,29 @@ mod stems_artifact_tests {
 // ---------------------------------------------------------------------------
 // GET /job/<id>
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[test]
+    fn unified_memory_health_round_trips_and_older_nodes_read_not_unified() {
+        let old = r#"{"service":"makepad-asset-ai","version":"test","models_loaded":[]}"#;
+        let mut health = HealthJson::deserialize_json(old).unwrap();
+        assert_eq!(health.vram_unified, None);
+        for unified in [false, true] {
+            health.vram_unified = Some(unified);
+            health.vram_free_mb = Some(0);
+            health.vram_total_mb = Some(1);
+            let encoded = health.serialize_json();
+            let decoded = HealthJson::deserialize_json(&encoded).unwrap();
+            assert_eq!(decoded.vram_unified, Some(unified));
+            assert_eq!(decoded.vram_free_mb, Some(0));
+            assert_eq!(decoded.vram_total_mb, Some(1));
+            assert_eq!(decoded.serialize_json(), encoded);
+        }
+    }
+}
 
 pub const JOB_STATE_QUEUED: &str = "queued";
 pub const JOB_STATE_RUNNING: &str = "running";

@@ -110,19 +110,19 @@ impl Program {
     /// again by its resolve in the same order (Relink), with the ids a fresh build gives them.
     pub fn retain_collected_prefix(&mut self, crates: usize) -> Option<usize> {
         let s = *self.collected_starts.get(crates)?;
-        let no = |why: &str| { if crate::preload::trace() { eprintln!("makepad-run collected: prefix of {crates} crates not retained: {why}"); } };
+        let no = |why: &str| { if crate::preload::trace() { eprintln!("relax collected: prefix of {crates} crates not retained: {why}"); } };
         if s.mods > self.mods.len() || self.mods.iter().skip(s.mods).any(|m| (m.krate as usize) < crates) { no("a module of a retained crate after the suffix start"); return None; }
         if self.file_crate.get(s.files..)?.iter().any(|k| (*k as usize) < crates) {
             if crate::preload::trace() {
                 let late: Vec<_> = self.file_crate[s.files..].iter().enumerate().filter(|(_, k)| (**k as usize) < crates).take(5).map(|(i, _)| self.file_paths[s.files + i].clone()).collect();
-                eprintln!("makepad-run collected: late files of retained crates: {late:?}");
+                eprintln!("relax collected: late files of retained crates: {late:?}");
             }
             no("a file of a retained crate after the suffix start"); return None;
         }
         let Some(relink) = self.on_demand_tail(crates, s.defs) else {
             if crate::preload::trace() {
                 let bad: Vec<_> = self.defs.get(s.defs..).unwrap_or_default().iter().filter(|d| (d.krate as usize) < crates).take(5).map(|d| format!("{:?} {}", d.kind, self.syms.str(d.name))).collect();
-                eprintln!("makepad-run collected: tail definitions of retained crates: {bad:?}");
+                eprintln!("relax collected: tail definitions of retained crates: {bad:?}");
             }
             no("on-demand tail"); return None;
         };
@@ -262,7 +262,7 @@ impl Program {
     /// encode under a front read gives way to a waiting writer.
     pub fn collected_writer_with(&self, stop: &dyn Fn() -> bool) -> Option<crate::image::Writer<'_>> {
         if !self.imports_done || !self.errors.is_empty() || !self.pending_macs.is_empty() {
-            if crate::preload::trace() { eprintln!("makepad-run collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); if let Some(e) = self.errors.first() { eprintln!("makepad-run collected: first program error: {e}"); } }
+            if crate::preload::trace() { eprintln!("relax collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); if let Some(e) = self.errors.first() { eprintln!("relax collected: first program error: {e}"); } }
             return None;
         }
         // Certify record relationships once, when publishing. The reader verifies the
@@ -272,7 +272,7 @@ impl Program {
                 || d.scope as usize >= self.mods.len() || d.file as usize >= self.files.len()
                 || (d.parent != NO_DEF && d.parent.0 as usize >= self.defs.len())) { return None; }
         let mut w = Vec::new();
-        5u32.put(&mut w);
+        6u32.put(&mut w);
         let late = self.syms.late.lock().unwrap_or_else(|e| e.into_inner());
         late.1.len().put(&mut w);
         for s in &late.1 { s.to_string().put(&mut w); }
@@ -301,6 +301,8 @@ impl Program {
         for (i, f) in self.files.iter().enumerate() {
             if i % 256 == 255 && stop() { return None; }
             f.source_hash(&self.file_paths[i]).put(&mut w);
+            // the ids of the tables above are this parse's: a restore maps an image of it only
+            f.numbering().put(&mut w);
             f.edition.put(&mut w); f.src_len.put(&mut w); f.token_input.put(&mut w);
             // length-prefixed: a restore keeps it encoded until a body parse needs it
             let lazy = crate::crate_image::encode(&f.lazy);
@@ -316,7 +318,7 @@ impl Program {
         self.macros.write_image(&mut image, 2);
         self.syms.write_image(&mut image, 3);
         let mut id = 6;
-        let tr = std::env::var_os("MAKEPAD_RUN_COLLECTED_TRACE").is_some();
+        let tr = std::env::var_os("RELAX_COLLECTED_TRACE").is_some();
         let mut t = std::time::Instant::now();
         let mut lap = |what: &str| if tr { eprintln!("program-writer: {what} {:.1} ms", t.elapsed().as_secs_f64() * 1e3); t = std::time::Instant::now(); };
         lap("head, files, macros, syms");
@@ -371,11 +373,11 @@ impl Program {
     ) -> Option<Self> {
         let started = std::time::Instant::now();
         let phase = |name: &str| if crate::preload::trace() {
-            eprintln!("makepad-run collected: Program {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
+            eprintln!("relax collected: Program {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
         };
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);
-        if u32::get(&mut r)? != 5 { return None; }
+        if u32::get(&mut r)? != 6 { return None; }
         let mut p = Program::new(session);
         p.syms = Interner::from_image(&image, 3, 3)?;
         for s in Vec::<String>::get(&mut r)? { p.syms.intern_late(&s); }
@@ -396,7 +398,7 @@ impl Program {
             context.restore_fingerprint(selection_hash);
             p.crates.push(CrateInfo {
                 name, root_mod, edition, recursion_limit: 128, deps, cfg: CfgSet { set, session: session.clone() },
-                proc_macro, is_bin: false, harness: false, validate: false, relaxed: OnceLock::new(), features: OnceLock::new(), impl_view: OnceLock::new(), root_path, context,
+                proc_macro, is_bin: false, harness: false, validate: false, rustc_laid: false, relaxed: OnceLock::new(), export_opt_level: OnceLock::new(), features: OnceLock::new(), impl_view: OnceLock::new(), root_path, context,
             });
         }
         macro_rules! get { ($($f:ident),+) => { $(p.$f = Codec::get(&mut r)?;)+ }; }
@@ -422,7 +424,7 @@ impl Program {
         p.files.reserve(n);
         for i in 0..n {
             let mut meta = FileMeta {
-                path: p.file_paths[i].clone(), module: String::new(), hash: Codec::get(&mut r)?,
+                path: p.file_paths[i].clone(), module: String::new(), hash: Codec::get(&mut r)?, numbering: Codec::get(&mut r)?,
                 edition: Codec::get(&mut r)?, src_len: Codec::get(&mut r)?, token_input: Codec::get(&mut r)?,
                 lazy: { let n = usize::get(&mut r)?; crate::parser::FileLazy::mapped(r.take(n)?) }, shared: false,
                 used: crate::macros::MacroUse::from_image(Default::default(), Default::default()),

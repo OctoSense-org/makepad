@@ -10,7 +10,21 @@ autotests = false
 
 # files outside this crate its build reads (makepad-source-slice ships them in a slice or source archive)
 [package.metadata.commercial]
-include = ["../../libs/relax/build_stamp.rs"]
+include = ["../../libs/relax/build_stamp.rs", "../../docs/agents/change-report.md", "../../platform/build_gen.rs", "../../platform/build.rs"]
+
+# `devhub test` runs these tests in the lane's tree, never a JIT overlay: cargo reads the config
+# its build-flag tests check from the checkout it runs in, and an overlay's tree is one only the
+# JIT process reads
+[package.metadata.makepad]
+test-tree = "its build-flag tests run cargo in the checkout, which reads the workspace's .cargo/config.toml"
+# the loader runs natively, on a desktop or a phone: a web page runs no loader (and no provided
+# crate's #[relax_api] table, which the host-shims features below turn on)
+platforms = ["desktop", "mobile"]
+
+# test targets that run under cargo, never the JIT (the tests bucket and `devhub test` route them)
+[package.metadata.makepad.native-tests]
+"test:confined_macros" = "it re-runs its own binary as each case's runner: under makepad test each runner is a JIT of its own, and six at once took 41 GB"
+"test:confined_scripts" = "it re-runs its own binary as each case's runner, as confined_macros does"
 
 [lib]
 name = "makepad_run"
@@ -20,14 +34,31 @@ path = "src/lib.rs"
 name = "makepad"
 path = "src/main.rs"
 
+[[test]]
+name = "modules"
+path = "fixture/modules_harness.rs"
+
+# third-party proc macros under Open and Sandboxed: it re-executes itself as the runner
+[[test]]
+name = "confined_macros"
+path = "fixture/confined_macros.rs"
+harness = false
+
+# third-party build scripts under Open and Sandboxed: it re-executes itself as the runner
+[[test]]
+name = "confined_scripts"
+path = "fixture/confined_scripts.rs"
+harness = false
+
 [[bin]]
 name = "makepad-launcher"
 path = "launcher/main.rs"
 
 [dependencies]
-makepad-relax-api = { workspace = true, features = ["host-shims"] }
+relax-api = { workspace = true, features = ["host-shims"] }
 relax-compiler = { workspace = true }
 relax-runner = { path = "runner" }
+makepad-run-native-macros = { path = "native_macros" }
 relax-session = { workspace = true }
 makepad-remote = { workspace = true }
 # provided crates (Relax binds their C-shaped fns to this binary's code; loader-core.md section 8)
@@ -50,3 +81,6 @@ makepad-filesystem-watcher = { path = "../../libs/filesystem_watcher" }
 # Host keyboard codes and the existing Studio JumpToFile transport; no UI client.
 makepad-studio-protocol = { path = "../../platform/studio" }
 makepad-network = { path = "../../platform/network" }
+# `makepad change-report`: checks a change report exactly as makepad.nl does (docs/agents/change-report.md)
+makepad-change-report = { path = "../../libs/change_report" }
+relax-light-http = { workspace = true }

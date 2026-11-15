@@ -1,5 +1,4 @@
 use makepad_csg_mech::joint::Profile;
-use makepad_csg_mech::sim::{AnchorKind, AnchorSpec, Friction, MechWorld};
 use makepad_csg_mech::weave::*;
 
 fn setup() -> (WeaveProfile, SquareLink, Frame) {
@@ -52,32 +51,6 @@ fn tight_bracelet_is_flagged() {
 }
 
 #[test]
-fn hanging_mail_stays_linked() {
-    let (wp, link, frame) = setup();
-    let w = mail(&wp, link, frame, [-20.0, -20.0], [20.0, 20.0], 0.0, &|_| -1.0);
-    let mut asm = assembly(&w, 1.24e-3, 240.0);
-    let ys: Vec<f64> = w.links.iter().map(|l| frame.to_local(l.center())[1]).collect();
-    let top = ys.iter().cloned().fold(f64::MIN, f64::max);
-    for (i, y) in ys.iter().enumerate() {
-        if *y > top - 1e-6 {
-            asm.anchors.push(AnchorSpec { body: i, pivot: asm.bodies[i].mass.com, kind: AnchorKind::Fixed, friction: Friction::default() });
-        }
-    }
-    let rest: Vec<_> = asm.bodies.iter().map(|b| b.mass.com).collect();
-    let mut mw = MechWorld::new(&asm, makepad_csg_mech::geom::scale(frame.y, -9810.0), None);
-    for _ in 0..480 {
-        mw.step(1.0 / 240.0);
-    }
-    let poses = mw.poses();
-    let posed: Vec<Vec<_>> = w.links.iter().enumerate().map(|(i, l)| l.pts.iter().map(|p| poses[i].apply(rest[i], *p)).collect()).collect();
-    let unlinked = w.pairs.iter().filter(|(a, b)| linking_number(&posed[*a as usize], &posed[*b as usize]) == 0).count();
-    assert_eq!(unlinked, 0);
-    // it hangs: the bottom row fell below where it was printed
-    let low = (0..w.links.len()).map(|i| frame.to_local(poses[i].com)[1] - frame.to_local(rest[i])[1]).fold(0.0, f64::min);
-    assert!(low < -1.0, "moved {low}");
-}
-
-#[test]
 fn beads_of_a_clean_weave_stay_apart() {
     let (wp, link, frame) = setup();
     let w = chain(&wp, link, frame, &[[0.0, 0.0], [40.0, 0.0]], false);
@@ -108,14 +81,14 @@ fn scenes_keep_a_mail_together() {
     let (wp, link, frame) = setup();
     let w = mail(&wp, link, frame, [-20.0, -20.0], [20.0, 20.0], 0.0, &|_| -1.0);
     for scene in [WeaveScene::Drop, WeaveScene::Drape, WeaveScene::Hang] {
-        let r = simulate(&w, 1.24e-3, scene, 2.0, &|| false);
+        let r = simulate(&w, 1.24e-3, scene, 2.0, &|| false).unwrap();
         println!("{r:?}");
         assert_eq!(r.unlinked, 0, "{scene:?}");
         assert!(r.deepest > -0.5, "{scene:?} {}", r.deepest);
         assert!(r.drop > 1.0, "{scene:?} fell {}", r.drop);
     }
     let c = chain(&wp, link, frame, &[[0.0, 0.0], [80.0, 0.0]], false);
-    let r = simulate(&c, 1.24e-3, WeaveScene::Hang, 3.0, &|| false);
+    let r = simulate(&c, 1.24e-3, WeaveScene::Hang, 3.0, &|| false).unwrap();
     assert_eq!(r.unlinked, 0);
 }
 
@@ -140,7 +113,7 @@ fn graded_mail_interlocks_at_every_size() {
     assert!(c.bridge <= wp.bridge_max, "{}", c.bridge);
     assert!((c.min_gap_z.0 - wp.c_z).abs() < 1e-6, "{:?}", c.min_gap_z);
     assert!(c.min_gap_xy.0 >= wp.c_xy - 1e-6, "{:?}", c.min_gap_xy);
-    let r = simulate(&w, 1.24e-3, WeaveScene::Drop, 1.5, &|| false);
+    let r = simulate(&w, 1.24e-3, WeaveScene::Drop, 1.5, &|| false).unwrap();
     assert_eq!(r.unlinked, 0, "{r:?}");
 }
 
@@ -197,7 +170,7 @@ fn trellis_fills_a_box_standing_on_the_bed() {
     // near upright the planes barely cross: far fewer interlocks for the same box
     let upright = trellis(&wp, LeanLink::new(&wp, 80f64.to_radians()), frame, [-15.0, -15.0, 0.0], [15.0, 15.0, 20.0], 0.0, 0.0, &|_| -1.0);
     assert!(upright.pairs.len() * 2 < w.pairs.len(), "{} interlocks at 80 deg vs {} at 60", upright.pairs.len(), w.pairs.len());
-    let r = simulate(&w, 1.24e-3, WeaveScene::Drop, 2.0, &|| false);
+    let r = simulate(&w, 1.24e-3, WeaveScene::Drop, 2.0, &|| false).unwrap();
     println!("{r:?}");
     assert_eq!(r.unlinked, 0);
     assert!(r.pair_motion > wp.c_xy, "pairs moved {}", r.pair_motion);

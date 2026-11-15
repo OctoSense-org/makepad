@@ -1,7 +1,7 @@
 //! The live harness rendezvous: tests finish before the watcher applies another edit.
 
 use crate::inspect::json_str;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 #[derive(Clone)]
 pub(crate) struct Edit {
@@ -12,6 +12,9 @@ pub(crate) struct Edit {
     pub changed: Option<Vec<crate::program::DefId>>,
     /// a patch: the items it changed and the fns it installed (the verdict's reader sees both)
     pub patch: Option<(usize, usize)>,
+    /// the patch groups undone before this run (a fault in their code): it runs the code from
+    /// before them, so its verdict is none on the saved source
+    pub reverted: Vec<u32>,
 }
 
 impl Edit {
@@ -19,7 +22,8 @@ impl Edit {
         let edit = if self.paths.is_empty() { json_str("initial") }
             else { format!("[{}]", self.paths.iter().map(|p| json_str(p)).collect::<Vec<_>>().join(",")) };
         let patch = self.patch.map_or(String::new(), |(items, fns)| format!(",\"items_changed\":{items},\"fns_installed\":{fns}"));
-        format!("\"edit\":{edit},\"group\":{},\"compile_ms\":{},\"restarted\":{}{patch}",
+        let reverted = if self.reverted.is_empty() { String::new() } else { format!(",\"reverted\":{:?}", self.reverted) };
+        format!("\"edit\":{edit},\"group\":{},\"compile_ms\":{},\"restarted\":{}{patch}{reverted}",
             self.group, self.compile_ms.map_or("null".to_string(), |ms| ms.to_string()), self.restarted)
     }
 }
@@ -29,6 +33,9 @@ struct State {
     waiting: bool,
     faults: Vec<u32>,
     runs: u64,
+    /// the latest completed run's results, its edit group and the groups undone before it
+    /// (`test-results`)
+    results: Option<(u32, Vec<u32>, Arc<[TestResult]>)>,
 }
 
 static LIVE: OnceLock<(Mutex<State>, Condvar)> = OnceLock::new();
@@ -39,7 +46,7 @@ pub(crate) fn enabled() -> bool { LIVE.get().is_some() }
 pub(crate) fn start(restart: Option<&str>) -> Result<(), String> {
     let _k = crate::zone_alloc::kept();
     let edit = match restart {
-        None => Edit { paths: Vec::new(), group: 0, compile_ms: None, restarted: false, changed: None, patch: None },
+        None => Edit { paths: Vec::new(), group: 0, compile_ms: None, restarted: false, changed: None, patch: None, reverted: Vec::new() },
         Some(s) => {
             use crate::json::Json;
             let j = crate::json::parse(s.as_bytes())?;
@@ -57,15 +64,57 @@ pub(crate) fn start(restart: Option<&str>) -> Result<(), String> {
                 Some(Json::Null) => None,
                 _ => return Err("invalid harness restart compile time".into()),
             };
-            Edit { paths, group, compile_ms, restarted: true, changed: None, patch: None }
+            Edit { paths, group, compile_ms, restarted: true, changed: None, patch: None, reverted: Vec::new() }
         }
     };
-    let _ = LIVE.set((Mutex::new(State { edit, waiting: false, faults: Vec::new(), runs: 0 }), Condvar::new()));
+    let _ = LIVE.set((Mutex::new(State { edit, waiting: false, faults: Vec::new(), runs: 0, results: None }), Condvar::new()));
     Ok(())
 }
 
 pub(crate) fn group() -> u32 {
     LIVE.get().map_or(0, |(state, _)| state.lock().unwrap().edit.group)
+}
+
+pub(super) enum TestStatus { Passed, Failed, Ignored, Filtered }
+
+/// One test's outcome in a completed run.
+pub(super) struct TestResult {
+    pub name: String,
+    pub status: TestStatus,
+    /// it executed for this edit; a passed or failed result an earlier run left is kept with false
+    pub ran: bool,
+}
+
+impl TestResult {
+    fn json(&self) -> String {
+        let status = match self.status {
+            TestStatus::Passed => "passed",
+            TestStatus::Failed => "failed",
+            TestStatus::Ignored => "ignored",
+            TestStatus::Filtered => "filtered",
+        };
+        format!("{{\"name\":{},\"status\":\"{status}\",\"ran\":{}}}", json_str(&self.name), self.ran)
+    }
+}
+
+/// `test-results [group=<n>]`: the latest completed run's group and test count, then one line per
+/// test with its name, status and whether it ran for that edit. A group other than that run's is
+/// refused rather than answered with another edit's results. The rows are formatted after the
+/// lock is released (the harness takes it at every verdict; a target's tests can be thousands).
+pub(crate) fn cmd_results(req: &crate::inspect::Req, out: &mut crate::inspect::Out) {
+    let Some((state, _)) = LIVE.get() else { out.err("not a live test session"); return };
+    let asked = match req.get("group").map(str::parse::<u32>).transpose() {
+        Ok(group) => group,
+        Err(_) => { out.err("group must be an unsigned 32-bit integer"); return; }
+    };
+    let Some((group, reverted, tests)) = state.lock().unwrap().results.clone() else { out.err("no completed test run yet"); return };
+    if asked.is_some_and(|asked| asked != group) {
+        out.err(&format!("test results are for group {group}; read its testverdict event"));
+        return;
+    }
+    let reverted = if reverted.is_empty() { String::new() } else { format!(",\"reverted\":{reverted:?}") };
+    out.line(&format!("{{\"group\":{group},\"test_count\":{}{reverted}}}", tests.len()));
+    for t in tests.iter() { out.line(&t.json()); }
 }
 
 /// Whole-target results, with counts for this run's selection.
@@ -77,6 +126,8 @@ pub(super) struct Verdict {
     pub stale: Vec<String>,
     pub why: Option<String>,
     pub skipped: usize,
+    /// every test's outcome, in the table's order
+    pub tests: Vec<TestResult>,
 }
 
 /// Park outside the compiler owner until the next verified edit.
@@ -86,15 +137,31 @@ pub(super) fn complete(v: Verdict, ms: f64) -> Edit {
     let (state, ready) = LIVE.get().unwrap();
     let mut s = state.lock().unwrap();
     s.runs += 1;
-    let Verdict { ran, passed, ignored, failures, stale, why, skipped } = v;
+    // a test session presents no frame: each run's end is its present, the settle and its rebuild
+    // follow it as they follow a domain's first frame (run.rs)
+    crate::run::domain_present(format!("live test run {}", s.runs));
+    let Verdict { ran, passed, ignored, failures, stale, why, skipped, tests } = v;
     let failed = failures.len();
+    // a run whose patched code faulted is no pass of the edit whatever its tests say (the fault
+    // can be a thread no test waits for): the JIT undoes those groups and runs the tests again,
+    // and that run's verdict names them as `reverted`
+    let faulted = if s.faults.is_empty() { String::new() } else { format!(",\"faulted\":{:?}", s.faults) };
     let selected = if why.is_none() { "affected" } else { "all" };
     let why_field = why.as_ref().map_or(String::new(), |s| format!(",\"why\":{}", json_str(s)));
-    let fields = format!("{},\"ran\":{ran},\"passed\":{passed},\"failed\":{failed},\"ignored\":{ignored},\"failures\":[{}],\"ms\":{ms},\"selected\":\"{selected}\",\"skipped\":{skipped},\"stale\":[{}]{why_field}",
+    // the verdict stays small at any test count: each test's outcome is the `results` query's
+    let fields = format!("{},\"ran\":{ran},\"passed\":{passed},\"failed\":{failed},\"ignored\":{ignored},\"failures\":[{}],\"ms\":{ms},\"selected\":\"{selected}\",\"skipped\":{skipped},\"stale\":[{}]{why_field}{faulted},\"results\":\"test-results group={}\"",
         s.edit.fields(), failures.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","),
-        stale.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","));
+        stale.iter().map(|n| json_str(n)).collect::<Vec<_>>().join(","), s.edit.group);
+    s.results = Some((s.edit.group, s.edit.reverted.clone(), tests.into()));
     crate::inspect::events::emit("testverdict", &s.runs.to_string(), &fields);
-    println!("testverdict group={} ran={ran} passed={passed} failed={failed} ms={ms:.1} selected={selected} skipped={skipped}{}", s.edit.group, why.as_ref().map_or(String::new(), |s| format!(" why={s:?}")));
+    let mut note = why.as_ref().map_or(String::new(), |s| format!(" why={s:?}"));
+    if !s.faults.is_empty() {
+        note += &format!(" faulted={:?} (a fault in the patched code: no pass of the edit; the JIT undoes it and runs the tests again)", s.faults);
+    }
+    if !s.edit.reverted.is_empty() {
+        note += &format!(" reverted={:?} (these tests ran the code from before the edit, not the saved source)", s.edit.reverted);
+    }
+    println!("testverdict group={} ran={ran} passed={passed} failed={failed} ms={ms:.1} selected={selected} skipped={skipped}{note}", s.edit.group);
     use std::io::Write;
     let _ = std::io::stdout().flush();
     s.waiting = true;
@@ -150,7 +217,7 @@ pub(crate) fn restart(mut edit: Edit, why: &str) {
     edit.restarted = true;
     LIVE.get().unwrap().0.lock().unwrap().edit = edit;
     if let Err(e) = crate::reload::restart_run(why) {
-        eprintln!("makepad test: {e}");
+        eprintln!("relax test: {e}");
         crate::hot_failure::restart_failed(&e);
         crate::hot_failure::pump();
         if crate::hot_failure::has_error() { std::process::exit(crate::hot_failure::verdict(101).code()); }

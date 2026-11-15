@@ -12,9 +12,13 @@
 //! jit-cache `<run home>/target/*` (the newest is current) + `cache` + `flightrec`; weights
 //! `~/.makepad/weights`; desk-link `~/.makepad/wm/desk-link`; screencaps
 //! `~/makepad/local/screencap`; logs `~/.makepad/{devhub,wm}/*.log` and their rotations
-//! `*.log.<n>`; homes-tmp `<work>/tmp/*` of ended leases + `/tmp/landgate.*`.
+//! `*.log.<n>`; homes-tmp `<work>/tmp/*` of ended leases + `/tmp/landgate.*`; job inputs `<work>/inputs/*`
+//! (lease/ship.rs [`super::ship::Input`]); retired run dirs: the JIT's run dirs under their name
+//! before the 2026-11-12 relax rename (`<home>/<OLD_HOME>` and `<OLD>` in the targets above), listed
+//! but never in a reclaim plan: [`Guard::check`] removes them when a work node is idle and no
+//! process holds them, never on a user machine. Delete the category once no node has one.
 //!
-//! Reclaim order (stops at floor + 10 GB): 1 targets and native trees no lease or process uses (LRU), 2 JIT
+//! Reclaim order (stops at floor + 10 GB): 1 targets, native trees and job inputs no lease or process uses (LRU), 2 JIT
 //! target caches that are not current, 3 ended leases' tmp + orphaned gate dirs, 4 rotated logs,
 //! 5 (work nodes only) the current JIT cache, 6 (work nodes only, no lease on the box) the target of
 //! deployment and work trees. Never automatic: retired trees, worktrees (lease end owns them,
@@ -29,6 +33,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// The run dir's name and the run home's before the 2026-11-12 relax rename (written in two
+/// parts so that the rename's script, which rewrites the old names, leaves them).
+const OLD: &str = concat!("makepad", "-run");
+const OLD_HOME: &str = concat!(".makepad", "-run");
+
 /// How long a measurement stays good unless something changed (a lease started or ended).
 pub const MEASURE_EVERY: Duration = Duration::from_secs(600);
 /// Reclaim stops this far above the floor.
@@ -42,15 +51,17 @@ pub enum Cat {
     DeployTarget,
     WorkTarget,
     RetiredTree,
+    RetiredRunDir,
     JitCache,
     Weights,
     DeskLink,
     Screencaps,
     Logs,
     HomesTmp,
+    Inputs,
 }
 
-pub const CATS: [Cat; 12] = [Cat::Worktrees, Cat::Native, Cat::Targets, Cat::DeployTarget, Cat::WorkTarget, Cat::RetiredTree, Cat::JitCache, Cat::Weights, Cat::DeskLink, Cat::Screencaps, Cat::Logs, Cat::HomesTmp];
+pub const CATS: [Cat; 14] = [Cat::Worktrees, Cat::Native, Cat::Targets, Cat::DeployTarget, Cat::WorkTarget, Cat::RetiredTree, Cat::RetiredRunDir, Cat::JitCache, Cat::Weights, Cat::DeskLink, Cat::Screencaps, Cat::Logs, Cat::HomesTmp, Cat::Inputs];
 
 impl Cat {
     pub fn as_str(self) -> &'static str {
@@ -61,12 +72,14 @@ impl Cat {
             Cat::DeployTarget => "deployment target",
             Cat::WorkTarget => "ci-target",
             Cat::RetiredTree => "retired tree",
+            Cat::RetiredRunDir => "retired run dir",
             Cat::JitCache => "jit-cache",
             Cat::Weights => "weights",
             Cat::DeskLink => "desk-link",
             Cat::Screencaps => "screencaps",
             Cat::Logs => "logs",
             Cat::HomesTmp => "homes-tmp",
+            Cat::Inputs => "job inputs",
         }
     }
 }
@@ -171,7 +184,7 @@ pub struct Roots {
 impl Roots {
     pub fn of(work: &Path) -> Roots {
         let home = caps::home_dir();
-        let run_home = std::env::var_os("MAKEPAD_RUN_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".makepad-run"));
+        let run_home = std::env::var_os("RELAX_HOME").filter(|h| !h.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".relax"));
         #[cfg(feature = "checkout")]
         let deploy = Some(crate::sync::SyncConf::load().checkout).filter(|p| super::tree::ours(p));
         #[cfg(not(feature = "checkout"))]
@@ -200,6 +213,29 @@ fn rotated_log(n: &str) -> bool {
 }
 
 /// Lists and measures every category (a walk: run it niced, off the request path).
+/// The retired run dirs that exist (see the module doc).
+fn retired_run_dirs(r: &Roots) -> Vec<PathBuf> {
+    let mut targets = vec![r.work.join("ci-target"), r.work.join("tree/target"), r.work.join("dev/target")];
+    targets.extend(r.deploy.iter().map(|d| d.join("target")));
+    targets.extend(children(&r.work.join("target")));
+    targets.extend(children(&r.work.join("native-target")));
+    targets.extend(children(&r.work.join("dev/lane-jit")).into_iter().map(|p| p.join("target")));
+    let mut out: Vec<PathBuf> = targets.into_iter().map(|t| t.join(OLD)).collect();
+    out.push(r.home.join(OLD_HOME));
+    out.retain(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()));
+    out
+}
+
+/// Who still uses retired run dir `dir`: a lease, or a running JIT process of the old name
+/// (it holds a live lock in the run dir, or for the run home in one of its `target/*`).
+fn retired_user(r: &Roots, dir: &Path, live: &Live) -> Option<String> {
+    let mut dirs = vec![dir.to_path_buf()];
+    if dir == r.home.join(OLD_HOME) {
+        dirs.extend(children(&dir.join("target")));
+    }
+    live.user_of(dir).or_else(|| dirs.iter().any(|d| !crate::jitcache::held_locks(d).is_empty()).then(|| "a running process holds its live lock".into()))
+}
+
 pub fn list(r: &Roots, live: &Live) -> Vec<Item> {
     let mut out = Vec::new();
     let mut add = |cat: Cat, path: PathBuf, step: Option<u8>, user_data: bool, note: &str| {
@@ -230,6 +266,7 @@ pub fn list(r: &Roots, live: &Live) -> Vec<Item> {
     for p in [dev.join("git"), dev.join("jit"), dev.join("tree")] { add(Cat::Worktrees, p, None, false, "dev store: its owner reclaims it"); }
     for p in children(&dev.join("overlay")).into_iter().chain(children(&dev.join("lane"))) { add(Cat::Worktrees, p, None, false, "lane state: explicit lane cleanup owns it"); }
     for p in children(&dev.join("tmp")) { add(Cat::HomesTmp, p, Some(3), false, "tmp of an ended overlay lease"); }
+    for p in children(&r.work.join("inputs")) { add(Cat::Inputs, p, Some(1), false, "a job input: the next lease that names it ships it again"); }
     for p in children(&r.home.join("rc/pool")) {
         add(Cat::Targets, p.join("target"), Some(1), false, "legacy pool target");
     }
@@ -240,6 +277,10 @@ pub fn list(r: &Roots, live: &Live) -> Vec<Item> {
     }
     add(Cat::WorkTarget, r.work.join("ci-target"), step, false, "work tree target: the next lease build is cold");
     add(Cat::RetiredTree, r.work.join("tree"), None, false, "reclaimable retired tree including its target; manual removal only");
+    for p in retired_run_dirs(r) {
+        let note = retired_user(r, &p, live).map_or_else(|| "the run dir under its name before the relax rename: removed when the node is idle".into(), |u| format!("in use: {u}"));
+        add(Cat::RetiredRunDir, p, None, false, &note);
+    }
     let jit = children(&r.run_home.join("target"));
     let current = jit.iter().max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).cloned();
     for p in jit {
@@ -468,6 +509,30 @@ impl Guard {
         } else if !quiet {
             let _ = self.items(&live(), false);
         }
+        if !quiet && !self.user_machine() {
+            self.remove_retired_run_dirs(live);
+        }
+    }
+
+    /// Removes the retired run dirs while the node holds no lease and no process uses them.
+    fn remove_retired_run_dirs(&self, live: &dyn Fn() -> Live) {
+        for p in retired_run_dirs(&self.roots) {
+            let now = live();
+            if !now.leases.is_empty() {
+                return;
+            }
+            if retired_user(&self.roots, &p, &now).is_some() {
+                continue;
+            }
+            let bytes = dir_size(&p).0;
+            match remove(&p) {
+                Ok(()) => {
+                    self.emit(Sev::Info, format!("disk: {} removed the retired run dir {} ({:.1} GB)", self.machine, p.display(), gb(bytes)));
+                    self.touch();
+                }
+                Err(e) => eprintln!("devhub disk: {}: {e}", p.display()),
+            }
+        }
     }
 
     /// Reclaims (or with `dry`, plans) until `need` bytes are free over the floor (a waiting
@@ -595,15 +660,15 @@ mod tests {
     fn lists_categories_and_keeps_what_is_in_use() {
         let base = std::env::temp_dir().join(format!("devhub-disk-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let r = Roots { home: base.join("home"), work: base.join("home/devhub"), deploy: Some(base.join("home/makepad")), run_home: base.join("home/.makepad-run"), tmp: base.join("tmp") };
-        for d in ["home/makepad/target", "home/devhub/ci-target", "home/devhub/tree/target", "home/devhub/target/abc/release", "home/devhub/target/lane-x", "home/devhub/tmp/L1", "home/devhub/wt/x-L2", "home/.makepad/wm", "home/.makepad-run/target/0001", "tmp/landgate.Q1"] {
+        let r = Roots { home: base.join("home"), work: base.join("home/devhub"), deploy: Some(base.join("home/makepad")), run_home: base.join("home/.relax"), tmp: base.join("tmp") };
+        for d in ["home/makepad/target", "home/devhub/ci-target", "home/devhub/tree/target", "home/devhub/target/abc/release", "home/devhub/target/lane-x", "home/devhub/tmp/L1", "home/devhub/wt/x-L2", "home/.makepad/wm", "home/.relax/target/0001", "tmp/landgate.Q1", "home/devhub/inputs/aa/ui", "home/devhub/inputs/bb/ui"] {
             std::fs::create_dir_all(base.join(d)).unwrap();
         }
         std::fs::write(base.join("home/devhub/target/abc/release/bin"), vec![1u8; 100_000]).unwrap();
         std::fs::write(base.join("home/devhub/target/lane-x.last"), "abc").unwrap();
         std::fs::write(base.join("home/.makepad/wm/ai-hub.log"), "x").unwrap();
         std::fs::write(base.join("home/.makepad/wm/ai-hub.log.2"), "x").unwrap();
-        let live = Live { leases: vec![(base.join("home/devhub/target/lane-x"), "L9".into())], cwds: vec![] };
+        let live = Live { leases: vec![(base.join("home/devhub/target/lane-x"), "L9".into()), (base.join("home/devhub/inputs/bb"), "L8".into())], cwds: vec![] };
         let items = list(&r, &live);
         let find = |p: &str| items.iter().find(|i| i.path == base.join(p)).unwrap_or_else(|| panic!("{p}: {items:?}"));
         assert_eq!(find("home/makepad/target").cat, Cat::DeployTarget);
@@ -621,7 +686,17 @@ mod tests {
         assert_eq!(find("home/devhub/tmp/L1").cat, Cat::HomesTmp);
         assert_eq!(find("tmp/landgate.Q1").step, Some(3));
         assert_eq!(find("home/devhub/wt/x-L2").step, None);
-        assert_eq!(find("home/.makepad-run/target/0001").step, Some(5));
+        assert_eq!(find("home/.relax/target/0001").step, Some(5));
+        // a run dir under its name before the relax rename is listed, never planned
+        let old = format!("home/makepad/target/{OLD}");
+        std::fs::create_dir_all(base.join(&old)).unwrap();
+        let items = list(&r, &live);
+        let find = |p: &str| items.iter().find(|i| i.path == base.join(p)).unwrap_or_else(|| panic!("{p}: {items:?}"));
+        assert_eq!((find(&old).cat, find(&old).step), (Cat::RetiredRunDir, None));
+        // a job input is a cache: reclaimed first, unless a lease reads it
+        assert_eq!((find("home/devhub/inputs/aa").cat, find("home/devhub/inputs/aa").step), (Cat::Inputs, Some(1)));
+        assert_eq!(find("home/devhub/inputs/bb").step, None);
+        assert!(find("home/devhub/inputs/bb").note.contains("L8"));
         assert!(rotated_log("x.log.10") && rotated_log("x.log.1.gz") && !rotated_log("x.log") && !rotated_log("x.logs"));
         let _ = std::fs::remove_dir_all(&base);
     }
