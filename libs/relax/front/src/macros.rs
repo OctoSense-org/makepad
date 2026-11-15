@@ -2085,8 +2085,10 @@ impl MacroScope {
         }
         // the smallvec Relax provides (std/substitutes.txt) has no `macro_rules! smallvec`: its root's
         // `smallvec!` is the built-in one, through the crate's path as through an import (a smallvec
-        // compiled from its own source defines the macro, and the call resolves to that first)
-        if krate_name(k) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m {
+        // compiled from its own source defines the macro, and the call resolves to that first).
+        // The crate is known by its original name: a graph with two smallvec units (a path copy
+        // next to the registry's, as an app on a makepad checkout has) renames one of them.
+        if crate::crates::base_crate_name(krate_name(k)) == "smallvec" && name == "smallvec" && r.crate_root(k).1 == m {
             return Some(name.clone());
         }
         let uses = self.table.crates.get(k)?.uses.get(m)?;
