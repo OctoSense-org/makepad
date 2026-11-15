@@ -1,0 +1,12 @@
+[package]
+name = "relax-live-beside-app"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "relax-live-beside-app"
+path = "src/main.rs"
+
+[dependencies]
+relax-live-beside-count = { path = "../count" }

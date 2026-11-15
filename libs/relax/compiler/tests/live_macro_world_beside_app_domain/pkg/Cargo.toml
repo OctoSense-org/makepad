@@ -1,0 +1,7 @@
+# A hosted program (run.py adds makepad-widgets to `app`: with makepad's HAL in its crate graph
+# its main runs in an app domain, not in the unit's compile domain) that
+# tests/live_macro_world_beside_app_domain/run.py patches while it runs.
+# `count` is a proc-macro crate with a static of its own.
+[workspace]
+members = ["count", "app"]
+resolver = "2"
