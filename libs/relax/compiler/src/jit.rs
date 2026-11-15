@@ -5028,7 +5028,7 @@ fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId
             return crate::valtrees::const_to_valtree(u, addr, ty);
         }
         if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
-            want(Wanted::Const(def, compact.clone()), u.tcx.collect_epoch.load(Ordering::SeqCst));
+            want(u, Wanted::Const(def, compact.clone()), u.tcx.collect_epoch.load(Ordering::SeqCst));
         }
     }
     // a unit call: the value, and whether this evaluation (not an earlier one of the same
@@ -6121,7 +6121,7 @@ impl Unit {
             }
             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                want(Wanted::Tls(d), epoch);
+                want(self, Wanted::Tls(d), epoch);
             }
         }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).thread_local_place(d) })
@@ -7113,7 +7113,7 @@ impl Unit {
             if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) && WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
                 let key = if (id as usize) < self.fns.len() { Some(self.fns[id as usize].key.clone()) } else { lower_ahead_fn_key(id) };
                 if let Some(key) = key.filter(|k| self.closed_key(k)) {
-                    want(Wanted::Entry(key), self.tcx.collect_epoch.load(Ordering::SeqCst));
+                    want(self, Wanted::Entry(key), self.tcx.collect_epoch.load(Ordering::SeqCst));
                 }
             }
             lower_ahead_needs_unit();
@@ -7484,7 +7484,7 @@ impl Unit {
             // requests (const_drain) and the build's next take finds it
             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
                 let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
-                want(Wanted::Const(d, args.clone()), epoch);
+                want(self, Wanted::Const(d, args.clone()), epoch);
             }
         }
         owner::call(owner::Class::Job, || unsafe { (&mut *self.self_ptr.0).const_addr(d, args) })
@@ -7599,7 +7599,7 @@ impl Unit {
             // warm run's disk-cache code initializes without publishing: core::heap::alloc & co
             // failed their fronts for the whole run, and their hot callers' O3 builds left them out)
             if WANT_CONSTS.try_with(|w| w.get()).unwrap_or(false) {
-                want(Wanted::Static(d), self.tcx.collect_epoch.load(Ordering::SeqCst));
+                want(self, Wanted::Static(d), self.tcx.collect_epoch.load(Ordering::SeqCst));
             }
             lower_ahead_needs_unit();
         }
@@ -27926,7 +27926,7 @@ fn statics_ready(u: &Unit, body: &Body) -> bool {
                 if !want_them {
                     break;
                 }
-                want(Wanted::Static(*d), epoch);
+                want(u, Wanted::Static(*d), epoch);
             }
         }
     }
@@ -31405,17 +31405,19 @@ fn want_missing_body_consts(u: &Unit, body: &Body) -> bool {
     for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
         if let Res::Def(d) = r {
             if u.prog.def(*d).kind == DefKind::Const && seen.insert(*d) && u.front.consts.get(&(*d, Vec::new())).is_none() {
-                want(Wanted::Const(*d, Vec::new()), epoch);
+                want(u, Wanted::Const(*d, Vec::new()), epoch);
                 missing = true;
             }
         }
     }
     missing
 }
-/// Notes `w` for the owner's const_drain (and for the O3 build that asked: BUILD_WANTS).
-fn want(w: Wanted, epoch: u64) {
+/// Notes `w`, a value of unit `u`'s program at collect epoch `epoch`, for the owner's const_drain
+/// (and for the O3 build that asked: BUILD_WANTS).
+fn want(u: &Unit, w: Wanted, epoch: u64) {
+    let of = u.front.checker_id;
     let _ = BUILD_WANTS.try_with(|b| if let Some(v) = b.borrow_mut().as_mut() { v.push(wanted_key(&w, epoch)) });
-    crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((w, epoch)));
+    crate::zone_alloc::kept_with(|| CONSTS_WANTED.lock().unwrap_or_else(|e| e.into_inner()).push((of, w, epoch)));
     let _ = WANT_NOTES.try_with(|n| n.set(n.get().wrapping_add(1)));
 }
 struct WantConsts(bool);
@@ -31438,7 +31440,8 @@ impl Drop for WantConsts {
 /// CTFE on the owner: it evaluates them between requests (const_drain), nobody waits for it.
 /// The same holds for a `#[thread_local]` static nobody placed in this run (Unit::thread_local_place
 /// allocates its TLS: csg_boolean's CURRENT_CANCEL getter ran baseline).
-static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(Wanted, u64)>> = relax_session::sync::Mutex::new(Vec::new());
+/// (the unit it is a value of, by FrontShared::checker_id; what; that unit's collect epoch)
+static CONSTS_WANTED: relax_session::sync::Mutex<Vec<(usize, Wanted, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Item `w` of epoch `epoch` as a left-out build waits on it (LeftOut::items): one of another
 /// epoch is another item.
@@ -31517,7 +31520,7 @@ fn want_in_front(u: &Unit, body: Option<&Body>, w: impl FnOnce(Option<std::sync:
     if held.is_none() {
         return false;
     }
-    want(w(body.and(held)), u.tcx.collect_epoch.load(Ordering::SeqCst));
+    want(u, w(body.and(held)), u.tcx.collect_epoch.load(Ordering::SeqCst));
     true
 }
 
@@ -31538,11 +31541,15 @@ pub(crate) fn const_drain() {
     let u = unsafe { &mut *up };
     let epoch = u.tcx.collect_epoch.load(Ordering::SeqCst);
     let mut seen: crate::fxhash::HashSet<Wanted> = Default::default();
-    for (w, e) in want {
+    let of = u.front.checker_id;
+    for (unit, w, e) in want {
         // (what it makes, or finds made, ends the waits of the left-out builds that asked for it;
-        // an item of an earlier epoch is made by no drain)
+        // an item of an earlier epoch is made by no drain, and neither is one of another unit:
+        // it names that unit's definitions and slots -- the macro world's, alive beside the
+        // program once a live edit's derive rebuilt it -- and read as the program's it was a
+        // constant evaluated from whatever definition had its number)
         let item = wanted_key(&w, e);
-        if e != epoch {
+        if unit != of || e != epoch {
             left_out_drained(item, false);
             continue;
         }

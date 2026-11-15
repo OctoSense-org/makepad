@@ -755,7 +755,7 @@ fn a_left_out_build_is_built_again_once_per_thing_it_waited_on() {
     let retiers = |id: u32| crate::inspect::tierlog::history(id).0.map_or(0, |h| h.n[crate::inspect::tierlog::ev::RETIER as usize]);
     let drain = |w: Wanted| {
         let epoch = crate::owner::call(crate::owner::Class::Program, || u.tcx.collect_epoch.load(Ordering::SeqCst));
-        want(w, epoch);
+        want(&u, w, epoch);
         crate::owner::call(crate::owner::Class::Job, const_drain);
         crate::owner::call(crate::owner::Class::Program, || ());
     };
