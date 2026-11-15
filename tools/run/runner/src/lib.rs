@@ -140,11 +140,13 @@ pub fn set_host(host: &'static Host) {
         for &a in host.script_answers {
             relax_compiler::unitgraph::register_script_answer(a);
         }
-        // FORK: MAKEPAD_RUN_TRUST_PROC_MACROS=1 runs third-party compile-time code (proc macros,
+        // FORK: RELAX_TRUST_PROC_MACROS=1 runs third-party compile-time code (proc macros,
         // build scripts) as host code, as cargo and bare `relax` run it. For an app whose
         // dependencies already run that way in its cargo build (zerocopy-derive's `unsafe`): the
-        // sandbox otherwise refuses them before anything compiles.
-        let trust = std::env::var("MAKEPAD_RUN_TRUST_PROC_MACROS").is_ok_and(|v| !v.is_empty() && v != "0");
+        // sandbox otherwise refuses them before anything compiles. The switch still answers to
+        // the name it had before the rename of the environment (LEGACY_TRUST).
+        let on = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty() && v != "0");
+        let trust = on("RELAX_TRUST_PROC_MACROS") || on(LEGACY_TRUST);
         relax_compiler::sandbox::set_policy(if trust { relax_compiler::sandbox::Policy::Open } else { host.compile_time_code });
         relax_compiler::macro_reg::set_pure_crates(host.pure_macro_crates);
         relax_compiler::progenv::set_host_env(host.env);
@@ -250,6 +252,9 @@ pub fn main(host: &'static Host) {
     run(relax_compiler::os::proc::args_bytes())
 }
 
+/// FORK: the trust switch's name before the environment was renamed; `set_host` still reads it.
+const LEGACY_TRUST: &str = concat!("MAKEPAD_", "RUN_TRUST_PROC_MACROS");
+
 /// Warn about legacy environment names still carried in people's notes.
 fn warn_legacy_env() {
     const OLD_PREFIX: &str = concat!("MAKEPAD_", "RUN_");
@@ -259,6 +264,10 @@ fn warn_legacy_env() {
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
         if let Some(rest) = name.strip_prefix(OLD_PREFIX) {
+            if name == LEGACY_TRUST {
+                eprintln!("relax: {name} still works; its name is now RELAX_{rest}");
+                continue;
+            }
             eprintln!("relax: {name} is ignored; it is now RELAX_{rest}");
         }
     }

@@ -47,10 +47,10 @@ base = open(main_rs).read()
 assert base.count("    1\n}") == 1
 APP = "relax-live-beside-app"
 
-# MAKEPAD_RUN_TRUST_PROC_MACROS: makepad-widgets brings serde_json, whose build script `makepad run`
+# RELAX_TRUST_PROC_MACROS: makepad-widgets brings serde_json, whose build script `makepad run`
 # confines; fetched into the copy's own target folder it may not even name its build.rs. Not what
 # this test is about: third-party compile-time code runs as cargo runs it.
-env = dict(os.environ, RELAX_AHEAD="minimal", RELAX_CACHE="0", MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1", MAKEPAD_RUN_TRUST_PROC_MACROS="1")
+env = dict(os.environ, RELAX_AHEAD="minimal", RELAX_CACHE="0", MAKEPAD_HIDE_WINDOWS="1", MAKEPAD_MUTE="1", RELAX_TRUST_PROC_MACROS="1")
 p = subprocess.Popen([relax, "run", "--verbose", APP], cwd=pkg, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 out, err = [], []
 def pump(f, acc):
