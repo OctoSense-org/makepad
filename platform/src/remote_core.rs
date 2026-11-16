@@ -698,7 +698,7 @@ pub fn request_from(args: impl Iterator<Item = String>, env: Option<&str>) -> Re
 pub fn request() -> Request {
     let asked = std::env::var("MAKEPAD_REMOTE").ok();
     // an Android app gets no environment of its own, so `adb shell setprop debug.makepad.remote 1` asks too
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(target_os = "android")]
     let asked = asked.or_else(|| {
         let value = makepad_hal::backend::android::system_property("debug.makepad.remote")?;
         // every makepad app on the device reads it, so a value it can't use is ignored instead of ending the app

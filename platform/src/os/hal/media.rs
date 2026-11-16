@@ -106,11 +106,11 @@ fn audio_entry_buffer() -> AudioBuffer {
     // before registering the entry so resize in a realtime callback only changes the length.
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     { AudioBuffer::new_with_size(makepad_hal::backend::linux::media::AUDIO_BLOCK_FRAMES, 2) }
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(target_os = "android")]
     { AudioBuffer::new_with_size(makepad_hal::backend::android::media::AUDIO_BLOCK_FRAMES, 2) }
     // Elsewhere the device picks the period: room for 8192 frames of 8 channels up front, so
     // the callback's resize only changes the length (a larger period grows it once).
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_env = "ohos")))]
+    #[cfg(any(target_env = "ohos", not(any(target_os = "linux", target_os = "android"))))]
     { AudioBuffer::new_with_size(8192, 8) }
 }
 

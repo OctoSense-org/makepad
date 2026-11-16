@@ -430,6 +430,26 @@ pub struct AndroidParams {
     pub night_mode: bool,
 }
 
+/// What an OpenHarmony ability reports about its system (HarmonyOS phones).
+#[derive(Clone, Debug, Default, Script, ScriptHook)]
+pub struct OpenHarmonyParams {
+    #[live]
+    pub files_dir: String,
+    #[live]
+    pub cache_dir: String,
+    #[live]
+    pub temp_dir: String,
+    #[live]
+    pub device_type: String,
+    #[live]
+    pub os_full_name: String,
+    #[live]
+    pub display_density: f64,
+    /// The system is in dark (night) mode, as `AndroidParams::night_mode`.
+    #[live]
+    pub night_mode: bool,
+}
+
 #[derive(Clone, Debug, Default, Script, ScriptHook)]
 pub struct IosParams {
     #[live]
@@ -476,6 +496,8 @@ pub enum OsType {
     Ios(IosParams),
     #[live(AndroidParams::default())]
     Android(AndroidParams),
+    #[live(OpenHarmonyParams::default())]
+    OpenHarmony(OpenHarmonyParams),
     #[live(LinuxWindowParams::default())]
     LinuxWindow(LinuxWindowParams),
     LinuxDirect,
@@ -552,6 +574,7 @@ impl OsType {
     pub fn get_cache_dir(&self) -> Option<String> {
         match self {
             OsType::Android(params) => Some(params.cache_path.clone()),
+            OsType::OpenHarmony(params) => Some(params.cache_dir.clone()),
             // Desktop Linux (windowed or DRM/direct) uses the XDG cache directory.
             // Computed once and memoized (env lookup + directory creation).
             OsType::LinuxWindow(_) | OsType::LinuxDirect => {
@@ -586,6 +609,8 @@ impl OsType {
             Some(params.data_path.clone())
         } else if let OsType::Ios(params) = self {
             Some(params.data_path.clone())
+        } else if let OsType::OpenHarmony(params) = self {
+            Some(params.files_dir.clone())
         } else {
             None
         }

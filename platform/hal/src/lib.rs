@@ -71,13 +71,13 @@ pub mod gpu_limits;
 pub mod gpu_prof;
 pub mod gpu_pressure;
 pub mod h264_bits;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
 pub mod stream_encode;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream_decode;
 pub mod stream_pack;
 pub mod xr_remote;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
 pub mod frame_tap;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod framecap;
@@ -103,6 +103,8 @@ pub use backend::apple::appkit::restack_handover;
 pub use backend::linux::media::can_play_type;
 #[cfg(target_os = "android")]
 pub use backend::android::media::can_play_type;
+#[cfg(target_env = "ohos")]
+pub use backend::ohos::media::can_play_type;
 #[cfg(windows)]
 pub use backend::windows::media::can_play_type;
 pub use buffers::{CmdWriter, EventQueue, EventReader, EventStore};
@@ -523,6 +525,12 @@ impl Hal {
                 backend_id::AUTO | backend_id::VULKAN | backend_id::GL => match backend::android::open(id, req.flags, sessions.clone(), wake.clone(), notify.clone()) {
                     Ok(b) => Some(b),
                     Err(e) => { eprintln!("[hal-android] {e}"); None }
+                },
+                #[cfg(target_env = "ohos")]
+                // the ability's events and vsync callbacks make the pumps look
+                backend_id::AUTO | backend_id::GL => match backend::ohos::open(id, req.flags, wake.clone(), notify.clone()) {
+                    Ok(b) => Some(b),
+                    Err(e) => { eprintln!("[hal-ohos] {e}"); None }
                 },
                 _ => None,
             }
@@ -1246,9 +1254,9 @@ pub fn end_run() {
     profile::end_run();
     a11y::end_run();
     stream_decode::end_run();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
     stream_encode::end_run();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
     frame_tap::end_run();
     backend::end_run();
 }
@@ -1544,6 +1552,12 @@ pub fn open_url(url: &str) -> bool {
 #[relax_api]
 pub fn hal_read_asset(path: &str, out: &mut [u8]) -> i64 {
     backend::android::assets::read(path, out)
+}
+/// OpenHarmony's package assets are the HAP's raw files.
+#[cfg(target_env = "ohos")]
+#[relax_api]
+pub fn hal_read_asset(path: &str, out: &mut [u8]) -> i64 {
+    backend::ohos::assets::read(path, out)
 }
 
 /// Socket streams for the app's network stack (Android has no libssl for native code, so TLS is the
@@ -2015,8 +2029,9 @@ pub fn hal_video_file_close(id: i64) {
     media_results().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
-/// The path prefix naming a stored APK asset in a font open (`apk:<asset path>`).
-#[cfg(target_os = "android")]
+/// The path prefix naming a stored APK asset in a font open (`apk:<asset path>`); a HAP's raw
+/// file on OpenHarmony.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub const APK_ASSET_PREFIX: &str = "apk:";
 
 /// Opens a stored APK asset as a file range so the caller can map it without a heap copy: returns
@@ -2026,6 +2041,11 @@ pub const APK_ASSET_PREFIX: &str = "apk:";
 #[relax_api]
 pub fn hal_map_asset(path: &str, out: &mut [i64]) -> i64 {
     backend::android::assets::range(path, out)
+}
+#[cfg(target_env = "ohos")]
+#[relax_api]
+pub fn hal_map_asset(path: &str, out: &mut [i64]) -> i64 {
+    backend::ohos::assets::range(path, out)
 }
 
 /// Opens an external URL on the process main thread. The OS handles the URL scheme.
@@ -2151,7 +2171,7 @@ static BACKGROUND_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 pub fn set_background_hook(f: fn()) {
     let _ = BACKGROUND_HOOK.set(f);
 }
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) fn background_hook() {
     if let Some(f) = BACKGROUND_HOOK.get() {
         f();

@@ -152,8 +152,10 @@ pub struct GlBackend {
     /// video, audio, MIDI, camera, dialogs (`backend/linux/media`, `backend/android/media`)
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     media: super::linux::media::Media,
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(target_os = "android")]
     media: super::android::media::AndroidMedia,
+    #[cfg(target_env = "ohos")]
+    media: super::ohos::media::OhosMedia,
 }
 
 impl GlBackend {
@@ -279,8 +281,10 @@ impl GlBackend {
                         world.window_presented(sid, target, frame, gpu_ns, done.time);
                         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                         if let Some(shell) = self.shell { shell.presented(self.window_key(sid, target)); }
-                        #[cfg(any(target_os = "android", target_env = "ohos"))]
+                        #[cfg(target_os = "android")]
                         super::android::jni::surface_presented();
+                        #[cfg(target_env = "ohos")]
+                        super::ohos::surface_presented();
                     }
                     world.frame_done(sid, target, kind, frame, gpu_ns, done.time, [0.0; 2]);
                 }
@@ -458,7 +462,7 @@ impl Drop for GlBackend {
 }
 
 impl Gpu for GlBackend {
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(target_os = "android")]
     fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
         super::android::a11y::notify(window, notifications);
     }

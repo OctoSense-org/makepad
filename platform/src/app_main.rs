@@ -27,7 +27,7 @@ pub fn attach_parent_console() {
 
 /// `app_main!`'s JNI_OnLoad for a standalone Android app: ART loads libmakepad.so (the app
 /// crate as a cdylib). Chosen here so the app crate never sees the `relax` cfg.
-#[cfg(all(any(target_os = "android", target_env = "ohos"), not(relax)))]
+#[cfg(all(target_os = "android", not(relax)))]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! android_jni_entry {
@@ -39,10 +39,35 @@ macro_rules! android_jni_entry {
     };
 }
 
-#[cfg(not(all(any(target_os = "android", target_env = "ohos"), not(relax))))]
+#[cfg(not(all(target_os = "android", not(relax))))]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! android_jni_entry {
+    ($app:path) => {};
+}
+
+/// `app_main!`'s entry for a standalone OpenHarmony app: the ability loads libmakepad.so (the
+/// app crate as a cdylib), whose constructor registers it as the Node-API module `makepad`.
+#[cfg(all(target_env = "ohos", not(relax)))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! ohos_napi_entry {
+    ($app:path) => {
+        #[used]
+        #[link_section = ".init_array"]
+        static MAKEPAD_OHOS_ON_LOAD: extern "C" fn() = {
+            extern "C" fn on_load() {
+                unsafe { $crate::ohos_on_load($app) }
+            }
+            on_load
+        };
+    };
+}
+
+#[cfg(not(all(target_env = "ohos", not(relax))))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! ohos_napi_entry {
     ($app:path) => {};
 }
 
@@ -54,7 +79,7 @@ macro_rules! android_jni_entry {
 /// `app_main!` exports it; a packed app under makepad run never gets here (the host owns JNI).
 /// # Safety
 /// Called by ART with its JavaVM, once per process.
-#[cfg(all(any(target_os = "android", target_env = "ohos"), not(relax)))]
+#[cfg(all(target_os = "android", not(relax)))]
 #[doc(hidden)]
 pub unsafe fn android_on_load(vm: *mut std::ffi::c_void, app: fn()) -> i32 {
     makepad_android_state::jni_on_load(vm);
@@ -66,6 +91,17 @@ pub unsafe fn android_on_load(vm: *mut std::ffi::c_void, app: fn()) -> i32 {
         }
     }
     makepad_hal::backend::android::standalone::on_load(vm, app, activity_ready)
+}
+
+/// The load of a standalone OpenHarmony app's library (its libmakepad.so is the app, natively
+/// compiled): the HAL shell registers the Node-API module and runs `app` on its own thread once
+/// the ability starts it. `app_main!` runs it from a constructor.
+/// # Safety
+/// Called once, as the library loads.
+#[cfg(all(target_env = "ohos", not(relax)))]
+#[doc(hidden)]
+pub unsafe fn ohos_on_load(app: fn()) {
+    makepad_hal::backend::ohos::standalone::register(app)
 }
 
 /// `app` is the whole of the app's main: it creates its `Cx` itself.
@@ -922,6 +958,8 @@ macro_rules! app_main {
 
         // A standalone Android app's entry (decided in this crate, which knows the `relax` cfg).
         $crate::android_jni_entry!(app_main);
+        // ... and a standalone OpenHarmony app's.
+        $crate::ohos_napi_entry!(app_main);
 
         #[cfg(not(target_arch = "wasm32"))]
         pub fn app_main() {

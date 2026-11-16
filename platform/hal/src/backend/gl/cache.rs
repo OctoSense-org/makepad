@@ -43,8 +43,10 @@ impl ProgramCache {
         let none = |binaries| Self { dir: None, binaries, cold: false, verified: false };
         if gl.integer(sys::NUM_PROGRAM_BINARY_FORMATS) <= 0 { return none(false); }
         let driver = gl.driver();
-        #[cfg(any(target_os = "android", target_env = "ohos"))]
+        #[cfg(target_os = "android")]
         let driver = driver + &crate::backend::android::xr::system_property("ro.build.fingerprint").unwrap_or_default();
+        #[cfg(target_env = "ohos")]
+        let driver = driver + &crate::backend::ohos::OhosBackend::params().os_version;
         let Some(base) = base_dir() else { return none(true) };
         let parent = base.join("makepad-hal");
         let dir = parent.join(format!("gl-{:016x}", fxhash::hash64(&driver)));
@@ -180,7 +182,10 @@ fn base_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MAKEPAD_HAL_CACHE_DIR") { return Some(dir.into()); }
     #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
+        #[cfg(target_os = "android")]
         let cache = crate::backend::android::AndroidBackend::params().cache_path;
+        #[cfg(target_env = "ohos")]
+        let cache = crate::backend::ohos::OhosBackend::params().cache_path;
         if !cache.is_empty() { return Some(cache.into()); }
         std::env::var_os("TMPDIR").map(Into::into)
     }

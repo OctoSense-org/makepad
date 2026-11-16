@@ -13,7 +13,7 @@ fn log_level_prefix(level: LogLevel) -> &'static str {
     }
 }
 
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(target_os = "android")]
 fn android_logcat_write(
     file_name: &str,
     line_start: u32,
@@ -274,7 +274,7 @@ fn write_log_record(
         }
     }
 
-    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    #[cfg(target_os = "android")]
     android_logcat_write(file_name, line_start, column_start, &message, level);
 
     // Every line, always: the app's own console reads this ring, and so does
@@ -296,7 +296,7 @@ fn write_log_record(
     let studio_connected = Cx::has_studio_web_socket_connected();
 
     if !studio_connected {
-        #[cfg(not(any(target_os = "android", target_env = "ohos", target_os = "ios")))]
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         {
             use std::io::Write;
             // Log lines go to stderr: stdout is the program's own output (a

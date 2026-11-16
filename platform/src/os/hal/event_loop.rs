@@ -399,7 +399,7 @@ impl Cx {
         let mut quit_due = false;
         // the UI thread's time outside the idle wait, from this turn's wake (`pass_load`)
         let mut busy_from = None;
-        #[cfg(any(target_os = "android", target_env = "ohos"))]
+        #[cfg(target_os = "android")]
         let mut performance_hint = if hosted { None } else { makepad_hal::backend::android::performance_hint::PerformanceHint::for_this_thread(period) };
         'turns: loop {
             self.hal_frames_room();
@@ -447,8 +447,10 @@ impl Cx {
                 // a frame asked for and not announced is asked again when its wait runs out
                 match requested.filter(|_| display_clock && self.hal_has_work()) {
                     // Android's shell holds a paused app's request till it's back, so it sleeps meanwhile
-                    #[cfg(any(target_os = "android", target_env = "ohos"))]
+                    #[cfg(target_os = "android")]
                     Some(_) if makepad_hal::backend::android::jni::frame_requests_held() => u64::MAX,
+                    #[cfg(target_env = "ohos")]
+                    Some(_) if makepad_hal::backend::ohos::frame_requests_held() => u64::MAX,
                     Some(at) => (at + REREQUEST).saturating_duration_since(std::time::Instant::now()).as_nanos() as u64,
                     // (a run that beat and painted nothing wakes to count its rounds: `first_draw`)
                     None if self.first_draw.armed() && self.first_draw_window() => {
@@ -459,7 +461,7 @@ impl Cx {
             } else {
                 next_beat.saturating_duration_since(std::time::Instant::now()).as_nanos() as u64
             };
-            #[cfg(any(target_os = "android", target_env = "ohos"))]
+            #[cfg(target_os = "android")]
             if let Some(hint) = performance_hint.as_mut() {
                 hint.start_turn(!self.hal_has_work() || self.hal.device_lost);
             }
@@ -553,7 +555,7 @@ impl Cx {
                     eprintln!("[hal-client] session={} FrameReady starts draw beat", info.session);
                 }
                 // XR frames keep the headset's pace, not the beat's
-                #[cfg(any(target_os = "android", target_env = "ohos"))]
+                #[cfg(target_os = "android")]
                 if let Some(hint) = performance_hint.as_mut() {
                     match self.hal.xr {
                         Some(_) => hint.skip_frame(),
@@ -618,7 +620,7 @@ impl Cx {
             // what this turn leaves the loop waiting for, read by `loop` without the UI thread
             loop_watch::publish(display_clock && self.hal_has_work(), self.hal.beat,
                 self.hal.in_flight.len(), self.hal.in_flight.front().map(|&(_, at)| at), FRAMES_IN_FLIGHT);
-            #[cfg(any(target_os = "android", target_env = "ohos"))]
+            #[cfg(target_os = "android")]
             if let Some(hint) = performance_hint.as_mut() {
                 hint.finish_frame(self.repaint_id);
             }
@@ -1147,7 +1149,27 @@ fn host_os_type() -> OsType {
     return OsType::Unknown;
 }
 
-#[cfg(any(target_os = "android", target_env = "ohos"))]
+#[cfg(target_env = "ohos")]
+impl Cx {
+    /// OpenHarmony's `OsType` carries the ability's paths, density and version, as Android's does.
+    pub(crate) fn hal_update_android_os_type(&mut self) {
+        let params = makepad_hal::backend::ohos::OhosBackend::params();
+        if params.data_path.is_empty() {
+            return;
+        }
+        self.os_type = OsType::OpenHarmony(crate::cx::OpenHarmonyParams {
+            temp_dir: params.cache_path.clone(),
+            cache_dir: params.cache_path,
+            files_dir: params.data_path,
+            device_type: "phone".to_string(),
+            os_full_name: params.os_version,
+            display_density: params.density as f64,
+            night_mode: params.night_mode,
+        });
+    }
+}
+
+#[cfg(target_os = "android")]
 impl Cx {
     /// Android's `OsType` carries the Activity's paths, density and versions, which can come after
     /// the app starts and come again with each configuration change (followed by a `Display`).

@@ -25,7 +25,8 @@ pub mod headless;
 pub mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod gl;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// (OpenHarmony draws with the GLES core only)
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
 pub mod vulkan;
 #[cfg(target_vendor = "apple")]
 pub mod apple;
@@ -35,7 +36,7 @@ pub mod windows;
 use crate::buffers::CmdView;
 
 /// Native window-system work stays outside the GPU core (Vulkan's and GLES's).
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub trait Shell: Send {
     fn command(&mut self, session: u32, cmd: exec::OsCmd) -> bool;
     fn lent(&mut self, session: u32, alias: crate::types::Id, host: crate::types::Id, attach: bool);
@@ -139,5 +140,8 @@ pub trait Backend: Send {
     fn simulate_device_loss(&mut self) {}
 }
 
-#[cfg(any(target_os = "android", test))]
+// (OpenHarmony's shell shares the surface state)
+#[cfg(any(target_os = "android", target_env = "ohos", test))]
 pub mod android;
+#[cfg(target_env = "ohos")]
+pub mod ohos;
