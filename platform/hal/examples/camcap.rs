@@ -2,7 +2,7 @@
 //! name (the deck's rule: case-insensitive substring, else the first), opens it, grabs frames, prints
 //! sizes and timing (`camcap OBSBOT 30 1920x1080 5` repeats open/stream/release 5 times, the slide
 //! being left and entered again), releases it and checks the device is no longer held by this process.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn main() {
     use makepad_hal::backend::linux::media::v4l2_camera::Camera;
     use makepad_hal::media::VideoPixel;
@@ -79,5 +79,5 @@ fn main() {
         held("after release");
     }
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn main() {}

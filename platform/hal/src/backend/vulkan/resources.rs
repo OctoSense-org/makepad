@@ -83,7 +83,7 @@ pub struct Image {
     pub video: super::device::VideoSampler,
     /// The external allocation/handle owner, if any (released after image and memory).
     pub external: Option<Arc<dyn std::any::Any + Send + Sync>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) timeline: Option<Arc<super::share::sync::Timeline>>,
     /// The backend pool an image the backend made for itself is charged to (`in_pool`); a
     /// handle's image is on its session's ledger instead.
@@ -100,7 +100,7 @@ impl Image {
     }
 
     /// XRGB external buffers have undefined alpha. Sampling them must still be opaque.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(super) fn sample_alpha_one(&mut self) -> Result<(), String> {
         let info = vk::ImageViewCreateInfo::default().image(self.image)
             .format(vk_format(self.desc.format).ok_or("unknown image format")?)
@@ -204,7 +204,7 @@ impl Image {
         };
         Ok(Arc::new(Self { dev, image, memory: vk::DeviceMemory::null(), view, array_view, cube_view: vk::ImageView::null(), layers: Vec::new(), desc, bytes: 0,
             aspect: vk::ImageAspectFlags::DEPTH, layout: Mutex::new(vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL), external_owner: AtomicBool::new(false), borrowed: true,
-            video: Default::default(), external: None, #[cfg(target_os = "linux")] timeline: None, pool: OnceLock::new(), serial: super::sets::serial() }))
+            video: Default::default(), external: None, #[cfg(all(target_os = "linux", not(target_env = "ohos")))] timeline: None, pool: OnceLock::new(), serial: super::sets::serial() }))
     }
 
     /// A bound external-format image (a decoder's picture) sampled through `video`'s Y'CbCr
@@ -220,7 +220,7 @@ impl Image {
             // (the decoder's contents, acquired from the foreign queue in GENERAL: an acquire from
             // UNDEFINED lets the driver drop them; a compressed (UBWC) picture read so was noise)
             aspect: vk::ImageAspectFlags::COLOR, layout: Mutex::new(vk::ImageLayout::GENERAL), external_owner: AtomicBool::new(false), borrowed: false, video, external,
-            #[cfg(target_os = "linux")] timeline: None, pool: OnceLock::new(), serial: super::sets::serial() }))
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] timeline: None, pool: OnceLock::new(), serial: super::sets::serial() }))
     }
 
     /// The layout the image is in now, as its owner says (an acquired swapchain image).
@@ -235,7 +235,7 @@ impl Image {
             else if format::is_depth(desc.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
         let mut out = Self { dev, image, memory, view: vk::ImageView::null(), array_view: vk::ImageView::null(), cube_view: vk::ImageView::null(),
             layers: Vec::new(), desc, bytes, aspect, layout: Mutex::new(layout), external_owner: AtomicBool::new(false), borrowed, video: Default::default(), external,
-            #[cfg(target_os = "linux")] timeline: None, pool: OnceLock::new(), serial: super::sets::serial() };
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] timeline: None, pool: OnceLock::new(), serial: super::sets::serial() };
         let sampled_aspect = if format::is_depth(out.desc.format) { vk::ImageAspectFlags::DEPTH } else { aspect };
         let info = vk::ImageViewCreateInfo::default().image(image).format(vk_format(out.desc.format).ok_or("unknown image format")?)
             .view_type(vk::ImageViewType::TYPE_2D_ARRAY).subresource_range(vk::ImageSubresourceRange::default()
@@ -284,7 +284,7 @@ impl Image {
     }
 
     pub(super) fn supports_transfer(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if self.external.as_ref().and_then(|e| e.downcast_ref::<super::NativeHandle>()).is_some_and(|n| n.sample_only) {
             return false;
         }
@@ -328,7 +328,7 @@ impl Image {
     }
 
     fn foreign_family(&self) -> u32 {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if self.external.as_ref().and_then(|e| e.downcast_ref::<super::NativeHandle>()).is_some_and(|n| n.opaque.is_some()) {
             return vk::QUEUE_FAMILY_EXTERNAL;
         }
@@ -486,13 +486,13 @@ impl Buffer {
         unsafe { self.dev.raw.invalidate_mapped_memory_ranges(&[self.range(offset, len)]) }.map_err(error)
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(super) fn invalidate(&self) -> Result<(), String> {
         self.invalidate_range(0, self.size)
     }
 
     /// Caller holds the completed allocation exclusively against writers for the slice's life.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(super) unsafe fn completed_bytes(&self, length: usize) -> &[u8] {
         std::slice::from_raw_parts(self.place.mapped as *const u8, length.min(self.size as usize))
     }

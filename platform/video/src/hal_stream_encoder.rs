@@ -8,11 +8,11 @@
 
 use crate::stream_encoder::{EncodeTimings, EncodedPacket, EncoderCaps, QpGrid, StreamEncoderOs, StreamTile, StreamTuning, StreamVideoCodec, VideoStreamEncoderOptions};
 use crate::surface::{GpuCompletion, SurfaceHandle};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use crate::surface::{SurfaceFormat, SurfaceKind};
 use crate::VideoFileError;
 use makepad_hal::stream_encode as hal;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use std::os::fd::IntoRawFd;
 
 fn last_error() -> VideoFileError {
@@ -27,7 +27,7 @@ pub(crate) struct HalStreamEncoder {
     hevc: bool,
     key_wanted: bool,
     /// The next texture picture is a refinement (Linux's).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     refine_wanted: bool,
     keyint: u32,
     since_key: u32,
@@ -37,7 +37,7 @@ pub(crate) struct HalStreamEncoder {
 impl HalStreamEncoder {
     /// On encode engine `engine` (`EncoderCaps::engines`).
     fn new(options: &VideoStreamEncoderOptions, engine: u32, tuning: StreamTuning) -> Result<Self, VideoFileError> {
-        if cfg!(target_os = "linux") && options.width % 4 != 0 {
+        if cfg!(all(target_os = "linux", not(target_env = "ohos"))) && options.width % 4 != 0 {
             return Err(VideoFileError::new(format!("stream width {} must be a multiple of 4", options.width)));
         }
         let flags = if options.full_chroma { hal::FULL_CHROMA } else { 0 } | if options.codec == StreamVideoCodec::Hevc { hal::HEVC } else { 0 } | if tuning.constant_rate { hal::CBR } else { 0 } | if tuning.sharp { hal::SHARP } else { 0 };
@@ -45,7 +45,7 @@ impl HalStreamEncoder {
         if id == 0 {
             return Err(last_error());
         }
-        Ok(Self { id, hevc: options.codec == StreamVideoCodec::Hevc, key_wanted: true, #[cfg(target_os = "linux")] refine_wanted: false, keyint: options.keyint, since_key: 0, out: Vec::new() })
+        Ok(Self { id, hevc: options.codec == StreamVideoCodec::Hevc, key_wanted: true, #[cfg(all(target_os = "linux", not(target_env = "ohos")))] refine_wanted: false, keyint: options.keyint, since_key: 0, out: Vec::new() })
     }
 
     fn info(&self) -> String {
@@ -95,14 +95,14 @@ impl HalStreamEncoder {
 
 impl StreamEncoderOs for HalStreamEncoder {
     fn caps() -> EncoderCaps {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         return EncoderCaps { engines: hal::hal_stream_encoder_engines().max(1), tiles: true, full_chroma: true, hevc: true };
         #[cfg(target_os = "android")]
         return EncoderCaps { engines: 1, tiles: false, full_chroma: false, hevc: true };
     }
 
     fn max_size(codec: StreamVideoCodec, full_chroma: bool) -> Option<[u32; 2]> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let v = hal::hal_stream_encoder_max_size(if full_chroma { hal::FULL_CHROMA } else { 0 } | if codec == StreamVideoCodec::Hevc { hal::HEVC } else { 0 });
             return (v != 0).then(|| [(v >> 32) as u32, v as u32]);
@@ -126,7 +126,7 @@ impl StreamEncoderOs for HalStreamEncoder {
 
     /// The tile of a packed NV12 DMA-BUF picture; the GPU waits for `ready`'s sync_file.
     fn encode_surface(&mut self, surface: &SurfaceHandle, tile: StreamTile, ready: &GpuCompletion, pts_100ns: i64) -> Result<Vec<EncodedPacket>, VideoFileError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             if surface.kind != SurfaceKind::DmaBuf || surface.format != SurfaceFormat::PackedNv12 {
                 return Err(VideoFileError::new(format!("the stream encoder takes packed NV12 DMA-BUFs, not {surface:?}")));
@@ -151,7 +151,7 @@ impl StreamEncoderOs for HalStreamEncoder {
     }
 
     fn request_refinement(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             self.refine_wanted = true;
         }

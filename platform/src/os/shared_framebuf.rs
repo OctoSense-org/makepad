@@ -28,7 +28,7 @@ use crate::texture::Texture;
 pub struct HostPresentableImage {
     pub id: PresentableImageId,
     pub texture: Texture,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     frame: std::cell::RefCell<Option<(u64, crate::texture::WeakTexture)>>,
 }
 
@@ -39,7 +39,7 @@ impl HostPresentableImage {
     /// `snapshot` is the swapchain's one copy of its newest frame (Linux), reused frame
     /// after frame.
     pub fn texture_for_draw(&self, cx: &mut Cx, draw: &PresentableDraw, width: u32, height: u32, snapshot: &std::cell::RefCell<Option<Texture>>) -> Option<Texture> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let _ = (width, height);
             if let Some((sequence, texture)) = &*self.frame.borrow() {
@@ -62,7 +62,7 @@ impl HostPresentableImage {
                 }
             };
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         {
             let _ = (cx, draw, width, height, snapshot);
             Some(self.texture.clone())
@@ -97,7 +97,7 @@ impl HostSwapchain {
                 let id = PresentableImageId::alloc();
                 HostPresentableImage {
                     id,
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     frame: Default::default(),
                     #[cfg(not(target_arch = "wasm32"))]
                     texture: cx.create_shared_texture(alloc_width as usize, alloc_height as usize),
@@ -147,14 +147,14 @@ pub fn shared_swapchain_from_host_swapchain(host: &HostSwapchain, cx: &mut Cx) -
 // Linux: DMA-BUF-based swapchain
 // ============================================================================
 /// DRM layout metadata carried by the hosted image protocol.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct DrmFormat {
     pub fourcc: u32,
     pub modifiers: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Debug)]
 pub struct LinuxOwnedImagePlane {
     pub dma_buf_fd: std::os::fd::OwnedFd,
@@ -162,14 +162,14 @@ pub struct LinuxOwnedImagePlane {
     pub stride: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Debug)]
 pub struct LinuxOwnedVulkanImage {
     pub info: makepad_studio_protocol::LinuxVulkanSharedImage,
     pub semaphore_fd: std::os::fd::OwnedFd,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Debug)]
 pub struct LinuxOwnedImage {
     pub vulkan: Option<LinuxOwnedVulkanImage>,
@@ -178,14 +178,14 @@ pub struct LinuxOwnedImage {
     pub plane: LinuxOwnedImagePlane,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Debug)]
 pub struct LinuxPresentableImage {
     pub id: PresentableImageId,
     pub image: LinuxOwnedImage,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Debug)]
 pub enum SharedSwapchainCreateError {
     /// GPU allocation/export is pending; retain this swapchain and retry after its completion event.
@@ -193,12 +193,12 @@ pub enum SharedSwapchainCreateError {
     Vulkan(String),
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use crate::os::hosted_gpu_sender::{LinuxSwapchainSender, NativeDescriptors, SentSwapchain};
 
 /// An exported handle batch, with no CPU pixel payload. Ownership can move
 /// to a worker after Vulkan export has completed on the renderer thread.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub struct ExportedHostSwapchain {
     window_id: usize,
     alloc_width: u32,
@@ -206,7 +206,7 @@ pub struct ExportedHostSwapchain {
     images: [LinuxPresentableImage; SWAPCHAIN_IMAGE_COUNT],
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl ExportedHostSwapchain {
     pub(crate) fn send(self, endpoint: &makepad_hal::hosted_ipc::HostEndpoint) -> std::io::Result<SharedSwapchain> {
         let mut shared = Vec::with_capacity(SWAPCHAIN_IMAGE_COUNT);
@@ -220,7 +220,7 @@ impl ExportedHostSwapchain {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub fn export_host_swapchain(host: &mut HostSwapchain, cx: &mut Cx)
     -> Result<ExportedHostSwapchain, SharedSwapchainCreateError> {
     let mut owned_images: [Option<LinuxOwnedImage>; SWAPCHAIN_IMAGE_COUNT] =
@@ -246,7 +246,7 @@ pub fn export_host_swapchain(host: &mut HostSwapchain, cx: &mut Cx)
 // ============================================================================
 // Fallback for unsupported platforms
 // ============================================================================
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows")))]
 pub fn shared_swapchain_from_host_swapchain(
     host: &HostSwapchain,
     _cx: &mut crate::cx::Cx,
@@ -263,7 +263,7 @@ pub fn shared_swapchain_from_host_swapchain(
 }
 
 /// Auxiliary communication channel, besides stdin (only on Linux).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 // Unix-domain studio IPC is a native-only process boundary.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod aux_chan {
@@ -387,7 +387,7 @@ pub mod aux_chan {
         })
     }
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 pub mod aux_chan {
     use std::io;
 

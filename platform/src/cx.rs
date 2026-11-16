@@ -645,7 +645,7 @@ pub(crate) fn apple_physical_memory_bytes() -> Option<u64> {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_env = "ohos", target_os = "linux"))]
 pub(crate) fn linux_physical_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = meminfo.lines().find(|line| {
@@ -729,7 +729,7 @@ fn platform_memory_budget(default: usize) -> (usize, &'static str) {
         .unwrap_or((default, "default"))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 fn platform_memory_budget(default: usize) -> (usize, &'static str) {
     linux_physical_memory_bytes()
         .map(|bytes| {
@@ -753,7 +753,7 @@ fn platform_memory_budget(default: usize) -> (usize, &'static str) {
         .unwrap_or((default, "default"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn platform_memory_budget(default: usize) -> (usize, &'static str) {
     linux_physical_memory_bytes()
         .map(|bytes| {
@@ -765,7 +765,7 @@ fn platform_memory_budget(default: usize) -> (usize, &'static str) {
         .unwrap_or((default, "default"))
 }
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "macos", target_os = "ios", target_os = "android", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "macos", target_os = "ios", target_os = "android", target_env = "ohos", target_os = "windows", target_os = "linux")))]
 fn platform_memory_budget(default: usize) -> (usize, &'static str) {
     (default, "default")
 }
@@ -995,7 +995,7 @@ impl Cx {
 
     pub fn new(event_handler: Box<dyn FnMut(&mut Cx, &Event)>) -> Self {
         crate::thread::ui_hang::initialize();
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
         if !crate::restart::hosted() {
             crate::os::termination_signal::install();
         }

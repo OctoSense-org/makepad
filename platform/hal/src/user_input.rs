@@ -76,7 +76,7 @@ pub struct OpenDevice {
 static OPEN: std::sync::Mutex<Vec<OpenDevice>> = std::sync::Mutex::new(Vec::new());
 
 /// The device reader's open devices now: it says so when one opens, closes or first reports.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) fn set_open(devices: Vec<OpenDevice>) {
     *OPEN.lock().unwrap_or_else(|e| e.into_inner()) = devices;
 }

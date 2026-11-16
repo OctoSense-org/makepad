@@ -18,11 +18,11 @@ pub enum GlApi {
 /// on GL); elsewhere the bridge has no context and its calls do nothing.
 pub struct GlRenderBridge {
     /// A context of the GLES HAL backend's share group; none on the other HAL backends.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) inner: Option<makepad_hal::gl_interop::GlContext>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 impl GlRenderBridge {
     pub fn make_current(&self) {}
 
@@ -36,7 +36,7 @@ impl GlRenderBridge {
 }
 
 /// The GLES HAL backend: the bridge's context, when the backend is GL.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl GlRenderBridge {
     /// Make this GL context current on the calling thread (no-op without GL).
     pub fn make_current(&self) {

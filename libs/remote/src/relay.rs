@@ -96,7 +96,7 @@ fn forget(cfg: &Config, pid: u32) {
 }
 
 /// The start time of a running process; None when there is no such process (or it is a zombie).
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
 pub fn proc_start(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `pid (comm) state ...`: comm may hold spaces and parens, so count from the last `)`
@@ -138,7 +138,7 @@ pub fn proc_start(pid: u32) -> Option<u64> {
 
 /// Other Unix targets (iOS): no start time, only whether the process exists (signal 0 probe;
 /// the process list module is the server binary's, not this library's).
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_env = "ohos", target_os = "macos"))))]
 pub fn proc_start(pid: u32) -> Option<u64> {
     extern "C" {
         fn kill(pid: i32, sig: i32) -> i32;

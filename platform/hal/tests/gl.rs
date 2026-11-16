@@ -4,7 +4,7 @@
 //! and session 0's window layer over a lent window (the executor's badge layer).
 //! The fixtures follow the GLSL dialect's contract (shader_ir_glsl): packed geometry attributes,
 //! the clip-space Y flip under `mp_clip_y_flip`, `mp_pick` = (draw id, twin mask).
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", not(target_env = "ohos")))]
 
 use makepad_hal::glsl::{Attribute, GlslPipeline, Texture};
 use makepad_hal::ledger::Kind;

@@ -27,7 +27,7 @@ pub fn attach_parent_console() {
 
 /// `app_main!`'s JNI_OnLoad for a standalone Android app: ART loads libmakepad.so (the app
 /// crate as a cdylib). Chosen here so the app crate never sees the `relax` cfg.
-#[cfg(all(target_os = "android", not(relax)))]
+#[cfg(all(any(target_os = "android", target_env = "ohos"), not(relax)))]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! android_jni_entry {
@@ -39,7 +39,7 @@ macro_rules! android_jni_entry {
     };
 }
 
-#[cfg(not(all(target_os = "android", not(relax))))]
+#[cfg(not(all(any(target_os = "android", target_env = "ohos"), not(relax))))]
 #[macro_export]
 #[doc(hidden)]
 macro_rules! android_jni_entry {
@@ -54,7 +54,7 @@ macro_rules! android_jni_entry {
 /// `app_main!` exports it; a packed app under makepad run never gets here (the host owns JNI).
 /// # Safety
 /// Called by ART with its JavaVM, once per process.
-#[cfg(all(target_os = "android", not(relax)))]
+#[cfg(all(any(target_os = "android", target_env = "ohos"), not(relax)))]
 #[doc(hidden)]
 pub unsafe fn android_on_load(vm: *mut std::ffi::c_void, app: fn()) -> i32 {
     makepad_android_state::jni_on_load(vm);
@@ -78,13 +78,13 @@ pub fn run_app(app: fn()) {
     let hosted = std::relax::main_hosted();
     #[cfg(not(relax))]
     let hosted = false;
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
     if !hosted {
         /// Ends the main loop when the app thread is done, however it is done.
         struct Done;
         impl Drop for Done {
             fn drop(&mut self) {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
                 {
                     if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
                         eprintln!("[hal] app thread ending (panicking={}); closing remaining HAL sessions before stopping main loop", std::thread::panicking());
@@ -110,7 +110,7 @@ pub fn run_app(app: fn()) {
             })
             .expect("the app thread");
         makepad_hal::run_main_loop();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] main loop returned; joining app thread");
         }
@@ -121,7 +121,7 @@ pub fn run_app(app: fn()) {
         if panicked {
             std::process::exit(101);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] app thread joined, HAL stopped; run_app returning");
         }
@@ -211,13 +211,13 @@ pub struct WmAdmission {
     pub crate_name: &'static str,
 }
 
-#[cfg(all(target_os = "linux", not(relax)))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
 static ADMITTED: std::sync::OnceLock<Option<WmAdmission>> = std::sync::OnceLock::new();
 
 pub fn admitted_by_window_manager() -> Option<WmAdmission> {
-    #[cfg(all(target_os = "linux", not(relax)))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
     return ADMITTED.get().copied().flatten();
-    #[cfg(not(all(target_os = "linux", not(relax))))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"), not(relax))))]
     None
 }
 
@@ -233,9 +233,9 @@ pub fn discover_window_manager(crate_name: &'static str) {
     // reattach to the next WM): its package, which the WM finds the app's label and icon by.
     // Never the executable's file name: a rebuild replaces the binary under a running app and
     // Linux then reads it as "<path> (deleted)".
-    #[cfg(all(target_os = "linux", not(relax)))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
     makepad_hal::wm_socket::set_client_name(crate_name);
-    #[cfg(all(target_os = "linux", not(relax)))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
     ADMITTED.get_or_init(|| {
         use makepad_hal::wm_socket::{self, Backend};
         if launched_by_host() || is_window_manager() || OUTLIVES_WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
@@ -263,7 +263,7 @@ pub fn discover_window_manager(crate_name: &'static str) {
             }
         }
     });
-    #[cfg(not(all(target_os = "linux", not(relax))))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"), not(relax))))]
     let _ = crate_name;
 }
 

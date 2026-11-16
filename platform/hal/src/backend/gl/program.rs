@@ -122,7 +122,7 @@ pub(super) fn link_error(gl: &sys::Gl, program: GLuint, shaders: [GLuint; 2]) ->
 impl Renderer {
     pub fn compile(&mut self, state: &Arc<PipeState>) {
         let key = Key::of(&state.code.vertex, &state.code.fragment);
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if self.compile_on_worker(state, key) { return; }
         self.compile_here(state, key);
     }

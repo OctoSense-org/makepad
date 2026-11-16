@@ -225,7 +225,7 @@ impl ScriptHook for AppIcon {
                 desktop_style::current_style(vm)
             } else if cfg!(target_os = "ios") {
                 DesktopStyle::Ios
-            } else if cfg!(target_os = "android") {
+            } else if cfg!(any(target_os = "android", target_env = "ohos")) {
                 DesktopStyle::Android
             } else if cfg!(target_os = "macos") {
                 DesktopStyle::Macos

@@ -179,16 +179,16 @@ pub(crate) trait StreamEncoderOs: Sized + Send {
 use crate::apple_stream_encoder::AppleStreamEncoder as OsStreamEncoder;
 #[cfg(target_os = "windows")]
 use crate::windows_stream_encoder::WindowsStreamEncoder as OsStreamEncoder;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
 use crate::hal_stream_encoder::HalStreamEncoder as OsStreamEncoder;
-#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
 use NoStreamEncoder as OsStreamEncoder;
 
 /// No stream encoder on this platform.
-#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
 pub(crate) enum NoStreamEncoder {}
 
-#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
 impl StreamEncoderOs for NoStreamEncoder {
     fn caps() -> EncoderCaps {
         EncoderCaps { engines: 1, tiles: false, full_chroma: false, hevc: false }

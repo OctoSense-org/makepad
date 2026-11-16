@@ -41,13 +41,13 @@ impl Completion {
 }
 
 /// The backend's side of a [`Completion`]: answered once, then wakes whoever asked.
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_vendor = "apple"))]
 pub(crate) struct CompletionReply {
     tx: Mutex<Option<std::sync::mpsc::SyncSender<Answer>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
-#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_vendor = "apple"))]
 impl CompletionReply {
     pub fn new(wake: Arc<dyn Fn() + Send + Sync>) -> (Completion, CompletionReply) {
         let (tx, rx) = sync_channel(1);

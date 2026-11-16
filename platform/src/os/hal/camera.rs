@@ -320,7 +320,7 @@ impl Cx {
     }
 
     /// A camera preview of a camera (the video is of camera source): the camera runs for it only.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     pub(crate) fn hal_prepare_camera_preview(&mut self, video_id: LiveId, input: VideoInputId, format: VideoFormatId) {
         // the preview overrides slot 0: its frame callbacks are cleared
         *lock(&self.hal.camera.frame_cb[0]) = None;

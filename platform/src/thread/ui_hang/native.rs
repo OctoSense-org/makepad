@@ -10,7 +10,7 @@ use std::{
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 mod backend;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[path = "linux.rs"]
 mod backend;
 #[cfg(target_os = "windows")]

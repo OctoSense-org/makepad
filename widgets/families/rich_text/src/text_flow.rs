@@ -4175,7 +4175,7 @@ mod tests {
         fresh_drawer.draw("x", width);
         let row_starts = drawer.get_row_starts(CJK_IN_BRACKETS, width);
         // (Windows lays CJK out with its system fonts while the download is on its way)
-        if cfg!(target_os = "linux") {
+        if cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
             assert_ne!(row_starts, row_starts_without_font);
         }
         assert_eq!(row_starts, fresh_drawer.get_row_starts(CJK_IN_BRACKETS, width));

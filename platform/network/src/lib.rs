@@ -88,7 +88,7 @@ pub use crate::web_socket_parser::{
 };
 pub use makepad_error_log;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use crate::backend::{
     clear_platform_socket_factory as clear_android_socket_stream_factory_shim,
     register_platform_socket_factory as register_android_socket_stream_factory_shim,

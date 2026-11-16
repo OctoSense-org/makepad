@@ -56,7 +56,7 @@ use makepad_platform::audio_output_tap::{add_audio_output_tap, remove_audio_outp
 use makepad_platform::screen_capture::{
     add_screen_capture, remove_screen_capture, ScreenCaptureOptions,
 };
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 use makepad_platform::screen_capture::{
     add_screen_capture_surface, surfaces_supported, ScreenCaptureSurface,
 };
@@ -470,7 +470,7 @@ enum FramePixels {
     /// Tightly packed RGBA8 (the byte readback).
     Rgba(Vec<u8>),
     /// The GPU surface itself; holding it holds one capture buffer.
-    #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     Surface(ScreenCaptureSurface),
 }
 
@@ -478,13 +478,13 @@ impl CapturedFrame {
     /// The frame as RGBA bytes: its own, or read out of the surface into
     /// `scratch` (PNG evidence and letterboxing only, never per frame).
     #[cfg_attr(
-        not(any(target_vendor = "apple", target_os = "windows", target_os = "linux")),
+        not(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos")))),
         allow(unused_variables)
     )]
     fn rgba<'a>(&'a self, scratch: &'a mut Vec<u8>) -> &'a [u8] {
         match &self.pixels {
             FramePixels::Rgba(rgba) => rgba,
-            #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             FramePixels::Surface(surface) => {
                 surface.read_rgba(scratch);
                 scratch
@@ -686,7 +686,7 @@ fn install_sink(
         drop(slot);
         cvar.notify_one();
     }
-    #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     if surfaces_supported() {
         let (slot, stop, last_frame_ns) = (slot.clone(), stop.clone(), last_frame_ns.clone());
         return add_screen_capture_surface(options, move |surface| {
@@ -718,7 +718,7 @@ fn install_sink(
                     slot.dropped += 1;
                     old
                 }
-                #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+                #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
                 Some(_) => {
                     slot.dropped += 1;
                     std::mem::take(&mut slot.spare)
@@ -807,9 +807,9 @@ fn to_i16(sample: f32) -> i16 {
 /// (a home folder, say) is not where recordings go, wherever the app was launched from.
 pub fn repo_screencap_dir() -> PathBuf {
     // Not on Android: there the checkout is the APK's read-only source pack.
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     let starts = [std::env::current_exe().ok(), std::env::current_dir().ok(), std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(|home| PathBuf::from(home).join("makepad"))];
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     let starts: [Option<PathBuf>; 0] = [];
     screencap_dir_in(starts.into_iter().flatten()).unwrap_or_else(|| {
         crate::makepad_platform::home::app_data_dir("screencap").unwrap_or_else(|| std::env::temp_dir().join("makepad-screencap"))

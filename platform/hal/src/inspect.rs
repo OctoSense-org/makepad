@@ -308,7 +308,7 @@ fn diff(req: &Req, out: &mut Out) {
 static PUMP_LAST: Mutex<Option<(std::time::Instant, Vec<(u32, crate::PumpCounts)>)>> = Mutex::new(None);
 
 fn pace(out: &mut Out) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let lines = crate::backend::linux::wm::pace_lines();
         if !lines.is_empty() {

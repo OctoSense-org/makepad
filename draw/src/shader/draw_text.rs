@@ -2808,7 +2808,7 @@ fn load_font_resource(cx: &mut Cx, path: &str) {
     if std::path::Path::new(path).is_file() {
         return;
     }
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     if cx.get_resource_font_asset_bytes_by_path(path).is_some() {
         return;
     }

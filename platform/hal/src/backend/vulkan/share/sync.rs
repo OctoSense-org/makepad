@@ -4,7 +4,7 @@ use super::super::device::{error, Device};
 use makepad_vulkan::vk;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use std::{os::fd::{AsRawFd, IntoRawFd}, sync::atomic::{AtomicU64, Ordering}};
 
 pub(crate) struct Semaphore { pub dev: Arc<Device>, pub raw: vk::Semaphore }
@@ -20,7 +20,7 @@ pub(crate) fn sync_files(dev: &Device) -> bool {
     props.external_semaphore_features.contains(vk::ExternalSemaphoreFeatureFlags::EXPORTABLE | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) fn timeline_supported(dev: &Device) -> bool {
     if !dev.supports(vk::KHR_TIMELINE_SEMAPHORE_NAME) || !dev.supports(vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME) { return false; }
     let mut ty = vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
@@ -48,14 +48,14 @@ impl Semaphore {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) struct Timeline {
     pub semaphore: Arc<Semaphore>,
     pub producer: bool,
     next: AtomicU64,
     accepted: AtomicU64,
 }
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Timeline {
     pub fn create(dev: Arc<Device>) -> Result<Arc<Self>, String> {
         let mut export = vk::ExportSemaphoreCreateInfo::default().handle_types(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD);

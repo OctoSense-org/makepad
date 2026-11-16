@@ -3,7 +3,7 @@
 use std::{marker::PhantomData, rc::Rc};
 #[path = "ui_hash.rs"]
 pub mod hashing;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 use std::cell::Cell;
 
 #[derive(Clone, Copy, Debug)]
@@ -34,7 +34,7 @@ pub enum UiPhase {
     Tasks,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 fn phase_name(id: u32) -> &'static str {
     match id {
         256 => "native-event",
@@ -64,12 +64,12 @@ fn phase_name(id: u32) -> &'static str {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 mod native;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 use native::State;
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 thread_local! {
     static CURRENT: Cell<*const State> = const { Cell::new(std::ptr::null()) };
 }
@@ -77,7 +77,7 @@ thread_local! {
 /// Register the calling UI thread once, at Cx construction. Workers never
 /// register and their phase scopes are no-ops. No thread is spawned per frame.
 pub fn initialize() {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
     native::initialize();
 }
 
@@ -85,14 +85,14 @@ pub fn initialize() {
 /// event/frame; the event loop's idle wait must remain outside that scope.
 #[must_use]
 pub struct UiPhaseGuard {
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
     state: *const State,
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
     previous: u64,
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
     root: bool,
     /// the phase reported to makepad inspect's timeline at entry (0: none)
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
     traced: u64,
     _thread: PhantomData<Rc<()>>,
 }
@@ -101,7 +101,7 @@ pub struct UiPhaseGuard {
 /// makepad inspect leaves this time out of a frame.
 #[must_use]
 pub struct UiIdleGuard {
-    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
     hooks: Option<&'static relax_timeline::Hooks>,
     _thread: PhantomData<Rc<()>>,
 }
@@ -110,14 +110,14 @@ pub struct UiIdleGuard {
 /// makepad inspect leaves this time out of a frame.
 #[inline]
 pub fn ui_idle() -> UiIdleGuard {
-    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
     let hooks = relax_timeline::hooks();
-    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
     if let Some(h) = hooks {
         (h.begin)("idle".as_ptr(), "idle".len());
     }
     UiIdleGuard {
-        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         hooks,
         _thread: PhantomData,
     }
@@ -126,7 +126,7 @@ pub fn ui_idle() -> UiIdleGuard {
 impl Drop for UiIdleGuard {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         if let Some(h) = self.hooks {
             (h.end)("idle".as_ptr(), "idle".len());
         }
@@ -135,7 +135,7 @@ impl Drop for UiIdleGuard {
 
 /// makepad inspect's timeline under `makepad run` (dlsym'd once; absent in a rustc build): the
 /// loader's recording flag and its span entries. Off, a phase costs one load.
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
 pub(crate) mod relax_timeline {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;
@@ -191,7 +191,7 @@ pub fn ui_event_phase(event: &crate::event::Event) -> UiPhaseGuard {
     enter(event.to_u32() as u64 + 1)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 #[inline]
 fn enter(phase: u64) -> UiPhaseGuard {
     let state = CURRENT.with(Cell::get);
@@ -199,18 +199,18 @@ fn enter(phase: u64) -> UiPhaseGuard {
         state,
         previous: 0,
         root: false,
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
         traced: 0,
         _thread: PhantomData,
     };
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
     if let Some(h) = relax_timeline::hooks() {
         let name = phase_name(phase as u32);
         (h.begin)(name.as_ptr(), name.len());
         guard.traced = phase;
     }
     // a native build's profiler stream (a viewer is attached)
-    #[cfg(all(not(relax), any(target_os = "macos", target_os = "linux")))]
+    #[cfg(all(not(relax), any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
     if guard.traced == 0 && crate::prof_native::on() {
         crate::prof_native::begin(phase_name(phase as u32));
         guard.traced = phase;
@@ -229,7 +229,7 @@ fn enter(phase: u64) -> UiPhaseGuard {
     guard
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
 #[inline]
 fn enter(_: u64) -> UiPhaseGuard {
     UiPhaseGuard { _thread: PhantomData }
@@ -238,7 +238,7 @@ fn enter(_: u64) -> UiPhaseGuard {
 impl Drop for UiPhaseGuard {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
         if self.traced != 0 {
             if let Some(h) = relax_timeline::hooks() {
                 let name = phase_name(self.traced as u32);
@@ -248,7 +248,7 @@ impl Drop for UiPhaseGuard {
                 crate::prof_native::end(phase_name(self.traced as u32));
             }
         }
-        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
         if !self.state.is_null() {
             let state = unsafe { &*self.state };
             if self.root {

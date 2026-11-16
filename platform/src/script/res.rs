@@ -249,7 +249,7 @@ fn load_packaged_resource(cx: &Cx, dep_path: &str) -> Option<Rc<Vec<u8>>> {
 /// is free to start the process anywhere — see `crate::os::cx_native::exe_relative_path`.
 #[cfg(all(
     not(target_arch = "wasm32"),
-    not(any(target_os = "android", target_os = "ios", target_os = "tvos")),
+    not(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos")),
     not(all(target_os = "macos", apple_bundle))
 ))]
 fn load_packaged_resource(cx: &Cx, dep_path: &str) -> Option<Rc<Vec<u8>>> {
@@ -481,7 +481,7 @@ impl Cx {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if is_packaged {
-                    #[cfg(not(target_os = "android"))]
+                    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
                     if let Some(dep_path) = res.dependency_path.as_deref() {
                         if let Some(data) = load_packaged_resource(self, dep_path) {
                             res.data = CxScriptResourceData::Loaded(data);

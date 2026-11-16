@@ -79,13 +79,13 @@ impl Cx {
     }
 
     fn hal_init_session(&mut self, info: makepad_hal::HalInfo) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if info.backend == makepad_hal::backend_id::VULKAN { crate::screen_capture::set_surfaces_supported(); }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         { self.os_type = if info.flags & info_flags::DIRECT_DISPLAY != 0 { crate::cx::OsType::LinuxDirect } else { crate::cx::OsType::LinuxWindow(crate::cx::LinuxWindowParams {
             custom_window_chrome: info.flags & info_flags::CLIENT_CHROME != 0,
         }) }; }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         crate::screen::set_hal_direct_screens((info.flags & info_flags::DIRECT_DISPLAY != 0).then(Vec::new));
         let supports = |format| info.formats & (1u64 << format) != 0;
         self.gpu_info.float_color_targets = supports(makepad_hal::format::RGBA32F);
@@ -267,7 +267,7 @@ impl Cx {
         if self.hosted_frames_held() {
             return false;
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if self.hal.pending_ime_hide {
             return true;
         }
@@ -309,7 +309,7 @@ impl Cx {
         let interval = self.hal.frame_interval;
         // Android's Choreographer takes a request through the main thread's looper to SurfaceFlinger, which can
         // take longer than half a tick, so there we ask a quarter tick after the tick before the one it lands on.
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if self.hal_info_flags() & info_flags::DISPLAY_CLOCK != 0 {
             return self.time_repaint_tick_wake(self.time_fps_clock.frame_time, interval).map(|at| at + interval * 0.25);
         }
@@ -317,11 +317,11 @@ impl Cx {
     }
 
     fn hal_run(&mut self) {
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
         fn termination_requested() -> bool {
             crate::os::termination_signal::seen()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        #[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows")))]
         fn termination_requested() -> bool {
             false
         }
@@ -332,7 +332,7 @@ impl Cx {
         self.os_type = host_os_type();
         let hosted = crate::app_main::should_run_stdin_loop_from_env();
         // a desktop keyboard is physical (hosted children hear it from their host at startup)
-        #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_os = "android"))))]
+        #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"), not(any(target_os = "android", target_env = "ohos")))))]
         if !hosted {
             self.set_physical_keyboard_state(true);
         }
@@ -343,7 +343,7 @@ impl Cx {
             }
             self.in_makepad_studio = true;
             self.hal.hosted = Some(Default::default());
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             if let Err(error) = self.hal_hosted_start_transport() {
                 crate::error!("hal hosted transport: {error}");
                 return;
@@ -355,7 +355,7 @@ impl Cx {
         // `MAKEPAD_HAL_BACKEND=headless|offscreen|metal|vulkan`: Metal is the macOS default;
         // Linux defaults to desktop Vulkan; hidden/offscreen requests do not start an OS shell.
         let mut windows = 0;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if hosted { windows |= open_flags::OFFSCREEN_WINDOWS; }
         // a script (or the remote bridge) reads windows back: they keep their newest frame
         if std::env::var_os("MAKEPAD_HAL_SCRIPT").is_some() || crate::remote::requested() {
@@ -385,7 +385,7 @@ impl Cx {
         }
         self.hal_init_session(info);
         // Controllers wake the pump. Linux hosted apps own an evdev reader too.
-        #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
         self.hal.frames.w.game_out(0, makepad_hal::media::game_op::ENABLE, 0, 0, 0, 0, &[]);
         let display_clock = info.flags & info_flags::DISPLAY_CLOCK != 0;
         // a batch renderer beats as the GPU completes frames, not 60 times a second
@@ -399,7 +399,7 @@ impl Cx {
         let mut quit_due = false;
         // the UI thread's time outside the idle wait, from this turn's wake (`pass_load`)
         let mut busy_from = None;
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         let mut performance_hint = if hosted { None } else { makepad_hal::backend::android::performance_hint::PerformanceHint::for_this_thread(period) };
         'turns: loop {
             self.hal_frames_room();
@@ -447,7 +447,7 @@ impl Cx {
                 // a frame asked for and not announced is asked again when its wait runs out
                 match requested.filter(|_| display_clock && self.hal_has_work()) {
                     // Android's shell holds a paused app's request till it's back, so it sleeps meanwhile
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     Some(_) if makepad_hal::backend::android::jni::frame_requests_held() => u64::MAX,
                     Some(at) => (at + REREQUEST).saturating_duration_since(std::time::Instant::now()).as_nanos() as u64,
                     // (a run that beat and painted nothing wakes to count its rounds: `first_draw`)
@@ -459,7 +459,7 @@ impl Cx {
             } else {
                 next_beat.saturating_duration_since(std::time::Instant::now()).as_nanos() as u64
             };
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             if let Some(hint) = performance_hint.as_mut() {
                 hint.start_turn(!self.hal_has_work() || self.hal.device_lost);
             }
@@ -528,7 +528,7 @@ impl Cx {
             // app asked to quit during its Startup drew its first frame first, which compiled its
             // whole tree's draw code after the quit (5,300 lazy compiles of a counter's 14,600).
             if !hosted {
-                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
                 if crate::os::termination_signal::requested() {
                     self.handle_termination_signal();
                     if !self.hal_handle_platform_ops() {
@@ -553,7 +553,7 @@ impl Cx {
                     eprintln!("[hal-client] session={} FrameReady starts draw beat", info.session);
                 }
                 // XR frames keep the headset's pace, not the beat's
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_env = "ohos"))]
                 if let Some(hint) = performance_hint.as_mut() {
                     match self.hal.xr {
                         Some(_) => hint.skip_frame(),
@@ -567,7 +567,7 @@ impl Cx {
                 }
                 // A hide still pending after this draw really hides the keyboard,
                 // unless the draw queued a `ShowTextIME` for an input that took focus.
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_env = "ohos"))]
                 if self.hal.pending_ime_hide
                     && !self.platform_ops.iter().any(|queued| matches!(queued, crate::cx_api::CxOsOp::ShowTextIME(..)))
                 {
@@ -590,7 +590,7 @@ impl Cx {
             }
             // No draw is coming to wait for if no window is ready, the surface is gone, the
             // Activity is paused or the GPU device is lost, so a hide goes out now.
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             if self.hal.pending_ime_hide
                 && (self.hal.no_surface || self.hal.activity_paused || self.hal.device_lost
                     || !self.windows.id_iter().any(|w| self.hal.window_ready(w)))
@@ -618,7 +618,7 @@ impl Cx {
             // what this turn leaves the loop waiting for, read by `loop` without the UI thread
             loop_watch::publish(display_clock && self.hal_has_work(), self.hal.beat,
                 self.hal.in_flight.len(), self.hal.in_flight.front().map(|&(_, at)| at), FRAMES_IN_FLIGHT);
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             if let Some(hint) = performance_hint.as_mut() {
                 hint.finish_frame(self.repaint_id);
             }
@@ -741,7 +741,7 @@ impl Cx {
         self.hal.frames = fb;
         #[cfg(relax)]
         self.hal_audio_waiting_ready();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             self.hal.direct_display.flush(&mut self.hal.frames.w);
             if self.hal.direct_display.window.is_some() { crate::linux_input::flush(&mut self.hal.frames.w); }
@@ -972,7 +972,7 @@ impl Cx {
             self.hal.frame_trace.next_frame(time_now);
             self.call_next_frame_event(time_now);
             // the frame saw this beat's game input taps (held for it); later frames see them released
-            #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             self.hal.game.frame_end();
             self.hal.beat_phases[1] = [next_start, makepad_hal::clock_ns()];
         }
@@ -1019,7 +1019,7 @@ impl Cx {
                 if pending_glyphs != 0 || pending_pipelines != 0 {
                     // On a launch whose pipeline cache started cold, the Activity's cover explains this wait.
                     // No frame has sent it the app's background color yet, so we send that first, for the screen to match.
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     if !self.hal.shader_compile_screen_requested && first_frame && pending_pipelines != 0
                         && self.hal_info_flags() & makepad_hal::info_flags::PIPELINE_CACHE_COLD != 0 {
                         self.hal.shader_compile_screen_requested = true;
@@ -1147,7 +1147,7 @@ fn host_os_type() -> OsType {
     return OsType::Unknown;
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 impl Cx {
     /// Android's `OsType` carries the Activity's paths, density and versions, which can come after
     /// the app starts and come again with each configuration change (followed by a `Display`).

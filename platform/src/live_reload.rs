@@ -7,11 +7,11 @@ use makepad_live_reload_core::{
     normalize_path, normalize_path_string, normalize_relative_path_string,
 };
 use std::collections::{BTreeMap, HashSet};
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 use {
     crate::thread::SignalToUI,
     makepad_live_reload_core::{
@@ -38,7 +38,7 @@ pub struct CxLiveReloadState {
     /// compiler patch of a design's code under `makepad run`), so the next
     /// live edit re-runs the modules as a DSL change.
     pub(crate) overrides_changed: bool,
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     pub(crate) file_observer: Option<DesktopHotReloadWatcher>,
 }
 
@@ -115,12 +115,12 @@ struct CompiledScriptModSite {
     values: Vec<ScriptValue>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 pub(crate) struct DesktopHotReloadWatcher {
     _watcher: LiveReloadWatcherHandle,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 type HotReloadWatchPlan = LiveReloadWatchPlan;
 
 impl Default for CxLiveReloadState {
@@ -130,7 +130,7 @@ impl Default for CxLiveReloadState {
             source_locked: false,
             script_mod_overrides: Default::default(),
             overrides_changed: false,
-            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             file_observer: None,
         }
     }
@@ -216,7 +216,7 @@ impl Cx {
         state.source_locked = true;
         state.pending_files.clear();
         state.script_mod_overrides.replace(Default::default());
-        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
         {
             state.file_observer = None;
         }
@@ -224,7 +224,7 @@ impl Cx {
 
     pub fn start_hot_reload_file_observer_if_requested(&mut self) {
         if self.script_data.live_reload.source_locked { return; }
-        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
         self.start_desktop_hot_reload_file_observer_if_requested();
     }
 
@@ -233,7 +233,7 @@ impl Cx {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 impl Cx {
     fn start_desktop_hot_reload_file_observer_if_requested(&mut self) {
         if !hot_reload_requested_from_args() {
@@ -696,12 +696,12 @@ impl Cx {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 fn hot_reload_requested_from_args() -> bool {
     std::env::args().any(|arg| arg == "--hot")
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 fn collect_hot_reload_watch_plan(
     script_vm: &crate::makepad_script::ScriptVmBase,
 ) -> Option<HotReloadWatchPlan> {
@@ -754,7 +754,7 @@ fn collect_hot_reload_watch_plan(
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 fn excluded_hot_reload_manifest_paths() -> HashSet<String> {
     let platform_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     [
@@ -767,7 +767,7 @@ fn excluded_hot_reload_manifest_paths() -> HashSet<String> {
     .collect()
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 fn hot_reload_root_for_script_mod(
     script_mod: &ScriptMod,
     excluded_manifest_paths: &HashSet<String>,
@@ -782,7 +782,7 @@ fn hot_reload_root_for_script_mod(
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 fn resolve_script_mod_file_for_watch(script_mod: &ScriptMod) -> Option<String> {
     let candidates = resolve_script_mod_file_candidates(script_mod);
     candidates
@@ -1434,7 +1434,7 @@ mod tests {
         );
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     #[test]
     fn excludes_platform_script_and_draw_manifests_from_hot_reload() {
         let excluded = excluded_hot_reload_manifest_paths();

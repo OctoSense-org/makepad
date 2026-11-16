@@ -33,14 +33,14 @@ pub fn socket_dir() -> PathBuf {
 
 /// [`socket_dir`] of every process of this user.
 pub(crate) fn user_socket_dir() -> PathBuf {
-    #[cfg(all(unix, not(any(target_os = "android", target_os = "ios"))))]
+    #[cfg(all(unix, not(any(target_os = "android", target_env = "ohos", target_os = "ios"))))]
     {
         extern "C" {
             fn getuid() -> u32;
         }
         PathBuf::from(format!("/tmp/makepad-{}", unsafe { getuid() }))
     }
-    #[cfg(not(all(unix, not(any(target_os = "android", target_os = "ios")))))]
+    #[cfg(not(all(unix, not(any(target_os = "android", target_env = "ohos", target_os = "ios")))))]
     std::env::temp_dir()
 }
 
@@ -124,7 +124,7 @@ mod imp {
 
     /// Makes `dir` this user's own directory (0700). In /tmp anyone may make one: a directory (or
     /// link) that is not this user's is refused, never used.
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos", target_os = "ios")))]
     pub(super) fn make_own(dir: &Path) -> io::Result<()> {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
         extern "C" {
@@ -145,7 +145,7 @@ mod imp {
     }
 
     /// A phone's app temp dir is its own already.
-    #[cfg(any(target_os = "android", target_os = "ios"))]
+    #[cfg(any(target_os = "android", target_env = "ohos", target_os = "ios"))]
     pub(super) fn make_own(_: &Path) -> io::Result<()> {
         Ok(())
     }
@@ -238,7 +238,7 @@ mod imp {
     /// (`"socket_error"`, no caps): a client names the reason instead of finding no app.
     pub fn listen(ep: &Endpoint, extra: &str) -> io::Result<PathBuf> {
         let _ = crate::cmd::now_ms();
-        #[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+        #[cfg(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos"))]
         crate::discovery::remove_stale(ep.hooks());
         let (sock, disc) = paths(std::process::id());
         let served = serve_announced(ep, extra, &sock, &disc, own_dir);

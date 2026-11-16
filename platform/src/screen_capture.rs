@@ -83,7 +83,7 @@ impl Default for ScreenCaptureOptions {
 /// to the backend's small capture ring, so a sink that holds on to surfaces
 /// holds capture buffers (hold the newest only). With none free the backend
 /// skips frames rather than waiting.
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 #[derive(Clone)]
 pub struct ScreenCaptureSurface {
     pub(crate) inner: SurfaceInner,
@@ -124,12 +124,12 @@ pub(crate) struct SurfaceInner {
     pub(crate) device: crate::windows::Win32::Graphics::Direct3D11::ID3D11Device,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Clone)]
 pub(crate) struct SurfaceInner(pub(crate) std::sync::Arc<dyn MappedCapture>);
 
 /// A Linux capture buffer, mapped for reading while any handle lives.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) trait MappedCapture: Send + Sync {
     /// Rows of `stride()` bytes, top row first.
     fn bytes(&self) -> &[u8];
@@ -138,7 +138,7 @@ pub(crate) trait MappedCapture: Send + Sync {
     fn bgra(&self) -> bool;
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 impl ScreenCaptureSurface {
     /// The `CVPixelBufferRef`, valid while `self` lives.
     #[cfg(target_vendor = "apple")]
@@ -190,7 +190,7 @@ impl ScreenCaptureSurface {
         {
             read_d3d11_rgba(self, out)
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let (bytes, stride) = (self.inner.0.bytes(), self.inner.0.stride());
             if stride < width * 4 || bytes.len() < stride * height {
@@ -256,7 +256,7 @@ fn read_d3d11_rgba(surface: &ScreenCaptureSurface, out: &mut Vec<u8>) -> bool {
 }
 
 /// `src` pixels to opaque RGBA in `dst`, swapping red and blue when `bgra`.
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 pub(crate) fn swizzle_opaque(dst: &mut [u8], src: &[u8], bgra: bool) {
     for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
         if bgra {
@@ -267,7 +267,7 @@ pub(crate) fn swizzle_opaque(dst: &mut [u8], src: &[u8], bgra: bool) {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 pub type ScreenCaptureSurfaceFn = Box<dyn FnMut(&ScreenCaptureSurface) + Send + 'static>;
 
 /// Set by a backend that delivers surfaces ([`add_screen_capture_surface`]);
@@ -289,7 +289,7 @@ pub(crate) fn set_surfaces_supported() {
 
 enum SinkFn {
     Bytes(ScreenCaptureFn),
-    #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     Surface(ScreenCaptureSurfaceFn),
 }
 
@@ -354,7 +354,7 @@ pub fn add_screen_capture_box(options: ScreenCaptureOptions, f: ScreenCaptureFn)
 
 /// Install a surface sink (see the module docs): every due presented frame of
 /// the window, as a GPU surface, on the backend's frame-completion thread.
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 pub fn add_screen_capture_surface<F>(options: ScreenCaptureOptions, f: F) -> u64
 where
     F: FnMut(&ScreenCaptureSurface) + Send + 'static,
@@ -410,7 +410,7 @@ pub fn capture_wants_window(window_id: Option<usize>) -> bool {
 }
 
 /// Should this pass blit its drawable into a capture surface?
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 pub fn capture_wants_surface(window_id: Option<usize>) -> bool {
     if !ACTIVE.load(Ordering::Acquire) {
         return false;
@@ -426,7 +426,7 @@ pub fn capture_wants_surface(window_id: Option<usize>) -> bool {
 
 /// Hand a captured surface to every surface sink that wants it. Called from
 /// the backend's frame-completion path; `surface.time_ns` is set here.
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 pub(crate) fn deliver_capture_surface(window_id: Option<usize>, mut surface: ScreenCaptureSurface) {
     if !ACTIVE.load(Ordering::Acquire) {
         return;

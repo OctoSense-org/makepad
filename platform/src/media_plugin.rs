@@ -193,7 +193,7 @@ pub trait MediaPlaybackSession {
     fn poll_frame(&mut self) -> bool;
     fn take_yuv_frame(&mut self) -> Option<YuvPlaneData>;
     /// Optional Android zero-copy present: OES texture id for `sample_video`.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     fn take_oes_frame(&mut self) -> Option<crate::gpu_texture::OesFrame> {
         None
     }

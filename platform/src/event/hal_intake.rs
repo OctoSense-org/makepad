@@ -116,7 +116,7 @@ impl Cx {
             }
         }
         // A pending IME hide needs to know when there's no draw coming to wait for.
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if let HalEvent::Lifecycle { kind } = event {
             match kind {
                 makepad_hal::lifecycle::PAUSE => self.hal.activity_paused = true,
@@ -132,9 +132,9 @@ impl Cx {
                 Ok(rec) => self.hal.gpu_prof = Some(rec),
                 Err(error) => crate::error!("hal gpu profile: {error}"),
             },
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             HalEvent::HostedNativeOut { bytes } => self.hal_hosted_native_out(bytes),
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
             HalEvent::HostedNativeOut { .. } => {}
             // ---- pointer
             HalEvent::MouseDown { window, x, y, button, mods } => {
@@ -394,21 +394,21 @@ impl Cx {
             HalEvent::PayloadSize { bytes } => {
                 self.hal.event_arena_min = self.hal.event_arena_min.max(bytes as usize);
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             HalEvent::DirectDisplays { window, generation, inventory } => self.hal_display_inventory(window, generation, inventory),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             HalEvent::DirectFrameTiming { window, generation, output, last_present_ns, refresh_interval } => {
                 self.hal_display_timing(window, generation, output, last_present_ns, refresh_interval);
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             HalEvent::DirectDisplayResult { req, command, ok, message } => self.hal_display_result(req, command, ok, message),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             HalEvent::DirectInput { window, mouse_speed, touchpad_speed, natural_scroll_mouse, natural_scroll_touchpad, tap_to_click } => {
                 if self.hal.direct_display.window == Some(window) {
                     crate::linux_input::report([mouse_speed, touchpad_speed], [natural_scroll_mouse, natural_scroll_touchpad], tap_to_click);
                 }
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
             HalEvent::DirectDisplays { .. } | HalEvent::DirectFrameTiming { .. }
                 | HalEvent::DirectDisplayResult { .. } | HalEvent::DirectInput { .. } => {}
             HalEvent::Clipboard { req, supported, content } => {
@@ -441,7 +441,7 @@ impl Cx {
             }
             HalEvent::ImeResize { window, height, open } => {
                 // Every closed report lets the next show go out, even one the checks below ignore.
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_env = "ohos"))]
                 if !open { self.hal.ime_shown = None; }
                 let window_id = window_id(window);
                 if !self.windows.is_valid(window_id) {
@@ -557,7 +557,7 @@ impl Cx {
             }
             HalEvent::Geom { window, x, y, w, h, dpi, state } => self.hal_window_geom(window_id(window), dvec2(x, y), dvec2(w, h), dpi as f64, state),
             HalEvent::Display { window, dpi, refresh: _ } => {
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_env = "ohos"))]
                 self.hal_update_android_os_type();
                 let window_id = window_id(window);
                 if self.windows.is_valid(window_id) {
@@ -569,7 +569,7 @@ impl Cx {
                 }
             }
             HalEvent::Chrome { window, x, y, w, h, topmost } => {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 if w > 0.0 && h > 0.0 {
                     if let crate::cx::OsType::LinuxWindow(params) = &mut self.os_type { params.custom_window_chrome = true; }
                 }
@@ -579,7 +579,7 @@ impl Cx {
                     // Do not mix native points into the current layout geometry: it is the
                     // old side of the next change, and repeated Geom events must scale once.
                     self.hal.windows.entry(window_id.0).or_default().chrome = Some((Rect { pos: dvec2(x, y), size: dvec2(w, h) }, topmost));
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     {
                         let window = &mut self.windows[window_id];
                         window.uses_client_side_decorations = w > 0.0 && h > 0.0;
@@ -730,7 +730,7 @@ impl Cx {
             // ---- app
             // (every backend paints its windows once after the app started)
             HalEvent::Startup {} => {
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_env = "ohos"))]
                 self.hal_update_android_os_type();
                 if self.hal.hosted.is_some() {
                     Self::send_studio_message(crate::studio::AppToStudio::BeforeStartup);
@@ -764,7 +764,7 @@ impl Cx {
                 makepad_hal::lifecycle::PAUSE => self.call_event_handler(&Event::Pause),
                 makepad_hal::lifecycle::RESUME => {
                     // Java may cover the surface across a pause, and only a present lifts that.
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     self.redraw_all();
                     self.call_event_handler(&Event::Resume);
                 }
@@ -972,7 +972,7 @@ impl Cx {
                         use std::sync::atomic::{AtomicBool, Ordering};
                         static APP_DRAWN: AtomicBool = AtomicBool::new(false);
                         if window_frame { self.hal_window_presented(present_ns); }
-                        #[cfg(target_os = "linux")]
+                        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                         self.hal.frames.w.hosted_presented(window, frame);
                         Self::send_studio_message(crate::studio::AppToStudio::DrawCompleteAndFlip(draw));
                         if !APP_DRAWN.swap(true, Ordering::Relaxed) {
@@ -980,7 +980,7 @@ impl Cx {
                         }
                     }
                     // a hosted frame the GPU dropped: nothing to publish, paint it again
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     Some(crate::os::hal::HostedDone::Dropped) => self.hal_repaint_all(),
                     // the HAL presented the window's frame itself (other targets' frames are passes)
                     Some(crate::os::hal::HostedDone::Unknown) | None => if window_frame { self.hal_window_presented(present_ns) },
@@ -1067,9 +1067,9 @@ impl Cx {
                 self.hal.frames.texture_shared(texture, handle);
                 self.redraw_all();
             }
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
             HalEvent::GlShare { display, config, context } => self.hal.gl.share = Some([display, config, context]),
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             HalEvent::GlShare { .. } => {}
             HalEvent::TextureImported { texture, ok } => {
                 if let Some(draw) = self.hal.hosted.as_mut().and_then(|hosted| hosted.imported(texture, ok)) {
@@ -1209,7 +1209,7 @@ impl Cx {
         let safe = self.hal.safe_area;
         let window = &mut self.windows[window_id];
         window.os_dpi_factor = Some(dpi);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         { window.wayland_is_fullscreen = new_geom.is_fullscreen; }
         let mut new_geom = window.native_window_geom_to_layout(new_geom);
         new_geom.safe_area_insets = window.native_safe_area_insets_to_layout(safe);
@@ -1282,7 +1282,7 @@ impl Cx {
         let ui_signal = SignalToUI::check_and_clear_ui_signal();
         let mut did = false;
         if internal_signal || ui_signal {
-            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
             self.handle_termination_signal();
             self.handle_script_signals();
             did = true;

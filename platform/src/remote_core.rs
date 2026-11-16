@@ -698,7 +698,7 @@ pub fn request_from(args: impl Iterator<Item = String>, env: Option<&str>) -> Re
 pub fn request() -> Request {
     let asked = std::env::var("MAKEPAD_REMOTE").ok();
     // an Android app gets no environment of its own, so `adb shell setprop debug.makepad.remote 1` asks too
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     let asked = asked.or_else(|| {
         let value = makepad_hal::backend::android::system_property("debug.makepad.remote")?;
         // every makepad app on the device reads it, so a value it can't use is ignored instead of ending the app
@@ -712,7 +712,7 @@ pub fn request() -> Request {
         Request::Off | Request::Local if std::env::var("MAKEPAD_INSPECT").as_deref() == Ok("1") => Request::On,
         // nothing outside a release Android or iOS app can reach its socket, and the system kills such
         // an app without running exit handlers, so its socket and discovery file would only pile up
-        Request::Local if cfg!(all(any(target_os = "android", target_os = "ios", target_os = "tvos"), not(debug_assertions), not(relax))) => Request::Off,
+        Request::Local if cfg!(all(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos"), not(debug_assertions), not(relax))) => Request::Off,
         request => request,
     }
 }

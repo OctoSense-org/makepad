@@ -145,7 +145,7 @@ fn font_roots() -> Vec<PathBuf> {
         let windows = std::env::var_os("WINDIR").filter(|v| !v.is_empty())
             .unwrap_or_else(|| "C:\\Windows".into());
         roots.push(PathBuf::from(windows).join("Fonts"));
-    } else if cfg!(target_os = "android") {
+    } else if cfg!(any(target_os = "android", target_env = "ohos")) {
         roots.extend([PathBuf::from("/system/fonts"), PathBuf::from("/product/fonts")]);
     } else if cfg!(unix) {
         let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -278,7 +278,7 @@ pub(super) fn covering(text: &str, bold: bool, limit: usize) -> Vec<SystemFont> 
                 continue;
             }
             let has = |part: &str| face.families.iter().any(|name| name.contains(part));
-            let linux_family = cfg!(all(unix, not(target_vendor = "apple"), not(target_os = "android")))
+            let linux_family = cfg!(all(unix, not(target_vendor = "apple"), not(any(target_os = "android", target_env = "ohos"))))
                 && (has("noto") || has("dejavu") || has("droid"));
             let family_kind = if has("sans") { 0 } else if has("serif") { 2 } else { 1 };
             let distance = if face.has_wght_axis { 0 } else { face.weight.abs_diff(weight) };

@@ -14,7 +14,7 @@ pub fn release_unused_memory() {
         unsafe extern "C" { fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize; }
         malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
     }
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), target_env = "gnu"))]
     unsafe {
         unsafe extern "C" { fn malloc_trim(pad: usize) -> std::ffi::c_int; }
         malloc_trim(0);

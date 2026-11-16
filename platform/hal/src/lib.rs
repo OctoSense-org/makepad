@@ -15,7 +15,7 @@
 pub type FastMap<K, V> = std::collections::HashMap<K, V, fxhash::FxBuildHasher>;
 
 pub mod backend;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod dmabuf;
 /// Shared textures outside any session on Windows (frame rings): a producer's copy or upload
 /// into a slot a host shared, a slot read back.
@@ -24,7 +24,7 @@ pub use backend::windows::d3d11::share_copy as shared_texture;
 pub mod spirv;
 pub mod hlsl;
 pub mod glsl;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod gl_interop;
 pub mod automation;
 pub mod buffers;
@@ -39,22 +39,22 @@ pub mod drag_promise;
 pub mod direct;
 pub mod display_profiles;
 pub mod user_input;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod wide_desktop;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod wm_socket;
 /// Descriptor I/O over Unix sockets: hosted clients and hosts, and frame rings (app_host).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod linux_ipc;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod hosted_ipc;
 /// The native-layer bridge used by process-hosted Cx; the WM HAL shell uses it directly.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use backend::linux::wm::native as hosted_native;
 /// The WM connection kept across an exec of a WM-hosted process (a restart into a rebuilt
 /// makepad): the next image resumes on it as the same client and window.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use backend::linux::wm::{prepare_exec as wm_prepare_exec, undo_exec as wm_undo_exec};
 pub mod cmds;
 #[cfg(test)]
@@ -99,7 +99,7 @@ pub use backend::apple::media::{can_play_type, video_h264_probe};
 /// stacking and its focus (the exec restart).
 #[cfg(target_os = "macos")]
 pub use backend::apple::appkit::restack_handover;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use backend::linux::media::can_play_type;
 #[cfg(target_os = "android")]
 pub use backend::android::media::can_play_type;
@@ -405,14 +405,14 @@ static GLOBAL: OnceLock<Arc<Hal>> = OnceLock::new();
 /// exit() then ran the driver's exit handlers under them (a SIGSEGV in a batch's completion).
 /// Registered once the backend, and with it the driver, is made: exit() runs the handlers
 /// last registered first, so this one runs before those the driver registered as it loaded.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))]
 fn before_exit_at_exit() {
     extern "C" { fn atexit(f: extern "C" fn()) -> i32; }
     extern "C" fn at_exit() { if let Some(hal) = GLOBAL.get() { hal.before_exit(); } }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| { unsafe { atexit(at_exit) }; });
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos")))]
 fn before_exit_at_exit() {}
 
 impl Hal {
@@ -454,7 +454,7 @@ impl Hal {
     }
 
     fn open_as(&self, req: &OpenReq, caps: Caps, trusted: bool, host_session: bool) -> HalInfo {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         backend::linux::atspi::start();
         let refused = HalInfo { backend: backend_id::NONE, ..Default::default() };
         let mut guard = lock(&self.state);
@@ -486,12 +486,12 @@ impl Hal {
         });
         let make = |id: u32| -> Option<Box<dyn Backend>> {
             match id {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 backend_id::AUTO => match backend::linux::open(req.flags, wake.clone(), sessions.clone(), notify.clone()) {
                     Ok(b) => Some(b),
                     Err(e) => { eprintln!("[hal] {e}"); None }
                 },
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 backend_id::GL => match backend::gl::GlBackend::new(req.flags, wake.clone(), notify.clone()) {
                     Ok(gl) => Some(Box::new(gl)),
                     Err(e) => {
@@ -512,7 +512,7 @@ impl Hal {
                     Ok(d) => Some(Box::new(d)),
                     Err(e) => { eprintln!("[hal-d3d11] {e}"); None }
                 },
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 backend_id::VULKAN => match backend::vulkan::Vulkan::new(req.flags, sessions.clone(), notify.clone()) {
                     Ok(v) => Some(Box::new(v)),
                     Err(e) => { eprintln!("[hal-vulkan] {e}"); None }
@@ -538,7 +538,7 @@ impl Hal {
                     #[cfg(not(target_arch = "wasm32"))]
                     if b.info().backend != backend_id::HEADLESS {
                         let offscreen = req.flags & open_flags::OFFSCREEN_WINDOWS != 0;
-                        if offscreen || !cfg!(target_os = "linux") {
+                        if offscreen || !cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
                             *backend::shell::snapshot() = if offscreen {
                                 backend::shell::Snapshot::new("offscreen", "hidden windows: no shell or WM".into())
                             } else {
@@ -813,7 +813,7 @@ impl Hal {
                 if let Some((_, b)) = st.backend.as_mut() {
                     b.step(&mut st.world, sid);
                     xr_remote::drain_events(sid, &mut st.world);
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     hosted_native::drain_events(sid, &mut st.world);
                     // glyphs the font workers finished go to the atlas and to the sessions
                     if let Some(gpu) = b.host_gpu() {
@@ -1268,7 +1268,7 @@ mod main_loop {
 }
 
 /// The Linux shell owns the display connection and all native window objects.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod main_loop {
     pub use super::backend::linux::{expect_main_loop as expect, run_main_loop as run, stop_main_loop as stop};
     pub use super::backend::linux::host_dark;
@@ -1281,7 +1281,7 @@ mod main_loop {
     pub use super::backend::windows::win32::{expect_main_loop as expect, host_dark, run_main_loop as run, screens, stop_main_loop as stop};
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
+#[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), windows)))]
 mod main_loop {
     use std::sync::{Condvar, Mutex};
 

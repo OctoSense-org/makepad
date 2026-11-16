@@ -1,7 +1,7 @@
 //! Frame capture on Vulkan (Linux, offscreen windows): a recorded frame replays in a private HAL
 //! to the same pixels, a cut after draw k shows the first k draws, the texture the frame names is
 //! captured with its contents.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", not(target_env = "ohos")))]
 
 use makepad_hal::framecap::replay::{Cut, Opts, Replayer};
 use makepad_hal::framecap::{self, file};

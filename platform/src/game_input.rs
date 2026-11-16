@@ -1,6 +1,6 @@
 use crate::event::game_input::GameInputState;
 
-#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos")))))]
 use crate::cx::Cx;
 
 pub trait CxGameInputApi {
@@ -39,7 +39,7 @@ pub trait CxGameInputApi {
     }
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos")))))]
 /// These platforms have no native game-input backend, but an app hosted by
 /// Studio still gets controllers: Studio reads them and forwards the state, so
 /// a Linux app run from Studio on a machine whose Studio can see a pad works

@@ -45,7 +45,7 @@ fn wait_for(
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 #[test]
 fn kinds_sequence_and_epochs_on_the_host_backend() {
     let dir = scratch("kinds");
@@ -178,7 +178,7 @@ fn kinds_sequence_and_epochs_on_the_host_backend() {
 /// A watcher whose roots see no change is stopped and dropped: its root threads are waiting in
 /// their directory reads and must end (Windows: a synchronous ReadDirectoryChangesW never
 /// returned, so the drop's join hung -- every `makepad run` hung at its quit).
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 #[test]
 fn a_watcher_with_quiet_roots_stops() {
     let dir = scratch("quiet");

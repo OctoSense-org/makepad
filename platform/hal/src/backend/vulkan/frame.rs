@@ -218,7 +218,7 @@ impl Vulkan {
     /// writes of the frame, so a picture whose two stamps differ was torn or composited before the
     /// frame completed; a stamp shows which frame a grab or a capture holds
     /// (local/agent_state/relax-campaign/wmsync-tools/stampcheck.py).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn stamp_frame(&mut self, image: &Arc<Image>, frame: u64, batch: &mut Batch) {
         let [w, h] = [self.window_px[0].min(image.desc.w), self.window_px[1].min(image.desc.h)];
         if w < 2 * 48 + 128 || h < 32 { return; }
@@ -511,7 +511,7 @@ impl Vulkan {
                 s.stats.passes += 1;
                 continue;
             }
-            #[cfg(target_os = "linux")] self.native_apps.begin_pass();
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_apps.begin_pass();
             let draws = &view.draws[slice(pass.draws, view.draws.len()).unwrap()];
             #[cfg(target_os = "android")]
             if let Some(frame) = native_frame.as_ref().filter(|f| f.composited && pass.color.iter().all(Id::is_none)) {
@@ -535,15 +535,15 @@ impl Vulkan {
             let before = s.stats.skipped_draws;
             let missing = pick && draws.iter().any(|d| read_ids(view.arena, d.pick_tex).any(|t| self.pick_pending.contains(&(sid, t))));
             let mut failed = false;
-            #[cfg(target_os = "linux")] let mut window_pass = false;
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] let mut window_pass = false;
             match self.encode_pass(s, target, is_window, pick, pass, frame_size, draws, view, &mut batch, now, &mut deps, None) {
                 Ok(image) => {
-                    #[cfg(target_os = "linux")] { window_pass = image.is_some(); }
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))] { window_pass = image.is_some(); }
                     s.stats.passes += 1; if image.is_some() { window_image = image; }
                 }
                 Err(e) => { failed = true; eprintln!("[hal-vulkan] pass: {e}"); s.bad(); s.stats.skipped_draws += draws.len() as u64; }
             }
-            #[cfg(target_os = "linux")] self.native_apps.end_pass(sid, pass, !failed, pick, window_pass);
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_apps.end_pass(sid, pass, !failed, pick, window_pass);
             if pick {
                 let incomplete = failed || missing || before != s.stats.skipped_draws;
                 for id in pass.color.into_iter().filter(|t| !t.is_none()) {
@@ -555,14 +555,14 @@ impl Vulkan {
         let mut presented = false;
         if !pick && !composited {
             if let Some(image) = window_image {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 if kind & target::CAPTURE != 0 {
                     if let Err(e) = self.capture_frame(s, target, image.clone(), &mut batch) { eprintln!("[hal-capture] {e}"); }
                 }
                 let embedded = s.windows.get(sid, target).is_ok_and(|w| w.val.embedded.is_some());
                 let hosted = s.windows.get(sid, target).is_ok_and(|w| w.val.is_hosted());
                 // a platform-hosted window (a hosted Cx renders into its host's shared image itself)
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 if hosted && frame_stamp() {
                     self.stamp_frame(&image, packet.frame, &mut batch);
                     eprintln!("[hal-stamp] frame {} ({}) {}x{}", packet.frame, packet.frame & 0xffff, self.window_px[0], self.window_px[1]);
@@ -592,7 +592,7 @@ impl Vulkan {
                         } else if self.windows.source.is_target(&image) { Ok(image.clone()) } else { self.scanout_image(key, &image, &mut batch) };
                         match scanout {
                             Ok(image) => {
-                                #[cfg(target_os = "linux")]
+                                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                                 if frame_stamp() && self.windows.source.is_target(&image) {
                                     self.stamp_frame(&image, packet.frame, &mut batch);
                                     // the timeline value this frame will publish (`Timeline::submitted`): the host's PresentableDraw names it
@@ -1088,7 +1088,7 @@ impl Vulkan {
             self.win.insert((s.id, target.index), Texture { gen: target.gen, image: window.as_ref().unwrap().clone() });
             self.hosted_sizes.insert((s.id, target.index), size);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if window.is_some() { self.window_px = size; }
         Ok(window)
     }
@@ -1356,7 +1356,7 @@ impl Vulkan {
         if !same_pipeline { s.ledger.touch(Kind::Pipeline, d.pipeline.index, d.pipeline.gen, s.frame, now); }
         let named = [(d.vb, same_vertex), (d.ib, same_index), (d.inst.id, false)].into_iter().chain(d.ubufs.map(|id| (id, false)));
         for (id, _) in named.filter(|(id, same)| !*same && !id.is_none()) { s.ledger.touch(Kind::Buffer, id.index, id.gen, s.frame, now); }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if !same_images { for i in 0..p.code.textures.len() { self.native_apps.sample(s.id, id_at(arena, d.tex, i)); } }
         let memo = &mut self.draw_memo;
         if keep {
@@ -1446,7 +1446,7 @@ fn damage_check() -> bool {
 }
 
 /// `MAKEPAD_FRAME_STAMP=1`: stamp every frame handed to a host compositor (`Vulkan::stamp_frame`).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn frame_stamp() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("MAKEPAD_FRAME_STAMP").is_some_and(|v| v == "1"))

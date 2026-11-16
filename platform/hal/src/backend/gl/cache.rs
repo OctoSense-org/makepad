@@ -43,7 +43,7 @@ impl ProgramCache {
         let none = |binaries| Self { dir: None, binaries, cold: false, verified: false };
         if gl.integer(sys::NUM_PROGRAM_BINARY_FORMATS) <= 0 { return none(false); }
         let driver = gl.driver();
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         let driver = driver + &crate::backend::android::xr::system_property("ro.build.fingerprint").unwrap_or_default();
         let Some(base) = base_dir() else { return none(true) };
         let parent = base.join("makepad-hal");
@@ -63,7 +63,7 @@ impl ProgramCache {
         self.dir.is_some()
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub fn dir(&self) -> Option<PathBuf> {
         self.dir.clone()
     }
@@ -84,7 +84,7 @@ impl ProgramCache {
     }
 
     /// A binary this driver made loaded, so its binaries come back.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub fn loaded(&mut self) {
         self.verified = true;
     }
@@ -178,13 +178,13 @@ pub(super) fn write(dir: &Path, key: Key, format: GLenum, binary: &[u8]) {
 /// `MAKEPAD_HAL_CACHE_DIR`, else the app's cache dir (Android), XDG_CACHE_HOME or ~/.cache.
 fn base_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MAKEPAD_HAL_CACHE_DIR") { return Some(dir.into()); }
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         let cache = crate::backend::android::AndroidBackend::params().cache_path;
         if !cache.is_empty() { return Some(cache.into()); }
         std::env::var_os("TMPDIR").map(Into::into)
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
 }
 
@@ -196,7 +196,7 @@ fn sweep(parent: &Path, dir: &Path) {
         let Some(pid) = name.to_str().and_then(|n| n.strip_suffix(".tmp")).and_then(|n| n.rsplit('.').next()) else { continue };
         if !Path::new("/proc").join(pid).exists() { let _ = std::fs::remove_file(entry.path()); }
     }
-    if cfg!(target_os = "android") {
+    if cfg!(any(target_os = "android", target_env = "ohos")) {
         for entry in std::fs::read_dir(parent).into_iter().flatten().flatten() {
             if entry.path() != dir && entry.file_name().to_str().is_some_and(|n| n.starts_with("gl-")) {
                 let _ = std::fs::remove_dir_all(entry.path());

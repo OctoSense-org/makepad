@@ -231,21 +231,21 @@ use apple_encoder::MacosVideoFileEncoder as OsVideoFileEncoder;
 // installs. Same facade, same NV12 converters — see linux_encoder.rs /
 // linux_decoder.rs for the stated limitations. WRITTEN-UNTESTED: awaiting
 // the fleet's Linux verification pass.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux_gst_sys;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux_encoder;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux_decoder;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux_stream_decoder;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use linux_decoder::LinuxVideoFileDecoder as OsVideoFileDecoder;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use linux_encoder::LinuxVideoFileEncoder as OsVideoFileEncoder;
 
 // Linux's and Android's stream encoders are the HAL's (Vulkan Video; MediaCodec), one op set.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
 mod hal_stream_encoder;
 #[cfg(target_os = "android")]
 mod hal_stream_decoder;
@@ -256,7 +256,7 @@ mod android_decoder;
 #[cfg(target_os = "android")]
 use android_decoder::AndroidVideoFileDecoder as OsVideoFileDecoder;
 
-#[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+#[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
 const UNSUPPORTED: &str = "video file codec is not implemented on this platform yet";
 
 // ---------------------------------------------------------------------------
@@ -267,7 +267,7 @@ const UNSUPPORTED: &str = "video file codec is not implemented on this platform 
 pub use apple_texture_intake::GpuPicture;
 
 /// A picture ready for the encoder, in GPU memory (see [`GpuPictureMaker`]).
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
 pub struct GpuPicture {
     pub width: u32,
     pub height: u32,
@@ -275,7 +275,7 @@ pub struct GpuPicture {
 
 /// Linux: a picture is the region read back from the shared texture once, as
 /// NV12 (the Linux encoder, x264, takes CPU memory anyway).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub struct GpuPicture {
     pub width: u32,
     pub height: u32,
@@ -314,9 +314,9 @@ impl GpuPictureMaker {
         return Ok(GpuPictureMaker { intake: apple_texture_intake::TextureIntake::new()? });
         #[cfg(target_os = "windows")]
         makepad_hal::shared_texture::prepare();
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
         return Ok(GpuPictureMaker {});
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
         return Err(VideoFileError::new("GPU pictures are not implemented on this platform yet"));
     }
 
@@ -359,13 +359,13 @@ impl GpuPictureMaker {
         }
         #[cfg(target_vendor = "apple")]
         return unsafe { self.intake.picture(handle, region) };
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         return read_picture(handle, region);
         #[cfg(target_os = "windows")]
         return makepad_hal::shared_texture::picture(handle, region)
             .map(|texture| GpuPicture { width: region[2], height: region[3], texture })
             .map_err(|e| VideoFileError::new(format!("picture of shared texture {handle:#x}: {e}")));
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
         {
             let _ = handle;
             return Err(VideoFileError::new("GPU pictures are not implemented on this platform yet"));
@@ -375,13 +375,13 @@ impl GpuPictureMaker {
 
 /// The region's BGRA pixels of a shared texture. Linux: `handle` is a DMA-BUF
 /// registered with `makepad_hal::dmabuf::copy` (a frame ring's slot).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn read_shared_bgra(handle: u64, region: [u32; 4], out: &mut [u8]) -> bool {
     makepad_hal::dmabuf::hal_dmabuf_read(handle, &region, out) == out.len() as i64
 }
 
 /// A picture of a shared texture's region, read back once and made NV12.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn read_picture(handle: u64, region: [u32; 4]) -> Result<GpuPicture, VideoFileError> {
     let (width, height) = (region[2], region[3]);
     let mut bgra = vec![0u8; width as usize * height as usize * 4];
@@ -397,7 +397,7 @@ fn read_picture(handle: u64, region: [u32; 4]) -> Result<GpuPicture, VideoFileEr
 }
 
 /// Nearest-sample an NV12 picture to `width` x `height` (both even).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn nv12_resample(src: &[u8], sw: u32, sh: u32, width: u32, height: u32) -> Vec<u8> {
     let (sw, sh, w, h) = (sw as usize, sh as usize, width as usize, height as usize);
     let mut out = vec![0u8; nv12::nv12_frame_size(width, height)];
@@ -426,7 +426,7 @@ fn nv12_resample(src: &[u8], sw: u32, sh: u32, width: u32, height: u32) -> Vec<u
 
 pub struct VideoFileEncoder {
     options: VideoFileEncoderOptions,
-    #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+    #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
     os: OsVideoFileEncoder,
 }
 
@@ -495,13 +495,13 @@ impl VideoFileEncoder {
             let os = OsVideoFileEncoder::new_with(path, &options, fragment_interval_secs)?;
             return Ok(Self { options, os });
         }
-        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
         {
             let _ = fragment_interval_secs;
             let os = OsVideoFileEncoder::new(path, &options)?;
             return Ok(Self { options, os });
         }
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         {
             let _ = (path, fragment_interval_secs);
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -515,9 +515,9 @@ impl VideoFileEncoder {
     /// The codec transform the platform selected for the video stream, when
     /// known. Resolved during `new`.
     pub fn video_transform(&self) -> Option<&VideoTransformInfo> {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         return self.os.video_transform();
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         return None;
     }
 
@@ -534,9 +534,9 @@ impl VideoFileEncoder {
                 self.options.height
             )));
         }
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         return self.os.push_frame_rgb(rgb, 3, pts_100ns);
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         {
             let _ = pts_100ns;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -557,9 +557,9 @@ impl VideoFileEncoder {
                 self.options.height
             )));
         }
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         return self.os.push_frame_rgb(rgba, 4, pts_100ns);
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         {
             let _ = pts_100ns;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -576,9 +576,9 @@ impl VideoFileEncoder {
                 expected
             )));
         }
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         return self.os.push_frame_nv12(nv12, pts_100ns);
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         {
             let _ = pts_100ns;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -598,7 +598,7 @@ impl VideoFileEncoder {
                 .map_err(|e| VideoFileError::new(format!("picture to NV12: {e}")))?;
             return self.os.push_d3d11_texture(&nv12, pts_100ns);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let (w, h) = (self.options.width, self.options.height);
             if picture.width == w && picture.height == h {
@@ -607,7 +607,7 @@ impl VideoFileEncoder {
             let scaled = nv12_resample(&picture.nv12, picture.width, picture.height, w, h);
             return self.os.push_frame_nv12(&scaled, pts_100ns);
         }
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
         {
             let _ = (picture, pts_100ns);
             return Err(VideoFileError::new("GPU pictures are not implemented on this platform yet"));
@@ -625,12 +625,12 @@ impl VideoFileEncoder {
     pub fn push_frame_shared_texture(&mut self, handle: u64, region: [u32; 4], pts_100ns: Option<i64>) -> Result<(), VideoFileError> {
         #[cfg(target_vendor = "apple")]
         return self.os.push_shared_texture(handle, region, pts_100ns);
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
         {
             let picture = GpuPictureMaker::new()?.picture(handle, region)?;
             return self.push_gpu_picture(&picture, pts_100ns);
         }
-        #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
+        #[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
         {
             let _ = (handle, region, pts_100ns);
             return Err(VideoFileError::new("encoding from a shared texture is not implemented on this platform yet"));
@@ -714,17 +714,17 @@ impl VideoFileEncoder {
                 audio.channels
             )));
         }
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         return self.os.push_audio_i16(samples);
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         return Err(VideoFileError::new(UNSUPPORTED));
     }
 
     /// Flush and finalize the container. Must be called for a playable mp4.
     pub fn finish(mut self) -> Result<(), VideoFileError> {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         return self.os.finish();
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
         {
             let _ = &mut self;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -813,7 +813,7 @@ pub fn decode_first_frame_from_bytes(bytes: &[u8]) -> Result<DecodedVideoFrame, 
             color: au.color,
         });
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         return decode_still(&mp4_first_frame::first_access_unit(bytes)?);
     }
@@ -826,7 +826,7 @@ pub fn decode_first_frame_from_bytes(bytes: &[u8]) -> Result<DecodedVideoFrame, 
         let nv12 = android_hevc::decode(&au.annex_b, au.width, au.height)?;
         return Ok(DecodedVideoFrame { pts_100ns: 0, width: au.width, height: au.height, nv12, color: au.color });
     }
-    #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "android", target_os = "linux")))]
+    #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "android", all(target_os = "linux", not(target_env = "ohos")))))]
     {
         let _ = bytes;
         Err(VideoFileError::new(
@@ -836,7 +836,7 @@ pub fn decode_first_frame_from_bytes(bytes: &[u8]) -> Result<DecodedVideoFrame, 
 }
 
 /// Linux: a single picture's access unit decoded on an idle stream decoder.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn decode_still(au: &mp4_first_frame::FirstAccessUnit) -> Result<DecodedVideoFrame, VideoFileError> {
     let frame = linux_stream_decoder::decode_still(au)?;
     // the stream decoder delivers the stream's own range
@@ -848,7 +848,7 @@ fn decode_still(au: &mp4_first_frame::FirstAccessUnit) -> Result<DecodedVideoFra
 /// read, the media data left on disk) and decoded on an idle stream decoder;
 /// any other file goes through a file pipeline, whose demuxers read it.
 pub fn decode_first_frame_from_file(path: &str) -> Result<DecodedVideoFrame, VideoFileError> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if let Ok(au) = mp4_first_frame::first_access_unit_from_file(path) {
         return decode_still(&au);
     }
@@ -906,17 +906,17 @@ pub struct DecodedAudioChunk {
 }
 
 pub struct VideoFileDecoder {
-    #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
     os: OsVideoFileDecoder,
     /// Where [`VideoFileDecoder::seek`]'s discard loop stopped: the frame and
     /// chunk it kept, handed to the next `next_frame`/`next_audio` call. Held
     /// here rather than in each backend so the "first at or after the target"
     /// rule is written once and cannot drift between platforms.
-    #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
     pending_video: Option<DecodedVideoFrame>,
-    #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
     pending_audio: Option<DecodedAudioChunk>,
-    #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
     info: VideoFileInfo,
 }
 
@@ -925,7 +925,7 @@ impl VideoFileDecoder {
     /// opener here wants a picture and refuses a file with none; for a
     /// file that has only sound, see [`Self::open_audio`].
     pub fn open(path: &str) -> Result<Self, VideoFileError> {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
         {
             let os = OsVideoFileDecoder::open(path)?;
             return Ok(Self {
@@ -934,7 +934,7 @@ impl VideoFileDecoder {
                 pending_audio: None,
             });
         }
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
         {
             let _ = path;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -954,7 +954,7 @@ impl VideoFileDecoder {
         // decoder is built for every Apple target, not macOS alone. Guarded
         // by `target_os = "macos"` this fell through to `UNSUPPORTED` on
         // iOS and tvOS, a constant those targets do not have.
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
         {
             let os = OsVideoFileDecoder::open_audio(path)?;
             return Ok(Self {
@@ -963,7 +963,7 @@ impl VideoFileDecoder {
                 pending_audio: None,
             });
         }
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
         {
             let _ = path;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -985,35 +985,35 @@ impl VideoFileDecoder {
     }
 
     pub fn info(&self) -> &VideoFileInfo {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
         return self.os.info();
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
         return &self.info;
     }
 
     /// Pull the next decoded video frame; `Ok(None)` at end of stream.
     pub fn next_frame(&mut self) -> Result<Option<DecodedVideoFrame>, VideoFileError> {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
         {
             if let Some(frame) = self.pending_video.take() {
                 return Ok(Some(frame));
             }
             return self.os.next_frame();
         }
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
         return Err(VideoFileError::new(UNSUPPORTED));
     }
 
     /// Pull the next decoded PCM audio chunk; `Ok(None)` at end of stream.
     pub fn next_audio(&mut self) -> Result<Option<DecodedAudioChunk>, VideoFileError> {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
         {
             if let Some(chunk) = self.pending_audio.take() {
                 return Ok(Some(chunk));
             }
             return self.os.next_audio();
         }
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
         return Err(VideoFileError::new(UNSUPPORTED));
     }
 
@@ -1036,7 +1036,7 @@ impl VideoFileDecoder {
     /// [`next_frame`]: VideoFileDecoder::next_frame
     /// [`next_audio`]: VideoFileDecoder::next_audio
     pub fn seek(&mut self, pts_100ns: i64) -> Result<(), VideoFileError> {
-        #[cfg(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android"))]
         {
             let target = pts_100ns.max(0);
             // Anything held from a previous seek belongs to the old position.
@@ -1071,7 +1071,7 @@ impl VideoFileDecoder {
             }
             return Ok(());
         }
-        #[cfg(not(any(target_os = "windows", target_vendor = "apple", target_os = "linux", target_os = "android")))]
+        #[cfg(not(any(target_os = "windows", target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "android")))]
         {
             let _ = pts_100ns;
             return Err(VideoFileError::new(UNSUPPORTED));
@@ -1209,7 +1209,7 @@ pub fn encode_intra_frame_mp4(
     Ok(bytes)
 }
 
-#[cfg(all(test, any(target_vendor = "apple", target_os = "android", target_os = "linux", target_os = "windows")))]
+#[cfg(all(test, any(target_vendor = "apple", target_os = "android", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
 mod intra_frame_tests {
     use super::*;
 

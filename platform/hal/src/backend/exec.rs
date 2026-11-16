@@ -86,13 +86,13 @@ pub enum OsCmd {
     NativeAppearance { value: u32 },
     BackUnhandled,
     SelectionHandles { id: Id, op: u32, start: [f32; 2], end: [f32; 2] },
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     DirectDisplay { req: u64, command: crate::direct::DisplayCommand },
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     DirectPointerSpeed { touchpad: bool, hundredths: u32 },
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     DirectNaturalScroll { touchpad: bool, on: bool },
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     DirectTapToClick { on: bool },
 }
 
@@ -114,7 +114,7 @@ pub trait Gpu {
     fn a11y_prepare(&mut self, _window: u64, _update: &makepad_a11y::TreeUpdate) {}
     /// Semantic changes for this backend's accessibility adapter.
     fn a11y_notify(&mut self, _window: u64, _notifications: &[makepad_a11y::Notification]) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         super::linux::atspi::notify(_window, _notifications);
     }
     /// Host-owned native layers may allocate texture aliases through the world.
@@ -1324,19 +1324,19 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             crate::a11y::set_window_active(crate::a11y::window_key(sid, id.index), active);
         }
         HalCmd::HostedPresented { id, frame } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             crate::hosted_native::presented(sid, id, frame);
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
             let _ = (id, frame);
         }
         HalCmd::HostedNativeBridge {} => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             crate::hosted_native::enable_bridge(sid);
         }
         HalCmd::HostedNativeIn { bytes } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             crate::hosted_native::receive_bytes(bytes);
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
             let _ = bytes;
         }
         HalCmd::WindowHostedGeom { id, geom, dpi } => match s.windows.get_mut(sid, id) {
@@ -1521,19 +1521,19 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
             }
         }
         HalCmd::DirectPointerSpeed { touchpad, hundredths } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             if os_cmd(gpu, sid, OsCmd::DirectPointerSpeed { touchpad, hundredths }) { return; }
             let _ = (touchpad, hundredths);
             s.bad();
         }
         HalCmd::DirectNaturalScroll { touchpad, on } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             if os_cmd(gpu, sid, OsCmd::DirectNaturalScroll { touchpad, on }) { return; }
             let _ = (touchpad, on);
             s.bad();
         }
         HalCmd::DirectTapToClick { on } => {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             if os_cmd(gpu, sid, OsCmd::DirectTapToClick { on }) { return; }
             let _ = on;
             s.bad();
@@ -1834,7 +1834,7 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
                         gpu.a11y_prepare(crate::a11y::window_key(sid, id.index), &update);
                         let notifications = crate::a11y::apply_update(sid, id.index, update);
                         gpu.a11y_notify(crate::a11y::window_key(sid, id.index), &notifications);
-                        #[cfg(target_os = "linux")]
+                        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                         {
                             let key = crate::a11y::window_key(sid, id.index);
                             super::linux::wm::a11y::update(key, bytes);
@@ -1866,7 +1866,7 @@ fn exec(gpu: &mut dyn Gpu, world: &mut World, sid: u32, c: HalCmd, view: &CmdVie
 
 fn direct_display(_gpu: &mut dyn Gpu, s: &mut Session, req: u64, command: crate::direct::DisplayCommand) {
     let tag = command.tag() as u32;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if os_cmd(_gpu, s.id, OsCmd::DirectDisplay { req, command }) { return; }
     s.events.direct_display_result(req, tag, false, b"this backend does not own direct displays");
 }

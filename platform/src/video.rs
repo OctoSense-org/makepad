@@ -649,9 +649,9 @@ pub fn camera_upright_quarter_turns(sensor_orientation: u16, front_facing: bool)
 }
 
 pub fn camera_clock_ns() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     { Some(makepad_hal::clock_ns()) }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     {
         None
     }

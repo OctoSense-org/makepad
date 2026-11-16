@@ -4,7 +4,7 @@
 mod camera;
 mod domain;
 pub use domain::HalParentSender;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod display;
 #[cfg(test)]
 mod domain_test;
@@ -13,10 +13,10 @@ pub(crate) use hosted::HostedDone;
 mod encode_surface;
 mod event_loop;
 mod fonts;
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub(crate) mod gl_interop;
 mod hosted;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod linux;
 pub(crate) mod loop_watch;
 mod media;
@@ -136,9 +136,9 @@ pub struct HalClient {
     pub(crate) windows: HashMap<usize, HalWindow>,
     /// Only the first window may take a window offered by the host, even after it closes.
     pub(crate) window_created: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) direct_cursor: crate::cursor::MouseCursor,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) direct_display: display::DisplayClient,
     /// External compositor state for `--stdin-loop`; ordinary windows have none.
     pub(crate) hosted: Option<hosted::HostedClient>,
@@ -151,10 +151,10 @@ pub struct HalClient {
     /// synthesises Drag / Drop events from mouse move and up
     pub(crate) internal_drag_items: Option<Arc<Vec<DragItem>>>,
     /// the color last given to the Activity to show in place of its surface
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) app_background_argb: Option<u32>,
     /// the Activity's "compiling shaders" screen was already asked for, which only the first frame needs
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) shader_compile_screen_requested: bool,
     /// the oldest input event (HAL ns) consumed since the last frame was built
     pub(crate) input_ns: u64,
@@ -165,17 +165,17 @@ pub struct HalClient {
     pub(crate) ime_height: f64,
     /// The keyboard config we last showed, until our own hide or a closed report clears it. A child
     /// session embedded in a parent doesn't keep one, since its shows get dropped while unfocused.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) ime_shown: Option<u32>,
     /// Set by `HideTextIME`, which waits until after the next draw, so that moving focus
     /// from one text input to another keeps the keyboard up instead of hiding it.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) pending_ime_hide: bool,
     /// The backend answers no frame requests without a surface or while the Activity is
     /// paused, so a pending IME hide can't wait for a draw then.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) no_surface: bool,
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) activity_paused: bool,
     /// a window announced a frame (`FrameReady`)
     pub(crate) beat: bool,
@@ -227,7 +227,7 @@ pub struct HalClient {
     /// request ids of `hal_start_domain` / `hal_list_domains`
     pub(crate) next_domain_request: u32,
     /// the application icon went to the HAL
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     pub(crate) icon_sent: bool,
     /// the `MidiInput` handles: each gets every message, with the HAL's time stamp (ns)
     pub(crate) midi_senders: Vec<crate::makepad_network::mpsc::Sender<(MidiPortId, MidiData, u64)>>,
@@ -238,7 +238,7 @@ pub struct HalClient {
     /// entries whose real-time code Relax still compiles: they go to the HAL once it is ready
     #[cfg(relax)]
     pub(crate) audio_waiting: Vec<media::AudioWaiting>,
-    #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
     pub(crate) game: media::GameClient,
     pub(crate) camera: camera::CameraClient,
     /// videos the app's own decoder plays, and the ones the HAL's native player plays
@@ -254,12 +254,12 @@ pub struct HalClient {
     pub(crate) in_background: bool,
     pub(crate) glyph_wait: fonts::GlyphWait,
     /// the GLES backend's share group and the Cx thread's GL context (`Cx::with_gl`)
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     pub(crate) gl: gl_interop::GlInterop,
     /// the last safe-area insets the shell reported (native points), for windows that appear later
     pub(crate) safe_area: crate::event::SafeAreaInsets,
     /// APK font files already mapped (see `Cx::get_resource_font_asset_bytes_by_path`)
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) mapped_font_assets: std::cell::RefCell<HashMap<String, Option<crate::shared_bytes::HostBuf>>>,
 }
 
@@ -275,29 +275,29 @@ impl Default for HalClient {
             start_ns: 0,
             windows: HashMap::new(),
             window_created: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             direct_cursor: Default::default(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             direct_display: Default::default(),
             hosted: None,
             xr: None,
             xr_remote_seen: false,
             internal_drag_items: None,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             app_background_argb: None,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             shader_compile_screen_requested: false,
             input_ns: 0,
             composing: false,
             ime_visible: false,
             ime_height: 0.0,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             ime_shown: None,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             pending_ime_hide: false,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             no_surface: false,
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             activity_paused: false,
             beat: false,
             ready_flip: None,
@@ -321,14 +321,14 @@ impl Default for HalClient {
             dialogs: HashMap::new(),
             next_dialog: 0,
             next_domain_request: 0,
-            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             icon_sent: false,
             midi_senders: Vec::new(),
             audio_ctx: [Vec::new(), Vec::new()],
             retired_ctx: Vec::new(),
             #[cfg(relax)]
             audio_waiting: Vec::new(),
-            #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             game: Default::default(),
             camera: Default::default(),
             software_videos: HashMap::new(),
@@ -339,10 +339,10 @@ impl Default for HalClient {
             font_events: Vec::new(),
             in_background: false,
             glyph_wait: Default::default(),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(not(any(target_os = "android", target_env = "ohos")))]
             gl: Default::default(),
             safe_area: Default::default(),
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             mapped_font_assets: Default::default(),
         }
     }
@@ -549,9 +549,9 @@ impl CxMediaApi for Cx {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod android_socket;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) mod android_fleet;
 
 impl crate::cx_api::CxOsApi for Cx {
@@ -573,7 +573,7 @@ impl crate::cx_api::CxOsApi for Cx {
         // an Android APK and an iOS / tvOS device have no build tree: the resources are in the
         // package, under `makepad/` (the iOS simulator reads the build machine's files like a
         // desktop app)
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             android_socket::register();
             android_fleet::register();
@@ -585,7 +585,7 @@ impl crate::cx_api::CxOsApi for Cx {
             self.package_root = Some("makepad".to_string());
             self.bundle_load_dependencies();
         }
-        #[cfg(not(any(target_os = "android", all(any(target_os = "ios", target_os = "tvos"), not(apple_sim)))))]
+        #[cfg(not(any(target_os = "android", target_env = "ohos", all(any(target_os = "ios", target_os = "tvos"), not(apple_sim)))))]
         {
             if let Some(item) = crate::app_meta::package_dir() {
                 self.package_root = Some(item.to_string());
@@ -650,7 +650,7 @@ impl Cx {
 }
 
 /// The host reads APK assets; no app-side JNI state is needed by the HAL client.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) fn read_asset(path: &str) -> Option<Vec<u8>> {
     let path = if path.starts_with("makepad/") {
         path.to_string()
@@ -664,7 +664,7 @@ pub(crate) fn read_asset(path: &str) -> Option<Vec<u8>> {
 
 /// Maps a stored APK asset without a heap copy; compressed or missing assets return None. The
 /// mapping is named `apk:<asset>` so the HAL's font service maps the same asset by that name.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) fn map_asset(path: &str) -> Option<crate::shared_bytes::HostBuf> {
     use std::os::fd::{FromRawFd, OwnedFd, AsRawFd};
     let mut range = [0i64; 2];

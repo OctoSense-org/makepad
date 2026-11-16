@@ -32,7 +32,7 @@ pub struct ScreenGeom {
 /// on the Cx thread; other backends use their host screen inventory.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn screens() -> Vec<ScreenGeom> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if let Some(screens) = HAL_DIRECT_SCREENS.with(|s| s.borrow().as_ref().map(|s| {
         // The shell reports native points (pixels / the shell's DPI); a DPI override on
         // the desktop window (e.g. a saved display scale) changes the window's points.
@@ -65,7 +65,7 @@ pub fn screens() -> Vec<ScreenGeom> {
 }
 
 /// Other platforms do not expose Linux connector names.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 #[allow(dead_code)] // not read inside the platform crate; a host process reads it
 pub fn linux_screen_names() -> Vec<String> {
     Vec::new()
@@ -612,7 +612,7 @@ mod tests {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 thread_local! {
     // Free screen APIs are called on the session's Cx thread. Each domain has
     // its own cache, filled by DirectDisplays rather than the host's statics.
@@ -623,17 +623,17 @@ thread_local! {
 
 /// Set from the direct desktop window's native and effective DPI factors whenever
 /// the inventory arrives or that window's DPI override changes.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) fn set_hal_direct_scale(scale: f64) {
     if scale.is_finite() && scale > 0.0 { HAL_DIRECT_SCALE.with(|f| f.set(scale)); }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) fn set_hal_direct_screens(screens: Option<Vec<(String, ScreenGeom)>>) {
     HAL_DIRECT_SCREENS.with(|s| *s.borrow_mut() = screens);
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub fn linux_screen_names() -> Vec<String> {
     HAL_DIRECT_SCREENS.with(|s| s.borrow().as_ref().map_or_else(Vec::new, |s| s.iter().map(|(n, _)| n.clone()).collect()))
 }
