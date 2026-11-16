@@ -287,6 +287,28 @@ pub struct PeerToolCall {
     pub caller: PeerCaller,
 }
 
+impl PeerToolCall {
+    /// The call as the app's AI bus service takes it: the tool by its short name
+    /// (`plan`, not `route.plan`) and the arguments as JSON text.
+    pub fn as_service_call(&self) -> crate::wire::ServiceCall {
+        let tool = self.name.rsplit_once('.').map_or(self.name.as_str(), |(_, short)| short);
+        crate::wire::ServiceCall { call_id: self.call_id.clone(), tool: tool.to_string(), args: self.args.to_json(), caller: None }
+    }
+}
+
+/// A bus service's answer as a peer tool result: its text, note and data when
+/// the call went well, else its text (or the outcome's name) as the error.
+pub fn service_answer(result: &crate::wire::ToolResult) -> Result<Value, String> {
+    match result.outcome {
+        crate::wire::ToolOutcome::Ok => {
+            let data = json::parse(result.data.as_bytes()).unwrap_or(Value::Null);
+            Ok(json::obj(vec![("text", json::s(result.text.clone())), ("note", json::s(result.note.clone())), ("data", data)]))
+        }
+        other if result.text.is_empty() => Err(format!("{other:?}")),
+        _ => Err(result.text.clone()),
+    }
+}
+
 /// How the app answers a tool call.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PeerToolOutcome {
@@ -774,6 +796,25 @@ impl OctosPeer {
         };
         self.send(PeerUp::ToolResult { call_id: call_id.to_string(), outcome });
         true
+    }
+
+    /// For an app whose agent uses its tools and nothing more: take this
+    /// event's peer events, answer each tool call with `answer` (the same
+    /// function the app's AI bus service answers with, given the call as
+    /// [`PeerToolCall::as_service_call`] makes it) and drop the rest. Its
+    /// conversation is the host's to show; a call that needs the app's own
+    /// confirmation is refused, as such an app has none.
+    pub fn serve_tools(&mut self, cx: &mut Cx, event: &Event, mut answer: impl FnMut(&crate::wire::ServiceCall) -> crate::wire::ToolResult) {
+        for peer_event in self.handle_event(cx, event) {
+            if let PeerEvent::ToolCall(call) = peer_event {
+                let outcome = if call.confirm_required {
+                    Err("this app has no confirmation of its own".to_string())
+                } else {
+                    service_answer(&answer(&call.as_service_call()))
+                };
+                self.tool_result(&call.call_id, outcome);
+            }
+        }
     }
 
     /// Requests still waiting for their reply (queued messages included).
