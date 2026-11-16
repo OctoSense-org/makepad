@@ -698,6 +698,12 @@ impl Cx {
         self.pending_live_edit_request = true;
     }
 
+    /// Asks OpenHarmony for the device's location (what `Cx::gps_fix` then reads). The shell has
+    /// no location service wired yet, so no fix ever comes; the call is here for the apps that
+    /// ask on this system.
+    #[cfg(target_env = "ohos")]
+    pub fn ohos_request_gps(&mut self) {}
+
     /// Arm the VM's captured-error sink for the live-edit re-run that
     /// follows, so a hot-reloaded block that fails to run is reported to
     /// the caller as well as the log. Called by the `app_main!` expansion,
