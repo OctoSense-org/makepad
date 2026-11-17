@@ -145,3 +145,6 @@ pub trait Backend: Send {
 pub mod android;
 #[cfg(target_env = "ohos")]
 pub mod ohos;
+/// (OpenHarmony's streams use it; its tests run on any host)
+#[cfg(any(target_env = "ohos", test))]
+pub(crate) mod cert_host;

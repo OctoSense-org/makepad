@@ -3,6 +3,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit';
 import { display, window } from '@kit.ArkUI';
 import { BusinessError, deviceInfo, pasteboard } from '@kit.BasicServicesKit';
 import makepad from 'libmakepad.so';
+import { socketClose, socketOpen, socketSend } from './Sockets';
 
 const DOMAIN = 0xCA11;
 
@@ -37,7 +38,8 @@ export default class EntryAbility extends UIAbility {
     }
     const night = this.context.config.colorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK;
     makepad.start(this.context.filesDir, this.context.cacheDir, this.density, deviceInfo.osFullName, appBuild, night,
-      this.context.resourceManager, (name: string, value: string) => this.call(name, value), launch);
+      this.context.resourceManager, (name: string, value: string, data?: ArrayBuffer) => this.call(name, value, data),
+      launch);
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {
@@ -94,10 +96,16 @@ export default class EntryAbility extends UIAbility {
   }
 
   /** What the app asks of the ability (the shell's `napi::call`). */
-  private call(name: string, value: string): void {
+  private call(name: string, value: string, data?: ArrayBuffer): void {
     const mainWindow = this.mainWindow;
     try {
-      if (name === 'terminate') {
+      if (name === 'socketSend') {
+        socketSend(value, data);
+      } else if (name === 'socketOpen') {
+        socketOpen(value);
+      } else if (name === 'socketClose') {
+        socketClose(value);
+      } else if (name === 'terminate') {
         this.context.terminateSelf();
       } else if (name === 'backUnhandled') {
         this.context.moveAbilityToBackground();

@@ -1561,48 +1561,53 @@ pub fn hal_read_asset(path: &str, out: &mut [u8]) -> i64 {
 }
 
 /// Socket streams for the app's network stack (Android has no libssl for native code, so TLS is the
-/// Activity's `openSocketStream` family). A stream is named by an `id` the caller picks and keeps
-/// unique; any thread may call. `flags` bit 0: TLS, bit 1: skip certificate validation.
+/// Activity's `openSocketStream` family; on OpenHarmony it is the ability's TLS sockets). A stream
+/// is named by an `id` the caller picks and keeps unique; any thread may call. `flags` bit 0: TLS,
+/// bit 1: skip certificate validation.
 #[cfg(target_os = "android")]
+use backend::android::socket as os_socket;
+#[cfg(target_env = "ohos")]
+use backend::ohos::socket as os_socket;
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub const SOCKET_TLS: u32 = 1;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub const SOCKET_IGNORE_CERT: u32 = 2;
 
-/// Opens stream `id`. Returns 1 when open, 0 when Java refused.
-#[cfg(target_os = "android")]
+/// Opens stream `id`. Returns 1 when open, 0 when the shell refused.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_open(id: i64, host: &str, port: i32, flags: u32) -> u32 {
-    backend::android::socket::open(id, host, port, flags & SOCKET_TLS != 0, flags & SOCKET_IGNORE_CERT != 0) as u32
+    os_socket::open(id, host, port, flags & SOCKET_TLS != 0, flags & SOCKET_IGNORE_CERT != 0) as u32
 }
 
 /// Reads into `out`, blocking until bytes arrive or the read timeout passes. Returns the byte count,
 /// 0 when the read timed out, -1 when the stream is closed or failed.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_read(id: i64, out: &mut [u8]) -> i64 {
-    backend::android::socket::read_into(id, out).map_or(-1, |n| n as i64)
+    os_socket::read_into(id, out).map_or(-1, |n| n as i64)
 }
 
 /// Writes `data`. Returns the bytes written, or -1.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_write(id: i64, data: &[u8]) -> i64 {
-    backend::android::socket::write(id, data) as i64
+    os_socket::write(id, data) as i64
 }
 
 /// Sets the read (`read` != 0) or write timeout in milliseconds (0: none).
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_timeout(id: i64, read: u32, ms: i32) {
-    backend::android::socket::set_timeout(id, read != 0, ms)
+    os_socket::set_timeout(id, read != 0, ms)
 }
 
 /// Copies the server's leaf certificate DER into `out` when it fits. Returns the required
 /// byte length (call with an empty buffer to query it), or -1 when there is no certificate.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_certificate(id: i64, out: &mut [u8]) -> i64 {
-    match backend::android::socket::peer_certificate(id) {
+    match os_socket::peer_certificate(id) {
         Some(der) => {
             if out.len() >= der.len() {
                 out[..der.len()].copy_from_slice(&der);
@@ -1614,10 +1619,10 @@ pub fn hal_socket_certificate(id: i64, out: &mut [u8]) -> i64 {
 }
 
 /// Closes stream `id`.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_close(id: i64) {
-    backend::android::socket::close(id)
+    os_socket::close(id)
 }
 
 /// The phone's codecs for makepad_video: HEVC stills (the image tile libraries' frames) and

@@ -1,6 +1,7 @@
 //! The program's socket factory on Android. The app's makepad-network is compiled inside the
 //! program, so its factory slot is the program's own; the TLS streams live in the host (Java), reached
 //! through the `hal_socket_*` ops. Registered once at HAL client init, before anything can dial.
+//! OpenHarmony uses it as it is: there the same ops reach the ability's TLS sockets.
 //!
 //! Stream ids: the host's own streams (its remote tunnel) count 1, 2, 3 ...; the program's all have
 //! bit 62 set, so the two never collide in the Activity's one id table.
@@ -34,7 +35,7 @@ impl AndroidSocketStreamFactory for Factory {
         let id = PROGRAM_ID_BIT | NEXT.fetch_add(1, Ordering::Relaxed);
         let flags = if use_tls { SOCKET_TLS } else { 0 } | if ignore_ssl_cert { SOCKET_IGNORE_CERT } else { 0 };
         if makepad_hal::hal_socket_open(id, host, port, flags) == 0 {
-            return Err(other("the Java side could not open the socket stream"));
+            return Err(other("the shell could not open the socket stream"));
         }
         Ok(Box::new(Stream { id, closed: false }))
     }

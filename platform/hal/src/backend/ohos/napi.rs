@@ -8,14 +8,14 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static VSYNC: AtomicUsize = AtomicUsize::new(0);
 static FRAME_POSTED: AtomicBool = AtomicBool::new(false);
-/// ArkTS's `(name, value)` function as a thread-safe one: how the shell asks the ability for
-/// what only ArkTS can do (system bars, the clipboard), and how it gets onto the UI thread
-/// itself (`on_ui`).
+/// ArkTS's `(name, value, data)` function as a thread-safe one: how the shell asks the ability
+/// for what only ArkTS can do (system bars, the clipboard, TLS sockets), and how it gets onto
+/// the UI thread itself (`on_ui`).
 static CALL: AtomicUsize = AtomicUsize::new(0);
 /// What waits in the thread-safe function's queue.
 enum Job {
-    /// `name` and `value` for ArkTS
-    Call(CString, CString),
+    /// `name`, `value` and bytes (an ArrayBuffer) for ArkTS
+    Call(CString, CString, Option<Vec<u8>>),
     Run(Box<dyn FnOnce() + Send>),
 }
 
@@ -36,9 +36,10 @@ pub(super) unsafe fn register_module() { napi_module_register(std::ptr::addr_of_
 /// Runs for the ability's `import` and again for each XComponent that names the library, which
 /// then finds itself in the exports.
 unsafe extern "C" fn module_init(env: napi_env, exports: napi_value) -> napi_value {
-    let methods: [(&CStr, napi_callback); 10] = [
+    let methods: [(&CStr, napi_callback); 14] = [
         (c"start", start), (c"foreground", foreground), (c"background", background), (c"focus", focus), (c"destroy", destroy),
         (c"avoidArea", avoid_area), (c"keyboard", keyboard), (c"backPress", back_press), (c"nightMode", night_mode), (c"windowId", window_id),
+        (c"socketOpened", socket_opened), (c"socketData", socket_data), (c"socketSent", socket_sent), (c"socketClosed", socket_closed),
     ];
     let properties: Vec<napi_property_descriptor> = methods.iter().map(|(name, method)| napi_property_descriptor {
         utf8name: name.as_ptr(), name: null_mut(), method: Some(*method), getter: None, setter: None, value: null_mut(), attributes: 0, data: null_mut(),
@@ -80,6 +81,22 @@ unsafe fn boolean(env: napi_env, value: napi_value) -> bool {
     let mut out = false;
     if !value.is_null() { napi_get_value_bool(env, value, &mut out); }
     out
+}
+/// The bytes of an ArrayBuffer or of a byte array over one (a TLSSocket's messages are
+/// Uint8Arrays, whatever their declared type). None for any other value.
+unsafe fn bytes<'a>(env: napi_env, value: napi_value) -> &'a [u8] {
+    let (mut is, mut data, mut len) = (false, null_mut(), 0);
+    if value.is_null() { return &[]; }
+    if napi_is_arraybuffer(env, value, &mut is) == NAPI_OK && is {
+        if napi_get_arraybuffer_info(env, value, &mut data, &mut len) != NAPI_OK { return &[]; }
+    } else if napi_is_typedarray(env, value, &mut is) == NAPI_OK && is {
+        let (mut kind, mut buffer, mut offset) = (-1, null_mut(), 0);
+        if napi_get_typedarray_info(env, value, &mut kind, &mut len, &mut data, &mut buffer, &mut offset) != NAPI_OK { return &[]; }
+        // napi_int8_array, napi_uint8_array, napi_uint8_clamped_array: one byte an element
+        if !(0..=2).contains(&kind) { return &[]; }
+    }
+    if data.is_null() || len == 0 { return &[]; }
+    std::slice::from_raw_parts(data as *const u8, len)
 }
 unsafe fn undefined(env: napi_env) -> napi_value {
     let mut out = null_mut();
@@ -135,11 +152,18 @@ unsafe extern "C" fn call_js(env: napi_env, function: napi_value, _: *mut c_void
     if env.is_null() || function.is_null() { return; }
     match *job {
         Job::Run(f) => f(),
-        Job::Call(name, value) => {
-            let mut argv = [null_mut(); 2];
+        Job::Call(name, value, data) => {
+            let mut argv = [null_mut(); 3];
             napi_create_string_utf8(env, name.as_ptr(), NAPI_AUTO_LENGTH, &mut argv[0]);
             napi_create_string_utf8(env, value.as_ptr(), NAPI_AUTO_LENGTH, &mut argv[1]);
-            napi_call_function(env, undefined(env), function, 2, argv.as_ptr(), null_mut());
+            let mut argc = 2;
+            if let Some(data) = data {
+                let mut out = null_mut();
+                if napi_create_arraybuffer(env, data.len(), &mut out, &mut argv[2]) != NAPI_OK { return; }
+                if !out.is_null() { std::ptr::copy_nonoverlapping(data.as_ptr(), out as *mut u8, data.len()); }
+                argc = 3;
+            }
+            napi_call_function(env, undefined(env), function, argc, argv.as_ptr(), null_mut());
         }
     }
 }
@@ -158,7 +182,12 @@ fn post(job: Job) -> bool {
 /// Asks the ability to do `name` with `value`, on its UI thread, later. False before `start`.
 pub(super) fn call(name: &str, value: &str) -> bool {
     let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) else { return false };
-    post(Job::Call(name, value))
+    post(Job::Call(name, value, None))
+}
+/// `call` with bytes, which ArkTS gets as an ArrayBuffer.
+pub(super) fn call_with(name: &str, value: &str, data: &[u8]) -> bool {
+    let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) else { return false };
+    post(Job::Call(name, value, Some(data.to_vec())))
 }
 /// Runs `f` on the UI thread, later: the input method is spoken to from there, as ArkUI's own
 /// text fields do. False before `start`.
@@ -220,6 +249,32 @@ unsafe extern "C" fn night_mode(env: napi_env, info: napi_callback_info) -> napi
 /// `windowId(id)`: the ability's main window, which the input method is told its editor is in.
 unsafe extern "C" fn window_id(env: napi_env, info: napi_callback_info) -> napi_value {
     super::ime::set_window(number(env, args::<1>(env, info)[0]) as i32);
+    undefined(env)
+}
+
+/// What the ability's TLS sockets report (`socket.rs`); a stream's id is its decimal string.
+unsafe fn stream_id(env: napi_env, value: napi_value) -> i64 { string(env, value).parse().unwrap_or(0) }
+/// `socketOpened(id, ok, certificate)`: the handshake's end; the server's certificate is DER.
+unsafe extern "C" fn socket_opened(env: napi_env, info: napi_callback_info) -> napi_value {
+    let a = args::<3>(env, info);
+    super::socket::opened(stream_id(env, a[0]), boolean(env, a[1]), bytes(env, a[2]));
+    undefined(env)
+}
+/// `socketData(id, data)`: bytes the stream received.
+unsafe extern "C" fn socket_data(env: napi_env, info: napi_callback_info) -> napi_value {
+    let a = args::<2>(env, info);
+    super::socket::received(stream_id(env, a[0]), bytes(env, a[1]));
+    undefined(env)
+}
+/// `socketSent(id, ok)`: one `socketSend` is done.
+unsafe extern "C" fn socket_sent(env: napi_env, info: napi_callback_info) -> napi_value {
+    let a = args::<2>(env, info);
+    super::socket::sent(stream_id(env, a[0]), boolean(env, a[1]));
+    undefined(env)
+}
+/// `socketClosed(id)`: the peer closed the stream, or it failed.
+unsafe extern "C" fn socket_closed(env: napi_env, info: napi_callback_info) -> napi_value {
+    super::socket::closed(stream_id(env, args::<1>(env, info)[0]));
     undefined(env)
 }
 

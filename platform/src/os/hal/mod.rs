@@ -549,12 +549,10 @@ impl CxMediaApi for Cx {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod android_socket;
 #[cfg(target_os = "android")]
 pub(crate) mod android_fleet;
-#[cfg(target_env = "ohos")]
-mod ohos_socket;
 
 impl crate::cx_api::CxOsApi for Cx {
     fn xr_eye_matrices(&self) -> Option<[(crate::makepad_math::Mat4f, crate::makepad_math::Mat4f); 2]> {
@@ -577,13 +575,9 @@ impl crate::cx_api::CxOsApi for Cx {
         // desktop app)
         #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
+            android_socket::register();
             #[cfg(target_os = "android")]
-            {
-                android_socket::register();
-                android_fleet::register();
-            }
-            #[cfg(target_env = "ohos")]
-            ohos_socket::register();
+            android_fleet::register();
             self.package_root = Some("makepad".to_string());
             self.native_load_dependencies();
         }

@@ -58,6 +58,11 @@ extern "C" {
     pub fn napi_create_threadsafe_function(env: napi_env, function: napi_value, resource: napi_value, resource_name: napi_value, max_queue: usize, threads: usize,
         finalize_data: *mut c_void, finalize: *mut c_void, context: *mut c_void, call_js: Option<napi_threadsafe_function_call_js>, out: *mut napi_threadsafe_function) -> napi_status;
     pub fn napi_call_threadsafe_function(function: napi_threadsafe_function, data: *mut c_void, mode: c_int) -> napi_status;
+    pub fn napi_create_arraybuffer(env: napi_env, len: usize, data: *mut *mut c_void, out: *mut napi_value) -> napi_status;
+    pub fn napi_is_arraybuffer(env: napi_env, value: napi_value, out: *mut bool) -> napi_status;
+    pub fn napi_get_arraybuffer_info(env: napi_env, value: napi_value, data: *mut *mut c_void, len: *mut usize) -> napi_status;
+    pub fn napi_is_typedarray(env: napi_env, value: napi_value, out: *mut bool) -> napi_status;
+    pub fn napi_get_typedarray_info(env: napi_env, value: napi_value, kind: *mut c_int, len: *mut usize, data: *mut *mut c_void, buffer: *mut napi_value, offset: *mut usize) -> napi_status;
 }
 
 /// The property of a module's exports that holds the XComponent which loaded the library.

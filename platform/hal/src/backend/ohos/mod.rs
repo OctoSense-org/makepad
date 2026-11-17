@@ -7,6 +7,7 @@ mod shell;
 mod surface;
 pub mod napi;
 mod ime;
+pub mod socket;
 pub mod assets;
 pub mod media;
 pub mod standalone;
