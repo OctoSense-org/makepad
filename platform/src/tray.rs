@@ -93,7 +93,7 @@ impl Cx {
             return;
         }
         let shown = cfg!(any(target_os = "macos", target_os = "windows"))
-            || (cfg!(target_os = "linux") && crate::app_main::hosted_by_window_manager());
+            || (cfg!(all(target_os = "linux", not(target_env = "ohos"))) && crate::app_main::hosted_by_window_manager());
         if shown && !self.trays.contains(&tray.id) {
             self.trays.push(tray.id);
         }
@@ -115,7 +115,7 @@ impl Cx {
     /// HAL WM shell hosts; not a `--stdin-loop` child). True before the app has set a tray.
     pub fn desktop_has_tray_dropdown(&self) -> bool {
         cfg!(any(target_os = "macos", target_os = "windows"))
-            || (cfg!(target_os = "linux") && crate::app_main::hosted_by_window_manager() && !crate::app_main::launched_by_host())
+            || (cfg!(all(target_os = "linux", not(target_env = "ohos"))) && crate::app_main::hosted_by_window_manager() && !crate::app_main::launched_by_host())
     }
 
     /// The app has a tray the desktop shows and its `dropdown` tray's primary click is the app's

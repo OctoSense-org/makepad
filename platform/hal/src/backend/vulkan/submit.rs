@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone)]
 pub(super) struct Token { pub sid: u32, pub incarnation: Arc<FrameProgress> }
 pub(super) enum Event {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     Capture { window: Id, surface: Arc<crate::backend::linux::media::capture_surface::Surface> },
     Presented { target: Id, frame: u64 },
     /// `gpu_span`: the frame's first and last timestamps in seconds of the device's clock (the
@@ -44,7 +44,7 @@ impl Mailbox {
 
 pub(super) enum Ticket {
     BufferLeases { token: Token, req: u32, ranges: Vec<(Arc<Buffer>, u64, u64, crate::lease::Lease)> },
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     Capture { token: Token, window: Id, size: [u32;2], format: u32, buffer: Arc<Buffer> },
     Frame { token: Token, target: Id, kind: u32, frame: u64, window: bool },
     Read { token: Token, req: u32, rect: [u32; 4], format: u32, staging: Arc<Buffer>, stencil: Option<Arc<Buffer>>, pick: Option<[f32; 2]> },
@@ -310,11 +310,11 @@ pub(super) struct Batch {
     /// When `finish` handed the batch to the submit worker, while the frame profile records (0:
     /// not recording): its submit queue wait, vkQueueSubmit and submit->rendered times.
     finished_ns: u64,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub external_waits: Vec<(Arc<super::share::sync::Semaphore>, u64)>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub external_signals: Vec<(Arc<super::share::sync::Semaphore>, u64)>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub release_fence: Option<(Arc<super::share::sync::Semaphore>, crate::completion::CompletionReply)>,
     /// Hosted images (a host's shared swapchain image with this writer's timeline) this batch
     /// rendered a frame into. Only these publish a frame on their timeline (`finish`): a batch
@@ -322,7 +322,7 @@ pub(super) struct Batch {
     /// for the host's release nor publish a value the host never hears of -- that left the
     /// host rejecting the frame, never releasing the image, and the reading batch waiting on
     /// the GPU until the driver declared the device lost (`may_read`).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub hosted_frames: Vec<Arc<Image>>,
 }
 
@@ -331,7 +331,7 @@ impl Batch {
     /// waits for (value wanted against the semaphore's value now) and what it carries.
     fn stall_report(&self) -> String {
         let mut out = String::new();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             for (sem, want) in &self.external_waits {
                 let now = unsafe { self.dev.raw.get_semaphore_counter_value(sem.raw) };
@@ -353,7 +353,7 @@ impl Batch {
         let mut sids: Vec<u32> = Vec::new();
         for ticket in &self.tickets {
             let sid = match ticket {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 Ticket::Capture { token, .. } => token.sid,
                 Ticket::Frame { token, .. } | Ticket::Read { token, .. } | Ticket::Shared { token, .. } | Ticket::Copy { token, .. } | Ticket::BufferLeases { token, .. } => token.sid,
                 Ticket::Host { .. } | Ticket::FrameCap { .. } => continue,
@@ -378,10 +378,10 @@ impl Batch {
             #[cfg(target_os = "android")] native_frame: None,
             #[cfg(target_os = "android")] native_signal: None,
             blocks: [(0, 0, Placed::NONE); 8], pick_block: None, finished_ns: 0,
-            #[cfg(target_os = "linux")] external_waits: Vec::new(),
-            #[cfg(target_os = "linux")] external_signals: Vec::new(),
-            #[cfg(target_os = "linux")] release_fence: None,
-            #[cfg(target_os = "linux")] hosted_frames: Vec::new() };
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] external_waits: Vec::new(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] external_signals: Vec::new(),
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] release_fence: None,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] hosted_frames: Vec::new() };
         if let Some(mut slot) = spare {
             // the slot's objects move into this batch; the emptied slot destroys nothing
             b.pool = std::mem::replace(&mut slot.pool, vk::CommandPool::null());
@@ -429,23 +429,23 @@ impl Batch {
     /// batch that rendered its frame (the read is recorded before the image goes to the host),
     /// or while the host has given it back (the writer owns it; nothing is published).
     pub fn may_read(&self, image: &Arc<Image>) -> Result<(), String> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if image.timeline.as_ref().is_some_and(|t| t.producer)
             && !self.hosted_frames.iter().any(|f| Arc::ptr_eq(f, image)) && !image.hosted_writable() {
             return Err("the hosted window's newest frame is with its host".into());
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         let _ = image;
         Ok(())
     }
 
     /// `image` received a frame in this batch (a pass rendered into it).
     pub fn rendered(&mut self, image: &Arc<Image>) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if image.timeline.as_ref().is_some_and(|t| t.producer) && !self.hosted_frames.iter().any(|f| Arc::ptr_eq(f, image)) {
             self.hosted_frames.push(image.clone());
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         let _ = image;
     }
 
@@ -526,7 +526,7 @@ impl Batch {
     pub fn finish(mut self, submit: &Worker, complete: Arc<Worker>, mailbox: Mailbox) {
         if crate::profile::on() { self.finished_ns = crate::clock_ns(); }
         let later = submit.later();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let mut published: Vec<(Arc<super::share::sync::Timeline>, u64)> = Vec::new();
         let ended = (|| unsafe {
             for arena in &self.arenas { arena.flush()?; }
@@ -537,7 +537,7 @@ impl Batch {
                 if image.external.is_some() && external.insert(image.image) {
                     // a hosted frame rendered here waits for the host's release of the previous
                     // one and publishes this one (`hosted_frames`)
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     if let Some(timeline) = image.timeline.as_ref().filter(|t| t.producer && self.hosted_frames.iter().any(|f| Arc::ptr_eq(f, image))) {
                         let (wait, signal) = timeline.submitted()?;
                         published.push((timeline.clone(), wait));
@@ -551,7 +551,7 @@ impl Batch {
             self.dev.raw.end_command_buffer(self.cb).map_err(error)
         })();
         // a batch that is not submitted publishes no frame: its hosted images stay the writer's
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if ended.is_err() { for (timeline, wait) in &published { timeline.unsubmitted(*wait); } }
         submit.push(move || {
             let cb = [self.cb];
@@ -565,13 +565,13 @@ impl Batch {
                 if let Some(sem) = &self.native_signal { signals.push(sem.raw); }
                 signals
             };
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let (mut waits, mut signals, mut stages) = (waits, signals, stages);
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let mut wait_values = vec![0; waits.len()];
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let mut signal_values = vec![0; signals.len()];
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             {
                 for (sem, value) in &self.external_waits { waits.push(sem.raw); stages.push(vk::PipelineStageFlags::ALL_COMMANDS); wait_values.push(*value); }
                 for (sem, value) in &self.external_signals { signals.push(sem.raw); signal_values.push(*value); }
@@ -579,9 +579,9 @@ impl Batch {
             }
             let info = vk::SubmitInfo::default().command_buffers(&cb).wait_semaphores(&waits)
                 .wait_dst_stage_mask(&stages).signal_semaphores(&signals);
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let mut timeline = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wait_values).signal_semaphore_values(&signal_values);
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let info = if self.external_waits.iter().chain(&self.external_signals).any(|(_, v)| *v != 0) {
                 info.next_timeline_semaphore_submit_info(&mut timeline)
             } else { info };
@@ -605,7 +605,7 @@ impl Batch {
                     }
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             if outcome == Outcome::Ran {
                 if let Some((sem, reply)) = &self.release_fence {
                     // Export only after queue submission. Retain the semaphore in the batch
@@ -747,7 +747,7 @@ impl Batch {
 
     fn complete(mut self, failed: bool, mailbox: Mailbox) {
         crate::profile::since(crate::profile::Metric::SubmitToRendered, self.finished_ns);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some((_, reply)) = &self.release_fence {
             reply.send(if failed { Err("Vulkan release submission failed".into()) } else { Ok(None) });
         }
@@ -788,7 +788,7 @@ impl Batch {
                     push(token, Event::BufferLeases { req, status, leases });
                 }
 
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 Ticket::Capture { token, window, size, format, buffer } => {
                     if !failed {
                         match super::capture_gpu::completed(buffer, size, format) {

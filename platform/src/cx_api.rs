@@ -400,7 +400,7 @@ pub enum CxOsOp {
     StopLocationUpdates,
 
     /// A system haptic (Android under the HAL).
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     HapticFeedback(HapticFeedback),
 
     HttpRequest {
@@ -558,7 +558,7 @@ impl CxOsOp {
             Self::RequestPermission { .. } => "RequestPermission",
             Self::StartLocationUpdates => "StartLocationUpdates",
             Self::StopLocationUpdates => "StopLocationUpdates",
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             Self::HapticFeedback(..) => "HapticFeedback",
 
             Self::HttpRequest { .. } => "HttpRequest",
@@ -697,6 +697,12 @@ impl Cx {
     pub fn request_live_edit(&mut self) {
         self.pending_live_edit_request = true;
     }
+
+    /// Asks OpenHarmony for the device's location (what `Cx::gps_fix` then reads). The shell has
+    /// no location service wired yet, so no fix ever comes; the call is here for the apps that
+    /// ask on this system.
+    #[cfg(target_env = "ohos")]
+    pub fn ohos_request_gps(&mut self) {}
 
     /// Arm the VM's captured-error sink for the live-edit re-run that
     /// follows, so a hot-reloaded block that fails to run is reported to
@@ -905,7 +911,7 @@ impl Cx {
                 PriorityStatus::Failed
             }
         }
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
         {
             unsafe extern "C" {
                 fn setpriority(which: i32, who: u32, priority: i32) -> i32;
@@ -970,7 +976,7 @@ impl Cx {
         #[cfg(not(any(
             target_vendor = "apple",
             target_os = "linux",
-            target_os = "android",
+            target_os = "android", target_env = "ohos",
             target_os = "windows"
         )))]
         {
@@ -1002,7 +1008,7 @@ impl Cx {
             }
         }
 
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if let Some(data) = crate::os::hal::read_asset(path) {
             return Ok(Rc::new(data));
         }
@@ -1020,7 +1026,7 @@ impl Cx {
             }
         }
 
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if let Some(data) = crate::os::hal::read_asset(path) {
             return Ok(Rc::new(data));
         }
@@ -1085,7 +1091,7 @@ impl Cx {
         if let Ok(bytes) = HostBuf::from_file_mmap_or_read(path) {
             return Some(bytes);
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if let Some(bytes) = self.get_resource_font_asset_bytes_by_path(path) {
             return Some(bytes);
         }
@@ -1102,7 +1108,7 @@ impl Cx {
 
     /// Maps an APK font by its resource or dependency path, reusing the mapping across
     /// family loads. Cache actual asset paths so package-root and resource changes can resolve anew.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub fn get_resource_font_asset_bytes_by_path(&self, path: &str) -> Option<HostBuf> {
         let map_asset = |path: &str| {
             let mut assets = self.hal.mapped_font_assets.borrow_mut();
@@ -1198,7 +1204,7 @@ impl Cx {
                 Some(makepad_hal::backend_id::VULKAN) => GpuBackend::Vulkan,
                 Some(makepad_hal::backend_id::GL) => GpuBackend::OpenGl,
                 None if cfg!(target_vendor = "apple") => GpuBackend::Metal,
-                None if cfg!(target_os = "linux") => GpuBackend::Vulkan,
+                None if cfg!(all(target_os = "linux", not(target_env = "ohos"))) => GpuBackend::Vulkan,
                 Some(makepad_hal::backend_id::D3D11) => GpuBackend::Direct3d11,
                 _ => GpuBackend::Headless,
             }
@@ -1519,9 +1525,9 @@ impl Cx {
     /// forever. A call while the scanner is already open is ignored; the
     /// pending result still arrives once.
     pub fn show_qr_scanner(&mut self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         self.platform_ops.push_back(CxOsOp::ShowQrScanner);
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
         Cx::post_action(crate::event::NativeQrCancelled {
             reason: "unsupported".to_string(),
         });
@@ -1548,7 +1554,7 @@ impl Cx {
 
     #[track_caller]
     pub fn request_quit(&mut self, reason: QuitReason) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] Cx::request_quit reason={reason:?}");
         }
@@ -1567,7 +1573,7 @@ impl Cx {
         was_handled
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
     pub(crate) fn handle_termination_signal(&mut self) {
         if crate::os::termination_signal::take_requested() {
             self.request_quit(QuitReason::Signal);
@@ -1879,7 +1885,7 @@ impl Cx {
         }
         let current_dpi = self.windows[window_id].effective_dpi_factor();
         let target_dpi = dpi_override.unwrap_or_else(|| self.windows[window_id].native_dpi_factor());
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             self.windows[window_id].dpi_override = dpi_override;
             self.hal_sync_direct_scale();
@@ -1947,15 +1953,15 @@ impl Cx {
     /// Due to lack of platform clipboard support, it does not work on Web or tvOS.
     /// A system haptic (Android: the HAL's Haptic command; a no-op elsewhere).
     pub fn haptic_feedback(&mut self, kind: HapticFeedback) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         self.platform_ops.push_back(CxOsOp::HapticFeedback(kind));
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
         let _ = kind;
     }
 
     /// Brings another running app, by process id, to the front (a launcher showing the app it
     /// started). macOS and Windows; false where unsupported or refused.
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     pub fn activate_process(&mut self, pid: u32) -> bool {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         return makepad_hal::activate_process(pid);
@@ -2020,14 +2026,14 @@ impl Cx {
         let files_only = items
             .iter()
             .all(|item| matches!(item, DragItem::FilePath { internal_id: None, .. }));
-        let touch_backend = cfg!(any(target_os = "android", target_os = "ios"));
-        let os_drag = cfg!(not(any(target_arch = "wasm32", target_os = "linux", test)))
+        let touch_backend = cfg!(any(target_os = "android", target_env = "ohos", target_os = "ios"));
+        let os_drag = cfg!(not(any(target_arch = "wasm32", all(target_os = "linux", not(target_env = "ohos")), test)))
             && (files_only || touch_backend);
         if !os_drag {
             self.drag_drop.start_internal_drag(items);
             return;
         }
-        #[cfg(not(any(target_arch = "wasm32", target_os = "linux", test)))]
+        #[cfg(not(any(target_arch = "wasm32", all(target_os = "linux", not(target_env = "ohos")), test)))]
         {
             self.platform_ops.iter().for_each(|p| {
                 if let CxOsOp::StartDragging { .. } = p {
@@ -2839,7 +2845,7 @@ impl Cx {
     /// Keeps the display at its fastest refresh rate for about another second. Input already does this,
     /// so it's for content that keeps moving on its own, like a fling. Only Android needs it so far.
     pub fn boost_frame_rate(&mut self) {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if !self.platform_ops.iter().any(|queued| matches!(queued, CxOsOp::BoostFrameRate)) {
             self.platform_ops.push_back(CxOsOp::BoostFrameRate);
         }
@@ -2848,7 +2854,7 @@ impl Cx {
     /// Whether a screen created now gets its shaders built in the background, ready by the time it opens.
     /// The HAL compiles pipelines asynchronously, but this only reads true on Android, once the first frame has shown.
     pub fn is_building_shaders_in_background(&self) -> bool {
-        cfg!(target_os = "android") && crate::first_present_seen()
+        cfg!(any(target_os = "android", target_env = "ohos")) && crate::first_present_seen()
     }
 
     /// Sets whether a frame repaints only the parts of the window that changed, which it does by default.
@@ -3328,12 +3334,12 @@ mod stale_window_tests {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "windows", target_os = "android"))]
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "windows", target_os = "android", target_env = "ohos"))]
 fn can_play_type_impl(mime: &str) -> &'static str {
     makepad_hal::can_play_type(mime)
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows", target_os = "android", target_env = "ohos")))]
 fn can_play_type_impl(_mime: &str) -> &'static str { "" }
 
 #[macro_export]

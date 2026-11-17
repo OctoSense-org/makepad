@@ -813,7 +813,7 @@ fn detect_machine_topology(logical: usize) -> MachineTopology {
     .limited_to(logical)
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
 fn detect_machine_topology(logical: usize) -> MachineTopology {
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -973,7 +973,7 @@ fn detect_machine_topology(logical: usize) -> MachineTopology {
 #[cfg(not(any(
     target_vendor = "apple",
     target_os = "linux",
-    target_os = "android",
+    target_os = "android", target_env = "ohos",
     target_os = "windows"
 )))]
 fn detect_machine_topology(logical: usize) -> MachineTopology {
@@ -1998,7 +1998,7 @@ impl PoolInner {
         let class = |c: u8| ["I", "V", "B"][c as usize];
         // on Linux, the workers the kernel has on a CPU or ready for one: a permit held by a
         // worker that is not is held by a thread asleep (on a lock, a condition)
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let on_cpu = std::fs::read_dir("/proc/self/task").map_or(0, |dir| {
             dir.filter_map(Result::ok)
                 .filter_map(|task| std::fs::read_to_string(task.path().join("stat")).ok())
@@ -2009,7 +2009,7 @@ impl PoolInner {
                 })
                 .count()
         });
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         let on_cpu = "?";
         let mut line = format!(
             "pool timeline t={:.3} workers {}+{}: {on_jobs} on jobs, {idle} idle, {on_cpu} on a CPU | queued I{} V{} B{} | cpu {}/{} running, waiting I{} V{} B{} |",
@@ -2052,14 +2052,14 @@ impl PoolInner {
                 makepad_cpu_budget::strand_waited(class.budget(), ns(at - job.submitted_at), label)
             }
         }
-        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         let traced = ui_hang::relax_timeline::hooks()
             .inspect(|h| (h.begin)(label.as_ptr(), label.len()))
             .is_some();
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| job.run(&self.completed))) {
             crate::error!("pool job cleanup panicked: {}", panic_report(panic).message);
         }
-        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
         if traced {
             if let Some(h) = ui_hang::relax_timeline::hooks() {
                 (h.end)(label.as_ptr(), label.len());

@@ -112,9 +112,9 @@ mod wait {
     }
     const POLLIN: i16 = 0x1;
     const POLLOUT: i16 = 0x4;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
     type Nfds = std::ffi::c_ulong;
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_env = "ohos")))]
     type Nfds = std::ffi::c_uint;
     extern "C" {
         fn poll(fds: *mut PollFd, n: Nfds, timeout_ms: i32) -> i32;

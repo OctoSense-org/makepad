@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "A Makepad app"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "A Makepad app"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "Makepad"
+    }
+  ]
+}

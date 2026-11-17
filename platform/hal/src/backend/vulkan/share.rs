@@ -2,11 +2,11 @@
 //! registry tickets, never unchecked pointers or process-local FD numbers. A shell moves an
 //! owned DMA-BUF/AHardwareBuffer descriptor through this registry, then sends its ticket.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod dma_buf;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) mod sync;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod copy;
 #[cfg(target_os = "android")]
 mod hardware_buffer;
@@ -20,9 +20,9 @@ use std::ffi::CStr;
 use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use dma_buf::DmaBuf as NativeHandle;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use dma_buf::{DmaBufSupport, OpaqueMemory};
 #[cfg(target_os = "android")]
 pub use hardware_buffer::HardwareBuffer as NativeHandle;
@@ -142,7 +142,7 @@ impl VkExternalImages for NativeImages {
     fn session_closed(&mut self, session: u32) { lock(&self.entries).retain(|_, e| e.session != session); }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl crate::dmabuf::Api for super::Vulkan {
     fn supported(&self) -> Result<(), String> {
         NativeHandle::supported(&self.dev)?;
@@ -211,12 +211,12 @@ impl crate::dmabuf::Api for super::Vulkan {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(super) fn foreign_support(dev: &Device) -> Option<DmaBufSupport> { NativeHandle::support(dev) }
 
 /// A host compositor's shared image (a hosted window's swapchain image) as a render target of
 /// this device, with the host's timeline: [`Image::hosted_writable`], [`Image::hosted_sequence`].
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) fn import_foreign(dev: Arc<Device>, native: Arc<NativeHandle>) -> Result<Arc<Image>, String> {
     let opaque = native.fourcc == u32::from_le_bytes(*b"XR24");
     let mut image = NativeHandle::import(dev, native)?;
@@ -224,14 +224,14 @@ pub(crate) fn import_foreign(dev: Arc<Device>, native: Arc<NativeHandle>) -> Res
     Ok(image)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) fn import_hosted(dev: Arc<Device>, native: Arc<NativeHandle>) -> Result<Arc<Image>, String> {
     let image = NativeHandle::import(dev, native)?;
     if image.timeline.as_ref().is_none_or(|t| !t.producer) { return Err("hosted image has no writer timeline".into()); }
     Ok(image)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Image {
     /// The host released this hosted image: the next frame may render into it.
     pub(crate) fn hosted_writable(&self) -> bool {

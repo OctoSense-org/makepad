@@ -80,7 +80,7 @@ impl Texture {
 }
 
 /// Zero-copy OES frame for Android `sample_video` present.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub struct OesFrame {
     pub tex_id: u32,
     pub width: u32,

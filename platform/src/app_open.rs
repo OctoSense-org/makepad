@@ -116,7 +116,7 @@ pub enum SingleInstance {
     Standalone,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 mod native {
     use super::*;
     use crate::os::single_instance::{self as si, Claim, HANDOFF_TIMEOUT};
@@ -176,7 +176,7 @@ mod native {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
 mod native {
     use super::*;
 

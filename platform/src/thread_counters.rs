@@ -75,17 +75,17 @@ pub fn read_process() -> Option<(u64, u64)> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub fn read() -> Option<(u64, u64)> {
     linux::read()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
 pub fn read() -> Option<(u64, u64)> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux {
     use std::cell::Cell;
 

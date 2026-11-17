@@ -46,6 +46,31 @@ macro_rules! android_jni_entry {
     ($app:path) => {};
 }
 
+/// `app_main!`'s entry for a standalone OpenHarmony app: the ability loads libmakepad.so (the
+/// app crate as a cdylib), whose constructor registers it as the Node-API module `makepad`.
+#[cfg(all(target_env = "ohos", not(relax)))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! ohos_napi_entry {
+    ($app:path) => {
+        #[used]
+        #[link_section = ".init_array"]
+        static MAKEPAD_OHOS_ON_LOAD: extern "C" fn() = {
+            extern "C" fn on_load() {
+                unsafe { $crate::ohos_on_load($app) }
+            }
+            on_load
+        };
+    };
+}
+
+#[cfg(not(all(target_env = "ohos", not(relax))))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! ohos_napi_entry {
+    ($app:path) => {};
+}
+
 /// The process entry of a native app. Under the HAL on macOS/iOS/tvOS/Linux/Windows the HAL owns the
 /// main thread and runs the OS shell there (on iOS / tvOS `UIApplicationMain`, which never
 /// returns); the app, with its `Cx`, runs on its own thread. Elsewhere the app runs right here.
@@ -68,6 +93,17 @@ pub unsafe fn android_on_load(vm: *mut std::ffi::c_void, app: fn()) -> i32 {
     makepad_hal::backend::android::standalone::on_load(vm, app, activity_ready)
 }
 
+/// The load of a standalone OpenHarmony app's library (its libmakepad.so is the app, natively
+/// compiled): the HAL shell registers the Node-API module and runs `app` on its own thread once
+/// the ability starts it. `app_main!` runs it from a constructor.
+/// # Safety
+/// Called once, as the library loads.
+#[cfg(all(target_env = "ohos", not(relax)))]
+#[doc(hidden)]
+pub unsafe fn ohos_on_load(app: fn()) {
+    makepad_hal::backend::ohos::standalone::register(app)
+}
+
 /// `app` is the whole of the app's main: it creates its `Cx` itself.
 /// Under `makepad run` the host has done the same around the program's `main` (it gave the
 /// process's main thread to the HAL and called `main` on a thread of its own), so the app just
@@ -78,13 +114,13 @@ pub fn run_app(app: fn()) {
     let hosted = std::relax::main_hosted();
     #[cfg(not(relax))]
     let hosted = false;
-    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
     if !hosted {
         /// Ends the main loop when the app thread is done, however it is done.
         struct Done;
         impl Drop for Done {
             fn drop(&mut self) {
-                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
                 {
                     if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
                         eprintln!("[hal] app thread ending (panicking={}); closing remaining HAL sessions before stopping main loop", std::thread::panicking());
@@ -110,7 +146,7 @@ pub fn run_app(app: fn()) {
             })
             .expect("the app thread");
         makepad_hal::run_main_loop();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] main loop returned; joining app thread");
         }
@@ -121,7 +157,7 @@ pub fn run_app(app: fn()) {
         if panicked {
             std::process::exit(101);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
             eprintln!("[hal-linux] app thread joined, HAL stopped; run_app returning");
         }
@@ -211,13 +247,13 @@ pub struct WmAdmission {
     pub crate_name: &'static str,
 }
 
-#[cfg(all(target_os = "linux", not(relax)))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
 static ADMITTED: std::sync::OnceLock<Option<WmAdmission>> = std::sync::OnceLock::new();
 
 pub fn admitted_by_window_manager() -> Option<WmAdmission> {
-    #[cfg(all(target_os = "linux", not(relax)))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
     return ADMITTED.get().copied().flatten();
-    #[cfg(not(all(target_os = "linux", not(relax))))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"), not(relax))))]
     None
 }
 
@@ -233,9 +269,9 @@ pub fn discover_window_manager(crate_name: &'static str) {
     // reattach to the next WM): its package, which the WM finds the app's label and icon by.
     // Never the executable's file name: a rebuild replaces the binary under a running app and
     // Linux then reads it as "<path> (deleted)".
-    #[cfg(all(target_os = "linux", not(relax)))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
     makepad_hal::wm_socket::set_client_name(crate_name);
-    #[cfg(all(target_os = "linux", not(relax)))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), not(relax)))]
     ADMITTED.get_or_init(|| {
         use makepad_hal::wm_socket::{self, Backend};
         if launched_by_host() || is_window_manager() || OUTLIVES_WINDOW_MANAGER.load(std::sync::atomic::Ordering::Acquire)
@@ -263,7 +299,7 @@ pub fn discover_window_manager(crate_name: &'static str) {
             }
         }
     });
-    #[cfg(not(all(target_os = "linux", not(relax))))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"), not(relax))))]
     let _ = crate_name;
 }
 
@@ -922,6 +958,8 @@ macro_rules! app_main {
 
         // A standalone Android app's entry (decided in this crate, which knows the `relax` cfg).
         $crate::android_jni_entry!(app_main);
+        // ... and a standalone OpenHarmony app's.
+        $crate::ohos_napi_entry!(app_main);
 
         #[cfg(not(target_arch = "wasm32"))]
         pub fn app_main() {

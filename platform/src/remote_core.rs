@@ -712,7 +712,7 @@ pub fn request() -> Request {
         Request::Off | Request::Local if std::env::var("MAKEPAD_INSPECT").as_deref() == Ok("1") => Request::On,
         // nothing outside a release Android or iOS app can reach its socket, and the system kills such
         // an app without running exit handlers, so its socket and discovery file would only pile up
-        Request::Local if cfg!(all(any(target_os = "android", target_os = "ios", target_os = "tvos"), not(debug_assertions), not(relax))) => Request::Off,
+        Request::Local if cfg!(all(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos"), not(debug_assertions), not(relax))) => Request::Off,
         request => request,
     }
 }

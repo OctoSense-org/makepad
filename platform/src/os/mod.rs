@@ -1,6 +1,6 @@
 #[macro_use]
 #[cfg(any(
-    target_os = "android",
+    target_os = "android", target_env = "ohos",
     target_os = "linux",
     target_os = "macos",
     target_os = "ios",
@@ -15,15 +15,15 @@ pub mod cx_native;
 pub mod cx_shared;
 
 pub mod shared_framebuf;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod hosted_gpu;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod hosted_gpu_sender;
 
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
 pub(crate) mod termination_signal;
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 // Native-only: the launch handoff runs before any Cx (and its clock) exists.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub(crate) mod single_instance;
@@ -37,7 +37,7 @@ pub mod hal;
 pub use crate::os::hal::*;
 
 /// The GL function table of the GL interop API (`Cx::with_gl`).
-#[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
+#[cfg(not(any(target_os = "android", target_env = "ohos", target_arch = "wasm32")))]
 pub mod gl_sys;
 
 

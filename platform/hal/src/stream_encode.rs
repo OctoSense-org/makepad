@@ -8,10 +8,10 @@
 
 #[cfg(target_os = "android")]
 use crate::backend::android::media::stream_encode::{Codec, StreamEncoder, Tuning};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use crate::backend::vulkan::{share::copy, video_encode::{Codec, StreamEncoder, Tuning}};
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
@@ -67,7 +67,7 @@ pub fn hal_stream_encoder_error(out: &mut [u8]) -> u64 {
 /// lack the window system's extensions). False when no device could be made.
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_offscreen_device() -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     return StreamEncoder::offscreen_device();
     // MediaCodec needs no GPU device
     #[cfg(target_os = "android")]
@@ -78,7 +78,7 @@ pub fn hal_stream_encoder_offscreen_device() -> bool {
 /// best split into. 0 when this machine has no hardware encoder.
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_engines() -> u32 {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     return StreamEncoder::engines();
     // one codec a stream (MediaCodec does not split pictures)
     #[cfg(target_os = "android")]
@@ -90,7 +90,7 @@ pub fn hal_stream_encoder_engines() -> u32 {
 /// larger picture is split into tiles (columns and bands) of at most this size.
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_max_size(flags: u32) -> u64 {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     return StreamEncoder::max_size(codec_of(flags), flags & FULL_CHROMA != 0).map_or(0, |[w, h]| (w as u64) << 32 | h as u64);
     // not asked of the codec
     #[cfg(target_os = "android")]
@@ -124,7 +124,7 @@ fn codec_of(flags: u32) -> Codec {
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_open(width: u32, height: u32, fps: u32, kbps: u32, engine: u32, flags: u32, quality: u32, buffer_pictures: u32) -> u64 {
     let tuning = Tuning { quality, constant: flags & CBR != 0, buffer_pictures: buffer_pictures.max(1), sharp: flags & SHARP != 0 };
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     let opened = StreamEncoder::open(width, height, fps, kbps, engine as usize, flags & FULL_CHROMA != 0, codec_of(flags), tuning);
     #[cfg(target_os = "android")]
     let opened = if flags & FULL_CHROMA != 0 || engine != 0 {
@@ -184,7 +184,7 @@ fn encode(encoder: u64, f: impl FnOnce(&mut StreamEncoder) -> Result<Vec<u8>, St
 /// one rectangle of texels,
 /// once the sync_file `sync_fd` has signalled (taken over; -1 when the picture's GPU work is
 /// complete). The bitstream's length, -1 when it failed.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_texture(encoder: u64, handle: u64, source_height: u32, x0: u32, y0: u32, sync_fd: i32, flags: u32) -> i64 {
     let sync = (sync_fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(sync_fd) });
@@ -245,11 +245,11 @@ pub fn hal_stream_encoder_bitrate(encoder: u64, kbps: u32) {
 /// undershooting it). Vulkan Video only.
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_max_qp(encoder: u64, qp: u32) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if let Some(open) = get(encoder) {
         crate::lock(&open).encoder.set_max_qp(qp.min(51));
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     let _ = (encoder, qp);
 }
 
@@ -263,7 +263,7 @@ pub fn hal_stream_encoder_close(encoder: u64) {
 /// least and greatest delta): true when it takes one (Linux, VK_KHR_video_encode_quantization_map).
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_qp_grid(encoder: u64, out: &mut [i32]) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let Some(open) = get(encoder) else { return false };
         let grid = crate::lock(&open).encoder.qp_grid();
@@ -274,7 +274,7 @@ pub fn hal_stream_encoder_qp_grid(encoder: u64, out: &mut [i32]) -> bool {
         out[..6].copy_from_slice(&[cols as i32, rows as i32, tw as i32, th as i32, min, max]);
         true
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     {
         let _ = (encoder, out);
         false
@@ -285,7 +285,7 @@ pub fn hal_stream_encoder_qp_grid(encoder: u64, out: &mut [i32]) -> bool {
 /// pictures from the next one on: negative spends more bits there, positive fewer.
 #[makepad_relax_api::relax_api]
 pub fn hal_stream_encoder_qp_map(encoder: u64, deltas: &[u8]) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         let Some(open) = get(encoder) else { return false };
         // the bytes are the deltas as they lie (i8)
@@ -293,7 +293,7 @@ pub fn hal_stream_encoder_qp_map(encoder: u64, deltas: &[u8]) -> bool {
         let set = crate::lock(&open).encoder.set_qp_map(deltas);
         set
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     {
         let _ = (encoder, deltas);
         false

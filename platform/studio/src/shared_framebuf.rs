@@ -1,7 +1,7 @@
 use makepad_micro_serde::*;
 
 pub const SWAPCHAIN_IMAGE_COUNT: usize = match () {
-    _ if cfg!(target_os = "linux") => 3,
+    _ if cfg!(all(target_os = "linux", not(target_env = "ohos"))) => 3,
     // Android children draw into the host's AHardwareBuffers with no fence
     // between the processes: a third image keeps the one being written two
     // frames away from the one the desk samples (run_view paces the child
@@ -41,7 +41,7 @@ impl PresentableImageId {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct DrmFormat {
     pub fourcc: u32,
@@ -80,13 +80,13 @@ pub struct SharedSwapchain {
     pub presentable_images: [SharedPresentableImage; SWAPCHAIN_IMAGE_COUNT],
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct AuxChannedImageFd {
     pub _private: Option<u32>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct LinuxSharedImagePlane {
     pub dma_buf_fd: AuxChannedImageFd,
@@ -94,7 +94,7 @@ pub struct LinuxSharedImagePlane {
     pub stride: u32,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct LinuxVulkanSharedImage {
     pub allocation_size: u64,
@@ -103,7 +103,7 @@ pub struct LinuxVulkanSharedImage {
     pub driver_uuid: [u8; 16],
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct LinuxSharedImage {
     pub drm_format: DrmFormat,
@@ -116,14 +116,14 @@ pub struct LinuxSharedImage {
     pub dma_buf_timeline: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedPresentableImage {
     pub id: PresentableImageId,
     pub image: LinuxSharedImage,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedSwapchain {
     pub window_id: usize,
@@ -132,14 +132,14 @@ pub struct SharedSwapchain {
     pub presentable_images: [SharedPresentableImage; SWAPCHAIN_IMAGE_COUNT],
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedPresentableImage {
     pub id: PresentableImageId,
     pub _dummy: Option<u32>,
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows")))]
 #[derive(Copy, Clone, Debug, PartialEq, SerBin, DeBin, SerJson, DeJson)]
 pub struct SharedSwapchain {
     pub window_id: usize,

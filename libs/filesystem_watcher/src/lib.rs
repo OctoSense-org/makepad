@@ -228,7 +228,7 @@ impl Emitter {
         &self.exclude
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
     pub(crate) fn emit(
         &self,
         mount: String,
@@ -335,9 +335,9 @@ impl Emitter {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use linux as imp;
 
 #[cfg(target_os = "macos")]
@@ -350,9 +350,9 @@ mod windows;
 #[cfg(target_os = "windows")]
 use windows as imp;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows")))]
 mod unsupported;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows")))]
 use unsupported as imp;
 
 enum Control {

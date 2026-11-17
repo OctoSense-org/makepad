@@ -15,7 +15,7 @@
 pub type FastMap<K, V> = std::collections::HashMap<K, V, fxhash::FxBuildHasher>;
 
 pub mod backend;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod dmabuf;
 /// Shared textures outside any session on Windows (frame rings): a producer's copy or upload
 /// into a slot a host shared, a slot read back.
@@ -24,7 +24,7 @@ pub use backend::windows::d3d11::share_copy as shared_texture;
 pub mod spirv;
 pub mod hlsl;
 pub mod glsl;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod gl_interop;
 pub mod automation;
 pub mod buffers;
@@ -39,22 +39,22 @@ pub mod drag_promise;
 pub mod direct;
 pub mod display_profiles;
 pub mod user_input;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod wide_desktop;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod wm_socket;
 /// Descriptor I/O over Unix sockets: hosted clients and hosts, and frame rings (app_host).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod linux_ipc;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod hosted_ipc;
 /// The native-layer bridge used by process-hosted Cx; the WM HAL shell uses it directly.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use backend::linux::wm::native as hosted_native;
 /// The WM connection kept across an exec of a WM-hosted process (a restart into a rebuilt
 /// makepad): the next image resumes on it as the same client and window.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use backend::linux::wm::{prepare_exec as wm_prepare_exec, undo_exec as wm_undo_exec};
 pub mod cmds;
 #[cfg(test)]
@@ -71,13 +71,13 @@ pub mod gpu_limits;
 pub mod gpu_prof;
 pub mod gpu_pressure;
 pub mod h264_bits;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
 pub mod stream_encode;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod stream_decode;
 pub mod stream_pack;
 pub mod xr_remote;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
 pub mod frame_tap;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod framecap;
@@ -99,10 +99,12 @@ pub use backend::apple::media::{can_play_type, video_h264_probe};
 /// stacking and its focus (the exec restart).
 #[cfg(target_os = "macos")]
 pub use backend::apple::appkit::restack_handover;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use backend::linux::media::can_play_type;
 #[cfg(target_os = "android")]
 pub use backend::android::media::can_play_type;
+#[cfg(target_env = "ohos")]
+pub use backend::ohos::media::can_play_type;
 #[cfg(windows)]
 pub use backend::windows::media::can_play_type;
 pub use buffers::{CmdWriter, EventQueue, EventReader, EventStore};
@@ -405,14 +407,14 @@ static GLOBAL: OnceLock<Arc<Hal>> = OnceLock::new();
 /// exit() then ran the driver's exit handlers under them (a SIGSEGV in a batch's completion).
 /// Registered once the backend, and with it the driver, is made: exit() runs the handlers
 /// last registered first, so this one runs before those the driver registered as it loaded.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))]
 fn before_exit_at_exit() {
     extern "C" { fn atexit(f: extern "C" fn()) -> i32; }
     extern "C" fn at_exit() { if let Some(hal) = GLOBAL.get() { hal.before_exit(); } }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| { unsafe { atexit(at_exit) }; });
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos")))]
 fn before_exit_at_exit() {}
 
 impl Hal {
@@ -454,7 +456,7 @@ impl Hal {
     }
 
     fn open_as(&self, req: &OpenReq, caps: Caps, trusted: bool, host_session: bool) -> HalInfo {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         backend::linux::atspi::start();
         let refused = HalInfo { backend: backend_id::NONE, ..Default::default() };
         let mut guard = lock(&self.state);
@@ -486,12 +488,12 @@ impl Hal {
         });
         let make = |id: u32| -> Option<Box<dyn Backend>> {
             match id {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 backend_id::AUTO => match backend::linux::open(req.flags, wake.clone(), sessions.clone(), notify.clone()) {
                     Ok(b) => Some(b),
                     Err(e) => { eprintln!("[hal] {e}"); None }
                 },
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 backend_id::GL => match backend::gl::GlBackend::new(req.flags, wake.clone(), notify.clone()) {
                     Ok(gl) => Some(Box::new(gl)),
                     Err(e) => {
@@ -512,7 +514,7 @@ impl Hal {
                     Ok(d) => Some(Box::new(d)),
                     Err(e) => { eprintln!("[hal-d3d11] {e}"); None }
                 },
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 backend_id::VULKAN => match backend::vulkan::Vulkan::new(req.flags, sessions.clone(), notify.clone()) {
                     Ok(v) => Some(Box::new(v)),
                     Err(e) => { eprintln!("[hal-vulkan] {e}"); None }
@@ -523,6 +525,12 @@ impl Hal {
                 backend_id::AUTO | backend_id::VULKAN | backend_id::GL => match backend::android::open(id, req.flags, sessions.clone(), wake.clone(), notify.clone()) {
                     Ok(b) => Some(b),
                     Err(e) => { eprintln!("[hal-android] {e}"); None }
+                },
+                #[cfg(target_env = "ohos")]
+                // the ability's events and vsync callbacks make the pumps look
+                backend_id::AUTO | backend_id::GL => match backend::ohos::open(id, req.flags, wake.clone(), notify.clone()) {
+                    Ok(b) => Some(b),
+                    Err(e) => { eprintln!("[hal-ohos] {e}"); None }
                 },
                 _ => None,
             }
@@ -538,7 +546,7 @@ impl Hal {
                     #[cfg(not(target_arch = "wasm32"))]
                     if b.info().backend != backend_id::HEADLESS {
                         let offscreen = req.flags & open_flags::OFFSCREEN_WINDOWS != 0;
-                        if offscreen || !cfg!(target_os = "linux") {
+                        if offscreen || !cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
                             *backend::shell::snapshot() = if offscreen {
                                 backend::shell::Snapshot::new("offscreen", "hidden windows: no shell or WM".into())
                             } else {
@@ -813,7 +821,7 @@ impl Hal {
                 if let Some((_, b)) = st.backend.as_mut() {
                     b.step(&mut st.world, sid);
                     xr_remote::drain_events(sid, &mut st.world);
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     hosted_native::drain_events(sid, &mut st.world);
                     // glyphs the font workers finished go to the atlas and to the sessions
                     if let Some(gpu) = b.host_gpu() {
@@ -1246,9 +1254,9 @@ pub fn end_run() {
     profile::end_run();
     a11y::end_run();
     stream_decode::end_run();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
     stream_encode::end_run();
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
     frame_tap::end_run();
     backend::end_run();
 }
@@ -1268,7 +1276,7 @@ mod main_loop {
 }
 
 /// The Linux shell owns the display connection and all native window objects.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod main_loop {
     pub use super::backend::linux::{expect_main_loop as expect, run_main_loop as run, stop_main_loop as stop};
     pub use super::backend::linux::host_dark;
@@ -1281,7 +1289,7 @@ mod main_loop {
     pub use super::backend::windows::win32::{expect_main_loop as expect, host_dark, run_main_loop as run, screens, stop_main_loop as stop};
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", windows)))]
+#[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), windows)))]
 mod main_loop {
     use std::sync::{Condvar, Mutex};
 
@@ -1545,50 +1553,61 @@ pub fn open_url(url: &str) -> bool {
 pub fn hal_read_asset(path: &str, out: &mut [u8]) -> i64 {
     backend::android::assets::read(path, out)
 }
+/// OpenHarmony's package assets are the HAP's raw files.
+#[cfg(target_env = "ohos")]
+#[relax_api]
+pub fn hal_read_asset(path: &str, out: &mut [u8]) -> i64 {
+    backend::ohos::assets::read(path, out)
+}
 
 /// Socket streams for the app's network stack (Android has no libssl for native code, so TLS is the
-/// Activity's `openSocketStream` family). A stream is named by an `id` the caller picks and keeps
-/// unique; any thread may call. `flags` bit 0: TLS, bit 1: skip certificate validation.
+/// Activity's `openSocketStream` family; on OpenHarmony it is the ability's TLS sockets). A stream
+/// is named by an `id` the caller picks and keeps unique; any thread may call. `flags` bit 0: TLS,
+/// bit 1: skip certificate validation.
 #[cfg(target_os = "android")]
+use backend::android::socket as os_socket;
+#[cfg(target_env = "ohos")]
+use backend::ohos::socket as os_socket;
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub const SOCKET_TLS: u32 = 1;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub const SOCKET_IGNORE_CERT: u32 = 2;
 
-/// Opens stream `id`. Returns 1 when open, 0 when Java refused.
-#[cfg(target_os = "android")]
+/// Opens stream `id`. Returns 1 when open, 0 when the shell refused.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_open(id: i64, host: &str, port: i32, flags: u32) -> u32 {
-    backend::android::socket::open(id, host, port, flags & SOCKET_TLS != 0, flags & SOCKET_IGNORE_CERT != 0) as u32
+    os_socket::open(id, host, port, flags & SOCKET_TLS != 0, flags & SOCKET_IGNORE_CERT != 0) as u32
 }
 
 /// Reads into `out`, blocking until bytes arrive or the read timeout passes. Returns the byte count,
 /// 0 when the read timed out, -1 when the stream is closed or failed.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_read(id: i64, out: &mut [u8]) -> i64 {
-    backend::android::socket::read_into(id, out).map_or(-1, |n| n as i64)
+    os_socket::read_into(id, out).map_or(-1, |n| n as i64)
 }
 
 /// Writes `data`. Returns the bytes written, or -1.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_write(id: i64, data: &[u8]) -> i64 {
-    backend::android::socket::write(id, data) as i64
+    os_socket::write(id, data) as i64
 }
 
 /// Sets the read (`read` != 0) or write timeout in milliseconds (0: none).
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_timeout(id: i64, read: u32, ms: i32) {
-    backend::android::socket::set_timeout(id, read != 0, ms)
+    os_socket::set_timeout(id, read != 0, ms)
 }
 
 /// Copies the server's leaf certificate DER into `out` when it fits. Returns the required
 /// byte length (call with an empty buffer to query it), or -1 when there is no certificate.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_certificate(id: i64, out: &mut [u8]) -> i64 {
-    match backend::android::socket::peer_certificate(id) {
+    match os_socket::peer_certificate(id) {
         Some(der) => {
             if out.len() >= der.len() {
                 out[..der.len()].copy_from_slice(&der);
@@ -1600,10 +1619,10 @@ pub fn hal_socket_certificate(id: i64, out: &mut [u8]) -> i64 {
 }
 
 /// Closes stream `id`.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[relax_api]
 pub fn hal_socket_close(id: i64) {
-    backend::android::socket::close(id)
+    os_socket::close(id)
 }
 
 /// The phone's codecs for makepad_video: HEVC stills (the image tile libraries' frames) and
@@ -2015,8 +2034,9 @@ pub fn hal_video_file_close(id: i64) {
     media_results().lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
 }
 
-/// The path prefix naming a stored APK asset in a font open (`apk:<asset path>`).
-#[cfg(target_os = "android")]
+/// The path prefix naming a stored APK asset in a font open (`apk:<asset path>`); a HAP's raw
+/// file on OpenHarmony.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub const APK_ASSET_PREFIX: &str = "apk:";
 
 /// Opens a stored APK asset as a file range so the caller can map it without a heap copy: returns
@@ -2026,6 +2046,11 @@ pub const APK_ASSET_PREFIX: &str = "apk:";
 #[relax_api]
 pub fn hal_map_asset(path: &str, out: &mut [i64]) -> i64 {
     backend::android::assets::range(path, out)
+}
+#[cfg(target_env = "ohos")]
+#[relax_api]
+pub fn hal_map_asset(path: &str, out: &mut [i64]) -> i64 {
+    backend::ohos::assets::range(path, out)
 }
 
 /// Opens an external URL on the process main thread. The OS handles the URL scheme.
@@ -2151,7 +2176,7 @@ static BACKGROUND_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 pub fn set_background_hook(f: fn()) {
     let _ = BACKGROUND_HOOK.set(f);
 }
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) fn background_hook() {
     if let Some(f) = BACKGROUND_HOOK.get() {
         f();

@@ -291,7 +291,7 @@ pub fn process_footprint_bytes() -> Option<u64> {
         }
         None
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
     {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         for line in status.lines() {
@@ -307,7 +307,7 @@ pub fn process_footprint_bytes() -> Option<u64> {
         target_os = "ios",
         target_os = "tvos",
         target_os = "linux",
-        target_os = "android"
+        target_os = "android", target_env = "ohos"
     )))]
     {
         None
@@ -335,7 +335,7 @@ pub fn heap_in_use_bytes() -> Option<u64> {
         unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
         Some(stats.size_in_use as u64)
     }
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), target_env = "gnu"))]
     {
         #[repr(C)]
         struct Mallinfo2 {
@@ -360,7 +360,7 @@ pub fn heap_in_use_bytes() -> Option<u64> {
         target_os = "macos",
         target_os = "ios",
         target_os = "tvos",
-        all(target_os = "linux", target_env = "gnu")
+        all(target_os = "linux", not(target_env = "ohos"), target_env = "gnu")
     )))]
     {
         None
@@ -370,7 +370,7 @@ pub fn heap_in_use_bytes() -> Option<u64> {
 /// Give the allocator's free pages back to the system after a burst of work.
 /// Never call on the UI thread: this walks the allocator's arenas or zones.
 pub fn release_free_memory() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos"), target_env = "gnu"))]
     {
         extern "C" {
             fn malloc_trim(pad: usize) -> i32;

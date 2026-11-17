@@ -854,7 +854,7 @@ fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
 /// accepted socket carries its listener's path in /proc/net/unix, and this process holds it when
 /// one of its descriptors names its inode. A served end closes on its client's EOF: one still
 /// open is a descriptor this side kept, or one its client did.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn served_on(path: &std::path::Path) -> usize {
     const ACCEPTING: u32 = 1 << 16; // __SO_ACCEPTCON: the listener itself
     let held: std::collections::HashSet<String> = std::fs::read_dir("/proc/self/fd").unwrap().flatten()
@@ -870,7 +870,7 @@ fn served_on(path: &std::path::Path) -> usize {
 /// CLI): every connection's descriptors must go when the client does. Counted on a socket of its
 /// own, never the process's descriptors, which every test running beside it opens and closes:
 /// that count failed with no descriptor of this test kept (11-06).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[test]
 fn served_connections_release_their_descriptors() {
     let ep = Endpoint::new("makepad-remote-fd-test");
@@ -1007,7 +1007,7 @@ fn a_run_with_a_deep_tmpdir_is_reached() {
 /// restarted for a landing, and apps closed by their caption, and nothing said by whom, 11-06).
 /// A client of the endpoint's own process is known as that process (`asker_pid`): a run's end
 /// turns away at once what the ending run asks its own inspect.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))]
 #[test]
 fn a_command_names_the_agent_that_sent_it() {
     fn asked(req: &Req, out: &mut Out) {
@@ -1035,7 +1035,7 @@ fn a_command_names_the_agent_that_sent_it() {
 
 /// Who a process is, natively: its name and its parents' (a quit signal's sender and an inspect
 /// client are said so), and a process that is gone says so.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))]
 #[test]
 fn a_process_is_said_with_its_parents() {
     let me = crate::procs::process(std::process::id()).expect("this process runs");

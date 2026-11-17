@@ -255,7 +255,7 @@ pub enum Event {
     /// A reply to `Cx::read_clipboard`, routed by its request id.
     Clipboard(crate::clipboard_read::ClipboardEvent),
     /// Acceptance/error from a queued direct-display control request.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     LinuxDisplayResult(crate::linux_display::LinuxDisplayResultEvent),
     TextRangeReplace(TextRangeReplaceEvent),
     TextCopy(TextClipboardEvent),
@@ -542,7 +542,7 @@ impl Event {
             Self::PhysicalKeyboard(_) => 68,
             Self::TextInput(_) => 34,
             Self::Clipboard(_) => 85,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             Self::LinuxDisplayResult(_) => 86,
             Self::TextRangeReplace(_) => 35,
             Self::TextCopy(_) => 36,

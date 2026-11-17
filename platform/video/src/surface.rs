@@ -76,10 +76,10 @@ pub fn completion_notified() {
 }
 
 /// A sync_file the reader's GPU waits on (Linux).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub type SyncFile = std::os::fd::OwnedFd;
 /// No sync_file off Linux (never made there).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 pub struct SyncFile {
     _never: (),
 }
@@ -94,7 +94,7 @@ struct Inner {
     /// None once answered (or complete from the start).
     source: Option<Box<dyn CompletionSource>>,
     answer: Option<Result<(), String>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     sync_file: Option<std::os::fd::OwnedFd>,
 }
 
@@ -110,7 +110,7 @@ impl GpuCompletion {
         GpuCompletion(Arc::new(Mutex::new(Inner {
             source: None,
             answer: Some(Ok(())),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             sync_file: None,
         })))
     }
@@ -120,7 +120,7 @@ impl GpuCompletion {
         GpuCompletion(Arc::new(Mutex::new(Inner {
             source: Some(source),
             answer: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             sync_file: None,
         })))
     }
@@ -133,11 +133,11 @@ impl GpuCompletion {
             s.source = None;
             match answer {
                 Ok(sync) => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     {
                         s.sync_file = sync;
                     }
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
                     let _ = sync;
                     s.answer = Some(Ok(()));
                 }
@@ -166,7 +166,7 @@ impl GpuCompletion {
 
     /// A sync_file of its own for the reader's GPU to wait on (Linux), once answered; `None`
     /// when the work is complete already.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub fn sync_file(&self) -> Option<std::os::fd::OwnedFd> {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).sync_file.as_ref().and_then(|fd| fd.try_clone().ok())
     }

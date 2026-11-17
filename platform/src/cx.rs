@@ -430,6 +430,26 @@ pub struct AndroidParams {
     pub night_mode: bool,
 }
 
+/// What an OpenHarmony ability reports about its system (HarmonyOS phones).
+#[derive(Clone, Debug, Default, Script, ScriptHook)]
+pub struct OpenHarmonyParams {
+    #[live]
+    pub files_dir: String,
+    #[live]
+    pub cache_dir: String,
+    #[live]
+    pub temp_dir: String,
+    #[live]
+    pub device_type: String,
+    #[live]
+    pub os_full_name: String,
+    #[live]
+    pub display_density: f64,
+    /// The system is in dark (night) mode, as `AndroidParams::night_mode`.
+    #[live]
+    pub night_mode: bool,
+}
+
 #[derive(Clone, Debug, Default, Script, ScriptHook)]
 pub struct IosParams {
     #[live]
@@ -476,6 +496,8 @@ pub enum OsType {
     Ios(IosParams),
     #[live(AndroidParams::default())]
     Android(AndroidParams),
+    #[live(OpenHarmonyParams::default())]
+    OpenHarmony(OpenHarmonyParams),
     #[live(LinuxWindowParams::default())]
     LinuxWindow(LinuxWindowParams),
     LinuxDirect,
@@ -552,6 +574,7 @@ impl OsType {
     pub fn get_cache_dir(&self) -> Option<String> {
         match self {
             OsType::Android(params) => Some(params.cache_path.clone()),
+            OsType::OpenHarmony(params) => Some(params.cache_dir.clone()),
             // Desktop Linux (windowed or DRM/direct) uses the XDG cache directory.
             // Computed once and memoized (env lookup + directory creation).
             OsType::LinuxWindow(_) | OsType::LinuxDirect => {
@@ -586,6 +609,8 @@ impl OsType {
             Some(params.data_path.clone())
         } else if let OsType::Ios(params) = self {
             Some(params.data_path.clone())
+        } else if let OsType::OpenHarmony(params) = self {
+            Some(params.files_dir.clone())
         } else {
             None
         }
@@ -645,7 +670,7 @@ pub(crate) fn apple_physical_memory_bytes() -> Option<u64> {
     }
 }
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_env = "ohos", target_os = "linux"))]
 pub(crate) fn linux_physical_memory_bytes() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = meminfo.lines().find(|line| {
@@ -729,7 +754,7 @@ fn platform_memory_budget(default: usize) -> (usize, &'static str) {
         .unwrap_or((default, "default"))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 fn platform_memory_budget(default: usize) -> (usize, &'static str) {
     linux_physical_memory_bytes()
         .map(|bytes| {
@@ -753,7 +778,7 @@ fn platform_memory_budget(default: usize) -> (usize, &'static str) {
         .unwrap_or((default, "default"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn platform_memory_budget(default: usize) -> (usize, &'static str) {
     linux_physical_memory_bytes()
         .map(|bytes| {
@@ -765,7 +790,7 @@ fn platform_memory_budget(default: usize) -> (usize, &'static str) {
         .unwrap_or((default, "default"))
 }
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "macos", target_os = "ios", target_os = "android", target_os = "windows", target_os = "linux")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "macos", target_os = "ios", target_os = "android", target_env = "ohos", target_os = "windows", target_os = "linux")))]
 fn platform_memory_budget(default: usize) -> (usize, &'static str) {
     (default, "default")
 }
@@ -995,7 +1020,7 @@ impl Cx {
 
     pub fn new(event_handler: Box<dyn FnMut(&mut Cx, &Event)>) -> Self {
         crate::thread::ui_hang::initialize();
-        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
         if !crate::restart::hosted() {
             crate::os::termination_signal::install();
         }

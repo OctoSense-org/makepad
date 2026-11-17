@@ -1,4 +1,4 @@
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 pub mod gl_render_bridge;
 pub mod home;
 pub mod accessibility;
@@ -54,7 +54,7 @@ pub mod video;
 pub mod native_layer;
 pub use native_layer::{NativeContent, NativeLayer, NativeLayerId, NativeLayerStyle, NativeLayerMode, NativeLayerHandle, NativeLayerEvent, NativeLayerEventKind};
 pub mod gpu_texture;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod foreign_dmabuf;
 pub mod gpu_inventory;
 pub mod gpu_ledger;
@@ -87,15 +87,15 @@ pub mod splash_blank;
 pub mod splash_trace;
 
 // Native Linux services are owned by the HAL.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux_display;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[path = "os/hal/input.rs"]
 pub mod linux_input;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use makepad_hal::wide_desktop as linux_wide_desktop;
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows"))]
 mod app_icon;
 pub mod app_meta;
 pub mod app_open;
@@ -158,7 +158,7 @@ pub mod remote;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod remote_schema;
 // the profiler stream of a native build (a `makepad run` app serves it from relax inspect)
-#[cfg(all(not(relax), any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(not(relax), any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
 pub mod prof_native;
 // `prof` / `why-slow` of a native build (inspect's sampler and buckets; a `makepad run` app gets them from relax inspect)
 #[cfg(all(not(relax), target_os = "macos"))]
@@ -207,6 +207,8 @@ pub fn host_dark() -> Option<bool> {
 }
 #[cfg(all(target_os = "android", not(relax)))]
 pub use crate::app_main::android_on_load;
+#[cfg(all(target_env = "ohos", not(relax)))]
+pub use crate::app_main::ohos_on_load;
 pub use crate::app_main::{
     admitted_by_window_manager, attach_parent_console, discover_window_manager, hosted_by_window_manager, is_window_manager, launched_by_host, set_menu_bar_app, set_outlives_window_manager,
     new_cx_with_font_set, resolve_studio_http, run_app, set_window_manager, should_run_stdin_loop_from_env, studio_launch_token, WmAdmission,

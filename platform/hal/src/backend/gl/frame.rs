@@ -613,7 +613,7 @@ impl Renderer {
             match self.present(*key, image.key, job.damage.as_deref()) {
                 Ok(shown) => {
                     window = shown;
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     { self.presented |= shown; }
                 }
                 Err(e) => { eprintln!("[hal-gl] present: {e}"); window = false; }

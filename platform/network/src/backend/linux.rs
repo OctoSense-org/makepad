@@ -10,7 +10,7 @@ use crate::types::{
 };
 
 pub mod http;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod socket_stream;
 pub mod web_socket;
 

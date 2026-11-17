@@ -357,7 +357,7 @@ fn no_endpoint(spec: &str) -> String {
 
 /// Lists [`apps`] on a thread of its own, which removes the files killed launches left in a phone
 /// app's temp dir. A desktop keeps them, since the devhub reads one left behind as a crash.
-#[cfg(any(target_os = "android", target_os = "ios", target_os = "tvos"))]
+#[cfg(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos"))]
 pub(crate) fn remove_stale(hooks: crate::conn::Hooks) {
     let _ = std::thread::Builder::new().name("makepad-remote-sweep".into()).spawn(move || {
         (hooks.enter)();

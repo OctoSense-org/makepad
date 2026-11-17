@@ -22,14 +22,14 @@ pub fn start_if_enabled() {
     if !enabled() || STARTED.swap(true, Ordering::AcqRel) {
         return;
     }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
     {
         eprintln!("[net-audit] on: pid {} (lan {})", std::process::id(), if crate::lan::allowed() { "on" } else { "off" });
         let _ = std::thread::Builder::new().name("net-audit".into()).spawn(sampler);
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
 fn sampler() {
     use std::collections::HashSet;
     let mut seen: HashSet<(i32, String)> = HashSet::new();
@@ -48,22 +48,22 @@ fn sampler() {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
 mod sys {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[cfg(target_os = "macos")]
     const AF_INET6: u8 = 30;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     const AF_INET6: u16 = 10;
     const AF_INET: u8 = 2;
     #[cfg(target_os = "macos")]
     const SOL_SOCKET: i32 = 0xffff;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     const SOL_SOCKET: i32 = 1;
     #[cfg(target_os = "macos")]
     const SO_TYPE: i32 = 0x1008;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     const SO_TYPE: i32 = 3;
 
     extern "C" {
@@ -92,7 +92,7 @@ mod sys {
             .collect()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub fn socket_fds() -> Vec<i32> {
         let Ok(dir) = std::fs::read_dir("/proc/self/fd") else { return Vec::new() };
         dir.flatten()
@@ -104,7 +104,7 @@ mod sys {
     fn parse(buf: &[u8], len: usize) -> Option<SocketAddr> {
         #[cfg(target_os = "macos")]
         let family = buf[1];
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let family = u16::from_ne_bytes([buf[0], buf[1]]);
         let port = u16::from_be_bytes([buf[2], buf[3]]);
         if family as u16 == AF_INET as u16 && len >= 8 {

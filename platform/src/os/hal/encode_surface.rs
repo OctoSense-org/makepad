@@ -3,7 +3,7 @@
 use crate::{Cx, Texture};
 use makepad_hal::completion as hal;
 use makepad_video::{CompletionSource, GpuCompletion, SurfaceFormat, SurfaceHandle, SyncFile};
-#[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "windows"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_vendor = "apple", target_os = "windows"))]
 use makepad_video::SurfaceKind;
 
 /// A frame completion answered: the readers waiting on one look, and the UI (a reader polling
@@ -37,14 +37,14 @@ impl Drop for HalCompletion {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn sync_file(fd: i32) -> Option<SyncFile> {
     use std::os::fd::FromRawFd;
     (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 /// No sync_file off Linux (the HAL answers -1).
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn sync_file(_fd: i32) -> Option<SyncFile> {
     None
 }
@@ -61,10 +61,10 @@ fn completion_error() -> String {
 }
 
 /// Linux: the DMA-BUF registration a surface handle holds, released with its last clone.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 struct Registered(u64);
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Drop for Registered {
     fn drop(&mut self) {
         makepad_hal::dmabuf::hal_dmabuf_release(self.0);
@@ -78,7 +78,7 @@ impl Cx {
     /// export per texture (Linux registers its DMA-BUF once).
     pub fn encode_surface(&mut self, texture: &Texture, size: [u32; 2], format: SurfaceFormat) -> Option<SurfaceHandle> {
         let handle = self.shared_texture_handle(texture).filter(|h| *h != 0)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             use std::os::fd::IntoRawFd;
             let _ = handle;
@@ -94,7 +94,7 @@ impl Cx {
         return Some(SurfaceHandle::new(handle, SurfaceKind::IoSurface, size, format));
         #[cfg(target_os = "windows")]
         return Some(SurfaceHandle::new(handle, SurfaceKind::D3d11Keyed, size, format));
-        #[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "windows")))]
+        #[cfg(not(any(all(target_os = "linux", not(target_env = "ohos")), target_vendor = "apple", target_os = "windows")))]
         {
             let _ = (handle, size, format);
             return None;

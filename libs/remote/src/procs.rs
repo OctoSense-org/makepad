@@ -243,7 +243,7 @@ fn process_impl(pid: u32) -> Option<Proc> {
     Some(Proc { pid, ppid, name })
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
 fn process_impl(pid: u32) -> Option<Proc> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `pid (comm) state ppid ...`: comm may hold spaces and parens, so it ends at the last `)`
@@ -252,7 +252,7 @@ fn process_impl(pid: u32) -> Option<Proc> {
     Some(Proc { pid, ppid, name: stat.get(start..end)?.to_string() })
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_env = "ohos", target_os = "macos"))))]
 fn process_impl(_pid: u32) -> Option<Proc> {
     None
 }
@@ -283,7 +283,7 @@ fn list_processes_impl() -> io::Result<Vec<Proc>> {
     Ok(pids.into_iter().filter(|pid| *pid > 0).filter_map(|pid| process_impl(pid as u32)).collect())
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
 fn list_processes_impl() -> io::Result<Vec<Proc>> {
     let mut out = Vec::new();
     let proc_dir = std::fs::read_dir("/proc")?;
@@ -320,7 +320,7 @@ fn list_processes_impl() -> io::Result<Vec<Proc>> {
     Ok(out)
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_os = "macos"))))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android", target_env = "ohos", target_os = "macos"))))]
 fn list_processes_impl() -> io::Result<Vec<Proc>> {
     Err(io::Error::new(io::ErrorKind::Unsupported, "no process list on this platform"))
 }

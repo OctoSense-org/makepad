@@ -103,7 +103,7 @@ pub struct NativeSurface {
 pub struct Offscreen;
 impl VkSurfaceSource for Offscreen {
     fn instance_extensions(&self) -> Vec<&'static CStr> { Vec::new() }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn order_devices(&mut self, instance: &makepad_vulkan::Instance, devices: &mut Vec<vk::PhysicalDevice>) -> Result<(), String> {
         // Hosted processes inherit the display owner's render GPU, including a GPU
         // with no connected outputs. An unavailable explicit pin must not silently move.

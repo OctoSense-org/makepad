@@ -100,7 +100,7 @@ impl Cx {
 
     /// When a loop that paints on display ticks should ask for the tick the next `time_fps` frame lands on.
     /// That's the tick before the one nearest its due, on the grid `interval` apart through `last_tick`.
-    #[cfg(any(target_arch = "wasm32", target_os = "android"))]
+    #[cfg(any(target_arch = "wasm32", target_os = "android", target_env = "ohos"))]
     pub(crate) fn time_repaint_tick_wake(&self, last_tick: f64, interval: f64) -> Option<f64> {
         let due = self.time_repaint_at()?;
         if !(interval > 0.0 && interval.is_finite()) {
@@ -1667,7 +1667,7 @@ impl Cx {
     /// and a timer it started (a caret blink) landed a frame apart from run
     /// to run.
     #[cfg(not(target_arch = "wasm32"))]
-    #[cfg_attr(target_os = "android", allow(dead_code))] // only the remote bridge settles events, and Android has none
+    #[cfg_attr(any(target_os = "android", target_env = "ohos"), allow(dead_code))] // only the remote bridge settles events, and Android has none
     pub(crate) fn settle_deferred_events(&mut self) {
         self.handle_action_receiver();
         self.handle_triggers();
@@ -1771,7 +1771,7 @@ impl Cx {
         // Under `makepad run` with an agent watching (makepad inspect), the dispatch is a retry
         // boundary: a panic in it parks for the agent, and when the agent resumes it with
         // `retry` (after a hot patch) the event is dispatched again with the patched code.
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
         if let Some(r) = relax_retry::hooks() {
             let name = event.name();
             loop {
@@ -1948,7 +1948,7 @@ impl Cx {
         if matches!(event, Event::Shutdown) {
             crate::thread::service_scheduler(self, event);
             #[cfg(any(
-                target_os = "android",
+                target_os = "android", target_env = "ohos",
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
@@ -3164,7 +3164,7 @@ impl Cx {
 
 /// makepad inspect's retry boundary hooks (dlsym'd once; absent in a rustc build): set while an
 /// agent watches the app.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
 mod relax_retry {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::OnceLock;

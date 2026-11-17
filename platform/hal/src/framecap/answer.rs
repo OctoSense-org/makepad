@@ -418,7 +418,7 @@ fn write_png(req: &Req, default: &str, img: &Image) -> Result<String, String> {
 // ------------------------------------------------------------------ the scanout
 
 /// `cap scanout`: what the display plane shows, against the desktop frame it came from.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn scanout(req: &Req) -> Result<String, String> {
     use crate::backend::linux::direct;
     if !direct::connected() {
@@ -477,7 +477,7 @@ fn scanout(req: &Req) -> Result<String, String> {
     Ok(std::iter::once(verdict).chain(lines).collect::<Vec<_>>().join("\n"))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn scanout(_: &Req) -> Result<String, String> {
     Err("cap scanout reads the Linux direct display's swapchain".into())
 }

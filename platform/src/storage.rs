@@ -261,7 +261,7 @@ impl StorageHandle {
         #[cfg(all(
             not(target_arch = "wasm32"),
             any(
-                target_os = "android",
+                target_os = "android", target_env = "ohos",
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
@@ -274,7 +274,7 @@ impl StorageHandle {
         #[cfg(all(
             not(target_arch = "wasm32"),
             not(any(
-                target_os = "android",
+                target_os = "android", target_env = "ohos",
                 target_os = "linux",
                 target_os = "macos",
                 target_os = "ios",
@@ -1233,7 +1233,7 @@ pub(crate) mod native {
             assert_eq!(v.len(), 2, "{v:?}");
             assert_eq!((v[0].root.as_path(), v[0].name.as_str(), v[0].file_system.as_str(), v[0].is_fat()), (Path::new("/media/PRINT STICK"), "PRINT STICK", "vfat", true));
             assert_eq!((v[1].name.as_str(), v[1].is_fat()), ("CARD", false));
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             assert!(mounted_volumes().expect("the mount table").iter().all(|v| v.root.starts_with("/media") || v.root.starts_with("/run/media")), "removable media only");
         }
 
@@ -1599,7 +1599,7 @@ mod tests {
 
     /// What an app asked to write before it ended is on disk after its `Event::Shutdown`, though
     /// the pool cancels what no worker took: a close that saves and then ends keeps the save.
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    #[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos", target_os = "windows"))]
     #[test]
     fn what_an_app_asked_to_write_is_on_disk_after_its_shutdown() {
         let root = std::env::temp_dir().join(format!("makepad-storage-shutdown-{}", std::process::id()));

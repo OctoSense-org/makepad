@@ -171,7 +171,7 @@ fn connect_policy_addr(site: &str, addr: SocketAddr) -> std::io::Result<()> {
 
 /// The Android socket factory owns DNS/TLS on the Java side. Check names before
 /// handing them over, and check resolved destinations against the caller's policy.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) fn check_platform_connect(site: &str, host: &str, port: &str) -> std::io::Result<()> {
     use std::net::ToSocketAddrs;
     connect_policy_host(site, host)?;

@@ -83,7 +83,7 @@ pub(crate) fn requested() -> bool {
     TERMINATION.pending()
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), target_os = "macos"))]
 mod native {
     use super::*;
     use std::{
@@ -93,7 +93,7 @@ mod native {
         sync::{atomic::AtomicI32, OnceLock},
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     use std::sync::atomic::AtomicU64;
 
     // Both endpoints live for the process lifetime, including on partial setup
@@ -104,11 +104,11 @@ mod native {
     /// unless it comes within SAME_REQUEST_NS: that is one request delivered twice -- GNU
     /// timeout (and so every x64run/CI wrapper) sends SIGTERM to its child and then to its
     /// process group, and the child's _exit then cut off Relax's quit write of the cache.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     static FIRST_SIGNAL_NS: AtomicU64 = AtomicU64::new(0);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     const SAME_REQUEST_NS: u64 = 250_000_000;
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     #[repr(C)]
     struct Timespec {
         sec: i64,
@@ -123,18 +123,18 @@ mod native {
         fn signal(number: c_int, handler: usize) -> usize;
         fn write(fd: c_int, bytes: *const c_void, len: usize) -> isize;
         #[cfg_attr(target_os = "macos", link_name = "__error")]
-        #[cfg_attr(target_os = "linux", link_name = "__errno_location")]
+        #[cfg_attr(all(target_os = "linux", not(target_env = "ohos")), link_name = "__errno_location")]
         fn errno_location() -> *mut c_int;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         fn _exit(status: c_int) -> !;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         fn clock_gettime(clock: c_int, ts: *mut Timespec) -> c_int;
     }
 
     extern "C" fn handle(_: c_int) {
         // Only lock-free atomics and async-signal-safe C calls here. In
         // particular, the UI waker may lock or enter AppKit, so a worker runs it.
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let mut ts = Timespec { sec: 0, nsec: 0 };
             unsafe { clock_gettime(1, &mut ts) }; // CLOCK_MONOTONIC; async-signal-safe

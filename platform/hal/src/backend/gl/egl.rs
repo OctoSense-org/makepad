@@ -3,10 +3,10 @@
 //! where EGL has no surfaceless contexts) and stays current; a window's surface is bound only
 //! to present its finished image.
 use super::surface::{EglSurfaceSource, NativeSurface, SurfaceState, PLATFORM_ANDROID, PLATFORM_SURFACELESS};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use super::surface::PLATFORM_WAYLAND;
 use super::sys::{self, Gl};
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 use crate::backend::linux::media::module_loader::ModuleLoader;
 use crate::Id;
 use std::{collections::{HashMap, VecDeque}, ffi::{c_void, CStr}, ptr};
@@ -27,23 +27,23 @@ const BUFFER_AGE: i32 = 0x313D;
 /// Each repaint only reads as far back as its buffer's age.
 const DAMAGE_HISTORY_LEN: usize = 64;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 const LIBRARY: &str = "libEGL.so.1";
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 const LIBRARY: &str = "libEGL.so";
 
 /// Android's libEGL and libGLESv3, opened once like Linux's and never closed.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub struct ModuleLoader(Handle);
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[link(name = "dl")]
 extern "C" {
     fn dlopen(name: *const std::ffi::c_char, flags: i32) -> Handle;
     fn dlsym(handle: Handle, name: *const std::ffi::c_char) -> Handle;
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 impl ModuleLoader {
     pub fn load(path: &str) -> Result<Self, ()> {
         let path = std::ffi::CString::new(path).map_err(|_| ())?;
@@ -76,7 +76,7 @@ macro_rules! egl_functions {
             pub platform_display: Option<unsafe extern "C" fn(u32, Handle, *const isize) -> Handle>,
             _library: ModuleLoader,
             /// where Android's libEGL hands out no core GLES entry points
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             gles: Option<ModuleLoader>,
         }
         impl Egl {
@@ -90,7 +90,7 @@ macro_rules! egl_functions {
                     let library = ModuleLoader::load(LIBRARY).map_err(|_| format!("cannot load {LIBRARY}"))?;
                     Ok(Self { $($field: library.get_symbol($symbol).map_err(|_| concat!("libEGL lacks ", $symbol))?,)*
                         platform_display: library.get_symbol("eglGetPlatformDisplay").ok(),
-                        #[cfg(target_os = "android")]
+                        #[cfg(any(target_os = "android", target_env = "ohos"))]
                         gles: ModuleLoader::load("libGLESv3.so").ok(),
                         _library: library })
                 }).as_ref().map_err(String::clone)
@@ -127,7 +127,7 @@ impl Egl {
     pub fn gl(&self) -> Result<Gl, String> {
         Gl::load(|name: &CStr| {
             let f = unsafe { (self.get_proc)(name.as_ptr()) };
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             if f.is_null() {
                 return self.gles.as_ref().and_then(|lib| lib.get_symbol(&name.to_string_lossy()).ok()).unwrap_or(ptr::null_mut());
             }
@@ -136,7 +136,7 @@ impl Egl {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 struct Wayland {
     create: unsafe extern "C" fn(Handle, i32, i32) -> Handle,
     resize: unsafe extern "C" fn(Handle, i32, i32, i32, i32),
@@ -145,12 +145,12 @@ struct Wayland {
 }
 
 // SAFETY: entry points and a library handle that is never closed.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 unsafe impl Send for Wayland {}
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 unsafe impl Sync for Wayland {}
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Wayland {
     /// Loaded once for the process, like libEGL (never unloaded under the driver).
     fn load() -> Result<&'static Self, String> {
@@ -169,7 +169,7 @@ impl Wayland {
 
 struct Window {
     surface: Handle,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     wl_window: Handle,
     size: [u32; 2],
     native: NativeSurface,
@@ -196,7 +196,7 @@ pub struct Share {
     pub config: Handle,
     pub context: Handle,
     /// EGL_KHR_surfaceless_context; without it a context is made current on a 1x1 pbuffer
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub surfaceless: bool,
 }
 
@@ -206,7 +206,7 @@ unsafe impl Sync for Share {}
 
 /// A context of its own on the display (outside the share group), current on the thread that
 /// made it until it's dropped there.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub struct Private {
     share: std::sync::Arc<Share>,
     context: Handle,
@@ -214,7 +214,7 @@ pub struct Private {
     pub gl: Gl,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 impl Private {
     pub fn new(share: &std::sync::Arc<Share>) -> Result<Self, String> {
         let (egl, display) = (share.egl, share.display);
@@ -239,7 +239,7 @@ impl Private {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 impl Drop for Private {
     fn drop(&mut self) {
         let s = &self.share;
@@ -254,12 +254,12 @@ impl Drop for Private {
 pub struct Context {
     pub gl: Gl,
     pub share: std::sync::Arc<Share>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     wayland: Option<&'static Wayland>,
     source: Box<dyn EglSurfaceSource>,
     windows: HashMap<(u32, Id), Window>,
     /// how many window surfaces there are, so Android's `surfaceDestroyed` only waits while there's one
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     surfaces: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     current: Handle,
     /// what is bound while no window presents: nothing, or a 1x1 pbuffer without surfaceless contexts
@@ -268,10 +268,10 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(source: Box<dyn EglSurfaceSource>, #[cfg(target_os = "android")] surfaces: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Result<Self, String> {
+    pub fn new(source: Box<dyn EglSurfaceSource>, #[cfg(any(target_os = "android", target_env = "ohos"))] surfaces: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Result<Self, String> {
         let native = source.display()?;
         let egl = Egl::load()?;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let wayland = if native.platform == PLATFORM_WAYLAND { Some(Wayland::load()?) } else { None };
         unsafe {
             // Android's one display is the default one, which an EGL 1.4 driver opens too
@@ -356,8 +356,8 @@ impl Context {
             if super::super::log_enabled() {
                 eprintln!("[hal-gl] partial repaint: buffer_age={} set_damage_region={} swap_with_damage={}", partial.buffer_age, partial.set_damage_region.is_some(), partial.swap_with_damage.is_some());
             }
-            Ok(Self { gl, share: std::sync::Arc::new(Share { egl, display, config, context, #[cfg(target_os = "android")] surfaceless }), #[cfg(target_os = "linux")] wayland, source,
-                windows: HashMap::new(), #[cfg(target_os = "android")] surfaces, current: idle, idle, partial })
+            Ok(Self { gl, share: std::sync::Arc::new(Share { egl, display, config, context, #[cfg(any(target_os = "android", target_env = "ohos"))] surfaceless }), #[cfg(all(target_os = "linux", not(target_env = "ohos")))] wayland, source,
+                windows: HashMap::new(), #[cfg(any(target_os = "android", target_env = "ohos"))] surfaces, current: idle, idle, partial })
         }
     }
 
@@ -390,14 +390,14 @@ impl Context {
 
     pub fn close(&mut self, key: (u32, Id)) {
         let Some(window) = self.windows.remove(&key) else { return };
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         self.surfaces.store(self.windows.len(), std::sync::atomic::Ordering::SeqCst);
         if self.current == window.surface {
             let _ = self.bind(self.idle);
         }
         unsafe {
             (self.share.egl.destroy_surface)(self.share.display, window.surface);
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             if let Some(wl) = &self.wayland { (wl.destroy)(window.wl_window); }
         }
         // the native lease (window.native.keep) drops after EGL and wl_egl_window let go of it
@@ -409,7 +409,7 @@ impl Context {
     }
 
     /// Lets go of every native window, before Android's `surfaceDestroyed` returns.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub fn close_all(&mut self) {
         let keys: Vec<_> = self.windows.keys().copied().collect();
         for key in keys { self.close(key); }
@@ -431,7 +431,7 @@ impl Context {
         if self.windows.get(&key).is_some_and(|w| w.native.generation != native.generation) { self.close(key); }
         if !self.windows.contains_key(&key) {
             let share = &self.share;
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let wl_window = match &self.wayland {
                 Some(wl) => {
                     let w = unsafe { (wl.create)(native.window as Handle, native.size[0] as i32, native.size[1] as i32) };
@@ -440,29 +440,29 @@ impl Context {
                 }
                 None => ptr::null_mut(),
             };
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let window = if wl_window.is_null() { native.window } else { wl_window as usize };
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             let window = native.window;
             let surface = unsafe { (share.egl.create_window)(share.display, share.config, window, ptr::null()) };
             if surface.is_null() {
                 let error = unsafe { (share.egl.error)() };
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 if let Some(wl) = &self.wayland { unsafe { (wl.destroy)(wl_window) } }
                 return Err(format!("eglCreateWindowSurface: {error:#x}"));
             }
             let size = native.size;
-            self.windows.insert(key, Window { surface, #[cfg(target_os = "linux")] wl_window, size, native, history: VecDeque::new(), missed: false });
-            #[cfg(target_os = "android")]
+            self.windows.insert(key, Window { surface, #[cfg(all(target_os = "linux", not(target_env = "ohos")))] wl_window, size, native, history: VecDeque::new(), missed: false });
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             self.surfaces.store(self.windows.len(), std::sync::atomic::Ordering::SeqCst);
             self.bind(surface)?;
             // the shell paces frames (FrameReady); a swap never waits for the compositor. On
             // Android a swap waits for a free buffer, like Vulkan's FIFO swapchain there.
-            unsafe { (self.share.egl.interval)(self.share.display, if cfg!(target_os = "android") { 1 } else { 0 }) };
+            unsafe { (self.share.egl.interval)(self.share.display, if cfg!(any(target_os = "android", target_env = "ohos")) { 1 } else { 0 }) };
         } else {
             let w = self.windows.get_mut(&key).unwrap();
             if w.size != native.size {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 if let Some(wl) = &self.wayland { unsafe { (wl.resize)(w.wl_window, native.size[0] as i32, native.size[1] as i32, 0, 0) } }
                 w.size = native.size;
             }

@@ -586,7 +586,7 @@ mod imp {
             endpoint.set_end_fields(end_fields);
             endpoint.register("frames", 1, frames_service());
             // the profiler stream (Scope's Live, `makepad inspect <app> pf`)
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
             endpoint.register("prof", 1, crate::prof_native::service(app.clone()));
             endpoint.register("gpuprof", 1, makepad_hal::gpu_prof::stream_service());
             // held until ACTIVE is set, so a service registered meanwhile is not lost

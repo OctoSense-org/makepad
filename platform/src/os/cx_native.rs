@@ -1,4 +1,4 @@
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 use std::{fs::File, io::Read};
 use {
     crate::cx::Cx,
@@ -77,7 +77,7 @@ fn parse_package_paths(root: &Path, text: &str) -> std::collections::HashMap<Str
 }
 
 /// `crate_name/rest` resolved through the package map, when the crate is in it.
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 fn source_resource_path(
     packages: &std::collections::HashMap<String, PathBuf>,
     path: &Path,
@@ -95,7 +95,7 @@ fn source_resource_path(
 
 /// A mapped crate uses only its package directory; other crates use the package root.
 #[cfg(all(
-    not(any(target_os = "android", target_os = "ios", target_os = "tvos")),
+    not(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos")),
     not(all(target_os = "macos", apple_bundle))
 ))]
 pub(crate) fn packaged_resource_path(
@@ -107,7 +107,7 @@ pub(crate) fn packaged_resource_path(
         .unwrap_or_else(|| PathBuf::from(format!("{package_root}/{dep_path}")))
 }
 
-#[cfg(all(test, unix, not(any(target_os = "android", target_os = "ios", target_os = "tvos")), not(all(target_os = "macos", apple_bundle))))]
+#[cfg(all(test, unix, not(any(target_os = "android", target_env = "ohos", target_os = "ios", target_os = "tvos")), not(all(target_os = "macos", apple_bundle))))]
 mod tests {
     use super::*;
 
@@ -165,19 +165,19 @@ pub fn read_file_cwd_or_exe_relative(
     packages: &std::collections::HashMap<String, PathBuf>,
     path: impl AsRef<Path>,
 ) -> Option<Vec<u8>> {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     fn read(path: &Path) -> Option<Vec<u8>> {
         let mut buffer = Vec::<u8>::new();
         File::open(path).ok()?.read_to_end(&mut buffer).ok()?;
         Some(buffer)
     }
     let path = path.as_ref();
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     {
         let _ = packages;
         return crate::os::hal::read_asset(path.to_str()?);
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     source_resource_path(packages, path).and_then(|p| read(&p))
         .or_else(|| read(path)).or_else(|| read(&exe_relative_path(path)?))
 }

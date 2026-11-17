@@ -162,7 +162,7 @@ fn pixels(hal: &Hal, sid: u32, req: u32) -> Vec<u8> {
     pixels
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn sampled_shader() -> Vec<u8> {
     use makepad_shader::shader_output::TextureType;
     let mut ir = IrModule::new();
@@ -206,7 +206,7 @@ fn sampled_shader() -> Vec<u8> {
         samplers: vec![makepad_hal::spirv::SpirvSampler { filter: 0, address: 1, compare: false, pixel: false }], xr_vertex: Vec::new(), xr_fragment: Vec::new() }.encode()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[test]
 fn dmabuf_export_import_second_session_samples_identical_pixels() {
     let (hal, owner) = open();
@@ -281,7 +281,7 @@ fn dmabuf_export_import_second_session_samples_identical_pixels() {
 /// for as long as the device lives, and a batch slot keeps a pool per program for the next frames.
 /// The programs take turns between two shapes: a layout's handle may come back for the other shape,
 /// and a pool of the old shape would not serve it, so each turn's pixels are checked.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[test]
 fn programs_that_go_leave_no_descriptor_pools() {
     const TURNS: u32 = 40;

@@ -37,7 +37,7 @@ pub fn physical_memory_bytes() -> Option<u64> {
     {
         crate::cx::apple_physical_memory_bytes()
     }
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
     {
         crate::cx::linux_physical_memory_bytes()
     }
@@ -45,7 +45,7 @@ pub fn physical_memory_bytes() -> Option<u64> {
     {
         crate::cx::windows_physical_memory_bytes()
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android", target_env = "ohos", target_os = "windows")))]
     {
         None
     }
@@ -99,7 +99,7 @@ fn os_version() -> Option<String> {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn os_version() -> Option<String> {
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
@@ -161,13 +161,13 @@ fn os_version() -> Option<String> {
     ))
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
 fn os_version() -> Option<String> {
     None
 }
 
 // Audio stack descriptions for backends that expose them.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 impl crate::cx::Cx {
     /// The audio stack this process plays through, e.g. "CoreAudio",
     /// "WASAPI", "PipeWire 1.0.5 (PulseAudio API)" or "ALSA".
@@ -176,7 +176,7 @@ impl crate::cx::Cx {
             "CoreAudio"
         } else if cfg!(target_os = "windows") {
             "WASAPI"
-        } else if cfg!(target_os = "android") {
+        } else if cfg!(any(target_os = "android", target_env = "ohos")) {
             "AAudio"
         } else if cfg!(target_arch = "wasm32") {
             "Web Audio"

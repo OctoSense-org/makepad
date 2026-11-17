@@ -23,7 +23,7 @@ use makepad_hal::format;
 #[derive(Default)]
 pub(crate) struct GlInterop {
     pub(crate) share: Option<[u64; 3]>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     context: Option<(makepad_hal::gl_interop::GlContext, LibGl)>,
 }
 
@@ -37,7 +37,7 @@ impl Cx {
     /// current on this (the Cx) thread. Textures made here can be adopted by name; the HAL's next
     /// frames wait for the work `f` issued. Returns `None` when the backend has no GL.
     pub fn with_gl<R>(&mut self, f: impl FnOnce(&LibGl) -> R) -> Option<R> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let share = self.hal.gl.share?;
             if self.hal.gl.context.is_none() {
@@ -60,7 +60,7 @@ impl Cx {
             self.hal.frames.w.gl_fence(sync);
             Some(out)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         {
             let _ = f;
             None
@@ -96,14 +96,14 @@ impl Cx {
     /// Create a GL rendering bridge: a context of the HAL's share group for an external renderer
     /// (current on the thread that calls `make_current`). Without GL the bridge has no context.
     pub fn create_gl_render_bridge(&mut self) -> GlRenderBridge {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let inner = self.hal.gl.share.and_then(|share| {
                 makepad_hal::gl_interop::GlContext::new(share)
             });
             GlRenderBridge { inner }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         GlRenderBridge {}
     }
 

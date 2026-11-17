@@ -20,18 +20,18 @@ use makepad_hal::{media, HalEvent, Id};
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 use crate::{
     event::game_input::{PressLatch, ForceTarget, GameInputConnectedEvent, GameInputForce, GameInputInfo, GameInputOutput, GameInputState, GamepadHapticCapabilities, GamepadHapticPulse, GamepadState, JoystickState, WheelState},
     game_input::CxGameInputApi,
     makepad_math::Vec2,
 };
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 use makepad_hal::media::{game, game_output};
 
 /// The controllers the HAL told the session about, in the HAL's order (the order
 /// `game_input_states` has), with their latest states.
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 #[derive(Default)]
 pub(crate) struct GameClient {
     infos: Vec<GameInputInfo>,
@@ -43,7 +43,7 @@ pub(crate) struct GameClient {
     devices: Vec<game::GameDevice>,
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 impl GameClient {
     /// A frame was delivered to the app: the taps it saw as held are released.
     pub(crate) fn frame_end(&mut self) {
@@ -54,7 +54,7 @@ impl GameClient {
     }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 fn cx_state(s: game::GameState) -> GameInputState {
     match s {
         game::GameState::Gamepad(p) => GameInputState::Gamepad(GamepadState {
@@ -104,13 +104,13 @@ pub(crate) struct InputCtx {
 fn audio_entry_buffer() -> AudioBuffer {
     // Linux and Android transports split every negotiated period into this scratch quantum. Allocate
     // before registering the entry so resize in a realtime callback only changes the length.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     { AudioBuffer::new_with_size(makepad_hal::backend::linux::media::AUDIO_BLOCK_FRAMES, 2) }
     #[cfg(target_os = "android")]
     { AudioBuffer::new_with_size(makepad_hal::backend::android::media::AUDIO_BLOCK_FRAMES, 2) }
     // Elsewhere the device picks the period: room for 8192 frames of 8 channels up front, so
     // the callback's resize only changes the length (a larger period grows it once).
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(any(target_env = "ohos", not(any(target_os = "linux", target_os = "android"))))]
     { AudioBuffer::new_with_size(8192, 8) }
 }
 
@@ -164,7 +164,7 @@ extern "C" fn audio_output_entry(ctx: *mut c_void, block: *mut media::AudioBlock
         let b = unsafe { &mut *block };
         let (frames, channels) = (b.frames as usize, b.channels as usize);
         ctx.buffer.resize(frames, channels);
-        #[cfg(any(target_os = "linux", target_os = "android"))]
+        #[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
         ctx.buffer.data.fill(0.0);
         (ctx.f)(block_info(b), &mut ctx.buffer);
         for c in 0..channels {
@@ -218,7 +218,7 @@ impl Cx {
     }
 
     /// A system haptic (`media::haptic_kind::*`).
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) fn hal_haptic(&mut self, kind: crate::cx_api::HapticFeedback) {
         use crate::cx_api::HapticFeedback;
         self.hal.frames.w.haptic(match kind {
@@ -354,9 +354,9 @@ impl Cx {
     /// textures are made here and announced with `VideoYuvTexturesReady`, as every backend does.
     pub(crate) fn hal_prepare_video(&mut self, video_id: LiveId, source: VideoSource, texture: Option<TextureId>, autoplay: bool, looping: bool, camera_preview: CameraPreviewMode) {
         // Linux always delivers camera frames as textures: the preview mode is not consulted
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let _ = camera_preview;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if source.is_adaptive_manifest() && std::env::var_os("MAKEPAD_FORCE_SOFTWARE_VIDEO").is_some() {
             self.call_event_handler(&Event::VideoDecodingError(VideoDecodingErrorEvent {
                 video_id, error: "MAKEPAD_FORCE_SOFTWARE_VIDEO cannot decode HLS/DASH manifests; unset it or use a progressive URL".into(),
@@ -383,8 +383,8 @@ impl Cx {
             VideoSource::Camera(input, format) => {
                 // a native preview: a native view shows the camera, no textures. Linux and Android
                 // also deliver camera frames as textures; the other platforms only have the view.
-                #[cfg(not(target_os = "linux"))]
-                if camera_preview == CameraPreviewMode::Native || cfg!(not(target_os = "android")) {
+                #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+                if camera_preview == CameraPreviewMode::Native || cfg!(not(any(target_os = "android", target_env = "ohos"))) {
                     self.hal_prepare_camera_preview(video_id, *input, *format);
                     return;
                 }
@@ -438,9 +438,9 @@ impl Cx {
                 if let Some(native) = self.hal.native_videos.get_mut(&LiveId(video)) {
                     // GStreamer owns its negotiation/fallback timing on Linux, including
                     // paused and live sources. The AVFoundation watchdog stays on macOS.
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
                     { native.waiting_since = (size[0] > 0 && size[1] > 0).then(std::time::Instant::now); }
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     { native.waiting_since = None; }
                 }
                 let (video_tracks, audio_tracks) = media::read_tracks(tracks);
@@ -484,7 +484,7 @@ impl Cx {
                 let video_id = LiveId(video);
                 match kind {
                     // the native player failed to prepare: the app's decoder tries
-                    media::video_status::ERROR if self.hal.native_videos.get(&video_id).is_some_and(|n| !matches!(n.source, VideoSource::Camera(..)) && !(cfg!(target_os = "linux") && n.source.is_adaptive_manifest())) => {
+                    media::video_status::ERROR if self.hal.native_videos.get(&video_id).is_some_and(|n| !matches!(n.source, VideoSource::Camera(..)) && !(cfg!(all(target_os = "linux", not(target_env = "ohos"))) && n.source.is_adaptive_manifest())) => {
                         let reason = String::from_utf8_lossy(text).into_owned();
                         self.hal_switch_to_software(video_id, &reason);
                     }
@@ -560,7 +560,7 @@ impl Cx {
                 };
                 self.call_event_handler(&Event::PermissionResult(PermissionResult { permission: permission_of(kind), request_id: req as i32, status }));
             }
-            #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             HalEvent::GameDevices { devices } => {
                 let list = game::read_devices(devices);
                 let old: Vec<GameInputInfo> = std::mem::take(&mut self.hal.game.infos);
@@ -605,7 +605,7 @@ impl Cx {
                     self.call_event_handler(&Event::GameInputConnected(GameInputConnectedEvent::Connected(info)));
                 }
             }
-            #[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+            #[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
             HalEvent::GameInput { device, state } => {
                 if let (Some(index), Some(state)) = (self.hal.game.infos.iter().position(|i| i.id.0 == device), game::read_state(state)) {
                     let truth = cx_state(state);
@@ -639,7 +639,7 @@ impl Cx {
                 crate::screen_capture::deliver_capture_surface(Some(window.index as usize), surface);
             }
             HalEvent::MidiData { .. } => {}
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             HalEvent::ScreenSurface { window, size: _, handle } => {
                 let lease = makepad_hal::backend::linux::media::capture_surface::take_lease(self.hal.frames.w.session(), handle);
                 if lease.found() {
@@ -654,24 +654,24 @@ impl Cx {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl crate::screen_capture::MappedCapture for makepad_hal::backend::linux::media::capture_surface::CaptureLease {
     fn bytes(&self) -> &[u8] { self.bytes() }
     fn stride(&self) -> usize { self.width() as usize * 4 }
     fn bgra(&self) -> bool { self.bgra() }
 }
 
-#[cfg(any(target_vendor = "apple", target_os = "windows", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
 impl CxGameInputApi for Cx {
     fn game_input_state(&mut self, index: usize) -> Option<&GameInputState> {
-        if self.in_makepad_studio && !cfg!(target_os = "linux") {
+        if self.in_makepad_studio && !cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
             return self.game_input_remote.get(index);
         }
         self.hal.game.states.get(index)
     }
 
     fn game_input_state_mut(&mut self, index: usize) -> Option<&mut GameInputState> {
-        if self.in_makepad_studio && !cfg!(target_os = "linux") {
+        if self.in_makepad_studio && !cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
             return self.game_input_remote.get_mut(index);
         }
         self.hal.game.states.get_mut(index)
@@ -680,14 +680,14 @@ impl CxGameInputApi for Cx {
     fn game_input_states(&mut self) -> &[GameInputState] {
         // Apple/Windows hosted apps use forwarded input. Linux reads evdev in each
         // process, including hosted apps; each app owns its focus/muting policy.
-        if self.in_makepad_studio && !cfg!(target_os = "linux") {
+        if self.in_makepad_studio && !cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
             return &self.game_input_remote;
         }
         &self.hal.game.states
     }
 
     fn game_input_states_mut(&mut self) -> &mut [GameInputState] {
-        if self.in_makepad_studio && !cfg!(target_os = "linux") {
+        if self.in_makepad_studio && !cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
             return &mut self.game_input_remote;
         }
         &mut self.hal.game.states

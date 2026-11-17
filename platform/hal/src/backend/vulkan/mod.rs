@@ -2,13 +2,13 @@
 //! native surfaces are supplied by a shell through VkSurfaceSource. Linux desktop's CxVulkan
 //! backend remains independent until its HAL switch.
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[path = "../linux/media/linux_video_gpu.rs"]
 mod media_gpu;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[path = "../linux/media/capture_gpu.rs"]
 mod capture_gpu;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod native_app;
 mod blocks;
 mod device;
@@ -25,7 +25,7 @@ mod sets;
 mod submit;
 pub mod surface;
 pub(crate) mod tap;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) mod video_encode;
 
 pub use device::Device;
@@ -48,7 +48,7 @@ use device::{compile_rank, Compilers};
 use pipeline::{PassKey, RenderPass, State};
 pub(crate) use resources::Buffer;
 // the Linux direct renderer's staging buffers (linux/direct/render.rs)
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub(crate) use resources::buffer_usage;
 use submit::{Batch, Event, Mailbox, Token};
 use crate::FastMap;
@@ -67,17 +67,17 @@ struct Retained { gen: u32, buffer: Arc<Buffer>, evictable: bool, written: Optio
 struct Pipe { gen: u32, state: Arc<State>, epoch: u64, announced: bool, desc: PipelineDesc }
 
 pub struct Vulkan {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     native_apps: native_app::NativeApps,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     media: super::linux::media::Media,
     #[cfg(target_os = "android")]
     media: super::android::media::AndroidMedia,
     #[cfg(target_os = "android")]
     native_layers: native_layer::Layers,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     capture_pool: FastMap<(u32, Id), Vec<Arc<Buffer>>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     shell: Option<&'static super::linux::Shared>,
     /// the Android shell (Activity surface, lifecycle, input)
     #[cfg(target_os = "android")]
@@ -123,9 +123,9 @@ pub struct Vulkan {
     scanout_images: FastMap<(u32, Id), Vec<Arc<Image>>>,
     /// MAKEPAD_FRAME_STAMP: the red and blue 8x8 blocks stamped into each frame handed to a host
     /// (`frame::stamp_frame`), and the size the last window pass drew.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     stamp: Option<[Arc<Image>; 2]>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     window_px: [u32; 2],
     /// session 0's windows with a badge layer (by index): the images their layer was composed
     /// into (`frame::Badged`)
@@ -144,7 +144,7 @@ pub struct Vulkan {
     fallback: FastMap<u32, Arc<Image>>,
     windows: surface::Windows,
     sharing: Box<dyn VkExternalImages>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     foreign_support: Option<share::DmaBufSupport>,
     batch: Option<Batch>,
     spares: submit::Spares,
@@ -185,9 +185,9 @@ const PIPELINE_CACHE_SAVE_NS: u64 = 2_000_000_000;
 impl Vulkan {
     /// `sessions` makes a completion's session look; `notify` (the shell's events) every pump.
     pub fn new(flags: u32, sessions: super::SessionNotify, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         drop(notify);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if flags & open_flags::OFFSCREEN_WINDOWS == 0 {
             let shell = super::linux::Shared::global();
             shell.start(flags, notify)?;
@@ -197,7 +197,7 @@ impl Vulkan {
     }
 
     /// On a started Linux shell (X11, Wayland or the DRM/KMS direct shell).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub fn on_shell(flags: u32, sessions: super::SessionNotify, shell: &'static super::linux::Shared) -> Result<Self, String> {
         let mut backend = Self::with_sources(flags, sessions, super::linux::surface_source(shell), Box::new(NativeImages::default()))?;
         backend.info.flags |= info_flags::DISPLAY_CLOCK | info_flags::WINDOW_BADGES | info_flags::WINDOW_LAYERS;
@@ -217,7 +217,7 @@ impl Vulkan {
         let instance_extensions = extensions.clone();
         let dev = Device::shared(&extensions, &sharing.device_extensions(), &mut *source)?;
         source.device_ready(dev.clone())?;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let foreign_support = share::foreign_support(&dev);
         let formats = (0..format::COUNT).fold(0, |bits, f| {
             let properties = dev.formats[f as usize];
@@ -259,11 +259,11 @@ impl Vulkan {
         info.set_device_name(&unsafe { std::ffi::CStr::from_ptr(dev.properties.device_name.as_ptr()) }.to_string_lossy());
         crate::gpu_limits::set_max_gpu_buffer_bytes(info.max_buffer);
         crate::gpu_limits::set_gpu_working_set_bytes(info.working_set);
-        Ok(Self { #[cfg(target_os = "linux")] native_apps: Default::default(), #[cfg(any(target_os = "linux", target_os = "android"))] media: Default::default(), #[cfg(target_os = "linux")] capture_pool: FastMap::default(), #[cfg(any(target_os = "linux", target_os = "android"))] shell: None, leases: Default::default(), dev, info, tex: FastMap::default(), buf: FastMap::default(), zero_owed: Vec::new(), pipe: FastMap::default(), compute: FastMap::default(), programs: FastMap::default(), draw_bins: Vec::new(), draw_images: Vec::new(), draw_memo: Default::default(), kept: Default::default(),
+        Ok(Self { #[cfg(all(target_os = "linux", not(target_env = "ohos")))] native_apps: Default::default(), #[cfg(any(target_os = "linux", target_os = "android"))] media: Default::default(), #[cfg(all(target_os = "linux", not(target_env = "ohos")))] capture_pool: FastMap::default(), #[cfg(any(target_os = "linux", target_os = "android"))] shell: None, leases: Default::default(), dev, info, tex: FastMap::default(), buf: FastMap::default(), zero_owed: Vec::new(), pipe: FastMap::default(), compute: FastMap::default(), programs: FastMap::default(), draw_bins: Vec::new(), draw_images: Vec::new(), draw_memo: Default::default(), kept: Default::default(),
             #[cfg(target_os = "android")] native_layers: Default::default(),
-            passes: FastMap::default(), fbs: FastMap::default(), dead_fbs: Vec::new(), sweep_at: 0, msaa: FastMap::default(), win: FastMap::default(), damage_base: FastMap::default(), damage_checks: Vec::new(), hosted_sizes: FastMap::default(), scanout_images: FastMap::default(), #[cfg(target_os = "linux")] stamp: None, #[cfg(target_os = "linux")] window_px: [0, 0], badged: FastMap::default(), retained_stale: Default::default(), direct_frame: FastMap::default(), compose: None, aliases: FastMap::default(), pick_ids: FastMap::default(), pick_pending: HashSet::new(),
+            passes: FastMap::default(), fbs: FastMap::default(), dead_fbs: Vec::new(), sweep_at: 0, msaa: FastMap::default(), win: FastMap::default(), damage_base: FastMap::default(), damage_checks: Vec::new(), hosted_sizes: FastMap::default(), scanout_images: FastMap::default(), #[cfg(all(target_os = "linux", not(target_env = "ohos")))] stamp: None, #[cfg(all(target_os = "linux", not(target_env = "ohos")))] window_px: [0, 0], badged: FastMap::default(), retained_stale: Default::default(), direct_frame: FastMap::default(), compose: None, aliases: FastMap::default(), pick_ids: FastMap::default(), pick_pending: HashSet::new(),
             fallback: FastMap::default(), windows: surface::Windows::new(source), sharing,
-            #[cfg(target_os = "linux")] foreign_support,
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))] foreign_support,
             batch: None, spares: Default::default(), mailbox: Mailbox::new(sessions),
             queue: Some(Worker::new("makepad-vulkan-submit")?), complete: Arc::new(Worker::new("makepad-vulkan-complete")?),
             compiler: Compilers::new(), pipeline_cache_queued_ns: 0, pressure: Default::default(),
@@ -300,7 +300,7 @@ impl Vulkan {
         if let Some(batch) = self.batch.take() { batch.finish(self.queue.as_ref().unwrap(), self.complete.clone(), self.mailbox.clone()); }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn native_drain(&mut self, world: &mut World) {
         let mut native = std::mem::take(&mut self.native_apps);
         native.drain(self, world);
@@ -330,7 +330,7 @@ impl Vulkan {
             let sid = done.token.sid;
             if !world.session(sid).is_some_and(|s| Arc::ptr_eq(&s.font_frames, &done.token.incarnation)) { continue; }
             match done.event {
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 Event::Capture { window, surface } => {
                     let size = [surface.width as u16, surface.height as u16];
                     let handle = super::linux::media::capture_surface::publish(sid, surface);
@@ -339,8 +339,8 @@ impl Vulkan {
                 Event::Presented { target, frame } => {
                     world.window_presented(sid, target, frame, 0, done.time);
                     #[cfg(target_os = "android")] super::android::jni::surface_presented();
-                    #[cfg(target_os = "linux")] self.native_apps.presented(sid, target, frame);
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_apps.presented(sid, target, frame);
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     if let Some(shell) = self.shell { shell.presented(self.window_key(sid, target)); }
                 }
                 Event::DispatchTime { name, gpu_ns } => world.to_session(sid, |q| q.dispatch_time(name.as_bytes(), gpu_ns)),
@@ -357,10 +357,10 @@ impl Vulkan {
                         if gpu_ns > 0 { s.stats.gpu_frames += 1; s.stats.gpu_ns_total += gpu_ns; s.stats.gpu_ns_max = s.stats.gpu_ns_max.max(gpu_ns); }
                     }
                     if window {
-                        #[cfg(target_os = "linux")] self.native_apps.presented(sid, target, frame);
+                        #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_apps.presented(sid, target, frame);
                         world.window_presented(sid, target, frame, gpu_ns, done.time);
                         #[cfg(target_os = "android")] super::android::jni::surface_presented();
-                        #[cfg(target_os = "linux")]
+                        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                         if let Some(shell) = self.shell { shell.presented(self.window_key(sid, target)); }
                     }
                     world.frame_done(sid, target, kind, frame, gpu_ns, done.time, gpu_span);
@@ -524,11 +524,11 @@ impl Vulkan {
 }
 
 impl Backend for Vulkan {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn dmabuf(&mut self) -> Option<&mut dyn crate::dmabuf::Api> { Some(self) }
     /// A sync_file semaphore signalled by the batch that takes the session's submitted work:
     /// answered once the batch is on the queue (the reader's GPU waits on it).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn frame_completion(&mut self, session: u32, notify: Arc<dyn Fn() + Send + Sync>) -> Result<crate::completion::Completion, String> {
         let semaphore = share::sync::Semaphore::sync_file(self.dev.clone())?;
         self.flush();
@@ -539,7 +539,7 @@ impl Backend for Vulkan {
         Ok(completion)
     }
     fn info(&self) -> HalInfo { self.info }
-    fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) { self.recover(world); self.drain(world); #[cfg(target_os = "linux")] self.native_drain(world); exec::submit(self, world, sid, view); self.flush(); }
+    fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) { self.recover(world); self.drain(world); #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_drain(world); exec::submit(self, world, sid, view); self.flush(); }
 
     /// The pipeline variants this batch's frames draw with first (a target layout and blend /
     /// depth-write / cull state the program was not built with), compiled before the batch runs:
@@ -610,8 +610,8 @@ impl Backend for Vulkan {
         // attribution that every session needs in its DeviceLost event.
         self.recover(world);
         self.drain(world);
-        #[cfg(target_os = "linux")] self.native_drain(world);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_drain(world);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(shell) = self.shell {
             for (owner, id) in shell.drain_events(sid, world) {
                 // A parent close also closes native popups, and an X server can destroy a
@@ -628,7 +628,7 @@ impl Backend for Vulkan {
                 }
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(s) = world.session_mut(sid) {
             let mut media = std::mem::take(&mut self.media);
             media.step(self, s);
@@ -689,11 +689,11 @@ impl Backend for Vulkan {
         #[cfg(target_os = "android")]
         self.native_layers.close(sid);
         self.flush();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         { let mut native = std::mem::take(&mut self.native_apps); native.close(self, world, sid); self.native_apps = native; }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         self.media.session_closed(sid);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         self.capture_pool.retain(|key, _| key.0 != sid);
         self.windows.close_session(sid, self.queue.as_ref().unwrap());
         self.tex.retain(|k, _| k.0 != sid); self.buf.retain(|k, _| k.0 != sid); self.pipe.retain(|k, _| k.0 != sid); self.compute.retain(|k, _| k.0 != sid);
@@ -705,7 +705,7 @@ impl Backend for Vulkan {
         self.sharing.session_closed(sid);
         self.pressure.forget_session(sid);
         exec::free_session(world, sid);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(shell) = self.shell { shell.session_closed(sid); }
     }
     fn window_pixels(&mut self, world: &mut World, sid: u32, window: Option<Id>) -> Option<Pixels> { self.host_window_pixels(world, sid, window) }
@@ -820,7 +820,7 @@ impl exec::DeviceReset for Vulkan {
         }
         drop((old_queue, old_complete, old_compiler));
         self.drain(world);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         self.capture_pool.clear();
         self.tex.clear();
         #[cfg(target_os = "android")]
@@ -841,7 +841,7 @@ impl exec::DeviceReset for Vulkan {
         self.spares = Default::default();
         self.kept = Default::default();
         self.windows.source.device_ready(dev.clone())?;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             self.foreign_support = share::foreign_support(&dev);
             share::copy::device_replaced();
@@ -910,7 +910,7 @@ impl Gpu for Vulkan {
     fn a11y_notify(&mut self, window: u64, notifications: &[makepad_a11y::Notification]) {
         super::android::a11y::notify(window, notifications);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn native_layer(&mut self, world: &mut World, sid: u32, command: &crate::cmds::HalCmd) -> bool {
         let mut native = std::mem::take(&mut self.native_apps);
         let handled = native.command(self, world, sid, command);
@@ -926,7 +926,7 @@ impl Gpu for Vulkan {
         self.media = media;
         handled
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn badges(&self) -> bool { self.shell.is_some() }
     fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, now: u64) -> bool { self.copy_into_layer(s, window, layer, now) }
     fn badge_layer(&mut self, window: Id, on: bool) {
@@ -940,7 +940,7 @@ impl Gpu for Vulkan {
         if matches!(&cmd, exec::OsCmd::FileDialog { .. }) { return self.media.dialog(sid, cmd); }
         self.shell.as_mut().is_some_and(|s| s.command(sid, cmd))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn os(&mut self, sid: u32, command: exec::OsCmd) -> bool {
         if matches!(&command, exec::OsCmd::FileDialog { .. }) { return self.media.dialog(sid, command); }
         if let Some(shell) = self.shell { shell.command(sid, command); true } else { false }
@@ -984,7 +984,7 @@ impl Gpu for Vulkan {
         }
     }
     fn texture_destroy(&mut self, sid: u32, id: Id) {
-        #[cfg(target_os = "linux")] self.native_apps.forget_texture(sid, id);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))] self.native_apps.forget_texture(sid, id);
         if self.tex.get(&(sid, id.index)).is_some_and(|t| t.gen <= id.gen) {
             if let Some(texture) = self.tex.remove(&(sid, id.index)) {
                 if let Some(registry) = self.sharing.registry() { registry.retire(sid, &texture.image); }
@@ -1145,14 +1145,14 @@ impl Gpu for Vulkan {
                 s.events.frame_done(target, previous.view().frames[0].frame, 0, 0, 0.0, 0.0);
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             let mut native = std::mem::take(&mut self.native_apps);
             native.begin(self, s);
             self.native_apps = native;
         }
         let result = self.encode_frame(s, sid, target, kind, packet, view, now);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(packet) = view.frames.get(packet as usize) {
             self.native_apps.end(sid, target, packet.frame, result.as_ref().is_some_and(|r| r.window ||
                 crate::hosted_native::bridge_enabled() && kind & !crate::target::FLAGS == crate::target::WINDOW));
@@ -1167,7 +1167,7 @@ impl Gpu for Vulkan {
     fn window_closed(&mut self, sid: u32, id: Id) {
         #[cfg(target_os = "android")]
         self.native_layers.close_window(sid, id);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         self.capture_pool.remove(&(sid, id));
         self.win.remove(&(sid, id.index)); self.damage_base.remove(&(sid, id.index)); self.hosted_sizes.remove(&(sid, id.index)); self.pick_ids.remove(&(sid, id));
         self.scanout_images.remove(&(sid, id));
@@ -1175,7 +1175,7 @@ impl Gpu for Vulkan {
         self.windows.remove((sid, id), self.queue.as_ref().unwrap());
     }
     fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(shell) = self.shell { shell.lend(host, if attach { sid } else { HOST }, if attach { id } else { host }); }
         #[cfg(target_os = "android")]
         if let Some(shell) = &mut self.shell { shell.lent(sid, id, host, attach); }

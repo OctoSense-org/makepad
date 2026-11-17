@@ -89,7 +89,7 @@ impl Cx {
         self.hal.focused.filter(|w| self.windows.is_valid(*w)).or_else(|| self.windows.id_iter().find(|w| self.hal.window_ready(*w)))
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(super) fn hal_send_pending_ime_hide(&mut self) {
         self.hal.pending_ime_hide = false;
         let w = self.hal_target_window();
@@ -155,7 +155,7 @@ impl Cx {
         // the geometry the app lays out against until the HAL confirms the window
         window.os_dpi_factor = Some(dpi);
         window.draws_chrome_buttons = !window.is_popup && self.hal.info.is_some_and(|info| info.flags & makepad_hal::info_flags::CLIENT_CHROME != 0);
-        if cfg!(target_os = "linux") {
+        if cfg!(all(target_os = "linux", not(target_env = "ohos"))) {
             window.uses_client_side_decorations = window.draws_chrome_buttons;
         }
         let placed = if position.x.is_nan() || position.y.is_nan() { crate::makepad_math::dvec2(0.0, 0.0) } else { position };
@@ -189,7 +189,7 @@ impl Cx {
             self.hal_native_appearance(appearance);
         }
         // the application icon, once (the Dock's; none in a bundled app, which has its own)
-        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "windows", all(target_os = "linux", not(target_env = "ohos"))))]
         if !self.hal.icon_sent {
             self.hal.icon_sent = true;
             if let Some(buf) = crate::app_icon::window_icon().buffers.first() {
@@ -295,7 +295,7 @@ impl Cx {
                     // a hosted app's main window is the host's tile, whose size the host owns: it
                     // is asked over the hosted wire (Linux's hosted transport asks from the WM's
                     // shell, linux/wm.rs; here the HAL is in-process and keeps hosted geometry)
-                    let asks_host = cfg!(not(target_os = "linux")) && self.hal.hosted.is_some() && !self.hal_hosted_extra_window(window_id);
+                    let asks_host = cfg!(not(all(target_os = "linux", not(target_env = "ohos")))) && self.hal.hosted.is_some() && !self.hal_hosted_extra_window(window_id);
                     if asks_host {
                         Self::send_studio_message(crate::studio::AppToStudio::Custom(makepad_hal::window_controls::HostedResize { w: size.x, h: size.y }.to_json()));
                     } else {
@@ -455,12 +455,12 @@ impl Cx {
                 CxOsOp::ShowTextIME(area, cursor_rect, config) => {
                     // An input asking for the keyboard right after a hide (e.g., it just took
                     // focus from another input) keeps the keyboard up.
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     { self.hal.pending_ime_hide = false; }
                     let config = ime_config(&config);
                     // The backend forgets its last show the moment the keyboard closes, so a repeat
                     // drawn before we've heard about that close would bring the keyboard back.
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     if !self.hal_is_embedded() && self.hal.ime_shown.replace(config) == Some(config) {
                         continue;
                     }
@@ -472,11 +472,11 @@ impl Cx {
                     self.hal.frames.w.ime_show(hal_window_id(window_id), [tl.x as f32, tl.y as f32, (br.x - tl.x) as f32, (br.y - tl.y) as f32], config);
                 }
                 CxOsOp::HideTextIME => {
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     { self.hal.ime_shown = None; }
                     // On Android a hide waits until after the next draw, but only the non-hosted
                     // beat in `hal_run` sends it, so a hosted or embedded session hides right away.
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(target_os = "android", target_env = "ohos"))]
                     if self.hal.hosted.is_none() && !self.hal.externally_driven {
                         self.hal.pending_ime_hide = true;
                         continue;
@@ -490,7 +490,7 @@ impl Cx {
                     self.hal.frames.w.ime_sync(w, selection.start.0 as u32, selection.end.0 as u32, cs, ce, text.as_bytes());
                 }
                 CxOsOp::SetCursor(cursor) => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     if matches!(self.os_type, crate::cx::OsType::LinuxDirect) && self.hal.direct_cursor != cursor {
                         self.hal.direct_cursor = cursor;
                         self.redraw_all();
@@ -518,7 +518,7 @@ impl Cx {
                     }
                 }
                 CxOsOp::Quit => {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                     if std::env::var_os("MAKEPAD_HAL_LOG").is_some() {
                         eprintln!("[hal-linux] CxOsOp::Quit consumed: session={} windows={} confirmed={} completed_frames={}",
                             self.hal.info.map_or(0, |i| i.session), self.hal.windows.len(),
@@ -698,7 +698,7 @@ impl Cx {
                 CxOsOp::CheckPermission { permission, request_id } => self.hal_permission(makepad_hal::media::permission_op::CHECK, permission, request_id),
                 CxOsOp::RequestPermission { permission, request_id } => self.hal_permission(makepad_hal::media::permission_op::REQUEST, permission, request_id),
                 CxOsOp::StartLocationUpdates => self.hal_location(makepad_hal::media::location_op::START),
-                #[cfg(target_os = "android")]
+                #[cfg(any(target_os = "android", target_env = "ohos"))]
                 CxOsOp::HapticFeedback(kind) => self.hal_haptic(kind),
                 CxOsOp::StopLocationUpdates => self.hal_location(makepad_hal::media::location_op::STOP),
                 CxOsOp::PrepareVideoPlayback(video_id, source, camera_preview, _gl_handle, texture_id, autoplay, looping) => {

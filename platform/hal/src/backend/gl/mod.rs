@@ -25,7 +25,7 @@ mod render;
 pub mod surface;
 mod sys;
 mod timer;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod worker;
 
 use super::exec::{self, Gpu, PipeStatus};
@@ -116,9 +116,9 @@ pub(crate) struct Composed {
 }
 
 /// The window system the windows live in: an X11/Wayland shell, or Android's Activity.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 type ShellRef = &'static super::linux::Shared;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 type ShellRef = Box<dyn super::Shell>;
 
 pub struct GlBackend {
@@ -150,14 +150,16 @@ pub struct GlBackend {
     compose: Option<Arc<TexObj>>,
     mailbox: Mailbox,
     /// video, audio, MIDI, camera, dialogs (`backend/linux/media`, `backend/android/media`)
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     media: super::linux::media::Media,
     #[cfg(target_os = "android")]
     media: super::android::media::AndroidMedia,
+    #[cfg(target_env = "ohos")]
+    media: super::ohos::media::OhosMedia,
 }
 
 impl GlBackend {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub fn new(flags: u32, wake: Arc<dyn Fn() + Send + Sync>, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, String> {
         if flags & open_flags::OFFSCREEN_WINDOWS != 0 {
             return Self::with_source(wake, Box::new(surface::Offscreen), None);
@@ -168,7 +170,7 @@ impl GlBackend {
     }
 
     /// On a started X11/Wayland shell (the DRM/KMS direct shell presents through Vulkan only).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub fn on_shell(wake: Arc<dyn Fn() + Send + Sync>, shell: &'static super::linux::Shared) -> Result<Self, String> {
         let mut backend = Self::with_source(wake, Box::new(super::linux::EglSurfaceSource(shell)), Some(shell))?;
         backend.info.flags |= info_flags::DISPLAY_CLOCK;
@@ -204,7 +206,7 @@ impl GlBackend {
 
     /// What Android's `surfaceDestroyed` calls: the render thread lets go of every window
     /// surface before it returns, as Android asks, or after a second at most.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub fn window_release(&self) -> Box<dyn Fn() + Send + Sync> {
         let queue = self.queue.clone();
         Box::new(move || {
@@ -277,10 +279,12 @@ impl GlBackend {
                     }
                     if window {
                         world.window_presented(sid, target, frame, gpu_ns, done.time);
-                        #[cfg(target_os = "linux")]
+                        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                         if let Some(shell) = self.shell { shell.presented(self.window_key(sid, target)); }
                         #[cfg(target_os = "android")]
                         super::android::jni::surface_presented();
+                        #[cfg(target_env = "ohos")]
+                        super::ohos::surface_presented();
                     }
                     world.frame_done(sid, target, kind, frame, gpu_ns, done.time, [0.0; 2]);
                 }
@@ -384,7 +388,7 @@ impl Backend for GlBackend {
     }
     fn step(&mut self, world: &mut World, sid: u32) {
         self.drain(world);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(shell) = self.shell {
             for (owner, id) in shell.drain_events(sid, world) {
                 // a parent close also closes native popups, and an X server can destroy a window
@@ -402,9 +406,9 @@ impl Backend for GlBackend {
         }
         if let Some(s) = world.session_mut(sid) {
             let mut media = std::mem::take(&mut self.media);
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             media.step(self, s);
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             media.drain(self, s);
             self.media = media;
         }
@@ -414,7 +418,7 @@ impl Backend for GlBackend {
         exec::next_timer(world, sid).into_iter().chain(self.media.next_due(sid, world.now())).min()
     }
     /// The app may make GL contexts of the HAL's share group (GL interop): it hears how.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn session_opened(&mut self, world: &mut World, sid: u32) {
         let [display, config, context] = self.caps.share;
         world.to_session(sid, |q| q.gl_share(display, config, context));
@@ -433,7 +437,7 @@ impl Backend for GlBackend {
         if sid == HOST { self.badged.clear(); }
         self.programs.retain(|_, state| state.strong_count() > 0);
         exec::free_session(world, sid);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(shell) = self.shell { shell.session_closed(sid); }
     }
     fn window_pixels(&mut self, world: &mut World, sid: u32, window: Option<Id>) -> Option<Pixels> {
@@ -468,13 +472,13 @@ impl Gpu for GlBackend {
         self.media = media;
         handled
     }
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     fn auto_adopt(&self) -> bool { self.shell.as_ref().is_some_and(|s| s.auto_adopt()) }
     fn os(&mut self, sid: u32, command: exec::OsCmd) -> bool {
         if matches!(&command, exec::OsCmd::FileDialog { .. }) { return self.media.dialog(sid, command); }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         { if let Some(shell) = self.shell { shell.command(sid, command); return true; } false }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         { self.shell.as_mut().is_some_and(|s| s.command(sid, command)) }
     }
     fn texture_create(&mut self, s: &mut Session, id: Id, t: &mut TextureObj) -> Result<(), String> {
@@ -593,7 +597,7 @@ impl Gpu for GlBackend {
     }
     fn frame(&mut self, s: &mut Session, sid: u32, target: Id, kind: u32, packet: u32, view: &CmdView, now: u64) -> Option<exec::SubmittedFrame> {
         // a native camera preview follows where the window frame places it
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if kind & !target::FLAGS == target::WINDOW && kind & (target::PICK | target::BADGES | target::REPLAY) == 0 {
             self.media.native_frame(s, target, packet, view);
         }
@@ -641,9 +645,9 @@ impl Gpu for GlBackend {
     }
     fn layer_copy(&mut self, s: &mut Session, window: Id, layer: Id, _now: u64) -> bool { self.copy_into_layer(s, window, layer) }
     fn window_lent(&mut self, sid: u32, id: Id, host: Id, attach: bool) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if let Some(shell) = self.shell { shell.lend(host, if attach { sid } else { HOST }, if attach { id } else { host }); }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         if let Some(shell) = &mut self.shell { shell.lent(sid, id, host, attach); }
         if attach {
             self.aliases.insert((sid, id), host);
@@ -656,7 +660,7 @@ impl Gpu for GlBackend {
 
 /// Decoded video planes reach GL as uploads into ordinary 2D textures; DMA-BUF planes are
 /// imported by the Vulkan backend only, so the media service falls back to system memory.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl super::linux::media::Sink for GlBackend {
     fn declare(&mut self, s: &mut Session, id: Id, fmt: u32) {
         if s.textures.get(s.id, id).is_ok() { return; }
@@ -708,7 +712,7 @@ impl super::linux::media::Sink for GlBackend {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn video_row(s: &mut Session, id: Id, desc: &TextureObj) {
     if let Some(row) = s.ledger.get_mut(Kind::Texture, id.index).filter(|r| r.gen == id.gen) {
         row.bytes = desc.bytes;

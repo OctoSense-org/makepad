@@ -23,10 +23,10 @@ pub(super) type Job = Box<dyn FnOnce(&mut Renderer) + Send>;
 pub(super) struct Queue {
     jobs: mpsc::Sender<Job>,
     /// jobs that run before the ones queued ahead of them, as soon as the running one ends
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     urgent: Arc<Mutex<Vec<Job>>>,
     /// how many window surfaces the render thread holds
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub surfaces: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -38,7 +38,7 @@ impl Queue {
 
     /// For a job that can't wait behind queued work (Android's surfaceDestroyed, the compile
     /// worker's answers): it must not depend on anything queued before it.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub fn push_urgent(&self, job: impl FnOnce(&mut Renderer) + Send + 'static) {
         self.urgent.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(job));
         self.push(|_| {});
@@ -67,7 +67,7 @@ pub(super) struct Caps {
     /// the program cache keeps binaries but has none yet (`info_flags::PIPELINE_CACHE_COLD`)
     pub program_cache_cold: bool,
     /// the EGL display, config and context of the share group (the `GlShare` event)
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub share: [u64; 3],
 }
 
@@ -242,12 +242,12 @@ pub(super) struct Renderer {
     pending: VecDeque<(GLsync, Then)>,
     pub mailbox: Mailbox,
     /// its own queue's urgent lane, which the compile worker answers through
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub queue: Queue,
     /// a window frame has been shown: from then on the compile worker can take compiles
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub presented: bool,
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub worker: super::worker::WorkerState,
     /// made with the context, since the Activity's params (the app's cache dir) come before the app starts
     pub cache: super::cache::ProgramCache,
@@ -257,12 +257,12 @@ pub(super) struct Renderer {
 
 pub(super) fn start(source: Box<dyn EglSurfaceSource>, mailbox: Mailbox, pools: Arc<Pools>) -> Result<(Queue, Arc<Caps>, std::thread::JoinHandle<()>), String> {
     let (tx, rx) = mpsc::channel::<Job>();
-    let queue = Queue { jobs: tx, #[cfg(target_os = "android")] urgent: Arc::new(Mutex::new(Vec::new())), #[cfg(target_os = "android")] surfaces: Default::default() };
-    #[cfg(target_os = "android")]
+    let queue = Queue { jobs: tx, #[cfg(any(target_os = "android", target_env = "ohos"))] urgent: Arc::new(Mutex::new(Vec::new())), #[cfg(any(target_os = "android", target_env = "ohos"))] surfaces: Default::default() };
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     let own = queue.clone();
     let (ready, made) = mpsc::sync_channel(1);
     let thread = std::thread::Builder::new().name("makepad-gl-render".into()).spawn(move || {
-        match Renderer::new(source, mailbox, pools, #[cfg(target_os = "android")] own) {
+        match Renderer::new(source, mailbox, pools, #[cfg(any(target_os = "android", target_env = "ohos"))] own) {
             Ok(r) => {
                 let _ = ready.send(Ok(r.caps.clone()));
                 r.run(rx);
@@ -278,11 +278,11 @@ pub(super) fn start(source: Box<dyn EglSurfaceSource>, mailbox: Mailbox, pools: 
 }
 
 impl Renderer {
-    fn new(source: Box<dyn EglSurfaceSource>, mailbox: Mailbox, pools: Arc<Pools>, #[cfg(target_os = "android")] queue: Queue) -> Result<Self, String> {
+    fn new(source: Box<dyn EglSurfaceSource>, mailbox: Mailbox, pools: Arc<Pools>, #[cfg(any(target_os = "android", target_env = "ohos"))] queue: Queue) -> Result<Self, String> {
         // Drop the guard before ctx on errors; Context::drop takes the same lock.
         let ctx;
         let _context_lifecycle = lock_context_lifecycle();
-        ctx = Context::new(source, #[cfg(target_os = "android")] queue.surfaces.clone())?;
+        ctx = Context::new(source, #[cfg(any(target_os = "android", target_env = "ohos"))] queue.surfaces.clone())?;
         let gl = &ctx.gl;
         let version = gl.string(sys::VERSION);
         if !version.starts_with("OpenGL ES 3") {
@@ -319,7 +319,7 @@ impl Renderer {
             software: ctx.software(),
             gpu_timer: timer.is_some(),
             program_cache_cold: cache.cold,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             share: [ctx.share.display as u64, ctx.share.config as u64, ctx.share.context as u64],
         });
         let mut names = [0; 4];
@@ -360,8 +360,8 @@ impl Renderer {
             fbos: HashMap::new(), read_fbo: names[0], copy_fbo: names[1], fallback, nearest,
             uniform_arena: names[2], instance_arena: names[3], arena_words: Words::default(), pools, arena_charges: None,
             _fallback_charges: fallback_charges, pending: VecDeque::new(), mailbox,
-            #[cfg(target_os = "android")] queue, #[cfg(target_os = "android")] presented: false,
-            #[cfg(target_os = "android")] worker: super::worker::WorkerState::Unstarted, cache, timer, exit: false })
+            #[cfg(any(target_os = "android", target_env = "ohos"))] queue, #[cfg(any(target_os = "android", target_env = "ohos"))] presented: false,
+            #[cfg(any(target_os = "android", target_env = "ohos"))] worker: super::worker::WorkerState::Unstarted, cache, timer, exit: false })
     }
 
     pub fn exit(&mut self) {
@@ -370,7 +370,7 @@ impl Renderer {
 
     fn run(mut self, rx: Receiver<Job>) {
         loop {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", target_env = "ohos"))]
             {
                 let urgent = std::mem::take(&mut *self.queue.urgent.lock().unwrap_or_else(|e| e.into_inner()));
                 for job in urgent { job(&mut self); }

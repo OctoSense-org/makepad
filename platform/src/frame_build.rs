@@ -265,12 +265,12 @@ impl FrameBuilder {
         self.window_frames.clear();
     }
 
-    #[cfg_attr(target_os = "android", allow(dead_code))] // read by the remote bridge, which Android has none of
+    #[cfg_attr(any(target_os = "android", target_env = "ohos"), allow(dead_code))] // read by the remote bridge, which Android has none of
     pub(crate) fn window_submission(&self, window: Id) -> u64 {
         self.window_submitted.get(&window).copied().unwrap_or(0)
     }
 
-    #[cfg_attr(target_os = "android", allow(dead_code))]
+    #[cfg_attr(any(target_os = "android", target_env = "ohos"), allow(dead_code))]
     pub(crate) fn window_completion(&self, window: Id) -> u64 {
         self.window_completed.get(&window).copied().unwrap_or(0)
     }
@@ -1365,7 +1365,7 @@ impl Cx {
 
     /// The Activity shows our clear color in place of the surface whenever it hasn't drawn yet,
     /// like at startup or while resuming.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     pub(crate) fn fb_send_app_background(&mut self, fb: &mut FrameBuilder, pass_id: DrawPassId) {
         if let CxDrawPassParent::Window(w) = self.passes[pass_id].parent {
             if !self.windows[w].is_popup {
@@ -1420,7 +1420,7 @@ impl Cx {
             },
             _ => (None, false),
         };
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         self.fb_send_app_background(fb, pass_id);
         if let Some(w) = window {
             if !self.hal.window_ready(w) {
@@ -2691,7 +2691,7 @@ mod tests {
 }
 
 /// A recorder is due this window frame: the HAL copies it into a capture surface.
-#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[cfg(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos"))))]
 fn capture_flag(window: usize) -> u32 {
     if crate::screen_capture::capture_wants_surface(Some(window)) {
         makepad_hal::target::CAPTURE
@@ -2700,7 +2700,7 @@ fn capture_flag(window: usize) -> u32 {
     }
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", all(target_os = "linux", not(target_env = "ohos")))))]
 fn capture_flag(_window: usize) -> u32 {
     0
 }

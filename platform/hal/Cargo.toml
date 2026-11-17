@@ -27,7 +27,7 @@ makepad-vulkan = { path = "../../libs/vulkan", version = "0.1.0" }
 # the Vulkan pipeline compiles run inside the process CPU budget (backend/vulkan/device.rs Compilers)
 makepad-cpu-budget = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_env = "ohos")))'.dependencies]
 makepad-dbus-wire = { path = "../../libs/dbus_wire", version = "0.1.0" }
 makepad-atspi = { path = "../../libs/atspi", version = "0.1.0" }
 makepad-zune-jpeg = { path = "../../libs/zune/zune-jpeg", version = "0.5.15" }

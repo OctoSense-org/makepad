@@ -39,7 +39,7 @@ impl Drop for InputTrustGuard {
 
 /// Android MotionEvent metadata. Missing/virtual devices, non-touch sources,
 /// obscured windows and cancellation never establish approval provenance.
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(target_os = "android", target_env = "ohos", test))]
 pub(crate) fn android_touch_is_trusted(device_id: i32, physical_device: bool, source: i32, flags: i32, action: i32) -> bool {
     const SOURCE_TOUCHSCREEN: i32 = 0x1002;
     const OBSCURED: i32 = 0x1 | 0x2;

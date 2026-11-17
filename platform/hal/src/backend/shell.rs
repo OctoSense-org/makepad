@@ -23,7 +23,7 @@ pub(crate) struct Snapshot {
     pub refused: Option<String>,
     pub hub: &'static str,
     // A retiring reader must not mark a replacement connection broken.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub hub_id: usize,
     pub app_frame_shown: Option<bool>,
     /// When the first app frame went to the WM (`crate::clock_ns`).
@@ -40,7 +40,7 @@ impl Snapshot {
             backend, reason,
             wm_socket: None, protocol: None, admitted: None, refused: None,
             hub: "none",
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             hub_id: 0,
             app_frame_shown: None, app_frame_at: None, detached: false,
             windows: HashMap::new(),

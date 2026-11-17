@@ -6,18 +6,18 @@ use makepad_live_id::LiveId;
 use crate::types::{HttpRequest, NetworkError, NetworkResponse, WsSend};
 use crate::ui_signal::SignalToUI;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod android;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub(crate) use self::android::{connect_platform_socket_stream, platform_crypto};
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub use self::android::{
     clear_platform_socket_factory, register_platform_crypto, register_platform_socket_factory, PlatformCrypto, PlatformSocketFactory, PlatformSocketStream,
     PlatformTlsServer, PlatformTlsSession,
 };
 #[cfg(any(target_os = "ios", target_os = "macos", target_os = "tvos"))]
 pub mod apple;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_env = "ohos"))]
 // Linux socket workers are native-only and never compiled into a web app.
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 pub mod linux;
@@ -230,7 +230,7 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
     not(target_arch = "wasm32"),
     not(target_os = "windows"),
     not(any(target_os = "ios", target_os = "macos", target_os = "tvos")),
-    any(target_os = "linux", target_os = "android")
+    any(target_os = "linux", target_os = "android", target_env = "ohos")
 ))]
 pub fn default_backend() -> Arc<dyn NetworkBackend> {
     linux::create_backend()
@@ -238,7 +238,7 @@ pub fn default_backend() -> Arc<dyn NetworkBackend> {
 
 #[cfg(not(any(
     target_arch = "wasm32",
-    target_os = "android",
+    target_os = "android", target_env = "ohos",
     target_os = "windows",
     target_os = "linux",
     target_os = "ios",

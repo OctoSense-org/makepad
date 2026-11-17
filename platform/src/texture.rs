@@ -21,7 +21,7 @@ pub fn image_cache_use_mipmaps() -> bool {
         return matches!(v.trim(), "1" | "true" | "on" | "yes");
     }
     // The Linux HAL builds the mip chain on its Vulkan queue.
-    cfg!(target_os = "linux")
+    cfg!(all(target_os = "linux", not(target_env = "ohos")))
 }
 
 /// A shared, reusable texture handle. GPU storage is allocated lazily by rendering.
@@ -42,11 +42,11 @@ pub fn image_cache_use_mipmaps() -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Texture(Rc<PoolId>);
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[derive(Debug)]
 pub(crate) struct WeakTexture(std::rc::Weak<PoolId>);
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl WeakTexture {
     pub(crate) fn upgrade(&self) -> Option<Texture> {
         self.0.upgrade().map(Texture)
@@ -100,7 +100,7 @@ pub(crate) enum ReadbackChannelOrder { Bgra, Rgba }
 pub(crate) enum ReadbackOrigin {
     /// Metal's raw window grab (`remote::deliver_grab_pixels`).
     TopLeft,
-    #[cfg_attr(target_os = "android", allow(dead_code))] // constructed by the readbacks that arrive bottom-up
+    #[cfg_attr(any(target_os = "android", target_env = "ohos"), allow(dead_code))] // constructed by the readbacks that arrive bottom-up
     BottomLeft,
 }
 
@@ -287,7 +287,7 @@ impl Default for TextureId {
 }
 
 impl Texture {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) fn downgrade(&self) -> WeakTexture {
         WeakTexture(Rc::downgrade(&self.0))
     }

@@ -218,7 +218,7 @@ pub fn is_fleet_endpoint(host_port: &str) -> bool {
 
 /// The process's one OpenSSL setup (no exit handler): what code outside this crate that calls
 /// OpenSSL itself calls first.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use crate::backend::linux::socket_stream::init_openssl;
 
 /// A fresh P-256 key (X9.63) from the OS.
@@ -690,7 +690,7 @@ impl Write for TlsStream {
 #[path = "backend/apple/tls_server.rs"]
 mod platform;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 #[path = "backend/linux/tls_server.rs"]
 #[allow(clippy::disallowed_types, clippy::disallowed_methods)]
 mod platform;
@@ -699,7 +699,7 @@ mod platform;
 #[path = "backend/windows/tls_server.rs"]
 pub(crate) mod platform;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 mod platform {
     //! The JIT host's registered provider (Java security on the device: backend/android.rs).
     use crate::backend::{platform_crypto, PlatformTlsServer, PlatformTlsSession};
@@ -790,7 +790,7 @@ mod platform {
     target_os = "tvos",
     target_os = "linux",
     target_os = "windows",
-    target_os = "android"
+    target_os = "android", target_env = "ohos"
 )))]
 mod platform {
     use std::io;
@@ -874,7 +874,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(all(test, any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")), target_os = "windows")))]
 mod server_tests {
     use super::*;
     use std::net::TcpListener;

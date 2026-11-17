@@ -4,7 +4,7 @@
 //! ticks is how long the window system waited for this process. A gap over 50 ms is printed when
 //! it ends, the summary when the main loop does: `makepad-hal: main-lag ticks=.. max_ms=..
 //! p99_ms=.. stalls=..`.
-#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))), allow(dead_code))]
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 

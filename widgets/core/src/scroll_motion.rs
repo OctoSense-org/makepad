@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 /// spline, a `VelocityTracker` least-squares release velocity, the platform's touch
 /// slop and fling limits, and a short, firm edge stretch. On Android a Makepad list
 /// must feel like a `RecyclerView` next to it; elsewhere the iOS-style model stays.
-pub const NATIVE_ANDROID_TOUCH: bool = cfg!(target_os = "android");
+pub const NATIVE_ANDROID_TOUCH: bool = cfg!(any(target_os = "android", target_env = "ohos"));
 
 /// Whether touch flicks animate along Android's native fling spline instead of the
 /// exponential decay (see [`NATIVE_ANDROID_TOUCH`]).

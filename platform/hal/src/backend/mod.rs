@@ -6,7 +6,7 @@ pub mod exec;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn end_run() {
     shell::end_run();
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
         linux::end_run();
         vulkan::share::copy::end_run();
@@ -18,14 +18,15 @@ pub(crate) fn end_run() {
 }
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod shell;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", all(target_os = "linux", not(target_env = "ohos"))))]
 pub mod main_lag;
 pub mod headless;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub mod gl;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+// (OpenHarmony draws with the GLES core only)
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(target_env = "ohos")))]
 pub mod vulkan;
 #[cfg(target_vendor = "apple")]
 pub mod apple;
@@ -35,7 +36,7 @@ pub mod windows;
 use crate::buffers::CmdView;
 
 /// Native window-system work stays outside the GPU core (Vulkan's and GLES's).
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 pub trait Shell: Send {
     fn command(&mut self, session: u32, cmd: exec::OsCmd) -> bool;
     fn lent(&mut self, session: u32, alias: crate::types::Id, host: crate::types::Id, attach: bool);
@@ -87,7 +88,7 @@ pub struct Pixels {
 /// Every backend reports completed frames through `World::frame_done`, including asynchronous
 /// GPU completions, so presenters and parent compositors receive the same notifications.
 pub trait Backend: Send {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     fn dmabuf(&mut self) -> Option<&mut dyn crate::dmabuf::Api> { None }
     /// The completion of everything `session` submitted so far, for a reader outside this
     /// backend (an encoder, another process): [`crate::completion`]. `notify` when it answers.
@@ -139,5 +140,11 @@ pub trait Backend: Send {
     fn simulate_device_loss(&mut self) {}
 }
 
-#[cfg(any(target_os = "android", test))]
+// (OpenHarmony's shell shares the surface state)
+#[cfg(any(target_os = "android", target_env = "ohos", test))]
 pub mod android;
+#[cfg(target_env = "ohos")]
+pub mod ohos;
+/// (OpenHarmony's streams use it; its tests run on any host)
+#[cfg(any(target_env = "ohos", test))]
+pub(crate) mod cert_host;

@@ -17,7 +17,7 @@ use crate::studio::{
     StudioToApp,
 };
 use std::collections::HashMap;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 use crate::studio::SharedPresentableImage;
 
 #[derive(Default)]
@@ -37,7 +37,7 @@ pub(crate) struct HostedClient {
     /// The app's first window: its main window, the one the host's tile shows. Every later
     /// window is a window of its own on the host (`window_controls::HostedWindow`).
     pub(super) first: Option<WindowId>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     inbox: Option<crate::os::hosted_gpu::GpuInbox>,
 }
 
@@ -93,11 +93,11 @@ struct HostedImage {
     import: ImportState,
     in_flight: Option<u64>,
     /// the newest timeline value of this image published to the host
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     published: u64,
     /// The newest frame sent to a device that was then lost (or replaced): published after the
     /// image is imported again if that frame did complete (its timeline went past `published`).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     unpublished: Option<(u64, PresentableDraw)>,
     warned: bool,
 }
@@ -107,7 +107,7 @@ pub(crate) enum HostedDone {
     /// publish this frame (`DrawCompleteAndFlip`)
     Publish(PresentableDraw),
     /// the GPU dropped the frame (its batch never ran): no new frame exists, paint again
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     Dropped,
     /// not a hosted frame this client is waiting for
     Unknown,
@@ -115,10 +115,10 @@ pub(crate) enum HostedDone {
 
 struct SharedHandle {
     value: u64,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     session: u32,
 }
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Drop for SharedHandle {
     fn drop(&mut self) { makepad_hal::dmabuf::hal_dmabuf_unregister(self.session, self.value); }
 }
@@ -128,9 +128,9 @@ struct PendingPresent {
     draw: PresentableDraw,
     // A replaced swapchain stays alive until the GPU finishes its already-submitted frames.
     _texture: Texture,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     hal: Id,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     session: u32,
 }
 
@@ -161,7 +161,7 @@ impl HostedClient {
             let index = (swapchain.next + offset) % swapchain.images.len();
             let image = &swapchain.images[index];
             let ready = image.import == ImportState::Ready && image.in_flight.is_none();
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             let ready = ready && makepad_hal::dmabuf::hal_dmabuf_write_available(image.handle.session, image.hal) == 1;
             ready.then_some((index, image.hal))
         })
@@ -196,9 +196,9 @@ impl HostedClient {
             window,
             draw: PresentableDraw { window_id: window.id(), target_id: image.image, width: size[0], height: size[1], sequence: 0 },
             _texture: image.texture.clone(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             hal: image.hal,
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             session: image.handle.session,
         });
         swapchain.next = (index + 1) % swapchain.images.len();
@@ -216,7 +216,7 @@ impl HostedClient {
                 }
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let pending = {
             let mut pending = pending;
             let mut sequence = 0;
@@ -246,7 +246,7 @@ impl HostedClient {
                 image.in_flight = None;
                 // imported again after DeviceReset (`imported`), without a warning
                 image.import = ImportState::Retry;
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 for (frame, p) in &pending {
                     if p.draw.target_id == image.image && image.unpublished.as_ref().is_none_or(|(f, _)| f < frame) {
                         image.unpublished = Some((*frame, p.draw));
@@ -254,7 +254,7 @@ impl HostedClient {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         drop(pending);
     }
 
@@ -267,9 +267,9 @@ impl HostedClient {
     /// finished but this client never published (the host holds the image until it hears of
     /// it) is returned to publish now.
     pub(crate) fn imported(&mut self, texture: Id, ok: bool) -> Option<PresentableDraw> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let mut publish = None;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         let publish = None;
         for swapchain in self.windows.values_mut() {
             for image in &mut swapchain.images {
@@ -279,7 +279,7 @@ impl HostedClient {
                 if !ok && !again && !std::mem::replace(&mut image.warned, true) {
                     crate::warning!("hal: shared image {:?} could not be imported; retrying on host ticks", image.image);
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 if ok {
                     if let Some((_, mut draw)) = image.unpublished.take() {
                         let mut sequence = 0;
@@ -298,7 +298,7 @@ impl HostedClient {
 
 // Only decoding/transport is target-specific; swapchain installation, rendering,
 // damage, retries and completion use the same client path on every backend.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
 fn image_handle(image: &SharedPresentableImage) -> Result<SharedHandle, &'static str> {
     #[cfg(target_os = "macos")]
     { Ok(SharedHandle { value: image.iosurface_id as u64 }) }
@@ -378,14 +378,14 @@ impl Cx {
     }
 
     fn hal_hosted_swapchain(&mut self, swapchain: SharedSwapchain) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             if let Err(error) = self.hal.hosted.as_mut().unwrap().inbox.as_mut().unwrap()
                 .enqueue(crate::os::hosted_gpu::SwapchainRequest { swapchain }) {
                 crate::error!("hal hosted descriptors: {error}");
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         match swapchain.presentable_images.iter().map(image_handle).collect() {
             Ok(handles) => self.hal_hosted_install(swapchain, handles),
             Err(reason) => self.hal.frames.gap(reason),
@@ -400,9 +400,9 @@ impl Cx {
                 && old.images.len() == swapchain.presentable_images.len()
                 && old.images.iter().zip(swapchain.presentable_images.iter().zip(&handles))
                     .all(|(old, (image, handle))| old.image == image.id && {
-                        #[cfg(target_os = "linux")]
+                        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                         { let _ = handle; true } // PresentableImageId identifies the allocation; tickets are per delivery.
-                        #[cfg(not(target_os = "linux"))]
+                        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
                         { old.handle.value == handle.value }
                     })
         }) {
@@ -416,7 +416,7 @@ impl Cx {
             self.textures[id].alloc_shared();
             let hal = self.hal.frames.external_texture(id.0, id.generation());
             self.hal.frames.w.texture_import(hal, handle.value, texture_handle::NATIVE);
-            HostedImage { image: image.id, handle, texture, hal, import: ImportState::Pending, in_flight: None, #[cfg(target_os = "linux")] published: 0, #[cfg(target_os = "linux")] unpublished: None, warned: false }
+            HostedImage { image: image.id, handle, texture, hal, import: ImportState::Pending, in_flight: None, #[cfg(all(target_os = "linux", not(target_env = "ohos")))] published: 0, #[cfg(all(target_os = "linux", not(target_env = "ohos")))] unpublished: None, warned: false }
         }).collect();
         let hosted = self.hal.hosted.as_mut().unwrap();
         let replaced = hosted.windows.insert(hal_window_id(window), HostedSwapchain {
@@ -442,7 +442,7 @@ impl Cx {
     /// when the host is idle. The shared network drain parks this socket's messages for us.
     /// None ends the session; the bool says a batch was consumed (drain again before sleeping).
     pub(super) fn hal_hosted_poll(&mut self) -> Option<bool> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         self.hal_hosted_descriptors();
         let mut batch = Vec::new();
         let closed = self.stdin_drain_host_batches(&mut batch);
@@ -462,7 +462,7 @@ impl Cx {
 
     fn hal_hosted_message(&mut self, msg: StudioToApp) -> bool {
         match msg {
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             StudioToApp::NativeApp(event) => {
                 if let Some(inbox) = self.hal.hosted.as_mut().and_then(|h| h.inbox.as_mut()) {
                     if let Err(error) = inbox.native(event) { crate::error!("hal native descriptors: {error}"); }
@@ -566,7 +566,7 @@ impl Cx {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 impl Cx {
     pub(super) fn hal_hosted_start_transport(&mut self) -> Result<(), String> {
         // Connect without waiting for Swapchain: the parent sends that metadata only after

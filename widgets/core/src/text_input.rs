@@ -3359,7 +3359,7 @@ impl Widget for TextInput {
                 self.select_all(cx);
                 // On touch platforms, show clipboard actions after select all
                 // This handles the case where select_all is triggered from the clipboard menu
-                #[cfg(any(target_os = "ios", target_os = "android"))]
+                #[cfg(any(target_os = "ios", target_os = "android", target_env = "ohos"))]
                 {
                     let has_selection = !self.selected_text().is_empty();
                     let selection_rect = self.get_selection_rect(cx);

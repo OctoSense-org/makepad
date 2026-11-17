@@ -658,7 +658,7 @@ fn uniform_packing() -> DrawShaderInputPacking {
         return DrawShaderInputPacking::UniformsGLSL140;
     }
 
-    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[cfg(any(target_os = "android", target_env = "ohos", target_os = "linux"))]
     {
         return DrawShaderInputPacking::UniformsGLSL140;
     }

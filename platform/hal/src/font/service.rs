@@ -1176,5 +1176,9 @@ fn open_font_file(path: &str) -> std::io::Result<Arc<MappedBytes>> {
     if let Some(asset) = path.strip_prefix(crate::APK_ASSET_PREFIX) {
         return crate::backend::android::assets::map(asset);
     }
+    #[cfg(target_env = "ohos")]
+    if let Some(asset) = path.strip_prefix(crate::APK_ASSET_PREFIX) {
+        return crate::backend::ohos::assets::map(asset);
+    }
     MappedBytes::open(path).map(Arc::new)
 }

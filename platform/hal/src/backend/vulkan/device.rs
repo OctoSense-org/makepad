@@ -190,7 +190,7 @@ struct Wanted<'a> {
 impl Device {
     /// The process's Vulkan device if a backend made it already (code outside any session,
     /// such as the DMA-BUF copies of `crate::dmabuf::copy`, uses it and never makes one).
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) fn existing() -> Option<Arc<Self>> {
         lock(&SHARED).as_ref().map(|(_, device)| device.clone())
     }
@@ -295,9 +295,9 @@ impl Device {
         let mut wanted = if optional.iter().all(|n| supported(n)) { optional.to_vec() } else { Vec::new() };
         #[cfg(target_os = "android")]
         if supported(vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME) { wanted.push(vk::KHR_EXTERNAL_SEMAPHORE_FD_NAME); }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         let mut timeline = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         {
             // OPAQUE_FD hosted imports and sync are independent of modifier support.
             if supported(vk::KHR_EXTERNAL_MEMORY_FD_NAME) { wanted.push(vk::KHR_EXTERNAL_MEMORY_FD_NAME); }
@@ -437,7 +437,7 @@ impl Device {
         let queues = queue_infos;
         let mut create = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues).enabled_extension_names(&wanted).enabled_features(&features);
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if timeline.timeline_semaphore != 0 { create = create.next_physical_device_timeline_semaphore_features(&mut timeline); }
         if pacing { create = create.next_physical_device_present_id_features_khr(&mut present_id)
             .next_physical_device_present_wait_features_khr(&mut present_wait); }
@@ -607,7 +607,7 @@ impl Device {
 
     /// A display-only peer on another GPU. Rendering remains on the process's compositor
     /// device; this queue only reads imported images and drives that GPU's KMS outputs.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     pub(crate) fn display_peer(owner: Arc<Self>, physical: vk::PhysicalDevice) -> Result<Arc<Self>, String> {
         if physical == owner.physical { return Ok(owner); }
         let instance = &owner.instance;

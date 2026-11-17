@@ -81,15 +81,15 @@ pub fn window_key(session: u32, window: u32) -> u64 {
 
 /// Hosted shells supply desktop placement separately from their input coordinates.
 pub fn set_screen_origin(key: u64, origin: Option<(f32, f32)>) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     crate::backend::linux::atspi::geometry(key, origin.filter(|(x,y)| x.is_finite() && y.is_finite()));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     let _ = (key, origin);
 }
 pub fn set_window_active(key: u64, active: bool) {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     crate::backend::linux::atspi::focus(key, active);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     let _ = (key, active);
 }
 
@@ -109,13 +109,13 @@ pub(crate) fn apply_update(session: u32, window: u32, update: TreeUpdate) -> Vec
 
 pub(crate) fn drop_window(session: u32, window: u32) {
     lock(mirrors()).drop_window(window_key(session, window));
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     crate::backend::linux::atspi::notify(window_key(session, window), &[]);
 }
 
 fn drop_session(session: u32) {
     lock(mirrors()).trees.retain(|key, _| (key >> 32) as u32 != session);
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     crate::backend::linux::atspi::session_closed(session);
 }
 
