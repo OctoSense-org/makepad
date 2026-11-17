@@ -1,5 +1,6 @@
 //! The OpenHarmony NDK calls the shell makes: Node-API, the XComponent's surface and touch
-//! callbacks, the display's vsync, the native window's reference count, raw files and the log.
+//! callbacks, the display's vsync, the native window's reference count, raw files, the input
+//! method and the log.
 #![allow(non_camel_case_types, non_snake_case)]
 use std::ffi::{c_char, c_int, c_uint, c_void};
 
@@ -148,6 +149,93 @@ extern "C" {
     pub fn OH_ResourceManager_ReadRawFile64(file: *const c_void, out: *mut c_void, length: i64) -> i64;
     pub fn OH_ResourceManager_GetRawFileDescriptor64(file: *const c_void, descriptor: *mut RawFileDescriptor64) -> bool;
     pub fn OH_ResourceManager_CloseRawFile64(file: *mut c_void);
+}
+
+/// The editor the input method edits: its callbacks are the shell's (`ime.rs`).
+#[repr(C)]
+pub struct InputMethod_TextEditorProxy { _opaque: [u8; 0] }
+/// The input method, while the editor is attached to it.
+#[repr(C)]
+pub struct InputMethod_InputMethodProxy { _opaque: [u8; 0] }
+#[repr(C)]
+pub struct InputMethod_TextConfig { _opaque: [u8; 0] }
+#[repr(C)]
+pub struct InputMethod_AttachOptions { _opaque: [u8; 0] }
+
+/// `IME_ERR_OK`
+pub const IME_ERR_OK: c_int = 0;
+/// `InputMethod_KeyboardStatus`
+pub const IME_KEYBOARD_STATUS_HIDE: c_int = 1;
+/// `InputMethod_EnterKeyType`
+pub mod ime_enter_key {
+    pub const UNSPECIFIED: i32 = 0;
+    pub const NONE: i32 = 1;
+    pub const GO: i32 = 2;
+    pub const SEARCH: i32 = 3;
+    pub const SEND: i32 = 4;
+    pub const NEXT: i32 = 5;
+    pub const DONE: i32 = 6;
+    pub const PREVIOUS: i32 = 7;
+    pub const NEWLINE: i32 = 8;
+}
+/// `InputMethod_TextInputType`
+pub mod ime_text_input {
+    pub const TEXT: i32 = 0;
+    pub const MULTILINE: i32 = 1;
+    pub const NUMBER: i32 = 2;
+    pub const PHONE: i32 = 3;
+    pub const EMAIL_ADDRESS: i32 = 5;
+    pub const URL: i32 = 6;
+    pub const VISIBLE_PASSWORD: i32 = 7;
+    pub const NUMBER_PASSWORD: i32 = 8;
+    pub const NUMBER_DECIMAL: i32 = 12;
+}
+/// `InputMethod_Direction`
+pub mod ime_direction {
+    pub const UP: i32 = 1;
+    pub const DOWN: i32 = 2;
+    pub const LEFT: i32 = 3;
+    pub const RIGHT: i32 = 4;
+}
+/// `InputMethod_ExtendAction`
+pub mod ime_extend_action {
+    pub const SELECT_ALL: i32 = 0;
+    pub const CUT: i32 = 3;
+    pub const COPY: i32 = 4;
+}
+
+pub type ime_editor = *mut InputMethod_TextEditorProxy;
+#[link(name = "ohinputmethod")]
+extern "C" {
+    pub fn OH_TextEditorProxy_Create() -> ime_editor;
+    pub fn OH_TextEditorProxy_SetGetTextConfigFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, *mut InputMethod_TextConfig)) -> c_int;
+    pub fn OH_TextEditorProxy_SetInsertTextFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, *const u16, usize)) -> c_int;
+    pub fn OH_TextEditorProxy_SetDeleteForwardFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, i32)) -> c_int;
+    pub fn OH_TextEditorProxy_SetDeleteBackwardFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, i32)) -> c_int;
+    pub fn OH_TextEditorProxy_SetSendKeyboardStatusFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, c_int)) -> c_int;
+    pub fn OH_TextEditorProxy_SetSendEnterKeyFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, c_int)) -> c_int;
+    pub fn OH_TextEditorProxy_SetMoveCursorFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, c_int)) -> c_int;
+    pub fn OH_TextEditorProxy_SetHandleSetSelectionFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, i32, i32)) -> c_int;
+    pub fn OH_TextEditorProxy_SetHandleExtendActionFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, c_int)) -> c_int;
+    pub fn OH_TextEditorProxy_SetGetLeftTextOfCursorFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, i32, *mut u16, *mut usize)) -> c_int;
+    pub fn OH_TextEditorProxy_SetGetRightTextOfCursorFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, i32, *mut u16, *mut usize)) -> c_int;
+    pub fn OH_TextEditorProxy_SetGetTextIndexAtCursorFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor) -> i32) -> c_int;
+    pub fn OH_TextEditorProxy_SetReceivePrivateCommandFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, *mut *mut c_void, usize) -> i32) -> c_int;
+    pub fn OH_TextEditorProxy_SetSetPreviewTextFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor, *const u16, usize, i32, i32) -> i32) -> c_int;
+    pub fn OH_TextEditorProxy_SetFinishTextPreviewFunc(editor: ime_editor, f: unsafe extern "C" fn(ime_editor)) -> c_int;
+    pub fn OH_TextConfig_SetInputType(config: *mut InputMethod_TextConfig, kind: c_int) -> c_int;
+    pub fn OH_TextConfig_SetEnterKeyType(config: *mut InputMethod_TextConfig, kind: c_int) -> c_int;
+    pub fn OH_TextConfig_SetPreviewTextSupport(config: *mut InputMethod_TextConfig, supported: bool) -> c_int;
+    pub fn OH_TextConfig_SetSelection(config: *mut InputMethod_TextConfig, start: i32, end: i32) -> c_int;
+    pub fn OH_TextConfig_SetWindowId(config: *mut InputMethod_TextConfig, window: i32) -> c_int;
+    pub fn OH_AttachOptions_Create(show_keyboard: bool) -> *mut InputMethod_AttachOptions;
+    pub fn OH_AttachOptions_Destroy(options: *mut InputMethod_AttachOptions);
+    pub fn OH_InputMethodController_Attach(editor: ime_editor, options: *mut InputMethod_AttachOptions, out: *mut *mut InputMethod_InputMethodProxy) -> c_int;
+    pub fn OH_InputMethodController_Detach(input_method: *mut InputMethod_InputMethodProxy) -> c_int;
+    pub fn OH_InputMethodProxy_ShowKeyboard(input_method: *mut InputMethod_InputMethodProxy) -> c_int;
+    pub fn OH_InputMethodProxy_HideKeyboard(input_method: *mut InputMethod_InputMethodProxy) -> c_int;
+    pub fn OH_InputMethodProxy_NotifySelectionChange(input_method: *mut InputMethod_InputMethodProxy, text: *mut u16, len: usize, start: c_int, end: c_int) -> c_int;
+    pub fn OH_InputMethodProxy_NotifyConfigurationChange(input_method: *mut InputMethod_InputMethodProxy, enter_key: c_int, kind: c_int) -> c_int;
 }
 
 /// `LOG_APP`

@@ -9,3 +9,4 @@ export const avoidArea: (top: number, right: number, bottom: number, left: numbe
 export const keyboard: (height: number, open: boolean) => void;
 export const backPress: () => void;
 export const nightMode: (on: boolean) => void;
+export const windowId: (id: number) => void;

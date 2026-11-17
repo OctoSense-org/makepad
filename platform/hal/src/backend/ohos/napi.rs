@@ -9,8 +9,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 static VSYNC: AtomicUsize = AtomicUsize::new(0);
 static FRAME_POSTED: AtomicBool = AtomicBool::new(false);
 /// ArkTS's `(name, value)` function as a thread-safe one: how the shell asks the ability for
-/// what only ArkTS can do (system bars, the clipboard).
+/// what only ArkTS can do (system bars, the clipboard), and how it gets onto the UI thread
+/// itself (`on_ui`).
 static CALL: AtomicUsize = AtomicUsize::new(0);
+/// What waits in the thread-safe function's queue.
+enum Job {
+    /// `name` and `value` for ArkTS
+    Call(CString, CString),
+    Run(Box<dyn FnOnce() + Send>),
+}
 
 static mut MODULE: napi_module = napi_module {
     nm_version: 1, nm_flags: 0, nm_filename: std::ptr::null(), nm_register_func: Some(module_init),
@@ -29,9 +36,9 @@ pub(super) unsafe fn register_module() { napi_module_register(std::ptr::addr_of_
 /// Runs for the ability's `import` and again for each XComponent that names the library, which
 /// then finds itself in the exports.
 unsafe extern "C" fn module_init(env: napi_env, exports: napi_value) -> napi_value {
-    let methods: [(&CStr, napi_callback); 9] = [
+    let methods: [(&CStr, napi_callback); 10] = [
         (c"start", start), (c"foreground", foreground), (c"background", background), (c"focus", focus), (c"destroy", destroy),
-        (c"avoidArea", avoid_area), (c"keyboard", keyboard), (c"backPress", back_press), (c"nightMode", night_mode),
+        (c"avoidArea", avoid_area), (c"keyboard", keyboard), (c"backPress", back_press), (c"nightMode", night_mode), (c"windowId", window_id),
     ];
     let properties: Vec<napi_property_descriptor> = methods.iter().map(|(name, method)| napi_property_descriptor {
         utf8name: name.as_ptr(), name: null_mut(), method: Some(*method), getter: None, setter: None, value: null_mut(), attributes: 0, data: null_mut(),
@@ -124,19 +131,22 @@ unsafe extern "C" fn start(env: napi_env, info: napi_callback_info) -> napi_valu
 }
 
 unsafe extern "C" fn call_js(env: napi_env, function: napi_value, _: *mut c_void, data: *mut c_void) {
-    let call = Box::from_raw(data as *mut (CString, CString));
+    let job = Box::from_raw(data as *mut Job);
     if env.is_null() || function.is_null() { return; }
-    let mut argv = [null_mut(); 2];
-    napi_create_string_utf8(env, call.0.as_ptr(), NAPI_AUTO_LENGTH, &mut argv[0]);
-    napi_create_string_utf8(env, call.1.as_ptr(), NAPI_AUTO_LENGTH, &mut argv[1]);
-    napi_call_function(env, undefined(env), function, 2, argv.as_ptr(), null_mut());
+    match *job {
+        Job::Run(f) => f(),
+        Job::Call(name, value) => {
+            let mut argv = [null_mut(); 2];
+            napi_create_string_utf8(env, name.as_ptr(), NAPI_AUTO_LENGTH, &mut argv[0]);
+            napi_create_string_utf8(env, value.as_ptr(), NAPI_AUTO_LENGTH, &mut argv[1]);
+            napi_call_function(env, undefined(env), function, 2, argv.as_ptr(), null_mut());
+        }
+    }
 }
-/// Asks the ability to do `name` with `value`, on its UI thread, later. False before `start`.
-pub(super) fn call(name: &str, value: &str) -> bool {
+fn post(job: Job) -> bool {
     let function = CALL.load(Ordering::Acquire);
-    let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) else { return false };
     if function == 0 { return false; }
-    let data = Box::into_raw(Box::new((name, value)));
+    let data = Box::into_raw(Box::new(job));
     unsafe {
         if napi_call_threadsafe_function(function as _, data.cast(), NAPI_TSFN_NONBLOCKING) != NAPI_OK {
             drop(Box::from_raw(data));
@@ -145,6 +155,14 @@ pub(super) fn call(name: &str, value: &str) -> bool {
     }
     true
 }
+/// Asks the ability to do `name` with `value`, on its UI thread, later. False before `start`.
+pub(super) fn call(name: &str, value: &str) -> bool {
+    let (Ok(name), Ok(value)) = (CString::new(name), CString::new(value)) else { return false };
+    post(Job::Call(name, value))
+}
+/// Runs `f` on the UI thread, later: the input method is spoken to from there, as ArkUI's own
+/// text fields do. False before `start`.
+pub(super) fn on_ui(f: impl FnOnce() + Send + 'static) -> bool { post(Job::Run(Box::new(f))) }
 
 fn emit_lifecycle(kind: u32) { Shared::global().emit(clock_ns(), |q, _| q.lifecycle(kind)); }
 unsafe extern "C" fn foreground(env: napi_env, _: napi_callback_info) -> napi_value {
@@ -186,16 +204,22 @@ unsafe extern "C" fn keyboard(env: napi_env, info: napi_callback_info) -> napi_v
     let a = args::<2>(env, info);
     let (height, open) = (number(env, a[0]).max(0.) as i32, boolean(env, a[1]));
     lock(&Shared::global().state).ime = Some((height, open));
+    if !open { super::ime::closed(); }
     let height = height as f64 / Shared::global().dpi() as f64;
     Shared::global().emit(clock_ns(), |q, id| q.ime_resize(id, height, open));
     undefined(env)
 }
 unsafe extern "C" fn back_press(env: napi_env, _: napi_callback_info) -> napi_value {
-    Shared::global().emit(clock_ns(), |q, id| q.back_pressed(id));
+    if !super::ime::back() { Shared::global().emit(clock_ns(), |q, id| q.back_pressed(id)); }
     undefined(env)
 }
 unsafe extern "C" fn night_mode(env: napi_env, info: napi_callback_info) -> napi_value {
     lock(&Shared::global().state).params.night_mode = boolean(env, args::<1>(env, info)[0]);
+    undefined(env)
+}
+/// `windowId(id)`: the ability's main window, which the input method is told its editor is in.
+unsafe extern "C" fn window_id(env: napi_env, info: napi_callback_info) -> napi_value {
+    super::ime::set_window(number(env, args::<1>(env, info)[0]) as i32);
     undefined(env)
 }
 

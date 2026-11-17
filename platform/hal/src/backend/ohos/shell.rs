@@ -1,4 +1,4 @@
-use super::{napi, surface::{OhosEglSurfaces, Registry}};
+use super::{ime, napi, surface::{OhosEglSurfaces, Registry}};
 use crate::{backend::{exec::{Gpu, OsCmd}, gl::GlBackend, Backend, Pixels, Shell}, buffers::{CmdView, EventQueue}, session::{World, HOST}, *};
 use std::{collections::HashSet, sync::{Arc, Mutex, MutexGuard, OnceLock}};
 
@@ -22,6 +22,8 @@ impl Default for OhosParams {
 
 pub(super) struct State {
     pub recipient: Option<(u32, Id)>,
+    /// the session whose text field the soft keyboard may edit
+    pub ime_session: Option<u32>,
     pub events: Vec<(Option<u32>, EventQueue)>,
     pub params: OhosParams,
     /// the display's frame rate for this app, which each `FrameReady` predicts the next vsync from
@@ -49,7 +51,7 @@ impl Shared {
     pub fn global() -> &'static Self {
         static VALUE: OnceLock<Shared> = OnceLock::new();
         VALUE.get_or_init(|| Self { registry: Mutex::new(Registry::default()), state: Mutex::new(State {
-            recipient: None, events: Vec::new(), params: OhosParams::default(), refresh: 60., insets: [0.; 4], pending: HashSet::new(), active: false, focused: false, ime: None, fullscreen: None, wake: None,
+            recipient: None, ime_session: None, events: Vec::new(), params: OhosParams::default(), refresh: 60., insets: [0.; 4], pending: HashSet::new(), active: false, focused: false, ime: None, fullscreen: None, wake: None,
         }), release_window: Mutex::new(None) })
     }
     pub fn dpi(&self) -> f32 { lock(&self.state).params.density }
@@ -122,6 +124,10 @@ impl Shell for OhosShell {
                 Shared::global().display(); true
             }
             OsCmd::FrameRequest { id } => { lock(&Shared::global().state).pending.insert((sid, id)); napi::request_frame(); true }
+            cmd @ (OsCmd::ImeShow { .. } | OsCmd::ImeHide { .. } | OsCmd::ImeSync { .. }) => {
+                if lock(&Shared::global().state).ime_session != Some(sid) { return false; }
+                ime::command(cmd)
+            }
             OsCmd::ClipSet { text } => napi::call("copyToClipboard", &text),
             OsCmd::BackUnhandled => napi::call("backUnhandled", ""),
             OsCmd::MobileUi { op: mobile_ui::STATUS_BAR_DARK_ICONS, value } => napi::call("statusBarDarkIcons", if value != 0 { "1" } else { "0" }),
@@ -187,6 +193,9 @@ impl Backend for OhosBackend {
     fn submit(&mut self, world: &mut World, sid: u32, view: &CmdView) {
         self.ensure_host(world);
         self.drain(world);
+        let owner = lock(&Shared::global().state).recipient.map(|(sid, _)| sid);
+        let allowed = owner == Some(sid) || world.session(sid).is_some_and(|s| s.focused && s.parent != 0 && Some(s.parent) == owner);
+        lock(&Shared::global().state).ime_session = allowed.then_some(sid);
         self.core.submit(world, sid, view);
         self.drain(world);
     }

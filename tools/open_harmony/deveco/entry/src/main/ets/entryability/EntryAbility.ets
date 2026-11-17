@@ -55,6 +55,12 @@ export default class EntryAbility extends UIAbility {
     });
     windowStage.getMainWindow().then((mainWindow) => {
       this.mainWindow = mainWindow;
+      try {
+        // the input method is told which window its editor is in
+        makepad.windowId(mainWindow.getWindowProperties().id);
+      } catch (e) {
+        hilog.warn(DOMAIN, 'makepad', 'window id: %{public}s', JSON.stringify(e));
+      }
       // Edge to edge: the app draws under the system bars and is told what they cover.
       mainWindow.setWindowLayoutFullScreen(true).catch((e: BusinessError) => {
         hilog.warn(DOMAIN, 'makepad', 'layout full screen failed: %{public}d', e.code);

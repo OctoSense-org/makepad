@@ -6,6 +6,7 @@ pub mod sys;
 mod shell;
 mod surface;
 pub mod napi;
+mod ime;
 pub mod assets;
 pub mod media;
 pub mod standalone;
