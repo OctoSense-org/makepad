@@ -29,35 +29,40 @@ fn log(text: &str) {
     }
 }
 
-/// stdout and stderr go nowhere in an OpenHarmony app: a pipe on both, each line to hilog.
+/// stdout and stderr go nowhere in an OpenHarmony app: a pipe on each, each line to hilog.
+/// One pipe each, because the system's own libraries write to the process's stdout too (its
+/// TLS sockets print each server certificate's alternative names there, without a line end),
+/// and that must not run into a line on stderr, where the app's diagnostics go.
 fn redirect_stdio() {
-    unsafe {
-        let mut fds = [0 as c_int; 2];
-        if pipe(fds.as_mut_ptr()) != 0 {
-            return;
-        }
-        dup2(fds[1], 1);
-        dup2(fds[1], 2);
-        close(fds[1]);
-        let rd = fds[0];
-        let _ = std::thread::Builder::new().name("makepad-hilog".into()).spawn(move || {
-            let mut buf = vec![0u8; 8192];
-            let mut line: Vec<u8> = Vec::new();
-            loop {
-                let n = read(rd, buf.as_mut_ptr().cast(), buf.len());
-                if n <= 0 {
-                    break;
-                }
-                for &b in &buf[..n as usize] {
-                    if b == b'\n' {
-                        log(&String::from_utf8_lossy(&line));
-                        line.clear();
-                    } else {
-                        line.push(b);
+    for fd in [1, 2] {
+        unsafe {
+            let mut fds = [0 as c_int; 2];
+            if pipe(fds.as_mut_ptr()) != 0 {
+                return;
+            }
+            dup2(fds[1], fd);
+            close(fds[1]);
+            let rd = fds[0];
+            let _ = std::thread::Builder::new().name("makepad-hilog".into()).spawn(move || {
+                let mut buf = vec![0u8; 8192];
+                let mut line: Vec<u8> = Vec::new();
+                loop {
+                    let n = read(rd, buf.as_mut_ptr().cast(), buf.len());
+                    if n <= 0 {
+                        break;
+                    }
+                    for &b in &buf[..n as usize] {
+                        if b == b'\n' || line.len() >= 1 << 16 {
+                            log(&String::from_utf8_lossy(&line));
+                            line.clear();
+                        }
+                        if b != b'\n' {
+                            line.push(b);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
 }
 
