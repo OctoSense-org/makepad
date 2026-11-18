@@ -970,9 +970,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.ret_stack.push(out);
         fcx.async_depth += 1;
         let t = fcx.check_block(bid, Some(out));
-        if !fcx.diverges {
-            fcx.coerce_or_unify(t, out, None, ast.block(bid).hi);
-        }
+        fcx.coerce_body_tail(t, out, ast.block(bid).hi);
         fcx.async_depth -= 1;
         fcx.ret_stack.pop();
         fcx.closure_depth.pop();
@@ -984,23 +982,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     } else if let Some(bid) = body {
         fcx.b.body = Some(bid);
         let t = fcx.check_block(bid, Some(ret));
-        if !fcx.diverges {
-            fcx.coerce_or_unify(t, ret, None, ast.block(bid).hi);
-        } else {
-            // a tail after a diverging statement still types the return (rustc coerces the
-            // tail; `panic!(); MyStruct` defines `impl MyTrait` as MyStruct)
-            let st = fcx.shallow(t);
-            if !matches!(fcx.tcx.tys.kind(st), TyKind::Never) {
-                let save = fcx.start_snapshot();
-                if !fcx.try_coerce(t, ret, None) { fcx.rollback_to(save); } else { fcx.commit_from(save); }
-            }
-            // a body that only diverges (`fn f() -> impl Sized { todo!() }`): the return type's
-            // still-open variable falls back like any variable a `!` flowed into
-            let sr = fcx.shallow(ret);
-            if matches!(fcx.tcx.tys.kind(sr), TyKind::Infer(_)) {
-                fcx.diverging.push(sr);
-            }
-        }
+        fcx.coerce_body_tail(t, ret, ast.block(bid).hi);
     }
     fcx.finish();
     fcx.into_body()
@@ -6903,6 +6885,27 @@ impl<'a> Fcx<'a> {
         self.normalize_signature(ret)
     }
 
+    /// rustc check_return_or_body_tail, for fn, async fn and async block bodies: the tail is
+    /// coerced to the return type even after a diverging statement, so `panic!(); Ok(())` still
+    /// types the output and `panic!(); MyStruct` defines `impl MyTrait` as MyStruct. A body that
+    /// only diverges (`async { todo!() }`, `fn f() -> impl Sized { todo!() }`) leaves the return
+    /// type's still-open variable to fall back like any variable a `!` flowed into.
+    fn coerce_body_tail(&mut self, t: TyId, ret: TyId, pos: u32) {
+        if !self.diverges {
+            self.coerce_or_unify(t, ret, None, pos);
+            return;
+        }
+        let st = self.shallow(t);
+        if !matches!(self.tcx.tys.kind(st), TyKind::Never) {
+            let save = self.start_snapshot();
+            if !self.try_coerce(t, ret, None) { self.rollback_to(save); } else { self.commit_from(save); }
+        }
+        let sr = self.shallow(ret);
+        if matches!(self.tcx.tys.kind(sr), TyKind::Infer(_)) {
+            self.diverging.push(sr);
+        }
+    }
+
     /// `async [move] { .. }`: a coroutine -- a closure type with no parameters whose state
     /// holds the captures and a frame word, and which implements Future<Output = the block's
     /// type> (rustc lowers async blocks to coroutines; captures as for closures).
@@ -6924,16 +6927,7 @@ impl<'a> Fcx<'a> {
         self.loops = save_loops;
         self.in_loop_condition = save_condition;
         let points = std::mem::replace(&mut self.await_count, save_awaits);
-        if !self.diverges {
-            self.coerce_or_unify(bt, out, None, self.ast().block(b).hi);
-        } else {
-            // a body that only diverges (`async { todo!() }`): the return type's still-open
-            // variable falls back like any variable a `!` flowed into
-            let so = self.shallow(out);
-            if matches!(self.tcx.tys.kind(so), TyKind::Infer(_)) {
-                self.diverging.push(so);
-            }
-        }
+        self.coerce_body_tail(bt, out, self.ast().block(b).hi);
         self.async_depth -= 1;
         self.ret_stack.pop();
         self.closure_depth.pop();
