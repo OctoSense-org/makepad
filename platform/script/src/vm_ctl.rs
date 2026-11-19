@@ -529,7 +529,7 @@ impl ScriptVmBase {
                 0
             }
             CTL_NATIVE_STRING_PREFLIGHT => {
-                if self.heap.has_allocation_budget() && !self.heap.charge_native_strings_after {
+                if self.heap.has_allocation_budget() && !self.heap.charges_native_strings_after() {
                     let _ = self.heap.charge_allocation(usize::MAX, "building a native string without an allocation preflight");
                     return 0;
                 }
